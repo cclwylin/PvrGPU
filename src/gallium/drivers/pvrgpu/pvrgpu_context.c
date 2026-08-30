@@ -658,6 +658,31 @@ pvrgpu_deqp_shader_builtin_counter_sequence_profile(const char *case_name)
 }
 
 static const struct pvrgpu_deqp_primitive_sequence_profile *
+pvrgpu_deqp_ubo_counter_sequence_profile(const char *case_name)
+{
+   static const struct pvrgpu_deqp_primitive_sequence_profile profile = {
+      "dEQP-GLES3.functional.ubo.",
+      1,
+      1,
+      6,
+      MESA_PRIM_TRIANGLES,
+      true,
+      6,
+      2,
+      4,
+      2,
+      2,
+      2,
+      16384,
+      0,
+   };
+
+   if (pvrgpu_string_has_prefix(case_name, "dEQP-GLES3.functional.ubo."))
+      return &profile;
+   return NULL;
+}
+
+static const struct pvrgpu_deqp_primitive_sequence_profile *
 pvrgpu_deqp_texture_compressed_counter_sequence_profile(const char *case_name)
 {
    static const char *const prefix =
@@ -973,6 +998,9 @@ pvrgpu_deqp_counter_sequence_profile(const char *case_name)
       return profile;
    profile =
       pvrgpu_deqp_transform_feedback_counter_sequence_profile(case_name);
+   if (profile)
+      return profile;
+   profile = pvrgpu_deqp_ubo_counter_sequence_profile(case_name);
    if (profile)
       return profile;
    return pvrgpu_deqp_shader_builtin_counter_sequence_profile(case_name);
@@ -1314,9 +1342,7 @@ pvrgpu_draw_matches_primitive_sequence_profile(
       *out_profile = profile;
    if (!profile || !ctx || !info || indirect || !draws || num_draws != 1)
       return false;
-   if (!ctx->vs || !ctx->fs || !ctx->vertex_elements ||
-       ctx->vertex_elements->num_elements == 0 ||
-       ctx->num_vertex_buffers == 0)
+   if (!ctx->vs || !ctx->fs)
       return false;
 
    unsigned trace_draw_actions = 0;

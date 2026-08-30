@@ -29,8 +29,8 @@ pvrgpu_init_single_shader_caps(struct pipe_screen *screen,
    caps->max_control_flow_depth = 8;
    caps->max_inputs = shader == MESA_SHADER_FRAGMENT ? 8 : 16;
    caps->max_outputs = shader == MESA_SHADER_FRAGMENT ? 1 : 8;
-   caps->max_const_buffer0_size = 16 * 1024;
-   caps->max_const_buffers = 1;
+   caps->max_const_buffer0_size = 64 * 1024;
+   caps->max_const_buffers = 16;
    caps->max_temps = 256;
    caps->max_texture_samplers = 16;
    caps->max_sampler_views = 16;
@@ -123,7 +123,8 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    caps->max_texture_2d_size = 4096;
    caps->max_texture_cube_levels = 13;
    caps->max_render_targets = 1;
-   caps->max_constant_buffer_size = 16 * 1024;
+   caps->max_constant_buffer_size = 64 * 1024;
+   caps->constant_buffer_offset_alignment = 16;
    caps->max_vertex_attrib_stride = 2048;
    caps->max_vertex_buffers = PIPE_MAX_ATTRIBS;
    caps->max_stream_output_buffers = PIPE_MAX_SO_BUFFERS;
@@ -134,7 +135,9 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    caps->stream_output_interleave_buffers = true;
    caps->user_vertex_buffers = true;
    caps->texture_transfer_modes = 0;
-   caps->essl_feature_level = 100;
+   caps->glsl_feature_level = 330;
+   caps->glsl_feature_level_compatibility = 330;
+   caps->essl_feature_level = 300;
 }
 
 static bool
