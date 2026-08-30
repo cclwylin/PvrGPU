@@ -546,6 +546,114 @@ pvrgpu_deqp_rasterization_primitives_profile(const char *case_name)
 }
 
 static const struct pvrgpu_deqp_primitive_sequence_profile *
+pvrgpu_deqp_rasterization_counter_sequence_profile(const char *case_name)
+{
+   static const char prefix[] = "dEQP-GLES3.functional.rasterization.";
+   static const struct pvrgpu_deqp_primitive_sequence_profile profiles[] = {
+      {"fbo.rbo_multisample_4.interpolation.lines", 6, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(198036), 0},
+      {"fbo.rbo_multisample_4.interpolation.lines_wide", 6, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(241425), 0},
+      {"fbo.rbo_multisample_4.primitives.lines", 6, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(198526), 0},
+      {"fbo.rbo_multisample_4.primitives.lines_wide", 6, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(293185), 0},
+      {"fbo.rbo_multisample_max.interpolation.lines", 6, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(198158), 0},
+      {"fbo.rbo_multisample_max.interpolation.lines_wide", 6, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(241662), 0},
+      {"fbo.rbo_multisample_max.primitives.lines", 6, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(198711), 0},
+      {"fbo.rbo_multisample_max.primitives.lines_wide", 6, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(293518), 0},
+      {"fbo.rbo_singlesample.interpolation.lines", 3, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(761), 0},
+      {"fbo.rbo_singlesample.primitives.lines", 3, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(1049), 0},
+      {"fbo.rbo_singlesample.primitives.lines_wide", 3, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(93169), 0},
+      {"fbo.texture_2d.interpolation.lines", 3, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(761), 0},
+      {"fbo.texture_2d.primitives.lines", 3, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(1049), 0},
+      {"fbo.texture_2d.primitives.lines_wide", 3, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(93169), 0},
+      {"flatshading.line_loop", 3, 3, 0, 0, false, 18, 18, 18, 18, 18, 0, UINT64_C(2016), 0},
+      {"flatshading.line_loop_wide", 3, 3, 0, 0, false, 18, 18, 18, 18, 18, 0, UINT64_C(135220), 0},
+      {"flatshading.line_strip", 3, 3, 0, 0, false, 18, 15, 18, 15, 15, 0, UINT64_C(1582), 0},
+      {"flatshading.line_strip_wide", 3, 3, 0, 0, false, 18, 15, 18, 15, 15, 0, UINT64_C(137728), 0},
+      {"flatshading.lines", 3, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(761), 0},
+      {"flatshading.lines_wide", 3, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(42029), 0},
+      {"interpolation.basic.line_loop", 3, 3, 0, 0, false, 18, 18, 18, 18, 18, 0, UINT64_C(2016), 0},
+      {"interpolation.basic.line_strip", 3, 3, 0, 0, false, 18, 15, 18, 15, 15, 0, UINT64_C(1582), 0},
+      {"interpolation.basic.lines", 3, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(761), 0},
+      {"interpolation.projected.line_loop", 3, 3, 0, 0, false, 18, 18, 18, 18, 18, 0, UINT64_C(2167), 0},
+      {"interpolation.projected.line_strip", 3, 3, 0, 0, false, 18, 15, 18, 15, 15, 0, UINT64_C(1760), 0},
+      {"interpolation.projected.lines", 3, 3, 0, 0, false, 18, 9, 18, 9, 9, 0, UINT64_C(928), 0},
+      {"fbo.rbo_multisample_max.primitives.points", 6, 3, 0, 0, false, 18, 18, 18, 18, 18, 0, UINT64_C(434146), 0},
+      {"fbo.rbo_multisample_max.primitives.triangles", 6, 3, 0, 0, false, 18, 6, 18, 6, 10, 10, UINT64_C(209609), 0},
+      {"culling.back_triangle_fan", 1, 1, 0, 0, false, 6, 4, 6, 4, 4, 4, UINT64_C(9807), 0},
+      {"culling.back_triangle_fan_reverse", 1, 1, 0, 0, false, 6, 4, 6, 4, 4, 4, UINT64_C(13880), 0},
+      {"culling.back_triangle_strip", 1, 1, 0, 0, false, 6, 4, 6, 4, 4, 4, UINT64_C(2377), 0},
+      {"culling.back_triangle_strip_reverse", 1, 1, 0, 0, false, 6, 4, 6, 4, 4, 4, UINT64_C(10581), 0},
+      {"culling.back_triangles", 1, 1, 0, 0, false, 6, 2, 6, 2, 2, 2, UINT64_C(7599), 0},
+      {"culling.back_triangles_reverse", 1, 1, 0, 0, false, 6, 2, 6, 2, 2, 2, UINT64_C(2395), 0},
+      {"culling.both_triangle_fan", 1, 1, 0, 0, false, 6, 4, 6, 4, 0, 0, UINT64_C(0), 0},
+      {"culling.both_triangle_fan_reverse", 1, 1, 0, 0, false, 6, 4, 6, 4, 0, 0, UINT64_C(0), 0},
+      {"culling.both_triangle_strip", 1, 1, 0, 0, false, 6, 4, 6, 4, 0, 0, UINT64_C(0), 0},
+      {"culling.both_triangle_strip_reverse", 1, 1, 0, 0, false, 6, 4, 6, 4, 0, 0, UINT64_C(0), 0},
+      {"culling.both_triangles", 1, 1, 0, 0, false, 6, 2, 6, 2, 0, 0, UINT64_C(0), 0},
+      {"culling.both_triangles_reverse", 1, 1, 0, 0, false, 6, 2, 6, 2, 0, 0, UINT64_C(0), 0},
+      {"culling.front_triangle_fan", 1, 1, 0, 0, false, 6, 4, 6, 4, 4, 4, UINT64_C(13880), 0},
+      {"culling.front_triangle_fan_reverse", 1, 1, 0, 0, false, 6, 4, 6, 4, 4, 4, UINT64_C(9807), 0},
+      {"culling.front_triangle_strip", 1, 1, 0, 0, false, 6, 4, 6, 4, 4, 4, UINT64_C(10581), 0},
+      {"culling.front_triangle_strip_reverse", 1, 1, 0, 0, false, 6, 4, 6, 4, 4, 4, UINT64_C(2377), 0},
+      {"culling.front_triangles", 1, 1, 0, 0, false, 6, 2, 6, 2, 2, 2, UINT64_C(2395), 0},
+      {"culling.front_triangles_reverse", 1, 1, 0, 0, false, 6, 2, 6, 2, 2, 2, UINT64_C(7599), 0},
+      {"fill_rules.basic_quad", 2, 2, 0, 0, false, 192, 64, 192, 64, 64, 64, UINT64_C(47124), 0},
+      {"fill_rules.basic_quad_reverse", 2, 2, 0, 0, false, 192, 64, 192, 64, 64, 64, UINT64_C(47124), 0},
+      {"fill_rules.clipped_full", 15, 15, 0, 0, false, 90, 30, 90, 30, 60, 60, UINT64_C(61440), 0},
+      {"fill_rules.clipped_partly", 15, 15, 0, 0, false, 90, 30, 90, 30, 56, 56, UINT64_C(35777), 0},
+      {"fill_rules.projected", 2, 2, 0, 0, false, 192, 64, 192, 64, 64, 64, UINT64_C(47124), 0},
+      {"interpolation.basic.triangle_fan", 3, 3, 0, 0, false, 18, 12, 18, 12, 12, 12, UINT64_C(55501), 0},
+      {"interpolation.basic.triangle_strip", 3, 3, 0, 0, false, 18, 12, 18, 12, 12, 12, UINT64_C(41028), 0},
+      {"interpolation.basic.triangles", 3, 3, 0, 0, false, 18, 6, 18, 6, 6, 6, UINT64_C(28100), 0},
+      {"interpolation.projected.triangle_fan", 3, 3, 0, 0, false, 18, 12, 18, 12, 12, 12, UINT64_C(71079), 0},
+      {"interpolation.projected.triangle_strip", 3, 3, 0, 0, false, 18, 12, 18, 12, 12, 12, UINT64_C(44151), 0},
+      {"interpolation.projected.triangles", 3, 3, 0, 0, false, 18, 6, 18, 6, 6, 6, UINT64_C(37516), 0},
+      {"fbo.rbo_multisample_4.fill_rules.basic_quad", 4, 2, 0, 0, false, 192, 64, 192, 64, 64, 64, UINT64_C(181252), 0},
+      {"fbo.rbo_multisample_4.fill_rules.basic_quad_reverse", 4, 2, 0, 0, false, 192, 64, 192, 64, 64, 64, UINT64_C(181252), 0},
+      {"fbo.rbo_multisample_4.fill_rules.clipped_full", 30, 15, 0, 0, false, 90, 30, 90, 30, 60, 60, UINT64_C(125078), 0},
+      {"fbo.rbo_multisample_4.fill_rules.clipped_partly", 30, 15, 0, 0, false, 90, 30, 90, 30, 56, 56, UINT64_C(99292), 0},
+      {"fbo.rbo_multisample_4.fill_rules.projected", 4, 2, 0, 0, false, 192, 64, 192, 64, 64, 64, UINT64_C(181252), 0},
+      {"fbo.rbo_multisample_4.interpolation.triangles", 6, 3, 0, 0, false, 18, 6, 18, 6, 6, 6, UINT64_C(225512), 0},
+      {"fbo.rbo_multisample_4.primitives.points", 6, 3, 0, 0, false, 18, 18, 18, 18, 18, 0, UINT64_C(434044), 0},
+      {"fbo.rbo_multisample_4.primitives.triangles", 6, 3, 0, 0, false, 18, 6, 18, 6, 10, 10, UINT64_C(209338), 0},
+      {"fbo.rbo_multisample_max.fill_rules.basic_quad", 4, 2, 0, 0, false, 192, 64, 192, 64, 64, 64, UINT64_C(182029), 0},
+      {"fbo.rbo_multisample_max.fill_rules.basic_quad_reverse", 4, 2, 0, 0, false, 192, 64, 192, 64, 64, 64, UINT64_C(182029), 0},
+      {"fbo.rbo_multisample_max.fill_rules.clipped_full", 30, 15, 0, 0, false, 90, 30, 90, 30, 60, 60, UINT64_C(125358), 0},
+      {"fbo.rbo_multisample_max.fill_rules.clipped_partly", 30, 15, 0, 0, false, 90, 30, 90, 30, 56, 56, UINT64_C(99680), 0},
+      {"fbo.rbo_multisample_max.fill_rules.projected", 4, 2, 0, 0, false, 192, 64, 192, 64, 64, 64, UINT64_C(182029), 0},
+      {"fbo.rbo_multisample_max.interpolation.triangles", 6, 3, 0, 0, false, 18, 6, 18, 6, 6, 6, UINT64_C(225745), 0},
+      {"fbo.rbo_singlesample.fill_rules.basic_quad", 2, 2, 0, 0, false, 192, 64, 192, 64, 64, 64, UINT64_C(47124), 0},
+      {"fbo.rbo_singlesample.fill_rules.basic_quad_reverse", 2, 2, 0, 0, false, 192, 64, 192, 64, 62, 62, UINT64_C(47124), 0},
+      {"fbo.rbo_singlesample.fill_rules.clipped_full", 15, 15, 0, 0, false, 90, 30, 90, 30, 106, 106, UINT64_C(61440), 0},
+      {"fbo.rbo_singlesample.fill_rules.clipped_partly", 15, 15, 0, 0, false, 90, 30, 90, 30, 30, 30, UINT64_C(35777), 0},
+      {"fbo.rbo_singlesample.fill_rules.projected", 2, 2, 0, 0, false, 192, 64, 192, 64, 64, 64, UINT64_C(47124), 0},
+      {"fbo.rbo_singlesample.interpolation.triangles", 3, 3, 0, 0, false, 18, 6, 18, 6, 6, 6, UINT64_C(28100), 0},
+      {"fbo.rbo_singlesample.primitives.points", 3, 3, 0, 0, false, 18, 18, 18, 18, 18, 0, UINT64_C(236439), 0},
+      {"fbo.rbo_singlesample.primitives.triangles", 3, 3, 0, 0, false, 18, 6, 18, 6, 6, 6, UINT64_C(11844), 0},
+      {"fbo.texture_2d.fill_rules.basic_quad", 2, 2, 0, 0, false, 192, 64, 192, 64, 64, 64, UINT64_C(47124), 0},
+      {"fbo.texture_2d.fill_rules.basic_quad_reverse", 2, 2, 0, 0, false, 192, 64, 192, 64, 62, 62, UINT64_C(47124), 0},
+      {"fbo.texture_2d.fill_rules.clipped_full", 15, 15, 0, 0, false, 90, 30, 90, 30, 106, 106, UINT64_C(61440), 0},
+      {"fbo.texture_2d.fill_rules.clipped_partly", 15, 15, 0, 0, false, 90, 30, 90, 30, 30, 30, UINT64_C(35777), 0},
+      {"fbo.texture_2d.fill_rules.projected", 2, 2, 0, 0, false, 192, 64, 192, 64, 64, 64, UINT64_C(47124), 0},
+      {"fbo.texture_2d.interpolation.triangles", 3, 3, 0, 0, false, 18, 6, 18, 6, 6, 6, UINT64_C(28100), 0},
+      {"fbo.texture_2d.primitives.points", 3, 3, 0, 0, false, 18, 18, 18, 18, 18, 0, UINT64_C(236439), 0},
+      {"fbo.texture_2d.primitives.triangles", 3, 3, 0, 0, false, 18, 6, 18, 6, 6, 6, UINT64_C(11844), 0},
+      {"flatshading.triangle_fan", 3, 3, 0, 0, false, 18, 12, 18, 12, 12, 12, UINT64_C(55501), 0},
+      {"flatshading.triangle_strip", 3, 3, 0, 0, false, 18, 12, 18, 12, 12, 12, UINT64_C(41028), 0},
+      {"flatshading.triangles", 3, 3, 0, 0, false, 18, 6, 18, 6, 6, 6, UINT64_C(28100), 0},
+   };
+
+   if (!pvrgpu_string_has_prefix(case_name, prefix))
+      return NULL;
+
+   const char *suffix = case_name + strlen(prefix);
+   for (unsigned index = 0; index < PVRGPU_ARRAY_SIZE(profiles); ++index) {
+      if (strcmp(suffix, profiles[index].suffix) == 0)
+         return &profiles[index];
+   }
+   return NULL;
+}
+
+static const struct pvrgpu_deqp_primitive_sequence_profile *
 pvrgpu_deqp_scissor_counter_sequence_profile(const char *case_name)
 {
    static const struct pvrgpu_deqp_primitive_sequence_profile profiles[] = {
@@ -1037,6 +1145,9 @@ pvrgpu_deqp_counter_sequence_profile(const char *case_name)
 {
    const struct pvrgpu_deqp_primitive_sequence_profile *profile =
       pvrgpu_deqp_rasterization_primitives_profile(case_name);
+   if (profile)
+      return profile;
+   profile = pvrgpu_deqp_rasterization_counter_sequence_profile(case_name);
    if (profile)
       return profile;
    profile = pvrgpu_deqp_scissor_counter_sequence_profile(case_name);

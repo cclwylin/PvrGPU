@@ -134,10 +134,32 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    caps->stream_output_pause_resume = true;
    caps->stream_output_interleave_buffers = true;
    caps->user_vertex_buffers = true;
+   caps->texture_multisample = true;
    caps->texture_transfer_modes = 0;
    caps->glsl_feature_level = 330;
    caps->glsl_feature_level_compatibility = 330;
    caps->essl_feature_level = 300;
+}
+
+static bool
+pvrgpu_is_supported_sample_count(unsigned sample_count)
+{
+   switch (sample_count) {
+   case 0:
+   case 1:
+   case 4:
+   case 8:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+pvrgpu_is_multisampled_request(unsigned sample_count,
+                               unsigned storage_sample_count)
+{
+   return sample_count > 1 || storage_sample_count > 1;
 }
 
 static bool
@@ -209,10 +231,14 @@ pvrgpu_is_format_supported(struct pipe_screen *screen,
                            unsigned bind)
 {
    (void)screen;
-   if (sample_count > 1 || storage_sample_count > 1)
+   if (!pvrgpu_is_supported_sample_count(sample_count) ||
+       !pvrgpu_is_supported_sample_count(storage_sample_count))
       return false;
 
    if (target == PIPE_BUFFER) {
+      if (pvrgpu_is_multisampled_request(sample_count,
+                                         storage_sample_count))
+         return false;
       const unsigned supported_buffer_binds =
          PIPE_BIND_VERTEX_BUFFER |
          PIPE_BIND_INDEX_BUFFER |
@@ -231,6 +257,9 @@ pvrgpu_is_format_supported(struct pipe_screen *screen,
    }
 
    if (!pvrgpu_is_supported_texture_target(target))
+      return false;
+   if (pvrgpu_is_multisampled_request(sample_count, storage_sample_count) &&
+       target != PIPE_TEXTURE_2D)
       return false;
    if (pvrgpu_is_supported_color_format(format)) {
       unsigned supported_binds = PIPE_BIND_SAMPLER_VIEW;

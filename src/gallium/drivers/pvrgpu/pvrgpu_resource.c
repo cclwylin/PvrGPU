@@ -136,13 +136,39 @@ pvrgpu_can_create_buffer(const struct pipe_resource *template)
 }
 
 static bool
+pvrgpu_is_supported_resource_sample_count(unsigned sample_count)
+{
+   switch (sample_count) {
+   case 0:
+   case 1:
+   case 4:
+   case 8:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+pvrgpu_resource_is_multisampled(const struct pipe_resource *resource)
+{
+   return resource &&
+          (resource->nr_samples > 1 || resource->nr_storage_samples > 1);
+}
+
+static bool
 pvrgpu_can_create_texture_target(const struct pipe_resource *template)
 {
    if (!template ||
        template->width0 == 0 ||
        template->height0 == 0 ||
-       template->nr_samples > 1 ||
-       template->nr_storage_samples > 1)
+       !pvrgpu_is_supported_resource_sample_count(template->nr_samples) ||
+       !pvrgpu_is_supported_resource_sample_count(
+          template->nr_storage_samples))
+      return false;
+
+   if (pvrgpu_resource_is_multisampled(template) &&
+       template->target != PIPE_TEXTURE_2D)
       return false;
 
    switch (template->target) {
@@ -190,6 +216,15 @@ pvrgpu_resource_layer_count(const struct pipe_resource *resource)
    return resource->array_size > 0 ? resource->array_size : 1;
 }
 
+static unsigned
+pvrgpu_resource_storage_sample_count(const struct pipe_resource *resource)
+{
+   unsigned sample_count = resource->nr_storage_samples;
+   if (sample_count == 0)
+      sample_count = resource->nr_samples;
+   return sample_count > 1 ? sample_count : 1;
+}
+
 static bool
 pvrgpu_init_resource_storage(struct pvrgpu_resource *resource)
 {
@@ -203,7 +238,9 @@ pvrgpu_init_resource_storage(struct pvrgpu_resource *resource)
       if (block_size == 0)
          return false;
 
-      resource->stride = resource->base.width0 * block_size;
+      resource->stride =
+         resource->base.width0 * block_size *
+         pvrgpu_resource_storage_sample_count(&resource->base);
       resource->layer_stride =
          (uintptr_t)resource->stride * resource->base.height0;
       resource->size =
