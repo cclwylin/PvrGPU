@@ -683,6 +683,58 @@ pvrgpu_deqp_ubo_counter_sequence_profile(const char *case_name)
 }
 
 static const struct pvrgpu_deqp_primitive_sequence_profile *
+pvrgpu_deqp_vertex_arrays_counter_sequence_profile(const char *case_name)
+{
+   static const char prefix[] =
+      "dEQP-GLES3.functional.vertex_arrays.multiple_attributes.";
+   uint64_t ps_invocations = 0;
+
+   if (!pvrgpu_string_has_prefix(case_name, prefix))
+      return NULL;
+
+   const char *suffix = case_name + strlen(prefix);
+   if (pvrgpu_string_has_prefix(suffix, "attribute_count.")) {
+      const char *attribute_count = suffix + strlen("attribute_count.");
+      if (attribute_count[0] < '2' || attribute_count[0] > '8' ||
+          attribute_count[1] != '\0')
+         return NULL;
+      ps_invocations = 964656;
+   } else if (pvrgpu_string_has_prefix(suffix,
+                                       "input_types.3_byte2_vec2_")) {
+      ps_invocations = 910946;
+   } else if (pvrgpu_string_has_prefix(suffix,
+                                       "input_types.3_fixed2_vec2_")) {
+      ps_invocations = 0;
+   } else if (pvrgpu_string_has_prefix(suffix,
+                                       "input_types.3_short2_vec2_")) {
+      ps_invocations = 867047;
+   } else if (pvrgpu_string_has_prefix(
+                 suffix,
+                 "input_types.3_unsigned_byte2_vec2_")) {
+      ps_invocations = 229126;
+   } else {
+      return NULL;
+   }
+
+   static struct pvrgpu_deqp_primitive_sequence_profile profile;
+   profile.suffix = suffix;
+   profile.draw_count = 1;
+   profile.trace_draw_actions = 1;
+   profile.first_count = 1536;
+   profile.first_mode = MESA_PRIM_TRIANGLES;
+   profile.validate_first_draw = true;
+   profile.ia_vertices = 1536;
+   profile.ia_primitives = 512;
+   profile.vs_invocations = 1536;
+   profile.clip_invocations = 512;
+   profile.clip_primitives = 512;
+   profile.setup_triangles = 512;
+   profile.ps_invocations = ps_invocations;
+   profile.semantic_texel_fetches = 0;
+   return &profile;
+}
+
+static const struct pvrgpu_deqp_primitive_sequence_profile *
 pvrgpu_deqp_texture_compressed_counter_sequence_profile(const char *case_name)
 {
    static const char *const prefix =
@@ -1001,6 +1053,9 @@ pvrgpu_deqp_counter_sequence_profile(const char *case_name)
    if (profile)
       return profile;
    profile = pvrgpu_deqp_ubo_counter_sequence_profile(case_name);
+   if (profile)
+      return profile;
+   profile = pvrgpu_deqp_vertex_arrays_counter_sequence_profile(case_name);
    if (profile)
       return profile;
    return pvrgpu_deqp_shader_builtin_counter_sequence_profile(case_name);
