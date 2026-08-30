@@ -415,7 +415,7 @@ void NormalizeDriverPrimitiveSequenceApiCounters(const Options &options,
   counters.ps_invocations = command.ps_invocations;
   counters.drawlists = command.draw_count;
   counters.setup_triangles = command.setup_triangles;
-  counters.texel_fetches = 0;
+  counters.texel_fetches = command.semantic_texel_fetches;
   counters.vs_alu_instructions = 0;
   counters.vs_tex_instructions = 0;
   counters.vs_memory_instructions = 0;

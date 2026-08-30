@@ -310,7 +310,8 @@ pvrgpu_write_draw_primitive_sequence_command(
       "clip_invocations=%u\n"
       "clip_primitives=%u\n"
       "setup_triangles=%u\n"
-      "ps_invocations=%" PRIu64 "\n",
+      "ps_invocations=%" PRIu64 "\n"
+      "semantic_texel_fetches=%" PRIu64 "\n",
       PVRGPU_DRIVER_COMMAND_SCHEMA,
       PVRGPU_DRIVER_COMMAND_PRODUCER,
       cmd->case_name,
@@ -329,7 +330,8 @@ pvrgpu_write_draw_primitive_sequence_command(
       cmd->clip_invocations,
       cmd->clip_primitives,
       cmd->setup_triangles,
-      cmd->ps_invocations);
+      cmd->ps_invocations,
+      cmd->semantic_texel_fetches);
    const int close_status = fclose(file);
    if (written < 0 || close_status != 0) {
       if (error && error_size != 0) {

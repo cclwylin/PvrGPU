@@ -158,7 +158,8 @@ int main() {
             "clip_invocations=12\n"
             "clip_primitives=12\n"
             "setup_triangles=0\n"
-            "ps_invocations=1052\n");
+            "ps_invocations=1052\n"
+            "semantic_texel_fetches=0\n");
   error.clear();
   if (int failed =
           Expect(LoadDriverCommand(primitives.string(), &command, &error),
@@ -169,7 +170,8 @@ int main() {
                      command.draw_count == 3 &&
                      command.ia_vertices == 12 &&
                      command.clip_primitives == 12 &&
-                     command.ps_invocations == 1052,
+                     command.ps_invocations == 1052 &&
+                     command.semantic_texel_fetches == 0,
                  "wrong primitive sequence metadata"))
     return failed;
 
@@ -191,7 +193,8 @@ int main() {
             "clip_invocations=0\n"
             "clip_primitives=0\n"
             "setup_triangles=0\n"
-            "ps_invocations=0\n");
+            "ps_invocations=0\n"
+            "semantic_texel_fetches=0\n");
   error.clear();
   if (int failed =
           Expect(LoadDriverCommand(discard.string(), &command, &error),

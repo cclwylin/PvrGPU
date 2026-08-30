@@ -87,7 +87,7 @@ const std::set<std::string> &DrawPrimitiveSequenceFields() {
       "height",           "format",          "clear_color_bits",
       "draw_count",       "ia_vertices",     "ia_primitives",
       "vs_invocations",   "clip_invocations", "clip_primitives",
-      "setup_triangles",  "ps_invocations",
+      "setup_triangles",  "ps_invocations",  "semantic_texel_fetches",
   };
   return fields;
 }
@@ -399,7 +399,9 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         parsed.clip_primitives < parsed.clip_invocations ||
         !ParseU32(fields["setup_triangles"], &parsed.setup_triangles) ||
         parsed.setup_triangles > parsed.clip_primitives ||
-        !ParseU64(fields["ps_invocations"], &parsed.ps_invocations)) {
+        !ParseU64(fields["ps_invocations"], &parsed.ps_invocations) ||
+        !ParseU64(fields["semantic_texel_fetches"],
+                  &parsed.semantic_texel_fetches)) {
       *error =
           "draw primitive sequence contains invalid semantic counter metadata";
       return false;

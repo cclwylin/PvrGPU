@@ -594,6 +594,7 @@ def verify_driver_primitive_sequence(
                 "clip_primitives=12",
                 "setup_triangles=0",
                 "ps_invocations=1052",
+                "semantic_texel_fetches=0",
             )
         )
         + "\n",

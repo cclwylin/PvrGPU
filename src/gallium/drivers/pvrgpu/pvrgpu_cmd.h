@@ -71,6 +71,7 @@ struct pvrgpu_draw_primitive_sequence_command {
    uint32_t clip_primitives;
    uint32_t setup_triangles;
    uint64_t ps_invocations;
+   uint64_t semantic_texel_fetches;
 };
 
 bool

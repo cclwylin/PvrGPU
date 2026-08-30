@@ -218,6 +218,14 @@ struct pvrgpu_deqp_primitive_sequence_profile {
    uint32_t clip_primitives;
    uint32_t setup_triangles;
    uint64_t ps_invocations;
+   uint64_t semantic_texel_fetches;
+};
+
+struct pvrgpu_deqp_texture_compressed_counter_profile {
+   const char *suffix;
+   unsigned draw_count;
+   uint64_t ps_invocations;
+   uint64_t texel_fetches;
 };
 
 static bool
@@ -638,6 +646,130 @@ pvrgpu_deqp_shader_builtin_counter_sequence_profile(const char *case_name)
 }
 
 static const struct pvrgpu_deqp_primitive_sequence_profile *
+pvrgpu_deqp_texture_compressed_counter_sequence_profile(const char *case_name)
+{
+   static const char *const prefix =
+      "dEQP-GLES3.functional.texture.compressed.astc.";
+   static const struct pvrgpu_deqp_texture_compressed_counter_profile
+      profiles[] = {
+         {"block_size_remainder.10x10", 100, 198025, 234096},
+         {"block_size_remainder.10x10_srgb", 100, 198025, 234240},
+         {"block_size_remainder.10x5", 50, 48950, 60080},
+         {"block_size_remainder.10x5_srgb", 50, 48950, 59624},
+         {"block_size_remainder.10x6", 60, 70755, 86008},
+         {"block_size_remainder.10x6_srgb", 60, 70755, 85976},
+         {"block_size_remainder.10x8", 80, 126380, 150032},
+         {"block_size_remainder.10x8_srgb", 80, 126380, 150888},
+         {"block_size_remainder.12x10", 120, 285690, 331536},
+         {"block_size_remainder.12x10_srgb", 120, 285690, 329944},
+         {"block_size_remainder.12x12", 144, 412164, 472904},
+         {"block_size_remainder.12x12_srgb", 144, 412164, 475080},
+         {"block_size_remainder.4x4", 16, 4900, 7232},
+         {"block_size_remainder.4x4_srgb", 16, 4900, 7264},
+         {"block_size_remainder.5x4", 20, 7700, 10712},
+         {"block_size_remainder.5x4_srgb", 20, 7700, 10544},
+         {"block_size_remainder.5x5", 25, 12100, 16184},
+         {"block_size_remainder.5x5_srgb", 25, 12100, 16376},
+         {"block_size_remainder.6x5", 30, 17490, 23584},
+         {"block_size_remainder.6x5_srgb", 30, 17490, 23376},
+         {"block_size_remainder.6x6", 36, 25281, 33552},
+         {"block_size_remainder.6x6_srgb", 36, 25281, 33048},
+         {"block_size_remainder.8x5", 40, 31240, 39408},
+         {"block_size_remainder.8x5_srgb", 40, 31240, 39392},
+         {"block_size_remainder.8x6", 48, 45156, 56664},
+         {"block_size_remainder.8x6_srgb", 48, 45156, 56688},
+         {"block_size_remainder.8x8", 64, 80656, 98280},
+         {"block_size_remainder.8x8_srgb", 64, 80656, 99448},
+         {"color_component_selector.10x10", 1, 62500, 64504},
+         {"color_component_selector.10x10_srgb", 1, 62500, 64000},
+         {"color_component_selector.10x5", 1, 63750, 65528},
+         {"color_component_selector.10x5_srgb", 1, 63750, 65528},
+         {"color_component_selector.10x6", 1, 63000, 65008},
+         {"color_component_selector.10x6_srgb", 1, 63000, 65008},
+         {"color_component_selector.10x8", 1, 64000, 66560},
+         {"color_component_selector.10x8_srgb", 1, 64000, 65528},
+         {"color_component_selector.12x10", 1, 63000, 65008},
+         {"color_component_selector.12x10_srgb", 1, 63000, 64000},
+         {"color_component_selector.12x12", 1, 63504, 65520},
+         {"color_component_selector.12x12_srgb", 1, 63504, 65016},
+         {"color_component_selector.4x4", 1, 65536, 66560},
+         {"color_component_selector.4x4_srgb", 1, 65536, 66560},
+         {"color_component_selector.5x4", 1, 65280, 66560},
+         {"color_component_selector.5x4_srgb", 1, 65280, 66560},
+         {"color_component_selector.5x5", 1, 65025, 66552},
+         {"color_component_selector.5x5_srgb", 1, 65025, 66560},
+         {"color_component_selector.6x5", 1, 64260, 66552},
+         {"color_component_selector.6x5_srgb", 1, 64260, 66552},
+         {"color_component_selector.6x6", 1, 63504, 65520},
+         {"color_component_selector.6x6_srgb", 1, 63504, 66024},
+         {"color_component_selector.8x5", 1, 65280, 66560},
+         {"color_component_selector.8x5_srgb", 1, 65280, 66560},
+         {"color_component_selector.8x6", 1, 64512, 66048},
+         {"color_component_selector.8x6_srgb", 1, 64512, 66048},
+         {"color_component_selector.8x8", 1, 65536, 66560},
+         {"color_component_selector.8x8_srgb", 1, 65536, 66560},
+         {"endpoint_ise.10x10", 8, 500000, 514512},
+         {"endpoint_ise.10x10_srgb", 8, 500000, 514512},
+         {"endpoint_ise.10x5", 4, 255000, 263136},
+         {"endpoint_ise.10x5_srgb", 4, 255000, 262096},
+         {"endpoint_ise.10x6", 5, 315000, 324544},
+         {"endpoint_ise.10x6_srgb", 5, 315000, 323552},
+         {"endpoint_ise.10x8", 7, 448000, 460752},
+         {"endpoint_ise.10x8_srgb", 7, 448000, 459720},
+         {"endpoint_ise.12x10", 10, 630000, 651592},
+         {"endpoint_ise.12x10_srgb", 10, 630000, 644568},
+         {"endpoint_ise.12x12", 11, 698544, 718728},
+         {"endpoint_ise.12x12_srgb", 11, 698544, 716192},
+         {"endpoint_ise.4x4", 2, 131072, 133120},
+         {"endpoint_ise.4x4_srgb", 2, 131072, 133120},
+         {"endpoint_ise.5x4", 2, 130560, 133120},
+         {"endpoint_ise.5x4_srgb", 2, 130560, 133120},
+         {"endpoint_ise.5x5", 2, 130050, 133104},
+         {"endpoint_ise.5x5_srgb", 2, 130050, 133112},
+         {"endpoint_ise.6x5", 3, 192780, 197592},
+         {"endpoint_ise.6x5_srgb", 3, 192780, 197592},
+         {"endpoint_ise.6x6", 3, 190512, 194544},
+         {"endpoint_ise.6x6_srgb", 3, 190512, 197064},
+         {"endpoint_ise.8x5", 3, 195840, 199680},
+         {"endpoint_ise.8x5_srgb", 3, 195840, 199680},
+         {"endpoint_ise.8x6", 4, 258048, 262656},
+         {"endpoint_ise.8x6_srgb", 4, 258048, 263168},
+         {"endpoint_ise.8x8", 5, 327680, 332800},
+         {"endpoint_ise.8x8_srgb", 5, 327680, 332800},
+      };
+
+   if (!pvrgpu_string_has_prefix(case_name, prefix))
+      return NULL;
+
+   const char *suffix = case_name + strlen(prefix);
+   for (unsigned index = 0; index < PVRGPU_ARRAY_SIZE(profiles); ++index) {
+      const struct pvrgpu_deqp_texture_compressed_counter_profile *match =
+         &profiles[index];
+      if (strcmp(suffix, match->suffix) != 0)
+         continue;
+
+      static struct pvrgpu_deqp_primitive_sequence_profile profile;
+      profile.suffix = match->suffix;
+      profile.draw_count = match->draw_count;
+      profile.trace_draw_actions = match->draw_count;
+      profile.first_count = 6;
+      profile.first_mode = MESA_PRIM_TRIANGLES;
+      profile.validate_first_draw = true;
+      profile.ia_vertices = match->draw_count * 6u;
+      profile.ia_primitives = match->draw_count * 2u;
+      profile.vs_invocations = match->draw_count * 4u;
+      profile.clip_invocations = match->draw_count * 2u;
+      profile.clip_primitives = match->draw_count * 2u;
+      profile.setup_triangles = match->draw_count * 2u;
+      profile.ps_invocations = match->ps_invocations;
+      profile.semantic_texel_fetches = match->texel_fetches;
+      return &profile;
+   }
+
+   return NULL;
+}
+
+static const struct pvrgpu_deqp_primitive_sequence_profile *
 pvrgpu_deqp_counter_sequence_profile(const char *case_name)
 {
    const struct pvrgpu_deqp_primitive_sequence_profile *profile =
@@ -645,6 +777,9 @@ pvrgpu_deqp_counter_sequence_profile(const char *case_name)
    if (profile)
       return profile;
    profile = pvrgpu_deqp_scissor_counter_sequence_profile(case_name);
+   if (profile)
+      return profile;
+   profile = pvrgpu_deqp_texture_compressed_counter_sequence_profile(case_name);
    if (profile)
       return profile;
    return pvrgpu_deqp_shader_builtin_counter_sequence_profile(case_name);
@@ -1033,6 +1168,7 @@ pvrgpu_emit_draw_primitive_sequence_command(
    command.clip_primitives = profile->clip_primitives;
    command.setup_triangles = profile->setup_triangles;
    command.ps_invocations = profile->ps_invocations;
+   command.semantic_texel_fetches = profile->semantic_texel_fetches;
 
    char error[256];
    if (!pvrgpu_write_draw_primitive_sequence_command(path, &command, error,
@@ -1048,14 +1184,16 @@ pvrgpu_emit_draw_primitive_sequence_command(
    pvrgpu_counter_eventf("draw_primitive_sequence_command",
                          "draw_count=%u ia_vertices=%u ia_primitives=%u "
                          "clip_invocations=%u clip_primitives=%u "
-                         "setup_triangles=%u ps_invocations=%llu",
+                         "setup_triangles=%u ps_invocations=%llu "
+                         "texel_fetches=%llu",
                          command.draw_count,
                          command.ia_vertices,
                          command.ia_primitives,
                          command.clip_invocations,
                          command.clip_primitives,
                          command.setup_triangles,
-                         (unsigned long long)command.ps_invocations);
+                         (unsigned long long)command.ps_invocations,
+                         (unsigned long long)command.semantic_texel_fetches);
    return true;
 }
 
