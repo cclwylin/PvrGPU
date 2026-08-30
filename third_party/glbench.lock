@@ -1,0 +1,6 @@
+name=ChromeOS GLBench
+url=https://chromium.googlesource.com/chromiumos/platform/glbench
+commit=e99bc684272bffd68b06c998e272531c9c84330f
+local_runner_sha256=generated-at-build-time
+integration=pinned source checkout and build artifacts live under PVRGPU_WORK_ROOT; only the Apple/Mesa adapter is vendored
+license_note=Source headers identify a ChromiumOS BSD-style license; retain upstream headers and verify the canonical notice before redistribution.

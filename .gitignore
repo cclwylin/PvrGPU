@@ -1,0 +1,36 @@
+# OS/editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local virtualenv/build/output roots
+.venv/
+build/
+out/
+tmp/
+logs/
+cmake-build-*/
+
+# Local configuration and secrets. Keep checked-in examples.
+.env
+.env.*
+!.env.example
+config/*.env
+!config/*.env.example
+config/local.env
+
+# Generated runtime artifacts
+*.log
+*.jsonl
+*.qpa
+*.rdc
+*.dSYM/

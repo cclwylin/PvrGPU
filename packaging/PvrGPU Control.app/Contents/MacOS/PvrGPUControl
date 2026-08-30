@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+bundle_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+project_dir="$(cd "${bundle_dir}/../.." && pwd)"
+local_config="${project_dir}/config/local.env"
+if [[ -f "${local_config}" ]]; then
+    # shellcheck source=/dev/null
+    source "${local_config}"
+fi
+# shellcheck source=scripts/lib/runtime-paths.sh
+source "${project_dir}/scripts/lib/runtime-paths.sh"
+log_dir="${PVRGPU_LOG_DIR}"
+mkdir -p "${log_dir}"
+
+exec "${project_dir}/scripts/run-pvrgpu-control.sh" "$@" \
+    >>"${log_dir}/pvrgpu-control.log" 2>&1

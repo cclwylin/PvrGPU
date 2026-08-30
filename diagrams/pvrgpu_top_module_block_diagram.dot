@@ -1,0 +1,199 @@
+digraph PvrGPU_SystemC_Top_Module {
+    // Page & Graph Configuration
+    graph [
+        rankdir="TB",
+        nodesep=0.6,
+        ranksep=0.8,
+        fontname="Helvetica-Bold",
+        fontsize=16,
+        label="PvrGPU SystemC Top Module Architecture & Block Diagram\n(33 Module Classes | Event-Driven FIFO & MemoryPool Contract)",
+        labelloc="t",
+        compound=true,
+        splines=spline,
+        bgcolor="#FAFAFA",
+        dpi=300
+    ];
+
+    node [
+        fontname="Helvetica-Bold",
+        fontsize=10,
+        shape=rect,
+        style="filled,rounded",
+        penwidth=1.5,
+        margin="0.25,0.12"
+    ];
+
+    edge [
+        fontname="Helvetica",
+        fontsize=9,
+        penwidth=1.5,
+        color="#37474F"
+    ];
+
+    // Color Legend
+    subgraph cluster_legend {
+        label = "Module State Legend";
+        fontname = "Helvetica-Bold";
+        fontsize = 11;
+        style = "dashed";
+        color = "#78909C";
+        bgcolor = "#FFFFFF";
+
+        leg_active [label="ACTIVE-FUNCTIONAL\n(Executable Pipeline Path)", fillcolor="#C8E6C9", color="#2E7D32"];
+        leg_bypass [label="ACTIVE-BYPASS\n(Bypass / Fast-Path)", fillcolor="#DCEDC8", color="#558B2F"];
+        leg_idle   [label="IMPLEMENTED-IDLE\n(Cache Array Unit-Tested)", fillcolor="#FFE0B2", color="#EF6C00"];
+        leg_holder [label="EMPTY-PLACEHOLDER\n(System Boundary Interface)", fillcolor="#F3E5F5", color="#7B1FA2"];
+        leg_harness[label="HARNESS / OBSERVER\n(Test Engine & Reporting)", fillcolor="#ECEFF1", color="#455A64"];
+
+        leg_active -> leg_bypass -> leg_idle -> leg_holder -> leg_harness [style=invis];
+    }
+
+    // 1. Host & Control Subsystem
+    subgraph cluster_host {
+        label = "1. Host & Control Subsystem";
+        fontname = "Helvetica-Bold";
+        fontsize = 12;
+        color = "#455A64";
+        bgcolor = "#F5F5F5";
+
+        SocBusInterface     [label="SocBusInterface\n[EMPTY-PLACEHOLDER]", fillcolor="#F3E5F5", color="#7B1FA2"];
+        XpuInterface        [label="XpuInterface\n[EMPTY-PLACEHOLDER]", fillcolor="#F3E5F5", color="#7B1FA2"];
+        ControlRegisterBus  [label="ControlRegisterBus\n[EMPTY-PLACEHOLDER]", fillcolor="#F3E5F5", color="#7B1FA2"];
+        FirmwareScheduler   [label="FirmwareScheduler\n[EMPTY-PLACEHOLDER]", fillcolor="#F3E5F5", color="#7B1FA2"];
+        Submitter           [label="Submitter\n(Job Submitter)\n[HARNESS]", fillcolor="#ECEFF1", color="#455A64"];
+    }
+
+    // 2. Data Masters Subsystem
+    subgraph cluster_masters {
+        label = "2. Data Masters Subsystem";
+        fontname = "Helvetica-Bold";
+        fontsize = 12;
+        color = "#1565C0";
+        bgcolor = "#E3F2FD";
+
+        Vdm                [label="VDM\n(Vertex Data Master)\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+        PixelDataMaster    [label="PixelDataMaster\n(PDM)\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+        ComputeDataMaster  [label="ComputeDataMaster\n[EMPTY-PLACEHOLDER]", fillcolor="#F3E5F5", color="#7B1FA2"];
+        DomainDataMaster   [label="DomainDataMaster\n[EMPTY-PLACEHOLDER]", fillcolor="#F3E5F5", color="#7B1FA2"];
+        TwoDDataMaster     [label="TwoDDataMaster\n[EMPTY-PLACEHOLDER]", fillcolor="#F3E5F5", color="#7B1FA2"];
+    }
+
+    // 3. Geometry Phase Pipeline
+    subgraph cluster_geometry {
+        label = "3. Geometry Phase Pipeline";
+        fontname = "Helvetica-Bold";
+        fontsize = 12;
+        color = "#2E7D32";
+        bgcolor = "#E8F5E9";
+
+        VertexFetch        [label="VertexFetch\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+        ClipCull           [label="ClipCull\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+        Tiler              [label="Tiler\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+        ParameterBuffer    [label="ParameterBuffer\n(PB)\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+    }
+
+    // 4. Unified Shading Cluster Subsystem
+    subgraph cluster_usc {
+        label = "4. Unified Shading Cluster Subsystem (USC)";
+        fontname = "Helvetica-Bold";
+        fontsize = 12;
+        color = "#6A1B9A";
+        bgcolor = "#F3E5F5";
+
+        subgraph cluster_usc_vs {
+            label = "Vertex Shader Instance";
+            fontname = "Helvetica-Oblique";
+            fontsize = 10;
+            bgcolor = "#EDE7F6";
+
+            PcoDecoder_VS [label="PcoDecoder (VS)\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+            UscSlot_VS    [label="UscSlot (VS)\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+            UscCluster_VS [label="UscCluster (VS)\n(pco_iss Executor)\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+        }
+
+        subgraph cluster_usc_fs {
+            label = "Fragment Shader Instance";
+            fontname = "Helvetica-Oblique";
+            fontsize = 10;
+            bgcolor = "#EDE7F6";
+
+            PcoDecoder_FS [label="PcoDecoder (FS)\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+            UscSlot_FS    [label="UscSlot (FS)\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+            UscCluster_FS [label="UscCluster (FS)\n(pco_iss Executor)\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+        }
+    }
+
+    // 5. Fragment Phase Pipeline
+    subgraph cluster_fragment {
+        label = "5. Fragment Phase Pipeline";
+        fontname = "Helvetica-Bold";
+        fontsize = 12;
+        color = "#D84315";
+        bgcolor = "#FBE9E7";
+
+        PdsEngine          [label="PdsEngine\n[EMPTY-PLACEHOLDER]", fillcolor="#F3E5F5", color="#7B1FA2"];
+        TileScheduler      [label="TileScheduler\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+        Isp                [label="ISP\n(HSR / Depth-Stencil)\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+        FragmentFrontend   [label="FragmentFrontend\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+        TextureUnit        [label="TextureUnit (TPU)\n[ACTIVE-BYPASS]", fillcolor="#DCEDC8", color="#558B2F"];
+        Pbe                [label="PBE\n(Pixel Backend Engine)\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+    }
+
+    // 6. Cache & Memory Hierarchy
+    subgraph cluster_memory {
+        label = "6. Cache & Memory Hierarchy Subsystem";
+        fontname = "Helvetica-Bold";
+        fontsize = 12;
+        color = "#E65100";
+        bgcolor = "#FFF3E0";
+
+        UscL2Cache        [label="UscL2Cache\n(8 KiB / 4-way)\n[IMPLEMENTED-IDLE]", fillcolor="#FFE0B2", color="#EF6C00"];
+        MixedCache        [label="MixedCache\n(24 KiB MCU L1)\n[IMPLEMENTED-IDLE]", fillcolor="#FFE0B2", color="#EF6C00"];
+        TextureCache      [label="TextureCache\n(24 KiB TCU L1)\n[IMPLEMENTED-IDLE]", fillcolor="#FFE0B2", color="#EF6C00"];
+        MmuBif            [label="MmuBif\n[EMPTY-PLACEHOLDER]", fillcolor="#F3E5F5", color="#7B1FA2"];
+        
+        OnChipFabric      [label="OnChipFabric\n[EMPTY-PLACEHOLDER]", fillcolor="#F3E5F5", color="#7B1FA2"];
+        MemFabric         [label="MemFabric\n[EMPTY-PLACEHOLDER]", fillcolor="#F3E5F5", color="#7B1FA2"];
+        
+        Slc               [label="Slc\n(System Level Cache 2 MiB)\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+        DramModel         [label="DramModel\n(DRAM Backing Model)\n[ACTIVE-FUNCTIONAL]", fillcolor="#C8E6C9", color="#2E7D32"];
+        ImageCompression  [label="ImageCompression\n(PVRIC / IMGIC)\n[EMPTY-PLACEHOLDER]", fillcolor="#F3E5F5", color="#7B1FA2"];
+    }
+
+    // Observer
+    JsonReporter          [label="JsonReporter\n[HARNESS]", fillcolor="#ECEFF1", color="#455A64"];
+
+    // Dataflow Connections
+    Submitter -> Vdm [label="Job Submit", color="#1E88E5", fontcolor="#0D47A1"];
+    Vdm -> VertexFetch [label="Indices", color="#1E88E5", fontcolor="#0D47A1"];
+    VertexFetch -> PcoDecoder_VS [label="Unshaded VTX", color="#1E88E5", fontcolor="#0D47A1"];
+    PcoDecoder_VS -> UscSlot_VS -> UscCluster_VS [color="#43A047"];
+    UscCluster_VS -> ClipCull [label="Shaded VTX", color="#43A047", fontcolor="#1B5E20"];
+    ClipCull -> Tiler [label="Clipped VTX", color="#43A047", fontcolor="#1B5E20"];
+    Tiler -> ParameterBuffer [label="Bounding Box", color="#43A047", fontcolor="#1B5E20"];
+    
+    ParameterBuffer -> TileScheduler [label="Tile Page Handle", color="#E65100", fontcolor="#BF360C"];
+    TileScheduler -> Isp [label="Tile Primitives", color="#E65100", fontcolor="#BF360C"];
+    Isp -> FragmentFrontend [label="Visibility / HSR", color="#E65100", fontcolor="#BF360C"];
+    FragmentFrontend -> PcoDecoder_FS [label="Fragment Quads", color="#E65100", fontcolor="#BF360C"];
+    PcoDecoder_FS -> UscSlot_FS -> UscCluster_FS [color="#8E24AA"];
+    UscCluster_FS -> TextureUnit [label="Unshaded Pixels", color="#8E24AA", fontcolor="#4A148C"];
+    TextureUnit -> Pbe [label="Texel Fetched", color="#8E24AA", fontcolor="#4A148C"];
+    
+    Pbe -> PixelDataMaster [label="RGBA Store", color="#D84315", fontcolor="#BF360C"];
+    PixelDataMaster -> Slc [label="Memory Txn", color="#D84315", fontcolor="#BF360C"];
+    Slc -> DramModel [label="Dirty Writeback", color="#D84315", fontcolor="#BF360C"];
+    DramModel -> JsonReporter [label="Done", color="#455A64", fontcolor="#263238"];
+
+    // Cache Connections (Dashed Lines)
+    UscCluster_VS -> MixedCache [style=dashed, label="Code/Data", color="#FB8C00", fontcolor="#E65100"];
+    UscCluster_FS -> MixedCache [style=dashed, label="Code/Data", color="#FB8C00", fontcolor="#E65100"];
+    UscCluster_VS -> UscL2Cache [style=dashed, label="USC Mem", color="#FB8C00", fontcolor="#E65100"];
+    UscCluster_FS -> UscL2Cache [style=dashed, label="USC Mem", color="#FB8C00", fontcolor="#E65100"];
+    TextureUnit -> TextureCache [style=dashed, label="Tex Fetch", color="#FB8C00", fontcolor="#E65100"];
+    
+    MixedCache -> OnChipFabric [style=dashed, color="#FB8C00"];
+    UscL2Cache -> OnChipFabric [style=dashed, color="#FB8C00"];
+    TextureCache -> OnChipFabric [style=dashed, color="#FB8C00"];
+    OnChipFabric -> MmuBif -> Slc [style=dashed, color="#FB8C00"];
+}

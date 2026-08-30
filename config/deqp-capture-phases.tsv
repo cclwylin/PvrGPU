@@ -1,0 +1,8 @@
+phase	key	title	goal	default_filters
+0	phase0-context-info	Context and Info	Capture metadata, EGL/context creation, and no-render smoke.	info,context,create_context
+1	phase1-clear-scissor	Clear and Scissor	Color clears, clear masks, and scissor-limited clears.	color_clear,clear,scissor
+2	phase2-basic-draw	Basic Draw	Primitive draw, vertex arrays, attributes, instancing, and simple shaders.	rasterization.primitives,vertex_arrays,draw,instancing
+3	phase3-fragment-state	Fragment State	Rasterization, depth/stencil, blend, and fragment operations.	fragment_ops,depth,stencil,blend
+4	phase4-texture-sampler	Texture and Sampler	Texture upload, filtering, compressed formats, mipmaps, and samplers.	texture,filtering,compressed
+5	phase5-fbo-sync-image	FBO, Sync, and Image	FBOs, framebuffer blits, EGL images, sync, and multi-pass setup.	fbo,sync,image
+6	phase6-advanced-large	Advanced and Large Features	Compute, SSBO/UBO, transform feedback, tessellation, geometry, robustness, stress, and Manhattan-class features.	compute,ssbo,ubo,transform_feedback,tessellation,geometry_shading,robustness,debug,stress,multisample

@@ -1,0 +1,147 @@
+diff --git a/src/gallium/auxiliary/driver_trace/tr_context.c b/src/gallium/auxiliary/driver_trace/tr_context.c
+index 7cdd98d..767a07e 100644
+--- a/src/gallium/auxiliary/driver_trace/tr_context.c
++++ b/src/gallium/auxiliary/driver_trace/tr_context.c
+@@ -119,6 +119,37 @@ trace_context_draw_vbo(struct pipe_context *_pipe,
+    trace_dump_arg_end();
+    trace_dump_arg(uint, num_draws);
+ 
++   /* Preserve the exact direct-draw index range for PvrGPU's bounded RDC
++    * command capsule.  Indirect and multi-draw calls remain unsupported and
++    * are represented as null so the translator can fail closed. */
++   trace_dump_arg_begin("index_data");
++   if (!info->index_size || indirect || num_draws != 1) {
++      trace_dump_null();
++   } else {
++      const uint64_t offset = (uint64_t)draws[0].start * info->index_size;
++      const uint64_t size = (uint64_t)draws[0].count * info->index_size;
++      if (info->has_user_indices && info->index.user && size) {
++         trace_dump_bytes((const uint8_t *)info->index.user + offset, size);
++      } else if (!info->has_user_indices && info->index.resource && size &&
++                 offset <= info->index.resource->width0 &&
++                 size <= info->index.resource->width0 - offset &&
++                 offset <= UINT_MAX && size <= UINT_MAX) {
++         struct pipe_transfer *transfer = NULL;
++         const void *map = pipe_buffer_map_range(
++            pipe, info->index.resource, (unsigned)offset, (unsigned)size,
++            PIPE_MAP_READ, &transfer);
++         if (map)
++            trace_dump_bytes(map, size);
++         else
++            trace_dump_null();
++         if (map)
++            pipe_buffer_unmap(pipe, transfer);
++      } else {
++         trace_dump_null();
++      }
++   }
++   trace_dump_arg_end();
++
+    trace_dump_trace_flush();
+ 
+    trace_dump_call_end();
+@@ -953,6 +953,31 @@ trace_context_set_constant_buffer(struct pipe_context *_pipe,
+    trace_dump_arg_enum(mesa_shader_stage, shader);
+    trace_dump_arg(uint, index);
+    trace_dump_arg(constant_buffer, constant_buffer);
++   trace_dump_arg_begin("data");
++   if (!constant_buffer || !constant_buffer->buffer_size) {
++      trace_dump_null();
++   } else if (constant_buffer->user_buffer) {
++      trace_dump_bytes(constant_buffer->user_buffer,
++                       constant_buffer->buffer_size);
++   } else if (constant_buffer->buffer) {
++      struct pipe_transfer *transfer = NULL;
++      const void *map = pipe_buffer_map_range(pipe,
++                                              constant_buffer->buffer,
++                                              constant_buffer->buffer_offset,
++                                              constant_buffer->buffer_size,
++                                              PIPE_MAP_READ,
++                                              &transfer);
++      if (map)
++         trace_dump_bytes(map, constant_buffer->buffer_size);
++      else
++         trace_dump_null();
++
++      if (map)
++         pipe_buffer_unmap(pipe, transfer);
++   } else {
++      trace_dump_null();
++   }
++   trace_dump_arg_end();
+ 
+    pipe->set_constant_buffer(pipe, shader, index, constant_buffer);
+ 
+@@ -1252,6 +1277,44 @@ trace_context_set_vertex_buffers(struct pipe_context *_pipe,
+       trace_dump_null();
+    trace_dump_arg_end();
+ 
++   /* PvrGPU's bounded RDC POC needs the bytes behind the active Gallium
++    * vertex bindings, not just process-local resource pointers.  Dump each
++    * complete buffer from its binding offset.  The trace is diagnostic input
++    * for a frozen one-frame suite, so fail closed with null if a resource
++    * cannot be mapped instead of changing the draw. */
++   trace_dump_arg_begin("buffer_data");
++   if (found) {
++      trace_dump_array_begin();
++      for (unsigned i = 0; i < num_buffers; ++i) {
++         trace_dump_elem_begin();
++         if (buffers[i].is_user_buffer) {
++            trace_dump_null();
++         } else if (buffers[i].buffer.resource &&
++                    buffers[i].buffer_offset <
++                       buffers[i].buffer.resource->width0) {
++            struct pipe_transfer *transfer = NULL;
++            const unsigned size = buffers[i].buffer.resource->width0 -
++                                  buffers[i].buffer_offset;
++            const void *map = pipe_buffer_map_range(
++               pipe, buffers[i].buffer.resource, buffers[i].buffer_offset,
++               size, PIPE_MAP_READ, &transfer);
++            if (map)
++               trace_dump_bytes(map, size);
++            else
++               trace_dump_null();
++            if (map)
++               pipe_buffer_unmap(pipe, transfer);
++         } else {
++            trace_dump_null();
++         }
++         trace_dump_elem_end();
++      }
++      trace_dump_array_end();
++   } else {
++      trace_dump_null();
++   }
++   trace_dump_arg_end();
++
+    pipe->set_vertex_buffers(pipe, num_buffers, buffers);
+ 
+    trace_dump_call_end();
+@@ -1938,11 +2032,22 @@ trace_context_texture_subdata(struct pipe_context *_context,
+    trace_dump_arg(box, box);
+ 
+    trace_dump_arg_begin("data");
+-   trace_dump_box_bytes(data,
+-                        resource,
+-                        box,
+-                        stride,
+-                        layer_stride);
++   /* The generic trace helper intentionally omits texture payloads.  The
++    * bounded PvrGPU RDC POC needs the exact linear upload bytes so it can
++    * reconstruct the sampled mip chain without reading process-local GPU
++    * resources.  Keep this diagnostic capture fail-closed and capped. */
++   const uint64_t row_bytes =
++      util_format_get_nblocksx(resource->format, box->width) *
++      (uint64_t)util_format_get_blocksize(resource->format);
++   const uint64_t rows =
++      util_format_get_nblocksy(resource->format, box->height);
++   const uint64_t data_size =
++      row_bytes + (rows - 1) * (uint64_t)stride +
++      (box->depth - 1) * (uint64_t)layer_stride;
++   if (data && data_size <= 16 * 1024 * 1024)
++      trace_dump_bytes(data, (size_t)data_size);
++   else
++      trace_dump_null();
+    trace_dump_arg_end();
+ 
+    trace_dump_arg(uint, stride);

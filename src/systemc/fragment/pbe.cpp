@@ -1,0 +1,220 @@
+// PBE (Pixel Back End) consumes ordered USC PIXOUT records, converts raw
+// float32 PIXOUT0..3 values to RGBA8 UNORM, and performs fixed-function GLES
+// blend destination read/modify/write when enabled. Untouched pixels come from
+// explicit render-target clear state. PixelDataMaster, SLC and DramModel then
+// commit/read the result; JsonReporter never consumes this pre-memory handle.
+// FIFO traffic carries only the state handle and timing is event-driven.
+#include "fragment/pbe.h"
+
+#include "common/functional_types.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <vector>
+
+namespace {
+
+float BitsFloat(std::uint32_t bits) {
+  float value = 0.0f;
+  static_assert(sizeof(value) == sizeof(bits));
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+std::uint8_t FloatValueToUnorm8(float value) {
+  if (!std::isfinite(value))
+    throw std::runtime_error("PBE cannot convert a non-finite PIXOUT value");
+  const float clamped = std::clamp(value, 0.0f, 1.0f);
+  const float scaled = clamped * 255.0F;
+  const float lower = std::floor(scaled);
+  const float fraction = scaled - lower;
+  std::uint32_t rounded = static_cast<std::uint32_t>(lower);
+  if (fraction > 0.5F ||
+      (fraction == 0.5F && (rounded & 1U) != 0U)) {
+    ++rounded;
+  }
+  return static_cast<std::uint8_t>(std::min<std::uint32_t>(rounded, 255U));
+}
+
+std::uint8_t FloatBitsToUnorm8(std::uint32_t raw_bits) {
+  return FloatValueToUnorm8(BitsFloat(raw_bits));
+}
+
+std::uint8_t FactorToUnorm8(pvrgpu::stub::BlendFactor factor,
+                            const std::array<std::uint8_t, 4> &source) {
+  using pvrgpu::stub::BlendFactor;
+  switch (factor) {
+  case BlendFactor::kZero:
+    return 0;
+  case BlendFactor::kOne:
+    return 255;
+  case BlendFactor::kSourceAlpha:
+    return source[3];
+  case BlendFactor::kOneMinusSourceAlpha:
+    return static_cast<std::uint8_t>(255U - source[3]);
+  }
+  throw std::runtime_error("PBE received an unsupported blend factor");
+}
+
+std::uint8_t BlendAddUnorm8(std::uint8_t source, std::uint8_t destination,
+                            std::uint8_t source_factor,
+                            std::uint8_t destination_factor) {
+  const std::uint32_t numerator =
+      static_cast<std::uint32_t>(source) * source_factor +
+      static_cast<std::uint32_t>(destination) * destination_factor;
+  const std::uint32_t rounded = (numerator + 127U) / 255U;
+  return static_cast<std::uint8_t>(std::min<std::uint32_t>(rounded, 255U));
+}
+
+void ValidateBlendState(const pvrgpu::stub::BlendState &blend) {
+  using pvrgpu::stub::BlendEquation;
+  if (!blend.enable)
+    return;
+  if (blend.rgb_equation != BlendEquation::kAdd ||
+      blend.alpha_equation != BlendEquation::kAdd) {
+    throw std::runtime_error("PBE only implements the GLES ADD blend equation");
+  }
+  const std::array<pvrgpu::stub::BlendFactor, 4> factors = {
+      blend.source_rgb_factor,
+      blend.destination_rgb_factor,
+      blend.source_alpha_factor,
+      blend.destination_alpha_factor,
+  };
+  const std::array<std::uint8_t, 4> dummy_source{};
+  for (const pvrgpu::stub::BlendFactor factor : factors)
+    (void)FactorToUnorm8(factor, dummy_source);
+}
+
+} // namespace
+
+namespace pvrgpu::stub {
+
+Pbe::Pbe(sc_core::sc_module_name name, MemoryPool &pool)
+    : sc_module(name), pool_(pool) {
+  SC_THREAD(Run);
+}
+
+void Pbe::Run() {
+  while (true) {
+    const PipelineTxn txn = input.read();
+    PipelineState state = LoadPipelineState(pool_, txn.state);
+    RequireStage(state.stage, PipelineStage::kTextureComplete, name());
+    if (!IsRasterFunctionalCase(state.functional_case) ||
+        !HasPoolHandle(state.fragment_outputs) ||
+        !HasPoolHandle(state.fragment_invocations)) {
+      throw std::runtime_error("PBE received no supported fragment results");
+    }
+    ValidateBlendState(state.raster_state.blend);
+
+    const std::uint64_t pixel_count =
+        static_cast<std::uint64_t>(state.width) * state.height;
+    if (pixel_count > std::numeric_limits<std::size_t>::max() / 4)
+      throw std::overflow_error("PBE framebuffer size overflow");
+    const std::vector<FragmentInvocation> invocations =
+        LoadArray<FragmentInvocation>(pool_, state.fragment_invocations);
+    const std::vector<FragmentOutput> outputs =
+        LoadArray<FragmentOutput>(pool_, state.fragment_outputs);
+    if (outputs.size() != invocations.size() ||
+        outputs.size() != state.active_fragment_invocations) {
+      throw std::runtime_error("PBE fragment input/output count mismatch");
+    }
+
+    std::vector<std::uint8_t> framebuffer(
+        static_cast<std::size_t>(pixel_count) * 4, 0);
+    for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
+      for (std::size_t component = 0; component < 4; ++component) {
+        framebuffer[pixel * 4 + component] =
+            FloatValueToUnorm8(state.raster_state.clear_color[component]);
+      }
+    }
+    std::vector<std::uint32_t> written_map(
+        static_cast<std::size_t>(pixel_count), 0);
+    std::vector<std::uint64_t> last_submit_ordinal(
+        static_cast<std::size_t>(pixel_count), 0);
+    for (std::size_t index = 0; index < outputs.size(); ++index) {
+      const FragmentInvocation &invocation = invocations[index];
+      const FragmentOutput &output = outputs[index];
+      if (output.x != invocation.x || output.y != invocation.y ||
+          output.primitive_id != invocation.primitive_id ||
+          output.parameter_index != invocation.parameter_index ||
+          output.submit_ordinal != invocation.submit_ordinal ||
+          output.written_mask != 0x0f) {
+        throw std::runtime_error("PBE lost fragment identity or PIXOUT lanes");
+      }
+      if (output.x >= state.width || output.y >= state.height)
+        throw std::runtime_error("PBE fragment coordinate is out of bounds");
+      const std::size_t pixel_index =
+          static_cast<std::size_t>(output.y) * state.width + output.x;
+      if (written_map[pixel_index] != 0) {
+        if (!state.raster_state.blend.enable)
+          throw std::runtime_error("PBE attempted to shade one opaque owner twice");
+        if (output.submit_ordinal < last_submit_ordinal[pixel_index])
+          throw std::runtime_error("PBE blended fragments lost API order");
+      }
+      ++written_map[pixel_index];
+      last_submit_ordinal[pixel_index] = output.submit_ordinal;
+      const std::size_t byte_offset = pixel_index * 4;
+      std::array<std::uint8_t, 4> source{};
+      for (std::size_t component = 0; component < 4; ++component)
+        source[component] = FloatBitsToUnorm8(output.pixel_output[component]);
+
+      if (state.raster_state.blend.enable) {
+        const BlendState &blend = state.raster_state.blend;
+        for (std::size_t component = 0; component < 4; ++component) {
+          const BlendFactor source_factor =
+              component == 3 ? blend.source_alpha_factor
+                             : blend.source_rgb_factor;
+          const BlendFactor destination_factor =
+              component == 3 ? blend.destination_alpha_factor
+                             : blend.destination_rgb_factor;
+          framebuffer[byte_offset + component] = BlendAddUnorm8(
+              source[component], framebuffer[byte_offset + component],
+              FactorToUnorm8(source_factor, source),
+              FactorToUnorm8(destination_factor, source));
+        }
+      } else {
+        for (std::size_t component = 0; component < 4; ++component)
+          framebuffer[byte_offset + component] = source[component];
+      }
+    }
+    const std::uint64_t pixels_touched = static_cast<std::uint64_t>(
+        std::count_if(written_map.begin(), written_map.end(),
+                      [](std::uint32_t writes) { return writes != 0; }));
+    if ((!state.raster_state.blend.enable &&
+         pixels_touched != state.active_fragment_invocations) ||
+        outputs.size() != state.active_fragment_invocations)
+      throw std::runtime_error("PBE fragment write count mismatch");
+
+    state.pbe_framebuffer = StoreNewArray(pool_, framebuffer);
+    state.framebuffer_bytes = framebuffer.size();
+    state.counters.pbe_pixels_written = pixel_count;
+    state.counters.pbe_fragment_writes = outputs.size();
+    if (state.raster_state.blend.enable) {
+      state.counters.pbe_color_reads = outputs.size();
+      state.counters.pbe_blended_fragments = outputs.size();
+    }
+    const std::uint64_t blend_cycles =
+        state.raster_state.blend.enable
+            ? CeilDivide(outputs.size(),
+                         kReferenceUarch.pbe_blend_fragments_per_batch)
+            : 0;
+    const std::uint64_t cycles =
+        kReferenceUarch.pbe_base_cycles +
+        CeilDivide(pixel_count, kReferenceUarch.pbe_pixels_per_batch) +
+        blend_cycles;
+    state.counters.pbe_cycles = cycles;
+    state.counters.renderer_cycles += cycles;
+    WaitForCycles(cycles);
+
+    state.stage = PipelineStage::kPbeComplete;
+    StorePipelineState(pool_, txn.state, state);
+    output.write(txn);
+  }
+}
+
+} // namespace pvrgpu::stub
