@@ -187,6 +187,10 @@ class MesaIntegrationScriptTests(unittest.TestCase):
     def test_rdc_runner_passes_case_name_to_driver(self) -> None:
         runner = RDC_SYSTEMC_RUNNER.read_text(encoding="utf-8")
         self.assertIn("PVRGPU_RDC_CASE_NAME", runner)
+        self.assertIn("PVRGPU_RDC_OUTPUT_WIDTH", runner)
+        self.assertIn("PVRGPU_RDC_OUTPUT_HEIGHT", runner)
+        self.assertIn("dEQP-GLES31.*", runner)
+        self.assertIn('default_gles_override="3.1"', runner)
 
     def _write_fake_mesa_tree(self, mesa: Path) -> None:
         (mesa / "src" / "gallium" / "targets" / "dri").mkdir(parents=True)

@@ -1049,16 +1049,19 @@ class DirectoryCounterRun:
             self._emit_stage(index, "compare", "SKIP")
             return self._store_case_result(result, case_root)
 
-        runner_arguments = [
-            "--rdc",
-            str(staged_rdc),
-            "--case",
-            entry.case,
-            "--width",
-            str(entry.width),
-            "--height",
-            str(entry.height),
-        ]
+        def runner_arguments_for(width: int, height: int) -> list[str]:
+            return [
+                "--rdc",
+                str(staged_rdc),
+                "--case",
+                entry.case,
+                "--width",
+                str(width),
+                "--height",
+                str(height),
+            ]
+
+        runner_arguments = runner_arguments_for(entry.width, entry.height)
 
         result.stage = "golden"
         self._emit_stage(index, "golden", "RUNNING")
@@ -1166,6 +1169,20 @@ class DirectoryCounterRun:
         (pvrgpu_dir / "png").mkdir(parents=True)
         result.stage = "pvrgpu"
         self._emit_stage(index, "pvrgpu", "RUNNING")
+        pvrgpu_runner_arguments = runner_arguments
+        golden_png_path_for_extent = (
+            case_root / result.golden_png if result.golden_png else None
+        )
+        if golden_png_path_for_extent is not None:
+            try:
+                golden_png_width, golden_png_height, _ = decode_rgba8_png(
+                    golden_png_path_for_extent
+                )
+                pvrgpu_runner_arguments = runner_arguments_for(
+                    golden_png_width, golden_png_height
+                )
+            except (OSError, PngCompareError):
+                pvrgpu_runner_arguments = runner_arguments
         pvrgpu_environment = dict(os.environ)
         pvrgpu_environment["PVRGPU_RDC_MANIFEST"] = str(self.manifest_path)
         if trace_draw_actions is not None:
@@ -1177,7 +1194,7 @@ class DirectoryCounterRun:
             self._run_command(
                 [
                     *self._runner_argv(self.pvrgpu_runner),
-                    *runner_arguments,
+                    *pvrgpu_runner_arguments,
                     "--outdir",
                     str(pvrgpu_dir / "png"),
                 ],

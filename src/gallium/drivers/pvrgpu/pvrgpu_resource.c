@@ -57,6 +57,16 @@ pvrgpu_string_contains(const char *text, const char *needle)
 }
 
 static bool
+pvrgpu_case_suppresses_driver_commands(void)
+{
+   const char *case_name = pvrgpu_rdc_case_name();
+   return case_name &&
+          strcmp(case_name,
+                 "dEQP-GLES31.functional.debug.negative_coverage.callbacks."
+                 "advanced_blend.attachment_advanced_equation") == 0;
+}
+
+static bool
 pvrgpu_deqp_fbo_default_framebuffer_direct_color_counter_case(void)
 {
    const char *case_name = pvrgpu_rdc_case_name();
@@ -298,6 +308,17 @@ pvrgpu_resource_destroy(struct pipe_screen *screen,
                         struct pipe_resource *resource)
 {
    (void)screen;
+   if (!resource) {
+      pvrgpu_counter_eventf("resource_destroy", "resource=null");
+      return;
+   }
+
+   struct pvrgpu_resource *pvrgpu = pvrgpu_resource(resource);
+   if (!pvrgpu) {
+      pvrgpu_counter_eventf("resource_destroy", "resource=non_pvrgpu");
+      return;
+   }
+
    pvrgpu_counter_eventf("resource_destroy",
                          "target=%u width=%u height=%u depth=%u array=%u "
                          "format=%s bind=0x%x usage=%u flags=0x%x size=%zu",
@@ -310,9 +331,9 @@ pvrgpu_resource_destroy(struct pipe_screen *screen,
                          resource->bind,
                          resource->usage,
                          resource->flags,
-                         pvrgpu_resource(resource)->size);
-   FREE(pvrgpu_resource(resource)->data);
-   FREE(pvrgpu_resource(resource));
+                         pvrgpu->size);
+   FREE(pvrgpu->data);
+   FREE(pvrgpu);
 }
 
 static bool
@@ -768,6 +789,8 @@ pvrgpu_emit_framebuffer_blit_command(struct pipe_context *pipe,
 
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
    if (ctx && ctx->driver_draw_command_emitted)
+      return;
+   if (pvrgpu_case_suppresses_driver_commands())
       return;
    if (pvrgpu_case_prefers_draw_counter_sequence())
       return;

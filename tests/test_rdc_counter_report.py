@@ -17,6 +17,7 @@ TOOLS_DIR = PROJECT_ROOT / "tools"
 sys.path.insert(0, str(TOOLS_DIR))
 
 from counter_protocol import STANDARD_COUNTER_FIELDS  # noqa: E402
+from rdc_counter_report import decode_rgba8_png  # noqa: E402
 
 
 WORKER = TOOLS_DIR / "rdc_counter_report.py"
@@ -87,12 +88,14 @@ class RdcCounterReportTests(unittest.TestCase):
                     '',
                 ]
                 (args.outdir / 'Report.md').write_text('\\n'.join(report), encoding='utf-8')
-                if mode in {'png-same', 'png-mismatch', 'png-golden-only'}:
+                if mode in {'png-same', 'png-mismatch', 'png-golden-only', 'png-size-from-golden'}:
                     trace_stem = args.rdc.stem
+                    png_width = 32 if mode == 'png-size-from-golden' else int(args.width)
+                    png_height = 48 if mode == 'png-size-from-golden' else int(args.height)
                     write_rgba8_png(
                         args.outdir / 'player-output' / trace_stem / 'png' / f'{trace_stem}_replay.png',
-                        int(args.width),
-                        int(args.height),
+                        png_width,
+                        png_height,
                         (1, 2, 3, 255),
                     )
                 """
@@ -110,9 +113,11 @@ class RdcCounterReportTests(unittest.TestCase):
                 if mode == 'mismatch':
                     values[FIELDS[-1]] += 1
                 artifact_png = None
-                if mode in {'png-same', 'png-mismatch', 'png-pvrgpu-only'}:
+                if mode in {'png-same', 'png-mismatch', 'png-pvrgpu-only', 'png-size-from-golden'}:
                     artifact_png = args.outdir / 'driver_indexed_quad_sample_000001.png'
                     pixel = (1, 2, 3, 255) if mode == 'png-same' else (9, 2, 3, 255)
+                    if mode == 'png-size-from-golden':
+                        pixel = (1, 2, 3, 255)
                     write_rgba8_png(artifact_png, int(args.width), int(args.height), pixel)
                 digest = hashlib.sha256(args.rdc.read_bytes()).hexdigest()
                 counter_message = {
@@ -360,6 +365,34 @@ class RdcCounterReportTests(unittest.TestCase):
             report = (run_root / "report.md").read_text(encoding="utf-8")
             self.assertIn("PNG comparison", report)
             self.assertIn("PNG | Result", report)
+
+    def test_pvrgpu_runner_receives_actual_golden_png_extent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            rdc = inputs / "png_size_from_golden.rdc"
+            rdc.write_text("png-size-from-golden", encoding="utf-8")
+            manifest = root / "manifest.tsv"
+            self._write_manifest(manifest, [("png_size_from_golden", rdc)])
+            golden, pvrgpu = self._write_fake_runners(root)
+            output = root / "output"
+
+            completed = self._run(
+                input_root=inputs,
+                output_root=output,
+                manifest=manifest,
+                golden=golden,
+                pvrgpu=pvrgpu,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            run_root = self._single_run_root(output)
+            run_data = json.loads((run_root / "run.json").read_text(encoding="utf-8"))
+            result = run_data["results"][0]
+            self.assertEqual(result["status"], "PASS")
+            pvrgpu_png = run_root / result["artifact_dir"] / result["pvrgpu_png"]
+            self.assertEqual(decode_rgba8_png(pvrgpu_png)[:2], (32, 48))
 
     def test_require_manifest_fails_unmapped_rdc_before_replay(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

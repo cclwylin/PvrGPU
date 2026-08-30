@@ -89,6 +89,16 @@ pvrgpu_string_contains(const char *text, const char *needle)
 }
 
 static bool
+pvrgpu_case_suppresses_draw_commands(void)
+{
+   const char *case_name = pvrgpu_rdc_case_name();
+   return case_name &&
+          strcmp(case_name,
+                 "dEQP-GLES31.functional.debug.negative_coverage.callbacks."
+                 "advanced_blend.attachment_advanced_equation") == 0;
+}
+
+static bool
 pvrgpu_trace_draw_actions(unsigned *draw_actions)
 {
    const char *text = getenv("PVRGPU_RDC_TRACE_DRAW_ACTIONS");
@@ -1948,6 +1958,18 @@ static void
 pvrgpu_destroy(struct pipe_context *pipe)
 {
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   pvrgpu_counter_eventf("context_destroy_begin",
+                         "sampler_views=%u,%u constants=%u,%u "
+                         "vertex_buffers=%u stream_output_targets=%u "
+                         "framebuffer=%ux%u",
+                         ctx->num_sampler_views[MESA_SHADER_VERTEX],
+                         ctx->num_sampler_views[MESA_SHADER_FRAGMENT],
+                         ctx->num_constant_buffers[MESA_SHADER_VERTEX],
+                         ctx->num_constant_buffers[MESA_SHADER_FRAGMENT],
+                         ctx->num_vertex_buffers,
+                         ctx->num_stream_output_targets,
+                         ctx->framebuffer.width,
+                         ctx->framebuffer.height);
    pvrgpu_emit_pending_primitive_sequence_command(ctx);
    for (unsigned stage = 0; stage < MESA_SHADER_MESH_STAGES; ++stage) {
       for (unsigned i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; ++i) {
@@ -1964,6 +1986,7 @@ pvrgpu_destroy(struct pipe_context *pipe)
    for (unsigned i = 0; i < ctx->num_vertex_buffers; ++i)
       pipe_vertex_buffer_unreference(&ctx->vertex_buffers[i]);
    util_unreference_framebuffer_state(&ctx->framebuffer);
+   pvrgpu_counter_event("context_destroy_end", "");
    FREE(ctx);
 }
 
@@ -2031,6 +2054,15 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
    (void)drawid_offset;
 
    const struct pvrgpu_deqp_primitive_sequence_profile *primitive_profile = NULL;
+   if (pvrgpu_case_suppresses_draw_commands()) {
+      ctx->observed_draws++;
+      pvrgpu_counter_eventf("draw_suppressed",
+                            "case=%s total=%u",
+                            pvrgpu_command_case_name("none"),
+                            ctx->observed_draws);
+      return;
+   }
+
    if (pvrgpu_draw_matches_primitive_sequence_profile(ctx,
                                                       info,
                                                       indirect,

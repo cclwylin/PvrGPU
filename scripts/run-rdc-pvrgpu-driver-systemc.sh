@@ -29,7 +29,8 @@ Environment overrides:
   PVRGPU_MESA_PVRGPU_PREFIX        Mesa install prefix with pvrgpu Gallium
   PVRGPU_RENDERDOC_MESA_ROOT       RenderDoc player/runtime root
   PVRGPU_MODEL_STUB                pvrgpu-model-stub executable
-  PVRGPU_MESA_GLES_VERSION_OVERRIDE  GLES replay gate, default 3.0
+  PVRGPU_MESA_GLES_VERSION_OVERRIDE  GLES replay gate override; default is
+                                      inferred from the dEQP case name
 EOF
 }
 
@@ -106,7 +107,16 @@ mesa_prefix="${PVRGPU_MESA_PVRGPU_PREFIX:-${pvrgpu_work_root}/tmp/pvrgpu-mesa-in
 renderdoc_root="${PVRGPU_RENDERDOC_MESA_ROOT:-${working_root}/build/renderdoc-mesa}"
 player="${renderdoc_root}/bin/renderdoc-mesa-player"
 model="${PVRGPU_MODEL_STUB}"
-gles_override="${PVRGPU_MESA_GLES_VERSION_OVERRIDE:-3.0}"
+default_gles_override="3.0"
+case "${case_name}" in
+    dEQP-GLES32.*)
+        default_gles_override="3.2"
+        ;;
+    dEQP-GLES31.*)
+        default_gles_override="3.1"
+        ;;
+esac
+gles_override="${PVRGPU_MESA_GLES_VERSION_OVERRIDE:-${default_gles_override}}"
 
 for required_runtime in \
     "${mesa_prefix}/lib/libEGL.dylib" \
@@ -210,6 +220,8 @@ env \
     PVRGPU_DRIVER_COMMAND_OUT="${command_out}" \
     PVRGPU_DRIVER_COUNTER_OUT="${counter_out}" \
     PVRGPU_RDC_CASE_NAME="${case_name}" \
+    PVRGPU_RDC_OUTPUT_WIDTH="${width}" \
+    PVRGPU_RDC_OUTPUT_HEIGHT="${height}" \
     "${player}" "${rdc_path}" "${player_png}" \
     >"${player_stdout}" \
     2>"${player_stderr}"

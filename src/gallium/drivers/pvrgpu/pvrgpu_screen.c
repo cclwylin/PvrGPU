@@ -113,6 +113,7 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    struct pipe_caps *caps = (struct pipe_caps *)&screen->caps;
 
    u_init_pipe_screen_caps(screen, 0);
+   caps->shareable_shaders = false;
    caps->npot_textures = true;
    caps->blend_equation_separate = true;
    caps->texture_swizzle = true;

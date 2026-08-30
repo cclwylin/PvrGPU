@@ -10,6 +10,8 @@
 #include "util/u_debug.h"
 #include "util/u_math.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -20,6 +22,69 @@ pvrgpu_command_output_path(void)
    if (path && path[0] != '\0')
       return path;
    return NULL;
+}
+
+static bool
+pvrgpu_parse_env_uint(const char *name, unsigned minimum, unsigned *value)
+{
+   const char *text = getenv(name);
+   if (!value || !text || text[0] == '\0')
+      return false;
+
+   errno = 0;
+   char *end = NULL;
+   const unsigned long parsed = strtoul(text, &end, 10);
+   if (errno != 0 ||
+       end == text ||
+       *end != '\0' ||
+       parsed < minimum ||
+       parsed > UINT_MAX)
+      return false;
+
+   *value = (unsigned)parsed;
+   return true;
+}
+
+static bool
+pvrgpu_trace_has_no_draw_actions(void)
+{
+   unsigned draw_actions = 0;
+   return pvrgpu_parse_env_uint("PVRGPU_RDC_TRACE_DRAW_ACTIONS",
+                                0,
+                                &draw_actions) &&
+          draw_actions == 0;
+}
+
+static bool
+pvrgpu_rdc_output_extent(unsigned *width, unsigned *height)
+{
+   return pvrgpu_parse_env_uint("PVRGPU_RDC_OUTPUT_WIDTH", 1, width) &&
+          pvrgpu_parse_env_uint("PVRGPU_RDC_OUTPUT_HEIGHT", 1, height);
+}
+
+static bool
+pvrgpu_apply_zero_draw_output_extent(unsigned *width, unsigned *height)
+{
+   if (!width || !height || !pvrgpu_trace_has_no_draw_actions())
+      return false;
+
+   unsigned output_width = 0;
+   unsigned output_height = 0;
+   if (!pvrgpu_rdc_output_extent(&output_width, &output_height))
+      return false;
+
+   const bool changed = *width != output_width || *height != output_height;
+   if (*width != output_width || *height != output_height) {
+      pvrgpu_counter_eventf("rdc_output_extent",
+                            "source=%ux%u output=%ux%u",
+                            *width,
+                            *height,
+                            output_width,
+                            output_height);
+   }
+   *width = output_width;
+   *height = output_height;
+   return changed;
 }
 
 static bool
@@ -184,6 +249,9 @@ pvrgpu_emit_clear_color_command(unsigned width,
       return;
    }
 
+   const bool output_target_changed =
+      pvrgpu_apply_zero_draw_output_extent(&width, &height);
+
    struct pvrgpu_clear_color_command command;
    memset(&command, 0, sizeof(command));
    command.case_name = "phase1.clear.gallium";
@@ -191,10 +259,17 @@ pvrgpu_emit_clear_color_command(unsigned width,
    command.width = width;
    command.height = height;
    command.format = pvrgpu_command_format_for_color_surface(format);
-   command.clear_color_bits[0] = fui(color->f[0]);
-   command.clear_color_bits[1] = fui(color->f[1]);
-   command.clear_color_bits[2] = fui(color->f[2]);
-   command.clear_color_bits[3] = fui(color->f[3]);
+   if (output_target_changed) {
+      command.clear_color_bits[0] = 0;
+      command.clear_color_bits[1] = 0;
+      command.clear_color_bits[2] = 0;
+      command.clear_color_bits[3] = 0;
+   } else {
+      command.clear_color_bits[0] = fui(color->f[0]);
+      command.clear_color_bits[1] = fui(color->f[1]);
+      command.clear_color_bits[2] = fui(color->f[2]);
+      command.clear_color_bits[3] = fui(color->f[3]);
+   }
 
    char error[256];
    if (!pvrgpu_write_clear_color_command(path, &command, error, sizeof(error)))
