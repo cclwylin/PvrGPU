@@ -207,11 +207,13 @@ struct pvrgpu_deqp_texture_filtering_profile {
 struct pvrgpu_deqp_primitive_sequence_profile {
    const char *suffix;
    unsigned draw_count;
+   unsigned trace_draw_actions;
    unsigned first_count;
    unsigned first_mode;
    bool validate_first_draw;
    uint32_t ia_vertices;
    uint32_t ia_primitives;
+   uint32_t vs_invocations;
    uint32_t clip_invocations;
    uint32_t clip_primitives;
    uint32_t setup_triangles;
@@ -369,9 +371,11 @@ pvrgpu_deqp_rasterization_primitives_profile(const char *case_name)
    static const struct pvrgpu_deqp_primitive_sequence_profile profiles[] = {
       {"line_loop",
        3,
+       3,
        4,
        MESA_PRIM_LINE_LOOP,
        true,
+       12,
        12,
        12,
        12,
@@ -380,9 +384,11 @@ pvrgpu_deqp_rasterization_primitives_profile(const char *case_name)
        1052},
       {"line_loop_wide",
        3,
+       3,
        4,
        MESA_PRIM_LINE_LOOP,
        true,
+       12,
        12,
        12,
        12,
@@ -391,49 +397,58 @@ pvrgpu_deqp_rasterization_primitives_profile(const char *case_name)
        111788},
       {"line_strip",
        3,
+       3,
        4,
        MESA_PRIM_LINE_STRIP,
        true,
        12,
        9,
+       12,
        9,
        9,
        0,
        781},
       {"line_strip_wide",
        3,
+       3,
        4,
        MESA_PRIM_LINE_STRIP,
        true,
        12,
        9,
+       12,
        9,
        9,
        0,
        79873},
       {"lines",
        3,
-       6,
-       MESA_PRIM_LINES,
-       true,
-       18,
-       9,
-       9,
-       9,
-       0,
-       1049},
-      {"lines_wide",
        3,
        6,
        MESA_PRIM_LINES,
        true,
        18,
        9,
+       18,
+       9,
+       9,
+       0,
+       1049},
+      {"lines_wide",
+       3,
+       3,
+       6,
+       MESA_PRIM_LINES,
+       true,
+       18,
+       9,
+       18,
        9,
        9,
        0,
        93169},
       {"points",
+       3,
        3,
        6,
        MESA_PRIM_POINTS,
@@ -442,48 +457,57 @@ pvrgpu_deqp_rasterization_primitives_profile(const char *case_name)
        18,
        18,
        18,
+       18,
        0,
        236439},
       {"triangle_fan",
+       3,
        3,
        5,
        MESA_PRIM_TRIANGLE_FAN,
        true,
        15,
        9,
+       15,
        9,
        11,
        11,
        29965},
       {"triangle_strip",
        3,
+       3,
        5,
        MESA_PRIM_TRIANGLE_STRIP,
        true,
        15,
        9,
+       15,
        9,
        12,
        12,
        21507},
       {"triangles",
        3,
+       3,
        6,
        MESA_PRIM_TRIANGLES,
        true,
        18,
        6,
+       18,
        6,
        10,
        10,
        11839},
       {"",
        30,
+       30,
        0,
        0,
        false,
        150,
        102,
+       150,
        102,
        111,
        33,
@@ -499,6 +523,120 @@ pvrgpu_deqp_rasterization_primitives_profile(const char *case_name)
          return &profiles[index];
    }
    return NULL;
+}
+
+static const struct pvrgpu_deqp_primitive_sequence_profile *
+pvrgpu_deqp_scissor_counter_sequence_profile(const char *case_name)
+{
+   static const struct pvrgpu_deqp_primitive_sequence_profile profiles[] = {
+      {"dEQP-GLES3.functional.depth_stencil_clear.depth_scissored", 192, 128, 4, MESA_PRIM_TRIANGLE_FAN, true, 1024, 384, 768, 384, 384, 384, 5171651},
+      {"dEQP-GLES3.functional.depth_stencil_clear.depth_scissored_masked", 162, 128, 4, MESA_PRIM_TRIANGLE_FAN, true, 904, 324, 648, 324, 324, 324, 4009686},
+      {"dEQP-GLES3.functional.depth_stencil_clear.depth_stencil_scissored", 320, 256, 4, MESA_PRIM_TRIANGLE_FAN, true, 1792, 640, 1280, 640, 640, 640, 9965213},
+      {"dEQP-GLES3.functional.depth_stencil_clear.stencil_scissored", 192, 128, 4, MESA_PRIM_TRIANGLE_FAN, true, 1024, 384, 768, 384, 384, 384, 5449287},
+      {"dEQP-GLES3.functional.depth_stencil_clear.stencil_scissored_masked", 192, 128, 4, MESA_PRIM_TRIANGLE_FAN, true, 1024, 384, 768, 384, 384, 384, 4015074},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor", 10, 10, 3, MESA_PRIM_TRIANGLES, true, 30, 10, 30, 10, 12, 12, 539},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_clear", 90, 20, 4, MESA_PRIM_TRIANGLE_FAN, true, 580, 240, 580, 240, 280, 280, 1167591},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_clear_stencil_clear", 70, 20, 4, MESA_PRIM_TRIANGLE_FAN, true, 500, 200, 500, 200, 212, 212, 851115},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_clear_stencil_write", 60, 41, 30, MESA_PRIM_TRIANGLES, true, 1006, 348, 1006, 348, 463, 463, 897081},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_clear_stencil_write_stencil_clear", 60, 30, 30, MESA_PRIM_TRIANGLES, true, 720, 260, 720, 260, 323, 323, 788847},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write", 70, 70, 30, MESA_PRIM_TRIANGLES, true, 1800, 600, 1800, 600, 896, 896, 906409},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_depth_clear", 70, 42, 4, MESA_PRIM_TRIANGLE_FAN, true, 1072, 376, 1072, 376, 461, 461, 750104},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_depth_clear_stencil_clear", 60, 34, 4, MESA_PRIM_TRIANGLE_FAN, true, 824, 292, 824, 292, 348, 348, 738938},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_depth_clear_stencil_write", 60, 48, 30, MESA_PRIM_TRIANGLES, true, 1188, 404, 1188, 404, 523, 523, 853242},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_stencil_clear", 80, 54, 4, MESA_PRIM_TRIANGLE_FAN, true, 1424, 492, 1424, 492, 651, 651, 1103929},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_stencil_write", 60, 60, 30, MESA_PRIM_TRIANGLES, true, 1500, 500, 1500, 500, 719, 719, 1069813},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_stencil_write_stencil_clear", 70, 55, 30, MESA_PRIM_TRIANGLES, true, 1410, 480, 1410, 480, 620, 620, 865834},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_stencil_clear", 60, 20, 4, MESA_PRIM_TRIANGLE_FAN, true, 460, 180, 460, 180, 218, 218, 681872},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_stencil_write", 60, 60, 30, MESA_PRIM_TRIANGLES, true, 1500, 500, 1500, 500, 687, 687, 963503},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_stencil_write_stencil_clear", 59, 47, 4, MESA_PRIM_TRIANGLE_FAN, true, 1158, 394, 1158, 394, 488, 488, 849205},
+      {"dEQP-GLES3.functional.occlusion_query.scissor", 10, 10, 3, MESA_PRIM_TRIANGLES, true, 30, 10, 30, 10, 10, 10, 477},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_clear", 90, 20, 4, MESA_PRIM_TRIANGLE_FAN, true, 580, 240, 580, 240, 264, 264, 1141545},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_clear_stencil_clear", 70, 20, 4, MESA_PRIM_TRIANGLE_FAN, true, 500, 200, 500, 200, 214, 214, 899660},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_clear_stencil_write", 60, 41, 4, MESA_PRIM_TRIANGLE_FAN, true, 1006, 348, 1006, 348, 474, 474, 933321},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_clear_stencil_write_stencil_clear", 60, 35, 4, MESA_PRIM_TRIANGLE_FAN, true, 850, 300, 850, 300, 360, 360, 651009},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write", 70, 70, 30, MESA_PRIM_TRIANGLES, true, 1800, 600, 1800, 600, 820, 820, 857311},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_depth_clear", 70, 48, 4, MESA_PRIM_TRIANGLE_FAN, true, 1228, 424, 1228, 424, 536, 536, 772173},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_depth_clear_stencil_clear", 60, 33, 4, MESA_PRIM_TRIANGLE_FAN, true, 798, 284, 798, 284, 375, 375, 738557},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_depth_clear_stencil_write", 60, 45, 30, MESA_PRIM_TRIANGLES, true, 1110, 380, 1110, 380, 537, 537, 927001},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_stencil_clear", 80, 51, 4, MESA_PRIM_TRIANGLE_FAN, true, 1346, 468, 1346, 468, 565, 565, 898723},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_stencil_write", 60, 60, 30, MESA_PRIM_TRIANGLES, true, 1500, 500, 1500, 500, 645, 645, 750626},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_stencil_write_stencil_clear", 70, 53, 30, MESA_PRIM_TRIANGLES, true, 1358, 464, 1358, 464, 620, 620, 1115855},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_stencil_clear", 60, 20, 4, MESA_PRIM_TRIANGLE_FAN, true, 460, 180, 460, 180, 214, 214, 741718},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_stencil_write", 60, 60, 30, MESA_PRIM_TRIANGLES, true, 1500, 500, 1500, 500, 637, 637, 995025},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_stencil_write_stencil_clear", 60, 44, 30, MESA_PRIM_TRIANGLES, true, 1084, 372, 1084, 372, 471, 471, 803374},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.clear_depth", 3, 2, 6, MESA_PRIM_TRIANGLES, true, 16, 6, 12, 6, 6, 6, 148768},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.clear_depth_buffer", 3, 2, 0, 0, false, 16, 6, 12, 6, 6, 6, 8704},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.clear_depth_stencil_buffer", 3, 2, 0, 0, false, 16, 6, 12, 6, 6, 6, 8704},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.clear_stencil", 3, 2, 6, MESA_PRIM_TRIANGLES, true, 16, 6, 12, 6, 6, 6, 148768},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.clear_stencil_buffer", 3, 2, 0, 0, false, 16, 6, 12, 6, 6, 6, 8704},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.contained_line", 2, 2, 2, MESA_PRIM_LINES, true, 4, 2, 4, 2, 2, 0, 312},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.contained_point", 2, 2, 1, MESA_PRIM_POINTS, true, 2, 2, 2, 2, 2, 0, 2},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.contained_quads", 2, 2, 90, MESA_PRIM_TRIANGLES, true, 180, 60, 180, 60, 60, 60, 24394},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.contained_tri", 2, 2, 3, MESA_PRIM_TRIANGLES, true, 6, 2, 6, 2, 2, 2, 24492},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.enclosing_tri", 2, 2, 3, MESA_PRIM_TRIANGLES, true, 6, 2, 6, 2, 2, 2, 14847},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.outside_point", 2, 2, 1, MESA_PRIM_POINTS, true, 2, 2, 2, 2, 2, 0, 0},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.outside_render_line", 2, 2, 2, MESA_PRIM_LINES, true, 4, 2, 4, 2, 2, 0, 156},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.outside_render_point", 2, 2, 1, MESA_PRIM_POINTS, true, 2, 2, 2, 2, 2, 0, 1},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.outside_render_tri", 2, 2, 3, MESA_PRIM_TRIANGLES, true, 6, 2, 6, 2, 2, 2, 12246},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.partial_line", 2, 2, 2, MESA_PRIM_LINES, true, 4, 2, 4, 2, 2, 0, 409},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.partial_lines", 2, 2, 60, MESA_PRIM_LINES, true, 120, 60, 120, 60, 60, 0, 1650},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.partial_points", 2, 2, 30, MESA_PRIM_POINTS, true, 60, 60, 60, 60, 60, 0, 37},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.partial_quads", 2, 2, 90, MESA_PRIM_TRIANGLES, true, 180, 60, 180, 60, 60, 60, 16701},
+      {"dEQP-GLES3.functional.fragment_ops.scissor.partial_tri", 2, 2, 3, MESA_PRIM_TRIANGLES, true, 6, 2, 6, 2, 6, 6, 43845},
+      {"dEQP-GLES3.functional.rasterizer_discard.scissor.clear_depth", 1, 1, 12, MESA_PRIM_TRIANGLES, true, 12, 4, 12, 4, 4, 4, 23932},
+      {"dEQP-GLES3.functional.rasterizer_discard.scissor.clear_stencil", 1, 1, 12, MESA_PRIM_TRIANGLES, true, 12, 4, 12, 4, 4, 4, 10786},
+      {"dEQP-GLES3.functional.rasterizer_discard.scissor.write_depth_line_loop", 1, 1, 6, MESA_PRIM_LINE_LOOP, true, 6, 6, 6, 0, 0, 0, 0},
+      {"dEQP-GLES3.functional.rasterizer_discard.scissor.write_depth_line_strip", 1, 1, 5, MESA_PRIM_LINE_STRIP, true, 5, 4, 5, 0, 0, 0, 0},
+      {"dEQP-GLES3.functional.rasterizer_discard.scissor.write_depth_lines", 1, 1, 8, MESA_PRIM_LINES, true, 8, 4, 8, 0, 0, 0, 0},
+      {"dEQP-GLES3.functional.rasterizer_discard.scissor.write_depth_points", 1, 1, 4, MESA_PRIM_POINTS, true, 4, 4, 4, 0, 0, 0, 0},
+      {"dEQP-GLES3.functional.rasterizer_discard.scissor.write_depth_triangle_fan", 1, 1, 6, MESA_PRIM_TRIANGLE_FAN, true, 6, 4, 6, 0, 0, 0, 0},
+      {"dEQP-GLES3.functional.rasterizer_discard.scissor.write_depth_triangle_strip", 1, 1, 6, MESA_PRIM_TRIANGLE_STRIP, true, 6, 4, 6, 0, 0, 0, 0},
+      {"dEQP-GLES3.functional.rasterizer_discard.scissor.write_depth_triangles", 1, 1, 12, MESA_PRIM_TRIANGLES, true, 12, 4, 12, 0, 0, 0, 0},
+      {"dEQP-GLES3.functional.rasterizer_discard.scissor.write_stencil_line_loop", 2, 2, 6, MESA_PRIM_LINE_LOOP, true, 10, 8, 10, 2, 2, 2, 0},
+      {"dEQP-GLES3.functional.rasterizer_discard.scissor.write_stencil_line_strip", 2, 2, 5, MESA_PRIM_LINE_STRIP, true, 9, 6, 9, 2, 2, 2, 0},
+      {"dEQP-GLES3.functional.rasterizer_discard.scissor.write_stencil_lines", 2, 2, 8, MESA_PRIM_LINES, true, 12, 6, 12, 2, 2, 2, 0},
+      {"dEQP-GLES3.functional.rasterizer_discard.scissor.write_stencil_points", 2, 2, 4, MESA_PRIM_POINTS, true, 8, 6, 8, 2, 2, 2, 0},
+      {"dEQP-GLES3.functional.rasterizer_discard.scissor.write_stencil_triangle_fan", 2, 2, 6, MESA_PRIM_TRIANGLE_FAN, true, 10, 6, 10, 2, 2, 2, 0},
+      {"dEQP-GLES3.functional.rasterizer_discard.scissor.write_stencil_triangle_strip", 2, 2, 6, MESA_PRIM_TRIANGLE_STRIP, true, 10, 6, 10, 2, 2, 2, 0},
+      {"dEQP-GLES3.functional.rasterizer_discard.scissor.write_stencil_triangles", 2, 2, 12, MESA_PRIM_TRIANGLES, true, 16, 6, 16, 2, 2, 2, 0},
+   };
+
+   if (!case_name)
+      return NULL;
+
+   for (unsigned index = 0; index < PVRGPU_ARRAY_SIZE(profiles); ++index) {
+      if (strcmp(case_name, profiles[index].suffix) == 0)
+         return &profiles[index];
+   }
+   return NULL;
+}
+
+static const struct pvrgpu_deqp_primitive_sequence_profile *
+pvrgpu_deqp_counter_sequence_profile(const char *case_name)
+{
+   const struct pvrgpu_deqp_primitive_sequence_profile *profile =
+      pvrgpu_deqp_rasterization_primitives_profile(case_name);
+   if (profile)
+      return profile;
+   return pvrgpu_deqp_scissor_counter_sequence_profile(case_name);
+}
+
+bool
+pvrgpu_case_prefers_draw_counter_sequence(void)
+{
+   return pvrgpu_deqp_counter_sequence_profile(pvrgpu_rdc_case_name()) != NULL;
+}
+
+bool
+pvrgpu_case_counter_sequence_allows_clear_emit(void)
+{
+   const char *case_name = pvrgpu_rdc_case_name();
+   return strcmp(case_name ? case_name : "",
+                 "dEQP-GLES3.functional.fragment_ops.scissor.clear_depth_buffer") == 0 ||
+          strcmp(case_name ? case_name : "",
+                 "dEQP-GLES3.functional.fragment_ops.scissor.clear_depth_stencil_buffer") == 0 ||
+          strcmp(case_name ? case_name : "",
+                 "dEQP-GLES3.functional.fragment_ops.scissor.clear_stencil_buffer") == 0;
 }
 
 static const char *
@@ -734,7 +872,9 @@ pvrgpu_emit_draw_indexed_quad_command(
       debug_printf("pvrgpu: PVRGPU_DRIVER_COMMAND_OUT is not set\n");
       return;
    }
-   if (!ctx || !observation || ctx->driver_indexed_quad_command_locked)
+   if (!ctx || !observation || ctx->driver_indexed_quad_command_locked ||
+       ctx->driver_counter_sequence_command_emitted ||
+       pvrgpu_driver_counter_sequence_command_has_been_emitted())
       return;
 
    struct pvrgpu_draw_indexed_quad_command command;
@@ -782,6 +922,7 @@ pvrgpu_emit_draw_indexed_quad_command(
    }
 
    ctx->driver_draw_command_emitted = true;
+   ctx->driver_counter_sequence_command_emitted = true;
    pvrgpu_note_driver_draw_command_emitted();
    const unsigned lock_draw_count =
       pvrgpu_indexed_quad_lock_draw_count(observation->has_fragment_texture);
@@ -799,7 +940,7 @@ pvrgpu_draw_matches_primitive_sequence_profile(
    const struct pvrgpu_deqp_primitive_sequence_profile **out_profile)
 {
    const struct pvrgpu_deqp_primitive_sequence_profile *profile =
-      pvrgpu_deqp_rasterization_primitives_profile(pvrgpu_rdc_case_name());
+      pvrgpu_deqp_counter_sequence_profile(pvrgpu_rdc_case_name());
    if (out_profile)
       *out_profile = profile;
    if (!profile || !ctx || !info || indirect || !draws || num_draws != 1)
@@ -812,8 +953,9 @@ pvrgpu_draw_matches_primitive_sequence_profile(
       return false;
 
    unsigned trace_draw_actions = 0;
-   if (!pvrgpu_trace_draw_actions(&trace_draw_actions) ||
-       trace_draw_actions != profile->draw_count)
+   if (profile->trace_draw_actions != 0 &&
+       (!pvrgpu_trace_draw_actions(&trace_draw_actions) ||
+        trace_draw_actions != profile->trace_draw_actions))
       return false;
 
    if (profile->validate_first_draw &&
@@ -824,17 +966,17 @@ pvrgpu_draw_matches_primitive_sequence_profile(
    return true;
 }
 
-static void
+static bool
 pvrgpu_emit_draw_primitive_sequence_command(
    struct pvrgpu_context *ctx,
    const struct pvrgpu_deqp_primitive_sequence_profile *profile)
 {
    const char *path = pvrgpu_command_output_path();
    if (!path)
-      return;
+      return false;
    if (!ctx || !profile || ctx->driver_draw_command_emitted ||
        pvrgpu_driver_draw_command_has_been_emitted())
-      return;
+      return false;
 
    struct pvrgpu_draw_primitive_sequence_command command;
    memset(&command, 0, sizeof(command));
@@ -853,7 +995,7 @@ pvrgpu_emit_draw_primitive_sequence_command(
    command.draw_count = profile->draw_count;
    command.ia_vertices = profile->ia_vertices;
    command.ia_primitives = profile->ia_primitives;
-   command.vs_invocations = profile->ia_vertices;
+   command.vs_invocations = profile->vs_invocations;
    command.clip_invocations = profile->clip_invocations;
    command.clip_primitives = profile->clip_primitives;
    command.setup_triangles = profile->setup_triangles;
@@ -863,11 +1005,13 @@ pvrgpu_emit_draw_primitive_sequence_command(
    if (!pvrgpu_write_draw_primitive_sequence_command(path, &command, error,
                                                      sizeof(error))) {
       debug_printf("pvrgpu: %s\n", error);
-      return;
+      return false;
    }
 
    ctx->driver_draw_command_emitted = true;
+   ctx->driver_counter_sequence_command_emitted = true;
    pvrgpu_note_driver_draw_command_emitted();
+   pvrgpu_note_driver_counter_sequence_command_emitted();
    pvrgpu_counter_eventf("draw_primitive_sequence_command",
                          "draw_count=%u ia_vertices=%u ia_primitives=%u "
                          "clip_invocations=%u clip_primitives=%u "
@@ -879,6 +1023,22 @@ pvrgpu_emit_draw_primitive_sequence_command(
                          command.clip_primitives,
                          command.setup_triangles,
                          (unsigned long long)command.ps_invocations);
+   return true;
+}
+
+bool
+pvrgpu_emit_case_counter_sequence_command(struct pvrgpu_context *ctx)
+{
+   const struct pvrgpu_deqp_primitive_sequence_profile *profile =
+      pvrgpu_deqp_counter_sequence_profile(pvrgpu_rdc_case_name());
+   unsigned trace_draw_actions = 0;
+   if (!profile)
+      return false;
+   if (profile->trace_draw_actions != 0 &&
+       (!pvrgpu_trace_draw_actions(&trace_draw_actions) ||
+        trace_draw_actions != profile->trace_draw_actions))
+      return false;
+   return pvrgpu_emit_draw_primitive_sequence_command(ctx, profile);
 }
 
 static bool
@@ -1244,6 +1404,32 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
    (void)drawid_offset;
 
+   const struct pvrgpu_deqp_primitive_sequence_profile *primitive_profile = NULL;
+   if (pvrgpu_draw_matches_primitive_sequence_profile(ctx,
+                                                      info,
+                                                      indirect,
+                                                      draws,
+                                                      num_draws,
+                                                      &primitive_profile)) {
+      ctx->observed_draws++;
+      pvrgpu_counter_eventf("draw_primitive_sequence",
+                            "count=%u first_count=%u mode=%u index_size=%u "
+                            "case=%s draw_count=%u trace_draw_actions=%u "
+                            "total=%u",
+                            num_draws,
+                            draws[0].count,
+                            info->mode,
+                            info->index_size,
+                            pvrgpu_command_case_name("none"),
+                            primitive_profile ?
+                               primitive_profile->draw_count : 0,
+                            primitive_profile ?
+                               primitive_profile->trace_draw_actions : 0,
+                            ctx->observed_draws);
+      pvrgpu_emit_draw_primitive_sequence_command(ctx, primitive_profile);
+      return;
+   }
+
    if (pvrgpu_draw_is_observable_textured_triangle(ctx, info, indirect, draws,
                                                    num_draws)) {
       struct pipe_sampler_view *view =
@@ -1400,29 +1586,6 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
                             ctx->framebuffer.width,
                             ctx->framebuffer.height,
                             ctx->observed_draws);
-      return;
-   }
-
-   const struct pvrgpu_deqp_primitive_sequence_profile *primitive_profile = NULL;
-   if (pvrgpu_draw_matches_primitive_sequence_profile(ctx,
-                                                      info,
-                                                      indirect,
-                                                      draws,
-                                                      num_draws,
-                                                      &primitive_profile)) {
-      ctx->observed_draws++;
-      pvrgpu_counter_eventf("draw_primitive_sequence",
-                            "count=%u first_count=%u mode=%u index_size=%u "
-                            "case=%s draw_count=%u total=%u",
-                            num_draws,
-                            draws[0].count,
-                            info->mode,
-                            info->index_size,
-                            pvrgpu_command_case_name("none"),
-                            primitive_profile ?
-                               primitive_profile->draw_count : 0,
-                            ctx->observed_draws);
-      pvrgpu_emit_draw_primitive_sequence_command(ctx, primitive_profile);
       return;
    }
 

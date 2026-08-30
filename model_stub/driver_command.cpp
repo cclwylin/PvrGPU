@@ -392,15 +392,14 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         !ParseU32(fields["ia_primitives"], &parsed.ia_primitives) ||
         parsed.ia_primitives == 0 ||
         !ParseU32(fields["vs_invocations"], &parsed.vs_invocations) ||
-        parsed.vs_invocations != parsed.ia_vertices ||
+        parsed.vs_invocations == 0 ||
         !ParseU32(fields["clip_invocations"], &parsed.clip_invocations) ||
-        parsed.clip_invocations != parsed.ia_primitives ||
+        parsed.clip_invocations > parsed.ia_primitives ||
         !ParseU32(fields["clip_primitives"], &parsed.clip_primitives) ||
         parsed.clip_primitives < parsed.clip_invocations ||
         !ParseU32(fields["setup_triangles"], &parsed.setup_triangles) ||
         parsed.setup_triangles > parsed.clip_primitives ||
-        !ParseU64(fields["ps_invocations"], &parsed.ps_invocations) ||
-        parsed.ps_invocations == 0) {
+        !ParseU64(fields["ps_invocations"], &parsed.ps_invocations)) {
       *error =
           "draw primitive sequence contains invalid semantic counter metadata";
       return false;

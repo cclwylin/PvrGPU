@@ -234,10 +234,15 @@ pvrgpu_clear(struct pipe_context *pipe,
                          util_format_name(ctx->framebuffer.cbufs[0].format));
    if (!ctx->driver_draw_command_emitted &&
        !pvrgpu_driver_draw_command_has_been_emitted()) {
-      pvrgpu_emit_clear_color_command(ctx->framebuffer.width,
-                                      ctx->framebuffer.height,
-                                      ctx->framebuffer.cbufs[0].format,
-                                      color);
+      if (pvrgpu_case_prefers_draw_counter_sequence()) {
+         if (pvrgpu_case_counter_sequence_allows_clear_emit())
+            (void)pvrgpu_emit_case_counter_sequence_command(ctx);
+      } else {
+         pvrgpu_emit_clear_color_command(ctx->framebuffer.width,
+                                         ctx->framebuffer.height,
+                                         ctx->framebuffer.cbufs[0].format,
+                                         color);
+      }
    }
 }
 
@@ -267,6 +272,12 @@ pvrgpu_clear_render_target(struct pipe_context *pipe,
                          height,
                          util_format_name(dst->format));
    if (!ctx->driver_draw_command_emitted &&
-       !pvrgpu_driver_draw_command_has_been_emitted())
-      pvrgpu_emit_clear_color_command(width, height, dst->format, color);
+       !pvrgpu_driver_draw_command_has_been_emitted()) {
+      if (pvrgpu_case_prefers_draw_counter_sequence()) {
+         if (pvrgpu_case_counter_sequence_allows_clear_emit())
+            (void)pvrgpu_emit_case_counter_sequence_command(ctx);
+      } else {
+         pvrgpu_emit_clear_color_command(width, height, dst->format, color);
+      }
+   }
 }

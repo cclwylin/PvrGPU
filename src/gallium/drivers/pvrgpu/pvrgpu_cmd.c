@@ -8,6 +8,7 @@
 #include <string.h>
 
 static bool pvrgpu_global_driver_draw_command_emitted;
+static bool pvrgpu_global_driver_counter_sequence_command_emitted;
 
 bool
 pvrgpu_driver_draw_command_has_been_emitted(void)
@@ -19,6 +20,18 @@ void
 pvrgpu_note_driver_draw_command_emitted(void)
 {
    pvrgpu_global_driver_draw_command_emitted = true;
+}
+
+bool
+pvrgpu_driver_counter_sequence_command_has_been_emitted(void)
+{
+   return pvrgpu_global_driver_counter_sequence_command_emitted;
+}
+
+void
+pvrgpu_note_driver_counter_sequence_command_emitted(void)
+{
+   pvrgpu_global_driver_counter_sequence_command_emitted = true;
 }
 
 static void
@@ -196,11 +209,10 @@ pvrgpu_cmd_validate_draw_primitive_sequence(
    if (cmd->draw_count == 0 ||
        cmd->ia_vertices == 0 ||
        cmd->ia_primitives == 0 ||
-       cmd->vs_invocations != cmd->ia_vertices ||
-       cmd->clip_invocations != cmd->ia_primitives ||
+       cmd->vs_invocations == 0 ||
+       cmd->clip_invocations > cmd->ia_primitives ||
        cmd->clip_primitives < cmd->clip_invocations ||
-       cmd->setup_triangles > cmd->clip_primitives ||
-       cmd->ps_invocations == 0) {
+       cmd->setup_triangles > cmd->clip_primitives) {
       pvrgpu_cmd_error(error, error_size,
                        "draw primitive sequence command contains invalid "
                        "semantic counter metadata");

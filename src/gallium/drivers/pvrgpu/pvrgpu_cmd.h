@@ -105,6 +105,12 @@ pvrgpu_driver_draw_command_has_been_emitted(void);
 void
 pvrgpu_note_driver_draw_command_emitted(void);
 
+bool
+pvrgpu_driver_counter_sequence_command_has_been_emitted(void);
+
+void
+pvrgpu_note_driver_counter_sequence_command_emitted(void);
+
 #ifdef __cplusplus
 }
 #endif

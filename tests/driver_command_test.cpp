@@ -173,6 +173,38 @@ int main() {
                  "wrong primitive sequence metadata"))
     return failed;
 
+  const std::filesystem::path discard = TempFile("discard.txt");
+  WriteText(discard,
+            "schema=pvrgpu.driver-command.v1\n"
+            "producer=pvrgpu-gallium-driver\n"
+            "command=draw_primitive_sequence\n"
+            "case=dEQP-GLES3.functional.rasterizer_discard.scissor.write_depth_triangle_fan\n"
+            "frame=1\n"
+            "width=512\n"
+            "height=512\n"
+            "format=PIPE_FORMAT_R8G8B8A8_UNORM\n"
+            "clear_color_bits=0,0,0,1065353216\n"
+            "draw_count=1\n"
+            "ia_vertices=6\n"
+            "ia_primitives=4\n"
+            "vs_invocations=6\n"
+            "clip_invocations=0\n"
+            "clip_primitives=0\n"
+            "setup_triangles=0\n"
+            "ps_invocations=0\n");
+  error.clear();
+  if (int failed =
+          Expect(LoadDriverCommand(discard.string(), &command, &error),
+                 error))
+    return failed;
+  if (int failed =
+          Expect(command.command == "draw_primitive_sequence" &&
+                     command.draw_count == 1 &&
+                     command.clip_invocations == 0 &&
+                     command.ps_invocations == 0,
+                 "wrong discard primitive sequence metadata"))
+    return failed;
+
   const std::filesystem::path bad = TempFile("bad.txt");
   WriteText(bad,
             "schema=pvrgpu.driver-command.v1\n"
@@ -198,6 +230,7 @@ int main() {
   std::filesystem::remove(draw);
   std::filesystem::remove(quad);
   std::filesystem::remove(primitives);
+  std::filesystem::remove(discard);
   std::filesystem::remove(bad);
   return 0;
 }
