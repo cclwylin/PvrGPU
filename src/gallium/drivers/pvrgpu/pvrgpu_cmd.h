@@ -13,6 +13,8 @@ extern "C" {
 #define PVRGPU_DRIVER_COMMAND_SCHEMA "pvrgpu.driver-command.v1"
 #define PVRGPU_DRIVER_COMMAND_PRODUCER "pvrgpu-gallium-driver"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8 "PIPE_FORMAT_R8G8B8A8_UNORM"
+#define PVRGPU_DRIVER_COMMAND_FORMAT_RGBX8 "PIPE_FORMAT_R8G8B8X8_UNORM"
+#define PVRGPU_DRIVER_COMMAND_FORMAT_BGRX8 "PIPE_FORMAT_B8G8R8X8_UNORM"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_R10G10B10A2 "PIPE_FORMAT_R10G10B10A2_UNORM"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_B10G10R10A2 "PIPE_FORMAT_B10G10R10A2_UNORM"
 
@@ -49,6 +51,8 @@ struct pvrgpu_draw_indexed_quad_command {
    uint32_t index_count;
    uint32_t unique_vertices;
    uint32_t primitive_count;
+   uint32_t clip_primitives;
+   uint32_t setup_triangles;
    uint64_t semantic_texel_fetches;
 };
 

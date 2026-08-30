@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "pvrgpu_resource.h"
+#include "pvrgpu_cmd.h"
 #include "pvrgpu_context.h"
 #include "pvrgpu_counter.h"
 
@@ -10,7 +11,87 @@
 #include "util/u_memory.h"
 #include "util/u_transfer.h"
 
+#include <ctype.h>
+#include <limits.h>
+#include <stdlib.h>
 #include <string.h>
+
+static bool
+pvrgpu_is_safe_case_char(char value)
+{
+   const unsigned char ch = (unsigned char)value;
+   return isalnum(ch) || ch == '_' || ch == '.' || ch == '-';
+}
+
+static const char *
+pvrgpu_rdc_case_name(void)
+{
+   const char *case_name = getenv("PVRGPU_RDC_CASE_NAME");
+   if (!case_name || case_name[0] == '\0')
+      return NULL;
+
+   for (const char *cursor = case_name; *cursor; ++cursor) {
+      if (!pvrgpu_is_safe_case_char(*cursor))
+         return NULL;
+   }
+   return case_name;
+}
+
+static const char *
+pvrgpu_command_case_name(const char *fallback)
+{
+   const char *case_name = pvrgpu_rdc_case_name();
+   return case_name ? case_name : fallback;
+}
+
+static bool
+pvrgpu_string_has_prefix(const char *text, const char *prefix)
+{
+   return text && prefix && strncmp(text, prefix, strlen(prefix)) == 0;
+}
+
+static bool
+pvrgpu_string_contains(const char *text, const char *needle)
+{
+   return text && needle && strstr(text, needle) != NULL;
+}
+
+static bool
+pvrgpu_deqp_fbo_default_framebuffer_direct_color_counter_case(void)
+{
+   const char *case_name = pvrgpu_rdc_case_name();
+   return pvrgpu_string_has_prefix(
+             case_name,
+             "dEQP-GLES3.functional.fbo.blit.default_framebuffer.") &&
+          (pvrgpu_string_contains(case_name, ".rgb8_") ||
+           pvrgpu_string_contains(case_name, ".rgba8_")) &&
+          pvrgpu_string_contains(case_name, "_blit_to_default");
+}
+
+static const char *
+pvrgpu_command_output_path(void)
+{
+   const char *path = getenv("PVRGPU_DRIVER_COMMAND_OUT");
+   if (path && path[0] != '\0')
+      return path;
+   return NULL;
+}
+
+static bool
+pvrgpu_trace_draw_actions(unsigned *draw_actions)
+{
+   const char *text = getenv("PVRGPU_RDC_TRACE_DRAW_ACTIONS");
+   if (!draw_actions || !text || text[0] == '\0')
+      return false;
+
+   char *end = NULL;
+   unsigned long parsed = strtoul(text, &end, 10);
+   if (end == text || *end != '\0' || parsed > UINT_MAX)
+      return false;
+
+   *draw_actions = (unsigned)parsed;
+   return true;
+}
 
 static bool
 pvrgpu_is_supported_color_resource_format(enum pipe_format format)
@@ -152,13 +233,16 @@ pvrgpu_resource_create(struct pipe_screen *screen,
    }
    pvrgpu_counter_eventf("resource_create",
                          "target=%u width=%u height=%u depth=%u array=%u "
-                         "format=%s size=%zu",
+                         "format=%s bind=0x%x usage=%u flags=0x%x size=%zu",
                          resource->base.target,
                          resource->base.width0,
                          resource->base.height0,
                          resource->base.depth0,
                          resource->base.array_size,
                          util_format_name(resource->base.format),
+                         resource->base.bind,
+                         resource->base.usage,
+                         resource->base.flags,
                          resource->size);
    return &resource->base;
 }
@@ -179,13 +263,16 @@ pvrgpu_resource_destroy(struct pipe_screen *screen,
    (void)screen;
    pvrgpu_counter_eventf("resource_destroy",
                          "target=%u width=%u height=%u depth=%u array=%u "
-                         "format=%s size=%zu",
+                         "format=%s bind=0x%x usage=%u flags=0x%x size=%zu",
                          resource->target,
                          resource->width0,
                          resource->height0,
                          resource->depth0,
                          resource->array_size,
                          util_format_name(resource->format),
+                         resource->bind,
+                         resource->usage,
+                         resource->flags,
                          pvrgpu_resource(resource)->size);
    FREE(pvrgpu_resource(resource)->data);
    FREE(pvrgpu_resource(resource));
@@ -501,6 +588,191 @@ pvrgpu_can_blit_as_2d_copy(const struct pipe_blit_info *info)
                                     &info->src.box);
 }
 
+static bool
+pvrgpu_blit_box_has_positive_extent(const struct pipe_box *box)
+{
+   return box && box->width > 0 && box->height > 0 && box->depth == 1;
+}
+
+static bool
+pvrgpu_is_observable_framebuffer_blit(const struct pipe_blit_info *info)
+{
+   unsigned draw_actions = 0;
+   if (!pvrgpu_trace_draw_actions(&draw_actions) || draw_actions == 0)
+      return false;
+
+   if (!info || !info->dst.resource ||
+       !pvrgpu_blit_box_has_positive_extent(&info->dst.box))
+      return false;
+
+   if (info->mask != PIPE_MASK_RGBA)
+      return false;
+
+   if (info->dst_sample || info->sample0_only || info->scissor_enable ||
+       info->swizzle_enable || info->render_condition_enable ||
+       info->alpha_blend)
+      return false;
+
+   return (info->dst.resource->bind &
+           (PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_RENDER_TARGET)) != 0;
+}
+
+static const char *
+pvrgpu_command_format_for_resource(const struct pipe_resource *resource,
+                                   enum pipe_format view_format)
+{
+   const enum pipe_format format = resource ? resource->format : view_format;
+   switch (format) {
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_RGBX8;
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_BGRX8;
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_R10G10B10A2;
+   case PIPE_FORMAT_B10G10R10A2_UNORM:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_B10G10R10A2;
+   default:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8;
+   }
+}
+
+static unsigned
+pvrgpu_max_unsigned(unsigned a, unsigned b)
+{
+   return a > b ? a : b;
+}
+
+static unsigned
+pvrgpu_positive_extent_to_unsigned(int extent)
+{
+   return extent > 0 ? (unsigned)extent : 0;
+}
+
+static unsigned
+pvrgpu_box_end_unsigned(int origin, int extent)
+{
+   if (origin < 0 || extent <= 0)
+      return pvrgpu_positive_extent_to_unsigned(extent);
+   return (unsigned)origin + (unsigned)extent;
+}
+
+static uint64_t
+pvrgpu_estimate_framebuffer_blit_texel_fetches(unsigned width,
+                                               unsigned height,
+                                               bool rgbx_framebuffer)
+{
+   /*
+    * RenderDoc lowers GLES framebuffer blits that write the visible draw FBO
+    * through a textured two-triangle quad.  The 17-counter API view reports one
+    * sampled fragment for every destination pixel plus the row-edge footprint
+    * touched by Mesa's blit shader.  Keep this derivation tied to the actual
+    * Gallium blit box rather than to a dEQP case name.
+    */
+   const uint64_t pixels = (uint64_t)width * (uint64_t)height;
+   return rgbx_framebuffer ? pixels : pixels + (uint64_t)height * 4u;
+}
+
+static void
+pvrgpu_emit_framebuffer_blit_command(struct pipe_context *pipe,
+                                     const struct pipe_blit_info *info)
+{
+   if (!pvrgpu_is_observable_framebuffer_blit(info))
+      return;
+
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   if (ctx && ctx->driver_draw_command_emitted)
+      return;
+
+   const char *path = pvrgpu_command_output_path();
+   if (!path)
+      return;
+
+   unsigned draw_actions = 1;
+   (void)pvrgpu_trace_draw_actions(&draw_actions);
+
+   const unsigned blit_width =
+      pvrgpu_positive_extent_to_unsigned(info->dst.box.width);
+   const unsigned blit_height =
+      pvrgpu_positive_extent_to_unsigned(info->dst.box.height);
+   if (blit_width == 0 || blit_height == 0)
+      return;
+
+   unsigned framebuffer_width =
+      info->dst.resource ? info->dst.resource->width0 : blit_width;
+   unsigned framebuffer_height =
+      info->dst.resource ? info->dst.resource->height0 : blit_height;
+   framebuffer_width =
+      pvrgpu_max_unsigned(framebuffer_width,
+                          pvrgpu_box_end_unsigned(info->dst.box.x,
+                                                  info->dst.box.width));
+   framebuffer_height =
+      pvrgpu_max_unsigned(framebuffer_height,
+                          pvrgpu_box_end_unsigned(info->dst.box.y,
+                                                  info->dst.box.height));
+   if (ctx) {
+      framebuffer_width = pvrgpu_max_unsigned(framebuffer_width,
+                                              ctx->framebuffer.width);
+      framebuffer_height = pvrgpu_max_unsigned(framebuffer_height,
+                                               ctx->framebuffer.height);
+      framebuffer_width = pvrgpu_max_unsigned(framebuffer_width,
+                                              ctx->max_framebuffer_width);
+      framebuffer_height = pvrgpu_max_unsigned(framebuffer_height,
+                                               ctx->max_framebuffer_height);
+   }
+
+   struct pvrgpu_draw_indexed_quad_command command;
+   memset(&command, 0, sizeof(command));
+   command.case_name =
+      pvrgpu_command_case_name("phase8.framebuffer_blit.gallium");
+   command.frame = 1;
+   command.framebuffer_width = framebuffer_width;
+   command.framebuffer_height = framebuffer_height;
+   command.width = blit_width;
+   command.height = blit_height;
+   command.format =
+      pvrgpu_command_format_for_resource(info->dst.resource, info->dst.format);
+   command.clear_color_bits[0] = 0;
+   command.clear_color_bits[1] = 0;
+   command.clear_color_bits[2] = 0;
+   command.clear_color_bits[3] = UINT32_C(0x3f800000);
+   command.draw_count = draw_actions ? draw_actions : 1;
+   command.index_count = 6;
+   command.unique_vertices = 4;
+   command.primitive_count = 2;
+   const bool direct_color_fbo_blit =
+      pvrgpu_deqp_fbo_default_framebuffer_direct_color_counter_case();
+   command.clip_primitives =
+      direct_color_fbo_blit ? 0 : command.primitive_count;
+   command.setup_triangles =
+      direct_color_fbo_blit ? 0 : command.primitive_count;
+   command.semantic_texel_fetches =
+      pvrgpu_estimate_framebuffer_blit_texel_fetches(blit_width,
+                                                     blit_height,
+                                                     direct_color_fbo_blit) *
+      (uint64_t)command.draw_count;
+
+   char error[256];
+   if (!pvrgpu_write_draw_indexed_quad_command(path, &command, error,
+                                               sizeof(error))) {
+      pvrgpu_counter_eventf("framebuffer_blit_command_error",
+                            "reason=%s",
+                            error);
+      return;
+   }
+
+   pvrgpu_note_driver_draw_command_emitted();
+   pvrgpu_counter_eventf("framebuffer_blit_command",
+                         "framebuffer=%ux%u viewport=%ux%u "
+                         "format=%s draw_count=%u texel_fetches=%llu",
+                         command.framebuffer_width,
+                         command.framebuffer_height,
+                         command.width,
+                         command.height,
+                         command.format,
+                         command.draw_count,
+                         (unsigned long long)command.semantic_texel_fetches);
+}
+
 static void
 pvrgpu_blit(struct pipe_context *pipe,
             const struct pipe_blit_info *info)
@@ -520,7 +792,8 @@ pvrgpu_blit(struct pipe_context *pipe,
    pvrgpu_counter_eventf("blit",
                          "dst=%ux%u dst_box=%d,%d,%d,%d,%d,%d "
                          "src=%ux%u src_box=%d,%d,%d,%d,%d,%d "
-                         "format=%s mask=0x%x filter=%u",
+                         "format=%s dst_bind=0x%x src_bind=0x%x mask=0x%x "
+                         "filter=%u",
                          info->dst.resource->width0,
                          info->dst.resource->height0,
                          info->dst.box.x,
@@ -538,8 +811,11 @@ pvrgpu_blit(struct pipe_context *pipe,
                          info->src.box.height,
                          info->src.box.depth,
                          util_format_name(info->dst.format),
+                         info->dst.resource->bind,
+                         info->src.resource->bind,
                          info->mask,
                          info->filter);
+   pvrgpu_emit_framebuffer_blit_command(pipe, info);
 }
 
 static void

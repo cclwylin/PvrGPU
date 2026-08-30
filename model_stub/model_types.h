@@ -29,6 +29,8 @@ struct DriverCommand {
   std::uint32_t index_count = 0;
   std::uint32_t unique_vertices = 0;
   std::uint32_t primitive_count = 0;
+  std::uint32_t clip_primitives = 0;
+  std::uint32_t setup_triangles = 0;
   std::uint64_t semantic_texel_fetches = 0;
 };
 

@@ -387,12 +387,12 @@ void NormalizeDriverIndexedQuadApiCounters(const Options &options,
   counters.c_invocations =
       CheckedMul(command.primitive_count, command.draw_count, "c_invocations");
   counters.c_primitives =
-      CheckedMul(command.primitive_count, command.draw_count, "c_primitives");
+      CheckedMul(command.clip_primitives, command.draw_count, "c_primitives");
   counters.ps_invocations =
       CheckedMul(draw_pixels, command.draw_count, "ps_invocations");
   counters.drawlists = command.draw_count;
   counters.setup_triangles =
-      CheckedMul(command.primitive_count, command.draw_count,
+      CheckedMul(command.setup_triangles, command.draw_count,
                  "setup_triangles");
   counters.texel_fetches = command.semantic_texel_fetches;
 }

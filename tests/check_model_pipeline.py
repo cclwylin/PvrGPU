@@ -503,6 +503,8 @@ def verify_driver_indexed_quad_framebuffer_size(
                 "index_count=6",
                 "unique_vertices=4",
                 "primitive_count=2",
+                "clip_primitives=2",
+                "setup_triangles=2",
                 "semantic_texel_fetches=12345",
             )
         )

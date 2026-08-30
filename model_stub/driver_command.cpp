@@ -20,6 +20,8 @@ constexpr const char *kClearColorCommand = "clear_color";
 constexpr const char *kDrawTriangleCommand = "draw_triangle";
 constexpr const char *kDrawIndexedQuadCommand = "draw_indexed_quad";
 constexpr const char *kRgba8Format = "PIPE_FORMAT_R8G8B8A8_UNORM";
+constexpr const char *kRgbx8Format = "PIPE_FORMAT_R8G8B8X8_UNORM";
+constexpr const char *kBgrx8Format = "PIPE_FORMAT_B8G8R8X8_UNORM";
 constexpr const char *kR10G10B10A2Format = "PIPE_FORMAT_R10G10B10A2_UNORM";
 constexpr const char *kB10G10R10A2Format = "PIPE_FORMAT_B10G10R10A2_UNORM";
 
@@ -30,7 +32,7 @@ const std::set<std::string> &KnownFields() {
       "height", "format", "clear_color_bits", "fragment_color_bits",
       "vertex0_bits", "vertex1_bits", "vertex2_bits",
       "draw_count", "index_count", "unique_vertices", "primitive_count",
-      "semantic_texel_fetches",
+      "clip_primitives", "setup_triangles", "semantic_texel_fetches",
   };
   return fields;
 }
@@ -70,7 +72,7 @@ const std::set<std::string> &DrawIndexedQuadFields() {
       "framebuffer_height", "width",              "height",
       "format",             "clear_color_bits",   "draw_count",
       "index_count",        "unique_vertices",    "primitive_count",
-      "semantic_texel_fetches",
+      "clip_primitives",    "setup_triangles",    "semantic_texel_fetches",
   };
   return fields;
 }
@@ -82,7 +84,8 @@ bool IsDecimal(const std::string &text) {
 }
 
 bool IsSupportedDriverCommandFormat(const std::string &format) {
-  return format == kRgba8Format || format == kR10G10B10A2Format ||
+  return format == kRgba8Format || format == kRgbx8Format ||
+         format == kBgrx8Format || format == kR10G10B10A2Format ||
          format == kB10G10R10A2Format;
 }
 
@@ -340,6 +343,18 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     if (!ParseU32(fields["primitive_count"], &parsed.primitive_count) ||
         parsed.primitive_count != 2) {
       *error = "draw_indexed_quad primitive_count must be exactly 2";
+      return false;
+    }
+    if (!ParseU32(fields["clip_primitives"], &parsed.clip_primitives) ||
+        parsed.clip_primitives > parsed.primitive_count) {
+      *error =
+          "draw_indexed_quad clip_primitives must be within primitive_count";
+      return false;
+    }
+    if (!ParseU32(fields["setup_triangles"], &parsed.setup_triangles) ||
+        parsed.setup_triangles > parsed.primitive_count) {
+      *error =
+          "draw_indexed_quad setup_triangles must be within primitive_count";
       return false;
     }
     if (!ParseU64(fields["semantic_texel_fetches"],

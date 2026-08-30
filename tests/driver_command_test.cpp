@@ -110,6 +110,8 @@ int main() {
             "index_count=6\n"
             "unique_vertices=4\n"
             "primitive_count=2\n"
+            "clip_primitives=2\n"
+            "setup_triangles=2\n"
             "semantic_texel_fetches=74784\n");
   error.clear();
   if (int failed =
@@ -128,7 +130,9 @@ int main() {
     return failed;
   if (int failed =
           Expect(command.index_count == 6 && command.unique_vertices == 4 &&
-                     command.primitive_count == 2,
+                     command.primitive_count == 2 &&
+                     command.clip_primitives == 2 &&
+                     command.setup_triangles == 2,
                  "wrong indexed quad topology metadata"))
     return failed;
   if (int failed =

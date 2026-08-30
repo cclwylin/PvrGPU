@@ -34,6 +34,8 @@ pvrgpu_cmd_format_supported(const char *format)
 {
    return format &&
           (strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8) == 0 ||
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBX8) == 0 ||
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_BGRX8) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R10G10B10A2) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_B10G10R10A2) == 0);
 }
@@ -159,6 +161,13 @@ pvrgpu_cmd_validate_draw_indexed_quad(
                        "index_count=6, unique_vertices=4, primitive_count=2");
       return false;
    }
+   if (cmd->clip_primitives > cmd->primitive_count ||
+       cmd->setup_triangles > cmd->primitive_count) {
+      pvrgpu_cmd_error(error, error_size,
+                       "draw indexed quad command expects clip_primitives and "
+                       "setup_triangles within primitive_count");
+      return false;
+   }
    return true;
 }
 
@@ -249,6 +258,8 @@ pvrgpu_write_draw_indexed_quad_command(
       "index_count=%u\n"
       "unique_vertices=%u\n"
       "primitive_count=%u\n"
+      "clip_primitives=%u\n"
+      "setup_triangles=%u\n"
       "semantic_texel_fetches=%" PRIu64 "\n",
       PVRGPU_DRIVER_COMMAND_SCHEMA,
       PVRGPU_DRIVER_COMMAND_PRODUCER,
@@ -267,6 +278,8 @@ pvrgpu_write_draw_indexed_quad_command(
       cmd->index_count,
       cmd->unique_vertices,
       cmd->primitive_count,
+      cmd->clip_primitives,
+      cmd->setup_triangles,
       cmd->semantic_texel_fetches);
    const int close_status = fclose(file);
    if (written < 0 || close_status != 0) {

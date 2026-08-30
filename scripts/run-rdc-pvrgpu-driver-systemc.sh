@@ -184,8 +184,9 @@ rm -f -- "${player_png}" "${command_out}" "${counter_out}" \
     printf 'mesa_prefix=%s\n' "${mesa_prefix}"
     printf 'renderdoc_root=%s\n' "${renderdoc_root}"
     printf 'gles_version_override=%s\n' "${gles_override}"
+    printf 'trace_draw_actions=%s\n' "${PVRGPU_RDC_TRACE_DRAW_ACTIONS:-}"
     printf 'uses_gallium_trace=false\n'
-    printf 'uses_command_capsule=false\n'
+    printf 'uses_driver_command=true\n'
 } >"${artifact_root}/runner.txt"
 
 set +e

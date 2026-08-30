@@ -47,6 +47,7 @@ from rdc.write_counter_txt import (  # noqa: E402
 EVENT_SCHEMA = "pvrgpu.rdc-counter-run.v1"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+TRACE_DRAW_ACTIONS_RE = re.compile(r"^Trace draw actions:\s*([0-9]+)\s*$")
 DEQP_MANIFEST_ROW_RE = re.compile(
     r"^\s*(\d+)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*$"
 )
@@ -118,6 +119,7 @@ class CaseResult:
     pvrgpu_png: str = ""
     png_diff: str = ""
     golden_cache: str = ""
+    trace_draw_actions: int | None = None
 
 
 def utc_now() -> str:
@@ -185,6 +187,31 @@ def normalized_counter_text_from_file(path: Path) -> str:
             f"{path}: missing counter fields: {', '.join(missing)}"
         )
     return format_counter_text(counters)
+
+
+def parse_trace_draw_actions(path: Path) -> int | None:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        match = TRACE_DRAW_ACTIONS_RE.match(line.strip())
+        if match is not None:
+            return int(match.group(1))
+    return None
+
+
+def trace_draw_actions_from_counter_text(counter_text: str) -> int:
+    counters: dict[str, int] = {}
+    for raw_line in counter_text.splitlines():
+        line = raw_line.strip()
+        if not line or "=" not in line:
+            continue
+        name, value_text = (part.strip() for part in line.split("=", 1))
+        if name not in STANDARD_COUNTER_FIELDS:
+            continue
+        counters[name] = int(value_text, 10)
+    return counters.get("drawlists", 0)
 
 
 def paeth_predictor(left: int, above: int, upper_left: int) -> int:
@@ -895,6 +922,17 @@ class DirectoryCounterRun:
             return stable
         return None
 
+    def _lookup_golden_trace_draw_actions_cache(self, sha256: str) -> int | None:
+        metadata_path = self.golden_cache_dir / sha256 / "metadata.json"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get("trace_draw_actions")
+        return value if isinstance(value, int) and value >= 0 else None
+
     def _store_golden_counter_cache(
         self,
         *,
@@ -902,6 +940,7 @@ class DirectoryCounterRun:
         counter_text: str,
         source_counter: Path,
         source_png: Path | None = None,
+        trace_draw_actions: int | None = None,
     ) -> None:
         cache_dir = self.golden_cache_dir / sha256
         counter_path = cache_dir / "counter_golden.txt"
@@ -922,6 +961,7 @@ class DirectoryCounterRun:
                     "source_counter": str(source_counter),
                     "source_png": str(source_png) if source_png is not None else "",
                     "cached_png": cached_png,
+                    "trace_draw_actions": trace_draw_actions,
                     "created_at": utc_now(),
                 },
                 ensure_ascii=False,
@@ -982,6 +1022,7 @@ class DirectoryCounterRun:
             ),
             artifact_dir=f"cases/{case_dir_name}",
         )
+        trace_draw_actions: int | None = None
 
         self.events.emit(
             "rdc_started",
@@ -1032,6 +1073,14 @@ class DirectoryCounterRun:
                 result.golden = "CACHED"
                 result.golden_counter = golden_counter.name
                 result.golden_cache = str(cached_golden_counter)
+                trace_draw_actions = self._lookup_golden_trace_draw_actions_cache(
+                    item.sha256
+                )
+                if trace_draw_actions is None:
+                    trace_draw_actions = trace_draw_actions_from_counter_text(
+                        counter_text
+                    )
+                result.trace_draw_actions = trace_draw_actions
                 cached_golden_png = self._lookup_golden_png_cache(item.sha256)
                 if cached_golden_png is not None:
                     case_golden_png = self._copy_png_artifact(
@@ -1066,6 +1115,18 @@ class DirectoryCounterRun:
                 golden_report = golden_dir / "Report.md"
                 counters = counters_from_golden_report(golden_report)
                 counter_text = format_counter_text(counters)
+                trace_draw_actions = parse_trace_draw_actions(
+                    golden_dir / "player-wrapper.stdout.log"
+                )
+                if trace_draw_actions is None:
+                    trace_draw_actions = parse_trace_draw_actions(
+                        golden_dir / "stdout.log"
+                    )
+                if trace_draw_actions is None:
+                    trace_draw_actions = trace_draw_actions_from_counter_text(
+                        counter_text
+                    )
+                result.trace_draw_actions = trace_draw_actions
                 atomic_write_text(golden_counter, counter_text)
                 source_golden_png = self._find_golden_png(golden_dir)
                 case_golden_png: Path | None = None
@@ -1081,6 +1142,7 @@ class DirectoryCounterRun:
                     counter_text=counter_text,
                     source_counter=golden_counter,
                     source_png=case_golden_png,
+                    trace_draw_actions=trace_draw_actions,
                 )
                 result.golden = "PASS"
                 result.golden_counter = golden_counter.name
@@ -1106,6 +1168,10 @@ class DirectoryCounterRun:
         self._emit_stage(index, "pvrgpu", "RUNNING")
         pvrgpu_environment = dict(os.environ)
         pvrgpu_environment["PVRGPU_RDC_MANIFEST"] = str(self.manifest_path)
+        if trace_draw_actions is not None:
+            pvrgpu_environment["PVRGPU_RDC_TRACE_DRAW_ACTIONS"] = str(
+                trace_draw_actions
+            )
         assert self.pvrgpu_runner is not None
         try:
             self._run_command(

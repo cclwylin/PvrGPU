@@ -107,6 +107,10 @@ static const char *
 pvrgpu_command_format_for_color_surface(enum pipe_format format)
 {
    switch (format) {
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_RGBX8;
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_BGRX8;
    case PIPE_FORMAT_R10G10B10A2_UNORM:
       return PVRGPU_DRIVER_COMMAND_FORMAT_R10G10B10A2;
    case PIPE_FORMAT_B10G10R10A2_UNORM:
