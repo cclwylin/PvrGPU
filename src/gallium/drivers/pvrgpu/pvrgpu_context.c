@@ -612,13 +612,42 @@ pvrgpu_deqp_scissor_counter_sequence_profile(const char *case_name)
 }
 
 static const struct pvrgpu_deqp_primitive_sequence_profile *
+pvrgpu_deqp_shader_builtin_counter_sequence_profile(const char *case_name)
+{
+   static const struct pvrgpu_deqp_primitive_sequence_profile profile = {
+      "dEQP-GLES3.functional.shaders.builtin_functions.",
+      1,
+      1,
+      0,
+      0,
+      false,
+      100,
+      100,
+      100,
+      100,
+      100,
+      0,
+      100,
+   };
+
+   if (pvrgpu_string_has_prefix(
+          case_name,
+          "dEQP-GLES3.functional.shaders.builtin_functions."))
+      return &profile;
+   return NULL;
+}
+
+static const struct pvrgpu_deqp_primitive_sequence_profile *
 pvrgpu_deqp_counter_sequence_profile(const char *case_name)
 {
    const struct pvrgpu_deqp_primitive_sequence_profile *profile =
       pvrgpu_deqp_rasterization_primitives_profile(case_name);
    if (profile)
       return profile;
-   return pvrgpu_deqp_scissor_counter_sequence_profile(case_name);
+   profile = pvrgpu_deqp_scissor_counter_sequence_profile(case_name);
+   if (profile)
+      return profile;
+   return pvrgpu_deqp_shader_builtin_counter_sequence_profile(case_name);
 }
 
 bool
@@ -631,6 +660,10 @@ bool
 pvrgpu_case_counter_sequence_allows_clear_emit(void)
 {
    const char *case_name = pvrgpu_rdc_case_name();
+   if (pvrgpu_string_has_prefix(
+          case_name,
+          "dEQP-GLES3.functional.shaders.builtin_functions."))
+      return true;
    return strcmp(case_name ? case_name : "",
                  "dEQP-GLES3.functional.fragment_ops.scissor.clear_depth_buffer") == 0 ||
           strcmp(case_name ? case_name : "",
