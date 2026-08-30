@@ -6,6 +6,7 @@
 #include "pvrgpu_counter.h"
 #include "pvrgpu_resource.h"
 
+#include "pipe/p_defines.h"
 #include "pipe/p_state.h"
 #include "util/format/u_format.h"
 #include "util/u_debug_cb.h"
@@ -15,9 +16,21 @@
 #include "util/ralloc.h"
 
 #include <string.h>
+#include <stdint.h>
 
 struct pvrgpu_state_object {
    unsigned placeholder;
+};
+
+struct pvrgpu_stream_output_target {
+   struct pipe_stream_output_target base;
+   uint32_t internal_offset;
+};
+
+struct pvrgpu_query {
+   unsigned type;
+   unsigned index;
+   bool active;
 };
 
 static void *
@@ -793,6 +806,225 @@ pvrgpu_set_vertex_buffers(struct pipe_context *pipe,
                             ctx->vertex_buffers[0].buffer_offset : 0);
 }
 
+static struct pipe_query *
+pvrgpu_create_query(struct pipe_context *pipe,
+                    unsigned query_type,
+                    unsigned index)
+{
+   (void)pipe;
+   struct pvrgpu_query *query = CALLOC_STRUCT(pvrgpu_query);
+   if (!query)
+      return NULL;
+
+   query->type = query_type;
+   query->index = index;
+   pvrgpu_counter_eventf("create_query",
+                         "type=%u index=%u",
+                         query_type,
+                         index);
+   return (struct pipe_query *)query;
+}
+
+static void
+pvrgpu_destroy_query(struct pipe_context *pipe, struct pipe_query *query)
+{
+   (void)pipe;
+   if (!query)
+      return;
+   pvrgpu_counter_eventf("destroy_query", "");
+   FREE(query);
+}
+
+static bool
+pvrgpu_begin_query(struct pipe_context *pipe, struct pipe_query *query)
+{
+   (void)pipe;
+   struct pvrgpu_query *pvrgpu_query = (struct pvrgpu_query *)query;
+   if (!pvrgpu_query)
+      return false;
+
+   pvrgpu_query->active = true;
+   pvrgpu_counter_eventf("begin_query",
+                         "type=%u index=%u",
+                         pvrgpu_query->type,
+                         pvrgpu_query->index);
+   return true;
+}
+
+static bool
+pvrgpu_end_query(struct pipe_context *pipe, struct pipe_query *query)
+{
+   (void)pipe;
+   struct pvrgpu_query *pvrgpu_query = (struct pvrgpu_query *)query;
+   if (!pvrgpu_query)
+      return false;
+
+   pvrgpu_query->active = false;
+   pvrgpu_counter_eventf("end_query",
+                         "type=%u index=%u",
+                         pvrgpu_query->type,
+                         pvrgpu_query->index);
+   return true;
+}
+
+static bool
+pvrgpu_get_query_result(struct pipe_context *pipe,
+                        struct pipe_query *query,
+                        bool wait,
+                        union pipe_query_result *result)
+{
+   (void)pipe;
+   struct pvrgpu_query *pvrgpu_query = (struct pvrgpu_query *)query;
+   if (!pvrgpu_query || !result)
+      return false;
+
+   memset(result, 0, sizeof(*result));
+   switch (pvrgpu_query->type) {
+   case PIPE_QUERY_GPU_FINISHED:
+      result->b = true;
+      break;
+   case PIPE_QUERY_TIMESTAMP_DISJOINT:
+      result->timestamp_disjoint.frequency = UINT64_C(1000000000);
+      result->timestamp_disjoint.disjoint = false;
+      break;
+   case PIPE_QUERY_SO_STATISTICS:
+      result->so_statistics.num_primitives_written = 0;
+      result->so_statistics.primitives_storage_needed = 0;
+      break;
+   default:
+      break;
+   }
+
+   pvrgpu_counter_eventf("get_query_result",
+                         "type=%u index=%u wait=%u",
+                         pvrgpu_query->type,
+                         pvrgpu_query->index,
+                         wait ? 1 : 0);
+   return true;
+}
+
+static void
+pvrgpu_set_active_query_state(struct pipe_context *pipe, bool enable)
+{
+   (void)pipe;
+   pvrgpu_counter_eventf("set_active_query_state",
+                         "enable=%u",
+                         enable ? 1 : 0);
+}
+
+static void
+pvrgpu_render_condition(struct pipe_context *pipe,
+                        struct pipe_query *query,
+                        bool condition,
+                        enum pipe_render_cond_flag mode)
+{
+   (void)pipe;
+   (void)query;
+   pvrgpu_counter_eventf("render_condition",
+                         "condition=%u mode=%u",
+                         condition ? 1 : 0,
+                         mode);
+}
+
+static struct pipe_stream_output_target *
+pvrgpu_create_stream_output_target(struct pipe_context *pipe,
+                                   struct pipe_resource *resource,
+                                   unsigned buffer_offset,
+                                   unsigned buffer_size)
+{
+   if (!resource || resource->target != PIPE_BUFFER ||
+       buffer_offset > resource->width0 ||
+       buffer_size > resource->width0 - buffer_offset)
+      return NULL;
+
+   struct pvrgpu_stream_output_target *target =
+      CALLOC_STRUCT(pvrgpu_stream_output_target);
+   if (!target)
+      return NULL;
+
+   pipe_reference_init(&target->base.reference, 1);
+   pipe_resource_reference(&target->base.buffer, resource);
+   target->base.context = pipe;
+   target->base.buffer_offset = buffer_offset;
+   target->base.buffer_size = buffer_size;
+   target->internal_offset = 0;
+
+   pvrgpu_counter_eventf("create_stream_output_target",
+                         "buffer_width=%u offset=%u size=%u",
+                         resource->width0,
+                         buffer_offset,
+                         buffer_size);
+   return &target->base;
+}
+
+static void
+pvrgpu_stream_output_target_destroy(struct pipe_context *pipe,
+                                    struct pipe_stream_output_target *target)
+{
+   (void)pipe;
+   if (!target)
+      return;
+
+   pvrgpu_counter_eventf("stream_output_target_destroy",
+                         "offset=%u size=%u has_buffer=%u",
+                         target->buffer_offset,
+                         target->buffer_size,
+                         target->buffer ? 1 : 0);
+   pipe_resource_reference(&target->buffer, NULL);
+   FREE(target);
+}
+
+static void
+pvrgpu_set_stream_output_targets(struct pipe_context *pipe,
+                                 unsigned num_targets,
+                                 struct pipe_stream_output_target **targets,
+                                 const unsigned *offsets,
+                                 enum mesa_prim output_prim)
+{
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   if (num_targets > PIPE_MAX_SO_BUFFERS)
+      num_targets = PIPE_MAX_SO_BUFFERS;
+
+   for (unsigned i = 0; i < num_targets; ++i) {
+      if (targets && targets[i] && targets[i]->context != pipe) {
+         pvrgpu_counter_eventf("stream_output_target_context_mismatch",
+                               "slot=%u",
+                               i);
+      }
+      pipe_so_target_reference(&ctx->stream_output_targets[i],
+                               targets ? targets[i] : NULL);
+      if (ctx->stream_output_targets[i] && offsets &&
+          offsets[i] != (unsigned)-1) {
+         struct pvrgpu_stream_output_target *target =
+            (struct pvrgpu_stream_output_target *)
+               ctx->stream_output_targets[i];
+         target->internal_offset = offsets[i];
+      }
+   }
+
+   for (unsigned i = num_targets; i < ctx->num_stream_output_targets; ++i)
+      pipe_so_target_reference(&ctx->stream_output_targets[i], NULL);
+
+   ctx->num_stream_output_targets = num_targets;
+   ctx->stream_output_prim = output_prim;
+   pvrgpu_counter_eventf("set_stream_output_targets",
+                         "count=%u output_prim=%u first_offset=%u "
+                         "first_append=%u",
+                         num_targets,
+                         output_prim,
+                         (num_targets && offsets) ? offsets[0] : 0,
+                         (num_targets && offsets &&
+                          offsets[0] == (unsigned)-1) ? 1 : 0);
+}
+
+static uint32_t
+pvrgpu_stream_output_target_offset(struct pipe_stream_output_target *target)
+{
+   if (!target)
+      return 0;
+   return ((struct pvrgpu_stream_output_target *)target)->internal_offset;
+}
+
 static enum pipe_reset_status
 pvrgpu_get_device_reset_status(struct pipe_context *pipe)
 {
@@ -863,6 +1095,17 @@ pvrgpu_init_state_functions(struct pipe_context *pipe)
    pipe->set_window_rectangles = pvrgpu_set_window_rectangles;
    pipe->set_viewport_states = pvrgpu_set_viewport_states;
    pipe->set_vertex_buffers = pvrgpu_set_vertex_buffers;
+   pipe->create_query = pvrgpu_create_query;
+   pipe->destroy_query = pvrgpu_destroy_query;
+   pipe->begin_query = pvrgpu_begin_query;
+   pipe->end_query = pvrgpu_end_query;
+   pipe->get_query_result = pvrgpu_get_query_result;
+   pipe->set_active_query_state = pvrgpu_set_active_query_state;
+   pipe->render_condition = pvrgpu_render_condition;
+   pipe->create_stream_output_target = pvrgpu_create_stream_output_target;
+   pipe->stream_output_target_destroy = pvrgpu_stream_output_target_destroy;
+   pipe->set_stream_output_targets = pvrgpu_set_stream_output_targets;
+   pipe->stream_output_target_offset = pvrgpu_stream_output_target_offset;
    pipe->set_tess_state = pvrgpu_set_tess_state;
    pipe->set_patch_vertices = pvrgpu_set_patch_vertices;
    pipe->set_debug_callback = u_default_set_debug_callback;

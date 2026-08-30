@@ -126,6 +126,12 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    caps->max_constant_buffer_size = 16 * 1024;
    caps->max_vertex_attrib_stride = 2048;
    caps->max_vertex_buffers = PIPE_MAX_ATTRIBS;
+   caps->max_stream_output_buffers = PIPE_MAX_SO_BUFFERS;
+   caps->max_stream_output_separate_components = 16 * 4;
+   caps->max_stream_output_interleaved_components = 16 * 4;
+   caps->max_vertex_streams = 1;
+   caps->stream_output_pause_resume = true;
+   caps->stream_output_interleave_buffers = true;
    caps->user_vertex_buffers = true;
    caps->texture_transfer_modes = 0;
    caps->essl_feature_level = 100;
@@ -207,11 +213,17 @@ pvrgpu_is_format_supported(struct pipe_screen *screen,
       const unsigned supported_buffer_binds =
          PIPE_BIND_VERTEX_BUFFER |
          PIPE_BIND_INDEX_BUFFER |
-         PIPE_BIND_CONSTANT_BUFFER;
+         PIPE_BIND_CONSTANT_BUFFER |
+         PIPE_BIND_STREAM_OUTPUT |
+         PIPE_BIND_QUERY_BUFFER;
       if (!(bind & supported_buffer_binds))
          return false;
       if (bind & ~supported_buffer_binds)
          return false;
+      if (bind & (PIPE_BIND_STREAM_OUTPUT | PIPE_BIND_QUERY_BUFFER))
+         return format == PIPE_FORMAT_NONE ||
+                format == PIPE_FORMAT_R8_UNORM ||
+                pvrgpu_is_supported_vertex_format(format);
       return pvrgpu_is_supported_vertex_format(format);
    }
 

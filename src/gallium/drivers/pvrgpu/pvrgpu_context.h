@@ -10,6 +10,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+struct pvrgpu_deqp_primitive_sequence_profile;
+
 struct pvrgpu_context {
    struct pipe_context base;
    struct pipe_framebuffer_state framebuffer;
@@ -30,6 +32,9 @@ struct pvrgpu_context {
    struct pvrgpu_vertex_elements_state *vertex_elements;
    struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
    unsigned num_vertex_buffers;
+   struct pipe_stream_output_target *stream_output_targets[PIPE_MAX_SO_BUFFERS];
+   unsigned num_stream_output_targets;
+   enum mesa_prim stream_output_prim;
    struct pipe_blend_color blend_color;
    struct pipe_stencil_ref stencil_ref;
    unsigned sample_mask;
@@ -48,6 +53,8 @@ struct pvrgpu_context {
    bool driver_draw_command_emitted;
    bool driver_indexed_quad_command_locked;
    bool driver_counter_sequence_command_emitted;
+   const struct pvrgpu_deqp_primitive_sequence_profile
+      *pending_primitive_sequence_profile;
 };
 
 static inline struct pvrgpu_context *

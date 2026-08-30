@@ -508,6 +508,42 @@ pvrgpu_copy_2d_region_unchecked(struct pipe_resource *dst,
    }
 }
 
+static bool
+pvrgpu_can_copy_buffer_region(struct pipe_resource *dst,
+                              unsigned dst_level,
+                              unsigned dstx,
+                              unsigned dsty,
+                              unsigned dstz,
+                              struct pipe_resource *src,
+                              unsigned src_level,
+                              const struct pipe_box *src_box)
+{
+   if (!dst || !src || !src_box)
+      return false;
+   if (dst_level != 0 || src_level != 0 || dsty != 0 || dstz != 0)
+      return false;
+   if (dst->target != PIPE_BUFFER || src->target != PIPE_BUFFER)
+      return false;
+   if (src_box->x < 0 || src_box->y != 0 || src_box->z != 0 ||
+       src_box->width <= 0 || src_box->height != 1 || src_box->depth != 1)
+      return false;
+   if (!pvrgpu_resource(dst)->data || !pvrgpu_resource(src)->data)
+      return false;
+   return (uint64_t)dstx + (uint64_t)src_box->width <= dst->width0 &&
+          (uint64_t)src_box->x + (uint64_t)src_box->width <= src->width0;
+}
+
+static void
+pvrgpu_copy_buffer_region_unchecked(struct pipe_resource *dst,
+                                    unsigned dstx,
+                                    struct pipe_resource *src,
+                                    const struct pipe_box *src_box)
+{
+   uint8_t *dst_bytes = pvrgpu_resource(dst)->data + dstx;
+   const uint8_t *src_bytes = pvrgpu_resource(src)->data + src_box->x;
+   memmove(dst_bytes, src_bytes, (size_t)src_box->width);
+}
+
 static void
 pvrgpu_resource_copy_region(struct pipe_context *pipe,
                             struct pipe_resource *dst,
@@ -519,11 +555,25 @@ pvrgpu_resource_copy_region(struct pipe_context *pipe,
                             unsigned src_level,
                             const struct pipe_box *src_box)
 {
+   if (pvrgpu_can_copy_buffer_region(dst, dst_level, dstx, dsty, dstz,
+                                     src, src_level, src_box)) {
+      pvrgpu_copy_buffer_region_unchecked(dst, dstx, src, src_box);
+      pvrgpu_counter_eventf("buffer_copy_region",
+                            "dst_width=%u dst_offset=%u src_width=%u "
+                            "src_offset=%d size=%d",
+                            dst->width0,
+                            dstx,
+                            src->width0,
+                            src_box->x,
+                            src_box->width);
+      return;
+   }
+
    if (!pvrgpu_can_copy_2d_region(dst, dst_level, dstx, dsty, dstz,
                                   src, src_level, src_box)) {
       pvrgpu_emit_unsupported_resource_op(pipe,
                                           "unsupported_resource_copy_region",
-                                          "2d-level0-same-format-only");
+                                          "buffer-or-2d-level0-same-format-only");
       return;
    }
 

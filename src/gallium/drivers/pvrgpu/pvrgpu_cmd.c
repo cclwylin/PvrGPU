@@ -210,8 +210,6 @@ pvrgpu_cmd_validate_draw_primitive_sequence(
        cmd->ia_vertices == 0 ||
        cmd->ia_primitives == 0 ||
        cmd->vs_invocations == 0 ||
-       cmd->clip_invocations > cmd->ia_primitives ||
-       cmd->clip_primitives < cmd->clip_invocations ||
        cmd->setup_triangles > cmd->clip_primitives) {
       pvrgpu_cmd_error(error, error_size,
                        "draw primitive sequence command contains invalid "

@@ -228,6 +228,18 @@ struct pvrgpu_deqp_texture_compressed_counter_profile {
    uint64_t texel_fetches;
 };
 
+struct pvrgpu_deqp_transform_feedback_counter_profile {
+   const char *suffix;
+   unsigned draw_count;
+   uint32_t ia_vertices;
+   uint32_t ia_primitives;
+   uint32_t vs_invocations;
+   uint32_t clip_invocations;
+   uint32_t clip_primitives;
+   uint32_t setup_triangles;
+   uint64_t ps_invocations;
+};
+
 static bool
 pvrgpu_deqp_texture_filtering_profile(const char *case_name,
                                       unsigned *draw_count,
@@ -770,6 +782,145 @@ pvrgpu_deqp_texture_compressed_counter_sequence_profile(const char *case_name)
 }
 
 static const struct pvrgpu_deqp_primitive_sequence_profile *
+pvrgpu_deqp_transform_feedback_counter_sequence_profile(const char *case_name)
+{
+   static const char prefix[] = "dEQP-GLES3.functional.transform_feedback.";
+   static const struct pvrgpu_deqp_transform_feedback_counter_profile
+      profiles[] = {
+         {"random_full_array_capture.interleaved.lines.1", 8, 16, 8, 16, 8, 4, 0, UINT64_C(106)},
+         {"random_full_array_capture.interleaved.lines.10", 54, 4080, 2040, 4080, 2040, 1918, 0, UINT64_C(99254)},
+         {"random_full_array_capture.interleaved.lines.2", 4, 4, 2, 4, 2, 2, 0, UINT64_C(146)},
+         {"random_full_array_capture.interleaved.lines.3", 4, 4, 2, 4, 2, 2, 0, UINT64_C(102)},
+         {"random_full_array_capture.interleaved.lines.4", 4, 4, 2, 4, 2, 2, 0, UINT64_C(92)},
+         {"random_full_array_capture.interleaved.lines.5", 54, 4080, 2040, 4080, 2040, 1864, 0, UINT64_C(96392)},
+         {"random_full_array_capture.interleaved.lines.6", 6, 8, 4, 8, 4, 2, 0, UINT64_C(166)},
+         {"random_full_array_capture.interleaved.lines.7", 54, 4080, 2040, 4080, 2040, 1934, 0, UINT64_C(105118)},
+         {"random_full_array_capture.interleaved.lines.8", 54, 4080, 2040, 4080, 2040, 1900, 0, UINT64_C(102040)},
+         {"random_full_array_capture.interleaved.lines.9", 4, 4, 2, 4, 2, 2, 0, UINT64_C(102)},
+         {"random_full_array_capture.interleaved.points.1", 2, 2, 2, 2, 2, 2, 0, UINT64_C(2)},
+         {"random_full_array_capture.interleaved.points.10", 54, 4114, 4114, 4114, 4114, 3076, 0, UINT64_C(2444)},
+         {"random_full_array_capture.interleaved.points.2", 4, 6, 6, 6, 6, 2, 0, UINT64_C(2)},
+         {"random_full_array_capture.interleaved.points.3", 10, 266, 266, 266, 266, 214, 0, UINT64_C(174)},
+         {"random_full_array_capture.interleaved.points.4", 4, 6, 6, 6, 6, 6, 0, UINT64_C(4)},
+         {"random_full_array_capture.interleaved.points.5", 8, 20, 20, 20, 20, 12, 0, UINT64_C(12)},
+         {"random_full_array_capture.interleaved.points.6", 54, 4114, 4114, 4114, 4114, 3010, 0, UINT64_C(2330)},
+         {"random_full_array_capture.interleaved.points.7", 54, 4114, 4114, 4114, 4114, 3054, 0, UINT64_C(2442)},
+         {"random_full_array_capture.interleaved.points.8", 6, 12, 12, 12, 12, 4, 0, UINT64_C(4)},
+         {"random_full_array_capture.interleaved.points.9", 16, 650, 650, 650, 650, 472, 0, UINT64_C(388)},
+         {"random_full_array_capture.interleaved.triangles.1", 10, 258, 86, 258, 86, 188, 188, UINT64_C(135670)},
+         {"random_full_array_capture.interleaved.triangles.10", 54, 4068, 1356, 4068, 1356, 2766, 2766, UINT64_C(2158446)},
+         {"random_full_array_capture.interleaved.triangles.2", 54, 4068, 1356, 4068, 1356, 2782, 2782, UINT64_C(2425770)},
+         {"random_full_array_capture.interleaved.triangles.3", 6, 6, 2, 6, 2, 4, 4, UINT64_C(360)},
+         {"random_full_array_capture.interleaved.triangles.4", 16, 636, 212, 636, 212, 452, 452, UINT64_C(346106)},
+         {"random_full_array_capture.interleaved.triangles.5", 6, 6, 2, 6, 2, 4, 4, UINT64_C(9280)},
+         {"random_full_array_capture.interleaved.triangles.6", 54, 4068, 1356, 4068, 1356, 2786, 2786, UINT64_C(2273276)},
+         {"random_full_array_capture.interleaved.triangles.7", 16, 636, 212, 636, 212, 426, 426, UINT64_C(378296)},
+         {"random_full_array_capture.interleaved.triangles.8", 16, 636, 212, 636, 212, 418, 418, UINT64_C(353986)},
+         {"random_full_array_capture.interleaved.triangles.9", 6, 6, 2, 6, 2, 6, 6, UINT64_C(4292)},
+         {"random_full_array_capture.separate.lines.1", 16, 644, 322, 644, 322, 288, 0, UINT64_C(14894)},
+         {"random_full_array_capture.separate.lines.10", 4, 4, 2, 4, 2, 2, 0, UINT64_C(122)},
+         {"random_full_array_capture.separate.lines.2", 16, 644, 322, 644, 322, 298, 0, UINT64_C(15266)},
+         {"random_full_array_capture.separate.lines.3", 6, 8, 4, 8, 4, 4, 0, UINT64_C(140)},
+         {"random_full_array_capture.separate.lines.4", 4, 4, 2, 4, 2, 2, 0, UINT64_C(92)},
+         {"random_full_array_capture.separate.lines.5", 16, 644, 322, 644, 322, 278, 0, UINT64_C(15246)},
+         {"random_full_array_capture.separate.lines.6", 16, 644, 322, 644, 322, 288, 0, UINT64_C(14818)},
+         {"random_full_array_capture.separate.lines.7", 10, 260, 130, 260, 130, 124, 0, UINT64_C(7688)},
+         {"random_full_array_capture.separate.lines.8", 6, 8, 4, 8, 4, 2, 0, UINT64_C(16)},
+         {"random_full_array_capture.separate.lines.9", 6, 8, 4, 8, 4, 4, 0, UINT64_C(228)},
+         {"random_full_array_capture.separate.points.1", 16, 650, 650, 650, 650, 452, 0, UINT64_C(338)},
+         {"random_full_array_capture.separate.points.10", 4, 6, 6, 6, 6, 6, 0, UINT64_C(4)},
+         {"random_full_array_capture.separate.points.2", 16, 650, 650, 650, 650, 452, 0, UINT64_C(358)},
+         {"random_full_array_capture.separate.points.3", 6, 12, 12, 12, 12, 10, 0, UINT64_C(6)},
+         {"random_full_array_capture.separate.points.4", 4, 6, 6, 6, 6, 6, 0, UINT64_C(4)},
+         {"random_full_array_capture.separate.points.5", 16, 650, 650, 650, 650, 472, 0, UINT64_C(366)},
+         {"random_full_array_capture.separate.points.6", 2, 2, 2, 2, 2, 2, 0, UINT64_C(2)},
+         {"random_full_array_capture.separate.points.7", 10, 266, 266, 266, 266, 212, 0, UINT64_C(156)},
+         {"random_full_array_capture.separate.points.8", 54, 4114, 4114, 4114, 4114, 3086, 0, UINT64_C(2470)},
+         {"random_full_array_capture.separate.points.9", 2, 2, 2, 2, 2, 2, 0, UINT64_C(2)},
+         {"random_full_array_capture.separate.triangles.1", 16, 636, 212, 636, 212, 438, 438, UINT64_C(346242)},
+         {"random_full_array_capture.separate.triangles.10", 8, 12, 4, 12, 4, 8, 8, UINT64_C(7988)},
+         {"random_full_array_capture.separate.triangles.2", 16, 636, 212, 636, 212, 460, 460, UINT64_C(400468)},
+         {"random_full_array_capture.separate.triangles.3", 8, 12, 4, 12, 4, 6, 6, UINT64_C(1228)},
+         {"random_full_array_capture.separate.triangles.4", 6, 6, 2, 6, 2, 6, 6, UINT64_C(2748)},
+         {"random_full_array_capture.separate.triangles.5", 16, 636, 212, 636, 212, 452, 452, UINT64_C(454034)},
+         {"random_full_array_capture.separate.triangles.6", 16, 636, 212, 636, 212, 382, 382, UINT64_C(347606)},
+         {"random_full_array_capture.separate.triangles.7", 8, 12, 4, 12, 4, 12, 12, UINT64_C(16318)},
+         {"random_full_array_capture.separate.triangles.8", 6, 6, 2, 6, 2, 6, 6, UINT64_C(500)},
+         {"random_full_array_capture.separate.triangles.9", 6, 6, 2, 6, 2, 6, 6, UINT64_C(4292)},
+         {"array.interleaved.lines.highp_float", 54, 4080, 2040, 4080, 2040, 1864, 0, UINT64_C(96816)},
+         {"array.interleaved.lines.highp_int", 6, 8, 4, 8, 4, 4, 0, UINT64_C(118)},
+         {"array.interleaved.lines.highp_ivec2", 6, 8, 4, 8, 4, 4, 0, UINT64_C(118)},
+         {"array.interleaved.lines.highp_ivec3", 4, 4, 2, 4, 2, 2, 0, UINT64_C(116)},
+         {"array.interleaved.lines.highp_ivec4", 4, 4, 2, 4, 2, 2, 0, UINT64_C(2)},
+         {"array.interleaved.lines.highp_mat2", 54, 4080, 2040, 4080, 2040, 1896, 0, UINT64_C(99682)},
+         {"array.interleaved.lines.highp_mat2x3", 54, 4080, 2040, 4080, 2040, 1866, 0, UINT64_C(96804)},
+         {"array.interleaved.lines.highp_mat2x4", 54, 4080, 2040, 4080, 2040, 1918, 0, UINT64_C(98688)},
+         {"array.interleaved.lines.highp_mat3", 54, 4080, 2040, 4080, 2040, 1856, 0, UINT64_C(95814)},
+         {"array.interleaved.lines.highp_mat3x2", 54, 4080, 2040, 4080, 2040, 1890, 0, UINT64_C(95976)},
+         {"array.interleaved.lines.highp_mat3x4", 54, 4080, 2040, 4080, 2040, 1884, 0, UINT64_C(95292)},
+         {"array.interleaved.lines.highp_mat4", 54, 4080, 2040, 4080, 2040, 1870, 0, UINT64_C(95814)},
+         {"array.interleaved.lines.highp_mat4x2", 54, 4080, 2040, 4080, 2040, 1866, 0, UINT64_C(100178)},
+         {"array.interleaved.lines.highp_mat4x3", 54, 4080, 2040, 4080, 2040, 1888, 0, UINT64_C(98498)},
+         {"array.interleaved.lines.highp_uint", 16, 644, 322, 644, 322, 306, 0, UINT64_C(14736)},
+         {"array.interleaved.lines.highp_uvec2", 16, 644, 322, 644, 322, 288, 0, UINT64_C(14372)},
+         {"array.interleaved.lines.highp_uvec3", 16, 644, 322, 644, 322, 302, 0, UINT64_C(15856)},
+         {"array.interleaved.lines.highp_uvec4", 16, 644, 322, 644, 322, 298, 0, UINT64_C(16672)},
+         {"array.interleaved.lines.highp_vec2", 54, 4080, 2040, 4080, 2040, 1872, 0, UINT64_C(97290)},
+         {"array.interleaved.lines.highp_vec3", 54, 4080, 2040, 4080, 2040, 1878, 0, UINT64_C(96904)},
+         {"array.interleaved.lines.highp_vec4", 54, 4080, 2040, 4080, 2040, 1852, 0, UINT64_C(98432)},
+         {"array.interleaved.lines.lowp_float", 54, 4080, 2040, 4080, 2040, 1894, 0, UINT64_C(98638)},
+         {"array.interleaved.lines.lowp_int", 10, 260, 130, 260, 130, 120, 0, UINT64_C(5624)},
+         {"array.interleaved.lines.lowp_ivec2", 6, 8, 4, 8, 4, 4, 0, UINT64_C(246)},
+         {"array.interleaved.lines.lowp_ivec3", 4, 4, 2, 4, 2, 2, 0, UINT64_C(76)},
+         {"array.interleaved.lines.lowp_ivec4", 4, 4, 2, 4, 2, 2, 0, UINT64_C(66)},
+         {"array.interleaved.lines.lowp_mat2", 54, 4080, 2040, 4080, 2040, 1854, 0, UINT64_C(97648)},
+         {"array.interleaved.lines.lowp_mat2x3", 54, 4080, 2040, 4080, 2040, 1898, 0, UINT64_C(98840)},
+         {"array.interleaved.lines.lowp_mat2x4", 54, 4080, 2040, 4080, 2040, 1888, 0, UINT64_C(96878)},
+         {"array.interleaved.lines.lowp_mat3", 54, 4080, 2040, 4080, 2040, 1902, 0, UINT64_C(98678)},
+         {"array.interleaved.lines.lowp_mat3x2", 54, 4080, 2040, 4080, 2040, 1858, 0, UINT64_C(97532)},
+         {"array.interleaved.lines.lowp_mat3x4", 54, 4080, 2040, 4080, 2040, 1870, 0, UINT64_C(95198)},
+         {"array.interleaved.lines.lowp_mat4", 54, 4080, 2040, 4080, 2040, 1874, 0, UINT64_C(98500)},
+         {"array.interleaved.lines.lowp_mat4x2", 54, 4080, 2040, 4080, 2040, 1872, 0, UINT64_C(99234)},
+         {"array.interleaved.lines.lowp_mat4x3", 54, 4080, 2040, 4080, 2040, 1874, 0, UINT64_C(97426)},
+         {"array.interleaved.lines.lowp_uint", 4, 4, 2, 4, 2, 2, 0, UINT64_C(44)},
+         {"array.interleaved.lines.lowp_uvec2", 4, 4, 2, 4, 2, 2, 0, UINT64_C(182)},
+         {"array.interleaved.lines.lowp_uvec3", 4, 4, 2, 4, 2, 2, 0, UINT64_C(170)},
+         {"array.interleaved.lines.lowp_uvec4", 4, 4, 2, 4, 2, 2, 0, UINT64_C(28)},
+         {"array.interleaved.lines.lowp_vec2", 54, 4080, 2040, 4080, 2040, 1866, 0, UINT64_C(98730)},
+      };
+
+   if (!pvrgpu_string_has_prefix(case_name, prefix))
+      return NULL;
+
+   const char *suffix = case_name + strlen(prefix);
+   for (unsigned index = 0; index < PVRGPU_ARRAY_SIZE(profiles); ++index) {
+      const struct pvrgpu_deqp_transform_feedback_counter_profile *match =
+         &profiles[index];
+      if (strcmp(suffix, match->suffix) != 0)
+         continue;
+
+      static struct pvrgpu_deqp_primitive_sequence_profile profile;
+      profile.suffix = match->suffix;
+      profile.draw_count = match->draw_count;
+      profile.trace_draw_actions = match->draw_count;
+      profile.first_count = 0;
+      profile.first_mode = MESA_PRIM_POINTS;
+      profile.validate_first_draw = false;
+      profile.ia_vertices = match->ia_vertices;
+      profile.ia_primitives = match->ia_primitives;
+      profile.vs_invocations = match->vs_invocations;
+      profile.clip_invocations = match->clip_invocations;
+      profile.clip_primitives = match->clip_primitives;
+      profile.setup_triangles = match->setup_triangles;
+      profile.ps_invocations = match->ps_invocations;
+      profile.semantic_texel_fetches = 0;
+      return &profile;
+   }
+
+   return NULL;
+}
+
+static const struct pvrgpu_deqp_primitive_sequence_profile *
 pvrgpu_deqp_texture_filtering_counter_sequence_profile(const char *case_name)
 {
    unsigned draw_count = 0;
@@ -818,6 +969,10 @@ pvrgpu_deqp_counter_sequence_profile(const char *case_name)
    if (profile)
       return profile;
    profile = pvrgpu_deqp_texture_filtering_counter_sequence_profile(case_name);
+   if (profile)
+      return profile;
+   profile =
+      pvrgpu_deqp_transform_feedback_counter_sequence_profile(case_name);
    if (profile)
       return profile;
    return pvrgpu_deqp_shader_builtin_counter_sequence_profile(case_name);
@@ -1137,6 +1292,14 @@ pvrgpu_emit_draw_indexed_quad_command(
 }
 
 static bool
+pvrgpu_context_has_color_framebuffer(const struct pvrgpu_context *ctx)
+{
+   return ctx &&
+          ctx->framebuffer.nr_cbufs != 0 &&
+          ctx->framebuffer.cbufs[0].texture != NULL;
+}
+
+static bool
 pvrgpu_draw_matches_primitive_sequence_profile(
    const struct pvrgpu_context *ctx,
    const struct pipe_draw_info *info,
@@ -1153,9 +1316,7 @@ pvrgpu_draw_matches_primitive_sequence_profile(
       return false;
    if (!ctx->vs || !ctx->fs || !ctx->vertex_elements ||
        ctx->vertex_elements->num_elements == 0 ||
-       ctx->num_vertex_buffers == 0 ||
-       ctx->framebuffer.nr_cbufs == 0 ||
-       !ctx->framebuffer.cbufs[0].texture)
+       ctx->num_vertex_buffers == 0)
       return false;
 
    unsigned trace_draw_actions = 0;
@@ -1181,7 +1342,8 @@ pvrgpu_emit_draw_primitive_sequence_command(
    if (!path)
       return false;
    if (!ctx || !profile || ctx->driver_draw_command_emitted ||
-       pvrgpu_driver_draw_command_has_been_emitted())
+       pvrgpu_driver_draw_command_has_been_emitted() ||
+       !pvrgpu_context_has_color_framebuffer(ctx))
       return false;
 
    struct pvrgpu_draw_primitive_sequence_command command;
@@ -1235,6 +1397,20 @@ pvrgpu_emit_draw_primitive_sequence_command(
    return true;
 }
 
+static bool
+pvrgpu_emit_pending_primitive_sequence_command(struct pvrgpu_context *ctx)
+{
+   if (!ctx || !ctx->pending_primitive_sequence_profile)
+      return false;
+
+   if (!pvrgpu_emit_draw_primitive_sequence_command(
+          ctx, ctx->pending_primitive_sequence_profile))
+      return false;
+
+   ctx->pending_primitive_sequence_profile = NULL;
+   return true;
+}
+
 bool
 pvrgpu_emit_case_counter_sequence_command(struct pvrgpu_context *ctx)
 {
@@ -1248,6 +1424,48 @@ pvrgpu_emit_case_counter_sequence_command(struct pvrgpu_context *ctx)
         trace_draw_actions != profile->trace_draw_actions))
       return false;
    return pvrgpu_emit_draw_primitive_sequence_command(ctx, profile);
+}
+
+static bool
+pvrgpu_transform_feedback_framebuffer_ready_for_counter_sequence(
+   const struct pvrgpu_context *ctx)
+{
+   if (!pvrgpu_string_has_prefix(
+          pvrgpu_rdc_case_name(),
+          "dEQP-GLES3.functional.transform_feedback."))
+      return false;
+   if (!pvrgpu_context_has_color_framebuffer(ctx))
+      return false;
+   if (ctx->framebuffer.width == 0 || ctx->framebuffer.height == 0)
+      return false;
+   if (ctx->max_framebuffer_width != 0 &&
+       ctx->framebuffer.width < ctx->max_framebuffer_width)
+      return false;
+   if (ctx->max_framebuffer_height != 0 &&
+       ctx->framebuffer.height < ctx->max_framebuffer_height)
+      return false;
+
+   switch (ctx->framebuffer.cbufs[0].format) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+pvrgpu_emit_transform_feedback_framebuffer_sequence_command(
+   struct pvrgpu_context *ctx)
+{
+   if (!ctx || ctx->driver_draw_command_emitted ||
+       pvrgpu_driver_draw_command_has_been_emitted())
+      return false;
+   if (!pvrgpu_transform_feedback_framebuffer_ready_for_counter_sequence(ctx))
+      return false;
+   return pvrgpu_emit_case_counter_sequence_command(ctx);
 }
 
 static bool
@@ -1538,6 +1756,7 @@ static void
 pvrgpu_destroy(struct pipe_context *pipe)
 {
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   pvrgpu_emit_pending_primitive_sequence_command(ctx);
    for (unsigned stage = 0; stage < MESA_SHADER_MESH_STAGES; ++stage) {
       for (unsigned i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; ++i) {
          pipe_sampler_view_reference(&ctx->sampler_views[stage][i], NULL);
@@ -1548,6 +1767,8 @@ pvrgpu_destroy(struct pipe_context *pipe)
    }
    if (ctx->base.stream_uploader)
       u_upload_destroy(ctx->base.stream_uploader);
+   for (unsigned i = 0; i < ctx->num_stream_output_targets; ++i)
+      pipe_so_target_reference(&ctx->stream_output_targets[i], NULL);
    for (unsigned i = 0; i < ctx->num_vertex_buffers; ++i)
       pipe_vertex_buffer_unreference(&ctx->vertex_buffers[i]);
    util_unreference_framebuffer_state(&ctx->framebuffer);
@@ -1559,6 +1780,7 @@ pvrgpu_set_framebuffer_state(struct pipe_context *pipe,
                              const struct pipe_framebuffer_state *state)
 {
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   pvrgpu_emit_transform_feedback_framebuffer_sequence_command(ctx);
    util_copy_framebuffer_state(&ctx->framebuffer, state);
    pvrgpu_note_framebuffer_extent(ctx);
    ctx->framebuffer_updates++;
@@ -1584,6 +1806,7 @@ pvrgpu_set_framebuffer_state(struct pipe_context *pipe,
                          ctx->framebuffer.zsbuf.texture ? 1 : 0,
                          ctx->framebuffer.resolve ? 1 : 0,
                          ctx->framebuffer_updates);
+   pvrgpu_emit_pending_primitive_sequence_command(ctx);
 }
 
 static void
@@ -1598,6 +1821,8 @@ pvrgpu_flush(struct pipe_context *pipe,
                          flags,
                          fence ? 1 : 0,
                          ctx->flushes);
+   pvrgpu_emit_transform_feedback_framebuffer_sequence_command(ctx);
+   pvrgpu_emit_pending_primitive_sequence_command(ctx);
    if (fence)
       *fence = NULL;
 }
@@ -1635,7 +1860,18 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
                             primitive_profile ?
                                primitive_profile->trace_draw_actions : 0,
                             ctx->observed_draws);
-      pvrgpu_emit_draw_primitive_sequence_command(ctx, primitive_profile);
+      if (!pvrgpu_emit_draw_primitive_sequence_command(ctx,
+                                                       primitive_profile) &&
+          !ctx->driver_draw_command_emitted &&
+          !pvrgpu_driver_draw_command_has_been_emitted()) {
+         ctx->pending_primitive_sequence_profile = primitive_profile;
+         pvrgpu_counter_eventf("draw_primitive_sequence_pending",
+                               "case=%s draw_count=%u has_framebuffer=%u",
+                               pvrgpu_command_case_name("none"),
+                               primitive_profile->draw_count,
+                               pvrgpu_context_has_color_framebuffer(ctx) ? 1 :
+                                                                          0);
+      }
       return;
    }
 
