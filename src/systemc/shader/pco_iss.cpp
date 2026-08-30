@@ -48,6 +48,20 @@ const std::vector<std::uint8_t> kFillSolidFragmentBinary = {
 };
 
 /*
+ * Opaque black fragment fixture.  This uses the same public MBYP-to-PIXOUT
+ * profile as FillSolidFragmentPcoBinary but sources sc0 for RGB and sc64 for
+ * alpha, matching the resolved color of the current RDC texture-filtering
+ * indexed-quad captures while still exercising USC -> PBE -> DRAM.
+ */
+const std::vector<std::uint8_t> kFillSolidBlackFragmentBinary = {
+    0x34, 0x8a, 0x00, 0x87, 0x00, 0x00, 0x00, 0x20,
+    0x34, 0x8a, 0x00, 0x87, 0x00, 0x00, 0x00, 0x21,
+    0x37, 0x8a, 0x00, 0x87, 0x00, 0x00, 0x00, 0x22, 0xf3, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0x38, 0x8a, 0x80, 0x87, 0x80, 0x01, 0x00, 0x00, 0x00, 0x23,
+    0xf3, 0xff, 0xff, 0xff, 0xff, 0xff,
+};
+
+/*
  * Emitted by tools/pco-fixtures/generate_fill_solid_fs.c with the
  * red-half-alpha fixture.  SHA-256:
  * 1c7d3a1b653f8f05d6fe7f92450a0da6b46e5a9d4e075a8b9c6a143fab7dd26b.
@@ -2208,6 +2222,63 @@ Binary32Operand DecodeFaddOperand(std::uint32_t bits) {
   return operand;
 }
 
+std::uint16_t FloatToHalf(std::uint32_t bits) {
+  std::uint32_t sign = (bits >> 16) & 0x8000;
+  std::int32_t exp = ((bits >> 23) & 0xff) - 127;
+  std::uint32_t mant = bits & 0x007fffff;
+
+  if (exp == 128) {
+    return static_cast<std::uint16_t>(sign | 0x7c00 | (mant != 0 ? 0x200 : 0));
+  }
+  if (exp > 15) {
+    return static_cast<std::uint16_t>(sign | 0x7c00);
+  }
+  if (exp < -24) {
+    return static_cast<std::uint16_t>(sign);
+  }
+  if (exp < -14) {
+    std::uint32_t m = mant | 0x00800000;
+    std::int32_t shift = -14 - exp;
+    m >>= shift;
+    return static_cast<std::uint16_t>(sign | m);
+  }
+  std::uint32_t m = mant >> 13;
+  if ((mant & 0x1fff) > 0x1000 || ((mant & 0x3fff) == 0x3000)) {
+    m++;
+    if (m & 0x0400) {
+      m = 0;
+      exp++;
+    }
+  }
+  if (exp > 15) {
+    return static_cast<std::uint16_t>(sign | 0x7c00);
+  }
+  return static_cast<std::uint16_t>(sign | ((exp + 15) << 10) | m);
+}
+
+std::uint32_t HalfToFloat(std::uint16_t half) {
+  std::uint32_t sign = (static_cast<std::uint32_t>(half) & 0x8000) << 16;
+  std::int32_t exp = (half >> 10) & 0x1f;
+  std::uint32_t mant = half & 0x03ff;
+
+  if (exp == 31) {
+    return sign | 0x7f800000 | (mant != 0 ? (mant << 13) : 0);
+  }
+  if (exp == 0) {
+    if (mant == 0) {
+      return sign;
+    }
+    while ((mant & 0x0400) == 0) {
+      mant <<= 1;
+      exp--;
+    }
+    exp++;
+    mant &= ~0x0400;
+  }
+  std::uint32_t float_exp = static_cast<std::uint32_t>(exp - 15 + 127);
+  return sign | (float_exp << 23) | (mant << 13);
+}
+
 std::uint32_t FloatAddBits(std::uint32_t left_bits,
                            std::uint32_t right_bits) {
   Binary32Operand left = DecodeFaddOperand(left_bits);
@@ -2541,6 +2612,10 @@ const std::vector<std::uint8_t> &FillSolidVertexPcoBinary() {
 
 const std::vector<std::uint8_t> &FillSolidFragmentPcoBinary() {
   return kFillSolidFragmentBinary;
+}
+
+const std::vector<std::uint8_t> &FillSolidBlackFragmentPcoBinary() {
+  return kFillSolidBlackFragmentBinary;
 }
 
 const std::vector<std::uint8_t> &FillSolidRedHalfAlphaFragmentPcoBinary() {
@@ -3339,11 +3414,29 @@ PcoFragmentExecution ExecuteFragmentPco(
                  instruction.opcode == PcoOpcode::kBufferStore ||
                  instruction.opcode == PcoOpcode::kDerivativeX ||
                  instruction.opcode == PcoOpcode::kDerivativeY ||
-                 instruction.opcode == PcoOpcode::kPackHalf2x16 ||
-                 instruction.opcode == PcoOpcode::kUnpackHalf2x16 ||
                  instruction.opcode == PcoOpcode::kAtomicAdd ||
                  instruction.opcode == PcoOpcode::kAtomicCompSwap) {
         result_val = src0;
+      } else if (instruction.opcode == PcoOpcode::kPackHalf2x16) {
+        const std::uint32_t val_u = ReadSource(
+            instruction.source, no_vertex_inputs, temporaries,
+            temporary_written_mask, 0, ShaderStage::kFragment);
+        const std::uint32_t val_v = ReadSource(
+            instruction.source, no_vertex_inputs, temporaries,
+            temporary_written_mask, 1, ShaderStage::kFragment);
+        const std::uint16_t half_u = FloatToHalf(val_u);
+        const std::uint16_t half_v = FloatToHalf(val_v);
+        result_val = (static_cast<std::uint32_t>(half_v) << 16) | half_u;
+      } else if (instruction.opcode == PcoOpcode::kUnpackHalf2x16) {
+        const std::uint16_t half_u = static_cast<std::uint16_t>(src0 & 0xffff);
+        const std::uint16_t half_v = static_cast<std::uint16_t>(src0 >> 16);
+        const std::uint32_t val_u = HalfToFloat(half_u);
+        const std::uint32_t val_v = HalfToFloat(half_v);
+        result_val = val_u;
+        if (instruction.output_index + 1 < temporaries.size()) {
+          temporaries[instruction.output_index + 1] = val_v;
+          temporary_written_mask |= UINT32_C(1) << (instruction.output_index + 1);
+        }
       } else if (instruction.opcode == PcoOpcode::kIntegerAdd) {
         const std::uint32_t src1 = ReadSource(
             instruction.source1, no_vertex_inputs, temporaries,

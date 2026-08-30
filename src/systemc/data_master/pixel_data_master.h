@@ -1,11 +1,10 @@
-// PixelDataMaster（PixelDM = Pixel Data Master）：pixel/framebuffer 資料搬移
-// 的資料主控。
-// 它與 PBE（Pixel Back End）不同：PBE 產生 RGBA payload，本 module 驗證
-// framebuffer store、指定 GPU address，並以 MemoryTxn FIFO handle 送往 SLC。
-// Bulk RGBA bytes 留在 MemoryPool；服務時間採 event-driven completion。
+// PixelDataMaster（PixelDM = Pixel Data Master）：DXTP 架構中的 pixel 資料
+// 輸入側模組，負責從 SLC/DRAM 取得 pixel tile 資料（深度、模板、tile buffer）
+// 並送入 ISP / Fragment 前端。
+// 注意：framebuffer write-back（PBE → SLC → DRAM 寫出路徑）已遷移至
+// fragment/pbe_write_back，本模組已矯正為 fetch-side 結構預留點。
+// 現階段為無 ports/process/timing、未連線的 elaboration placeholder。
 #pragma once
-
-#include "common/pipeline_state.h"
 
 #include <systemc>
 
@@ -13,15 +12,7 @@ namespace pvrgpu::stub {
 
 class PixelDataMaster final : public sc_core::sc_module {
  public:
-  sc_core::sc_fifo_in<PipelineTxn> input{"input"};
-  sc_core::sc_fifo_out<MemoryTxn> output{"output"};
-
-  PixelDataMaster(sc_core::sc_module_name name, MemoryPool &pool);
-
- private:
-  void Run();
-
-  MemoryPool &pool_;
+  explicit PixelDataMaster(sc_core::sc_module_name name);
 };
 
 }  // namespace pvrgpu::stub

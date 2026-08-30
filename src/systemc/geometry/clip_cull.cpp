@@ -72,7 +72,10 @@ ClipVertex ReadClipVertex(const VertexLane &vertex,
   return result;
 }
 
-float PlaneDistance(const ClipVertex &vertex, std::uint32_t plane) {
+float PlaneDistance(const ClipVertex &vertex, std::uint32_t plane, std::uint16_t clip_dist_reg = 0) {
+  if (plane >= 6) {
+    return vertex.output[clip_dist_reg + (plane - 6)];
+  }
   const float x = vertex.output[0];
   const float y = vertex.output[1];
   const float z = vertex.output[2];
@@ -95,13 +98,22 @@ float PlaneDistance(const ClipVertex &vertex, std::uint32_t plane) {
   }
 }
 
-std::uint32_t ClipMask(const ClipVertex &vertex) {
+std::uint32_t ClipMask(const ClipVertex &vertex, bool depth_clamp, std::uint8_t clip_dist_mask = 0, std::uint16_t clip_dist_reg = 0) {
   std::uint32_t mask = 0;
-  for (std::uint32_t plane = 0; plane < 6; ++plane) {
+  for (std::uint32_t plane = 0; plane < (depth_clamp ? 4U : 6U); ++plane) {
     // Mesa's clip test is expressed as !(dp >= 0), so boundary vertices are
     // inside and unordered NaNs fail closed as outside.
-    if (!(PlaneDistance(vertex, plane) >= 0.0F))
+    if (!(PlaneDistance(vertex, plane, clip_dist_reg) >= 0.0F))
       mask |= 1U << plane;
+  }
+  if (clip_dist_mask != 0) {
+    for (std::uint32_t i = 0; i < 8; ++i) {
+      if ((clip_dist_mask & (1U << i)) != 0) {
+        if (!(PlaneDistance(vertex, 6 + i, clip_dist_reg) >= 0.0F)) {
+          mask |= 1U << (6 + i);
+        }
+      }
+    }
   }
   return mask;
 }
@@ -127,9 +139,11 @@ ClipVertex Interpolate(float t, const ClipVertex &outside,
 }
 
 std::vector<ClipVertex>
-ClipTriangle(const std::array<ClipVertex, 3> &input) {
+ClipTriangle(const std::array<ClipVertex, 3> &input, bool depth_clamp, std::uint8_t clip_dist_mask = 0, std::uint16_t clip_dist_reg = 0) {
   const std::uint32_t masks[3] = {
-      ClipMask(input[0]), ClipMask(input[1]), ClipMask(input[2])};
+      ClipMask(input[0], depth_clamp, clip_dist_mask, clip_dist_reg),
+      ClipMask(input[1], depth_clamp, clip_dist_mask, clip_dist_reg),
+      ClipMask(input[2], depth_clamp, clip_dist_mask, clip_dist_reg)};
   const std::uint32_t union_mask = masks[0] | masks[1] | masks[2];
   if (union_mask == 0)
     return {input.begin(), input.end()};
@@ -137,7 +151,12 @@ ClipTriangle(const std::array<ClipVertex, 3> &input) {
     return {};
 
   std::vector<ClipVertex> polygon(input.begin(), input.end());
-  for (std::uint32_t plane = 0; plane < 6 && polygon.size() >= 3; ++plane) {
+  for (std::uint32_t plane = 0; plane < 14 && polygon.size() >= 3; ++plane) {
+    if (depth_clamp && (plane == 4 || plane == 5))
+      continue;
+    if (plane >= 6 && (clip_dist_mask & (1U << (plane - 6))) == 0)
+      continue;
+
     if ((union_mask & (1U << plane)) == 0)
       continue;
     if (polygon.size() > 15)
@@ -145,10 +164,10 @@ ClipTriangle(const std::array<ClipVertex, 3> &input) {
     std::vector<ClipVertex> output;
     output.reserve(polygon.size() + 1);
     ClipVertex previous = polygon.front();
-    float previous_distance = PlaneDistance(previous, plane);
+    float previous_distance = PlaneDistance(previous, plane, clip_dist_reg);
     for (std::size_t edge = 1; edge <= polygon.size(); ++edge) {
       const ClipVertex current = polygon[edge % polygon.size()];
-      const float distance = PlaneDistance(current, plane);
+      const float distance = PlaneDistance(current, plane, clip_dist_reg);
       bool different_sign = false;
       if (previous_distance >= 0.0F) {
         output.push_back(previous);
@@ -314,7 +333,8 @@ bool IsFaceCulled(const FaceCullState &state, bool front_facing) {
 RasterTriangle BuildRasterTriangle(const std::array<ClipVertex, 3> &vertices,
                                    std::uint32_t width, std::uint32_t height,
                                    bool front_facing,
-                                   std::vector<std::uint32_t> &vertex_outputs) {
+                                   std::vector<std::uint32_t> &vertex_outputs,
+                                   bool depth_clamp_enable) {
   RasterTriangle triangle;
   triangle.front_facing = front_facing ? 1U : 0U;
   const std::uint16_t output_count = vertices[0].output_count;
@@ -334,8 +354,11 @@ RasterTriangle BuildRasterTriangle(const std::array<ClipVertex, 3> &vertices,
         vertices[index].output[0] * triangle.reciprocal_w[index];
     const float ndc_y =
         vertices[index].output[1] * triangle.reciprocal_w[index];
-    const float ndc_z =
+    float ndc_z =
         vertices[index].output[2] * triangle.reciprocal_w[index];
+    if (depth_clamp_enable) {
+      ndc_z = std::max(std::min(ndc_z, 1.0F), -1.0F);
+    }
     triangle.x[index] =
         (ndc_x * 0.5F + 0.5F) * static_cast<float>(width);
     triangle.y[index] =
@@ -379,7 +402,8 @@ RasterTriangle BuildRasterTriangle(const std::array<ClipVertex, 3> &vertices,
 }
 
 bool IsInsideHomogeneousClip(const VertexLane &vertex,
-                             std::uint16_t output_count) {
+                             std::uint16_t output_count,
+                             bool depth_clamp) {
   const ClipVertex clip = ReadClipVertex(vertex, output_count);
   const float clip_x = clip.output[0];
   const float clip_y = clip.output[1];
@@ -388,8 +412,11 @@ bool IsInsideHomogeneousClip(const VertexLane &vertex,
   if (clip_w <= 0.0F)
     return false;
   (void)clip;
-  return clip_x >= -clip_w && clip_x <= clip_w && clip_y >= -clip_w &&
-         clip_y <= clip_w && clip_z >= -clip_w && clip_z <= clip_w;
+  bool xy_inside = clip_x >= -clip_w && clip_x <= clip_w && clip_y >= -clip_w &&
+                   clip_y <= clip_w;
+  if (depth_clamp)
+    return xy_inside;
+  return xy_inside && clip_z >= -clip_w && clip_z <= clip_w;
 }
 
 } // namespace
@@ -407,6 +434,9 @@ void ClipCull::Run() {
     PipelineState state = LoadPipelineState(pool_, txn.state);
 
     RequireStage(state.stage, PipelineStage::kVertexShaded, name());
+    const bool depth_clamp = state.raster_state.depth_clamp_enable != 0;
+    const std::uint8_t clip_dist_mask = state.clip_distance_mask;
+    const std::uint16_t clip_dist_reg = state.clip_distance_register;
     if (!IsRasterFunctionalCase(state.functional_case))
       throw std::runtime_error("ClipCull received an unsupported case");
     if (!HasPoolHandle(state.vertex_lanes))
@@ -451,7 +481,7 @@ void ClipCull::Run() {
         throw std::runtime_error(
           "ClipCull fullscreen strip requires four direct shaded vertices");
       for (const VertexLane &lane : lanes) {
-        if (!IsInsideHomogeneousClip(lane, active_vertex_output_dwords)) {
+        if (!IsInsideHomogeneousClip(lane, active_vertex_output_dwords, depth_clamp)) {
           throw std::runtime_error(
               "ClipCull Fill.Solid vertex is outside homogeneous clip space");
         }
@@ -469,7 +499,7 @@ void ClipCull::Run() {
               active_vertex_output_dwords);
         RasterTriangle triangle = BuildRasterTriangle(
             vertices, state.width, state.height, true,
-            raster_vertex_outputs);
+            raster_vertex_outputs, depth_clamp);
         if (!triangle.rasterizable)
           throw std::runtime_error(
               "ClipCull Fill.Solid produced a degenerate triangle");
@@ -540,7 +570,7 @@ void ClipCull::Run() {
             throw std::runtime_error(
                 "ClipCull lane reference is outside shaded lanes");
           if (ClipMask(ReadClipVertex(lanes[ref.lane_index],
-                                      active_vertex_output_dwords)) != 0)
+                                      active_vertex_output_dwords), depth_clamp, clip_dist_mask, clip_dist_reg) != 0)
             generic_clip_path = true;
         }
 
@@ -567,7 +597,7 @@ void ClipCull::Run() {
           }
           (void)ClassifyFrontFacing(
               vertices, state.raster_state.face_cull.front_face, true);
-          const std::vector<ClipVertex> polygon = ClipTriangle(vertices);
+          const std::vector<ClipVertex> polygon = ClipTriangle(vertices, depth_clamp, clip_dist_mask, clip_dist_reg);
           for (std::size_t fan = 2; fan < polygon.size(); ++fan) {
             if (fan - 2 > std::numeric_limits<std::uint16_t>::max())
               throw std::overflow_error("ClipCull clip-piece index overflow");
@@ -585,7 +615,7 @@ void ClipCull::Run() {
               continue;
             RasterTriangle triangle = BuildRasterTriangle(
                 fan_triangle, state.width, state.height, front_facing,
-                raster_vertex_outputs);
+                raster_vertex_outputs, depth_clamp);
             triangle.key.submit_ordinal = submit_ordinal;
             triangle.key.api_primitive_id =
                 static_cast<std::uint32_t>(primitive);

@@ -22,13 +22,6 @@ from counter_protocol import (  # noqa: E402
 )
 
 
-MESA_POC_COMMAND_SOURCE = "renderdoc-mesa-gallium-trace-poc"
-MESA_POC_COMMAND_SCHEMA = "pvrgpu.mesa-poc-command.v1"
-MESA_POC_SHA256_FIELDS = (
-    "rdc_sha256",
-    "api_trace_sha256",
-    "gallium_trace_sha256",
-)
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
@@ -64,35 +57,9 @@ def counters_from_golden_report(report_path: str | Path) -> dict[str, int]:
     )
 
 
-def _validate_mesa_ingest_hello(hello: Mapping[str, object]) -> None:
-    if hello.get("mesa_command_ingest") is not True:
-        raise CounterProtocolError(
-            "PvrGPU hello.mesa_command_ingest must be true when Mesa ingest "
-            "evidence is required"
-        )
-    if hello.get("command_source") != MESA_POC_COMMAND_SOURCE:
-        raise CounterProtocolError(
-            "PvrGPU hello.command_source must be "
-            f"'{MESA_POC_COMMAND_SOURCE}' when Mesa ingest evidence is required"
-        )
-    if hello.get("mesa_command_schema") != MESA_POC_COMMAND_SCHEMA:
-        raise CounterProtocolError(
-            "PvrGPU hello.mesa_command_schema must be "
-            f"'{MESA_POC_COMMAND_SCHEMA}' when Mesa ingest evidence is required"
-        )
-    for field in MESA_POC_SHA256_FIELDS:
-        value = hello.get(field)
-        if not isinstance(value, str) or SHA256_PATTERN.fullmatch(value) is None:
-            raise CounterProtocolError(
-                f"PvrGPU hello.{field} must be a lowercase SHA-256 hex digest "
-                "when Mesa ingest evidence is required"
-            )
-
-
 def counters_from_pvrgpu_jsonl(
     jsonl_path: str | Path,
     *,
-    require_mesa_ingest: bool = False,
     expected_rdc_sha256: str | None = None,
 ) -> dict[str, int]:
     path = Path(jsonl_path)
@@ -142,8 +109,6 @@ def counters_from_pvrgpu_jsonl(
     hello = hello_messages[0]
     if hello.get("backend") != "pvrgpu":
         raise CounterProtocolError("PvrGPU hello.backend must be 'pvrgpu'")
-    if require_mesa_ingest:
-        _validate_mesa_ingest_hello(hello)
     if expected_rdc_sha256 is not None:
         if SHA256_PATTERN.fullmatch(expected_rdc_sha256) is None:
             raise CounterProtocolError(
@@ -230,14 +195,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="write to this file instead of stdout",
     )
     parser.add_argument(
-        "--require-mesa-ingest",
-        action="store_true",
-        help=(
-            "require formal RenderDoc + Mesa/Gallium command-ingest provenance "
-            "in the PvrGPU hello message"
-        ),
-    )
-    parser.add_argument(
         "--expected-rdc-sha256",
         help="require PvrGPU hello.rdc_sha256 to match this exact digest",
     )
@@ -247,15 +204,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_argument_parser()
     options = parser.parse_args(argv)
-    if options.require_mesa_ingest and options.pvrgpu_jsonl is None:
-        parser.error("--require-mesa-ingest requires --pvrgpu-jsonl")
     try:
         if options.golden_report is not None:
             counters = counters_from_golden_report(options.golden_report)
         else:
             counters = counters_from_pvrgpu_jsonl(
                 options.pvrgpu_jsonl,
-                require_mesa_ingest=options.require_mesa_ingest,
                 expected_rdc_sha256=options.expected_rdc_sha256,
             )
         output = format_counter_text(counters)

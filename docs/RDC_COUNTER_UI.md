@@ -22,15 +22,21 @@ PNG 可能由 backend 產生並保留為 artifact，但不參與 PASS/FAIL。
 
 - RDC directory：要遞迴掃描的輸入目錄。
 - Output root：每次執行的 timestamped result directory 要放置的父目錄。
+- PvrGPU runner：單一 RDC 的 PvrGPU runner script/executable；預設為 `scripts/run-rdc-pvrgpu-driver-systemc.sh`，也就是 `RDC -> RenderDoc player -> Mesa/Gallium pvrgpu -> PvrGPU SystemC`。UI 會顯式傳給 backend，不會使用舊的 trace-capsule default。
 
-開始後，UI 會顯示目前檔案、Golden/PvrGPU/compare 階段及累計 PASS/FAIL。取消會終止目前 runner，尚未執行的 RDC 也會在最終報告中標示為失敗。完成後可由 UI 開啟該次執行的 `report.md`。
+開始後，UI 會顯示目前檔案、Golden/PvrGPU/compare 階段及累計 PASS/FAIL。取消會終止目前 runner，尚未執行的 RDC 也會在最終報告中標示為失敗。完成後可由 UI 開啟該次執行的 `report.md`。`Quit` 會關閉視窗；若 worker 還在執行，會先終止目前 replay 再退出。
+
+結果表格預設使用 `Fail` filter，只顯示最終結果為 FAIL 的 RDC，方便直接 debug。可切換成 `Pass` 只看通過項目，或 `All` 顯示整批掃描到的所有 RDC；切換 filter 不會重新執行測試。
+
+Golden counter 會依 RDC SHA-256 自動 cache 在 output root 下。若同一個 RDC 之前已成功產生過可解析的 `counter_golden.txt`，下一次 UI/CLI 執行會直接複製 cached Golden counter，跳過 llvmpipe replay，只重跑 PvrGPU 與 compare。cache hit 時 UI/報告的 Golden 欄會顯示 `CACHED` 而不是 `PASS`，case artifact 也會留下 `golden/cache-hit.txt`。
 
 ## 命令列執行
 
 ```bash
 ./scripts/run-rdc-counter-report.sh \
   --rdc-dir "/path/to/rdc-directory" \
-  --output-root "/path/to/result-root"
+  --output-root "/path/to/result-root" \
+  --pvrgpu-runner "/path/to/current-pvrgpu-runner"
 ```
 
 `--rdc-dir` 是必要參數。`--output-root` 可省略；預設為：
@@ -47,6 +53,7 @@ ${PVRGPU_WORK_ROOT}/out/rdc-counter-report
 ./scripts/run-rdc-counter-report.sh \
   --rdc-dir "/path/to/rdc-directory" \
   --output-root "/path/to/result-root" \
+  --pvrgpu-runner "/path/to/current-pvrgpu-runner" \
   --json
 ```
 
@@ -58,7 +65,7 @@ ${PVRGPU_WORK_ROOT}/out/rdc-counter-report
 ./scripts/run-rdc-counter-report.sh --help
 ```
 
-其中包括 `--manifest`、`--golden-runner`、`--pvrgpu-runner`、`--timeout-seconds` 及 `--no-require-mesa-ingest`。正式 PvrGPU 測試應保留預設的 Mesa-ingest provenance 檢查，不要使用 `--no-require-mesa-ingest`。
+其中包括 `--manifest`、`--golden-runner`、`--pvrgpu-runner`、`--timeout-seconds` 及 `--require-manifest`。`--pvrgpu-runner` 必須顯式指定；舊的 trace-capsule runner 已移除，避免誤跑 adapter。
 
 命令列退出碼：
 
@@ -71,18 +78,11 @@ ${PVRGPU_WORK_ROOT}/out/rdc-counter-report
 
 ## RDC 與 manifest 的映射
 
-工具不會從檔名或父目錄猜測 case。每個找到的 RDC 都會先計算 SHA-256，再以 digest 對應 `config/rdc-glbench-v1.tsv` 的 frozen manifest row；該 row 提供正式 runner 所需的 case、width、height 與 canonical filename。
+每個找到的 RDC 都會先計算 SHA-256。若 digest 對應到 `config/rdc-glbench-v1.tsv` 的 frozen manifest row，工具會沿用該 row 的 case、width、height 與 canonical filename。
 
-因此輸入目錄的階層可以任意安排，檔案也可位於多層子目錄。若內容已被重新命名，工具會在該次 artifact 中以 manifest 的 canonical filename 建立 staging link，再交給 backend。
+若 SHA-256 不在 frozen manifest 中，工具不會直接 FAIL；它會先嘗試讀取附近的 dEQP `recorder/manifest.txt` 取得正式 case name。若沒有 dEQP manifest，則由 RDC 檔名推導安全 case name。這讓已 capture 的 dEQP 或其他 RDC 可以進入真正的 Golden/PvrGPU replay。需要舊的 strict 行為時，命令列可加 `--require-manifest`。
 
-SHA-256 不在 manifest 中的 RDC 會明確記為 **FAIL**：
-
-- stage：`manifest-map`
-- case：`UNMAPPED`
-- Golden/PvrGPU/compare：`SKIP`
-- reason：`RDC SHA-256 is not present in the frozen manifest`
-
-這不是一般用途的 RenderDoc trace runner。目前 Mesa/POC adapter 只接受 frozen manifest 已驗證的 workload contract；未知 SHA 不會以相似檔名猜測，也不會被誤列為 PASS。未知或其他單檔失敗後，掃描批次仍會繼續。
+因此輸入目錄的階層可以任意安排，檔案也可位於多層子目錄。若內容已被重新命名且命中 frozen manifest，工具會在該次 artifact 中以 manifest 的 canonical filename 建立 staging link，再交給 backend。
 
 ## PASS/FAIL 規則
 
@@ -108,7 +108,7 @@ setup_triangles
 texel_fetches
 ```
 
-只有兩份正規化 counter text 完全相同才是 PASS。runner exit failure、缺少或無效的 Golden report、PvrGPU protocol/provenance failure、MemoryPool leak，或 counter mismatch 都是 FAIL；每個 failure stage 與原因都會寫進 `result.json` 和最終 `report.md`。
+只有兩份正規化 counter text 完全相同才是 PASS。runner exit failure、缺少或無效的 Golden report、PvrGPU protocol failure、MemoryPool leak，或 counter mismatch 都是 FAIL；每個 failure stage 與原因都會寫進 `result.json` 和最終 `report.md`。
 
 ## 產物
 
@@ -134,8 +134,18 @@ rdc-counter-<timestamp>-<pid>/
         └── pvrgpu/
             ├── stdout.jsonl
             ├── stderr.log
-            ├── mesa-poc/
+            ├── driver-command.txt
+            ├── driver-counter.txt
+            ├── player.stdout.log
+            ├── player.stderr.log
+            ├── model.stdout.jsonl
+            ├── model.stderr.log
+            ├── player-png/
             └── png/
+golden-cache/
+└── <rdc-sha256>/
+    ├── counter_golden.txt
+    └── metadata.json
 ```
 
 最外層小寫 `report.md` 是整批 PASS/FAIL 報告；`golden/Report.md` 是單次 llvmpipe replay 的原始 counter report，兩者用途不同。`run.json` 保存同一批結果的 machine-readable summary；每個 case 的 `result.json` 保存該檔案的 stage、reason 與 artifact 相對路徑。

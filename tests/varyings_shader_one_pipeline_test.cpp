@@ -21,6 +21,7 @@
 #include "geometry/vdm.h"
 #include "geometry/vertex_fetch.h"
 #include "pds/pds_engine.h"
+#include "pds/vertex_pds_engine.h"
 #include "shader/pco_decoder.h"
 #include "shader/usc_cluster.h"
 #include "shader/usc_slot.h"
@@ -367,8 +368,8 @@ int sc_main(int, char **) {
 
     sc_core::sc_fifo<PipelineTxn> submit_to_vdm("submit_to_vdm", 1);
     sc_core::sc_fifo<PipelineTxn> vdm_to_fetch("vdm_to_fetch", 1);
-    sc_core::sc_fifo<PipelineTxn> fetch_to_vs_decoder(
-        "fetch_to_vs_decoder", 1);
+    sc_core::sc_fifo<PipelineTxn> fetch_to_pds("fetch_to_pds", 1);
+    sc_core::sc_fifo<PipelineTxn> vs_pds_to_decoder("vs_pds_to_decoder", 1);
     sc_core::sc_fifo<PipelineTxn> vs_decoder_to_slot(
         "vs_decoder_to_slot", 1);
     sc_core::sc_fifo<PipelineTxn> vs_slot_to_cluster(
@@ -407,6 +408,7 @@ int sc_main(int, char **) {
     Isp isp("isp", pool);
     FragmentFrontend frontend("fragment_frontend", pool);
     PdsEngine pds("pds", pool);
+    VertexPdsEngine vertex_pds("vertex_pds", pool);
     UscSlot fragment_slot("fragment_usc_slot", pool,
                           ShaderStage::kFragment);
     UscCluster fragment_cluster("fragment_usc_cluster", pool,
@@ -416,8 +418,10 @@ int sc_main(int, char **) {
     vdm.input(submit_to_vdm);
     vdm.output(vdm_to_fetch);
     fetch.input(vdm_to_fetch);
-    fetch.output(fetch_to_vs_decoder);
-    vertex_decoder.input(fetch_to_vs_decoder);
+    fetch.output(fetch_to_pds);
+    vertex_pds.input(fetch_to_pds);
+    vertex_pds.output(vs_pds_to_decoder);
+    vertex_decoder.input(vs_pds_to_decoder);
     vertex_decoder.output(vs_decoder_to_slot);
     vertex_slot.input(vs_decoder_to_slot);
     vertex_slot.output(vs_slot_to_cluster);

@@ -1,7 +1,7 @@
 # PrvGPU dEQP Gallium Driver Plan
 
 > Date: 2026-08-30  
-> Goal: use captured dEQP RDC files first, then grow PrvGPU from the current RDC trace-capsule POC into a real Mesa Gallium driver.  
+> Goal: use captured dEQP RDC files first, then grow PrvGPU through the real Mesa Gallium driver path.
 > Principle: dEQP captures drive early debug; on-the-fly dEQP starts only after the capture replay path is stable; RDC validates real captured workloads. The paths should stay separate but share counter/report infrastructure where useful.
 
 ## Capture-First Policy
@@ -25,16 +25,16 @@ Current capture-first order:
 
 ## Why dEQP Captures
 
-The current GLBench RDC path is intentionally narrow:
+The old GLBench RDC trace-capsule route has been removed. The intended path is now the normal driver boundary:
 
 ```text
 RenderDoc .rdc
-  -> Mesa/POC trace capsule
+  -> Mesa Gallium pvrgpu driver
   -> PrvGPU SystemC/C-model
   -> counter_pvrgpu.txt
 ```
 
-That is good for validating PrvGPU counter behavior on known frames, but it is not a production Mesa Gallium driver. A real Gallium driver must accept arbitrary Mesa state, resources, shaders, draws, clears, flushes, and synchronization through the normal Mesa frontend.
+A real Gallium driver must accept arbitrary Mesa state, resources, shaders, draws, clears, flushes, and synchronization through the normal Mesa frontend.
 
 dEQP is still the right source of tests, but early execution should come from the captured `.rdc` corpus because it removes live harness variability while PrvGPU is still immature. The captures cover driver behavior systematically:
 
@@ -74,7 +74,7 @@ PrvGPU C-model / SystemC
 counter / image / trace artifacts
 ```
 
-The important change is that Mesa calls PrvGPU through normal Gallium hooks. The trace-capsule translator becomes a bring-up aid, not the driver boundary.
+The important change is that Mesa calls PrvGPU through normal Gallium hooks. There is no trace-capsule translator in the active path.
 
 ## Keep Three Test Paths
 
@@ -121,8 +121,8 @@ Use this path for tight debug loops:
 
 ```text
 dEQP captured .rdc
-  -> RenderDoc replay / trace extraction
-  -> PrvGPU Gallium-driver lowering or POC lowering
+  -> RenderDoc replay / capture reproduction
+  -> PrvGPU Gallium-driver lowering or explicit UNSUPPORTED
   -> PrvGPU C-model/SystemC
   -> counter/image/log artifact
 ```
@@ -136,7 +136,7 @@ Purpose: validate real captured workloads and counter equivalence.
 ```text
 .rdc
   -> RenderDoc + Mesa + llvmpipe -> counter_golden.txt
-  -> RenderDoc + Mesa/POC + PrvGPU -> counter_pvrgpu.txt
+  -> Mesa Gallium pvrgpu driver + PrvGPU -> counter_pvrgpu.txt
   -> exact counter compare
 ```
 
@@ -145,6 +145,15 @@ Use this for GLBench, Manhattan, and app captures. For large captures, split by 
 ## Phase 0: Driver Skeleton
 
 Goal: Mesa can load a `pvrgpu` Gallium driver and create/destroy a context without drawing.
+
+Current implementation slice:
+
+- `src/gallium/drivers/pvrgpu/` now contains the initial driver skeleton and Meson source list.
+- `pipe_screen`, `pipe_context`, resource, framebuffer-state, flush, and clear file boundaries are present.
+- `scripts/install-pvrgpu-mesa-driver.sh` patches a Mesa source tree so `pvrgpu` is accepted by `-Dgallium-drivers`.
+- `scripts/check-pvrgpu-mesa-driver-build.sh --platforms macos --full-dri --install` verifies that Mesa configure lists `llvmpipe zink pvrgpu`, builds the pvrgpu static driver, links the full Gallium DRI shared library, and installs a local Mesa prefix.
+- the driver is selectable through `GALLIUM_DRIVER=pvrgpu`, but it is still a bring-up driver, not a production driver.
+- unsupported hooks remain fail-closed while each dEQP-driven feature is added.
 
 Required Gallium surface:
 
@@ -172,6 +181,19 @@ Exit criteria:
 
 Goal: support framebuffer clear with color target.
 
+Current implementation slice:
+
+- `clear()` for full-frame RGBA8 color target lowers to `pvrgpu.driver-command.v1`.
+- the driver exposes the minimum GLES2 caps needed for surfaceless pbuffer creation.
+- CPU-backed resources and transfer map/unmap/subdata hooks support clear readback/upload bring-up.
+- no-op-complete fence callbacks satisfy Mesa teardown/throttle paths while the driver remains synchronous.
+- `PVRGPU_DRIVER_COUNTER_OUT` emits lightweight `pvrgpu.driver-counter.v1` event lines for clear/resource/transfer/unsupported draw visibility.
+- `pvrgpu-model-stub --driver-command` validates that command and executes the `driver_clear_color` functional case.
+- direct Mesa smoke creates a surfaceless GLES2 pbuffer, clears it, verifies `glReadPixels()` returns the expected pixel, emits `driver-command.txt`, and emits `driver-counter.txt`.
+- the model smoke path emits driver provenance in hello/counter JSONL and verifies the framebuffer PNG.
+- scissor clear, depth/stencil clear, texture sampling, shader lowering, and real draw lowering are still pending.
+- on this macOS host, full DRI shared-library build uses a modern bison from Homebrew when present; `/usr/bin/bison` is too old for Mesa's GLSL parser generation.
+
 Gallium hooks/features:
 
 - resource create/destroy for RGBA8 render targets
@@ -197,6 +219,28 @@ Exit criteria:
 
 Goal: draw one non-textured triangle with simple vertex and fragment shaders.
 
+Current implementation slice:
+
+- the driver owns/releases NIR shader objects handed in by Mesa and records
+  shader create/bind events;
+- vertex element state and vertex buffer binding are stored in
+  `pvrgpu_context`;
+- `PIPE_BIND_VERTEX_BUFFER` is exposed for the float formats needed by the
+  first GLES2 client-array triangle;
+- viewport/scissor state is tracked for later lowering;
+- required Mesa state-tracker no-op callbacks are installed so missing optional
+  hooks fail closed instead of crashing;
+- `draw_vbo` recognizes one non-indexed `MESA_PRIM_TRIANGLES` draw with
+  `count=3`, a bound VS/FS pair, vertex elements, vertex buffers, and a color
+  framebuffer, then emits `event=draw_triangles`;
+- all other draw shapes still emit `event=unsupported_draw`;
+- `scripts/run-pvrgpu-mesa-driver-triangle-smoke.sh` validates this path through
+  surfaceless EGL/GLES2 and counter inspection.
+
+This is an observable driver-front-end checkpoint, not real triangle
+rasterization yet. Pixel comparison remains intentionally disabled until shader
+lowering and a model draw command exist.
+
 Gallium hooks/features:
 
 - vertex buffer binding
@@ -208,6 +252,13 @@ Gallium hooks/features:
 - shader object creation for a limited NIR subset
 - constant/uniform path for simple values
 - VS to FS varying linkage
+
+Validated checkpoint:
+
+```bash
+./scripts/check-pvrgpu-mesa-driver-build.sh --platforms macos --full-dri --install
+./scripts/run-pvrgpu-mesa-driver-triangle-smoke.sh --size 16x16
+```
 
 Suggested tests:
 
@@ -225,6 +276,28 @@ Exit criteria:
 ## Phase 3: State Completeness for GLES2 Core
 
 Goal: build enough fixed-function state handling to make simple applications meaningful.
+
+Current implementation slice:
+
+- blend, depth/stencil/alpha, and rasterizer state objects are copied into
+  driver-owned structs, bound on the context, and reported through driver
+  counters;
+- blend color, stencil ref, sample mask, viewport, and scissor are tracked on
+  the context for later lowering;
+- `draw_vbo` recognizes one indexed `MESA_PRIM_TRIANGLES` draw with `count=3`,
+  `index_size=2`, user indices, a bound VS/FS pair, vertex elements, vertex
+  buffers, and a color framebuffer, then emits `event=draw_indexed_triangles`;
+- `PIPE_BIND_INDEX_BUFFER` and `PIPE_BIND_CONSTANT_BUFFER` are exposed for the
+  buffer formats Mesa uses in this smoke path;
+- Mesa's upload manager is initialized and the resource-release hook is wired
+  so state-tracker internal uploads and teardown are clean;
+- `scripts/run-pvrgpu-mesa-driver-phase3-state-smoke.sh` validates this through
+  surfaceless EGL/GLES2 and counter inspection only.
+
+This phase is still a driver-front-end checkpoint. It proves Mesa state reaches
+the PrvGPU Gallium boundary deterministically; it does not prove indexed
+triangle pixels, depth, stencil, blend, or color-mask behavior are correct in
+the model yet.
 
 Feature order:
 
@@ -254,6 +327,28 @@ Exit criteria:
 
 Goal: support the common texture path needed by GLBench and Manhattan-style workloads.
 
+Current implementation slice:
+
+- 2D RGBA8/BGRA8 resources can be created for sampler-view use and updated
+  through CPU-backed `texture_subdata`;
+- sampler state objects are copied into driver-owned structs and reported
+  through `create_sampler_state` / `bind_sampler_states` counters;
+- sampler views are ref-counted, retain their texture resource, and are reported
+  through `create_sampler_view` / `set_sampler_views` counters;
+- fragment-stage sampler state and sampler view slot 0 are tracked on
+  `pvrgpu_context`;
+- `draw_vbo` recognizes a textured `MESA_PRIM_TRIANGLES` draw with `count=3`,
+  a bound VS/FS pair, vertex elements, vertex buffers, a color framebuffer,
+  and a fragment sampler+view, then emits `event=draw_textured_triangles`;
+- `scripts/run-pvrgpu-mesa-driver-phase4-texture-smoke.sh` validates this with
+  surfaceless EGL/GLES2, `glTexImage2D`, nearest/clamp texture parameters,
+  a `sampler2D` fragment shader, and counter inspection.
+
+This is still a frontend/counter checkpoint. It proves texture payload and
+sampler state reach the PrvGPU Gallium boundary; it does not prove texture
+sampling, mipmap selection, filtering, wrap behavior, or textured pixels are
+correct in the model yet.
+
 Feature order:
 
 1. 2D RGBA8 texture upload
@@ -280,6 +375,29 @@ Exit criteria:
 
 Goal: support multi-pass rendering and larger captured patterns.
 
+Current implementation slice:
+
+- `set_framebuffer_state` records framebuffer dimensions, color attachment
+  metadata, depth/stencil attachment presence, resolve presence, and update
+  count through `event=set_framebuffer_state`;
+- texture-backed GLES2 FBO attach/switch traffic is now observable through
+  `scripts/run-pvrgpu-mesa-driver-phase5-fbo-smoke.sh`;
+- a full FBO color clear plus `glReadPixels()` validates the existing
+  CPU-backed clear/readback path on a user FBO, not only the default pbuffer;
+- same-format, level-0, non-MSAA 2D copies are implemented for the CPU-backed
+  resource path and reported through `event=resource_copy_region`;
+- same-size, same-format RGBA blits are accepted as copy-equivalent and
+  reported through `event=blit`; unsupported blit/copy shapes fail closed with
+  explicit unsupported counters;
+- one triangle draw into that FBO is observed through the existing
+  `event=draw_triangles` checkpoint with an FBO-sized framebuffer;
+- `flush`, `flush_resource`, `fence_reference`, and `fence_finish` now emit
+  counters so sync traffic is visible, while the implementation remains
+  synchronous/no-real-fence;
+- this is still a frontend/counter checkpoint. It does not prove MRT, scaled
+  blit, format-converting blit, resolve, depth/stencil FBO behavior, FBO draw
+  pixels, or real async sync correctness yet.
+
 Feature order:
 
 - framebuffer object attach/detach
@@ -305,6 +423,24 @@ Exit criteria:
 ## Phase 6: Advanced and Large Features
 
 Goal: make the driver robust enough for GLES3/GLES31 advanced features and Manhattan-class captured workloads.
+
+Current implementation slice:
+
+- `pvrgpu_context` now retains Gallium constant-buffer state per shader stage
+  and slot with proper pipe-resource references;
+- `set_constant_buffer` records stage, slot, resource-vs-user backing, offset,
+  size, highest bound slot, and the first four payload words for quick uniform
+  debug;
+- `set_inlinable_constants` records lightweight stage/value counters if Mesa
+  chooses that path;
+- `draw_vbo` recognizes a simple triangle draw with a bound fragment constant
+  buffer and emits `event=draw_uniform_triangles`;
+- `scripts/run-pvrgpu-mesa-driver-phase6-uniform-smoke.sh` validates this with
+  surfaceless EGL/GLES2, a `vec4[8]` fragment uniform array uploaded through
+  `glUniform4fv`, and counter inspection;
+- this intentionally does not advertise GLES3/GLES31, UBO, SSBO, image, or
+  compute correctness yet. Those remain hidden behind conservative caps until
+  real lowering/model behavior exists.
 
 Feature order:
 
@@ -449,7 +585,6 @@ out/deqp-capture/<name>/
         counter_pvrgpu.txt
         stdout.jsonl
         stderr.log
-        mesa-poc/
       counter_diff.txt
 ```
 
@@ -492,26 +627,37 @@ Keep a checked-in table so the driver grows deliberately:
 
 ```text
 Feature                          Status       First dEQP gate
-pipe_screen/context              TODO         Phase 0
-RGBA8 render target resource     TODO         Phase 1
-clear color                      TODO         Phase 1
+pipe_screen/context              COMPILES     Phase 0
+GLES2 pbuffer context            SMOKE        Phase 0
+RGBA8/BGRA8 render target        SMOKE        Phase 1
+CPU resource transfer/readback   SMOKE        Phase 1
+clear color                      SMOKE        Phase 1
+driver event counter             SMOKE        Phase 1
 scissor clear                    TODO         Phase 1
-draw arrays triangle             TODO         Phase 2
-vertex buffer                    TODO         Phase 2
-simple VS/FS shader              TODO         Phase 2
-viewport/scissor draw            TODO         Phase 2
-indexed draw                     TODO         Phase 3
-depth test/write                 TODO         Phase 3
-stencil                          TODO         Phase 3
-blend                            TODO         Phase 3
-2D RGBA8 texture upload          TODO         Phase 4
-nearest/linear sampler           TODO         Phase 4
+draw arrays triangle             OBSERVED     Phase 2
+vertex buffer                    OBSERVED     Phase 2
+simple VS/FS shader              OBSERVED     Phase 2
+viewport/scissor draw            TRACKED      Phase 2/3
+indexed draw                     OBSERVED     Phase 3
+depth test/write                 TRACKED      Phase 3
+stencil                          TRACKED      Phase 3
+blend                            TRACKED      Phase 3
+2D RGBA8 texture upload          OBSERVED     Phase 4
+nearest sampler                  TRACKED      Phase 4
+linear sampler                   TODO         Phase 4
 mipmap                           TODO         Phase 4
-FBO attach/detach                TODO         Phase 5
-flush/fence                      TODO         Phase 5
+FBO attach/detach                OBSERVED     Phase 5
+FBO clear/readback               SMOKE        Phase 5
+same-format 2D copy              SMOKE        Phase 5
+same-format blit                 OBSERVED     Phase 5
+flush/fence                      TRACKED      Phase 5
+scaled/format blit               TODO         Phase 5
+resolve                          TODO         Phase 5/6
 EGL image                        TODO         Phase 6
 multisample/resolve              TODO         Phase 6
-UBO/SSBO/image                   TODO         Phase 6
+GLES2 uniform constants          OBSERVED     Phase 6
+UBO                              TODO         Phase 6
+SSBO/image                       TODO         Phase 6
 compute                          TODO         Phase 6
 transform feedback               TODO         Phase 6
 large workload bisection         TODO         Phase 6

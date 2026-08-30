@@ -51,6 +51,12 @@ FunctionalCase FunctionalCaseFromName(std::string_view name) {
     return FunctionalCase::kFillTexTrilinearLinear04;
   if (name == "fill_tex_trilinear_linear_05")
     return FunctionalCase::kFillTexTrilinearLinear05;
+  if (name == "driver_clear_color")
+    return FunctionalCase::kDriverClearColor;
+  if (name == "driver_triangle_solid")
+    return FunctionalCase::kDriverTriangleSolid;
+  if (name == "driver_indexed_quad")
+    return FunctionalCase::kDriverIndexedQuad;
   return FunctionalCase::kNone;
 }
 
@@ -96,6 +102,12 @@ const char *FunctionalCaseName(FunctionalCase functional_case) {
     return "fill_tex_trilinear_linear_04";
   case FunctionalCase::kFillTexTrilinearLinear05:
     return "fill_tex_trilinear_linear_05";
+  case FunctionalCase::kDriverClearColor:
+    return "driver_clear_color";
+  case FunctionalCase::kDriverTriangleSolid:
+    return "driver_triangle_solid";
+  case FunctionalCase::kDriverIndexedQuad:
+    return "driver_indexed_quad";
   case FunctionalCase::kNone:
     return "none";
   }
@@ -106,13 +118,16 @@ bool IsFillSolidFamily(FunctionalCase functional_case) {
   return functional_case == FunctionalCase::kFillSolid ||
          functional_case == FunctionalCase::kFillSolidDepthNotEqual ||
          functional_case == FunctionalCase::kFillSolidDepthNever ||
-         functional_case == FunctionalCase::kFillSolidBlended;
+         functional_case == FunctionalCase::kFillSolidBlended ||
+         functional_case == FunctionalCase::kDriverClearColor;
 }
 
 bool IsTriangleSetupFamily(FunctionalCase functional_case) {
   return functional_case == FunctionalCase::kTriangleSetup ||
          functional_case == FunctionalCase::kTriangleSetupAllCulled ||
-         functional_case == FunctionalCase::kTriangleSetupHalfCulled;
+         functional_case == FunctionalCase::kTriangleSetupHalfCulled ||
+         functional_case == FunctionalCase::kDriverTriangleSolid ||
+         functional_case == FunctionalCase::kDriverIndexedQuad;
 }
 
 bool IsAttributeFetchFamily(FunctionalCase functional_case) {
@@ -233,6 +248,8 @@ const char *PipelineStageName(PipelineStage stage) {
     return "vdm-complete";
   case PipelineStage::kVertexFetched:
     return "vertex-fetched";
+  case PipelineStage::kVertexPdsReady:
+    return "vertex-pds-ready";
   case PipelineStage::kVertexDecoded:
     return "vertex-decoded";
   case PipelineStage::kVertexIssued:
@@ -357,6 +374,24 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
   };
   for (const PoolHandle handle : handles)
     release_unique(handle);
+}
+
+std::size_t GetComponentTypeBytes(VertexComponentType type) {
+  switch (type) {
+    case VertexComponentType::kInt8:
+    case VertexComponentType::kUint8:
+      return 1;
+    case VertexComponentType::kInt16:
+    case VertexComponentType::kUint16:
+    case VertexComponentType::kHalfFloat:
+      return 2;
+    case VertexComponentType::kFloat32:
+    case VertexComponentType::kInt32:
+    case VertexComponentType::kUint32:
+      return 4;
+    default:
+      return 0;
+  }
 }
 
 } // namespace pvrgpu::stub

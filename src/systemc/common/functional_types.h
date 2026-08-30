@@ -74,6 +74,9 @@ enum class FunctionalCase : std::uint32_t {
   kFillTexTrilinearLinear01 = 18,
   kFillTexTrilinearLinear04 = 19,
   kFillTexTrilinearLinear05 = 20,
+  kDriverClearColor = 21,
+  kDriverTriangleSolid = 22,
+  kDriverIndexedQuad = 23,
 };
 
 FunctionalCase FunctionalCaseFromName(std::string_view name);
@@ -97,6 +100,7 @@ enum class PipelineStage : std::uint32_t {
   kSubmitted = 0,
   kVdmComplete,
   kVertexFetched,
+  kVertexPdsReady,
   kVertexDecoded,
   kVertexIssued,
   kVertexShaded,
@@ -121,12 +125,19 @@ enum class PipelineStage : std::uint32_t {
 
 enum class PrimitiveTopology : std::uint32_t {
   kTriangleStrip = 0,
-  kTriangleList,
+  kTriangleList = 1,
+  kPoints = 2,
+  kLines = 3,
+  kLineStrip = 4,
+  kLineLoop = 5,
+  kTriangleFan = 6,
 };
 
 enum class IndexFormat : std::uint32_t {
   kNone = 0,
-  kUint16,
+  kUint8 = 1,
+  kUint16 = 2,
+  kUint32 = 3,
 };
 
 enum class DepthCompareOp : std::uint32_t {
@@ -189,6 +200,10 @@ struct DepthState {
 
 enum class BlendEquation : std::uint8_t {
   kAdd = 0,
+  kSubtract = 1,
+  kReverseSubtract = 2,
+  kMin = 3,
+  kMax = 4,
 };
 
 enum class BlendFactor : std::uint8_t {
@@ -196,6 +211,12 @@ enum class BlendFactor : std::uint8_t {
   kOne,
   kSourceAlpha,
   kOneMinusSourceAlpha,
+  kSourceColor,
+  kOneMinusSourceColor,
+  kDestinationColor,
+  kOneMinusDestinationColor,
+  kDestinationAlpha,
+  kOneMinusDestinationAlpha,
 };
 
 // GLES blend state is explicit for both RGB and alpha.  GLBench Fill.Solid
@@ -244,7 +265,8 @@ struct RasterState {
   std::uint8_t shader_may_discard = 0;
   std::uint8_t shader_writes_depth = 0;
   std::uint8_t shader_writes_sample_mask = 0;
-  std::uint8_t reserved = 0;
+  std::uint8_t depth_clamp_enable = 0;
+  std::uint8_t color_mask = 0x0f;
 };
 
 struct InputVertex {
@@ -258,6 +280,13 @@ struct InputVertex {
 // inputs may read the same VBO without duplicating or aliasing its PoolHandle.
 enum class VertexComponentType : std::uint8_t {
   kFloat32 = 0,
+  kInt8 = 1,
+  kUint8 = 2,
+  kInt16 = 3,
+  kUint16 = 4,
+  kInt32 = 5,
+  kUint32 = 6,
+  kHalfFloat = 7,
 };
 
 struct VertexBufferResource {
@@ -601,6 +630,7 @@ struct DramLineWrite {
 static_assert(std::is_trivially_copyable_v<DramLineWrite>);
 
 const char *PipelineStageName(PipelineStage stage);
+std::size_t GetComponentTypeBytes(VertexComponentType type);
 void RequireStage(PipelineStage actual, PipelineStage expected,
                   const char *module_name);
 

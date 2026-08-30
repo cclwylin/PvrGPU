@@ -62,21 +62,87 @@ TextureFilter DecodeFilter(std::uint64_t encoded, const char *field) {
   }
 }
 
+TextureWrapMode DecodeWrapMode(std::uint64_t encoded) {
+  switch (encoded) {
+  case 0:
+    return TextureWrapMode::kRepeat;
+  case 1:
+    return TextureWrapMode::kClampToEdge;
+  case 2:
+    return TextureWrapMode::kMirroredRepeat;
+  case 3:
+    return TextureWrapMode::kClampToBorder;
+  default:
+    throw std::runtime_error("TextureUnit unsupported wrap mode encoding");
+  }
+}
+
 std::uint32_t RepeatIndex(std::int64_t integer, std::uint32_t extent) {
   const std::int64_t modulus = extent;
   const std::int64_t wrapped = ((integer % modulus) + modulus) % modulus;
   return static_cast<std::uint32_t>(wrapped);
 }
 
-std::uint32_t NearestRepeat(float coordinate, std::uint32_t extent) {
+std::uint32_t WrapTexelIndex(std::int64_t integer, std::uint32_t extent,
+                             TextureWrapMode wrap) {
+  if (extent == 0)
+    throw std::runtime_error("TextureUnit texel extent is invalid");
+  if (wrap == TextureWrapMode::kRepeat)
+    return RepeatIndex(integer, extent);
+  if (wrap == TextureWrapMode::kClampToEdge) {
+    if (integer < 0)
+      return 0;
+    if (integer >= static_cast<std::int64_t>(extent))
+      return extent - 1U;
+    return static_cast<std::uint32_t>(integer);
+  }
+  if (wrap == TextureWrapMode::kMirroredRepeat) {
+    const std::int64_t period = static_cast<std::int64_t>(extent) * 2;
+    const std::int64_t wrapped = ((integer % period) + period) % period;
+    if (wrapped >= static_cast<std::int64_t>(extent))
+      return static_cast<std::uint32_t>(period - 1 - wrapped);
+    return static_cast<std::uint32_t>(wrapped);
+  }
+  throw std::runtime_error("TextureUnit clamp-to-border sampling is unsupported");
+}
+
+std::uint32_t NearestRepeat(float coordinate, std::uint32_t extent, TextureWrapMode wrap) {
   if (!std::isfinite(coordinate) || extent == 0)
     throw std::runtime_error("TextureUnit coordinate/extent is invalid");
-  const double scaled = std::floor(static_cast<double>(coordinate) * extent);
-  if (scaled < static_cast<double>(std::numeric_limits<std::int64_t>::min()) ||
-      scaled > static_cast<double>(std::numeric_limits<std::int64_t>::max())) {
-    throw std::overflow_error("TextureUnit normalized coordinate overflow");
+
+  if (wrap == TextureWrapMode::kClampToEdge) {
+    float clamped = std::clamp(coordinate, 0.0f, 1.0f);
+    double scaled = std::floor(static_cast<double>(clamped) * extent);
+    std::int64_t index = static_cast<std::int64_t>(scaled);
+    if (index >= static_cast<std::int64_t>(extent)) {
+      index = extent - 1;
+    }
+    if (index < 0) {
+      index = 0;
+    }
+    return static_cast<std::uint32_t>(index);
+  } else if (wrap == TextureWrapMode::kMirroredRepeat) {
+    float floored = std::floor(coordinate);
+    float frac = coordinate - floored;
+    bool is_odd = (static_cast<std::int64_t>(floored) % 2) != 0;
+    float mapped = is_odd ? (1.0f - frac) : frac;
+    double scaled = std::floor(static_cast<double>(mapped) * extent);
+    std::int64_t index = static_cast<std::int64_t>(scaled);
+    if (index >= static_cast<std::int64_t>(extent)) {
+      index = extent - 1;
+    }
+    if (index < 0) {
+      index = 0;
+    }
+    return static_cast<std::uint32_t>(index);
+  } else {
+    const double scaled = std::floor(static_cast<double>(coordinate) * extent);
+    if (scaled < static_cast<double>(std::numeric_limits<std::int64_t>::min()) ||
+        scaled > static_cast<double>(std::numeric_limits<std::int64_t>::max())) {
+      throw std::overflow_error("TextureUnit normalized coordinate overflow");
+    }
+    return RepeatIndex(static_cast<std::int64_t>(scaled), extent);
   }
-  return RepeatIndex(static_cast<std::int64_t>(scaled), extent);
 }
 
 } // namespace
@@ -146,6 +212,9 @@ RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
   descriptor.normalized_coordinates =
       ExtractBits(word0, 49, 49) == 0U ? 1U : 0U;
 
+  descriptor.wrap_u = DecodeWrapMode(ExtractBits(word0, 33, 35));
+  descriptor.wrap_v = DecodeWrapMode(ExtractBits(word0, 41, 43));
+
   // dadjust=4095 is zero bias.  The selected path implements repeat U/V/W,
   // no anisotropy/luma-key/border/compare/YUV state, and either an exact LOD0
   // non-mip sampler (Gates 16/17) or the public full-range mip-linear sampler
@@ -172,13 +241,12 @@ RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
     throw std::runtime_error(
         "TextureUnit unsupported raw Rogue sampler descriptor");
   }
-  descriptor.wrap_u = TextureWrapMode::kRepeat;
-  descriptor.wrap_v = TextureWrapMode::kRepeat;
   return descriptor;
 }
 
 TextureLinearAxis ComputeTextureLinearRepeat(float coordinate,
-                                             std::uint32_t extent) {
+                                             std::uint32_t extent,
+                                             TextureWrapMode wrap) {
   if (!std::isfinite(coordinate) || extent == 0)
     throw std::runtime_error("TextureUnit coordinate/extent is invalid");
   // The selected reference TPU uses the common 8-bit UNORM filter datapath:
@@ -212,8 +280,8 @@ TextureLinearAxis ComputeTextureLinearRepeat(float coordinate,
   if (weight < 0 || weight > 255)
     throw std::runtime_error("TextureUnit linear weight is invalid");
   TextureLinearAxis result;
-  result.lower = RepeatIndex(lower_integer, extent);
-  result.upper = RepeatIndex(lower_integer + 1, extent);
+  result.lower = WrapTexelIndex(lower_integer, extent, wrap);
+  result.upper = WrapTexelIndex(lower_integer + 1, extent, wrap);
   result.weight = static_cast<std::uint16_t>(weight);
   return result;
 }
@@ -546,9 +614,11 @@ void TextureUnit::SampleRun() {
           [&](const TextureMipLevel &mip,
               std::uint64_t first_request_id) {
         const TextureLinearAxis x = ComputeTextureLinearRepeat(
-            BitsFloat(request.coordinates[0]), mip.width);
+            BitsFloat(request.coordinates[0]), mip.width,
+            decoded_sampler.wrap_u);
         const TextureLinearAxis y = ComputeTextureLinearRepeat(
-            BitsFloat(request.coordinates[1]), mip.height);
+            BitsFloat(request.coordinates[1]), mip.height,
+            decoded_sampler.wrap_v);
         const std::array<std::uint8_t, 4> texel00 =
             read_texel(mip, x.lower, y.lower, first_request_id + 0U);
         const std::array<std::uint8_t, 4> texel10 =
@@ -576,9 +646,11 @@ void TextureUnit::SampleRun() {
       if (!linear_filter) {
         const TextureMipLevel &mip = resource.mip[0];
         const std::uint32_t x =
-            NearestRepeat(BitsFloat(request.coordinates[0]), mip.width);
+            NearestRepeat(BitsFloat(request.coordinates[0]), mip.width,
+                          decoded_sampler.wrap_u);
         const std::uint32_t y =
-            NearestRepeat(BitsFloat(request.coordinates[1]), mip.height);
+            NearestRepeat(BitsFloat(request.coordinates[1]), mip.height,
+                          decoded_sampler.wrap_v);
         const std::array<std::uint8_t, 4> texel =
             read_texel(mip, x, y, request.request_id);
         for (std::size_t component = 0; component < 4; ++component)

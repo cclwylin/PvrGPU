@@ -1,7 +1,7 @@
 // Pbe module：PBE = Pixel Back End（像素後端）。它驗證 USC PIXOUT0..3
 // identity/order，做 F32→RGBA8 UNORM 格式轉換；opaque 路徑驗證每個 HSR
 // owner 只寫一次，blend 路徑依 API order 做 destination read/modify/write。
-// framebuffer 後續必須經 PixelDataMaster、SLC、DRAM readback；FIFO 只傳
+// framebuffer 後續必須經 PbeWriteBack、SLC、DRAM readback；FIFO 只傳
 // MemoryPool handle，fragment/framebuffer bulk data 留在 pool。
 #pragma once
 

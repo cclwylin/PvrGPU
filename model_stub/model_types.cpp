@@ -45,10 +45,10 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       std::cout << "Usage: " << argv[0]
                 << " [--frames N] [--width N] [--height N] [--case NAME]"
                    " [--outdir PATH] [--cache-bypass on|off]"
-                   " [--mesa-command PATH]\n"
+                   " [--driver-command PATH]\n"
                    "  --cache-bypass off  Run the cache models (default)\n"
                    "  --cache-bypass on   Bypass caches for faster simulation\n"
-                   "  --mesa-command PATH Ingest one validated Mesa/POC frame\n";
+                   "  --driver-command PATH Ingest one pvrgpu.driver-command.v1 command\n";
       std::exit(0);
     }
     if (i + 1 >= argc) {
@@ -69,8 +69,8 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       options->test_case = value;
     } else if (arg == "--outdir") {
       options->output_dir = value;
-    } else if (arg == "--mesa-command") {
-      options->mesa_command_path = value;
+    } else if (arg == "--driver-command") {
+      options->driver_command_path = value;
     } else if (arg == "--cache-bypass") {
       if (!ParseOnOff(value, &options->cache_bypass)) {
         std::cerr << "Invalid value for --cache-bypass: " << value
@@ -108,6 +108,12 @@ std::string JsonEscape(const std::string& value) {
 }
 
 std::uint32_t WorkloadClass(const std::string& test_case) {
+  if (test_case == "driver_clear_color")
+    return 5;
+  if (test_case == "driver_triangle_solid")
+    return 6;
+  if (test_case == "driver_indexed_quad")
+    return 7;
   if (test_case.find("triangle_setup") != std::string::npos)
     return 1;
   if (test_case.find("attribute_fetch") != std::string::npos)

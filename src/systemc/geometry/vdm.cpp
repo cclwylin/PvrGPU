@@ -17,7 +17,7 @@
 namespace pvrgpu::stub {
 namespace {
 
-inline constexpr std::uint64_t kFloat32Bytes = sizeof(float);
+// inline constexpr std::uint64_t kFloat32Bytes = sizeof(float);
 
 void ValidateDrawList(const MemoryPool &pool, PoolHandle handle) {
   if (!HasPoolHandle(handle))
@@ -58,17 +58,17 @@ std::uint64_t ValidateVertexInputState(const MemoryPool &pool,
   }
 
   std::uint64_t vertex_capacity = std::numeric_limits<std::uint64_t>::max();
+  bool has_vertex_binding = false;
   for (const VertexAttributeBinding &binding : bindings) {
     if (binding.buffer_index >= resources.size() ||
-        binding.component_type != VertexComponentType::kFloat32 ||
         binding.source_components == 0 || binding.source_components > 4 ||
         binding.destination_components < binding.source_components ||
-        binding.destination_components > 4 || binding.normalized != 0 ||
-        binding.integer != 0 || binding.instance_divisor != 0) {
+        binding.destination_components > 4) {
       throw std::runtime_error("VDM received an unsupported vertex binding");
     }
     const std::uint64_t element_bytes =
-        static_cast<std::uint64_t>(binding.source_components) * kFloat32Bytes;
+        static_cast<std::uint64_t>(binding.source_components) *
+        GetComponentTypeBytes(binding.component_type);
     if (binding.stride_bytes < element_bytes)
       throw std::runtime_error("VDM vertex binding stride is too small");
     const VertexBufferResource &resource = resources[binding.buffer_index];
@@ -76,15 +76,22 @@ std::uint64_t ValidateVertexInputState(const MemoryPool &pool,
         static_cast<std::uint64_t>(binding.offset_bytes) + element_bytes;
     if (first_element_end > resource.byte_size)
       throw std::runtime_error("VDM vertex binding starts outside its VBO");
+
+    // Instanced attributes scale with instance_count, not vertex_count
+    if (binding.instance_divisor != 0) {
+      continue;
+    }
+    has_vertex_binding = true;
+
     const std::uint64_t capacity =
         1U + (resource.byte_size - first_element_end) / binding.stride_bytes;
     vertex_capacity = std::min(vertex_capacity, capacity);
   }
-  if (vertex_capacity == 0 ||
-      vertex_capacity == std::numeric_limits<std::uint64_t>::max()) {
+  if (has_vertex_binding && (vertex_capacity == 0 ||
+      vertex_capacity == std::numeric_limits<std::uint64_t>::max())) {
     throw std::runtime_error("VDM vertex input capacity is invalid");
   }
-  return vertex_capacity;
+  return has_vertex_binding ? vertex_capacity : std::numeric_limits<std::uint64_t>::max();
 }
 
 } // namespace
@@ -127,17 +134,35 @@ void Vdm::Run() {
       state.counters.ia_primitives = 2;
     } else {
       if (!IsIndexedTriangleRasterCase(state.functional_case) ||
-          state.draw.topology != PrimitiveTopology::kTriangleList ||
+          (state.draw.topology != PrimitiveTopology::kTriangleList &&
+           state.draw.topology != PrimitiveTopology::kTriangleStrip &&
+           state.draw.topology != PrimitiveTopology::kPoints &&
+           state.draw.topology != PrimitiveTopology::kLines &&
+           state.draw.topology != PrimitiveTopology::kLineStrip &&
+           state.draw.topology != PrimitiveTopology::kLineLoop &&
+           state.draw.topology != PrimitiveTopology::kTriangleFan) ||
           state.draw.first_vertex != 0 ||
-          state.draw.index_format != IndexFormat::kUint16 ||
-          state.draw.index_count == 0 || state.draw.index_count % 3 != 0) {
+          state.draw.index_format == IndexFormat::kNone ||
+          state.draw.index_count == 0) {
         throw std::runtime_error(
-            "VDM indexed raster cases require a uint16 TRIANGLE_LIST");
+            "VDM indexed raster cases require a valid GLES indexed draw command");
       }
       if (!HasPoolHandle(state.vertex_indices))
         throw std::runtime_error("VDM indexed draw received no index buffer");
-      const std::vector<std::uint16_t> indices =
-          LoadArray<std::uint16_t>(pool_, state.vertex_indices);
+
+      std::vector<std::uint32_t> indices;
+      if (state.draw.index_format == IndexFormat::kUint8) {
+        const std::vector<std::uint8_t> raw = LoadArray<std::uint8_t>(pool_, state.vertex_indices);
+        indices.assign(raw.begin(), raw.end());
+      } else if (state.draw.index_format == IndexFormat::kUint16) {
+        const std::vector<std::uint16_t> raw = LoadArray<std::uint16_t>(pool_, state.vertex_indices);
+        indices.assign(raw.begin(), raw.end());
+      } else if (state.draw.index_format == IndexFormat::kUint32) {
+        indices = LoadArray<std::uint32_t>(pool_, state.vertex_indices);
+      } else {
+        throw std::runtime_error("VDM received an unsupported index format");
+      }
+
       const std::uint64_t index_end =
           static_cast<std::uint64_t>(state.draw.first_index) +
           state.draw.index_count;
@@ -145,19 +170,57 @@ void Vdm::Run() {
         throw std::runtime_error(
             "VDM indexed draw range exceeds its index buffer");
       }
+
+      std::uint64_t ia_primitives = 0;
+      std::uint64_t ia_vertices = 0;
+
+      std::vector<std::vector<std::uint32_t>> segments;
+      std::vector<std::uint32_t> current_segment;
+
       for (std::uint64_t occurrence = state.draw.first_index;
            occurrence < index_end; ++occurrence) {
-        const std::int64_t resolved =
-            static_cast<std::int64_t>(indices[occurrence]) +
-            state.draw.base_vertex;
-        if (resolved < 0 ||
-            static_cast<std::uint64_t>(resolved) >= vertex_capacity) {
-          throw std::runtime_error(
-              "VDM resolved index is outside the vertex input capacity");
+        std::uint32_t idx = indices[occurrence];
+        if (state.primitive_restart_enable && idx == state.primitive_restart_index) {
+          if (!current_segment.empty()) {
+            segments.push_back(current_segment);
+            current_segment.clear();
+          }
+        } else {
+          const std::int64_t resolved =
+              static_cast<std::int64_t>(idx) + state.draw.base_vertex;
+          if (resolved < 0 ||
+              static_cast<std::uint64_t>(resolved) >= vertex_capacity) {
+            throw std::runtime_error(
+                "VDM resolved index is outside the vertex input capacity");
+          }
+          current_segment.push_back(idx);
+          ia_vertices++;
         }
       }
-      state.counters.ia_vertices = state.draw.index_count;
-      state.counters.ia_primitives = state.draw.index_count / 3;
+      if (!current_segment.empty()) {
+        segments.push_back(current_segment);
+      }
+
+      for (const auto& seg : segments) {
+        std::uint64_t n = seg.size();
+        if (state.draw.topology == PrimitiveTopology::kPoints) {
+          ia_primitives += n;
+        } else if (state.draw.topology == PrimitiveTopology::kLines) {
+          ia_primitives += n / 2;
+        } else if (state.draw.topology == PrimitiveTopology::kLineStrip) {
+          if (n >= 2) ia_primitives += (n - 1);
+        } else if (state.draw.topology == PrimitiveTopology::kLineLoop) {
+          if (n >= 2) ia_primitives += n;
+        } else if (state.draw.topology == PrimitiveTopology::kTriangleList) {
+          ia_primitives += n / 3;
+        } else if (state.draw.topology == PrimitiveTopology::kTriangleStrip ||
+                   state.draw.topology == PrimitiveTopology::kTriangleFan) {
+          if (n >= 3) ia_primitives += (n - 2);
+        }
+      }
+
+      state.counters.ia_vertices = ia_vertices;
+      state.counters.ia_primitives = ia_primitives;
     }
 
     state.counters.drawlists = 1;

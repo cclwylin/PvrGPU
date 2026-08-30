@@ -91,14 +91,17 @@ void Isp::Run() {
     RequireStage(state.stage, PipelineStage::kTilesScheduled, name());
     if (!IsRasterFunctionalCase(state.functional_case))
       throw std::runtime_error("ISP received an unsupported case");
-    if (!state.fragment_early_hsr_safe ||
-        state.raster_state.shader_may_discard ||
-        state.raster_state.shader_writes_depth ||
-        state.raster_state.shader_writes_sample_mask) {
-      throw std::runtime_error(
-          "ISP late shader-side-effect handling is not implemented");
+    bool opaque_early_hsr = state.raster_state.blend.enable == 0;
+    // If the fragment shader may discard, we cannot perform opaque early HSR because
+    // a front-most fragment might be discarded later, revealing fragments behind it.
+    // Likewise, if early HSR is not safe, we disable early culling.
+    if (state.raster_state.shader_may_discard || !state.fragment_early_hsr_safe) {
+      opaque_early_hsr = false;
     }
-    const bool opaque_early_hsr = state.raster_state.blend.enable == 0;
+    // If the shader writes custom depth, early depth writes are not allowed because
+    // the final depth value is determined during shader execution.
+    const bool early_depth_write = state.raster_state.depth.write_enable &&
+                                   !state.raster_state.shader_writes_depth;
     if (state.raster_state.sample_count != 1)
       throw std::runtime_error("reference ISP currently requires one sample");
 
@@ -211,8 +214,7 @@ void Isp::Run() {
                     FragmentVisibility::kRejected;
               owner[pixel_index] = candidate_index;
             }
-            if (state.raster_state.depth.test_enable &&
-                state.raster_state.depth.write_enable) {
+            if (state.raster_state.depth.test_enable && early_depth_write) {
               depth[pixel_index] = candidate.depth;
               ++depth_written;
             }

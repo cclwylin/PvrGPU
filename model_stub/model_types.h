@@ -10,64 +10,26 @@ namespace pvrgpu::stub {
 
 inline constexpr const char *kSchema = "pvrgpu.counter.v1";
 
-struct MesaPocCommand {
+struct DriverCommand {
   bool enabled = false;
   std::string schema;
-  std::string mesa_driver;
-  std::uint32_t manifest_index = 0;
+  std::string producer;
+  std::string command;
   std::string test_case;
+  std::uint32_t frame = 1;
+  std::uint32_t framebuffer_width = 0;
+  std::uint32_t framebuffer_height = 0;
   std::uint32_t width = 0;
   std::uint32_t height = 0;
-  std::string rdc_sha256;
-  std::string api_trace_sha256;
-  std::string gallium_trace_sha256;
-  std::string vertex_shader_sha256;
-  std::string fragment_shader_sha256;
-  std::uint64_t api_calls = 0;
-  std::uint64_t api_draw_calls = 0;
-  std::string primitive;
-  bool indexed = false;
-  std::uint32_t draw_count = 0;
-  std::uint32_t index_size = 0;
-  std::vector<std::uint16_t> indices;
-  std::uint64_t gallium_draw_calls = 0;
-  std::uint64_t gallium_target_draws = 0;
-  std::uint64_t gallium_framebuffer_matches = 0;
-  std::uint64_t gallium_resource_creates = 0;
-  std::uint64_t gallium_state_calls = 0;
-  std::uint64_t gallium_constant_bytes = 0;
-  std::string framebuffer_format;
+  std::string format;
   std::array<std::uint32_t, 4> clear_color_bits{};
-  bool depth_enabled = false;
-  bool depth_write = false;
-  std::uint32_t depth_func = 0;
-  bool blend_enabled = false;
-  std::string blend_rgb_func;
-  std::string blend_rgb_src_factor;
-  std::string blend_rgb_dst_factor;
-  std::string blend_alpha_func;
-  std::string blend_alpha_src_factor;
-  std::string blend_alpha_dst_factor;
-  bool front_ccw = false;
-  std::uint32_t cull_face = 0;
-  std::uint32_t vertex_elements = 0;
-  std::string vertex_format;
-  std::uint32_t vertex_stride = 0;
-  std::uint32_t vertex_offset = 0;
-  std::vector<std::uint32_t> vertex_buffer_map;
-  std::vector<float> vertex_float2;
-  std::vector<float> vertex_float2_1;
-  std::vector<std::uint8_t> vertex_constants;
-  std::vector<std::uint8_t> fragment_constants;
-  std::string texture_format;
-  std::uint32_t texture_width = 0;
-  std::uint32_t texture_height = 0;
-  std::uint32_t texture_levels = 0;
-  std::vector<std::uint32_t> texture_mip_sizes;
-  std::vector<std::uint8_t> texture_bytes;
-  std::uint32_t sampler_min_img_filter = 0;
-  std::uint32_t sampler_min_mip_filter = 0;
-  std::uint32_t sampler_mag_img_filter = 0;
+  std::array<std::array<std::uint32_t, 2>, 3> vertex_bits{};
+  std::array<std::uint32_t, 4> fragment_color_bits{};
+  std::uint32_t draw_count = 0;
+  std::uint32_t index_count = 0;
+  std::uint32_t unique_vertices = 0;
+  std::uint32_t primitive_count = 0;
+  std::uint64_t semantic_texel_fetches = 0;
 };
 
 struct Options {
@@ -79,8 +41,8 @@ struct Options {
   // false: run the complete cache hierarchy; true: bypass caches for a
   // faster functional simulation while preserving the DRAM access path.
   bool cache_bypass = false;
-  std::string mesa_command_path;
-  MesaPocCommand mesa_command;
+  std::string driver_command_path;
+  DriverCommand driver_command;
 };
 
 bool ParseOptions(int argc, char **argv, Options *options);

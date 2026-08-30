@@ -94,7 +94,12 @@ struct TestStateHandles {
 
 TestStateHandles MakeState(MemoryPool &pool, std::uint32_t sequence,
                            const std::vector<PcoFragmentExecution> &executions,
-                           bool blend_enabled = true) {
+                           bool blend_enabled = true,
+                           BlendEquation rgb_eq = BlendEquation::kAdd,
+                           BlendEquation alpha_eq = BlendEquation::kAdd,
+                           BlendFactor src_rgb_f = BlendFactor::kSourceAlpha,
+                           BlendFactor dst_rgb_f = BlendFactor::kOneMinusSourceAlpha,
+                           std::uint8_t color_mask = 0x0f) {
   std::vector<FragmentInvocation> invocations;
   std::vector<FragmentOutput> outputs;
   for (std::size_t index = 0; index < executions.size(); ++index) {
@@ -117,14 +122,14 @@ TestStateHandles MakeState(MemoryPool &pool, std::uint32_t sequence,
   state.raster_state.clear_color[2] = 1.0F;
   state.raster_state.clear_color[3] = 1.0F;
   state.raster_state.blend.enable = blend_enabled ? 1 : 0;
-  state.raster_state.blend.rgb_equation = BlendEquation::kAdd;
-  state.raster_state.blend.alpha_equation = BlendEquation::kAdd;
-  state.raster_state.blend.source_rgb_factor = BlendFactor::kSourceAlpha;
-  state.raster_state.blend.destination_rgb_factor =
-      BlendFactor::kOneMinusSourceAlpha;
+  state.raster_state.blend.rgb_equation = rgb_eq;
+  state.raster_state.blend.alpha_equation = alpha_eq;
+  state.raster_state.blend.source_rgb_factor = src_rgb_f;
+  state.raster_state.blend.destination_rgb_factor = dst_rgb_f;
   state.raster_state.blend.source_alpha_factor = BlendFactor::kSourceAlpha;
   state.raster_state.blend.destination_alpha_factor =
       BlendFactor::kOneMinusSourceAlpha;
+  state.raster_state.color_mask = color_mask;
   state.fragment_invocations = StoreNewArray(pool, invocations);
   state.fragment_outputs = StoreNewArray(pool, outputs);
 
@@ -165,8 +170,8 @@ void CheckResult(MemoryPool &pool, const TestStateHandles &handles,
 int sc_main(int, char **) {
   try {
     MemoryPool pool;
-    sc_core::sc_fifo<PipelineTxn> input("input", 4);
-    sc_core::sc_fifo<PipelineTxn> output("output", 4);
+    sc_core::sc_fifo<PipelineTxn> input("input", 8);
+    sc_core::sc_fifo<PipelineTxn> output("output", 8);
     Pbe pbe("pbe", pool);
     pbe.input(input);
     pbe.output(output);
@@ -188,12 +193,34 @@ int sc_main(int, char **) {
         FloatBits(2.5F / 255.0F), FloatBits(3.5F / 255.0F)};
     const TestStateHandles ties =
         MakeState(pool, 4, {tie_quantization}, false);
+
+    // GLES 3.x Subtract Blending Equation test
+    const TestStateHandles subtract_test =
+        MakeState(pool, 5, {red_half}, true,
+                  BlendEquation::kSubtract, BlendEquation::kAdd,
+                  BlendFactor::kOne, BlendFactor::kOne);
+
+    // GLES 3.x Color Write Mask test (write red and blue only, keep green and alpha)
+    const TestStateHandles colormask_test =
+        MakeState(pool, 6, {red_half}, false,
+                  BlendEquation::kAdd, BlendEquation::kAdd,
+                  BlendFactor::kOne, BlendFactor::kZero,
+                  0x05); // write mask Red(0b0001) | Blue(0b0100) = 0x05
+
+    // GLES 3.x Max Blending Equation test
+    const TestStateHandles max_test =
+        MakeState(pool, 7, {red_half}, true,
+                  BlendEquation::kMax, BlendEquation::kAdd);
+
     input.write({single.state, 1, 1});
     input.write({red_green.state, 2, 2});
     input.write({green_red.state, 3, 3});
     input.write({ties.state, 4, 4});
+    input.write({subtract_test.state, 5, 5});
+    input.write({colormask_test.state, 6, 6});
+    input.write({max_test.state, 7, 7});
 
-    sc_core::sc_start(sc_core::sc_time(100, sc_core::SC_NS));
+    sc_core::sc_start(sc_core::sc_time(200, sc_core::SC_NS));
     sc_core::sc_start(sc_core::SC_ZERO_TIME);
 
     PipelineTxn completed;
@@ -205,10 +232,20 @@ int sc_main(int, char **) {
           "green-red FIFO completion order");
     Check(output.nb_read(completed) && completed.sequence == 4,
           "tie-quantization FIFO completion order");
+    Check(output.nb_read(completed) && completed.sequence == 5,
+          "subtract-test FIFO completion order");
+    Check(output.nb_read(completed) && completed.sequence == 6,
+          "colormask-test FIFO completion order");
+    Check(output.nb_read(completed) && completed.sequence == 7,
+          "max-test FIFO completion order");
+
     CheckResult(pool, single, {128, 0, 127, 191}, 1);
     CheckResult(pool, red_green, {64, 128, 63, 159}, 2);
     CheckResult(pool, green_red, {128, 64, 63, 159}, 2);
     CheckResult(pool, ties, {0, 2, 2, 4}, 1, false);
+    CheckResult(pool, subtract_test, {255, 0, 0, 191}, 1);
+    CheckResult(pool, colormask_test, {255, 0, 0, 255}, 1, false);
+    CheckResult(pool, max_test, {255, 0, 255, 191}, 1);
     Check(pool.bytes_in_flight() == 0 && pool.allocations() == pool.releases(),
           "MemoryPool balanced");
     std::cout << "pbe_blend_test: PASS\n";

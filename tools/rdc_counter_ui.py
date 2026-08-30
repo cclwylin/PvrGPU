@@ -13,6 +13,7 @@ from PySide6.QtCore import QProcess, QProcessEnvironment, QSettings, QTimer, QUr
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -85,6 +87,7 @@ class MainWindow(QMainWindow):
         self.cancel_requested = False
         self.run_generation = 0
         self._fatal_shown = False
+        self.result_filter = "FAIL"
 
         self._build_ui()
         self._restore_settings()
@@ -102,7 +105,7 @@ class MainWindow(QMainWindow):
         title = QLabel("RDC Counter Pass / Fail")
         title.setObjectName("title")
         subtitle = QLabel(
-            "Recursive RenderDoc replay · Golden and PvrGPU 17-counter comparison"
+            "Recursive RenderDoc replay · Golden and explicit PvrGPU 17-counter comparison"
         )
         subtitle.setObjectName("subtitle")
         heading.addWidget(title)
@@ -135,6 +138,16 @@ class MainWindow(QMainWindow):
         run_grid.addWidget(self.output_dir_edit, 1, 1)
         run_grid.addWidget(self.output_browse_button, 1, 2)
 
+        self.pvrgpu_runner_edit = QLineEdit()
+        self.pvrgpu_runner_edit.setPlaceholderText(
+            "Single-RDC PvrGPU runner script or executable"
+        )
+        self.pvrgpu_runner_browse_button = QPushButton("Browse")
+        self.pvrgpu_runner_browse_button.clicked.connect(self._browse_pvrgpu_runner)
+        run_grid.addWidget(QLabel("PvrGPU runner"), 2, 0)
+        run_grid.addWidget(self.pvrgpu_runner_edit, 2, 1)
+        run_grid.addWidget(self.pvrgpu_runner_browse_button, 2, 2)
+
         actions = QHBoxLayout()
         self.start_button = QPushButton("Start")
         self.start_button.setObjectName("primaryButton")
@@ -145,11 +158,14 @@ class MainWindow(QMainWindow):
         self.open_report_button = QPushButton("Open report.md")
         self.open_report_button.setEnabled(False)
         self.open_report_button.clicked.connect(self._open_report)
+        self.quit_button = QPushButton("Quit")
+        self.quit_button.clicked.connect(self.close)
         actions.addWidget(self.start_button)
         actions.addWidget(self.cancel_button)
         actions.addWidget(self.open_report_button)
         actions.addStretch()
-        run_grid.addLayout(actions, 2, 0, 1, 3)
+        actions.addWidget(self.quit_button)
+        run_grid.addLayout(actions, 3, 0, 1, 3)
         root.addWidget(run_box)
 
         progress_row = QHBoxLayout()
@@ -161,11 +177,24 @@ class MainWindow(QMainWindow):
         self.summary_label.setObjectName("summary")
         progress_row.addWidget(self.progress_bar, 3)
         progress_row.addWidget(self.summary_label, 2)
+        progress_row.addStretch()
+        progress_row.addWidget(QLabel("Filter"))
+        self.filter_button_group = QButtonGroup(self)
+        self.filter_buttons: dict[str, QRadioButton] = {}
+        for filter_key, label in (("FAIL", "Fail"), ("PASS", "Pass"), ("ALL", "All")):
+            button = QRadioButton(label)
+            button.toggled.connect(
+                lambda checked, key=filter_key: checked
+                and self._set_result_filter(key)
+            )
+            self.filter_button_group.addButton(button)
+            self.filter_buttons[filter_key] = button
+            progress_row.addWidget(button)
         root.addLayout(progress_row)
 
-        self.results_table = QTableWidget(0, 4)
+        self.results_table = QTableWidget(0, 5)
         self.results_table.setHorizontalHeaderLabels(
-            ("RDC", "Golden", "PvrGPU", "Result")
+            ("RDC", "Golden", "PvrGPU", "PNG", "Result")
         )
         self.results_table.setAlternatingRowColors(True)
         self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -175,16 +204,18 @@ class MainWindow(QMainWindow):
         self.results_table.verticalHeader().setVisible(False)
         header_view = self.results_table.horizontalHeader()
         header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in (1, 2, 3):
+        for column in (1, 2, 3, 4):
             header_view.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         root.addWidget(self.results_table, 1)
 
         # Short aliases make offscreen integration tests less coupled to wording.
         self.input_edit = self.input_dir_edit
         self.output_edit = self.output_dir_edit
+        self.pvrgpu_runner_edit_alias = self.pvrgpu_runner_edit
         self.progress = self.progress_bar
         self.table = self.results_table
 
+        self.filter_buttons[self.result_filter].setChecked(True)
         self._set_style()
 
     def _restore_settings(self) -> None:
@@ -195,16 +226,32 @@ class MainWindow(QMainWindow):
             "PVRGPU_RDC_COUNTER_OUTPUT",
             str(WORK_ROOT / "out" / "rdc-counter-report"),
         )
+        default_pvrgpu_runner = os.environ.get(
+            "PVRGPU_RDC_PVRGPU_RUNNER",
+            os.environ.get(
+                "PVRGPU_RDC_DUT_RUNNER",
+                str(PROJECT_ROOT / "scripts" / "run-rdc-pvrgpu-driver-systemc.sh"),
+            ),
+        )
         self.input_dir_edit.setText(
             str(self.settings.value("input_dir", default_input))
         )
         self.output_dir_edit.setText(
             str(self.settings.value("output_dir", default_output))
         )
+        saved_pvrgpu_runner = str(
+            self.settings.value("pvrgpu_runner", default_pvrgpu_runner)
+        ).strip()
+        self.pvrgpu_runner_edit.setText(
+            saved_pvrgpu_runner or default_pvrgpu_runner
+        )
 
     def _save_settings(self) -> None:
         self.settings.setValue("input_dir", self.input_dir_edit.text().strip())
         self.settings.setValue("output_dir", self.output_dir_edit.text().strip())
+        self.settings.setValue(
+            "pvrgpu_runner", self.pvrgpu_runner_edit.text().strip()
+        )
         self.settings.sync()
 
     def _browse_input(self) -> None:
@@ -221,6 +268,15 @@ class MainWindow(QMainWindow):
         if path:
             self.output_dir_edit.setText(path)
 
+    def _browse_pvrgpu_runner(self) -> None:
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Select PvrGPU runner",
+            self.pvrgpu_runner_edit.text() or str(PROJECT_ROOT / "scripts"),
+        )
+        if path:
+            self.pvrgpu_runner_edit.setText(path)
+
     def _start(self) -> None:
         if self.process.state() != QProcess.ProcessState.NotRunning:
             return
@@ -231,9 +287,17 @@ class MainWindow(QMainWindow):
         if not self.output_dir_edit.text().strip():
             QMessageBox.warning(self, "Output directory required", "Select an output directory.")
             return
+        if not self.pvrgpu_runner_edit.text().strip():
+            QMessageBox.warning(
+                self,
+                "PvrGPU runner required",
+                "Select the explicit single-RDC PvrGPU runner to compare against Golden.",
+            )
+            return
 
         input_root = _resolved_path(self.input_dir_edit.text())
         output_root = _resolved_path(self.output_dir_edit.text())
+        pvrgpu_runner = _resolved_path(self.pvrgpu_runner_edit.text())
         if not input_root.is_dir():
             QMessageBox.critical(
                 self, "Input directory missing", f"Input directory was not found:\n{input_root}"
@@ -244,6 +308,22 @@ class MainWindow(QMainWindow):
                 self,
                 "Output directory overlaps input",
                 "Choose an output directory outside the RDC input directory.",
+            )
+            return
+        if not pvrgpu_runner.is_file():
+            QMessageBox.critical(
+                self,
+                "PvrGPU runner missing",
+                f"PvrGPU runner was not found:\n{pvrgpu_runner}",
+            )
+            return
+        if pvrgpu_runner.suffix.lower() != ".sh" and not os.access(
+            pvrgpu_runner, os.X_OK
+        ):
+            QMessageBox.critical(
+                self,
+                "PvrGPU runner is not executable",
+                f"PvrGPU runner must be executable or a .sh script:\n{pvrgpu_runner}",
             )
             return
         if not self.worker_path.is_file():
@@ -276,6 +356,8 @@ class MainWindow(QMainWindow):
             str(input_root),
             "--output-root",
             str(output_root),
+            "--pvrgpu-runner",
+            str(pvrgpu_runner),
             "--json",
         ]
         if self.worker_path.suffix == ".py":
@@ -308,6 +390,7 @@ class MainWindow(QMainWindow):
         self.cancel_requested = False
         self._fatal_shown = False
         self.results_table.setRowCount(0)
+        self._apply_result_filter()
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("0 / 0")
@@ -319,6 +402,8 @@ class MainWindow(QMainWindow):
         self.input_browse_button.setEnabled(not running)
         self.output_dir_edit.setEnabled(not running)
         self.output_browse_button.setEnabled(not running)
+        self.pvrgpu_runner_edit.setEnabled(not running)
+        self.pvrgpu_runner_browse_button.setEnabled(not running)
         self.start_button.setEnabled(not running)
         self.cancel_button.setEnabled(running)
 
@@ -393,6 +478,7 @@ class MainWindow(QMainWindow):
                 raise ValueError("total must be non-negative")
             self.total = total
             self.results_table.setRowCount(total)
+            self._apply_result_filter()
             self.progress_bar.setRange(0, max(1, total))
             self.progress_bar.setValue(0)
             self.progress_bar.setFormat(f"%v / {total}")
@@ -410,6 +496,7 @@ class MainWindow(QMainWindow):
             self._set_cell(row, 1, "PENDING", "PENDING")
             self._set_cell(row, 2, "PENDING", "PENDING")
             self._set_cell(row, 3, "PENDING", "PENDING")
+            self._set_cell(row, 4, "PENDING", "PENDING")
             self.summary_label.setText(f"Running {index} of {self.total or event.get('total', '?')}")
             return
 
@@ -418,10 +505,10 @@ class MainWindow(QMainWindow):
             row = self._ensure_row(index)
             stage = str(event["stage"])
             status = str(event["status"])
-            columns = {"golden": 1, "pvrgpu": 2, "compare": 3}
+            columns = {"golden": 1, "pvrgpu": 2, "png": 3, "compare": 4}
             if stage not in columns:
                 raise ValueError(f"unsupported stage {stage!r}")
-            if status not in {"RUNNING", "PASS", "FAIL", "SKIP"}:
+            if status not in {"RUNNING", "PASS", "FAIL", "SKIP", "CACHED"}:
                 raise ValueError(f"unsupported stage status {status!r}")
             self._set_cell(row, columns[stage], status, status)
             return
@@ -437,17 +524,17 @@ class MainWindow(QMainWindow):
             self._set_cell(row, 0, rdc)
             if case:
                 self.results_table.item(row, 0).setToolTip(f"case={case}\n{rdc}")
-            self._set_cell(row, 3, status, status)
+            self._set_cell(row, 4, status, status)
             reason = str(event.get("reason", "")).strip()
             if reason:
-                self.results_table.item(row, 3).setToolTip(reason)
-            for field, column in (("golden", 1), ("pvrgpu", 2), ("compare", 3)):
+                self.results_table.item(row, 4).setToolTip(reason)
+            for field, column in (("golden", 1), ("pvrgpu", 2), ("png", 3)):
                 stage_status = str(event.get(field, ""))
-                if stage_status in {"PASS", "FAIL", "SKIP"}:
+                if stage_status in {"PASS", "FAIL", "SKIP", "CACHED"}:
                     self._set_cell(row, column, stage_status, stage_status)
-            self._set_cell(row, 3, status, status)
+            self._set_cell(row, 4, status, status)
             if reason:
-                self.results_table.item(row, 3).setToolTip(reason)
+                self.results_table.item(row, 4).setToolTip(reason)
             self.completed_indices.add(index)
             self.progress_bar.setValue(min(len(self.completed_indices), max(1, self.total)))
             return
@@ -495,7 +582,10 @@ class MainWindow(QMainWindow):
     def _ensure_row(self, index: int) -> int:
         row = index - 1
         if row >= self.results_table.rowCount():
+            previous_count = self.results_table.rowCount()
             self.results_table.setRowCount(row + 1)
+            for new_row in range(previous_count, row + 1):
+                self._update_row_visibility(new_row)
         return row
 
     def _set_cell(self, row: int, column: int, text: str, status: str = "") -> None:
@@ -508,6 +598,7 @@ class MainWindow(QMainWindow):
             "RUNNING": QColor("#1d4ed8"),
             "PASS": QColor("#166534"),
             "FAIL": QColor("#b91c1c"),
+            "CACHED": QColor("#9333ea"),
             "SKIP": QColor("#64748b"),
             "PENDING": QColor("#64748b"),
         }
@@ -515,6 +606,26 @@ class MainWindow(QMainWindow):
             item.setForeground(colors[status])
         if column > 0:
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        if column == 4:
+            self._update_row_visibility(row)
+
+    def _set_result_filter(self, result_filter: str) -> None:
+        if result_filter not in {"FAIL", "PASS", "ALL"}:
+            raise ValueError(f"unsupported result filter {result_filter!r}")
+        self.result_filter = result_filter
+        self._apply_result_filter()
+
+    def _apply_result_filter(self) -> None:
+        for row in range(self.results_table.rowCount()):
+            self._update_row_visibility(row)
+
+    def _update_row_visibility(self, row: int) -> None:
+        if row < 0 or row >= self.results_table.rowCount():
+            return
+        result_item = self.results_table.item(row, 4)
+        result = result_item.text() if result_item is not None else ""
+        visible = self.result_filter == "ALL" or result == self.result_filter
+        self.results_table.setRowHidden(row, not visible)
 
     def _set_report_path(self, value: object) -> None:
         path = Path(str(value)).expanduser()

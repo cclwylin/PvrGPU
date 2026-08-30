@@ -12,8 +12,8 @@ pkg_check_modules(SYSTEMC REQUIRED IMPORTED_TARGET systemc)
 pkg_check_modules(LIBPNG REQUIRED IMPORTED_TARGET libpng>=1.6)
 
 add_executable(pvrgpu-model-stub
+    model_stub/driver_command.cpp
     model_stub/json_reporter.cpp
-    model_stub/mesa_command.cpp
     model_stub/memory_pool.cpp
     model_stub/model_types.cpp
     model_stub/pvrgpu_model_stub.cpp
@@ -33,11 +33,13 @@ add_executable(pvrgpu-model-stub
     src/systemc/data_master/compute_data_master.cpp
     src/systemc/data_master/domain_data_master.cpp
     src/systemc/data_master/pixel_data_master.cpp
+    src/systemc/data_master/vertex_data_master.cpp
     src/systemc/data_master/two_d_data_master.cpp
     src/systemc/firmware/firmware_scheduler.cpp
     src/systemc/fragment/fragment_frontend.cpp
     src/systemc/fragment/isp.cpp
     src/systemc/fragment/pbe.cpp
+    src/systemc/fragment/pbe_write_back.cpp
     src/systemc/fragment/tile_scheduler.cpp
     src/systemc/geometry/clip_cull.cpp
     src/systemc/geometry/parameter_buffer.cpp
@@ -51,6 +53,7 @@ add_executable(pvrgpu-model-stub
     src/systemc/memory/on_chip_fabric.cpp
     src/systemc/memory/dram_model.cpp
     src/systemc/pds/pds_engine.cpp
+    src/systemc/pds/vertex_pds_engine.cpp
     src/systemc/shader/pco_decoder.cpp
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp
@@ -79,6 +82,16 @@ target_include_directories(pco-iss-test PRIVATE
 )
 target_compile_options(pco-iss-test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME pco-iss-unit COMMAND pco-iss-test)
+
+add_executable(driver-command-test
+    tests/driver_command_test.cpp
+    model_stub/driver_command.cpp
+)
+target_include_directories(driver-command-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+)
+target_compile_options(driver-command-test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME driver-command-unit COMMAND driver-command-test)
 
 add_executable(cache-array-test
     tests/cache_array_test.cpp
@@ -135,6 +148,7 @@ add_executable(pbe-blend-test
     src/systemc/common/functional_types.cpp
     src/systemc/common/pipeline_state.cpp
     src/systemc/fragment/pbe.cpp
+    src/systemc/fragment/pbe_write_back.cpp
     src/systemc/shader/pco_iss.cpp
 )
 target_include_directories(pbe-blend-test PRIVATE
@@ -155,8 +169,10 @@ add_executable(ordered-blend-pipeline-test
     src/systemc/fragment/fragment_frontend.cpp
     src/systemc/fragment/isp.cpp
     src/systemc/fragment/pbe.cpp
+    src/systemc/fragment/pbe_write_back.cpp
     src/systemc/fragment/tile_scheduler.cpp
     src/systemc/pds/pds_engine.cpp
+    src/systemc/pds/vertex_pds_engine.cpp
     src/systemc/shader/pco_decoder.cpp
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp
@@ -331,6 +347,7 @@ add_executable(varyings-shader-one-pipeline-test
     src/systemc/geometry/vdm.cpp
     src/systemc/geometry/vertex_fetch.cpp
     src/systemc/pds/pds_engine.cpp
+    src/systemc/pds/vertex_pds_engine.cpp
     src/systemc/shader/pco_decoder.cpp
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp
@@ -364,9 +381,11 @@ add_executable(varyings-shader-two-pipeline-test
     src/systemc/common/glbench_texture_fixture.cpp
     src/systemc/common/pipeline_state.cpp
     src/systemc/data_master/pixel_data_master.cpp
+    src/systemc/data_master/vertex_data_master.cpp
     src/systemc/fragment/fragment_frontend.cpp
     src/systemc/fragment/isp.cpp
     src/systemc/fragment/pbe.cpp
+    src/systemc/fragment/pbe_write_back.cpp
     src/systemc/fragment/tile_scheduler.cpp
     src/systemc/geometry/clip_cull.cpp
     src/systemc/geometry/parameter_buffer.cpp
@@ -375,6 +394,7 @@ add_executable(varyings-shader-two-pipeline-test
     src/systemc/geometry/vertex_fetch.cpp
     src/systemc/memory/dram_model.cpp
     src/systemc/pds/pds_engine.cpp
+    src/systemc/pds/vertex_pds_engine.cpp
     src/systemc/shader/pco_decoder.cpp
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp
@@ -434,9 +454,11 @@ add_executable(varyings-shader-four-pipeline-test
     src/systemc/common/glbench_texture_fixture.cpp
     src/systemc/common/pipeline_state.cpp
     src/systemc/data_master/pixel_data_master.cpp
+    src/systemc/data_master/vertex_data_master.cpp
     src/systemc/fragment/fragment_frontend.cpp
     src/systemc/fragment/isp.cpp
     src/systemc/fragment/pbe.cpp
+    src/systemc/fragment/pbe_write_back.cpp
     src/systemc/fragment/tile_scheduler.cpp
     src/systemc/geometry/clip_cull.cpp
     src/systemc/geometry/parameter_buffer.cpp
@@ -445,6 +467,7 @@ add_executable(varyings-shader-four-pipeline-test
     src/systemc/geometry/vertex_fetch.cpp
     src/systemc/memory/dram_model.cpp
     src/systemc/pds/pds_engine.cpp
+    src/systemc/pds/vertex_pds_engine.cpp
     src/systemc/shader/pco_decoder.cpp
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp
@@ -504,9 +527,11 @@ add_executable(varyings-shader-eight-pipeline-test
     src/systemc/common/glbench_texture_fixture.cpp
     src/systemc/common/pipeline_state.cpp
     src/systemc/data_master/pixel_data_master.cpp
+    src/systemc/data_master/vertex_data_master.cpp
     src/systemc/fragment/fragment_frontend.cpp
     src/systemc/fragment/isp.cpp
     src/systemc/fragment/pbe.cpp
+    src/systemc/fragment/pbe_write_back.cpp
     src/systemc/fragment/tile_scheduler.cpp
     src/systemc/geometry/clip_cull.cpp
     src/systemc/geometry/parameter_buffer.cpp
@@ -515,6 +540,7 @@ add_executable(varyings-shader-eight-pipeline-test
     src/systemc/geometry/vertex_fetch.cpp
     src/systemc/memory/dram_model.cpp
     src/systemc/pds/pds_engine.cpp
+    src/systemc/pds/vertex_pds_engine.cpp
     src/systemc/shader/pco_decoder.cpp
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp

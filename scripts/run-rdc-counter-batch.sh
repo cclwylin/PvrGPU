@@ -25,8 +25,8 @@ For each selected RDC, in frozen manifest order:
 PNG files may be emitted by the replay/model executables, but this script
 never compares them and they do not affect PASS/FAIL.
 
-By default the current PvrGPU --case adapter is used for step 2.  A real
-RenderDoc + Mesa/POC runner can replace it without changing this batch:
+By default the current PvrGPU --case adapter is used for step 2.  A separate
+explicit PvrGPU runner can replace it without changing this batch:
 
   PVRGPU_RDC_DUT_RUNNER=/path/to/runner ./scripts/run-rdc-counter-batch.sh --all
 
@@ -105,7 +105,7 @@ if [[ -n "${dut_runner}" ]]; then
         echo "PVRGPU_RDC_DUT_RUNNER is not executable: ${dut_runner}" >&2
         exit 1
     fi
-    dut_mode="renderdoc-mesa-poc-runner"
+    dut_mode="external-pvrgpu-runner"
 else
     if [[ ! -x "${model}" ]]; then
         echo "PvrGPU model is missing: ${model}" >&2
@@ -200,15 +200,9 @@ do
             >"${dut_root}/stdout.jsonl" \
             2>"${dut_root}/stderr.log"
     fi
-    pvrgpu_normalizer_args=(
-        --pvrgpu-jsonl "${dut_root}/stdout.jsonl"
-        --output "${case_root}/counter_pvrgpu.txt"
-    )
-    if [[ -n "${dut_runner}" ]]; then
-        pvrgpu_normalizer_args+=(--require-mesa-ingest)
-    fi
     PYTHONDONTWRITEBYTECODE=1 python3 "${normalizer}" \
-        "${pvrgpu_normalizer_args[@]}"
+        --pvrgpu-jsonl "${dut_root}/stdout.jsonl" \
+        --output "${case_root}/counter_pvrgpu.txt"
 
     echo "[${padded_index}/020] ${case_name}: compare"
     if ! cmp -s "${case_root}/counter_golden.txt" \

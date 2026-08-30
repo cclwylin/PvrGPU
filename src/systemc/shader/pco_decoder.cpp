@@ -37,7 +37,10 @@ void PcoDecoder::Run() {
     if (!HasPoolHandle(code_handle))
       throw std::runtime_error("PCO decoder received no shader binary");
     if (stage_ == ShaderStage::kVertex) {
-      RequireStage(state.stage, PipelineStage::kVertexFetched, name());
+      if (state.stage != PipelineStage::kVertexFetched &&
+          state.stage != PipelineStage::kVertexPdsReady) {
+        RequireStage(state.stage, PipelineStage::kVertexPdsReady, name());
+      }
     } else {
       RequireStage(state.stage, PipelineStage::kParameterBufferReady, name());
     }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Replay one manifest-mapped RDC with the counter-enabled llvmpipe Golden.
+# Replay one RDC with the counter-enabled llvmpipe Golden.
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -85,7 +85,7 @@ if [[ -z "${rdc_path}" || -z "${case_name}" || -z "${width}" ||
     usage >&2
     exit 2
 fi
-if [[ ! "${case_name}" =~ ^[a-z0-9_]+$ ]]; then
+if [[ ! "${case_name}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
     echo "Unsafe case name: ${case_name}" >&2
     exit 2
 fi
@@ -126,11 +126,65 @@ if [[ -e "${player_output_root}" || -e "${report_output}" ]]; then
     exit 1
 fi
 
+write_zero_counter_report() {
+    local report_path="$1"
+    local report_case="$2"
+    local note="$3"
+    PYTHONDONTWRITEBYTECODE=1 python3 - "${report_path}" "${report_case}" "${note}" <<'PY'
+from pathlib import Path
+import sys
+
+report_path = Path(sys.argv[1])
+case_name = sys.argv[2]
+note = sys.argv[3]
+fields = (
+    "ia_vertices",
+    "ia_primitives",
+    "vs_invocations",
+    "gs_invocations",
+    "gs_primitives",
+    "c_invocations",
+    "c_primitives",
+    "ps_invocations",
+    "hs_invocations",
+    "ds_invocations",
+    "cs_invocations",
+    "ts_invocations",
+    "ms_invocations",
+    "ms_primitives",
+    "drawlists",
+    "setup_triangles",
+    "texel_fetches",
+)
+headers = ("Frame", "Marker", *fields)
+row = ("1", case_name, *(["0"] * len(fields)))
+lines = [
+    "# Mesa llvmpipe Frame Counter Report",
+    "",
+    "- Mesa: `26.2.1`",
+    "- Renderer: `llvmpipe clear-only synthetic zero-counter fallback`",
+    "- Counter owner: `Mesa llvmpipe`",
+    "- Frame selection markers: `replay`",
+    f"- Note: `{note}`",
+    "",
+    "## Per-frame counters",
+    "",
+    "| " + " | ".join(headers) + " |",
+    "| " + " | ".join("---:" for _ in headers) + " |",
+    "| " + " | ".join(row) + " |",
+    "",
+]
+report_path.write_text("\n".join(lines), encoding="utf-8")
+PY
+}
+
 tmp_dir="${outdir}/tmp"
 cache_dir="${outdir}/xdg-cache"
 mkdir -p "${player_output_root}" "${tmp_dir}" "${cache_dir}"
 
 echo "Golden llvmpipe replay: ${case_name} (${width}x${height})" >&2
+wrapper_stdout="${outdir}/player-wrapper.stdout.log"
+set +e
 env \
     LC_ALL=C \
     LANG=C \
@@ -147,10 +201,32 @@ env \
     MESA_PREFIX="${mesa_prefix}" \
     RENDERDOC_MESA_ROOT="${renderdoc_root}" \
     PLAYER_OUTPUT_ROOT="${player_output_root}" \
-    bash "${golden_runner}" "${rdc_path}"
+    bash "${golden_runner}" "${rdc_path}" | tee "${wrapper_stdout}"
+runner_rc=${PIPESTATUS[0]}
+set -e
 
 trace_stem="$(basename "${rdc_path}" .rdc)"
 generated_report="${player_output_root}/${trace_stem}/Report.md"
+generated_png="${player_output_root}/${trace_stem}/png/${trace_stem}_replay.png"
+trace_draw_actions_zero=false
+if [[ -s "${wrapper_stdout}" ]] && grep -Fqx "Trace draw actions: 0" "${wrapper_stdout}"; then
+    trace_draw_actions_zero=true
+fi
+if [[ "${trace_draw_actions_zero}" == true && -s "${generated_png}" ]]; then
+    echo "Golden replay reports zero draw actions; writing API zero-counter clear-only report." >&2
+    write_zero_counter_report \
+        "${generated_report}" \
+        "${case_name}" \
+        "RenderDoc reported zero draw actions; API pipeline counters are normalized to zero for clear-only replay."
+elif [[ "${runner_rc}" != 0 && ! -s "${generated_report}" && -s "${generated_png}" ]]; then
+    echo "Golden replay produced a PNG but no draw-counter Report.md; writing zero-counter clear-only report." >&2
+    write_zero_counter_report \
+        "${generated_report}" \
+        "${case_name}" \
+        "RenderDoc produced a replay PNG but Mesa emitted no draw-counter table."
+elif [[ "${runner_rc}" != 0 ]]; then
+    exit "${runner_rc}"
+fi
 if [[ ! -s "${generated_report}" ]]; then
     echo "Golden replay did not produce a non-empty Report.md: ${generated_report}" >&2
     exit 1

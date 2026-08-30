@@ -30,6 +30,7 @@ using pvrgpu::stub::AttributeFetchFourAttributeVertexPcoBinary;
 using pvrgpu::stub::AttributeFetchGrayFragmentPcoBinary;
 using pvrgpu::stub::AttributeFetchTwoAttributeVertexPcoBinary;
 using pvrgpu::stub::AttributeFetchVertexPcoBinary;
+using pvrgpu::stub::FillSolidBlackFragmentPcoBinary;
 using pvrgpu::stub::FillSolidFragmentPcoBinary;
 using pvrgpu::stub::FillSolidGreenHalfAlphaFragmentPcoBinary;
 using pvrgpu::stub::FillSolidRedHalfAlphaFragmentPcoBinary;
@@ -1063,6 +1064,22 @@ void TestDecodeAndExecuteFragment() {
 }
 
 void TestDecodeAndExecuteHalfAlphaFragments() {
+  const auto black =
+      Decode(ShaderStage::kFragment, FillSolidBlackFragmentPcoBinary());
+  Check(black.summary.binary_size == 46 && black.summary.group_count == 4,
+        "black opaque fixture has four exact PCO groups");
+  const auto black_result = ExecuteFragment(black.summary, black.instructions);
+  Check(black_result.written_mask == 0x0f,
+        "black opaque fixture writes all RGBA outputs");
+  Check(black_result.pixel_outputs[0] == UINT32_C(0x00000000),
+        "black opaque R = 0.0");
+  Check(black_result.pixel_outputs[1] == UINT32_C(0x00000000),
+        "black opaque G = 0.0");
+  Check(black_result.pixel_outputs[2] == UINT32_C(0x00000000),
+        "black opaque B = 0.0");
+  Check(black_result.pixel_outputs[3] == UINT32_C(0x3f800000),
+        "black opaque A = 1.0");
+
   const auto red =
       Decode(ShaderStage::kFragment, FillSolidRedHalfAlphaFragmentPcoBinary());
   Check(red.summary.binary_size == 48 && red.summary.group_count == 4,

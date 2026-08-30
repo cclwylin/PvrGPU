@@ -26,7 +26,7 @@ std::uint32_t FloatBits(float value) {
   return bits;
 }
 
-inline constexpr std::uint64_t kFloat32Bytes = sizeof(float);
+// inline constexpr std::uint64_t kFloat32Bytes = sizeof(float);
 
 struct VertexInputState {
   std::vector<VertexBufferResource> resources;
@@ -70,11 +70,9 @@ VertexInputState LoadVertexInputState(const MemoryPool &pool,
   std::array<std::uint8_t, kPcoVertexInputRegisterCount> occupied{};
   for (const VertexAttributeBinding &binding : input.bindings) {
     if (binding.buffer_index >= input.resources.size() ||
-        binding.component_type != VertexComponentType::kFloat32 ||
         binding.source_components == 0 || binding.source_components > 4 ||
         binding.destination_components < binding.source_components ||
-        binding.destination_components > 4 || binding.normalized != 0 ||
-        binding.integer != 0 || binding.instance_divisor != 0) {
+        binding.destination_components > 4) {
       throw std::runtime_error(
           "VertexFetch received an unsupported attribute binding");
     }
@@ -93,7 +91,8 @@ VertexInputState LoadVertexInputState(const MemoryPool &pool,
       slot = 1;
     }
     const std::uint64_t element_bytes =
-        static_cast<std::uint64_t>(binding.source_components) * kFloat32Bytes;
+        static_cast<std::uint64_t>(binding.source_components) *
+        GetComponentTypeBytes(binding.component_type);
     if (binding.stride_bytes < element_bytes)
       throw std::runtime_error("VertexFetch attribute stride is too small");
     const VertexBufferResource &resource =
@@ -112,16 +111,24 @@ VertexInputState LoadVertexInputState(const MemoryPool &pool,
   return input;
 }
 
+float ReadComponentAsFloat(const std::vector<std::uint8_t>& buffer, std::size_t offset, VertexComponentType type, bool normalized);
+std::uint32_t ReadComponentAsInteger(const std::vector<std::uint8_t>& buffer, std::size_t offset, VertexComponentType type);
+
 VertexLane MakeLane(std::uint32_t vertex_index,
                     const VertexInputState &input) {
   VertexLane lane;
   for (const VertexAttributeBinding &binding : input.bindings) {
+    std::uint32_t active_index = vertex_index;
+    if (binding.instance_divisor != 0) {
+      active_index = 0;
+    }
     const std::uint64_t stride_offset =
-        static_cast<std::uint64_t>(vertex_index) * binding.stride_bytes;
+        static_cast<std::uint64_t>(active_index) * binding.stride_bytes;
     const std::uint64_t source_offset =
         stride_offset + binding.offset_bytes;
+    const std::size_t component_bytes = GetComponentTypeBytes(binding.component_type);
     const std::uint64_t source_bytes =
-        static_cast<std::uint64_t>(binding.source_components) * kFloat32Bytes;
+        static_cast<std::uint64_t>(binding.source_components) * component_bytes;
     const std::vector<std::uint8_t> &buffer =
         input.buffers[binding.buffer_index];
     if (source_offset > buffer.size() ||
@@ -134,8 +141,13 @@ VertexLane MakeLane(std::uint32_t vertex_index,
       std::uint32_t value = component == 3 ? FloatBits(1.0F) : 0U;
       if (component < binding.source_components) {
         const std::size_t component_offset = static_cast<std::size_t>(
-            source_offset + component * kFloat32Bytes);
-        std::memcpy(&value, buffer.data() + component_offset, sizeof(value));
+            source_offset + component * component_bytes);
+        if (binding.integer) {
+          value = ReadComponentAsInteger(buffer, component_offset, binding.component_type);
+        } else {
+          float fval = ReadComponentAsFloat(buffer, component_offset, binding.component_type, binding.normalized != 0);
+          value = FloatBits(fval);
+        }
       }
       lane.vertex_input[binding.destination_register + component] = value;
     }
@@ -148,6 +160,200 @@ struct CacheEntry {
   std::uint32_t lane_index = 0;
   bool valid = false;
 };
+
+std::vector<std::uint32_t> ExpandTopology(const std::vector<std::uint32_t>& indices,
+                                          PrimitiveTopology topology,
+                                          bool restart_enable,
+                                          std::uint32_t restart_index) {
+  std::vector<std::uint32_t> expanded;
+
+  std::vector<std::vector<std::uint32_t>> segments;
+  std::vector<std::uint32_t> current_segment;
+  for (std::uint32_t idx : indices) {
+    if (restart_enable && idx == restart_index) {
+      if (!current_segment.empty()) {
+        segments.push_back(current_segment);
+        current_segment.clear();
+      }
+    } else {
+      current_segment.push_back(idx);
+    }
+  }
+  if (!current_segment.empty()) {
+    segments.push_back(current_segment);
+  }
+
+  for (const auto& seg : segments) {
+    std::size_t n = seg.size();
+    if (topology == PrimitiveTopology::kTriangleList) {
+      for (std::size_t i = 0; i + 2 < n; i += 3) {
+        expanded.push_back(seg[i]);
+        expanded.push_back(seg[i + 1]);
+        expanded.push_back(seg[i + 2]);
+      }
+    } else if (topology == PrimitiveTopology::kTriangleStrip) {
+      for (std::size_t i = 0; i + 2 < n; ++i) {
+        if (i % 2 == 0) {
+          expanded.push_back(seg[i]);
+          expanded.push_back(seg[i + 1]);
+          expanded.push_back(seg[i + 2]);
+        } else {
+          expanded.push_back(seg[i + 1]);
+          expanded.push_back(seg[i]);
+          expanded.push_back(seg[i + 2]);
+        }
+      }
+    } else if (topology == PrimitiveTopology::kTriangleFan) {
+      for (std::size_t i = 1; i + 1 < n; ++i) {
+        expanded.push_back(seg[0]);
+        expanded.push_back(seg[i]);
+        expanded.push_back(seg[i + 1]);
+      }
+    } else if (topology == PrimitiveTopology::kLines) {
+      for (std::size_t i = 0; i + 1 < n; i += 2) {
+        expanded.push_back(seg[i]);
+        expanded.push_back(seg[i + 1]);
+        expanded.push_back(seg[i + 1]);
+      }
+    } else if (topology == PrimitiveTopology::kLineStrip) {
+      for (std::size_t i = 0; i + 1 < n; ++i) {
+        expanded.push_back(seg[i]);
+        expanded.push_back(seg[i + 1]);
+        expanded.push_back(seg[i + 1]);
+      }
+    } else if (topology == PrimitiveTopology::kLineLoop) {
+      if (n >= 2) {
+        for (std::size_t i = 0; i + 1 < n; ++i) {
+          expanded.push_back(seg[i]);
+          expanded.push_back(seg[i + 1]);
+          expanded.push_back(seg[i + 1]);
+        }
+        expanded.push_back(seg[n - 1]);
+        expanded.push_back(seg[0]);
+        expanded.push_back(seg[0]);
+      }
+    } else if (topology == PrimitiveTopology::kPoints) {
+      for (std::size_t i = 0; i < n; ++i) {
+        expanded.push_back(seg[i]);
+        expanded.push_back(seg[i]);
+        expanded.push_back(seg[i]);
+      }
+    }
+  }
+  return expanded;
+}
+
+float ReadComponentAsFloat(const std::vector<std::uint8_t>& buffer, std::size_t offset, VertexComponentType type, bool normalized) {
+  if (type == VertexComponentType::kFloat32) {
+    float val;
+    std::memcpy(&val, buffer.data() + offset, sizeof(val));
+    return val;
+  }
+
+  if (type == VertexComponentType::kUint8) {
+    std::uint8_t val = buffer[offset];
+    if (normalized) return static_cast<float>(val) / 255.0f;
+    return static_cast<float>(val);
+  }
+  if (type == VertexComponentType::kInt8) {
+    std::int8_t val;
+    std::memcpy(&val, buffer.data() + offset, sizeof(val));
+    if (normalized) {
+      return std::max(static_cast<float>(val) / 127.0f, -1.0f);
+    }
+    return static_cast<float>(val);
+  }
+  if (type == VertexComponentType::kUint16) {
+    std::uint16_t val;
+    std::memcpy(&val, buffer.data() + offset, sizeof(val));
+    if (normalized) return static_cast<float>(val) / 65535.0f;
+    return static_cast<float>(val);
+  }
+  if (type == VertexComponentType::kInt16) {
+    std::int16_t val;
+    std::memcpy(&val, buffer.data() + offset, sizeof(val));
+    if (normalized) {
+      return std::max(static_cast<float>(val) / 32767.0f, -1.0f);
+    }
+    return static_cast<float>(val);
+  }
+  if (type == VertexComponentType::kUint32) {
+    std::uint32_t val;
+    std::memcpy(&val, buffer.data() + offset, sizeof(val));
+    if (normalized) return static_cast<float>(val) / 4294967295.0f;
+    return static_cast<float>(val);
+  }
+  if (type == VertexComponentType::kInt32) {
+    std::int32_t val;
+    std::memcpy(&val, buffer.data() + offset, sizeof(val));
+    if (normalized) {
+      return std::max(static_cast<float>(val) / 2147483647.0f, -1.0f);
+    }
+    return static_cast<float>(val);
+  }
+  if (type == VertexComponentType::kHalfFloat) {
+    std::uint16_t raw;
+    std::memcpy(&raw, buffer.data() + offset, sizeof(raw));
+    std::uint32_t sign = (raw & 0x8000) >> 15;
+    std::uint32_t exponent = (raw & 0x7C00) >> 10;
+    std::uint32_t fraction = raw & 0x03FF;
+
+    std::uint32_t result;
+    if (exponent == 0) {
+      if (fraction == 0) {
+        result = sign << 31;
+      } else {
+        while ((fraction & 0x0400) == 0) {
+          fraction <<= 1;
+          exponent--;
+        }
+        exponent++;
+        fraction &= ~0x0400;
+        result = (sign << 31) | ((exponent - 15 + 127) << 23) | (fraction << 13);
+      }
+    } else if (exponent == 31) {
+      result = (sign << 31) | (0xFF << 23) | (fraction << 13);
+    } else {
+      result = (sign << 31) | ((exponent - 15 + 127) << 23) | (fraction << 13);
+    }
+    float val;
+    std::memcpy(&val, &result, sizeof(val));
+    return val;
+  }
+  return 0.0f;
+}
+
+std::uint32_t ReadComponentAsInteger(const std::vector<std::uint8_t>& buffer, std::size_t offset, VertexComponentType type) {
+  if (type == VertexComponentType::kUint8) {
+    return static_cast<std::uint32_t>(buffer[offset]);
+  }
+  if (type == VertexComponentType::kInt8) {
+    std::int8_t val;
+    std::memcpy(&val, buffer.data() + offset, sizeof(val));
+    return static_cast<std::uint32_t>(static_cast<std::int32_t>(val));
+  }
+  if (type == VertexComponentType::kUint16) {
+    std::uint16_t val;
+    std::memcpy(&val, buffer.data() + offset, sizeof(val));
+    return static_cast<std::uint32_t>(val);
+  }
+  if (type == VertexComponentType::kInt16) {
+    std::int16_t val;
+    std::memcpy(&val, buffer.data() + offset, sizeof(val));
+    return static_cast<std::uint32_t>(static_cast<std::int32_t>(val));
+  }
+  if (type == VertexComponentType::kUint32 || type == VertexComponentType::kInt32) {
+    std::uint32_t val;
+    std::memcpy(&val, buffer.data() + offset, sizeof(val));
+    return val;
+  }
+  if (type == VertexComponentType::kFloat32) {
+    float val;
+    std::memcpy(&val, buffer.data() + offset, sizeof(val));
+    return static_cast<std::uint32_t>(static_cast<std::int32_t>(val));
+  }
+  return 0;
+}
 
 } // namespace
 
@@ -189,22 +395,63 @@ void VertexFetch::Run() {
             MakeLane(static_cast<std::uint32_t>(resolved), vertex_input));
       }
     } else if (IsIndexedTriangleRasterCase(state.functional_case)) {
-      if (state.draw.topology != PrimitiveTopology::kTriangleList ||
-          state.draw.index_format != IndexFormat::kUint16 ||
+      if ((state.draw.topology != PrimitiveTopology::kTriangleList &&
+           state.draw.topology != PrimitiveTopology::kTriangleStrip &&
+           state.draw.topology != PrimitiveTopology::kPoints &&
+           state.draw.topology != PrimitiveTopology::kLines &&
+           state.draw.topology != PrimitiveTopology::kLineStrip &&
+           state.draw.topology != PrimitiveTopology::kLineLoop &&
+           state.draw.topology != PrimitiveTopology::kTriangleFan) ||
+          state.draw.index_format == IndexFormat::kNone ||
           !HasPoolHandle(state.vertex_indices)) {
         throw std::runtime_error(
             "VertexFetch indexed raster state is invalid");
       }
-      const std::vector<std::uint16_t> indices =
-          LoadArray<std::uint16_t>(pool_, state.vertex_indices);
-      const std::uint64_t index_end =
-          static_cast<std::uint64_t>(state.draw.first_index) +
-          state.draw.index_count;
-      if (index_end > indices.size() || state.draw.index_count == 0 ||
-          state.draw.index_count % 3 != 0) {
-        throw std::runtime_error(
-            "VertexFetch indexed draw range is invalid");
+
+      std::vector<std::uint32_t> indices;
+      if (state.draw.index_format == IndexFormat::kUint8) {
+        const std::vector<std::uint8_t> raw = LoadArray<std::uint8_t>(pool_, state.vertex_indices);
+        indices.assign(raw.begin(), raw.end());
+      } else if (state.draw.index_format == IndexFormat::kUint16) {
+        const std::vector<std::uint16_t> raw = LoadArray<std::uint16_t>(pool_, state.vertex_indices);
+        indices.assign(raw.begin(), raw.end());
+      } else if (state.draw.index_format == IndexFormat::kUint32) {
+        indices = LoadArray<std::uint32_t>(pool_, state.vertex_indices);
+      } else {
+        throw std::runtime_error("VertexFetch received an unsupported index format");
       }
+
+      std::vector<std::uint16_t> expanded_indices_16;
+      bool needs_expansion = (state.draw.topology != PrimitiveTopology::kTriangleList ||
+                              state.primitive_restart_enable != 0 ||
+                              state.draw.index_format != IndexFormat::kUint16);
+
+      if (needs_expansion) {
+        // Expand topologies and restarts into a standard TriangleList
+        std::vector<std::uint32_t> expanded_indices = ExpandTopology(
+            indices, state.draw.topology, state.primitive_restart_enable != 0,
+            state.primitive_restart_index);
+
+        // Reallocate and update state.vertex_indices
+        expanded_indices_16.reserve(expanded_indices.size());
+        for (std::uint32_t val : expanded_indices) {
+          expanded_indices_16.push_back(static_cast<std::uint16_t>(val));
+        }
+        pool_.Release(state.vertex_indices);
+        state.vertex_indices = StoreNewArray(pool_, expanded_indices_16);
+
+        state.draw.topology = PrimitiveTopology::kTriangleList;
+        state.draw.index_count = expanded_indices_16.size();
+        state.draw.first_index = 0;
+      } else {
+        // Direct conversion without pool allocation/release to maintain exact telemetry
+        expanded_indices_16.reserve(indices.size());
+        for (std::uint32_t val : indices) {
+          expanded_indices_16.push_back(static_cast<std::uint16_t>(val));
+        }
+      }
+
+      const std::uint64_t index_end = state.draw.index_count;
       if (kReferenceUarch.index_segment_max_indices == 0 ||
           kReferenceUarch.index_segment_max_indices % 3 != 0 ||
           kReferenceUarch.post_transform_cache_slots == 0) {
@@ -226,7 +473,7 @@ void VertexFetch::Run() {
         const std::size_t segment_end = occurrence + segment_count;
         for (; occurrence < segment_end; ++occurrence) {
           const std::int64_t resolved =
-              static_cast<std::int64_t>(indices[occurrence]) +
+              static_cast<std::int64_t>(expanded_indices_16[occurrence]) +
               state.draw.base_vertex;
           if (resolved < 0 ||
               static_cast<std::uint64_t>(resolved) >

@@ -1,5 +1,5 @@
 // SLC (System Level Cache) controller implementation. PBE framebuffer stores
-// arrive through PixelDataMaster as a linear MemoryPool payload. With cache
+// arrive through PbeWriteBack as a linear MemoryPool payload. With cache
 // modeling enabled, each complete 128-byte line traverses the real tag/data
 // array and dirty lines are serialized as DramLineWrite records. With bypass
 // enabled the original linear payload is forwarded. Both paths complete at

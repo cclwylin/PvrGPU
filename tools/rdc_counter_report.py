@@ -19,12 +19,15 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import sys
 import time
+import struct
 from typing import Mapping, Sequence
 from urllib.parse import quote
+import zlib
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +36,7 @@ if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
 from counter_protocol import CounterProtocolError  # noqa: E402
+from counter_protocol import STANDARD_COUNTER_FIELDS  # noqa: E402
 from rdc.write_counter_txt import (  # noqa: E402
     counters_from_golden_report,
     counters_from_pvrgpu_jsonl,
@@ -43,7 +47,11 @@ from rdc.write_counter_txt import (  # noqa: E402
 EVENT_SCHEMA = "pvrgpu.rdc-counter-run.v1"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+DEQP_MANIFEST_ROW_RE = re.compile(
+    r"^\s*(\d+)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*$"
+)
 CANCEL_GRACE_SECONDS = 0.75
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 class BatchSetupError(RuntimeError):
@@ -52,6 +60,10 @@ class BatchSetupError(RuntimeError):
 
 class RunnerFailure(RuntimeError):
     """One backend failed for one RDC."""
+
+
+class PngCompareError(RuntimeError):
+    """Framebuffer PNG comparison failed or could not be decoded."""
 
 
 class BatchCancelled(RuntimeError):
@@ -66,6 +78,14 @@ class ManifestEntry:
     rdc_sha256: str
     width: int
     height: int
+
+
+@dataclass(frozen=True)
+class DeqpManifestRecord:
+    index: int
+    case: str
+    rdc_filename: str
+    status: str
 
 
 @dataclass(frozen=True)
@@ -88,11 +108,16 @@ class CaseResult:
     golden: str = "SKIP"
     pvrgpu: str = "SKIP"
     compare: str = "SKIP"
+    png: str = "SKIP"
     stage: str = "manifest-map"
     reason: str = ""
     golden_counter: str = ""
     pvrgpu_counter: str = ""
     diff: str = ""
+    golden_png: str = ""
+    pvrgpu_png: str = ""
+    png_diff: str = ""
+    golden_cache: str = ""
 
 
 def utc_now() -> str:
@@ -117,6 +142,256 @@ def atomic_write_text(path: Path, text: str) -> None:
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     temporary.write_text(text, encoding="utf-8")
     os.replace(temporary, path)
+
+
+def normalized_counter_text_from_file(path: Path) -> str:
+    """Read an existing strict 17-counter text file and normalize formatting."""
+
+    counters: dict[str, int] = {}
+    expected = set(STANDARD_COUNTER_FIELDS)
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "=" not in line:
+            raise CounterProtocolError(
+                f"{path}: counter line {line_number} is not name=value"
+            )
+        name, value_text = (part.strip() for part in line.split("=", 1))
+        if name not in expected:
+            raise CounterProtocolError(
+                f"{path}: unexpected counter field {name!r}"
+            )
+        if name in counters:
+            raise CounterProtocolError(
+                f"{path}: duplicate counter field {name!r}"
+            )
+        try:
+            value = int(value_text, 10)
+        except ValueError as exc:
+            raise CounterProtocolError(
+                f"{path}: counter field {name!r} is not an integer"
+            ) from exc
+        if value < 0:
+            raise CounterProtocolError(
+                f"{path}: counter field {name!r} is negative"
+            )
+        counters[name] = value
+    missing = [field for field in STANDARD_COUNTER_FIELDS if field not in counters]
+    if missing:
+        raise CounterProtocolError(
+            f"{path}: missing counter fields: {', '.join(missing)}"
+        )
+    return format_counter_text(counters)
+
+
+def paeth_predictor(left: int, above: int, upper_left: int) -> int:
+    prediction = left + above - upper_left
+    distance_left = abs(prediction - left)
+    distance_above = abs(prediction - above)
+    distance_upper_left = abs(prediction - upper_left)
+    if distance_left <= distance_above and distance_left <= distance_upper_left:
+        return left
+    if distance_above <= distance_upper_left:
+        return above
+    return upper_left
+
+
+def decode_rgba8_png(path: Path) -> tuple[int, int, bytes]:
+    """Decode a non-interlaced RGBA8 PNG into top-to-bottom RGBA bytes."""
+
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise PngCompareError(f"{path}: cannot read PNG: {exc}") from exc
+    if not data.startswith(PNG_SIGNATURE):
+        raise PngCompareError(f"{path}: invalid PNG signature")
+
+    offset = len(PNG_SIGNATURE)
+    ihdr: tuple[int, int, int, int, int, int, int] | None = None
+    idat_parts: list[bytes] = []
+    saw_iend = False
+    chunk_index = 0
+
+    while offset < len(data):
+        if offset + 12 > len(data):
+            raise PngCompareError(f"{path}: truncated PNG chunk header")
+        length = struct.unpack_from(">I", data, offset)[0]
+        chunk_type = data[offset + 4 : offset + 8]
+        payload_start = offset + 8
+        payload_end = payload_start + length
+        crc_end = payload_end + 4
+        if crc_end > len(data):
+            raise PngCompareError(f"{path}: truncated {chunk_type!r} chunk")
+
+        payload = data[payload_start:payload_end]
+        expected_crc = struct.unpack_from(">I", data, payload_end)[0]
+        actual_crc = zlib.crc32(chunk_type)
+        actual_crc = zlib.crc32(payload, actual_crc) & 0xFFFFFFFF
+        if actual_crc != expected_crc:
+            raise PngCompareError(f"{path}: bad {chunk_type!r} CRC")
+
+        if chunk_type == b"IHDR":
+            if chunk_index != 0:
+                raise PngCompareError(f"{path}: IHDR is not the first chunk")
+            if ihdr is not None:
+                raise PngCompareError(f"{path}: duplicate IHDR")
+            if length != 13:
+                raise PngCompareError(f"{path}: invalid IHDR length")
+            ihdr = struct.unpack(">IIBBBBB", payload)
+        elif chunk_type == b"IDAT":
+            if ihdr is None:
+                raise PngCompareError(f"{path}: IDAT precedes IHDR")
+            idat_parts.append(payload)
+        elif chunk_type == b"IEND":
+            if length != 0:
+                raise PngCompareError(f"{path}: invalid IEND length")
+            saw_iend = True
+            offset = crc_end
+            break
+
+        offset = crc_end
+        chunk_index += 1
+
+    if ihdr is None:
+        raise PngCompareError(f"{path}: missing IHDR")
+    if not idat_parts:
+        raise PngCompareError(f"{path}: missing IDAT")
+    if not saw_iend:
+        raise PngCompareError(f"{path}: missing IEND")
+    if offset != len(data):
+        raise PngCompareError(f"{path}: trailing bytes after IEND")
+
+    width, height, bit_depth, color_type, compression, filtering, interlace = ihdr
+    if bit_depth != 8:
+        raise PngCompareError(f"{path}: expected 8-bit channels, got {bit_depth}")
+    if color_type != 6:
+        raise PngCompareError(f"{path}: expected RGBA color type, got {color_type}")
+    if compression != 0:
+        raise PngCompareError(f"{path}: unsupported compression method")
+    if filtering != 0:
+        raise PngCompareError(f"{path}: unsupported PNG filtering method")
+    if interlace != 0:
+        raise PngCompareError(f"{path}: interlaced PNG is not supported")
+
+    try:
+        decompressor = zlib.decompressobj()
+        filtered = decompressor.decompress(b"".join(idat_parts))
+        filtered += decompressor.flush()
+    except zlib.error as exc:
+        raise PngCompareError(f"{path}: invalid zlib stream: {exc}") from exc
+    if not decompressor.eof:
+        raise PngCompareError(f"{path}: incomplete zlib stream")
+    if decompressor.unused_data:
+        raise PngCompareError(f"{path}: trailing zlib stream data")
+    if decompressor.unconsumed_tail:
+        raise PngCompareError(f"{path}: unconsumed zlib input")
+
+    bytes_per_pixel = 4
+    row_bytes = width * bytes_per_pixel
+    expected_filtered_bytes = height * (row_bytes + 1)
+    if len(filtered) != expected_filtered_bytes:
+        raise PngCompareError(
+            f"{path}: expected {expected_filtered_bytes} filtered bytes, "
+            f"got {len(filtered)}"
+        )
+
+    pixels = bytearray()
+    previous_row = bytearray(row_bytes)
+    cursor = 0
+    for row_index in range(height):
+        filter_type = filtered[cursor]
+        cursor += 1
+        encoded = filtered[cursor : cursor + row_bytes]
+        cursor += row_bytes
+        reconstructed = bytearray(row_bytes)
+
+        for byte_index, encoded_byte in enumerate(encoded):
+            left = (
+                reconstructed[byte_index - bytes_per_pixel]
+                if byte_index >= bytes_per_pixel
+                else 0
+            )
+            above = previous_row[byte_index]
+            upper_left = (
+                previous_row[byte_index - bytes_per_pixel]
+                if byte_index >= bytes_per_pixel
+                else 0
+            )
+
+            if filter_type == 0:
+                predictor = 0
+            elif filter_type == 1:
+                predictor = left
+            elif filter_type == 2:
+                predictor = above
+            elif filter_type == 3:
+                predictor = (left + above) // 2
+            elif filter_type == 4:
+                predictor = paeth_predictor(left, above, upper_left)
+            else:
+                raise PngCompareError(
+                    f"{path}: row {row_index} has invalid filter {filter_type}"
+                )
+            reconstructed[byte_index] = (encoded_byte + predictor) & 0xFF
+
+        pixels.extend(reconstructed)
+        previous_row = reconstructed
+
+    return width, height, bytes(pixels)
+
+
+def compare_rgba8_pngs(golden_path: Path, pvrgpu_path: Path) -> tuple[bool, str]:
+    """Return exact decoded-RGBA framebuffer comparison status and summary."""
+
+    golden_width, golden_height, golden_pixels = decode_rgba8_png(golden_path)
+    pvrgpu_width, pvrgpu_height, pvrgpu_pixels = decode_rgba8_png(pvrgpu_path)
+    if (golden_width, golden_height) != (pvrgpu_width, pvrgpu_height):
+        return (
+            False,
+            "PNG dimension mismatch: "
+            f"golden={golden_width}x{golden_height}, "
+            f"pvrgpu={pvrgpu_width}x{pvrgpu_height}",
+        )
+
+    differing_pixels = 0
+    max_channel_delta = 0
+    first_difference: tuple[int, int, bytes, bytes] | None = None
+    for pixel in range(golden_width * golden_height):
+        offset = pixel * 4
+        golden_pixel = golden_pixels[offset : offset + 4]
+        pvrgpu_pixel = pvrgpu_pixels[offset : offset + 4]
+        if golden_pixel == pvrgpu_pixel:
+            continue
+        differing_pixels += 1
+        max_channel_delta = max(
+            max_channel_delta,
+            *(abs(first - second) for first, second in zip(golden_pixel, pvrgpu_pixel)),
+        )
+        if first_difference is None:
+            first_difference = (
+                pixel % golden_width,
+                pixel // golden_width,
+                golden_pixel,
+                pvrgpu_pixel,
+            )
+
+    if first_difference is not None:
+        x, y, golden_pixel, pvrgpu_pixel = first_difference
+        return (
+            False,
+            f"RGBA_MISMATCH pixels={differing_pixels} "
+            f"max_channel_delta={max_channel_delta} first=({x},{y}) "
+            f"golden={tuple(golden_pixel)} pvrgpu={tuple(pvrgpu_pixel)}",
+        )
+
+    return (
+        True,
+        f"RGBA_MATCH size={golden_width}x{golden_height} "
+        "differing_pixels=0 max_channel_delta=0",
+    )
 
 
 def load_manifest(path: Path) -> dict[str, ManifestEntry]:
@@ -173,6 +448,85 @@ def load_manifest(path: Path) -> dict[str, ManifestEntry]:
     if not by_digest:
         raise BatchSetupError(f"Manifest contains no RDC rows: {path}")
     return by_digest
+
+
+def parse_deqp_manifest(path: Path) -> dict[str, DeqpManifestRecord]:
+    records: dict[str, DeqpManifestRecord] = {}
+    if not path.is_file():
+        return records
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            match = DEQP_MANIFEST_ROW_RE.match(line)
+            if match is None:
+                continue
+            index_text, case, rdc_filename, status = match.groups()
+            rdc_filename = rdc_filename.strip()
+            if not rdc_filename or rdc_filename == "(none)":
+                continue
+            try:
+                index = int(index_text)
+            except ValueError:
+                continue
+            records[rdc_filename] = DeqpManifestRecord(
+                index=index,
+                case=case.strip(),
+                rdc_filename=rdc_filename,
+                status=status.strip(),
+            )
+    except OSError as exc:
+        raise BatchSetupError(f"Cannot read dEQP manifest {path}: {exc}") from exc
+    return records
+
+
+def nearest_recorder_dir(path: Path) -> Path | None:
+    current = path.parent
+    while current != current.parent:
+        if current.name == "recorder":
+            return current
+        current = current.parent
+    return None
+
+
+def derive_deqp_group(root: Path, path: Path, recorder_dir: Path | None) -> str:
+    if recorder_dir is not None:
+        try:
+            relative_recorder = recorder_dir.relative_to(root).parts
+            if len(relative_recorder) >= 2:
+                return relative_recorder[-2].rstrip(".")
+        except ValueError:
+            pass
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        parts = path.parts
+    if len(parts) >= 2:
+        return parts[-2].rstrip(".")
+    return "unknown"
+
+
+def derive_case_from_path(root: Path, path: Path) -> tuple[str, int | None]:
+    recorder_dir = nearest_recorder_dir(path)
+    if recorder_dir is not None:
+        records = parse_deqp_manifest(recorder_dir / "manifest.txt")
+        record = records.get(path.name)
+        if record is not None and record.case:
+            return record.case, record.index
+
+    group = derive_deqp_group(root, path, recorder_dir)
+    stem = path.stem
+    if stem.endswith("_capture"):
+        stem = stem[: -len("_capture")]
+    stem = re.sub(r"^\d+_", "", stem).strip("_")
+    if group != "unknown" and stem:
+        return f"{group}.{stem.replace('_', '.')}", None
+    return stem or path.stem, None
+
+
+def sanitize_runner_case(value: str, fallback: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._-")
+    return cleaned[:128] or fallback
 
 
 def discover_rdcs(root: Path, manifest: Mapping[str, ManifestEntry]) -> list[DiscoveredRdc]:
@@ -250,24 +604,31 @@ class DirectoryCounterRun:
         output_root: Path,
         manifest_path: Path,
         golden_runner: Path,
-        pvrgpu_runner: Path,
-        require_mesa_ingest: bool,
+        pvrgpu_runner: Path | None,
         timeout_seconds: float,
+        require_manifest: bool,
         events: EventSink,
     ) -> None:
         self.input_root = input_root.expanduser().resolve()
         self.output_root = output_root.expanduser().resolve()
         self.manifest_path = manifest_path.expanduser().resolve()
         self.golden_runner = golden_runner.expanduser().resolve()
-        self.pvrgpu_runner = pvrgpu_runner.expanduser().resolve()
-        self.require_mesa_ingest = require_mesa_ingest
+        self.pvrgpu_runner = (
+            pvrgpu_runner.expanduser().resolve()
+            if pvrgpu_runner is not None
+            else None
+        )
         self.timeout_seconds = timeout_seconds
+        self.require_manifest = require_manifest
         self.events = events
         self.cancel_requested = False
         self.cancel_requested_at: float | None = None
         self.active_process: subprocess.Popen[bytes] | None = None
         self.run_root: Path | None = None
         self.started_at = utc_now()
+        self.golden_cache_dir = self.output_root / "golden-cache"
+        self.golden_counter_cache_index: dict[str, Path] = {}
+        self.golden_png_cache_index: dict[str, Path] = {}
 
     def request_cancel(self) -> None:
         if not self.cancel_requested:
@@ -383,14 +744,219 @@ class DirectoryCounterRun:
             golden=result.golden,
             pvrgpu=result.pvrgpu,
             compare=result.compare,
+            png=result.png,
         )
         return result
 
-    def _stage_input(self, item: DiscoveredRdc, case_root: Path) -> Path:
-        assert item.manifest is not None
+    @staticmethod
+    def _valid_counter_text_path(path: Path) -> bool:
+        try:
+            normalized_counter_text_from_file(path)
+        except (CounterProtocolError, OSError, UnicodeError):
+            return False
+        return True
+
+    @staticmethod
+    def _valid_png_path(path: Path) -> bool:
+        try:
+            decode_rgba8_png(path)
+        except (PngCompareError, OSError, ValueError):
+            return False
+        return True
+
+    @staticmethod
+    def _first_valid_png(paths: Sequence[Path]) -> Path | None:
+        for path in paths:
+            if path.is_file() and DirectoryCounterRun._valid_png_path(path):
+                return path
+        return None
+
+    @staticmethod
+    def _find_golden_png(golden_dir: Path) -> Path | None:
+        preferred = sorted(golden_dir.glob("player-output/*/png/*_replay.png"))
+        fallback = sorted(golden_dir.rglob("*.png"))
+        return DirectoryCounterRun._first_valid_png([*preferred, *fallback])
+
+    @staticmethod
+    def _find_pvrgpu_png(pvrgpu_dir: Path) -> Path | None:
+        jsonl_path = pvrgpu_dir / "stdout.jsonl"
+        candidates: list[Path] = []
+        if jsonl_path.is_file():
+            try:
+                for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+                    stripped = line.lstrip()
+                    if not stripped.startswith("{"):
+                        continue
+                    try:
+                        message = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    artifact = message.get("artifact_png")
+                    if isinstance(artifact, str) and artifact.strip():
+                        artifact_path = Path(artifact)
+                        if not artifact_path.is_absolute():
+                            artifact_path = (pvrgpu_dir / artifact_path).resolve()
+                        candidates.append(artifact_path)
+            except (OSError, UnicodeError):
+                pass
+        candidates.extend(sorted((pvrgpu_dir / "png").glob("*.png")))
+        # Deliberately do not fall back to pvrgpu/player-png here: that is the
+        # RenderDoc/Mesa replay image, while this report is checking the
+        # framebuffer emitted by the PvrGPU SystemC/model backend.
+        return DirectoryCounterRun._first_valid_png(candidates)
+
+    @staticmethod
+    def _copy_png_artifact(source: Path, destination: Path) -> Path:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+        return destination
+
+    @staticmethod
+    def _relative_artifact_path(case_root: Path, path: Path) -> str:
+        try:
+            return path.relative_to(case_root).as_posix()
+        except ValueError:
+            return str(path)
+
+    def _build_golden_counter_cache_index(self) -> dict[str, Path]:
+        index: dict[str, Path] = {}
+
+        if self.golden_cache_dir.is_dir():
+            for counter_path in self.golden_cache_dir.glob("*/counter_golden.txt"):
+                digest = counter_path.parent.name.lower()
+                if (
+                    SHA256_RE.fullmatch(digest) is not None
+                    and digest not in index
+                    and self._valid_counter_text_path(counter_path)
+                ):
+                    index[digest] = counter_path
+                    cached_png = counter_path.parent / "golden.png"
+                    if self._valid_png_path(cached_png):
+                        self.golden_png_cache_index[digest] = cached_png
+
+        for run_root in sorted(self.output_root.glob("rdc-counter-*"), reverse=True):
+            cases_root = run_root / "cases"
+            if not cases_root.is_dir():
+                continue
+            for result_path in sorted(cases_root.glob("*/result.json")):
+                try:
+                    result_data = json.loads(result_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(result_data, dict):
+                    continue
+                digest = str(result_data.get("sha256", "")).lower()
+                if digest in index or SHA256_RE.fullmatch(digest) is None:
+                    continue
+                if result_data.get("golden") not in {"PASS", "CACHED"}:
+                    continue
+                counter_name = str(result_data.get("golden_counter", "")).strip()
+                candidates = []
+                if counter_name:
+                    candidates.append(result_path.parent / counter_name)
+                candidates.extend(
+                    (
+                        result_path.parent / "counter_golden.txt",
+                        result_path.parent / "counter.txt",
+                        result_path.parent / "golden" / "counter.txt",
+                    )
+                )
+                for candidate in candidates:
+                    if candidate.is_file() and self._valid_counter_text_path(candidate):
+                        index[digest] = candidate
+                        if digest not in self.golden_png_cache_index:
+                            golden_png = self._find_golden_png(result_path.parent / "golden")
+                            if golden_png is not None:
+                                self.golden_png_cache_index[digest] = golden_png
+                        break
+        return index
+
+    def _lookup_golden_counter_cache(self, sha256: str) -> Path | None:
+        cached = self.golden_counter_cache_index.get(sha256)
+        if cached is not None and self._valid_counter_text_path(cached):
+            return cached
+        self.golden_counter_cache_index.pop(sha256, None)
+        stable = self.golden_cache_dir / sha256 / "counter_golden.txt"
+        if stable.is_file() and self._valid_counter_text_path(stable):
+            self.golden_counter_cache_index[sha256] = stable
+            return stable
+        return None
+
+    def _lookup_golden_png_cache(self, sha256: str) -> Path | None:
+        cached = self.golden_png_cache_index.get(sha256)
+        if cached is not None and self._valid_png_path(cached):
+            return cached
+        self.golden_png_cache_index.pop(sha256, None)
+        stable = self.golden_cache_dir / sha256 / "golden.png"
+        if self._valid_png_path(stable):
+            self.golden_png_cache_index[sha256] = stable
+            return stable
+        return None
+
+    def _store_golden_counter_cache(
+        self,
+        *,
+        sha256: str,
+        counter_text: str,
+        source_counter: Path,
+        source_png: Path | None = None,
+    ) -> None:
+        cache_dir = self.golden_cache_dir / sha256
+        counter_path = cache_dir / "counter_golden.txt"
+        atomic_write_text(counter_path, counter_text)
+        png_path = cache_dir / "golden.png"
+        cached_png = ""
+        if source_png is not None and self._valid_png_path(source_png):
+            self._copy_png_artifact(source_png, png_path)
+            cached_png = str(png_path)
+            self.golden_png_cache_index[sha256] = png_path
+        atomic_write_text(
+            cache_dir / "metadata.json",
+            json.dumps(
+                {
+                    "schema": EVENT_SCHEMA,
+                    "type": "golden_counter_cache",
+                    "rdc_sha256": sha256,
+                    "source_counter": str(source_counter),
+                    "source_png": str(source_png) if source_png is not None else "",
+                    "cached_png": cached_png,
+                    "created_at": utc_now(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+        )
+        self.golden_counter_cache_index[sha256] = counter_path
+
+    def _entry_for_item(self, item: DiscoveredRdc) -> tuple[ManifestEntry | None, bool]:
+        if item.manifest is not None:
+            return item.manifest, False
+        if self.require_manifest:
+            return None, False
+
+        derived_case, derived_index = derive_case_from_path(self.input_root, item.path)
+        safe_case = sanitize_runner_case(derived_case, item.path.stem)
+        return (
+            ManifestEntry(
+                index=derived_index or 0,
+                case=safe_case,
+                rdc_path=item.relative_path,
+                rdc_sha256=item.sha256,
+                width=1,
+                height=1,
+            ),
+            True,
+        )
+
+    def _stage_input(
+        self, item: DiscoveredRdc, case_root: Path, entry: ManifestEntry
+    ) -> Path:
         input_dir = case_root / "input"
         input_dir.mkdir(parents=True, exist_ok=True)
-        staged = input_dir / Path(item.manifest.rdc_path).name
+        staged = input_dir / Path(entry.rdc_path).name
         try:
             staged.symlink_to(item.path.resolve())
         except OSError as exc:
@@ -398,7 +964,7 @@ class DirectoryCounterRun:
         return staged
 
     def _run_one(self, item: DiscoveredRdc, index: int, total: int) -> CaseResult:
-        entry = item.manifest
+        entry, derived_metadata = self._entry_for_item(item)
         label = entry.case if entry is not None else item.path.stem
         case_dir_name = f"{index:04d}-{safe_name(label)}-{item.sha256[:8]}"
         assert self.run_root is not None
@@ -409,7 +975,11 @@ class DirectoryCounterRun:
             rdc=item.relative_path,
             sha256=item.sha256,
             case=entry.case if entry is not None else "UNMAPPED",
-            manifest_index=entry.index if entry is not None else None,
+            manifest_index=(
+                entry.index
+                if entry is not None and not derived_metadata and entry.index > 0
+                else None
+            ),
             artifact_dir=f"cases/{case_dir_name}",
         )
 
@@ -429,7 +999,7 @@ class DirectoryCounterRun:
             return self._store_case_result(result, case_root)
 
         try:
-            staged_rdc = self._stage_input(item, case_root)
+            staged_rdc = self._stage_input(item, case_root, entry)
         except RunnerFailure as exc:
             result.stage = "input"
             result.reason = str(exc)
@@ -449,42 +1019,86 @@ class DirectoryCounterRun:
             str(entry.height),
         ]
 
-        golden_dir = case_root / "golden"
-        golden_dir.mkdir()
         result.stage = "golden"
         self._emit_stage(index, "golden", "RUNNING")
-        try:
-            self._run_command(
-                [
-                    *self._runner_argv(self.golden_runner),
-                    *runner_arguments,
-                    "--outdir",
-                    str(golden_dir),
-                ],
-                stdout_path=golden_dir / "stdout.log",
-                stderr_path=golden_dir / "stderr.log",
-                environment=os.environ,
-            )
-            golden_report = golden_dir / "Report.md"
-            counters = counters_from_golden_report(golden_report)
-            golden_counter = case_root / "counter_golden.txt"
-            atomic_write_text(golden_counter, format_counter_text(counters))
-            result.golden = "PASS"
-            result.golden_counter = golden_counter.name
-            self._emit_stage(index, "golden", "PASS")
-        except BatchCancelled as exc:
-            result.stage = "cancelled"
-            result.reason = str(exc)
-            self._emit_stage(index, "golden", "FAIL")
-            self._emit_stage(index, "pvrgpu", "SKIP")
-            self._emit_stage(index, "compare", "SKIP")
-            return self._store_case_result(result, case_root)
-        except (RunnerFailure, CounterProtocolError, OSError, UnicodeError) as exc:
-            result.reason = f"Golden failed: {exc}"
-            self._emit_stage(index, "golden", "FAIL")
-            self._emit_stage(index, "pvrgpu", "SKIP")
-            self._emit_stage(index, "compare", "SKIP")
-            return self._store_case_result(result, case_root)
+        golden_dir = case_root / "golden"
+        golden_dir.mkdir()
+        golden_counter = case_root / "counter_golden.txt"
+        cached_golden_counter = self._lookup_golden_counter_cache(item.sha256)
+        if cached_golden_counter is not None:
+            try:
+                counter_text = normalized_counter_text_from_file(cached_golden_counter)
+                atomic_write_text(golden_counter, counter_text)
+                result.golden = "CACHED"
+                result.golden_counter = golden_counter.name
+                result.golden_cache = str(cached_golden_counter)
+                cached_golden_png = self._lookup_golden_png_cache(item.sha256)
+                if cached_golden_png is not None:
+                    case_golden_png = self._copy_png_artifact(
+                        cached_golden_png, case_root / "golden.png"
+                    )
+                    result.golden_png = self._relative_artifact_path(
+                        case_root, case_golden_png
+                    )
+                atomic_write_text(
+                    golden_dir / "cache-hit.txt",
+                    "Golden counter cache hit; llvmpipe replay was skipped.\n"
+                    f"source={cached_golden_counter}\n",
+                )
+                self._emit_stage(index, "golden", "CACHED")
+            except (CounterProtocolError, OSError, UnicodeError):
+                self.golden_counter_cache_index.pop(item.sha256, None)
+                cached_golden_counter = None
+
+        if cached_golden_counter is None:
+            try:
+                self._run_command(
+                    [
+                        *self._runner_argv(self.golden_runner),
+                        *runner_arguments,
+                        "--outdir",
+                        str(golden_dir),
+                    ],
+                    stdout_path=golden_dir / "stdout.log",
+                    stderr_path=golden_dir / "stderr.log",
+                    environment=os.environ,
+                )
+                golden_report = golden_dir / "Report.md"
+                counters = counters_from_golden_report(golden_report)
+                counter_text = format_counter_text(counters)
+                atomic_write_text(golden_counter, counter_text)
+                source_golden_png = self._find_golden_png(golden_dir)
+                case_golden_png: Path | None = None
+                if source_golden_png is not None:
+                    case_golden_png = self._copy_png_artifact(
+                        source_golden_png, case_root / "golden.png"
+                    )
+                    result.golden_png = self._relative_artifact_path(
+                        case_root, case_golden_png
+                    )
+                self._store_golden_counter_cache(
+                    sha256=item.sha256,
+                    counter_text=counter_text,
+                    source_counter=golden_counter,
+                    source_png=case_golden_png,
+                )
+                result.golden = "PASS"
+                result.golden_counter = golden_counter.name
+                self._emit_stage(index, "golden", "PASS")
+            except BatchCancelled as exc:
+                result.stage = "cancelled"
+                result.reason = str(exc)
+                self._emit_stage(index, "golden", "FAIL")
+                self._emit_stage(index, "pvrgpu", "SKIP")
+                self._emit_stage(index, "compare", "SKIP")
+                return self._store_case_result(result, case_root)
+            except (RunnerFailure, CounterProtocolError, OSError, UnicodeError) as exc:
+                result.reason = f"Golden failed: {exc}"
+                result.golden = "FAIL"
+                self._emit_stage(index, "golden", "FAIL")
+                self._emit_stage(index, "pvrgpu", "SKIP")
+                self._emit_stage(index, "compare", "SKIP")
+                return self._store_case_result(result, case_root)
 
         pvrgpu_dir = case_root / "pvrgpu"
         (pvrgpu_dir / "png").mkdir(parents=True)
@@ -492,9 +1106,7 @@ class DirectoryCounterRun:
         self._emit_stage(index, "pvrgpu", "RUNNING")
         pvrgpu_environment = dict(os.environ)
         pvrgpu_environment["PVRGPU_RDC_MANIFEST"] = str(self.manifest_path)
-        pvrgpu_environment["PVRGPU_RDC_POC_ARTIFACT_DIR"] = str(
-            pvrgpu_dir / "mesa-poc"
-        )
+        assert self.pvrgpu_runner is not None
         try:
             self._run_command(
                 [
@@ -509,11 +1121,13 @@ class DirectoryCounterRun:
             )
             counters = counters_from_pvrgpu_jsonl(
                 pvrgpu_dir / "stdout.jsonl",
-                require_mesa_ingest=self.require_mesa_ingest,
                 expected_rdc_sha256=item.sha256,
             )
             pvrgpu_counter = case_root / "counter_pvrgpu.txt"
             atomic_write_text(pvrgpu_counter, format_counter_text(counters))
+            pvrgpu_png = self._find_pvrgpu_png(pvrgpu_dir)
+            if pvrgpu_png is not None:
+                result.pvrgpu_png = self._relative_artifact_path(case_root, pvrgpu_png)
             result.pvrgpu = "PASS"
             result.pvrgpu_counter = pvrgpu_counter.name
             self._emit_stage(index, "pvrgpu", "PASS")
@@ -525,6 +1139,7 @@ class DirectoryCounterRun:
             return self._store_case_result(result, case_root)
         except (RunnerFailure, CounterProtocolError, OSError, UnicodeError) as exc:
             result.reason = f"PvrGPU failed: {exc}"
+            result.pvrgpu = "FAIL"
             self._emit_stage(index, "pvrgpu", "FAIL")
             self._emit_stage(index, "compare", "SKIP")
             return self._store_case_result(result, case_root)
@@ -533,6 +1148,7 @@ class DirectoryCounterRun:
         self._emit_stage(index, "compare", "RUNNING")
         golden_text = (case_root / result.golden_counter).read_text(encoding="utf-8")
         pvrgpu_text = (case_root / result.pvrgpu_counter).read_text(encoding="utf-8")
+        failure_reasons: list[str] = []
         if golden_text != pvrgpu_text:
             diff_path = case_root / "counter_diff.txt"
             diff_text = "".join(
@@ -546,14 +1162,85 @@ class DirectoryCounterRun:
             atomic_write_text(diff_path, diff_text)
             result.compare = "FAIL"
             result.diff = diff_path.name
-            result.reason = "17-counter exact comparison mismatch"
+            failure_reasons.append("17-counter exact comparison mismatch")
             self._emit_stage(index, "compare", "FAIL")
-            return self._store_case_result(result, case_root)
+        else:
+            result.compare = "PASS"
+            self._emit_stage(index, "compare", "PASS")
 
-        result.status = "PASS"
-        result.compare = "PASS"
-        result.reason = ""
-        self._emit_stage(index, "compare", "PASS")
+        result.stage = "png"
+        self._emit_stage(index, "png", "RUNNING")
+        golden_png_path = (
+            case_root / result.golden_png if result.golden_png else None
+        )
+        pvrgpu_png_path = (
+            case_root / result.pvrgpu_png if result.pvrgpu_png else None
+        )
+        if golden_png_path is None and pvrgpu_png_path is None:
+            result.png = "SKIP"
+            self._emit_stage(index, "png", "SKIP")
+        elif golden_png_path is None or pvrgpu_png_path is None:
+            result.png = "FAIL"
+            missing_side = "Golden" if golden_png_path is None else "PvrGPU"
+            existing_side = "PvrGPU" if golden_png_path is None else "Golden"
+            message = (
+                f"{missing_side} PNG output is missing while {existing_side} "
+                "wrote a framebuffer PNG"
+            )
+            png_diff_path = case_root / "png_diff.txt"
+            atomic_write_text(
+                png_diff_path,
+                "\n".join(
+                    (
+                        "PNG framebuffer comparison: FAIL",
+                        f"reason={message}",
+                        f"golden_png={result.golden_png}",
+                        f"pvrgpu_png={result.pvrgpu_png}",
+                    )
+                )
+                + "\n",
+            )
+            result.png_diff = png_diff_path.name
+            failure_reasons.append(message)
+            self._emit_stage(index, "png", "FAIL")
+        else:
+            try:
+                png_match, png_message = compare_rgba8_pngs(
+                    golden_png_path, pvrgpu_png_path
+                )
+            except PngCompareError as exc:
+                png_match = False
+                png_message = f"PNG decode failed: {exc}"
+            if png_match:
+                result.png = "PASS"
+                self._emit_stage(index, "png", "PASS")
+            else:
+                png_diff_path = case_root / "png_diff.txt"
+                atomic_write_text(
+                    png_diff_path,
+                    "\n".join(
+                        (
+                            "PNG framebuffer comparison: FAIL",
+                            f"reason={png_message}",
+                            f"golden_png={result.golden_png}",
+                            f"pvrgpu_png={result.pvrgpu_png}",
+                        )
+                    )
+                    + "\n",
+                )
+                result.png = "FAIL"
+                result.png_diff = png_diff_path.name
+                failure_reasons.append(png_message)
+                self._emit_stage(index, "png", "FAIL")
+
+        if failure_reasons:
+            result.status = "FAIL"
+            result.stage = "compare" if result.compare == "FAIL" else "png"
+            result.reason = "; ".join(failure_reasons)
+        else:
+            result.status = "PASS"
+            result.stage = "compare"
+            result.reason = ""
         return self._store_case_result(result, case_root)
 
     @staticmethod
@@ -597,7 +1284,6 @@ class DirectoryCounterRun:
             "failed": failed,
             "cancelled": cancelled,
             "reason": global_reason,
-            "require_mesa_ingest": self.require_mesa_ingest,
             "results": [asdict(result) for result in results],
         }
         atomic_write_text(
@@ -615,7 +1301,7 @@ class DirectoryCounterRun:
             f"- PASS: **{passed}**",
             f"- FAIL: **{failed}**",
             "- Comparison: normalized 17-counter exact text comparison",
-            "- PNG comparison: not used",
+            "- PNG comparison: decoded RGBA exact comparison when either side writes a framebuffer PNG",
         ]
         if global_reason:
             lines.append(f"- Note: {self._markdown_text(global_reason)}")
@@ -624,8 +1310,8 @@ class DirectoryCounterRun:
                 "",
                 "## Results",
                 "",
-                "| # | RDC | Case | Golden | PvrGPU | Result |",
-                "|---:|---|---|---|---|---|",
+                "| # | RDC | Case | Golden | PvrGPU | Counter | PNG | Result |",
+                "|---:|---|---|---|---|---|---|---|",
             ]
         )
         for result in results:
@@ -635,10 +1321,23 @@ class DirectoryCounterRun:
                 golden_cell += " " + self._markdown_link(
                     "counter", f"{artifact}/{result.golden_counter}"
                 )
+            if result.golden_png:
+                golden_cell += " " + self._markdown_link(
+                    "png", f"{artifact}/{result.golden_png}"
+                )
             pvrgpu_cell = result.pvrgpu
             if result.pvrgpu_counter:
                 pvrgpu_cell += " " + self._markdown_link(
                     "counter", f"{artifact}/{result.pvrgpu_counter}"
+                )
+            if result.pvrgpu_png:
+                pvrgpu_cell += " " + self._markdown_link(
+                    "png", f"{artifact}/{result.pvrgpu_png}"
+                )
+            png_cell = result.png
+            if result.png_diff:
+                png_cell += " " + self._markdown_link(
+                    "diff", f"{artifact}/{result.png_diff}"
                 )
             result_cell = f"**{result.status}**"
             if result.diff:
@@ -654,6 +1353,8 @@ class DirectoryCounterRun:
                         self._markdown_text(result.case),
                         golden_cell,
                         pvrgpu_cell,
+                        result.compare,
+                        png_cell,
                         result_cell,
                     )
                 )
@@ -670,6 +1371,8 @@ class DirectoryCounterRun:
                         "",
                         f"- Stage: `{self._markdown_text(result.stage)}`",
                         f"- Reason: {self._markdown_text(result.reason or 'Unspecified failure')}",
+                        f"- Counter compare: `{self._markdown_text(result.compare)}`",
+                        f"- PNG compare: `{self._markdown_text(result.png)}`",
                         "- Artifacts: "
                         + self._markdown_link(
                             "result.json", f"{result.artifact_dir}/result.json"
@@ -691,17 +1394,33 @@ class DirectoryCounterRun:
             )
         for label, runner in (
             ("Golden", self.golden_runner),
-            ("PvrGPU", self.pvrgpu_runner),
         ):
             if not runner.is_file():
                 raise BatchSetupError(f"{label} runner does not exist: {runner}")
             if runner.suffix.lower() != ".sh" and not os.access(runner, os.X_OK):
                 raise BatchSetupError(f"{label} runner is not executable: {runner}")
+        if self.pvrgpu_runner is None:
+            raise BatchSetupError(
+                "PvrGPU runner must be specified explicitly; the legacy "
+                "trace-capsule runner has been removed."
+            )
+        if not self.pvrgpu_runner.is_file():
+            raise BatchSetupError(
+                f"PvrGPU runner does not exist: {self.pvrgpu_runner}"
+            )
+        if self.pvrgpu_runner.suffix.lower() != ".sh" and not os.access(
+            self.pvrgpu_runner, os.X_OK
+        ):
+            raise BatchSetupError(
+                f"PvrGPU runner is not executable: {self.pvrgpu_runner}"
+            )
 
         manifest = load_manifest(self.manifest_path)
         discovered = discover_rdcs(self.input_root, manifest)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
         self.output_root.mkdir(parents=True, exist_ok=True)
+        self.golden_png_cache_index = {}
+        self.golden_counter_cache_index = self._build_golden_counter_cache_index()
         self.run_root = self.output_root / f"rdc-counter-{stamp}-{os.getpid()}"
         self.run_root.mkdir(parents=False, exist_ok=False)
         self.events.emit(
@@ -723,7 +1442,8 @@ class DirectoryCounterRun:
 
         if self.cancel_requested and len(results) < len(discovered):
             for index, item in enumerate(discovered[len(results) :], start=len(results) + 1):
-                label = item.manifest.case if item.manifest else "UNMAPPED"
+                entry, derived_metadata = self._entry_for_item(item)
+                label = entry.case if entry is not None else "UNMAPPED"
                 case_dir_name = f"{index:04d}-{safe_name(label)}-{item.sha256[:8]}"
                 case_root = self.run_root / "cases" / case_dir_name
                 case_root.mkdir(parents=True, exist_ok=True)
@@ -732,7 +1452,11 @@ class DirectoryCounterRun:
                     rdc=item.relative_path,
                     sha256=item.sha256,
                     case=label,
-                    manifest_index=item.manifest.index if item.manifest else None,
+                    manifest_index=(
+                        entry.index
+                        if entry is not None and not derived_metadata and entry.index > 0
+                        else None
+                    ),
                     artifact_dir=f"cases/{case_dir_name}",
                     stage="cancelled",
                     reason="Cancelled before execution",
@@ -803,19 +1527,26 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pvrgpu-runner",
         type=Path,
-        default=PROJECT_ROOT / "scripts" / "run-rdc-pvrgpu-poc.sh",
-    )
-    parser.add_argument(
-        "--require-mesa-ingest",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="require formal RenderDoc+Mesa ingest evidence in PvrGPU JSONL",
+        default=None,
+        required=True,
+        help=(
+            "single-RDC PvrGPU runner; no default trace-capsule runner is "
+            "provided"
+        ),
     )
     parser.add_argument(
         "--timeout-seconds",
         type=float,
         default=0,
         help="per-runner timeout; zero disables the timeout",
+    )
+    parser.add_argument(
+        "--require-manifest",
+        action="store_true",
+        help=(
+            "fail unmapped RDCs instead of deriving replay metadata from the "
+            "RDC path or dEQP recorder manifest"
+        ),
     )
     parser.add_argument(
         "--json",
@@ -835,8 +1566,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         manifest_path=options.manifest,
         golden_runner=options.golden_runner,
         pvrgpu_runner=options.pvrgpu_runner,
-        require_mesa_ingest=options.require_mesa_ingest,
         timeout_seconds=options.timeout_seconds,
+        require_manifest=options.require_manifest,
         events=events,
     )
 

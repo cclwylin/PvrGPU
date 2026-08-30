@@ -1,0 +1,82 @@
+/* SPDX-License-Identifier: MIT */
+#ifndef PVRGPU_CONTEXT_H
+#define PVRGPU_CONTEXT_H
+
+#include "pvrgpu_state.h"
+
+#include "pipe/p_context.h"
+#include "pipe/p_state.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+
+struct pvrgpu_context {
+   struct pipe_context base;
+   struct pipe_framebuffer_state framebuffer;
+   struct pvrgpu_blend_state *blend;
+   struct pvrgpu_depth_stencil_alpha_state *dsa;
+   struct pvrgpu_rasterizer_state *rasterizer;
+   struct pvrgpu_sampler_state *samplers[MESA_SHADER_MESH_STAGES]
+                                      [PIPE_MAX_SAMPLERS];
+   unsigned num_samplers[MESA_SHADER_MESH_STAGES];
+   struct pipe_sampler_view *sampler_views[MESA_SHADER_MESH_STAGES]
+                                            [PIPE_MAX_SHADER_SAMPLER_VIEWS];
+   unsigned num_sampler_views[MESA_SHADER_MESH_STAGES];
+   struct pipe_constant_buffer constant_buffers[MESA_SHADER_MESH_STAGES]
+                                                [PIPE_MAX_CONSTANT_BUFFERS];
+   unsigned num_constant_buffers[MESA_SHADER_MESH_STAGES];
+   struct pvrgpu_shader_state *vs;
+   struct pvrgpu_shader_state *fs;
+   struct pvrgpu_vertex_elements_state *vertex_elements;
+   struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
+   unsigned num_vertex_buffers;
+   struct pipe_blend_color blend_color;
+   struct pipe_stencil_ref stencil_ref;
+   unsigned sample_mask;
+   struct pipe_viewport_state viewport;
+   bool has_viewport;
+   struct pipe_scissor_state scissor;
+   bool has_scissor;
+   unsigned max_framebuffer_width;
+   unsigned max_framebuffer_height;
+   unsigned framebuffer_updates;
+   unsigned flushes;
+   unsigned unsupported_draws;
+   unsigned observed_draws;
+   unsigned unsupported_resource_ops;
+   unsigned indexed_quad_draws;
+   bool driver_draw_command_emitted;
+   bool driver_indexed_quad_command_locked;
+};
+
+static inline struct pvrgpu_context *
+pvrgpu_context(struct pipe_context *pipe)
+{
+   return (struct pvrgpu_context *)pipe;
+}
+
+struct pipe_context *
+pvrgpu_create_context(struct pipe_screen *screen, void *priv,
+                      unsigned flags);
+
+void
+pvrgpu_clear(struct pipe_context *pipe,
+             unsigned buffers,
+             uint32_t color_clear_mask,
+             uint8_t stencil_clear_mask,
+             const struct pipe_scissor_state *scissor_state,
+             const union pipe_color_union *color,
+             double depth,
+             unsigned stencil);
+
+void
+pvrgpu_clear_render_target(struct pipe_context *pipe,
+                           struct pipe_surface *dst,
+                           const union pipe_color_union *color,
+                           unsigned dstx,
+                           unsigned dsty,
+                           unsigned width,
+                           unsigned height,
+                           bool render_condition_enabled);
+
+#endif /* PVRGPU_CONTEXT_H */

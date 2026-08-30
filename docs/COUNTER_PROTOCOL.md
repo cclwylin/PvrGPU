@@ -148,7 +148,7 @@ The SystemC producer must additionally report `profile`, `fidelity`
 (`F0`–`F3`), `calibration` (`P0`–`P2`), and `config_hash` in `hello` or run
 metadata. For the current slice it must also identify
 `functional_scope=<case>-pco-iss-v1`, `command_source=builtin-glbench-fixture`,
-`mesa_command_ingest=false`, and `timing_provenance=uncalibrated`.
+`timing_provenance=uncalibrated`.
 `<case>` is the exact canonical case token selected for that run, so scope is
 never silently inherited from another fixture; examples include
 `fill_solid-pco-iss-v1`, `triangle_setup-pco-iss-v1`, and

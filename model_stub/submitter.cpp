@@ -42,109 +42,26 @@ float FloatFromBits(std::uint32_t bits) {
   return value;
 }
 
-std::uint32_t LoadLittleEndianU32(const std::uint8_t *bytes) {
-  return static_cast<std::uint32_t>(bytes[0]) |
-         (static_cast<std::uint32_t>(bytes[1]) << 8U) |
-         (static_cast<std::uint32_t>(bytes[2]) << 16U) |
-         (static_cast<std::uint32_t>(bytes[3]) << 24U);
+bool DriverTriangleFragmentColorSupported(const DriverCommand &command) {
+  static constexpr std::array<std::uint32_t, 4> kOpaqueRed = {
+      UINT32_C(0x3f800000), 0U, 0U, UINT32_C(0x3f800000)};
+  return command.fragment_color_bits == kOpaqueRed;
 }
 
-const std::vector<std::uint8_t> &MesaPocFragmentBinary(
-    const MesaPocCommand &command) {
-  // These public PCO programs materialize constants directly. Recheck the
-  // real Mesa bytes at the selection point so an unrecognized uniform cannot
-  // silently receive a fixture shader.
-  static constexpr std::array<std::uint8_t, 16> kRed = {
-      0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00,
-      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f,
-  };
-  static constexpr std::array<std::uint8_t, 16> kOrange = {
-      0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x3f,
-      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f,
-  };
-  static constexpr std::array<std::uint8_t, 16> kCyan = {
-      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f,
-      0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x80, 0x3f,
-  };
-  if (command.fragment_constants.empty() &&
-      command.test_case.rfind("attribute_fetch_shader", 0) == 0) {
-    return AttributeFetchGrayFragmentPcoBinary();
-  }
-  if (command.fragment_constants.empty() &&
-      command.test_case == "varyings_shader_1") {
-    return VaryingsOneFragmentPcoBinary();
-  }
-  if (command.fragment_constants.empty() &&
-      command.test_case == "varyings_shader_2") {
-    return VaryingsTwoFragmentPcoBinary();
-  }
-  if (command.fragment_constants.empty() &&
-      command.test_case == "varyings_shader_4") {
-    return VaryingsFourFragmentPcoBinary();
-  }
-  if (command.fragment_constants.empty() &&
-      command.test_case == "varyings_shader_8") {
-    return VaryingsEightFragmentPcoBinary();
-  }
-  if (command.fragment_constants.empty() &&
-      command.test_case.rfind("fill_tex", 0) == 0) {
-    return FillTexNearestFragmentPcoBinary();
-  }
-  if (command.fragment_constants.size() == kRed.size() &&
-      std::equal(command.fragment_constants.begin(),
-                 command.fragment_constants.end(), kRed.begin())) {
-    return FillSolidFragmentPcoBinary();
-  }
-  if (command.fragment_constants.size() == kOrange.size() &&
-      std::equal(command.fragment_constants.begin(),
-                 command.fragment_constants.end(), kOrange.begin())) {
-    return TriangleSetupOrangeFragmentPcoBinary();
-  }
-  if (command.fragment_constants.size() == kCyan.size() &&
-      std::equal(command.fragment_constants.begin(),
-                 command.fragment_constants.end(), kCyan.begin())) {
-    return TriangleSetupCyanFragmentPcoBinary();
-  }
-  throw std::runtime_error(
-      "Mesa POC fragment constants do not match an enabled public PCO");
+bool DriverIndexedQuadCommandSupported(const DriverCommand &command) {
+  return command.draw_count != 0 && command.index_count == 6 &&
+         command.unique_vertices == 4 && command.primitive_count == 2;
 }
 
-const std::vector<std::uint8_t> &MesaPocVertexBinary(
-    const MesaPocCommand &command) {
-  if (command.test_case.rfind("attribute_fetch_shader", 0) == 0) {
-    switch (command.vertex_elements) {
-    case 1:
-      return AttributeFetchVertexPcoBinary();
-    case 2:
-      return AttributeFetchTwoAttributeVertexPcoBinary();
-    case 4:
-      return AttributeFetchFourAttributeVertexPcoBinary();
-    case 8:
-      return AttributeFetchEightAttributeVertexPcoBinary();
-    default:
-      throw std::runtime_error(
-          "Mesa POC attribute count has no enabled public PCO");
-    }
+std::vector<float> DriverTriangleFloat2Vertices(
+    const DriverCommand &command) {
+  std::vector<float> vertices;
+  vertices.reserve(6);
+  for (const auto &vertex : command.vertex_bits) {
+    vertices.push_back(FloatFromBits(vertex[0]));
+    vertices.push_back(FloatFromBits(vertex[1]));
   }
-  if (command.test_case == "varyings_shader_1")
-    return VaryingsOneVertexPcoBinary();
-  if (command.test_case == "varyings_shader_2")
-    return VaryingsTwoVertexPcoBinary();
-  if (command.test_case == "varyings_shader_4")
-    return VaryingsFourVertexPcoBinary();
-  if (command.test_case == "varyings_shader_8")
-    return VaryingsEightVertexPcoBinary();
-  if (command.test_case.rfind("fill_tex", 0) == 0)
-    return FillTexNearestVertexPcoBinary();
-  return FillSolidVertexPcoBinary();
-}
-
-BlendFactor MesaPocBlendFactor(const std::string &factor) {
-  if (factor == "PIPE_BLENDFACTOR_SRC_ALPHA")
-    return BlendFactor::kSourceAlpha;
-  if (factor == "PIPE_BLENDFACTOR_INV_SRC_ALPHA")
-    return BlendFactor::kOneMinusSourceAlpha;
-  throw std::runtime_error("Mesa POC blend factor is unsupported: " + factor);
+  return vertices;
 }
 
 VertexBufferResource StoreFloat2VertexBuffer(MemoryPool &pool,
@@ -189,40 +106,49 @@ Submitter::Submitter(sc_core::sc_module_name name, MemoryPool &pool,
 }
 
 void Submitter::Run() {
-  const bool mesa_poc = options_.mesa_command.enabled;
+  const bool driver_command = options_.driver_command.enabled;
+  const bool driver_clear_command =
+      driver_command && options_.driver_command.command == "clear_color";
+  const bool driver_triangle_command =
+      driver_command && options_.driver_command.command == "draw_triangle";
+  const bool driver_indexed_quad_command =
+      driver_command && options_.driver_command.command == "draw_indexed_quad";
   const FunctionalCase functional_case =
       FunctionalCaseFromName(options_.test_case);
   if (!IsRasterFunctionalCase(functional_case))
     throw std::runtime_error("Submitter received an unsupported GLBench case");
-  const bool mesa_poc_case_supported =
-      functional_case == FunctionalCase::kFillSolid ||
-      functional_case == FunctionalCase::kFillSolidDepthNever ||
-      functional_case == FunctionalCase::kFillSolidDepthNotEqual ||
-      functional_case == FunctionalCase::kFillSolidBlended ||
-      functional_case == FunctionalCase::kTriangleSetup ||
-      functional_case == FunctionalCase::kTriangleSetupAllCulled ||
-      functional_case == FunctionalCase::kTriangleSetupHalfCulled ||
-      functional_case == FunctionalCase::kAttributeFetchShader ||
-      functional_case == FunctionalCase::kAttributeFetchShaderTwoAttribute ||
-      functional_case == FunctionalCase::kAttributeFetchShaderFourAttribute ||
-      functional_case == FunctionalCase::kAttributeFetchShaderEightAttribute ||
-      functional_case == FunctionalCase::kVaryingsShaderOne ||
-      functional_case == FunctionalCase::kVaryingsShaderTwo ||
-      functional_case == FunctionalCase::kVaryingsShaderFour ||
-      functional_case == FunctionalCase::kVaryingsShaderEight ||
-      functional_case == FunctionalCase::kFillTexNearest ||
-      functional_case == FunctionalCase::kFillTexBilinear ||
-      functional_case == FunctionalCase::kFillTexTrilinearLinear01 ||
-      functional_case == FunctionalCase::kFillTexTrilinearLinear04 ||
-      functional_case == FunctionalCase::kFillTexTrilinearLinear05;
-  if (mesa_poc &&
-      (!mesa_poc_case_supported ||
-       options_.frames != 1 ||
-       options_.test_case != options_.mesa_command.test_case ||
-       options_.width != options_.mesa_command.width ||
-       options_.height != options_.mesa_command.height)) {
+  const std::uint32_t command_framebuffer_width =
+      driver_indexed_quad_command
+          ? options_.driver_command.framebuffer_width
+          : options_.driver_command.width;
+  const std::uint32_t command_framebuffer_height =
+      driver_indexed_quad_command
+          ? options_.driver_command.framebuffer_height
+          : options_.driver_command.height;
+  if (driver_command &&
+      (options_.frames != 1 ||
+       options_.width != command_framebuffer_width ||
+       options_.height != command_framebuffer_height ||
+       (driver_clear_command &&
+        functional_case != FunctionalCase::kDriverClearColor) ||
+       (driver_triangle_command &&
+        functional_case != FunctionalCase::kDriverTriangleSolid) ||
+       (driver_indexed_quad_command &&
+        functional_case != FunctionalCase::kDriverIndexedQuad) ||
+       (!driver_clear_command && !driver_triangle_command &&
+        !driver_indexed_quad_command))) {
     throw std::runtime_error(
-        "Submitter Mesa POC options do not match the one-frame command");
+        "Submitter driver command options do not match the one-frame command");
+  }
+  if (driver_triangle_command &&
+      !DriverTriangleFragmentColorSupported(options_.driver_command)) {
+    throw std::runtime_error(
+        "Submitter driver triangle currently supports only opaque red fragments");
+  }
+  if (driver_indexed_quad_command &&
+      !DriverIndexedQuadCommandSupported(options_.driver_command)) {
+    throw std::runtime_error(
+        "Submitter driver indexed quad command fields are unsupported");
   }
 
   for (unsigned frame = 1; frame <= options_.frames; ++frame) {
@@ -253,13 +179,18 @@ void Submitter::Run() {
                         : 1U;
     const bool indexed_triangle =
         IsIndexedTriangleRasterCase(functional_case);
+    const bool driver_clear = driver_clear_command;
+    const bool driver_triangle = driver_triangle_command;
+    const bool driver_indexed_quad = driver_indexed_quad_command;
     const bool depth_case =
+        driver_clear ||
         functional_case == FunctionalCase::kFillSolidDepthNotEqual ||
         functional_case == FunctionalCase::kFillSolidDepthNever;
     state.raster_state.depth.test_enable = depth_case ? 1U : 0U;
     state.raster_state.depth.write_enable = depth_case ? 1U : 0U;
     state.raster_state.depth.compare_op =
-        functional_case == FunctionalCase::kFillSolidDepthNever
+        (driver_clear ||
+         functional_case == FunctionalCase::kFillSolidDepthNever)
             ? DepthCompareOp::kNever
             : DepthCompareOp::kNotEqual;
     if (functional_case == FunctionalCase::kFillSolidBlended) {
@@ -286,47 +217,10 @@ void Submitter::Run() {
       state.raster_state.face_cull.front_face =
           FrontFaceWinding::kCounterClockwise;
     }
-    if (mesa_poc) {
-      const MesaPocCommand &command = options_.mesa_command;
-      state.raster_state.depth.test_enable =
-          command.depth_enabled ? 1U : 0U;
-      state.raster_state.depth.write_enable = command.depth_write ? 1U : 0U;
-      state.raster_state.depth.compare_op =
-          static_cast<DepthCompareOp>(command.depth_func);
-      state.raster_state.blend.enable = command.blend_enabled ? 1U : 0U;
-      if (command.blend_enabled) {
-        if (command.blend_rgb_func != "PIPE_BLEND_ADD" ||
-            command.blend_alpha_func != "PIPE_BLEND_ADD") {
-          throw std::runtime_error("Mesa POC blend equation is unsupported");
-        }
-        state.raster_state.blend.rgb_equation = BlendEquation::kAdd;
-        state.raster_state.blend.alpha_equation = BlendEquation::kAdd;
-        state.raster_state.blend.source_rgb_factor =
-            MesaPocBlendFactor(command.blend_rgb_src_factor);
-        state.raster_state.blend.destination_rgb_factor =
-            MesaPocBlendFactor(command.blend_rgb_dst_factor);
-        state.raster_state.blend.source_alpha_factor =
-            MesaPocBlendFactor(command.blend_alpha_src_factor);
-        state.raster_state.blend.destination_alpha_factor =
-            MesaPocBlendFactor(command.blend_alpha_dst_factor);
-      }
-      state.raster_state.face_cull.enable = command.cull_face != 0 ? 1U : 0U;
-      if (command.cull_face == 1)
-        state.raster_state.face_cull.mode = CullFaceMode::kFront;
-      else if (command.cull_face == 2)
-        state.raster_state.face_cull.mode = CullFaceMode::kBack;
-      else if (command.cull_face == 3)
-        state.raster_state.face_cull.mode = CullFaceMode::kFrontAndBack;
-      else if (command.cull_face != 0)
-        throw std::runtime_error("Mesa POC cull-face value is unsupported");
-      // Gallium's lower-left framebuffer convention reverses the winding bit
-      // relative to the GLES/API-space convention consumed by this model.
-      state.raster_state.face_cull.front_face =
-          command.front_ccw ? FrontFaceWinding::kClockwise
-                            : FrontFaceWinding::kCounterClockwise;
+    if (driver_clear || driver_triangle || driver_indexed_quad) {
       for (std::size_t component = 0; component < 4; ++component) {
         state.raster_state.clear_color[component] =
-            FloatFromBits(command.clear_color_bits[component]);
+            FloatFromBits(options_.driver_command.clear_color_bits[component]);
       }
     }
     state.counters.frame = frame;
@@ -336,35 +230,30 @@ void Submitter::Run() {
     GlbenchFillTextureFixture texture_fixture;
     if (texture_case) {
       texture_fixture = MakeGlbenchFillTextureFixture(functional_case);
-      if (mesa_poc) {
-        const MesaPocCommand &command = options_.mesa_command;
-        if (command.vertex_float2_1.empty() ||
-            command.vertex_constants.size() != sizeof(std::uint32_t) ||
-            command.texture_bytes.size() != texture_fixture.texture_bytes.size()) {
-          throw std::runtime_error(
-              "Submitter Mesa texture command payload is incomplete");
-        }
-        texture_fixture.texture_coordinates = command.vertex_float2_1;
-        texture_fixture.texture_bytes = command.texture_bytes;
-        texture_fixture.vertex_scale_bits =
-            LoadLittleEndianU32(command.vertex_constants.data());
-      }
     }
-    if (mesa_poc) {
-      vertex_buffer = options_.mesa_command.vertex_float2;
-      if (options_.mesa_command.indexed) {
-        state.draw.topology = PrimitiveTopology::kTriangleList;
-        state.draw.first_index = 0;
-        state.draw.index_count = options_.mesa_command.draw_count;
-        state.draw.base_vertex = 0;
-        state.draw.index_format = IndexFormat::kUint16;
-        state.vertex_indices =
-            StoreNewArray(pool_, options_.mesa_command.indices);
-      } else {
-        state.draw.topology = PrimitiveTopology::kTriangleStrip;
-        state.draw.first_vertex = 0;
-        state.draw.vertex_count = options_.mesa_command.draw_count;
-      }
+    if (driver_triangle) {
+      vertex_buffer = DriverTriangleFloat2Vertices(options_.driver_command);
+      const std::vector<std::uint16_t> indices = {0, 1, 2};
+      state.draw.topology = PrimitiveTopology::kTriangleList;
+      state.draw.first_index = 0;
+      state.draw.index_count = static_cast<std::uint32_t>(indices.size());
+      state.draw.base_vertex = 0;
+      state.draw.index_format = IndexFormat::kUint16;
+      state.vertex_indices = StoreNewArray(pool_, indices);
+    } else if (driver_indexed_quad) {
+      vertex_buffer = {
+          -1.0F, -1.0F,
+          -1.0F, 1.0F,
+          1.0F,  -1.0F,
+          1.0F,  1.0F,
+      };
+      const std::vector<std::uint16_t> indices = {0, 2, 1, 1, 2, 3};
+      state.draw.topology = PrimitiveTopology::kTriangleList;
+      state.draw.first_index = 0;
+      state.draw.index_count = static_cast<std::uint32_t>(indices.size());
+      state.draw.base_vertex = 0;
+      state.draw.index_format = IndexFormat::kUint16;
+      state.vertex_indices = StoreNewArray(pool_, indices);
     } else if (indexed_triangle) {
       const GlbenchTriangleMeshShape &mesh =
           varyings ? kGlbenchVaryingsMesh
@@ -417,14 +306,7 @@ void Submitter::Run() {
     }
     state.vertex_buffer_resources = StoreNewArray(pool_, vertex_resources);
     std::vector<VertexAttributeBinding> bindings;
-    if (mesa_poc && attribute_fetch) {
-      bindings.reserve(options_.mesa_command.vertex_elements);
-      for (std::uint32_t attribute = 0;
-           attribute < options_.mesa_command.vertex_elements; ++attribute) {
-        bindings.push_back(MakeFloat2Binding(
-            0, static_cast<std::uint16_t>(attribute * 2U), 2));
-      }
-    } else if (attribute_fetch && attribute_count > 1) {
+    if (attribute_fetch && attribute_count > 1) {
       // GLBench binds every cN to the same VBO object. PVI supplies two
       // float32 components per input in consecutive VTXIN registers.
       bindings.reserve(attribute_count);
@@ -440,12 +322,6 @@ void Submitter::Run() {
       };
     } else {
       bindings = {MakeFloat2Binding(0, 0, 4)};
-    }
-    if (mesa_poc) {
-      for (VertexAttributeBinding &binding : bindings) {
-        binding.offset_bytes = options_.mesa_command.vertex_offset;
-        binding.stride_bytes = options_.mesa_command.vertex_stride;
-      }
     }
     state.vertex_attribute_bindings = StoreNewArray(pool_, bindings);
     if (shader_varyings) {
@@ -487,8 +363,7 @@ void Submitter::Run() {
                      texture_fixture.fragment_shared.end()));
     }
     state.vertex_code = StoreNewArray(
-        pool_, mesa_poc ? MesaPocVertexBinary(options_.mesa_command)
-                    : texture_case ? FillTexNearestVertexPcoBinary()
+        pool_, texture_case ? FillTexNearestVertexPcoBinary()
                     : functional_case == FunctionalCase::kVaryingsShaderEight
                     ? VaryingsEightVertexPcoBinary()
                     : functional_case == FunctionalCase::kVaryingsShaderFour
@@ -505,8 +380,7 @@ void Submitter::Run() {
                          : attribute_fetch ? AttributeFetchVertexPcoBinary()
                                            : FillSolidVertexPcoBinary());
     state.fragment_code = StoreNewArray(
-        pool_, mesa_poc ? MesaPocFragmentBinary(options_.mesa_command)
-                    : texture_case ? FillTexNearestFragmentPcoBinary()
+        pool_, texture_case ? FillTexNearestFragmentPcoBinary()
                     : functional_case == FunctionalCase::kVaryingsShaderEight
                     ? VaryingsEightFragmentPcoBinary()
                     : functional_case == FunctionalCase::kVaryingsShaderFour
@@ -516,6 +390,9 @@ void Submitter::Run() {
                           : varyings ? VaryingsOneFragmentPcoBinary()
                         : attribute_fetch
                    ? AttributeFetchGrayFragmentPcoBinary()
+                   : driver_indexed_quad ? FillSolidBlackFragmentPcoBinary()
+                   : driver_triangle
+                         ? FillSolidFragmentPcoBinary()
                    : functional_case == FunctionalCase::kTriangleSetupHalfCulled
                    ? TriangleSetupCyanFragmentPcoBinary()
                    : triangle_setup ? TriangleSetupOrangeFragmentPcoBinary()

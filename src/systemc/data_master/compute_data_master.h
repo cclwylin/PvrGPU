@@ -1,6 +1,7 @@
-// ComputeDataMaster：compute workload 的 Data Master（資料主控）module boundary。
-// 它預留 compute dispatch/task 的資料移動與 memory-request ingress；目前 graphics
-// Fill.Solid slice 不使用 compute，亦沒有假造 command 或 timing 行為。
+// ComputeDataMaster：compute workload 的 Data Master（資料主控）fetch-side 模組。
+// 依照 DXTP 架構規範，它負責從 SLC/DRAM 取得 SSBO、Uniform Buffer、
+// Atomic Counter 等資料，送入 USC Compute Shader 執行單元。
+// 目前 graphics Fill.Solid slice 不使用 compute，亦沒有假造 command 或 timing 行為。
 // 現階段為無 ports/process/timing、未連線的 elaboration placeholder。
 #pragma once
 

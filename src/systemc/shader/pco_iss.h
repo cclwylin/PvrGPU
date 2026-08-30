@@ -263,6 +263,7 @@ struct PcoFragmentExecutionContext {
  */
 const std::vector<std::uint8_t> &FillSolidVertexPcoBinary();
 const std::vector<std::uint8_t> &FillSolidFragmentPcoBinary();
+const std::vector<std::uint8_t> &FillSolidBlackFragmentPcoBinary();
 const std::vector<std::uint8_t> &FillSolidRedHalfAlphaFragmentPcoBinary();
 const std::vector<std::uint8_t> &FillSolidGreenHalfAlphaFragmentPcoBinary();
 const std::vector<std::uint8_t> &TriangleSetupOrangeFragmentPcoBinary();

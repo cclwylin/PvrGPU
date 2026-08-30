@@ -46,7 +46,9 @@ std::uint8_t FloatBitsToUnorm8(std::uint32_t raw_bits) {
 }
 
 std::uint8_t FactorToUnorm8(pvrgpu::stub::BlendFactor factor,
-                            const std::array<std::uint8_t, 4> &source) {
+                            const std::array<std::uint8_t, 4> &source,
+                            const std::array<std::uint8_t, 4> &destination,
+                            std::size_t component) {
   using pvrgpu::stub::BlendFactor;
   switch (factor) {
   case BlendFactor::kZero:
@@ -57,27 +59,68 @@ std::uint8_t FactorToUnorm8(pvrgpu::stub::BlendFactor factor,
     return source[3];
   case BlendFactor::kOneMinusSourceAlpha:
     return static_cast<std::uint8_t>(255U - source[3]);
+  case BlendFactor::kSourceColor:
+    return source[component];
+  case BlendFactor::kOneMinusSourceColor:
+    return static_cast<std::uint8_t>(255U - source[component]);
+  case BlendFactor::kDestinationColor:
+    return destination[component];
+  case BlendFactor::kOneMinusDestinationColor:
+    return static_cast<std::uint8_t>(255U - destination[component]);
+  case BlendFactor::kDestinationAlpha:
+    return destination[3];
+  case BlendFactor::kOneMinusDestinationAlpha:
+    return static_cast<std::uint8_t>(255U - destination[3]);
   }
   throw std::runtime_error("PBE received an unsupported blend factor");
 }
 
-std::uint8_t BlendAddUnorm8(std::uint8_t source, std::uint8_t destination,
-                            std::uint8_t source_factor,
-                            std::uint8_t destination_factor) {
-  const std::uint32_t numerator =
-      static_cast<std::uint32_t>(source) * source_factor +
-      static_cast<std::uint32_t>(destination) * destination_factor;
-  const std::uint32_t rounded = (numerator + 127U) / 255U;
-  return static_cast<std::uint8_t>(std::min<std::uint32_t>(rounded, 255U));
+std::uint8_t BlendEquationUnorm8(pvrgpu::stub::BlendEquation equation,
+                                 std::uint8_t source, std::uint8_t destination,
+                                 std::uint8_t source_factor,
+                                 std::uint8_t destination_factor) {
+  using pvrgpu::stub::BlendEquation;
+  if (equation == BlendEquation::kMin) {
+    return std::min(source, destination);
+  }
+  if (equation == BlendEquation::kMax) {
+    return std::max(source, destination);
+  }
+
+  const std::int32_t term1 = static_cast<std::int32_t>(source) * source_factor;
+  const std::int32_t term2 = static_cast<std::int32_t>(destination) * destination_factor;
+  std::int32_t result = 0;
+
+  if (equation == BlendEquation::kAdd) {
+    result = (term1 + term2 + 127) / 255;
+  } else if (equation == BlendEquation::kSubtract) {
+    result = (term1 - term2 + 127) / 255;
+  } else if (equation == BlendEquation::kReverseSubtract) {
+    result = (term2 - term1 + 127) / 255;
+  } else {
+    throw std::runtime_error("PBE received an unsupported blend equation in calculation");
+  }
+
+  return static_cast<std::uint8_t>(std::clamp(result, 0, 255));
 }
 
 void ValidateBlendState(const pvrgpu::stub::BlendState &blend) {
   using pvrgpu::stub::BlendEquation;
   if (!blend.enable)
     return;
-  if (blend.rgb_equation != BlendEquation::kAdd ||
-      blend.alpha_equation != BlendEquation::kAdd) {
-    throw std::runtime_error("PBE only implements the GLES ADD blend equation");
+  if (blend.rgb_equation != BlendEquation::kAdd &&
+      blend.rgb_equation != BlendEquation::kSubtract &&
+      blend.rgb_equation != BlendEquation::kReverseSubtract &&
+      blend.rgb_equation != BlendEquation::kMin &&
+      blend.rgb_equation != BlendEquation::kMax) {
+    throw std::runtime_error("PBE received an unsupported RGB blend equation");
+  }
+  if (blend.alpha_equation != BlendEquation::kAdd &&
+      blend.alpha_equation != BlendEquation::kSubtract &&
+      blend.alpha_equation != BlendEquation::kReverseSubtract &&
+      blend.alpha_equation != BlendEquation::kMin &&
+      blend.alpha_equation != BlendEquation::kMax) {
+    throw std::runtime_error("PBE received an unsupported alpha blend equation");
   }
   const std::array<pvrgpu::stub::BlendFactor, 4> factors = {
       blend.source_rgb_factor,
@@ -86,8 +129,9 @@ void ValidateBlendState(const pvrgpu::stub::BlendState &blend) {
       blend.destination_alpha_factor,
   };
   const std::array<std::uint8_t, 4> dummy_source{};
+  const std::array<std::uint8_t, 4> dummy_dest{};
   for (const pvrgpu::stub::BlendFactor factor : factors)
-    (void)FactorToUnorm8(factor, dummy_source);
+    (void)FactorToUnorm8(factor, dummy_source, dummy_dest, 0);
 }
 
 } // namespace
@@ -165,6 +209,10 @@ void Pbe::Run() {
 
       if (state.raster_state.blend.enable) {
         const BlendState &blend = state.raster_state.blend;
+        std::array<std::uint8_t, 4> destination_color{};
+        for (std::size_t component = 0; component < 4; ++component) {
+          destination_color[component] = framebuffer[byte_offset + component];
+        }
         for (std::size_t component = 0; component < 4; ++component) {
           const BlendFactor source_factor =
               component == 3 ? blend.source_alpha_factor
@@ -172,14 +220,25 @@ void Pbe::Run() {
           const BlendFactor destination_factor =
               component == 3 ? blend.destination_alpha_factor
                              : blend.destination_rgb_factor;
-          framebuffer[byte_offset + component] = BlendAddUnorm8(
-              source[component], framebuffer[byte_offset + component],
-              FactorToUnorm8(source_factor, source),
-              FactorToUnorm8(destination_factor, source));
+          const BlendEquation equation =
+              component == 3 ? blend.alpha_equation
+                             : blend.rgb_equation;
+          const std::uint8_t sf = FactorToUnorm8(source_factor, source, destination_color, component);
+          const std::uint8_t df = FactorToUnorm8(destination_factor, source, destination_color, component);
+
+          const std::uint8_t blended_val = BlendEquationUnorm8(
+              equation, source[component], destination_color[component], sf, df);
+
+          if ((state.raster_state.color_mask & (1U << component)) != 0) {
+            framebuffer[byte_offset + component] = blended_val;
+          }
         }
       } else {
-        for (std::size_t component = 0; component < 4; ++component)
-          framebuffer[byte_offset + component] = source[component];
+        for (std::size_t component = 0; component < 4; ++component) {
+          if ((state.raster_state.color_mask & (1U << component)) != 0) {
+            framebuffer[byte_offset + component] = source[component];
+          }
+        }
       }
     }
     const std::uint64_t pixels_touched = static_cast<std::uint64_t>(

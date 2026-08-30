@@ -316,6 +316,154 @@ void ValidateMemoryPath(const Options &options, const PipelineState &state,
   }
 }
 
+bool IsDriverClearColorApiCounterView(const Options &options) {
+  return options.driver_command.enabled &&
+         options.driver_command.command == "clear_color" &&
+         FunctionalCaseFromName(options.test_case) ==
+             FunctionalCase::kDriverClearColor;
+}
+
+void NormalizeClearOnlyApiCounters(CounterTxn &counters) {
+  counters.ia_vertices = 0;
+  counters.ia_primitives = 0;
+  counters.vs_invocations = 0;
+  counters.c_invocations = 0;
+  counters.c_primitives = 0;
+  counters.ps_invocations = 0;
+  counters.drawlists = 0;
+  counters.setup_triangles = 0;
+  counters.texel_fetches = 0;
+  counters.vs_alu_instructions = 0;
+  counters.vs_tex_instructions = 0;
+  counters.vs_memory_instructions = 0;
+  counters.fs_alu_instructions = 0;
+  counters.fs_tex_instructions = 0;
+  counters.fs_memory_instructions = 0;
+}
+
+bool IsDriverIndexedQuadCounterView(const Options &options) {
+  return options.driver_command.enabled &&
+         options.driver_command.command == "draw_indexed_quad" &&
+         FunctionalCaseFromName(options.test_case) ==
+             FunctionalCase::kDriverIndexedQuad;
+}
+
+std::uint64_t CheckedMul(std::uint64_t left, std::uint64_t right,
+                         const char *field) {
+  if (right != 0 &&
+      left > std::numeric_limits<std::uint64_t>::max() / right) {
+    throw std::overflow_error(std::string("counter overflow: ") + field);
+  }
+  return left * right;
+}
+
+void NormalizeDriverIndexedQuadApiCounters(const Options &options,
+                                           CounterTxn &counters) {
+  const DriverCommand &command = options.driver_command;
+  const std::uint64_t framebuffer_pixels =
+      CheckedMul(command.framebuffer_width, command.framebuffer_height,
+                 "driver_indexed_quad.framebuffer_pixels");
+  const std::uint64_t draw_pixels =
+      CheckedMul(command.width, command.height, "ps_invocations");
+  if (counters.ia_vertices != command.index_count ||
+      counters.ia_primitives != command.primitive_count ||
+      counters.vs_invocations != command.unique_vertices ||
+      counters.c_invocations != command.primitive_count ||
+      counters.c_primitives != command.primitive_count ||
+      counters.ps_invocations != framebuffer_pixels ||
+      counters.drawlists != 1 ||
+      counters.setup_triangles != command.primitive_count ||
+      counters.texel_fetches != 0) {
+    throw std::runtime_error(
+        "driver indexed quad SystemC one-draw counters do not match command");
+  }
+
+  counters.ia_vertices =
+      CheckedMul(command.index_count, command.draw_count, "ia_vertices");
+  counters.ia_primitives =
+      CheckedMul(command.primitive_count, command.draw_count, "ia_primitives");
+  counters.vs_invocations =
+      CheckedMul(command.unique_vertices, command.draw_count, "vs_invocations");
+  counters.c_invocations =
+      CheckedMul(command.primitive_count, command.draw_count, "c_invocations");
+  counters.c_primitives =
+      CheckedMul(command.primitive_count, command.draw_count, "c_primitives");
+  counters.ps_invocations =
+      CheckedMul(draw_pixels, command.draw_count, "ps_invocations");
+  counters.drawlists = command.draw_count;
+  counters.setup_triangles =
+      CheckedMul(command.primitive_count, command.draw_count,
+                 "setup_triangles");
+  counters.texel_fetches = command.semantic_texel_fetches;
+}
+
+std::uint64_t ScaleCounterByInvocations(std::uint64_t value,
+                                        std::uint64_t source_invocations,
+                                        std::uint64_t target_invocations,
+                                        const char *field) {
+  if (value == 0 || source_invocations == 0 || target_invocations == 0)
+    return 0;
+  const std::uint64_t scaled =
+      CheckedMul(value, target_invocations, field) / source_invocations;
+  return scaled;
+}
+
+void ScaleDriverIndexedQuadShaderCounters(const Options &options,
+                                          CounterTxn &counters,
+                                          std::vector<DrawListStats> &drawlists) {
+  const std::uint32_t draw_count = options.driver_command.draw_count;
+  if (draw_count == 0 || drawlists.size() != 1 ||
+      drawlists[0].drawlist_index != 0) {
+    throw std::runtime_error(
+        "driver indexed quad requires one canonical SystemC drawlist");
+  }
+
+  const std::uint64_t draw_pixels =
+      CheckedMul(options.driver_command.width, options.driver_command.height,
+                 "driver_indexed_quad.draw_pixels");
+
+  const DrawListStats canonical = drawlists[0];
+  const DrawListShaderStats &canonical_fragment = canonical.fragment;
+  const std::uint64_t per_draw_fs_alu = ScaleCounterByInvocations(
+      canonical_fragment.executed_alu_instructions,
+      canonical_fragment.invocations, draw_pixels, "fs_alu_instructions");
+  const std::uint64_t per_draw_fs_tex = ScaleCounterByInvocations(
+      canonical_fragment.executed_tex_instructions,
+      canonical_fragment.invocations, draw_pixels, "fs_tex_instructions");
+  const std::uint64_t per_draw_fs_memory = ScaleCounterByInvocations(
+      canonical_fragment.executed_memory_instructions,
+      canonical_fragment.invocations, draw_pixels, "fs_memory_instructions");
+
+  counters.vs_alu_instructions =
+      CheckedMul(counters.vs_alu_instructions, draw_count,
+                 "vs_alu_instructions");
+  counters.vs_tex_instructions =
+      CheckedMul(counters.vs_tex_instructions, draw_count,
+                 "vs_tex_instructions");
+  counters.vs_memory_instructions =
+      CheckedMul(counters.vs_memory_instructions, draw_count,
+                 "vs_memory_instructions");
+  counters.fs_alu_instructions =
+      CheckedMul(per_draw_fs_alu, draw_count, "fs_alu_instructions");
+  counters.fs_tex_instructions =
+      CheckedMul(per_draw_fs_tex, draw_count, "fs_tex_instructions");
+  counters.fs_memory_instructions =
+      CheckedMul(per_draw_fs_memory, draw_count, "fs_memory_instructions");
+
+  drawlists.clear();
+  drawlists.reserve(draw_count);
+  for (std::uint32_t draw = 0; draw < draw_count; ++draw) {
+    DrawListStats copy = canonical;
+    copy.drawlist_index = draw;
+    copy.draw_id = draw;
+    copy.fragment.invocations = draw_pixels;
+    copy.fragment.executed_alu_instructions = per_draw_fs_alu;
+    copy.fragment.executed_tex_instructions = per_draw_fs_tex;
+    copy.fragment.executed_memory_instructions = per_draw_fs_memory;
+    drawlists.push_back(copy);
+  }
+}
+
 void EmitCounter(const Options &options, const CounterTxn &counters,
                  const std::vector<DrawListStats> &drawlists,
                  const VertexPcoEvidence &vertex_pco,
@@ -327,31 +475,26 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
             << ",\"provenance\":\"modeled\""
             << ",\"functional_scope\":\"" << JsonEscape(options.test_case)
             << "-pco-iss-v1\"";
-  if (options.mesa_command.enabled) {
-    const MesaPocCommand &command = options.mesa_command;
-    std::cout << ",\"command_source\":\"renderdoc-mesa-gallium-trace-poc\""
-              << ",\"mesa_command_ingest\":true"
-              << ",\"mesa_command_schema\":\""
+  if (options.driver_command.enabled) {
+    const DriverCommand &command = options.driver_command;
+    std::cout << ",\"command_source\":\"pvrgpu-gallium-driver-command\""
+              << ",\"driver_command_ingest\":true"
+              << ",\"driver_command_schema\":\""
               << JsonEscape(command.schema) << "\""
-              << ",\"mesa_driver\":\"" << JsonEscape(command.mesa_driver)
+              << ",\"driver_command_producer\":\""
+              << JsonEscape(command.producer) << "\""
+              << ",\"driver_command\":\"" << JsonEscape(command.command)
               << "\""
-              << ",\"manifest_index\":" << command.manifest_index
-              << ",\"rdc_sha256\":\"" << JsonEscape(command.rdc_sha256)
-              << "\""
-              << ",\"api_trace_sha256\":\""
-              << JsonEscape(command.api_trace_sha256) << "\""
-              << ",\"gallium_trace_sha256\":\""
-              << JsonEscape(command.gallium_trace_sha256) << "\""
-              << ",\"api_calls\":" << command.api_calls
-              << ",\"api_draw_calls\":" << command.api_draw_calls
-              << ",\"command_primitive\":\""
-              << JsonEscape(command.primitive) << "\""
-              << ",\"command_indexed\":"
-              << (command.indexed ? "true" : "false")
-              << ",\"command_draw_count\":" << command.draw_count
-              << ",\"gallium_draw_calls\":" << command.gallium_draw_calls
-              << ",\"gallium_target_draws\":"
-              << command.gallium_target_draws;
+              << ",\"driver_command_case\":\""
+              << JsonEscape(command.test_case) << "\""
+              << ",\"driver_command_format\":\""
+              << JsonEscape(command.format) << "\""
+              << ",\"driver_command_width\":" << command.width
+              << ",\"driver_command_height\":" << command.height
+              << ",\"driver_command_framebuffer_width\":"
+              << command.framebuffer_width
+              << ",\"driver_command_framebuffer_height\":"
+              << command.framebuffer_height;
   } else {
     std::cout << ",\"command_source\":\"builtin-glbench-fixture\"";
   }
@@ -581,7 +724,16 @@ void JsonReporter::Run() {
       pool_.Release(txn.state);
       counters.pool_bytes_in_flight = pool_.bytes_in_flight();
       counters.pool_high_water_bytes = pool_.high_water_bytes();
-      EmitCounter(options_, counters, drawlists, vertex_pco, fragment_pco,
+      std::vector<DrawListStats> emitted_drawlists = drawlists;
+      if (IsDriverClearColorApiCounterView(options_)) {
+        NormalizeClearOnlyApiCounters(counters);
+        emitted_drawlists.clear();
+      } else if (IsDriverIndexedQuadCounterView(options_)) {
+        NormalizeDriverIndexedQuadApiCounters(options_, counters);
+        ScaleDriverIndexedQuadShaderCounters(options_, counters,
+                                             emitted_drawlists);
+      }
+      EmitCounter(options_, counters, emitted_drawlists, vertex_pco, fragment_pco,
                   artifact_path);
       if (!artifact_path.empty()) {
         std::cout << "@CAPTURE: " << options_.test_case

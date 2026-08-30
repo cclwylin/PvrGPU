@@ -12,7 +12,7 @@
 #include "cache_mmu/slc.h"
 #include "common/functional_types.h"
 #include "common/pipeline_state.h"
-#include "data_master/pixel_data_master.h"
+#include "fragment/pbe_write_back.h"
 #include "fragment/fragment_frontend.h"
 #include "fragment/isp.h"
 #include "fragment/pbe.h"
@@ -24,6 +24,7 @@
 #include "geometry/vertex_fetch.h"
 #include "memory/dram_model.h"
 #include "pds/pds_engine.h"
+#include "pds/vertex_pds_engine.h"
 #include "shader/pco_decoder.h"
 #include "shader/pco_iss.h"
 #include "shader/usc_cluster.h"
@@ -370,7 +371,8 @@ int sc_main(int, char **) {
 
     sc_core::sc_fifo<PipelineTxn> submit_to_vdm("submit_to_vdm", 1);
     sc_core::sc_fifo<PipelineTxn> vdm_to_fetch("vdm_to_fetch", 1);
-    sc_core::sc_fifo<PipelineTxn> fetch_to_vs_decoder("fetch_to_vs_decoder", 1);
+    sc_core::sc_fifo<PipelineTxn> fetch_to_pds("fetch_to_pds", 1);
+    sc_core::sc_fifo<PipelineTxn> vs_pds_to_decoder("vs_pds_to_decoder", 1);
     sc_core::sc_fifo<PipelineTxn> vs_decoder_to_slot("vs_decoder_to_slot", 1);
     sc_core::sc_fifo<PipelineTxn> vs_slot_to_cluster("vs_slot_to_cluster", 1);
     sc_core::sc_fifo<PipelineTxn> vs_cluster_to_clip("vs_cluster_to_clip", 1);
@@ -409,13 +411,14 @@ int sc_main(int, char **) {
     Isp isp("isp", pool);
     FragmentFrontend frontend("fragment_frontend", pool);
     PdsEngine pds("pds", pool);
+    VertexPdsEngine vertex_pds("vertex_pds", pool);
     UscSlot fragment_slot("fragment_usc_slot", pool,
                           ShaderStage::kFragment);
     UscCluster fragment_cluster("fragment_usc_cluster", pool,
                                 ShaderStage::kFragment);
     TextureUnit texture("texture_unit", pool);
     Pbe pbe("pbe", pool);
-    PixelDataMaster pixel_dm("pixel_data_master", pool);
+    PbeWriteBack pixel_dm("pbe_write_back", pool);
     Slc slc("slc", pool, false);
     DramModel dram("dram_model", pool);
 
@@ -423,8 +426,10 @@ int sc_main(int, char **) {
     vdm.input(submit_to_vdm);
     vdm.output(vdm_to_fetch);
     fetch.input(vdm_to_fetch);
-    fetch.output(fetch_to_vs_decoder);
-    vertex_decoder.input(fetch_to_vs_decoder);
+    fetch.output(fetch_to_pds);
+    vertex_pds.input(fetch_to_pds);
+    vertex_pds.output(vs_pds_to_decoder);
+    vertex_decoder.input(vs_pds_to_decoder);
     vertex_decoder.output(vs_decoder_to_slot);
     vertex_slot.input(vs_decoder_to_slot);
     vertex_slot.output(vs_slot_to_cluster);

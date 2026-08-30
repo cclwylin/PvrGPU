@@ -53,25 +53,13 @@ def golden_markdown(
 
 def pvrgpu_messages(
     counters: dict[str, object] | None = None,
-    *,
-    formal_mesa_ingest: bool = False,
 ) -> list[dict[str, object]]:
     hello: dict[str, object] = {
         "schema": "pvrgpu.counter.v1",
         "type": "hello",
         "backend": "pvrgpu",
+        "rdc_sha256": "1" * 64,
     }
-    if formal_mesa_ingest:
-        hello.update(
-            {
-                "mesa_command_ingest": True,
-                "command_source": "renderdoc-mesa-gallium-trace-poc",
-                "mesa_command_schema": "pvrgpu.mesa-poc-command.v1",
-                "rdc_sha256": "1" * 64,
-                "api_trace_sha256": "a" * 64,
-                "gallium_trace_sha256": "f" * 64,
-            }
-        )
     return [
         hello,
         {
@@ -179,45 +167,6 @@ class RdcCounterTextTests(unittest.TestCase):
             parsed = counters_from_pvrgpu_jsonl(path)
         self.assertEqual(parsed, expected)
 
-    def test_pvrgpu_jsonl_formal_mesa_ingest_accepts_complete_evidence(self) -> None:
-        expected = sample_counters()
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "stdout.jsonl"
-            write_jsonl(path, pvrgpu_messages(formal_mesa_ingest=True))
-            parsed = counters_from_pvrgpu_jsonl(
-                path, require_mesa_ingest=True
-            )
-        self.assertEqual(parsed, expected)
-
-    def test_pvrgpu_jsonl_formal_mesa_ingest_rejects_bad_evidence(self) -> None:
-        mutations = {
-            "ingest disabled": ("mesa_command_ingest", False),
-            "wrong command source": ("command_source", "builtin-glbench-fixture"),
-            "wrong command schema": ("mesa_command_schema", "pvrgpu.command.v0"),
-            "invalid RDC digest": ("rdc_sha256", "not-a-sha256"),
-            "invalid API trace digest": ("api_trace_sha256", "A" * 64),
-            "invalid Gallium trace digest": ("gallium_trace_sha256", "f" * 63),
-        }
-        for description, (field, value) in mutations.items():
-            with self.subTest(description=description):
-                messages = pvrgpu_messages(formal_mesa_ingest=True)
-                messages[0][field] = value
-                with tempfile.TemporaryDirectory() as directory:
-                    path = Path(directory) / "stdout.jsonl"
-                    write_jsonl(path, messages)
-                    with self.assertRaises(CounterProtocolError):
-                        counters_from_pvrgpu_jsonl(
-                            path, require_mesa_ingest=True
-                        )
-
-        messages = pvrgpu_messages(formal_mesa_ingest=True)
-        del messages[0]["rdc_sha256"]
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "stdout.jsonl"
-            write_jsonl(path, messages)
-            with self.assertRaises(CounterProtocolError):
-                counters_from_pvrgpu_jsonl(path, require_mesa_ingest=True)
-
     def test_pvrgpu_jsonl_rejects_invalid_acceptance_evidence(self) -> None:
         base = pvrgpu_messages()
 
@@ -311,18 +260,19 @@ class RdcCounterTextTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertIn("not allowed with argument", completed.stderr)
 
-    def test_cli_require_mesa_ingest_accepts_only_formal_pvrgpu_input(self) -> None:
+    def test_cli_expected_rdc_digest_checks_pvrgpu_hello(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             jsonl = root / "stdout.jsonl"
-            write_jsonl(jsonl, pvrgpu_messages(formal_mesa_ingest=True))
+            write_jsonl(jsonl, pvrgpu_messages())
             accepted = subprocess.run(
                 [
                     sys.executable,
                     str(SCRIPT),
                     "--pvrgpu-jsonl",
                     str(jsonl),
-                    "--require-mesa-ingest",
+                    "--expected-rdc-sha256",
+                    "1" * 64,
                 ],
                 cwd=PROJECT_ROOT,
                 text=True,
@@ -331,17 +281,14 @@ class RdcCounterTextTests(unittest.TestCase):
                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
             )
 
-            report = root / "Report.md"
-            report.write_text(
-                golden_markdown([sample_counters()]), encoding="utf-8"
-            )
             rejected = subprocess.run(
                 [
                     sys.executable,
                     str(SCRIPT),
-                    "--golden-report",
-                    str(report),
-                    "--require-mesa-ingest",
+                    "--pvrgpu-jsonl",
+                    str(jsonl),
+                    "--expected-rdc-sha256",
+                    "2" * 64,
                 ],
                 cwd=PROJECT_ROOT,
                 text=True,
@@ -354,7 +301,7 @@ class RdcCounterTextTests(unittest.TestCase):
         self.assertEqual(accepted.stdout, format_counter_text(sample_counters()))
         self.assertEqual(rejected.returncode, 2)
         self.assertIn(
-            "--require-mesa-ingest requires --pvrgpu-jsonl", rejected.stderr
+            "PvrGPU hello.rdc_sha256 does not match", rejected.stderr
         )
 
 

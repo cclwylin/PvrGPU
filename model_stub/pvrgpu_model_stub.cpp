@@ -16,7 +16,9 @@
 #include "data_master/compute_data_master.h"
 #include "data_master/domain_data_master.h"
 #include "data_master/pixel_data_master.h"
+#include "fragment/pbe_write_back.h"
 #include "data_master/two_d_data_master.h"
+#include "driver_command.h"
 #include "firmware/firmware_scheduler.h"
 #include "fragment/fragment_frontend.h"
 #include "fragment/isp.h"
@@ -34,10 +36,10 @@
 #include "memory/mem_fabric.h"
 #include "memory/dram_model.h"
 #include "memory/on_chip_fabric.h"
-#include "mesa_command.h"
 #include "memory_pool.h"
 #include "model_types.h"
 #include "pds/pds_engine.h"
+#include "pds/vertex_pds_engine.h"
 #include "shader/pco_decoder.h"
 #include "shader/usc_cluster.h"
 #include "shader/usc_slot.h"
@@ -68,7 +70,7 @@ int sc_main(int argc, char **argv) {
   using pvrgpu::stub::JsonEscape;
   using pvrgpu::stub::JsonReporter;
   using pvrgpu::stub::kSchema;
-  using pvrgpu::stub::LoadMesaPocCommand;
+  using pvrgpu::stub::LoadDriverCommand;
   using pvrgpu::stub::MemFabric;
   using pvrgpu::stub::MemoryPool;
   using pvrgpu::stub::MemoryTxn;
@@ -81,8 +83,10 @@ int sc_main(int argc, char **argv) {
   using pvrgpu::stub::Pbe;
   using pvrgpu::stub::PcoDecoder;
   using pvrgpu::stub::PdsEngine;
+  using pvrgpu::stub::PbeWriteBack;
   using pvrgpu::stub::PixelDataMaster;
   using pvrgpu::stub::PipelineTxn;
+  using pvrgpu::stub::VertexPdsEngine;
   using pvrgpu::stub::RequiresBackCcwFaceCull;
   using pvrgpu::stub::ShaderStage;
   using pvrgpu::stub::Slc;
@@ -103,20 +107,27 @@ int sc_main(int argc, char **argv) {
   Options options;
   if (!ParseOptions(argc, argv, &options))
     return 2;
-  if (!options.mesa_command_path.empty()) {
+  if (!options.driver_command_path.empty()) {
     std::string command_error;
-    if (!LoadMesaPocCommand(options.mesa_command_path, &options.mesa_command,
-                            &command_error)) {
+    if (!LoadDriverCommand(options.driver_command_path,
+                           &options.driver_command, &command_error)) {
       std::cerr << command_error << '\n';
       return 2;
     }
-    // A Mesa capsule describes exactly one captured frame.  It is the source
-    // of truth for the workload identity and dimensions, regardless of any
-    // legacy fixture options supplied on the command line.
     options.frames = 1;
-    options.width = options.mesa_command.width;
-    options.height = options.mesa_command.height;
-    options.test_case = options.mesa_command.test_case;
+    if (options.driver_command.command == "draw_triangle") {
+      options.width = options.driver_command.width;
+      options.height = options.driver_command.height;
+      options.test_case = "driver_triangle_solid";
+    } else if (options.driver_command.command == "draw_indexed_quad") {
+      options.width = options.driver_command.framebuffer_width;
+      options.height = options.driver_command.framebuffer_height;
+      options.test_case = "driver_indexed_quad";
+    } else {
+      options.width = options.driver_command.width;
+      options.height = options.driver_command.height;
+      options.test_case = "driver_clear_color";
+    }
   }
   const FunctionalCase functional_case =
       FunctionalCaseFromName(options.test_case);
@@ -133,11 +144,16 @@ int sc_main(int argc, char **argv) {
                  "varyings_shader_8, fill_tex_nearest, "
                  "fill_tex_bilinear, fill_tex_trilinear_linear_01, "
                  "fill_tex_trilinear_linear_04, "
-                 "fill_tex_trilinear_linear_05)\n";
+                 "fill_tex_trilinear_linear_05, driver_clear_color, "
+                 "driver_triangle_solid, driver_indexed_quad)\n";
     return 2;
   }
   const bool is_blended =
       functional_case == FunctionalCase::kFillSolidBlended;
+  const bool is_driver_triangle =
+      functional_case == FunctionalCase::kDriverTriangleSolid;
+  const bool is_driver_indexed_quad =
+      functional_case == FunctionalCase::kDriverIndexedQuad;
   const bool is_triangle_setup = IsTriangleSetupFamily(functional_case);
   const bool is_triangle_setup_all_culled =
       functional_case == FunctionalCase::kTriangleSetupAllCulled;
@@ -163,6 +179,12 @@ int sc_main(int argc, char **argv) {
   const bool is_eight_attribute_fetch =
       functional_case == FunctionalCase::kAttributeFetchShaderEightAttribute;
   const char *mode =
+      options.driver_command.enabled
+          ? (is_driver_indexed_quad
+                 ? "pvrgpu-driver-draw-indexed-quad-phase7"
+                 : is_driver_triangle ? "pvrgpu-driver-draw-triangle-phase2"
+                                      : "pvrgpu-driver-clear-color-phase1")
+          :
       is_trilinear_linear_05
           ? "systemc-functional-fill-texture-trilinear-linear-05"
           : is_trilinear_linear_04
@@ -197,34 +219,28 @@ int sc_main(int argc, char **argv) {
             << JsonEscape(options.test_case) << "\""
             << ",\"functional_scope\":\"" << JsonEscape(options.test_case)
             << "-pco-iss-v1\"";
-  if (options.mesa_command.enabled) {
-    const pvrgpu::stub::MesaPocCommand &command = options.mesa_command;
-    std::cout << ",\"command_source\":\"renderdoc-mesa-gallium-trace-poc\""
-              << ",\"mesa_command_ingest\":true"
-              << ",\"mesa_command_schema\":\""
+  if (options.driver_command.enabled) {
+    const pvrgpu::stub::DriverCommand &command = options.driver_command;
+    std::cout << ",\"command_source\":\"pvrgpu-gallium-driver-command\""
+              << ",\"driver_command_ingest\":true"
+              << ",\"driver_command_schema\":\""
               << JsonEscape(command.schema) << "\""
-              << ",\"mesa_driver\":\"" << JsonEscape(command.mesa_driver)
+              << ",\"driver_command_producer\":\""
+              << JsonEscape(command.producer) << "\""
+              << ",\"driver_command\":\"" << JsonEscape(command.command)
               << "\""
-              << ",\"manifest_index\":" << command.manifest_index
-              << ",\"rdc_sha256\":\"" << JsonEscape(command.rdc_sha256)
-              << "\""
-              << ",\"api_trace_sha256\":\""
-              << JsonEscape(command.api_trace_sha256) << "\""
-              << ",\"gallium_trace_sha256\":\""
-              << JsonEscape(command.gallium_trace_sha256) << "\""
-              << ",\"api_calls\":" << command.api_calls
-              << ",\"api_draw_calls\":" << command.api_draw_calls
-              << ",\"command_primitive\":\""
-              << JsonEscape(command.primitive) << "\""
-              << ",\"command_indexed\":"
-              << (command.indexed ? "true" : "false")
-              << ",\"command_draw_count\":" << command.draw_count
-              << ",\"gallium_draw_calls\":" << command.gallium_draw_calls
-              << ",\"gallium_target_draws\":"
-              << command.gallium_target_draws;
+              << ",\"driver_command_case\":\""
+              << JsonEscape(command.test_case) << "\""
+              << ",\"driver_command_format\":\""
+              << JsonEscape(command.format) << "\""
+              << ",\"driver_command_width\":" << command.width
+              << ",\"driver_command_height\":" << command.height
+              << ",\"driver_command_framebuffer_width\":"
+              << command.framebuffer_width
+              << ",\"driver_command_framebuffer_height\":"
+              << command.framebuffer_height;
   } else {
-    std::cout << ",\"command_source\":\"builtin-glbench-fixture\""
-              << ",\"mesa_command_ingest\":false";
+    std::cout << ",\"command_source\":\"builtin-glbench-fixture\"";
   }
   std::cout << ",\"shader_binary\":\"mesa-pco-public-encoding\""
             << ",\"pco_subset\":\""
@@ -238,6 +254,10 @@ int sc_main(int argc, char **argv) {
                     ? "fadd-mbyp-uvsw-attribute-fetch"
                     : is_attribute_fetch
                     ? "mbyp-uvsw-attribute-fetch"
+                    : is_driver_indexed_quad
+                    ? "mbyp-uvsw-driver-indexed-quad"
+                    : is_driver_triangle
+                    ? "mbyp-uvsw-driver-triangle"
                     : is_triangle_setup ? "mbyp-uvsw-triangle-setup"
                                         : "mbyp-uvsw-fill-solid")
             << "\""
@@ -301,13 +321,32 @@ int sc_main(int argc, char **argv) {
             << ",\"tile_width\":" << pvrgpu::stub::kReferenceUarch.tile_width
             << ",\"tile_height\":" << pvrgpu::stub::kReferenceUarch.tile_height
             << ",\"warning\":\"";
-  if (options.mesa_command.enabled) {
-    std::cout
-        << "function-correct supported raster case; real public PCO subset; "
-           "RenderDoc and Mesa Gallium trace command capsule ingested; "
-           "trace-driven POC, not a production Gallium PvrGPU driver; "
-           "assumed uncalibrated uArch timing; framebuffer published only "
-           "from DRAM readback";
+  if (options.driver_command.enabled) {
+    if (options.driver_command.command == "draw_indexed_quad") {
+      std::cout
+          << "Phase7 driver-command indexed-quad path; command is generated "
+             "by the Mesa Gallium pvrgpu driver skeleton from a validated "
+             "RDC indexed triangle-list quad; SystemC emits a DRAM readback "
+             "framebuffer at framebuffer_width/height while reporting "
+             "frame-level draw batch counters from viewport width/height "
+             "metadata; assumed "
+             "uncalibrated uArch timing; framebuffer published only from DRAM "
+             "readback";
+    } else if (options.driver_command.command == "draw_triangle") {
+      std::cout
+          << "Phase2 driver-command draw-triangle path; command is generated "
+             "by the Mesa Gallium pvrgpu driver skeleton; non-indexed Gallium "
+             "draw is lowered to a canonical internal indexed triangle for "
+             "the SystemC raster pipeline; assumed uncalibrated uArch timing; "
+             "framebuffer published only from DRAM readback";
+    } else {
+      std::cout
+          << "Phase1 driver-command clear-color path; command is generated by "
+             "the Mesa Gallium pvrgpu driver skeleton; implemented through the "
+             "validated depth-never clear framebuffer path until the dedicated "
+             "PrvGPU clear engine is split out; assumed uncalibrated uArch "
+             "timing; framebuffer published only from DRAM readback";
+    }
   } else {
     std::cout
         << "function-correct supported raster case; real public PCO subset; "
@@ -331,6 +370,7 @@ int sc_main(int argc, char **argv) {
   FirmwareScheduler firmware_scheduler("firmware_scheduler");
   ComputeDataMaster compute_data_master("compute_data_master");
   DomainDataMaster domain_data_master("domain_data_master");
+  PixelDataMaster pixel_data_master("pixel_data_master");
   TwoDDataMaster two_d_data_master("two_d_data_master");
   ImageCompression image_compression("image_compression");
 
@@ -350,8 +390,10 @@ int sc_main(int argc, char **argv) {
   sc_core::sc_fifo<PipelineTxn> submit_to_vdm("submit_to_vdm", fifo_depth);
   sc_core::sc_fifo<PipelineTxn> vdm_to_vertex_fetch("vdm_to_vertex_fetch",
                                                     fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> vertex_fetch_to_decoder(
-      "vertex_fetch_to_decoder", fifo_depth);
+  sc_core::sc_fifo<PipelineTxn> vertex_fetch_to_pds(
+      "vertex_fetch_to_pds", fifo_depth);
+  sc_core::sc_fifo<PipelineTxn> vertex_pds_to_decoder(
+      "vertex_pds_to_decoder", fifo_depth);
   sc_core::sc_fifo<PipelineTxn> vertex_decoder_to_slot("vertex_decoder_to_slot",
                                                        fifo_depth);
   sc_core::sc_fifo<PipelineTxn> vertex_slot_to_cluster("vertex_slot_to_cluster",
@@ -382,10 +424,10 @@ int sc_main(int argc, char **argv) {
   sc_core::sc_fifo<PipelineTxn> texture_samples_to_fragment_cluster(
       "texture_samples_to_fragment_cluster", fifo_depth);
   sc_core::sc_fifo<PipelineTxn> texture_to_pbe("texture_to_pbe", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> pbe_to_pixel_data_master(
-      "pbe_to_pixel_data_master", fifo_depth);
-  sc_core::sc_fifo<MemoryTxn> pixel_data_master_to_slc(
-      "pixel_data_master_to_slc", fifo_depth);
+  sc_core::sc_fifo<PipelineTxn> pbe_to_pbe_write_back(
+      "pbe_to_pbe_write_back", fifo_depth);
+  sc_core::sc_fifo<MemoryTxn> pbe_write_back_to_slc(
+      "pbe_write_back_to_slc", fifo_depth);
   sc_core::sc_fifo<MemoryTxn> slc_to_dram("slc_to_dram", fifo_depth);
   sc_core::sc_fifo<MemoryTxn> texture_unit_to_tcu(
       "texture_unit_to_tcu", fifo_depth);
@@ -426,6 +468,7 @@ int sc_main(int argc, char **argv) {
   Isp isp("isp", pool);
   FragmentFrontend fragment_frontend("fragment_frontend", pool);
   PdsEngine pds_engine("pds_engine", pool);
+  VertexPdsEngine vertex_pds_engine("vertex_pds_engine", pool);
   PcoDecoder fragment_decoder("fragment_pco_decoder", pool,
                               ShaderStage::kFragment);
   UscSlot fragment_slot("fragment_usc_slot", pool, ShaderStage::kFragment);
@@ -433,7 +476,7 @@ int sc_main(int argc, char **argv) {
                               ShaderStage::kFragment);
   TextureUnit texture_unit("texture_unit", pool);
   Pbe pbe("pbe", pool);
-  PixelDataMaster pixel_data_master("pixel_data_master", pool);
+  PbeWriteBack pbe_write_back("pbe_write_back", pool);
   Slc slc("slc", pool, options.cache_bypass);
   DramModel dram_model("dram_model", pool);
   JsonReporter reporter("json_reporter", options, pool);
@@ -453,8 +496,10 @@ int sc_main(int argc, char **argv) {
   vdm.input(submit_to_vdm);
   vdm.output(vdm_to_vertex_fetch);
   vertex_fetch.input(vdm_to_vertex_fetch);
-  vertex_fetch.output(vertex_fetch_to_decoder);
-  vertex_decoder.input(vertex_fetch_to_decoder);
+  vertex_fetch.output(vertex_fetch_to_pds);
+  vertex_pds_engine.input(vertex_fetch_to_pds);
+  vertex_pds_engine.output(vertex_pds_to_decoder);
+  vertex_decoder.input(vertex_pds_to_decoder);
   vertex_decoder.output(vertex_decoder_to_slot);
   vertex_slot.input(vertex_decoder_to_slot);
   vertex_slot.output(vertex_slot_to_cluster);
@@ -493,10 +538,10 @@ int sc_main(int argc, char **argv) {
   texture_unit.input(fragment_cluster_to_texture);
   texture_unit.output(texture_to_pbe);
   pbe.input(texture_to_pbe);
-  pbe.output(pbe_to_pixel_data_master);
-  pixel_data_master.input(pbe_to_pixel_data_master);
-  pixel_data_master.output(pixel_data_master_to_slc);
-  slc.input(pixel_data_master_to_slc);
+  pbe.output(pbe_to_pbe_write_back);
+  pbe_write_back.input(pbe_to_pbe_write_back);
+  pbe_write_back.output(pbe_write_back_to_slc);
+  slc.input(pbe_write_back_to_slc);
   slc.output(slc_to_dram);
   slc.texture_input(tcu_to_slc);
   slc.texture_output(slc_to_tcu);

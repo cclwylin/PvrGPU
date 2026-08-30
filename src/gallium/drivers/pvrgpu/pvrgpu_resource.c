@@ -1,0 +1,581 @@
+/* SPDX-License-Identifier: MIT */
+
+#include "pvrgpu_resource.h"
+#include "pvrgpu_context.h"
+#include "pvrgpu_counter.h"
+
+#include "pipe/p_defines.h"
+#include "util/format/u_format.h"
+#include "util/u_inlines.h"
+#include "util/u_memory.h"
+#include "util/u_transfer.h"
+
+#include <string.h>
+
+static bool
+pvrgpu_is_supported_color_resource_format(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+   case PIPE_FORMAT_B10G10R10A2_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+pvrgpu_is_supported_depth_stencil_resource_format(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_Z32_FLOAT:
+   case PIPE_FORMAT_Z32_UNORM:
+   case PIPE_FORMAT_Z32_FLOAT_S8X24_UINT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+pvrgpu_can_create_buffer(const struct pipe_resource *template)
+{
+   return template &&
+          template->target == PIPE_BUFFER &&
+          template->width0 != 0 &&
+          template->height0 <= 1 &&
+          template->depth0 <= 1 &&
+          template->array_size <= 1 &&
+          template->nr_samples <= 1 &&
+          template->nr_storage_samples <= 1;
+}
+
+static bool
+pvrgpu_can_create_texture_target(const struct pipe_resource *template)
+{
+   if (!template ||
+       template->width0 == 0 ||
+       template->height0 == 0 ||
+       template->nr_samples > 1 ||
+       template->nr_storage_samples > 1)
+      return false;
+
+   switch (template->target) {
+   case PIPE_TEXTURE_2D:
+      return template->depth0 <= 1 && template->array_size <= 1;
+   case PIPE_TEXTURE_2D_ARRAY:
+      return template->depth0 <= 1 && template->array_size > 0;
+   case PIPE_TEXTURE_3D:
+      return template->depth0 > 0 && template->array_size <= 1;
+   case PIPE_TEXTURE_CUBE:
+      return template->depth0 <= 1;
+   default:
+      return false;
+   }
+}
+
+static bool
+pvrgpu_can_create_texture(const struct pipe_resource *template)
+{
+   return template &&
+          pvrgpu_can_create_texture_target(template) &&
+          (pvrgpu_is_supported_color_resource_format(template->format) ||
+           (template->target == PIPE_TEXTURE_2D &&
+            pvrgpu_is_supported_depth_stencil_resource_format(template->format)));
+}
+
+static bool
+pvrgpu_can_create_resource(struct pipe_screen *screen,
+                           const struct pipe_resource *template)
+{
+   (void)screen;
+   return pvrgpu_can_create_buffer(template) ||
+          pvrgpu_can_create_texture(template);
+}
+
+static unsigned
+pvrgpu_resource_layer_count(const struct pipe_resource *resource)
+{
+   if (resource->target == PIPE_TEXTURE_3D)
+      return resource->depth0 > 0 ? resource->depth0 : 1;
+
+   if (resource->target == PIPE_TEXTURE_CUBE && resource->array_size < 6)
+      return 6;
+
+   return resource->array_size > 0 ? resource->array_size : 1;
+}
+
+static bool
+pvrgpu_init_resource_storage(struct pvrgpu_resource *resource)
+{
+   if (resource->base.target == PIPE_BUFFER) {
+      resource->stride = resource->base.width0;
+      resource->layer_stride = resource->base.width0;
+      resource->size = resource->base.width0;
+   } else {
+      const unsigned block_size =
+         util_format_get_blocksize(resource->base.format);
+      if (block_size == 0)
+         return false;
+
+      resource->stride = resource->base.width0 * block_size;
+      resource->layer_stride =
+         (uintptr_t)resource->stride * resource->base.height0;
+      resource->size =
+         resource->layer_stride * pvrgpu_resource_layer_count(&resource->base);
+   }
+
+   resource->data = CALLOC(1, resource->size);
+   return resource->data != NULL;
+}
+
+static struct pipe_resource *
+pvrgpu_resource_create(struct pipe_screen *screen,
+                       const struct pipe_resource *template)
+{
+   if (!pvrgpu_can_create_resource(screen, template))
+      return NULL;
+
+   struct pvrgpu_resource *resource = CALLOC_STRUCT(pvrgpu_resource);
+   if (!resource)
+      return NULL;
+   resource->base = *template;
+   pipe_reference_init(&resource->base.reference, 1);
+   resource->base.screen = screen;
+   if (!pvrgpu_init_resource_storage(resource)) {
+      FREE(resource);
+      return NULL;
+   }
+   pvrgpu_counter_eventf("resource_create",
+                         "target=%u width=%u height=%u depth=%u array=%u "
+                         "format=%s size=%zu",
+                         resource->base.target,
+                         resource->base.width0,
+                         resource->base.height0,
+                         resource->base.depth0,
+                         resource->base.array_size,
+                         util_format_name(resource->base.format),
+                         resource->size);
+   return &resource->base;
+}
+
+static struct pipe_resource *
+pvrgpu_resource_create_front(struct pipe_screen *screen,
+                             const struct pipe_resource *template,
+                             const void *map_front_private)
+{
+   (void)map_front_private;
+   return pvrgpu_resource_create(screen, template);
+}
+
+static void
+pvrgpu_resource_destroy(struct pipe_screen *screen,
+                        struct pipe_resource *resource)
+{
+   (void)screen;
+   pvrgpu_counter_eventf("resource_destroy",
+                         "target=%u width=%u height=%u depth=%u array=%u "
+                         "format=%s size=%zu",
+                         resource->target,
+                         resource->width0,
+                         resource->height0,
+                         resource->depth0,
+                         resource->array_size,
+                         util_format_name(resource->format),
+                         pvrgpu_resource(resource)->size);
+   FREE(pvrgpu_resource(resource)->data);
+   FREE(pvrgpu_resource(resource));
+}
+
+static bool
+pvrgpu_transfer_box_in_bounds(const struct pipe_resource *resource,
+                              unsigned level,
+                              const struct pipe_box *box)
+{
+   if (!resource || !box || level != 0)
+      return false;
+
+   if (resource->target == PIPE_BUFFER) {
+      return box->x >= 0 &&
+             box->y == 0 &&
+             box->z == 0 &&
+             box->height == 1 &&
+             box->depth == 1 &&
+             box->width >= 0 &&
+             (uint64_t)box->x + (uint64_t)box->width <= resource->width0;
+   }
+
+   return pvrgpu_can_create_texture_target(resource) &&
+          box->x >= 0 &&
+          box->y >= 0 &&
+          box->z >= 0 &&
+          box->width >= 0 &&
+          box->height >= 0 &&
+          box->depth >= 0 &&
+          (uint64_t)box->x + (uint64_t)box->width <= resource->width0 &&
+          (uint64_t)box->y + (uint64_t)box->height <= resource->height0 &&
+          (uint64_t)box->z + (uint64_t)box->depth <=
+             pvrgpu_resource_layer_count(resource);
+}
+
+static void *
+pvrgpu_transfer_map(struct pipe_context *pipe,
+                    struct pipe_resource *resource,
+                    unsigned level,
+                    unsigned usage,
+                    const struct pipe_box *box,
+                    struct pipe_transfer **out_transfer)
+{
+   (void)pipe;
+   struct pvrgpu_resource *pvrgpu = pvrgpu_resource(resource);
+   if (!out_transfer || !pvrgpu || !pvrgpu->data ||
+       !pvrgpu_transfer_box_in_bounds(resource, level, box))
+      return NULL;
+
+   struct pipe_transfer *transfer = CALLOC_STRUCT(pipe_transfer);
+   if (!transfer)
+      return NULL;
+
+   pipe_resource_reference(&transfer->resource, resource);
+   transfer->level = level;
+   transfer->usage = usage;
+   transfer->box = *box;
+   transfer->stride = pvrgpu->stride;
+   transfer->layer_stride = pvrgpu->layer_stride;
+   *out_transfer = transfer;
+
+   pvrgpu_counter_eventf(resource->target == PIPE_BUFFER ?
+                         "buffer_map" : "texture_map",
+                         "usage=0x%x x=%d y=%d z=%d width=%d height=%d depth=%d",
+                         usage,
+                         box->x,
+                         box->y,
+                         box->z,
+                         box->width,
+                         box->height,
+                         box->depth);
+
+   if (resource->target == PIPE_BUFFER)
+      return pvrgpu->data + box->x;
+
+   const unsigned block_size = util_format_get_blocksize(resource->format);
+   return pvrgpu->data + (uintptr_t)box->z * pvrgpu->layer_stride +
+          (uintptr_t)box->y * pvrgpu->stride +
+          (uintptr_t)box->x * block_size;
+}
+
+static void
+pvrgpu_transfer_unmap(struct pipe_context *pipe,
+                      struct pipe_transfer *transfer)
+{
+   (void)pipe;
+   if (!transfer)
+      return;
+   if (transfer->resource) {
+      pvrgpu_counter_event(transfer->resource->target == PIPE_BUFFER ?
+                           "buffer_unmap" : "texture_unmap",
+                           "");
+   }
+   pipe_resource_reference(&transfer->resource, NULL);
+   FREE(transfer);
+}
+
+static void
+pvrgpu_buffer_subdata(struct pipe_context *pipe,
+                      struct pipe_resource *resource,
+                      unsigned usage,
+                      unsigned offset,
+                      unsigned size,
+                      const void *data)
+{
+   (void)pipe;
+   (void)usage;
+   struct pvrgpu_resource *pvrgpu = pvrgpu_resource(resource);
+   if (!pvrgpu || !data || resource->target != PIPE_BUFFER ||
+       (uint64_t)offset + (uint64_t)size > pvrgpu->size)
+      return;
+   memcpy(pvrgpu->data + offset, data, size);
+   pvrgpu_counter_eventf("buffer_subdata",
+                         "offset=%u size=%u",
+                         offset,
+                         size);
+}
+
+static void
+pvrgpu_texture_subdata(struct pipe_context *pipe,
+                       struct pipe_resource *resource,
+                       unsigned level,
+                       unsigned usage,
+                       const struct pipe_box *box,
+                       const void *data,
+                       unsigned stride,
+                       uintptr_t layer_stride)
+{
+   (void)pipe;
+   (void)usage;
+   struct pvrgpu_resource *pvrgpu = pvrgpu_resource(resource);
+   if (!pvrgpu || !data ||
+       !pvrgpu_transfer_box_in_bounds(resource, level, box))
+      return;
+
+   const unsigned block_size = util_format_get_blocksize(resource->format);
+   const unsigned row_bytes = (unsigned)box->width * block_size;
+   uint8_t *dst = pvrgpu->data + (uintptr_t)box->z * pvrgpu->layer_stride +
+                  (uintptr_t)box->y * pvrgpu->stride +
+                  (uintptr_t)box->x * block_size;
+   const uint8_t *src = (const uint8_t *)data;
+   for (int layer = 0; layer < box->depth; ++layer) {
+      for (int row = 0; row < box->height; ++row) {
+         memcpy(dst + (uintptr_t)layer * pvrgpu->layer_stride +
+                   (uintptr_t)row * pvrgpu->stride,
+                src + (uintptr_t)layer * layer_stride +
+                   (uintptr_t)row * stride,
+                row_bytes);
+      }
+   }
+   pvrgpu_counter_eventf("texture_subdata",
+                         "x=%d y=%d z=%d width=%d height=%d depth=%d "
+                         "stride=%u layer_stride=%zu",
+                         box->x,
+                         box->y,
+                         box->z,
+                         box->width,
+                         box->height,
+                         box->depth,
+                         stride,
+                         (size_t)layer_stride);
+}
+
+static void
+pvrgpu_emit_unsupported_resource_op(struct pipe_context *pipe,
+                                    const char *event,
+                                    const char *reason)
+{
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   ctx->unsupported_resource_ops++;
+   pvrgpu_counter_eventf(event,
+                         "reason=%s total=%u",
+                         reason,
+                         ctx->unsupported_resource_ops);
+}
+
+static bool
+pvrgpu_can_copy_2d_region(struct pipe_resource *dst,
+                          unsigned dst_level,
+                          unsigned dstx,
+                          unsigned dsty,
+                          unsigned dstz,
+                          struct pipe_resource *src,
+                          unsigned src_level,
+                          const struct pipe_box *src_box)
+{
+   if (!dst || !src || !src_box)
+      return false;
+   if (dst_level != 0 || src_level != 0 || dstz != 0)
+      return false;
+   if (dst->target != PIPE_TEXTURE_2D || src->target != PIPE_TEXTURE_2D)
+      return false;
+   if (dst->format != src->format)
+      return false;
+   if (dst->nr_samples > 1 || src->nr_samples > 1 ||
+       dst->nr_storage_samples > 1 || src->nr_storage_samples > 1)
+      return false;
+   if (src_box->width <= 0 || src_box->height <= 0 ||
+       src_box->depth != 1)
+      return false;
+   if (!pvrgpu_transfer_box_in_bounds(src, src_level, src_box))
+      return false;
+   if ((uint64_t)dstx + (uint64_t)src_box->width > dst->width0 ||
+       (uint64_t)dsty + (uint64_t)src_box->height > dst->height0)
+      return false;
+   if (!pvrgpu_resource(dst)->data || !pvrgpu_resource(src)->data)
+      return false;
+   return util_format_get_blocksize(dst->format) != 0;
+}
+
+static void
+pvrgpu_copy_2d_region_unchecked(struct pipe_resource *dst,
+                                unsigned dstx,
+                                unsigned dsty,
+                                struct pipe_resource *src,
+                                const struct pipe_box *src_box)
+{
+   struct pvrgpu_resource *pvrgpu_dst = pvrgpu_resource(dst);
+   struct pvrgpu_resource *pvrgpu_src = pvrgpu_resource(src);
+   const unsigned block_size = util_format_get_blocksize(dst->format);
+   const unsigned row_bytes = (unsigned)src_box->width * block_size;
+
+   for (int row = 0; row < src_box->height; ++row) {
+      uint8_t *dst_row =
+         pvrgpu_dst->data + (uintptr_t)(dsty + row) * pvrgpu_dst->stride +
+         (uintptr_t)dstx * block_size;
+      const uint8_t *src_row =
+         pvrgpu_src->data +
+         (uintptr_t)(src_box->y + row) * pvrgpu_src->stride +
+         (uintptr_t)src_box->x * block_size;
+      memmove(dst_row, src_row, row_bytes);
+   }
+}
+
+static void
+pvrgpu_resource_copy_region(struct pipe_context *pipe,
+                            struct pipe_resource *dst,
+                            unsigned dst_level,
+                            unsigned dstx,
+                            unsigned dsty,
+                            unsigned dstz,
+                            struct pipe_resource *src,
+                            unsigned src_level,
+                            const struct pipe_box *src_box)
+{
+   if (!pvrgpu_can_copy_2d_region(dst, dst_level, dstx, dsty, dstz,
+                                  src, src_level, src_box)) {
+      pvrgpu_emit_unsupported_resource_op(pipe,
+                                          "unsupported_resource_copy_region",
+                                          "2d-level0-same-format-only");
+      return;
+   }
+
+   pvrgpu_copy_2d_region_unchecked(dst, dstx, dsty, src, src_box);
+   pvrgpu_counter_eventf("resource_copy_region",
+                         "dst=%ux%u dst_xyz=%u,%u,%u dst_format=%s "
+                         "src=%ux%u src_box=%d,%d,%d,%d,%d,%d src_format=%s",
+                         dst->width0,
+                         dst->height0,
+                         dstx,
+                         dsty,
+                         dstz,
+                         util_format_name(dst->format),
+                         src->width0,
+                         src->height0,
+                         src_box->x,
+                         src_box->y,
+                         src_box->z,
+                         src_box->width,
+                         src_box->height,
+                         src_box->depth,
+                         util_format_name(src->format));
+}
+
+static bool
+pvrgpu_can_blit_as_2d_copy(const struct pipe_blit_info *info)
+{
+   if (!info || !info->dst.resource || !info->src.resource)
+      return false;
+   if (info->dst.format != info->src.format)
+      return false;
+   if (info->dst.resource->format != info->src.resource->format)
+      return false;
+   if (info->mask != PIPE_MASK_RGBA)
+      return false;
+   if (info->dst.box.width <= 0 || info->dst.box.height <= 0 ||
+       info->dst.box.depth != 1)
+      return false;
+   if (info->src.box.width <= 0 || info->src.box.height <= 0 ||
+       info->src.box.depth != 1)
+      return false;
+   if (info->dst.box.width != info->src.box.width ||
+       info->dst.box.height != info->src.box.height)
+      return false;
+   if (info->dst.box.x < 0 || info->dst.box.y < 0 ||
+       info->dst.box.z != 0)
+      return false;
+   if (info->filter != PIPE_TEX_FILTER_NEAREST &&
+       info->filter != PIPE_TEX_FILTER_LINEAR)
+      return false;
+   if (info->dst_sample || info->sample0_only || info->scissor_enable ||
+       info->swizzle_enable || info->render_condition_enable ||
+       info->alpha_blend)
+      return false;
+   return pvrgpu_can_copy_2d_region(info->dst.resource,
+                                    info->dst.level,
+                                    info->dst.box.x,
+                                    info->dst.box.y,
+                                    info->dst.box.z,
+                                    info->src.resource,
+                                    info->src.level,
+                                    &info->src.box);
+}
+
+static void
+pvrgpu_blit(struct pipe_context *pipe,
+            const struct pipe_blit_info *info)
+{
+   if (!pvrgpu_can_blit_as_2d_copy(info)) {
+      pvrgpu_emit_unsupported_resource_op(pipe,
+                                          "unsupported_blit",
+                                          "no-scale-same-format-rgba-only");
+      return;
+   }
+
+   pvrgpu_copy_2d_region_unchecked(info->dst.resource,
+                                   info->dst.box.x,
+                                   info->dst.box.y,
+                                   info->src.resource,
+                                   &info->src.box);
+   pvrgpu_counter_eventf("blit",
+                         "dst=%ux%u dst_box=%d,%d,%d,%d,%d,%d "
+                         "src=%ux%u src_box=%d,%d,%d,%d,%d,%d "
+                         "format=%s mask=0x%x filter=%u",
+                         info->dst.resource->width0,
+                         info->dst.resource->height0,
+                         info->dst.box.x,
+                         info->dst.box.y,
+                         info->dst.box.z,
+                         info->dst.box.width,
+                         info->dst.box.height,
+                         info->dst.box.depth,
+                         info->src.resource->width0,
+                         info->src.resource->height0,
+                         info->src.box.x,
+                         info->src.box.y,
+                         info->src.box.z,
+                         info->src.box.width,
+                         info->src.box.height,
+                         info->src.box.depth,
+                         util_format_name(info->dst.format),
+                         info->mask,
+                         info->filter);
+}
+
+static void
+pvrgpu_flush_resource(struct pipe_context *pipe,
+                      struct pipe_resource *resource)
+{
+   (void)pipe;
+   pvrgpu_counter_eventf("flush_resource",
+                         "target=%u width=%u height=%u format=%s",
+                         resource ? resource->target : 0,
+                         resource ? resource->width0 : 0,
+                         resource ? resource->height0 : 0,
+                         resource ? util_format_name(resource->format) : "none");
+}
+
+void
+pvrgpu_init_resource_functions(struct pipe_screen *screen)
+{
+   screen->can_create_resource = pvrgpu_can_create_resource;
+   screen->resource_create = pvrgpu_resource_create;
+   screen->resource_create_front = pvrgpu_resource_create_front;
+   screen->resource_destroy = pvrgpu_resource_destroy;
+}
+
+void
+pvrgpu_init_context_resource_functions(struct pipe_context *context)
+{
+   context->resource_release = u_default_resource_release;
+   context->buffer_map = pvrgpu_transfer_map;
+   context->buffer_unmap = pvrgpu_transfer_unmap;
+   context->texture_map = pvrgpu_transfer_map;
+   context->texture_unmap = pvrgpu_transfer_unmap;
+   context->transfer_flush_region = u_default_transfer_flush_region;
+   context->buffer_subdata = pvrgpu_buffer_subdata;
+   context->texture_subdata = pvrgpu_texture_subdata;
+   context->resource_copy_region = pvrgpu_resource_copy_region;
+   context->blit = pvrgpu_blit;
+   context->flush_resource = pvrgpu_flush_resource;
+}

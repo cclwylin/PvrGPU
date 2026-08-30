@@ -71,7 +71,8 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
 RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
     const std::array<std::uint32_t, 4>& words);
 TextureLinearAxis ComputeTextureLinearRepeat(float coordinate,
-                                             std::uint32_t extent);
+                                             std::uint32_t extent,
+                                             TextureWrapMode wrap = TextureWrapMode::kRepeat);
 std::uint8_t LerpTextureUnorm8(std::uint8_t first, std::uint8_t second,
                                std::uint16_t weight);
 TextureImplicitLod ComputeTextureImplicitLod(

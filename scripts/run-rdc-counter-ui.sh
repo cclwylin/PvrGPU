@@ -54,7 +54,10 @@ export PVRGPU_RDC_COUNTER_OUTPUT="${rdc_counter_output}"
 export PVRGPU_BENCHSCOPE_ROOT="${PVRGPU_BENCHSCOPE_ROOT:-}"
 export PVRGPU_LLVMPIPE_MESA_PREFIX="${PVRGPU_LLVMPIPE_MESA_PREFIX:-}"
 export PVRGPU_RENDERDOC_MESA_ROOT="${PVRGPU_RENDERDOC_MESA_ROOT:-}"
-export PVRGPU_RDC_DUT_RUNNER="${PVRGPU_RDC_DUT_RUNNER:-}"
+default_pvrgpu_runner="${project_dir}/scripts/run-rdc-pvrgpu-driver-systemc.sh"
+export PVRGPU_RDC_PVRGPU_RUNNER="${PVRGPU_RDC_PVRGPU_RUNNER:-${PVRGPU_RDC_DUT_RUNNER:-${default_pvrgpu_runner}}}"
 export PVRGPU_MODEL_STUB
 
-exec "${ui_python}" "${project_dir}/tools/rdc_counter_ui.py" "$@"
+"${ui_python}" "${project_dir}/tools/rdc_counter_ui.py" "$@" 2> >(
+    grep -v -F "error messaging the mach port for IMKCFRunLoopWakeUpReliable" >&2
+)

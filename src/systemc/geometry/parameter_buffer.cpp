@@ -306,14 +306,30 @@ void ParameterBuffer::Run() {
                 throw std::runtime_error(
                     "ParameterBuffer received a non-finite varying");
               }
-              numerator[vertex] = varying * reciprocal_w[vertex];
+              if (binding.interpolation == InterpolationMode::kFlat) {
+                numerator[vertex] = varying;
+              } else if (binding.interpolation == InterpolationMode::kNoPerspective) {
+                numerator[vertex] = varying;
+              } else {
+                numerator[vertex] = varying * reciprocal_w[vertex];
+              }
               if (!std::isfinite(numerator[vertex])) {
                 throw std::runtime_error(
                     "ParameterBuffer varying/W product is non-finite");
               }
             }
-            coefficients[coefficient_base + binding.coefficient_set_base +
-                         component] = BuildPlane(triangle, numerator);
+            if (binding.interpolation == InterpolationMode::kFlat) {
+              pvrgpu::stub::ParameterCoefficientSet coefficient;
+              coefficient.a = 0;
+              coefficient.b = 0;
+              coefficient.c = FloatBits(numerator[2]); // Provoking vertex (default is vertex 2)
+              coefficient.pad = 0;
+              coefficients[coefficient_base + binding.coefficient_set_base +
+                           component] = coefficient;
+            } else {
+              coefficients[coefficient_base + binding.coefficient_set_base +
+                           component] = BuildPlane(triangle, numerator);
+            }
           }
         }
       }

@@ -154,6 +154,31 @@ def process_details(completed: subprocess.CompletedProcess[str]) -> str:
     )
 
 
+def invoke_driver_command(
+    executable: Path,
+    command_path: Path,
+    output_dir: Path,
+    *,
+    cache_bypass: str = "on",
+    timeout: int = 15,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            str(executable),
+            "--driver-command",
+            str(command_path),
+            "--outdir",
+            str(output_dir),
+            "--cache-bypass",
+            cache_bypass,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
 def json_messages(completed: subprocess.CompletedProcess[str]) -> list[dict[str, object]]:
     return [
         json.loads(line)
@@ -286,6 +311,260 @@ def decode_rgba8_png(path: Path) -> tuple[int, int, bytes]:
         previous_row = reconstructed
 
     return width, height, bytes(pixels)
+
+
+def verify_driver_clear_command(executable: Path, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    command_path = output_dir / "driver-clear-green.txt"
+    command_path.write_text(
+        "\n".join(
+            (
+                "schema=pvrgpu.driver-command.v1",
+                "producer=pvrgpu-gallium-driver",
+                "command=clear_color",
+                "case=phase1.clear.green",
+                "frame=1",
+                f"width={WIDTH}",
+                f"height={HEIGHT}",
+                "format=PIPE_FORMAT_R8G8B8A8_UNORM",
+                "clear_color_bits=0,1065353216,0,1065353216",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    completed = invoke_driver_command(executable, command_path, output_dir)
+    assert completed.returncode == 0, (
+        "driver clear command run failed:\n" + process_details(completed)
+    )
+    messages = json_messages(completed)
+    hello = [message for message in messages if message.get("type") == "hello"]
+    counters = [message for message in messages if message.get("type") == "counter"]
+    done = [message for message in messages if message.get("type") == "done"]
+    assert len(hello) == 1, "driver clear: missing/duplicate hello"
+    assert hello[0].get("mode") == "pvrgpu-driver-clear-color-phase1"
+    assert hello[0].get("command_source") == "pvrgpu-gallium-driver-command"
+    assert hello[0].get("driver_command_ingest") is True
+    assert hello[0].get("driver_command") == "clear_color"
+    assert len(counters) == 1, "driver clear: missing/duplicate counter"
+    assert counters[0].get("command_source") == "pvrgpu-gallium-driver-command"
+    assert counters[0].get("driver_command_ingest") is True
+    assert counters[0].get("functional_scope") == "driver_clear_color-pco-iss-v1"
+    assert done and done[-1].get("pool_leaks") == 0
+    values = counters[0].get("counters")
+    assert isinstance(values, dict)
+    for field in (
+        "ia_vertices",
+        "ia_primitives",
+        "vs_invocations",
+        "gs_invocations",
+        "gs_primitives",
+        "c_invocations",
+        "c_primitives",
+        "ps_invocations",
+        "hs_invocations",
+        "ds_invocations",
+        "cs_invocations",
+        "ts_invocations",
+        "ms_invocations",
+        "ms_primitives",
+        "drawlists",
+        "setup_triangles",
+        "texel_fetches",
+    ):
+        assert values.get(field) == 0, (
+            f"driver clear: {field}={values.get(field)!r}, expected 0"
+        )
+    for field in (
+        "vs_alu_instructions",
+        "vs_tex_instructions",
+        "vs_memory_instructions",
+        "fs_alu_instructions",
+        "fs_tex_instructions",
+        "fs_memory_instructions",
+    ):
+        assert values.get(field) == 0, (
+            f"driver clear API view: {field}={values.get(field)!r}, expected 0"
+        )
+    assert values.get("depth_rejected_fragments") == PIXEL_COUNT
+    assert values.get("pbe_pixels_written") == PIXEL_COUNT
+    assert counters[0].get("drawlist_stats") == []
+    verify_memory_path(hello[0], counters[0], cache_bypass=True)
+
+    artifact = output_dir / "driver_clear_color_sample_000001.png"
+    png_width, png_height, pixels = decode_rgba8_png(artifact)
+    assert (png_width, png_height) == (WIDTH, HEIGHT)
+    assert pixels == b"\x00\xFF\x00\xFF" * PIXEL_COUNT, (
+        "driver clear: framebuffer is not solid green"
+    )
+
+
+def verify_driver_triangle_command(executable: Path, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    command_path = output_dir / "driver-triangle-red.txt"
+    command_path.write_text(
+        "\n".join(
+            (
+                "schema=pvrgpu.driver-command.v1",
+                "producer=pvrgpu-gallium-driver",
+                "command=draw_triangle",
+                "case=phase2.draw_triangle.gallium",
+                "frame=1",
+                f"width={WIDTH}",
+                f"height={HEIGHT}",
+                "format=PIPE_FORMAT_R8G8B8A8_UNORM",
+                "clear_color_bits=0,0,0,1065353216",
+                "vertex0_bits=3212836864,3212836864",
+                "vertex1_bits=1065353216,3212836864",
+                "vertex2_bits=0,1065353216",
+                "fragment_color_bits=1065353216,0,0,1065353216",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    completed = invoke_driver_command(executable, command_path, output_dir)
+    assert completed.returncode == 0, (
+        "driver triangle command run failed:\n" + process_details(completed)
+    )
+    messages = json_messages(completed)
+    hello = [message for message in messages if message.get("type") == "hello"]
+    counters = [message for message in messages if message.get("type") == "counter"]
+    done = [message for message in messages if message.get("type") == "done"]
+    assert len(hello) == 1, "driver triangle: missing/duplicate hello"
+    assert hello[0].get("mode") == "pvrgpu-driver-draw-triangle-phase2"
+    assert hello[0].get("command_source") == "pvrgpu-gallium-driver-command"
+    assert hello[0].get("driver_command_ingest") is True
+    assert hello[0].get("driver_command") == "draw_triangle"
+    assert hello[0].get("pco_subset") == "mbyp-uvsw-driver-triangle"
+    assert len(counters) == 1, "driver triangle: missing/duplicate counter"
+    assert counters[0].get("command_source") == "pvrgpu-gallium-driver-command"
+    assert counters[0].get("driver_command_ingest") is True
+    assert (
+        counters[0].get("functional_scope")
+        == "driver_triangle_solid-pco-iss-v1"
+    )
+    assert done and done[-1].get("pool_leaks") == 0
+    values = counters[0].get("counters")
+    assert isinstance(values, dict)
+    assert values.get("ia_vertices") == 3
+    assert values.get("ia_primitives") == 1
+    assert values.get("vs_invocations") == 3
+    assert values.get("c_primitives") == 1
+    assert values.get("setup_triangles") == 1
+    assert values.get("ps_invocations", 0) > 0
+    assert values.get("pbe_pixels_written", 0) > 0
+    verify_memory_path(hello[0], counters[0], cache_bypass=True)
+
+    artifact = output_dir / "driver_triangle_solid_sample_000001.png"
+    png_width, png_height, pixels = decode_rgba8_png(artifact)
+    assert (png_width, png_height) == (WIDTH, HEIGHT)
+    red_pixels = sum(
+        1
+        for offset in range(0, len(pixels), 4)
+        if pixels[offset : offset + 4] == b"\xFF\x00\x00\xFF"
+    )
+    black_pixels = sum(
+        1
+        for offset in range(0, len(pixels), 4)
+        if pixels[offset : offset + 4] == b"\x00\x00\x00\xFF"
+    )
+    assert red_pixels > 0, "driver triangle: framebuffer has no red pixels"
+    assert black_pixels > 0, "driver triangle: framebuffer has no clear pixels"
+
+
+def verify_driver_indexed_quad_framebuffer_size(
+    executable: Path, output_dir: Path
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    command_path = output_dir / "driver-indexed-quad.txt"
+    framebuffer_width = 128
+    framebuffer_height = 96
+    viewport_width = 64
+    viewport_height = 64
+    draw_count = 3
+    command_path.write_text(
+        "\n".join(
+            (
+                "schema=pvrgpu.driver-command.v1",
+                "producer=pvrgpu-gallium-driver",
+                "command=draw_indexed_quad",
+                "case=phase7.draw_indexed_quad.gallium",
+                "frame=1",
+                f"framebuffer_width={framebuffer_width}",
+                f"framebuffer_height={framebuffer_height}",
+                f"width={viewport_width}",
+                f"height={viewport_height}",
+                "format=PIPE_FORMAT_R8G8B8A8_UNORM",
+                "clear_color_bits=0,0,0,1065353216",
+                f"draw_count={draw_count}",
+                "index_count=6",
+                "unique_vertices=4",
+                "primitive_count=2",
+                "semantic_texel_fetches=12345",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    completed = invoke_driver_command(executable, command_path, output_dir)
+    assert completed.returncode == 0, (
+        "driver indexed quad command run failed:\n" + process_details(completed)
+    )
+    messages = json_messages(completed)
+    hello = [message for message in messages if message.get("type") == "hello"]
+    counters = [message for message in messages if message.get("type") == "counter"]
+    done = [message for message in messages if message.get("type") == "done"]
+    assert len(hello) == 1, "driver indexed quad: missing/duplicate hello"
+    assert hello[0].get("mode") == "pvrgpu-driver-draw-indexed-quad-phase7"
+    assert hello[0].get("driver_command_ingest") is True
+    assert hello[0].get("driver_command") == "draw_indexed_quad"
+    assert hello[0].get("driver_command_width") == viewport_width
+    assert hello[0].get("driver_command_height") == viewport_height
+    assert hello[0].get("driver_command_framebuffer_width") == framebuffer_width
+    assert hello[0].get("driver_command_framebuffer_height") == framebuffer_height
+    assert len(counters) == 1, "driver indexed quad: missing/duplicate counter"
+    assert done and done[-1].get("pool_leaks") == 0
+    values = counters[0].get("counters")
+    assert isinstance(values, dict)
+    assert values.get("ia_vertices") == 6 * draw_count
+    assert values.get("ia_primitives") == 2 * draw_count
+    assert values.get("vs_invocations") == 4 * draw_count
+    assert values.get("c_invocations") == 2 * draw_count
+    assert values.get("c_primitives") == 2 * draw_count
+    assert values.get("ps_invocations") == (
+        viewport_width * viewport_height * draw_count
+    )
+    assert values.get("drawlists") == draw_count
+    assert values.get("setup_triangles") == 2 * draw_count
+    assert values.get("texel_fetches") == 12345
+    assert values.get("fs_alu_instructions") == (
+        viewport_width * viewport_height * 4 * draw_count
+    )
+    verify_memory_path(
+        hello[0],
+        counters[0],
+        cache_bypass=True,
+        framebuffer_bytes=framebuffer_width * framebuffer_height * 4,
+    )
+
+    drawlists = counters[0].get("drawlist_stats")
+    assert isinstance(drawlists, list) and len(drawlists) == draw_count
+    for drawlist in drawlists:
+        fs = drawlist.get("fs")
+        assert isinstance(fs, dict)
+        assert fs.get("invocations") == viewport_width * viewport_height
+
+    artifact = output_dir / "driver_indexed_quad_sample_000001.png"
+    png_width, png_height, pixels = decode_rgba8_png(artifact)
+    assert (png_width, png_height) == (framebuffer_width, framebuffer_height)
+    assert len(pixels) == framebuffer_width * framebuffer_height * 4
+    assert set(
+        tuple(pixels[offset : offset + 4]) for offset in range(0, len(pixels), 4)
+    ) == {(0, 0, 0, 255)}, "driver indexed quad framebuffer is not opaque black"
 
 
 def triangle_setup_half_culled_golden_pixels() -> bytes:
@@ -2420,7 +2699,6 @@ def verify_fill_tex_nearest(executable: Path, output_dir: Path) -> None:
         "mode": "systemc-functional-fill-texture-nearest",
         "functional_scope": f"{case_name}-pco-iss-v1",
         "command_source": "builtin-glbench-fixture",
-        "mesa_command_ingest": False,
         "shader_binary": "mesa-pco-public-encoding",
         "pco_subset": "fmul-fitrp-wdf-smp-mbyp-uvsw-texture",
         "reference_uarch": "pvrgpu-ref-v1",
@@ -2747,7 +3025,6 @@ def verify_fill_tex_bilinear(executable: Path, output_dir: Path) -> None:
         "mode": "systemc-functional-fill-texture-bilinear",
         "functional_scope": f"{case_name}-pco-iss-v1",
         "command_source": "builtin-glbench-fixture",
-        "mesa_command_ingest": False,
         "shader_binary": "mesa-pco-public-encoding",
         "pco_subset": "fmul-fitrp-wdf-smp-mbyp-uvsw-texture",
         "workload": case_name,
@@ -3058,7 +3335,6 @@ def verify_fill_tex_trilinear_linear_01(
         "mode": "systemc-functional-fill-texture-trilinear-linear-01",
         "functional_scope": f"{case_name}-pco-iss-v1",
         "command_source": "builtin-glbench-fixture",
-        "mesa_command_ingest": False,
         "shader_binary": "mesa-pco-public-encoding",
         "pco_subset": "fmul-fitrp-wdf-smp-mbyp-uvsw-texture",
         "reference_uarch": "pvrgpu-ref-v1",
@@ -3422,7 +3698,6 @@ def verify_fill_tex_trilinear_linear_04_or_05(
         "mode": profile["mode"],
         "functional_scope": f"{case_name}-pco-iss-v1",
         "command_source": "builtin-glbench-fixture",
-        "mesa_command_ingest": False,
         "shader_binary": "mesa-pco-public-encoding",
         "pco_subset": "fmul-fitrp-wdf-smp-mbyp-uvsw-texture",
         "reference_uarch": "pvrgpu-ref-v1",
@@ -3710,6 +3985,11 @@ def main() -> int:
     verify_cache_bypass_options(executable)
     with tempfile.TemporaryDirectory(prefix="pvrgpu-functional-test-") as temporary:
         root = Path(temporary)
+        verify_driver_clear_command(executable, root / "driver-clear-green")
+        verify_driver_triangle_command(executable, root / "driver-triangle-red")
+        verify_driver_indexed_quad_framebuffer_size(
+            executable, root / "driver-indexed-quad-framebuffer-size"
+        )
         verify_fill_solid(executable, root / "fill-solid")
         verify_fill_solid_bypass(
             executable,

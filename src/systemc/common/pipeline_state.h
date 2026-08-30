@@ -92,7 +92,10 @@ struct PipelineState {
   std::uint8_t fragment_early_hsr_safe = 0;
   std::uint8_t cache_bypass = 0;
   std::uint8_t framebuffer_from_dram = 0;
-  std::uint8_t reserved[5]{};
+  std::uint8_t primitive_restart_enable = 0;
+  std::uint32_t primitive_restart_index = 0xFFFFFFFF;
+  std::uint8_t clip_distance_mask = 0;
+  std::uint16_t clip_distance_register = 0;
   std::uint64_t vertex_groups = 0;
   std::uint64_t fragment_groups = 0;
   CounterTxn counters;
