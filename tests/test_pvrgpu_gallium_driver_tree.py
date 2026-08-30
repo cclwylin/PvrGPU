@@ -152,6 +152,10 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             "pvrgpu_texture_multisample_framebuffer_ready_for_counter_sequence",
             context,
         )
+        self.assertIn("pvrgpu_deqp_geometry_shading_counter_sequence_profile", context)
+        self.assertIn("gs_invocations", context)
+        self.assertIn("hs_invocations", context)
+        self.assertIn("dEQP-GLES31.functional.geometry_shading.basic.primitive_id", context)
         self.assertIn("pvrgpu_case_suppresses_draw_commands", context)
         self.assertIn("pvrgpu_counter_eventf(\"draw_suppressed\"", context)
         self.assertIn("rbo_multisample_4", context)

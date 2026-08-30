@@ -590,10 +590,14 @@ def verify_driver_primitive_sequence(
                 "ia_vertices=12",
                 "ia_primitives=12",
                 "vs_invocations=12",
+                "gs_invocations=6",
+                "gs_primitives=9",
                 "clip_invocations=12",
                 "clip_primitives=12",
                 "setup_triangles=0",
                 "ps_invocations=1052",
+                "hs_invocations=2",
+                "ds_invocations=8",
                 "semantic_texel_fetches=0",
             )
         )
@@ -623,9 +627,13 @@ def verify_driver_primitive_sequence(
     assert values.get("ia_vertices") == 12
     assert values.get("ia_primitives") == 12
     assert values.get("vs_invocations") == 12
+    assert values.get("gs_invocations") == 6
+    assert values.get("gs_primitives") == 9
     assert values.get("c_invocations") == 12
     assert values.get("c_primitives") == 12
     assert values.get("ps_invocations") == 1052
+    assert values.get("hs_invocations") == 2
+    assert values.get("ds_invocations") == 8
     assert values.get("drawlists") == 3
     assert values.get("setup_triangles") == 0
     assert values.get("texel_fetches") == 0
@@ -2409,7 +2417,7 @@ def verify_varyings_shader_four(executable: Path, output_dir: Path) -> None:
         "texture_requests": 0,
         "fifo_stall_events": 0,
         "pool_bytes_in_flight": 0,
-        "pool_high_water_bytes": 1037240,
+        "pool_high_water_bytes": 1037272,
         "vdm_cycles": 9,
         "vertex_fetch_cycles": 5,
         "vertex_attribute_fetches": 25,
@@ -2628,7 +2636,7 @@ def verify_varyings_shader_eight(executable: Path, output_dir: Path) -> None:
         "texture_requests": 0,
         "fifo_stall_events": 0,
         "pool_bytes_in_flight": 0,
-        "pool_high_water_bytes": 1347912,
+        "pool_high_water_bytes": 1347944,
         "vdm_cycles": 9,
         "vertex_fetch_cycles": 5,
         "vertex_attribute_fetches": 25,
@@ -2894,7 +2902,7 @@ def verify_fill_tex_nearest(executable: Path, output_dir: Path) -> None:
         "fifo_stall_events": 0,
         "pool_bytes_in_flight": 0,
         # Includes quad_id/quad_lane in the TextureSampleRequest ABI.
-        "pool_high_water_bytes": 3246322,
+        "pool_high_water_bytes": 3246354,
         "vdm_cycles": 9,
         "vertex_fetch_cycles": 5,
         "vertex_attribute_fetches": 8,
@@ -3223,7 +3231,7 @@ def verify_fill_tex_bilinear(executable: Path, output_dir: Path) -> None:
         "fifo_stall_events": 0,
         "pool_bytes_in_flight": 0,
         # Includes quad_id/quad_lane in the TextureSampleRequest ABI.
-        "pool_high_water_bytes": 3246322,
+        "pool_high_water_bytes": 3246354,
         "vdm_cycles": 9,
         "vertex_fetch_cycles": 5,
         "vertex_attribute_fetches": 8,
@@ -3532,7 +3540,7 @@ def verify_fill_tex_trilinear_linear_01(
         "texture_requests": 4080,
         "fifo_stall_events": 0,
         "pool_bytes_in_flight": 0,
-        "pool_high_water_bytes": 3108130,
+        "pool_high_water_bytes": 3108162,
         "vdm_cycles": 9,
         "vertex_fetch_cycles": 5,
         "vertex_attribute_fetches": 8,
@@ -3711,7 +3719,7 @@ def verify_fill_tex_trilinear_linear_04_or_05(
             "renderer_cycles": 26305,
             "usc_groups": 625,
             "texture_requests": 2496,
-            "pool_high_water_bytes": 2456242,
+            "pool_high_water_bytes": 2456274,
             "fs_alu_instructions": 47424,
             "usc_slot_cycles": 317,
             "usc_cluster_cycles": 165,
@@ -3736,7 +3744,7 @@ def verify_fill_tex_trilinear_linear_04_or_05(
             "renderer_cycles": 26222,
             "usc_groups": 623,
             "texture_requests": 2488,
-            "pool_high_water_bytes": 2435530,
+            "pool_high_water_bytes": 2435562,
             "fs_alu_instructions": 47272,
             "usc_slot_cycles": 316,
             "usc_cluster_cycles": 165,

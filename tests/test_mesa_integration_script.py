@@ -9,6 +9,10 @@ import unittest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PROJECT_ROOT / "scripts" / "install-pvrgpu-mesa-driver.sh"
+COUNTER_MESA_SCRIPT = PROJECT_ROOT / "scripts" / "build-counter-mesa.sh"
+COUNTER_MESA_ZERO_OUTPUT_PATCH = (
+    PROJECT_ROOT / "third_party" / "mesa-26.2.1-llvmpipe-gs-zero-output-stats.patch"
+)
 SMOKE_SCRIPT = PROJECT_ROOT / "scripts" / "run-pvrgpu-mesa-driver-smoke.sh"
 TRIANGLE_SMOKE_SCRIPT = (
     PROJECT_ROOT / "scripts" / "run-pvrgpu-mesa-driver-triangle-smoke.sh"
@@ -85,6 +89,15 @@ class MesaIntegrationScriptTests(unittest.TestCase):
             self.assertIn('#include "pvrgpu/pvrgpu_public.h"', sw_helper)
             self.assertIn('strcmp(driver, "pvrgpu") == 0', sw_helper)
             self.assertNotIn('"pvrgpu",\n#endif\n#if defined(GALLIUM_LLVMPIPE)', sw_helper)
+
+    def test_counter_mesa_builder_applies_zero_output_gs_patch(self) -> None:
+        script = COUNTER_MESA_SCRIPT.read_text(encoding="utf-8")
+        patch = COUNTER_MESA_ZERO_OUTPUT_PATCH.read_text(encoding="utf-8")
+        self.assertIn("mesa-26.2.1-llvmpipe-gs-zero-output-stats.patch", script)
+        self.assertIn("MESA_EXTRA_PATCH", script)
+        self.assertIn("draw_stats_clipper_primitives", patch)
+        self.assertIn("prim_info->count == 0", patch)
+        self.assertIn("!prim_info->primitive_lengths", patch)
 
     def test_smoke_runner_checks_counter_channel(self) -> None:
         smoke = SMOKE_SCRIPT.read_text(encoding="utf-8")

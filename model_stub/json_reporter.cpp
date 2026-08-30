@@ -689,9 +689,13 @@ void NormalizeDriverPrimitiveSequenceApiCounters(const Options &options,
   counters.ia_vertices = command.ia_vertices;
   counters.ia_primitives = command.ia_primitives;
   counters.vs_invocations = command.vs_invocations;
+  counters.gs_invocations = command.gs_invocations;
+  counters.gs_primitives = command.gs_primitives;
   counters.c_invocations = command.clip_invocations;
   counters.c_primitives = command.clip_primitives;
   counters.ps_invocations = command.ps_invocations;
+  counters.hs_invocations = command.hs_invocations;
+  counters.ds_invocations = command.ds_invocations;
   counters.drawlists = command.draw_count;
   counters.setup_triangles = command.setup_triangles;
   counters.texel_fetches = command.semantic_texel_fetches;
@@ -859,11 +863,13 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
       << "\"ia_vertices\":" << counters.ia_vertices
       << ",\"ia_primitives\":" << counters.ia_primitives
       << ",\"vs_invocations\":" << counters.vs_invocations
-      << ",\"gs_invocations\":0,\"gs_primitives\":0"
+      << ",\"gs_invocations\":" << counters.gs_invocations
+      << ",\"gs_primitives\":" << counters.gs_primitives
       << ",\"c_invocations\":" << counters.c_invocations
       << ",\"c_primitives\":" << counters.c_primitives
       << ",\"ps_invocations\":" << counters.ps_invocations
-      << ",\"hs_invocations\":0,\"ds_invocations\":0"
+      << ",\"hs_invocations\":" << counters.hs_invocations
+      << ",\"ds_invocations\":" << counters.ds_invocations
       << ",\"cs_invocations\":0,\"ts_invocations\":0"
       << ",\"ms_invocations\":0,\"ms_primitives\":0"
       << ",\"drawlists\":" << counters.drawlists

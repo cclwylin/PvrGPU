@@ -35,7 +35,8 @@ const std::set<std::string> &KnownFields() {
       "draw_count", "index_count", "unique_vertices", "primitive_count",
       "clip_primitives", "setup_triangles", "semantic_texel_fetches",
       "ia_vertices", "ia_primitives", "vs_invocations", "clip_invocations",
-      "ps_invocations",
+      "gs_invocations", "gs_primitives", "ps_invocations",
+      "hs_invocations", "ds_invocations",
   };
   return fields;
 }
@@ -165,13 +166,30 @@ bool RequireExactFields(const std::map<std::string, std::string> &fields,
   }
 
   for (const auto &entry : fields) {
-    if (!required.count(entry.first)) {
+    const bool optional_primitive_sequence_counter =
+        command == kDrawPrimitiveSequenceCommand &&
+        (entry.first == "gs_invocations" || entry.first == "gs_primitives" ||
+         entry.first == "hs_invocations" || entry.first == "ds_invocations");
+    if (!required.count(entry.first) && !optional_primitive_sequence_counter) {
       *error = "field is not valid for " + command +
                " driver command: " + entry.first;
       return false;
     }
   }
   return true;
+}
+
+bool ParseOptionalU32(const std::map<std::string, std::string> &fields,
+                      const std::string &field,
+                      std::uint32_t *value,
+                      std::string *error) {
+  const auto entry = fields.find(field);
+  if (entry == fields.end())
+    return true;
+  if (ParseU32(entry->second, value))
+    return true;
+  *error = "driver command " + field + " must be a uint32 value";
+  return false;
 }
 
 bool RequireBaseFields(const std::map<std::string, std::string> &fields,
@@ -388,11 +406,8 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
       return false;
     }
     if (!ParseU32(fields["ia_vertices"], &parsed.ia_vertices) ||
-        parsed.ia_vertices == 0 ||
         !ParseU32(fields["ia_primitives"], &parsed.ia_primitives) ||
-        parsed.ia_primitives == 0 ||
         !ParseU32(fields["vs_invocations"], &parsed.vs_invocations) ||
-        parsed.vs_invocations == 0 ||
         !ParseU32(fields["clip_invocations"], &parsed.clip_invocations) ||
         !ParseU32(fields["clip_primitives"], &parsed.clip_primitives) ||
         !ParseU32(fields["setup_triangles"], &parsed.setup_triangles) ||
@@ -402,6 +417,16 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
                   &parsed.semantic_texel_fetches)) {
       *error =
           "draw primitive sequence contains invalid semantic counter metadata";
+      return false;
+    }
+    if (!ParseOptionalU32(fields, "gs_invocations", &parsed.gs_invocations,
+                          error) ||
+        !ParseOptionalU32(fields, "gs_primitives", &parsed.gs_primitives,
+                          error) ||
+        !ParseOptionalU32(fields, "hs_invocations", &parsed.hs_invocations,
+                          error) ||
+        !ParseOptionalU32(fields, "ds_invocations", &parsed.ds_invocations,
+                          error)) {
       return false;
     }
   }

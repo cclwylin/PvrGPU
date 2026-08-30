@@ -1,0 +1,19 @@
+diff --git a/src/gallium/auxiliary/draw/draw_context.c b/src/gallium/auxiliary/draw/draw_context.c
+index cb0b73b..c7352f5 100644
+--- a/src/gallium/auxiliary/draw/draw_context.c
++++ b/src/gallium/auxiliary/draw/draw_context.c
+@@ -1225,6 +1225,14 @@ draw_stats_clipper_primitives(struct draw_context *draw,
+ {
+    if (draw->collect_statistics) {
+       unsigned i;
++      if (prim_info->count == 0)
++         return;
++      if (!prim_info->primitive_lengths) {
++         draw->statistics.c_invocations +=
++            u_decomposed_prims_for_vertices(prim_info->prim,
++                                            prim_info->count);
++         return;
++      }
+       for (i = 0; i < prim_info->primitive_count; i++) {
+          draw->statistics.c_invocations +=
+             u_decomposed_prims_for_vertices(prim_info->prim,

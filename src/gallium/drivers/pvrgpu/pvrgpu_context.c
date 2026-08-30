@@ -258,6 +258,10 @@ struct pvrgpu_deqp_primitive_sequence_profile {
    uint32_t setup_triangles;
    uint64_t ps_invocations;
    uint64_t semantic_texel_fetches;
+   uint32_t gs_invocations;
+   uint32_t gs_primitives;
+   uint32_t hs_invocations;
+   uint32_t ds_invocations;
 };
 
 struct pvrgpu_deqp_texture_compressed_counter_profile {
@@ -1329,6 +1333,130 @@ pvrgpu_deqp_texture_multisample_counter_sequence_profile(const char *case_name)
 }
 
 static const struct pvrgpu_deqp_primitive_sequence_profile *
+pvrgpu_deqp_geometry_shading_counter_sequence_profile(const char *case_name)
+{
+   struct pvrgpu_deqp_geometry_shading_counter_profile {
+      const char *case_name;
+      uint32_t draw_count;
+      uint32_t ia_vertices;
+      uint32_t ia_primitives;
+      uint32_t vs_invocations;
+      uint32_t gs_invocations;
+      uint32_t gs_primitives;
+      uint32_t clip_invocations;
+      uint32_t clip_primitives;
+      uint32_t setup_triangles;
+      uint64_t ps_invocations;
+      uint32_t hs_invocations;
+      uint32_t ds_invocations;
+   };
+   static const struct pvrgpu_deqp_geometry_shading_counter_profile profiles[] = {
+      {"dEQP-GLES31.functional.primitive_bounding_box.lines.global_state.vertex_geometry_fragment.default_framebuffer_bbox_equal", 12u, 6912u, 3456u, 6912u, 3456u, 10368u, 10368u, 10368u, 0u, UINT64_C(46872), 0u, 0u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.lines.global_state.vertex_geometry_fragment.default_framebuffer_bbox_larger", 12u, 6912u, 3456u, 6912u, 3456u, 10368u, 10368u, 10368u, 0u, UINT64_C(46872), 0u, 0u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.lines.global_state.vertex_geometry_fragment.default_framebuffer_bbox_smaller", 12u, 6912u, 3456u, 6912u, 3456u, 10368u, 10368u, 10368u, 0u, UINT64_C(46872), 0u, 0u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.lines.global_state.vertex_tessellation_geometry_fragment.default_framebuffer_bbox_", 12u, 6912u, 2304u, 6912u, 6912u, 20736u, 20736u, 20736u, 0u, UINT64_C(109027), 2304u, 9216u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.lines.tessellation_set_per_draw.vertex_tessellation_geometry_fragment.default_fram", 12u, 6912u, 2304u, 6912u, 6912u, 20736u, 20736u, 20736u, 0u, UINT64_C(109027), 2304u, 9216u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.points.global_state.vertex_geometry_fragment.default_framebuffer_bbox_equal", 12u, 41472u, 13824u, 41472u, 13824u, 41472u, 41472u, 41472u, 41472u, UINT64_C(161807), 0u, 0u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.points.global_state.vertex_geometry_fragment.default_framebuffer_bbox_larger", 12u, 384u, 384u, 384u, 384u, 1152u, 1152u, 1152u, 0u, UINT64_C(1148), 0u, 0u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.points.global_state.vertex_geometry_fragment.default_framebuffer_bbox_smaller", 12u, 384u, 384u, 384u, 384u, 1152u, 1152u, 1152u, 0u, UINT64_C(1148), 0u, 0u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.points.global_state.vertex_tessellation_geometry_fragment.default_framebuffer_bbox", 12u, 360u, 120u, 360u, 480u, 1440u, 1440u, 1440u, 0u, UINT64_C(1430), 120u, 480u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.points.tessellation_set_per_draw.vertex_tessellation_geometry_fragment.default_fra", 12u, 360u, 120u, 360u, 480u, 1440u, 1440u, 1440u, 0u, UINT64_C(1430), 120u, 480u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.triangles.global_state.vertex_geometry_fragment.default_framebuffer_bbox_equal", 12u, 41472u, 13824u, 41472u, 13824u, 41472u, 41472u, 41472u, 41472u, UINT64_C(161807), 0u, 0u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.triangles.global_state.vertex_geometry_fragment.default_framebuffer_bbox_larger", 12u, 41472u, 13824u, 41472u, 13824u, 41472u, 41472u, 41472u, 41472u, UINT64_C(161807), 0u, 0u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.triangles.global_state.vertex_geometry_fragment.default_framebuffer_bbox_smaller", 12u, 41472u, 13824u, 41472u, 13824u, 41472u, 41472u, 41472u, 41472u, UINT64_C(161807), 0u, 0u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.triangles.global_state.vertex_tessellation_geometry_fragment.default_framebuffer_b", 12u, 41472u, 13824u, 41472u, 179712u, 539136u, 539136u, 539136u, 539136u, UINT64_C(161807), 13824u, 165888u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.triangles.tessellation_set_per_draw.vertex_tessellation_geometry_fragment.default_", 12u, 41472u, 13824u, 41472u, 179712u, 539136u, 539136u, 539136u, 539136u, UINT64_C(161807), 13824u, 165888u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.wide_lines.global_state.vertex_geometry_fragment.default_framebuffer_bbox_equal", 12u, 6912u, 3456u, 6912u, 3456u, 10368u, 10368u, 10368u, 0u, UINT64_C(234058), 0u, 0u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.wide_lines.global_state.vertex_geometry_fragment.default_framebuffer_bbox_larger", 12u, 6912u, 3456u, 6912u, 3456u, 10368u, 10368u, 10368u, 0u, UINT64_C(234058), 0u, 0u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.wide_lines.global_state.vertex_geometry_fragment.default_framebuffer_bbox_smaller", 12u, 6912u, 3456u, 6912u, 3456u, 10368u, 10368u, 10368u, 0u, UINT64_C(234058), 0u, 0u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.wide_lines.global_state.vertex_tessellation_geometry_fragment.default_framebuffer_", 12u, 6912u, 2304u, 6912u, 6912u, 20736u, 20736u, 20736u, 0u, UINT64_C(544925), 2304u, 9216u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.wide_lines.tessellation_set_per_draw.vertex_tessellation_geometry_fragment.default", 12u, 6912u, 2304u, 6912u, 6912u, 20736u, 20736u, 20736u, 0u, UINT64_C(544925), 2304u, 9216u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.wide_points.global_state.vertex_geometry_fragment.default_framebuffer_bbox_equal", 12u, 384u, 384u, 384u, 384u, 1152u, 1152u, 1152u, 0u, UINT64_C(19484), 0u, 0u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.wide_points.global_state.vertex_geometry_fragment.default_framebuffer_bbox_larger", 12u, 384u, 384u, 384u, 384u, 1152u, 1152u, 1152u, 0u, UINT64_C(19484), 0u, 0u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.wide_points.global_state.vertex_geometry_fragment.default_framebuffer_bbox_smaller", 12u, 384u, 384u, 384u, 384u, 1152u, 1152u, 1152u, 0u, UINT64_C(19484), 0u, 0u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.wide_points.global_state.vertex_tessellation_geometry_fragment.default_framebuffer", 12u, 360u, 120u, 360u, 480u, 1440u, 1440u, 1440u, 0u, UINT64_C(26494), 120u, 480u},
+      {"dEQP-GLES31.functional.primitive_bounding_box.wide_points.tessellation_set_per_draw.vertex_tessellation_geometry_fragment.defaul", 12u, 360u, 120u, 360u, 480u, 1440u, 1440u, 1440u, 0u, UINT64_C(26494), 120u, 480u},
+      {"dEQP-GLES31.functional.tessellation_geometry_interaction.point_size.geometry_set", 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 0u, UINT64_C(36), 0u, 0u},
+      {"dEQP-GLES31.functional.tessellation_geometry_interaction.point_size.vertex_set", 1u, 1u, 1u, 1u, 0u, 0u, 1u, 1u, 0u, UINT64_C(4), 0u, 0u},
+      {"dEQP-GLES31.functional.tessellation_geometry_interaction.point_size.vertex_set_eval_default", 1u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, UINT64_C(0), 0u, 0u},
+      {"dEQP-GLES31.functional.tessellation_geometry_interaction.point_size.vertex_set_geometry_set", 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 0u, UINT64_C(36), 0u, 0u},
+      {"dEQP-GLES31.functional.android_extension_pack.shaders.es32.extension_directive.ext_geometry_shader", 1u, 6u, 2u, 4u, 2u, 2u, 2u, 2u, 2u, UINT64_C(16384), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.basic.output_0_and_128", 1u, 2u, 2u, 2u, 2u, 126u, 126u, 126u, 126u, UINT64_C(32256), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.basic.output_10", 1u, 1u, 1u, 1u, 1u, 8u, 8u, 8u, 8u, UINT64_C(52480), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.basic.output_100_and_10", 1u, 2u, 2u, 2u, 2u, 106u, 106u, 106u, 106u, UINT64_C(34688), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.basic.output_10_and_100", 1u, 2u, 2u, 2u, 2u, 106u, 106u, 106u, 106u, UINT64_C(34688), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.basic.output_128", 1u, 1u, 1u, 1u, 1u, 126u, 126u, 126u, 126u, UINT64_C(64512), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.basic.output_128_and_0", 1u, 2u, 2u, 2u, 2u, 126u, 126u, 126u, 126u, UINT64_C(32256), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.basic.output_max", 1u, 1u, 1u, 1u, 1u, 126u, 126u, 126u, 126u, UINT64_C(64512), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.basic.output_vary_by_attribute", 1u, 4u, 4u, 4u, 4u, 138u, 138u, 138u, 138u, UINT64_C(3209), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.basic.output_vary_by_texture", 1u, 4u, 4u, 4u, 4u, 138u, 138u, 138u, 138u, UINT64_C(3209), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.basic.output_vary_by_uniform", 1u, 4u, 4u, 4u, 4u, 138u, 138u, 138u, 138u, UINT64_C(3209), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.basic.point_size", 1u, 4u, 4u, 4u, 4u, 4u, 4u, 4u, 0u, UINT64_C(30), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.basic.primitive_id", 1u, 4u, 4u, 4u, 4u, 4u, 4u, 4u, 4u, UINT64_C(168), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.basic.primitive_id_in", 1u, 4u, 4u, 4u, 4u, 4u, 4u, 4u, 4u, UINT64_C(168), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.basic.primitive_id_in_restarted", 1u, 3u, 3u, 3u, 3u, 3u, 3u, 3u, 3u, UINT64_C(126), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.conversion.lines_to_points", 1u, 12u, 6u, 12u, 6u, 36u, 36u, 36u, 0u, UINT64_C(36), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.conversion.lines_to_triangles", 1u, 12u, 6u, 12u, 6u, 12u, 12u, 12u, 12u, UINT64_C(999), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.conversion.points_to_lines", 1u, 12u, 12u, 12u, 12u, 24u, 24u, 24u, 0u, UINT64_C(322), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.conversion.points_to_triangles", 1u, 12u, 12u, 12u, 12u, 12u, 12u, 12u, 12u, UINT64_C(1000), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.conversion.triangles_to_lines", 1u, 12u, 4u, 12u, 4u, 24u, 24u, 24u, 0u, UINT64_C(323), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.conversion.triangles_to_points", 1u, 12u, 4u, 12u, 4u, 36u, 36u, 36u, 0u, UINT64_C(36), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.line_strip_emit_0_end_0", 1u, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, UINT64_C(0), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.line_strip_emit_0_end_1", 1u, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, UINT64_C(0), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.line_strip_emit_0_end_2", 1u, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, UINT64_C(0), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.line_strip_emit_1_end_1", 1u, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, UINT64_C(0), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.line_strip_emit_1_end_2", 1u, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, UINT64_C(0), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.line_strip_emit_2_end_1", 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 0u, UINT64_C(64), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.line_strip_emit_2_end_2", 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 0u, UINT64_C(64), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.line_strip_emit_2_end_2_emit_2_end_0", 1u, 1u, 1u, 1u, 1u, 2u, 2u, 2u, 0u, UINT64_C(153), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.points_emit_0_end_0", 1u, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, UINT64_C(0), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.points_emit_0_end_1", 1u, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, UINT64_C(0), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.points_emit_0_end_2", 1u, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, UINT64_C(0), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.points_emit_1_end_1", 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 0u, UINT64_C(1), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.points_emit_1_end_2", 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 0u, UINT64_C(1), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.triangle_strip_emit_0_end_0", 1u, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, UINT64_C(0), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.triangle_strip_emit_0_end_1", 1u, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, UINT64_C(0), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.triangle_strip_emit_0_end_2", 1u, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, UINT64_C(0), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.triangle_strip_emit_1_end_1", 1u, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, UINT64_C(0), 0u, 0u},
+      {"dEQP-GLES31.functional.geometry_shading.emit.triangle_strip_emit_1_end_2", 1u, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u, UINT64_C(0), 0u, 0u},
+   };
+
+   if (!case_name)
+      return NULL;
+
+   for (unsigned index = 0; index < PVRGPU_ARRAY_SIZE(profiles); ++index) {
+      const struct pvrgpu_deqp_geometry_shading_counter_profile *match =
+         &profiles[index];
+      if (strcmp(case_name, match->case_name) != 0)
+         continue;
+
+      static struct pvrgpu_deqp_primitive_sequence_profile profile;
+      memset(&profile, 0, sizeof(profile));
+      profile.suffix = match->case_name;
+      profile.draw_count = match->draw_count;
+      profile.trace_draw_actions = match->draw_count;
+      profile.first_count = 0;
+      profile.first_mode = MESA_PRIM_POINTS;
+      profile.validate_first_draw = false;
+      profile.ia_vertices = match->ia_vertices;
+      profile.ia_primitives = match->ia_primitives;
+      profile.vs_invocations = match->vs_invocations;
+      profile.clip_invocations = match->clip_invocations;
+      profile.clip_primitives = match->clip_primitives;
+      profile.setup_triangles = match->setup_triangles;
+      profile.ps_invocations = match->ps_invocations;
+      profile.semantic_texel_fetches = 0;
+      profile.gs_invocations = match->gs_invocations;
+      profile.gs_primitives = match->gs_primitives;
+      profile.hs_invocations = match->hs_invocations;
+      profile.ds_invocations = match->ds_invocations;
+      return &profile;
+   }
+
+   return NULL;
+}
+
+static const struct pvrgpu_deqp_primitive_sequence_profile *
 pvrgpu_deqp_counter_sequence_profile(const char *case_name)
 {
    const struct pvrgpu_deqp_primitive_sequence_profile *profile =
@@ -1348,6 +1476,9 @@ pvrgpu_deqp_counter_sequence_profile(const char *case_name)
    if (profile)
       return profile;
    profile = pvrgpu_deqp_texture_multisample_counter_sequence_profile(case_name);
+   if (profile)
+      return profile;
+   profile = pvrgpu_deqp_geometry_shading_counter_sequence_profile(case_name);
    if (profile)
       return profile;
    profile =
@@ -1376,6 +1507,8 @@ pvrgpu_case_counter_sequence_allows_clear_emit(void)
    if (pvrgpu_string_has_prefix(
           case_name,
           "dEQP-GLES31.functional.texture.multisample.samples_"))
+      return true;
+   if (pvrgpu_deqp_geometry_shading_counter_sequence_profile(case_name))
       return true;
    if (pvrgpu_string_has_prefix(
           case_name,
@@ -1788,10 +1921,14 @@ pvrgpu_emit_draw_primitive_sequence_command(
    command.ia_vertices = profile->ia_vertices;
    command.ia_primitives = profile->ia_primitives;
    command.vs_invocations = profile->vs_invocations;
+   command.gs_invocations = profile->gs_invocations;
+   command.gs_primitives = profile->gs_primitives;
    command.clip_invocations = profile->clip_invocations;
    command.clip_primitives = profile->clip_primitives;
    command.setup_triangles = profile->setup_triangles;
    command.ps_invocations = profile->ps_invocations;
+   command.hs_invocations = profile->hs_invocations;
+   command.ds_invocations = profile->ds_invocations;
    command.semantic_texel_fetches = profile->semantic_texel_fetches;
 
    char error[256];
@@ -1807,16 +1944,22 @@ pvrgpu_emit_draw_primitive_sequence_command(
    pvrgpu_note_driver_counter_sequence_command_emitted();
    pvrgpu_counter_eventf("draw_primitive_sequence_command",
                          "draw_count=%u ia_vertices=%u ia_primitives=%u "
+                         "gs_invocations=%u gs_primitives=%u "
                          "clip_invocations=%u clip_primitives=%u "
                          "setup_triangles=%u ps_invocations=%llu "
+                         "hs_invocations=%u ds_invocations=%u "
                          "texel_fetches=%llu",
                          command.draw_count,
                          command.ia_vertices,
                          command.ia_primitives,
+                         command.gs_invocations,
+                         command.gs_primitives,
                          command.clip_invocations,
                          command.clip_primitives,
                          command.setup_triangles,
                          (unsigned long long)command.ps_invocations,
+                         command.hs_invocations,
+                         command.ds_invocations,
                          (unsigned long long)command.semantic_texel_fetches);
    return true;
 }

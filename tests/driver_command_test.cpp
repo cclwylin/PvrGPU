@@ -155,10 +155,14 @@ int main() {
             "ia_vertices=12\n"
             "ia_primitives=12\n"
             "vs_invocations=12\n"
+            "gs_invocations=6\n"
+            "gs_primitives=9\n"
             "clip_invocations=12\n"
             "clip_primitives=12\n"
             "setup_triangles=0\n"
             "ps_invocations=1052\n"
+            "hs_invocations=2\n"
+            "ds_invocations=8\n"
             "semantic_texel_fetches=0\n");
   error.clear();
   if (int failed =
@@ -169,8 +173,12 @@ int main() {
           Expect(command.command == "draw_primitive_sequence" &&
                      command.draw_count == 3 &&
                      command.ia_vertices == 12 &&
+                     command.gs_invocations == 6 &&
+                     command.gs_primitives == 9 &&
                      command.clip_primitives == 12 &&
                      command.ps_invocations == 1052 &&
+                     command.hs_invocations == 2 &&
+                     command.ds_invocations == 8 &&
                      command.semantic_texel_fetches == 0,
                  "wrong primitive sequence metadata"))
     return failed;

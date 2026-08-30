@@ -67,10 +67,14 @@ struct pvrgpu_draw_primitive_sequence_command {
    uint32_t ia_vertices;
    uint32_t ia_primitives;
    uint32_t vs_invocations;
+   uint32_t gs_invocations;
+   uint32_t gs_primitives;
    uint32_t clip_invocations;
    uint32_t clip_primitives;
    uint32_t setup_triangles;
    uint64_t ps_invocations;
+   uint32_t hs_invocations;
+   uint32_t ds_invocations;
    uint64_t semantic_texel_fetches;
 };
 

@@ -35,8 +35,12 @@ struct DriverCommand {
   std::uint32_t ia_vertices = 0;
   std::uint32_t ia_primitives = 0;
   std::uint32_t vs_invocations = 0;
+  std::uint32_t gs_invocations = 0;
+  std::uint32_t gs_primitives = 0;
   std::uint32_t clip_invocations = 0;
   std::uint64_t ps_invocations = 0;
+  std::uint32_t hs_invocations = 0;
+  std::uint32_t ds_invocations = 0;
 };
 
 struct Options {
@@ -112,9 +116,13 @@ struct CounterTxn {
   std::uint64_t ia_vertices = 0;
   std::uint64_t ia_primitives = 0;
   std::uint64_t vs_invocations = 0;
+  std::uint64_t gs_invocations = 0;
+  std::uint64_t gs_primitives = 0;
   std::uint64_t c_invocations = 0;
   std::uint64_t c_primitives = 0;
   std::uint64_t ps_invocations = 0;
+  std::uint64_t hs_invocations = 0;
+  std::uint64_t ds_invocations = 0;
   std::uint64_t drawlists = 0;
   std::uint64_t setup_triangles = 0;
   std::uint64_t texel_fetches = 0;

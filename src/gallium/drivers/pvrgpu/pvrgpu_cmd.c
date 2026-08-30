@@ -206,11 +206,7 @@ pvrgpu_cmd_validate_draw_primitive_sequence(
                                    error,
                                    error_size))
       return false;
-   if (cmd->draw_count == 0 ||
-       cmd->ia_vertices == 0 ||
-       cmd->ia_primitives == 0 ||
-       cmd->vs_invocations == 0 ||
-       cmd->setup_triangles > cmd->clip_primitives) {
+   if (cmd->draw_count == 0 || cmd->setup_triangles > cmd->clip_primitives) {
       pvrgpu_cmd_error(error, error_size,
                        "draw primitive sequence command contains invalid "
                        "semantic counter metadata");
@@ -305,10 +301,14 @@ pvrgpu_write_draw_primitive_sequence_command(
       "ia_vertices=%u\n"
       "ia_primitives=%u\n"
       "vs_invocations=%u\n"
+      "gs_invocations=%u\n"
+      "gs_primitives=%u\n"
       "clip_invocations=%u\n"
       "clip_primitives=%u\n"
       "setup_triangles=%u\n"
       "ps_invocations=%" PRIu64 "\n"
+      "hs_invocations=%u\n"
+      "ds_invocations=%u\n"
       "semantic_texel_fetches=%" PRIu64 "\n",
       PVRGPU_DRIVER_COMMAND_SCHEMA,
       PVRGPU_DRIVER_COMMAND_PRODUCER,
@@ -325,10 +325,14 @@ pvrgpu_write_draw_primitive_sequence_command(
       cmd->ia_vertices,
       cmd->ia_primitives,
       cmd->vs_invocations,
+      cmd->gs_invocations,
+      cmd->gs_primitives,
       cmd->clip_invocations,
       cmd->clip_primitives,
       cmd->setup_triangles,
       cmd->ps_invocations,
+      cmd->hs_invocations,
+      cmd->ds_invocations,
       cmd->semantic_texel_fetches);
    const int close_status = fclose(file);
    if (written < 0 || close_status != 0) {
