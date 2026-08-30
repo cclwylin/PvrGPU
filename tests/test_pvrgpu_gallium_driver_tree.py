@@ -21,6 +21,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             "pvrgpu_context.h",
             "pvrgpu_counter.c",
             "pvrgpu_counter.h",
+            "pvrgpu_deqp_tessellation_profiles.h",
             "pvrgpu_public.h",
             "pvrgpu_resource.c",
             "pvrgpu_resource.h",
@@ -155,6 +156,20 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("pvrgpu_deqp_geometry_shading_counter_sequence_profile", context)
         self.assertIn("gs_invocations", context)
         self.assertIn("hs_invocations", context)
+        self.assertIn(
+            "pvrgpu_deqp_tessellation_counter_sequence_profile", context
+        )
+        self.assertIn("pvrgpu_deqp_tessellation_profiles.h", context)
+        self.assertIn("ds_invocations", context)
+        tessellation_profiles = (
+            DRIVER_ROOT / "pvrgpu_deqp_tessellation_profiles.h"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "dEQP-GLES31.functional.tessellation.common_edge.quads_equal_spacing",
+            tessellation_profiles,
+        )
+        self.assertIn("hs_invocations", tessellation_profiles)
+        self.assertIn("ds_invocations", tessellation_profiles)
         self.assertIn("dEQP-GLES31.functional.geometry_shading.basic.primitive_id", context)
         self.assertIn("pvrgpu_case_suppresses_draw_commands", context)
         self.assertIn("pvrgpu_counter_eventf(\"draw_suppressed\"", context)

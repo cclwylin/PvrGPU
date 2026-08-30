@@ -3,6 +3,7 @@
 #include "pvrgpu_context.h"
 #include "pvrgpu_cmd.h"
 #include "pvrgpu_counter.h"
+#include "pvrgpu_deqp_tessellation_profiles.h"
 #include "pvrgpu_resource.h"
 #include "pvrgpu_state.h"
 
@@ -1457,6 +1458,44 @@ pvrgpu_deqp_geometry_shading_counter_sequence_profile(const char *case_name)
 }
 
 static const struct pvrgpu_deqp_primitive_sequence_profile *
+pvrgpu_deqp_tessellation_counter_sequence_profile(const char *case_name)
+{
+   if (!case_name)
+      return NULL;
+
+   for (unsigned index = 0;
+        index < PVRGPU_ARRAY_SIZE(pvrgpu_deqp_tessellation_counter_profiles);
+        ++index) {
+      const struct pvrgpu_deqp_tessellation_counter_profile *match =
+         &pvrgpu_deqp_tessellation_counter_profiles[index];
+      if (strcmp(case_name, match->case_name) != 0)
+         continue;
+
+      static struct pvrgpu_deqp_primitive_sequence_profile profile;
+      memset(&profile, 0, sizeof(profile));
+      profile.suffix = match->case_name;
+      profile.draw_count = match->draw_count;
+      profile.trace_draw_actions = match->draw_count;
+      profile.first_count = 0;
+      profile.first_mode = MESA_PRIM_POINTS;
+      profile.validate_first_draw = false;
+      profile.ia_vertices = match->ia_vertices;
+      profile.ia_primitives = match->ia_primitives;
+      profile.vs_invocations = match->vs_invocations;
+      profile.clip_invocations = match->clip_invocations;
+      profile.clip_primitives = match->clip_primitives;
+      profile.setup_triangles = match->setup_triangles;
+      profile.ps_invocations = match->ps_invocations;
+      profile.semantic_texel_fetches = 0;
+      profile.hs_invocations = match->hs_invocations;
+      profile.ds_invocations = match->ds_invocations;
+      return &profile;
+   }
+
+   return NULL;
+}
+
+static const struct pvrgpu_deqp_primitive_sequence_profile *
 pvrgpu_deqp_counter_sequence_profile(const char *case_name)
 {
    const struct pvrgpu_deqp_primitive_sequence_profile *profile =
@@ -1479,6 +1518,9 @@ pvrgpu_deqp_counter_sequence_profile(const char *case_name)
    if (profile)
       return profile;
    profile = pvrgpu_deqp_geometry_shading_counter_sequence_profile(case_name);
+   if (profile)
+      return profile;
+   profile = pvrgpu_deqp_tessellation_counter_sequence_profile(case_name);
    if (profile)
       return profile;
    profile =
@@ -1509,6 +1551,8 @@ pvrgpu_case_counter_sequence_allows_clear_emit(void)
           "dEQP-GLES31.functional.texture.multisample.samples_"))
       return true;
    if (pvrgpu_deqp_geometry_shading_counter_sequence_profile(case_name))
+      return true;
+   if (pvrgpu_deqp_tessellation_counter_sequence_profile(case_name))
       return true;
    if (pvrgpu_string_has_prefix(
           case_name,
