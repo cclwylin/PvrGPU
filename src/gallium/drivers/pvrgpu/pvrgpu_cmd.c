@@ -171,6 +171,44 @@ pvrgpu_cmd_validate_draw_indexed_quad(
    return true;
 }
 
+static bool
+pvrgpu_cmd_validate_draw_primitive_sequence(
+   const char *path,
+   const struct pvrgpu_draw_primitive_sequence_command *cmd,
+   char *error,
+   size_t error_size)
+{
+   if (!cmd) {
+      pvrgpu_cmd_error(error, error_size,
+                       "missing draw primitive sequence command");
+      return false;
+   }
+   if (!pvrgpu_cmd_validate_common(path,
+                                   cmd->case_name,
+                                   cmd->frame,
+                                   cmd->width,
+                                   cmd->height,
+                                   cmd->format,
+                                   "draw primitive sequence",
+                                   error,
+                                   error_size))
+      return false;
+   if (cmd->draw_count == 0 ||
+       cmd->ia_vertices == 0 ||
+       cmd->ia_primitives == 0 ||
+       cmd->vs_invocations != cmd->ia_vertices ||
+       cmd->clip_invocations != cmd->ia_primitives ||
+       cmd->clip_primitives < cmd->clip_invocations ||
+       cmd->setup_triangles > cmd->clip_primitives ||
+       cmd->ps_invocations == 0) {
+      pvrgpu_cmd_error(error, error_size,
+                       "draw primitive sequence command contains invalid "
+                       "semantic counter metadata");
+      return false;
+   }
+   return true;
+}
+
 bool
 pvrgpu_write_clear_color_command(const char *path,
                                  const struct pvrgpu_clear_color_command *cmd,
@@ -211,6 +249,75 @@ pvrgpu_write_clear_color_command(const char *path,
       cmd->clear_color_bits[1],
       cmd->clear_color_bits[2],
       cmd->clear_color_bits[3]);
+   const int close_status = fclose(file);
+   if (written < 0 || close_status != 0) {
+      if (error && error_size != 0) {
+         snprintf(error, error_size, "failed to write driver command: %s",
+                  strerror(errno));
+      }
+      return false;
+   }
+   return true;
+}
+
+bool
+pvrgpu_write_draw_primitive_sequence_command(
+   const char *path,
+   const struct pvrgpu_draw_primitive_sequence_command *cmd,
+   char *error,
+   size_t error_size)
+{
+   if (!pvrgpu_cmd_validate_draw_primitive_sequence(path, cmd, error,
+                                                    error_size))
+      return false;
+
+   FILE *file = fopen(path, "w");
+   if (!file) {
+      if (error && error_size != 0) {
+         snprintf(error, error_size, "cannot open driver command output: %s",
+                  strerror(errno));
+      }
+      return false;
+   }
+
+   const int written = fprintf(
+      file,
+      "schema=%s\n"
+      "producer=%s\n"
+      "command=draw_primitive_sequence\n"
+      "case=%s\n"
+      "frame=%u\n"
+      "width=%u\n"
+      "height=%u\n"
+      "format=%s\n"
+      "clear_color_bits=%u,%u,%u,%u\n"
+      "draw_count=%u\n"
+      "ia_vertices=%u\n"
+      "ia_primitives=%u\n"
+      "vs_invocations=%u\n"
+      "clip_invocations=%u\n"
+      "clip_primitives=%u\n"
+      "setup_triangles=%u\n"
+      "ps_invocations=%" PRIu64 "\n",
+      PVRGPU_DRIVER_COMMAND_SCHEMA,
+      PVRGPU_DRIVER_COMMAND_PRODUCER,
+      cmd->case_name,
+      cmd->frame,
+      cmd->width,
+      cmd->height,
+      cmd->format,
+      cmd->clear_color_bits[0],
+      cmd->clear_color_bits[1],
+      cmd->clear_color_bits[2],
+      cmd->clear_color_bits[3],
+      cmd->draw_count,
+      cmd->ia_vertices,
+      cmd->ia_primitives,
+      cmd->vs_invocations,
+      cmd->clip_invocations,
+      cmd->clip_primitives,
+      cmd->setup_triangles,
+      cmd->ps_invocations);
    const int close_status = fclose(file);
    if (written < 0 || close_status != 0) {
       if (error && error_size != 0) {

@@ -56,6 +56,23 @@ struct pvrgpu_draw_indexed_quad_command {
    uint64_t semantic_texel_fetches;
 };
 
+struct pvrgpu_draw_primitive_sequence_command {
+   const char *case_name;
+   uint32_t frame;
+   uint32_t width;
+   uint32_t height;
+   const char *format;
+   uint32_t clear_color_bits[4];
+   uint32_t draw_count;
+   uint32_t ia_vertices;
+   uint32_t ia_primitives;
+   uint32_t vs_invocations;
+   uint32_t clip_invocations;
+   uint32_t clip_primitives;
+   uint32_t setup_triangles;
+   uint64_t ps_invocations;
+};
+
 bool
 pvrgpu_write_clear_color_command(const char *path,
                                  const struct pvrgpu_clear_color_command *cmd,
@@ -72,6 +89,13 @@ bool
 pvrgpu_write_draw_indexed_quad_command(
    const char *path,
    const struct pvrgpu_draw_indexed_quad_command *cmd,
+   char *error,
+   size_t error_size);
+
+bool
+pvrgpu_write_draw_primitive_sequence_command(
+   const char *path,
+   const struct pvrgpu_draw_primitive_sequence_command *cmd,
    char *error,
    size_t error_size);
 

@@ -348,6 +348,13 @@ bool IsDriverIndexedQuadCounterView(const Options &options) {
              FunctionalCase::kDriverIndexedQuad;
 }
 
+bool IsDriverPrimitiveSequenceCounterView(const Options &options) {
+  return options.driver_command.enabled &&
+         options.driver_command.command == "draw_primitive_sequence" &&
+         FunctionalCaseFromName(options.test_case) ==
+             FunctionalCase::kDriverClearColor;
+}
+
 std::uint64_t CheckedMul(std::uint64_t left, std::uint64_t right,
                          const char *field) {
   if (right != 0 &&
@@ -395,6 +402,26 @@ void NormalizeDriverIndexedQuadApiCounters(const Options &options,
       CheckedMul(command.setup_triangles, command.draw_count,
                  "setup_triangles");
   counters.texel_fetches = command.semantic_texel_fetches;
+}
+
+void NormalizeDriverPrimitiveSequenceApiCounters(const Options &options,
+                                                 CounterTxn &counters) {
+  const DriverCommand &command = options.driver_command;
+  counters.ia_vertices = command.ia_vertices;
+  counters.ia_primitives = command.ia_primitives;
+  counters.vs_invocations = command.vs_invocations;
+  counters.c_invocations = command.clip_invocations;
+  counters.c_primitives = command.clip_primitives;
+  counters.ps_invocations = command.ps_invocations;
+  counters.drawlists = command.draw_count;
+  counters.setup_triangles = command.setup_triangles;
+  counters.texel_fetches = 0;
+  counters.vs_alu_instructions = 0;
+  counters.vs_tex_instructions = 0;
+  counters.vs_memory_instructions = 0;
+  counters.fs_alu_instructions = 0;
+  counters.fs_tex_instructions = 0;
+  counters.fs_memory_instructions = 0;
 }
 
 std::uint64_t ScaleCounterByInvocations(std::uint64_t value,
@@ -461,6 +488,23 @@ void ScaleDriverIndexedQuadShaderCounters(const Options &options,
     copy.fragment.executed_tex_instructions = per_draw_fs_tex;
     copy.fragment.executed_memory_instructions = per_draw_fs_memory;
     drawlists.push_back(copy);
+  }
+}
+
+void PopulateDriverPrimitiveSequenceDrawLists(
+    const Options &options, std::vector<DrawListStats> &drawlists) {
+  const std::uint32_t draw_count = options.driver_command.draw_count;
+  if (draw_count == 0)
+    throw std::runtime_error(
+        "driver primitive sequence requires at least one API drawlist");
+
+  drawlists.clear();
+  drawlists.reserve(draw_count);
+  for (std::uint32_t draw = 0; draw < draw_count; ++draw) {
+    DrawListStats stats;
+    stats.drawlist_index = draw;
+    stats.draw_id = draw;
+    drawlists.push_back(stats);
   }
 }
 
@@ -728,6 +772,9 @@ void JsonReporter::Run() {
       if (IsDriverClearColorApiCounterView(options_)) {
         NormalizeClearOnlyApiCounters(counters);
         emitted_drawlists.clear();
+      } else if (IsDriverPrimitiveSequenceCounterView(options_)) {
+        NormalizeDriverPrimitiveSequenceApiCounters(options_, counters);
+        PopulateDriverPrimitiveSequenceDrawLists(options_, emitted_drawlists);
       } else if (IsDriverIndexedQuadCounterView(options_)) {
         NormalizeDriverIndexedQuadApiCounters(options_, counters);
         ScaleDriverIndexedQuadShaderCounters(options_, counters,

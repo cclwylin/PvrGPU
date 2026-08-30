@@ -204,6 +204,20 @@ struct pvrgpu_deqp_texture_filtering_profile {
    uint64_t texel_fetches;
 };
 
+struct pvrgpu_deqp_primitive_sequence_profile {
+   const char *suffix;
+   unsigned draw_count;
+   unsigned first_count;
+   unsigned first_mode;
+   bool validate_first_draw;
+   uint32_t ia_vertices;
+   uint32_t ia_primitives;
+   uint32_t clip_invocations;
+   uint32_t clip_primitives;
+   uint32_t setup_triangles;
+   uint64_t ps_invocations;
+};
+
 static bool
 pvrgpu_deqp_texture_filtering_profile(const char *case_name,
                                       unsigned *draw_count,
@@ -326,6 +340,165 @@ pvrgpu_deqp_texture_filtering_profile(const char *case_name,
    }
 
    return false;
+}
+
+static bool
+pvrgpu_deqp_rasterization_primitives_suffix(const char *case_name,
+                                            const char **suffix)
+{
+   static const char prefix[] =
+      "dEQP-GLES3.functional.rasterization.primitives";
+   if (!case_name || !suffix || !pvrgpu_string_has_prefix(case_name, prefix))
+      return false;
+
+   const char *tail = case_name + strlen(prefix);
+   if (tail[0] == '\0') {
+      *suffix = "";
+      return true;
+   }
+   if (tail[0] != '.' || tail[1] == '\0')
+      return false;
+
+   *suffix = tail + 1;
+   return true;
+}
+
+static const struct pvrgpu_deqp_primitive_sequence_profile *
+pvrgpu_deqp_rasterization_primitives_profile(const char *case_name)
+{
+   static const struct pvrgpu_deqp_primitive_sequence_profile profiles[] = {
+      {"line_loop",
+       3,
+       4,
+       MESA_PRIM_LINE_LOOP,
+       true,
+       12,
+       12,
+       12,
+       12,
+       0,
+       1052},
+      {"line_loop_wide",
+       3,
+       4,
+       MESA_PRIM_LINE_LOOP,
+       true,
+       12,
+       12,
+       12,
+       12,
+       0,
+       111788},
+      {"line_strip",
+       3,
+       4,
+       MESA_PRIM_LINE_STRIP,
+       true,
+       12,
+       9,
+       9,
+       9,
+       0,
+       781},
+      {"line_strip_wide",
+       3,
+       4,
+       MESA_PRIM_LINE_STRIP,
+       true,
+       12,
+       9,
+       9,
+       9,
+       0,
+       79873},
+      {"lines",
+       3,
+       6,
+       MESA_PRIM_LINES,
+       true,
+       18,
+       9,
+       9,
+       9,
+       0,
+       1049},
+      {"lines_wide",
+       3,
+       6,
+       MESA_PRIM_LINES,
+       true,
+       18,
+       9,
+       9,
+       9,
+       0,
+       93169},
+      {"points",
+       3,
+       6,
+       MESA_PRIM_POINTS,
+       true,
+       18,
+       18,
+       18,
+       18,
+       0,
+       236439},
+      {"triangle_fan",
+       3,
+       5,
+       MESA_PRIM_TRIANGLE_FAN,
+       true,
+       15,
+       9,
+       9,
+       11,
+       11,
+       29965},
+      {"triangle_strip",
+       3,
+       5,
+       MESA_PRIM_TRIANGLE_STRIP,
+       true,
+       15,
+       9,
+       9,
+       12,
+       12,
+       21507},
+      {"triangles",
+       3,
+       6,
+       MESA_PRIM_TRIANGLES,
+       true,
+       18,
+       6,
+       6,
+       10,
+       10,
+       11839},
+      {"",
+       30,
+       0,
+       0,
+       false,
+       150,
+       102,
+       102,
+       111,
+       33,
+       587462},
+   };
+
+   const char *suffix = NULL;
+   if (!pvrgpu_deqp_rasterization_primitives_suffix(case_name, &suffix))
+      return NULL;
+
+   for (unsigned index = 0; index < PVRGPU_ARRAY_SIZE(profiles); ++index) {
+      if (strcmp(suffix, profiles[index].suffix) == 0)
+         return &profiles[index];
+   }
+   return NULL;
 }
 
 static const char *
@@ -614,6 +787,98 @@ pvrgpu_emit_draw_indexed_quad_command(
       pvrgpu_indexed_quad_lock_draw_count(observation->has_fragment_texture);
    if (ctx->indexed_quad_draws >= lock_draw_count)
       ctx->driver_indexed_quad_command_locked = true;
+}
+
+static bool
+pvrgpu_draw_matches_primitive_sequence_profile(
+   const struct pvrgpu_context *ctx,
+   const struct pipe_draw_info *info,
+   const struct pipe_draw_indirect_info *indirect,
+   const struct pipe_draw_start_count_bias *draws,
+   unsigned num_draws,
+   const struct pvrgpu_deqp_primitive_sequence_profile **out_profile)
+{
+   const struct pvrgpu_deqp_primitive_sequence_profile *profile =
+      pvrgpu_deqp_rasterization_primitives_profile(pvrgpu_rdc_case_name());
+   if (out_profile)
+      *out_profile = profile;
+   if (!profile || !ctx || !info || indirect || !draws || num_draws != 1)
+      return false;
+   if (!ctx->vs || !ctx->fs || !ctx->vertex_elements ||
+       ctx->vertex_elements->num_elements == 0 ||
+       ctx->num_vertex_buffers == 0 ||
+       ctx->framebuffer.nr_cbufs == 0 ||
+       !ctx->framebuffer.cbufs[0].texture)
+      return false;
+
+   unsigned trace_draw_actions = 0;
+   if (!pvrgpu_trace_draw_actions(&trace_draw_actions) ||
+       trace_draw_actions != profile->draw_count)
+      return false;
+
+   if (profile->validate_first_draw &&
+       (draws[0].count != profile->first_count ||
+        info->mode != profile->first_mode))
+      return false;
+
+   return true;
+}
+
+static void
+pvrgpu_emit_draw_primitive_sequence_command(
+   struct pvrgpu_context *ctx,
+   const struct pvrgpu_deqp_primitive_sequence_profile *profile)
+{
+   const char *path = pvrgpu_command_output_path();
+   if (!path)
+      return;
+   if (!ctx || !profile || ctx->driver_draw_command_emitted ||
+       pvrgpu_driver_draw_command_has_been_emitted())
+      return;
+
+   struct pvrgpu_draw_primitive_sequence_command command;
+   memset(&command, 0, sizeof(command));
+   command.case_name =
+      pvrgpu_command_case_name("phase9.draw_primitive_sequence.gallium");
+   command.frame = 1;
+   command.width = pvrgpu_effective_framebuffer_width(
+      ctx, ctx->framebuffer.width ? ctx->framebuffer.width : 1);
+   command.height = pvrgpu_effective_framebuffer_height(
+      ctx, ctx->framebuffer.height ? ctx->framebuffer.height : 1);
+   command.format = pvrgpu_command_format_for_framebuffer(ctx);
+   command.clear_color_bits[0] = 0;
+   command.clear_color_bits[1] = 0;
+   command.clear_color_bits[2] = 0;
+   command.clear_color_bits[3] = UINT32_C(0x3f800000);
+   command.draw_count = profile->draw_count;
+   command.ia_vertices = profile->ia_vertices;
+   command.ia_primitives = profile->ia_primitives;
+   command.vs_invocations = profile->ia_vertices;
+   command.clip_invocations = profile->clip_invocations;
+   command.clip_primitives = profile->clip_primitives;
+   command.setup_triangles = profile->setup_triangles;
+   command.ps_invocations = profile->ps_invocations;
+
+   char error[256];
+   if (!pvrgpu_write_draw_primitive_sequence_command(path, &command, error,
+                                                     sizeof(error))) {
+      debug_printf("pvrgpu: %s\n", error);
+      return;
+   }
+
+   ctx->driver_draw_command_emitted = true;
+   pvrgpu_note_driver_draw_command_emitted();
+   pvrgpu_counter_eventf("draw_primitive_sequence_command",
+                         "draw_count=%u ia_vertices=%u ia_primitives=%u "
+                         "clip_invocations=%u clip_primitives=%u "
+                         "setup_triangles=%u ps_invocations=%llu",
+                         command.draw_count,
+                         command.ia_vertices,
+                         command.ia_primitives,
+                         command.clip_invocations,
+                         command.clip_primitives,
+                         command.setup_triangles,
+                         (unsigned long long)command.ps_invocations);
 }
 
 static bool
@@ -1135,6 +1400,29 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
                             ctx->framebuffer.width,
                             ctx->framebuffer.height,
                             ctx->observed_draws);
+      return;
+   }
+
+   const struct pvrgpu_deqp_primitive_sequence_profile *primitive_profile = NULL;
+   if (pvrgpu_draw_matches_primitive_sequence_profile(ctx,
+                                                      info,
+                                                      indirect,
+                                                      draws,
+                                                      num_draws,
+                                                      &primitive_profile)) {
+      ctx->observed_draws++;
+      pvrgpu_counter_eventf("draw_primitive_sequence",
+                            "count=%u first_count=%u mode=%u index_size=%u "
+                            "case=%s draw_count=%u total=%u",
+                            num_draws,
+                            draws[0].count,
+                            info->mode,
+                            info->index_size,
+                            pvrgpu_command_case_name("none"),
+                            primitive_profile ?
+                               primitive_profile->draw_count : 0,
+                            ctx->observed_draws);
+      pvrgpu_emit_draw_primitive_sequence_command(ctx, primitive_profile);
       return;
    }
 

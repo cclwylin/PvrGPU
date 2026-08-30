@@ -19,6 +19,7 @@ constexpr const char *kDriverCommandProducer = "pvrgpu-gallium-driver";
 constexpr const char *kClearColorCommand = "clear_color";
 constexpr const char *kDrawTriangleCommand = "draw_triangle";
 constexpr const char *kDrawIndexedQuadCommand = "draw_indexed_quad";
+constexpr const char *kDrawPrimitiveSequenceCommand = "draw_primitive_sequence";
 constexpr const char *kRgba8Format = "PIPE_FORMAT_R8G8B8A8_UNORM";
 constexpr const char *kRgbx8Format = "PIPE_FORMAT_R8G8B8X8_UNORM";
 constexpr const char *kBgrx8Format = "PIPE_FORMAT_B8G8R8X8_UNORM";
@@ -33,6 +34,8 @@ const std::set<std::string> &KnownFields() {
       "vertex0_bits", "vertex1_bits", "vertex2_bits",
       "draw_count", "index_count", "unique_vertices", "primitive_count",
       "clip_primitives", "setup_triangles", "semantic_texel_fetches",
+      "ia_vertices", "ia_primitives", "vs_invocations", "clip_invocations",
+      "ps_invocations",
   };
   return fields;
 }
@@ -73,6 +76,18 @@ const std::set<std::string> &DrawIndexedQuadFields() {
       "format",             "clear_color_bits",   "draw_count",
       "index_count",        "unique_vertices",    "primitive_count",
       "clip_primitives",    "setup_triangles",    "semantic_texel_fetches",
+  };
+  return fields;
+}
+
+const std::set<std::string> &DrawPrimitiveSequenceFields() {
+  static const std::set<std::string> fields = {
+      "schema",           "producer",        "command",
+      "case",             "frame",           "width",
+      "height",           "format",          "clear_color_bits",
+      "draw_count",       "ia_vertices",     "ia_primitives",
+      "vs_invocations",   "clip_invocations", "clip_primitives",
+      "setup_triangles",  "ps_invocations",
   };
   return fields;
 }
@@ -251,7 +266,8 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
   }
   if (parsed.command != kClearColorCommand &&
       parsed.command != kDrawTriangleCommand &&
-      parsed.command != kDrawIndexedQuadCommand) {
+      parsed.command != kDrawIndexedQuadCommand &&
+      parsed.command != kDrawPrimitiveSequenceCommand) {
     *error = "unsupported driver command: " + parsed.command;
     return false;
   }
@@ -301,7 +317,9 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
           ? ClearColorFields()
           : parsed.command == kDrawTriangleCommand
                 ? DrawTriangleFields()
-                : DrawIndexedQuadFields();
+                : parsed.command == kDrawIndexedQuadCommand
+                      ? DrawIndexedQuadFields()
+                      : DrawPrimitiveSequenceFields();
   if (!RequireExactFields(fields, required, parsed.command, error))
     return false;
 
@@ -360,6 +378,31 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     if (!ParseU64(fields["semantic_texel_fetches"],
                   &parsed.semantic_texel_fetches)) {
       *error = "driver command semantic_texel_fetches must be a uint64 value";
+      return false;
+    }
+  }
+  if (parsed.command == kDrawPrimitiveSequenceCommand) {
+    if (!ParseU32(fields["draw_count"], &parsed.draw_count) ||
+        parsed.draw_count == 0) {
+      *error = "draw primitive sequence draw_count must be positive";
+      return false;
+    }
+    if (!ParseU32(fields["ia_vertices"], &parsed.ia_vertices) ||
+        parsed.ia_vertices == 0 ||
+        !ParseU32(fields["ia_primitives"], &parsed.ia_primitives) ||
+        parsed.ia_primitives == 0 ||
+        !ParseU32(fields["vs_invocations"], &parsed.vs_invocations) ||
+        parsed.vs_invocations != parsed.ia_vertices ||
+        !ParseU32(fields["clip_invocations"], &parsed.clip_invocations) ||
+        parsed.clip_invocations != parsed.ia_primitives ||
+        !ParseU32(fields["clip_primitives"], &parsed.clip_primitives) ||
+        parsed.clip_primitives < parsed.clip_invocations ||
+        !ParseU32(fields["setup_triangles"], &parsed.setup_triangles) ||
+        parsed.setup_triangles > parsed.clip_primitives ||
+        !ParseU64(fields["ps_invocations"], &parsed.ps_invocations) ||
+        parsed.ps_invocations == 0) {
+      *error =
+          "draw primitive sequence contains invalid semantic counter metadata";
       return false;
     }
   }

@@ -113,6 +113,9 @@ void Submitter::Run() {
       driver_command && options_.driver_command.command == "draw_triangle";
   const bool driver_indexed_quad_command =
       driver_command && options_.driver_command.command == "draw_indexed_quad";
+  const bool driver_primitive_sequence_command =
+      driver_command &&
+      options_.driver_command.command == "draw_primitive_sequence";
   const FunctionalCase functional_case =
       FunctionalCaseFromName(options_.test_case);
   if (!IsRasterFunctionalCase(functional_case))
@@ -135,8 +138,11 @@ void Submitter::Run() {
         functional_case != FunctionalCase::kDriverTriangleSolid) ||
        (driver_indexed_quad_command &&
         functional_case != FunctionalCase::kDriverIndexedQuad) ||
+       (driver_primitive_sequence_command &&
+        functional_case != FunctionalCase::kDriverClearColor) ||
        (!driver_clear_command && !driver_triangle_command &&
-        !driver_indexed_quad_command))) {
+        !driver_indexed_quad_command &&
+        !driver_primitive_sequence_command))) {
     throw std::runtime_error(
         "Submitter driver command options do not match the one-frame command");
   }
@@ -182,14 +188,16 @@ void Submitter::Run() {
     const bool driver_clear = driver_clear_command;
     const bool driver_triangle = driver_triangle_command;
     const bool driver_indexed_quad = driver_indexed_quad_command;
+    const bool driver_primitive_sequence = driver_primitive_sequence_command;
+    const bool driver_clear_like = driver_clear || driver_primitive_sequence;
     const bool depth_case =
-        driver_clear ||
+        driver_clear_like ||
         functional_case == FunctionalCase::kFillSolidDepthNotEqual ||
         functional_case == FunctionalCase::kFillSolidDepthNever;
     state.raster_state.depth.test_enable = depth_case ? 1U : 0U;
     state.raster_state.depth.write_enable = depth_case ? 1U : 0U;
     state.raster_state.depth.compare_op =
-        (driver_clear ||
+        (driver_clear_like ||
          functional_case == FunctionalCase::kFillSolidDepthNever)
             ? DepthCompareOp::kNever
             : DepthCompareOp::kNotEqual;
@@ -217,7 +225,7 @@ void Submitter::Run() {
       state.raster_state.face_cull.front_face =
           FrontFaceWinding::kCounterClockwise;
     }
-    if (driver_clear || driver_triangle || driver_indexed_quad) {
+    if (driver_clear_like || driver_triangle || driver_indexed_quad) {
       for (std::size_t component = 0; component < 4; ++component) {
         state.raster_state.clear_color[component] =
             FloatFromBits(options_.driver_command.clear_color_bits[component]);

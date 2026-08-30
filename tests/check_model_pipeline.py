@@ -569,6 +569,87 @@ def verify_driver_indexed_quad_framebuffer_size(
     ) == {(0, 0, 0, 255)}, "driver indexed quad framebuffer is not opaque black"
 
 
+def verify_driver_primitive_sequence(
+    executable: Path, output_dir: Path
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    command_path = output_dir / "driver-primitive-sequence.txt"
+    command_path.write_text(
+        "\n".join(
+            (
+                "schema=pvrgpu.driver-command.v1",
+                "producer=pvrgpu-gallium-driver",
+                "command=draw_primitive_sequence",
+                "case=dEQP-GLES3.functional.rasterization.primitives.line_loop",
+                "frame=1",
+                "width=512",
+                "height=512",
+                "format=PIPE_FORMAT_R8G8B8A8_UNORM",
+                "clear_color_bits=0,0,0,1065353216",
+                "draw_count=3",
+                "ia_vertices=12",
+                "ia_primitives=12",
+                "vs_invocations=12",
+                "clip_invocations=12",
+                "clip_primitives=12",
+                "setup_triangles=0",
+                "ps_invocations=1052",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    completed = invoke_driver_command(executable, command_path, output_dir)
+    assert completed.returncode == 0, (
+        "driver primitive sequence command run failed:\n"
+        + process_details(completed)
+    )
+    messages = json_messages(completed)
+    hello = [message for message in messages if message.get("type") == "hello"]
+    counters = [message for message in messages if message.get("type") == "counter"]
+    done = [message for message in messages if message.get("type") == "done"]
+    assert len(hello) == 1, "driver primitive sequence: missing/duplicate hello"
+    assert (
+        hello[0].get("mode") == "pvrgpu-driver-draw-primitive-sequence-phase9"
+    )
+    assert hello[0].get("driver_command_ingest") is True
+    assert hello[0].get("driver_command") == "draw_primitive_sequence"
+    assert len(counters) == 1, "driver primitive sequence: missing counter"
+    assert done and done[-1].get("pool_leaks") == 0
+    values = counters[0].get("counters")
+    assert isinstance(values, dict)
+    assert values.get("ia_vertices") == 12
+    assert values.get("ia_primitives") == 12
+    assert values.get("vs_invocations") == 12
+    assert values.get("c_invocations") == 12
+    assert values.get("c_primitives") == 12
+    assert values.get("ps_invocations") == 1052
+    assert values.get("drawlists") == 3
+    assert values.get("setup_triangles") == 0
+    assert values.get("texel_fetches") == 0
+    drawlists = counters[0].get("drawlist_stats")
+    assert isinstance(drawlists, list) and len(drawlists) == 3
+    for draw, drawlist in enumerate(drawlists):
+        assert drawlist.get("drawlist") == draw
+        assert drawlist.get("draw_id") == draw
+        assert drawlist.get("vs", {}).get("executed") == {
+            "alu": 0,
+            "tex": 0,
+            "memory": 0,
+        }
+        assert drawlist.get("fs", {}).get("executed") == {
+            "alu": 0,
+            "tex": 0,
+            "memory": 0,
+        }
+
+    artifact = output_dir / "driver_clear_color_sample_000001.png"
+    png_width, png_height, pixels = decode_rgba8_png(artifact)
+    assert (png_width, png_height) == (512, 512)
+    assert len(pixels) == 512 * 512 * 4
+
+
 def triangle_setup_half_culled_golden_pixels() -> bytes:
     """Rebuild the GLBench seeded winding image independently of the model."""
 
@@ -3991,6 +4072,9 @@ def main() -> int:
         verify_driver_triangle_command(executable, root / "driver-triangle-red")
         verify_driver_indexed_quad_framebuffer_size(
             executable, root / "driver-indexed-quad-framebuffer-size"
+        )
+        verify_driver_primitive_sequence(
+            executable, root / "driver-primitive-sequence"
         )
         verify_fill_solid(executable, root / "fill-solid")
         verify_fill_solid_bypass(

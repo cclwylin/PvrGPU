@@ -32,6 +32,11 @@ struct DriverCommand {
   std::uint32_t clip_primitives = 0;
   std::uint32_t setup_triangles = 0;
   std::uint64_t semantic_texel_fetches = 0;
+  std::uint32_t ia_vertices = 0;
+  std::uint32_t ia_primitives = 0;
+  std::uint32_t vs_invocations = 0;
+  std::uint32_t clip_invocations = 0;
+  std::uint64_t ps_invocations = 0;
 };
 
 struct Options {

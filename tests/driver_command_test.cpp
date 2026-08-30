@@ -140,6 +140,39 @@ int main() {
                  "wrong indexed quad semantic texel fetch metadata"))
     return failed;
 
+  const std::filesystem::path primitives = TempFile("primitives.txt");
+  WriteText(primitives,
+            "schema=pvrgpu.driver-command.v1\n"
+            "producer=pvrgpu-gallium-driver\n"
+            "command=draw_primitive_sequence\n"
+            "case=dEQP-GLES3.functional.rasterization.primitives.line_loop\n"
+            "frame=1\n"
+            "width=512\n"
+            "height=512\n"
+            "format=PIPE_FORMAT_R8G8B8A8_UNORM\n"
+            "clear_color_bits=0,0,0,1065353216\n"
+            "draw_count=3\n"
+            "ia_vertices=12\n"
+            "ia_primitives=12\n"
+            "vs_invocations=12\n"
+            "clip_invocations=12\n"
+            "clip_primitives=12\n"
+            "setup_triangles=0\n"
+            "ps_invocations=1052\n");
+  error.clear();
+  if (int failed =
+          Expect(LoadDriverCommand(primitives.string(), &command, &error),
+                 error))
+    return failed;
+  if (int failed =
+          Expect(command.command == "draw_primitive_sequence" &&
+                     command.draw_count == 3 &&
+                     command.ia_vertices == 12 &&
+                     command.clip_primitives == 12 &&
+                     command.ps_invocations == 1052,
+                 "wrong primitive sequence metadata"))
+    return failed;
+
   const std::filesystem::path bad = TempFile("bad.txt");
   WriteText(bad,
             "schema=pvrgpu.driver-command.v1\n"
@@ -164,6 +197,7 @@ int main() {
   std::filesystem::remove(good);
   std::filesystem::remove(draw);
   std::filesystem::remove(quad);
+  std::filesystem::remove(primitives);
   std::filesystem::remove(bad);
   return 0;
 }
