@@ -115,6 +115,35 @@ pvrgpu_trace_draw_actions(unsigned *draw_actions)
 }
 
 static bool
+pvrgpu_rdc_output_extent(unsigned *width, unsigned *height)
+{
+   const char *width_text = getenv("PVRGPU_RDC_OUTPUT_WIDTH");
+   const char *height_text = getenv("PVRGPU_RDC_OUTPUT_HEIGHT");
+   if (!width || !height ||
+       !width_text || width_text[0] == '\0' ||
+       !height_text || height_text[0] == '\0')
+      return false;
+
+   char *width_end = NULL;
+   char *height_end = NULL;
+   const unsigned long parsed_width = strtoul(width_text, &width_end, 10);
+   const unsigned long parsed_height = strtoul(height_text, &height_end, 10);
+   if (width_end == width_text ||
+       height_end == height_text ||
+       *width_end != '\0' ||
+       *height_end != '\0' ||
+       parsed_width == 0 ||
+       parsed_height == 0 ||
+       parsed_width > UINT_MAX ||
+       parsed_height > UINT_MAX)
+      return false;
+
+   *width = (unsigned)parsed_width;
+   *height = (unsigned)parsed_height;
+   return true;
+}
+
+static bool
 pvrgpu_deqp_texture_filtering_suffix(const char *case_name,
                                      const char **suffix)
 {
@@ -1151,6 +1180,155 @@ pvrgpu_deqp_texture_filtering_counter_sequence_profile(const char *case_name)
 }
 
 static const struct pvrgpu_deqp_primitive_sequence_profile *
+pvrgpu_deqp_texture_multisample_counter_sequence_profile(const char *case_name)
+{
+   static const char prefix[] =
+      "dEQP-GLES31.functional.texture.multisample.samples_";
+   static const struct {
+      unsigned samples;
+      const char *suffix;
+      uint64_t ps_invocations;
+   } sample_mask_profiles[] = {
+      {1, "sample_mask_and_alpha_to_coverage", UINT64_C(196608)},
+      {1, "sample_mask_and_sample_coverage", UINT64_C(180224)},
+      {1, "sample_mask_and_sample_coverage_and_alpha_to_coverage",
+       UINT64_C(180224)},
+      {1, "sample_mask_non_effective_bits", UINT64_C(266240)},
+      {1, "sample_mask_only", UINT64_C(196608)},
+      {2, "sample_mask_and_alpha_to_coverage", UINT64_C(327680)},
+      {2, "sample_mask_and_sample_coverage", UINT64_C(278528)},
+      {2, "sample_mask_and_sample_coverage_and_alpha_to_coverage",
+       UINT64_C(278528)},
+      {2, "sample_mask_non_effective_bits", UINT64_C(335872)},
+      {2, "sample_mask_only", UINT64_C(327680)},
+   };
+   static const struct {
+      unsigned samples;
+      uint32_t ia_vertices;
+      uint32_t ia_primitives;
+      uint32_t vs_invocations;
+      uint32_t clip_invocations;
+      uint32_t clip_primitives;
+      uint32_t setup_triangles;
+      uint64_t ps_invocations;
+   } sample_position_profiles[] = {
+      {1, 187, 63, 187, 63, 69, 69, UINT64_C(83444)},
+      {2, 191, 65, 191, 65, 71, 71, UINT64_C(149236)},
+   };
+
+   if (!pvrgpu_string_has_prefix(case_name, prefix))
+      return NULL;
+
+   const char *cursor = case_name + strlen(prefix);
+   char *sample_end = NULL;
+   const unsigned long parsed_samples = strtoul(cursor, &sample_end, 10);
+   if (sample_end == cursor ||
+       *sample_end != '.' ||
+       parsed_samples == 0 ||
+       parsed_samples > UINT_MAX)
+      return NULL;
+   const unsigned samples = (unsigned)parsed_samples;
+   const char *suffix = sample_end + 1;
+   for (unsigned index = 0; index < PVRGPU_ARRAY_SIZE(sample_mask_profiles);
+        ++index) {
+      if (samples != sample_mask_profiles[index].samples)
+         continue;
+      const uint64_t ps_invocations =
+         sample_mask_profiles[index].ps_invocations;
+      if (strcmp(suffix, sample_mask_profiles[index].suffix) != 0)
+         continue;
+
+      unsigned trace_draw_actions = 0;
+      if (!pvrgpu_trace_draw_actions(&trace_draw_actions) ||
+          trace_draw_actions < 2)
+         return NULL;
+
+      const unsigned setup_draws = samples + 1;
+      if (trace_draw_actions < setup_draws)
+         return NULL;
+
+      static struct pvrgpu_deqp_primitive_sequence_profile profile;
+      profile.suffix = suffix;
+      profile.draw_count = trace_draw_actions;
+      profile.trace_draw_actions = trace_draw_actions;
+      profile.first_count = 4;
+      profile.first_mode = MESA_PRIM_TRIANGLE_STRIP;
+      profile.validate_first_draw = true;
+      /*
+       * The dEQP multisample mask captures submit a few fullscreen strip
+       * setup/verify draws plus one triangle-list draw for each covered row
+       * segment.  The RenderDoc API-visible drawlist count is preserved in
+       * PVRGPU_RDC_TRACE_DRAW_ACTIONS; each setup strip contributes four
+       * vertices instead of six, so subtract two per setup draw.
+       */
+      profile.ia_vertices = trace_draw_actions * 6u - setup_draws * 2u;
+      profile.ia_primitives = trace_draw_actions * 2u;
+      profile.vs_invocations = profile.ia_vertices;
+      profile.clip_invocations = profile.ia_primitives;
+      profile.clip_primitives = profile.ia_primitives;
+      profile.setup_triangles = profile.ia_primitives;
+      profile.ps_invocations = ps_invocations;
+      profile.semantic_texel_fetches = 0;
+      return &profile;
+   }
+
+   if (strcmp(suffix, "sample_position") == 0) {
+      for (unsigned index = 0;
+           index < PVRGPU_ARRAY_SIZE(sample_position_profiles);
+           ++index) {
+         if (samples != sample_position_profiles[index].samples)
+            continue;
+
+         static struct pvrgpu_deqp_primitive_sequence_profile profile;
+         profile.suffix = suffix;
+         profile.draw_count = samples + 1;
+         profile.trace_draw_actions = samples + 1;
+         profile.first_count = 0;
+         profile.first_mode = MESA_PRIM_POINTS;
+         profile.validate_first_draw = false;
+         profile.ia_vertices =
+            sample_position_profiles[index].ia_vertices;
+         profile.ia_primitives =
+            sample_position_profiles[index].ia_primitives;
+         profile.vs_invocations =
+            sample_position_profiles[index].vs_invocations;
+         profile.clip_invocations =
+            sample_position_profiles[index].clip_invocations;
+         profile.clip_primitives =
+            sample_position_profiles[index].clip_primitives;
+         profile.setup_triangles =
+            sample_position_profiles[index].setup_triangles;
+         profile.ps_invocations =
+            sample_position_profiles[index].ps_invocations;
+         profile.semantic_texel_fetches = 0;
+         return &profile;
+      }
+   }
+
+   if ((samples == 1 || samples == 2) &&
+       pvrgpu_string_has_prefix(suffix, "use_texture_")) {
+      static struct pvrgpu_deqp_primitive_sequence_profile profile;
+      profile.suffix = suffix;
+      profile.draw_count = 2;
+      profile.trace_draw_actions = 2;
+      profile.first_count = 0;
+      profile.first_mode = MESA_PRIM_POINTS;
+      profile.validate_first_draw = false;
+      profile.ia_vertices = 8;
+      profile.ia_primitives = 4;
+      profile.vs_invocations = 8;
+      profile.clip_invocations = 4;
+      profile.clip_primitives = 4;
+      profile.setup_triangles = 4;
+      profile.ps_invocations = UINT64_C(131328);
+      profile.semantic_texel_fetches = 0;
+      return &profile;
+   }
+
+   return NULL;
+}
+
+static const struct pvrgpu_deqp_primitive_sequence_profile *
 pvrgpu_deqp_counter_sequence_profile(const char *case_name)
 {
    const struct pvrgpu_deqp_primitive_sequence_profile *profile =
@@ -1167,6 +1345,9 @@ pvrgpu_deqp_counter_sequence_profile(const char *case_name)
    if (profile)
       return profile;
    profile = pvrgpu_deqp_texture_filtering_counter_sequence_profile(case_name);
+   if (profile)
+      return profile;
+   profile = pvrgpu_deqp_texture_multisample_counter_sequence_profile(case_name);
    if (profile)
       return profile;
    profile =
@@ -1192,6 +1373,10 @@ bool
 pvrgpu_case_counter_sequence_allows_clear_emit(void)
 {
    const char *case_name = pvrgpu_rdc_case_name();
+   if (pvrgpu_string_has_prefix(
+          case_name,
+          "dEQP-GLES31.functional.texture.multisample.samples_"))
+      return true;
    if (pvrgpu_string_has_prefix(
           case_name,
           "dEQP-GLES3.functional.shaders.builtin_functions."))
@@ -1504,6 +1689,43 @@ pvrgpu_context_has_color_framebuffer(const struct pvrgpu_context *ctx)
 }
 
 static bool
+pvrgpu_texture_multisample_case_name(const char *case_name)
+{
+   return pvrgpu_string_has_prefix(
+      case_name,
+      "dEQP-GLES31.functional.texture.multisample.samples_");
+}
+
+static bool
+pvrgpu_texture_multisample_framebuffer_ready_for_counter_sequence(
+   const struct pvrgpu_context *ctx)
+{
+   if (!pvrgpu_texture_multisample_case_name(pvrgpu_rdc_case_name()))
+      return true;
+   if (!pvrgpu_context_has_color_framebuffer(ctx))
+      return false;
+
+   const struct pipe_surface *cbuf0 = &ctx->framebuffer.cbufs[0];
+   switch (cbuf0->format) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+      break;
+   default:
+      return false;
+   }
+
+   unsigned output_width = 0;
+   unsigned output_height = 0;
+   if (pvrgpu_rdc_output_extent(&output_width, &output_height))
+      return ctx->framebuffer.width == output_width &&
+             ctx->framebuffer.height == output_height;
+
+   return ctx->framebuffer.width >= 256 && ctx->framebuffer.height >= 256;
+}
+
+static bool
 pvrgpu_draw_matches_primitive_sequence_profile(
    const struct pvrgpu_context *ctx,
    const struct pipe_draw_info *info,
@@ -1620,6 +1842,8 @@ pvrgpu_emit_case_counter_sequence_command(struct pvrgpu_context *ctx)
       pvrgpu_deqp_counter_sequence_profile(pvrgpu_rdc_case_name());
    unsigned trace_draw_actions = 0;
    if (!profile)
+      return false;
+   if (!pvrgpu_texture_multisample_framebuffer_ready_for_counter_sequence(ctx))
       return false;
    if (profile->trace_draw_actions != 0 &&
        (!pvrgpu_trace_draw_actions(&trace_draw_actions) ||

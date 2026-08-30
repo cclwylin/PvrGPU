@@ -358,6 +358,13 @@ pvrgpu_create_fs_state(struct pipe_context *pipe,
 }
 
 static void *
+pvrgpu_create_gs_state(struct pipe_context *pipe,
+                       const struct pipe_shader_state *state)
+{
+   return pvrgpu_create_shader_state_for_stage(pipe, state, MESA_SHADER_GEOMETRY);
+}
+
+static void *
 pvrgpu_create_unsupported_shader_state(struct pipe_context *pipe,
                                        const struct pipe_shader_state *state)
 {
@@ -379,6 +386,15 @@ pvrgpu_bind_fs_state(struct pipe_context *pipe, void *state)
    pvrgpu_context(pipe)->fs = (struct pvrgpu_shader_state *)state;
    pvrgpu_counter_eventf("bind_shader",
                          "stage=fragment bound=%u",
+                         state ? 1 : 0);
+}
+
+static void
+pvrgpu_bind_gs_state(struct pipe_context *pipe, void *state)
+{
+   pvrgpu_context(pipe)->gs = (struct pvrgpu_shader_state *)state;
+   pvrgpu_counter_eventf("bind_shader",
+                         "stage=geometry bound=%u",
                          state ? 1 : 0);
 }
 
@@ -1061,8 +1077,8 @@ pvrgpu_init_state_functions(struct pipe_context *pipe)
    pipe->bind_vs_state = pvrgpu_bind_vs_state;
    pipe->delete_vs_state = pvrgpu_delete_shader_state;
 
-   pipe->create_gs_state = pvrgpu_create_unsupported_shader_state;
-   pipe->bind_gs_state = pvrgpu_bind_state_object;
+   pipe->create_gs_state = pvrgpu_create_gs_state;
+   pipe->bind_gs_state = pvrgpu_bind_gs_state;
    pipe->delete_gs_state = pvrgpu_delete_shader_state;
 
    pipe->create_tcs_state = pvrgpu_create_unsupported_shader_state;

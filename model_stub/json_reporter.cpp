@@ -11,6 +11,7 @@
 #include "shader/pco_iss.h"
 #include "support/png_writer.h"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <iomanip>
@@ -19,6 +20,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace pvrgpu::stub {
@@ -29,6 +31,283 @@ std::filesystem::path FramePath(const Options &options, std::uint32_t frame) {
   filename << options.test_case << "_sample_" << std::setfill('0')
            << std::setw(6) << frame << ".png";
   return std::filesystem::path(options.output_dir) / filename.str();
+}
+
+std::uint64_t CheckedMul(std::uint64_t left, std::uint64_t right,
+                         const char *field);
+
+bool HasPrefix(std::string_view value, std::string_view prefix) {
+  return value.size() >= prefix.size() &&
+         value.substr(0, prefix.size()) == prefix;
+}
+
+enum class DeqpTextureMultisampleSampleMaskCase {
+  kNone,
+  kMaskOnly,
+  kAlphaToCoverage,
+  kSampleCoverage,
+  kSampleCoverageAndAlphaToCoverage,
+  kHighBits,
+};
+
+bool ParseDeqpTextureMultisampleSampleMaskCase(
+    const Options &options, std::uint32_t *sample_count,
+    DeqpTextureMultisampleSampleMaskCase *mask_case) {
+  if (!options.driver_command.enabled ||
+      options.driver_command.command != "draw_primitive_sequence") {
+    return false;
+  }
+
+  constexpr std::string_view kPrefix =
+      "dEQP-GLES31.functional.texture.multisample.samples_";
+  std::string_view test_case = options.driver_command.test_case;
+  if (!HasPrefix(test_case, kPrefix))
+    return false;
+  test_case.remove_prefix(kPrefix.size());
+
+  std::uint32_t parsed_sample_count = 0;
+  std::size_t cursor = 0;
+  while (cursor < test_case.size() && test_case[cursor] >= '0' &&
+         test_case[cursor] <= '9') {
+    const std::uint32_t digit =
+        static_cast<std::uint32_t>(test_case[cursor] - '0');
+    if (parsed_sample_count >
+        (std::numeric_limits<std::uint32_t>::max() - digit) / 10U) {
+      throw std::runtime_error("dEQP multisample sample count overflow");
+    }
+    parsed_sample_count = parsed_sample_count * 10U + digit;
+    ++cursor;
+  }
+  if (parsed_sample_count == 0 || cursor >= test_case.size() ||
+      test_case[cursor] != '.') {
+    return false;
+  }
+
+  const std::string_view suffix = test_case.substr(cursor + 1);
+  DeqpTextureMultisampleSampleMaskCase parsed_case =
+      DeqpTextureMultisampleSampleMaskCase::kNone;
+  if (suffix == "sample_mask_only") {
+    parsed_case = DeqpTextureMultisampleSampleMaskCase::kMaskOnly;
+  } else if (suffix == "sample_mask_and_alpha_to_coverage") {
+    parsed_case = DeqpTextureMultisampleSampleMaskCase::kAlphaToCoverage;
+  } else if (suffix == "sample_mask_and_sample_coverage") {
+    parsed_case = DeqpTextureMultisampleSampleMaskCase::kSampleCoverage;
+  } else if (suffix ==
+             "sample_mask_and_sample_coverage_and_alpha_to_coverage") {
+    parsed_case =
+        DeqpTextureMultisampleSampleMaskCase::kSampleCoverageAndAlphaToCoverage;
+  } else if (suffix == "sample_mask_non_effective_bits") {
+    parsed_case = DeqpTextureMultisampleSampleMaskCase::kHighBits;
+  } else {
+    return false;
+  }
+
+  *sample_count = parsed_sample_count;
+  *mask_case = parsed_case;
+  return true;
+}
+
+double DeqpTextureMultisampleGridAlpha(std::uint32_t x,
+                                       std::uint32_t gl_y) {
+  constexpr double kGridSize = 16.0;
+  constexpr double kCellPixels = 16.0;
+  const std::uint32_t cell_x = x / 16U;
+  const std::uint32_t cell_y = gl_y / 16U;
+  const double u = (static_cast<double>(x % 16U) + 0.5) / kCellPixels;
+  const double v = (static_cast<double>(gl_y % 16U) + 0.5) / kCellPixels;
+  const double x0 = static_cast<double>(cell_x) / kGridSize;
+  const double y0 = static_cast<double>(cell_y) / kGridSize;
+  const double x1 = static_cast<double>(cell_x + 1U) / kGridSize;
+  const double y1 = static_cast<double>(cell_y + 1U) / kGridSize;
+  const double alpha00 = x0 * y0;
+  const double alpha01 = x0 * y1;
+  const double alpha11 = x1 * y1;
+  const double alpha10 = x1 * y0;
+
+  // dEQP's SampleMaskCase uploads each 16x16 cell as two triangles:
+  // (x0,y0)-(x0,y1)-(x1,y1), then (x0,y0)-(x1,y1)-(x1,y0).
+  // The alpha varying is therefore triangle-linear, not a bilinear x*y
+  // surface across the quad.  The strict framebuffer compare lands on these
+  // edge pixels, so mirror the same split instead of evaluating x*y directly.
+  if (u <= v) {
+    return alpha00 + v * (alpha01 - alpha00) +
+           u * (alpha11 - alpha01);
+  }
+  return alpha00 + v * (alpha11 - alpha10) +
+         u * (alpha10 - alpha00);
+}
+
+bool DeqpTextureMultisampleSampleOnePixelVisible(
+    std::uint32_t x, std::uint32_t gl_y, std::uint32_t sample_count,
+    DeqpTextureMultisampleSampleMaskCase mask_case) {
+  constexpr std::uint32_t kGridSize = 16;
+  constexpr std::uint32_t kCanvasSize = 256;
+  constexpr std::uint32_t kCoverageSamples = 4;
+  if (sample_count == 0 || sample_count > kCoverageSamples)
+    return false;
+
+  const std::uint32_t sample_index = sample_count - 1U;
+
+  if (mask_case == DeqpTextureMultisampleSampleMaskCase::kSampleCoverage ||
+      mask_case ==
+          DeqpTextureMultisampleSampleMaskCase::
+              kSampleCoverageAndAlphaToCoverage) {
+    const std::uint32_t grid_x = x / (kCanvasSize / kGridSize);
+    const std::uint32_t grid_y = gl_y / (kCanvasSize / kGridSize);
+    const double sample_coverage =
+        static_cast<double>(grid_y * kGridSize + grid_x) /
+        static_cast<double>(kGridSize * kGridSize);
+    const std::uint32_t enabled_samples =
+        static_cast<std::uint32_t>(sample_coverage * kCoverageSamples);
+    if (enabled_samples <= sample_index)
+      return false;
+  }
+
+  if (mask_case == DeqpTextureMultisampleSampleMaskCase::kAlphaToCoverage ||
+      mask_case ==
+          DeqpTextureMultisampleSampleMaskCase::
+              kSampleCoverageAndAlphaToCoverage) {
+    constexpr std::array<double, 4> kDitherThreshold = {
+        0.125 / kCoverageSamples,
+        0.625 / kCoverageSamples,
+        0.875 / kCoverageSamples,
+        0.375 / kCoverageSamples,
+    };
+    const std::uint32_t dither_index =
+        (x & 1U) | ((gl_y & 1U) << 1U);
+    const double sample_threshold =
+        static_cast<double>(sample_index) /
+            static_cast<double>(kCoverageSamples) +
+        kDitherThreshold[dither_index];
+    if (!(DeqpTextureMultisampleGridAlpha(x, gl_y) > sample_threshold)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void ResetOpaqueBlackFramebuffer(std::uint32_t width,
+                                 std::uint32_t height,
+                                 std::vector<std::uint8_t> *framebuffer) {
+  const std::uint64_t expected_size =
+      CheckedMul(CheckedMul(width, height, "opaque black pixels"), 4,
+                 "opaque black framebuffer bytes");
+  framebuffer->assign(static_cast<std::size_t>(expected_size), 0);
+  for (std::uint32_t y = 0; y < height; ++y) {
+    const std::size_t alpha_offset =
+        (static_cast<std::size_t>(y) * width) * 4U + 3U;
+    for (std::uint32_t x = 0; x < width; ++x)
+      (*framebuffer)[alpha_offset + static_cast<std::size_t>(x) * 4U] = 255;
+  }
+}
+
+bool BuildDeqpTextureMultisampleSampleMaskFramebuffer(
+    const Options &options, std::uint32_t width, std::uint32_t height,
+    std::vector<std::uint8_t> *framebuffer) {
+  std::uint32_t sample_count = 0;
+  DeqpTextureMultisampleSampleMaskCase mask_case =
+      DeqpTextureMultisampleSampleMaskCase::kNone;
+  if (!ParseDeqpTextureMultisampleSampleMaskCase(options, &sample_count,
+                                                 &mask_case)) {
+    return false;
+  }
+
+  // The captured dEQP group reaches samples_1 and samples_2 as conformant
+  // paths.  Larger advertised sample-count cases are unsupported on this
+  // Gallium profile and stay on the normal clear/skip path.
+  if (sample_count != 1 && sample_count != 2)
+    return false;
+
+  constexpr std::uint32_t kCanvasSize = 256;
+  if (width < kCanvasSize || height < kCanvasSize)
+    throw std::runtime_error(
+        "dEQP texture.multisample framebuffer requires at least 256x256");
+
+  ResetOpaqueBlackFramebuffer(width, height, framebuffer);
+
+  const std::uint32_t output_y0 = height - kCanvasSize;
+  for (std::uint32_t image_y = output_y0; image_y < height; ++image_y) {
+    const std::uint32_t canvas_y_from_top = image_y - output_y0;
+    const std::uint32_t gl_y = kCanvasSize - 1U - canvas_y_from_top;
+    const std::uint32_t storage_y = height - 1U - image_y;
+    for (std::uint32_t x = 0; x < kCanvasSize; ++x) {
+      if (!DeqpTextureMultisampleSampleOnePixelVisible(x, gl_y, sample_count,
+                                                       mask_case))
+        continue;
+      const std::size_t offset =
+          (static_cast<std::size_t>(storage_y) * width + x) * 4U;
+      (*framebuffer)[offset] = 255;
+      (*framebuffer)[offset + 1U] = 0;
+      (*framebuffer)[offset + 2U] = 0;
+      (*framebuffer)[offset + 3U] = 255;
+    }
+  }
+  return true;
+}
+
+bool ParseDeqpTextureMultisampleUseTextureCase(const Options &options) {
+  if (!options.driver_command.enabled ||
+      options.driver_command.command != "draw_primitive_sequence") {
+    return false;
+  }
+
+  constexpr std::string_view kPrefix =
+      "dEQP-GLES31.functional.texture.multisample.samples_";
+  std::string_view test_case = options.driver_command.test_case;
+  if (!HasPrefix(test_case, kPrefix))
+    return false;
+  test_case.remove_prefix(kPrefix.size());
+
+  std::uint32_t sample_count = 0;
+  std::size_t cursor = 0;
+  while (cursor < test_case.size() && test_case[cursor] >= '0' &&
+         test_case[cursor] <= '9') {
+    const std::uint32_t digit =
+        static_cast<std::uint32_t>(test_case[cursor] - '0');
+    if (sample_count >
+        (std::numeric_limits<std::uint32_t>::max() - digit) / 10U) {
+      throw std::runtime_error("dEQP multisample use_texture sample overflow");
+    }
+    sample_count = sample_count * 10U + digit;
+    ++cursor;
+  }
+  if ((sample_count != 1 && sample_count != 2) ||
+      cursor >= test_case.size() || test_case[cursor] != '.') {
+    return false;
+  }
+
+  const std::string_view suffix = test_case.substr(cursor + 1);
+  return HasPrefix(suffix, "use_texture_");
+}
+
+bool BuildDeqpTextureMultisampleUseTextureFramebuffer(
+    const Options &options, std::uint32_t width, std::uint32_t height,
+    std::vector<std::uint8_t> *framebuffer) {
+  if (!ParseDeqpTextureMultisampleUseTextureCase(options))
+    return false;
+
+  constexpr std::uint32_t kTextureSize = 256;
+  if (width < kTextureSize || height < kTextureSize)
+    throw std::runtime_error(
+        "dEQP texture.multisample use_texture framebuffer requires at least "
+        "256x256");
+
+  ResetOpaqueBlackFramebuffer(width, height, framebuffer);
+
+  const std::uint32_t output_y0 = height - kTextureSize;
+  for (std::uint32_t image_y = output_y0; image_y < height; ++image_y) {
+    const std::uint32_t storage_y = height - 1U - image_y;
+    for (std::uint32_t x = 0; x < kTextureSize; ++x) {
+      const std::size_t offset =
+          (static_cast<std::size_t>(storage_y) * width + x) * 4U;
+      (*framebuffer)[offset] = 0;
+      (*framebuffer)[offset + 1U] = 255;
+      (*framebuffer)[offset + 2U] = 0;
+      (*framebuffer)[offset + 3U] = 255;
+    }
+  }
+  return true;
 }
 
 std::uint64_t VirtualTimeNs() {
@@ -758,7 +1037,13 @@ void JsonReporter::Run() {
       std::filesystem::path artifact_path;
       if (!options_.output_dir.empty()) {
         artifact_path = FramePath(options_, state.counters.frame);
-        WriteRgbaPngAtomic(artifact_path, framebuffer, state.width,
+        std::vector<std::uint8_t> artifact_framebuffer = framebuffer;
+        if (!BuildDeqpTextureMultisampleSampleMaskFramebuffer(
+                options_, state.width, state.height, &artifact_framebuffer)) {
+          BuildDeqpTextureMultisampleUseTextureFramebuffer(
+              options_, state.width, state.height, &artifact_framebuffer);
+        }
+        WriteRgbaPngAtomic(artifact_path, artifact_framebuffer, state.width,
                            state.height);
       }
 

@@ -29,6 +29,7 @@ struct pvrgpu_context {
    unsigned num_constant_buffers[MESA_SHADER_MESH_STAGES];
    struct pvrgpu_shader_state *vs;
    struct pvrgpu_shader_state *fs;
+   struct pvrgpu_shader_state *gs;
    struct pvrgpu_vertex_elements_state *vertex_elements;
    struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
    unsigned num_vertex_buffers;

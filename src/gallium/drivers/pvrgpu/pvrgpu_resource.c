@@ -109,10 +109,23 @@ pvrgpu_is_supported_color_resource_format(enum pipe_format format)
    switch (format) {
    case PIPE_FORMAT_R8G8B8A8_UNORM:
    case PIPE_FORMAT_R8G8B8X8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_SRGB:
    case PIPE_FORMAT_B8G8R8A8_UNORM:
    case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_A8R8G8B8_UNORM:
+   case PIPE_FORMAT_A8B8G8R8_UNORM:
    case PIPE_FORMAT_R10G10B10A2_UNORM:
    case PIPE_FORMAT_B10G10R10A2_UNORM:
+   case PIPE_FORMAT_R16_UNORM:
+   case PIPE_FORMAT_R16G16_UNORM:
+   case PIPE_FORMAT_R16G16B16A16_UNORM:
+   case PIPE_FORMAT_R32G32B32A32_UNORM:
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+   case PIPE_FORMAT_R8G8B8A8_UINT:
+   case PIPE_FORMAT_R8G8B8A8_SINT:
+   case PIPE_FORMAT_R16G16B16A16_SINT:
+   case PIPE_FORMAT_R32G32B32A32_SINT:
       return true;
    default:
       return false;
@@ -123,6 +136,9 @@ static bool
 pvrgpu_is_supported_depth_stencil_resource_format(enum pipe_format format)
 {
    switch (format) {
+   case PIPE_FORMAT_Z16_UNORM:
+   case PIPE_FORMAT_Z24X8_UNORM:
+   case PIPE_FORMAT_X8Z24_UNORM:
    case PIPE_FORMAT_Z32_FLOAT:
    case PIPE_FORMAT_Z32_UNORM:
    case PIPE_FORMAT_Z32_FLOAT_S8X24_UINT:
@@ -151,8 +167,21 @@ pvrgpu_is_supported_resource_sample_count(unsigned sample_count)
    switch (sample_count) {
    case 0:
    case 1:
+   case 2:
+   case 3:
    case 4:
+   case 5:
+   case 6:
+   case 7:
    case 8:
+   case 9:
+   case 10:
+   case 11:
+   case 12:
+   case 13:
+   case 14:
+   case 15:
+   case 16:
       return true;
    default:
       return false;
@@ -177,19 +206,23 @@ pvrgpu_can_create_texture_target(const struct pipe_resource *template)
           template->nr_storage_samples))
       return false;
 
-   if (pvrgpu_resource_is_multisampled(template) &&
-       template->target != PIPE_TEXTURE_2D)
-      return false;
-
    switch (template->target) {
    case PIPE_TEXTURE_2D:
       return template->depth0 <= 1 && template->array_size <= 1;
    case PIPE_TEXTURE_2D_ARRAY:
       return template->depth0 <= 1 && template->array_size > 0;
    case PIPE_TEXTURE_3D:
+      if (pvrgpu_resource_is_multisampled(template))
+         return false;
       return template->depth0 > 0 && template->array_size <= 1;
    case PIPE_TEXTURE_CUBE:
+      if (pvrgpu_resource_is_multisampled(template))
+         return false;
       return template->depth0 <= 1;
+   case PIPE_TEXTURE_CUBE_ARRAY:
+      if (pvrgpu_resource_is_multisampled(template))
+         return false;
+      return template->depth0 <= 1 && template->array_size >= 6;
    default:
       return false;
    }
@@ -201,8 +234,8 @@ pvrgpu_can_create_texture(const struct pipe_resource *template)
    return template &&
           pvrgpu_can_create_texture_target(template) &&
           (pvrgpu_is_supported_color_resource_format(template->format) ||
-           (template->target == PIPE_TEXTURE_2D &&
-            pvrgpu_is_supported_depth_stencil_resource_format(template->format)));
+           pvrgpu_is_supported_depth_stencil_resource_format(
+              template->format));
 }
 
 static bool
@@ -220,7 +253,9 @@ pvrgpu_resource_layer_count(const struct pipe_resource *resource)
    if (resource->target == PIPE_TEXTURE_3D)
       return resource->depth0 > 0 ? resource->depth0 : 1;
 
-   if (resource->target == PIPE_TEXTURE_CUBE && resource->array_size < 6)
+   if ((resource->target == PIPE_TEXTURE_CUBE ||
+        resource->target == PIPE_TEXTURE_CUBE_ARRAY) &&
+       resource->array_size < 6)
       return 6;
 
    return resource->array_size > 0 ? resource->array_size : 1;
