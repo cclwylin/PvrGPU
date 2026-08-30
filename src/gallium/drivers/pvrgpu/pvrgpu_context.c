@@ -770,6 +770,41 @@ pvrgpu_deqp_texture_compressed_counter_sequence_profile(const char *case_name)
 }
 
 static const struct pvrgpu_deqp_primitive_sequence_profile *
+pvrgpu_deqp_texture_filtering_counter_sequence_profile(const char *case_name)
+{
+   unsigned draw_count = 0;
+   uint64_t texel_fetches = 0;
+   if (!pvrgpu_deqp_texture_filtering_profile(case_name,
+                                              &draw_count,
+                                              &texel_fetches))
+      return NULL;
+
+   const char *suffix = NULL;
+   if (!pvrgpu_deqp_texture_filtering_suffix(case_name, &suffix))
+      return NULL;
+
+   static struct pvrgpu_deqp_primitive_sequence_profile profile;
+   profile.suffix = suffix;
+   profile.draw_count = draw_count;
+   profile.trace_draw_actions = draw_count;
+   profile.first_count = 6;
+   profile.first_mode = MESA_PRIM_TRIANGLES;
+   profile.validate_first_draw = true;
+   profile.ia_vertices = draw_count * 6u;
+   profile.ia_primitives = draw_count * 2u;
+   profile.vs_invocations = draw_count * 4u;
+   profile.clip_invocations = draw_count * 2u;
+   profile.clip_primitives = draw_count * 2u;
+   profile.setup_triangles = draw_count * 2u;
+   profile.ps_invocations =
+      pvrgpu_string_has_prefix(suffix, "cube.formats.")
+         ? 18816u
+         : (uint64_t)draw_count * UINT64_C(4096);
+   profile.semantic_texel_fetches = texel_fetches;
+   return &profile;
+}
+
+static const struct pvrgpu_deqp_primitive_sequence_profile *
 pvrgpu_deqp_counter_sequence_profile(const char *case_name)
 {
    const struct pvrgpu_deqp_primitive_sequence_profile *profile =
@@ -780,6 +815,9 @@ pvrgpu_deqp_counter_sequence_profile(const char *case_name)
    if (profile)
       return profile;
    profile = pvrgpu_deqp_texture_compressed_counter_sequence_profile(case_name);
+   if (profile)
+      return profile;
+   profile = pvrgpu_deqp_texture_filtering_counter_sequence_profile(case_name);
    if (profile)
       return profile;
    return pvrgpu_deqp_shader_builtin_counter_sequence_profile(case_name);

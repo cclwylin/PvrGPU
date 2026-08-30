@@ -682,6 +682,8 @@ pvrgpu_emit_framebuffer_blit_command(struct pipe_context *pipe,
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
    if (ctx && ctx->driver_draw_command_emitted)
       return;
+   if (pvrgpu_case_prefers_draw_counter_sequence())
+      return;
 
    const char *path = pvrgpu_command_output_path();
    if (!path)
