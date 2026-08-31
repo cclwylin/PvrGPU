@@ -157,6 +157,13 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("gs_invocations", context)
         self.assertIn("hs_invocations", context)
         self.assertIn(
+            "pvrgpu_deqp_gles31_shader_counter_sequence_profile", context
+        )
+        self.assertIn("arrays_of_arrays.es31", context)
+        self.assertIn("multisample_interpolation", context)
+        self.assertIn("sample_variables", context)
+        self.assertIn("pvrgpu_profile_set_repeated_quad_counters", context)
+        self.assertIn(
             "pvrgpu_deqp_tessellation_counter_sequence_profile", context
         )
         self.assertIn("pvrgpu_deqp_tessellation_profiles.h", context)

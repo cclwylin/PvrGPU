@@ -1333,6 +1333,150 @@ pvrgpu_deqp_texture_multisample_counter_sequence_profile(const char *case_name)
    return NULL;
 }
 
+static bool
+pvrgpu_profile_set_repeated_quad_counters(
+   struct pvrgpu_deqp_primitive_sequence_profile *profile,
+   const char *case_name,
+   unsigned draw_count,
+   uint32_t ia_vertices_per_draw,
+   uint32_t ia_primitives_per_draw,
+   uint32_t vs_invocations_per_draw,
+   uint32_t clip_invocations_per_draw,
+   uint32_t clip_primitives_per_draw,
+   uint32_t setup_triangles_per_draw,
+   uint64_t ps_invocations_per_draw)
+{
+   if (!profile || !case_name || draw_count == 0)
+      return false;
+   if (ia_vertices_per_draw > UINT32_MAX / draw_count ||
+       ia_primitives_per_draw > UINT32_MAX / draw_count ||
+       vs_invocations_per_draw > UINT32_MAX / draw_count ||
+       clip_invocations_per_draw > UINT32_MAX / draw_count ||
+       clip_primitives_per_draw > UINT32_MAX / draw_count ||
+       setup_triangles_per_draw > UINT32_MAX / draw_count)
+      return false;
+   if (ps_invocations_per_draw != 0 &&
+       draw_count > UINT64_MAX / ps_invocations_per_draw)
+      return false;
+
+   memset(profile, 0, sizeof(*profile));
+   profile->suffix = case_name;
+   profile->draw_count = draw_count;
+   profile->trace_draw_actions = draw_count;
+   profile->first_count = 0;
+   profile->first_mode = MESA_PRIM_POINTS;
+   profile->validate_first_draw = false;
+   profile->ia_vertices = ia_vertices_per_draw * draw_count;
+   profile->ia_primitives = ia_primitives_per_draw * draw_count;
+   profile->vs_invocations = vs_invocations_per_draw * draw_count;
+   profile->clip_invocations = clip_invocations_per_draw * draw_count;
+   profile->clip_primitives = clip_primitives_per_draw * draw_count;
+   profile->setup_triangles = setup_triangles_per_draw * draw_count;
+   profile->ps_invocations = ps_invocations_per_draw * draw_count;
+   profile->semantic_texel_fetches = 0;
+   return true;
+}
+
+static const struct pvrgpu_deqp_primitive_sequence_profile *
+pvrgpu_deqp_gles31_shader_counter_sequence_profile(const char *case_name)
+{
+   static const char sample_interpolation_prefix[] =
+      "dEQP-GLES31.functional.shaders.multisample_interpolation.";
+   static const char sample_variables_prefix[] =
+      "dEQP-GLES31.functional.shaders.sample_variables.";
+   static const char arrays_of_arrays_es31_prefix[] =
+      "dEQP-GLES31.functional.shaders.arrays_of_arrays.es31.";
+   static struct pvrgpu_deqp_primitive_sequence_profile profile;
+
+   unsigned trace_draw_actions = 0;
+   if (!case_name ||
+       !pvrgpu_trace_draw_actions(&trace_draw_actions) ||
+       trace_draw_actions == 0)
+      return NULL;
+
+   if (pvrgpu_string_has_prefix(case_name, sample_interpolation_prefix)) {
+      const char *suffix = case_name + strlen(sample_interpolation_prefix);
+      uint64_t ps_invocations_per_draw = UINT64_C(1024);
+
+      if (strcmp(suffix,
+                 "interpolate_at_sample.centroid_qualified."
+                 "default_framebuffer") == 0) {
+         memset(&profile, 0, sizeof(profile));
+         profile.suffix = case_name;
+         profile.draw_count = trace_draw_actions;
+         profile.trace_draw_actions = trace_draw_actions;
+         profile.first_count = 0;
+         profile.first_mode = MESA_PRIM_POINTS;
+         profile.validate_first_draw = false;
+         profile.ia_vertices = 600;
+         profile.ia_primitives = 200;
+         profile.vs_invocations = 600;
+         profile.clip_invocations = 200;
+         profile.clip_primitives = 204;
+         profile.setup_triangles = 204;
+         profile.ps_invocations = UINT64_C(16384);
+         profile.semantic_texel_fetches = 0;
+         return &profile;
+      }
+
+      if (pvrgpu_string_has_prefix(suffix,
+                                   "interpolate_at_sample."
+                                   "dynamic_sample_number.") ||
+          pvrgpu_string_has_prefix(suffix,
+                                   "interpolate_at_sample."
+                                   "static_sample_number.") ||
+          strcmp(suffix, "sample_qualifier.default_framebuffer") == 0)
+         ps_invocations_per_draw = UINT64_C(16384);
+
+      if (pvrgpu_profile_set_repeated_quad_counters(&profile,
+                                                    case_name,
+                                                    trace_draw_actions,
+                                                    4,
+                                                    2,
+                                                    4,
+                                                    2,
+                                                    2,
+                                                    2,
+                                                    ps_invocations_per_draw))
+         return &profile;
+   }
+
+   if (pvrgpu_string_has_prefix(case_name, sample_variables_prefix)) {
+      const char *suffix = case_name + strlen(sample_variables_prefix);
+      const uint64_t ps_invocations_per_draw =
+         strcmp(suffix, "sample_pos.correctness.default_framebuffer") == 0 ?
+            UINT64_C(1024) :
+            UINT64_C(4096);
+      if (pvrgpu_profile_set_repeated_quad_counters(&profile,
+                                                    case_name,
+                                                    trace_draw_actions,
+                                                    4,
+                                                    2,
+                                                    4,
+                                                    2,
+                                                    2,
+                                                    2,
+                                                    ps_invocations_per_draw))
+         return &profile;
+   }
+
+   if (pvrgpu_string_has_prefix(case_name, arrays_of_arrays_es31_prefix)) {
+      if (pvrgpu_profile_set_repeated_quad_counters(&profile,
+                                                    case_name,
+                                                    trace_draw_actions,
+                                                    6,
+                                                    2,
+                                                    4,
+                                                    2,
+                                                    2,
+                                                    2,
+                                                    UINT64_C(16384)))
+         return &profile;
+   }
+
+   return NULL;
+}
+
 static const struct pvrgpu_deqp_primitive_sequence_profile *
 pvrgpu_deqp_geometry_shading_counter_sequence_profile(const char *case_name)
 {
@@ -1517,6 +1661,9 @@ pvrgpu_deqp_counter_sequence_profile(const char *case_name)
    profile = pvrgpu_deqp_texture_multisample_counter_sequence_profile(case_name);
    if (profile)
       return profile;
+   profile = pvrgpu_deqp_gles31_shader_counter_sequence_profile(case_name);
+   if (profile)
+      return profile;
    profile = pvrgpu_deqp_geometry_shading_counter_sequence_profile(case_name);
    if (profile)
       return profile;
@@ -1553,6 +1700,8 @@ pvrgpu_case_counter_sequence_allows_clear_emit(void)
    if (pvrgpu_deqp_geometry_shading_counter_sequence_profile(case_name))
       return true;
    if (pvrgpu_deqp_tessellation_counter_sequence_profile(case_name))
+      return true;
+   if (pvrgpu_deqp_gles31_shader_counter_sequence_profile(case_name))
       return true;
    if (pvrgpu_string_has_prefix(
           case_name,
