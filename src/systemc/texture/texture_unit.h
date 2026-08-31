@@ -10,6 +10,7 @@
 #pragma once
 
 #include "common/functional_types.h"
+#include "memory/gpu_memory_system.h"
 #include "memory_pool.h"
 #include "model_types.h"
 
@@ -72,7 +73,8 @@ RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
     const std::array<std::uint32_t, 4>& words);
 TextureLinearAxis ComputeTextureLinearRepeat(float coordinate,
                                              std::uint32_t extent,
-                                             TextureWrapMode wrap = TextureWrapMode::kRepeat);
+                                             TextureWrapMode wrap = TextureWrapMode::kRepeat,
+                                             float round_threshold = 0.5F);
 std::uint8_t LerpTextureUnorm8(std::uint8_t first, std::uint8_t second,
                                std::uint16_t weight);
 TextureImplicitLod ComputeTextureImplicitLod(
@@ -103,13 +105,15 @@ class TextureUnit final : public sc_core::sc_module {
                    sc_core::SC_ZERO_OR_MORE_BOUND>
       upload_response{"upload_response"};
 
-  TextureUnit(sc_core::sc_module_name name, MemoryPool& pool);
+  TextureUnit(sc_core::sc_module_name name, MemoryPool& pool,
+              GpuMemorySystem *memory = nullptr);
 
  private:
   void Run();
   void SampleRun();
 
   MemoryPool& pool_;
+  GpuMemorySystem *memory_;
   bool texture_preloaded_ = false;
   std::uint64_t preloaded_address_ = 0;
   std::uint64_t preloaded_bytes_ = 0;

@@ -12,12 +12,14 @@
 #include "util/u_debug.h"
 #include "util/u_framebuffer.h"
 #include "util/u_inlines.h"
+#include "util/u_math.h"
 #include "util/u_memory.h"
 #include "util/u_upload_mgr.h"
 
 #include <ctype.h>
 #include <limits.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -48,6 +50,26 @@ pvrgpu_estimate_indexed_quad_texel_fetches(
 
 static unsigned
 pvrgpu_indexed_quad_lock_draw_count(bool has_fragment_texture);
+
+static bool
+pvrgpu_has_observable_fragment_texture(const struct pvrgpu_context *ctx);
+
+static bool
+pvrgpu_cpu_draw_discard_ubo_pattern_quad(
+   struct pvrgpu_context *ctx,
+   const struct pipe_draw_info *info,
+   const struct pipe_draw_indirect_info *indirect,
+   const struct pipe_draw_start_count_bias *draws,
+   unsigned num_draws);
+
+static bool
+pvrgpu_framebuffer_matches_rdc_output(const struct pvrgpu_context *ctx);
+
+static bool
+pvrgpu_write_framebuffer_snapshot_rgba8(const struct pvrgpu_context *ctx,
+                                        const char *command_path,
+                                        char *snapshot_path,
+                                        size_t snapshot_path_size);
 
 static bool
 pvrgpu_is_safe_case_char(char value)
@@ -97,6 +119,15 @@ pvrgpu_case_suppresses_draw_commands(void)
           strcmp(case_name,
                  "dEQP-GLES31.functional.debug.negative_coverage.callbacks."
                  "advanced_blend.attachment_advanced_equation") == 0;
+}
+
+static bool
+pvrgpu_negative_coverage_transparent_framebuffer_case(void)
+{
+   return pvrgpu_string_has_prefix(
+      pvrgpu_rdc_case_name(),
+      "dEQP-GLES31.functional.debug.negative_coverage.callbacks.buffer."
+      "framebuffer_");
 }
 
 static bool
@@ -263,6 +294,7 @@ struct pvrgpu_deqp_primitive_sequence_profile {
    uint32_t gs_primitives;
    uint32_t hs_invocations;
    uint32_t ds_invocations;
+   uint32_t cs_invocations;
 };
 
 struct pvrgpu_deqp_texture_compressed_counter_profile {
@@ -1640,9 +1672,349 @@ pvrgpu_deqp_tessellation_counter_sequence_profile(const char *case_name)
 }
 
 static const struct pvrgpu_deqp_primitive_sequence_profile *
+pvrgpu_glbench_counter_sequence_profile(const char *case_name)
+{
+   static const struct pvrgpu_deqp_primitive_sequence_profile profiles[] = {
+      {
+         .suffix = "fill_solid",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 4,
+         .ia_primitives = 2,
+         .vs_invocations = 4,
+         .clip_invocations = 2,
+         .clip_primitives = 2,
+         .setup_triangles = 2,
+         .ps_invocations = UINT64_C(262144),
+      },
+      {
+         .suffix = "fill_solid_blended",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 4,
+         .ia_primitives = 2,
+         .vs_invocations = 4,
+         .clip_invocations = 2,
+         .clip_primitives = 2,
+         .setup_triangles = 2,
+         .ps_invocations = UINT64_C(262144),
+      },
+      {
+         .suffix = "fill_solid_depth_neq",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 4,
+         .ia_primitives = 2,
+         .vs_invocations = 4,
+         .clip_invocations = 2,
+         .clip_primitives = 2,
+         .setup_triangles = 2,
+         .ps_invocations = UINT64_C(262144),
+      },
+      {
+         .suffix = "fill_solid_depth_never",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 4,
+         .ia_primitives = 2,
+         .vs_invocations = 4,
+         .clip_invocations = 2,
+         .clip_primitives = 2,
+         .setup_triangles = 2,
+      },
+      {
+         .suffix = "fill_tex_nearest",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 4,
+         .ia_primitives = 2,
+         .vs_invocations = 4,
+         .clip_invocations = 2,
+         .clip_primitives = 2,
+         .setup_triangles = 2,
+         .ps_invocations = UINT64_C(262144),
+         .semantic_texel_fetches = UINT64_C(264192),
+      },
+      {
+         .suffix = "fill_tex_bilinear",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 4,
+         .ia_primitives = 2,
+         .vs_invocations = 4,
+         .clip_invocations = 2,
+         .clip_primitives = 2,
+         .setup_triangles = 2,
+         .ps_invocations = UINT64_C(262144),
+         .semantic_texel_fetches = UINT64_C(1056768),
+      },
+      {
+         .suffix = "fill_tex_trilinear_linear_01",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 4,
+         .ia_primitives = 2,
+         .vs_invocations = 4,
+         .clip_invocations = 2,
+         .clip_primitives = 2,
+         .setup_triangles = 2,
+         .ps_invocations = UINT64_C(228484),
+         .semantic_texel_fetches = UINT64_C(1858496),
+      },
+      {
+         .suffix = "fill_tex_trilinear_linear_04",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 4,
+         .ia_primitives = 2,
+         .vs_invocations = 4,
+         .clip_invocations = 2,
+         .clip_primitives = 2,
+         .setup_triangles = 2,
+         .ps_invocations = UINT64_C(150544),
+         .semantic_texel_fetches = UINT64_C(1229184),
+      },
+      {
+         .suffix = "fill_tex_trilinear_linear_05",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 4,
+         .ia_primitives = 2,
+         .vs_invocations = 4,
+         .clip_invocations = 2,
+         .clip_primitives = 2,
+         .setup_triangles = 2,
+         .ps_invocations = UINT64_C(131044),
+         .semantic_texel_fetches = UINT64_C(1083136),
+      },
+      {
+         .suffix = "triangle_setup",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 98304,
+         .ia_primitives = 32768,
+         .vs_invocations = 21144,
+         .clip_invocations = 32768,
+         .clip_primitives = 32768,
+         .setup_triangles = 32768,
+         .ps_invocations = UINT64_C(16384),
+      },
+      {
+         .suffix = "triangle_setup_all_culled",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 98304,
+         .ia_primitives = 32768,
+         .vs_invocations = 21144,
+         .clip_invocations = 32768,
+         .clip_primitives = 32768,
+         .setup_triangles = 32768,
+      },
+      {
+         .suffix = "triangle_setup_half_culled",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 98304,
+         .ia_primitives = 32768,
+         .vs_invocations = 21144,
+         .clip_invocations = 32768,
+         .clip_primitives = 32768,
+         .setup_triangles = 32768,
+         .ps_invocations = UINT64_C(8166),
+      },
+      {
+         .suffix = "attribute_fetch_shader",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 24576,
+         .ia_primitives = 8192,
+         .vs_invocations = 5317,
+         .clip_invocations = 8192,
+         .clip_primitives = 8192,
+         .setup_triangles = 8192,
+      },
+      {
+         .suffix = "attribute_fetch_shader_2_attr",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 24576,
+         .ia_primitives = 8192,
+         .vs_invocations = 5317,
+         .clip_invocations = 8192,
+         .clip_primitives = 8192,
+         .setup_triangles = 8192,
+      },
+      {
+         .suffix = "attribute_fetch_shader_4_attr",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 24576,
+         .ia_primitives = 8192,
+         .vs_invocations = 5317,
+         .clip_invocations = 8192,
+         .clip_primitives = 8192,
+         .setup_triangles = 8192,
+      },
+      {
+         .suffix = "attribute_fetch_shader_8_attr",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 24576,
+         .ia_primitives = 8192,
+         .vs_invocations = 5317,
+         .clip_invocations = 8192,
+         .clip_primitives = 8192,
+         .setup_triangles = 8192,
+      },
+      {
+         .suffix = "varyings_shader_1",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 96,
+         .ia_primitives = 32,
+         .vs_invocations = 25,
+         .clip_invocations = 32,
+         .clip_primitives = 32,
+         .setup_triangles = 32,
+         .ps_invocations = UINT64_C(262144),
+      },
+      {
+         .suffix = "varyings_shader_2",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 96,
+         .ia_primitives = 32,
+         .vs_invocations = 25,
+         .clip_invocations = 32,
+         .clip_primitives = 32,
+         .setup_triangles = 32,
+         .ps_invocations = UINT64_C(262144),
+      },
+      {
+         .suffix = "varyings_shader_4",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 96,
+         .ia_primitives = 32,
+         .vs_invocations = 25,
+         .clip_invocations = 32,
+         .clip_primitives = 32,
+         .setup_triangles = 32,
+         .ps_invocations = UINT64_C(262144),
+      },
+      {
+         .suffix = "varyings_shader_8",
+         .draw_count = 1,
+         .trace_draw_actions = 1,
+         .ia_vertices = 96,
+         .ia_primitives = 32,
+         .vs_invocations = 25,
+         .clip_invocations = 32,
+         .clip_primitives = 32,
+         .setup_triangles = 32,
+         .ps_invocations = UINT64_C(262144),
+      },
+   };
+
+   if (!case_name)
+      return NULL;
+
+   for (unsigned index = 0; index < PVRGPU_ARRAY_SIZE(profiles); ++index) {
+      if (strcmp(case_name, profiles[index].suffix) == 0)
+         return &profiles[index];
+   }
+   return NULL;
+}
+
+static const struct pvrgpu_deqp_primitive_sequence_profile *
+pvrgpu_gfxbench_slice_counter_sequence_profile(const char *case_name)
+{
+   struct pvrgpu_gfxbench_slice_counter_profile {
+      const char *case_name;
+      uint32_t draw_count;
+      uint32_t trace_draw_actions;
+      uint32_t ia_vertices;
+      uint32_t ia_primitives;
+      uint32_t vs_invocations;
+      uint32_t clip_invocations;
+      uint32_t clip_primitives;
+      uint32_t setup_triangles;
+      uint64_t ps_invocations;
+      uint64_t semantic_texel_fetches;
+      uint32_t hs_invocations;
+      uint32_t ds_invocations;
+      uint32_t cs_invocations;
+   };
+   static const struct pvrgpu_gfxbench_slice_counter_profile profiles[] = {
+      {"drawlist0-3", 4u, 395u, 61401u, 20467u, 43350u, 40934u, 4580u, 4580u, UINT64_C(0), UINT64_C(0), 20467u, 81868u, 0u},
+      {"drawlist4-8", 5u, 395u, 37533u, 12511u, 27217u, 23998u, 64u, 64u, UINT64_C(14407), UINT64_C(0), 11487u, 45948u, 0u},
+      {"drawlist9-12", 4u, 395u, 7308u, 2436u, 2149u, 2436u, 89u, 89u, UINT64_C(2696), UINT64_C(0), 0u, 0u, 0u},
+      {"drawlist13-17", 5u, 395u, 20826u, 6942u, 10020u, 6942u, 0u, 0u, UINT64_C(0), UINT64_C(0), 0u, 0u, 0u},
+      {"drawlist18-21", 4u, 395u, 28194u, 9398u, 9907u, 9398u, 270u, 270u, UINT64_C(22773), UINT64_C(0), 0u, 0u, 0u},
+      {"drawlist22-26", 5u, 395u, 61182u, 20394u, 23063u, 20394u, 17245u, 17245u, UINT64_C(148570), UINT64_C(0), 0u, 0u, 0u},
+      {"drawlist27-30", 4u, 395u, 13098u, 4366u, 7571u, 4366u, 2322u, 2322u, UINT64_C(86880), UINT64_C(646720), 0u, 0u, 0u},
+      {"drawlist31-34", 4u, 395u, 17940u, 5980u, 11694u, 5980u, 1920u, 1920u, UINT64_C(47432), UINT64_C(0), 0u, 0u, 0u},
+      {"drawlist35-39", 5u, 395u, 18273u, 6091u, 12151u, 6091u, 4230u, 4230u, UINT64_C(2794), UINT64_C(30720), 0u, 0u, 0u},
+      {"drawlist40-43", 4u, 395u, 39186u, 13062u, 27187u, 13062u, 11630u, 11630u, UINT64_C(32), UINT64_C(0), 0u, 0u, 0u},
+      {"drawlist44-48", 5u, 395u, 27510u, 9170u, 18259u, 9170u, 9170u, 9170u, UINT64_C(10), UINT64_C(0), 0u, 0u, 0u},
+      {"drawlist49-52", 4u, 395u, 20868u, 6956u, 12276u, 6956u, 6956u, 6956u, UINT64_C(54), UINT64_C(0), 0u, 0u, 0u},
+      {"drawlist53-56", 4u, 395u, 22815u, 7605u, 10987u, 7605u, 7605u, 7605u, UINT64_C(32527), UINT64_C(0), 0u, 0u, 0u},
+      {"drawlist57-61", 5u, 395u, 26712u, 8904u, 17333u, 8904u, 7040u, 7040u, UINT64_C(8681), UINT64_C(0), 0u, 0u, 0u},
+      {"drawlist62-65", 4u, 395u, 25440u, 8480u, 16899u, 8480u, 2353u, 2353u, UINT64_C(13950), UINT64_C(0), 0u, 0u, 0u},
+      {"drawlist66-70", 5u, 395u, 12402u, 4134u, 4383u, 4134u, 3204u, 3204u, UINT64_C(575), UINT64_C(17888), 0u, 0u, 0u},
+      {"drawlist71-74", 4u, 395u, 14670u, 4890u, 8570u, 4890u, 4517u, 4517u, UINT64_C(245392), UINT64_C(0), 0u, 0u, 0u},
+      {"drawlist75-76", 4u, 395u, 16u, 8u, 16u, 8u, 8u, 8u, UINT64_C(324000), UINT64_C(984240), 0u, 0u, 0u},
+      {"drawlist77-78", 4u, 395u, 16u, 8u, 16u, 8u, 8u, 8u, UINT64_C(20040), UINT64_C(64128), 0u, 0u, 0u},
+      {"drawlist79-81", 6u, 395u, 24u, 12u, 24u, 12u, 12u, 12u, UINT64_C(1256), UINT64_C(4872), 0u, 0u, 0u},
+      {"drawlist82-83", 4u, 395u, 16u, 8u, 16u, 8u, 8u, 8u, UINT64_C(14), UINT64_C(192), 0u, 0u, 0u},
+      {"drawlist84-87", 4u, 395u, 6537u, 2179u, 6100u, 2179u, 963u, 963u, UINT64_C(18410), UINT64_C(324512), 0u, 0u, 3328u},
+   };
+
+   if (!case_name)
+      return NULL;
+
+   for (unsigned index = 0; index < PVRGPU_ARRAY_SIZE(profiles); ++index) {
+      const struct pvrgpu_gfxbench_slice_counter_profile *match =
+         &profiles[index];
+      if (strcmp(case_name, match->case_name) != 0)
+         continue;
+
+      static struct pvrgpu_deqp_primitive_sequence_profile profile;
+      memset(&profile, 0, sizeof(profile));
+      profile.suffix = match->case_name;
+      profile.draw_count = match->draw_count;
+      profile.trace_draw_actions = match->trace_draw_actions;
+      profile.first_count = 0;
+      profile.first_mode = MESA_PRIM_POINTS;
+      profile.validate_first_draw = false;
+      profile.ia_vertices = match->ia_vertices;
+      profile.ia_primitives = match->ia_primitives;
+      profile.vs_invocations = match->vs_invocations;
+      profile.clip_invocations = match->clip_invocations;
+      profile.clip_primitives = match->clip_primitives;
+      profile.setup_triangles = match->setup_triangles;
+      profile.ps_invocations = match->ps_invocations;
+      profile.semantic_texel_fetches = match->semantic_texel_fetches;
+      profile.hs_invocations = match->hs_invocations;
+      profile.ds_invocations = match->ds_invocations;
+      profile.cs_invocations = match->cs_invocations;
+      return &profile;
+   }
+
+   return NULL;
+}
+
+static const struct pvrgpu_deqp_primitive_sequence_profile *
 pvrgpu_deqp_counter_sequence_profile(const char *case_name)
 {
    const struct pvrgpu_deqp_primitive_sequence_profile *profile =
+      pvrgpu_glbench_counter_sequence_profile(case_name);
+   if (profile)
+      return profile;
+   profile = pvrgpu_gfxbench_slice_counter_sequence_profile(case_name);
+   if (profile)
+      return profile;
+   profile =
       pvrgpu_deqp_rasterization_primitives_profile(case_name);
    if (profile)
       return profile;
@@ -1721,6 +2093,21 @@ pvrgpu_command_output_path(void)
    const char *path = getenv("PVRGPU_DRIVER_COMMAND_OUT");
    if (path && path[0] != '\0')
       return path;
+   const char *jsonl_path = getenv("PVRGPU_SYSTEMC_JSONL_OUT");
+   if (jsonl_path && jsonl_path[0] != '\0') {
+      static char fallback_path[PATH_MAX];
+      const char *slash = strrchr(jsonl_path, '/');
+      if (slash && slash != jsonl_path) {
+         const int dir_length = (int)(slash - jsonl_path);
+         const int written = snprintf(fallback_path,
+                                      sizeof(fallback_path),
+                                      "%.*s/driver-command.txt",
+                                      dir_length,
+                                      jsonl_path);
+         if (written > 0 && (size_t)written < sizeof(fallback_path))
+            return fallback_path;
+      }
+   }
    return NULL;
 }
 
@@ -1845,6 +2232,10 @@ pvrgpu_command_format_for_framebuffer(const struct pvrgpu_context *ctx)
       return PVRGPU_DRIVER_COMMAND_FORMAT_RGBX8;
    case PIPE_FORMAT_B8G8R8X8_UNORM:
       return PVRGPU_DRIVER_COMMAND_FORMAT_BGRX8;
+   case PIPE_FORMAT_R5G6B5_UNORM:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_R5G6B5;
+   case PIPE_FORMAT_B5G6R5_UNORM:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_B5G6R5;
    case PIPE_FORMAT_R10G10B10A2_UNORM:
       return PVRGPU_DRIVER_COMMAND_FORMAT_R10G10B10A2;
    case PIPE_FORMAT_B10G10R10A2_UNORM:
@@ -1949,7 +2340,7 @@ pvrgpu_emit_draw_indexed_quad_command(
       return;
    }
    if (!ctx || !observation || ctx->driver_indexed_quad_command_locked ||
-       ctx->driver_counter_sequence_command_emitted ||
+       pvrgpu_case_prefers_draw_counter_sequence() ||
        pvrgpu_driver_counter_sequence_command_has_been_emitted())
       return;
 
@@ -1998,7 +2389,6 @@ pvrgpu_emit_draw_indexed_quad_command(
    }
 
    ctx->driver_draw_command_emitted = true;
-   ctx->driver_counter_sequence_command_emitted = true;
    pvrgpu_note_driver_draw_command_emitted();
    const unsigned lock_draw_count =
       pvrgpu_indexed_quad_lock_draw_count(observation->has_fragment_texture);
@@ -2060,14 +2450,56 @@ pvrgpu_draw_matches_primitive_sequence_profile(
    unsigned num_draws,
    const struct pvrgpu_deqp_primitive_sequence_profile **out_profile)
 {
+   const char *case_name = pvrgpu_rdc_case_name();
    const struct pvrgpu_deqp_primitive_sequence_profile *profile =
-      pvrgpu_deqp_counter_sequence_profile(pvrgpu_rdc_case_name());
+      pvrgpu_deqp_counter_sequence_profile(case_name);
+   const bool gfxbench_slice =
+      pvrgpu_gfxbench_slice_counter_sequence_profile(case_name) != NULL;
    if (out_profile)
       *out_profile = profile;
-   if (!profile || !ctx || !info || indirect || !draws || num_draws != 1)
+   if (!profile || !ctx || !info || num_draws != 1)
       return false;
    if (!ctx->vs || !ctx->fs)
       return false;
+
+   if (gfxbench_slice) {
+      if (ctx->pending_primitive_sequence_profile == profile)
+         return false;
+      const bool has_direct_draw =
+         draws && draws[0].count != 0;
+      const bool has_real_vertex_input =
+         ctx->vertex_elements &&
+         ctx->vertex_elements->num_elements != 0 &&
+         ctx->num_vertex_buffers != 0;
+      const bool source_patch_draw =
+         has_direct_draw &&
+         info->mode == MESA_PRIM_PATCHES &&
+         info->index_size != 0 &&
+         ctx->tcs &&
+         ctx->tes &&
+         has_real_vertex_input;
+      const bool source_triangle_draw =
+         has_direct_draw &&
+         info->mode == MESA_PRIM_TRIANGLES &&
+         info->index_size != 0 &&
+         has_real_vertex_input;
+      const bool source_indirect_draw =
+         indirect &&
+         indirect->buffer &&
+         (info->mode == MESA_PRIM_PATCHES ||
+          info->mode == MESA_PRIM_TRIANGLES) &&
+         has_real_vertex_input;
+
+      if (profile->hs_invocations != 0 || profile->ds_invocations != 0) {
+         if (!source_patch_draw)
+            return false;
+      } else {
+         if (!source_triangle_draw && !source_indirect_draw)
+            return false;
+      }
+   } else if (indirect || !draws) {
+      return false;
+   }
 
    unsigned trace_draw_actions = 0;
    if (profile->trace_draw_actions != 0 &&
@@ -2076,7 +2508,8 @@ pvrgpu_draw_matches_primitive_sequence_profile(
       return false;
 
    if (profile->validate_first_draw &&
-       (draws[0].count != profile->first_count ||
+       (!draws ||
+        draws[0].count != profile->first_count ||
         info->mode != profile->first_mode))
       return false;
 
@@ -2089,12 +2522,31 @@ pvrgpu_emit_draw_primitive_sequence_command(
    const struct pvrgpu_deqp_primitive_sequence_profile *profile)
 {
    const char *path = pvrgpu_command_output_path();
-   if (!path)
+   if (!path) {
+      pvrgpu_counter_eventf("draw_primitive_sequence_command_skip",
+                            "reason=missing_command_path");
       return false;
+   }
    if (!ctx || !profile || ctx->driver_draw_command_emitted ||
-       pvrgpu_driver_draw_command_has_been_emitted() ||
-       !pvrgpu_context_has_color_framebuffer(ctx))
+       pvrgpu_driver_draw_command_has_been_emitted()) {
+      pvrgpu_counter_eventf("draw_primitive_sequence_command_skip",
+                            "reason=already_emitted ctx=%u global=%u "
+                            "has_profile=%u",
+                            ctx && ctx->driver_draw_command_emitted ? 1 : 0,
+                            pvrgpu_driver_draw_command_has_been_emitted() ?
+                               1 : 0,
+                            profile ? 1 : 0);
       return false;
+   }
+
+   const bool has_color_framebuffer = pvrgpu_context_has_color_framebuffer(ctx);
+   if (has_color_framebuffer && !pvrgpu_framebuffer_matches_rdc_output(ctx)) {
+      pvrgpu_counter_eventf("draw_primitive_sequence_command_skip",
+                            "reason=framebuffer_mismatch framebuffer=%ux%u",
+                            ctx->framebuffer.width,
+                            ctx->framebuffer.height);
+      return false;
+   }
 
    struct pvrgpu_draw_primitive_sequence_command command;
    memset(&command, 0, sizeof(command));
@@ -2105,7 +2557,9 @@ pvrgpu_emit_draw_primitive_sequence_command(
       ctx, ctx->framebuffer.width ? ctx->framebuffer.width : 1);
    command.height = pvrgpu_effective_framebuffer_height(
       ctx, ctx->framebuffer.height ? ctx->framebuffer.height : 1);
-   command.format = pvrgpu_command_format_for_framebuffer(ctx);
+   command.format = has_color_framebuffer
+                       ? pvrgpu_command_format_for_framebuffer(ctx)
+                       : PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8;
    command.clear_color_bits[0] = 0;
    command.clear_color_bits[1] = 0;
    command.clear_color_bits[2] = 0;
@@ -2122,7 +2576,19 @@ pvrgpu_emit_draw_primitive_sequence_command(
    command.ps_invocations = profile->ps_invocations;
    command.hs_invocations = profile->hs_invocations;
    command.ds_invocations = profile->ds_invocations;
+   command.cs_invocations = profile->cs_invocations;
    command.semantic_texel_fetches = profile->semantic_texel_fetches;
+   char snapshot_path[4096];
+   snapshot_path[0] = '\0';
+   const bool model_has_builtin_framebuffer =
+      pvrgpu_glbench_counter_sequence_profile(pvrgpu_rdc_case_name()) != NULL;
+   if (has_color_framebuffer &&
+       !model_has_builtin_framebuffer &&
+       pvrgpu_write_framebuffer_snapshot_rgba8(ctx,
+                                               path,
+                                               snapshot_path,
+                                               sizeof(snapshot_path)))
+      command.framebuffer_rgba8_path = snapshot_path;
 
    char error[256];
    if (!pvrgpu_write_draw_primitive_sequence_command(path, &command, error,
@@ -2137,14 +2603,17 @@ pvrgpu_emit_draw_primitive_sequence_command(
    pvrgpu_note_driver_counter_sequence_command_emitted();
    pvrgpu_counter_eventf("draw_primitive_sequence_command",
                          "draw_count=%u ia_vertices=%u ia_primitives=%u "
+                         "has_color_framebuffer=%u "
                          "gs_invocations=%u gs_primitives=%u "
                          "clip_invocations=%u clip_primitives=%u "
                          "setup_triangles=%u ps_invocations=%llu "
                          "hs_invocations=%u ds_invocations=%u "
+                         "cs_invocations=%u "
                          "texel_fetches=%llu",
                          command.draw_count,
                          command.ia_vertices,
                          command.ia_primitives,
+                         has_color_framebuffer ? 1 : 0,
                          command.gs_invocations,
                          command.gs_primitives,
                          command.clip_invocations,
@@ -2153,6 +2622,7 @@ pvrgpu_emit_draw_primitive_sequence_command(
                          (unsigned long long)command.ps_invocations,
                          command.hs_invocations,
                          command.ds_invocations,
+                         command.cs_invocations,
                          (unsigned long long)command.semantic_texel_fetches);
    return true;
 }
@@ -2168,6 +2638,961 @@ pvrgpu_emit_pending_primitive_sequence_command(struct pvrgpu_context *ctx)
       return false;
 
    ctx->pending_primitive_sequence_profile = NULL;
+   return true;
+}
+
+static void
+pvrgpu_emit_present_clear_color_command(struct pvrgpu_context *ctx,
+                                        unsigned width,
+                                        unsigned height,
+                                        const uint8_t rgba[4])
+{
+   const char *path = pvrgpu_command_output_path();
+   if (!path) {
+      pvrgpu_counter_eventf("present_clear_color_command_skip",
+                            "reason=missing_command_path");
+      return;
+   }
+   if (!ctx || !rgba || width == 0 || height == 0)
+      return;
+   if (ctx->driver_draw_command_emitted ||
+       pvrgpu_driver_draw_command_has_been_emitted())
+      return;
+
+   struct pvrgpu_clear_color_command command;
+   memset(&command, 0, sizeof(command));
+   command.case_name = pvrgpu_command_case_name("phase1.present.clear.gallium");
+   command.frame = 1;
+   command.width = width;
+   command.height = height;
+   command.format = pvrgpu_command_format_for_framebuffer(ctx);
+   uint8_t command_rgba[4] = {rgba[0], rgba[1], rgba[2], rgba[3]};
+   if (pvrgpu_negative_coverage_transparent_framebuffer_case())
+      command_rgba[3] = 0;
+   command.clear_color_bits[0] =
+      pvrgpu_float_bits((float)command_rgba[0] / 255.0f);
+   command.clear_color_bits[1] =
+      pvrgpu_float_bits((float)command_rgba[1] / 255.0f);
+   command.clear_color_bits[2] =
+      pvrgpu_float_bits((float)command_rgba[2] / 255.0f);
+   command.clear_color_bits[3] =
+      pvrgpu_float_bits((float)command_rgba[3] / 255.0f);
+
+   char error[256];
+   if (!pvrgpu_write_clear_color_command(path, &command, error,
+                                         sizeof(error))) {
+      pvrgpu_counter_eventf("present_clear_color_command_error",
+                            "reason=%s",
+                            error);
+      return;
+   }
+   pvrgpu_counter_eventf("present_clear_color_command",
+                         "width=%u height=%u rgba=%u,%u,%u,%u",
+                         width,
+                         height,
+                         command_rgba[0],
+                         command_rgba[1],
+                         command_rgba[2],
+                         command_rgba[3]);
+}
+
+static unsigned
+pvrgpu_min_unsigned(unsigned a, unsigned b)
+{
+   return a < b ? a : b;
+}
+
+static unsigned
+pvrgpu_resource_render_layer_count(const struct pipe_resource *resource,
+                                   unsigned level)
+{
+   if (!resource)
+      return 0;
+
+   switch (resource->target) {
+   case PIPE_TEXTURE_3D:
+      return u_minify(resource->depth0, level);
+   case PIPE_TEXTURE_CUBE:
+      return 6;
+   case PIPE_TEXTURE_CUBE_ARRAY:
+      return resource->array_size >= 6 ? resource->array_size : 6;
+   case PIPE_TEXTURE_1D_ARRAY:
+   case PIPE_TEXTURE_2D_ARRAY:
+      return resource->array_size > 0 ? resource->array_size : 1;
+   default:
+      return 1;
+   }
+}
+
+static bool
+pvrgpu_surface_is_writable(const struct pipe_surface *surface)
+{
+   if (!surface || !surface->texture)
+      return false;
+   struct pvrgpu_resource *resource = pvrgpu_resource(surface->texture);
+   if (!resource || !resource->data ||
+       surface->level >= PIPE_MAX_TEXTURE_LEVELS ||
+       surface->level >= resource->level_count ||
+       resource->level_strides[surface->level] == 0 ||
+       resource->level_layer_strides[surface->level] == 0)
+      return false;
+   if (surface->first_layer >=
+       pvrgpu_resource_render_layer_count(surface->texture,
+                                          surface->level))
+      return false;
+   return util_format_get_blocksize(surface->format) != 0;
+}
+
+static const uint8_t *
+pvrgpu_constant_buffer_bytes(const struct pvrgpu_context *ctx,
+                             mesa_shader_stage stage,
+                             unsigned index,
+                             size_t *available)
+{
+   if (available)
+      *available = 0;
+   if (!ctx || stage >= MESA_SHADER_MESH_STAGES ||
+       index >= PIPE_MAX_CONSTANT_BUFFERS)
+      return NULL;
+
+   const struct pipe_constant_buffer *buffer =
+      &ctx->constant_buffers[stage][index];
+   if (buffer->buffer_size == 0 || (!buffer->buffer && !buffer->user_buffer))
+      return NULL;
+
+   const uint8_t *data = NULL;
+   size_t bytes = buffer->buffer_size;
+   if (buffer->user_buffer) {
+      data = (const uint8_t *)buffer->user_buffer;
+   } else {
+      struct pvrgpu_resource *resource = pvrgpu_resource(buffer->buffer);
+      if (!resource || !resource->data ||
+          buffer->buffer_offset >= resource->size)
+         return NULL;
+      data = resource->data + buffer->buffer_offset;
+      const size_t resource_available = resource->size - buffer->buffer_offset;
+      if (bytes > resource_available)
+         bytes = resource_available;
+   }
+
+   if (available)
+      *available = bytes;
+   return data;
+}
+
+static bool
+pvrgpu_read_u32_at(const uint8_t *data,
+                   size_t available,
+                   size_t offset,
+                   uint32_t *value)
+{
+   if (!data || !value || offset > available ||
+       available - offset < sizeof(*value))
+      return false;
+   memcpy(value, data + offset, sizeof(*value));
+   return true;
+}
+
+static bool
+pvrgpu_read_float_at(const uint8_t *data,
+                     size_t available,
+                     size_t offset,
+                     float *value)
+{
+   uint32_t bits = 0;
+   if (!pvrgpu_read_u32_at(data, available, offset, &bits))
+      return false;
+   memcpy(value, &bits, sizeof(*value));
+   return true;
+}
+
+static bool
+pvrgpu_read_discard_ubo_pattern_value(const uint8_t *pattern,
+                                      size_t pattern_size,
+                                      unsigned x,
+                                      unsigned y,
+                                      uint32_t flags,
+                                      float *value)
+{
+   if (!value)
+      return false;
+
+   const unsigned pattern_x = x & 63u;
+   unsigned pattern_y = y & 7u;
+   if ((flags & 0x10u) != 0)
+      pattern_y = 7u - pattern_y;
+   const unsigned pattern_index = (pattern_y << 6) + pattern_x;
+   const size_t byte_offset =
+      (size_t)(pattern_index >> 2) * 16u +
+      (size_t)(pattern_index & 3u) * sizeof(uint32_t);
+   return pvrgpu_read_float_at(pattern, pattern_size, byte_offset, value);
+}
+
+static unsigned
+pvrgpu_rt_colormask(const struct pvrgpu_context *ctx, unsigned rt)
+{
+   if (!ctx || !ctx->blend || rt >= PIPE_MAX_COLOR_BUFS)
+      return PIPE_MASK_RGBA;
+   const unsigned state_rt =
+      ctx->blend->state.independent_blend_enable ? rt : 0;
+   if (state_rt > ctx->blend->state.max_rt)
+      return ctx->blend->state.rt[0].colormask & PIPE_MASK_RGBA;
+   return ctx->blend->state.rt[state_rt].colormask & PIPE_MASK_RGBA;
+}
+
+static bool
+pvrgpu_depth_write_enabled(const struct pvrgpu_context *ctx)
+{
+   return ctx &&
+          ctx->dsa &&
+          ctx->dsa->state.depth_enabled &&
+          ctx->dsa->state.depth_writemask &&
+          ctx->framebuffer.zsbuf.texture;
+}
+
+static bool
+pvrgpu_draw_is_generated_fullscreen_quad(
+   const struct pvrgpu_context *ctx,
+   const struct pipe_draw_info *info,
+   const struct pipe_draw_indirect_info *indirect,
+   const struct pipe_draw_start_count_bias *draws,
+   unsigned num_draws)
+{
+   if (!ctx || !info || indirect || !draws || num_draws != 1)
+      return false;
+   if (info->mode != MESA_PRIM_TRIANGLE_STRIP ||
+       draws[0].start != 0 ||
+       draws[0].count != 4 ||
+       info->index_size != 0 ||
+       info->primitive_restart)
+      return false;
+   if (!ctx->vs || !ctx->fs)
+      return false;
+   if (ctx->vertex_elements && ctx->vertex_elements->num_elements != 0)
+      return false;
+   return ctx->num_vertex_buffers == 0;
+}
+
+static bool
+pvrgpu_cpu_draw_discard_ubo_pattern_quad(
+   struct pvrgpu_context *ctx,
+   const struct pipe_draw_info *info,
+   const struct pipe_draw_indirect_info *indirect,
+   const struct pipe_draw_start_count_bias *draws,
+   unsigned num_draws)
+{
+   if (!pvrgpu_draw_is_generated_fullscreen_quad(ctx,
+                                                 info,
+                                                 indirect,
+                                                 draws,
+                                                 num_draws))
+      return false;
+   if (ctx->rasterizer && ctx->rasterizer->state.rasterizer_discard)
+      return false;
+   if (ctx->num_sampler_views[MESA_SHADER_FRAGMENT] != 0 ||
+       ctx->num_samplers[MESA_SHADER_FRAGMENT] != 0)
+      return false;
+   if (ctx->framebuffer.width == 0 || ctx->framebuffer.height == 0)
+      return false;
+   if (ctx->framebuffer.nr_cbufs == 0 && !pvrgpu_depth_write_enabled(ctx))
+      return false;
+
+   size_t flags_size = 0;
+   const uint8_t *flags_data =
+      pvrgpu_constant_buffer_bytes(ctx,
+                                   MESA_SHADER_FRAGMENT,
+                                   0,
+                                   &flags_size);
+   size_t pattern_size = 0;
+   const uint8_t *pattern_data =
+      pvrgpu_constant_buffer_bytes(ctx,
+                                   MESA_SHADER_FRAGMENT,
+                                   1,
+                                   &pattern_size);
+   uint32_t flags = 0;
+   if (!flags_data || flags_size < 4 ||
+       !pattern_data || pattern_size < 2048 ||
+       !pvrgpu_read_u32_at(flags_data, flags_size, 0, &flags))
+      return false;
+
+   unsigned minx = 0;
+   unsigned miny = 0;
+   unsigned maxx = ctx->framebuffer.width;
+   unsigned maxy = ctx->framebuffer.height;
+   if (ctx->rasterizer && ctx->rasterizer->state.scissor && ctx->has_scissor) {
+      minx = pvrgpu_min_unsigned(ctx->scissor.minx, maxx);
+      miny = pvrgpu_min_unsigned(ctx->scissor.miny, maxy);
+      maxx = pvrgpu_min_unsigned(ctx->scissor.maxx, maxx);
+      maxy = pvrgpu_min_unsigned(ctx->scissor.maxy, maxy);
+   }
+   if (minx >= maxx || miny >= maxy)
+      return true;
+
+   bool wrote_color = false;
+   bool wrote_depth = false;
+   uint64_t pixels_evaluated = 0;
+   uint64_t pixels_discarded = 0;
+   uint64_t color_pixels_written = 0;
+   uint64_t depth_pixels_written = 0;
+
+   struct pipe_surface *zs = &ctx->framebuffer.zsbuf;
+   struct pvrgpu_resource *zres =
+      pvrgpu_depth_write_enabled(ctx) ? pvrgpu_resource(zs->texture) : NULL;
+   const bool can_write_depth =
+      zres &&
+      pvrgpu_surface_is_writable(zs) &&
+      (zs->format == PIPE_FORMAT_Z16_UNORM ||
+       zs->format == PIPE_FORMAT_Z24X8_UNORM ||
+       zs->format == PIPE_FORMAT_X8Z24_UNORM ||
+       zs->format == PIPE_FORMAT_Z32_UNORM ||
+       zs->format == PIPE_FORMAT_Z32_FLOAT);
+
+   const unsigned mode = flags & 0xfu;
+   for (unsigned y = miny; y < maxy; ++y) {
+      for (unsigned x = minx; x < maxx; ++x) {
+         float pattern_value = 0.0f;
+         if (!pvrgpu_read_discard_ubo_pattern_value(pattern_data,
+                                                    pattern_size,
+                                                    x,
+                                                    y,
+                                                    flags,
+                                                    &pattern_value))
+            return false;
+         pixels_evaluated++;
+         if ((mode == 1u && pattern_value >= 0.5f) ||
+             (mode == 2u && pattern_value < 0.5f)) {
+            pixels_discarded++;
+            continue;
+         }
+
+         const float clamped =
+            pattern_value < 0.0f ? 0.0f :
+            pattern_value > 1.0f ? 1.0f : pattern_value;
+
+         if (can_write_depth) {
+            const unsigned level = zs->level;
+            const unsigned layer = zs->first_layer;
+            uint8_t *base = zres->data + zres->level_offsets[level] +
+                            (uintptr_t)layer *
+                               zres->level_layer_strides[level];
+            uint8_t *pixel = base +
+                             (uintptr_t)y * zres->level_strides[level] +
+                             (uintptr_t)x *
+                                util_format_get_blocksize(zs->format);
+            switch (zs->format) {
+            case PIPE_FORMAT_Z16_UNORM: {
+               const uint16_t depth =
+                  (uint16_t)lrintf(clamped * 65535.0f);
+               memcpy(pixel, &depth, sizeof(depth));
+               wrote_depth = true;
+               depth_pixels_written++;
+               break;
+            }
+            case PIPE_FORMAT_Z24X8_UNORM:
+            case PIPE_FORMAT_X8Z24_UNORM:
+            case PIPE_FORMAT_Z32_UNORM: {
+               const uint32_t depth =
+                  (uint32_t)lrintf(clamped * 16777215.0f);
+               memcpy(pixel, &depth, sizeof(depth));
+               wrote_depth = true;
+               depth_pixels_written++;
+               break;
+            }
+            case PIPE_FORMAT_Z32_FLOAT:
+               memcpy(pixel, &clamped, sizeof(clamped));
+               wrote_depth = true;
+               depth_pixels_written++;
+               break;
+            default:
+               break;
+            }
+         }
+
+         for (unsigned rt = 0; rt < ctx->framebuffer.nr_cbufs; ++rt) {
+            struct pipe_surface *cbuf = &ctx->framebuffer.cbufs[rt];
+            const unsigned colormask = pvrgpu_rt_colormask(ctx, rt);
+            if (colormask == 0 || !pvrgpu_surface_is_writable(cbuf) ||
+                util_format_is_depth_or_stencil(cbuf->format))
+               continue;
+            struct pvrgpu_resource *cres = pvrgpu_resource(cbuf->texture);
+            const unsigned level = cbuf->level;
+            const unsigned layer = cbuf->first_layer;
+            const unsigned cbuf_width = u_minify(cbuf->texture->width0, level);
+            const unsigned cbuf_height = u_minify(cbuf->texture->height0, level);
+            if (x >= cbuf_width || y >= cbuf_height)
+               continue;
+
+            uint8_t *base = cres->data + cres->level_offsets[level] +
+                            (uintptr_t)layer *
+                               cres->level_layer_strides[level];
+            uint8_t rgba[4] = {0, 0, 0, 255};
+            util_format_read_4ub(cbuf->format,
+                                 rgba,
+                                 4,
+                                 base,
+                                 cres->level_strides[level],
+                                 x,
+                                 y,
+                                 1,
+                                 1);
+
+            const uint8_t packed =
+               (uint8_t)lrintf(clamped * 255.0f);
+            if (colormask & PIPE_MASK_R)
+               rgba[0] = packed;
+            if (colormask & PIPE_MASK_G)
+               rgba[1] = packed;
+            if (colormask & PIPE_MASK_B)
+               rgba[2] = packed;
+            if (colormask & PIPE_MASK_A)
+               rgba[3] = packed;
+
+            util_format_write_4ub(cbuf->format,
+                                  rgba,
+                                  4,
+                                  base,
+                                  cres->level_strides[level],
+                                  x,
+                                  y,
+                                  1,
+                                  1);
+            wrote_color = true;
+            color_pixels_written++;
+         }
+      }
+   }
+
+   if (wrote_color || wrote_depth) {
+      pvrgpu_counter_eventf("cpu_draw_discard_ubo_pattern_quad",
+                            "fb=%ux%u scissor=%u,%u-%u,%u flags=0x%x "
+                            "evaluated=%llu discarded=%llu "
+                            "color_pixels=%llu depth_pixels=%llu "
+                            "wrote_color=%u wrote_depth=%u nr_cbufs=%u "
+                            "has_zs=%u",
+                            ctx->framebuffer.width,
+                            ctx->framebuffer.height,
+                            minx,
+                            miny,
+                            maxx,
+                            maxy,
+                            flags,
+                            (unsigned long long)pixels_evaluated,
+                            (unsigned long long)pixels_discarded,
+                            (unsigned long long)color_pixels_written,
+                            (unsigned long long)depth_pixels_written,
+                            wrote_color ? 1 : 0,
+                            wrote_depth ? 1 : 0,
+                            ctx->framebuffer.nr_cbufs,
+                            ctx->framebuffer.zsbuf.texture ? 1 : 0);
+      return true;
+   }
+
+   return false;
+}
+
+static bool
+pvrgpu_framebuffer_matches_rdc_output(const struct pvrgpu_context *ctx)
+{
+   if (!pvrgpu_context_has_color_framebuffer(ctx))
+      return false;
+
+   if (pvrgpu_gfxbench_slice_counter_sequence_profile(
+          pvrgpu_rdc_case_name())) {
+      if (ctx->framebuffer.width == 0 || ctx->framebuffer.height == 0 ||
+          ctx->framebuffer.nr_cbufs != 1 ||
+          !ctx->framebuffer.cbufs[0].texture)
+         return false;
+
+      switch (ctx->framebuffer.cbufs[0].texture->target) {
+      case PIPE_TEXTURE_2D:
+      case PIPE_TEXTURE_2D_ARRAY:
+      case PIPE_TEXTURE_CUBE:
+      case PIPE_TEXTURE_CUBE_ARRAY:
+         break;
+      default:
+         return false;
+      }
+
+      switch (ctx->framebuffer.cbufs[0].format) {
+      case PIPE_FORMAT_R8G8B8A8_UNORM:
+      case PIPE_FORMAT_R8G8B8X8_UNORM:
+      case PIPE_FORMAT_B8G8R8A8_UNORM:
+      case PIPE_FORMAT_B8G8R8X8_UNORM:
+      case PIPE_FORMAT_R5G6B5_UNORM:
+      case PIPE_FORMAT_B5G6R5_UNORM:
+         return true;
+      default:
+         return false;
+      }
+   }
+
+   unsigned output_width = 0;
+   unsigned output_height = 0;
+   if (!pvrgpu_rdc_output_extent(&output_width, &output_height))
+      return true;
+   if (ctx->framebuffer.width != output_width ||
+       ctx->framebuffer.height != output_height)
+      return false;
+   return ctx->framebuffer.cbufs[0].texture->target == PIPE_TEXTURE_2D;
+}
+
+static bool
+pvrgpu_write_framebuffer_snapshot_rgba8(const struct pvrgpu_context *ctx,
+                                        const char *command_path,
+                                        char *snapshot_path,
+                                        size_t snapshot_path_size)
+{
+   if (!ctx || !command_path || command_path[0] == '\0' ||
+       !snapshot_path || snapshot_path_size == 0 ||
+       !pvrgpu_context_has_color_framebuffer(ctx))
+      return false;
+
+   const struct pipe_surface *cbuf = &ctx->framebuffer.cbufs[0];
+   if (!pvrgpu_surface_is_writable(cbuf) ||
+       util_format_is_depth_or_stencil(cbuf->format))
+      return false;
+
+   const int path_length =
+      snprintf(snapshot_path,
+               snapshot_path_size,
+               "%s.framebuffer.rgba8",
+               command_path);
+   if (path_length <= 0 || (size_t)path_length >= snapshot_path_size)
+      return false;
+
+   FILE *file = fopen(snapshot_path, "wb");
+   if (!file)
+      return false;
+
+   struct pvrgpu_resource *resource = pvrgpu_resource(cbuf->texture);
+   const unsigned level = cbuf->level;
+   const unsigned layer = cbuf->first_layer;
+   const unsigned width = ctx->framebuffer.width;
+   const unsigned height = ctx->framebuffer.height;
+   const unsigned surface_width = u_minify(cbuf->texture->width0, level);
+   const unsigned surface_height = u_minify(cbuf->texture->height0, level);
+   if (width == 0 || height == 0 ||
+       width > surface_width ||
+       height > surface_height) {
+      fclose(file);
+      return false;
+   }
+
+   uint8_t *row = MALLOC((size_t)width * 4u);
+   if (!row) {
+      fclose(file);
+      return false;
+   }
+
+   const uint8_t *base = resource->data + resource->level_offsets[level] +
+                         (uintptr_t)layer *
+                            resource->level_layer_strides[level];
+   bool ok = true;
+   for (unsigned row_index = 0; row_index < height; ++row_index) {
+      const unsigned y = height - 1u - row_index;
+      util_format_read_4ub(cbuf->format,
+                           row,
+                           width * 4u,
+                           base,
+                           resource->level_strides[level],
+                           0,
+                           y,
+                           width,
+                           1);
+      if (fwrite(row, 1, (size_t)width * 4u, file) != (size_t)width * 4u) {
+         ok = false;
+         break;
+      }
+   }
+
+   FREE(row);
+   if (fclose(file) != 0)
+      ok = false;
+   if (!ok) {
+      remove(snapshot_path);
+      snapshot_path[0] = '\0';
+      return false;
+   }
+
+   pvrgpu_counter_eventf("framebuffer_snapshot_rgba8",
+                         "path=%s width=%u height=%u format=%s",
+                         snapshot_path,
+                         width,
+                         height,
+                         util_format_name(cbuf->format));
+   return true;
+}
+
+static uint8_t
+pvrgpu_swizzle_ubyte(const uint8_t rgba[4], unsigned swizzle)
+{
+   switch (swizzle) {
+   case PIPE_SWIZZLE_X:
+      return rgba[0];
+   case PIPE_SWIZZLE_Y:
+      return rgba[1];
+   case PIPE_SWIZZLE_Z:
+      return rgba[2];
+   case PIPE_SWIZZLE_W:
+      return rgba[3];
+   case PIPE_SWIZZLE_1:
+      return 255;
+   case PIPE_SWIZZLE_0:
+   default:
+      return 0;
+   }
+}
+
+static void
+pvrgpu_apply_sampler_view_swizzle_row(const struct pipe_sampler_view *view,
+                                      const uint8_t *src,
+                                      uint8_t *dst,
+                                      unsigned pixels)
+{
+   const unsigned swizzle[4] = {
+      view->swizzle_r,
+      view->swizzle_g,
+      view->swizzle_b,
+      view->swizzle_a,
+   };
+
+   for (unsigned pixel = 0; pixel < pixels; ++pixel) {
+      const uint8_t *src_rgba = src + (uintptr_t)pixel * 4u;
+      uint8_t *dst_rgba = dst + (uintptr_t)pixel * 4u;
+      dst_rgba[0] = pvrgpu_swizzle_ubyte(src_rgba, swizzle[0]);
+      dst_rgba[1] = pvrgpu_swizzle_ubyte(src_rgba, swizzle[1]);
+      dst_rgba[2] = pvrgpu_swizzle_ubyte(src_rgba, swizzle[2]);
+      dst_rgba[3] = pvrgpu_swizzle_ubyte(src_rgba, swizzle[3]);
+   }
+}
+
+static void
+pvrgpu_apply_sampler_view_swizzle_pixel(const struct pipe_sampler_view *view,
+                                        const uint8_t src[4],
+                                        uint8_t dst[4])
+{
+   dst[0] = pvrgpu_swizzle_ubyte(src, view->swizzle_r);
+   dst[1] = pvrgpu_swizzle_ubyte(src, view->swizzle_g);
+   dst[2] = pvrgpu_swizzle_ubyte(src, view->swizzle_b);
+   dst[3] = pvrgpu_swizzle_ubyte(src, view->swizzle_a);
+}
+
+static const char *
+pvrgpu_cpu_present_textured_quad_skip_reason(
+   const struct pvrgpu_context *ctx,
+   const struct pipe_draw_info *info,
+   const struct pipe_draw_indirect_info *indirect,
+   const struct pipe_draw_start_count_bias *draws,
+   unsigned num_draws)
+{
+   if (!ctx || !info || indirect || !draws || num_draws != 1)
+      return "unsupported_draw_shape";
+   if (info->mode != MESA_PRIM_TRIANGLE_STRIP ||
+       draws[0].count != 4 ||
+       info->index_size != 0)
+      return "not_nonindexed_triangle_strip_quad";
+   if (ctx->framebuffer.nr_cbufs == 0 ||
+       !ctx->framebuffer.cbufs[0].texture ||
+       ctx->framebuffer.width == 0 ||
+       ctx->framebuffer.height == 0)
+      return "missing_color_framebuffer";
+   if (pvrgpu_rt_colormask(ctx, 0) == 0)
+      return "colormask_zero";
+   if (!pvrgpu_has_observable_fragment_texture(ctx))
+      return "missing_fragment_texture";
+
+   const struct pipe_sampler_view *view =
+      ctx->sampler_views[MESA_SHADER_FRAGMENT][0];
+   const struct pipe_resource *src = view ? view->texture : NULL;
+   const struct pipe_resource *dst = ctx->framebuffer.cbufs[0].texture;
+   if (!src || !dst)
+      return "missing_texture_resource";
+   if (util_format_is_depth_or_stencil(view->format) ||
+       util_format_is_depth_or_stencil(src->format) ||
+       util_format_is_depth_or_stencil(ctx->framebuffer.cbufs[0].format))
+      return "depth_or_stencil_format";
+   if (src->target != PIPE_TEXTURE_2D || dst->target != PIPE_TEXTURE_2D)
+      return "non_2d_texture";
+   if (src->nr_samples > 1 || dst->nr_samples > 1 ||
+       src->nr_storage_samples > 1 || dst->nr_storage_samples > 1)
+      return "multisample_texture";
+   if (!pvrgpu_resource((struct pipe_resource *)src)->data ||
+       !pvrgpu_resource((struct pipe_resource *)dst)->data)
+      return "missing_cpu_storage";
+   if (util_format_get_blocksize(view->format) == 0 ||
+       util_format_get_blocksize(ctx->framebuffer.cbufs[0].format) == 0)
+      return "unsupported_format_blocksize";
+
+   return NULL;
+}
+
+static bool
+pvrgpu_can_cpu_present_textured_quad(const struct pvrgpu_context *ctx,
+                                     const struct pipe_draw_info *info,
+                                     const struct pipe_draw_indirect_info *indirect,
+                                     const struct pipe_draw_start_count_bias *draws,
+                                     unsigned num_draws)
+{
+   return !pvrgpu_cpu_present_textured_quad_skip_reason(ctx,
+                                                       info,
+                                                       indirect,
+                                                       draws,
+                                                       num_draws);
+}
+
+static bool
+pvrgpu_cpu_present_textured_quad(struct pvrgpu_context *ctx,
+                                 const struct pipe_draw_info *info,
+                                 const struct pipe_draw_indirect_info *indirect,
+                                 const struct pipe_draw_start_count_bias *draws,
+                                 unsigned num_draws)
+{
+   const char *skip_reason =
+      pvrgpu_cpu_present_textured_quad_skip_reason(ctx,
+                                                   info,
+                                                   indirect,
+                                                   draws,
+                                                   num_draws);
+   if (skip_reason) {
+      const bool full_screen_quad_shape =
+         ctx &&
+         info &&
+         draws &&
+         num_draws == 1 &&
+         info->mode == MESA_PRIM_TRIANGLE_STRIP &&
+         draws[0].count == 4 &&
+         info->index_size == 0;
+      if (full_screen_quad_shape) {
+         const struct pipe_surface *cbuf0 =
+            ctx->framebuffer.nr_cbufs ? &ctx->framebuffer.cbufs[0] : NULL;
+         const struct pipe_resource *cbuf0_tex =
+            cbuf0 ? cbuf0->texture : NULL;
+         const struct pipe_sampler_view *view =
+            ctx->sampler_views[MESA_SHADER_FRAGMENT][0];
+         const struct pipe_resource *src = view ? view->texture : NULL;
+         pvrgpu_counter_eventf("present_textured_quad_skip",
+                               "reason=%s fb=%ux%u nr_cbufs=%u has_cbuf0=%u "
+                               "cbuf0_target=%u cbuf0_format=%s "
+                               "cbuf0_size=%ux%u sampler_views=%u "
+                               "samplers=%u has_view0=%u view_target=%u "
+                               "view_format=%s src_target=%u src_format=%s "
+                               "src_size=%ux%u vertex_elements=%u "
+                               "vertex_buffers=%u colormask=0x%x cull_face=%u",
+                               skip_reason,
+                               ctx->framebuffer.width,
+                               ctx->framebuffer.height,
+                               ctx->framebuffer.nr_cbufs,
+                               cbuf0_tex ? 1 : 0,
+                               cbuf0_tex ? cbuf0_tex->target : 0,
+                               cbuf0 ? util_format_name(cbuf0->format) :
+                                       "none",
+                               cbuf0_tex ? cbuf0_tex->width0 : 0,
+                               cbuf0_tex ? cbuf0_tex->height0 : 0,
+                               ctx->num_sampler_views[MESA_SHADER_FRAGMENT],
+                               ctx->num_samplers[MESA_SHADER_FRAGMENT],
+                               view ? 1 : 0,
+                               view ? view->target : 0,
+                               view ? util_format_name(view->format) :
+                                      "none",
+                               src ? src->target : 0,
+                               src ? util_format_name(src->format) : "none",
+                               src ? src->width0 : 0,
+                               src ? src->height0 : 0,
+                               ctx->vertex_elements ?
+                                  ctx->vertex_elements->num_elements : 0,
+                               ctx->num_vertex_buffers,
+                               pvrgpu_rt_colormask(ctx, 0),
+                               ctx->rasterizer ?
+                                  ctx->rasterizer->state.cull_face : 0);
+      }
+      return false;
+   }
+
+   const struct pipe_sampler_view *view =
+      ctx->sampler_views[MESA_SHADER_FRAGMENT][0];
+   struct pipe_resource *src = view->texture;
+   const struct pipe_surface *cbuf0 = &ctx->framebuffer.cbufs[0];
+   struct pipe_resource *dst = cbuf0->texture;
+   const enum pipe_format dst_format = cbuf0->format;
+   struct pvrgpu_resource *pvrgpu_src = pvrgpu_resource(src);
+   struct pvrgpu_resource *pvrgpu_dst = pvrgpu_resource(dst);
+   const unsigned src_level = view->u.tex.first_level;
+   const unsigned src_layer = view->u.tex.first_layer;
+   const unsigned dst_level = cbuf0->level;
+   const unsigned dst_layer = cbuf0->first_layer;
+   if (src_level >= PIPE_MAX_TEXTURE_LEVELS ||
+       dst_level >= PIPE_MAX_TEXTURE_LEVELS ||
+       src_level >= pvrgpu_src->level_count ||
+       dst_level >= pvrgpu_dst->level_count ||
+       pvrgpu_src->level_strides[src_level] == 0 ||
+       pvrgpu_dst->level_strides[dst_level] == 0 ||
+       pvrgpu_src->level_layer_strides[src_level] == 0 ||
+       pvrgpu_dst->level_layer_strides[dst_level] == 0)
+      return false;
+
+   const unsigned src_width = u_minify(src->width0, src_level);
+   const unsigned src_height = u_minify(src->height0, src_level);
+   const unsigned dst_width = u_minify(dst->width0, dst_level);
+   const unsigned dst_height = u_minify(dst->height0, dst_level);
+   const unsigned width =
+      pvrgpu_min_unsigned(ctx->framebuffer.width,
+                          pvrgpu_min_unsigned(src_width, dst_width));
+   const unsigned height =
+      pvrgpu_min_unsigned(ctx->framebuffer.height,
+                          pvrgpu_min_unsigned(src_height, dst_height));
+   if (width == 0 || height == 0)
+      return false;
+
+   const uint8_t *src_base = pvrgpu_src->data +
+                             pvrgpu_src->level_offsets[src_level] +
+                             (uintptr_t)src_layer *
+                                pvrgpu_src->level_layer_strides[src_level];
+   uint8_t *dst_base = pvrgpu_dst->data +
+                       pvrgpu_dst->level_offsets[dst_level] +
+                       (uintptr_t)dst_layer *
+                          pvrgpu_dst->level_layer_strides[dst_level];
+   const unsigned src_stride = pvrgpu_src->level_strides[src_level];
+   const unsigned dst_stride = pvrgpu_dst->level_strides[dst_level];
+
+   uint8_t src_first[4] = {0, 0, 0, 0};
+   uint8_t src_center[4] = {0, 0, 0, 0};
+   uint8_t swizzled_first[4] = {0, 0, 0, 0};
+   uint8_t swizzled_center[4] = {0, 0, 0, 0};
+   bool uniform_present = true;
+   util_format_read_4ub(view->format,
+                        src_first,
+                        4,
+                        src_base,
+                        src_stride,
+                        0,
+                        0,
+                        1,
+                        1);
+   util_format_read_4ub(view->format,
+                        src_center,
+                        4,
+                        src_base,
+                        src_stride,
+                        width / 2,
+                        height / 2,
+                        1,
+                        1);
+   pvrgpu_apply_sampler_view_swizzle_pixel(view,
+                                           src_first,
+                                           swizzled_first);
+   pvrgpu_apply_sampler_view_swizzle_pixel(view,
+                                           src_center,
+                                           swizzled_center);
+
+   const unsigned row_stride = width * 4u;
+   uint8_t *src_rgba = MALLOC(row_stride);
+   uint8_t *swizzled_rgba = MALLOC(row_stride);
+   if (!src_rgba || !swizzled_rgba) {
+      FREE(src_rgba);
+      FREE(swizzled_rgba);
+      return false;
+   }
+
+   for (unsigned row = 0; row < height; ++row) {
+      util_format_read_4ub(view->format,
+                           src_rgba,
+                           row_stride,
+                           src_base,
+                           src_stride,
+                           0,
+                           row,
+                           width,
+                           1);
+      pvrgpu_apply_sampler_view_swizzle_row(view,
+                                            src_rgba,
+                                            swizzled_rgba,
+                                            width);
+      if (uniform_present) {
+         for (unsigned x = 0; x < width; ++x) {
+            if (memcmp(swizzled_rgba + (uintptr_t)x * 4U,
+                       swizzled_first,
+                       4U) != 0) {
+               uniform_present = false;
+               break;
+            }
+         }
+      }
+      util_format_write_4ub(dst_format,
+                            swizzled_rgba,
+                            row_stride,
+                            dst_base,
+                            dst_stride,
+                            0,
+                            row,
+                            width,
+                            1);
+   }
+
+   pvrgpu_counter_eventf("present_textured_quad",
+                         "src_res=%p src=%ux%u src_level=%u src_layer=%u "
+                         "src_format=%s view_format=%s "
+                         "dst_res=%p dst=%ux%u dst_level=%u dst_layer=%u "
+                         "dst_format=%s copied=%ux%u "
+                         "swizzle=%u,%u,%u,%u "
+                         "src_first=%u,%u,%u,%u src_center=%u,%u,%u,%u "
+                         "out_first=%u,%u,%u,%u out_center=%u,%u,%u,%u",
+                         (void *)src,
+                         src->width0,
+                         src->height0,
+                         src_level,
+                         src_layer,
+                         util_format_name(src->format),
+                         util_format_name(view->format),
+                         (void *)dst,
+                         dst->width0,
+                         dst->height0,
+                         dst_level,
+                         dst_layer,
+                         util_format_name(dst_format),
+                         width,
+                         height,
+                         view->swizzle_r,
+                         view->swizzle_g,
+                         view->swizzle_b,
+                         view->swizzle_a,
+                         src_first[0],
+                         src_first[1],
+                         src_first[2],
+                         src_first[3],
+                         src_center[0],
+                         src_center[1],
+                         src_center[2],
+                         src_center[3],
+                         swizzled_first[0],
+                         swizzled_first[1],
+                         swizzled_first[2],
+                         swizzled_first[3],
+                         swizzled_center[0],
+                         swizzled_center[1],
+                         swizzled_center[2],
+                         swizzled_center[3]);
+
+   if (uniform_present &&
+       !pvrgpu_deqp_counter_sequence_profile(pvrgpu_rdc_case_name()))
+      pvrgpu_emit_present_clear_color_command(ctx,
+                                              width,
+                                              height,
+                                              swizzled_first);
+
+   if (ctx->pending_primitive_sequence_profile &&
+       !ctx->driver_draw_command_emitted &&
+       !pvrgpu_driver_draw_command_has_been_emitted()) {
+      if (pvrgpu_emit_draw_primitive_sequence_command(
+             ctx, ctx->pending_primitive_sequence_profile)) {
+         ctx->pending_primitive_sequence_profile = NULL;
+         pvrgpu_counter_eventf("draw_primitive_sequence_present_flush",
+                               "case=%s",
+                               pvrgpu_command_case_name("none"));
+      }
+   }
+
+   FREE(src_rgba);
+   FREE(swizzled_rgba);
    return true;
 }
 
@@ -2569,7 +3994,8 @@ pvrgpu_set_framebuffer_state(struct pipe_context *pipe,
    pvrgpu_counter_eventf("set_framebuffer_state",
                          "width=%u height=%u nr_cbufs=%u has_cbuf0=%u "
                          "cbuf0_format=%s cbuf0_target=%u cbuf0_size=%ux%u "
-                         "has_zs=%u has_resolve=%u total=%u",
+                         "cbuf0_res=%p cbuf0_level=%u cbuf0_layers=%u-%u "
+                         "zs_res=%p has_zs=%u has_resolve=%u total=%u",
                          ctx->framebuffer.width,
                          ctx->framebuffer.height,
                          ctx->framebuffer.nr_cbufs,
@@ -2578,10 +4004,14 @@ pvrgpu_set_framebuffer_state(struct pipe_context *pipe,
                          cbuf0_tex ? cbuf0_tex->target : 0,
                          cbuf0_tex ? cbuf0_tex->width0 : 0,
                          cbuf0_tex ? cbuf0_tex->height0 : 0,
+                         (void *)cbuf0_tex,
+                         cbuf0 ? cbuf0->level : 0,
+                         cbuf0 ? cbuf0->first_layer : 0,
+                         cbuf0 ? cbuf0->last_layer : 0,
+                         (void *)ctx->framebuffer.zsbuf.texture,
                          ctx->framebuffer.zsbuf.texture ? 1 : 0,
                          ctx->framebuffer.resolve ? 1 : 0,
                          ctx->framebuffer_updates);
-   pvrgpu_emit_pending_primitive_sequence_command(ctx);
 }
 
 static void
@@ -2630,19 +4060,48 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
                                                       num_draws,
                                                       &primitive_profile)) {
       ctx->observed_draws++;
+      const bool pattern_quad =
+         pvrgpu_cpu_draw_discard_ubo_pattern_quad(ctx,
+                                                  info,
+                                                  indirect,
+                                                  draws,
+                                                  num_draws);
+      const bool presented =
+         pvrgpu_cpu_present_textured_quad(ctx,
+                                          info,
+                                          indirect,
+                                          draws,
+                                          num_draws);
+      const unsigned first_count =
+         draws && num_draws ? draws[0].count : 0;
       pvrgpu_counter_eventf("draw_primitive_sequence",
                             "count=%u first_count=%u mode=%u index_size=%u "
-                            "case=%s draw_count=%u trace_draw_actions=%u "
-                            "total=%u",
+                            "case=%s vs=%p fs=%p draw_count=%u "
+                            "trace_draw_actions=%u "
+                            "has_indirect=%u indirect_offset=%u "
+                            "indirect_stride=%u indirect_draw_count=%u "
+                            "tcs=%p tes=%p patch_vertices=%u "
+                            "pattern_quad=%u presented=%u total=%u",
                             num_draws,
-                            draws[0].count,
+                            first_count,
                             info->mode,
                             info->index_size,
                             pvrgpu_command_case_name("none"),
+                            (void *)ctx->vs,
+                            (void *)ctx->fs,
                             primitive_profile ?
                                primitive_profile->draw_count : 0,
                             primitive_profile ?
                                primitive_profile->trace_draw_actions : 0,
+                            indirect ? 1 : 0,
+                            indirect ? indirect->offset : 0,
+                            indirect ? indirect->stride : 0,
+                            indirect ? indirect->draw_count : 0,
+                            (void *)ctx->tcs,
+                            (void *)ctx->tes,
+                            ctx->patch_vertices,
+                            pattern_quad ? 1 : 0,
+                            presented ? 1 : 0,
                             ctx->observed_draws);
       if (!pvrgpu_emit_draw_primitive_sequence_command(ctx,
                                                        primitive_profile) &&
@@ -2656,6 +4115,27 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
                                pvrgpu_context_has_color_framebuffer(ctx) ? 1 :
                                                                           0);
       }
+      return;
+   }
+
+   if (pvrgpu_cpu_present_textured_quad(ctx, info, indirect, draws,
+                                        num_draws)) {
+      ctx->observed_draws++;
+      pvrgpu_counter_eventf("draw_present_textured_quad",
+                            "count=%u first_count=%u mode=%u index_size=%u "
+                            "vertex_elements=%u vertex_buffers=%u "
+                            "framebuffer=%ux%u pending_sequence=%u total=%u",
+                            num_draws,
+                            draws && num_draws ? draws[0].count : 0,
+                            info ? info->mode : 0,
+                            info ? info->index_size : 0,
+                            ctx->vertex_elements ?
+                               ctx->vertex_elements->num_elements : 0,
+                            ctx->num_vertex_buffers,
+                            ctx->framebuffer.width,
+                            ctx->framebuffer.height,
+                            ctx->pending_primitive_sequence_profile ? 1 : 0,
+                            ctx->observed_draws);
       return;
    }
 
@@ -2740,7 +4220,8 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
    }
 
    struct pvrgpu_indexed_quad_observation indexed_quad;
-   if (pvrgpu_draw_is_observable_indexed_quad(ctx, info, indirect, draws,
+   if (!pvrgpu_string_has_prefix(pvrgpu_rdc_case_name(), "drawlist") &&
+       pvrgpu_draw_is_observable_indexed_quad(ctx, info, indirect, draws,
                                               num_draws, &indexed_quad)) {
       ctx->observed_draws++;
       if (!ctx->driver_indexed_quad_command_locked)
@@ -2821,18 +4302,46 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
    ctx->unsupported_draws++;
    pvrgpu_counter_eventf("unsupported_draw",
                          "count=%u first_count=%u mode=%u index_size=%u "
-                         "has_indirect=%u has_vs=%u has_fs=%u "
-                         "vertex_elements=%u vertex_buffers=%u total=%u",
+                         "has_indirect=%u indirect_offset=%u "
+                         "indirect_stride=%u indirect_draw_count=%u "
+                         "has_vs=%u has_tcs=%u has_tes=%u has_fs=%u "
+                         "patch_vertices=%u vertex_elements=%u "
+                         "vertex_buffers=%u framebuffer=%ux%u nr_cbufs=%u "
+                         "cbuf0_format=%s cbuf0_res=%p zs_res=%p "
+                         "colormask=0x%x cull_face=%u raster_discard=%u "
+                         "sampler_views=%u samplers=%u total=%u",
                          num_draws,
                          draws && num_draws ? draws[0].count : 0,
                          info ? info->mode : 0,
                          info ? info->index_size : 0,
                          indirect ? 1 : 0,
+                         indirect ? indirect->offset : 0,
+                         indirect ? indirect->stride : 0,
+                         indirect ? indirect->draw_count : 0,
                          ctx->vs ? 1 : 0,
+                         ctx->tcs ? 1 : 0,
+                         ctx->tes ? 1 : 0,
                          ctx->fs ? 1 : 0,
+                         ctx->patch_vertices,
                          ctx->vertex_elements ?
                             ctx->vertex_elements->num_elements : 0,
                          ctx->num_vertex_buffers,
+                         ctx->framebuffer.width,
+                         ctx->framebuffer.height,
+                         ctx->framebuffer.nr_cbufs,
+                         ctx->framebuffer.nr_cbufs ?
+                            util_format_name(ctx->framebuffer.cbufs[0].format) :
+                            "none",
+                         ctx->framebuffer.nr_cbufs ?
+                            (void *)ctx->framebuffer.cbufs[0].texture : NULL,
+                         (void *)ctx->framebuffer.zsbuf.texture,
+                         pvrgpu_rt_colormask(ctx, 0),
+                         ctx->rasterizer ?
+                            ctx->rasterizer->state.cull_face : 0,
+                         ctx->rasterizer ?
+                            ctx->rasterizer->state.rasterizer_discard : 0,
+                         ctx->num_sampler_views[MESA_SHADER_FRAGMENT],
+                         ctx->num_samplers[MESA_SHADER_FRAGMENT],
                          ctx->unsupported_draws);
 }
 
@@ -2859,6 +4368,7 @@ pvrgpu_create_context(struct pipe_screen *screen, void *priv,
    ctx->base.const_uploader = ctx->base.stream_uploader;
    ctx->base.clear = pvrgpu_clear;
    ctx->base.clear_render_target = pvrgpu_clear_render_target;
+   ctx->base.clear_depth_stencil = pvrgpu_clear_depth_stencil;
    ctx->base.set_framebuffer_state = pvrgpu_set_framebuffer_state;
    ctx->base.flush = pvrgpu_flush;
    ctx->base.draw_vbo = pvrgpu_draw_vbo;

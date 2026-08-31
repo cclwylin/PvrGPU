@@ -43,6 +43,7 @@ import time
 parser = argparse.ArgumentParser()
 parser.add_argument("--rdc-dir", required=True)
 parser.add_argument("--output-root", required=True)
+parser.add_argument("--golden-runner", required=True)
 parser.add_argument("--pvrgpu-runner", required=True)
 parser.add_argument("--json", action="store_true")
 options = parser.parse_args()
@@ -69,6 +70,7 @@ import time
 parser = argparse.ArgumentParser()
 parser.add_argument("--rdc-dir", required=True)
 parser.add_argument("--output-root", required=True)
+parser.add_argument("--golden-runner", required=True)
 parser.add_argument("--pvrgpu-runner", required=True)
 parser.add_argument("--json", action="store_true")
 options = parser.parse_args()
@@ -117,17 +119,33 @@ def main() -> int:
 
         worker = root / "fake_worker.py"
         _write_worker(worker, slow=False)
-        pvrgpu_runner = root / "fake_pvrgpu_runner.sh"
-        pvrgpu_runner.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        native_runner = root / "fake_native_runner.py"
+        native_runner.write_text(
+            "#!/usr/bin/env python3\nraise SystemExit(0)\n", encoding="utf-8"
+        )
+        native_runner.chmod(0o755)
         settings = QSettings(
             str(root / "settings.ini"), QSettings.Format.IniFormat
         )
+        settings.setValue(
+            "llvmpipe_runner",
+            str(root / "scripts" / "run-rdc-golden-counter.sh"),
+        )
+        settings.setValue(
+            "pvrgpu_runner",
+            str(root / "scripts" / "run-rdc-pvrgpu-driver-systemc.sh"),
+        )
         window = MainWindow(worker_path=worker, settings=settings)
+        if window.llvmpipe_runner_edit.text().endswith(".sh"):
+            raise RuntimeError("legacy llvmpipe shell runner setting was not migrated")
+        if window.pvrgpu_runner_edit.text().endswith(".sh"):
+            raise RuntimeError("legacy PvrGPU shell runner setting was not migrated")
         if window.quit_button.text() != "Quit" or not window.quit_button.isEnabled():
             raise RuntimeError("Quit button is missing or disabled")
         window.input_dir_edit.setText(str(input_root))
         window.output_dir_edit.setText(str(output_root))
-        window.pvrgpu_runner_edit.setText(str(pvrgpu_runner))
+        window.llvmpipe_runner_edit.setText(str(native_runner))
+        window.pvrgpu_runner_edit.setText(str(native_runner))
         window._start()
         if window.start_button.isEnabled() or not window.cancel_button.isEnabled():
             raise RuntimeError("running controls are not locked correctly")
@@ -197,7 +215,8 @@ def main() -> int:
         cancel_window = MainWindow(worker_path=slow_worker, settings=cancel_settings)
         cancel_window.input_dir_edit.setText(str(input_root))
         cancel_window.output_dir_edit.setText(str(output_root))
-        cancel_window.pvrgpu_runner_edit.setText(str(pvrgpu_runner))
+        cancel_window.llvmpipe_runner_edit.setText(str(native_runner))
+        cancel_window.pvrgpu_runner_edit.setText(str(native_runner))
         cancel_window._start()
         _pump_until(app, lambda: cancel_window.results_table.rowCount() == 1)
         cancel_window._cancel()

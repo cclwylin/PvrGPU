@@ -10,6 +10,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,13 +18,75 @@ TOOLS_DIR = PROJECT_ROOT / "tools"
 sys.path.insert(0, str(TOOLS_DIR))
 
 from counter_protocol import STANDARD_COUNTER_FIELDS  # noqa: E402
+from rdc_counter_report import build_argument_parser  # noqa: E402
+from rdc_counter_report import DirectoryCounterRun  # noqa: E402
+from rdc_counter_report import DiscoveredRdc  # noqa: E402
 from rdc_counter_report import decode_rgba8_png  # noqa: E402
+from rdc_counter_report import EventSink  # noqa: E402
+from rdc_counter_report import ManifestEntry  # noqa: E402
+from rdc_counter_report import natural_path_sort_key  # noqa: E402
 
 
 WORKER = TOOLS_DIR / "rdc_counter_report.py"
 
 
 class RdcCounterReportTests(unittest.TestCase):
+    def test_default_runners_come_from_the_native_build_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            build_root = Path(directory) / "native-build"
+            with mock.patch.dict(
+                os.environ, {"PVRGPU_BUILD_DIR": str(build_root)}, clear=False
+            ):
+                os.environ.pop("PVRGPU_RDC_GOLDEN_RUNNER", None)
+                os.environ.pop("PVRGPU_RDC_PVRGPU_RUNNER", None)
+                options = build_argument_parser().parse_args(
+                    ["--rdc-dir", "/tmp/rdcs"]
+                )
+
+            suffix = ".exe" if os.name == "nt" else ""
+            self.assertEqual(
+                options.golden_runner, build_root / "bin" / f"llvmpipe{suffix}"
+            )
+            self.assertEqual(
+                options.pvrgpu_runner, build_root / "bin" / f"pvrgpu{suffix}"
+            )
+
+    def test_natural_path_sort_key_keeps_drawlists_in_frame_order(self) -> None:
+        names = ["drawlist101-104.rdc", "drawlist4-8.rdc", "drawlist0-3.rdc"]
+        self.assertEqual(
+            sorted(names, key=natural_path_sort_key),
+            ["drawlist0-3.rdc", "drawlist4-8.rdc", "drawlist101-104.rdc"],
+        )
+
+    def test_staging_copies_when_links_are_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.rdc"
+            source.write_bytes(b"rdc-payload")
+            case_root = root / "case"
+            case_root.mkdir()
+            entry = ManifestEntry(1, "case", "canonical.rdc", "0" * 64, 1, 1)
+            item = DiscoveredRdc(source, source.name, "0" * 64, entry)
+            run = DirectoryCounterRun(
+                input_root=root,
+                output_root=root / "output",
+                manifest_path=root / "manifest.tsv",
+                golden_runner=root / "llvmpipe",
+                pvrgpu_runner=root / "pvrgpu",
+                timeout_seconds=0,
+                require_manifest=False,
+                reuse_golden_cache=False,
+                events=EventSink(False),
+            )
+
+            with mock.patch.object(
+                Path, "symlink_to", side_effect=OSError("no symlinks")
+            ), mock.patch("rdc_counter_report.os.link", side_effect=OSError("no links")):
+                staged = run._stage_input(item, case_root, entry)
+
+            self.assertEqual(staged.name, "canonical.rdc")
+            self.assertEqual(staged.read_bytes(), b"rdc-payload")
+
     def _write_fake_runners(self, root: Path) -> tuple[Path, Path]:
         fields = repr(tuple(STANDARD_COUNTER_FIELDS))
         common = f"""
@@ -66,6 +129,9 @@ class RdcCounterReportTests(unittest.TestCase):
             mode = args.rdc.read_text(encoding='utf-8').strip()
             args.outdir.mkdir(parents=True, exist_ok=True)
             values = {{field: index + 10 for index, field in enumerate(FIELDS)}}
+            if mode == 'png-no-color-write':
+                values['drawlists'] = 1
+                values['ps_invocations'] = 0
         """
         golden = root / "fake_golden.py"
         golden.write_text(
@@ -88,7 +154,17 @@ class RdcCounterReportTests(unittest.TestCase):
                     '',
                 ]
                 (args.outdir / 'Report.md').write_text('\\n'.join(report), encoding='utf-8')
-                if mode in {'png-same', 'png-mismatch', 'png-golden-only', 'png-size-from-golden'}:
+                if mode == 'png-no-selected-color':
+                    (args.outdir / 'player-wrapper.stdout.log').write_text(
+                        'Color output: none\\n'
+                        'PNG: none (selected replay range has no color output)\\n',
+                        encoding='utf-8',
+                    )
+                if mode not in {
+                    'png-both-missing',
+                    'png-pvrgpu-only',
+                    'png-no-selected-color',
+                }:
                     trace_stem = args.rdc.stem
                     png_width = 32 if mode == 'png-size-from-golden' else int(args.width)
                     png_height = 48 if mode == 'png-size-from-golden' else int(args.height)
@@ -113,11 +189,13 @@ class RdcCounterReportTests(unittest.TestCase):
                 if mode == 'mismatch':
                     values[FIELDS[-1]] += 1
                 artifact_png = None
-                if mode in {'png-same', 'png-mismatch', 'png-pvrgpu-only', 'png-size-from-golden'}:
-                    artifact_png = args.outdir / 'driver_indexed_quad_sample_000001.png'
-                    pixel = (1, 2, 3, 255) if mode == 'png-same' else (9, 2, 3, 255)
-                    if mode == 'png-size-from-golden':
-                        pixel = (1, 2, 3, 255)
+                if mode not in {'png-both-missing', 'png-golden-only'}:
+                    artifact_png = args.outdir / 'png' / 'driver_indexed_quad_sample_000001.png'
+                    pixel = (
+                        (9, 2, 3, 255)
+                        if mode == 'png-mismatch'
+                        else (1, 2, 3, 255)
+                    )
                     write_rgba8_png(artifact_png, int(args.width), int(args.height), pixel)
                 digest = hashlib.sha256(args.rdc.read_bytes()).hexdigest()
                 counter_message = {
@@ -182,6 +260,7 @@ class RdcCounterReportTests(unittest.TestCase):
         pvrgpu: Path,
         timeout: float = 0,
         require_manifest: bool = False,
+        reuse_golden_cache: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         arguments = [
             sys.executable,
@@ -202,6 +281,8 @@ class RdcCounterReportTests(unittest.TestCase):
         ]
         if require_manifest:
             arguments.append("--require-manifest")
+        if reuse_golden_cache:
+            arguments.append("--reuse-golden-cache")
         return subprocess.run(
             arguments,
             text=True,
@@ -236,6 +317,7 @@ class RdcCounterReportTests(unittest.TestCase):
             first.write_text("pass-a", encoding="utf-8")
             second.write_text("pass-b", encoding="utf-8")
             (inputs / "ignored.txt").write_text("ignored", encoding="utf-8")
+            (inputs / "wrong-extension.drc").write_text("ignored", encoding="utf-8")
             manifest = root / "manifest.tsv"
             self._write_manifest(manifest, [("case_a", first), ("case_b", second)])
             golden, pvrgpu = self._write_fake_runners(root)
@@ -366,6 +448,106 @@ class RdcCounterReportTests(unittest.TestCase):
             self.assertIn("PNG comparison", report)
             self.assertIn("PNG | Result", report)
 
+    def test_missing_pngs_fail_without_explicit_no_color_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            rdc = inputs / "png_both_missing.rdc"
+            rdc.write_text("png-both-missing", encoding="utf-8")
+            manifest = root / "manifest.tsv"
+            self._write_manifest(manifest, [("png_both_missing", rdc)])
+            golden, pvrgpu = self._write_fake_runners(root)
+            output = root / "output"
+
+            completed = self._run(
+                input_root=inputs,
+                output_root=output,
+                manifest=manifest,
+                golden=golden,
+                pvrgpu=pvrgpu,
+            )
+
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            run_root = self._single_run_root(output)
+            run_data = json.loads((run_root / "run.json").read_text(encoding="utf-8"))
+            result = run_data["results"][0]
+            self.assertEqual(result["status"], "FAIL")
+            self.assertEqual(result["compare"], "PASS")
+            self.assertEqual(result["png"], "FAIL")
+            self.assertIn("both missing", result["reason"])
+
+    def test_png_compare_is_skipped_for_draw_counter_with_no_pixel_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            rdc = inputs / "png_no_color_write.rdc"
+            rdc.write_text("png-no-color-write", encoding="utf-8")
+            manifest = root / "manifest.tsv"
+            self._write_manifest(manifest, [("png_no_color_write", rdc)])
+            golden, pvrgpu = self._write_fake_runners(root)
+            output = root / "output"
+
+            completed = self._run(
+                input_root=inputs,
+                output_root=output,
+                manifest=manifest,
+                golden=golden,
+                pvrgpu=pvrgpu,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            run_root = self._single_run_root(output)
+            run_data = json.loads((run_root / "run.json").read_text(encoding="utf-8"))
+            result = run_data["results"][0]
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(result["compare"], "PASS")
+            self.assertEqual(result["png"], "SKIP")
+            self.assertEqual(result["png_diff"], "png_skip.txt")
+            self.assertIn("ps_invocations=0", (run_root / result["artifact_dir"] / "png_skip.txt").read_text(encoding="utf-8"))
+
+    def test_png_compare_is_skipped_when_selected_action_has_no_color_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            rdc = inputs / "png_no_selected_color.rdc"
+            rdc.write_text("png-no-selected-color", encoding="utf-8")
+            manifest = root / "manifest.tsv"
+            self._write_manifest(manifest, [("png_no_selected_color", rdc)])
+            golden, pvrgpu = self._write_fake_runners(root)
+            output = root / "output"
+
+            completed = self._run(
+                input_root=inputs,
+                output_root=output,
+                manifest=manifest,
+                golden=golden,
+                pvrgpu=pvrgpu,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            run_root = self._single_run_root(output)
+            run_data = json.loads((run_root / "run.json").read_text(encoding="utf-8"))
+            result = run_data["results"][0]
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(result["compare"], "PASS")
+            self.assertEqual(result["png"], "SKIP")
+            self.assertEqual(result["golden_png"], "")
+            self.assertIn("/png/", result["pvrgpu_png"])
+            case_root = run_root / result["artifact_dir"]
+            skip_text = (case_root / "png_skip.txt").read_text(encoding="utf-8")
+            self.assertIn("no color output", skip_text)
+            self.assertNotIn("ps_invocations=0", skip_text)
+            digest = hashlib.sha256(rdc.read_bytes()).hexdigest()
+            metadata = json.loads(
+                (output / "golden-cache" / digest / "metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertIs(metadata["no_color_output"], True)
+
     def test_pvrgpu_runner_receives_actual_golden_png_extent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -445,6 +627,7 @@ class RdcCounterReportTests(unittest.TestCase):
                 manifest=manifest,
                 golden=golden,
                 pvrgpu=pvrgpu,
+                reuse_golden_cache=True,
             )
             self.assertEqual(first.returncode, 0, first.stderr)
             digest = hashlib.sha256(rdc.read_bytes()).hexdigest()
@@ -467,6 +650,7 @@ class RdcCounterReportTests(unittest.TestCase):
                 manifest=manifest,
                 golden=golden,
                 pvrgpu=pvrgpu,
+                reuse_golden_cache=True,
             )
             self.assertEqual(second.returncode, 0, second.stderr)
             events = [json.loads(line) for line in second.stdout.splitlines()]
@@ -488,6 +672,52 @@ class RdcCounterReportTests(unittest.TestCase):
             case_root = self._latest_run_root(output) / result["artifact_dir"]
             self.assertTrue((case_root / "golden" / "cache-hit.txt").is_file())
             self.assertFalse((case_root / "golden" / "stderr.log").exists())
+
+    def test_golden_cache_is_not_reused_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            rdc = inputs / "fresh.rdc"
+            rdc.write_text("pass", encoding="utf-8")
+            manifest = root / "manifest.tsv"
+            self._write_manifest(manifest, [("fresh_case", rdc)])
+            golden, pvrgpu = self._write_fake_runners(root)
+            output = root / "output"
+
+            first = self._run(
+                input_root=inputs,
+                output_root=output,
+                manifest=manifest,
+                golden=golden,
+                pvrgpu=pvrgpu,
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+
+            golden.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "print('fresh golden failure', file=sys.stderr)\n"
+                "raise SystemExit(77)\n",
+                encoding="utf-8",
+            )
+            golden.chmod(0o755)
+
+            second = self._run(
+                input_root=inputs,
+                output_root=output,
+                manifest=manifest,
+                golden=golden,
+                pvrgpu=pvrgpu,
+            )
+            self.assertEqual(second.returncode, 1, second.stderr)
+            run_data = json.loads(
+                (self._latest_run_root(output) / "run.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(run_data["results"][0]["golden"], "FAIL")
+            self.assertIn("code 77", run_data["results"][0]["reason"])
 
     def test_runner_timeout_does_not_prevent_later_rdc(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

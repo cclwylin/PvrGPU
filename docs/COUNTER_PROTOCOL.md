@@ -56,13 +56,18 @@ metadata, not a numeric counter:
   "type": "hello",
   "backend": "pvrgpu",
   "source": "pvrgpu-systemc",
-  "cache_bypass": false
+  "cache_bypass": false,
+  "memory_mode": "cache",
+  "cache_simulated": true
 }
 ```
 
-`cache_bypass` must be a JSON boolean. `false` is the default and enables the
-cache model. `true` skips cache lookup and allocation for faster functional
-simulation, but does not bypass DRAM.
+`memory_mode` is `direct`, `bypass`, or `cache`. `direct` uses the unified DRAM
+backing directly for fast functional simulation and does not report modeled
+cache/DRAM traffic. `bypass` skips cache lookup/allocation but still reports DRAM
+transactions. `cache` is the default and simulates the shared SLC. The legacy
+`cache_bypass` boolean is still emitted for compatibility and is true only in
+`bypass` mode.
 
 Example sample:
 
@@ -475,15 +480,15 @@ color writes that survive the preceding tests.
 
 | Field | Unit | Meaning |
 |---|---|---|
-| `tcu_line_accesses` | lines | Texture cache-line access attempts presented to TCU; bypassed lines are included here and identified separately by `tcu_bypassed` |
-| `tcu_read_accesses` | lines | TCU cache-line read accesses issued by TextureUnit |
-| `tcu_hits` | lines | Texture reads satisfied by resident TCU lines |
-| `tcu_misses` | lines | Texture reads that require an SLC fill |
-| `tcu_evictions` | lines | Valid TCU lines displaced by replacement |
-| `tcu_writebacks` | lines | Dirty TCU lines written to SLC; the current read-only texture-sampling path leaves this zero |
-| `tcu_bypassed` | lines | Texture lines forwarded without TCU lookup or allocation |
-| `tcu_cycles` | cycles | Event-driven TCU service cycles |
-| `pixel_data_master_transactions` | transactions | Framebuffer transactions issued by PixelDM toward SLC |
+| `tcu_line_accesses` | lines | Legacy TCU cache-line access attempts; unified-memory model runs texture traffic through shared SLC and leaves TCU counters zero |
+| `tcu_read_accesses` | lines | Legacy TCU cache-line read accesses issued by TextureUnit |
+| `tcu_hits` | lines | Legacy texture reads satisfied by resident TCU lines |
+| `tcu_misses` | lines | Legacy texture reads that require an SLC fill |
+| `tcu_evictions` | lines | Legacy valid TCU lines displaced by replacement |
+| `tcu_writebacks` | lines | Legacy dirty TCU lines written to SLC |
+| `tcu_bypassed` | lines | Legacy texture lines forwarded without TCU lookup or allocation |
+| `tcu_cycles` | cycles | Legacy event-driven TCU service cycles |
+| `pixel_data_master_transactions` | transactions | Framebuffer writeback transactions issued by the PBE writeback boundary |
 | `pixel_data_master_bytes` | bytes | Framebuffer payload bytes issued by PixelDM |
 | `pixel_data_master_cycles` | cycles | Event-driven PixelDM service cycles |
 | `slc_line_accesses` | lines | Cache-line lookups actually performed by SLC |
@@ -495,28 +500,21 @@ color writes that survive the preceding tests.
 | `slc_writebacks` | lines | Dirty SLC lines written back to DRAM |
 | `slc_bypassed` | transactions | Transactions forwarded to DRAM without lookup or allocation |
 | `slc_cycles` | cycles | Event-driven SLC service cycles |
-| `dram_read_transactions` | transactions | Read transactions serviced by the DRAM model |
-| `dram_write_transactions` | transactions | Write transactions serviced by the DRAM model |
-| `dram_read_bytes` | bytes | Payload bytes returned by the DRAM model |
-| `dram_write_bytes` | bytes | Payload bytes committed by the DRAM model |
+| `dram_read_transactions` | transactions | Read transactions serviced by modeled DRAM (`bypass`/`cache` modes only) |
+| `dram_write_transactions` | transactions | Write transactions serviced by modeled DRAM (`bypass`/`cache` modes only) |
+| `dram_read_bytes` | bytes | Payload bytes returned by modeled DRAM |
+| `dram_write_bytes` | bytes | Payload bytes committed by modeled DRAM |
 | `dram_cycles` | cycles | Fixed-latency DRAM service cycles |
+| `memory_direct_read_bytes` | bytes | Fast functional reads from the authoritative DRAM backing (`direct` mode only) |
+| `memory_direct_write_bytes` | bytes | Fast functional writes to the authoritative DRAM backing (`direct` mode only) |
 | `framebuffer_dram_readback_bytes` | bytes | Final framebuffer bytes fetched from DRAM for PNG publication |
 
-The modeled texture-read route is `USC SMP → TextureUnit → TCU → SLC → DRAM`
-on a miss, followed by the response path back to the suspended USC lane. TCU
-uses 64-byte lines; its misses become SLC reads, where the lower cache uses
-128-byte lines. TextureUnit decodes the live public Rogue IMAGE/SAMPLER words;
-their address, extent, stride, mip count, filter, wrap, normalized-coordinate,
-and LOD fields drive execution. Parallel MemoryPool resource/sampler objects
-are ownership/cross-check metadata and cannot override the raw descriptor.
-The decoded filter turns one SMP request into one nearest read or four
-bilinear tap reads before returning one filtered response to USC. With TCU
-bypass enabled, access/read/bypass counters still describe the forwarded
-request while TCU hit/miss/eviction/writeback counters remain zero.
-
-The modeled framebuffer route remains
-`PBE → PixelDM → SLC (or SLC bypass) → DRAM → framebuffer readback → PNG` in
-both cache modes. The DRAM model uses fixed latency 1 for each request.
+The unified memory route keeps texture, vertex, index, parameter, and
+framebuffer persistent data in one DRAM backing. In `cache` mode GPU clients
+access that data through the shared SLC and dirty lines are flushed before final
+framebuffer readback. In `bypass` mode cache lookup/allocation is skipped while
+DRAM transactions are still modeled. In `direct` mode modules access the same
+authoritative backing directly for speed.
 With cache active, every 128-byte SLC writeback line is one request and final
 PNG readback is one exact-size bulk request; bypass uses one bulk write plus
 the same independent readback request. The PNG must be published only after

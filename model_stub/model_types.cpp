@@ -36,6 +36,25 @@ bool ParseOnOff(const char* text, bool* value) {
   return false;
 }
 
+bool ParseMemoryMode(const char *text, MemoryMode *mode) {
+  if (!text || !mode)
+    return false;
+  const std::string value(text);
+  if (value == "direct") {
+    *mode = MemoryMode::kDirect;
+    return true;
+  }
+  if (value == "bypass") {
+    *mode = MemoryMode::kBypass;
+    return true;
+  }
+  if (value == "cache") {
+    *mode = MemoryMode::kCache;
+    return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 bool ParseOptions(int argc, char** argv, Options* options) {
@@ -44,10 +63,13 @@ bool ParseOptions(int argc, char** argv, Options* options) {
     if (arg == "--help" || arg == "-h") {
       std::cout << "Usage: " << argv[0]
                 << " [--frames N] [--width N] [--height N] [--case NAME]"
-                   " [--outdir PATH] [--cache-bypass on|off]"
+                   " [--outdir PATH] [--memory-mode direct|bypass|cache]"
+                   " [--cache-bypass on|off]"
                    " [--driver-command PATH]\n"
-                   "  --cache-bypass off  Run the cache models (default)\n"
-                   "  --cache-bypass on   Bypass caches for faster simulation\n"
+                   "  --memory-mode cache   Run SLC/DRAM simulation (default)\n"
+                   "  --memory-mode bypass  Bypass cache but retain DRAM timing\n"
+                   "  --memory-mode direct  Direct DRAM backing access (fast)\n"
+                   "  --cache-bypass on|off Legacy alias for bypass|cache\n"
                    "  --driver-command PATH Ingest one pvrgpu.driver-command.v1 command\n";
       std::exit(0);
     }
@@ -71,18 +93,39 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       options->output_dir = value;
     } else if (arg == "--driver-command") {
       options->driver_command_path = value;
+    } else if (arg == "--memory-mode") {
+      if (!ParseMemoryMode(value, &options->memory_mode)) {
+        std::cerr << "Invalid value for --memory-mode: " << value
+                  << " (expected direct, bypass, or cache)\n";
+        return false;
+      }
+      options->cache_bypass = options->memory_mode == MemoryMode::kBypass;
     } else if (arg == "--cache-bypass") {
       if (!ParseOnOff(value, &options->cache_bypass)) {
         std::cerr << "Invalid value for --cache-bypass: " << value
                   << " (expected on or off)\n";
         return false;
       }
+      options->memory_mode = options->cache_bypass ? MemoryMode::kBypass
+                                                   : MemoryMode::kCache;
     } else {
       std::cerr << "Unknown option: " << arg << "\n";
       return false;
     }
   }
   return true;
+}
+
+const char *MemoryModeName(MemoryMode mode) {
+  switch (mode) {
+  case MemoryMode::kDirect:
+    return "direct";
+  case MemoryMode::kBypass:
+    return "bypass";
+  case MemoryMode::kCache:
+    return "cache";
+  }
+  return "invalid";
 }
 
 std::string JsonEscape(const std::string& value) {

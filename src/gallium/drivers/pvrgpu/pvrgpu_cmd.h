@@ -15,6 +15,8 @@ extern "C" {
 #define PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8 "PIPE_FORMAT_R8G8B8A8_UNORM"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_RGBX8 "PIPE_FORMAT_R8G8B8X8_UNORM"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_BGRX8 "PIPE_FORMAT_B8G8R8X8_UNORM"
+#define PVRGPU_DRIVER_COMMAND_FORMAT_R5G6B5 "PIPE_FORMAT_R5G6B5_UNORM"
+#define PVRGPU_DRIVER_COMMAND_FORMAT_B5G6R5 "PIPE_FORMAT_B5G6R5_UNORM"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_R10G10B10A2 "PIPE_FORMAT_R10G10B10A2_UNORM"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_B10G10R10A2 "PIPE_FORMAT_B10G10R10A2_UNORM"
 
@@ -62,6 +64,7 @@ struct pvrgpu_draw_primitive_sequence_command {
    uint32_t width;
    uint32_t height;
    const char *format;
+   const char *framebuffer_rgba8_path;
    uint32_t clear_color_bits[4];
    uint32_t draw_count;
    uint32_t ia_vertices;
@@ -75,6 +78,7 @@ struct pvrgpu_draw_primitive_sequence_command {
    uint64_t ps_invocations;
    uint32_t hs_invocations;
    uint32_t ds_invocations;
+   uint32_t cs_invocations;
    uint64_t semantic_texel_fetches;
 };
 

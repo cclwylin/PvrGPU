@@ -64,8 +64,10 @@ ChromeOS GLBench（20 cases）
   → Qt PvrGPU Control counter table/chart/image/log
 ```
 
-- `scripts/run-path-smoke.sh` 驗證真實 renderer string、counter report 與 PNG。
-- `scripts/run-pvrgpu-control.sh` 啟動 Qt/PySide6 控制台，能選 backend、case、sample、surface size，並啟停獨立 runner。
+- CMake/CTest 的 native smoke gates 驗證真實 renderer string、counter report 與 PNG。
+- `tools/rdc_counter_ui.py` 是目前的 PySide6 thin process 控制台，只負責
+  啟停獨立的 `llvmpipe`／`pvrgpu` backend；後續 native Qt/C++ UI 仍須
+  維持相同 process boundary，且需要正式 Qt 6 SDK。
 - iCloud workspace 只保存 source/documentation；venv、CMake/Ninja build、Mesa/GLBench checkout、runtime output、log 與 temporary files 統一放在 `$PVRGPU_WORK_ROOT`，預設為 `$HOME/Downloads/_Codex/Working/PvrGPU`，可用 `PVRGPU_WORK_ROOT` 改址。
 - 現行 llvmpipe report 包含 14 個 Gallium pipeline statistics，加上 `drawlists`、`setup_triangles`、`texel_fetches` 三個本地 telemetry extension；UI 標示為 `REP · llvmpipe`，不宣稱硬體 cycles/cache/bandwidth。
 - `pvrgpu-model-stub` 已實作 **`fill_solid`、`fill_solid_depth_never`、`fill_solid_depth_neq` function-correct slice**，以內建 GLBench command fixture實際執行 `VDM → VertexFetch → vertex PCO decode/USC ISS → ClipCull → Tiler → ParameterBuffer → fragment PCO decode → TileScheduler → ISP/HSR/depth → FragmentFrontend → USC ISS → TPU bypass → PBE → PixelDataMaster → SLC → DramModel → JsonReporter`。PBE 只產生 pre-memory RGBA；PNG writer 只能讀 `DramModel` backing 所建立的新 readback handle，不能直接讀 PBE payload。module 連線使用 bounded FIFO，bulk shader/primitive/tile/fragment/framebuffer data 均留在 generation-checked `MemoryPool`。Counter 標示 `modeled` / `MOD · PvrGPU`，timing 仍為 assumed/uncalibrated。
@@ -116,10 +118,16 @@ Qt/QProcess offscreen smoke 亦為 5/5 PASS：llvmpipe、PvrGPU Fill.Solid cache
 目前 33 個 module class 中，16 個位於 active Fill.Solid pipeline、3 個是已實作但尚未有 active workload traffic 的 cache controller、12 個仍是空 structural placeholder，另有 2 個 harness；不能把 idle cache controller或空 placeholder算成 benchmark feature coverage。
 
 ```bash
-./scripts/run-glbench-differential.sh fill_solid 64x64
-./scripts/run-glbench-differential.sh fill_solid_depth_never 64x64
-./scripts/run-glbench-differential.sh fill_solid_depth_neq 64x64
+cmake --build build --target llvmpipe pvrgpu
+python3 tools/rdc_counter_report.py \
+  --rdc-dir /path/to/supported-glbench-rdcs \
+  --manifest config/rdc-glbench-v1.tsv \
+  --golden-runner build/bin/llvmpipe \
+  --pvrgpu-runner build/bin/pvrgpu
 ```
+
+上述 executable 在 macOS/Linux 沒有 suffix；Windows 使用同名的
+`llvmpipe.exe` 與 `pvrgpu.exe`。
 
 下一個尚未通過的 gate 固定為 `fill_solid_blended`。在 alpha=1 GLBench differential 之外，必須先增加 alpha=0.5 與兩個重疊半透明 primitive 的 ordered blend unit/integration probes；未通過前不進 triangle、varying 或 texture。
 

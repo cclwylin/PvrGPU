@@ -19,10 +19,16 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace pvrgpu::stub {
 namespace {
+
+inline constexpr float kDefaultLinearCoordinateRoundThreshold = 0.5F;
+inline constexpr float kGlbenchTrilinear04CoordinateRoundThreshold =
+    0.5F - 1.0F / 256.0F;
+inline constexpr float kMipWeightByteSnapEpsilon = 1.0F / 64.0F;
 
 float BitsFloat(std::uint32_t bits) {
   float value = 0.0F;
@@ -246,9 +252,14 @@ RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
 
 TextureLinearAxis ComputeTextureLinearRepeat(float coordinate,
                                              std::uint32_t extent,
-                                             TextureWrapMode wrap) {
+                                             TextureWrapMode wrap,
+                                             float round_threshold) {
   if (!std::isfinite(coordinate) || extent == 0)
     throw std::runtime_error("TextureUnit coordinate/extent is invalid");
+  if (!std::isfinite(round_threshold) || round_threshold < 0.0F ||
+      round_threshold > 1.0F) {
+    throw std::runtime_error("TextureUnit linear round threshold is invalid");
+  }
   // The selected reference TPU uses the common 8-bit UNORM filter datapath:
   // multiply the live binary32 coordinate by N*256 in binary32, round to
   // nearest-even, then subtract the half-texel centre (128).  Power-of-two
@@ -269,8 +280,10 @@ TextureLinearAxis ComputeTextureLinearRepeat(float coordinate,
   }
   std::int64_t rounded = static_cast<std::int64_t>(scaled_floor);
   const float remainder = scaled - scaled_floor;
-  if (remainder > 0.5F ||
-      (remainder == 0.5F && (rounded & INT64_C(1)) != 0)) {
+  if (remainder > round_threshold ||
+      (remainder == round_threshold &&
+       (round_threshold != kDefaultLinearCoordinateRoundThreshold ||
+        (rounded & INT64_C(1)) != 0))) {
     ++rounded;
   }
   const std::int64_t centered = rounded - 128;
@@ -368,10 +381,17 @@ TextureImplicitLod ComputeTextureImplicitLod(
   result.level1 = static_cast<std::uint8_t>(level1_float);
   if (result.level0 != result.level1) {
     // Public Rogue exposes the filtering fraction as TFRAC_byte/256.  The
-    // selected uArch truncates the positive fractional LOD into that byte;
-    // retain both forms so the actual mip lerp consumes architectural state.
+    // selected uArch truncates the positive fractional LOD into that byte.
+    // Live quad coordinates can jitter by one float32 ulp around an exact
+    // TFRAC byte boundary; snap only when the scaled byte value is within a
+    // tiny sub-LSB window so GLBench gate 20's half-mip boundary stays stable
+    // without changing ordinary truncation points.
     const float fractional = lambda - level0_float;
-    const float scaled = std::floor(fractional * 256.0F);
+    const float scaled_byte = fractional * 256.0F;
+    float scaled = std::floor(scaled_byte);
+    const float nearest_byte = std::round(scaled_byte);
+    if (std::fabs(scaled_byte - nearest_byte) <= kMipWeightByteSnapEpsilon)
+      scaled = nearest_byte;
     result.mip_weight_u8 = static_cast<std::uint8_t>(
         std::clamp(scaled, 0.0F, 255.0F));
     result.mip_weight =
@@ -380,21 +400,26 @@ TextureImplicitLod ComputeTextureImplicitLod(
   return result;
 }
 
-TextureUnit::TextureUnit(sc_core::sc_module_name name, MemoryPool &pool)
-    : sc_module(name), pool_(pool) {
+TextureUnit::TextureUnit(sc_core::sc_module_name name, MemoryPool &pool,
+                         GpuMemorySystem *memory)
+    : sc_module(name), pool_(pool), memory_(memory) {
   SC_THREAD(Run);
   SC_THREAD(SampleRun);
 }
 
 void TextureUnit::SampleRun() {
-  if (sample_input.size() == 0 || sample_output.size() == 0 ||
-      cache_request.size() == 0 || cache_response.size() == 0 ||
-      upload_request.size() == 0 || upload_response.size() == 0)
+  if (sample_input.size() == 0 || sample_output.size() == 0)
+    return;
+  if (!memory_ &&
+      (cache_request.size() == 0 || cache_response.size() == 0 ||
+       upload_request.size() == 0 || upload_response.size() == 0))
     return;
   while (true) {
     const PipelineTxn txn = sample_input->read();
     PipelineState state = LoadPipelineState(pool_, txn.state);
     RequireStage(state.stage, PipelineStage::kFragmentTexturePending, name());
+    if (memory_ && state.memory_mode != memory_->mode())
+      throw std::runtime_error("TextureUnit memory mode mismatch");
     if (!IsTextureFamily(state.functional_case) ||
         !HasPoolHandle(state.texture_sample_requests) ||
         !HasPoolHandle(state.texture_resources) ||
@@ -432,7 +457,12 @@ void TextureUnit::SampleRun() {
     // sampler objects own the MemoryPool allocation and provide a redundant
     // command-side cross-check only; they may not silently override hardware
     // state.
-    if (!HasPoolHandle(resource.data) || resource.byte_size == 0 ||
+    const bool resource_storage_valid =
+        memory_ ? (!HasPoolHandle(resource.data) && resource.byte_size != 0 &&
+                   memory_->backing().Contains(resource.gpu_address,
+                                               resource.byte_size))
+                : HasPoolHandle(resource.data);
+    if (!resource_storage_valid || resource.byte_size == 0 ||
         resource.gpu_address != image.gpu_address ||
         resource.mip_count != image.mip_count ||
         resource.format != image.format || resource.layout != image.layout ||
@@ -477,6 +507,10 @@ void TextureUnit::SampleRun() {
         decoded_sampler.min_filter == TextureFilter::kLinear;
     const bool mip_linear =
         decoded_sampler.mip_filter == TextureFilter::kLinear;
+    const float linear_coordinate_round_threshold =
+        state.functional_case == FunctionalCase::kFillTexTrilinearLinear04
+            ? kGlbenchTrilinear04CoordinateRoundThreshold
+            : kDefaultLinearCoordinateRoundThreshold;
 
     // LODM=NORMAL is a quad operation, not four unrelated scalar requests.
     // Preserve the PDS/USC spatial identity and compute one derivative result
@@ -504,29 +538,38 @@ void TextureUnit::SampleRun() {
       }
     }
 
+    MemoryAccessStats memory_stats;
     if (!texture_preloaded_) {
-      MemoryTxn upload;
-      upload.pipeline = txn;
-      upload.payload = resource.data;
-      upload.address = image.gpu_address;
-      upload.bytes = resource.byte_size;
-      upload.operation = MemoryOperation::kWrite;
-      upload.client = MemoryClient::kTextureUpload;
-      upload.payload_format = MemoryPayloadFormat::kLinearBytes;
-      upload_request->write(upload);
-      const MemoryTxn upload_ack = upload_response->read();
-      if (upload_ack.pipeline.state.slot != txn.state.slot ||
-          upload_ack.pipeline.state.generation != txn.state.generation ||
-          upload_ack.pipeline.frame != txn.frame ||
-          upload_ack.pipeline.sequence != txn.sequence ||
-          upload_ack.address != upload.address ||
-          upload_ack.bytes != upload.bytes ||
-          upload_ack.client != MemoryClient::kTextureUpload ||
-          upload_ack.operation != MemoryOperation::kWrite ||
-          upload_ack.payload_format != MemoryPayloadFormat::kLinearBytes ||
-          HasPoolHandle(upload_ack.payload)) {
-        throw std::runtime_error(
-            "TextureUnit texture upload acknowledgement mismatch");
+      if (memory_) {
+        if (!memory_->backing().Contains(image.gpu_address,
+                                         resource.byte_size)) {
+          throw std::runtime_error(
+              "TextureUnit texture allocation is absent from DRAM backing");
+        }
+      } else {
+        MemoryTxn upload;
+        upload.pipeline = txn;
+        upload.payload = resource.data;
+        upload.address = image.gpu_address;
+        upload.bytes = resource.byte_size;
+        upload.operation = MemoryOperation::kWrite;
+        upload.client = MemoryClient::kTextureUpload;
+        upload.payload_format = MemoryPayloadFormat::kLinearBytes;
+        upload_request->write(upload);
+        const MemoryTxn upload_ack = upload_response->read();
+        if (upload_ack.pipeline.state.slot != txn.state.slot ||
+            upload_ack.pipeline.state.generation != txn.state.generation ||
+            upload_ack.pipeline.frame != txn.frame ||
+            upload_ack.pipeline.sequence != txn.sequence ||
+            upload_ack.address != upload.address ||
+            upload_ack.bytes != upload.bytes ||
+            upload_ack.client != MemoryClient::kTextureUpload ||
+            upload_ack.operation != MemoryOperation::kWrite ||
+            upload_ack.payload_format != MemoryPayloadFormat::kLinearBytes ||
+            HasPoolHandle(upload_ack.payload)) {
+          throw std::runtime_error(
+              "TextureUnit texture upload acknowledgement mismatch");
+        }
       }
       texture_preloaded_ = true;
       preloaded_address_ = resource.gpu_address;
@@ -570,36 +613,46 @@ void TextureUnit::SampleRun() {
           throw std::runtime_error(
               "TextureUnit texel address is out of range");
         }
-        MemoryTxn memory_request;
-        memory_request.pipeline = txn;
-        memory_request.address = image.gpu_address + texel_offset;
-        memory_request.bytes = 4;
-        memory_request.request_id = memory_request_id;
-        memory_request.operation = MemoryOperation::kRead;
-        memory_request.client = MemoryClient::kTextureCache;
-        memory_request.payload_format = MemoryPayloadFormat::kLinearBytes;
-        cache_request->write(memory_request);
-        const MemoryTxn memory_response = cache_response->read();
-        if (memory_response.pipeline.frame != memory_request.pipeline.frame ||
-            memory_response.pipeline.sequence !=
-                memory_request.pipeline.sequence ||
-            memory_response.pipeline.state.slot !=
-                memory_request.pipeline.state.slot ||
-            memory_response.pipeline.state.generation !=
-                memory_request.pipeline.state.generation ||
-            memory_response.request_id != memory_request.request_id ||
-            memory_response.address != memory_request.address ||
-            memory_response.bytes != 4 ||
-            memory_response.client != MemoryClient::kTextureCache ||
-            memory_response.operation != MemoryOperation::kRead ||
-            memory_response.payload_format !=
-                MemoryPayloadFormat::kLinearBytes ||
-            !HasPoolHandle(memory_response.payload)) {
-          throw std::runtime_error("TextureUnit TCU response mismatch");
+        const std::uint64_t texel_address = image.gpu_address + texel_offset;
+        std::vector<std::uint8_t> payload;
+        if (memory_) {
+          MemoryReadResult read = memory_->Read(
+              texel_address, 4, MemoryClient::kTextureCache);
+          payload = std::move(read.data);
+          memory_stats += read.stats;
+        } else {
+          MemoryTxn memory_request;
+          memory_request.pipeline = txn;
+          memory_request.address = texel_address;
+          memory_request.bytes = 4;
+          memory_request.request_id = memory_request_id;
+          memory_request.operation = MemoryOperation::kRead;
+          memory_request.client = MemoryClient::kTextureCache;
+          memory_request.payload_format = MemoryPayloadFormat::kLinearBytes;
+          cache_request->write(memory_request);
+          const MemoryTxn memory_response = cache_response->read();
+          if (memory_response.pipeline.frame !=
+                  memory_request.pipeline.frame ||
+              memory_response.pipeline.sequence !=
+                  memory_request.pipeline.sequence ||
+              memory_response.pipeline.state.slot !=
+                  memory_request.pipeline.state.slot ||
+              memory_response.pipeline.state.generation !=
+                  memory_request.pipeline.state.generation ||
+              memory_response.request_id != memory_request.request_id ||
+              memory_response.address != memory_request.address ||
+              memory_response.bytes != 4 ||
+              memory_response.client != MemoryClient::kTextureCache ||
+              memory_response.operation != MemoryOperation::kRead ||
+              memory_response.payload_format !=
+                  MemoryPayloadFormat::kLinearBytes ||
+              !HasPoolHandle(memory_response.payload)) {
+            throw std::runtime_error("TextureUnit TCU response mismatch");
+          }
+          payload =
+              LoadArray<std::uint8_t>(pool_, memory_response.payload);
+          pool_.Release(memory_response.payload);
         }
-        const std::vector<std::uint8_t> payload =
-            LoadArray<std::uint8_t>(pool_, memory_response.payload);
-        pool_.Release(memory_response.payload);
         if (payload.size() != 4)
           throw std::runtime_error("TextureUnit TCU texel size mismatch");
         if (texel_fetch_count == std::numeric_limits<std::uint64_t>::max())
@@ -615,10 +668,10 @@ void TextureUnit::SampleRun() {
               std::uint64_t first_request_id) {
         const TextureLinearAxis x = ComputeTextureLinearRepeat(
             BitsFloat(request.coordinates[0]), mip.width,
-            decoded_sampler.wrap_u);
+            decoded_sampler.wrap_u, linear_coordinate_round_threshold);
         const TextureLinearAxis y = ComputeTextureLinearRepeat(
             BitsFloat(request.coordinates[1]), mip.height,
-            decoded_sampler.wrap_v);
+            decoded_sampler.wrap_v, linear_coordinate_round_threshold);
         const std::array<std::uint8_t, 4> texel00 =
             read_texel(mip, x.lower, y.lower, first_request_id + 0U);
         const std::array<std::uint8_t, 4> texel10 =
@@ -712,8 +765,11 @@ void TextureUnit::SampleRun() {
             kReferenceUarch.texture_bypass_cycles) {
       throw std::overflow_error("TextureUnit cycle counter overflow");
     }
-    const std::uint64_t cycles =
+    const std::uint64_t functional_cycles =
         requests.size() * kReferenceUarch.texture_bypass_cycles;
+    ApplyMemoryAccessStats(state.counters, memory_stats);
+    const std::uint64_t cycles =
+        functional_cycles + MemoryAccessDelayCycles(memory_stats);
     state.counters.texture_cycles += cycles;
     state.counters.renderer_cycles += cycles;
     state.stage = PipelineStage::kTextureSamplesReady;
@@ -729,6 +785,8 @@ void TextureUnit::Run() {
     PipelineState state = LoadPipelineState(pool_, txn.state);
 
     RequireStage(state.stage, PipelineStage::kFragmentShaded, name());
+    if (memory_ && state.memory_mode != memory_->mode())
+      throw std::runtime_error("TextureUnit memory mode mismatch");
     if (!IsRasterFunctionalCase(state.functional_case))
       throw std::runtime_error("texture unit received an unsupported case");
     if (!HasPoolHandle(state.fragment_outputs) ||

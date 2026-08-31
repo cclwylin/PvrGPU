@@ -23,8 +23,10 @@ The short version:
 - Phase 4 driver bring-up can now observe `glTexImage2D` RGBA8 upload, fragment sampler view binding, nearest/clamp sampler state, and one textured `glDrawArrays(GL_TRIANGLES, 0, 3)` path via `event=draw_textured_triangles`. This is still counter-only, not texture sampling pixel correctness.
 - Phase 5 driver bring-up can now observe texture-backed FBO attachment/framebuffer-state traffic, FBO clear/readback, same-format 2D copy/blit traffic, one triangle draw into the FBO, and `glFlush`/`glFinish` visibility via driver counters. This is still counter-only for draw/sync correctness; scaled blits and resolves are not implemented.
 - Phase 6 driver bring-up can now retain GLES2 uniform uploads as Gallium constant-buffer state, expose first payload words in the driver counter log, and observe one uniform-driven triangle via `event=draw_uniform_triangles`. This is still counter-only, not uniform math or UBO/model correctness.
-- `scripts/install-pvrgpu-mesa-driver.sh` installs the skeleton into a Mesa source tree.
-- `scripts/check-pvrgpu-mesa-driver-build.sh` verifies the Mesa build seam with `-Dgallium-drivers=llvmpipe,zink,pvrgpu`.
+- `src/gallium/drivers/pvrgpu/meson.build` is the Mesa integration seam for
+  `-Dgallium-drivers=llvmpipe,zink,pvrgpu`.
+- The native single-RDC entry points are built as `llvmpipe` and `pvrgpu`.
+  They keep RenderDoc/Mesa/SystemC outside the UI process.
 
 ## Important Documents
 
@@ -59,29 +61,79 @@ export PVRGPU_WORK_ROOT=/path/to/working/PvrGPU
 ## Build and Smoke Checks
 
 ```bash
-./scripts/build.sh
-./scripts/check-source-tree.sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build
+ctest --test-dir build --output-on-failure
+python3 tests/check_source_tree.py --root .
 PYTHONPATH=tools PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
 
-## Driver Command and Counter Smoke
+CMake uses native executable suffixes. The paths shown in this document are
+for macOS/Linux, where the files are `build/bin/llvmpipe`,
+`build/bin/pvrgpu`, and `build/bin/pvrgpu-model-stub`. Windows produces the
+same targets as `llvmpipe.exe`, `pvrgpu.exe`, and
+`pvrgpu-model-stub.exe`; append `.exe` to the command paths below.
 
-Install and compile-check the Mesa driver seam:
+The two RDC targets are compiled entry points, not monolithic Mesa/RenderDoc
+links. They directly launch the pinned `renderdoc-mesa-player` with the
+backend-specific Mesa prefix; `pvrgpu` then loads the built SystemC bridge (or
+falls back to `pvrgpu-model-stub`). Keep those machine-specific sidecar paths
+in `config/local.env` so every run records and reuses the same runtime.
+
+## RDC Comparison UI
+
+The current UI is the retained PySide6 thin process front end. It launches the
+native backend executables; it does not load Mesa or SystemC into the UI
+process:
 
 ```bash
-./scripts/check-pvrgpu-mesa-driver-build.sh --platforms macos --full-dri --install
-./scripts/run-pvrgpu-mesa-driver-smoke.sh --size 16x16
-./scripts/run-pvrgpu-mesa-driver-triangle-smoke.sh --size 16x16
-./scripts/run-pvrgpu-mesa-driver-phase3-state-smoke.sh --size 16x16
-./scripts/run-pvrgpu-mesa-driver-phase4-texture-smoke.sh --size 16x16
-./scripts/run-pvrgpu-mesa-driver-phase5-fbo-smoke.sh --size 16x16 --fbo-size 8x8
-./scripts/run-pvrgpu-mesa-driver-phase6-uniform-smoke.sh --size 16x16
+python3 -m venv "$HOME/Downloads/_Codex/Working/PvrGPU/venv"
+"$HOME/Downloads/_Codex/Working/PvrGPU/venv/bin/python" \
+  -m pip install -r requirements-ui.txt
+PVRGPU_BUILD_DIR="$PWD/build" \
+  "$HOME/Downloads/_Codex/Working/PvrGPU/venv/bin/python" \
+  tools/rdc_counter_ui.py
 ```
+
+A native Qt/C++ UI is follow-up work and requires a Qt 6 C++ SDK. The batch
+PASS gate already requires both the normalized 17-counter comparison and the
+decoded-RGBA PNG comparison to pass, except for captures with explicit
+no-color evidence. See [docs/RDC_COUNTER_UI.md](docs/RDC_COUNTER_UI.md).
+
+## Driver Command and Counter Smoke
+
+Build the two native replay entry points and run the registered native smoke
+tests:
+
+```bash
+cmake --build build --target llvmpipe pvrgpu
+ctest --test-dir build --output-on-failure
+```
+
+Each player accepts the same single-capture contract. It writes all raw and
+normalized artifacts below the requested output directory:
+
+```bash
+build/bin/llvmpipe \
+  /path/to/file.rdc \
+  --case fill_solid --width 512 --height 512 \
+  --outdir /tmp/pvrgpu-golden
+
+build/bin/pvrgpu \
+  /path/to/file.rdc \
+  --case fill_solid --width 512 --height 512 \
+  --outdir /tmp/pvrgpu-model
+```
+
+For worker compatibility, both players also accept the input as
+`--rdc /path/to/file.rdc` instead of the positional argument.
 
 The checked-in model can consume one clear command emitted by the Gallium skeleton:
 
 ```bash
-pvrgpu-model-stub --driver-command /path/to/command.txt --outdir /tmp/pvrgpu-driver-smoke
+build/bin/pvrgpu-model-stub \
+  --driver-command /path/to/command.txt \
+  --outdir /tmp/pvrgpu-driver-smoke
 ```
 
 That command path is deliberately small:
@@ -121,13 +173,13 @@ $HOME/Downloads/_Codex/Working/deqp
 List the Phase 0-6 contract:
 
 ```bash
-./scripts/run-deqp-capture-rdc-report.sh --list-phases
+python3 tools/deqp_capture_report.py --list-phases
 ```
 
 Catalog captures without running dEQP binaries:
 
 ```bash
-./scripts/run-deqp-capture-rdc-report.sh \
+python3 tools/deqp_capture_report.py \
   --rdc-dir "$HOME/Downloads/_Codex/Working/deqp" \
   --phase-max 6
 ```
@@ -135,21 +187,23 @@ Catalog captures without running dEQP binaries:
 Run one golden replay:
 
 ```bash
-./scripts/run-deqp-capture-rdc-report.sh \
+python3 tools/deqp_capture_report.py \
   --rdc-dir "$HOME/Downloads/_Codex/Working/deqp" \
   --phase 1 \
   --limit 1 \
-  --run-golden
+  --run-golden \
+  --golden-runner build/bin/llvmpipe
 ```
 
 Probe the current PrvGPU hook:
 
 ```bash
-./scripts/run-deqp-capture-rdc-report.sh \
+python3 tools/deqp_capture_report.py \
   --rdc-dir "$HOME/Downloads/_Codex/Working/deqp" \
   --phase 6 \
   --limit 1 \
-  --run-pvrgpu
+  --run-pvrgpu \
+  --pvrgpu-runner build/bin/pvrgpu
 ```
 
 ## GitHub Notes

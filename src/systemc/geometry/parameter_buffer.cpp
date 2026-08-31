@@ -115,8 +115,18 @@ BuildPlane(const pvrgpu::stub::RasterTriangle &triangle,
 
 namespace pvrgpu::stub {
 
-ParameterBuffer::ParameterBuffer(sc_core::sc_module_name name, MemoryPool &pool)
-    : sc_module(name), pool_(pool) {
+namespace {
+
+inline constexpr std::uint64_t kParameterTrianglesGpuAddress =
+    UINT64_C(0x30000000);
+inline constexpr std::uint64_t kParameterCoefficientsGpuAddress =
+    UINT64_C(0x34000000);
+
+} // namespace
+
+ParameterBuffer::ParameterBuffer(sc_core::sc_module_name name, MemoryPool &pool,
+                                 GpuMemorySystem *memory)
+    : sc_module(name), pool_(pool), memory_(memory) {
   SC_THREAD(Run);
 }
 
@@ -126,6 +136,8 @@ void ParameterBuffer::Run() {
     PipelineState state = LoadPipelineState(pool_, txn.state);
 
     RequireStage(state.stage, PipelineStage::kTiled, name());
+    if (memory_ && state.memory_mode != memory_->mode())
+      throw std::runtime_error("ParameterBuffer memory mode mismatch");
     if (!HasPoolHandle(state.raster_triangles))
       throw std::runtime_error("ParameterBuffer received no raster triangles");
     const std::vector<RasterTriangle> triangles =
@@ -336,9 +348,35 @@ void ParameterBuffer::Run() {
       parameters.push_back(parameter);
     }
 
-    state.parameter_triangles = StoreNewArray(pool_, parameters);
+    MemoryAccessStats memory_stats;
+    if (memory_) {
+      state.parameter_triangles = {};
+      state.parameter_triangles_gpu_address =
+          parameters.empty() ? 0 : kParameterTrianglesGpuAddress;
+      state.parameter_triangles_bytes =
+          static_cast<std::uint64_t>(parameters.size()) *
+          sizeof(ParameterTriangle);
+      memory_stats += WriteMemoryArray(*memory_,
+                                      state.parameter_triangles_gpu_address,
+                                      parameters,
+                                      MemoryClient::kParameterWrite);
+    } else {
+      state.parameter_triangles = StoreNewArray(pool_, parameters);
+    }
     if (UsesShaderVaryings(state.functional_case)) {
-      state.parameter_coefficients = StoreNewArray(pool_, coefficients);
+      if (memory_) {
+        state.parameter_coefficients = {};
+        state.parameter_coefficients_gpu_address =
+            coefficients.empty() ? 0 : kParameterCoefficientsGpuAddress;
+        state.parameter_coefficients_bytes =
+            static_cast<std::uint64_t>(coefficients.size()) *
+            sizeof(ParameterCoefficientSet);
+        memory_stats += WriteMemoryArray(
+            *memory_, state.parameter_coefficients_gpu_address, coefficients,
+            MemoryClient::kParameterWrite);
+      } else {
+        state.parameter_coefficients = StoreNewArray(pool_, coefficients);
+      }
       state.counters.parameter_coefficient_sets = coefficients.size();
       state.counters.parameter_write_bytes =
           static_cast<std::uint64_t>(coefficients.size()) *
@@ -349,13 +387,18 @@ void ParameterBuffer::Run() {
             "ParameterBuffer generated coefficients for a solid case");
       state.counters.parameter_coefficient_sets = 0;
       state.counters.parameter_write_bytes = 0;
+      state.parameter_coefficients_gpu_address = 0;
+      state.parameter_coefficients_bytes = 0;
     }
     state.stage = PipelineStage::kParameterBufferReady;
 
-    const std::uint64_t cycles =
+    const std::uint64_t functional_cycles =
         kReferenceUarch.parameter_base_cycles +
         CeilDivide(state.counters.setup_triangles,
                    kReferenceUarch.parameter_triangles_per_batch);
+    ApplyMemoryAccessStats(state.counters, memory_stats);
+    const std::uint64_t cycles =
+        functional_cycles + MemoryAccessDelayCycles(memory_stats);
     state.counters.parameter_buffer_cycles = cycles;
     state.counters.tiler_cycles += cycles;
     WaitForCycles(cycles);

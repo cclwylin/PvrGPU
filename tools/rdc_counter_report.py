@@ -55,6 +55,17 @@ CANCEL_GRACE_SECONDS = 0.75
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
+def native_executable_name(name: str) -> str:
+    return f"{name}.exe" if os.name == "nt" else name
+
+
+def default_runner_path(work_root: Path, name: str) -> Path:
+    build_root = Path(
+        os.environ.get("PVRGPU_BUILD_DIR", str(work_root / "build"))
+    ).expanduser()
+    return build_root / "bin" / native_executable_name(name)
+
+
 class BatchSetupError(RuntimeError):
     """A run-level configuration error that prevents discovery/execution."""
 
@@ -201,7 +212,7 @@ def parse_trace_draw_actions(path: Path) -> int | None:
     return None
 
 
-def trace_draw_actions_from_counter_text(counter_text: str) -> int:
+def counter_values_from_text(counter_text: str) -> dict[str, int]:
     counters: dict[str, int] = {}
     for raw_line in counter_text.splitlines():
         line = raw_line.strip()
@@ -211,7 +222,52 @@ def trace_draw_actions_from_counter_text(counter_text: str) -> int:
         if name not in STANDARD_COUNTER_FIELDS:
             continue
         counters[name] = int(value_text, 10)
+    return counters
+
+
+def trace_draw_actions_from_counter_text(counter_text: str) -> int:
+    counters = counter_values_from_text(counter_text)
     return counters.get("drawlists", 0)
+
+
+def png_compare_skip_reason_from_golden_counter(counter_text: str) -> str:
+    """Return a reason when the selected counter row has no color writes.
+
+    RenderDoc's replay PNG is a final framebuffer snapshot.  It is only a
+    strict oracle for this batch when the selected API work actually writes
+    color.  Clear-only captures still keep PNG comparison enabled because a
+    clear is a real framebuffer write even though it has no pixel shader
+    invocations.
+    """
+
+    counters = counter_values_from_text(counter_text)
+    if counters.get("drawlists", 0) > 0 and counters.get("ps_invocations", 0) == 0:
+        return (
+            "Selected draw counter has drawlists but ps_invocations=0; "
+            "no measured framebuffer color writes, so the replay PNG is not "
+            "used as this frame's comparison oracle."
+        )
+    return ""
+
+
+def golden_player_logs_no_color_output(golden_dir: Path) -> bool:
+    """Return true when the Golden player says the selected replay has no color target."""
+
+    for relative in (
+        "player-wrapper.stdout.log",
+        "stdout.log",
+        "player.stdout.log",
+    ):
+        log_path = golden_dir / relative
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if re.search(r"(?m)^Color output:\s*none\s*$", text):
+            return True
+        if "selected replay range has no color output" in text:
+            return True
+    return False
 
 
 def paeth_predictor(left: int, above: int, upper_left: int) -> int:
@@ -556,6 +612,18 @@ def sanitize_runner_case(value: str, fallback: str) -> str:
     return cleaned[:128] or fallback
 
 
+def natural_path_sort_key(value: str) -> tuple[tuple[int, object], ...]:
+    parts: list[tuple[int, object]] = []
+    for part in re.split(r"([0-9]+)", value):
+        if not part:
+            continue
+        if part.isdigit():
+            parts.append((0, int(part)))
+        else:
+            parts.append((1, part.casefold()))
+    return tuple(parts)
+
+
 def discover_rdcs(root: Path, manifest: Mapping[str, ManifestEntry]) -> list[DiscoveredRdc]:
     if not root.is_dir():
         raise BatchSetupError(f"RDC directory does not exist: {root}")
@@ -573,7 +641,10 @@ def discover_rdcs(root: Path, manifest: Mapping[str, ManifestEntry]) -> list[Dis
         error = walk_errors[0]
         raise BatchSetupError(f"Cannot scan RDC directory: {error}")
     paths.sort(
-        key=lambda path: (path.relative_to(root).as_posix().casefold(), path.as_posix())
+        key=lambda path: (
+            natural_path_sort_key(path.relative_to(root).as_posix()),
+            path.as_posix(),
+        )
     )
     discovered: list[DiscoveredRdc] = []
     for path in paths:
@@ -631,22 +702,20 @@ class DirectoryCounterRun:
         output_root: Path,
         manifest_path: Path,
         golden_runner: Path,
-        pvrgpu_runner: Path | None,
+        pvrgpu_runner: Path,
         timeout_seconds: float,
         require_manifest: bool,
+        reuse_golden_cache: bool,
         events: EventSink,
     ) -> None:
         self.input_root = input_root.expanduser().resolve()
         self.output_root = output_root.expanduser().resolve()
         self.manifest_path = manifest_path.expanduser().resolve()
         self.golden_runner = golden_runner.expanduser().resolve()
-        self.pvrgpu_runner = (
-            pvrgpu_runner.expanduser().resolve()
-            if pvrgpu_runner is not None
-            else None
-        )
+        self.pvrgpu_runner = pvrgpu_runner.expanduser().resolve()
         self.timeout_seconds = timeout_seconds
         self.require_manifest = require_manifest
+        self.reuse_golden_cache = reuse_golden_cache
         self.events = events
         self.cancel_requested = False
         self.cancel_requested_at: float | None = None
@@ -656,6 +725,7 @@ class DirectoryCounterRun:
         self.golden_cache_dir = self.output_root / "golden-cache"
         self.golden_counter_cache_index: dict[str, Path] = {}
         self.golden_png_cache_index: dict[str, Path] = {}
+        self.golden_no_color_output_cache_index: set[str] = set()
 
     def request_cancel(self) -> None:
         if not self.cancel_requested:
@@ -663,12 +733,6 @@ class DirectoryCounterRun:
             self.cancel_requested_at = time.monotonic()
         if self.active_process is not None:
             self._terminate_process(self.active_process)
-
-    @staticmethod
-    def _runner_argv(path: Path) -> list[str]:
-        if path.suffix.lower() == ".sh":
-            return ["bash", str(path)]
-        return [str(path)]
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen[bytes]) -> None:
@@ -849,6 +913,8 @@ class DirectoryCounterRun:
 
     def _build_golden_counter_cache_index(self) -> dict[str, Path]:
         index: dict[str, Path] = {}
+        if not self.reuse_golden_cache:
+            return index
 
         if self.golden_cache_dir.is_dir():
             for counter_path in self.golden_cache_dir.glob("*/counter_golden.txt"):
@@ -862,6 +928,18 @@ class DirectoryCounterRun:
                     cached_png = counter_path.parent / "golden.png"
                     if self._valid_png_path(cached_png):
                         self.golden_png_cache_index[digest] = cached_png
+                    metadata_path = counter_path.parent / "metadata.json"
+                    try:
+                        metadata = json.loads(
+                            metadata_path.read_text(encoding="utf-8")
+                        )
+                    except (OSError, UnicodeError, json.JSONDecodeError):
+                        metadata = {}
+                    if (
+                        isinstance(metadata, dict)
+                        and metadata.get("no_color_output") is True
+                    ):
+                        self.golden_no_color_output_cache_index.add(digest)
 
         for run_root in sorted(self.output_root.glob("rdc-counter-*"), reverse=True):
             cases_root = run_root / "cases"
@@ -897,6 +975,10 @@ class DirectoryCounterRun:
                             golden_png = self._find_golden_png(result_path.parent / "golden")
                             if golden_png is not None:
                                 self.golden_png_cache_index[digest] = golden_png
+                        if golden_player_logs_no_color_output(
+                            result_path.parent / "golden"
+                        ):
+                            self.golden_no_color_output_cache_index.add(digest)
                         break
         return index
 
@@ -933,6 +1015,19 @@ class DirectoryCounterRun:
         value = metadata.get("trace_draw_actions")
         return value if isinstance(value, int) and value >= 0 else None
 
+    def _lookup_golden_no_color_output_cache(self, sha256: str) -> bool:
+        if sha256 in self.golden_no_color_output_cache_index:
+            return True
+        metadata_path = self.golden_cache_dir / sha256 / "metadata.json"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        if isinstance(metadata, dict) and metadata.get("no_color_output") is True:
+            self.golden_no_color_output_cache_index.add(sha256)
+            return True
+        return False
+
     def _store_golden_counter_cache(
         self,
         *,
@@ -941,6 +1036,7 @@ class DirectoryCounterRun:
         source_counter: Path,
         source_png: Path | None = None,
         trace_draw_actions: int | None = None,
+        no_color_output: bool = False,
     ) -> None:
         cache_dir = self.golden_cache_dir / sha256
         counter_path = cache_dir / "counter_golden.txt"
@@ -951,6 +1047,8 @@ class DirectoryCounterRun:
             self._copy_png_artifact(source_png, png_path)
             cached_png = str(png_path)
             self.golden_png_cache_index[sha256] = png_path
+        elif png_path.exists():
+            png_path.unlink()
         atomic_write_text(
             cache_dir / "metadata.json",
             json.dumps(
@@ -962,6 +1060,7 @@ class DirectoryCounterRun:
                     "source_png": str(source_png) if source_png is not None else "",
                     "cached_png": cached_png,
                     "trace_draw_actions": trace_draw_actions,
+                    "no_color_output": no_color_output,
                     "created_at": utc_now(),
                 },
                 ensure_ascii=False,
@@ -970,6 +1069,10 @@ class DirectoryCounterRun:
             + "\n",
         )
         self.golden_counter_cache_index[sha256] = counter_path
+        if no_color_output:
+            self.golden_no_color_output_cache_index.add(sha256)
+        else:
+            self.golden_no_color_output_cache_index.discard(sha256)
 
     def _entry_for_item(self, item: DiscoveredRdc) -> tuple[ManifestEntry | None, bool]:
         if item.manifest is not None:
@@ -997,10 +1100,20 @@ class DirectoryCounterRun:
         input_dir = case_root / "input"
         input_dir.mkdir(parents=True, exist_ok=True)
         staged = input_dir / Path(entry.rdc_path).name
+        source = item.path.resolve()
         try:
-            staged.symlink_to(item.path.resolve())
-        except OSError as exc:
-            raise RunnerFailure(f"Could not stage RDC input: {exc}") from exc
+            staged.symlink_to(source)
+        except OSError as symlink_error:
+            try:
+                os.link(source, staged)
+            except OSError:
+                try:
+                    shutil.copy2(source, staged)
+                except OSError as copy_error:
+                    raise RunnerFailure(
+                        "Could not stage RDC input by symlink, hardlink, or "
+                        f"copy: {copy_error}; symlink error: {symlink_error}"
+                    ) from copy_error
         return staged
 
     def _run_one(self, item: DiscoveredRdc, index: int, total: int) -> CaseResult:
@@ -1023,6 +1136,7 @@ class DirectoryCounterRun:
             artifact_dir=f"cases/{case_dir_name}",
         )
         trace_draw_actions: int | None = None
+        golden_no_color_output = False
 
         self.events.emit(
             "rdc_started",
@@ -1068,7 +1182,11 @@ class DirectoryCounterRun:
         golden_dir = case_root / "golden"
         golden_dir.mkdir()
         golden_counter = case_root / "counter_golden.txt"
-        cached_golden_counter = self._lookup_golden_counter_cache(item.sha256)
+        cached_golden_counter = (
+            self._lookup_golden_counter_cache(item.sha256)
+            if self.reuse_golden_cache
+            else None
+        )
         if cached_golden_counter is not None:
             try:
                 counter_text = normalized_counter_text_from_file(cached_golden_counter)
@@ -1084,7 +1202,23 @@ class DirectoryCounterRun:
                         counter_text
                     )
                 result.trace_draw_actions = trace_draw_actions
-                cached_golden_png = self._lookup_golden_png_cache(item.sha256)
+                golden_no_color_output = self._lookup_golden_no_color_output_cache(
+                    item.sha256
+                )
+                cached_golden_png = (
+                    None
+                    if golden_no_color_output
+                    else self._lookup_golden_png_cache(item.sha256)
+                )
+                if (
+                    cached_golden_png is None
+                    and not golden_no_color_output
+                    and not png_compare_skip_reason_from_golden_counter(counter_text)
+                ):
+                    raise CounterProtocolError(
+                        "cached Golden result has no framebuffer PNG or "
+                        "explicit no-color evidence"
+                    )
                 if cached_golden_png is not None:
                     case_golden_png = self._copy_png_artifact(
                         cached_golden_png, case_root / "golden.png"
@@ -1106,7 +1240,7 @@ class DirectoryCounterRun:
             try:
                 self._run_command(
                     [
-                        *self._runner_argv(self.golden_runner),
+                        str(self.golden_runner),
                         *runner_arguments,
                         "--outdir",
                         str(golden_dir),
@@ -1140,12 +1274,14 @@ class DirectoryCounterRun:
                     result.golden_png = self._relative_artifact_path(
                         case_root, case_golden_png
                     )
+                golden_no_color_output = golden_player_logs_no_color_output(golden_dir)
                 self._store_golden_counter_cache(
                     sha256=item.sha256,
                     counter_text=counter_text,
                     source_counter=golden_counter,
                     source_png=case_golden_png,
                     trace_draw_actions=trace_draw_actions,
+                    no_color_output=golden_no_color_output,
                 )
                 result.golden = "PASS"
                 result.golden_counter = golden_counter.name
@@ -1189,14 +1325,13 @@ class DirectoryCounterRun:
             pvrgpu_environment["PVRGPU_RDC_TRACE_DRAW_ACTIONS"] = str(
                 trace_draw_actions
             )
-        assert self.pvrgpu_runner is not None
         try:
             self._run_command(
                 [
-                    *self._runner_argv(self.pvrgpu_runner),
+                    str(self.pvrgpu_runner),
                     *pvrgpu_runner_arguments,
                     "--outdir",
-                    str(pvrgpu_dir / "png"),
+                    str(pvrgpu_dir),
                 ],
                 stdout_path=pvrgpu_dir / "stdout.jsonl",
                 stderr_path=pvrgpu_dir / "stderr.log",
@@ -1259,17 +1394,51 @@ class DirectoryCounterRun:
         pvrgpu_png_path = (
             case_root / result.pvrgpu_png if result.pvrgpu_png else None
         )
-        if golden_png_path is None and pvrgpu_png_path is None:
+        png_skip_reason = png_compare_skip_reason_from_golden_counter(golden_text)
+        if not png_skip_reason and golden_no_color_output:
+            png_skip_reason = (
+                "Golden RenderDoc replay selected range has no color output; "
+                "no framebuffer PNG is used as this frame's comparison oracle."
+            )
+        if png_skip_reason:
+            png_skip_path = case_root / "png_skip.txt"
+            atomic_write_text(
+                png_skip_path,
+                "\n".join(
+                    (
+                        "PNG framebuffer comparison: SKIP",
+                        f"reason={png_skip_reason}",
+                        f"golden_png={result.golden_png}",
+                        f"pvrgpu_png={result.pvrgpu_png}",
+                    )
+                )
+                + "\n",
+            )
             result.png = "SKIP"
+            result.png_diff = png_skip_path.name
             self._emit_stage(index, "png", "SKIP")
         elif golden_png_path is None or pvrgpu_png_path is None:
             result.png = "FAIL"
-            missing_side = "Golden" if golden_png_path is None else "PvrGPU"
-            existing_side = "PvrGPU" if golden_png_path is None else "Golden"
-            message = (
-                f"{missing_side} PNG output is missing while {existing_side} "
-                "wrote a framebuffer PNG"
-            )
+            missing_sides = [
+                side
+                for side, path in (
+                    ("Golden", golden_png_path),
+                    ("PvrGPU", pvrgpu_png_path),
+                )
+                if path is None
+            ]
+            if len(missing_sides) == 2:
+                message = (
+                    "Golden and PvrGPU PNG outputs are both missing without "
+                    "explicit no-color evidence"
+                )
+            else:
+                missing_side = missing_sides[0]
+                existing_side = "PvrGPU" if missing_side == "Golden" else "Golden"
+                message = (
+                    f"{missing_side} PNG output is missing while {existing_side} "
+                    "wrote a framebuffer PNG"
+                )
             png_diff_path = case_root / "png_diff.txt"
             atomic_write_text(
                 png_diff_path,
@@ -1384,7 +1553,10 @@ class DirectoryCounterRun:
             f"- PASS: **{passed}**",
             f"- FAIL: **{failed}**",
             "- Comparison: normalized 17-counter exact text comparison",
-            "- PNG comparison: decoded RGBA exact comparison when either side writes a framebuffer PNG",
+            (
+                "- PNG comparison: decoded RGBA exact comparison when the "
+                "selected frame has measured framebuffer color writes"
+            ),
         ]
         if global_reason:
             lines.append(f"- Note: {self._markdown_text(global_reason)}")
@@ -1477,26 +1649,12 @@ class DirectoryCounterRun:
             )
         for label, runner in (
             ("Golden", self.golden_runner),
+            ("PvrGPU", self.pvrgpu_runner),
         ):
             if not runner.is_file():
                 raise BatchSetupError(f"{label} runner does not exist: {runner}")
-            if runner.suffix.lower() != ".sh" and not os.access(runner, os.X_OK):
+            if os.name != "nt" and not os.access(runner, os.X_OK):
                 raise BatchSetupError(f"{label} runner is not executable: {runner}")
-        if self.pvrgpu_runner is None:
-            raise BatchSetupError(
-                "PvrGPU runner must be specified explicitly; the legacy "
-                "trace-capsule runner has been removed."
-            )
-        if not self.pvrgpu_runner.is_file():
-            raise BatchSetupError(
-                f"PvrGPU runner does not exist: {self.pvrgpu_runner}"
-            )
-        if self.pvrgpu_runner.suffix.lower() != ".sh" and not os.access(
-            self.pvrgpu_runner, os.X_OK
-        ):
-            raise BatchSetupError(
-                f"PvrGPU runner is not executable: {self.pvrgpu_runner}"
-            )
 
         manifest = load_manifest(self.manifest_path)
         discovered = discover_rdcs(self.input_root, manifest)
@@ -1575,8 +1733,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser = argparse.ArgumentParser(
         description=(
-            "Recursively run Golden/PvrGPU counter comparison for every RDC and "
-            "write report.md."
+            "Recursively run Golden/PvrGPU counter and framebuffer comparison "
+            "for every RDC and write report.md."
         )
     )
     parser.add_argument(
@@ -1605,17 +1763,24 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--golden-runner",
         type=Path,
-        default=PROJECT_ROOT / "scripts" / "run-rdc-golden-counter.sh",
+        default=Path(
+            os.environ.get(
+                "PVRGPU_RDC_GOLDEN_RUNNER",
+                str(default_runner_path(work_root, "llvmpipe")),
+            )
+        ),
+        help="single-RDC Mesa llvmpipe executable",
     )
     parser.add_argument(
         "--pvrgpu-runner",
         type=Path,
-        default=None,
-        required=True,
-        help=(
-            "single-RDC PvrGPU runner; no default trace-capsule runner is "
-            "provided"
+        default=Path(
+            os.environ.get(
+                "PVRGPU_RDC_PVRGPU_RUNNER",
+                str(default_runner_path(work_root, "pvrgpu")),
+            )
         ),
+        help="single-RDC Mesa/Gallium pvrgpu executable",
     )
     parser.add_argument(
         "--timeout-seconds",
@@ -1629,6 +1794,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help=(
             "fail unmapped RDCs instead of deriving replay metadata from the "
             "RDC path or dEQP recorder manifest"
+        ),
+    )
+    parser.add_argument(
+        "--reuse-golden-cache",
+        action="store_true",
+        help=(
+            "reuse prior Golden artifacts by RDC SHA; opt in only when the "
+            "llvmpipe player, Mesa runtime, and replay policy are unchanged"
         ),
     )
     parser.add_argument(
@@ -1651,6 +1824,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         pvrgpu_runner=options.pvrgpu_runner,
         timeout_seconds=options.timeout_seconds,
         require_manifest=options.require_manifest,
+        reuse_golden_cache=options.reuse_golden_cache,
         events=events,
     )
 

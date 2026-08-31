@@ -84,12 +84,19 @@ struct PipelineState {
   PcoProgramSummary fragment_program_summary;
   std::uint64_t framebuffer_gpu_address = 0;
   std::uint64_t framebuffer_bytes = 0;
+  std::uint64_t index_buffer_gpu_address = 0;
+  std::uint64_t index_buffer_bytes = 0;
+  std::uint64_t parameter_triangles_gpu_address = 0;
+  std::uint64_t parameter_triangles_bytes = 0;
+  std::uint64_t parameter_coefficients_gpu_address = 0;
+  std::uint64_t parameter_coefficients_bytes = 0;
   // Number of fragment invocations. With ordered blending this may exceed the
   // number of unique covered pixels.
   std::uint32_t active_fragment_invocations = 0;
   std::uint32_t fragment_shader_lane_count = 0;
   std::uint32_t scheduled_tiles = 0;
   std::uint8_t fragment_early_hsr_safe = 0;
+  MemoryMode memory_mode = MemoryMode::kCache;
   std::uint8_t cache_bypass = 0;
   std::uint8_t framebuffer_from_dram = 0;
   std::uint8_t primitive_restart_enable = 0;

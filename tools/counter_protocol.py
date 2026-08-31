@@ -24,8 +24,12 @@ MAX_JSONL_BYTES = 1024 * 1024
 
 # Run configuration transported by a producer hello message.  Values remain
 # top-level JSON metadata rather than counters so they are never summed across
-# frames.  The current boolean field is type-checked by parse_jsonl_line().
-HELLO_METADATA_FIELDS: tuple[str, ...] = ("cache_bypass",)
+# frames.  These fields are type-checked by parse_jsonl_line().
+HELLO_METADATA_FIELDS: tuple[str, ...] = (
+    "cache_bypass",
+    "memory_mode",
+    "cache_simulated",
+)
 
 STANDARD_COUNTER_FIELDS: tuple[str, ...] = (
     "ia_vertices",
@@ -108,6 +112,8 @@ MODEL_COUNTER_FIELDS: tuple[str, ...] = (
     "dram_read_bytes",
     "dram_write_bytes",
     "dram_cycles",
+    "memory_direct_read_bytes",
+    "memory_direct_write_bytes",
     "framebuffer_dram_readback_bytes",
     "tiles_binned",
     "tiles_scheduled",
@@ -363,6 +369,16 @@ COUNTER_INFO: Mapping[str, tuple[str, str, str]] = {
         "cycles",
         "Modeled fixed-latency DRAM service cycles.",
     ),
+    "memory_direct_read_bytes": (
+        "Direct memory reads",
+        "bytes",
+        "Functional bytes read directly from DRAM backing with timing simulation disabled.",
+    ),
+    "memory_direct_write_bytes": (
+        "Direct memory writes",
+        "bytes",
+        "Functional bytes written directly to DRAM backing with timing simulation disabled.",
+    ),
     "framebuffer_dram_readback_bytes": (
         "Framebuffer DRAM readback",
         "bytes",
@@ -580,6 +596,22 @@ def parse_jsonl_line(line: str | bytes) -> dict[str, Any]:
         and not isinstance(message["cache_bypass"], bool)
     ):
         raise CounterProtocolError("hello.cache_bypass must be a JSON boolean")
+    if (
+        message.get("type") == "hello"
+        and "memory_mode" in message
+        and message["memory_mode"] not in {"direct", "bypass", "cache"}
+    ):
+        raise CounterProtocolError(
+            "hello.memory_mode must be direct, bypass, or cache"
+        )
+    if (
+        message.get("type") == "hello"
+        and "cache_simulated" in message
+        and not isinstance(message["cache_simulated"], bool)
+    ):
+        raise CounterProtocolError(
+            "hello.cache_simulated must be a JSON boolean"
+        )
     return message
 
 

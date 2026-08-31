@@ -10,6 +10,19 @@ namespace pvrgpu::stub {
 
 inline constexpr const char *kSchema = "pvrgpu.counter.v1";
 
+enum class MemoryMode : std::uint8_t {
+  // Fast functional mode. GPU clients access the authoritative DRAM backing
+  // directly and do not claim cache or DRAM timing/counter provenance.
+  kDirect = 0,
+  // Cache controllers are bypassed, but accesses still reach DRAM and retain
+  // transaction/latency accounting.
+  kBypass = 1,
+  // Full SLC tag/data, write-back/write-allocate and DRAM miss/writeback path.
+  kCache = 2,
+};
+
+const char *MemoryModeName(MemoryMode mode);
+
 struct DriverCommand {
   bool enabled = false;
   std::string schema;
@@ -41,6 +54,8 @@ struct DriverCommand {
   std::uint64_t ps_invocations = 0;
   std::uint32_t hs_invocations = 0;
   std::uint32_t ds_invocations = 0;
+  std::uint32_t cs_invocations = 0;
+  std::string framebuffer_rgba8_path;
 };
 
 struct Options {
@@ -49,8 +64,9 @@ struct Options {
   unsigned height = 512;
   std::string test_case = "fill_solid";
   std::string output_dir;
-  // false: run the complete cache hierarchy; true: bypass caches for a
-  // faster functional simulation while preserving the DRAM access path.
+  MemoryMode memory_mode = MemoryMode::kCache;
+  // Legacy compatibility mirror for --cache-bypass and existing reports.
+  // It is true only for kBypass; kDirect is identified by memory_mode.
   bool cache_bypass = false;
   std::string driver_command_path;
   DriverCommand driver_command;
@@ -86,6 +102,11 @@ enum class MemoryClient : std::uint8_t {
   kTextureCache = 2,
   kUscL2 = 3,
   kTextureUpload = 4,
+  kIndexFetch = 5,
+  kVertexFetch = 6,
+  kParameterWrite = 7,
+  kParameterRead = 8,
+  kFramebufferReadback = 9,
 };
 
 enum class MemoryPayloadFormat : std::uint8_t {
@@ -186,6 +207,8 @@ struct CounterTxn {
   std::uint64_t dram_read_bytes = 0;
   std::uint64_t dram_write_bytes = 0;
   std::uint64_t dram_cycles = 0;
+  std::uint64_t memory_direct_read_bytes = 0;
+  std::uint64_t memory_direct_write_bytes = 0;
   std::uint64_t framebuffer_dram_readback_bytes = 0;
   std::uint64_t tiles_binned = 0;
   std::uint64_t tiles_scheduled = 0;

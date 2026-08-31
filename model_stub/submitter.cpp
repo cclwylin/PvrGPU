@@ -17,6 +17,7 @@
 #include "common/glbench_triangle_fixture.h"
 #include "common/glbench_texture_fixture.h"
 #include "common/pipeline_state.h"
+#include "memory/gpu_memory_system.h"
 #include "shader/pco_iss.h"
 
 #include <algorithm>
@@ -34,6 +35,8 @@ inline constexpr std::uint64_t kBuiltinVertexBufferGpuAddress =
     UINT64_C(0x20000000);
 inline constexpr std::uint64_t kBuiltinTexcoordBufferGpuAddress =
     UINT64_C(0x21000000);
+inline constexpr std::uint64_t kBuiltinIndexBufferGpuAddress =
+    UINT64_C(0x22000000);
 
 float FloatFromBits(std::uint32_t bits) {
   float value = 0.0F;
@@ -66,18 +69,39 @@ std::vector<float> DriverTriangleFloat2Vertices(
 
 VertexBufferResource StoreFloat2VertexBuffer(MemoryPool &pool,
                                              const std::vector<float> &values,
-                                             std::uint64_t gpu_address) {
+                                             std::uint64_t gpu_address,
+                                             GpuMemorySystem *memory) {
   if (values.empty() || values.size() % 2 != 0 ||
       values.size() > std::numeric_limits<std::uint32_t>::max() /
                           sizeof(float)) {
     throw std::runtime_error("Submitter float2 VBO size is invalid");
   }
   VertexBufferResource resource;
-  resource.data = StoreNewArray(pool, values);
+  if (memory)
+    HostWriteArray(*memory, gpu_address, values);
+  else
+    resource.data = StoreNewArray(pool, values);
   resource.gpu_address = gpu_address;
   resource.byte_size =
       static_cast<std::uint32_t>(values.size() * sizeof(float));
   return resource;
+}
+
+template <typename T>
+void StoreIndexBuffer(MemoryPool &pool, GpuMemorySystem *memory,
+                      const std::vector<T> &indices, PipelineState *state) {
+  static_assert(std::is_trivially_copyable_v<T>);
+  if (!state || indices.empty() ||
+      indices.size() > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+    throw std::runtime_error("Submitter index buffer size is invalid");
+  }
+  if (memory) {
+    HostWriteArray(*memory, kBuiltinIndexBufferGpuAddress, indices);
+    state->index_buffer_gpu_address = kBuiltinIndexBufferGpuAddress;
+    state->index_buffer_bytes = indices.size() * sizeof(T);
+  } else {
+    state->vertex_indices = StoreNewArray(pool, indices);
+  }
 }
 
 VertexAttributeBinding MakeFloat2Binding(std::uint32_t buffer_index,
@@ -100,8 +124,8 @@ VertexAttributeBinding MakeFloat2Binding(std::uint32_t buffer_index,
 } // namespace
 
 Submitter::Submitter(sc_core::sc_module_name name, MemoryPool &pool,
-                     const Options &options)
-    : sc_module(name), pool_(pool), options_(options) {
+                     const Options &options, GpuMemorySystem *memory)
+    : sc_module(name), pool_(pool), options_(options), memory_(memory) {
   SC_THREAD(Run);
 }
 
@@ -138,8 +162,6 @@ void Submitter::Run() {
         functional_case != FunctionalCase::kDriverTriangleSolid) ||
        (driver_indexed_quad_command &&
         functional_case != FunctionalCase::kDriverIndexedQuad) ||
-       (driver_primitive_sequence_command &&
-        functional_case != FunctionalCase::kDriverClearColor) ||
        (!driver_clear_command && !driver_triangle_command &&
         !driver_indexed_quad_command &&
         !driver_primitive_sequence_command))) {
@@ -165,6 +187,7 @@ void Submitter::Run() {
     state.sequence = frame;
     state.functional_case = functional_case;
     state.stage = PipelineStage::kSubmitted;
+    state.memory_mode = options_.memory_mode;
     state.cache_bypass = options_.cache_bypass ? 1U : 0U;
     state.raster_state.sample_count = 1;
     const bool triangle_setup = IsTriangleSetupFamily(functional_case);
@@ -189,7 +212,11 @@ void Submitter::Run() {
     const bool driver_triangle = driver_triangle_command;
     const bool driver_indexed_quad = driver_indexed_quad_command;
     const bool driver_primitive_sequence = driver_primitive_sequence_command;
-    const bool driver_clear_like = driver_clear || driver_primitive_sequence;
+    const bool driver_counter_only_primitive_sequence =
+        driver_primitive_sequence &&
+        functional_case == FunctionalCase::kDriverClearColor;
+    const bool driver_clear_like =
+        driver_clear || driver_counter_only_primitive_sequence;
     const bool depth_case =
         driver_clear_like ||
         functional_case == FunctionalCase::kFillSolidDepthNotEqual ||
@@ -247,7 +274,7 @@ void Submitter::Run() {
       state.draw.index_count = static_cast<std::uint32_t>(indices.size());
       state.draw.base_vertex = 0;
       state.draw.index_format = IndexFormat::kUint16;
-      state.vertex_indices = StoreNewArray(pool_, indices);
+      StoreIndexBuffer(pool_, memory_, indices, &state);
     } else if (driver_indexed_quad) {
       vertex_buffer = {
           -1.0F, -1.0F,
@@ -261,7 +288,7 @@ void Submitter::Run() {
       state.draw.index_count = static_cast<std::uint32_t>(indices.size());
       state.draw.base_vertex = 0;
       state.draw.index_format = IndexFormat::kUint16;
-      state.vertex_indices = StoreNewArray(pool_, indices);
+      StoreIndexBuffer(pool_, memory_, indices, &state);
     } else if (indexed_triangle) {
       const GlbenchTriangleMeshShape &mesh =
           varyings ? kGlbenchVaryingsMesh
@@ -286,7 +313,7 @@ void Submitter::Run() {
       state.draw.index_count = static_cast<std::uint32_t>(indices.size());
       state.draw.base_vertex = 0;
       state.draw.index_format = IndexFormat::kUint16;
-      state.vertex_indices = StoreNewArray(pool_, indices);
+      StoreIndexBuffer(pool_, memory_, indices, &state);
     } else if (texture_case) {
       vertex_buffer = texture_fixture.positions;
       state.draw.topology = PrimitiveTopology::kTriangleStrip;
@@ -305,12 +332,12 @@ void Submitter::Run() {
     }
     const VertexBufferResource vertex_resource =
         StoreFloat2VertexBuffer(pool_, vertex_buffer,
-                                kBuiltinVertexBufferGpuAddress);
+                                kBuiltinVertexBufferGpuAddress, memory_);
     std::vector<VertexBufferResource> vertex_resources{vertex_resource};
     if (texture_case) {
       vertex_resources.push_back(StoreFloat2VertexBuffer(
           pool_, texture_fixture.texture_coordinates,
-          kBuiltinTexcoordBufferGpuAddress));
+          kBuiltinTexcoordBufferGpuAddress, memory_));
     }
     state.vertex_buffer_resources = StoreNewArray(pool_, vertex_resources);
     std::vector<VertexAttributeBinding> bindings;
@@ -356,8 +383,13 @@ void Submitter::Run() {
           StoreNewArray(pool_, linkages);
     }
     if (texture_case) {
-      texture_fixture.resource.data =
-          StoreNewArray(pool_, texture_fixture.texture_bytes);
+      if (memory_) {
+        HostWriteArray(*memory_, texture_fixture.resource.gpu_address,
+                       texture_fixture.texture_bytes);
+      } else {
+        texture_fixture.resource.data =
+            StoreNewArray(pool_, texture_fixture.texture_bytes);
+      }
       state.texture_resources = StoreNewArray(
           pool_, std::vector<TextureResource>{texture_fixture.resource});
       state.sampler_states = StoreNewArray(

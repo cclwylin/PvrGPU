@@ -6,10 +6,23 @@ Before pushing this workspace to GitHub:
 - [ ] Choose a license, or intentionally keep no license.
 - [ ] Keep `config/local.env` local only.
 - [ ] Keep captures and generated reports outside the repository.
-- [ ] Run source-tree guard:
+- [ ] Configure and build the native targets:
 
   ```bash
-  ./scripts/check-source-tree.sh
+  cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+  cmake --build build
+  ```
+
+- [ ] Run the source-tree guard directly:
+
+  ```bash
+  python3 tests/check_source_tree.py --root .
+  ```
+
+- [ ] Run the registered native unit, smoke, and Python regression gates:
+
+  ```bash
+  ctest --test-dir build --output-on-failure
   ```
 
 - [ ] Run Python tests:

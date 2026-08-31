@@ -8,10 +8,21 @@ if [[ -f "${local_config}" ]]; then
     # shellcheck source=/dev/null
     source "${local_config}"
 fi
-# shellcheck source=scripts/lib/runtime-paths.sh
-source "${project_dir}/scripts/lib/runtime-paths.sh"
-log_dir="${PVRGPU_LOG_DIR}"
+
+work_root="${PVRGPU_WORK_ROOT:-${HOME}/Downloads/_Codex/Working/PvrGPU}"
+ui_python="${PVRGPU_UI_PYTHON:-${work_root}/venv/bin/python}"
+log_dir="${PVRGPU_LOG_DIR:-${work_root}/logs}"
+ui_program="${project_dir}/tools/rdc_counter_ui.py"
+
+if [[ ! -x "${ui_python}" ]]; then
+    echo "PvrGPU UI Python is missing or not executable: ${ui_python}" >&2
+    exit 1
+fi
+if [[ ! -f "${ui_program}" ]]; then
+    echo "PvrGPU UI entry point is missing: ${ui_program}" >&2
+    exit 1
+fi
 mkdir -p "${log_dir}"
 
-exec "${project_dir}/scripts/run-pvrgpu-control.sh" "$@" \
-    >>"${log_dir}/pvrgpu-control.log" 2>&1
+exec "${ui_python}" "${ui_program}" "$@" \
+    >>"${log_dir}/rdc-counter-ui.log" 2>&1

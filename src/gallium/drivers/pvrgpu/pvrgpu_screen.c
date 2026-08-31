@@ -50,10 +50,14 @@ pvrgpu_init_shader_caps(struct pipe_screen *screen)
    pvrgpu_init_single_shader_caps(screen, MESA_SHADER_VERTEX);
    pvrgpu_init_single_shader_caps(screen, MESA_SHADER_FRAGMENT);
    pvrgpu_init_single_shader_caps(screen, MESA_SHADER_GEOMETRY);
+   pvrgpu_init_single_shader_caps(screen, MESA_SHADER_TESS_CTRL);
+   pvrgpu_init_single_shader_caps(screen, MESA_SHADER_TESS_EVAL);
 
    screen->nir_options[MESA_SHADER_VERTEX] = &pvrgpu_nir_options;
    screen->nir_options[MESA_SHADER_FRAGMENT] = &pvrgpu_nir_options;
    screen->nir_options[MESA_SHADER_GEOMETRY] = &pvrgpu_nir_options;
+   screen->nir_options[MESA_SHADER_TESS_CTRL] = &pvrgpu_nir_options;
+   screen->nir_options[MESA_SHADER_TESS_EVAL] = &pvrgpu_nir_options;
 }
 
 static const char *
@@ -157,16 +161,19 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    caps->shader_samples_identical = true;
    caps->framebuffer_no_attachment = true;
    caps->shader_array_components = true;
+   caps->draw_indirect = true;
    caps->fs_fine_derivative = true;
+   caps->glsl_tess_levels_as_inputs = true;
    caps->copy_between_compressed_and_plain_formats = true;
    caps->texture_transfer_modes = 0;
    caps->max_viewports = PIPE_MAX_VIEWPORTS;
    caps->max_varyings = 32;
+   caps->max_shader_patch_varyings = 32;
    caps->max_gs_invocations = 32;
    caps->max_geometry_output_vertices = 256;
    caps->max_geometry_total_output_components = 1024;
-   caps->glsl_feature_level = 330;
-   caps->glsl_feature_level_compatibility = 330;
+   caps->glsl_feature_level = 400;
+   caps->glsl_feature_level_compatibility = 400;
    caps->essl_feature_level = 310;
 }
 
@@ -222,6 +229,8 @@ pvrgpu_is_supported_color_format(enum pipe_format format)
    case PIPE_FORMAT_B8G8R8X8_UNORM:
    case PIPE_FORMAT_A8R8G8B8_UNORM:
    case PIPE_FORMAT_A8B8G8R8_UNORM:
+   case PIPE_FORMAT_R5G6B5_UNORM:
+   case PIPE_FORMAT_B5G6R5_UNORM:
    case PIPE_FORMAT_R10G10B10A2_UNORM:
    case PIPE_FORMAT_B10G10R10A2_UNORM:
    case PIPE_FORMAT_R16_UNORM:
@@ -247,6 +256,8 @@ pvrgpu_is_supported_depth_stencil_format(enum pipe_format format)
    case PIPE_FORMAT_Z16_UNORM:
    case PIPE_FORMAT_Z24X8_UNORM:
    case PIPE_FORMAT_X8Z24_UNORM:
+   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+   case PIPE_FORMAT_S8_UINT_Z24_UNORM:
    case PIPE_FORMAT_Z32_FLOAT:
    case PIPE_FORMAT_Z32_UNORM:
    case PIPE_FORMAT_Z32_FLOAT_S8X24_UINT:
@@ -327,12 +338,15 @@ pvrgpu_is_format_supported(struct pipe_screen *screen,
          PIPE_BIND_INDEX_BUFFER |
          PIPE_BIND_CONSTANT_BUFFER |
          PIPE_BIND_STREAM_OUTPUT |
-         PIPE_BIND_QUERY_BUFFER;
+         PIPE_BIND_QUERY_BUFFER |
+         PIPE_BIND_COMMAND_ARGS_BUFFER;
       if (!(bind & supported_buffer_binds))
          goto out;
       if (bind & ~supported_buffer_binds)
          goto out;
-      if (bind & (PIPE_BIND_STREAM_OUTPUT | PIPE_BIND_QUERY_BUFFER))
+      if (bind & (PIPE_BIND_STREAM_OUTPUT |
+                  PIPE_BIND_QUERY_BUFFER |
+                  PIPE_BIND_COMMAND_ARGS_BUFFER))
          supported = format == PIPE_FORMAT_NONE ||
                      format == PIPE_FORMAT_R8_UNORM ||
                      pvrgpu_is_supported_vertex_format(format);

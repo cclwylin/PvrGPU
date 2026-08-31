@@ -57,6 +57,7 @@ using pvrgpu::stub::TextureResource;
 using pvrgpu::stub::TextureSampleRequest;
 using pvrgpu::stub::TextureSampleResponse;
 using pvrgpu::stub::TextureUnit;
+using pvrgpu::stub::TextureWrapMode;
 
 void Check(bool condition, const std::string &message) {
   if (!condition)
@@ -231,6 +232,18 @@ void CheckDescriptorAndArithmetic() {
             FloatBits(gate20_lod.mip_weight) == FloatBits(0.5F) &&
             FloatBits(gate20_lod.lambda) == UINT32_C(0x40600026),
         "Gate 20 implicit LOD levels, approximate lambda, and TFRAC");
+  const std::array<std::array<float, 2>, 4> gate20_edge_coordinates = {{
+      {{0.5013811588287354F, 0.9764730930328369F}},
+      {{0.5041432380676270F, 0.9764730930328369F}},
+      {{0.5013811588287354F, 0.9792351722717285F}},
+      {{0.5041432380676270F, 0.9792351722717285F}},
+  }};
+  const TextureImplicitLod gate20_edge_lod = ComputeTextureImplicitLod(
+      gate20_edge_coordinates, trilinear05_image, trilinear05_sampler);
+  Check(gate20_edge_lod.level0 == 0 && gate20_edge_lod.level1 == 1 &&
+            gate20_edge_lod.mip_weight_u8 == 128 &&
+            FloatBits(gate20_edge_lod.mip_weight) == FloatBits(0.5F),
+        "Gate 20 TFRAC byte-boundary snap is stable");
 
   auto mutated = DescriptorDwords(linear, 8);
   mutated[0] |= UINT32_C(1) << 23U; // public maxlod[0]
@@ -269,6 +282,18 @@ void CheckDescriptorAndArithmetic() {
   Check(negative.lower == 2 && negative.upper == 3 &&
             negative.weight == 128,
         "u=-0.25 negative repeat");
+  const TextureLinearAxis trilinear04_default =
+      ComputeTextureLinearRepeat(0.921287477016449F, 256);
+  const TextureLinearAxis trilinear04_snap = ComputeTextureLinearRepeat(
+      0.921287477016449F, 256, TextureWrapMode::kRepeat,
+      0.5F - 1.0F / 256.0F);
+  Check(trilinear04_default.lower == 235 &&
+            trilinear04_default.upper == 236 &&
+            trilinear04_default.weight == 89 &&
+            trilinear04_snap.lower == 235 &&
+            trilinear04_snap.upper == 236 &&
+            trilinear04_snap.weight == 90,
+        "Gate 19 coordinate half-LSB snap preserves tap identity");
   Check(LerpTextureUnorm8(0, 1, 128) == 0,
         "positive +0.5 delta tie rounds to even zero");
   Check(LerpTextureUnorm8(1, 2, 128) == 1,

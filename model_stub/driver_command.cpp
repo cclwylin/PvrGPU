@@ -23,6 +23,8 @@ constexpr const char *kDrawPrimitiveSequenceCommand = "draw_primitive_sequence";
 constexpr const char *kRgba8Format = "PIPE_FORMAT_R8G8B8A8_UNORM";
 constexpr const char *kRgbx8Format = "PIPE_FORMAT_R8G8B8X8_UNORM";
 constexpr const char *kBgrx8Format = "PIPE_FORMAT_B8G8R8X8_UNORM";
+constexpr const char *kR5G6B5Format = "PIPE_FORMAT_R5G6B5_UNORM";
+constexpr const char *kB5G6R5Format = "PIPE_FORMAT_B5G6R5_UNORM";
 constexpr const char *kR10G10B10A2Format = "PIPE_FORMAT_R10G10B10A2_UNORM";
 constexpr const char *kB10G10R10A2Format = "PIPE_FORMAT_B10G10R10A2_UNORM";
 
@@ -36,7 +38,8 @@ const std::set<std::string> &KnownFields() {
       "clip_primitives", "setup_triangles", "semantic_texel_fetches",
       "ia_vertices", "ia_primitives", "vs_invocations", "clip_invocations",
       "gs_invocations", "gs_primitives", "ps_invocations",
-      "hs_invocations", "ds_invocations",
+      "hs_invocations", "ds_invocations", "cs_invocations",
+      "framebuffer_rgba8_path",
   };
   return fields;
 }
@@ -101,7 +104,8 @@ bool IsDecimal(const std::string &text) {
 
 bool IsSupportedDriverCommandFormat(const std::string &format) {
   return format == kRgba8Format || format == kRgbx8Format ||
-         format == kBgrx8Format || format == kR10G10B10A2Format ||
+         format == kBgrx8Format || format == kR5G6B5Format ||
+         format == kB5G6R5Format || format == kR10G10B10A2Format ||
          format == kB10G10R10A2Format;
 }
 
@@ -169,7 +173,9 @@ bool RequireExactFields(const std::map<std::string, std::string> &fields,
     const bool optional_primitive_sequence_counter =
         command == kDrawPrimitiveSequenceCommand &&
         (entry.first == "gs_invocations" || entry.first == "gs_primitives" ||
-         entry.first == "hs_invocations" || entry.first == "ds_invocations");
+         entry.first == "hs_invocations" || entry.first == "ds_invocations" ||
+         entry.first == "cs_invocations" ||
+         entry.first == "framebuffer_rgba8_path");
     if (!required.count(entry.first) && !optional_primitive_sequence_counter) {
       *error = "field is not valid for " + command +
                " driver command: " + entry.first;
@@ -426,8 +432,18 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         !ParseOptionalU32(fields, "hs_invocations", &parsed.hs_invocations,
                           error) ||
         !ParseOptionalU32(fields, "ds_invocations", &parsed.ds_invocations,
+                          error) ||
+        !ParseOptionalU32(fields, "cs_invocations", &parsed.cs_invocations,
                           error)) {
       return false;
+    }
+    const auto framebuffer_path = fields.find("framebuffer_rgba8_path");
+    if (framebuffer_path != fields.end()) {
+      if (framebuffer_path->second.empty()) {
+        *error = "draw primitive sequence framebuffer_rgba8_path is empty";
+        return false;
+      }
+      parsed.framebuffer_rgba8_path = framebuffer_path->second;
     }
   }
 

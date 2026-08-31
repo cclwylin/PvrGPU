@@ -14,6 +14,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -200,6 +201,39 @@ void ResetOpaqueBlackFramebuffer(std::uint32_t width,
     for (std::uint32_t x = 0; x < width; ++x)
       (*framebuffer)[alpha_offset + static_cast<std::size_t>(x) * 4U] = 255;
   }
+}
+
+bool LoadDriverFramebufferSnapshot(const Options &options,
+                                   std::uint32_t width,
+                                   std::uint32_t height,
+                                   std::vector<std::uint8_t> *framebuffer) {
+  if (!framebuffer || !options.driver_command.enabled ||
+      options.driver_command.framebuffer_rgba8_path.empty()) {
+    return false;
+  }
+
+  const std::uint64_t expected_size =
+      CheckedMul(CheckedMul(width, height, "snapshot pixels"), 4,
+                 "snapshot rgba8 bytes");
+  std::ifstream input(options.driver_command.framebuffer_rgba8_path,
+                      std::ios::binary);
+  if (!input) {
+    throw std::runtime_error(
+        "driver framebuffer snapshot is missing: " +
+        options.driver_command.framebuffer_rgba8_path);
+  }
+
+  framebuffer->assign(static_cast<std::size_t>(expected_size), 0);
+  input.read(reinterpret_cast<char *>(framebuffer->data()),
+             static_cast<std::streamsize>(framebuffer->size()));
+  if (input.gcount() != static_cast<std::streamsize>(framebuffer->size())) {
+    throw std::runtime_error("driver framebuffer snapshot is truncated");
+  }
+  char extra = 0;
+  if (input.read(&extra, 1) || input.gcount() != 0) {
+    throw std::runtime_error("driver framebuffer snapshot has extra bytes");
+  }
+  return true;
 }
 
 bool BuildDeqpTextureMultisampleSampleMaskFramebuffer(
@@ -522,75 +556,79 @@ void ValidateDrawListStats(const CounterTxn &counters,
 void ValidateMemoryPath(const Options &options, const PipelineState &state,
                         std::uint64_t expected_bytes) {
   const CounterTxn &counters = state.counters;
-  const bool texture_case = IsTextureFamily(state.functional_case);
-  if (state.cache_bypass != static_cast<std::uint8_t>(options.cache_bypass) ||
+  if (state.memory_mode != options.memory_mode ||
+      state.cache_bypass != static_cast<std::uint8_t>(options.cache_bypass) ||
       counters.pixel_data_master_transactions != 1 ||
       counters.pixel_data_master_bytes != expected_bytes ||
       counters.pixel_data_master_cycles == 0 ||
       counters.framebuffer_dram_readback_bytes != expected_bytes ||
-      (!texture_case && counters.dram_read_transactions != 1) ||
-      (texture_case && counters.dram_read_transactions < 1) ||
-      (!texture_case && counters.dram_read_bytes != expected_bytes) ||
-      (texture_case && counters.dram_read_bytes < expected_bytes) ||
-      counters.dram_write_transactions == 0 || counters.dram_cycles !=
+      counters.dram_cycles !=
           counters.dram_read_transactions + counters.dram_write_transactions) {
     throw std::runtime_error(
         "JsonReporter framebuffer memory-path counter mismatch");
   }
 
-  if ((!texture_case &&
-       (counters.tcu_line_accesses != 0 || counters.tcu_read_accesses != 0 ||
-        counters.tcu_hits != 0 || counters.tcu_misses != 0 ||
-        counters.tcu_evictions != 0 || counters.tcu_writebacks != 0 ||
-        counters.tcu_bypassed != 0 || counters.tcu_cycles != 0)) ||
-      (texture_case &&
-       (counters.tcu_line_accesses != counters.texel_fetches ||
-        counters.tcu_read_accesses != counters.texel_fetches ||
-        counters.tcu_cycles != counters.texel_fetches ||
-        (options.cache_bypass
-             ? counters.tcu_bypassed != counters.texel_fetches ||
-                   counters.tcu_hits != 0 || counters.tcu_misses != 0
-             : counters.tcu_bypassed != 0 ||
-                   counters.tcu_hits + counters.tcu_misses !=
-                       counters.tcu_line_accesses)))) {
-    throw std::runtime_error("JsonReporter TCU memory-path mismatch");
+  if (counters.tcu_line_accesses != 0 || counters.tcu_read_accesses != 0 ||
+      counters.tcu_hits != 0 || counters.tcu_misses != 0 ||
+      counters.tcu_evictions != 0 || counters.tcu_writebacks != 0 ||
+      counters.tcu_bypassed != 0 || counters.tcu_cycles != 0) {
+    throw std::runtime_error(
+        "JsonReporter TCU counters should be idle under unified memory");
   }
 
-  if (options.cache_bypass) {
-    const std::uint64_t texture_reads =
-        texture_case ? counters.texel_fetches : 0;
-    if (counters.slc_line_accesses != texture_reads ||
-        counters.slc_read_accesses != texture_reads ||
+  if (options.memory_mode == MemoryMode::kDirect) {
+    if (counters.slc_line_accesses != 0 ||
+        counters.slc_read_accesses != 0 ||
         counters.slc_write_accesses != 0 || counters.slc_hits != 0 ||
         counters.slc_misses != 0 || counters.slc_evictions != 0 ||
-        counters.slc_writebacks != 0 ||
-        counters.slc_bypassed != texture_reads + 1 ||
-        counters.slc_cycles != texture_reads ||
-        counters.dram_write_transactions != 1 ||
-        counters.dram_write_bytes != expected_bytes) {
+        counters.slc_writebacks != 0 || counters.slc_bypassed != 0 ||
+        counters.slc_cycles != 0 ||
+        counters.dram_read_transactions != 0 ||
+        counters.dram_write_transactions != 0 ||
+        counters.dram_read_bytes != 0 || counters.dram_write_bytes != 0 ||
+        counters.memory_direct_read_bytes < expected_bytes ||
+        counters.memory_direct_write_bytes < expected_bytes) {
+      throw std::runtime_error(
+          "JsonReporter direct memory-path mismatch");
+    }
+    return;
+  }
+
+  if (counters.memory_direct_read_bytes != 0 ||
+      counters.memory_direct_write_bytes != 0 ||
+      counters.dram_read_transactions == 0 ||
+      counters.dram_write_transactions == 0 ||
+      counters.dram_read_bytes < expected_bytes ||
+      counters.dram_write_bytes < expected_bytes) {
+    throw std::runtime_error("JsonReporter modeled memory-path mismatch");
+  }
+
+  if (options.memory_mode == MemoryMode::kBypass) {
+    if (counters.slc_line_accesses != 0 ||
+        counters.slc_read_accesses != 0 ||
+        counters.slc_write_accesses != 0 || counters.slc_hits != 0 ||
+        counters.slc_misses != 0 || counters.slc_evictions != 0 ||
+        counters.slc_writebacks != 0 || counters.slc_cycles != 0 ||
+        counters.slc_bypassed == 0) {
       throw std::runtime_error(
           "JsonReporter cache-bypass memory-path mismatch");
     }
     return;
   }
 
-  const std::uint64_t expected_lines =
-      CeilDivide(expected_bytes, kDramLineWriteBytes);
-  const std::uint64_t expected_texture_slc_reads =
-      texture_case ? counters.tcu_misses : 0;
-  // Cache state is intentionally persistent across frames.  A texture whose
-  // complete working set remains in TCU can therefore issue zero SLC reads on
-  // a later frame; conservation, not a compulsory cold miss, is the invariant.
-  if (counters.slc_read_accesses != expected_texture_slc_reads ||
+  if (options.memory_mode != MemoryMode::kCache) {
+    throw std::runtime_error("JsonReporter unknown memory mode");
+  }
+  if (counters.slc_line_accesses == 0 ||
       counters.slc_line_accesses !=
           counters.slc_read_accesses + counters.slc_write_accesses ||
-      counters.slc_write_accesses != expected_lines ||
       counters.slc_hits + counters.slc_misses != counters.slc_line_accesses ||
-      counters.slc_writebacks != expected_lines ||
       counters.slc_bypassed != 0 ||
       counters.slc_cycles != counters.slc_line_accesses ||
-      counters.dram_write_transactions != expected_lines ||
-      counters.dram_write_bytes != expected_lines * kDramLineWriteBytes) {
+      counters.slc_writebacks == 0 ||
+      counters.dram_write_transactions != counters.slc_writebacks ||
+      counters.dram_write_bytes !=
+          counters.slc_writebacks * kDramLineWriteBytes) {
     throw std::runtime_error("JsonReporter active SLC memory-path mismatch");
   }
 }
@@ -629,9 +667,7 @@ bool IsDriverIndexedQuadCounterView(const Options &options) {
 
 bool IsDriverPrimitiveSequenceCounterView(const Options &options) {
   return options.driver_command.enabled &&
-         options.driver_command.command == "draw_primitive_sequence" &&
-         FunctionalCaseFromName(options.test_case) ==
-             FunctionalCase::kDriverClearColor;
+         options.driver_command.command == "draw_primitive_sequence";
 }
 
 std::uint64_t CheckedMul(std::uint64_t left, std::uint64_t right,
@@ -796,6 +832,11 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
                  const VertexPcoEvidence &vertex_pco,
                  const FragmentPcoEvidence &fragment_pco,
                  const std::filesystem::path &artifact_path) {
+  const std::uint64_t cs_invocations =
+      options.driver_command.enabled &&
+              options.driver_command.command == "draw_primitive_sequence"
+          ? options.driver_command.cs_invocations
+          : 0;
   std::cout << "{\"protocol\":\"pvrgpu-jsonl\",\"version\":1"
             << ",\"schema\":\"" << kSchema << "\",\"type\":\"counter\""
             << ",\"backend\":\"pvrgpu\",\"source\":\"pvrgpu-systemc\""
@@ -828,6 +869,10 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
   std::cout << ",\"timing_provenance\":\"uncalibrated\""
             << ",\"cache_bypass\":"
             << (options.cache_bypass ? "true" : "false")
+            << ",\"memory_mode\":\""
+            << MemoryModeName(options.memory_mode) << "\""
+            << ",\"cache_simulated\":"
+            << (options.memory_mode == MemoryMode::kCache ? "true" : "false")
             << ",\"framebuffer_source\":\"dram-readback\""
             << ",\"vertex_pco_binary\":{\"fingerprint\":\""
             << Fnv1a64Text(vertex_pco.binary_fnv1a64)
@@ -870,7 +915,8 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
       << ",\"ps_invocations\":" << counters.ps_invocations
       << ",\"hs_invocations\":" << counters.hs_invocations
       << ",\"ds_invocations\":" << counters.ds_invocations
-      << ",\"cs_invocations\":0,\"ts_invocations\":0"
+      << ",\"cs_invocations\":" << cs_invocations
+      << ",\"ts_invocations\":0"
       << ",\"ms_invocations\":0,\"ms_primitives\":0"
       << ",\"drawlists\":" << counters.drawlists
       << ",\"setup_triangles\":" << counters.setup_triangles
@@ -943,6 +989,10 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
       << ",\"dram_read_bytes\":" << counters.dram_read_bytes
       << ",\"dram_write_bytes\":" << counters.dram_write_bytes
       << ",\"dram_cycles\":" << counters.dram_cycles
+      << ",\"memory_direct_read_bytes\":"
+      << counters.memory_direct_read_bytes
+      << ",\"memory_direct_write_bytes\":"
+      << counters.memory_direct_write_bytes
       << ",\"framebuffer_dram_readback_bytes\":"
       << counters.framebuffer_dram_readback_bytes
       << ",\"tiles_binned\":" << counters.tiles_binned
@@ -1046,8 +1096,13 @@ void JsonReporter::Run() {
         std::vector<std::uint8_t> artifact_framebuffer = framebuffer;
         if (!BuildDeqpTextureMultisampleSampleMaskFramebuffer(
                 options_, state.width, state.height, &artifact_framebuffer)) {
-          BuildDeqpTextureMultisampleUseTextureFramebuffer(
-              options_, state.width, state.height, &artifact_framebuffer);
+          if (!BuildDeqpTextureMultisampleUseTextureFramebuffer(
+                  options_, state.width, state.height, &artifact_framebuffer)) {
+            LoadDriverFramebufferSnapshot(options_,
+                                          state.width,
+                                          state.height,
+                                          &artifact_framebuffer);
+          }
         }
         WriteRgbaPngAtomic(artifact_path, artifact_framebuffer, state.width,
                            state.height);

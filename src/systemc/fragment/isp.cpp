@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -79,8 +80,9 @@ float InterpolateDepth(const ParameterTriangle &triangle,
 
 namespace pvrgpu::stub {
 
-Isp::Isp(sc_core::sc_module_name name, MemoryPool &pool)
-    : sc_module(name), pool_(pool) {
+Isp::Isp(sc_core::sc_module_name name, MemoryPool &pool,
+         GpuMemorySystem *memory)
+    : sc_module(name), pool_(pool), memory_(memory) {
   SC_THREAD(Run);
 }
 
@@ -89,6 +91,8 @@ void Isp::Run() {
     const PipelineTxn txn = input.read();
     PipelineState state = LoadPipelineState(pool_, txn.state);
     RequireStage(state.stage, PipelineStage::kTilesScheduled, name());
+    if (memory_ && state.memory_mode != memory_->mode())
+      throw std::runtime_error("ISP memory mode mismatch");
     if (!IsRasterFunctionalCase(state.functional_case))
       throw std::runtime_error("ISP received an unsupported case");
     bool opaque_early_hsr = state.raster_state.blend.enable == 0;
@@ -113,8 +117,18 @@ void Isp::Run() {
         LoadArray<TileRecord>(pool_, state.tile_records);
     const std::vector<TilePrimitiveRef> primitive_refs =
         LoadArray<TilePrimitiveRef>(pool_, state.tile_primitive_refs);
-    const std::vector<ParameterTriangle> parameters =
-        LoadArray<ParameterTriangle>(pool_, state.parameter_triangles);
+    MemoryAccessStats memory_stats;
+    std::vector<ParameterTriangle> parameters;
+    if (memory_) {
+      auto read = ReadMemoryArray<ParameterTriangle>(
+          *memory_, state.parameter_triangles_gpu_address,
+          state.parameter_triangles_bytes, MemoryClient::kParameterRead);
+      parameters = std::move(read.values);
+      memory_stats += read.stats;
+    } else {
+      parameters =
+          LoadArray<ParameterTriangle>(pool_, state.parameter_triangles);
+    }
     const bool empty_face_culled_setup =
         parameters.empty() && primitive_refs.empty() &&
         state.raster_state.face_cull.enable &&
@@ -240,9 +254,12 @@ void Isp::Run() {
     state.counters.depth_tested_fragments = depth_tested;
     state.counters.depth_rejected_fragments = depth_rejected;
     state.counters.depth_written_fragments = depth_written;
-    const std::uint64_t cycles =
+    const std::uint64_t functional_cycles =
         kReferenceUarch.isp_base_cycles +
         CeilDivide(candidates.size(), kReferenceUarch.isp_candidates_per_batch);
+    ApplyMemoryAccessStats(state.counters, memory_stats);
+    const std::uint64_t cycles =
+        functional_cycles + MemoryAccessDelayCycles(memory_stats);
     state.counters.isp_cycles = cycles;
     state.counters.renderer_cycles += cycles;
     state.stage = PipelineStage::kVisibilityReady;

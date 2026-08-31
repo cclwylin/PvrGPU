@@ -20,13 +20,26 @@ class CounterProtocolTests(unittest.TestCase):
     def test_cache_bypass_hello_requires_json_boolean(self) -> None:
         accepted = parse_jsonl_line(
             '{"schema":"pvrgpu.counter.v1","type":"hello",'
-            '"cache_bypass":false}'
+            '"cache_bypass":false,"memory_mode":"cache",'
+            '"cache_simulated":true}'
         )
         self.assertIs(accepted["cache_bypass"], False)
+        self.assertEqual(accepted["memory_mode"], "cache")
+        self.assertIs(accepted["cache_simulated"], True)
         with self.assertRaises(CounterProtocolError):
             parse_jsonl_line(
                 '{"schema":"pvrgpu.counter.v1","type":"hello",'
                 '"cache_bypass":"off"}'
+            )
+        with self.assertRaises(CounterProtocolError):
+            parse_jsonl_line(
+                '{"schema":"pvrgpu.counter.v1","type":"hello",'
+                '"memory_mode":"fast"}'
+            )
+        with self.assertRaises(CounterProtocolError):
+            parse_jsonl_line(
+                '{"schema":"pvrgpu.counter.v1","type":"hello",'
+                '"cache_simulated":"yes"}'
             )
 
     def test_memory_path_counter_catalog_is_complete(self) -> None:
@@ -56,6 +69,8 @@ class CounterProtocolTests(unittest.TestCase):
             "dram_read_bytes",
             "dram_write_bytes",
             "dram_cycles",
+            "memory_direct_read_bytes",
+            "memory_direct_write_bytes",
             "framebuffer_dram_readback_bytes",
         }
         self.assertTrue(memory_fields.issubset(MODEL_COUNTER_FIELDS))

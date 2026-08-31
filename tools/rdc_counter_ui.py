@@ -43,13 +43,31 @@ WORK_ROOT = Path(
         str(Path.home() / "Downloads" / "_Codex" / "Working" / "PvrGPU"),
     )
 ).expanduser().resolve()
-DEFAULT_WORKER = PROJECT_ROOT / "scripts" / "run-rdc-counter-report.sh"
+BUILD_ROOT = Path(
+    os.environ.get("PVRGPU_BUILD_DIR", str(WORK_ROOT / "build"))
+).expanduser().resolve()
+NATIVE_EXECUTABLE_SUFFIX = ".exe" if os.name == "nt" else ""
+DEFAULT_WORKER = PROJECT_ROOT / "tools" / "rdc_counter_report.py"
+DEFAULT_LLVMPIPE_RUNNER = BUILD_ROOT / "bin" / f"llvmpipe{NATIVE_EXECUTABLE_SUFFIX}"
+DEFAULT_PVRGPU_RUNNER = BUILD_ROOT / "bin" / f"pvrgpu{NATIVE_EXECUTABLE_SUFFIX}"
 STDERR_TAIL_LIMIT = 12_000
 
 
 def _resolved_path(value: str) -> Path:
     path = Path(value.strip()).expanduser()
     return path.resolve() if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+
+
+def _migrate_native_runner_setting(value: object, default: Path) -> str:
+    """Discard saved paths that point at the removed shell adapters."""
+    saved = str(value or "").strip()
+    if not saved:
+        return str(default)
+    candidate = Path(saved).expanduser()
+    legacy_parts = {part.casefold() for part in candidate.parts}
+    if candidate.suffix.casefold() in {".sh", ".bash"} or "scripts" in legacy_parts:
+        return str(default)
+    return saved
 
 
 class MainWindow(QMainWindow):
@@ -138,15 +156,27 @@ class MainWindow(QMainWindow):
         run_grid.addWidget(self.output_dir_edit, 1, 1)
         run_grid.addWidget(self.output_browse_button, 1, 2)
 
+        self.llvmpipe_runner_edit = QLineEdit()
+        self.llvmpipe_runner_edit.setPlaceholderText(
+            "Single-RDC llvmpipe executable"
+        )
+        self.llvmpipe_runner_browse_button = QPushButton("Browse")
+        self.llvmpipe_runner_browse_button.clicked.connect(
+            self._browse_llvmpipe_runner
+        )
+        run_grid.addWidget(QLabel("llvmpipe runner"), 2, 0)
+        run_grid.addWidget(self.llvmpipe_runner_edit, 2, 1)
+        run_grid.addWidget(self.llvmpipe_runner_browse_button, 2, 2)
+
         self.pvrgpu_runner_edit = QLineEdit()
         self.pvrgpu_runner_edit.setPlaceholderText(
-            "Single-RDC PvrGPU runner script or executable"
+            "Single-RDC pvrgpu executable"
         )
         self.pvrgpu_runner_browse_button = QPushButton("Browse")
         self.pvrgpu_runner_browse_button.clicked.connect(self._browse_pvrgpu_runner)
-        run_grid.addWidget(QLabel("PvrGPU runner"), 2, 0)
-        run_grid.addWidget(self.pvrgpu_runner_edit, 2, 1)
-        run_grid.addWidget(self.pvrgpu_runner_browse_button, 2, 2)
+        run_grid.addWidget(QLabel("PvrGPU runner"), 3, 0)
+        run_grid.addWidget(self.pvrgpu_runner_edit, 3, 1)
+        run_grid.addWidget(self.pvrgpu_runner_browse_button, 3, 2)
 
         actions = QHBoxLayout()
         self.start_button = QPushButton("Start")
@@ -165,7 +195,7 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.open_report_button)
         actions.addStretch()
         actions.addWidget(self.quit_button)
-        run_grid.addLayout(actions, 3, 0, 1, 3)
+        run_grid.addLayout(actions, 4, 0, 1, 3)
         root.addWidget(run_box)
 
         progress_row = QHBoxLayout()
@@ -211,6 +241,7 @@ class MainWindow(QMainWindow):
         # Short aliases make offscreen integration tests less coupled to wording.
         self.input_edit = self.input_dir_edit
         self.output_edit = self.output_dir_edit
+        self.llvmpipe_runner_edit_alias = self.llvmpipe_runner_edit
         self.pvrgpu_runner_edit_alias = self.pvrgpu_runner_edit
         self.progress = self.progress_bar
         self.table = self.results_table
@@ -220,7 +251,7 @@ class MainWindow(QMainWindow):
 
     def _restore_settings(self) -> None:
         default_input = os.environ.get("PVRGPU_RDC_ROOT") or str(
-            WORK_ROOT.parent / "drc_patterns" / "1.GLBench"
+            WORK_ROOT.parent / "deqp"
         )
         default_output = os.environ.get(
             "PVRGPU_RDC_COUNTER_OUTPUT",
@@ -228,10 +259,11 @@ class MainWindow(QMainWindow):
         )
         default_pvrgpu_runner = os.environ.get(
             "PVRGPU_RDC_PVRGPU_RUNNER",
-            os.environ.get(
-                "PVRGPU_RDC_DUT_RUNNER",
-                str(PROJECT_ROOT / "scripts" / "run-rdc-pvrgpu-driver-systemc.sh"),
-            ),
+            str(DEFAULT_PVRGPU_RUNNER),
+        )
+        default_llvmpipe_runner = os.environ.get(
+            "PVRGPU_RDC_GOLDEN_RUNNER",
+            str(DEFAULT_LLVMPIPE_RUNNER),
         )
         self.input_dir_edit.setText(
             str(self.settings.value("input_dir", default_input))
@@ -239,16 +271,26 @@ class MainWindow(QMainWindow):
         self.output_dir_edit.setText(
             str(self.settings.value("output_dir", default_output))
         )
-        saved_pvrgpu_runner = str(
-            self.settings.value("pvrgpu_runner", default_pvrgpu_runner)
-        ).strip()
-        self.pvrgpu_runner_edit.setText(
-            saved_pvrgpu_runner or default_pvrgpu_runner
+        saved_llvmpipe_runner = _migrate_native_runner_setting(
+            self.settings.value("llvmpipe_runner", default_llvmpipe_runner),
+            Path(default_llvmpipe_runner),
         )
+        saved_pvrgpu_runner = _migrate_native_runner_setting(
+            self.settings.value("pvrgpu_runner", default_pvrgpu_runner),
+            Path(default_pvrgpu_runner),
+        )
+        self.llvmpipe_runner_edit.setText(saved_llvmpipe_runner)
+        self.pvrgpu_runner_edit.setText(saved_pvrgpu_runner)
+        self.settings.setValue("llvmpipe_runner", saved_llvmpipe_runner)
+        self.settings.setValue("pvrgpu_runner", saved_pvrgpu_runner)
+        self.settings.sync()
 
     def _save_settings(self) -> None:
         self.settings.setValue("input_dir", self.input_dir_edit.text().strip())
         self.settings.setValue("output_dir", self.output_dir_edit.text().strip())
+        self.settings.setValue(
+            "llvmpipe_runner", self.llvmpipe_runner_edit.text().strip()
+        )
         self.settings.setValue(
             "pvrgpu_runner", self.pvrgpu_runner_edit.text().strip()
         )
@@ -272,10 +314,19 @@ class MainWindow(QMainWindow):
         path, _selected_filter = QFileDialog.getOpenFileName(
             self,
             "Select PvrGPU runner",
-            self.pvrgpu_runner_edit.text() or str(PROJECT_ROOT / "scripts"),
+            self.pvrgpu_runner_edit.text() or str(BUILD_ROOT / "bin"),
         )
         if path:
             self.pvrgpu_runner_edit.setText(path)
+
+    def _browse_llvmpipe_runner(self) -> None:
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Select llvmpipe runner",
+            self.llvmpipe_runner_edit.text() or str(BUILD_ROOT / "bin"),
+        )
+        if path:
+            self.llvmpipe_runner_edit.setText(path)
 
     def _start(self) -> None:
         if self.process.state() != QProcess.ProcessState.NotRunning:
@@ -287,16 +338,24 @@ class MainWindow(QMainWindow):
         if not self.output_dir_edit.text().strip():
             QMessageBox.warning(self, "Output directory required", "Select an output directory.")
             return
+        if not self.llvmpipe_runner_edit.text().strip():
+            QMessageBox.warning(
+                self,
+                "llvmpipe runner required",
+                "Select the single-RDC llvmpipe executable used as Golden.",
+            )
+            return
         if not self.pvrgpu_runner_edit.text().strip():
             QMessageBox.warning(
                 self,
                 "PvrGPU runner required",
-                "Select the explicit single-RDC PvrGPU runner to compare against Golden.",
+                "Select the single-RDC pvrgpu executable to compare against llvmpipe.",
             )
             return
 
         input_root = _resolved_path(self.input_dir_edit.text())
         output_root = _resolved_path(self.output_dir_edit.text())
+        llvmpipe_runner = _resolved_path(self.llvmpipe_runner_edit.text())
         pvrgpu_runner = _resolved_path(self.pvrgpu_runner_edit.text())
         if not input_root.is_dir():
             QMessageBox.critical(
@@ -310,6 +369,20 @@ class MainWindow(QMainWindow):
                 "Choose an output directory outside the RDC input directory.",
             )
             return
+        if not llvmpipe_runner.is_file():
+            QMessageBox.critical(
+                self,
+                "llvmpipe runner missing",
+                f"llvmpipe runner was not found:\n{llvmpipe_runner}",
+            )
+            return
+        if os.name != "nt" and not os.access(llvmpipe_runner, os.X_OK):
+            QMessageBox.critical(
+                self,
+                "llvmpipe runner is not executable",
+                f"llvmpipe runner must be executable:\n{llvmpipe_runner}",
+            )
+            return
         if not pvrgpu_runner.is_file():
             QMessageBox.critical(
                 self,
@@ -317,13 +390,11 @@ class MainWindow(QMainWindow):
                 f"PvrGPU runner was not found:\n{pvrgpu_runner}",
             )
             return
-        if pvrgpu_runner.suffix.lower() != ".sh" and not os.access(
-            pvrgpu_runner, os.X_OK
-        ):
+        if os.name != "nt" and not os.access(pvrgpu_runner, os.X_OK):
             QMessageBox.critical(
                 self,
                 "PvrGPU runner is not executable",
-                f"PvrGPU runner must be executable or a .sh script:\n{pvrgpu_runner}",
+                f"PvrGPU runner must be executable:\n{pvrgpu_runner}",
             )
             return
         if not self.worker_path.is_file():
@@ -356,16 +427,14 @@ class MainWindow(QMainWindow):
             str(input_root),
             "--output-root",
             str(output_root),
+            "--golden-runner",
+            str(llvmpipe_runner),
             "--pvrgpu-runner",
             str(pvrgpu_runner),
             "--json",
         ]
-        if self.worker_path.suffix == ".py":
-            program = sys.executable
-            arguments = [str(self.worker_path), *worker_arguments]
-        else:
-            program = "/bin/bash"
-            arguments = [str(self.worker_path), *worker_arguments]
+        program = sys.executable
+        arguments = [str(self.worker_path), *worker_arguments]
 
         self.process.start(program, arguments)
         if not self.process.waitForStarted(3000):
@@ -402,6 +471,8 @@ class MainWindow(QMainWindow):
         self.input_browse_button.setEnabled(not running)
         self.output_dir_edit.setEnabled(not running)
         self.output_browse_button.setEnabled(not running)
+        self.llvmpipe_runner_edit.setEnabled(not running)
+        self.llvmpipe_runner_browse_button.setEnabled(not running)
         self.pvrgpu_runner_edit.setEnabled(not running)
         self.pvrgpu_runner_browse_button.setEnabled(not running)
         self.start_button.setEnabled(not running)

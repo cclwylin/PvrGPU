@@ -12,17 +12,26 @@
 
 namespace pvrgpu::stub {
 
+class GpuMemorySystem;
+
 class PbeWriteBack final : public sc_core::sc_module {
  public:
   sc_core::sc_fifo_in<PipelineTxn> input{"input"};
-  sc_core::sc_fifo_out<MemoryTxn> output{"output"};
+  sc_core::sc_port<sc_core::sc_fifo_out_if<MemoryTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND>
+      output{"output"};
+  sc_core::sc_port<sc_core::sc_fifo_out_if<PipelineTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND>
+      completion{"completion"};
 
-  PbeWriteBack(sc_core::sc_module_name name, MemoryPool &pool);
+  PbeWriteBack(sc_core::sc_module_name name, MemoryPool &pool,
+               GpuMemorySystem *memory = nullptr);
 
  private:
   void Run();
 
   MemoryPool &pool_;
+  GpuMemorySystem *memory_;
 };
 
 }  // namespace pvrgpu::stub

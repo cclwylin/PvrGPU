@@ -150,8 +150,12 @@ Current implementation slice:
 
 - `src/gallium/drivers/pvrgpu/` now contains the initial driver skeleton and Meson source list.
 - `pipe_screen`, `pipe_context`, resource, framebuffer-state, flush, and clear file boundaries are present.
-- `scripts/install-pvrgpu-mesa-driver.sh` patches a Mesa source tree so `pvrgpu` is accepted by `-Dgallium-drivers`.
-- `scripts/check-pvrgpu-mesa-driver-build.sh --platforms macos --full-dri --install` verifies that Mesa configure lists `llvmpipe zink pvrgpu`, builds the pvrgpu static driver, links the full Gallium DRI shared library, and installs a local Mesa prefix.
+- `src/gallium/drivers/pvrgpu/meson.build` is the Mesa source/build seam that
+  makes `pvrgpu` available to `-Dgallium-drivers`.
+- CMake builds the native `pvrgpu` replay entry point, while CTest covers the
+  checked-in driver source contract and the SystemC/model unit and smoke
+  regressions. A full Mesa configure/link/install remains a separate operation
+  in the configured Mesa source tree and prefix.
 - the driver is selectable through `GALLIUM_DRIVER=pvrgpu`, but it is still a bring-up driver, not a production driver.
 - unsupported hooks remain fail-closed while each dEQP-driven feature is added.
 
@@ -234,8 +238,8 @@ Current implementation slice:
   `count=3`, a bound VS/FS pair, vertex elements, vertex buffers, and a color
   framebuffer, then emits `event=draw_triangles`;
 - all other draw shapes still emit `event=unsupported_draw`;
-- `scripts/run-pvrgpu-mesa-driver-triangle-smoke.sh` validates this path through
-  surfaceless EGL/GLES2 and counter inspection.
+- the registered native triangle smoke validates this path through surfaceless
+  EGL/GLES2 and counter inspection.
 
 This is an observable driver-front-end checkpoint, not real triangle
 rasterization yet. Pixel comparison remains intentionally disabled until shader
@@ -256,8 +260,8 @@ Gallium hooks/features:
 Validated checkpoint:
 
 ```bash
-./scripts/check-pvrgpu-mesa-driver-build.sh --platforms macos --full-dri --install
-./scripts/run-pvrgpu-mesa-driver-triangle-smoke.sh --size 16x16
+cmake --build build --target pvrgpu
+ctest --test-dir build --output-on-failure
 ```
 
 Suggested tests:
@@ -291,8 +295,8 @@ Current implementation slice:
   buffer formats Mesa uses in this smoke path;
 - Mesa's upload manager is initialized and the resource-release hook is wired
   so state-tracker internal uploads and teardown are clean;
-- `scripts/run-pvrgpu-mesa-driver-phase3-state-smoke.sh` validates this through
-  surfaceless EGL/GLES2 and counter inspection only.
+- the registered Phase 3 native smoke validates this through surfaceless
+  EGL/GLES2 and counter inspection only.
 
 This phase is still a driver-front-end checkpoint. It proves Mesa state reaches
 the PrvGPU Gallium boundary deterministically; it does not prove indexed
@@ -340,9 +344,9 @@ Current implementation slice:
 - `draw_vbo` recognizes a textured `MESA_PRIM_TRIANGLES` draw with `count=3`,
   a bound VS/FS pair, vertex elements, vertex buffers, a color framebuffer,
   and a fragment sampler+view, then emits `event=draw_textured_triangles`;
-- `scripts/run-pvrgpu-mesa-driver-phase4-texture-smoke.sh` validates this with
-  surfaceless EGL/GLES2, `glTexImage2D`, nearest/clamp texture parameters,
-  a `sampler2D` fragment shader, and counter inspection.
+- the registered Phase 4 native smoke validates this with surfaceless
+  EGL/GLES2, `glTexImage2D`, nearest/clamp texture parameters, a `sampler2D`
+  fragment shader, and counter inspection.
 
 This is still a frontend/counter checkpoint. It proves texture payload and
 sampler state reach the PrvGPU Gallium boundary; it does not prove texture
@@ -380,8 +384,8 @@ Current implementation slice:
 - `set_framebuffer_state` records framebuffer dimensions, color attachment
   metadata, depth/stencil attachment presence, resolve presence, and update
   count through `event=set_framebuffer_state`;
-- texture-backed GLES2 FBO attach/switch traffic is now observable through
-  `scripts/run-pvrgpu-mesa-driver-phase5-fbo-smoke.sh`;
+- texture-backed GLES2 FBO attach/switch traffic is now observable through the
+  registered Phase 5 native smoke;
 - a full FBO color clear plus `glReadPixels()` validates the existing
   CPU-backed clear/readback path on a user FBO, not only the default pbuffer;
 - same-format, level-0, non-MSAA 2D copies are implemented for the CPU-backed
@@ -435,8 +439,8 @@ Current implementation slice:
   chooses that path;
 - `draw_vbo` recognizes a simple triangle draw with a bound fragment constant
   buffer and emits `event=draw_uniform_triangles`;
-- `scripts/run-pvrgpu-mesa-driver-phase6-uniform-smoke.sh` validates this with
-  surfaceless EGL/GLES2, a `vec4[8]` fragment uniform array uploaded through
+- the registered Phase 6 native smoke validates this with surfaceless
+  EGL/GLES2, a `vec4[8]` fragment uniform array uploaded through
   `glUniform4fv`, and counter inspection;
 - this intentionally does not advertise GLES3/GLES31, UBO, SSBO, image, or
   compute correctness yet. Those remain hidden behind conservative caps until
@@ -497,9 +501,12 @@ out/deqp/<timestamp>/
 Recommended command shape:
 
 ```bash
-./scripts/run-deqp-pvrgpu.sh \
-  --caselist config/deqp-gles2-phase1.txt \
-  --output "$PVRGPU_WORK_ROOT/out/deqp/phase1"
+python3 tools/deqp_capture_report.py \
+  --rdc-dir "$PVRGPU_WORK_ROOT/deqp" \
+  --phase 1 \
+  --run-pvrgpu \
+  --pvrgpu-runner build/bin/pvrgpu \
+  --output-root "$PVRGPU_WORK_ROOT/out/deqp/phase1"
 ```
 
 Each test should be classified as:
@@ -519,16 +526,19 @@ Implemented files:
 
 ```text
 config/deqp-capture-phases.tsv
-scripts/run-deqp-capture-golden.sh
-scripts/run-deqp-capture-pvrgpu-probe.sh
-scripts/run-deqp-capture-rdc-report.sh
 tools/deqp_capture_report.py
+build/bin/llvmpipe[.exe]
+build/bin/pvrgpu[.exe]
 ```
+
+The bracketed suffix means platform-native naming: macOS/Linux use
+`llvmpipe` and `pvrgpu`; Windows automatically produces `llvmpipe.exe` and
+`pvrgpu.exe`.
 
 Recommended command shape:
 
 ```bash
-./scripts/run-deqp-capture-rdc-report.sh \
+python3 tools/deqp_capture_report.py \
   --rdc-dir "$HOME/Downloads/_Codex/Working/deqp" \
   --phase-max 6 \
   --filter color_clear \
@@ -538,32 +548,36 @@ Recommended command shape:
 Golden replay mode:
 
 ```bash
-./scripts/run-deqp-capture-rdc-report.sh \
+python3 tools/deqp_capture_report.py \
   --rdc-dir "$HOME/Downloads/_Codex/Working/deqp" \
   --filter color_clear \
   --limit 1 \
-  --run-golden
+  --run-golden \
+  --golden-runner build/bin/llvmpipe
 ```
 
 PvrGPU probe mode:
 
 ```bash
-./scripts/run-deqp-capture-rdc-report.sh \
+python3 tools/deqp_capture_report.py \
   --rdc-dir "$HOME/Downloads/_Codex/Working/deqp" \
   --phase 6 \
   --limit 1 \
-  --run-pvrgpu
+  --run-pvrgpu \
+  --pvrgpu-runner build/bin/pvrgpu
 ```
 
 Combined counter mode:
 
 ```bash
-./scripts/run-deqp-capture-rdc-report.sh \
+python3 tools/deqp_capture_report.py \
   --rdc-dir "$HOME/Downloads/_Codex/Working/deqp" \
   --phase 1 \
   --limit 1 \
   --run-golden \
-  --run-pvrgpu
+  --run-pvrgpu \
+  --golden-runner build/bin/llvmpipe \
+  --pvrgpu-runner build/bin/pvrgpu
 ```
 
 Expected output:
@@ -571,43 +585,53 @@ Expected output:
 ```text
 out/deqp-capture/<name>/
   report.md
-  run.txt
+  run.json
   discovered-rdc.txt
   cases/
     <safe-test-name>-<sha12>/
       input.txt
-      result.txt
+      result.json
       golden/
-        counter_golden.txt
-        stdout.log
-        stderr.log
+        Report.md
+        counter.txt
+        frame.png
+        runner.stdout.log
+        runner.stderr.log
       pvrgpu/
-        counter_pvrgpu.txt
-        stdout.jsonl
-        stderr.log
+        counter.txt
+        frame.png
+        runner.stdout.log
+        runner.stderr.log
       counter_diff.txt
 ```
 
 Recommended classification:
 
 ```text
-PASS        golden and PrvGPU counters match exactly
+PASS        Golden and PvrGPU counters match exactly
 FAIL        both sides ran, but counters differ
 UNSUPPORTED capture uses a feature not yet handled by PrvGPU lowering
 ERROR       replay, extraction, protocol, crash, timeout, or invalid artifact
 ```
 
-Current PrvGPU capture hook behavior:
+`tools/deqp_capture_report.py` is a capture catalog/probe and its combined
+comparison is counter-only. It is not the final image-correctness acceptance
+path. Run the same directory through `tools/rdc_counter_report.py` (or its UI)
+for the required decoded-RGBA PNG PASS gate.
+
+Current native PvrGPU player behavior:
 
 ```text
-scripts/run-deqp-capture-pvrgpu-probe.sh
-  -> writes pvrgpu/probe.txt
-  -> writes pvrgpu/unsupported.txt
-  -> exits 3
-  -> report classifies the case as UNSUPPORTED
+build/bin/pvrgpu[.exe] FILE.rdc --outdir DIRECTORY
+  -> writes runner.txt and raw player/model logs
+  -> writes counter.txt and frame.png after a supported successful replay
+  -> exits non-zero on setup, replay, protocol, model, or artifact failure
 ```
 
-This is intentional. It keeps the runner honest while arbitrary dEQP RDC lowering is still being implemented. A phase is allowed to move from `UNSUPPORTED` to `PVRGPU_PASS` only when the hook writes a real `pvrgpu/counter_pvrgpu.txt` produced by PrvGPU execution.
+The catalog tool retains `UNSUPPORTED` handling for any explicitly selected
+custom runner that exits 3. The checked-in native player does not synthesize
+that result: it must write a real `pvrgpu/counter.txt` from PrvGPU execution or
+the case is an error.
 
 For debug speed, this runner should support:
 

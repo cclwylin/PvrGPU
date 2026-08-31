@@ -7,6 +7,7 @@
 #include "geometry/vdm.h"
 
 #include "common/functional_types.h"
+#include "memory/gpu_memory_system.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -29,7 +30,8 @@ void ValidateDrawList(const MemoryPool &pool, PoolHandle handle) {
 }
 
 std::uint64_t ValidateVertexInputState(const MemoryPool &pool,
-                                       const PipelineState &state) {
+                                       const PipelineState &state,
+                                       const GpuMemorySystem *memory) {
   if (!HasPoolHandle(state.vertex_buffer_resources) ||
       !HasPoolHandle(state.vertex_attribute_bindings)) {
     throw std::runtime_error("VDM received no vertex buffer/binding tables");
@@ -44,13 +46,27 @@ std::uint64_t ValidateVertexInputState(const MemoryPool &pool,
 
   for (std::size_t index = 0; index < resources.size(); ++index) {
     const VertexBufferResource &resource = resources[index];
-    if (!HasPoolHandle(resource.data) ||
-        pool.Read(resource.data).size() != resource.byte_size) {
+    if (memory) {
+      if (HasPoolHandle(resource.data) || resource.gpu_address == 0 ||
+          resource.byte_size == 0 ||
+          !memory->backing().Contains(resource.gpu_address,
+                                      resource.byte_size)) {
+        throw std::runtime_error(
+            "VDM DRAM-backed vertex resource is invalid");
+      }
+    } else if (!HasPoolHandle(resource.data) ||
+               pool.Read(resource.data).size() != resource.byte_size) {
       throw std::runtime_error("VDM vertex buffer resource size mismatch");
     }
     for (std::size_t prior = 0; prior < index; ++prior) {
-      if (resources[prior].data.slot == resource.data.slot &&
-          resources[prior].data.generation == resource.data.generation) {
+      const bool aliases = memory
+                               ? resources[prior].gpu_address ==
+                                     resource.gpu_address
+                               : resources[prior].data.slot ==
+                                         resource.data.slot &&
+                                     resources[prior].data.generation ==
+                                         resource.data.generation;
+      if (aliases) {
         throw std::runtime_error(
             "VDM vertex buffer resources must own unique payloads");
       }
@@ -96,8 +112,9 @@ std::uint64_t ValidateVertexInputState(const MemoryPool &pool,
 
 } // namespace
 
-Vdm::Vdm(sc_core::sc_module_name name, MemoryPool &pool)
-    : sc_module(name), pool_(pool) {
+Vdm::Vdm(sc_core::sc_module_name name, MemoryPool &pool,
+         GpuMemorySystem *memory)
+    : sc_module(name), pool_(pool), memory_(memory) {
   SC_THREAD(Run);
 }
 
@@ -109,9 +126,12 @@ void Vdm::Run() {
     RequireStage(state.stage, PipelineStage::kSubmitted, name());
     if (!IsRasterFunctionalCase(state.functional_case))
       throw std::runtime_error("VDM received an unsupported functional case");
+    if (memory_ && state.memory_mode != memory_->mode())
+      throw std::runtime_error("VDM memory mode mismatch");
     ValidateDrawList(pool_, state.drawlist_stats);
     const std::uint64_t vertex_capacity =
-        ValidateVertexInputState(pool_, state);
+        ValidateVertexInputState(pool_, state, memory_);
+    MemoryAccessStats memory_stats;
 
     if (IsFillSolidFamily(state.functional_case) ||
         IsTextureFamily(state.functional_case)) {
@@ -120,7 +140,9 @@ void Vdm::Run() {
           state.draw.first_index != 0 || state.draw.index_count != 0 ||
           state.draw.base_vertex != 0 ||
           state.draw.index_format != IndexFormat::kNone ||
-          HasPoolHandle(state.vertex_indices)) {
+          HasPoolHandle(state.vertex_indices) ||
+          state.index_buffer_gpu_address != 0 ||
+          state.index_buffer_bytes != 0) {
         throw std::runtime_error(
             "VDM Fill.Solid requires non-indexed TRIANGLE_STRIP first=0 "
             "count=4");
@@ -147,8 +169,21 @@ void Vdm::Run() {
         throw std::runtime_error(
             "VDM indexed raster cases require a valid GLES indexed draw command");
       }
-      if (!HasPoolHandle(state.vertex_indices))
-        throw std::runtime_error("VDM indexed draw received no index buffer");
+      if (!HasPoolHandle(state.vertex_indices)) {
+        if (!memory_ || state.index_buffer_gpu_address == 0 ||
+            state.index_buffer_bytes == 0 ||
+            !memory_->backing().Contains(state.index_buffer_gpu_address,
+                                         state.index_buffer_bytes)) {
+          throw std::runtime_error("VDM indexed draw received no index buffer");
+        }
+        MemoryReadResult read = memory_->Read(
+            state.index_buffer_gpu_address,
+            static_cast<std::size_t>(state.index_buffer_bytes),
+            MemoryClient::kIndexFetch);
+        memory_stats += read.stats;
+        state.vertex_indices = pool_.Allocate(read.data.size());
+        pool_.Write(state.vertex_indices) = std::move(read.data);
+      }
 
       std::vector<std::uint32_t> indices;
       if (state.draw.index_format == IndexFormat::kUint8) {
@@ -226,10 +261,16 @@ void Vdm::Run() {
     state.counters.drawlists = 1;
     state.stage = PipelineStage::kVdmComplete;
 
-    const std::uint64_t cycles =
+    ApplyMemoryAccessStats(state.counters, memory_stats);
+    const std::uint64_t memory_cycles = MemoryAccessDelayCycles(memory_stats);
+    const std::uint64_t service_cycles =
         kReferenceUarch.vdm_base_cycles +
         CeilDivide(state.counters.ia_vertices,
                    kReferenceUarch.vdm_vertices_per_batch);
+    if (memory_cycles > std::numeric_limits<std::uint64_t>::max() -
+                            service_cycles)
+      throw std::overflow_error("VDM total cycle overflow");
+    const std::uint64_t cycles = service_cycles + memory_cycles;
     state.counters.vdm_cycles = cycles;
     state.counters.tiler_cycles += cycles;
     WaitForCycles(cycles);

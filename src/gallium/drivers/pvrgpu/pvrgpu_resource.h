@@ -7,11 +7,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
+struct sw_displaytarget;
+
 struct pvrgpu_resource {
    struct pipe_resource base;
    uint8_t *data;
+   struct sw_displaytarget *displaytarget;
+   unsigned displaytarget_stride;
    unsigned stride;
    uintptr_t layer_stride;
+   unsigned level_strides[PIPE_MAX_TEXTURE_LEVELS];
+   uintptr_t level_layer_strides[PIPE_MAX_TEXTURE_LEVELS];
+   uintptr_t level_offsets[PIPE_MAX_TEXTURE_LEVELS];
+   unsigned level_count;
    size_t size;
 };
 

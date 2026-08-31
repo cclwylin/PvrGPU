@@ -96,6 +96,17 @@ def default_work_root() -> Path:
     return Path.home() / "Downloads" / "_Codex" / "Working" / "PvrGPU"
 
 
+def native_executable_name(name: str) -> str:
+    return f"{name}.exe" if os.name == "nt" else name
+
+
+def default_runner_path(work_root: Path, name: str) -> Path:
+    build_root = Path(
+        os.environ.get("PVRGPU_BUILD_DIR", str(work_root / "build"))
+    ).expanduser()
+    return build_root / "bin" / native_executable_name(name)
+
+
 def default_deqp_rdc_root() -> Path:
     return Path.home() / "Downloads" / "_Codex" / "Working" / "deqp"
 
@@ -639,7 +650,6 @@ class DeqpCaptureReport:
             try:
                 self._run_command(
                     [
-                        "bash",
                         str(self.golden_runner),
                         "--rdc",
                         str(capture.path),
@@ -651,13 +661,16 @@ class DeqpCaptureReport:
                     stdout_path=golden_dir / "runner.stdout.log",
                     stderr_path=golden_dir / "runner.stderr.log",
                 )
-                counter_path = golden_dir / "counter_golden.txt"
+                counter_path = golden_dir / "counter.txt"
+                legacy_counter_path = golden_dir / "counter_golden.txt"
+                if not counter_path.is_file() and legacy_counter_path.is_file():
+                    counter_path = legacy_counter_path
                 if not counter_path.is_file() or counter_path.stat().st_size == 0:
                     raise RunnerFailure(f"Golden counter was not produced: {counter_path}")
                 result.status = "GOLDEN_PASS"
                 result.stage = "golden"
                 result.golden = "PASS"
-                result.golden_counter = "golden/counter_golden.txt"
+                result.golden_counter = f"golden/{counter_path.name}"
             except ReportCancelled as exc:
                 result.status = "CANCELLED"
                 result.stage = "cancelled"
@@ -677,28 +690,26 @@ class DeqpCaptureReport:
             try:
                 self._run_command(
                     [
-                        "bash",
                         str(self.pvrgpu_runner),
                         "--rdc",
                         str(capture.path),
                         "--case",
                         capture.case,
-                        "--phase",
-                        str(capture.phase),
-                        "--phase-key",
-                        capture.phase_key,
                         "--outdir",
                         str(pvrgpu_dir),
                     ],
                     stdout_path=pvrgpu_dir / "runner.stdout.log",
                     stderr_path=pvrgpu_dir / "runner.stderr.log",
                 )
-                counter_path = pvrgpu_dir / "counter_pvrgpu.txt"
+                counter_path = pvrgpu_dir / "counter.txt"
+                legacy_counter_path = pvrgpu_dir / "counter_pvrgpu.txt"
+                if not counter_path.is_file() and legacy_counter_path.is_file():
+                    counter_path = legacy_counter_path
                 if not counter_path.is_file() or counter_path.stat().st_size == 0:
                     raise RunnerFailure(f"PvrGPU counter was not produced: {counter_path}")
                 result.stage = "pvrgpu"
                 result.pvrgpu = "PASS"
-                result.pvrgpu_counter = "pvrgpu/counter_pvrgpu.txt"
+                result.pvrgpu_counter = f"pvrgpu/{counter_path.name}"
                 result.status = "PVRGPU_PASS"
             except RunnerFailure as exc:
                 result.stage = "pvrgpu"
@@ -954,10 +965,16 @@ class DeqpCaptureReport:
             raise ReportSetupError("--timeout-seconds must be zero or a positive number")
         if self.output_root == self.input_root or self.input_root in self.output_root.parents:
             raise ReportSetupError("Output root must be outside the dEQP capture input directory")
-        if self.run_golden and not self.golden_runner.is_file():
-            raise ReportSetupError(f"Golden capture runner does not exist: {self.golden_runner}")
-        if self.run_pvrgpu and not self.pvrgpu_runner.is_file():
-            raise ReportSetupError(f"PvrGPU capture runner does not exist: {self.pvrgpu_runner}")
+        for enabled, label, runner in (
+            (self.run_golden, "Golden", self.golden_runner),
+            (self.run_pvrgpu, "PvrGPU", self.pvrgpu_runner),
+        ):
+            if not enabled:
+                continue
+            if not runner.is_file():
+                raise ReportSetupError(f"{label} capture runner does not exist: {runner}")
+            if os.name != "nt" and not os.access(runner, os.X_OK):
+                raise ReportSetupError(f"{label} capture runner is not executable: {runner}")
 
         captures = discover_captures(
             self.input_root,
@@ -1081,14 +1098,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--golden-runner",
         type=Path,
-        default=PROJECT_ROOT / "scripts" / "run-deqp-capture-golden.sh",
-        help="single-capture Golden runner used only with --run-golden",
+        default=Path(
+            os.environ.get(
+                "PVRGPU_RDC_GOLDEN_RUNNER",
+                str(default_runner_path(work_root, "llvmpipe")),
+            )
+        ),
+        help="single-capture llvmpipe executable used only with --run-golden",
     )
     parser.add_argument(
         "--pvrgpu-runner",
         type=Path,
-        default=PROJECT_ROOT / "scripts" / "run-deqp-capture-pvrgpu-probe.sh",
-        help="single-capture PvrGPU runner used only with --run-pvrgpu",
+        default=default_runner_path(work_root, "pvrgpu"),
+        help="single-capture pvrgpu executable used only with --run-pvrgpu",
     )
     parser.add_argument(
         "--timeout-seconds",

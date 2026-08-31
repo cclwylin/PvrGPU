@@ -19,12 +19,14 @@
 
 namespace pvrgpu::stub {
 
+class GpuMemorySystem;
+
 class Submitter final : public sc_core::sc_module {
 public:
   sc_core::sc_fifo_out<PipelineTxn> output{"output"};
 
   Submitter(sc_core::sc_module_name name, MemoryPool &pool,
-            const Options &options);
+            const Options &options, GpuMemorySystem *memory = nullptr);
 
   std::uint64_t fifo_stalls() const { return fifo_stalls_; }
 
@@ -33,6 +35,7 @@ private:
 
   MemoryPool &pool_;
   Options options_;
+  GpuMemorySystem *memory_ = nullptr;
   std::uint64_t fifo_stalls_ = 0;
 };
 

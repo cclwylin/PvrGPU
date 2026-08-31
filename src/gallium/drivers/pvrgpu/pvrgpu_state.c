@@ -8,6 +8,7 @@
 
 #include "pipe/p_defines.h"
 #include "pipe/p_state.h"
+#include "nir/nir.h"
 #include "util/format/u_format.h"
 #include "util/u_debug_cb.h"
 #include "util/u_helpers.h"
@@ -15,6 +16,8 @@
 #include "util/u_memory.h"
 #include "util/ralloc.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -32,6 +35,42 @@ struct pvrgpu_query {
    unsigned index;
    bool active;
 };
+
+static const char *
+pvrgpu_shader_stage_name(mesa_shader_stage stage);
+
+static void
+pvrgpu_dump_nir_shader(const struct pvrgpu_shader_state *shader)
+{
+   const char *dir = getenv("PVRGPU_NIR_DUMP_DIR");
+   if (!dir || dir[0] == '\0' || !shader || !shader->nir)
+      return;
+
+   static unsigned dump_index = 0;
+   char path[4096];
+   snprintf(path,
+            sizeof(path),
+            "%s/%04u-%s.nir",
+            dir,
+            ++dump_index,
+            pvrgpu_shader_stage_name(shader->stage));
+   FILE *file = fopen(path, "w");
+   if (!file) {
+      pvrgpu_counter_eventf("dump_nir_failed",
+                            "stage=%s path=%s",
+                            pvrgpu_shader_stage_name(shader->stage),
+                            path);
+      return;
+   }
+
+   nir_print_shader(shader->nir, file);
+   fclose(file);
+   pvrgpu_counter_eventf("dump_nir",
+                         "shader=%p stage=%s path=%s",
+                         (void *)shader,
+                         pvrgpu_shader_stage_name(shader->stage),
+                         path);
+}
 
 static void *
 pvrgpu_create_state_object(struct pipe_context *pipe, const void *state)
@@ -136,10 +175,14 @@ pvrgpu_count_bound_constant_buffers(const struct pvrgpu_context *ctx,
 }
 
 static bool
-pvrgpu_constant_buffer_first_words(const struct pipe_constant_buffer *buffer,
-                                   uint32_t words[4])
+pvrgpu_constant_buffer_words(const struct pipe_constant_buffer *buffer,
+                             uint32_t *words,
+                             unsigned word_count)
 {
-   memset(words, 0, 4 * sizeof(words[0]));
+   if (!words || word_count == 0)
+      return false;
+
+   memset(words, 0, (size_t)word_count * sizeof(words[0]));
    if (!pvrgpu_constant_buffer_is_bound(buffer))
       return false;
 
@@ -161,8 +204,8 @@ pvrgpu_constant_buffer_first_words(const struct pipe_constant_buffer *buffer,
    if (!data || available < sizeof(uint32_t))
       return false;
 
-   const size_t copy_bytes =
-      available < 4 * sizeof(uint32_t) ? available : 4 * sizeof(uint32_t);
+   const size_t max_bytes = (size_t)word_count * sizeof(uint32_t);
+   const size_t copy_bytes = available < max_bytes ? available : max_bytes;
    memcpy(words, data, copy_bytes);
    return true;
 }
@@ -179,17 +222,30 @@ pvrgpu_create_blend_state(struct pipe_context *pipe,
       blend->state = *state;
 
    pvrgpu_counter_eventf("create_blend_state",
+                         "independent=%u max_rt=%u logicop=%u "
+                         "logicop_func=%u dither=%u alpha_to_coverage=%u "
                          "rt0_enable=%u rt0_colormask=0x%x "
                          "rt0_rgb_func=%u rt0_rgb_src=%u rt0_rgb_dst=%u "
-                         "rt0_alpha_func=%u logicop=%u dither=%u",
+                         "rt0_alpha_func=%u rt0_alpha_src=%u "
+                         "rt0_alpha_dst=%u rt1_colormask=0x%x "
+                         "rt2_colormask=0x%x rt3_colormask=0x%x",
+                         blend->state.independent_blend_enable,
+                         blend->state.max_rt,
+                         blend->state.logicop_enable,
+                         blend->state.logicop_func,
+                         blend->state.dither,
+                         blend->state.alpha_to_coverage,
                          blend->state.rt[0].blend_enable,
                          blend->state.rt[0].colormask,
                          blend->state.rt[0].rgb_func,
                          blend->state.rt[0].rgb_src_factor,
                          blend->state.rt[0].rgb_dst_factor,
                          blend->state.rt[0].alpha_func,
-                         blend->state.logicop_enable,
-                         blend->state.dither);
+                         blend->state.rt[0].alpha_src_factor,
+                         blend->state.rt[0].alpha_dst_factor,
+                         blend->state.rt[1].colormask,
+                         blend->state.rt[2].colormask,
+                         blend->state.rt[3].colormask);
    return blend;
 }
 
@@ -280,10 +336,18 @@ pvrgpu_bind_blend_state(struct pipe_context *pipe, void *state)
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
    ctx->blend = (struct pvrgpu_blend_state *)state;
    pvrgpu_counter_eventf("bind_blend_state",
-                         "bound=%u rt0_enable=%u rt0_colormask=0x%x",
+                         "bound=%u independent=%u max_rt=%u rt0_enable=%u "
+                         "rt0_colormask=0x%x rt1_colormask=0x%x "
+                         "rt2_colormask=0x%x rt3_colormask=0x%x",
                          state ? 1 : 0,
+                         ctx->blend ?
+                            ctx->blend->state.independent_blend_enable : 0,
+                         ctx->blend ? ctx->blend->state.max_rt : 0,
                          ctx->blend ? ctx->blend->state.rt[0].blend_enable : 0,
-                         ctx->blend ? ctx->blend->state.rt[0].colormask : 0);
+                         ctx->blend ? ctx->blend->state.rt[0].colormask : 0,
+                         ctx->blend ? ctx->blend->state.rt[1].colormask : 0,
+                         ctx->blend ? ctx->blend->state.rt[2].colormask : 0,
+                         ctx->blend ? ctx->blend->state.rt[3].colormask : 0);
 }
 
 static void
@@ -335,11 +399,13 @@ pvrgpu_create_shader_state_for_stage(struct pipe_context *pipe,
       shader->stream_output = state->stream_output;
    }
    pvrgpu_counter_eventf("create_shader",
-                         "stage=%s ir=%u has_nir=%u has_tgsi=%u",
+                         "shader=%p stage=%s ir=%u has_nir=%u has_tgsi=%u",
+                         (void *)shader,
                          pvrgpu_shader_stage_name(stage),
                          shader->type,
                          shader->has_nir ? 1 : 0,
                          shader->has_tgsi ? 1 : 0);
+   pvrgpu_dump_nir_shader(shader);
    return shader;
 }
 
@@ -365,10 +431,17 @@ pvrgpu_create_gs_state(struct pipe_context *pipe,
 }
 
 static void *
-pvrgpu_create_unsupported_shader_state(struct pipe_context *pipe,
-                                       const struct pipe_shader_state *state)
+pvrgpu_create_tcs_state(struct pipe_context *pipe,
+                        const struct pipe_shader_state *state)
 {
-   return pvrgpu_create_shader_state_for_stage(pipe, state, MESA_SHADER_NONE);
+   return pvrgpu_create_shader_state_for_stage(pipe, state, MESA_SHADER_TESS_CTRL);
+}
+
+static void *
+pvrgpu_create_tes_state(struct pipe_context *pipe,
+                        const struct pipe_shader_state *state)
+{
+   return pvrgpu_create_shader_state_for_stage(pipe, state, MESA_SHADER_TESS_EVAL);
 }
 
 static void
@@ -376,7 +449,8 @@ pvrgpu_bind_vs_state(struct pipe_context *pipe, void *state)
 {
    pvrgpu_context(pipe)->vs = (struct pvrgpu_shader_state *)state;
    pvrgpu_counter_eventf("bind_shader",
-                         "stage=vertex bound=%u",
+                         "stage=vertex shader=%p bound=%u",
+                         state,
                          state ? 1 : 0);
 }
 
@@ -385,7 +459,8 @@ pvrgpu_bind_fs_state(struct pipe_context *pipe, void *state)
 {
    pvrgpu_context(pipe)->fs = (struct pvrgpu_shader_state *)state;
    pvrgpu_counter_eventf("bind_shader",
-                         "stage=fragment bound=%u",
+                         "stage=fragment shader=%p bound=%u",
+                         state,
                          state ? 1 : 0);
 }
 
@@ -394,7 +469,28 @@ pvrgpu_bind_gs_state(struct pipe_context *pipe, void *state)
 {
    pvrgpu_context(pipe)->gs = (struct pvrgpu_shader_state *)state;
    pvrgpu_counter_eventf("bind_shader",
-                         "stage=geometry bound=%u",
+                         "stage=geometry shader=%p bound=%u",
+                         state,
+                         state ? 1 : 0);
+}
+
+static void
+pvrgpu_bind_tcs_state(struct pipe_context *pipe, void *state)
+{
+   pvrgpu_context(pipe)->tcs = (struct pvrgpu_shader_state *)state;
+   pvrgpu_counter_eventf("bind_shader",
+                         "stage=tess_ctrl shader=%p bound=%u",
+                         state,
+                         state ? 1 : 0);
+}
+
+static void
+pvrgpu_bind_tes_state(struct pipe_context *pipe, void *state)
+{
+   pvrgpu_context(pipe)->tes = (struct pvrgpu_shader_state *)state;
+   pvrgpu_counter_eventf("bind_shader",
+                         "stage=tess_eval shader=%p bound=%u",
+                         state,
                          state ? 1 : 0);
 }
 
@@ -432,6 +528,19 @@ pvrgpu_create_vertex_elements_state(struct pipe_context *pipe,
                          state->num_elements,
                          state->num_elements ? state->elements[0].src_format : 0,
                          state->num_elements ? state->elements[0].src_stride : 0);
+   for (unsigned i = 0; i < state->num_elements; ++i) {
+      const struct pipe_vertex_element *element = &state->elements[i];
+      pvrgpu_counter_eventf("vertex_element",
+                            "slot=%u buffer=%u format=%s offset=%u "
+                            "stride=%u divisor=%u dual_slot=%u",
+                            i,
+                            element->vertex_buffer_index,
+                            util_format_name(element->src_format),
+                            element->src_offset,
+                            element->src_stride,
+                            element->instance_divisor,
+                            element->dual_slot ? 1 : 0);
+   }
    return state;
 }
 
@@ -511,9 +620,12 @@ pvrgpu_create_sampler_view(struct pipe_context *pipe,
    pipe_reference_init(&view->reference, 1);
    view->context = pipe;
    pvrgpu_counter_eventf("create_sampler_view",
-                         "target=%u texture_target=%u format=%s "
+                         "view=%p texture_res=%p target=%u texture_target=%u "
+                         "format=%s "
                          "texture_format=%s width=%u height=%u levels=%u-%u "
-                         "swizzle=%u,%u,%u,%u",
+                         "layers=%u-%u swizzle=%u,%u,%u,%u",
+                         (void *)view,
+                         (void *)texture,
                          view->target,
                          texture->target,
                          util_format_name(view->format),
@@ -522,6 +634,8 @@ pvrgpu_create_sampler_view(struct pipe_context *pipe,
                          texture->height0,
                          view->u.tex.first_level,
                          view->u.tex.last_level,
+                         view->u.tex.first_layer,
+                         view->u.tex.last_layer,
                          view->swizzle_r,
                          view->swizzle_g,
                          view->swizzle_b,
@@ -645,16 +759,33 @@ pvrgpu_set_tess_state(struct pipe_context *pipe,
                       const float default_outer_level[4],
                       const float default_inner_level[2])
 {
-   (void)pipe;
-   (void)default_outer_level;
-   (void)default_inner_level;
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   if (default_outer_level)
+      memcpy(ctx->tess_default_outer_level,
+             default_outer_level,
+             sizeof(ctx->tess_default_outer_level));
+   if (default_inner_level)
+      memcpy(ctx->tess_default_inner_level,
+             default_inner_level,
+             sizeof(ctx->tess_default_inner_level));
+   pvrgpu_counter_eventf("set_tess_state",
+                         "outer=%f,%f,%f,%f inner=%f,%f",
+                         ctx->tess_default_outer_level[0],
+                         ctx->tess_default_outer_level[1],
+                         ctx->tess_default_outer_level[2],
+                         ctx->tess_default_outer_level[3],
+                         ctx->tess_default_inner_level[0],
+                         ctx->tess_default_inner_level[1]);
 }
 
 static void
 pvrgpu_set_patch_vertices(struct pipe_context *pipe, uint8_t patch_vertices)
 {
-   (void)pipe;
-   (void)patch_vertices;
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   ctx->patch_vertices = patch_vertices;
+   pvrgpu_counter_eventf("set_patch_vertices",
+                         "patch_vertices=%u",
+                         ctx->patch_vertices);
 }
 
 static void
@@ -679,17 +810,25 @@ pvrgpu_set_constant_buffer(struct pipe_context *pipe,
 
    const struct pipe_constant_buffer *bound =
       &ctx->constant_buffers[shader][index];
-   uint32_t words[4];
-   const bool has_words = pvrgpu_constant_buffer_first_words(bound, words);
+   uint32_t words[16];
+   const bool has_words =
+      pvrgpu_constant_buffer_words(bound,
+                                   words,
+                                   sizeof(words) / sizeof(words[0]));
    pvrgpu_counter_eventf("set_constant_buffer",
                          "stage=%s index=%u has_buffer=%u has_resource=%u "
-                         "has_user=%u offset=%u size=%u total=%u "
-                         "has_words=%u first_words=0x%08x,0x%08x,0x%08x,0x%08x",
+                         "has_user=%u resource=%p offset=%u size=%u total=%u "
+                         "has_words=%u "
+                         "words0_15=0x%08x,0x%08x,0x%08x,0x%08x,"
+                         "0x%08x,0x%08x,0x%08x,0x%08x,"
+                         "0x%08x,0x%08x,0x%08x,0x%08x,"
+                         "0x%08x,0x%08x,0x%08x,0x%08x",
                          pvrgpu_shader_stage_name(shader),
                          index,
                          pvrgpu_constant_buffer_is_bound(bound) ? 1 : 0,
                          bound->buffer ? 1 : 0,
                          bound->user_buffer ? 1 : 0,
+                         (void *)bound->buffer,
                          bound->buffer_offset,
                          bound->buffer_size,
                          ctx->num_constant_buffers[shader],
@@ -697,7 +836,19 @@ pvrgpu_set_constant_buffer(struct pipe_context *pipe,
                          words[0],
                          words[1],
                          words[2],
-                         words[3]);
+                         words[3],
+                         words[4],
+                         words[5],
+                         words[6],
+                         words[7],
+                         words[8],
+                         words[9],
+                         words[10],
+                         words[11],
+                         words[12],
+                         words[13],
+                         words[14],
+                         words[15]);
 }
 
 static void
@@ -746,7 +897,9 @@ pvrgpu_set_sampler_views(struct pipe_context *pipe,
    pvrgpu_counter_eventf("set_sampler_views",
                          "stage=%s start=%u count=%u unbind=%u bound=%u "
                          "total=%u first_target=%u first_format=%s "
-                         "texture=%ux%u texture_format=%s",
+                         "first_view=%p texture_res=%p texture=%ux%u "
+                         "texture_format=%s first_level=%u last_level=%u "
+                         "first_layer=%u last_layer=%u",
                          pvrgpu_shader_stage_name(shader),
                          start_slot,
                          bind_count,
@@ -755,9 +908,15 @@ pvrgpu_set_sampler_views(struct pipe_context *pipe,
                          ctx->num_sampler_views[shader],
                          first ? first->target : 0,
                          first ? util_format_name(first->format) : "none",
+                         (void *)first,
+                         (void *)texture,
                          texture ? texture->width0 : 0,
                          texture ? texture->height0 : 0,
-                         texture ? util_format_name(texture->format) : "none");
+                         texture ? util_format_name(texture->format) : "none",
+                         first ? first->u.tex.first_level : 0,
+                         first ? first->u.tex.last_level : 0,
+                         first ? first->u.tex.first_layer : 0,
+                         first ? first->u.tex.last_layer : 0);
 }
 
 static void
@@ -820,6 +979,21 @@ pvrgpu_set_vertex_buffers(struct pipe_context *pipe,
                             ctx->vertex_buffers[0].is_user_buffer : 0,
                          ctx->num_vertex_buffers ?
                             ctx->vertex_buffers[0].buffer_offset : 0);
+   for (unsigned i = 0; i < ctx->num_vertex_buffers; ++i) {
+      const struct pipe_vertex_buffer *buffer = &ctx->vertex_buffers[i];
+      const struct pipe_resource *resource =
+         buffer->is_user_buffer ? NULL : buffer->buffer.resource;
+      pvrgpu_counter_eventf("vertex_buffer",
+                            "slot=%u user=%u offset=%u "
+                            "resource=%p resource_size=%u user_ptr=%p",
+                            i,
+                            buffer->is_user_buffer ? 1 : 0,
+                            buffer->buffer_offset,
+                            (void *)resource,
+                            resource ? resource->width0 : 0,
+                            buffer->is_user_buffer ? buffer->buffer.user :
+                                                     NULL);
+   }
 }
 
 static struct pipe_query *
@@ -1081,12 +1255,12 @@ pvrgpu_init_state_functions(struct pipe_context *pipe)
    pipe->bind_gs_state = pvrgpu_bind_gs_state;
    pipe->delete_gs_state = pvrgpu_delete_shader_state;
 
-   pipe->create_tcs_state = pvrgpu_create_unsupported_shader_state;
-   pipe->bind_tcs_state = pvrgpu_bind_state_object;
+   pipe->create_tcs_state = pvrgpu_create_tcs_state;
+   pipe->bind_tcs_state = pvrgpu_bind_tcs_state;
    pipe->delete_tcs_state = pvrgpu_delete_shader_state;
 
-   pipe->create_tes_state = pvrgpu_create_unsupported_shader_state;
-   pipe->bind_tes_state = pvrgpu_bind_state_object;
+   pipe->create_tes_state = pvrgpu_create_tes_state;
+   pipe->bind_tes_state = pvrgpu_bind_tes_state;
    pipe->delete_tes_state = pvrgpu_delete_shader_state;
 
    pipe->create_vertex_elements_state = pvrgpu_create_vertex_elements_state;

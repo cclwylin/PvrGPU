@@ -21,7 +21,9 @@ Current status:
 - Mesa's upload manager is initialized for state-tracker internal uploads, and resource release hooks are wired so teardown is clean.
 - real draw lowering/rasterization is not implemented yet; unsupported draw shapes still record `unsupported_draw`.
 - real texture sampling, shader lowering, scaled/format-converting blits, resolves, FBO draw pixels, UBO layout correctness, EGL image import/export, depth/stencil/blend pixel behavior, compute, and real synchronization paths are still intentionally fail-closed, tracked-only, or no-op.
-- these files are not wired into the repository CMake build; use `scripts/install-pvrgpu-mesa-driver.sh` to copy and patch them into a Mesa source tree.
+- `meson.build` is the Mesa source/build seam; the repository CMake build
+  produces the native `pvrgpu` replay entry point, which consumes the
+  separately configured Mesa install prefix at runtime.
 
 The first real target is:
 
@@ -43,14 +45,13 @@ The command format consumed by the model is documented in
 Direct Mesa smoke:
 
 ```bash
-./scripts/check-pvrgpu-mesa-driver-build.sh --platforms macos --full-dri --install
-./scripts/run-pvrgpu-mesa-driver-smoke.sh --size 16x16
-./scripts/run-pvrgpu-mesa-driver-triangle-smoke.sh --size 16x16
-./scripts/run-pvrgpu-mesa-driver-phase3-state-smoke.sh --size 16x16
-./scripts/run-pvrgpu-mesa-driver-phase4-texture-smoke.sh --size 16x16
-./scripts/run-pvrgpu-mesa-driver-phase5-fbo-smoke.sh --size 16x16 --fbo-size 8x8
-./scripts/run-pvrgpu-mesa-driver-phase6-uniform-smoke.sh --size 16x16
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build --target pvrgpu
+ctest --test-dir build --output-on-failure
 ```
+
+The player is `build/bin/pvrgpu` on macOS/Linux and
+`build/bin/pvrgpu.exe` on Windows.
 
 The clear smoke creates a surfaceless GLES2 pbuffer, clears it, verifies
 `glReadPixels()` returns `32,64,128,255`, writes `driver-command.txt`, and

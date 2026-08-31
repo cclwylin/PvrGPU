@@ -11,12 +11,14 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace pvrgpu::stub {
 
-PdsEngine::PdsEngine(sc_core::sc_module_name name, MemoryPool &pool)
-    : sc_module(name), pool_(pool) {
+PdsEngine::PdsEngine(sc_core::sc_module_name name, MemoryPool &pool,
+                     GpuMemorySystem *memory)
+    : sc_module(name), pool_(pool), memory_(memory) {
   SC_THREAD(Run);
 }
 
@@ -25,11 +27,15 @@ void PdsEngine::Run() {
     const PipelineTxn txn = input.read();
     PipelineState state = LoadPipelineState(pool_, txn.state);
     RequireStage(state.stage, PipelineStage::kFragmentsReady, name());
+    if (memory_ && state.memory_mode != memory_->mode())
+      throw std::runtime_error("PDS memory mode mismatch");
     if (!IsRasterFunctionalCase(state.functional_case))
       throw std::runtime_error("PDS received an unsupported case");
+    const bool has_parameter_payload =
+        memory_ ? !HasPoolHandle(state.parameter_triangles)
+                : HasPoolHandle(state.parameter_triangles);
     if (!HasPoolHandle(state.fragment_invocations) ||
-        !HasPoolHandle(state.fragment_quads) ||
-        !HasPoolHandle(state.parameter_triangles) ||
+        !HasPoolHandle(state.fragment_quads) || !has_parameter_payload ||
         HasPoolHandle(state.usc_fragment_tasks) ||
         HasPoolHandle(state.usc_coefficient_banks)) {
       throw std::runtime_error("PDS input/output payload ownership is invalid");
@@ -54,8 +60,18 @@ void PdsEngine::Run() {
     }
     const std::vector<FragmentQuad> quads =
         LoadArray<FragmentQuad>(pool_, state.fragment_quads);
-    const std::vector<ParameterTriangle> parameters =
-        LoadArray<ParameterTriangle>(pool_, state.parameter_triangles);
+    MemoryAccessStats memory_stats;
+    std::vector<ParameterTriangle> parameters;
+    if (memory_) {
+      auto read = ReadMemoryArray<ParameterTriangle>(
+          *memory_, state.parameter_triangles_gpu_address,
+          state.parameter_triangles_bytes, MemoryClient::kParameterRead);
+      parameters = std::move(read.values);
+      memory_stats += read.stats;
+    } else {
+      parameters =
+          LoadArray<ParameterTriangle>(pool_, state.parameter_triangles);
+    }
     if (invocations.size() != state.active_fragment_invocations ||
         quads.size() != state.fragment_groups) {
       throw std::runtime_error("PDS fragment work counts are inconsistent");
@@ -64,8 +80,13 @@ void PdsEngine::Run() {
     const bool varying_case = UsesShaderVaryings(state.functional_case);
     std::vector<ParameterCoefficientSet> parameter_coefficients;
     if (varying_case) {
+      const bool has_coefficients =
+          memory_ ? (!HasPoolHandle(state.parameter_coefficients) &&
+                     state.parameter_coefficients_gpu_address != 0 &&
+                     state.parameter_coefficients_bytes != 0)
+                  : HasPoolHandle(state.parameter_coefficients);
       if (!HasPoolHandle(state.shader_varying_bindings) ||
-          !HasPoolHandle(state.parameter_coefficients)) {
+          !has_coefficients) {
         throw std::runtime_error(
             "PDS varying case has no linkage/coefficient payload");
       }
@@ -84,8 +105,16 @@ void PdsEngine::Run() {
           throw std::runtime_error("PDS varying linkage is not exact");
         }
       }
-      parameter_coefficients = LoadArray<ParameterCoefficientSet>(
-          pool_, state.parameter_coefficients);
+      if (memory_) {
+        auto read = ReadMemoryArray<ParameterCoefficientSet>(
+            *memory_, state.parameter_coefficients_gpu_address,
+            state.parameter_coefficients_bytes, MemoryClient::kParameterRead);
+        parameter_coefficients = std::move(read.values);
+        memory_stats += read.stats;
+      } else {
+        parameter_coefficients = LoadArray<ParameterCoefficientSet>(
+            pool_, state.parameter_coefficients);
+      }
       if (state.counters.parameter_coefficient_sets !=
               parameter_coefficients.size() ||
           state.counters.parameter_write_bytes !=
@@ -96,6 +125,8 @@ void PdsEngine::Run() {
       }
     } else if (HasPoolHandle(state.shader_varying_bindings) ||
                HasPoolHandle(state.parameter_coefficients) ||
+               state.parameter_coefficients_gpu_address != 0 ||
+               state.parameter_coefficients_bytes != 0 ||
                state.counters.parameter_coefficient_sets != 0 ||
                state.counters.parameter_write_bytes != 0) {
       throw std::runtime_error(
@@ -259,6 +290,11 @@ void PdsEngine::Run() {
       }
     }
     state.stage = PipelineStage::kPdsReady;
+    ApplyMemoryAccessStats(state.counters, memory_stats);
+    const std::uint64_t memory_cycles =
+        MemoryAccessDelayCycles(memory_stats);
+    state.counters.renderer_cycles += memory_cycles;
+    WaitForCycles(memory_cycles);
     StorePipelineState(pool_, txn.state, state);
     output.write(txn);
   }

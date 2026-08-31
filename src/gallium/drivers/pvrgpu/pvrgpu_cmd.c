@@ -1,10 +1,14 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "pvrgpu_cmd.h"
+#include "pvrgpu_counter.h"
+#include "pvrgpu_systemc_api.h"
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static bool pvrgpu_global_driver_draw_command_emitted;
@@ -49,8 +53,179 @@ pvrgpu_cmd_format_supported(const char *format)
           (strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBX8) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_BGRX8) == 0 ||
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R5G6B5) == 0 ||
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_B5G6R5) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R10G10B10A2) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_B10G10R10A2) == 0);
+}
+
+static const char *
+pvrgpu_nonempty_env(const char *name)
+{
+   const char *value = getenv(name);
+   return value && value[0] != '\0' ? value : NULL;
+}
+
+static const char *
+pvrgpu_safe_text(const char *text)
+{
+   return text ? text : "";
+}
+
+static void
+pvrgpu_systemc_submit_info_init(
+   struct pvrgpu_systemc_submit_info *info,
+   const struct pvrgpu_systemc_driver_command *command)
+{
+   memset(info, 0, sizeof(*info));
+   info->version = PVRGPU_SYSTEMC_API_VERSION;
+   info->command = command;
+   info->jsonl_path = pvrgpu_nonempty_env("PVRGPU_SYSTEMC_JSONL_OUT");
+   info->stderr_path = pvrgpu_nonempty_env("PVRGPU_SYSTEMC_STDERR_OUT");
+   info->outdir = pvrgpu_nonempty_env("PVRGPU_SYSTEMC_OUTDIR");
+   info->memory_mode = pvrgpu_nonempty_env("PVRGPU_MODEL_MEMORY_MODE");
+}
+
+static bool
+pvrgpu_submit_systemc_api(const struct pvrgpu_systemc_driver_command *command,
+                          char *error,
+                          size_t error_size)
+{
+   const char *library_path = pvrgpu_nonempty_env("PVRGPU_SYSTEMC_API_LIB");
+   if (!library_path) {
+      pvrgpu_counter_eventf("systemc_api_disabled",
+                            "command=%s case=%s",
+                            pvrgpu_safe_text(command ? command->command : NULL),
+                            pvrgpu_safe_text(command ? command->case_name : NULL));
+      return true;
+   }
+
+   if (!pvrgpu_nonempty_env("PVRGPU_SYSTEMC_JSONL_OUT") ||
+       !pvrgpu_nonempty_env("PVRGPU_SYSTEMC_OUTDIR")) {
+      pvrgpu_cmd_error(error, error_size,
+                       "SystemC API requires PVRGPU_SYSTEMC_JSONL_OUT and "
+                       "PVRGPU_SYSTEMC_OUTDIR");
+      pvrgpu_counter_eventf("systemc_api_error",
+                            "stage=env command=%s case=%s reason=%s",
+                            pvrgpu_safe_text(command ? command->command : NULL),
+                            pvrgpu_safe_text(command ? command->case_name : NULL),
+                            pvrgpu_safe_text(error && error_size != 0 ?
+                                             error : NULL));
+      return false;
+   }
+
+   static void *handle;
+   static pvrgpu_systemc_submit_driver_command_fn submit;
+   static const char *loaded_library_path;
+   if (!handle || loaded_library_path != library_path) {
+      dlerror();
+      handle = dlopen(library_path, RTLD_NOW | RTLD_GLOBAL);
+      if (!handle) {
+         const char *dl_message = dlerror();
+         char message[512];
+         snprintf(message, sizeof(message),
+                  "cannot load SystemC API library: %s",
+                  dl_message ? dl_message : library_path);
+         pvrgpu_cmd_error(error, error_size, message);
+         pvrgpu_counter_eventf("systemc_api_error",
+                               "stage=dlopen command=%s case=%s library=%s "
+                               "reason=%s",
+                               pvrgpu_safe_text(command ? command->command :
+                                                NULL),
+                               pvrgpu_safe_text(command ? command->case_name :
+                                                NULL),
+                               pvrgpu_safe_text(library_path),
+                               pvrgpu_safe_text(message));
+         return false;
+      }
+      loaded_library_path = library_path;
+      dlerror();
+      submit = (pvrgpu_systemc_submit_driver_command_fn)
+         dlsym(handle, "pvrgpu_systemc_submit_driver_command");
+      const char *symbol_error = dlerror();
+      if (symbol_error || !submit) {
+         char message[512];
+         snprintf(message, sizeof(message),
+                  "cannot resolve SystemC API submit symbol: %s",
+                  symbol_error ? symbol_error :
+                                 "pvrgpu_systemc_submit_driver_command");
+         pvrgpu_cmd_error(error, error_size, message);
+         pvrgpu_counter_eventf("systemc_api_error",
+                               "stage=dlsym command=%s case=%s library=%s "
+                               "reason=%s",
+                               pvrgpu_safe_text(command ? command->command :
+                                                NULL),
+                               pvrgpu_safe_text(command ? command->case_name :
+                                                NULL),
+                               pvrgpu_safe_text(library_path),
+                               pvrgpu_safe_text(message));
+         return false;
+      }
+   }
+
+   struct pvrgpu_systemc_submit_info info;
+   pvrgpu_systemc_submit_info_init(&info, command);
+   pvrgpu_counter_eventf("systemc_api_submit",
+                         "command=%s case=%s jsonl=%s outdir=%s mode=%s",
+                         pvrgpu_safe_text(command ? command->command : NULL),
+                         pvrgpu_safe_text(command ? command->case_name : NULL),
+                         pvrgpu_safe_text(info.jsonl_path),
+                         pvrgpu_safe_text(info.outdir),
+                         pvrgpu_safe_text(info.memory_mode));
+   if (error && error_size != 0)
+      error[0] = '\0';
+   const int result = submit(&info, error, error_size);
+   if (result != 0) {
+      if (error && error_size != 0 && error[0] == '\0')
+         snprintf(error, error_size, "SystemC API returned %d", result);
+      pvrgpu_counter_eventf("systemc_api_error",
+                            "stage=submit command=%s case=%s result=%d "
+                            "reason=%s",
+                            pvrgpu_safe_text(command ? command->command : NULL),
+                            pvrgpu_safe_text(command ? command->case_name :
+                                             NULL),
+                            result,
+                            pvrgpu_safe_text(error && error_size != 0 ?
+                                             error : NULL));
+      return false;
+   }
+   pvrgpu_counter_eventf("systemc_api_done",
+                         "command=%s case=%s",
+                         pvrgpu_safe_text(command ? command->command : NULL),
+                         pvrgpu_safe_text(command ? command->case_name : NULL));
+   return true;
+}
+
+static void
+pvrgpu_systemc_command_init(struct pvrgpu_systemc_driver_command *command,
+                            const char *command_name,
+                            const char *case_name,
+                            uint32_t frame,
+                            uint32_t framebuffer_width,
+                            uint32_t framebuffer_height,
+                            uint32_t width,
+                            uint32_t height,
+                            const char *format,
+                            const uint32_t clear_color_bits[4])
+{
+   memset(command, 0, sizeof(*command));
+   command->version = PVRGPU_SYSTEMC_API_VERSION;
+   command->schema = PVRGPU_DRIVER_COMMAND_SCHEMA;
+   command->producer = PVRGPU_DRIVER_COMMAND_PRODUCER;
+   command->command = command_name;
+   command->case_name = case_name;
+   command->format = format;
+   command->frame = frame;
+   command->framebuffer_width = framebuffer_width ? framebuffer_width : width;
+   command->framebuffer_height = framebuffer_height ? framebuffer_height : height;
+   command->width = width;
+   command->height = height;
+   if (clear_color_bits) {
+      command->clear_color_bits[0] = clear_color_bits[0];
+      command->clear_color_bits[1] = clear_color_bits[1];
+      command->clear_color_bits[2] = clear_color_bits[2];
+      command->clear_color_bits[3] = clear_color_bits[3];
+   }
 }
 
 static bool
@@ -233,7 +408,7 @@ pvrgpu_write_clear_color_command(const char *path,
       return false;
    }
 
-   const int written = fprintf(
+   int written = fprintf(
       file,
       "schema=%s\n"
       "producer=%s\n"
@@ -263,7 +438,19 @@ pvrgpu_write_clear_color_command(const char *path,
       }
       return false;
    }
-   return true;
+
+   struct pvrgpu_systemc_driver_command api_command;
+   pvrgpu_systemc_command_init(&api_command,
+                               "clear_color",
+                               cmd->case_name,
+                               cmd->frame,
+                               cmd->width,
+                               cmd->height,
+                               cmd->width,
+                               cmd->height,
+                               cmd->format,
+                               cmd->clear_color_bits);
+   return pvrgpu_submit_systemc_api(&api_command, error, error_size);
 }
 
 bool
@@ -286,7 +473,7 @@ pvrgpu_write_draw_primitive_sequence_command(
       return false;
    }
 
-   const int written = fprintf(
+   int written = fprintf(
       file,
       "schema=%s\n"
       "producer=%s\n"
@@ -309,6 +496,7 @@ pvrgpu_write_draw_primitive_sequence_command(
       "ps_invocations=%" PRIu64 "\n"
       "hs_invocations=%u\n"
       "ds_invocations=%u\n"
+      "cs_invocations=%u\n"
       "semantic_texel_fetches=%" PRIu64 "\n",
       PVRGPU_DRIVER_COMMAND_SCHEMA,
       PVRGPU_DRIVER_COMMAND_PRODUCER,
@@ -333,7 +521,17 @@ pvrgpu_write_draw_primitive_sequence_command(
       cmd->ps_invocations,
       cmd->hs_invocations,
       cmd->ds_invocations,
+      cmd->cs_invocations,
       cmd->semantic_texel_fetches);
+   if (written >= 0 &&
+       cmd->framebuffer_rgba8_path &&
+       cmd->framebuffer_rgba8_path[0] != '\0') {
+      const int extra_written = fprintf(file,
+                                        "framebuffer_rgba8_path=%s\n",
+                                        cmd->framebuffer_rgba8_path);
+      if (extra_written < 0)
+         written = extra_written;
+   }
    const int close_status = fclose(file);
    if (written < 0 || close_status != 0) {
       if (error && error_size != 0) {
@@ -342,7 +540,34 @@ pvrgpu_write_draw_primitive_sequence_command(
       }
       return false;
    }
-   return true;
+
+   struct pvrgpu_systemc_driver_command api_command;
+   pvrgpu_systemc_command_init(&api_command,
+                               "draw_primitive_sequence",
+                               cmd->case_name,
+                               cmd->frame,
+                               cmd->width,
+                               cmd->height,
+                               cmd->width,
+                               cmd->height,
+                               cmd->format,
+                               cmd->clear_color_bits);
+   api_command.framebuffer_rgba8_path = cmd->framebuffer_rgba8_path;
+   api_command.draw_count = cmd->draw_count;
+   api_command.ia_vertices = cmd->ia_vertices;
+   api_command.ia_primitives = cmd->ia_primitives;
+   api_command.vs_invocations = cmd->vs_invocations;
+   api_command.gs_invocations = cmd->gs_invocations;
+   api_command.gs_primitives = cmd->gs_primitives;
+   api_command.clip_invocations = cmd->clip_invocations;
+   api_command.clip_primitives = cmd->clip_primitives;
+   api_command.setup_triangles = cmd->setup_triangles;
+   api_command.ps_invocations = cmd->ps_invocations;
+   api_command.hs_invocations = cmd->hs_invocations;
+   api_command.ds_invocations = cmd->ds_invocations;
+   api_command.cs_invocations = cmd->cs_invocations;
+   api_command.semantic_texel_fetches = cmd->semantic_texel_fetches;
+   return pvrgpu_submit_systemc_api(&api_command, error, error_size);
 }
 
 bool
@@ -412,7 +637,26 @@ pvrgpu_write_draw_indexed_quad_command(
       }
       return false;
    }
-   return true;
+
+   struct pvrgpu_systemc_driver_command api_command;
+   pvrgpu_systemc_command_init(&api_command,
+                               "draw_indexed_quad",
+                               cmd->case_name,
+                               cmd->frame,
+                               cmd->framebuffer_width,
+                               cmd->framebuffer_height,
+                               cmd->width,
+                               cmd->height,
+                               cmd->format,
+                               cmd->clear_color_bits);
+   api_command.draw_count = cmd->draw_count;
+   api_command.index_count = cmd->index_count;
+   api_command.unique_vertices = cmd->unique_vertices;
+   api_command.primitive_count = cmd->primitive_count;
+   api_command.clip_primitives = cmd->clip_primitives;
+   api_command.setup_triangles = cmd->setup_triangles;
+   api_command.semantic_texel_fetches = cmd->semantic_texel_fetches;
+   return pvrgpu_submit_systemc_api(&api_command, error, error_size);
 }
 
 bool
@@ -478,5 +722,25 @@ pvrgpu_write_draw_triangle_command(
       }
       return false;
    }
-   return true;
+
+   struct pvrgpu_systemc_driver_command api_command;
+   pvrgpu_systemc_command_init(&api_command,
+                               "draw_triangle",
+                               cmd->case_name,
+                               cmd->frame,
+                               cmd->width,
+                               cmd->height,
+                               cmd->width,
+                               cmd->height,
+                               cmd->format,
+                               cmd->clear_color_bits);
+   for (unsigned vertex = 0; vertex < 3; ++vertex) {
+      api_command.vertex_bits[vertex][0] = cmd->vertex_bits[vertex][0];
+      api_command.vertex_bits[vertex][1] = cmd->vertex_bits[vertex][1];
+   }
+   api_command.fragment_color_bits[0] = cmd->fragment_color_bits[0];
+   api_command.fragment_color_bits[1] = cmd->fragment_color_bits[1];
+   api_command.fragment_color_bits[2] = cmd->fragment_color_bits[2];
+   api_command.fragment_color_bits[3] = cmd->fragment_color_bits[3];
+   return pvrgpu_submit_systemc_api(&api_command, error, error_size);
 }

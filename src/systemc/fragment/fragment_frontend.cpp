@@ -21,8 +21,9 @@
 namespace pvrgpu::stub {
 
 FragmentFrontend::FragmentFrontend(sc_core::sc_module_name name,
-                                   MemoryPool &pool)
-    : sc_module(name), pool_(pool) {
+                                   MemoryPool &pool,
+                                   GpuMemorySystem *memory)
+    : sc_module(name), pool_(pool), memory_(memory) {
   SC_THREAD(Run);
 }
 
@@ -31,6 +32,8 @@ void FragmentFrontend::Run() {
     const PipelineTxn txn = input.read();
     PipelineState state = LoadPipelineState(pool_, txn.state);
     RequireStage(state.stage, PipelineStage::kVisibilityReady, name());
+    if (memory_ && state.memory_mode != memory_->mode())
+      throw std::runtime_error("FragmentFrontend memory mode mismatch");
     if (!IsRasterFunctionalCase(state.functional_case) ||
         !HasPoolHandle(state.fragment_candidates)) {
       throw std::runtime_error(
@@ -39,10 +42,20 @@ void FragmentFrontend::Run() {
 
     const std::vector<FragmentCandidate> candidates =
         LoadArray<FragmentCandidate>(pool_, state.fragment_candidates);
-    if (!HasPoolHandle(state.parameter_triangles))
-      throw std::runtime_error("FragmentFrontend has no parameter payload");
-    const std::vector<ParameterTriangle> parameters =
-        LoadArray<ParameterTriangle>(pool_, state.parameter_triangles);
+    MemoryAccessStats memory_stats;
+    std::vector<ParameterTriangle> parameters;
+    if (memory_) {
+      auto read = ReadMemoryArray<ParameterTriangle>(
+          *memory_, state.parameter_triangles_gpu_address,
+          state.parameter_triangles_bytes, MemoryClient::kParameterRead);
+      parameters = std::move(read.values);
+      memory_stats += read.stats;
+    } else {
+      if (!HasPoolHandle(state.parameter_triangles))
+        throw std::runtime_error("FragmentFrontend has no parameter payload");
+      parameters =
+          LoadArray<ParameterTriangle>(pool_, state.parameter_triangles);
+    }
     const std::uint64_t pixel_count =
         static_cast<std::uint64_t>(state.width) * state.height;
     if (pixel_count > std::numeric_limits<std::size_t>::max())
@@ -330,10 +343,13 @@ void FragmentFrontend::Run() {
     state.fragment_quads = StoreNewArray(pool_, fragment_quads);
     state.counters.ps_invocations = invocations.size();
     state.fragment_groups = active_quad_count;
-    const std::uint64_t cycles =
+    const std::uint64_t functional_cycles =
         kReferenceUarch.fragment_frontend_base_cycles +
         CeilDivide(state.fragment_shader_lane_count,
                    kReferenceUarch.fragment_lanes_per_batch);
+    ApplyMemoryAccessStats(state.counters, memory_stats);
+    const std::uint64_t cycles =
+        functional_cycles + MemoryAccessDelayCycles(memory_stats);
     state.counters.fragment_frontend_cycles = cycles;
     state.counters.renderer_cycles += cycles;
     state.stage = PipelineStage::kFragmentsReady;

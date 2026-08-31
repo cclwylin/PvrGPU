@@ -163,6 +163,7 @@ int main() {
             "ps_invocations=1052\n"
             "hs_invocations=2\n"
             "ds_invocations=8\n"
+            "cs_invocations=13\n"
             "semantic_texel_fetches=0\n");
   error.clear();
   if (int failed =
@@ -179,6 +180,7 @@ int main() {
                      command.ps_invocations == 1052 &&
                      command.hs_invocations == 2 &&
                      command.ds_invocations == 8 &&
+                     command.cs_invocations == 13 &&
                      command.semantic_texel_fetches == 0,
                  "wrong primitive sequence metadata"))
     return failed;

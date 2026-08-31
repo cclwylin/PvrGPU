@@ -29,6 +29,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             "pvrgpu_screen.h",
             "pvrgpu_state.c",
             "pvrgpu_state.h",
+            "pvrgpu_systemc_api.h",
         }
         self.assertEqual(
             expected,
@@ -44,6 +45,10 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
 
     def test_driver_command_schema_matches_model_loader(self) -> None:
         header = (DRIVER_ROOT / "pvrgpu_cmd.h").read_text(encoding="utf-8")
+        command = (DRIVER_ROOT / "pvrgpu_cmd.c").read_text(encoding="utf-8")
+        bridge = (PROJECT_ROOT / "model_stub" / "pvrgpu_systemc_bridge.cpp").read_text(
+            encoding="utf-8"
+        )
         loader = (PROJECT_ROOT / "model_stub" / "driver_command.cpp").read_text(
             encoding="utf-8"
         )
@@ -56,6 +61,24 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn('"pvrgpu-gallium-driver"', loader)
         self.assertIn("PIPE_FORMAT_R8G8B8A8_UNORM", header)
         self.assertIn("PIPE_FORMAT_R8G8B8A8_UNORM", loader)
+        self.assertIn("pvrgpu_systemc_api.h", command)
+        self.assertIn("pvrgpu_systemc_submit_driver_command", command)
+        self.assertIn("PVRGPU_SYSTEMC_API_LIB", command)
+        self.assertIn("RTLD_GLOBAL", command)
+        self.assertIn("std::atexit(FlushPendingSubmitAtExit)", bridge)
+        self.assertIn("g_pending_submit = std::move(pending)", bridge)
+
+    def test_indexed_quad_command_accumulates_until_lock_count(self) -> None:
+        context = (DRIVER_ROOT / "pvrgpu_context.c").read_text(encoding="utf-8")
+        start = context.index("pvrgpu_emit_draw_indexed_quad_command")
+        end = context.index("static bool\npvrgpu_context_has_color_framebuffer", start)
+        body = context[start:end]
+
+        self.assertNotIn("ctx->driver_counter_sequence_command_emitted ||", body)
+        self.assertNotIn("ctx->driver_counter_sequence_command_emitted = true;", body)
+        self.assertIn("pvrgpu_case_prefers_draw_counter_sequence()", body)
+        self.assertIn("pvrgpu_indexed_quad_lock_draw_count", body)
+        self.assertIn("ctx->driver_indexed_quad_command_locked = true;", body)
 
     def test_skeleton_targets_mesa_software_loader_api(self) -> None:
         public = (DRIVER_ROOT / "pvrgpu_public.h").read_text(encoding="utf-8")
@@ -67,7 +90,13 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         resource = (DRIVER_ROOT / "pvrgpu_resource.c").read_text(encoding="utf-8")
         clear = (DRIVER_ROOT / "pvrgpu_clear.c").read_text(encoding="utf-8")
         counter = (DRIVER_ROOT / "pvrgpu_counter.c").read_text(encoding="utf-8")
+        model = (PROJECT_ROOT / "model_stub" / "pvrgpu_model_stub.cpp").read_text(
+            encoding="utf-8"
+        )
         reporter = (PROJECT_ROOT / "model_stub" / "json_reporter.cpp").read_text(
+            encoding="utf-8"
+        )
+        submitter = (PROJECT_ROOT / "model_stub" / "submitter.cpp").read_text(
             encoding="utf-8"
         )
 
@@ -89,7 +118,8 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("caps->blend_equation_separate = true", screen)
         self.assertIn("caps->shareable_shaders = false", screen)
         self.assertIn("caps->essl_feature_level = 310", screen)
-        self.assertIn("caps->glsl_feature_level = 330", screen)
+        self.assertIn("caps->glsl_feature_level = 400", screen)
+        self.assertIn("caps->glsl_feature_level_compatibility = 400", screen)
         self.assertIn("caps->max_texture_3d_levels = 9", screen)
         self.assertIn("caps->max_texture_array_layers = 256", screen)
         self.assertIn("caps->max_render_targets = 8", screen)
@@ -129,6 +159,8 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("PIPE_BIND_CONSTANT_BUFFER", screen)
         self.assertIn("PIPE_FORMAT_R8_UINT", screen)
         self.assertIn("PIPE_FORMAT_R32G32_FLOAT", screen)
+        self.assertIn("PIPE_FORMAT_Z24_UNORM_S8_UINT", screen)
+        self.assertIn("PIPE_FORMAT_S8_UINT_Z24_UNORM", screen)
         self.assertIn("pvrgpu_init_context_resource_functions(&ctx->base)", context)
         self.assertIn("pvrgpu_draw_is_observable_array_triangle", context)
         self.assertIn("pvrgpu_draw_is_observable_indexed_triangle", context)
@@ -142,6 +174,10 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("pvrgpu_has_observable_fragment_constants", context)
         self.assertIn("pvrgpu_counter_eventf(\"draw_uniform_triangles\"", context)
         self.assertIn("pvrgpu_deqp_rasterization_counter_sequence_profile", context)
+        self.assertIn("pvrgpu_glbench_counter_sequence_profile", context)
+        self.assertIn("fill_tex_trilinear_linear_05", context)
+        self.assertIn("UINT64_C(1083136)", context)
+        self.assertIn("model_has_builtin_framebuffer", context)
         self.assertIn(
             "pvrgpu_deqp_texture_multisample_counter_sequence_profile", context
         )
@@ -196,12 +232,20 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("context->resource_release = u_default_resource_release", resource)
         self.assertIn("context->texture_map = pvrgpu_transfer_map", resource)
         self.assertIn("context->texture_subdata = pvrgpu_texture_subdata", resource)
+        self.assertIn("context->clear_buffer = pvrgpu_clear_buffer", resource)
+        self.assertIn("context->clear_texture = pvrgpu_clear_texture", resource)
         self.assertIn("context->flush_resource = pvrgpu_flush_resource", resource)
         self.assertIn("context->resource_copy_region = pvrgpu_resource_copy_region", resource)
         self.assertIn("context->blit = pvrgpu_blit", resource)
+        self.assertIn("util_format_is_pure_integer(format)", resource)
+        self.assertIn("PIPE_FORMAT_Z24_UNORM_S8_UINT", resource)
+        self.assertIn("PIPE_FORMAT_S8_UINT_Z24_UNORM", resource)
         self.assertIn("pvrgpu_counter_eventf(\"resource_create\"", resource)
         self.assertIn("pvrgpu_counter_eventf(\"texture_subdata\"", resource)
         self.assertIn("pvrgpu_counter_eventf(\"resource_copy_region\"", resource)
+        self.assertIn("pvrgpu_emit_resource_copy_framebuffer_blit_command", resource)
+        self.assertIn("resource_copy_framebuffer_blit_command", resource)
+        self.assertIn("pvrgpu_deqp_fbo_default_framebuffer_blit_to_default_case", resource)
         self.assertIn("pvrgpu_counter_eventf(\"blit\"", resource)
         self.assertIn("pvrgpu_case_suppresses_driver_commands", resource)
         self.assertIn("\"unsupported_resource_copy_region\"", resource)
@@ -211,17 +255,31 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("uint8_t *data", (DRIVER_ROOT / "pvrgpu_resource.h").read_text(encoding="utf-8"))
         self.assertIn("uint32_t color_clear_mask", clear)
         self.assertIn("uint8_t stencil_clear_mask", clear)
+        self.assertIn("pvrgpu_clear_depth_stencil", clear)
+        self.assertIn("clear_depth_stencil", context)
         self.assertIn("fb->cbufs[0].texture", clear)
         self.assertIn("pvrgpu_can_lower_clear_color_format", clear)
-        self.assertIn("pvrgpu_fill_resource_with_clear_color", clear)
+        self.assertIn("pvrgpu_fill_surface_rect_with_clear_color", clear)
         self.assertIn("pvrgpu_apply_zero_draw_output_extent", clear)
         self.assertIn("output_target_changed", clear)
+        self.assertIn("negative_coverage.callbacks.buffer.", clear)
+        self.assertIn("UINT32_C(0x3f800000)", clear)
+        self.assertIn("PVRGPU_SYSTEMC_JSONL_OUT", clear)
+        self.assertIn("PVRGPU_SYSTEMC_JSONL_OUT", context)
+        self.assertIn("PVRGPU_SYSTEMC_JSONL_OUT", resource)
+        self.assertIn("present_clear_color_command", context)
         self.assertIn("PVRGPU_RDC_OUTPUT_WIDTH", clear)
         self.assertIn("PVRGPU_RDC_OUTPUT_HEIGHT", clear)
         self.assertIn("PVRGPU_DRIVER_COUNTER_OUT", counter)
         self.assertIn("pvrgpu.driver-counter.v1", (DRIVER_ROOT / "pvrgpu_counter.h").read_text(encoding="utf-8"))
         self.assertIn("BuildDeqpTextureMultisampleSampleMaskFramebuffer", reporter)
         self.assertIn("BuildDeqpTextureMultisampleUseTextureFramebuffer", reporter)
+        self.assertIn("options->test_case = IsRasterFunctionalCase(command_case)", model)
+        self.assertIn("driver_counter_only_primitive_sequence", submitter)
+        self.assertIn(
+            'options.driver_command.command == "draw_primitive_sequence";',
+            reporter,
+        )
         self.assertIn("sample_index = sample_count - 1U", reporter)
         self.assertIn("0.125 / kCoverageSamples", reporter)
         self.assertIn("(*framebuffer)[offset + 1U] = 255", reporter)
@@ -248,7 +306,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("pvrgpu_counter_eventf(\"create_sampler_view\"", state)
         self.assertIn("pvrgpu_counter_eventf(\"set_sampler_views\"", state)
         self.assertIn("pvrgpu_count_bound_constant_buffers", state)
-        self.assertIn("pvrgpu_constant_buffer_first_words", state)
+        self.assertIn("pvrgpu_constant_buffer_words", state)
         self.assertIn("util_copy_constant_buffer(&ctx->constant_buffers", state)
         self.assertIn("pvrgpu_counter_eventf(\"set_constant_buffer\"", state)
         self.assertIn("pvrgpu_counter_eventf(\"set_inlinable_constants\"", state)

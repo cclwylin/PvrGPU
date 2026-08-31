@@ -33,10 +33,12 @@
 #include "host/soc_bus_interface.h"
 #include "host/xpu_interface.h"
 #include "json_reporter.h"
+#include "memory/gpu_memory_system.h"
 #include "memory/mem_fabric.h"
 #include "memory/dram_model.h"
 #include "memory/on_chip_fabric.h"
 #include "memory_pool.h"
+#include "model_runner.h"
 #include "model_types.h"
 #include "pds/pds_engine.h"
 #include "pds/vertex_pds_engine.h"
@@ -49,8 +51,54 @@
 #include <systemc>
 
 #include <iostream>
+#include <string>
 
-int sc_main(int argc, char **argv) {
+namespace pvrgpu::stub {
+
+bool ConfigureDriverCommandOptions(Options *options, std::string *error) {
+  if (!options || !error)
+    return false;
+  if (!options->driver_command.enabled && options->driver_command_path.empty())
+    return true;
+  if (!options->driver_command_path.empty()) {
+    if (!LoadDriverCommand(options->driver_command_path,
+                           &options->driver_command, error)) {
+      return false;
+    }
+  }
+  if (!options->driver_command.enabled) {
+    *error = "driver command is not populated";
+    return false;
+  }
+
+  options->frames = 1;
+  if (options->driver_command.command == "draw_triangle") {
+    options->width = options->driver_command.width;
+    options->height = options->driver_command.height;
+    options->test_case = "driver_triangle_solid";
+  } else if (options->driver_command.command == "draw_indexed_quad") {
+    options->width = options->driver_command.framebuffer_width;
+    options->height = options->driver_command.framebuffer_height;
+    options->test_case = "driver_indexed_quad";
+  } else if (options->driver_command.command == "draw_primitive_sequence") {
+    options->width = options->driver_command.width;
+    options->height = options->driver_command.height;
+    const FunctionalCase command_case =
+        FunctionalCaseFromName(options->driver_command.test_case);
+    options->test_case = IsRasterFunctionalCase(command_case)
+                             ? options->driver_command.test_case
+                             : "driver_clear_color";
+  } else {
+    options->width = options->driver_command.width;
+    options->height = options->driver_command.height;
+    options->test_case = "driver_clear_color";
+  }
+  return true;
+}
+
+}  // namespace pvrgpu::stub
+
+int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options) {
   using pvrgpu::stub::ClipCull;
   using pvrgpu::stub::ComputeDataMaster;
   using pvrgpu::stub::ControlRegisterBus;
@@ -60,6 +108,7 @@ int sc_main(int argc, char **argv) {
   using pvrgpu::stub::FragmentFrontend;
   using pvrgpu::stub::FunctionalCase;
   using pvrgpu::stub::FunctionalCaseFromName;
+  using pvrgpu::stub::GpuMemorySystem;
   using pvrgpu::stub::IsAttributeFetchFamily;
   using pvrgpu::stub::IsRasterFunctionalCase;
   using pvrgpu::stub::IsTriangleSetupFamily;
@@ -77,9 +126,7 @@ int sc_main(int argc, char **argv) {
   using pvrgpu::stub::MixedCache;
   using pvrgpu::stub::MmuBif;
   using pvrgpu::stub::OnChipFabric;
-  using pvrgpu::stub::Options;
   using pvrgpu::stub::ParameterBuffer;
-  using pvrgpu::stub::ParseOptions;
   using pvrgpu::stub::Pbe;
   using pvrgpu::stub::PcoDecoder;
   using pvrgpu::stub::PdsEngine;
@@ -104,34 +151,10 @@ int sc_main(int argc, char **argv) {
   using pvrgpu::stub::VertexFetch;
   using pvrgpu::stub::XpuInterface;
 
-  Options options;
-  if (!ParseOptions(argc, argv, &options))
+  std::string command_error;
+  if (!pvrgpu::stub::ConfigureDriverCommandOptions(&options, &command_error)) {
+    std::cerr << command_error << '\n';
     return 2;
-  if (!options.driver_command_path.empty()) {
-    std::string command_error;
-    if (!LoadDriverCommand(options.driver_command_path,
-                           &options.driver_command, &command_error)) {
-      std::cerr << command_error << '\n';
-      return 2;
-    }
-    options.frames = 1;
-    if (options.driver_command.command == "draw_triangle") {
-      options.width = options.driver_command.width;
-      options.height = options.driver_command.height;
-      options.test_case = "driver_triangle_solid";
-    } else if (options.driver_command.command == "draw_indexed_quad") {
-      options.width = options.driver_command.framebuffer_width;
-      options.height = options.driver_command.framebuffer_height;
-      options.test_case = "driver_indexed_quad";
-    } else if (options.driver_command.command == "draw_primitive_sequence") {
-      options.width = options.driver_command.width;
-      options.height = options.driver_command.height;
-      options.test_case = "driver_clear_color";
-    } else {
-      options.width = options.driver_command.width;
-      options.height = options.driver_command.height;
-      options.test_case = "driver_clear_color";
-    }
   }
   const FunctionalCase functional_case =
       FunctionalCaseFromName(options.test_case);
@@ -279,6 +302,12 @@ int sc_main(int argc, char **argv) {
             << ",\"timing_provenance\":\"uncalibrated\""
             << ",\"cache_bypass\":"
             << (options.cache_bypass ? "true" : "false")
+            << ",\"memory_mode\":\""
+            << pvrgpu::stub::MemoryModeName(options.memory_mode) << "\""
+            << ",\"cache_simulated\":"
+            << (options.memory_mode == pvrgpu::stub::MemoryMode::kCache
+                    ? "true"
+                    : "false")
             << ",\"cache_policy\":\"set-associative-write-back-"
                "write-allocate-true-lru\""
             << ",\"mcu_cache\":{\"capacity_bytes\":"
@@ -305,7 +334,7 @@ int sc_main(int argc, char **argv) {
             << pvrgpu::stub::kUscL2CacheConfig.line_size_bytes
             << ",\"ways\":" << pvrgpu::stub::kUscL2CacheConfig.ways
             << ",\"banks\":" << pvrgpu::stub::kUscL2CacheConfig.banks << '}'
-            << ",\"dram_model\":\"fixed-latency-backing-store\""
+            << ",\"dram_model\":\"unified-fixed-latency-backing-store\""
             << ",\"dram_fixed_latency_cycles\":"
             << pvrgpu::stub::kDramFixedLatencyCycles
             << ",\"framebuffer_source\":\"dram-readback\""
@@ -380,6 +409,7 @@ int sc_main(int argc, char **argv) {
   std::cout.flush();
 
   MemoryPool pool;
+  GpuMemorySystem memory(options.memory_mode);
 
   // DXTP-aligned structural placeholders. They elaborate as distinct SystemC
   // modules but intentionally have no ports, process, timing, or functional
@@ -394,10 +424,9 @@ int sc_main(int argc, char **argv) {
   TwoDDataMaster two_d_data_master("two_d_data_master");
   ImageCompression image_compression("image_compression");
 
-  // MMU/fabric modules remain structural placeholders. MCU and USC-L2 bind
-  // idle traffic because their clients are not active yet. TCU's generic
-  // test port also binds idle FIFOs, while its dedicated sample port is the
-  // live Gate-16 TPU -> TCU -> SLC -> DRAM texture-read path below.
+  // MMU/fabric modules remain structural placeholders. MCU, TCU and USC-L2
+  // bind idle traffic because active clients now use the shared GpuMemorySystem
+  // API for DRAM backing plus optional SLC simulation.
   MmuBif mmu_bif("mmu_bif");
   MixedCache mixed_cache("mixed_cache", pool, options.cache_bypass);
   TextureCache texture_cache("texture_cache", pool, options.cache_bypass);
@@ -446,23 +475,6 @@ int sc_main(int argc, char **argv) {
   sc_core::sc_fifo<PipelineTxn> texture_to_pbe("texture_to_pbe", fifo_depth);
   sc_core::sc_fifo<PipelineTxn> pbe_to_pbe_write_back(
       "pbe_to_pbe_write_back", fifo_depth);
-  sc_core::sc_fifo<MemoryTxn> pbe_write_back_to_slc(
-      "pbe_write_back_to_slc", fifo_depth);
-  sc_core::sc_fifo<MemoryTxn> slc_to_dram("slc_to_dram", fifo_depth);
-  sc_core::sc_fifo<MemoryTxn> texture_unit_to_tcu(
-      "texture_unit_to_tcu", fifo_depth);
-  sc_core::sc_fifo<MemoryTxn> tcu_to_texture_unit(
-      "tcu_to_texture_unit", fifo_depth);
-  sc_core::sc_fifo<MemoryTxn> tcu_to_slc("tcu_to_slc", fifo_depth);
-  sc_core::sc_fifo<MemoryTxn> slc_to_tcu("slc_to_tcu", fifo_depth);
-  sc_core::sc_fifo<MemoryTxn> slc_to_texture_dram(
-      "slc_to_texture_dram", fifo_depth);
-  sc_core::sc_fifo<MemoryTxn> texture_dram_to_slc(
-      "texture_dram_to_slc", fifo_depth);
-  sc_core::sc_fifo<MemoryTxn> texture_upload_to_dram(
-      "texture_upload_to_dram", fifo_depth);
-  sc_core::sc_fifo<MemoryTxn> texture_upload_from_dram(
-      "texture_upload_from_dram", fifo_depth);
   sc_core::sc_fifo<PipelineTxn> dram_to_reporter("dram_to_reporter",
                                                  fifo_depth);
 
@@ -475,40 +487,34 @@ int sc_main(int argc, char **argv) {
   sc_core::sc_fifo<MemoryTxn> idle_usc_l2_output("idle_usc_l2_output",
                                                  fifo_depth);
 
-  Submitter submitter("submitter", pool, options);
-  Vdm vdm("vdm", pool);
-  VertexFetch vertex_fetch("vertex_fetch", pool);
+  Submitter submitter("submitter", pool, options, &memory);
+  Vdm vdm("vdm", pool, &memory);
+  VertexFetch vertex_fetch("vertex_fetch", pool, &memory);
   PcoDecoder vertex_decoder("vertex_pco_decoder", pool, ShaderStage::kVertex);
   UscSlot vertex_slot("vertex_usc_slot", pool, ShaderStage::kVertex);
   UscCluster vertex_cluster("vertex_usc_cluster", pool, ShaderStage::kVertex);
   ClipCull clip_cull("clip_cull", pool);
   Tiler tiler("tiler", pool);
-  ParameterBuffer parameter_buffer("parameter_buffer", pool);
-  TileScheduler tile_scheduler("tile_scheduler", pool);
-  Isp isp("isp", pool);
-  FragmentFrontend fragment_frontend("fragment_frontend", pool);
-  PdsEngine pds_engine("pds_engine", pool);
+  ParameterBuffer parameter_buffer("parameter_buffer", pool, &memory);
+  TileScheduler tile_scheduler("tile_scheduler", pool, &memory);
+  Isp isp("isp", pool, &memory);
+  FragmentFrontend fragment_frontend("fragment_frontend", pool, &memory);
+  PdsEngine pds_engine("pds_engine", pool, &memory);
   VertexPdsEngine vertex_pds_engine("vertex_pds_engine", pool);
   PcoDecoder fragment_decoder("fragment_pco_decoder", pool,
                               ShaderStage::kFragment);
   UscSlot fragment_slot("fragment_usc_slot", pool, ShaderStage::kFragment);
   UscCluster fragment_cluster("fragment_usc_cluster", pool,
                               ShaderStage::kFragment);
-  TextureUnit texture_unit("texture_unit", pool);
+  TextureUnit texture_unit("texture_unit", pool, &memory);
   Pbe pbe("pbe", pool);
-  PbeWriteBack pbe_write_back("pbe_write_back", pool);
-  Slc slc("slc", pool, options.cache_bypass);
-  DramModel dram_model("dram_model", pool);
+  PbeWriteBack pbe_write_back("pbe_write_back", pool, &memory);
   JsonReporter reporter("json_reporter", options, pool);
 
   mixed_cache.input(idle_mcu_input);
   mixed_cache.output(idle_mcu_output);
   texture_cache.input(idle_tcu_input);
   texture_cache.output(idle_tcu_output);
-  texture_cache.sample_input(texture_unit_to_tcu);
-  texture_cache.sample_output(tcu_to_texture_unit);
-  texture_cache.lower_request(tcu_to_slc);
-  texture_cache.lower_response(slc_to_tcu);
   usc_l2_cache.input(idle_usc_l2_input);
   usc_l2_cache.output(idle_usc_l2_output);
 
@@ -551,28 +557,12 @@ int sc_main(int argc, char **argv) {
   fragment_cluster.output(fragment_cluster_to_texture);
   texture_unit.sample_input(fragment_cluster_to_texture_samples);
   texture_unit.sample_output(texture_samples_to_fragment_cluster);
-  texture_unit.cache_request(texture_unit_to_tcu);
-  texture_unit.cache_response(tcu_to_texture_unit);
-  texture_unit.upload_request(texture_upload_to_dram);
-  texture_unit.upload_response(texture_upload_from_dram);
   texture_unit.input(fragment_cluster_to_texture);
   texture_unit.output(texture_to_pbe);
   pbe.input(texture_to_pbe);
   pbe.output(pbe_to_pbe_write_back);
   pbe_write_back.input(pbe_to_pbe_write_back);
-  pbe_write_back.output(pbe_write_back_to_slc);
-  slc.input(pbe_write_back_to_slc);
-  slc.output(slc_to_dram);
-  slc.texture_input(tcu_to_slc);
-  slc.texture_output(slc_to_tcu);
-  slc.dram_request(slc_to_texture_dram);
-  slc.dram_response(texture_dram_to_slc);
-  dram_model.input(slc_to_dram);
-  dram_model.output(dram_to_reporter);
-  dram_model.texture_input(slc_to_texture_dram);
-  dram_model.texture_output(texture_dram_to_slc);
-  dram_model.upload_input(texture_upload_to_dram);
-  dram_model.upload_output(texture_upload_from_dram);
+  pbe_write_back.completion(dram_to_reporter);
   reporter.input(dram_to_reporter);
 
   sc_core::sc_start();
@@ -580,4 +570,11 @@ int sc_main(int argc, char **argv) {
                  pool.bytes_in_flight() == 0
              ? 0
              : 1;
+}
+
+int sc_main(int argc, char **argv) {
+  pvrgpu::stub::Options options;
+  if (!pvrgpu::stub::ParseOptions(argc, argv, &options))
+    return 2;
+  return pvrgpu::stub::RunConfiguredModel(options);
 }

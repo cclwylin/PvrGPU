@@ -7,6 +7,8 @@
 // FIFO 只傳 handle，完成採 event-driven wait。
 #include "geometry/vertex_fetch.h"
 
+#include "memory/gpu_memory_system.h"
+
 #include "common/functional_types.h"
 
 #include <algorithm>
@@ -36,7 +38,9 @@ struct VertexInputState {
 };
 
 VertexInputState LoadVertexInputState(const MemoryPool &pool,
-                                      const PipelineState &state) {
+                                      const PipelineState &state,
+                                      GpuMemorySystem *memory,
+                                      MemoryAccessStats *memory_stats) {
   if (!HasPoolHandle(state.vertex_buffer_resources) ||
       !HasPoolHandle(state.vertex_attribute_bindings)) {
     throw std::runtime_error(
@@ -53,16 +57,40 @@ VertexInputState LoadVertexInputState(const MemoryPool &pool,
   input.buffers.reserve(input.resources.size());
   for (std::size_t index = 0; index < input.resources.size(); ++index) {
     const VertexBufferResource &resource = input.resources[index];
-    if (!HasPoolHandle(resource.data))
+    if (memory) {
+      if (HasPoolHandle(resource.data) || resource.gpu_address == 0 ||
+          resource.byte_size == 0 ||
+          !memory->backing().Contains(resource.gpu_address,
+                                      resource.byte_size)) {
+        throw std::runtime_error(
+            "VertexFetch resource has no DRAM-backed VBO");
+      }
+    } else if (!HasPoolHandle(resource.data)) {
       throw std::runtime_error("VertexFetch resource has no VBO payload");
+    }
     for (std::size_t prior = 0; prior < index; ++prior) {
-      if (input.resources[prior].data.slot == resource.data.slot &&
-          input.resources[prior].data.generation == resource.data.generation) {
+      const bool aliases = memory
+                               ? input.resources[prior].gpu_address ==
+                                     resource.gpu_address
+                               : input.resources[prior].data.slot ==
+                                         resource.data.slot &&
+                                     input.resources[prior].data.generation ==
+                                         resource.data.generation;
+      if (aliases) {
         throw std::runtime_error(
             "VertexFetch resources must own unique VBO payloads");
       }
     }
-    input.buffers.push_back(LoadArray<std::uint8_t>(pool, resource.data));
+    if (memory) {
+      MemoryReadResult read = memory->Read(resource.gpu_address,
+                                           resource.byte_size,
+                                           MemoryClient::kVertexFetch);
+      if (memory_stats)
+        *memory_stats += read.stats;
+      input.buffers.push_back(std::move(read.data));
+    } else {
+      input.buffers.push_back(LoadArray<std::uint8_t>(pool, resource.data));
+    }
     if (input.buffers.back().size() != resource.byte_size)
       throw std::runtime_error("VertexFetch VBO byte size mismatch");
   }
@@ -357,8 +385,9 @@ std::uint32_t ReadComponentAsInteger(const std::vector<std::uint8_t>& buffer, st
 
 } // namespace
 
-VertexFetch::VertexFetch(sc_core::sc_module_name name, MemoryPool &pool)
-    : sc_module(name), pool_(pool) {
+VertexFetch::VertexFetch(sc_core::sc_module_name name, MemoryPool &pool,
+                         GpuMemorySystem *memory)
+    : sc_module(name), pool_(pool), memory_(memory) {
   SC_THREAD(Run);
 }
 
@@ -368,12 +397,15 @@ void VertexFetch::Run() {
     PipelineState state = LoadPipelineState(pool_, txn.state);
 
     RequireStage(state.stage, PipelineStage::kVdmComplete, name());
+    if (memory_ && state.memory_mode != memory_->mode())
+      throw std::runtime_error("VertexFetch memory mode mismatch");
     if (HasPoolHandle(state.vertex_lanes) ||
         HasPoolHandle(state.vertex_lane_refs)) {
       throw std::runtime_error("VertexFetch received pre-existing output");
     }
+    MemoryAccessStats memory_stats;
     const VertexInputState vertex_input =
-        LoadVertexInputState(pool_, state);
+        LoadVertexInputState(pool_, state, memory_, &memory_stats);
 
     std::vector<VertexLane> lanes;
     if (IsFillSolidFamily(state.functional_case) ||
@@ -523,10 +555,16 @@ void VertexFetch::Run() {
         lanes.size() * vertex_input.bytes_per_vertex;
     state.stage = PipelineStage::kVertexFetched;
 
-    const std::uint64_t cycles =
+    ApplyMemoryAccessStats(state.counters, memory_stats);
+    const std::uint64_t memory_cycles = MemoryAccessDelayCycles(memory_stats);
+    const std::uint64_t service_cycles =
         kReferenceUarch.vertex_fetch_base_cycles +
         CeilDivide(state.counters.vertex_attribute_bytes,
                    kReferenceUarch.vertex_fetch_bytes_per_batch);
+    if (memory_cycles > std::numeric_limits<std::uint64_t>::max() -
+                            service_cycles)
+      throw std::overflow_error("VertexFetch total cycle overflow");
+    const std::uint64_t cycles = service_cycles + memory_cycles;
     state.counters.vertex_fetch_cycles = cycles;
     state.counters.tiler_cycles += cycles;
     WaitForCycles(cycles);

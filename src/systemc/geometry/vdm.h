@@ -14,17 +14,21 @@
 
 namespace pvrgpu::stub {
 
+class GpuMemorySystem;
+
 class Vdm final : public sc_core::sc_module {
  public:
   sc_core::sc_fifo_in<PipelineTxn> input{"input"};
   sc_core::sc_fifo_out<PipelineTxn> output{"output"};
 
-  Vdm(sc_core::sc_module_name name, MemoryPool &pool);
+  Vdm(sc_core::sc_module_name name, MemoryPool &pool,
+      GpuMemorySystem *memory = nullptr);
 
  private:
   void Run();
 
   MemoryPool &pool_;
+  GpuMemorySystem *memory_ = nullptr;
 };
 
 } // namespace pvrgpu::stub

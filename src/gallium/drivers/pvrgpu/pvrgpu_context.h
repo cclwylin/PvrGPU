@@ -30,6 +30,8 @@ struct pvrgpu_context {
    struct pvrgpu_shader_state *vs;
    struct pvrgpu_shader_state *fs;
    struct pvrgpu_shader_state *gs;
+   struct pvrgpu_shader_state *tcs;
+   struct pvrgpu_shader_state *tes;
    struct pvrgpu_vertex_elements_state *vertex_elements;
    struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
    unsigned num_vertex_buffers;
@@ -43,6 +45,9 @@ struct pvrgpu_context {
    bool has_viewport;
    struct pipe_scissor_state scissor;
    bool has_scissor;
+   uint8_t patch_vertices;
+   float tess_default_outer_level[4];
+   float tess_default_inner_level[2];
    unsigned max_framebuffer_width;
    unsigned max_framebuffer_height;
    unsigned framebuffer_updates;
@@ -91,6 +96,18 @@ void
 pvrgpu_clear_render_target(struct pipe_context *pipe,
                            struct pipe_surface *dst,
                            const union pipe_color_union *color,
+                           unsigned dstx,
+                           unsigned dsty,
+                           unsigned width,
+                           unsigned height,
+                           bool render_condition_enabled);
+
+void
+pvrgpu_clear_depth_stencil(struct pipe_context *pipe,
+                           struct pipe_surface *dst,
+                           unsigned clear_flags,
+                           double depth,
+                           unsigned stencil,
                            unsigned dstx,
                            unsigned dsty,
                            unsigned width,

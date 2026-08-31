@@ -36,17 +36,20 @@ Those records use `pvrgpu.driver-counter.v1` and are intended for debug,
 reporting, and Golden-vs-PvrGPU counter comparison. They are not parsed by the
 model command loader.
 
-To install the driver skeleton into the local Mesa source tree:
+The driver source list is integrated through
+`src/gallium/drivers/pvrgpu/meson.build`. Build the native PvrGPU replay entry
+point and run the repository's registered source-contract, unit, and smoke
+checks with CMake/CTest:
 
 ```bash
-./scripts/install-pvrgpu-mesa-driver.sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build --target pvrgpu
+ctest --test-dir build --output-on-failure
 ```
 
-To compile-check the Mesa selection seam:
-
-```bash
-./scripts/check-pvrgpu-mesa-driver-build.sh
-```
+The target is `build/bin/pvrgpu` on macOS/Linux and
+`build/bin/pvrgpu.exe` on Windows. CMake supplies the native suffix; do not
+name a macOS/Linux binary `.exe`.
 
 At runtime, Mesa should select this bring-up driver only when explicitly asked:
 
@@ -68,7 +71,9 @@ counter profiles. Generic runs without the hint keep the fallback estimator.
 The current consumer is:
 
 ```bash
-pvrgpu-model-stub --driver-command /path/to/command.txt --outdir /path/to/out
+build/bin/pvrgpu-model-stub \
+  --driver-command /path/to/command.txt \
+  --outdir /path/to/out
 ```
 
 The model validates every required field before execution. A malformed,
@@ -230,17 +235,13 @@ Expected smoke-test evidence:
 - output PNG contains both opaque red triangle pixels and opaque black clear
   pixels
 
-Direct Mesa driver smoke also verifies the frontend path before invoking the
-model:
+The registered native smoke suite verifies the checked-in driver/model
+contracts and the model boundary. End-to-end Mesa replay still consumes the
+separately configured Mesa prefix at runtime:
 
 ```bash
-./scripts/check-pvrgpu-mesa-driver-build.sh --platforms macos --full-dri --install
-./scripts/run-pvrgpu-mesa-driver-smoke.sh --size 16x16
-./scripts/run-pvrgpu-mesa-driver-triangle-smoke.sh --size 16x16
-./scripts/run-pvrgpu-mesa-driver-phase3-state-smoke.sh --size 16x16
-./scripts/run-pvrgpu-mesa-driver-phase4-texture-smoke.sh --size 16x16
-./scripts/run-pvrgpu-mesa-driver-phase5-fbo-smoke.sh --size 16x16 --fbo-size 8x8
-./scripts/run-pvrgpu-mesa-driver-phase6-uniform-smoke.sh --size 16x16
+cmake --build build --target pvrgpu pvrgpu-model-stub
+ctest --test-dir build --output-on-failure
 ```
 
 The clear smoke creates a surfaceless GLES2 pbuffer, reports
@@ -253,16 +254,24 @@ one client vertex array, calls `glDrawArrays(GL_TRIANGLES, 0, 3)`, verifies
 `driver-counter.txt` contains `event=draw_triangles`, and verifies
 `driver-command.txt` ends as `command=draw_triangle`.
 
-The direct driver-to-SystemC vertical smoke runs the triangle driver smoke,
-then feeds the generated command to the model:
+The native `pvrgpu` process owns the direct RenderDoc → Mesa/Gallium pvrgpu →
+SystemC vertical path for one capture:
 
 ```bash
-./scripts/run-pvrgpu-mesa-driver-triangle-systemc-smoke.sh --size 16x16
+build/bin/pvrgpu \
+  /path/to/triangle.rdc \
+  --case driver_triangle_solid \
+  --width 16 --height 16 \
+  --outdir /tmp/pvrgpu-triangle
 ```
+
+The batch worker may supply the equivalent `--rdc /path/to/triangle.rdc`
+form.
 
 It verifies the model JSONL, counters, memory-pool leak status, and final PNG.
 For the current fixture, a 16×16 run should contain 128 opaque red triangle
-pixels and 128 opaque black clear pixels.
+pixels and 128 opaque black clear pixels. Directory comparison treats the
+decoded RGBA8 PNG as a PASS gate, not as an informational artifact.
 
 The Phase 3 state smoke is also counter-only. It exercises fixed-function
 GLES2 state object traffic for blend, depth/stencil/alpha, rasterizer, blend

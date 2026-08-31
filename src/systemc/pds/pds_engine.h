@@ -6,6 +6,7 @@
 #pragma once
 
 #include "common/pipeline_state.h"
+#include "memory/gpu_memory_system.h"
 
 #include <systemc>
 
@@ -16,12 +17,14 @@ class PdsEngine final : public sc_core::sc_module {
   sc_core::sc_fifo_in<PipelineTxn> input{"input"};
   sc_core::sc_fifo_out<PipelineTxn> output{"output"};
 
-  PdsEngine(sc_core::sc_module_name name, MemoryPool &pool);
+  PdsEngine(sc_core::sc_module_name name, MemoryPool &pool,
+            GpuMemorySystem *memory = nullptr);
 
  private:
   void Run();
 
   MemoryPool &pool_;
+  GpuMemorySystem *memory_;
 };
 
 }  // namespace pvrgpu::stub
