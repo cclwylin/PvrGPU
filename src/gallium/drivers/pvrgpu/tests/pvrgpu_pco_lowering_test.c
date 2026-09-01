@@ -3425,8 +3425,8 @@ test_terrain_d6_compile(struct pvrgpu_pco_compiler *compiler)
       fnv1a64(binary.fragment.data, binary.fragment.size);
    if (binary.vertex.size != 192 ||
        vertex_hash != UINT64_C(0x081618f544cc6abe) ||
-       binary.fragment.size != 232 ||
-       fragment_hash != UINT64_C(0x834f6b41c2c7bdd8)) {
+       binary.fragment.size != 448 ||
+       fragment_hash != UINT64_C(0x412b9e844c3de073)) {
       fprintf(stderr,
               "terrain D6 PCO got VS=%zu/%016llx FS=%zu/%016llx\n",
               binary.vertex.size,
@@ -3530,8 +3530,8 @@ test_terrain_d1_compile(struct pvrgpu_pco_compiler *compiler)
       fnv1a64(binary.fragment.data, binary.fragment.size);
    if (binary.vertex.size != 200U ||
        vertex_hash != UINT64_C(0x9abe96cad5fe9f4e) ||
-       binary.fragment.size != 39560U ||
-       fragment_hash != UINT64_C(0xe5ede07e1317d604)) {
+       binary.fragment.size != 38832U ||
+       fragment_hash != UINT64_C(0x9e1c3ea2dfa1d8a5)) {
       fprintf(stderr,
               "terrain D1 PCO got VS=%zu/%016llx FS=%zu/%016llx\n",
               binary.vertex.size,
@@ -3543,7 +3543,7 @@ test_terrain_d1_compile(struct pvrgpu_pco_compiler *compiler)
    const struct pvrgpu_pco_stage_abi expected_vs_abi =
       { 7, 4, 6, 0, 8, 0, 8, 0 };
    const struct pvrgpu_pco_stage_abi expected_fs_abi =
-      { 49, 0, 0, 12, 4, 0, 4, 0 };
+      { 50, 0, 0, 12, 4, 0, 4, 0 };
    if (memcmp(&binary.vertex.abi,
               &expected_vs_abi,
               sizeof(expected_vs_abi)) != 0 ||
@@ -3622,8 +3622,8 @@ test_terrain_d2_compile(struct pvrgpu_pco_compiler *compiler)
       fnv1a64(binary.fragment.data, binary.fragment.size);
    if (binary.vertex.size != 192 ||
        vertex_hash != UINT64_C(0x081618f544cc6abe) ||
-       binary.fragment.size != 472 ||
-       fragment_hash != UINT64_C(0xf37c4b6785de2e44)) {
+       binary.fragment.size != 1208 ||
+       fragment_hash != UINT64_C(0x9711b79a7b5b63a6)) {
       fprintf(stderr,
               "terrain D2 PCO got VS=%zu/%016llx FS=%zu/%016llx\n",
               binary.vertex.size,
@@ -3635,7 +3635,7 @@ test_terrain_d2_compile(struct pvrgpu_pco_compiler *compiler)
    const struct pvrgpu_pco_stage_abi expected_vs_abi =
       { 6, 4, 6, 0, 8, 0, 8, 0 };
    const struct pvrgpu_pco_stage_abi expected_fs_abi =
-      { 34, 0, 0, 12, 28, 20, 8, 0 };
+      { 24, 0, 0, 12, 28, 20, 8, 0 };
    if (memcmp(&binary.vertex.abi,
               &expected_vs_abi,
               sizeof(expected_vs_abi)) != 0 ||
@@ -3645,6 +3645,16 @@ test_terrain_d2_compile(struct pvrgpu_pco_compiler *compiler)
        binary.fragment_texture_descriptor_start != 0 ||
        binary.fragment_texture_descriptor_count != 20 ||
        binary.fragment_texture_descriptor_stride != 20) {
+      fprintf(stderr,
+              "terrain D2 ABI got FS=(%u,%u,%u,%u,%u,%u,%u,%u)\n",
+              binary.fragment.abi.temps,
+              binary.fragment.abi.vertex_inputs,
+              binary.fragment.abi.vertex_outputs,
+              binary.fragment.abi.coefficients,
+              binary.fragment.abi.shareds,
+              binary.fragment.abi.push_constant_start,
+              binary.fragment.abi.push_constant_count,
+              binary.fragment.abi.entry_offset);
       fail("terrain D2 PCO ABI/linkage changed");
    }
    pvrgpu_pco_graphics_binary_finish(&binary);
@@ -3676,10 +3686,10 @@ test_terrain_d3_compile(struct pvrgpu_pco_compiler *compiler)
       fnv1a64(binary.vertex.data, binary.vertex.size);
    const uint64_t fragment_hash =
       fnv1a64(binary.fragment.data, binary.fragment.size);
-   if (binary.vertex.size != 2440U ||
-       vertex_hash != UINT64_C(0xde47363e398a2bcc) ||
-       binary.fragment.size != 2312U ||
-       fragment_hash != UINT64_C(0x02a543327636e98f)) {
+   if (binary.vertex.size != 2680U ||
+       vertex_hash != UINT64_C(0x8d0f6d4b38cdecf4) ||
+       binary.fragment.size != 7328U ||
+       fragment_hash != UINT64_C(0x4fecdd1ce1feb997)) {
       fprintf(stderr,
               "terrain D3 PCO got VS=%zu/%016llx FS=%zu/%016llx\n",
               binary.vertex.size,
@@ -3691,7 +3701,7 @@ test_terrain_d3_compile(struct pvrgpu_pco_compiler *compiler)
    const struct pvrgpu_pco_stage_abi expected_vs_abi =
       { 44, 16, 18, 0, 96, 40, 56, 0 };
    const struct pvrgpu_pco_stage_abi expected_fs_abi =
-      { 36, 0, 0, 60, 164, 100, 64, 0 };
+      { 33, 0, 0, 60, 164, 100, 64, 0 };
    if (memcmp(&binary.vertex.abi,
               &expected_vs_abi,
               sizeof(expected_vs_abi)) != 0 ||
@@ -3709,6 +3719,25 @@ test_terrain_d3_compile(struct pvrgpu_pco_compiler *compiler)
        binary.fragment_texture_descriptor_start != 0 ||
        binary.fragment_texture_descriptor_count != 100 ||
        binary.fragment_texture_descriptor_stride != 20) {
+      fprintf(stderr,
+              "terrain D3 ABI got VS=(%u,%u,%u,%u,%u,%u,%u,%u) "
+              "FS=(%u,%u,%u,%u,%u,%u,%u,%u)\n",
+              binary.vertex.abi.temps,
+              binary.vertex.abi.vertex_inputs,
+              binary.vertex.abi.vertex_outputs,
+              binary.vertex.abi.coefficients,
+              binary.vertex.abi.shareds,
+              binary.vertex.abi.push_constant_start,
+              binary.vertex.abi.push_constant_count,
+              binary.vertex.abi.entry_offset,
+              binary.fragment.abi.temps,
+              binary.fragment.abi.vertex_inputs,
+              binary.fragment.abi.vertex_outputs,
+              binary.fragment.abi.coefficients,
+              binary.fragment.abi.shareds,
+              binary.fragment.abi.push_constant_start,
+              binary.fragment.abi.push_constant_count,
+              binary.fragment.abi.entry_offset);
       fail("terrain D3 PCO ABI/linkage changed");
    }
    if (count_intrinsic(vs, nir_intrinsic_load_uniform) != 14 ||
@@ -3738,16 +3767,16 @@ test_terrain_blur_compile(struct pvrgpu_pco_compiler *compiler)
       PVRGPU_PCO_TERRAIN_D8,
    };
    static const unsigned profile_numbers[] = { 4U, 5U, 7U, 8U };
-   static const size_t expected_fragment_sizes[] = { 680U, 680U, 1144U,
-                                                     1144U };
+   static const size_t expected_fragment_sizes[] = { 1920U, 1880U, 3528U,
+                                                     3504U };
    static const uint64_t expected_fragment_hashes[] = {
-      UINT64_C(0xa6e167a6cd068362),
-      UINT64_C(0x6b171a8aaec8fa96),
-      UINT64_C(0x0196ab8e374c830d),
-      UINT64_C(0x1fd6e9c5b3efd7bd),
+      UINT64_C(0x956d5ea59737b66f),
+      UINT64_C(0x76fac56a9fbc5918),
+      UINT64_C(0xab0dfc14e6aa5116),
+      UINT64_C(0xd0b9eb8de7e641d2),
    };
-   static const unsigned expected_fragment_temps[] = { 31U, 31U, 33U,
-                                                       33U };
+   static const unsigned expected_fragment_temps[] = { 30U, 30U, 35U,
+                                                       35U };
 
    for (unsigned i = 0; i < ARRAY_SIZE(profiles); ++i) {
       nir_shader *vs =
@@ -3810,6 +3839,17 @@ test_terrain_blur_compile(struct pvrgpu_pco_compiler *compiler)
           binary.fragment_texture_descriptor_start != 0 ||
           binary.fragment_texture_descriptor_count != 20 ||
           binary.fragment_texture_descriptor_stride != 20) {
+         fprintf(stderr,
+                 "terrain D%u ABI got FS=(%u,%u,%u,%u,%u,%u,%u,%u)\n",
+                 profile_numbers[i],
+                 binary.fragment.abi.temps,
+                 binary.fragment.abi.vertex_inputs,
+                 binary.fragment.abi.vertex_outputs,
+                 binary.fragment.abi.coefficients,
+                 binary.fragment.abi.shareds,
+                 binary.fragment.abi.push_constant_start,
+                 binary.fragment.abi.push_constant_count,
+                 binary.fragment.abi.entry_offset);
          fail("terrain blur PCO ABI/linkage changed");
       }
       if (count_intrinsic(vs, nir_intrinsic_load_uniform) != 2 ||

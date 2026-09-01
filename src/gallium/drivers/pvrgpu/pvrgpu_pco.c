@@ -4504,7 +4504,23 @@ pvrgpu_pack_terrain_texture_bindings(nir_shader *nir,
                                      char *error,
                                      size_t error_size)
 {
+   /* The driver command packs sampled resources in first-use order.  PCO
+    * descriptor sets must use the same order; raw GLSL binding numbers are
+    * not necessarily monotonic (Terrain D3 uses VS {1, 0} and FS
+    * {2, 0, 1, 4, 3}). */
+   uint16_t binding_to_set[9];
+   if (texture_count > ARRAY_SIZE(binding_to_set)) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "%s has too many unique texture bindings",
+                             profile_name);
+   }
+   for (unsigned binding = 0; binding < ARRAY_SIZE(binding_to_set);
+        ++binding)
+      binding_to_set[binding] = UINT16_MAX;
+
    unsigned rewritten = 0;
+   unsigned unique_bindings = 0;
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block (block, impl) {
          nir_foreach_instr (instr, block) {
@@ -4519,7 +4535,10 @@ pvrgpu_pack_terrain_texture_bindings(nir_shader *nir,
                                       "%s texture binding is out of range",
                                       profile_name);
             }
-            const uint32_t packed = tex->texture_index << 16U;
+            const unsigned binding = tex->texture_index;
+            if (binding_to_set[binding] == UINT16_MAX)
+               binding_to_set[binding] = unique_bindings++;
+            const uint32_t packed = binding_to_set[binding] << 16U;
             tex->texture_index = packed;
             tex->sampler_index = packed;
             ++rewritten;
@@ -4527,13 +4546,17 @@ pvrgpu_pack_terrain_texture_bindings(nir_shader *nir,
       }
       nir_progress(rewritten != 0, impl, nir_metadata_control_flow);
    }
-   if (rewritten != expected_texture_ops) {
+   if (rewritten != expected_texture_ops ||
+       unique_bindings != texture_count) {
       return pvrgpu_pco_fail(error,
                              error_size,
-                             "%s rewrote %u texture ops, expected %u",
+                             "%s rewrote %u texture ops/%u bindings, "
+                             "expected %u/%u",
                              profile_name,
                              rewritten,
-                             expected_texture_ops);
+                             unique_bindings,
+                             expected_texture_ops,
+                             texture_count);
    }
    return true;
 }
@@ -5510,6 +5533,377 @@ pvrgpu_terrain_d1_round_half_rtne(nir_builder *builder, nir_def *value)
    return nir_f2f32(builder, nir_f2f16_rtne(builder, value));
 }
 
+#define PVRGPU_TERRAIN_D1_OCTAVES 4U
+
+struct pvrgpu_terrain_d1_splat_dot {
+   nir_alu_instr *dot;
+   unsigned value_source;
+   unsigned coefficient_source;
+   nir_scalar values[3];
+   nir_scalar base_values[3];
+   nir_scalar coefficient;
+   unsigned scale;
+};
+
+static nir_scalar
+pvrgpu_terrain_d1_resolve_alu_component(const nir_alu_src *source,
+                                         unsigned component)
+{
+   if (!source || !source->src.ssa || component >= 3)
+      return (nir_scalar){ 0 };
+   return nir_scalar_resolved(source->src.ssa,
+                              source->swizzle[component]);
+}
+
+static bool
+pvrgpu_terrain_d1_scalars_equal(nir_scalar left, nir_scalar right)
+{
+   return left.def && right.def && left.def == right.def &&
+          left.comp == right.comp;
+}
+
+static bool
+pvrgpu_terrain_d1_scalar_arrays_equal(const nir_scalar left[3],
+                                       const nir_scalar right[3])
+{
+   for (unsigned component = 0; component < 3; ++component) {
+      if (!pvrgpu_terrain_d1_scalars_equal(left[component],
+                                            right[component]))
+         return false;
+   }
+   return true;
+}
+
+static bool
+pvrgpu_terrain_d1_alu_source_is_splat_bits(const nir_alu_src *source,
+                                            uint32_t bits)
+{
+   if (!source || !source->src.ssa)
+      return false;
+   for (unsigned component = 0; component < 3; ++component) {
+      uint64_t actual = 0;
+      if (!nir_alu_src_comp_get_uint(*source, component, &actual) ||
+          actual != bits)
+         return false;
+   }
+   return true;
+}
+
+static bool
+pvrgpu_terrain_d1_collect_splat_dot(
+   nir_alu_instr *dot,
+   uint32_t coefficient_bits,
+   struct pvrgpu_terrain_d1_splat_dot *out)
+{
+   if (!dot || !out || dot->op != nir_op_fdot3 ||
+       dot->def.bit_size != 32 || dot->def.num_components != 1)
+      return false;
+
+   const bool source0_coefficient =
+      pvrgpu_terrain_d1_alu_source_is_splat_bits(&dot->src[0],
+                                                 coefficient_bits);
+   const bool source1_coefficient =
+      pvrgpu_terrain_d1_alu_source_is_splat_bits(&dot->src[1],
+                                                 coefficient_bits);
+   if (source0_coefficient == source1_coefficient)
+      return false;
+
+   memset(out, 0, sizeof(*out));
+   out->dot = dot;
+   out->coefficient_source = source0_coefficient ? 0U : 1U;
+   out->value_source = 1U - out->coefficient_source;
+   for (unsigned component = 0; component < 3; ++component) {
+      out->values[component] = pvrgpu_terrain_d1_resolve_alu_component(
+         &dot->src[out->value_source], component);
+      if (!out->values[component].def)
+         return false;
+   }
+   out->coefficient = pvrgpu_terrain_d1_resolve_alu_component(
+      &dot->src[out->coefficient_source], 0);
+   return out->coefficient.def != NULL;
+}
+
+static bool
+pvrgpu_terrain_d1_classify_skew_scale(
+   struct pvrgpu_terrain_d1_splat_dot *dot)
+{
+   if (!dot || !dot->dot)
+      return false;
+
+   nir_def *value = dot->dot->src[dot->value_source].src.ssa;
+   if (!value || value->bit_size != 32 || value->num_components != 3)
+      return false;
+
+   nir_instr *producer = nir_def_instr(value);
+   if (producer->type != nir_instr_type_alu ||
+       nir_instr_as_alu(producer)->op != nir_op_fmul) {
+      dot->scale = 1U;
+      memcpy(dot->base_values, dot->values, sizeof(dot->base_values));
+      return true;
+   }
+
+   nir_alu_instr *multiply = nir_instr_as_alu(producer);
+   if (multiply->def.bit_size != 32 ||
+       multiply->def.num_components != 3)
+      return false;
+
+   static const struct {
+      uint32_t bits;
+      unsigned scale;
+   } scales[] = {
+      { UINT32_C(0x40000000), 2U },
+      { UINT32_C(0x40800000), 4U },
+      { UINT32_C(0x41000000), 8U },
+   };
+
+   int constant_source = -1;
+   unsigned scale = 0;
+   for (unsigned source = 0; source < 2; ++source) {
+      for (unsigned candidate = 0; candidate < ARRAY_SIZE(scales);
+           ++candidate) {
+         if (!pvrgpu_terrain_d1_alu_source_is_splat_bits(
+                &multiply->src[source], scales[candidate].bits))
+            continue;
+         if (constant_source >= 0)
+            return false;
+         constant_source = (int)source;
+         scale = scales[candidate].scale;
+      }
+   }
+   if (constant_source < 0)
+      return false;
+
+   const unsigned base_source = 1U - (unsigned)constant_source;
+   for (unsigned component = 0; component < 3; ++component) {
+      const unsigned value_component =
+         dot->dot->src[dot->value_source].swizzle[component];
+      if (value_component >= 3)
+         return false;
+      dot->base_values[component] = nir_scalar_resolved(
+         multiply->src[base_source].src.ssa,
+         multiply->src[base_source].swizzle[value_component]);
+      if (!dot->base_values[component].def)
+         return false;
+   }
+   dot->scale = scale;
+   return true;
+}
+
+static bool
+pvrgpu_terrain_d1_cell_dot_matches_skew(
+   const struct pvrgpu_terrain_d1_splat_dot *cell,
+   const struct pvrgpu_terrain_d1_splat_dot *skew)
+{
+   if (!cell || !cell->dot || !skew || !skew->dot)
+      return false;
+
+   nir_def *cell_value = cell->dot->src[cell->value_source].src.ssa;
+   if (!cell_value || cell_value->bit_size != 32 ||
+       cell_value->num_components != 3 ||
+       nir_def_instr(cell_value)->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *floor = nir_instr_as_alu(nir_def_instr(cell_value));
+   if (floor->op != nir_op_ffloor || floor->def.num_components != 3 ||
+       !floor->src[0].src.ssa ||
+       nir_def_instr(floor->src[0].src.ssa)->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *add =
+      nir_instr_as_alu(nir_def_instr(floor->src[0].src.ssa));
+   if (add->op != nir_op_fadd || add->def.bit_size != 32 ||
+       add->def.num_components != 3)
+      return false;
+
+   for (unsigned coordinate_source = 0; coordinate_source < 2;
+        ++coordinate_source) {
+      const unsigned skew_source = 1U - coordinate_source;
+      bool matches = true;
+      for (unsigned component = 0; component < 3; ++component) {
+         nir_scalar coordinate = pvrgpu_terrain_d1_resolve_alu_component(
+            &add->src[coordinate_source], component);
+         nir_scalar skew_value = pvrgpu_terrain_d1_resolve_alu_component(
+            &add->src[skew_source], component);
+         if (!pvrgpu_terrain_d1_scalars_equal(coordinate,
+                                               skew->values[component]) ||
+             !skew_value.def || skew_value.def != &skew->dot->def ||
+             skew_value.comp != 0) {
+            matches = false;
+            break;
+         }
+      }
+      if (matches)
+         return true;
+   }
+   return false;
+}
+
+static nir_def *
+pvrgpu_terrain_d1_scalar_def(nir_builder *builder, nir_scalar scalar)
+{
+   if (!scalar.def)
+      return NULL;
+   if (scalar.comp == 0 && scalar.def->num_components == 1)
+      return scalar.def;
+   return nir_channel(builder, scalar.def, scalar.comp);
+}
+
+static bool
+pvrgpu_terrain_d1_reconstruct_splat_dots(nir_shader *nir,
+                                          nir_function_impl *entrypoint,
+                                          char *error,
+                                          size_t error_size)
+{
+   struct pvrgpu_terrain_d1_splat_dot skew[PVRGPU_TERRAIN_D1_OCTAVES] =
+      { 0 };
+   struct pvrgpu_terrain_d1_splat_dot cell[PVRGPU_TERRAIN_D1_OCTAVES] =
+      { 0 };
+   unsigned skew_count = 0;
+   unsigned cell_count = 0;
+   unsigned dot3_count = 0;
+   unsigned dot4_count = 0;
+
+   nir_foreach_block (block, entrypoint) {
+      nir_foreach_instr (instr, block) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         if (alu->op == nir_op_fdot4) {
+            ++dot4_count;
+            continue;
+         }
+         if (alu->op != nir_op_fdot3)
+            continue;
+         ++dot3_count;
+
+         struct pvrgpu_terrain_d1_splat_dot matched = { 0 };
+         if (pvrgpu_terrain_d1_collect_splat_dot(
+                alu, UINT32_C(0x3eaaaaab), &matched)) {
+            if (skew_count >= ARRAY_SIZE(skew))
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D1 skew dot count changed");
+            skew[skew_count++] = matched;
+         } else if (pvrgpu_terrain_d1_collect_splat_dot(
+                       alu, UINT32_C(0x3e2aaaab), &matched)) {
+            if (cell_count >= ARRAY_SIZE(cell))
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D1 cell dot count changed");
+            cell[cell_count++] = matched;
+         }
+      }
+   }
+
+   if (dot3_count != 56U || dot4_count != 4U ||
+       skew_count != PVRGPU_TERRAIN_D1_OCTAVES ||
+       cell_count != PVRGPU_TERRAIN_D1_OCTAVES) {
+      return pvrgpu_pco_fail(
+         error,
+         error_size,
+         "terrain D1 dot signature changed (dot3=%u dot4=%u skew=%u cell=%u)",
+         dot3_count,
+         dot4_count,
+         skew_count,
+         cell_count);
+   }
+
+   static const unsigned expected_scales[PVRGPU_TERRAIN_D1_OCTAVES] = {
+      1U, 2U, 4U, 8U,
+   };
+   for (unsigned octave = 0; octave < PVRGPU_TERRAIN_D1_OCTAVES;
+        ++octave) {
+      if (!pvrgpu_terrain_d1_classify_skew_scale(&skew[octave]) ||
+          skew[octave].scale != expected_scales[octave]) {
+         return pvrgpu_pco_fail(
+            error,
+            error_size,
+            "terrain D1 skew scale graph changed at octave %u",
+            octave);
+      }
+      if (octave != 0 &&
+          !pvrgpu_terrain_d1_scalar_arrays_equal(skew[0].base_values,
+                                                  skew[octave].base_values)) {
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "terrain D1 skew base graph changed");
+      }
+      if (!pvrgpu_terrain_d1_cell_dot_matches_skew(&cell[octave],
+                                                    &skew[octave])) {
+         return pvrgpu_pco_fail(
+            error,
+            error_size,
+            "terrain D1 cell/skew association changed at octave %u",
+            octave);
+      }
+   }
+
+   nir_builder base_builder =
+      nir_builder_at(nir_before_instr(&skew[0].dot->instr));
+   base_builder.fp_math_ctrl = skew[0].dot->fp_math_ctrl;
+   nir_def *base_z = pvrgpu_terrain_d1_scalar_def(
+      &base_builder, skew[0].base_values[2]);
+   nir_def *base_y = pvrgpu_terrain_d1_scalar_def(
+      &base_builder, skew[0].base_values[1]);
+   nir_def *base_x = pvrgpu_terrain_d1_scalar_def(
+      &base_builder, skew[0].base_values[0]);
+   if (!base_x || !base_y || !base_z)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D1 skew base scalar is missing");
+   nir_def *base_sum = nir_fadd(&base_builder, base_z, base_y);
+   base_sum = nir_fadd(&base_builder, base_sum, base_x);
+
+   static const uint32_t skew_coefficient_bits
+      [PVRGPU_TERRAIN_D1_OCTAVES] = {
+         UINT32_C(0x3eaaaaab),
+         UINT32_C(0x3f2aaaab),
+         UINT32_C(0x3faaaaab),
+         UINT32_C(0x402aaaab),
+      };
+   for (unsigned octave = 0; octave < PVRGPU_TERRAIN_D1_OCTAVES;
+        ++octave) {
+      nir_builder builder =
+         nir_builder_at(nir_before_instr(&skew[octave].dot->instr));
+      builder.fp_math_ctrl = skew[octave].dot->fp_math_ctrl;
+      nir_def *coefficient =
+         octave == 0
+            ? pvrgpu_terrain_d1_scalar_def(&builder,
+                                            skew[octave].coefficient)
+            : nir_imm_int(&builder, skew_coefficient_bits[octave]);
+      if (!coefficient)
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "terrain D1 skew coefficient is missing");
+      nir_def_replace(&skew[octave].dot->def,
+                      nir_fmul(&builder, base_sum, coefficient));
+   }
+
+   for (unsigned octave = 0; octave < PVRGPU_TERRAIN_D1_OCTAVES;
+        ++octave) {
+      nir_builder builder =
+         nir_builder_at(nir_before_instr(&cell[octave].dot->instr));
+      builder.fp_math_ctrl = cell[octave].dot->fp_math_ctrl;
+      nir_def *cell_z =
+         pvrgpu_terrain_d1_scalar_def(&builder, cell[octave].values[2]);
+      nir_def *cell_y =
+         pvrgpu_terrain_d1_scalar_def(&builder, cell[octave].values[1]);
+      nir_def *cell_x =
+         pvrgpu_terrain_d1_scalar_def(&builder, cell[octave].values[0]);
+      nir_def *coefficient = pvrgpu_terrain_d1_scalar_def(
+         &builder, cell[octave].coefficient);
+      if (!cell_x || !cell_y || !cell_z || !coefficient)
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "terrain D1 cell scalar is missing");
+      nir_def *cell_sum = nir_fadd(&builder, cell_z, cell_y);
+      cell_sum = nir_fadd(&builder, cell_sum, cell_x);
+      nir_def_replace(&cell[octave].dot->def,
+                      nir_fmul(&builder, cell_sum, coefficient));
+   }
+
+   nir_opt_dce(nir);
+   return true;
+}
+
 static bool
 pvrgpu_lower_terrain_d1_fragment_mediump(nir_shader *nir,
                                           char *error,
@@ -5537,14 +5931,27 @@ pvrgpu_lower_terrain_d1_fragment_mediump(nir_shader *nir,
                              error_size,
                              "terrain D1 mediump entrypoint is missing");
 
+   if (getenv("PVRGPU_TERRAIN_D1_PRECISION_DEBUG")) {
+      fprintf(stderr, "terrain D1 precision graph before scalarization:\n");
+      nir_print_shader(nir, stderr);
+   }
+
+   if (!pvrgpu_terrain_d1_reconstruct_splat_dots(nir,
+                                                  entrypoint,
+                                                  error,
+                                                  error_size))
+      return false;
+
    /* Gallivm lowers fdot3 as z+y+x and fdot4 as w+z+y+x.  PCO's generic
     * scalarizer uses the same reverse component order; exposing the scalar
     * products here lets every half multiply and intermediate add receive an
     * independent RTNE boundary below. */
    nir_lower_alu_to_scalar(nir, NULL, NULL);
 
-   if (getenv("PVRGPU_TERRAIN_D1_PRECISION_DEBUG"))
+   if (getenv("PVRGPU_TERRAIN_D1_PRECISION_DEBUG")) {
+      fprintf(stderr, "terrain D1 precision graph after scalarization:\n");
       nir_print_shader(nir, stderr);
+   }
 
    struct pvrgpu_terrain_d1_highp_graph highp = { 0 };
    unsigned total_fmods = 0;
@@ -5762,6 +6169,12 @@ pvrgpu_lower_terrain_d1_fragment_mediump(nir_shader *nir,
          case nir_op_f2f16_rtne:
          case nir_op_f2f32:
             break;
+         case nir_op_ffma:
+         case nir_op_ffma_weak:
+            return pvrgpu_pco_fail(
+               error,
+               error_size,
+               "terrain D1 fused arithmetic changed");
          default:
             break;
          }
@@ -5780,8 +6193,8 @@ pvrgpu_lower_terrain_d1_fragment_mediump(nir_shader *nir,
       }
    }
 
-   if (rounded_inputs != 2U || rounded_constants != 23U ||
-       rounded_adds != 519U || rounded_multiplies != 468U ||
+   if (rounded_inputs != 2U || rounded_constants != 26U ||
+       rounded_adds != 513U || rounded_multiplies != 452U ||
        rounded_divides != 12U ||
        rounded_permute_results != PVRGPU_TERRAIN_D1_HIGHP_ROOTS) {
       return pvrgpu_pco_fail(
@@ -5801,6 +6214,3593 @@ pvrgpu_lower_terrain_d1_fragment_mediump(nir_shader *nir,
    return true;
 }
 
+static bool
+pvrgpu_terrain_d2_offset_coord_matches(const nir_tex_instr *texture,
+                                        const nir_intrinsic_instr *varying,
+                                        const nir_intrinsic_instr *resolution,
+                                        unsigned active_component)
+{
+   if (!texture || !varying || !resolution || active_component >= 2)
+      return false;
+   const int coord_index =
+      nir_tex_instr_src_index(texture, nir_tex_src_coord);
+   if (coord_index < 0 || !texture->src[coord_index].src.ssa ||
+       nir_def_instr(texture->src[coord_index].src.ssa)->type !=
+          nir_instr_type_alu)
+      return false;
+   nir_alu_instr *add = nir_instr_as_alu(
+      nir_def_instr(texture->src[coord_index].src.ssa));
+   if (add->op != nir_op_fadd || add->def.bit_size != 32 ||
+       add->def.num_components != 2)
+      return false;
+
+   for (unsigned varying_source = 0; varying_source < 2;
+        ++varying_source) {
+      const unsigned offset_source = 1U - varying_source;
+      bool matches = true;
+      for (unsigned component = 0; component < 2; ++component) {
+         nir_scalar varying_value = nir_scalar_resolved(
+            add->src[varying_source].src.ssa,
+            add->src[varying_source].swizzle[component]);
+         nir_scalar expected_varying = {
+            .def = (nir_def *)&varying->def,
+            .comp = component,
+         };
+         if (!pvrgpu_terrain_d1_scalars_equal(varying_value,
+                                               expected_varying)) {
+            matches = false;
+            break;
+         }
+
+         nir_scalar offset = nir_scalar_resolved(
+            add->src[offset_source].src.ssa,
+            add->src[offset_source].swizzle[component]);
+         if (component != active_component) {
+            if (!nir_scalar_is_const(offset) ||
+                nir_scalar_as_uint(offset) != 0U) {
+               matches = false;
+               break;
+            }
+            continue;
+         }
+
+         if (!offset.def || offset.comp != 0 ||
+             offset.def->num_components != 1 ||
+             nir_def_instr(offset.def)->type != nir_instr_type_alu) {
+            matches = false;
+            break;
+         }
+         nir_alu_instr *reciprocal =
+            nir_instr_as_alu(nir_def_instr(offset.def));
+         if (reciprocal->op != nir_op_frcp ||
+             reciprocal->def.bit_size != 32 ||
+             reciprocal->def.num_components != 1) {
+            matches = false;
+            break;
+         }
+         nir_scalar reciprocal_source = nir_scalar_resolved(
+            reciprocal->src[0].src.ssa,
+            reciprocal->src[0].swizzle[0]);
+         nir_scalar expected_resolution = {
+            .def = (nir_def *)&resolution->def,
+            .comp = active_component,
+         };
+         if (!pvrgpu_terrain_d1_scalars_equal(reciprocal_source,
+                                               expected_resolution)) {
+            matches = false;
+            break;
+         }
+      }
+      if (matches)
+         return true;
+   }
+   return false;
+}
+
+static nir_def *
+pvrgpu_terrain_d2_round_texture_x_rtz(nir_tex_instr *texture)
+{
+   nir_builder builder =
+      nir_builder_at(nir_after_instr(&texture->instr));
+   nir_def *components[4];
+   components[0] = nir_f2f32(
+      &builder,
+      nir_f2f16_rtz(&builder, nir_channel(&builder, &texture->def, 0)));
+   for (unsigned component = 1; component < 4; ++component)
+      components[component] =
+         nir_channel(&builder, &texture->def, component);
+   nir_def *replacement = nir_vec(&builder, components, 4);
+   nir_def_rewrite_uses_after(&texture->def, replacement);
+   return replacement;
+}
+
+/* Terrain D2 reconstructs a normal map from three height-map samples.  The
+ * source variables are mediump, but the Gallium-facing NIR is widened to
+ * fp32 before it reaches PCO.  Restore only the captured GLES precision graph:
+ * the center texture coordinate and each untouched offset component remain
+ * fp32, while active UV/resolution components enter half arithmetic through
+ * RTNE; normalized texture results enter through RTZ.  Every half add,
+ * multiply, and reciprocal receives its own RTNE boundary.  LLVM implements
+ * half rsqrt as a rounded half sqrt followed by a rounded half reciprocal, so
+ * expose both steps rather than rounding one fp32 FRSQ result. */
+static bool
+pvrgpu_lower_terrain_d2_fragment_mediump(nir_shader *nir,
+                                          char *error,
+                                          size_t error_size)
+{
+   if (!nir || nir->info.stage != MESA_SHADER_FRAGMENT)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D2 mediump requires a fragment shader");
+
+   nir_function_impl *entrypoint = nir_shader_get_entrypoint(nir);
+   if (!entrypoint)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D2 mediump entrypoint is missing");
+
+   nir_intrinsic_instr *varying = NULL;
+   nir_intrinsic_instr *height = NULL;
+   nir_intrinsic_instr *resolution = NULL;
+   nir_tex_instr *textures[3] = { 0 };
+   unsigned texture_count = 0;
+   unsigned source_adds = 0;
+   unsigned source_multiplies = 0;
+   unsigned source_reciprocals = 0;
+   unsigned source_rsqrt = 0;
+   nir_foreach_block (block, entrypoint) {
+      nir_foreach_instr (instr, block) {
+         if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_load_deref) {
+               nir_variable *var = nir_intrinsic_get_var(intr, 0);
+               if (!var || var->data.mode != nir_var_shader_in ||
+                   var->data.location != VARYING_SLOT_VAR0 || varying ||
+                   intr->def.bit_size != 32 ||
+                   intr->def.num_components != 2) {
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "terrain D2 varying graph changed");
+               }
+               varying = intr;
+            } else if (intr->intrinsic ==
+                       nir_intrinsic_load_push_constant) {
+               if (intr->def.bit_size != 32)
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "terrain D2 push precision changed");
+               if (intr->def.num_components == 1 && !height)
+                  height = intr;
+               else if (intr->def.num_components == 2 && !resolution)
+                  resolution = intr;
+               else
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "terrain D2 push graph changed");
+            }
+         } else if (instr->type == nir_instr_type_tex) {
+            if (texture_count >= ARRAY_SIZE(textures))
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D2 texture count changed");
+            textures[texture_count++] = nir_instr_as_tex(instr);
+         } else if (instr->type == nir_instr_type_alu) {
+            switch (nir_instr_as_alu(instr)->op) {
+            case nir_op_fadd:
+               ++source_adds;
+               break;
+            case nir_op_fmul:
+               ++source_multiplies;
+               break;
+            case nir_op_frcp:
+               ++source_reciprocals;
+               break;
+            case nir_op_frsq:
+               ++source_rsqrt;
+               break;
+            case nir_op_ffma:
+            case nir_op_ffma_weak:
+               return pvrgpu_pco_fail(
+                  error,
+                  error_size,
+                  "terrain D2 fused arithmetic changed");
+            default:
+               break;
+            }
+         }
+      }
+   }
+
+   if (!varying || !height || !resolution || texture_count != 3U ||
+       source_adds != 5U || source_multiplies != 2U ||
+       source_reciprocals != 2U || source_rsqrt != 1U) {
+      return pvrgpu_pco_fail(
+         error,
+         error_size,
+         "terrain D2 source graph changed (tex=%u add=%u mul=%u rcp=%u rsq=%u)",
+         texture_count,
+         source_adds,
+         source_multiplies,
+         source_reciprocals,
+         source_rsqrt);
+   }
+
+   const int center_coord_index =
+      nir_tex_instr_src_index(textures[0], nir_tex_src_coord);
+   if (center_coord_index < 0 ||
+       textures[0]->src[center_coord_index].src.ssa != &varying->def ||
+       !pvrgpu_terrain_d2_offset_coord_matches(textures[1],
+                                                varying,
+                                                resolution,
+                                                0) ||
+       !pvrgpu_terrain_d2_offset_coord_matches(textures[2],
+                                                varying,
+                                                resolution,
+                                                1)) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D2 texture coordinate graph changed");
+   }
+
+   nir_builder varying_builder =
+      nir_builder_at(nir_after_instr(&varying->instr));
+   nir_def *uv_half[2];
+   for (unsigned component = 0; component < 2; ++component) {
+      uv_half[component] = pvrgpu_terrain_d1_round_half_rtne(
+         &varying_builder,
+         nir_channel(&varying_builder, &varying->def, component));
+   }
+
+   nir_builder resolution_builder =
+      nir_builder_at(nir_after_instr(&resolution->instr));
+   nir_def *reciprocal[2];
+   for (unsigned component = 0; component < 2; ++component) {
+      nir_def *rounded_resolution = pvrgpu_terrain_d1_round_half_rtne(
+         &resolution_builder,
+         nir_channel(&resolution_builder, &resolution->def, component));
+      reciprocal[component] = nir_frcp(&resolution_builder,
+                                        rounded_resolution);
+   }
+
+   nir_builder coord_u_builder =
+      nir_builder_at(nir_before_instr(&textures[1]->instr));
+   nir_def *coord_u_x =
+      nir_fadd(&coord_u_builder, uv_half[0], reciprocal[0]);
+   nir_def *coord_u = nir_vec2(
+      &coord_u_builder,
+      coord_u_x,
+      nir_channel(&coord_u_builder, &varying->def, 1));
+   const int coord_u_index =
+      nir_tex_instr_src_index(textures[1], nir_tex_src_coord);
+   nir_src_rewrite(&textures[1]->src[coord_u_index].src, coord_u);
+
+   nir_builder coord_v_builder =
+      nir_builder_at(nir_before_instr(&textures[2]->instr));
+   nir_def *coord_v_y =
+      nir_fadd(&coord_v_builder, uv_half[1], reciprocal[1]);
+   nir_def *coord_v = nir_vec2(
+      &coord_v_builder,
+      nir_channel(&coord_v_builder, &varying->def, 0),
+      coord_v_y);
+   const int coord_v_index =
+      nir_tex_instr_src_index(textures[2], nir_tex_src_coord);
+   nir_src_rewrite(&textures[2]->src[coord_v_index].src, coord_v);
+
+   nir_builder height_builder =
+      nir_builder_at(nir_after_instr(&height->instr));
+   nir_def *rounded_height = pvrgpu_terrain_d1_round_half_rtne(
+      &height_builder, &height->def);
+   nir_def_rewrite_uses_after(&height->def, rounded_height);
+
+   for (unsigned texture = 0; texture < ARRAY_SIZE(textures); ++texture)
+      pvrgpu_terrain_d2_round_texture_x_rtz(textures[texture]);
+
+   nir_opt_dce(nir);
+   nir_lower_alu_to_scalar(nir, NULL, NULL);
+
+   nir_alu_instr *rsqrt = NULL;
+   unsigned rounded_adds = 0;
+   unsigned rounded_multiplies = 0;
+   unsigned rounded_reciprocals = 0;
+   nir_foreach_block (block, entrypoint) {
+      nir_foreach_instr_safe (instr, block) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         bool round_result = false;
+         switch (alu->op) {
+         case nir_op_fadd:
+            ++rounded_adds;
+            round_result = true;
+            break;
+         case nir_op_fmul:
+            ++rounded_multiplies;
+            round_result = true;
+            break;
+         case nir_op_frcp:
+            ++rounded_reciprocals;
+            round_result = true;
+            break;
+         case nir_op_frsq:
+            if (rsqrt)
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D2 rsqrt count changed");
+            rsqrt = alu;
+            break;
+         case nir_op_ffma:
+         case nir_op_ffma_weak:
+            return pvrgpu_pco_fail(error,
+                                   error_size,
+                                   "terrain D2 fused arithmetic changed");
+         default:
+            break;
+         }
+         if (!round_result)
+            continue;
+         if (alu->def.bit_size != 32 || alu->def.num_components != 1)
+            return pvrgpu_pco_fail(
+               error,
+               error_size,
+               "terrain D2 scalar arithmetic changed");
+         nir_builder builder =
+            nir_builder_at(nir_after_instr(&alu->instr));
+         nir_def *rounded = pvrgpu_terrain_d1_round_half_rtne(
+            &builder, &alu->def);
+         nir_def_rewrite_uses_after(&alu->def, rounded);
+      }
+   }
+
+   if (!rsqrt || rounded_adds != 9U || rounded_multiplies != 9U ||
+       rounded_reciprocals != 2U) {
+      return pvrgpu_pco_fail(
+         error,
+         error_size,
+         "terrain D2 lowered graph changed (add=%u mul=%u rcp=%u rsq=%u)",
+         rounded_adds,
+         rounded_multiplies,
+         rounded_reciprocals,
+         rsqrt ? 1U : 0U);
+   }
+
+   nir_builder rsqrt_builder =
+      nir_builder_at(nir_after_instr(&rsqrt->instr));
+   nir_def *sqrt_value = nir_frcp(&rsqrt_builder, &rsqrt->def);
+   nir_def *sqrt_rounded = pvrgpu_terrain_d1_round_half_rtne(
+      &rsqrt_builder, sqrt_value);
+   nir_def *scale = nir_frcp(&rsqrt_builder, sqrt_rounded);
+   nir_def *scale_rounded = pvrgpu_terrain_d1_round_half_rtne(
+      &rsqrt_builder, scale);
+   nir_def_rewrite_uses_after(&rsqrt->def, scale_rounded);
+
+   nir_progress(true, entrypoint, nir_metadata_control_flow);
+   return true;
+}
+
+static nir_def *
+pvrgpu_terrain_d3_round_texture_rtz(nir_tex_instr *texture)
+{
+   nir_builder builder =
+      nir_builder_at(nir_after_instr(&texture->instr));
+   nir_def *components[4];
+   for (unsigned component = 0; component < ARRAY_SIZE(components);
+        ++component) {
+      components[component] = nir_f2f32(
+         &builder,
+         nir_f2f16_rtz(
+            &builder,
+            nir_channel(&builder, &texture->def, component)));
+   }
+   nir_def *replacement = nir_vec(&builder, components, 4);
+   nir_def_rewrite_uses_after(&texture->def, replacement);
+   return replacement;
+}
+
+static bool
+pvrgpu_terrain_d3_scalar_source_is_texture_component(
+   const nir_alu_src *source,
+   const nir_tex_instr *texture,
+   unsigned component)
+{
+   if (!source || !source->src.ssa || !texture || component >= 4)
+      return false;
+   const nir_scalar scalar =
+      nir_scalar_resolved(source->src.ssa, source->swizzle[0]);
+   return scalar.def == &texture->def && scalar.comp == component;
+}
+
+static bool
+pvrgpu_terrain_d3_scalar_source_is_def(const nir_alu_src *source,
+                                        const nir_def *def)
+{
+   if (!source || !source->src.ssa || !def || def->num_components != 1)
+      return false;
+   const nir_scalar scalar =
+      nir_scalar_resolved(source->src.ssa, source->swizzle[0]);
+   return scalar.def == def && scalar.comp == 0;
+}
+
+/* Terrain D3's vertex source is highp except for normalized texture results.
+ * Gallivm converts all four channels of both UNORM samples to binary16 with
+ * RTZ.  The displacement sample is widened immediately and all of its math
+ * remains highp.  Only the normal-map RGB `sample * 2.0 - 1.0` chain has a
+ * mediump ALU result boundary: three RTNE multiplies and three RTNE adds.
+ * Varying stores intentionally remain fp32; the fragment pass restores their
+ * mediump boundary at the consumer. */
+static bool
+pvrgpu_lower_terrain_d3_vertex_mediump(nir_shader *nir,
+                                        char *error,
+                                        size_t error_size)
+{
+   if (!nir || nir->info.stage != MESA_SHADER_VERTEX)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 mediump requires a vertex shader");
+
+   nir_function_impl *entrypoint = nir_shader_get_entrypoint(nir);
+   if (!entrypoint)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 vertex entrypoint is missing");
+
+   nir_tex_instr *textures[2] = { 0 };
+   unsigned texture_count = 0;
+   nir_foreach_block (block, entrypoint) {
+      nir_foreach_instr (instr, block) {
+         if (instr->type != nir_instr_type_tex)
+            continue;
+         if (texture_count >= ARRAY_SIZE(textures))
+            return pvrgpu_pco_fail(error,
+                                   error_size,
+                                   "terrain D3 VS texture count changed");
+         textures[texture_count++] = nir_instr_as_tex(instr);
+      }
+   }
+
+   if (texture_count != ARRAY_SIZE(textures) ||
+       textures[0]->texture_index != 0U ||
+       textures[0]->sampler_index != 0U ||
+       textures[1]->texture_index != (1U << 16U) ||
+       textures[1]->sampler_index != (1U << 16U) ||
+       textures[0]->def.bit_size != 32 ||
+       textures[0]->def.num_components != 4 ||
+       textures[1]->def.bit_size != 32 ||
+       textures[1]->def.num_components != 4) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 VS texture ABI changed");
+   }
+
+   const int displacement_coord =
+      nir_tex_instr_src_index(textures[0], nir_tex_src_coord);
+   const int normal_coord =
+      nir_tex_instr_src_index(textures[1], nir_tex_src_coord);
+   if (displacement_coord < 0 || normal_coord < 0 ||
+       !textures[0]->src[displacement_coord].src.ssa ||
+       textures[0]->src[displacement_coord].src.ssa !=
+          textures[1]->src[normal_coord].src.ssa ||
+       textures[0]->src[displacement_coord].src.ssa->bit_size != 32 ||
+       textures[0]->src[displacement_coord].src.ssa->num_components != 2) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 VS texture coordinate graph changed");
+   }
+
+   nir_lower_alu_to_scalar(nir, NULL, NULL);
+
+   nir_alu_instr *normal_multiplies[3] = { 0 };
+   nir_alu_instr *normal_adds[3] = { 0 };
+   nir_foreach_block (block, entrypoint) {
+      nir_foreach_instr (instr, block) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         if (alu->def.bit_size != 32 || alu->def.num_components != 1)
+            continue;
+         if (alu->op == nir_op_fmul) {
+            for (unsigned component = 0;
+                 component < ARRAY_SIZE(normal_multiplies);
+                 ++component) {
+               const bool match =
+                  (pvrgpu_terrain_d3_scalar_source_is_texture_component(
+                      &alu->src[0], textures[1], component) &&
+                   pvrgpu_terrain_d1_scalar_source_is_bits(
+                      &alu->src[1], UINT32_C(0x40000000))) ||
+                  (pvrgpu_terrain_d3_scalar_source_is_texture_component(
+                      &alu->src[1], textures[1], component) &&
+                   pvrgpu_terrain_d1_scalar_source_is_bits(
+                      &alu->src[0], UINT32_C(0x40000000)));
+               if (!match)
+                  continue;
+               if (normal_multiplies[component])
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "terrain D3 VS normal multiply graph is ambiguous");
+               normal_multiplies[component] = alu;
+            }
+         }
+      }
+   }
+
+   for (unsigned component = 0; component < ARRAY_SIZE(normal_multiplies);
+        ++component) {
+      if (!normal_multiplies[component])
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "terrain D3 VS normal multiply graph changed");
+   }
+
+   nir_foreach_block (block, entrypoint) {
+      nir_foreach_instr (instr, block) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         if (alu->op != nir_op_fadd || alu->def.bit_size != 32 ||
+             alu->def.num_components != 1)
+            continue;
+         for (unsigned component = 0;
+              component < ARRAY_SIZE(normal_adds);
+              ++component) {
+            const bool match =
+               (pvrgpu_terrain_d3_scalar_source_is_def(
+                   &alu->src[0], &normal_multiplies[component]->def) &&
+                pvrgpu_terrain_d1_scalar_source_is_bits(
+                   &alu->src[1], UINT32_C(0xbf800000))) ||
+               (pvrgpu_terrain_d3_scalar_source_is_def(
+                   &alu->src[1], &normal_multiplies[component]->def) &&
+                pvrgpu_terrain_d1_scalar_source_is_bits(
+                   &alu->src[0], UINT32_C(0xbf800000)));
+            if (!match)
+               continue;
+            if (normal_adds[component])
+               return pvrgpu_pco_fail(
+                  error,
+                  error_size,
+                  "terrain D3 VS normal add graph is ambiguous");
+            normal_adds[component] = alu;
+         }
+      }
+   }
+
+   for (unsigned component = 0; component < ARRAY_SIZE(normal_adds);
+        ++component) {
+      if (!normal_adds[component])
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "terrain D3 VS normal add graph changed");
+   }
+
+   for (unsigned texture = 0; texture < ARRAY_SIZE(textures); ++texture)
+      pvrgpu_terrain_d3_round_texture_rtz(textures[texture]);
+
+   for (unsigned component = 0; component < ARRAY_SIZE(normal_multiplies);
+        ++component) {
+      nir_builder builder =
+         nir_builder_at(nir_after_instr(&normal_multiplies[component]->instr));
+      nir_def *rounded = pvrgpu_terrain_d1_round_half_rtne(
+         &builder, &normal_multiplies[component]->def);
+      nir_def_rewrite_uses_after(&normal_multiplies[component]->def,
+                                 rounded);
+   }
+   for (unsigned component = 0; component < ARRAY_SIZE(normal_adds);
+        ++component) {
+      nir_builder builder =
+         nir_builder_at(nir_after_instr(&normal_adds[component]->instr));
+      nir_def *rounded = pvrgpu_terrain_d1_round_half_rtne(
+         &builder, &normal_adds[component]->def);
+      nir_def_rewrite_uses_after(&normal_adds[component]->def, rounded);
+   }
+
+   nir_opt_dce(nir);
+   nir_progress(true, entrypoint, nir_metadata_control_flow);
+   return true;
+}
+
+#define PVRGPU_TERRAIN_D3_FS_VARYINGS 4U
+#define PVRGPU_TERRAIN_D3_FS_PUSH_SLOTS 16U
+#define PVRGPU_TERRAIN_D3_FS_TEXTURES 5U
+#define PVRGPU_TERRAIN_D3_FS_FADDS 13U
+#define PVRGPU_TERRAIN_D3_FS_FMULS 24U
+#define PVRGPU_TERRAIN_D3_FS_DOTS 7U
+#define PVRGPU_TERRAIN_D3_FS_RSQRTS 5U
+
+struct pvrgpu_terrain_d3_fragment_graph {
+   nir_intrinsic_instr *varying[PVRGPU_TERRAIN_D3_FS_VARYINGS];
+   nir_intrinsic_instr *push[PVRGPU_TERRAIN_D3_FS_PUSH_SLOTS];
+   nir_tex_instr *texture[PVRGPU_TERRAIN_D3_FS_TEXTURES];
+   nir_alu_instr *fadd[PVRGPU_TERRAIN_D3_FS_FADDS];
+   nir_alu_instr *fmul[PVRGPU_TERRAIN_D3_FS_FMULS];
+   nir_alu_instr *dot[PVRGPU_TERRAIN_D3_FS_DOTS];
+   nir_alu_instr *rsqrt[PVRGPU_TERRAIN_D3_FS_RSQRTS];
+   nir_alu_instr *fneg[2];
+   nir_alu_instr *fmax[2];
+   nir_alu_instr *flrp;
+   nir_alu_instr *flt;
+   nir_alu_instr *bcsel;
+   nir_alu_instr *fdiv;
+   nir_alu_instr *fmin;
+   nir_alu_instr *fsqrt;
+   nir_alu_instr *fpow;
+   nir_alu_instr *attenuation_neg;
+   nir_alu_instr *attenuation_add;
+   nir_alu_instr *light_direction;
+   nir_alu_instr *diffuse_max;
+   nir_alu_instr *halfway_add;
+   nir_alu_instr *halfway_normalize;
+   nir_alu_instr *halfway_max;
+   nir_alu_instr *material_surface;
+   unsigned material_source;
+   unsigned surface_source;
+   unsigned fadd_components;
+   unsigned fmul_components;
+};
+
+static bool
+pvrgpu_terrain_d3_alu_source_matches_slice(const nir_alu_src *source,
+                                            const nir_def *expected,
+                                            unsigned first_component,
+                                            unsigned components)
+{
+   if (!source || !source->src.ssa || !expected ||
+       first_component + components > expected->num_components)
+      return false;
+   for (unsigned component = 0; component < components; ++component) {
+      const nir_scalar actual = nir_scalar_resolved(
+         source->src.ssa, source->swizzle[component]);
+      if (actual.def != expected ||
+          actual.comp != first_component + component)
+         return false;
+   }
+   return true;
+}
+
+static bool
+pvrgpu_terrain_d3_def_matches_slice(const nir_def *value,
+                                     const nir_def *expected,
+                                     unsigned first_component,
+                                     unsigned components)
+{
+   if (!value || !expected || value->num_components < components ||
+       first_component + components > expected->num_components)
+      return false;
+   for (unsigned component = 0; component < components; ++component) {
+      const nir_scalar actual =
+         nir_scalar_resolved((nir_def *)value, component);
+      if (actual.def != expected ||
+          actual.comp != first_component + component)
+         return false;
+   }
+   return true;
+}
+
+static bool
+pvrgpu_terrain_d3_alu_has_def(const nir_alu_instr *alu,
+                               const nir_def *def)
+{
+   if (!alu || !def)
+      return false;
+   const unsigned inputs = nir_op_infos[alu->op].num_inputs;
+   for (unsigned source = 0; source < inputs; ++source) {
+      if (alu->src[source].src.ssa == def)
+         return true;
+   }
+   return false;
+}
+
+static bool
+pvrgpu_terrain_d3_material_source_matches(const nir_alu_src *source,
+                                           const nir_def *opacity)
+{
+   if (!source || !source->src.ssa || !opacity)
+      return false;
+
+   for (unsigned component = 0; component < 4U; ++component) {
+      const nir_scalar scalar = nir_scalar_resolved(
+         source->src.ssa, source->swizzle[component]);
+      if (component < 3U) {
+         if (!nir_scalar_is_const(scalar) ||
+             nir_scalar_as_uint(scalar) != 0x3f800000U)
+            return false;
+      } else if (scalar.def != opacity || scalar.comp != 0U) {
+         return false;
+      }
+   }
+   return true;
+}
+
+static nir_def *
+pvrgpu_terrain_d3_texture_coord(nir_tex_instr *texture)
+{
+   if (!texture)
+      return NULL;
+   const int index = nir_tex_instr_src_index(texture, nir_tex_src_coord);
+   return index < 0 ? NULL : texture->src[index].src.ssa;
+}
+
+static bool
+pvrgpu_terrain_d3_collect_fragment_graph(
+   nir_shader *nir,
+   nir_function_impl *entrypoint,
+   struct pvrgpu_terrain_d3_fragment_graph *graph,
+   char *error,
+   size_t error_size)
+{
+   memset(graph, 0, sizeof(*graph));
+   nir_opt_shrink_vectors(nir, true);
+   nir_opt_dce(nir);
+
+   unsigned textures = 0;
+   unsigned fadds = 0;
+   unsigned fmuls = 0;
+   unsigned dots = 0;
+   unsigned rsqrts = 0;
+   unsigned fnegs = 0;
+   unsigned fmaxes = 0;
+   unsigned flrps = 0;
+   unsigned flts = 0;
+   unsigned bcsels = 0;
+   unsigned fdivs = 0;
+   unsigned fmins = 0;
+   unsigned fsqrts = 0;
+   unsigned fpows = 0;
+
+   nir_foreach_block (block, entrypoint) {
+      nir_foreach_instr (instr, block) {
+         if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_load_deref) {
+               nir_variable *var = nir_intrinsic_get_var(intr, 0);
+               if (!var || var->data.mode != nir_var_shader_in ||
+                   var->data.location < VARYING_SLOT_VAR0 ||
+                   var->data.location >=
+                      VARYING_SLOT_VAR0 + PVRGPU_TERRAIN_D3_FS_VARYINGS) {
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "terrain D3 FS varying graph changed");
+               }
+               const unsigned slot =
+                  var->data.location - VARYING_SLOT_VAR0;
+               if (graph->varying[slot])
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "terrain D3 FS varying load is duplicated");
+               graph->varying[slot] = intr;
+            } else if (intr->intrinsic ==
+                       nir_intrinsic_load_push_constant) {
+               if (!nir_src_is_const(intr->src[0]) ||
+                   nir_intrinsic_base(intr) != 0) {
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "terrain D3 FS push address changed");
+               }
+               const unsigned byte_offset = nir_src_as_uint(intr->src[0]);
+               if ((byte_offset & 15U) != 0 ||
+                   byte_offset / 16U >= PVRGPU_TERRAIN_D3_FS_PUSH_SLOTS ||
+                   graph->push[byte_offset / 16U]) {
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "terrain D3 FS push layout changed");
+               }
+               graph->push[byte_offset / 16U] = intr;
+            }
+            continue;
+         }
+
+         if (instr->type == nir_instr_type_tex) {
+            if (textures >= ARRAY_SIZE(graph->texture))
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D3 FS texture count changed");
+            graph->texture[textures++] = nir_instr_as_tex(instr);
+            continue;
+         }
+
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         switch (alu->op) {
+         case nir_op_fadd:
+            if (fadds >= ARRAY_SIZE(graph->fadd))
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D3 FS fadd count changed");
+            graph->fadd[fadds++] = alu;
+            graph->fadd_components += alu->def.num_components;
+            break;
+         case nir_op_fmul:
+            if (fmuls >= ARRAY_SIZE(graph->fmul))
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D3 FS fmul count changed");
+            graph->fmul[fmuls++] = alu;
+            graph->fmul_components += alu->def.num_components;
+            break;
+         case nir_op_fdot3:
+            if (dots >= ARRAY_SIZE(graph->dot))
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D3 FS dot count changed");
+            graph->dot[dots++] = alu;
+            break;
+         case nir_op_frsq:
+            if (rsqrts >= ARRAY_SIZE(graph->rsqrt))
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D3 FS rsqrt count changed");
+            graph->rsqrt[rsqrts++] = alu;
+            break;
+         case nir_op_fneg:
+            if (fnegs >= ARRAY_SIZE(graph->fneg))
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D3 FS fneg count changed");
+            graph->fneg[fnegs++] = alu;
+            break;
+         case nir_op_fmax:
+            if (fmaxes >= ARRAY_SIZE(graph->fmax))
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D3 FS fmax count changed");
+            graph->fmax[fmaxes++] = alu;
+            break;
+         case nir_op_flrp:
+            graph->flrp = alu;
+            ++flrps;
+            break;
+         case nir_op_flt:
+            graph->flt = alu;
+            ++flts;
+            break;
+         case nir_op_bcsel:
+            graph->bcsel = alu;
+            ++bcsels;
+            break;
+         case nir_op_fdiv:
+            graph->fdiv = alu;
+            ++fdivs;
+            break;
+         case nir_op_fmin:
+            graph->fmin = alu;
+            ++fmins;
+            break;
+         case nir_op_fsqrt:
+            graph->fsqrt = alu;
+            ++fsqrts;
+            break;
+         case nir_op_fpow:
+            graph->fpow = alu;
+            ++fpows;
+            break;
+         case nir_op_ffma:
+         case nir_op_ffma_weak:
+            return pvrgpu_pco_fail(error,
+                                   error_size,
+                                   "terrain D3 FS retained fused arithmetic");
+         default:
+            break;
+         }
+      }
+   }
+
+   if (textures != ARRAY_SIZE(graph->texture) ||
+       fadds != ARRAY_SIZE(graph->fadd) ||
+       fmuls != ARRAY_SIZE(graph->fmul) ||
+       dots != ARRAY_SIZE(graph->dot) ||
+       rsqrts != ARRAY_SIZE(graph->rsqrt) || fnegs != 2U ||
+       fmaxes != 2U || flrps != 1U || flts != 1U || bcsels != 1U ||
+       fdivs != 1U || fmins != 1U || fsqrts != 1U || fpows != 1U ||
+       graph->fadd_components != 37U ||
+       graph->fmul_components != 69U) {
+      return pvrgpu_pco_fail(
+         error,
+         error_size,
+         "terrain D3 FS source graph changed "
+         "(tex=%u add=%u/%u mul=%u/%u dot=%u rsq=%u)",
+         textures,
+         fadds,
+         graph->fadd_components,
+         fmuls,
+         graph->fmul_components,
+         dots,
+         rsqrts);
+   }
+
+   static const unsigned varying_components[4] = { 4, 4, 4, 2 };
+   for (unsigned slot = 0; slot < ARRAY_SIZE(graph->varying); ++slot) {
+      if (!graph->varying[slot] ||
+          graph->varying[slot]->def.bit_size != 32 ||
+          graph->varying[slot]->def.num_components !=
+             varying_components[slot]) {
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "terrain D3 FS varying ABI changed");
+      }
+   }
+
+   static const unsigned push_components[16] = {
+      3, 3, 3, 1, 1, 1, 2, 2, 3, 3, 3, 3, 3, 3, 3, 1,
+   };
+   for (unsigned slot = 0; slot < ARRAY_SIZE(graph->push); ++slot) {
+      if (!graph->push[slot] || graph->push[slot]->def.bit_size != 32 ||
+          graph->push[slot]->def.num_components != push_components[slot]) {
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "terrain D3 FS push ABI changed at slot %u",
+                                slot);
+      }
+   }
+
+   for (unsigned multiply = 0; multiply < ARRAY_SIZE(graph->fmul);
+        ++multiply) {
+      nir_alu_instr *alu = graph->fmul[multiply];
+      if (alu->def.num_components != 4U)
+         continue;
+      for (unsigned surface_source = 0; surface_source < 2U;
+           ++surface_source) {
+         const unsigned material_source = 1U - surface_source;
+         if (!pvrgpu_terrain_d3_alu_source_matches_slice(
+                &alu->src[surface_source], &graph->flrp->def, 0, 4) ||
+             !pvrgpu_terrain_d3_material_source_matches(
+                &alu->src[material_source], &graph->push[4]->def)) {
+            continue;
+         }
+         if (graph->material_surface)
+            return pvrgpu_pco_fail(
+               error,
+               error_size,
+               "terrain D3 FS material multiply is ambiguous");
+         graph->material_surface = alu;
+         graph->material_source = material_source;
+         graph->surface_source = surface_source;
+      }
+   }
+   if (!graph->material_surface)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS material multiply changed");
+
+   nir_def *detail_coord =
+      pvrgpu_terrain_d3_texture_coord(graph->texture[0]);
+   nir_def *base_coord =
+      pvrgpu_terrain_d3_texture_coord(graph->texture[3]);
+   if (!detail_coord || !base_coord || detail_coord->bit_size != 32 ||
+       detail_coord->num_components != 2 || base_coord->bit_size != 32 ||
+       base_coord->num_components != 2 ||
+       pvrgpu_terrain_d3_texture_coord(graph->texture[1]) != detail_coord ||
+       pvrgpu_terrain_d3_texture_coord(graph->texture[2]) != detail_coord ||
+       pvrgpu_terrain_d3_texture_coord(graph->texture[4]) != detail_coord ||
+       !pvrgpu_terrain_d3_def_matches_slice(
+          base_coord, &graph->varying[0]->def, 0, 2)) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS texture coordinate graph changed");
+   }
+
+   for (unsigned texture = 0; texture < ARRAY_SIZE(graph->texture);
+        ++texture) {
+      const uint32_t expected_index = texture << 16U;
+      if (graph->texture[texture]->texture_index != expected_index ||
+          graph->texture[texture]->sampler_index != expected_index ||
+          graph->texture[texture]->def.bit_size != 32 ||
+          graph->texture[texture]->def.num_components != 4) {
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "terrain D3 FS texture ABI changed at %u",
+                                texture);
+      }
+   }
+
+   if (nir_def_instr(detail_coord)->type != nir_instr_type_alu)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS detail coordinate is not ALU");
+   nir_alu_instr *detail_add =
+      nir_instr_as_alu(nir_def_instr(detail_coord));
+   if (detail_add->op != nir_op_fadd ||
+       detail_add->def.num_components != 2)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS detail add changed");
+
+   bool detail_graph_matches = false;
+   for (unsigned offset_source = 0; offset_source < 2; ++offset_source) {
+      const unsigned multiply_source = 1U - offset_source;
+      if (!pvrgpu_terrain_d3_alu_source_matches_slice(
+             &detail_add->src[offset_source],
+             &graph->push[7]->def,
+             0,
+             2) ||
+          !detail_add->src[multiply_source].src.ssa ||
+          nir_def_instr(detail_add->src[multiply_source].src.ssa)->type !=
+             nir_instr_type_alu)
+         continue;
+      nir_alu_instr *detail_multiply = nir_instr_as_alu(
+         nir_def_instr(detail_add->src[multiply_source].src.ssa));
+      if (detail_multiply->op != nir_op_fmul ||
+          detail_multiply->def.num_components != 2)
+         continue;
+      for (unsigned repeat_source = 0; repeat_source < 2;
+           ++repeat_source) {
+         const unsigned varying_source = 1U - repeat_source;
+         if (pvrgpu_terrain_d3_alu_source_matches_slice(
+                &detail_multiply->src[repeat_source],
+                &graph->push[6]->def,
+                0,
+                2) &&
+             pvrgpu_terrain_d3_alu_source_matches_slice(
+                &detail_multiply->src[varying_source],
+                &graph->varying[0]->def,
+                0,
+                2)) {
+            detail_graph_matches = true;
+         }
+      }
+   }
+   if (!detail_graph_matches)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS detail coordinate inputs changed");
+
+   for (unsigned dot = 0; dot < ARRAY_SIZE(graph->dot); ++dot) {
+      if (graph->dot[dot]->def.bit_size != 32 ||
+          graph->dot[dot]->def.num_components != 1)
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "terrain D3 FS dot ABI changed");
+   }
+   static const unsigned rsqrt_dot[5] = { 0, 1, 2, 3, 5 };
+   for (unsigned rsqrt = 0; rsqrt < ARRAY_SIZE(graph->rsqrt); ++rsqrt) {
+      if (graph->rsqrt[rsqrt]->def.bit_size != 32 ||
+          graph->rsqrt[rsqrt]->def.num_components != 1 ||
+          !pvrgpu_terrain_d3_alu_has_def(
+             graph->rsqrt[rsqrt], &graph->dot[rsqrt_dot[rsqrt]]->def)) {
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "terrain D3 FS rsqrt/dot association changed");
+      }
+   }
+   if (!pvrgpu_terrain_d3_alu_has_def(graph->fsqrt,
+                                      &graph->dot[3]->def) ||
+       !pvrgpu_terrain_d3_alu_has_def(graph->fdiv,
+                                      &graph->fsqrt->def) ||
+       !pvrgpu_terrain_d3_alu_has_def(graph->fdiv,
+                                      &graph->push[15]->def) ||
+       !pvrgpu_terrain_d3_alu_has_def(graph->flt,
+                                      &graph->push[15]->def) ||
+       !pvrgpu_terrain_d3_alu_has_def(graph->fmin,
+                                      &graph->fdiv->def)) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS distance highp island changed");
+   }
+
+   for (unsigned neg = 0; neg < ARRAY_SIZE(graph->fneg); ++neg) {
+      if (pvrgpu_terrain_d3_alu_has_def(graph->fneg[neg],
+                                        &graph->fmin->def)) {
+         graph->attenuation_neg = graph->fneg[neg];
+      }
+   }
+   if (!graph->attenuation_neg)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS attenuation neg changed");
+   for (unsigned add = 0; add < ARRAY_SIZE(graph->fadd); ++add) {
+      if (pvrgpu_terrain_d3_alu_has_def(
+             graph->fadd[add], &graph->attenuation_neg->def)) {
+         if (graph->attenuation_add)
+            return pvrgpu_pco_fail(error,
+                                   error_size,
+                                   "terrain D3 FS attenuation add ambiguous");
+         graph->attenuation_add = graph->fadd[add];
+      }
+   }
+   if (!graph->attenuation_add ||
+       !pvrgpu_terrain_d3_alu_has_def(graph->bcsel, &graph->flt->def) ||
+       !pvrgpu_terrain_d3_alu_has_def(
+          graph->bcsel, &graph->attenuation_add->def)) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS attenuation select changed");
+   }
+
+   nir_def *light_vector = graph->dot[3]->src[0].src.ssa;
+   nir_def *halfway = graph->dot[5]->src[0].src.ssa;
+   if (!light_vector || graph->dot[3]->src[1].src.ssa != light_vector ||
+       !halfway || graph->dot[5]->src[1].src.ssa != halfway ||
+       nir_def_instr(halfway)->type != nir_instr_type_alu) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS highp vector graph changed");
+   }
+   graph->halfway_add = nir_instr_as_alu(nir_def_instr(halfway));
+   if (graph->halfway_add->op != nir_op_fadd ||
+       graph->halfway_add->def.num_components != 3)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS halfway add changed");
+
+   for (unsigned multiply = 0; multiply < ARRAY_SIZE(graph->fmul);
+        ++multiply) {
+      nir_alu_instr *alu = graph->fmul[multiply];
+      if (pvrgpu_terrain_d3_alu_has_def(alu, light_vector) &&
+          pvrgpu_terrain_d3_alu_has_def(alu, &graph->rsqrt[3]->def)) {
+         graph->light_direction = alu;
+      }
+      if (pvrgpu_terrain_d3_alu_has_def(alu, halfway) &&
+          pvrgpu_terrain_d3_alu_has_def(alu, &graph->rsqrt[4]->def)) {
+         graph->halfway_normalize = alu;
+      }
+   }
+   if (!graph->light_direction || !graph->halfway_normalize ||
+       graph->light_direction->def.num_components != 3 ||
+       graph->halfway_normalize->def.num_components != 3 ||
+       !pvrgpu_terrain_d3_alu_has_def(graph->dot[4],
+                                      &graph->light_direction->def) ||
+       !pvrgpu_terrain_d3_alu_has_def(graph->dot[6],
+                                      &graph->halfway_normalize->def)) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS highp normalize graph changed");
+   }
+
+   for (unsigned maximum = 0; maximum < ARRAY_SIZE(graph->fmax);
+        ++maximum) {
+      if (pvrgpu_terrain_d3_alu_has_def(graph->fmax[maximum],
+                                        &graph->dot[4]->def))
+         graph->diffuse_max = graph->fmax[maximum];
+      if (pvrgpu_terrain_d3_alu_has_def(graph->fmax[maximum],
+                                        &graph->dot[6]->def))
+         graph->halfway_max = graph->fmax[maximum];
+   }
+   if (!graph->diffuse_max || !graph->halfway_max ||
+       !pvrgpu_terrain_d3_alu_has_def(graph->fpow,
+                                      &graph->halfway_max->def) ||
+       !pvrgpu_terrain_d3_alu_has_def(graph->fpow,
+                                      &graph->push[3]->def)) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS lighting weight graph changed");
+   }
+
+   const unsigned highp_add_components =
+      graph->attenuation_add->def.num_components +
+      graph->halfway_add->def.num_components;
+   const unsigned highp_multiply_components =
+      graph->light_direction->def.num_components +
+      graph->halfway_normalize->def.num_components;
+   if (highp_add_components != 4U || highp_multiply_components != 6U)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS highp scalar count changed");
+   return true;
+}
+
+static nir_def *
+pvrgpu_terrain_d3_round_alu_result_rtne(nir_alu_instr *alu)
+{
+   nir_builder builder = nir_builder_at(nir_after_instr(&alu->instr));
+   nir_def *rounded =
+      pvrgpu_terrain_d1_round_half_rtne(&builder, &alu->def);
+   nir_def_rewrite_uses_after(&alu->def, rounded);
+   return rounded;
+}
+
+static bool
+pvrgpu_terrain_d3_replace_dot(nir_alu_instr *dot,
+                               bool mediump,
+                               char *error,
+                               size_t error_size)
+{
+   if (!dot || dot->op != nir_op_fdot3 || dot->def.bit_size != 32 ||
+       dot->def.num_components != 1)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS dot replacement changed");
+
+   nir_builder builder = nir_builder_at(nir_before_instr(&dot->instr));
+   builder.fp_math_ctrl = dot->fp_math_ctrl;
+   nir_def *left = nir_ssa_for_alu_src(&builder, dot, 0);
+   nir_def *right = nir_ssa_for_alu_src(&builder, dot, 1);
+   if (!left || !right || left->num_components != 3 ||
+       right->num_components != 3)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS dot sources changed");
+
+   /* Gallivm scalarizes dot3 in z, y, x order. */
+   nir_def *sum = NULL;
+   for (int component = 2; component >= 0; --component) {
+      nir_def *product = nir_fmul(
+         &builder,
+         nir_channel(&builder, left, (unsigned)component),
+         nir_channel(&builder, right, (unsigned)component));
+      if (mediump)
+         product = pvrgpu_terrain_d1_round_half_rtne(&builder, product);
+      if (!sum) {
+         sum = product;
+         continue;
+      }
+      sum = nir_fadd(&builder, sum, product);
+      if (mediump)
+         sum = pvrgpu_terrain_d1_round_half_rtne(&builder, sum);
+   }
+   nir_def_replace(&dot->def, sum);
+   return true;
+}
+
+static bool
+pvrgpu_terrain_d3_replace_flrp(
+   struct pvrgpu_terrain_d3_fragment_graph *graph,
+   char *error,
+   size_t error_size)
+{
+   nir_alu_instr *flrp = graph->flrp;
+   if (!flrp || flrp->op != nir_op_flrp || flrp->def.bit_size != 32 ||
+       flrp->def.num_components != 4 ||
+       flrp->src[0].src.ssa != &graph->texture[1]->def ||
+       flrp->src[1].src.ssa != &graph->texture[2]->def ||
+       !flrp->src[2].src.ssa ||
+       nir_def_instr(flrp->src[2].src.ssa)->type != nir_instr_type_alu) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS flrp sources changed");
+   }
+
+   nir_alu_instr *mix_factor =
+      nir_instr_as_alu(nir_def_instr(flrp->src[2].src.ssa));
+   nir_alu_instr *mix_neg = NULL;
+   for (unsigned neg = 0; neg < ARRAY_SIZE(graph->fneg); ++neg) {
+      if (pvrgpu_terrain_d3_alu_has_def(graph->fneg[neg],
+                                        &graph->texture[3]->def)) {
+         mix_neg = graph->fneg[neg];
+      }
+   }
+   if (!mix_neg || mix_factor->op != nir_op_fadd ||
+       mix_factor->def.num_components != 4 ||
+       !pvrgpu_terrain_d3_alu_has_def(mix_factor, &mix_neg->def)) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS mix factor changed");
+   }
+
+   nir_builder builder = nir_builder_at(nir_before_instr(&flrp->instr));
+   builder.fp_math_ctrl = flrp->fp_math_ctrl;
+   nir_def *first = nir_ssa_for_alu_src(&builder, flrp, 0);
+   nir_def *second = nir_ssa_for_alu_src(&builder, flrp, 1);
+   nir_def *factor = nir_ssa_for_alu_src(&builder, flrp, 2);
+   nir_def *delta = nir_fadd(&builder, second, nir_fneg(&builder, first));
+   delta = pvrgpu_terrain_d1_round_half_rtne(&builder, delta);
+   nir_def *weighted = nir_fmul(&builder, factor, delta);
+   weighted = pvrgpu_terrain_d1_round_half_rtne(&builder, weighted);
+   nir_def *surface = nir_fadd(&builder, first, weighted);
+   surface = pvrgpu_terrain_d1_round_half_rtne(&builder, surface);
+   nir_def_replace(&flrp->def, surface);
+   return true;
+}
+
+static bool
+pvrgpu_terrain_d3_replace_material_surface(
+   struct pvrgpu_terrain_d3_fragment_graph *graph,
+   char *error,
+   size_t error_size)
+{
+   nir_alu_instr *multiply = graph->material_surface;
+   if (!multiply || multiply->op != nir_op_fmul ||
+       multiply->def.bit_size != 32 ||
+       multiply->def.num_components != 4 ||
+       graph->material_source >= 2U || graph->surface_source >= 2U ||
+       graph->material_source == graph->surface_source) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS material replacement changed");
+   }
+
+   nir_builder builder =
+      nir_builder_at(nir_before_instr(&multiply->instr));
+   builder.fp_math_ctrl = multiply->fp_math_ctrl;
+   nir_def *material = nir_ssa_for_alu_src(
+      &builder, multiply, graph->material_source);
+   nir_def *surface = nir_ssa_for_alu_src(
+      &builder, multiply, graph->surface_source);
+   if (!material || !surface || material->num_components != 4U ||
+       surface->num_components != 4U) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS material sources changed");
+   }
+
+   /* GLSL's material RGB is exactly one.  Gallivm folds those three
+    * multiplications; only the opacity product crosses a mediump boundary. */
+   nir_def *alpha = nir_fmul(&builder,
+                             nir_channel(&builder, material, 3),
+                             nir_channel(&builder, surface, 3));
+   alpha = pvrgpu_terrain_d1_round_half_rtne(&builder, alpha);
+   nir_def *result = nir_vec4(&builder,
+                              nir_channel(&builder, surface, 0),
+                              nir_channel(&builder, surface, 1),
+                              nir_channel(&builder, surface, 2),
+                              alpha);
+   nir_def_replace(&multiply->def, result);
+   return true;
+}
+
+static bool
+pvrgpu_terrain_d3_replace_power(
+   struct pvrgpu_terrain_d3_fragment_graph *graph,
+   char *error,
+   size_t error_size)
+{
+   nir_alu_instr *power = graph->fpow;
+   if (!power || power->op != nir_op_fpow ||
+       power->def.bit_size != 32 || power->def.num_components != 1 ||
+       !pvrgpu_terrain_d3_alu_has_def(power, &graph->halfway_max->def) ||
+       !pvrgpu_terrain_d3_alu_has_def(power, &graph->push[3]->def)) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS power sources changed");
+   }
+
+   nir_builder builder = nir_builder_at(nir_before_instr(&power->instr));
+   builder.fp_math_ctrl = power->fp_math_ctrl;
+   nir_def *base = nir_ssa_for_alu_src(&builder, power, 0);
+   nir_def *exponent = nir_ssa_for_alu_src(&builder, power, 1);
+   nir_def *logarithm = nir_flog2(&builder, base);
+   logarithm =
+      pvrgpu_terrain_d1_round_half_rtne(&builder, logarithm);
+   nir_def *scaled = nir_fmul(&builder, logarithm, exponent);
+   scaled = pvrgpu_terrain_d1_round_half_rtne(&builder, scaled);
+   nir_def *result = nir_fexp2(&builder, scaled);
+   result = pvrgpu_terrain_d1_round_half_rtne(&builder, result);
+   nir_def_replace(&power->def, result);
+   return true;
+}
+
+/* Terrain D3 is default-mediump with two source-level highp lighting islands.
+ * Restore the captured GLES precision graph without changing raw texture
+ * coordinates or promoting the whole shader to half.  The pass is deliberately
+ * profile-local and validates every structural anchor before rewriting:
+ *  - 14 interpolants and 38 push values enter mediump with RTNE;
+ *  - all five RGBA UNORM samples enter with RTZ;
+ *  - flrp is rebuilt in source order a + (1-d) * (b-a);
+ *  - mediump dot3 uses z/y/x scalar order and per-operation RTNE;
+ *  - three mediump rsqrt operations expose rounded sqrt and reciprocal; and
+ *  - fpow exposes rounded log2, multiply, and exp2 boundaries.
+ * The distance and halfway-vector islands remain highp until their explicit
+ * five-component return boundary. */
+static bool
+pvrgpu_lower_terrain_d3_fragment_mediump(nir_shader *nir,
+                                          char *error,
+                                          size_t error_size)
+{
+   if (!nir || nir->info.stage != MESA_SHADER_FRAGMENT)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 mediump requires a fragment shader");
+   nir_function_impl *entrypoint = nir_shader_get_entrypoint(nir);
+   if (!entrypoint)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 fragment entrypoint is missing");
+
+   struct pvrgpu_terrain_d3_fragment_graph graph;
+   if (!pvrgpu_terrain_d3_collect_fragment_graph(
+          nir, entrypoint, &graph, error, error_size) ||
+       !pvrgpu_terrain_d3_replace_flrp(&graph, error, error_size) ||
+       !pvrgpu_terrain_d3_replace_material_surface(
+          &graph, error, error_size) ||
+       !pvrgpu_terrain_d3_replace_power(&graph, error, error_size)) {
+      return false;
+   }
+
+   unsigned half_dot_adds = 0;
+   unsigned half_dot_multiplies = 0;
+   for (unsigned dot = 0; dot < ARRAY_SIZE(graph.dot); ++dot) {
+      const bool mediump = dot < 3U || dot == 6U;
+      if (!pvrgpu_terrain_d3_replace_dot(
+             graph.dot[dot], mediump, error, error_size)) {
+         return false;
+      }
+      if (mediump) {
+         half_dot_adds += 2U;
+         half_dot_multiplies += 3U;
+      }
+   }
+
+   unsigned rounded_varying_components = 0;
+   for (unsigned slot = 0; slot < ARRAY_SIZE(graph.varying); ++slot) {
+      nir_intrinsic_instr *load = graph.varying[slot];
+      nir_builder builder = nir_builder_at(nir_after_instr(&load->instr));
+      nir_def *rounded =
+         pvrgpu_terrain_d1_round_half_rtne(&builder, &load->def);
+      nir_def_rewrite_uses_after(&load->def, rounded);
+      rounded_varying_components += load->def.num_components;
+   }
+
+   /* The displacement sample alone consumes the original highp vUv. */
+   const int displacement_coord_index =
+      nir_tex_instr_src_index(graph.texture[3], nir_tex_src_coord);
+   if (displacement_coord_index < 0)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS displacement coord disappeared");
+   nir_builder base_builder =
+      nir_builder_at(nir_before_instr(&graph.texture[3]->instr));
+   nir_def *raw_base_coord = nir_vec2(
+      &base_builder,
+      nir_channel(&base_builder, &graph.varying[0]->def, 0),
+      nir_channel(&base_builder, &graph.varying[0]->def, 1));
+   nir_src_rewrite(&graph.texture[3]->src[displacement_coord_index].src,
+                   raw_base_coord);
+
+   unsigned rounded_push_components = 0;
+   for (unsigned slot = 0; slot < 15U; ++slot) {
+      nir_intrinsic_instr *load = graph.push[slot];
+      nir_builder builder = nir_builder_at(nir_after_instr(&load->instr));
+      nir_def *rounded =
+         pvrgpu_terrain_d1_round_half_rtne(&builder, &load->def);
+      nir_def_rewrite_uses_after(&load->def, rounded);
+      rounded_push_components += load->def.num_components;
+   }
+
+   nir_intrinsic_instr *distance = graph.push[15];
+   unsigned distance_uses = 0;
+   unsigned distance_compare_uses = 0;
+   unsigned distance_divide_uses = 0;
+   nir_foreach_use (use, &distance->def) {
+      nir_instr *use_instr = nir_src_use_instr(use);
+      if (use_instr == &graph.flt->instr)
+         ++distance_compare_uses;
+      else if (use_instr == &graph.fdiv->instr)
+         ++distance_divide_uses;
+      ++distance_uses;
+   }
+   if (distance_uses != 2U || distance_compare_uses != 1U ||
+       distance_divide_uses != 1U) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS distance dual-use changed");
+   }
+   nir_builder distance_builder =
+      nir_builder_at(nir_after_instr(&distance->instr));
+   nir_def *rounded_distance = pvrgpu_terrain_d1_round_half_rtne(
+      &distance_builder, &distance->def);
+   bool rewrote_distance_compare = false;
+   for (unsigned source = 0; source < 2; ++source) {
+      if (graph.flt->src[source].src.ssa != &distance->def)
+         continue;
+      nir_src_rewrite(&graph.flt->src[source].src, rounded_distance);
+      rewrote_distance_compare = true;
+   }
+   if (!rewrote_distance_compare)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D3 FS distance comparison changed");
+   ++rounded_push_components;
+
+   for (unsigned texture = 0; texture < ARRAY_SIZE(graph.texture);
+        ++texture)
+      pvrgpu_terrain_d3_round_texture_rtz(graph.texture[texture]);
+
+   unsigned rounded_original_adds = 0;
+   for (unsigned add = 0; add < ARRAY_SIZE(graph.fadd); ++add) {
+      nir_alu_instr *alu = graph.fadd[add];
+      if (alu == graph.attenuation_add || alu == graph.halfway_add)
+         continue;
+      rounded_original_adds += alu->def.num_components;
+      pvrgpu_terrain_d3_round_alu_result_rtne(alu);
+   }
+
+   /* The material vec4 multiply was reduced above to its one non-identity
+    * alpha lane and rounded at that source-level operation boundary. */
+   unsigned rounded_original_multiplies = 1U;
+   for (unsigned multiply = 0; multiply < ARRAY_SIZE(graph.fmul);
+        ++multiply) {
+      nir_alu_instr *alu = graph.fmul[multiply];
+      if (alu == graph.material_surface ||
+          alu == graph.light_direction ||
+          alu == graph.halfway_normalize)
+         continue;
+      rounded_original_multiplies += alu->def.num_components;
+      pvrgpu_terrain_d3_round_alu_result_rtne(alu);
+   }
+
+   /* Explicit highp-to-mediump return boundaries. */
+   pvrgpu_terrain_d3_round_alu_result_rtne(graph.attenuation_add);
+   pvrgpu_terrain_d3_round_alu_result_rtne(graph.diffuse_max);
+   pvrgpu_terrain_d3_round_alu_result_rtne(graph.halfway_normalize);
+   const unsigned highp_return_components = 5U;
+
+   unsigned rounded_rsqrt_steps = 0;
+   for (unsigned index = 0; index < 3U; ++index) {
+      nir_alu_instr *rsqrt = graph.rsqrt[index];
+      nir_builder builder = nir_builder_at(nir_after_instr(&rsqrt->instr));
+      nir_def *sqrt_value = nir_frcp(&builder, &rsqrt->def);
+      nir_def *sqrt_rounded =
+         pvrgpu_terrain_d1_round_half_rtne(&builder, sqrt_value);
+      nir_def *scale = nir_frcp(&builder, sqrt_rounded);
+      nir_def *scale_rounded =
+         pvrgpu_terrain_d1_round_half_rtne(&builder, scale);
+      nir_def_rewrite_uses_after(&rsqrt->def, scale_rounded);
+      rounded_rsqrt_steps += 2U;
+   }
+
+   const unsigned flrp_adds = 8U;
+   const unsigned flrp_multiplies = 4U;
+   const unsigned half_adds =
+      rounded_original_adds + half_dot_adds + flrp_adds;
+   const unsigned half_multiplies =
+      rounded_original_multiplies + half_dot_multiplies +
+      flrp_multiplies;
+   const unsigned input_and_return_rounds =
+      rounded_varying_components + rounded_push_components +
+      highp_return_components;
+   const unsigned power_rounds = 3U;
+   const unsigned rtne_rounds = input_and_return_rounds + half_adds +
+                                half_multiplies + rounded_rsqrt_steps +
+                                power_rounds;
+   const unsigned rtz_rounds = PVRGPU_TERRAIN_D3_FS_TEXTURES * 4U;
+   if (rounded_varying_components != 14U ||
+       rounded_push_components != 38U ||
+       rounded_original_adds != 33U ||
+       rounded_original_multiplies != 60U || half_adds != 49U ||
+       half_multiplies != 76U || input_and_return_rounds != 57U ||
+       rounded_rsqrt_steps != 6U || rtne_rounds != 191U ||
+       rtz_rounds != 20U) {
+      return pvrgpu_pco_fail(
+         error,
+         error_size,
+         "terrain D3 FS mediump signature changed "
+         "(in=%u add=%u mul=%u rsq=%u pow=%u rtne=%u rtz=%u)",
+         input_and_return_rounds,
+         half_adds,
+         half_multiplies,
+         rounded_rsqrt_steps,
+         power_rounds,
+         rtne_rounds,
+         rtz_rounds);
+   }
+
+   nir_opt_dce(nir);
+   nir_lower_alu_to_scalar(nir, NULL, NULL);
+   nir_opt_dce(nir);
+   nir_progress(true, entrypoint, nir_metadata_control_flow);
+   return true;
+}
+
+/*
+ * Terrain D4/D5/D6 GLES-mediump precision recovery.  This pass runs after
+ * fragment-output canonicalization, uniform-to-push lowering, and
+ * texture-binding packing, but before pco_preprocess_nir().
+ *
+ * Capture-derived native scalar operation counts (one logical RGBA output;
+ * exclude the reference replay's seven duplicate MRT stores):
+ *
+ *   D4/D5: tex=5 fabs=1 fmul=18 fdiv=1 fneg=1 fadd=16
+ *            native input f2f16 RTNE=2/1, texture f16 RTZ=15,
+ *            native f2f32=7 (four off-center coordinates plus RGB output).
+ *   D6:    tex=1 fmul=4, native opacity f2f16 RTNE=1,
+ *            texture f16 RTZ=4, native f2f32=4.
+ *   Native NIR total instructions are D4=68, D5=67, D6=17 per logical
+ *            output, or 82/81/31 in the reference compiler dump with eight
+ *            MRT stores.
+ *
+ * PCO currently executes fp32 ALU, so this lowering emulates each live half
+ * boundary with f2f16/f2f32.  Exact post-lowering conversion counts are:
+ *
+ *   D4: f2f16_rtne=43, f2f16_rtz=15, f2f32=58
+ *   D5: f2f16_rtne=42, f2f16_rtz=15, f2f32=57
+ *   D6: f2f16_rtne=5,  f2f16_rtz=4,  f2f32=9
+ */
+
+struct pvrgpu_terrain_d4_d5_graph {
+   nir_function_impl *entrypoint;
+   nir_intrinsic_instr *varying;
+   nir_tex_instr *texture[5];
+   nir_intrinsic_instr *store[4];
+   nir_load_const_instr *zero;
+   nir_load_const_instr *one;
+   nir_load_const_instr *two;
+   nir_load_const_instr *step;
+   nir_load_const_instr *weight[3];
+   nir_alu_instr *absolute;
+   nir_alu_instr *scaled_multiply;
+   nir_alu_instr *scaled_divide;
+   nir_alu_instr *twice;
+   nir_alu_instr *negative_twice;
+   nir_alu_instr *negative_scaled;
+   nir_alu_instr *term[5];
+   nir_alu_instr *sum[4];
+};
+
+struct pvrgpu_terrain_d4_d6_lowered_counts {
+   unsigned constants;
+   unsigned textures;
+   unsigned frag_stores;
+   unsigned fabs;
+   unsigned fadd;
+   unsigned fdiv;
+   unsigned fmul;
+   unsigned fneg;
+   unsigned vec2;
+   unsigned vec4;
+   unsigned f2f16_rtne;
+   unsigned f2f16_rtz;
+   unsigned f2f32;
+};
+
+static nir_scalar
+pvrgpu_terrain_d4_d6_resolve_source(const nir_alu_src *source,
+                                     unsigned component)
+{
+   if (!source || !source->src.ssa || component >= NIR_MAX_VEC_COMPONENTS)
+      return (nir_scalar){ 0 };
+   return nir_scalar_resolved(source->src.ssa,
+                              source->swizzle[component]);
+}
+
+static bool
+pvrgpu_terrain_d4_d6_scalar_is_def(nir_scalar scalar,
+                                    const nir_def *def,
+                                    unsigned component)
+{
+   return scalar.def && def && scalar.def == def &&
+          scalar.comp == component;
+}
+
+static bool
+pvrgpu_terrain_d4_d6_source_is_def_slice(const nir_alu_src *source,
+                                          const nir_def *def,
+                                          unsigned first_component,
+                                          unsigned components)
+{
+   if (!source || !source->src.ssa || !def ||
+       first_component + components > def->num_components)
+      return false;
+   for (unsigned component = 0; component < components; ++component) {
+      if (!pvrgpu_terrain_d4_d6_scalar_is_def(
+             pvrgpu_terrain_d4_d6_resolve_source(source, component),
+             def,
+             first_component + component))
+         return false;
+   }
+   return true;
+}
+
+static bool
+pvrgpu_terrain_d4_d6_source_is_splat_def(const nir_alu_src *source,
+                                          const nir_def *def,
+                                          unsigned component,
+                                          unsigned components)
+{
+   if (!source || !source->src.ssa || !def ||
+       component >= def->num_components)
+      return false;
+   for (unsigned lane = 0; lane < components; ++lane) {
+      if (!pvrgpu_terrain_d4_d6_scalar_is_def(
+             pvrgpu_terrain_d4_d6_resolve_source(source, lane),
+             def,
+             component))
+         return false;
+   }
+   return true;
+}
+
+static bool
+pvrgpu_terrain_d4_d6_binary_matches(const nir_alu_instr *alu,
+                                     nir_op op,
+                                     const nir_def *left,
+                                     const nir_def *right,
+                                     unsigned components)
+{
+   if (!alu || alu->op != op || alu->def.bit_size != 32 ||
+       alu->def.num_components != components)
+      return false;
+   return (pvrgpu_terrain_d4_d6_source_is_def_slice(&alu->src[0],
+                                                     left,
+                                                     0,
+                                                     components) &&
+           pvrgpu_terrain_d4_d6_source_is_def_slice(&alu->src[1],
+                                                     right,
+                                                     0,
+                                                     components)) ||
+          (pvrgpu_terrain_d4_d6_source_is_def_slice(&alu->src[1],
+                                                     left,
+                                                     0,
+                                                     components) &&
+           pvrgpu_terrain_d4_d6_source_is_def_slice(&alu->src[0],
+                                                     right,
+                                                     0,
+                                                     components));
+}
+
+static nir_alu_instr *
+pvrgpu_terrain_d4_d6_find_binary(nir_function_impl *entrypoint,
+                                  nir_op op,
+                                  const nir_def *left,
+                                  const nir_def *right,
+                                  unsigned components)
+{
+   nir_alu_instr *found = NULL;
+   nir_foreach_block (block, entrypoint) {
+      nir_foreach_instr (instr, block) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         if (!pvrgpu_terrain_d4_d6_binary_matches(alu,
+                                                   op,
+                                                   left,
+                                                   right,
+                                                   components))
+            continue;
+         if (found)
+            return NULL;
+         found = alu;
+      }
+   }
+   return found;
+}
+
+static nir_alu_instr *
+pvrgpu_terrain_d4_d6_find_vector_times_splat(
+   nir_function_impl *entrypoint,
+   const nir_def *vector,
+   const nir_def *scalar,
+   unsigned components)
+{
+   nir_alu_instr *found = NULL;
+   nir_foreach_block (block, entrypoint) {
+      nir_foreach_instr (instr, block) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         if (alu->op != nir_op_fmul || alu->def.bit_size != 32 ||
+             alu->def.num_components != components)
+            continue;
+         bool matches = false;
+         for (unsigned vector_source = 0; vector_source < 2;
+              ++vector_source) {
+            const unsigned scalar_source = 1U - vector_source;
+            if (pvrgpu_terrain_d4_d6_source_is_def_slice(
+                   &alu->src[vector_source], vector, 0, components) &&
+                pvrgpu_terrain_d4_d6_source_is_splat_def(
+                   &alu->src[scalar_source], scalar, 0, components)) {
+               matches = true;
+               break;
+            }
+         }
+         if (!matches)
+            continue;
+         if (found)
+            return NULL;
+         found = alu;
+      }
+   }
+   return found;
+}
+
+static nir_alu_instr *
+pvrgpu_terrain_d4_d6_find_fneg(nir_function_impl *entrypoint,
+                                const nir_def *value)
+{
+   nir_alu_instr *found = NULL;
+   nir_foreach_block (block, entrypoint) {
+      nir_foreach_instr (instr, block) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         if (alu->op != nir_op_fneg || alu->def.bit_size != 32 ||
+             alu->def.num_components != 1 ||
+             !pvrgpu_terrain_d4_d6_source_is_def_slice(&alu->src[0],
+                                                        value,
+                                                        0,
+                                                        1))
+            continue;
+         if (found)
+            return NULL;
+         found = alu;
+      }
+   }
+   return found;
+}
+
+static bool
+pvrgpu_terrain_d4_d5_texture_is_canonical(const nir_tex_instr *texture)
+{
+   if (!texture || texture->op != nir_texop_tex ||
+       texture->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+       texture->dest_type != nir_type_float32 ||
+       texture->def.num_components != 4 || texture->def.bit_size != 32 ||
+       texture->num_srcs != 1 || texture->coord_components != 2 ||
+       texture->src[0].src_type != nir_tex_src_coord ||
+       !texture->src[0].src.ssa || texture->is_array ||
+       texture->is_shadow || texture->is_sparse ||
+       texture->texture_non_uniform || texture->sampler_non_uniform ||
+       texture->embedded_sampler || texture->offset_non_uniform ||
+       texture->texture_index != 0 || texture->sampler_index != 0 ||
+       texture->backend_flags != 0)
+      return false;
+   return true;
+}
+
+static bool
+pvrgpu_terrain_d4_d5_coord_matches(const nir_tex_instr *texture,
+                                    const nir_intrinsic_instr *varying,
+                                    unsigned active_component,
+                                    const nir_def *offset,
+                                    const nir_def *zero)
+{
+   if (!texture || !varying || active_component >= 2 || !offset || !zero)
+      return false;
+   const int coord_index =
+      nir_tex_instr_src_index(texture, nir_tex_src_coord);
+   if (coord_index < 0 || !texture->src[coord_index].src.ssa ||
+       nir_def_instr(texture->src[coord_index].src.ssa)->type !=
+          nir_instr_type_alu)
+      return false;
+   nir_alu_instr *add = nir_instr_as_alu(
+      nir_def_instr(texture->src[coord_index].src.ssa));
+   if (add->op != nir_op_fadd || add->def.bit_size != 32 ||
+       add->def.num_components != 2)
+      return false;
+
+   for (unsigned varying_source = 0; varying_source < 2;
+        ++varying_source) {
+      const unsigned delta_source = 1U - varying_source;
+      if (!pvrgpu_terrain_d4_d6_source_is_def_slice(
+             &add->src[varying_source], &varying->def, 0, 2))
+         continue;
+      bool delta_matches = true;
+      for (unsigned component = 0; component < 2; ++component) {
+         const nir_def *expected =
+            component == active_component ? offset : zero;
+         if (!pvrgpu_terrain_d4_d6_scalar_is_def(
+                pvrgpu_terrain_d4_d6_resolve_source(
+                   &add->src[delta_source], component),
+                expected,
+                0)) {
+            delta_matches = false;
+            break;
+         }
+      }
+      if (delta_matches)
+         return true;
+   }
+   return false;
+}
+
+static bool
+pvrgpu_terrain_d4_d6_store_matches(const nir_intrinsic_instr *store,
+                                    const nir_def *value,
+                                    unsigned component)
+{
+   if (!store || store->intrinsic != nir_intrinsic_frag_store_pco ||
+       !store->src[0].ssa || component >= value->num_components)
+      return false;
+   const nir_scalar actual =
+      nir_scalar_resolved(store->src[0].ssa, 0);
+   return pvrgpu_terrain_d4_d6_scalar_is_def(actual, value, component);
+}
+
+static bool
+pvrgpu_terrain_d4_d5_collect_graph(
+   nir_shader *nir,
+   enum pvrgpu_pco_terrain_profile profile,
+   struct pvrgpu_terrain_d4_d5_graph *graph,
+   char *error,
+   size_t error_size)
+{
+   if (!nir || nir->info.stage != MESA_SHADER_FRAGMENT || !graph ||
+       (profile != PVRGPU_PCO_TERRAIN_D4 &&
+        profile != PVRGPU_PCO_TERRAIN_D5))
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D4/D5 mediump profile mismatch");
+
+   memset(graph, 0, sizeof(*graph));
+   graph->entrypoint = nir_shader_get_entrypoint(nir);
+   if (!graph->entrypoint)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D4/D5 mediump entrypoint is missing");
+
+   const uint32_t step_bits =
+      profile == PVRGPU_PCO_TERRAIN_D4 ? UINT32_C(0x3c4ccccd) :
+                                        UINT32_C(0x3b7ffbce);
+   unsigned constants = 0;
+   unsigned textures = 0;
+   unsigned frag_stores = 0;
+   unsigned fabs_count = 0;
+   unsigned fadd_count = 0;
+   unsigned fdiv_count = 0;
+   unsigned fmul_count = 0;
+   unsigned fneg_count = 0;
+   unsigned vec2_count = 0;
+   unsigned vec4_count = 0;
+
+   nir_foreach_block (block, graph->entrypoint) {
+      nir_foreach_instr (instr, block) {
+         switch (instr->type) {
+         case nir_instr_type_load_const: {
+            nir_load_const_instr *constant = nir_instr_as_load_const(instr);
+            if (constant->def.bit_size != 32 ||
+                constant->def.num_components != 1)
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D4/D5 constant shape changed");
+            ++constants;
+            nir_load_const_instr **slot = NULL;
+            switch (constant->value[0].u32) {
+            case UINT32_C(0x00000000):
+               slot = &graph->zero;
+               break;
+            case UINT32_C(0x3f800000):
+               slot = &graph->one;
+               break;
+            case UINT32_C(0x40000000):
+               slot = &graph->two;
+               break;
+            case UINT32_C(0x3e40214b):
+               slot = &graph->weight[0];
+               break;
+            case UINT32_C(0x3e53037d):
+               slot = &graph->weight[1];
+               break;
+            case UINT32_C(0x3e59b62c):
+               slot = &graph->weight[2];
+               break;
+            default:
+               if (constant->value[0].u32 == step_bits)
+                  slot = &graph->step;
+               break;
+            }
+            if (!slot || *slot)
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D4/D5 constant set changed");
+            *slot = constant;
+            break;
+         }
+         case nir_instr_type_intrinsic: {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_load_deref) {
+               nir_variable *var = nir_intrinsic_get_var(intr, 0);
+               if (graph->varying || !var ||
+                   var->data.mode != nir_var_shader_in ||
+                   var->data.location != VARYING_SLOT_VAR0 ||
+                   intr->def.bit_size != 32 ||
+                   intr->def.num_components != 2)
+                  return pvrgpu_pco_fail(error,
+                                         error_size,
+                                         "terrain D4/D5 varying graph changed");
+               graph->varying = intr;
+            } else if (intr->intrinsic == nir_intrinsic_frag_store_pco) {
+               const unsigned base = nir_intrinsic_base(intr);
+               if (base >= ARRAY_SIZE(graph->store) ||
+                   graph->store[base])
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "terrain D4/D5 fragment store graph changed");
+               graph->store[base] = intr;
+               ++frag_stores;
+            }
+            break;
+         }
+         case nir_instr_type_tex:
+            if (textures >= ARRAY_SIZE(graph->texture) ||
+                !pvrgpu_terrain_d4_d5_texture_is_canonical(
+                   nir_instr_as_tex(instr)))
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D4/D5 texture graph changed");
+            graph->texture[textures++] = nir_instr_as_tex(instr);
+            break;
+         case nir_instr_type_alu:
+            switch (nir_instr_as_alu(instr)->op) {
+            case nir_op_fabs:
+               ++fabs_count;
+               graph->absolute = nir_instr_as_alu(instr);
+               break;
+            case nir_op_fadd:
+               ++fadd_count;
+               break;
+            case nir_op_fdiv:
+               ++fdiv_count;
+               graph->scaled_divide = nir_instr_as_alu(instr);
+               break;
+            case nir_op_fmul:
+               ++fmul_count;
+               break;
+            case nir_op_fneg:
+               ++fneg_count;
+               break;
+            case nir_op_vec2:
+               ++vec2_count;
+               break;
+            case nir_op_vec4:
+               ++vec4_count;
+               break;
+            case nir_op_mov:
+               /* pvrgpu_canonicalize_fragment_output() may add channels. */
+               break;
+            case nir_op_ffma:
+            case nir_op_ffma_weak:
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D4/D5 fused arithmetic changed");
+            default:
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D4/D5 ALU graph changed");
+            }
+            break;
+         default:
+            break;
+         }
+      }
+   }
+
+   if (constants != 7U || textures != 5U || frag_stores != 4U ||
+       fabs_count != 1U || fadd_count != 8U || fdiv_count != 1U ||
+       fmul_count != 7U || fneg_count != 2U || vec2_count != 4U ||
+       vec4_count != 1U || !graph->varying || !graph->zero ||
+       !graph->one || !graph->two || !graph->step ||
+       !graph->weight[0] || !graph->weight[1] || !graph->weight[2] ||
+       !graph->absolute || !graph->scaled_divide) {
+      return pvrgpu_pco_fail(
+         error,
+         error_size,
+         "terrain D4/D5 raw graph signature changed "
+         "(const=%u tex=%u store=%u abs=%u add=%u div=%u mul=%u neg=%u)",
+         constants,
+         textures,
+         frag_stores,
+         fabs_count,
+         fadd_count,
+         fdiv_count,
+         fmul_count,
+         fneg_count);
+   }
+
+   if (graph->absolute->def.bit_size != 32 ||
+       graph->absolute->def.num_components != 1 ||
+       !pvrgpu_terrain_d4_d6_source_is_def_slice(
+          &graph->absolute->src[0], &graph->varying->def, 1, 1))
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D4/D5 tilt graph changed");
+
+   graph->scaled_multiply = pvrgpu_terrain_d4_d6_find_binary(
+      graph->entrypoint,
+      nir_op_fmul,
+      &graph->step->def,
+      &graph->absolute->def,
+      1);
+   if (!graph->scaled_multiply ||
+       graph->scaled_divide->def.bit_size != 32 ||
+       graph->scaled_divide->def.num_components != 1 ||
+       !pvrgpu_terrain_d4_d6_source_is_def_slice(
+          &graph->scaled_divide->src[0],
+          &graph->scaled_multiply->def,
+          0,
+          1) ||
+       !pvrgpu_terrain_d4_d6_source_is_def_slice(
+          &graph->scaled_divide->src[1], &graph->one->def, 0, 1))
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D4/D5 scaled-step graph changed");
+
+   graph->twice = pvrgpu_terrain_d4_d6_find_binary(
+      graph->entrypoint,
+      nir_op_fmul,
+      &graph->two->def,
+      &graph->scaled_divide->def,
+      1);
+   graph->negative_twice = pvrgpu_terrain_d4_d6_find_fneg(
+      graph->entrypoint, graph->twice ? &graph->twice->def : NULL);
+   graph->negative_scaled = pvrgpu_terrain_d4_d6_find_fneg(
+      graph->entrypoint, &graph->scaled_divide->def);
+   if (!graph->twice || !graph->negative_twice ||
+       !graph->negative_scaled)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D4/D5 signed-offset graph changed");
+
+   const unsigned active_component =
+      profile == PVRGPU_PCO_TERRAIN_D4 ? 0U : 1U;
+   const nir_def *offset[5] = {
+      &graph->negative_twice->def,
+      &graph->negative_scaled->def,
+      NULL,
+      &graph->scaled_divide->def,
+      &graph->twice->def,
+   };
+   for (unsigned tap = 0; tap < ARRAY_SIZE(graph->texture); ++tap) {
+      const int coord_index = nir_tex_instr_src_index(
+         graph->texture[tap], nir_tex_src_coord);
+      if ((tap == 2U &&
+           (coord_index < 0 ||
+            graph->texture[tap]->src[coord_index].src.ssa !=
+               &graph->varying->def)) ||
+          (tap != 2U &&
+           !pvrgpu_terrain_d4_d5_coord_matches(
+              graph->texture[tap],
+              graph->varying,
+              active_component,
+              offset[tap],
+              &graph->zero->def))) {
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "terrain D4/D5 tap %u coordinate changed",
+                                tap);
+      }
+   }
+
+   const unsigned weight_index[5] = { 0U, 1U, 2U, 1U, 0U };
+   for (unsigned tap = 0; tap < ARRAY_SIZE(graph->term); ++tap) {
+      graph->term[tap] =
+         pvrgpu_terrain_d4_d6_find_vector_times_splat(
+            graph->entrypoint,
+            &graph->texture[tap]->def,
+            &graph->weight[weight_index[tap]]->def,
+            4);
+      if (!graph->term[tap])
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "terrain D4/D5 tap %u weight changed",
+                                tap);
+   }
+
+   graph->sum[0] = pvrgpu_terrain_d4_d6_find_binary(
+      graph->entrypoint,
+      nir_op_fadd,
+      &graph->term[0]->def,
+      &graph->term[1]->def,
+      4);
+   for (unsigned tap = 2; tap < ARRAY_SIZE(graph->term); ++tap) {
+      graph->sum[tap - 1U] = pvrgpu_terrain_d4_d6_find_binary(
+         graph->entrypoint,
+         nir_op_fadd,
+         graph->sum[tap - 2U] ? &graph->sum[tap - 2U]->def : NULL,
+         &graph->term[tap]->def,
+         4);
+   }
+   if (!graph->sum[0] || !graph->sum[1] ||
+       !graph->sum[2] || !graph->sum[3])
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D4/D5 accumulation order changed");
+
+   for (unsigned component = 0; component < 3; ++component) {
+      if (!pvrgpu_terrain_d4_d6_store_matches(
+             graph->store[component], &graph->sum[3]->def, component))
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "terrain D4/D5 RGB output graph changed");
+   }
+   if (!pvrgpu_terrain_d4_d6_store_matches(
+          graph->store[3], &graph->one->def, 0))
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D4/D5 alpha graph changed");
+
+   return true;
+}
+
+static bool
+pvrgpu_terrain_d4_d6_validate_lowered_counts(
+   nir_function_impl *entrypoint,
+   const struct pvrgpu_terrain_d4_d6_lowered_counts *expected,
+   const char *name,
+   char *error,
+   size_t error_size)
+{
+   struct pvrgpu_terrain_d4_d6_lowered_counts observed = { 0 };
+   nir_foreach_block (block, entrypoint) {
+      nir_foreach_instr (instr, block) {
+         if (instr->type == nir_instr_type_load_const) {
+            ++observed.constants;
+         } else if (instr->type == nir_instr_type_tex) {
+            ++observed.textures;
+         } else if (instr->type == nir_instr_type_intrinsic) {
+            if (nir_instr_as_intrinsic(instr)->intrinsic ==
+                nir_intrinsic_frag_store_pco)
+               ++observed.frag_stores;
+         } else if (instr->type == nir_instr_type_alu) {
+            switch (nir_instr_as_alu(instr)->op) {
+            case nir_op_fabs:
+               ++observed.fabs;
+               break;
+            case nir_op_fadd:
+               ++observed.fadd;
+               break;
+            case nir_op_fdiv:
+               ++observed.fdiv;
+               break;
+            case nir_op_fmul:
+               ++observed.fmul;
+               break;
+            case nir_op_fneg:
+               ++observed.fneg;
+               break;
+            case nir_op_vec2:
+               ++observed.vec2;
+               break;
+            case nir_op_vec4:
+               ++observed.vec4;
+               break;
+            case nir_op_f2f16_rtne:
+               ++observed.f2f16_rtne;
+               break;
+            case nir_op_f2f16_rtz:
+               ++observed.f2f16_rtz;
+               break;
+            case nir_op_f2f32:
+               ++observed.f2f32;
+               break;
+            case nir_op_mov:
+               break;
+            case nir_op_ffma:
+            case nir_op_ffma_weak:
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "%s retained fused arithmetic",
+                                      name);
+            default:
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "%s lowered ALU graph changed",
+                                      name);
+            }
+         }
+      }
+   }
+
+   if (memcmp(&observed, expected, sizeof(observed)) != 0) {
+      return pvrgpu_pco_fail(
+         error,
+         error_size,
+         "%s lowered count changed "
+         "(const=%u tex=%u store=%u abs=%u add=%u div=%u mul=%u neg=%u "
+         "vec2=%u vec4=%u rtne=%u rtz=%u widen=%u)",
+         name,
+         observed.constants,
+         observed.textures,
+         observed.frag_stores,
+         observed.fabs,
+         observed.fadd,
+         observed.fdiv,
+         observed.fmul,
+         observed.fneg,
+         observed.vec2,
+         observed.vec4,
+         observed.f2f16_rtne,
+         observed.f2f16_rtz,
+         observed.f2f32);
+   }
+   return true;
+}
+
+static nir_def *
+pvrgpu_terrain_d4_d6_round_texture_component_rtz(nir_builder *builder,
+                                                  nir_tex_instr *texture,
+                                                  unsigned component)
+{
+   return nir_f2f32(
+      builder,
+      nir_f2f16_rtz(builder, nir_channel(builder, &texture->def, component)));
+}
+
+static bool
+pvrgpu_lower_terrain_d4_d5_fragment_mediump(
+   nir_shader *nir,
+   enum pvrgpu_pco_terrain_profile profile,
+   char *error,
+   size_t error_size)
+{
+   struct pvrgpu_terrain_d4_d5_graph graph;
+   if (!pvrgpu_terrain_d4_d5_collect_graph(nir,
+                                            profile,
+                                            &graph,
+                                            error,
+                                            error_size))
+      return false;
+
+   const unsigned active_component =
+      profile == PVRGPU_PCO_TERRAIN_D4 ? 0U : 1U;
+   nir_builder common =
+      nir_builder_at(nir_before_instr(&graph.texture[0]->instr));
+
+   /* Six source arithmetic constants enter the mediump island through RTNE.
+    * The new -2 literal below is already exactly representable in binary16;
+    * it corresponds to Gallivm's separate half constant and intentionally is
+    * not derived through fneg(+2), which would add an extra fneg absent from
+    * the captured native operation sequence. */
+   nir_def *one_half = pvrgpu_terrain_d1_round_half_rtne(
+      &common, &graph.one->def);
+   nir_def *two_half = pvrgpu_terrain_d1_round_half_rtne(
+      &common, &graph.two->def);
+   nir_def *step_half = pvrgpu_terrain_d1_round_half_rtne(
+      &common, &graph.step->def);
+   nir_def *weight_half[3];
+   for (unsigned weight = 0; weight < ARRAY_SIZE(weight_half); ++weight) {
+      weight_half[weight] = pvrgpu_terrain_d1_round_half_rtne(
+         &common, &graph.weight[weight]->def);
+   }
+
+   nir_def *base_half = pvrgpu_terrain_d1_round_half_rtne(
+      &common,
+      nir_channel(&common, &graph.varying->def, active_component));
+   nir_def *tilt_half =
+      active_component == 1U
+         ? base_half
+         : pvrgpu_terrain_d1_round_half_rtne(
+              &common, nir_channel(&common, &graph.varying->def, 1));
+   nir_def *tilt = nir_fabs(&common, tilt_half);
+   nir_def *scaled_product = pvrgpu_terrain_d1_round_half_rtne(
+      &common, nir_fmul(&common, step_half, tilt));
+   nir_def *scaled = pvrgpu_terrain_d1_round_half_rtne(
+      &common, nir_fdiv(&common, scaled_product, one_half));
+   nir_def *negative_scaled = nir_fneg(&common, scaled);
+   nir_def *negative_twice = pvrgpu_terrain_d1_round_half_rtne(
+      &common,
+      nir_fmul(&common, nir_imm_float(&common, -2.0f), scaled));
+   nir_def *positive_twice = pvrgpu_terrain_d1_round_half_rtne(
+      &common, nir_fmul(&common, two_half, scaled));
+
+   nir_def *offset[5] = {
+      negative_twice,
+      negative_scaled,
+      NULL,
+      scaled,
+      positive_twice,
+   };
+   const unsigned weight_index[5] = { 0U, 1U, 2U, 1U, 0U };
+   nir_def *accumulator[3] = { 0 };
+   for (unsigned tap = 0; tap < ARRAY_SIZE(graph.texture); ++tap) {
+      const int coord_index = nir_tex_instr_src_index(
+         graph.texture[tap], nir_tex_src_coord);
+      if (tap == 2U) {
+         nir_src_rewrite(&graph.texture[tap]->src[coord_index].src,
+                         &graph.varying->def);
+      } else {
+         nir_builder coord_builder =
+            nir_builder_at(nir_before_instr(&graph.texture[tap]->instr));
+         nir_def *active = pvrgpu_terrain_d1_round_half_rtne(
+            &coord_builder,
+            nir_fadd(&coord_builder, base_half, offset[tap]));
+         nir_def *coord =
+            active_component == 0U
+               ? nir_vec2(&coord_builder,
+                          active,
+                          nir_channel(&coord_builder,
+                                      &graph.varying->def,
+                                      1))
+               : nir_vec2(&coord_builder,
+                          nir_channel(&coord_builder,
+                                      &graph.varying->def,
+                                      0),
+                          active);
+         nir_src_rewrite(&graph.texture[tap]->src[coord_index].src, coord);
+      }
+
+      nir_builder sample_builder =
+         nir_builder_at(nir_after_instr(&graph.texture[tap]->instr));
+      for (unsigned component = 0; component < 3; ++component) {
+         nir_def *sample_half =
+            pvrgpu_terrain_d4_d6_round_texture_component_rtz(
+               &sample_builder, graph.texture[tap], component);
+         nir_def *term = pvrgpu_terrain_d1_round_half_rtne(
+            &sample_builder,
+            nir_fmul(&sample_builder,
+                     sample_half,
+                     weight_half[weight_index[tap]]));
+         accumulator[component] =
+            tap == 0U
+               ? term
+               : pvrgpu_terrain_d1_round_half_rtne(
+                    &sample_builder,
+                    nir_fadd(&sample_builder,
+                             accumulator[component],
+                             term));
+      }
+   }
+
+   for (unsigned component = 0; component < 3; ++component)
+      nir_src_rewrite(&graph.store[component]->src[0],
+                      accumulator[component]);
+
+   /* Split source 1.0 by precision domain: denominator is mediump above,
+    * while the declared highp literal alpha reaches the framebuffer raw. */
+   nir_builder alpha_builder =
+      nir_builder_at(nir_before_instr(&graph.store[3]->instr));
+   nir_src_rewrite(&graph.store[3]->src[0],
+                   nir_imm_float(&alpha_builder, 1.0f));
+
+   nir_opt_dce(nir);
+   const struct pvrgpu_terrain_d4_d6_lowered_counts expected = {
+      .constants = 8,
+      .textures = 5,
+      .frag_stores = 4,
+      .fabs = 1,
+      .fadd = 16,
+      .fdiv = 1,
+      .fmul = 18,
+      .fneg = 1,
+      .vec2 = 4,
+      .f2f16_rtne = profile == PVRGPU_PCO_TERRAIN_D4 ? 43U : 42U,
+      .f2f16_rtz = 15,
+      .f2f32 = profile == PVRGPU_PCO_TERRAIN_D4 ? 58U : 57U,
+   };
+   if (!pvrgpu_terrain_d4_d6_validate_lowered_counts(
+          graph.entrypoint,
+          &expected,
+          profile == PVRGPU_PCO_TERRAIN_D4 ? "terrain D4" : "terrain D5",
+          error,
+          error_size))
+      return false;
+
+   nir_progress(true, graph.entrypoint, nir_metadata_control_flow);
+   return true;
+}
+
+struct pvrgpu_terrain_d6_graph {
+   nir_function_impl *entrypoint;
+   nir_intrinsic_instr *varying;
+   nir_intrinsic_instr *opacity;
+   nir_tex_instr *texture;
+   nir_alu_instr *multiply;
+   nir_intrinsic_instr *store[4];
+};
+
+static bool
+pvrgpu_terrain_d6_collect_graph(nir_shader *nir,
+                                 struct pvrgpu_terrain_d6_graph *graph,
+                                 char *error,
+                                 size_t error_size)
+{
+   if (!nir || nir->info.stage != MESA_SHADER_FRAGMENT || !graph)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D6 mediump requires a fragment shader");
+   memset(graph, 0, sizeof(*graph));
+   graph->entrypoint = nir_shader_get_entrypoint(nir);
+   if (!graph->entrypoint)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D6 mediump entrypoint is missing");
+
+   /* Uniform-to-push lowering creates the byte-address immediate before the
+    * load and leaves the old vec4-slot zero dead until normal optimization. */
+   nir_opt_dce(nir);
+
+   unsigned constants = 0;
+   unsigned textures = 0;
+   unsigned multiplies = 0;
+   unsigned frag_stores = 0;
+   nir_load_const_instr *zero = NULL;
+   nir_foreach_block (block, graph->entrypoint) {
+      nir_foreach_instr (instr, block) {
+         if (instr->type == nir_instr_type_load_const) {
+            nir_load_const_instr *constant = nir_instr_as_load_const(instr);
+            ++constants;
+            if (zero || constant->def.bit_size != 32 ||
+                constant->def.num_components != 1 ||
+                constant->value[0].u32 != 0U)
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D6 push address changed");
+            zero = constant;
+         } else if (instr->type == nir_instr_type_tex) {
+            if (graph->texture ||
+                !pvrgpu_terrain_d4_d5_texture_is_canonical(
+                   nir_instr_as_tex(instr)))
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D6 texture graph changed");
+            graph->texture = nir_instr_as_tex(instr);
+            ++textures;
+         } else if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_load_deref) {
+               nir_variable *var = nir_intrinsic_get_var(intr, 0);
+               if (graph->varying || !var ||
+                   var->data.mode != nir_var_shader_in ||
+                   var->data.location != VARYING_SLOT_VAR0 ||
+                   intr->def.bit_size != 32 ||
+                   intr->def.num_components != 2)
+                  return pvrgpu_pco_fail(error,
+                                         error_size,
+                                         "terrain D6 varying graph changed");
+               graph->varying = intr;
+            } else if (intr->intrinsic ==
+                       nir_intrinsic_load_push_constant) {
+               if (graph->opacity || intr->def.bit_size != 32 ||
+                   intr->def.num_components != 1 ||
+                   nir_intrinsic_base(intr) != 0 ||
+                   nir_intrinsic_range(intr) != 16 ||
+                   !nir_src_is_const(intr->src[0]) ||
+                   nir_src_as_uint(intr->src[0]) != 0U)
+                  return pvrgpu_pco_fail(error,
+                                         error_size,
+                                         "terrain D6 opacity push graph changed");
+               graph->opacity = intr;
+            } else if (intr->intrinsic == nir_intrinsic_frag_store_pco) {
+               const unsigned base = nir_intrinsic_base(intr);
+               if (base >= ARRAY_SIZE(graph->store) ||
+                   graph->store[base])
+                  return pvrgpu_pco_fail(error,
+                                         error_size,
+                                         "terrain D6 output graph changed");
+               graph->store[base] = intr;
+               ++frag_stores;
+            }
+         } else if (instr->type == nir_instr_type_alu) {
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->op == nir_op_fmul) {
+               if (graph->multiply)
+                  return pvrgpu_pco_fail(error,
+                                         error_size,
+                                         "terrain D6 multiply is duplicated");
+               graph->multiply = alu;
+               ++multiplies;
+            } else if (alu->op != nir_op_mov) {
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "terrain D6 ALU graph changed");
+            }
+         }
+      }
+   }
+
+   if (constants != 1U || textures != 1U || multiplies != 1U ||
+       frag_stores != 4U || !zero || !graph->varying ||
+       !graph->opacity || !graph->texture || !graph->multiply) {
+      return pvrgpu_pco_fail(
+         error,
+         error_size,
+         "terrain D6 raw signature changed "
+         "(const=%u tex=%u mul=%u store=%u)",
+         constants,
+         textures,
+         multiplies,
+         frag_stores);
+   }
+
+   const int coord_index =
+      nir_tex_instr_src_index(graph->texture, nir_tex_src_coord);
+   if (coord_index < 0 ||
+       graph->texture->src[coord_index].src.ssa != &graph->varying->def ||
+       graph->multiply->def.bit_size != 32 ||
+       graph->multiply->def.num_components != 4)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D6 sample/coordinate graph changed");
+
+   bool multiply_matches = false;
+   for (unsigned texture_source = 0; texture_source < 2;
+        ++texture_source) {
+      const unsigned opacity_source = 1U - texture_source;
+      if (pvrgpu_terrain_d4_d6_source_is_def_slice(
+             &graph->multiply->src[texture_source],
+             &graph->texture->def,
+             0,
+             4) &&
+          pvrgpu_terrain_d4_d6_source_is_splat_def(
+             &graph->multiply->src[opacity_source],
+             &graph->opacity->def,
+             0,
+             4)) {
+         multiply_matches = true;
+         break;
+      }
+   }
+   if (!multiply_matches)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D6 modulation graph changed");
+   for (unsigned component = 0; component < 4; ++component) {
+      if (!pvrgpu_terrain_d4_d6_store_matches(
+             graph->store[component], &graph->multiply->def, component))
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "terrain D6 output component order changed");
+   }
+   return true;
+}
+
+static bool
+pvrgpu_lower_terrain_d6_fragment_mediump(nir_shader *nir,
+                                          char *error,
+                                          size_t error_size)
+{
+   struct pvrgpu_terrain_d6_graph graph;
+   if (!pvrgpu_terrain_d6_collect_graph(nir, &graph, error, error_size))
+      return false;
+
+   nir_builder opacity_builder =
+      nir_builder_at(nir_after_instr(&graph.opacity->instr));
+   nir_def *opacity_half = pvrgpu_terrain_d1_round_half_rtne(
+      &opacity_builder, &graph.opacity->def);
+
+   nir_builder sample_builder =
+      nir_builder_at(nir_after_instr(&graph.texture->instr));
+   for (unsigned component = 0; component < 4; ++component) {
+      nir_def *sample_half =
+         pvrgpu_terrain_d4_d6_round_texture_component_rtz(
+            &sample_builder, graph.texture, component);
+      nir_def *product = pvrgpu_terrain_d1_round_half_rtne(
+         &sample_builder,
+         nir_fmul(&sample_builder, sample_half, opacity_half));
+      nir_src_rewrite(&graph.store[component]->src[0], product);
+   }
+
+   nir_opt_dce(nir);
+   const struct pvrgpu_terrain_d4_d6_lowered_counts expected = {
+      .constants = 1,
+      .textures = 1,
+      .frag_stores = 4,
+      .fmul = 4,
+      .f2f16_rtne = 5,
+      .f2f16_rtz = 4,
+      .f2f32 = 9,
+   };
+   if (!pvrgpu_terrain_d4_d6_validate_lowered_counts(
+          graph.entrypoint,
+          &expected,
+          "terrain D6",
+          error,
+          error_size))
+      return false;
+
+   nir_progress(true, graph.entrypoint, nir_metadata_control_flow);
+   return true;
+}
+
+static bool
+pvrgpu_lower_terrain_d4_d6_fragment_mediump(
+   nir_shader *nir,
+   enum pvrgpu_pco_terrain_profile profile,
+   char *error,
+   size_t error_size)
+{
+   switch (profile) {
+   case PVRGPU_PCO_TERRAIN_D4:
+   case PVRGPU_PCO_TERRAIN_D5:
+      return pvrgpu_lower_terrain_d4_d5_fragment_mediump(nir,
+                                                          profile,
+                                                          error,
+                                                          error_size);
+   case PVRGPU_PCO_TERRAIN_D6:
+      return pvrgpu_lower_terrain_d6_fragment_mediump(nir,
+                                                       error,
+                                                       error_size);
+   default:
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "terrain D4-D6 mediump profile mismatch");
+   }
+}
+
+/* Terrain D7/D8 native-mediump lowering fragment.
+ *
+ * Integration point: place this after pvrgpu_terrain_d1_round_half_rtne()
+ * and the D3 helpers in pvrgpu_pco.c, then add the following arm to the
+ * mediump dispatch immediately before pco_preprocess_nir():
+ *
+ *   ((profile == PVRGPU_PCO_TERRAIN_D7 ||
+ *     profile == PVRGPU_PCO_TERRAIN_D8) &&
+ *    !pvrgpu_lower_terrain_d7d8_fragment_mediump(fs,
+ *                                                 profile,
+ *                                                 error,
+ *                                                 error_size))
+ *
+ * The source-hash and canonical-signature checks in
+ * pvrgpu_pco_compile_terrain() remain the outer trust boundary.  This pass
+ * additionally matches every source ALU and all nine texture/data-flow edges
+ * before replacing the widened fp32 graph.  Any compiler-shape drift fails
+ * closed.
+ */
+
+#define PVRGPU_TERRAIN_D7D8_TAPS 9U
+#define PVRGPU_TERRAIN_D7D8_COLOR_COMPONENTS 3U
+
+struct pvrgpu_terrain_d7d8_graph {
+   nir_function_impl *entrypoint;
+   nir_intrinsic_instr *varying;
+   nir_intrinsic_instr *stores[4];
+   nir_tex_instr *textures[PVRGPU_TERRAIN_D7D8_TAPS];
+
+   nir_alu_instr *fadds[17];
+   nir_alu_instr *fmuls[13];
+   nir_alu_instr *fnegs[5];
+   nir_alu_instr *vec2s[8];
+   nir_alu_instr *movs[4];
+   nir_alu_instr *fabs;
+   nir_alu_instr *fdiv;
+   nir_alu_instr *vec4;
+
+   nir_alu_instr *tilt_neg;
+   nir_alu_instr *tilt_add;
+   nir_alu_instr *scale_mul;
+   nir_alu_instr *magnitudes[3];       /* 2*t, 3*t, 4*t. */
+   nir_alu_instr *negative_offsets[4]; /* -4*t, -3*t, -2*t, -t. */
+   nir_alu_instr *coord_adds[8];
+   nir_alu_instr *offset_vecs[8];
+   nir_alu_instr *products[PVRGPU_TERRAIN_D7D8_TAPS];
+   nir_alu_instr *accumulator_adds[PVRGPU_TERRAIN_D7D8_TAPS - 1U];
+};
+
+struct pvrgpu_terrain_d7d8_lower_counts {
+   unsigned textures;
+   unsigned offset_coords;
+   unsigned input_rtne;
+   unsigned texture_rtz_lanes;
+   unsigned add_rtne;
+   unsigned mul_rtne;
+   unsigned div_rtne;
+   unsigned exact_negates;
+   unsigned exact_absolutes;
+   unsigned weighted_multiplies;
+   unsigned accumulator_adds;
+   unsigned widened_values;
+   unsigned architectural_coord_exits;
+   unsigned architectural_color_exits;
+};
+
+static nir_scalar
+pvrgpu_terrain_d7d8_alu_scalar(const nir_alu_src *source, unsigned component)
+{
+   if (!source || !source->src.ssa || component >= NIR_MAX_VEC_COMPONENTS)
+      return (nir_scalar){0};
+   return nir_scalar_resolved(source->src.ssa, source->swizzle[component]);
+}
+
+static bool
+pvrgpu_terrain_d7d8_alu_source_is_def(const nir_alu_src *source,
+                                      const nir_def *def, unsigned components)
+{
+   if (!source || !source->src.ssa || !def || def->num_components < components)
+      return false;
+
+   for (unsigned component = 0; component < components; ++component) {
+      const nir_scalar actual =
+         pvrgpu_terrain_d7d8_alu_scalar(source, component);
+      const nir_scalar expected = {
+         .def = (nir_def *)def,
+         .comp = component,
+      };
+      if (!nir_scalar_equal(actual, expected))
+         return false;
+   }
+   return true;
+}
+
+static bool
+pvrgpu_terrain_d7d8_alu_source_is_splat_bits(const nir_alu_src *source,
+                                             uint32_t bits, unsigned components)
+{
+   if (!source || !source->src.ssa)
+      return false;
+   for (unsigned component = 0; component < components; ++component) {
+      const nir_scalar scalar =
+         pvrgpu_terrain_d7d8_alu_scalar(source, component);
+      if (!nir_scalar_is_const(scalar) || nir_scalar_as_uint(scalar) != bits)
+         return false;
+   }
+   return true;
+}
+
+static bool
+pvrgpu_terrain_d7d8_match_def_and_bits(const nir_alu_instr *alu,
+                                       const nir_def *def, uint32_t bits,
+                                       unsigned components)
+{
+   if (!alu)
+      return false;
+   return (pvrgpu_terrain_d7d8_alu_source_is_def(&alu->src[0], def,
+                                                 components) &&
+           pvrgpu_terrain_d7d8_alu_source_is_splat_bits(&alu->src[1], bits,
+                                                        components)) ||
+          (pvrgpu_terrain_d7d8_alu_source_is_def(&alu->src[1], def,
+                                                 components) &&
+           pvrgpu_terrain_d7d8_alu_source_is_splat_bits(&alu->src[0], bits,
+                                                        components));
+}
+
+static bool
+pvrgpu_terrain_d7d8_match_ordered_defs(const nir_alu_instr *alu,
+                                       const nir_def *left,
+                                       const nir_def *right,
+                                       unsigned components)
+{
+   return alu &&
+          pvrgpu_terrain_d7d8_alu_source_is_def(&alu->src[0], left,
+                                                components) &&
+          pvrgpu_terrain_d7d8_alu_source_is_def(&alu->src[1], right,
+                                                components);
+}
+
+static nir_alu_instr *
+pvrgpu_terrain_d7d8_scalar_alu(nir_scalar scalar, nir_op op,
+                               unsigned components)
+{
+   if (!scalar.def || scalar.comp != 0 || scalar.def->bit_size != 32 ||
+       scalar.def->num_components != components ||
+       nir_def_instr(scalar.def)->type != nir_instr_type_alu)
+      return NULL;
+   nir_alu_instr *alu = nir_instr_as_alu(nir_def_instr(scalar.def));
+   return alu->op == op ? alu : NULL;
+}
+
+static bool
+pvrgpu_terrain_d7d8_mark(nir_instr **recognized, unsigned *recognized_count,
+                         nir_alu_instr *alu)
+{
+   return alu && pvrgpu_terrain_d1_instr_array_add(recognized, recognized_count,
+                                                   50U, &alu->instr);
+}
+
+static bool
+pvrgpu_terrain_d7d8_check_constant_set(const nir_shader *nir, bool horizontal,
+                                       char *error, size_t error_size)
+{
+   const uint32_t expected[12] = {
+      UINT32_C(0x00000000), /* 0 */
+      horizontal ? UINT32_C(0x3c4ccccd) : UINT32_C(0x3c88893b),
+      UINT32_C(0x3d5edbf9), /* K4 */
+      UINT32_C(0x3db4195d), /* K3 */
+      UINT32_C(0x3dfdc619), /* K2 */
+      UINT32_C(0x3e1be059), /* K1 */
+      UINT32_C(0x3e26f156), /* K0 */
+      UINT32_C(0x3f000000), /* 0.5 */
+      UINT32_C(0x3f800000), /* 1 */
+      UINT32_C(0x40000000), /* 2 */
+      UINT32_C(0x40400000), /* 3 */
+      UINT32_C(0x40800000), /* 4 */
+   };
+   uint16_t seen = 0;
+   unsigned constants = 0;
+
+   nir_foreach_function_impl(impl, nir)
+   {
+      nir_foreach_block(block, impl)
+      {
+         nir_foreach_instr(instr, block)
+         {
+            if (instr->type != nir_instr_type_load_const)
+               continue;
+            nir_load_const_instr *constant = nir_instr_as_load_const(instr);
+            if (constant->def.bit_size != 32 ||
+                constant->def.num_components != 1) {
+               return pvrgpu_pco_fail(error, error_size,
+                                      "terrain D7/D8 constant shape changed");
+            }
+            unsigned match = ARRAY_SIZE(expected);
+            for (unsigned i = 0; i < ARRAY_SIZE(expected); ++i) {
+               if (constant->value[0].u32 == expected[i]) {
+                  match = i;
+                  break;
+               }
+            }
+            if (match == ARRAY_SIZE(expected) || (seen & BITFIELD_BIT(match))) {
+               return pvrgpu_pco_fail(error, error_size,
+                                      "terrain D7/D8 constant set changed");
+            }
+            seen |= BITFIELD_BIT(match);
+            ++constants;
+         }
+      }
+   }
+
+   if (constants != ARRAY_SIZE(expected) ||
+       seen != BITFIELD_MASK(ARRAY_SIZE(expected))) {
+      return pvrgpu_pco_fail(error, error_size,
+                             "terrain D7/D8 constant count changed (%u)",
+                             constants);
+   }
+   return true;
+}
+
+static bool
+pvrgpu_terrain_d7d8_collect_source(nir_shader *nir,
+                                   enum pvrgpu_pco_terrain_profile profile,
+                                   struct pvrgpu_terrain_d7d8_graph *graph,
+                                   char *error, size_t error_size)
+{
+   const bool horizontal = profile == PVRGPU_PCO_TERRAIN_D7;
+   unsigned functions = 0;
+   unsigned blocks = 0;
+   unsigned derefs = 0;
+   unsigned load_derefs = 0;
+   unsigned frag_stores = 0;
+   unsigned textures = 0;
+   unsigned fadds = 0;
+   unsigned fmuls = 0;
+   unsigned fnegs = 0;
+   unsigned vec2s = 0;
+   unsigned movs = 0;
+   unsigned fabs = 0;
+   unsigned fdiv = 0;
+   unsigned vec4 = 0;
+   uint8_t store_mask = 0;
+
+   if (!nir || nir->info.stage != MESA_SHADER_FRAGMENT ||
+       (profile != PVRGPU_PCO_TERRAIN_D7 && profile != PVRGPU_PCO_TERRAIN_D8)) {
+      return pvrgpu_pco_fail(error, error_size,
+                             "terrain D7/D8 mediump profile mismatch");
+   }
+   memset(graph, 0, sizeof(*graph));
+
+   nir_foreach_function(function, nir)
+   {
+      if (!function->impl)
+         continue;
+      if (!function->is_entrypoint || ++functions != 1U) {
+         return pvrgpu_pco_fail(error, error_size,
+                                "terrain D7/D8 requires one entrypoint");
+      }
+      graph->entrypoint = function->impl;
+      nir_foreach_block(block, function->impl)
+      {
+         ++blocks;
+         nir_foreach_instr(instr, block)
+         {
+            switch (instr->type) {
+            case nir_instr_type_load_const:
+               break;
+            case nir_instr_type_deref:
+               if (nir_instr_as_deref(instr)->deref_type != nir_deref_type_var)
+                  goto source_changed;
+               ++derefs;
+               break;
+            case nir_instr_type_intrinsic: {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_load_deref) {
+                  nir_variable *var = nir_intrinsic_get_var(intr, 0);
+                  if (++load_derefs != 1U || graph->varying || !var ||
+                      var->data.mode != nir_var_shader_in ||
+                      var->data.location != VARYING_SLOT_VAR0 ||
+                      intr->def.bit_size != 32 || intr->def.num_components != 2)
+                     goto source_changed;
+                  graph->varying = intr;
+               } else if (intr->intrinsic == nir_intrinsic_frag_store_pco) {
+                  const unsigned base = nir_intrinsic_base(intr);
+                  if (base >= ARRAY_SIZE(graph->stores) ||
+                      (store_mask & BITFIELD_BIT(base)) || !intr->src[0].ssa ||
+                      intr->src[0].ssa->bit_size != 32 ||
+                      intr->src[0].ssa->num_components != 1)
+                     goto source_changed;
+                  graph->stores[base] = intr;
+                  store_mask |= BITFIELD_BIT(base);
+                  ++frag_stores;
+               } else {
+                  goto source_changed;
+               }
+               break;
+            }
+            case nir_instr_type_tex: {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+               if (textures >= ARRAY_SIZE(graph->textures) ||
+                   tex->op != nir_texop_tex || tex->texture_index != 0U ||
+                   tex->sampler_index != 0U ||
+                   tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+                   tex->dest_type != nir_type_float32 ||
+                   tex->def.bit_size != 32 || tex->def.num_components != 4 ||
+                   tex->coord_components != 2 || tex->num_srcs != 1 ||
+                   tex->src[0].src_type != nir_tex_src_coord ||
+                   !tex->src[0].src.ssa || tex->is_array || tex->is_shadow ||
+                   tex->is_sparse || tex->texture_non_uniform ||
+                   tex->sampler_non_uniform || tex->embedded_sampler ||
+                   tex->offset_non_uniform || tex->backend_flags != 0)
+                  goto source_changed;
+               graph->textures[textures++] = tex;
+               break;
+            }
+            case nir_instr_type_alu: {
+               nir_alu_instr *alu = nir_instr_as_alu(instr);
+               switch (alu->op) {
+               case nir_op_fadd:
+                  if (fadds >= ARRAY_SIZE(graph->fadds))
+                     goto source_changed;
+                  graph->fadds[fadds++] = alu;
+                  break;
+               case nir_op_fmul:
+                  if (fmuls >= ARRAY_SIZE(graph->fmuls))
+                     goto source_changed;
+                  graph->fmuls[fmuls++] = alu;
+                  break;
+               case nir_op_fneg:
+                  if (fnegs >= ARRAY_SIZE(graph->fnegs))
+                     goto source_changed;
+                  graph->fnegs[fnegs++] = alu;
+                  break;
+               case nir_op_vec2:
+                  if (vec2s >= ARRAY_SIZE(graph->vec2s))
+                     goto source_changed;
+                  graph->vec2s[vec2s++] = alu;
+                  break;
+               case nir_op_mov:
+                  if (movs >= ARRAY_SIZE(graph->movs))
+                     goto source_changed;
+                  graph->movs[movs++] = alu;
+                  break;
+               case nir_op_fabs:
+                  if (fabs++)
+                     goto source_changed;
+                  graph->fabs = alu;
+                  break;
+               case nir_op_fdiv:
+                  if (fdiv++)
+                     goto source_changed;
+                  graph->fdiv = alu;
+                  break;
+               case nir_op_vec4:
+                  if (vec4++)
+                     goto source_changed;
+                  graph->vec4 = alu;
+                  break;
+               case nir_op_ffma:
+               case nir_op_ffma_weak:
+               default:
+                  goto source_changed;
+               }
+               break;
+            }
+            default:
+               goto source_changed;
+            }
+         }
+      }
+   }
+
+   if (functions != 1U || blocks != 1U || derefs != 2U || load_derefs != 1U ||
+       frag_stores != 4U || store_mask != 0x0f ||
+       textures != ARRAY_SIZE(graph->textures) ||
+       fadds != ARRAY_SIZE(graph->fadds) || fmuls != ARRAY_SIZE(graph->fmuls) ||
+       fnegs != ARRAY_SIZE(graph->fnegs) || vec2s != ARRAY_SIZE(graph->vec2s) ||
+       movs != ARRAY_SIZE(graph->movs) || fabs != 1U || fdiv != 1U ||
+       vec4 != 1U || !graph->entrypoint || !graph->varying || !graph->fabs ||
+       !graph->fdiv || !graph->vec4) {
+      return pvrgpu_pco_fail(
+         error, error_size,
+         "terrain D7/D8 post-canonical signature changed "
+         "(block=%u deref=%u load=%u store=%u tex=%u add=%u mul=%u "
+         "neg=%u vec2=%u mov=%u)",
+         blocks, derefs, load_derefs, frag_stores, textures, fadds, fmuls,
+         fnegs, vec2s, movs);
+   }
+   if (!pvrgpu_terrain_d7d8_check_constant_set(nir, horizontal, error,
+                                               error_size))
+      return false;
+   return true;
+
+source_changed:
+   return pvrgpu_pco_fail(error, error_size,
+                          "terrain D7/D8 source instruction graph changed");
+}
+
+static bool
+pvrgpu_terrain_d7d8_match_source(nir_shader *nir,
+                                 enum pvrgpu_pco_terrain_profile profile,
+                                 struct pvrgpu_terrain_d7d8_graph *graph,
+                                 char *error, size_t error_size)
+{
+   const bool horizontal = profile == PVRGPU_PCO_TERRAIN_D7;
+   const unsigned active = horizontal ? 0U : 1U;
+   const uint32_t source_step =
+      horizontal ? UINT32_C(0x3c4ccccd) : UINT32_C(0x3c88893b);
+   static const uint32_t source_weights[PVRGPU_TERRAIN_D7D8_TAPS] = {
+      UINT32_C(0x3d5edbf9), UINT32_C(0x3db4195d), UINT32_C(0x3dfdc619),
+      UINT32_C(0x3e1be059), UINT32_C(0x3e26f156), UINT32_C(0x3e1be059),
+      UINT32_C(0x3dfdc619), UINT32_C(0x3db4195d), UINT32_C(0x3d5edbf9),
+   };
+   static const uint32_t magnitude_bits[3] = {
+      UINT32_C(0x40000000),
+      UINT32_C(0x40400000),
+      UINT32_C(0x40800000),
+   };
+   static const unsigned noncenter_taps[8] = {
+      0U, 1U, 2U, 3U, 5U, 6U, 7U, 8U,
+   };
+   nir_instr *recognized[50] = {0};
+   unsigned recognized_count = 0;
+
+   if (!pvrgpu_terrain_d7d8_collect_source(nir, profile, graph, error,
+                                           error_size))
+      return false;
+
+   /* step = stepConstant * abs(0.5 - uv.y) / 0.5 */
+   if (graph->fdiv->def.bit_size != 32 ||
+       graph->fdiv->def.num_components != 1 ||
+       graph->fabs->def.bit_size != 32 ||
+       graph->fabs->def.num_components != 1 ||
+       !pvrgpu_terrain_d7d8_alu_source_is_splat_bits(&graph->fdiv->src[1],
+                                                     UINT32_C(0x3f000000), 1))
+      goto graph_changed;
+   graph->scale_mul = pvrgpu_terrain_d7d8_scalar_alu(
+      pvrgpu_terrain_d7d8_alu_scalar(&graph->fdiv->src[0], 0), nir_op_fmul, 1);
+   if (!graph->scale_mul ||
+       !pvrgpu_terrain_d7d8_match_def_and_bits(
+          graph->scale_mul, &graph->fabs->def, source_step, 1))
+      goto graph_changed;
+   nir_scalar abs_source =
+      pvrgpu_terrain_d7d8_alu_scalar(&graph->fabs->src[0], 0);
+   graph->tilt_add = pvrgpu_terrain_d7d8_scalar_alu(abs_source, nir_op_fadd, 1);
+   if (!graph->tilt_add)
+      goto graph_changed;
+   for (unsigned source = 0; source < 2; ++source) {
+      if (!pvrgpu_terrain_d7d8_alu_source_is_splat_bits(
+             &graph->tilt_add->src[source], UINT32_C(0x3f000000), 1))
+         continue;
+      graph->tilt_neg = pvrgpu_terrain_d7d8_scalar_alu(
+         pvrgpu_terrain_d7d8_alu_scalar(&graph->tilt_add->src[1U - source], 0),
+         nir_op_fneg, 1);
+   }
+   const nir_scalar tilt_source =
+      graph->tilt_neg
+         ? pvrgpu_terrain_d7d8_alu_scalar(&graph->tilt_neg->src[0], 0)
+         : (nir_scalar){0};
+   const nir_scalar expected_tilt_source = {
+      .def = &graph->varying->def,
+      .comp = 1U,
+   };
+   if (!graph->tilt_neg || !nir_scalar_equal(tilt_source, expected_tilt_source))
+      goto graph_changed;
+
+   if (!pvrgpu_terrain_d7d8_mark(recognized, &recognized_count, graph->fdiv) ||
+       !pvrgpu_terrain_d7d8_mark(recognized, &recognized_count,
+                                 graph->scale_mul) ||
+       !pvrgpu_terrain_d7d8_mark(recognized, &recognized_count, graph->fabs) ||
+       !pvrgpu_terrain_d7d8_mark(recognized, &recognized_count,
+                                 graph->tilt_add) ||
+       !pvrgpu_terrain_d7d8_mark(recognized, &recognized_count,
+                                 graph->tilt_neg))
+      goto graph_changed;
+
+   /* Match the shared positive 2*t, 3*t, 4*t nodes. */
+   for (unsigned magnitude = 0; magnitude < 3; ++magnitude) {
+      for (unsigned i = 0; i < ARRAY_SIZE(graph->fmuls); ++i) {
+         if (!pvrgpu_terrain_d7d8_match_def_and_bits(
+                graph->fmuls[i], &graph->fdiv->def, magnitude_bits[magnitude],
+                1))
+            continue;
+         if (graph->fmuls[i]->def.bit_size != 32 ||
+             graph->fmuls[i]->def.num_components != 1)
+            goto graph_changed;
+         if (graph->magnitudes[magnitude])
+            goto graph_changed;
+         graph->magnitudes[magnitude] = graph->fmuls[i];
+      }
+      if (!pvrgpu_terrain_d7d8_mark(recognized, &recognized_count,
+                                    graph->magnitudes[magnitude]))
+         goto graph_changed;
+   }
+
+   const nir_def *positive_offsets[4] = {
+      &graph->magnitudes[2]->def,
+      &graph->magnitudes[1]->def,
+      &graph->magnitudes[0]->def,
+      &graph->fdiv->def,
+   };
+   for (unsigned offset = 0; offset < 4; ++offset) {
+      for (unsigned i = 0; i < ARRAY_SIZE(graph->fnegs); ++i) {
+         nir_alu_instr *neg = graph->fnegs[i];
+         if (!pvrgpu_terrain_d7d8_alu_source_is_def(
+                &neg->src[0], positive_offsets[offset], 1))
+            continue;
+         if (neg->def.bit_size != 32 || neg->def.num_components != 1)
+            goto graph_changed;
+         if (graph->negative_offsets[offset])
+            goto graph_changed;
+         graph->negative_offsets[offset] = neg;
+      }
+      if (!pvrgpu_terrain_d7d8_mark(recognized, &recognized_count,
+                                    graph->negative_offsets[offset]))
+         goto graph_changed;
+   }
+
+   /* Center is the unmodified highp coordinate.  Every other coordinate is
+    * one vec2 delta plus one vec2 fadd; only the active axis is offset. */
+   if (graph->textures[4]->src[0].src.ssa != &graph->varying->def)
+      goto graph_changed;
+   const nir_def *expected_offsets[PVRGPU_TERRAIN_D7D8_TAPS] = {
+      &graph->negative_offsets[0]->def,
+      &graph->negative_offsets[1]->def,
+      &graph->negative_offsets[2]->def,
+      &graph->negative_offsets[3]->def,
+      NULL,
+      &graph->fdiv->def,
+      &graph->magnitudes[0]->def,
+      &graph->magnitudes[1]->def,
+      &graph->magnitudes[2]->def,
+   };
+   for (unsigned slot = 0; slot < ARRAY_SIZE(noncenter_taps); ++slot) {
+      const unsigned tap = noncenter_taps[slot];
+      nir_def *coord_def = graph->textures[tap]->src[0].src.ssa;
+      if (!coord_def || coord_def->bit_size != 32 ||
+          coord_def->num_components != 2 ||
+          nir_def_instr(coord_def)->type != nir_instr_type_alu)
+         goto graph_changed;
+      nir_alu_instr *coord = nir_instr_as_alu(nir_def_instr(coord_def));
+      if (coord->op != nir_op_fadd)
+         goto graph_changed;
+
+      unsigned varying_source = 2U;
+      for (unsigned source = 0; source < 2; ++source) {
+         if (pvrgpu_terrain_d7d8_alu_source_is_def(&coord->src[source],
+                                                   &graph->varying->def, 2)) {
+            varying_source = source;
+            break;
+         }
+      }
+      if (varying_source == 2U)
+         goto graph_changed;
+      nir_def *delta_def = coord->src[1U - varying_source].src.ssa;
+      if (!delta_def || delta_def->bit_size != 32 ||
+          delta_def->num_components != 2 ||
+          nir_def_instr(delta_def)->type != nir_instr_type_alu)
+         goto graph_changed;
+      nir_alu_instr *delta = nir_instr_as_alu(nir_def_instr(delta_def));
+      if (delta->op != nir_op_vec2)
+         goto graph_changed;
+
+      const nir_alu_src *delta_source = &coord->src[1U - varying_source];
+      const nir_scalar active_delta =
+         pvrgpu_terrain_d7d8_alu_scalar(delta_source, active);
+      const nir_scalar expected_delta = {
+         .def = (nir_def *)expected_offsets[tap],
+         .comp = 0,
+      };
+      const nir_scalar inactive_delta =
+         pvrgpu_terrain_d7d8_alu_scalar(delta_source, 1U - active);
+      if (!nir_scalar_equal(active_delta, expected_delta) ||
+          !nir_scalar_is_const(inactive_delta) ||
+          nir_scalar_as_uint(inactive_delta) != 0U)
+         goto graph_changed;
+
+      graph->coord_adds[slot] = coord;
+      graph->offset_vecs[slot] = delta;
+      if (!pvrgpu_terrain_d7d8_mark(recognized, &recognized_count, coord) ||
+          !pvrgpu_terrain_d7d8_mark(recognized, &recognized_count, delta))
+         goto graph_changed;
+   }
+
+   /* Each texture has exactly one vector product with the source fp32
+    * coefficient, followed by an ordered, left-associated sum. */
+   for (unsigned tap = 0; tap < PVRGPU_TERRAIN_D7D8_TAPS; ++tap) {
+      for (unsigned i = 0; i < ARRAY_SIZE(graph->fmuls); ++i) {
+         nir_alu_instr *mul = graph->fmuls[i];
+         if (mul->def.bit_size != 32 || mul->def.num_components != 4 ||
+             !pvrgpu_terrain_d7d8_match_def_and_bits(
+                mul, &graph->textures[tap]->def, source_weights[tap], 4))
+            continue;
+         if (graph->products[tap])
+            goto graph_changed;
+         graph->products[tap] = mul;
+      }
+      if (!pvrgpu_terrain_d7d8_mark(recognized, &recognized_count,
+                                    graph->products[tap]))
+         goto graph_changed;
+   }
+
+   const nir_def *accumulator = &graph->products[0]->def;
+   for (unsigned tap = 1; tap < PVRGPU_TERRAIN_D7D8_TAPS; ++tap) {
+      nir_alu_instr *matched = NULL;
+      for (unsigned i = 0; i < ARRAY_SIZE(graph->fadds); ++i) {
+         nir_alu_instr *add = graph->fadds[i];
+         if (add->def.bit_size != 32 || add->def.num_components != 4 ||
+             !pvrgpu_terrain_d7d8_match_ordered_defs(
+                add, accumulator, &graph->products[tap]->def, 4))
+            continue;
+         if (matched)
+            goto graph_changed;
+         matched = add;
+      }
+      graph->accumulator_adds[tap - 1U] = matched;
+      if (!pvrgpu_terrain_d7d8_mark(recognized, &recognized_count, matched))
+         goto graph_changed;
+      accumulator = &matched->def;
+   }
+
+   if (graph->vec4->def.bit_size != 32 || graph->vec4->def.num_components != 4)
+      goto graph_changed;
+   for (unsigned component = 0;
+        component < PVRGPU_TERRAIN_D7D8_COLOR_COMPONENTS; ++component) {
+      const nir_scalar actual =
+         pvrgpu_terrain_d7d8_alu_scalar(&graph->vec4->src[component], 0);
+      const nir_scalar expected = {
+         .def = (nir_def *)accumulator,
+         .comp = component,
+      };
+      if (!nir_scalar_equal(actual, expected))
+         goto graph_changed;
+   }
+   if (!pvrgpu_terrain_d7d8_alu_source_is_splat_bits(&graph->vec4->src[3],
+                                                     UINT32_C(0x3f800000), 1) ||
+       !pvrgpu_terrain_d7d8_mark(recognized, &recognized_count, graph->vec4))
+      goto graph_changed;
+
+   /* canonicalize_fragment_output() creates one scalar mov per component. */
+   for (unsigned component = 0; component < 4; ++component) {
+      nir_def *store_value = graph->stores[component]->src[0].ssa;
+      if (!store_value ||
+          nir_def_instr(store_value)->type != nir_instr_type_alu)
+         goto graph_changed;
+      nir_alu_instr *mov = nir_instr_as_alu(nir_def_instr(store_value));
+      const nir_scalar actual = nir_scalar_resolved(store_value, 0);
+      const nir_scalar expected =
+         nir_scalar_resolved(&graph->vec4->def, component);
+      if (mov->op != nir_op_mov || !nir_scalar_equal(actual, expected) ||
+          !pvrgpu_terrain_d7d8_mark(recognized, &recognized_count, mov))
+         goto graph_changed;
+   }
+
+   /* Exact coverage makes unexpected aliases, re-association, extra uses of
+    * an ALU slot, and compiler-introduced operations fail closed. */
+   for (unsigned i = 0; i < ARRAY_SIZE(graph->fadds); ++i) {
+      if (!pvrgpu_terrain_d1_instr_array_contains(recognized, recognized_count,
+                                                  &graph->fadds[i]->instr))
+         goto graph_changed;
+   }
+   for (unsigned i = 0; i < ARRAY_SIZE(graph->fmuls); ++i) {
+      if (!pvrgpu_terrain_d1_instr_array_contains(recognized, recognized_count,
+                                                  &graph->fmuls[i]->instr))
+         goto graph_changed;
+   }
+   for (unsigned i = 0; i < ARRAY_SIZE(graph->fnegs); ++i) {
+      if (!pvrgpu_terrain_d1_instr_array_contains(recognized, recognized_count,
+                                                  &graph->fnegs[i]->instr))
+         goto graph_changed;
+   }
+   for (unsigned i = 0; i < ARRAY_SIZE(graph->vec2s); ++i) {
+      if (!pvrgpu_terrain_d1_instr_array_contains(recognized, recognized_count,
+                                                  &graph->vec2s[i]->instr))
+         goto graph_changed;
+   }
+   for (unsigned i = 0; i < ARRAY_SIZE(graph->movs); ++i) {
+      if (!pvrgpu_terrain_d1_instr_array_contains(recognized, recognized_count,
+                                                  &graph->movs[i]->instr))
+         goto graph_changed;
+   }
+   if (recognized_count != ARRAY_SIZE(recognized))
+      goto graph_changed;
+   return true;
+
+graph_changed:
+   return pvrgpu_pco_fail(error, error_size,
+                          "terrain D7/D8 blur data-flow changed");
+}
+
+static nir_def *
+pvrgpu_terrain_d7d8_input_rtne(nir_builder *builder, nir_def *value,
+                               struct pvrgpu_terrain_d7d8_lower_counts *counts)
+{
+   ++counts->input_rtne;
+   ++counts->widened_values;
+   return pvrgpu_terrain_d1_round_half_rtne(builder, value);
+}
+
+static nir_def *
+pvrgpu_terrain_d7d8_hadd(nir_builder *builder, nir_def *left, nir_def *right,
+                         struct pvrgpu_terrain_d7d8_lower_counts *counts)
+{
+   ++counts->add_rtne;
+   ++counts->widened_values;
+   return pvrgpu_terrain_d1_round_half_rtne(builder,
+                                            nir_fadd(builder, left, right));
+}
+
+static nir_def *
+pvrgpu_terrain_d7d8_hmul(nir_builder *builder, nir_def *left, nir_def *right,
+                         struct pvrgpu_terrain_d7d8_lower_counts *counts)
+{
+   ++counts->mul_rtne;
+   ++counts->widened_values;
+   return pvrgpu_terrain_d1_round_half_rtne(builder,
+                                            nir_fmul(builder, left, right));
+}
+
+static nir_def *
+pvrgpu_terrain_d7d8_hdiv(nir_builder *builder, nir_def *left, nir_def *right,
+                         struct pvrgpu_terrain_d7d8_lower_counts *counts)
+{
+   ++counts->div_rtne;
+   ++counts->widened_values;
+   return pvrgpu_terrain_d1_round_half_rtne(builder,
+                                            nir_fdiv(builder, left, right));
+}
+
+static nir_def *
+pvrgpu_terrain_d7d8_hneg(nir_builder *builder, nir_def *value,
+                         struct pvrgpu_terrain_d7d8_lower_counts *counts)
+{
+   /* Sign changes are exact for a widened binary16 value. */
+   ++counts->exact_negates;
+   return nir_fneg(builder, value);
+}
+
+static nir_def *
+pvrgpu_terrain_d7d8_habs(nir_builder *builder, nir_def *value,
+                         struct pvrgpu_terrain_d7d8_lower_counts *counts)
+{
+   /* Clearing the sign is exact for a widened binary16 value. */
+   ++counts->exact_absolutes;
+   return nir_fabs(builder, value);
+}
+
+static nir_def *
+pvrgpu_terrain_d7d8_texture_rtz(nir_tex_instr *texture,
+                                struct pvrgpu_terrain_d7d8_lower_counts *counts)
+{
+   nir_builder builder = nir_builder_at(nir_after_instr(&texture->instr));
+   nir_def *components[4];
+   for (unsigned component = 0; component < ARRAY_SIZE(components);
+        ++component) {
+      components[component] = nir_f2f32(
+         &builder, nir_f2f16_rtz(&builder, nir_channel(&builder, &texture->def,
+                                                       component)));
+      ++counts->texture_rtz_lanes;
+      ++counts->widened_values;
+   }
+   nir_def *replacement = nir_vec(&builder, components, 4);
+   nir_def_rewrite_uses_after(&texture->def, replacement);
+   return replacement;
+}
+
+static bool
+pvrgpu_lower_terrain_d7d8_fragment_mediump(
+   nir_shader *nir, enum pvrgpu_pco_terrain_profile profile, char *error,
+   size_t error_size)
+{
+   const bool horizontal = profile == PVRGPU_PCO_TERRAIN_D7;
+   const unsigned active = horizontal ? 0U : 1U;
+   static const float half_weight_constants[5] = {
+      0x1.bdcp-5f, /* 0x2af7, K4 */
+      0x1.684p-4f, /* 0x2da1, K3 */
+      0x1.fb8p-4f, /* 0x2fee, K2 */
+      0x1.37cp-3f, /* 0x30df, K1 */
+      0x1.4ep-3f,  /* 0x3138, K0 */
+   };
+   static const unsigned weight_index[PVRGPU_TERRAIN_D7D8_TAPS] = {
+      0U, 1U, 2U, 3U, 4U, 3U, 2U, 1U, 0U,
+   };
+   struct pvrgpu_terrain_d7d8_graph graph;
+   struct pvrgpu_terrain_d7d8_lower_counts counts = {0};
+
+   if (!pvrgpu_terrain_d7d8_match_source(nir, profile, &graph, error,
+                                         error_size))
+      return false;
+
+   nir_builder head = nir_builder_at(nir_after_instr(&graph.varying->instr));
+   nir_def *original[2] = {
+      nir_channel(&head, &graph.varying->def, 0),
+      nir_channel(&head, &graph.varying->def, 1),
+   };
+   nir_def *active_half =
+      pvrgpu_terrain_d7d8_input_rtne(&head, original[active], &counts);
+   nir_def *tilt_half =
+      active == 1U
+         ? active_half
+         : pvrgpu_terrain_d7d8_input_rtne(&head, original[1], &counts);
+
+   /* These fp32 immediates exactly widen the captured binary16 constants. */
+   nir_def *half = nir_imm_float(&head, 0.5f);         /* 0x3800 */
+   nir_def *two = nir_imm_float(&head, 2.0f);          /* 0x4000 */
+   nir_def *three = nir_imm_float(&head, 3.0f);        /* 0x4200 */
+   nir_def *four = nir_imm_float(&head, 4.0f);         /* 0x4400 */
+   nir_def *minus_two = nir_imm_float(&head, -2.0f);   /* 0xc000 */
+   nir_def *minus_three = nir_imm_float(&head, -3.0f); /* 0xc200 */
+   nir_def *minus_four = nir_imm_float(&head, -4.0f);  /* 0xc400 */
+   nir_def *step_constant = nir_imm_float(
+      &head, horizontal ? 0x1.998p-7f : 0x1.110p-6f); /* 0x2266 / 0x2444 */
+   nir_def *weight_constants[ARRAY_SIZE(half_weight_constants)];
+   for (unsigned weight = 0; weight < ARRAY_SIZE(half_weight_constants);
+        ++weight) {
+      weight_constants[weight] =
+         nir_imm_float(&head, half_weight_constants[weight]);
+   }
+
+   nir_def *tilt_delta = pvrgpu_terrain_d7d8_hadd(
+      &head, half, pvrgpu_terrain_d7d8_hneg(&head, tilt_half, &counts),
+      &counts);
+   nir_def *distance = pvrgpu_terrain_d7d8_habs(&head, tilt_delta, &counts);
+   nir_def *scaled =
+      pvrgpu_terrain_d7d8_hmul(&head, step_constant, distance, &counts);
+   nir_def *tap_step = pvrgpu_terrain_d7d8_hdiv(&head, scaled, half, &counts);
+   nir_def *offset[PVRGPU_TERRAIN_D7D8_TAPS] = {
+      pvrgpu_terrain_d7d8_hmul(&head, minus_four, tap_step, &counts),
+      pvrgpu_terrain_d7d8_hmul(&head, minus_three, tap_step, &counts),
+      pvrgpu_terrain_d7d8_hmul(&head, minus_two, tap_step, &counts),
+      pvrgpu_terrain_d7d8_hneg(&head, tap_step, &counts),
+      NULL,
+      tap_step,
+      pvrgpu_terrain_d7d8_hmul(&head, two, tap_step, &counts),
+      pvrgpu_terrain_d7d8_hmul(&head, three, tap_step, &counts),
+      pvrgpu_terrain_d7d8_hmul(&head, four, tap_step, &counts),
+   };
+
+   nir_def *accumulator[PVRGPU_TERRAIN_D7D8_COLOR_COMPONENTS] = {0};
+   for (unsigned tap = 0; tap < PVRGPU_TERRAIN_D7D8_TAPS; ++tap) {
+      if (tap != 4U) {
+         nir_builder coord_builder =
+            nir_builder_at(nir_before_instr(&graph.textures[tap]->instr));
+         nir_def *active_coord = pvrgpu_terrain_d7d8_hadd(
+            &coord_builder, active_half, offset[tap], &counts);
+         nir_def *tap_coord =
+            horizontal ? nir_vec2(&coord_builder, active_coord, original[1])
+                       : nir_vec2(&coord_builder, original[0], active_coord);
+         nir_src_rewrite(&graph.textures[tap]->src[0].src, tap_coord);
+         ++counts.offset_coords;
+         ++counts.architectural_coord_exits;
+      }
+
+      nir_def *sample =
+         pvrgpu_terrain_d7d8_texture_rtz(graph.textures[tap], &counts);
+      ++counts.textures;
+      nir_builder sample_builder =
+         nir_builder_at(nir_after_instr(nir_def_instr(sample)));
+      for (unsigned component = 0;
+           component < PVRGPU_TERRAIN_D7D8_COLOR_COMPONENTS; ++component) {
+         nir_def *product = pvrgpu_terrain_d7d8_hmul(
+            &sample_builder, nir_channel(&sample_builder, sample, component),
+            weight_constants[weight_index[tap]], &counts);
+         ++counts.weighted_multiplies;
+         if (accumulator[component]) {
+            product = pvrgpu_terrain_d7d8_hadd(
+               &sample_builder, accumulator[component], product, &counts);
+            ++counts.accumulator_adds;
+         }
+         accumulator[component] = product;
+      }
+   }
+
+   nir_builder output_builder =
+      nir_builder_at(nir_before_instr(&graph.stores[0]->instr));
+   for (unsigned component = 0;
+        component < PVRGPU_TERRAIN_D7D8_COLOR_COMPONENTS; ++component) {
+      nir_src_rewrite(&graph.stores[component]->src[0], accumulator[component]);
+      ++counts.architectural_color_exits;
+   }
+   nir_src_rewrite(&graph.stores[3]->src[0],
+                   nir_imm_float(&output_builder, 1.0f));
+
+   const unsigned expected_inputs = horizontal ? 2U : 1U;
+   const unsigned expected_widens = expected_inputs + 68U + 36U;
+   if (counts.textures != 9U || counts.offset_coords != 8U ||
+       counts.input_rtne != expected_inputs ||
+       counts.texture_rtz_lanes != 36U || counts.add_rtne != 33U ||
+       counts.mul_rtne != 34U || counts.div_rtne != 1U ||
+       counts.exact_negates != 2U || counts.exact_absolutes != 1U ||
+       counts.weighted_multiplies != 27U || counts.accumulator_adds != 24U ||
+       counts.widened_values != expected_widens ||
+       counts.architectural_coord_exits != 8U ||
+       counts.architectural_color_exits != 3U) {
+      return pvrgpu_pco_fail(
+         error, error_size,
+         "terrain D7/D8 lowered count changed "
+         "(tex=%u coord=%u in=%u rtz=%u add=%u mul=%u div=%u "
+         "neg=%u abs=%u weighted=%u accum=%u widen=%u)",
+         counts.textures, counts.offset_coords, counts.input_rtne,
+         counts.texture_rtz_lanes, counts.add_rtne, counts.mul_rtne,
+         counts.div_rtne, counts.exact_negates, counts.exact_absolutes,
+         counts.weighted_multiplies, counts.accumulator_adds,
+         counts.widened_values);
+   }
+
+   nir_opt_dce(nir);
+   nir_lower_alu_to_scalar(nir, NULL, NULL);
+   nir_progress(true, graph.entrypoint, nir_metadata_control_flow);
+   return true;
+}
 bool pvrgpu_pco_compile_terrain(
    struct pvrgpu_pco_compiler *compiler,
    const nir_shader *vertex_nir,
@@ -5901,7 +9901,7 @@ bool pvrgpu_pco_compile_terrain(
            error,
            error_size)) ||
        (desc->fragment_texture_count != 0 &&
-       !pvrgpu_pack_terrain_texture_bindings(
+        !pvrgpu_pack_terrain_texture_bindings(
            fs,
            desc->fragment_texture_count,
            desc->fragment_texture_ops,
@@ -5912,10 +9912,35 @@ bool pvrgpu_pco_compile_terrain(
       return false;
    }
 
-   if (profile == PVRGPU_PCO_TERRAIN_D1 &&
-       !pvrgpu_lower_terrain_d1_fragment_mediump(fs,
-                                                  error,
-                                                  error_size)) {
+   if ((profile == PVRGPU_PCO_TERRAIN_D1 &&
+        !pvrgpu_lower_terrain_d1_fragment_mediump(fs,
+                                                   error,
+                                                   error_size)) ||
+       (profile == PVRGPU_PCO_TERRAIN_D2 &&
+        !pvrgpu_lower_terrain_d2_fragment_mediump(fs,
+                                                   error,
+                                                   error_size)) ||
+       (profile == PVRGPU_PCO_TERRAIN_D3 &&
+        !pvrgpu_lower_terrain_d3_vertex_mediump(vs,
+                                                 error,
+                                                 error_size)) ||
+       (profile == PVRGPU_PCO_TERRAIN_D3 &&
+        !pvrgpu_lower_terrain_d3_fragment_mediump(fs,
+                                                   error,
+                                                   error_size)) ||
+       ((profile == PVRGPU_PCO_TERRAIN_D4 ||
+         profile == PVRGPU_PCO_TERRAIN_D5 ||
+         profile == PVRGPU_PCO_TERRAIN_D6) &&
+        !pvrgpu_lower_terrain_d4_d6_fragment_mediump(fs,
+                                                      profile,
+                                                      error,
+                                                      error_size)) ||
+       ((profile == PVRGPU_PCO_TERRAIN_D7 ||
+         profile == PVRGPU_PCO_TERRAIN_D8) &&
+        !pvrgpu_lower_terrain_d7d8_fragment_mediump(fs,
+                                                     profile,
+                                                     error,
+                                                     error_size))) {
       ralloc_free(compile_mem_ctx);
       return false;
    }

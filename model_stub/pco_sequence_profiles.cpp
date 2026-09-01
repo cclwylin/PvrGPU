@@ -656,19 +656,19 @@ constexpr std::array<std::uint64_t, 7> kTerrainMainTextureFnv = {
     UINT64_C(0x3964257e9bde4861),
 };
 constexpr std::array<std::size_t, 8> kTerrainVertexPcoBytes = {
-    200, 192, 2440, 192, 192, 192, 192, 192};
+    200, 192, 2680, 192, 192, 192, 192, 192};
 constexpr std::array<std::uint64_t, 8> kTerrainVertexPcoFnv = {
     UINT64_C(0x9abe96cad5fe9f4e), UINT64_C(0x081618f544cc6abe),
-    UINT64_C(0xde47363e398a2bcc), UINT64_C(0x081618f544cc6abe),
+    UINT64_C(0x8d0f6d4b38cdecf4), UINT64_C(0x081618f544cc6abe),
     UINT64_C(0x081618f544cc6abe), UINT64_C(0x081618f544cc6abe),
     UINT64_C(0x081618f544cc6abe), UINT64_C(0x081618f544cc6abe)};
 constexpr std::array<std::size_t, 8> kTerrainFragmentPcoBytes = {
-    39560, 472, 2312, 680, 680, 232, 1144, 1144};
+    38832, 1208, 7328, 1920, 1880, 448, 3528, 3504};
 constexpr std::array<std::uint64_t, 8> kTerrainFragmentPcoFnv = {
-    UINT64_C(0xe5ede07e1317d604), UINT64_C(0xf37c4b6785de2e44),
-    UINT64_C(0x02a543327636e98f), UINT64_C(0xa6e167a6cd068362),
-    UINT64_C(0x6b171a8aaec8fa96), UINT64_C(0x834f6b41c2c7bdd8),
-    UINT64_C(0x0196ab8e374c830d), UINT64_C(0x1fd6e9c5b3efd7bd)};
+    UINT64_C(0x9e1c3ea2dfa1d8a5), UINT64_C(0x9711b79a7b5b63a6),
+    UINT64_C(0x4fecdd1ce1feb997), UINT64_C(0x956d5ea59737b66f),
+    UINT64_C(0x76fac56a9fbc5918), UINT64_C(0x412b9e844c3de073),
+    UINT64_C(0xab0dfc14e6aa5116), UINT64_C(0xd0b9eb8de7e641d2)};
 constexpr std::array<DriverPcoStageAbi, 8> kTerrainVertexAbi = {{
     {7, 4, 6, 0, 8, 0, 8, 0},
     {6, 4, 6, 0, 8, 0, 8, 0},
@@ -680,14 +680,14 @@ constexpr std::array<DriverPcoStageAbi, 8> kTerrainVertexAbi = {{
     {6, 4, 6, 0, 8, 0, 8, 0},
 }};
 constexpr std::array<DriverPcoStageAbi, 8> kTerrainFragmentAbi = {{
-    {49, 0, 0, 12, 4, 0, 4, 0},
-    {34, 0, 0, 12, 28, 20, 8, 0},
-    {36, 0, 0, 60, 164, 100, 64, 0},
-    {31, 0, 0, 12, 20, 20, 0, 0},
-    {31, 0, 0, 12, 20, 20, 0, 0},
+    {50, 0, 0, 12, 4, 0, 4, 0},
+    {24, 0, 0, 12, 28, 20, 8, 0},
+    {33, 0, 0, 60, 164, 100, 64, 0},
+    {30, 0, 0, 12, 20, 20, 0, 0},
+    {30, 0, 0, 12, 20, 20, 0, 0},
     {17, 0, 0, 12, 24, 20, 4, 0},
-    {33, 0, 0, 12, 20, 20, 0, 0},
-    {33, 0, 0, 12, 20, 20, 0, 0},
+    {35, 0, 0, 12, 20, 20, 0, 0},
+    {35, 0, 0, 12, 20, 20, 0, 0},
 }};
 constexpr std::array<std::size_t, 8> kTerrainVertexSharedDwords = {
     8, 8, 96, 8, 8, 8, 8, 8};

@@ -559,6 +559,7 @@ inline constexpr std::uint16_t kSpecialConstantEight = 67;
 inline constexpr std::uint16_t kSpecialConstantHalf = 75;
 inline constexpr std::uint16_t kSpecialConstantQuarter = 76;
 inline constexpr std::uint16_t kSpecialConstantEighth = 77;
+inline constexpr std::uint16_t kSpecialConstantOneOver256 = 82;
 inline constexpr std::uint16_t kSpecialConstantOneThird = 152;
 inline constexpr std::uint16_t kSpecialConstantOneSixth = 153;
 inline constexpr std::size_t kAttributeFetchTemporaryCount = 6;
@@ -570,6 +571,7 @@ bool IsSupportedSpecialConstant(std::uint16_t index) {
          index == kSpecialConstantEight || index == kSpecialConstantHalf ||
          index == kSpecialConstantQuarter ||
          index == kSpecialConstantEighth ||
+         index == kSpecialConstantOneOver256 ||
          index == kSpecialConstantOneThird ||
          index == kSpecialConstantOneSixth;
 }
@@ -4064,6 +4066,8 @@ std::uint32_t ReadSource(const PcoRegisterRef &source,
       return UINT32_C(0x3e800000);
     if (source.index == kSpecialConstantEighth)
       return UINT32_C(0x3e000000);
+    if (source.index == kSpecialConstantOneOver256)
+      return UINT32_C(0x3b800000);
     if (source.index == kSpecialConstantOneThird)
       return UINT32_C(0x3eaaaaab);
     if (source.index == kSpecialConstantOneSixth)
@@ -4528,6 +4532,20 @@ std::uint32_t ReciprocalBits(std::uint32_t val_bits) {
 }
 
 std::uint32_t ReciprocalSquareRootBits(std::uint32_t val_bits) {
+  constexpr std::uint32_t kExponentMask = UINT32_C(0x7f800000);
+  constexpr std::uint32_t kFractionMask = UINT32_C(0x007fffff);
+  constexpr std::uint32_t kCanonicalQuietNan = UINT32_C(0x7fc00000);
+  if ((val_bits & kExponentMask) == kExponentMask) {
+    /* Public PCO FRSQ follows binary32 1/sqrt(x).  In particular,
+     * +infinity is a valid normalized-vector intermediate and maps to +0.
+     * A NaN or -infinity has no real reciprocal square root; keep the ISS's
+     * deterministic quiet-NaN policy for those classes. */
+    if ((val_bits & kFractionMask) != 0 ||
+        (val_bits & UINT32_C(0x80000000)) != 0) {
+      return kCanonicalQuietNan;
+    }
+    return UINT32_C(0);
+  }
   const Binary32Operand operand = DecodeFaddOperand(val_bits);
   if (operand.zero) {
     /* PCO FRSQ follows the binary32 1/sqrt operation for signed zero.
@@ -4539,7 +4557,7 @@ std::uint32_t ReciprocalSquareRootBits(std::uint32_t val_bits) {
     /* A finite negative radicand has no real result.  Mesa's fsqrt lowering
      * relies on the canonical quiet NaN being carried until a later fcsel
      * discards the total-internal-reflection path. */
-    return UINT32_C(0x7fc00000);
+    return kCanonicalQuietNan;
   }
   float val = 0.0f;
   std::memcpy(&val, &val_bits, sizeof(val));

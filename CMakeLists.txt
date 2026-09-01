@@ -746,6 +746,7 @@ add_executable(varyings-shader-one-pipeline-test
     tests/varyings_shader_one_pipeline_test.cpp
     model_stub/memory_pool.cpp
     model_stub/model_types.cpp
+    model_stub/pco_sequence_profiles.cpp
     model_stub/submitter.cpp
     src/systemc/common/functional_types.cpp
     src/systemc/common/glbench_triangle_fixture.cpp
@@ -765,6 +766,7 @@ add_executable(varyings-shader-one-pipeline-test
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp
     src/systemc/shader/usc_slot.cpp
+    src/systemc/texture/texture_unit.cpp
 )
 target_include_directories(varyings-shader-one-pipeline-test PRIVATE
     "${CMAKE_SOURCE_DIR}/model_stub"
@@ -784,6 +786,7 @@ add_executable(varyings-shader-two-pipeline-test
     tests/varyings_shader_two_pipeline_test.cpp
     model_stub/memory_pool.cpp
     model_stub/model_types.cpp
+    model_stub/pco_sequence_profiles.cpp
     model_stub/submitter.cpp
     src/systemc/cache_mmu/slc.cpp
     src/systemc/common/functional_types.cpp
@@ -852,6 +855,7 @@ add_executable(varyings-shader-four-pipeline-test
     tests/varyings_shader_four_pipeline_test.cpp
     model_stub/memory_pool.cpp
     model_stub/model_types.cpp
+    model_stub/pco_sequence_profiles.cpp
     model_stub/submitter.cpp
     src/systemc/cache_mmu/slc.cpp
     src/systemc/common/functional_types.cpp
@@ -920,6 +924,7 @@ add_executable(varyings-shader-eight-pipeline-test
     tests/varyings_shader_eight_pipeline_test.cpp
     model_stub/memory_pool.cpp
     model_stub/model_types.cpp
+    model_stub/pco_sequence_profiles.cpp
     model_stub/submitter.cpp
     src/systemc/cache_mmu/slc.cpp
     src/systemc/common/functional_types.cpp

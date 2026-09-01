@@ -10422,13 +10422,13 @@ pvrgpu_terrain_pco_payload_matches_binary(
       };
    static const size_t expected_vertex_binary_size
       [PVRGPU_TERRAIN_PCO_DRAW_COUNT] = {
-         200U, 192U, 2440U, 192U, 192U, 192U, 192U, 192U,
+         200U, 192U, 2680U, 192U, 192U, 192U, 192U, 192U,
       };
    static const uint64_t expected_vertex_binary_fnv1a64
       [PVRGPU_TERRAIN_PCO_DRAW_COUNT] = {
          UINT64_C(0x9abe96cad5fe9f4e),
          UINT64_C(0x081618f544cc6abe),
-         UINT64_C(0xde47363e398a2bcc),
+         UINT64_C(0x8d0f6d4b38cdecf4),
          UINT64_C(0x081618f544cc6abe),
          UINT64_C(0x081618f544cc6abe),
          UINT64_C(0x081618f544cc6abe),
@@ -10437,18 +10437,18 @@ pvrgpu_terrain_pco_payload_matches_binary(
       };
    static const size_t expected_fragment_binary_size
       [PVRGPU_TERRAIN_PCO_DRAW_COUNT] = {
-         39560U, 472U, 2312U, 680U, 680U, 232U, 1144U, 1144U,
+         38832U, 1208U, 7328U, 1920U, 1880U, 448U, 3528U, 3504U,
       };
    static const uint64_t expected_fragment_binary_fnv1a64
       [PVRGPU_TERRAIN_PCO_DRAW_COUNT] = {
-         UINT64_C(0xe5ede07e1317d604),
-         UINT64_C(0xf37c4b6785de2e44),
-         UINT64_C(0x02a543327636e98f),
-         UINT64_C(0xa6e167a6cd068362),
-         UINT64_C(0x6b171a8aaec8fa96),
-         UINT64_C(0x834f6b41c2c7bdd8),
-         UINT64_C(0x0196ab8e374c830d),
-         UINT64_C(0x1fd6e9c5b3efd7bd),
+         UINT64_C(0x9e1c3ea2dfa1d8a5),
+         UINT64_C(0x9711b79a7b5b63a6),
+         UINT64_C(0x4fecdd1ce1feb997),
+         UINT64_C(0x956d5ea59737b66f),
+         UINT64_C(0x76fac56a9fbc5918),
+         UINT64_C(0x412b9e844c3de073),
+         UINT64_C(0xab0dfc14e6aa5116),
+         UINT64_C(0xd0b9eb8de7e641d2),
       };
    const struct pvrgpu_pco_graphics_binary *binary = &observation->binary;
    const unsigned profile = observation->profile;

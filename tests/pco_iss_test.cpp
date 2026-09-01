@@ -4418,6 +4418,48 @@ void TestDecodeAndExecuteTerrainAbsoluteBinarySources() {
       "Terrain source0 ABS is rejected on FMUL");
 }
 
+void TestDecodeAndExecuteTerrainOneOver256SpecialConstant() {
+  /* Exact D5 fragment group at byte 0x28 of the 1880-byte Terrain shader
+   * (FNV-1a64 76fac56a9fbc5918).  MOVI/PIXOUT only provide a closed
+   * executable envelope around the byte-identical compiler-emitted FMUL. */
+  const auto fragment_binary = BytesFromHex(R"hex(
+86 92 40 13 00 00 00 c0 00 00 50 ff
+35 82 00 42 92 f0 04 00 00 51
+34 8a 00 87 51 00 00 20
+34 8a 00 87 51 00 00 21
+34 8a 00 87 51 00 00 22
+34 8a 80 87 51 00 00 23
+)hex");
+  Check(fragment_binary.size() == 54,
+        "Terrain D5 SC82 fixture preserves exact group sizes");
+
+  const auto decoded = Decode(ShaderStage::kFragment, fragment_binary);
+  Check(decoded.summary.group_count == 6 &&
+            decoded.summary.instruction_count == 6 &&
+            decoded.summary.pixel_output_mask == 0x0f,
+        "Terrain D5 SC82 fixture has a closed fragment envelope");
+  const auto &multiply = decoded.instructions[1];
+  Check(multiply.binary_offset == 15 &&
+            multiply.opcode == PcoOpcode::kFloatMultiply &&
+            multiply.source.bank == PcoRegisterBank::kSpecial &&
+            multiply.source.index == 82 &&
+            multiply.source1.bank == PcoRegisterBank::kTemporary &&
+            multiply.source1.index == 16 && multiply.output_index == 17 &&
+            multiply.source0_absolute == 0 &&
+            multiply.source1_absolute == 1,
+        "Terrain exact 35 82 00 42 92 f0 04 00 00 51 is FMUL SC82, "
+        "abs(TEMP16)");
+  const auto executed = ExecuteFragment(decoded.summary, decoded.instructions);
+  Check(executed.pixel_outputs[0] == UINT32_C(0x3c000000),
+        "Terrain SC82 is exact binary32 1/256 before FMUL source1 ABS");
+
+  auto unmodeled_neighbor = fragment_binary;
+  unmodeled_neighbor[16] = 0x93;
+  ExpectFailure(
+      [&] { (void)Decode(ShaderStage::kFragment, unmodeled_neighbor); },
+      "Terrain D5 adjacent but unmodeled SC83 remains fail-closed");
+}
+
 void TestDecodeAndExecuteIdeasLogicalAnd() {
   /* Actual Ideas fragment group at byte 0x114.  The MOVI/PIXOUT groups only
    * provide a closed executable envelope around the byte-identical Boolean
@@ -4589,14 +4631,28 @@ void TestDecodeAndExecuteIdeasReciprocalZero() {
   Check(ExecuteFragment(frsq_positive.summary, frsq_positive.instructions)
                 .pixel_outputs[0] == FloatBits(0.5F),
         "PCO FRSQ retains the finite positive reciprocal-square-root path");
-  for (const auto &malformed : {
-           UINT32_C(0x00000001), UINT32_C(0x7f800000),
-           UINT32_C(0x7fc00000)}) {
+
+  const auto frsq_positive_infinity = Decode(
+      ShaderStage::kFragment, make_frsq_binary(UINT32_C(0x7f800000)));
+  Check(ExecuteFragment(frsq_positive_infinity.summary,
+                        frsq_positive_infinity.instructions)
+                .pixel_outputs[0] == UINT32_C(0x00000000),
+        "PCO FRSQ maps positive infinity to positive zero");
+  for (const auto non_numeric : {
+           UINT32_C(0xff800000), UINT32_C(0x7fc12345)}) {
+    const auto decoded =
+        Decode(ShaderStage::kFragment, make_frsq_binary(non_numeric));
+    Check(ExecuteFragment(decoded.summary, decoded.instructions)
+                  .pixel_outputs[0] == UINT32_C(0x7fc00000),
+          "PCO FRSQ canonicalizes negative infinity and NaN");
+  }
+
+  for (const auto malformed : {UINT32_C(0x00000001)}) {
     const auto decoded =
         Decode(ShaderStage::kFragment, make_frsq_binary(malformed));
     ExpectFailure(
         [&] { (void)ExecuteFragment(decoded.summary, decoded.instructions); },
-        "PCO FRSQ keeps subnormal/non-finite inputs outside the public gate");
+        "PCO FRSQ keeps subnormal inputs outside the public gate");
   }
 }
 
@@ -5516,6 +5572,7 @@ int main() {
     TestFloatMaxOrderedSourceRouting();
     TestDecodeAndExecuteTerrainFloatAddSaturate();
     TestDecodeAndExecuteTerrainAbsoluteBinarySources();
+    TestDecodeAndExecuteTerrainOneOver256SpecialConstant();
     TestDecodeAndExecuteIdeasLogicalAnd();
     TestDecodeAndExecuteIdeasReciprocalZero();
     TestDecodeAndExecuteIdeasNegatedFloatSources();
