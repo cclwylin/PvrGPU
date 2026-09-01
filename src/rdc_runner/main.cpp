@@ -708,6 +708,54 @@ std::filesystem::path CapturePng(const std::string &jsonl,
   return {};
 }
 
+std::size_t CountDriverEvents(const std::string &text,
+                              std::string_view event) {
+  const std::string marker = "event=" + std::string(event);
+  std::istringstream input(text);
+  std::size_t count = 0;
+  std::string line;
+  while (std::getline(input, line)) {
+    const std::size_t position = line.find(marker);
+    if (position == std::string::npos)
+      continue;
+    const std::size_t end = position + marker.size();
+    if (end == line.size() ||
+        std::isspace(static_cast<unsigned char>(line[end])))
+      ++count;
+  }
+  return count;
+}
+
+bool ReadPngExtent(const std::filesystem::path &path, unsigned *width,
+                   unsigned *height) {
+  if (!width || !height)
+    return false;
+  std::ifstream input(path, std::ios::binary);
+  std::array<unsigned char, 24> header{};
+  if (!input.read(reinterpret_cast<char *>(header.data()),
+                  static_cast<std::streamsize>(header.size())))
+    return false;
+  constexpr std::array<unsigned char, 8> kPngSignature = {
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
+  if (!std::equal(kPngSignature.begin(), kPngSignature.end(), header.begin()) ||
+      header[12] != 'I' || header[13] != 'H' || header[14] != 'D' ||
+      header[15] != 'R')
+    return false;
+  auto read_be32 = [&](std::size_t offset) {
+    return (static_cast<std::uint32_t>(header[offset]) << 24U) |
+           (static_cast<std::uint32_t>(header[offset + 1]) << 16U) |
+           (static_cast<std::uint32_t>(header[offset + 2]) << 8U) |
+           static_cast<std::uint32_t>(header[offset + 3]);
+  };
+  const std::uint32_t parsed_width = read_be32(16);
+  const std::uint32_t parsed_height = read_be32(20);
+  if (parsed_width == 0 || parsed_height == 0)
+    return false;
+  *width = parsed_width;
+  *height = parsed_height;
+  return true;
+}
+
 bool CopyArtifact(const std::filesystem::path &source,
                   const std::filesystem::path &destination,
                   std::string *error) {
@@ -973,7 +1021,11 @@ RunOutcome RunPvrgpu(const Options &options, const RuntimeConfig &config,
   const std::filesystem::path probe_stderr =
       artifact_root / "player.trace-probe.stderr.log";
 
-  std::string gles = "3.0";
+  // RenderDoc's replay initial-state path queries every texture level before
+  // copying captured mip chains.  glGetTexLevelParameteriv is core in GLES
+  // 3.1, while forcing 3.0 sends the emulated DSA path through incomplete
+  // replay metadata and silently truncates the restore to level zero.
+  std::string gles = "3.1";
   if (options.case_name.rfind("dEQP-GLES32.", 0) == 0)
     gles = "3.2";
   else if (options.case_name.rfind("dEQP-GLES31.", 0) == 0)
@@ -1143,16 +1195,38 @@ RunOutcome RunPvrgpu(const Options &options, const RuntimeConfig &config,
                      std::to_string(player_result.exit_code);
     return outcome;
   }
+  std::string driver_counter_text;
+  if (!ReadText(driver_counter, &driver_counter_text)) {
+    outcome.stage = "driver-support";
+    outcome.reason = "PvrGPU Gallium driver did not emit driver-counter.txt";
+    return outcome;
+  }
+  const std::size_t unsupported_draws =
+      CountDriverEvents(driver_counter_text, "unsupported_draw");
+  if (unsupported_draws != 0) {
+    outcome.stage = "driver-support";
+    outcome.reason =
+        "PvrGPU Gallium replay reported " +
+        std::to_string(unsupported_draws) +
+        " unsupported draw event(s) across replay passes; refusing to treat "
+        "a later framebuffer blit as the workload result";
+    return outcome;
+  }
   if (!NonEmptyFile(command)) {
+    outcome.stage = "driver-support";
     outcome.reason = "PvrGPU Gallium driver did not emit driver-command.txt";
     return outcome;
   }
 
   std::string native_bridge_output;
-  const bool bridge_completed = ReadText(model_stdout, &native_bridge_output) &&
-                                native_bridge_output.find(
-                                    "\"type\":\"done\"") != std::string::npos;
-  if (!bridge_completed) {
+  const bool bridge_started =
+      ReadText(model_stdout, &native_bridge_output) &&
+      !native_bridge_output.empty();
+  const bool bridge_completed =
+      bridge_started &&
+      native_bridge_output.find("\"type\":\"done\"") !=
+          std::string::npos;
+  if (!bridge_completed && !bridge_started) {
     outcome.stage = "model";
     outcome.stdout_log = model_stdout;
     outcome.stderr_log = model_stderr;
@@ -1173,8 +1247,16 @@ RunOutcome RunPvrgpu(const Options &options, const RuntimeConfig &config,
                        std::to_string(model_result.exit_code);
       return outcome;
     }
-  } else {
+  } else if (bridge_completed) {
     outcome.model_exit_code = 0;
+  } else {
+    // The in-process bridge already consumed the transient VBO, PCO binaries,
+    // shared registers and sampled-image bytes.  A standalone retry can only
+    // reload driver-command.txt metadata, so it would discard the real
+    // payload and overwrite the first actionable SystemC error with a false
+    // "empty PCO" failure.  Preserve the native JSONL and let protocol
+    // validation below report its exact error record.
+    outcome.model_exit_code = 1;
   }
 
   std::string model_text;
@@ -1207,7 +1289,36 @@ RunOutcome RunPvrgpu(const Options &options, const RuntimeConfig &config,
   const std::filesystem::path source_frame =
       CapturePng(bound_jsonl, model_png_dir);
   std::filesystem::path frame;
+  std::string player_output_text;
+  const bool explicit_no_color_output =
+      ReadText(player_stdout, &player_output_text) &&
+      player_output_text.find("selected replay range has no color output") !=
+          std::string::npos;
+  if (source_frame.empty() && !explicit_no_color_output) {
+    outcome.stage = "framebuffer";
+    outcome.reason =
+        "PvrGPU model did not emit a framebuffer PNG and the player did not "
+        "report explicit no-color output evidence";
+    return outcome;
+  }
   if (!source_frame.empty()) {
+    unsigned frame_width = 0;
+    unsigned frame_height = 0;
+    if (!ReadPngExtent(source_frame, &frame_width, &frame_height)) {
+      outcome.stage = "framebuffer";
+      outcome.reason = "PvrGPU model framebuffer is not a valid PNG";
+      return outcome;
+    }
+    if (frame_width != options.width || frame_height != options.height) {
+      outcome.stage = "framebuffer";
+      outcome.reason =
+          "PvrGPU model framebuffer extent mismatch: requested=" +
+          std::to_string(options.width) + "x" +
+          std::to_string(options.height) + " actual=" +
+          std::to_string(frame_width) + "x" +
+          std::to_string(frame_height);
+      return outcome;
+    }
     frame = artifact_root / "frame.png";
     if (!CopyArtifact(source_frame, frame, &outcome.reason)) {
       outcome.stage = "framebuffer";

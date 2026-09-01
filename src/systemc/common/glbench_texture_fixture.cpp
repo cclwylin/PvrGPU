@@ -174,6 +174,8 @@ MakeGlbenchFillTextureFixture(FunctionalCase functional_case) {
   fixture.sampler.min_filter = config.min_filter;
   fixture.sampler.mag_filter = config.mag_filter;
   fixture.sampler.mip_filter = config.mip_filter;
+  fixture.sampler.max_lod_u4_6 =
+      config.mip_filter == TextureFilter::kLinear ? 959U : 0U;
   return fixture;
 }
 

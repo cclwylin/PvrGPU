@@ -82,6 +82,23 @@ class BatchCancelled(RuntimeError):
     """The UI or terminal requested cancellation."""
 
 
+def runner_exit_failure_message(artifact_dir: Path, return_code: int) -> str:
+    fallback = f"Runner exited with code {return_code}"
+    result_path = artifact_dir / "backend-result.json"
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return fallback
+    if not isinstance(result, dict):
+        return fallback
+    reason = str(result.get("reason", "")).strip()
+    if not reason:
+        return fallback
+    stage = str(result.get("stage", "")).strip()
+    location = f" at {stage}" if stage else ""
+    return f"{fallback}{location}: {reason}"
+
+
 @dataclass(frozen=True)
 class ManifestEntry:
     index: int
@@ -814,7 +831,9 @@ class DirectoryCounterRun:
         if self.cancel_requested:
             raise BatchCancelled("Run cancelled by user")
         if return_code != 0:
-            raise RunnerFailure(f"Runner exited with code {return_code}")
+            raise RunnerFailure(
+                runner_exit_failure_message(stdout_path.parent, return_code)
+            )
 
     def _emit_stage(self, index: int, stage: str, status: str) -> None:
         self.events.emit("stage", index=index, stage=stage, status=status)
@@ -1730,7 +1749,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "PVRGPU_WORK_ROOT",
             str(Path.home() / "Downloads" / "_Codex" / "Working" / "PvrGPU"),
         )
-    )
+    ).expanduser()
+    default_rdc_dir = Path(
+        os.environ.get(
+            "PVRGPU_RDC_ROOT",
+            str(work_root.parent / "GPU_TestPatterns" / "1.GLBench"),
+        )
+    ).expanduser()
     parser = argparse.ArgumentParser(
         description=(
             "Recursively run Golden/PvrGPU counter and framebuffer comparison "
@@ -1742,8 +1767,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--input-dir",
         dest="rdc_dir",
         type=Path,
-        required=True,
-        help="directory to scan recursively for .rdc files",
+        default=default_rdc_dir,
+        help=(
+            "directory to scan recursively for .rdc files "
+            f"(default: {default_rdc_dir})"
+        ),
     )
     parser.add_argument(
         "--output-root",

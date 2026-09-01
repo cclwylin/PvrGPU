@@ -157,6 +157,10 @@ std::uint32_t WorkloadClass(const std::string& test_case) {
     return 6;
   if (test_case == "driver_indexed_quad")
     return 7;
+  if (test_case == "driver_textured_triangles")
+    return 8;
+  if (test_case == "driver_pco_triangles")
+    return 9;
   if (test_case.find("triangle_setup") != std::string::npos)
     return 1;
   if (test_case.find("attribute_fetch") != std::string::npos)

@@ -48,7 +48,7 @@ void PdsEngine::Run() {
 
     const std::vector<FragmentInvocation> invocations =
         LoadArray<FragmentInvocation>(pool_, state.fragment_invocations);
-    const bool texture_case = IsTextureFamily(state.functional_case);
+    const bool texture_case = UsesTextureSampling(state);
     std::vector<FragmentShaderLane> shader_lanes;
     if (texture_case) {
       if (!HasPoolHandle(state.fragment_shader_lanes))
@@ -77,7 +77,7 @@ void PdsEngine::Run() {
       throw std::runtime_error("PDS fragment work counts are inconsistent");
     }
 
-    const bool varying_case = UsesShaderVaryings(state.functional_case);
+    const bool varying_case = UsesShaderVaryings(state);
     std::vector<ParameterCoefficientSet> parameter_coefficients;
     if (varying_case) {
       const bool has_coefficients =
@@ -94,14 +94,13 @@ void PdsEngine::Run() {
           LoadArray<ShaderVaryingBinding>(pool_,
                                           state.shader_varying_bindings);
       const std::uint32_t varying_count =
-          VaryingVectorCount(state.functional_case);
+          VaryingVectorCount(state);
       if (varying_count == 0 || bindings.size() != varying_count) {
         throw std::runtime_error(
             "PDS varying linkage count is invalid");
       }
       for (std::size_t index = 0; index < bindings.size(); ++index) {
-        if (!IsExactVaryingBinding(state.functional_case, bindings[index],
-                                   index)) {
+        if (!IsExactVaryingBinding(state, bindings[index], index)) {
           throw std::runtime_error("PDS varying linkage is not exact");
         }
       }
@@ -145,9 +144,10 @@ void PdsEngine::Run() {
       const std::uint16_t expected_count =
           varying_case && parameter.rasterizable
               ? static_cast<std::uint16_t>(
-                    VaryingCoefficientSetCount(state.functional_case))
+                    VaryingCoefficientSetCount(state))
               : 0;
       if (parameter.coefficient_set_count != expected_count ||
+          !HasCanonicalDepthPlaneMetadata(state.functional_case, parameter) ||
           parameter.reserved[0] != 0 || parameter.reserved[1] != 0 ||
           parameter.reserved[2] != 0) {
         throw std::runtime_error(
@@ -168,7 +168,7 @@ void PdsEngine::Run() {
     std::vector<std::uint32_t> usc_coefficient_banks;
     tasks.reserve(quads.size());
     const std::uint32_t coefficient_dwords =
-        VaryingCoefficientDwordCount(state.functional_case);
+        VaryingCoefficientDwordCount(state);
     if (varying_case) {
       if (coefficient_dwords == 0 ||
           coefficient_dwords > std::numeric_limits<std::uint16_t>::max()) {

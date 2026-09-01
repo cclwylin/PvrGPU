@@ -23,7 +23,28 @@ namespace pvrgpu::stub {
 inline constexpr std::size_t kPcoVertexInputCount = 32;
 inline constexpr std::size_t kPcoVertexOutputCount = 64;
 inline constexpr std::size_t kPcoPixelOutputCount = 4;
-inline constexpr std::size_t kPcoTemporaryCount = 32;
+/* Public PCO programs may declare and address TEMP0..63.  Keep the execution
+ * file and its written-register bitmap at the same explicit 64-register ABI
+ * bound so valid high TEMP declarations do not fail before decode. */
+inline constexpr std::size_t kPcoTemporaryCount = 64;
+/* A combined image/sampler descriptor occupies one 20-dword public PDS/USC
+ * shared-register slot.  Descriptor count, sequential SMP count, and the
+ * transported shared-register span are independent bounds.  The captured
+ * terrain main draw transports 56 VS push DWORDs plus two descriptors (96
+ * total), and 64 FS push DWORDs plus five descriptors (164 total).  These are
+ * current public workload/transport gates, not Rogue hardware-file limits. */
+inline constexpr std::size_t kPcoTextureDescriptorDwordCount = 20;
+inline constexpr std::size_t kPcoMaximumTextureDescriptorSets = 5;
+/* Sequential SMP instructions are not descriptor sets.  The captured
+ * terrain post-process shaders issue as many as nine samples from one set,
+ * so continuation depth has its own strict program bound. */
+inline constexpr std::size_t kPcoMaximumTextureSampleInstructions = 9;
+inline constexpr std::size_t kPcoMaximumVertexSharedCount = 96;
+inline constexpr std::size_t kPcoMaximumFragmentSharedCount = 164;
+inline constexpr std::size_t kPcoMaximumSharedCount =
+    kPcoMaximumFragmentSharedCount;
+inline constexpr std::size_t kPcoConditionalsVertexSharedCount = 16;
+inline constexpr std::size_t kPcoConditionalsFragmentSharedCount = 4;
 inline constexpr std::size_t kPcoFillTexNearestCoefficientCount = 12;
 inline constexpr std::size_t kPcoFillTexNearestVertexSharedCount = 1;
 inline constexpr std::size_t kPcoFillTexNearestFragmentSharedCount = 20;
@@ -51,12 +72,31 @@ struct PcoRegisterRef {
   std::uint16_t index = 0;
 };
 
-/* Exact public PCO operations implemented by the first functional subset. */
+/* Public PCO semantic operations implemented by the functional ISS subset. */
 enum class PcoOpcode : std::uint8_t {
+  // Semantic operations emitted by the strict public conditionals profile.
+  // A compiler group can contain several internal phase operations; the
+  // decoded operation records their externally visible register effect.
+  kInternal,
   kMoveBypass,
+  kFloatNegate,
+  kFloatAbs,
+  kMoveImmediate,
+  kFragmentCoordinate,
+  kFloatFloor,
+  kFloatSubtract,
+  kFloatGreaterEqual,
+  kFloatEqual,
+  kFloatLess,
+  kConditionalSelect,
+  kConditionalSelectNegateTrue,
   kFloatAdd,
+  kFloatAddNegateSource0,
   kFloatMultiply,
   kFloatMad,
+  kFloatMadNegateSource2,
+  kFloatMadNegateSource0,
+  kFloatMadNegateSource0Source2,
   kFloatMin,
   kFloatMax,
   kReciprocal,
@@ -73,6 +113,7 @@ enum class PcoOpcode : std::uint8_t {
   kBitwiseAnd,
   kBitwiseOr,
   kBitwiseXor,
+  kBitwiseXnor,
   kFloatSine,
   kFloatCosine,
   kBufferLoad,
@@ -90,6 +131,15 @@ enum class PcoOpcode : std::uint8_t {
   kUvsWrite,
   kUvsWriteEmitEndTask,
   kUvsEmitEndTask,
+  /* Scalar PCO pck.f16f16/unpck.f16f16 operations.  These are distinct from
+   * the GLSL packHalf2x16/unpackHalf2x16 vector operations above: only the
+   * low 16-bit lane is transferred and one temporary is written. */
+  kFloatPackHalfRtne,
+  kFloatPackHalfRtz,
+  kFloatUnpackHalf,
+  /* Mesa fcsel_gt lowered as TST.F32.GZ + MOVC.  Keep this distinct from
+   * Boolean BCSEL: the condition is an ordered float comparison with +0. */
+  kConditionalSelectGreaterZero,
 };
 
 enum class PcoWriteTarget : std::uint8_t {
@@ -138,14 +188,29 @@ struct PcoInstruction {
   std::uint16_t output_index = 0;
   std::uint16_t branch_target_index = 0;
   std::uint32_t loop_count = 0;
+  // Raw binary32/integer payload for compiler-emitted immediate groups.
+  std::uint32_t immediate = 0;
   // FITRP uses component_count independently of the instruction-group repeat
-  // field: the exact gate-12 instruction interpolates four coefficient sets
-  // in one group, while its encoded group repeat remains one.
+  // field: one group interpolates one through four coefficient sets while its
+  // encoded group repeat remains one.
   std::uint8_t component_count = 1;
   std::uint8_t data_request = 0;
   PcoIterationMode iteration_mode = PcoIterationMode::kPixel;
   std::uint8_t perspective = 0;
   std::uint8_t saturate = 0;
+  // Public scalar ALU groups encode FLR as a modifier on source 0.  Keep it
+  // orthogonal to the base opcode so FADD and FMUL share the same exact
+  // decode/validation/execution contract.
+  std::uint8_t source0_floor = 0;
+  // The only public binary-source ABS modifiers currently admitted are
+  // FADD s0.abs and FMUL s1.abs.  Keep them explicit and orthogonal so other
+  // source/opcode combinations remain fail-closed.
+  std::uint8_t source0_absolute = 0;
+  std::uint8_t source1_absolute = 0;
+  // BCMP normally materializes canonical Boolean bits (all ones or zero).
+  // Mesa's PCK.ONE form instead materializes binary32 1.0 or 0.0; retain the
+  // distinction without inventing a second comparison opcode/histogram bin.
+  std::uint8_t comparison_result_float_one = 0;
   std::uint8_t source_count = 1;
   std::uint8_t repeat_count = 1;
   std::uint8_t end_group = 0;
@@ -173,24 +238,7 @@ struct PcoDecodedProgram {
   std::vector<PcoInstruction> instructions;
 };
 
-struct PcoVertexExecution {
-  std::array<std::uint32_t, kPcoVertexOutputCount> outputs{};
-  std::uint64_t written_mask = 0;
-  std::uint8_t emitted = 0;
-  std::uint8_t ended_task = 0;
-};
-
-/* Lane-local shared-register input used by the exact fill_tex_nearest VS.
- * SH0 is the raw IEEE-754 binary32 `scale` uniform supplied by the PDS/USC
- * shared-register ABI; the official GLBench draw writes 1.0f.
- */
-struct PcoVertexExecutionContext {
-  std::array<std::uint32_t, kPcoFillTexNearestVertexSharedCount>
-      shared_registers{};
-  std::uint8_t shared_count = 0;
-};
-
-/* One exact public SMP.2D.FCNORM request emitted by the fragment ISS. The
+/* One exact public SMP.2D.FCNORM request emitted by either shader-stage ISS. The
  * normalized coordinates and hardware texture/sampler state are the values
  * read by the decoded USC instruction, not a precomputed texel or case name.
  */
@@ -207,6 +255,56 @@ struct PcoTextureRequest {
   std::uint8_t data_request = 0;
 };
 
+/* Complete lane-local vertex state captured immediately after an SMP request.
+ * Vertex sampling resumes at the following WDF with one four-DWORD response.
+ * Inputs and shared registers are owned here because the resumed lane may run
+ * after its original PDS/USC work item has left the execution call stack.
+ */
+struct PcoVertexContinuation {
+  std::array<std::uint32_t, kPcoVertexInputCount> vertex_inputs{};
+  std::array<std::uint32_t, kPcoMaximumVertexSharedCount> shared_registers{};
+  std::array<std::uint32_t, kPcoTemporaryCount> temporaries{};
+  std::array<std::uint32_t, kPcoVertexOutputCount> outputs{};
+  std::uint64_t temporary_written_mask = 0;
+  std::uint64_t output_written_mask = 0;
+  std::uint32_t program_binary_size = 0;
+  std::uint32_t program_instruction_count = 0;
+  std::uint16_t resume_instruction_index = 0;
+  std::uint16_t pending_output_index = 0;
+  std::uint8_t pending_component_count = 0;
+  std::uint8_t data_request = 0;
+  std::uint8_t vertex_input_count = 0;
+  std::uint8_t shared_count = 0;
+  std::uint8_t emitted = 0;
+  std::uint8_t ended_task = 0;
+  std::uint8_t valid = 0;
+};
+
+struct PcoVertexExecution {
+  std::array<std::uint32_t, kPcoVertexOutputCount> outputs{};
+  PcoTextureRequest texture_request{};
+  PcoVertexContinuation continuation{};
+  std::uint64_t written_mask = 0;
+  std::uint32_t executed_instruction_count = 0;
+  std::uint8_t emitted = 0;
+  std::uint8_t ended_task = 0;
+  std::uint8_t texture_request_valid = 0;
+  std::uint8_t suspended = 0;
+};
+
+/* Lane-local shared-register input supplied by the PDS/USC ABI. The explicit
+ * shared_count keeps every access outside the producer-declared transport
+ * span fail-closed.  texture_response is accepted only with a valid saved
+ * continuation.
+ */
+struct PcoVertexExecutionContext {
+  std::array<std::uint32_t, kPcoMaximumSharedCount> shared_registers{};
+  std::array<std::uint32_t, kPcoPixelOutputCount> texture_response{};
+  PcoVertexContinuation continuation{};
+  std::uint8_t shared_count = 0;
+  std::uint8_t texture_response_valid = 0;
+};
+
 /* Lane-local USC state captured at the public SMP suspension point.  The
  * response path resumes at the following WDF; it must not replay FITRP, the
  * shared-register moves, or the SMP instruction.  This POD can therefore be
@@ -214,7 +312,7 @@ struct PcoTextureRequest {
  */
 struct PcoFragmentContinuation {
   std::array<std::uint32_t, kPcoTemporaryCount> temporaries{};
-  std::uint32_t temporary_written_mask = 0;
+  std::uint64_t temporary_written_mask = 0;
   std::uint32_t program_binary_size = 0;
   std::uint32_t program_instruction_count = 0;
   std::uint16_t resume_instruction_index = 0;
@@ -250,8 +348,7 @@ struct PcoFragmentExecutionContext {
       coefficients{};
   std::uint32_t sample_x = 0;
   std::uint32_t sample_y = 0;
-  std::array<std::uint32_t, kPcoFillTexNearestFragmentSharedCount>
-      shared_registers{};
+  std::array<std::uint32_t, kPcoMaximumSharedCount> shared_registers{};
   std::array<std::uint32_t, kPcoPixelOutputCount> texture_response{};
   PcoFragmentContinuation continuation{};
   std::uint8_t coefficient_count = 0;
@@ -283,6 +380,8 @@ const std::vector<std::uint8_t> &VaryingsEightVertexPcoBinary();
 const std::vector<std::uint8_t> &VaryingsEightFragmentPcoBinary();
 const std::vector<std::uint8_t> &FillTexNearestVertexPcoBinary();
 const std::vector<std::uint8_t> &FillTexNearestFragmentPcoBinary();
+const std::vector<std::uint8_t> &ConditionalsVertexPcoBinary();
+const std::vector<std::uint8_t> &ConditionalsFragmentPcoBinary();
 
 // Counts semantic groups when expand_repeats is false, or repeat-expanded
 // operations executed by one shader invocation when it is true.
@@ -290,7 +389,8 @@ PcoInstructionCounts
 CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
                      bool expand_repeats);
 
-/* Decode real PCO bytes and reject every encoding outside the exact subset. */
+/* Decode real PCO bytes and reject every encoding outside the modeled public
+ * subset, including malformed register ranges and non-canonical phase forms. */
 PcoDecodedProgram DecodePcoProgram(ShaderStage stage,
                                    const std::vector<std::uint8_t> &binary);
 
@@ -305,6 +405,11 @@ PcoVertexExecution ExecuteVertexPco(
     const std::vector<PcoInstruction> &instructions,
     const std::vector<std::uint32_t> &vertex_inputs,
     const PcoVertexExecutionContext &context);
+PcoVertexExecution ResumeVertexPco(
+    const PcoProgramSummary &summary,
+    const std::vector<PcoInstruction> &instructions,
+    const PcoVertexContinuation &continuation,
+    const std::array<std::uint32_t, kPcoPixelOutputCount> &texture_response);
 
 PcoFragmentExecution
 ExecuteFragmentPco(const PcoProgramSummary &summary,
@@ -340,6 +445,15 @@ inline PcoVertexExecution ExecuteVertex(
   return ExecuteVertexPco(summary, instructions, vertex_inputs, context);
 }
 
+inline PcoVertexExecution ResumeVertex(
+    const PcoProgramSummary &summary,
+    const std::vector<PcoInstruction> &instructions,
+    const PcoVertexContinuation &continuation,
+    const std::array<std::uint32_t, kPcoPixelOutputCount> &texture_response) {
+  return ResumeVertexPco(summary, instructions, continuation,
+                         texture_response);
+}
+
 inline PcoFragmentExecution
 ExecuteFragment(const PcoProgramSummary &summary,
                 const std::vector<PcoInstruction> &instructions) {
@@ -366,9 +480,10 @@ static_assert(std::is_trivially_copyable_v<PcoRegisterRef>);
 static_assert(std::is_trivially_copyable_v<PcoInstruction>);
 static_assert(std::is_trivially_copyable_v<PcoInstructionCounts>);
 static_assert(std::is_trivially_copyable_v<PcoProgramSummary>);
+static_assert(std::is_trivially_copyable_v<PcoTextureRequest>);
+static_assert(std::is_trivially_copyable_v<PcoVertexContinuation>);
 static_assert(std::is_trivially_copyable_v<PcoVertexExecution>);
 static_assert(std::is_trivially_copyable_v<PcoVertexExecutionContext>);
-static_assert(std::is_trivially_copyable_v<PcoTextureRequest>);
 static_assert(std::is_trivially_copyable_v<PcoFragmentContinuation>);
 static_assert(std::is_trivially_copyable_v<PcoFragmentExecution>);
 static_assert(std::is_trivially_copyable_v<PcoFragmentExecutionContext>);

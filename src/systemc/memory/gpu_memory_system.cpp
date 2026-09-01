@@ -93,6 +93,7 @@ void GpuMemorySystem::ValidateClient(MemoryClient client) {
   case MemoryClient::kParameterWrite:
   case MemoryClient::kParameterRead:
   case MemoryClient::kFramebufferReadback:
+  case MemoryClient::kTextureMipmap:
     return;
   case MemoryClient::kMixedCache:
   case MemoryClient::kUscL2:

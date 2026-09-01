@@ -1,7 +1,7 @@
 // Module：ParameterBuffer。
 // 縮寫：非縮寫（參數緩衝區）。
 // 功能：為任意數量 RasterTriangle 建立 24.8-style fixed-point top-left
-// edge equations、depth interpolation 與 bounding box（邊界框）。
+// coverage equations、bounding box，以及 driver-PCO 的 binary32 depth plane。
 // Zero-area 與 face-culled setup candidate 保留同 index placeholder 但跳過
 // equation，確保
 // TilePrimitiveRef.parameter_index identity 不被 compact。由 bounded FIFO

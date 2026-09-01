@@ -26,7 +26,8 @@ public:
   sc_core::sc_fifo_out<PipelineTxn> output{"output"};
 
   Submitter(sc_core::sc_module_name name, MemoryPool &pool,
-            const Options &options, GpuMemorySystem *memory = nullptr);
+            const Options &options, GpuMemorySystem *memory = nullptr,
+            sc_core::sc_event *sequence_completion = nullptr);
 
   std::uint64_t fifo_stalls() const { return fifo_stalls_; }
 
@@ -36,6 +37,7 @@ private:
   MemoryPool &pool_;
   Options options_;
   GpuMemorySystem *memory_ = nullptr;
+  sc_core::sc_event *sequence_completion_ = nullptr;
   std::uint64_t fifo_stalls_ = 0;
 };
 

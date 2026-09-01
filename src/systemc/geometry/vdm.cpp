@@ -133,10 +133,27 @@ void Vdm::Run() {
         ValidateVertexInputState(pool_, state, memory_);
     MemoryAccessStats memory_stats;
 
+    const bool driver_pco_triangles =
+        IsDriverPcoTrianglesCase(state.functional_case);
     if (IsFillSolidFamily(state.functional_case) ||
-        IsTextureFamily(state.functional_case)) {
-      if (state.draw.topology != PrimitiveTopology::kTriangleStrip ||
-          state.draw.first_vertex != 0 || state.draw.vertex_count != 4 ||
+        IsTextureFamily(state.functional_case) || driver_pco_triangles) {
+      const bool driver_textured_triangles =
+          state.functional_case == FunctionalCase::kDriverTexturedTriangles;
+      const PrimitiveTopology expected_topology =
+          driver_textured_triangles ? PrimitiveTopology::kTriangleList
+                                    : PrimitiveTopology::kTriangleStrip;
+      const std::uint32_t expected_vertex_count =
+          driver_textured_triangles ? 6U : 4U;
+      const bool direct_geometry_invalid =
+          driver_pco_triangles
+              ? state.draw.topology != PrimitiveTopology::kTriangleList ||
+                    state.draw.vertex_count == 0 ||
+                    state.draw.vertex_count % 3 != 0 ||
+                    state.primitive_restart_enable != 0
+              : state.draw.topology != expected_topology ||
+                    state.draw.first_vertex != 0 ||
+                    state.draw.vertex_count != expected_vertex_count;
+      if (direct_geometry_invalid ||
           state.draw.first_index != 0 || state.draw.index_count != 0 ||
           state.draw.base_vertex != 0 ||
           state.draw.index_format != IndexFormat::kNone ||
@@ -144,16 +161,16 @@ void Vdm::Run() {
           state.index_buffer_gpu_address != 0 ||
           state.index_buffer_bytes != 0) {
         throw std::runtime_error(
-            "VDM Fill.Solid requires non-indexed TRIANGLE_STRIP first=0 "
-            "count=4");
+            "VDM direct raster draw has unsupported topology or range");
       }
       const std::uint64_t vertex_end =
           static_cast<std::uint64_t>(state.draw.first_vertex) +
           state.draw.vertex_count;
       if (vertex_end > vertex_capacity)
-        throw std::runtime_error("VDM Fill.Solid vertex range exceeds its VBO");
+        throw std::runtime_error("VDM direct vertex range exceeds its VBO");
       state.counters.ia_vertices = state.draw.vertex_count;
-      state.counters.ia_primitives = 2;
+      state.counters.ia_primitives =
+          driver_pco_triangles ? state.draw.vertex_count / 3U : 2U;
     } else {
       if (!IsIndexedTriangleRasterCase(state.functional_case) ||
           (state.draw.topology != PrimitiveTopology::kTriangleList &&

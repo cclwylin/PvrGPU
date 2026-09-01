@@ -55,6 +55,29 @@
 
 namespace pvrgpu::stub {
 
+namespace {
+
+bool IsIdeasPcoSequenceCommand(const DriverCommand &command) {
+  const std::string &name = command.test_case;
+  return command.command == "draw_pco_triangles" &&
+         (name == "ideas" || name.rfind("ideas.", 0) == 0 ||
+          name.find(".ideas.") != std::string::npos);
+}
+
+bool IdeasDepthStateMatchesOrdinal(const DriverCommand &command,
+                                   std::size_t ordinal) {
+  const bool depth_enabled =
+      ordinal >= kDriverPcoIdeasDepthEnabledFirstCommand &&
+      ordinal < kDriverPcoIdeasDepthEnabledEndCommand;
+  return command.depth_clear_bits == UINT32_C(0x3f800000) &&
+         command.depth_format != 0 &&
+         command.depth_enable == (depth_enabled ? 1U : 0U) &&
+         command.depth_write == (depth_enabled ? 1U : 0U) &&
+         command.depth_func == (depth_enabled ? 3U : 0U);
+}
+
+}  // namespace
+
 bool ConfigureDriverCommandOptions(Options *options, std::string *error) {
   if (!options || !error)
     return false;
@@ -70,6 +93,58 @@ bool ConfigureDriverCommandOptions(Options *options, std::string *error) {
     *error = "driver command is not populated";
     return false;
   }
+  if (!options->driver_commands.empty()) {
+    const bool ideas = IsIdeasPcoSequenceCommand(options->driver_command);
+    const bool generic =
+        options->driver_command.command == "draw_pco_sequence";
+    if ((!ideas && !generic) ||
+        options->driver_commands.size() >
+            kDriverPcoMaximumSequenceCommands ||
+        (ideas &&
+         (options->driver_commands.size() !=
+              kDriverPcoIdeasSequenceCommands ||
+          options->driver_command.draw_count !=
+              options->driver_commands.size())) ||
+        (generic &&
+         (options->driver_commands.empty() ||
+          options->driver_commands.size() >
+              kDriverPcoMaximumNestedSequenceCommands))) {
+      *error = "driver PCO command sequence metadata is invalid";
+      return false;
+    }
+    for (std::size_t ordinal = 0;
+         ordinal < options->driver_commands.size(); ++ordinal) {
+      const DriverCommand &command = options->driver_commands[ordinal];
+      if (!command.enabled || command.command != "draw_pco_triangles" ||
+          command.test_case != options->driver_command.test_case ||
+          command.format != options->driver_command.format ||
+          (ideas &&
+           (command.framebuffer_width !=
+                options->driver_command.framebuffer_width ||
+            command.framebuffer_height !=
+                options->driver_command.framebuffer_height ||
+            command.width != options->driver_command.width ||
+            command.height != options->driver_command.height ||
+            command.clear_color_bits !=
+                options->driver_command.clear_color_bits ||
+            !IdeasDepthStateMatchesOrdinal(command, ordinal)))) {
+        *error = "driver PCO command sequence members are incompatible";
+        return false;
+      }
+    }
+    if (generic &&
+        (options->driver_commands.back().framebuffer_width !=
+             options->driver_command.framebuffer_width ||
+         options->driver_commands.back().framebuffer_height !=
+             options->driver_command.framebuffer_height ||
+         options->driver_commands.back().width !=
+             options->driver_command.width ||
+         options->driver_commands.back().height !=
+             options->driver_command.height)) {
+      *error = "driver PCO sequence final target is incompatible";
+      return false;
+    }
+  }
 
   options->frames = 1;
   if (options->driver_command.command == "draw_triangle") {
@@ -80,6 +155,15 @@ bool ConfigureDriverCommandOptions(Options *options, std::string *error) {
     options->width = options->driver_command.framebuffer_width;
     options->height = options->driver_command.framebuffer_height;
     options->test_case = "driver_indexed_quad";
+  } else if (options->driver_command.command == "draw_textured_triangles") {
+    options->width = options->driver_command.framebuffer_width;
+    options->height = options->driver_command.framebuffer_height;
+    options->test_case = "driver_textured_triangles";
+  } else if (options->driver_command.command == "draw_pco_triangles" ||
+             options->driver_command.command == "draw_pco_sequence") {
+    options->width = options->driver_command.framebuffer_width;
+    options->height = options->driver_command.framebuffer_height;
+    options->test_case = "driver_pco_triangles";
   } else if (options->driver_command.command == "draw_primitive_sequence") {
     options->width = options->driver_command.width;
     options->height = options->driver_command.height;
@@ -173,6 +257,7 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options) {
                  "fill_tex_trilinear_linear_04, "
                  "fill_tex_trilinear_linear_05, driver_clear_color, "
                  "driver_triangle_solid, driver_indexed_quad, "
+                 "driver_textured_triangles, driver_pco_triangles, "
                  "draw_primitive_sequence)\n";
     return 2;
   }
@@ -182,6 +267,13 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options) {
       functional_case == FunctionalCase::kDriverTriangleSolid;
   const bool is_driver_indexed_quad =
       functional_case == FunctionalCase::kDriverIndexedQuad;
+  const bool is_driver_textured_triangles =
+      functional_case == FunctionalCase::kDriverTexturedTriangles;
+  const bool is_driver_pco_triangles =
+      functional_case == FunctionalCase::kDriverPcoTriangles;
+  const bool is_driver_pco_varying =
+      is_driver_pco_triangles &&
+      options.driver_command.varying_output_count != 0;
   const bool is_driver_primitive_sequence =
       options.driver_command.enabled &&
       options.driver_command.command == "draw_primitive_sequence";
@@ -213,6 +305,10 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options) {
       options.driver_command.enabled
           ? (is_driver_indexed_quad
                  ? "pvrgpu-driver-draw-indexed-quad-phase7"
+                 : is_driver_pco_triangles
+                    ? "pvrgpu-driver-draw-pco-triangles"
+                 : is_driver_textured_triangles
+                    ? "pvrgpu-driver-draw-textured-triangles-phase10"
                  : is_driver_triangle
                     ? "pvrgpu-driver-draw-triangle-phase2"
                     : is_driver_primitive_sequence
@@ -273,12 +369,50 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options) {
               << command.framebuffer_width
               << ",\"driver_command_framebuffer_height\":"
               << command.framebuffer_height;
+    if (command.command == "draw_textured_triangles") {
+      std::cout << ",\"driver_texture_width\":" << command.texture_width
+                << ",\"driver_texture_height\":" << command.texture_height;
+    } else if (command.command == "draw_pco_triangles") {
+      std::cout << ",\"driver_first_vertex\":" << command.first_vertex
+                << ",\"driver_vertex_count\":" << command.vertex_count
+                << ",\"driver_vertex_stride\":" << command.vertex_stride
+                << ",\"driver_vertex_pco_bytes\":"
+                << command.vertex_pco.size()
+                << ",\"driver_fragment_pco_bytes\":"
+                << command.fragment_pco.size()
+                << ",\"driver_varying_output_start\":"
+                << command.varying_output_start
+                << ",\"driver_varying_output_count\":"
+                << command.varying_output_count
+                << ",\"driver_fragment_varying_start\":"
+                << command.fragment_varying_start
+                << ",\"driver_fragment_varying_count\":"
+                << command.fragment_varying_count;
+      if (!options.driver_commands.empty()) {
+        std::cout << ",\"driver_command_sequence_length\":"
+                  << options.driver_commands.size();
+      }
+    } else if (command.command == "draw_pco_sequence") {
+      std::uint64_t resource_count = 0;
+      for (const pvrgpu::stub::DriverCommand &physical :
+           options.driver_commands) {
+        resource_count += physical.sampled_textures.size();
+      }
+      std::cout << ",\"driver_command_sequence_length\":"
+                << options.driver_commands.size()
+                << ",\"driver_command_sequence_resources\":"
+                << resource_count;
+    }
   } else {
     std::cout << ",\"command_source\":\"builtin-glbench-fixture\"";
   }
   std::cout << ",\"shader_binary\":\"mesa-pco-public-encoding\""
             << ",\"pco_subset\":\""
-            << (is_texture
+            << (is_driver_pco_varying
+                    ? "driver-pco-dynamic-smooth-varying"
+                    : is_driver_pco_triangles
+                    ? "conditionals-public-pco"
+                    : is_texture
                     ? "fmul-fitrp-wdf-smp-mbyp-uvsw-texture"
                     : is_varyings_multi
                     ? "fmul-fitrp-wdf-fadd-mbyp-uvsw-varying"
@@ -355,9 +489,16 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options) {
             << (is_blended ? "false" : "true")
             << ",\"face_cull_state\":{"
             << "\"enabled\":"
-            << (RequiresBackCcwFaceCull(functional_case) ? "true" : "false")
+              << ((RequiresBackCcwFaceCull(functional_case) ||
+                   is_driver_textured_triangles || is_driver_pco_triangles)
+                    ? "true"
+                    : "false")
             << ",\"mode\":\"back\""
-            << ",\"front_face\":\"counter-clockwise\"}"
+            << ",\"front_face\":\""
+              << ((is_driver_textured_triangles || is_driver_pco_triangles)
+                      ? "clockwise"
+                      : "counter-clockwise")
+            << "\"}"
             << ",\"tile_width\":" << pvrgpu::stub::kReferenceUarch.tile_width
             << ",\"tile_height\":" << pvrgpu::stub::kReferenceUarch.tile_height
             << ",\"warning\":\"";
@@ -372,6 +513,34 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options) {
              "metadata; assumed "
              "uncalibrated uArch timing; framebuffer published only from DRAM "
              "readback";
+    } else if (options.driver_command.command == "draw_pco_triangles" ||
+               options.driver_command.command == "draw_pco_sequence") {
+      if (!options.driver_commands.empty()) {
+        std::cout
+            << "Ordered native driver-command PCO sequence; every owned "
+               "draw executes through VertexFetch and the USC ISS, and the "
+               "logical report aggregates physical DrawList evidence; "
+               "assumed uncalibrated uArch timing; final-subdraw framebuffer "
+               "published only from DRAM readback";
+      } else {
+      std::cout
+          << "Driver-command non-indexed triangle-list path; the raw float3 "
+             "position or interleaved float3 position/normal VBO, real Mesa "
+             "PCO VS/FS binaries, dynamic stage ABI/shared registers, and "
+             "generic smooth-varying linkage were synchronously copied from "
+             "the Gallium API v6 submission and execute through VertexFetch "
+             "and the USC ISS; "
+             "assumed uncalibrated uArch timing; framebuffer published only "
+             "from DRAM readback";
+      }
+    } else if (options.driver_command.command == "draw_textured_triangles") {
+      std::cout
+          << "Driver-command textured triangle-list path; six non-indexed "
+             "position/texcoord occurrences and an exact RGBA8 sidecar are "
+             "consumed by the public fill_tex_nearest PCO VS/FS through a "
+             "single-mip normalized clamp-to-edge sampler; assumed "
+             "uncalibrated uArch timing; framebuffer published only from "
+             "DRAM readback";
     } else if (options.driver_command.command == "draw_triangle") {
       std::cout
           << "Phase2 driver-command draw-triangle path; command is generated "
@@ -447,6 +616,10 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options) {
                                                        fifo_depth);
   sc_core::sc_fifo<PipelineTxn> vertex_slot_to_cluster("vertex_slot_to_cluster",
                                                        fifo_depth);
+  sc_core::sc_fifo<PipelineTxn> vertex_cluster_to_texture_samples(
+      "vertex_cluster_to_texture_samples", fifo_depth);
+  sc_core::sc_fifo<PipelineTxn> texture_samples_to_vertex_cluster(
+      "texture_samples_to_vertex_cluster", fifo_depth);
   sc_core::sc_fifo<PipelineTxn> vertex_cluster_to_clip("vertex_cluster_to_clip",
                                                        fifo_depth);
   sc_core::sc_fifo<PipelineTxn> clip_to_tiler("clip_to_tiler", fifo_depth);
@@ -487,7 +660,9 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options) {
   sc_core::sc_fifo<MemoryTxn> idle_usc_l2_output("idle_usc_l2_output",
                                                  fifo_depth);
 
-  Submitter submitter("submitter", pool, options, &memory);
+  sc_core::sc_event sequence_completion;
+  Submitter submitter("submitter", pool, options, &memory,
+                      &sequence_completion);
   Vdm vdm("vdm", pool, &memory);
   VertexFetch vertex_fetch("vertex_fetch", pool, &memory);
   PcoDecoder vertex_decoder("vertex_pco_decoder", pool, ShaderStage::kVertex);
@@ -509,7 +684,8 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options) {
   TextureUnit texture_unit("texture_unit", pool, &memory);
   Pbe pbe("pbe", pool);
   PbeWriteBack pbe_write_back("pbe_write_back", pool, &memory);
-  JsonReporter reporter("json_reporter", options, pool);
+  JsonReporter reporter("json_reporter", options, pool,
+                        &sequence_completion);
 
   mixed_cache.input(idle_mcu_input);
   mixed_cache.output(idle_mcu_output);
@@ -530,6 +706,8 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options) {
   vertex_slot.input(vertex_decoder_to_slot);
   vertex_slot.output(vertex_slot_to_cluster);
   vertex_cluster.input(vertex_slot_to_cluster);
+  vertex_cluster.texture_request_output(vertex_cluster_to_texture_samples);
+  vertex_cluster.texture_response_input(texture_samples_to_vertex_cluster);
   vertex_cluster.output(vertex_cluster_to_clip);
   clip_cull.input(vertex_cluster_to_clip);
   clip_cull.output(clip_to_tiler);
@@ -557,6 +735,8 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options) {
   fragment_cluster.output(fragment_cluster_to_texture);
   texture_unit.sample_input(fragment_cluster_to_texture_samples);
   texture_unit.sample_output(texture_samples_to_fragment_cluster);
+  texture_unit.vertex_sample_input(vertex_cluster_to_texture_samples);
+  texture_unit.vertex_sample_output(texture_samples_to_vertex_cluster);
   texture_unit.input(fragment_cluster_to_texture);
   texture_unit.output(texture_to_pbe);
   pbe.input(texture_to_pbe);

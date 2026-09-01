@@ -1,0 +1,27 @@
+diff --git a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -96,6 +96,8 @@ if with_gallium_freedreno or with_freedreno_vk or with_tools.contains('freedre
+   subdir('freedreno')
+ endif
+-if with_imagination_vk or with_tools.contains('imagination')
++if with_imagination_vk or \
++   with_gallium_pvrgpu or \
++   with_tools.contains('imagination')
+   subdir('imagination')
+ endif
+ if with_any_intel
+diff --git a/src/imagination/meson.build b/src/imagination/meson.build
+--- a/src/imagination/meson.build
++++ b/src/imagination/meson.build
+@@ -11,7 +11,9 @@ inc_imagination = include_directories([
+   'include',
+ ])
+
+-if with_imagination_vk or with_tools.contains('imagination')
++if with_imagination_vk or \
++   with_gallium_pvrgpu or \
++   with_tools.contains('imagination')
+   subdir('common')
+   subdir('csbgen')
+   subdir('pco')

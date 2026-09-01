@@ -1,0 +1,7 @@
+name=VK-GL-CTS / dEQP
+url=https://github.com/KhronosGroup/VK-GL-CTS
+commit=067e8832315e79817ede1c4863804e440f5d1c80
+target=nullws
+packages=deqp-egl-package;deqp-gles2-package;deqp-gles3-package;deqp-gles31-package
+integration=external checkout and build tree; packages are linked into pvrgpu-deqp and test data is copied beside the executable
+license=Apache-2.0

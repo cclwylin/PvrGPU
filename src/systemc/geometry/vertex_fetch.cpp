@@ -408,14 +408,33 @@ void VertexFetch::Run() {
         LoadVertexInputState(pool_, state, memory_, &memory_stats);
 
     std::vector<VertexLane> lanes;
+    const bool driver_pco_triangles =
+        IsDriverPcoTrianglesCase(state.functional_case);
     if (IsFillSolidFamily(state.functional_case) ||
-        IsTextureFamily(state.functional_case)) {
-      if (state.draw.vertex_count != 4 ||
+        IsTextureFamily(state.functional_case) || driver_pco_triangles) {
+      const std::uint32_t expected_vertex_count =
+          state.functional_case == FunctionalCase::kDriverTexturedTriangles
+              ? 6U
+              : 4U;
+      const bool direct_geometry_invalid =
+          driver_pco_triangles
+              ? state.draw.topology != PrimitiveTopology::kTriangleList ||
+                    state.draw.vertex_count == 0 ||
+                    state.draw.vertex_count % 3 != 0 ||
+                    state.primitive_restart_enable != 0
+              : state.draw.vertex_count != expected_vertex_count;
+      if (direct_geometry_invalid || state.draw.first_index != 0 ||
+          state.draw.index_count != 0 || state.draw.base_vertex != 0 ||
           state.draw.index_format != IndexFormat::kNone ||
-          HasPoolHandle(state.vertex_indices)) {
+          HasPoolHandle(state.vertex_indices) ||
+          state.index_buffer_gpu_address != 0 ||
+          state.index_buffer_bytes != 0) {
         throw std::runtime_error(
-            "VertexFetch Fill.Solid requires four non-indexed vertices");
+            "VertexFetch direct raster draw has an invalid vertex range");
       }
+      std::vector<VertexLaneRef> lane_refs;
+      if (driver_pco_triangles)
+        lane_refs.reserve(state.draw.vertex_count);
       lanes.reserve(state.draw.vertex_count);
       for (std::uint32_t vertex = 0; vertex < state.draw.vertex_count;
            ++vertex) {
@@ -423,9 +442,16 @@ void VertexFetch::Run() {
             static_cast<std::uint64_t>(state.draw.first_vertex) + vertex;
         if (resolved > std::numeric_limits<std::uint32_t>::max())
           throw std::overflow_error("VertexFetch vertex index exceeds uint32");
-        lanes.push_back(
-            MakeLane(static_cast<std::uint32_t>(resolved), vertex_input));
+        const std::uint32_t vertex_index =
+            static_cast<std::uint32_t>(resolved);
+        const std::uint32_t lane_index =
+            static_cast<std::uint32_t>(lanes.size());
+        lanes.push_back(MakeLane(vertex_index, vertex_input));
+        if (driver_pco_triangles)
+          lane_refs.push_back({lane_index, vertex_index});
       }
+      if (driver_pco_triangles)
+        state.vertex_lane_refs = StoreNewArray(pool_, lane_refs);
     } else if (IsIndexedTriangleRasterCase(state.functional_case)) {
       if ((state.draw.topology != PrimitiveTopology::kTriangleList &&
            state.draw.topology != PrimitiveTopology::kTriangleStrip &&

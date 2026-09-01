@@ -11,8 +11,10 @@
 #include "common/pipeline_state.h"
 #include "shader/pco_iss.h"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace pvrgpu::stub {
@@ -27,7 +29,9 @@ void PcoDecoder::Run() {
   while (true) {
     const PipelineTxn txn = input.read();
     PipelineState state = LoadPipelineState(pool_, txn.state);
-    const bool varying_case = UsesShaderVaryings(state.functional_case);
+    const bool varying_case = UsesShaderVaryings(state);
+    const bool driver_pco_triangles =
+        IsDriverPcoTrianglesCase(state.functional_case);
     if (!IsSolidColorRasterCase(state.functional_case) && !varying_case)
       throw std::runtime_error("PCO decoder received an unsupported case");
 
@@ -63,6 +67,8 @@ void PcoDecoder::Run() {
           LoadArray<VertexAttributeBinding>(pool_,
                                             state.vertex_attribute_bindings);
       std::uint32_t available_vertex_inputs = 0;
+      std::uint32_t driver_readable_vertex_inputs = 0;
+      std::uint32_t declared_vertex_input_count = 0;
       for (const VertexAttributeBinding &binding : bindings) {
         const std::size_t first = binding.destination_register;
         const std::size_t count = binding.destination_components;
@@ -75,10 +81,33 @@ void PcoDecoder::Run() {
           available_vertex_inputs |= static_cast<std::uint32_t>(
               UINT32_C(1) << (first + component));
         }
+        if (driver_pco_triangles) {
+          if (binding.source_components == 0 ||
+              binding.source_components > binding.destination_components) {
+            throw std::runtime_error(
+                "driver PCO attribute has an invalid source width");
+          }
+          for (std::size_t component = 0;
+               component < binding.source_components; ++component) {
+            driver_readable_vertex_inputs |= static_cast<std::uint32_t>(
+                UINT32_C(1) << (first + component));
+          }
+          declared_vertex_input_count = std::max(
+              declared_vertex_input_count,
+              static_cast<std::uint32_t>(first + count));
+        }
       }
       if ((decoded.summary.vertex_input_mask & ~available_vertex_inputs) != 0) {
         throw std::runtime_error(
             "vertex PCO reads VTXIN registers absent from attribute bindings");
+      }
+      if (driver_pco_triangles &&
+          (decoded.summary.vertex_input_mask != driver_readable_vertex_inputs ||
+           (state.vertex_pco_abi.vertex_inputs != 0 &&
+            state.vertex_pco_abi.vertex_inputs !=
+                declared_vertex_input_count))) {
+        throw std::runtime_error(
+            "driver PCO vertex-input mask does not match attribute bindings");
       }
     }
 
@@ -103,19 +132,50 @@ void PcoDecoder::Run() {
     shader_stats.program_recorded = 1;
 
     if (stage_ == ShaderStage::kVertex) {
-      const std::uint32_t expected_output_count =
-          varying_case
-              ? VaryingVertexOutputDwordCount(state.functional_case)
-              : 4;
+      std::uint32_t expected_output_count = 4;
+      if (driver_pco_triangles) {
+        if (state.position_output_start != 0 ||
+            state.position_output_count == 0 ||
+            state.position_output_count >= 64 ||
+            (state.varying_output_count != 0 &&
+             (state.varying_output_start != state.position_output_count ||
+              state.varying_output_count >=
+                  64 - state.varying_output_start))) {
+          throw std::runtime_error(
+              "driver PCO vertex-output linkage is invalid");
+        }
+        expected_output_count = state.position_output_count;
+        if (state.varying_output_count != 0) {
+          expected_output_count =
+              state.varying_output_start + state.varying_output_count;
+        }
+      } else if (varying_case) {
+        expected_output_count = VaryingVertexOutputDwordCount(state);
+      }
       if (expected_output_count == 0 || expected_output_count >= 64)
         throw std::runtime_error(
             "vertex PCO expected VTXOUT range is invalid");
       const std::uint64_t expected_output_mask =
           (UINT64_C(1) << expected_output_count) - 1;
-      if (decoded.summary.vertex_output_mask != expected_output_mask ||
+      const std::uint64_t required_position_mask =
+          driver_pco_triangles
+              ? (UINT64_C(1) << state.position_output_count) - 1
+              : expected_output_mask;
+      if ((decoded.summary.vertex_output_mask & required_position_mask) !=
+              required_position_mask ||
+          (decoded.summary.vertex_output_mask & ~expected_output_mask) != 0 ||
+          (driver_pco_triangles && state.vertex_pco_abi.vertex_outputs != 0 &&
+           state.vertex_pco_abi.vertex_outputs != expected_output_count) ||
           !decoded.summary.ends_task) {
         throw std::runtime_error(
-            "vertex PCO output mask does not match shader linkage");
+            "vertex PCO output mask does not match shader linkage: decoded=" +
+            std::to_string(decoded.summary.vertex_output_mask) +
+            " required_position=" +
+            std::to_string(required_position_mask) +
+            " declared=" + std::to_string(expected_output_mask) +
+            " abi_outputs=" +
+            std::to_string(state.vertex_pco_abi.vertex_outputs) +
+            " ends_task=" + std::to_string(decoded.summary.ends_task));
       }
       state.vertex_program_summary = decoded.summary;
       state.vertex_instructions = StoreNewArray(pool_, decoded.instructions);

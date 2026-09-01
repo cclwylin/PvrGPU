@@ -167,6 +167,7 @@ class NativeMesaIntegrationTests(unittest.TestCase):
 
         self.assertIn('options.case_name.rfind("dEQP-GLES32.", 0)', runner)
         self.assertIn('options.case_name.rfind("dEQP-GLES31.", 0)', runner)
+        self.assertIn('std::string gles = "3.1"', runner)
         self.assertIn('config.Get("PVRGPU_MESA_GLES_VERSION_OVERRIDE")', runner)
         self.assertIn('config.Path("PVRGPU_MESA_PVRGPU_PREFIX"', runner)
         self.assertIn('config.Path("PVRGPU_MODEL_STUB"', runner)
@@ -200,7 +201,13 @@ class NativeMesaIntegrationTests(unittest.TestCase):
 
     def test_mesa_driver_seam_owns_the_previous_smoke_contracts(self) -> None:
         meson = read_text(DRIVER_ROOT / "meson.build")
-        listed_sources = set(re.findall(r"'([^']+\.c)'", meson))
+        # The Meson file also declares native tests under tests/.  This check
+        # owns only the production driver translation units in DRIVER_ROOT.
+        listed_sources = {
+            source
+            for source in re.findall(r"'([^']+\.c)'", meson)
+            if "/" not in source
+        }
         actual_sources = {path.name for path in DRIVER_ROOT.glob("*.c")}
         self.assertEqual(actual_sources, listed_sources)
         self.assertIn("driver_pvrgpu = declare_dependency", meson)
@@ -259,7 +266,8 @@ class NativeMesaIntegrationTests(unittest.TestCase):
     def test_python_frontends_point_to_native_build_outputs(self) -> None:
         report_worker = read_text(PROJECT_ROOT / "tools" / "rdc_counter_report.py")
         deqp_worker = read_text(PROJECT_ROOT / "tools" / "deqp_capture_report.py")
-        ui = read_text(PROJECT_ROOT / "tools" / "rdc_counter_ui.py")
+        ui_path = PROJECT_ROOT / "tools" / "rdc_counter_ui.py"
+        ui = read_text(ui_path)
 
         for worker in (report_worker, deqp_worker):
             self.assertIn('os.environ.get("PVRGPU_BUILD_DIR"', worker)
@@ -273,8 +281,24 @@ class NativeMesaIntegrationTests(unittest.TestCase):
         self.assertIn('os.environ.get("PVRGPU_BUILD_DIR"', ui)
         self.assertIn('f"llvmpipe{NATIVE_EXECUTABLE_SUFFIX}"', ui)
         self.assertIn('f"pvrgpu{NATIVE_EXECUTABLE_SUFFIX}"', ui)
+        self.assertTrue(ui_path.stat().st_mode & 0o111)
+        self.assertIn('os.environ.get("PVRGPU_UI_PYTHON"', ui)
         for source in (read_text(CMAKE_FILE), report_worker, deqp_worker, ui):
             self.assertNotIn("/bin/bash", source)
+
+    def test_native_runner_fails_closed_on_unsupported_draws_and_bad_png_extent(self) -> None:
+        runner = read_text(RUNNER_MAIN)
+        self.assertIn('CountDriverEvents(driver_counter_text, "unsupported_draw")', runner)
+        self.assertIn("unsupported draw event(s) across replay passes", runner)
+        self.assertIn("a later framebuffer blit as the workload result", runner)
+        self.assertIn("ReadPngExtent(source_frame", runner)
+        self.assertIn("PvrGPU model framebuffer extent mismatch", runner)
+        self.assertIn("source_frame.empty() && !explicit_no_color_output", runner)
+        self.assertIn("selected replay range has no color output", runner)
+        self.assertIn("did not emit a framebuffer PNG", runner)
+        self.assertIn("const bool bridge_started", runner)
+        self.assertIn("!bridge_completed && !bridge_started", runner)
+        self.assertIn("Preserve the native JSONL", runner)
 
 
 if __name__ == "__main__":

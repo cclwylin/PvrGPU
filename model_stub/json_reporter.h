@@ -13,12 +13,26 @@
 
 namespace pvrgpu::stub {
 
+// Stage-aware evidence classification is deliberately narrower than the
+// decoder's opcode enum.  Native Terrain vertex shaders use ordinary SMP
+// followed by WDF; explicit-LOD texture forms and fragment interpolation must
+// remain rejected until their vertex-stage public contracts are implemented.
+enum class VertexPcoTextureEvidenceClass : std::uint8_t {
+  kUnsupported = 0,
+  kTextureSample,
+  kWaitDataFence,
+};
+
+VertexPcoTextureEvidenceClass
+ClassifyVertexPcoTextureEvidenceOpcode(PcoOpcode opcode);
+
 class JsonReporter final : public sc_core::sc_module {
 public:
   sc_core::sc_fifo_in<PipelineTxn> input{"input"};
 
   JsonReporter(sc_core::sc_module_name name, const Options &options,
-               MemoryPool &pool);
+               MemoryPool &pool,
+               sc_core::sc_event *sequence_completion = nullptr);
 
   bool failed() const { return failed_; }
 
@@ -27,6 +41,7 @@ private:
 
   Options options_;
   MemoryPool &pool_;
+  sc_core::sc_event *sequence_completion_ = nullptr;
   bool failed_ = false;
 };
 

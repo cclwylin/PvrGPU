@@ -14,6 +14,13 @@
 
 namespace pvrgpu::stub {
 
+// Validates the public shared-register layout used by a stage's combined
+// image/sampler descriptor prefix and optional push-constant suffix.  Mesa
+// may represent an empty suffix either as the legacy {start=0,count=0} pair or
+// as the canonical empty range at the end of the descriptor prefix.
+bool DriverPcoTextureSharedLayoutSupported(
+    const DriverPcoStageAbi &abi, std::uint32_t descriptor_set_count);
+
 class UscCluster final : public sc_core::sc_module {
 public:
   sc_core::sc_fifo_in<PipelineTxn> input{"input"};

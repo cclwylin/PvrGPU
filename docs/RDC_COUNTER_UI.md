@@ -32,8 +32,15 @@ PVRGPU_BUILD_DIR="$PWD/build" \
 ```
 
 如果未設定 `PVRGPU_UI_VENV`，checked-in default 是
-`$HOME/Downloads/_Codex/Working/PvrGPU/venv`。也可以用已安裝 PySide6
-的 Python 直接執行 `python3 tools/rdc_counter_ui.py`。
+`$HOME/Downloads/_Codex/Working/PvrGPU/venv`。安裝完成後也可以直接執行；
+若 PATH 上的 `python3` 沒有 PySide6，entry point 會自動切到該 venv：
+
+```bash
+cd tools
+./rdc_counter_ui.py
+```
+
+需要指定其他 interpreter 時，設定 `PVRGPU_UI_PYTHON`。
 
 macOS/Linux 的 backend 沒有 `.exe` suffix。Windows 由 CMake 自動產生
 `llvmpipe.exe` 與 `pvrgpu.exe`；文件中的 `build/bin/...` runner 路徑在
@@ -71,6 +78,14 @@ artifact 的操作。這些功能不得把 Mesa 或 SystemC 移入 UI process。
 ## 命令列執行
 
 ```bash
+python3 tools/rdc_counter_report.py
+```
+
+不帶參數時，輸入目錄預設為
+`${PVRGPU_RDC_ROOT}`；若未設定該環境變數，則使用
+`~/Downloads/_Codex/Working/GPU_TestPatterns/1.GLBench`。也可明確覆寫：
+
+```bash
 python3 tools/rdc_counter_report.py \
   --rdc-dir "/path/to/rdc-directory" \
   --output-root "/path/to/result-root" \
@@ -78,7 +93,7 @@ python3 tools/rdc_counter_report.py \
   --pvrgpu-runner build/bin/pvrgpu
 ```
 
-`--rdc-dir` 是必要參數。`--output-root` 可省略；預設為：
+`--rdc-dir` 與 `--output-root` 都可省略；output root 預設為：
 
 ```text
 ${PVRGPU_WORK_ROOT}/out/rdc-counter-report

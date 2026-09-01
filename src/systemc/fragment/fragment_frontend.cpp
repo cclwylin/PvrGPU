@@ -9,8 +9,10 @@
 
 #include "common/functional_types.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -19,6 +21,96 @@
 #include <vector>
 
 namespace pvrgpu::stub {
+
+namespace {
+
+void MaterializeDepthAttachment(MemoryPool &pool, GpuMemorySystem *memory,
+                                PipelineState *state) {
+  if (!state)
+    throw std::runtime_error("FragmentFrontend has no depth state");
+  if (state->capture_depth_attachment > 1 ||
+      state->depth_attachment_ready > 1 ||
+      HasPoolHandle(state->depth_attachment) ||
+      state->depth_attachment_bytes != 0 ||
+      state->depth_attachment_ready != 0) {
+    throw std::runtime_error(
+        "FragmentFrontend depth attachment control is invalid");
+  }
+  if (state->capture_depth_attachment == 0) {
+    if (HasPoolHandle(state->isp_depth_attachment))
+      throw std::runtime_error(
+          "FragmentFrontend received unrequested final depth values");
+    return;
+  }
+  const std::uint64_t depth_offset =
+      state->depth_attachment_gpu_address -
+      kDriverPcoSequenceDepthAddressBase;
+  if (!memory ||
+      state->depth_attachment_gpu_address <
+          kDriverPcoSequenceDepthAddressBase ||
+      depth_offset % kDriverPcoSequenceAttachmentStride != 0 ||
+      depth_offset / kDriverPcoSequenceAttachmentStride >=
+          kDriverPcoMaximumNestedSequenceCommands) {
+    throw std::runtime_error(
+        "FragmentFrontend sequence depth attachment address is invalid");
+  }
+
+  if (state->width == 0 || state->height == 0 ||
+      state->raster_state.sample_count != 1 ||
+      state->raster_state.shader_may_discard != 0 ||
+      state->raster_state.shader_writes_depth != 0 ||
+      state->raster_state.shader_writes_sample_mask != 0 ||
+      state->depth_attachment_format == 0 ||
+      !HasPoolHandle(state->isp_depth_attachment)) {
+    throw std::runtime_error(
+        "FragmentFrontend cannot materialize this final depth attachment");
+  }
+  const std::uint64_t pixel_count =
+      static_cast<std::uint64_t>(state->width) * state->height;
+  if (pixel_count == 0 ||
+      pixel_count > std::numeric_limits<std::size_t>::max() ||
+      pixel_count > std::numeric_limits<std::size_t>::max()) {
+    throw std::overflow_error(
+        "FragmentFrontend depth attachment size is invalid");
+  }
+
+  const std::vector<std::uint32_t> final_depth =
+      LoadArray<std::uint32_t>(pool, state->isp_depth_attachment);
+  if (final_depth.size() != pixel_count)
+    throw std::runtime_error(
+        "FragmentFrontend final depth value count mismatch");
+  const std::size_t bytes_per_pixel =
+      DepthAttachmentBytesPerPixel(state->depth_attachment_format);
+  if (pixel_count > std::numeric_limits<std::uint64_t>::max() /
+                        bytes_per_pixel)
+    throw std::overflow_error(
+        "FragmentFrontend depth attachment byte size overflow");
+  const std::uint64_t attachment_bytes = pixel_count * bytes_per_pixel;
+  std::vector<std::uint8_t> attachment = EncodeDepthAttachmentUnormBytes(
+      final_depth, state->depth_attachment_format);
+  if (attachment.size() != attachment_bytes)
+    throw std::runtime_error(
+        "FragmentFrontend encoded depth attachment size mismatch");
+  MemoryAccessStats memory_stats = memory->Write(
+      state->depth_attachment_gpu_address, attachment.data(),
+      static_cast<std::size_t>(attachment_bytes), MemoryClient::kFramebuffer);
+  MemoryReadResult readback = memory->Readback(
+      state->depth_attachment_gpu_address,
+      static_cast<std::size_t>(attachment_bytes),
+      MemoryClient::kFramebufferReadback);
+  memory_stats += readback.stats;
+  if (readback.data != attachment) {
+    throw std::runtime_error(
+        "FragmentFrontend depth attachment DRAM readback mismatch");
+  }
+  ApplyMemoryAccessStats(state->counters, memory_stats);
+  WaitForCycles(MemoryAccessDelayCycles(memory_stats));
+  state->depth_attachment = StoreNewArray(pool, readback.data);
+  state->depth_attachment_bytes = attachment_bytes;
+  state->depth_attachment_ready = 1;
+}
+
+} // namespace
 
 FragmentFrontend::FragmentFrontend(sc_core::sc_module_name name,
                                    MemoryPool &pool,
@@ -90,6 +182,7 @@ void FragmentFrontend::Run() {
       if (!parameter.rasterizable || parameter.face_culled ||
           parameter.front_facing > 1 || parameter.reserved[0] != 0 ||
           parameter.reserved[1] != 0 || parameter.reserved[2] != 0 ||
+          !HasCanonicalDepthPlaneMetadata(state.functional_case, parameter) ||
           parameter.key.api_primitive_id != candidate.primitive_id ||
           parameter.key.submit_ordinal != candidate.submit_ordinal ||
           candidate.x >= state.width || candidate.y >= state.height ||
@@ -182,8 +275,9 @@ void FragmentFrontend::Run() {
       throw std::runtime_error(
           "FragmentFrontend visible invocation count mismatch");
     }
+    MaterializeDepthAttachment(pool_, memory_, &state);
     std::vector<FragmentShaderLane> shader_lanes;
-    if (IsTextureFamily(state.functional_case)) {
+    if (UsesTextureSampling(state)) {
       // The selected reference USC dispatches a touched 4x2 SIMD half-stamp as
       // two architectural 2x2 quads. Lanes outside coverage are helpers: they
       // execute interpolation/SMP for derivatives and texture issue but never
@@ -287,7 +381,7 @@ void FragmentFrontend::Run() {
     }
     std::uint64_t grouped_invocations = 0;
     for (const FragmentQuad &quad : fragment_quads) {
-      const bool texture_case = IsTextureFamily(state.functional_case);
+      const bool texture_case = UsesTextureSampling(state);
       const std::uint8_t active_mask = static_cast<std::uint8_t>(
           quad.coverage_mask | quad.helper_mask);
       if ((!texture_case &&
@@ -332,7 +426,7 @@ void FragmentFrontend::Run() {
     }
 
     state.fragment_invocations = StoreNewArray(pool_, invocations);
-    if (IsTextureFamily(state.functional_case)) {
+    if (UsesTextureSampling(state)) {
       state.fragment_shader_lanes = StoreNewArray(pool_, shader_lanes);
       state.fragment_shader_lane_count =
           static_cast<std::uint32_t>(shader_lanes.size());

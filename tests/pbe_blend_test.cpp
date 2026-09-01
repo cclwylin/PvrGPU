@@ -99,7 +99,10 @@ TestStateHandles MakeState(MemoryPool &pool, std::uint32_t sequence,
                            BlendEquation alpha_eq = BlendEquation::kAdd,
                            BlendFactor src_rgb_f = BlendFactor::kSourceAlpha,
                            BlendFactor dst_rgb_f = BlendFactor::kOneMinusSourceAlpha,
-                           std::uint8_t color_mask = 0x0f) {
+                           std::uint8_t color_mask = 0x0f,
+                           BlendFactor src_alpha_f = BlendFactor::kSourceAlpha,
+                           BlendFactor dst_alpha_f =
+                               BlendFactor::kOneMinusSourceAlpha) {
   std::vector<FragmentInvocation> invocations;
   std::vector<FragmentOutput> outputs;
   for (std::size_t index = 0; index < executions.size(); ++index) {
@@ -126,9 +129,8 @@ TestStateHandles MakeState(MemoryPool &pool, std::uint32_t sequence,
   state.raster_state.blend.alpha_equation = alpha_eq;
   state.raster_state.blend.source_rgb_factor = src_rgb_f;
   state.raster_state.blend.destination_rgb_factor = dst_rgb_f;
-  state.raster_state.blend.source_alpha_factor = BlendFactor::kSourceAlpha;
-  state.raster_state.blend.destination_alpha_factor =
-      BlendFactor::kOneMinusSourceAlpha;
+  state.raster_state.blend.source_alpha_factor = src_alpha_f;
+  state.raster_state.blend.destination_alpha_factor = dst_alpha_f;
   state.raster_state.color_mask = color_mask;
   state.fragment_invocations = StoreNewArray(pool, invocations);
   state.fragment_outputs = StoreNewArray(pool, outputs);
@@ -136,6 +138,19 @@ TestStateHandles MakeState(MemoryPool &pool, std::uint32_t sequence,
   const PoolHandle state_handle = pool.Allocate(sizeof(PipelineState));
   StorePipelineState(pool, state_handle, state);
   return {state_handle, state.fragment_invocations, state.fragment_outputs};
+}
+
+void SetColorAttachmentLoad(MemoryPool &pool,
+                            const TestStateHandles &handles,
+                            const std::array<std::uint8_t, 4> &rgba) {
+  PipelineState state = LoadPipelineState(pool, handles.state);
+  Check(!pvrgpu::stub::HasPoolHandle(state.color_attachment_load),
+        "duplicate color attachment LOAD");
+  state.color_attachment_load = StoreNewArray(
+      pool, std::vector<std::uint8_t>(rgba.begin(), rgba.end()));
+  state.color_attachment_load_enable = 1;
+  state.color_attachment_load_bytes = rgba.size();
+  StorePipelineState(pool, handles.state, state);
 }
 
 void CheckResult(MemoryPool &pool, const TestStateHandles &handles,
@@ -160,6 +175,8 @@ void CheckResult(MemoryPool &pool, const TestStateHandles &handles,
         "RGBA8 result");
 
   pool.Release(state.pbe_framebuffer);
+  if (pvrgpu::stub::HasPoolHandle(state.color_attachment_load))
+    pool.Release(state.color_attachment_load);
   pool.Release(handles.invocations);
   pool.Release(handles.outputs);
   pool.Release(handles.state);
@@ -189,7 +206,7 @@ int sc_main(int, char **) {
     PcoFragmentExecution tie_quantization;
     tie_quantization.written_mask = 0x0f;
     tie_quantization.pixel_outputs = {
-        FloatBits(0.5F / 255.0F), FloatBits(1.5F / 255.0F),
+        FloatBits(0.3F), FloatBits(0.5F / 255.0F),
         FloatBits(2.5F / 255.0F), FloatBits(3.5F / 255.0F)};
     const TestStateHandles ties =
         MakeState(pool, 4, {tie_quantization}, false);
@@ -212,6 +229,16 @@ int sc_main(int, char **) {
         MakeState(pool, 7, {red_half}, true,
                   BlendEquation::kMax, BlendEquation::kAdd);
 
+    // API-v7 attachment aliasing must initialize the blend destination from
+    // the prior DRAM color attachment. Terrain's continuation pass uses
+    // ADD/SRC_ALPHA/ONE independently for RGB and alpha.
+    const TestStateHandles loaded_additive =
+        MakeState(pool, 8, {red_half}, true, BlendEquation::kAdd,
+                  BlendEquation::kAdd, BlendFactor::kSourceAlpha,
+                  BlendFactor::kOne, 0x0f, BlendFactor::kSourceAlpha,
+                  BlendFactor::kOne);
+    SetColorAttachmentLoad(pool, loaded_additive, {10, 20, 30, 40});
+
     input.write({single.state, 1, 1});
     input.write({red_green.state, 2, 2});
     input.write({green_red.state, 3, 3});
@@ -219,6 +246,7 @@ int sc_main(int, char **) {
     input.write({subtract_test.state, 5, 5});
     input.write({colormask_test.state, 6, 6});
     input.write({max_test.state, 7, 7});
+    input.write({loaded_additive.state, 8, 8});
 
     sc_core::sc_start(sc_core::sc_time(200, sc_core::SC_NS));
     sc_core::sc_start(sc_core::SC_ZERO_TIME);
@@ -238,14 +266,17 @@ int sc_main(int, char **) {
           "colormask-test FIFO completion order");
     Check(output.nb_read(completed) && completed.sequence == 7,
           "max-test FIFO completion order");
+    Check(output.nb_read(completed) && completed.sequence == 8,
+          "attachment-LOAD FIFO completion order");
 
     CheckResult(pool, single, {128, 0, 127, 191}, 1);
     CheckResult(pool, red_green, {64, 128, 63, 159}, 2);
     CheckResult(pool, green_red, {128, 64, 63, 159}, 2);
-    CheckResult(pool, ties, {0, 2, 2, 4}, 1, false);
+    CheckResult(pool, ties, {77, 1, 3, 4}, 1, false);
     CheckResult(pool, subtract_test, {255, 0, 0, 191}, 1);
     CheckResult(pool, colormask_test, {255, 0, 0, 255}, 1, false);
     CheckResult(pool, max_test, {255, 0, 255, 191}, 1);
+    CheckResult(pool, loaded_additive, {138, 20, 30, 104}, 1);
     Check(pool.bytes_in_flight() == 0 && pool.allocations() == pool.releases(),
           "MemoryPool balanced");
     std::cout << "pbe_blend_test: PASS\n";

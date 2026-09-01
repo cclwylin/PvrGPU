@@ -25,12 +25,58 @@ from rdc_counter_report import decode_rgba8_png  # noqa: E402
 from rdc_counter_report import EventSink  # noqa: E402
 from rdc_counter_report import ManifestEntry  # noqa: E402
 from rdc_counter_report import natural_path_sort_key  # noqa: E402
+from rdc_counter_report import runner_exit_failure_message  # noqa: E402
 
 
 WORKER = TOOLS_DIR / "rdc_counter_report.py"
 
 
 class RdcCounterReportTests(unittest.TestCase):
+    def test_runner_failure_uses_backend_stage_and_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact_dir = Path(directory)
+            (artifact_dir / "backend-result.json").write_text(
+                json.dumps(
+                    {
+                        "status": "FAIL",
+                        "stage": "driver-support",
+                        "reason": "unsupported draw",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                runner_exit_failure_message(artifact_dir, 1),
+                "Runner exited with code 1 at driver-support: unsupported draw",
+            )
+
+    def test_default_rdc_directory_comes_from_work_root_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work_root = Path(directory) / "PvrGPU"
+            environment = {
+                "PVRGPU_WORK_ROOT": str(work_root),
+                "PVRGPU_BUILD_DIR": str(work_root / "build"),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                os.environ.pop("PVRGPU_RDC_ROOT", None)
+                options = build_argument_parser().parse_args([])
+
+            self.assertEqual(
+                options.rdc_dir,
+                work_root.parent / "GPU_TestPatterns" / "1.GLBench",
+            )
+
+    def test_default_rdc_directory_accepts_environment_override(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            rdc_root = Path(directory) / "2.dEQP_100Frames"
+            with mock.patch.dict(
+                os.environ, {"PVRGPU_RDC_ROOT": str(rdc_root)}, clear=False
+            ):
+                options = build_argument_parser().parse_args([])
+
+            self.assertEqual(options.rdc_dir, rdc_root)
+
     def test_default_runners_come_from_the_native_build_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             build_root = Path(directory) / "native-build"

@@ -13,14 +13,15 @@ The short version:
 
 - GLBench/RDC counter infrastructure exists for fixed captured workloads.
 - dEQP capture cataloging is ready through Phase 0 to Phase 6.
-- dEQP binary execution is intentionally not part of the current flow.
+- `pvrgpu-deqp` now runs EGL/GLES2/GLES3/GLES31 dEQP cases directly through
+  the PvrGPU Mesa Gallium driver and the SystemC bridge, without RDC replay.
 - The PrvGPU dEQP capture hook is fail-closed: unsupported phases return `UNSUPPORTED` and do not write fake counters.
 - A Phase 0/1/2/3/4/5/6 Mesa Gallium driver skeleton now lives under `src/gallium/drivers/pvrgpu/`.
-- The first driver-to-model contract is `pvrgpu.driver-command.v1` for RGBA8 color clear.
+- The driver-to-model text contract is `pvrgpu.driver-command.v1`; it includes the original RGBA8 clear path and narrowly matched draw commands.
 - The driver can now create a surfaceless GLES2 context, clear a pbuffer, read back the clear pixel through CPU-backed transfer hooks, and emit a lightweight `pvrgpu.driver-counter.v1` event log.
 - Phase 2 driver bring-up can now observe a minimal GLES2 VS/FS + client vertex array + `glDrawArrays(GL_TRIANGLES, 0, 3)` path and emits `event=draw_triangles` in the driver counter log. This is not pixel-correct rasterization yet.
 - Phase 3 driver bring-up can now copy/bind fixed-function blend, depth/stencil/alpha, and rasterizer state, track scissor/blend-color/stencil-ref state, observe one indexed `glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, ...)` path, and emit `event=draw_indexed_triangles`. This is still counter-only, not depth/blend/stencil pixel correctness.
-- Phase 4 driver bring-up can now observe `glTexImage2D` RGBA8 upload, fragment sampler view binding, nearest/clamp sampler state, and one textured `glDrawArrays(GL_TRIANGLES, 0, 3)` path via `event=draw_textured_triangles`. This is still counter-only, not texture sampling pixel correctness.
+- Phase 4 driver bring-up observes RGBA8 upload, sampler/view state, and textured draws. The generic smoke remains counter-oriented, while the strictly matched glmark2 `effect2d` six-vertex full-screen draw now lowers through a tight RGBA8 sidecar into the SystemC depth/varying/nearest-sampling/readback path. Other texture draws remain fail-closed.
 - Phase 5 driver bring-up can now observe texture-backed FBO attachment/framebuffer-state traffic, FBO clear/readback, same-format 2D copy/blit traffic, one triangle draw into the FBO, and `glFlush`/`glFinish` visibility via driver counters. This is still counter-only for draw/sync correctness; scaled blits and resolves are not implemented.
 - Phase 6 driver bring-up can now retain GLES2 uniform uploads as Gallium constant-buffer state, expose first payload words in the driver counter log, and observe one uniform-driven triangle via `event=draw_uniform_triangles`. This is still counter-only, not uniform math or UBO/model correctness.
 - `src/gallium/drivers/pvrgpu/meson.build` is the Mesa integration seam for
@@ -145,13 +146,14 @@ Mesa Gallium clear()
   -> SystemC functional path produces counters and framebuffer PNG
 ```
 
-This is the first real driver/model seam. Phase 2/3/4/5/6 currently observe one
-simple triangle draw, one fixed-function indexed draw path, one textured
-triangle frontend path, one texture-backed FBO path, one same-format 2D
-copy/blit path, and one uniform/constant-buffer path through driver counters
-only; arbitrary draws, shader lowering, model texture sampling, UBO/model
-layout correctness, scaled blits, resolves, real fences/sync, pixel-correct FBO
-draw, depth/blend/stencil behavior, and live dEQP are still future phases.
+This is the first real driver/model seam. The strictly matched glmark2
+`effect2d` draw additionally crosses the seam with six positions/UVs and a
+tight RGBA8 texture sidecar, then runs SystemC depth, interpolation, nearest
+sampling, and readback. Phase 2/3/5/6 still have counter-oriented or narrowly
+modeled portions; arbitrary draws and shaders, general texture sampling,
+UBO/model layout correctness, scaled blits, resolves, real fences/sync,
+pixel-correct FBO draws and general depth/blend/stencil behavior remain future
+work. Live dEQP is now an executable integration gate for the supported slice.
 
 When testing through Mesa, select the driver explicitly:
 
@@ -161,6 +163,81 @@ PVRGPU_DRIVER_COMMAND_OUT=/tmp/pvrgpu-clear-command.txt \
 PVRGPU_DRIVER_COUNTER_OUT=/tmp/pvrgpu-driver-counter.txt \
 <mesa-test>
 ```
+
+## Live dEQP Runner
+
+`pvrgpu-deqp` is one directly linked runner process. It compiles the upstream
+EGL, GLES2, GLES3, and GLES31 dEQP packages into one executable, links the
+PvrGPU Mesa EGL/GLES libraries, and directly imports the SystemC bridge. The
+PvrGPU driver itself is folded into Mesa's Gallium dylib. This is therefore a
+single executable entry point, not a fully static single-file distribution;
+the Mesa/SystemC dylibs and dEQP data directories remain runtime sidecars.
+
+Configure it with a VK-GL-CTS checkout and a Mesa prefix that contains the
+PvrGPU Gallium driver:
+
+```bash
+set -a
+source config/local.env
+set +a
+
+cmake -S . -B "$PVRGPU_BUILD_DIR" -G Ninja \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DPVRGPU_ENABLE_LIVE_DEQP=ON \
+  -DPVRGPU_DEQP_SOURCE_DIR="$PVRGPU_DEQP_SOURCE_DIR" \
+  -DPVRGPU_DEQP_MESA_PREFIX="$PVRGPU_MESA_PVRGPU_PREFIX"
+cmake --build "$PVRGPU_BUILD_DIR" --target pvrgpu-deqp
+```
+
+Launch the desktop front end after the runner is built:
+
+```bash
+python3 tools/deqp_live_ui.py
+```
+
+The launcher automatically re-executes through `PVRGPU_UI_PYTHON` when the
+current Python does not have PySide6. The UI provides both exact-case mode and
+a 24-group batch catalog (16,608 leaf cases in the locked CTS), plus GL config,
+surface, watchdog, image logging, output, and optional bridge controls. Group
+mode discovers the current caselist, filters it through canonical selectors,
+and launches one fresh `pvrgpu-deqp` child per exact case. It aggregates QPA,
+progress, and a JSONL journal without violating the SystemC one-command-per-
+process boundary. Wildcards and comma lists remain rejected in exact-case mode.
+The catalog follows the 24 capture categories but uses the locked CTS names:
+`instanced` replaces stale `instancing`, scissor maps to
+`fragment_ops.scissor`, and shader stress maps to `long_shaders` plus
+`long_running_shaders`. Because this CTS has no GLES31 robustness leaf at all,
+that zero-case slot is explicitly named and mapped as draw-indirect stress
+instead of silently running unrelated tests.
+
+Only the three EGL groups can start with the current driver. GLES3 and GLES31
+groups remain visible with a blocked reason: none of the current PvrGPU EGL
+configs advertises `EGL_OPENGL_ES3_BIT_KHR`. The driver is missing multiple ES3
+format/query/restart prerequisites, while ES3.1 additionally lacks a real
+compute/SSBO/image/atomic implementation. `MESA_GLES_VERSION_OVERRIDE` is useful
+for caselist discovery only; using it to execute tests bypasses Mesa's capability
+checks and currently fails during state reset.
+
+Run an exact case on the fly; the executable configures the surfaceless PvrGPU
+runtime and artifact paths itself:
+
+```bash
+pvrgpu_deqp_out="$(mktemp -d /tmp/pvrgpu-deqp.XXXXXX)"
+"$PVRGPU_BUILD_DIR/bin/pvrgpu-deqp" \
+  --pvrgpu-output-dir="$pvrgpu_deqp_out" \
+  --deqp-case=dEQP-GLES2.functional.prerequisite.clear_color \
+  --deqp-gl-config-name=rgba8888d24s8ms0 \
+  --deqp-log-images=disable
+```
+
+The run writes `results.qpa`, `run.txt`, and a safe-name directory below
+`cases/` containing the driver command/counter and SystemC JSONL/PNG artifacts.
+The dEQP per-case callback switches driver output paths for expanded case
+lists. The current SystemC bridge deliberately defers simulation until process
+exit and retains only its latest submitted command. The UI group worker handles
+this by expanding first and invoking one exact case per process; do not pass a
+multi-case wildcard directly when complete per-case SystemC evidence is
+required.
 
 ## dEQP Capture-First Flow
 

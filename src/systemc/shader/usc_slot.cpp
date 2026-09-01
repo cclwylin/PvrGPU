@@ -34,7 +34,7 @@ void UscSlot::Run() {
 
     const bool texture_fragment =
         stage_ == ShaderStage::kFragment &&
-        IsTextureFamily(state.functional_case);
+        UsesTextureSampling(state);
     const std::uint64_t lanes = stage_ == ShaderStage::kVertex
                                     ? state.counters.vs_invocations
                                     : texture_fragment
@@ -85,9 +85,9 @@ void UscSlot::Run() {
       if (quads.size() != groups || tasks.size() != groups)
         throw std::runtime_error("fragment USC PDS task/group count mismatch");
 
-      const bool varying_case = UsesShaderVaryings(state.functional_case);
+      const bool varying_case = UsesShaderVaryings(state);
       const std::uint32_t varying_coefficient_dwords =
-          VaryingCoefficientDwordCount(state.functional_case);
+          VaryingCoefficientDwordCount(state);
       if (varying_case &&
           (varying_coefficient_dwords == 0 ||
            varying_coefficient_dwords >

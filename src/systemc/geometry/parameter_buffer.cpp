@@ -1,8 +1,8 @@
 // Module：ParameterBuffer。
 // 縮寫：非縮寫（參數緩衝區）。
 // 功能：把 screen coordinates 量化為 reference uArch 的 24.8-style
-// fixed-point，建立 exact top-left edge equations、depth interpolation 與
-// bbox；smooth varying 另建立 W 與 v/W 的 A/B/C/PAD coefficient sets。
+// fixed-point，建立 exact top-left edge equations 與 bbox；native driver-PCO
+// depth 及 smooth varying 則建立 llvmpipe-compatible A/B/C/PAD planes。
 // Zero-area 與 face-culled candidate 只保留 identity placeholder，
 // 不產生 raster equation。FIFO 只傳 MemoryPool handle，完成採
 // event-driven wait。
@@ -11,6 +11,7 @@
 #include "common/functional_types.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -111,6 +112,62 @@ BuildPlane(const pvrgpu::stub::RasterTriangle &triangle,
   return coefficient;
 }
 
+/* The validated Gallium driver command uses BACK/CW culling.  llvmpipe
+ * normalizes those clockwise triangles by exchanging v0/v1 before its JIT
+ * setup function computes interpolation coefficients.  Its coefficient
+ * arithmetic is binary32 and is anchored at (v0 - 0.5), while fragment
+ * interpolation is evaluated at integer pixel offsets.  This ordering is
+ * observable when a nearest-filtered coordinate lands exactly on a texel
+ * boundary, so preserve it for that narrow command instead of weakening the
+ * reference-uArch plane construction used by every other functional case. */
+pvrgpu::stub::ParameterCoefficientSet
+BuildLlvmPipeDriverPlane(const pvrgpu::stub::RasterTriangle &triangle,
+                         const float value[3]) {
+  constexpr std::array<std::size_t, 3> order{1, 0, 2};
+  const std::size_t i0 = order[0];
+  const std::size_t i1 = order[1];
+  const std::size_t i2 = order[2];
+
+  const float x0_center = triangle.x[i0] - 0.5F;
+  const float y0_center = triangle.y[i0] - 0.5F;
+  const float dx01 = triangle.x[i0] - triangle.x[i1];
+  const float dy01 = triangle.y[i0] - triangle.y[i1];
+  const float dx20 = triangle.x[i2] - triangle.x[i0];
+  const float dy20 = triangle.y[i2] - triangle.y[i0];
+  const float e = dx01 * dy20;
+  const float f = dy01 * dx20;
+  const float reciprocal_area = 1.0F / (e - f);
+  const float dx01_ooa = dx01 * reciprocal_area;
+  const float dy01_ooa = dy01 * reciprocal_area;
+  const float dx20_ooa = dx20 * reciprocal_area;
+  const float dy20_ooa = dy20 * reciprocal_area;
+
+  const float da01 = value[i0] - value[i1];
+  const float da20 = value[i2] - value[i0];
+  const float dadx_left = da01 * dy20_ooa;
+  const float dadx_right = da20 * dy01_ooa;
+  const float dady_left = da20 * dx01_ooa;
+  const float dady_right = da01 * dx20_ooa;
+  const float dadx = dadx_left - dadx_right;
+  const float dady = dady_left - dady_right;
+  const float origin_x = dadx * x0_center;
+  const float origin_y = dady * y0_center;
+  const float origin = origin_x + origin_y;
+  const float attr0 = value[i0] - origin;
+  if (!std::isfinite(dadx) || !std::isfinite(dady) ||
+      !std::isfinite(attr0)) {
+    throw std::runtime_error(
+        "ParameterBuffer produced a non-finite llvmpipe driver plane");
+  }
+
+  pvrgpu::stub::ParameterCoefficientSet coefficient;
+  coefficient.a = FloatBits(dadx);
+  coefficient.b = FloatBits(dady);
+  coefficient.c = FloatBits(attr0);
+  coefficient.pad = 0;
+  return coefficient;
+}
+
 } // namespace
 
 namespace pvrgpu::stub {
@@ -155,7 +212,7 @@ void ParameterBuffer::Run() {
     const std::vector<std::uint32_t> raster_vertex_outputs =
         LoadArray<std::uint32_t>(pool_, state.raster_vertex_outputs);
     std::vector<ShaderVaryingBinding> varying_bindings;
-    if (UsesShaderVaryings(state.functional_case)) {
+    if (UsesShaderVaryings(state)) {
       if (!HasPoolHandle(state.shader_varying_bindings)) {
         throw std::runtime_error(
             "ParameterBuffer varying case has no linkage payload");
@@ -163,14 +220,13 @@ void ParameterBuffer::Run() {
       varying_bindings = LoadArray<ShaderVaryingBinding>(
           pool_, state.shader_varying_bindings);
       const std::uint32_t varying_count =
-          VaryingVectorCount(state.functional_case);
+          VaryingVectorCount(state);
       if (varying_count == 0 || varying_bindings.size() != varying_count) {
         throw std::runtime_error(
             "ParameterBuffer varying linkage count is invalid");
       }
       for (std::size_t index = 0; index < varying_bindings.size(); ++index) {
-        if (!IsExactVaryingBinding(state.functional_case,
-                                   varying_bindings[index], index)) {
+        if (!IsExactVaryingBinding(state, varying_bindings[index], index)) {
           throw std::runtime_error(
               "ParameterBuffer varying linkage is not exact");
         }
@@ -186,9 +242,9 @@ void ParameterBuffer::Run() {
     parameters.reserve(triangles.size());
     for (const RasterTriangle &triangle : triangles) {
       const std::uint16_t expected_stride =
-          UsesShaderVaryings(state.functional_case)
+          UsesShaderVaryings(state)
               ? static_cast<std::uint16_t>(
-                    VaryingVertexOutputDwordCount(state.functional_case))
+                    VaryingVertexOutputDwordCount(state))
               : 4;
       if (triangle.vertex_output_stride_dwords != expected_stride ||
           triangle.front_facing > 1 || triangle.rasterizable > 1 ||
@@ -279,9 +335,19 @@ void ParameterBuffer::Run() {
       parameter.max_x = ClampCeil(x_bounds.second, state.width);
       parameter.max_y = ClampCeil(y_bounds.second, state.height);
 
-      if (UsesShaderVaryings(state.functional_case)) {
+      if (IsDriverPcoTrianglesCase(state.functional_case)) {
+        const ParameterCoefficientSet depth_plane =
+            BuildLlvmPipeDriverPlane(triangle, triangle.window_z);
+        parameter.depth_plane[0] = depth_plane.a;
+        parameter.depth_plane[1] = depth_plane.b;
+        parameter.depth_plane[2] = depth_plane.c;
+        parameter.depth_plane[3] = depth_plane.pad;
+        parameter.depth_plane_valid = 1;
+      }
+
+      if (UsesShaderVaryings(state)) {
         parameter.coefficient_set_count = static_cast<std::uint16_t>(
-            VaryingCoefficientSetCount(state.functional_case));
+            VaryingCoefficientSetCount(state));
         const std::size_t coefficient_base = coefficients.size();
         if (coefficient_base >
             std::numeric_limits<std::uint32_t>::max() -
@@ -300,8 +366,13 @@ void ParameterBuffer::Run() {
                 "ParameterBuffer received invalid reciprocal W");
           }
         }
+        const bool llvmpipe_driver_plane =
+            state.functional_case == FunctionalCase::kDriverTexturedTriangles ||
+            IsDriverPcoTrianglesCase(state.functional_case);
         coefficients[coefficient_base] =
-            BuildPlane(triangle, reciprocal_w);
+            llvmpipe_driver_plane
+                ? BuildLlvmPipeDriverPlane(triangle, reciprocal_w)
+                : BuildPlane(triangle, reciprocal_w);
 
         for (const ShaderVaryingBinding &binding : varying_bindings) {
           for (std::uint8_t component = 0;
@@ -340,7 +411,10 @@ void ParameterBuffer::Run() {
                            component] = coefficient;
             } else {
               coefficients[coefficient_base + binding.coefficient_set_base +
-                           component] = BuildPlane(triangle, numerator);
+                           component] =
+                  llvmpipe_driver_plane
+                      ? BuildLlvmPipeDriverPlane(triangle, numerator)
+                      : BuildPlane(triangle, numerator);
             }
           }
         }
@@ -363,7 +437,7 @@ void ParameterBuffer::Run() {
     } else {
       state.parameter_triangles = StoreNewArray(pool_, parameters);
     }
-    if (UsesShaderVaryings(state.functional_case)) {
+    if (UsesShaderVaryings(state)) {
       if (memory_) {
         state.parameter_coefficients = {};
         state.parameter_coefficients_gpu_address =

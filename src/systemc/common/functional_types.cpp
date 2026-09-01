@@ -6,9 +6,94 @@
 
 #include "common/pipeline_state.h"
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <sstream>
 
 namespace pvrgpu::stub {
+
+std::size_t DepthAttachmentBytesPerPixel(std::uint32_t format) {
+  if (format == kDriverPcoDepthFormatZ16Unorm)
+    return sizeof(std::uint16_t);
+  if (format == kDriverPcoDepthFormatZ24X8Unorm ||
+      format == kDriverPcoDepthFormatZ32Unorm) {
+    return sizeof(std::uint32_t);
+  }
+  throw std::runtime_error("unsupported native depth attachment format");
+}
+
+std::uint32_t EncodeDepthAttachmentUnorm(float depth,
+                                         std::uint32_t format) {
+  if (!std::isfinite(depth) || depth < 0.0F || depth > 1.0F)
+    throw std::runtime_error("native depth value is outside [0, 1]");
+  const std::uint64_t maximum =
+      format == kDriverPcoDepthFormatZ16Unorm
+          ? UINT64_C(0xffff)
+          : format == kDriverPcoDepthFormatZ24X8Unorm
+                ? UINT64_C(0xffffff)
+                : format == kDriverPcoDepthFormatZ32Unorm
+                      ? UINT64_C(0xffffffff)
+                      : throw std::runtime_error(
+                            "unsupported native depth attachment format");
+  const long double scaled = static_cast<long double>(depth) * maximum;
+  const long double integral = std::floor(scaled);
+  std::uint64_t encoded = static_cast<std::uint64_t>(integral);
+  const long double fraction = scaled - integral;
+  if (fraction > 0.5L || (fraction == 0.5L && (encoded & 1U) != 0))
+    ++encoded;
+  if (encoded > maximum)
+    encoded = maximum;
+  return static_cast<std::uint32_t>(encoded);
+}
+
+float DecodeDepthAttachmentUnorm(std::uint32_t encoded,
+                                 std::uint32_t format) {
+  const std::uint32_t maximum =
+      format == kDriverPcoDepthFormatZ16Unorm
+          ? UINT32_C(0xffff)
+          : format == kDriverPcoDepthFormatZ24X8Unorm
+                ? UINT32_C(0xffffff)
+                : format == kDriverPcoDepthFormatZ32Unorm
+                      ? UINT32_MAX
+                      : throw std::runtime_error(
+                            "unsupported native depth attachment format");
+  if ((encoded & ~maximum) != 0)
+    throw std::runtime_error("native depth attachment has nonzero padding");
+  return static_cast<float>(static_cast<double>(encoded) /
+                            static_cast<double>(maximum));
+}
+
+std::vector<std::uint32_t> DecodeDepthAttachmentUnormBytes(
+    const std::vector<std::uint8_t> &bytes, std::uint32_t format) {
+  const std::size_t bytes_per_pixel = DepthAttachmentBytesPerPixel(format);
+  if (bytes.empty() || bytes.size() % bytes_per_pixel != 0)
+    throw std::runtime_error("native depth attachment byte count is invalid");
+  std::vector<std::uint32_t> encoded(bytes.size() / bytes_per_pixel, 0);
+  for (std::size_t pixel = 0; pixel < encoded.size(); ++pixel) {
+    std::memcpy(&encoded[pixel], bytes.data() + pixel * bytes_per_pixel,
+                bytes_per_pixel);
+    (void)DecodeDepthAttachmentUnorm(encoded[pixel], format);
+  }
+  return encoded;
+}
+
+std::vector<std::uint8_t> EncodeDepthAttachmentUnormBytes(
+    const std::vector<std::uint32_t> &encoded, std::uint32_t format) {
+  const std::size_t bytes_per_pixel = DepthAttachmentBytesPerPixel(format);
+  if (encoded.empty() ||
+      encoded.size() >
+          std::numeric_limits<std::size_t>::max() / bytes_per_pixel) {
+    throw std::runtime_error("native depth attachment value count is invalid");
+  }
+  std::vector<std::uint8_t> bytes(encoded.size() * bytes_per_pixel, 0);
+  for (std::size_t pixel = 0; pixel < encoded.size(); ++pixel) {
+    (void)DecodeDepthAttachmentUnorm(encoded[pixel], format);
+    std::memcpy(bytes.data() + pixel * bytes_per_pixel, &encoded[pixel],
+                bytes_per_pixel);
+  }
+  return bytes;
+}
 
 FunctionalCase FunctionalCaseFromName(std::string_view name) {
   if (name == "fill_solid")
@@ -57,6 +142,10 @@ FunctionalCase FunctionalCaseFromName(std::string_view name) {
     return FunctionalCase::kDriverTriangleSolid;
   if (name == "driver_indexed_quad")
     return FunctionalCase::kDriverIndexedQuad;
+  if (name == "driver_textured_triangles")
+    return FunctionalCase::kDriverTexturedTriangles;
+  if (name == "driver_pco_triangles")
+    return FunctionalCase::kDriverPcoTriangles;
   return FunctionalCase::kNone;
 }
 
@@ -108,6 +197,10 @@ const char *FunctionalCaseName(FunctionalCase functional_case) {
     return "driver_triangle_solid";
   case FunctionalCase::kDriverIndexedQuad:
     return "driver_indexed_quad";
+  case FunctionalCase::kDriverTexturedTriangles:
+    return "driver_textured_triangles";
+  case FunctionalCase::kDriverPcoTriangles:
+    return "driver_pco_triangles";
   case FunctionalCase::kNone:
     return "none";
   }
@@ -149,11 +242,42 @@ bool IsTextureFamily(FunctionalCase functional_case) {
          functional_case == FunctionalCase::kFillTexBilinear ||
          functional_case == FunctionalCase::kFillTexTrilinearLinear01 ||
          functional_case == FunctionalCase::kFillTexTrilinearLinear04 ||
-         functional_case == FunctionalCase::kFillTexTrilinearLinear05;
+         functional_case == FunctionalCase::kFillTexTrilinearLinear05 ||
+         functional_case == FunctionalCase::kDriverTexturedTriangles;
+}
+
+bool IsDriverPcoTrianglesCase(FunctionalCase functional_case) {
+  return functional_case == FunctionalCase::kDriverPcoTriangles;
+}
+
+bool UsesTextureSampling(FunctionalCase functional_case) {
+  return IsTextureFamily(functional_case);
+}
+
+bool UsesTextureSampling(const PipelineState &state) {
+  return UsesTextureSampling(state, ShaderStage::kVertex) ||
+         UsesTextureSampling(state, ShaderStage::kFragment);
+}
+
+bool UsesTextureSampling(const PipelineState &state, ShaderStage stage) {
+  if (!IsDriverPcoTrianglesCase(state.functional_case)) {
+    return stage == ShaderStage::kFragment &&
+           UsesTextureSampling(state.functional_case);
+  }
+  return stage == ShaderStage::kVertex
+             ? state.vertex_sampled_texture_count != 0
+             : state.sampled_texture_count != 0;
 }
 
 bool UsesShaderVaryings(FunctionalCase functional_case) {
   return IsVaryingsFamily(functional_case) || IsTextureFamily(functional_case);
+}
+
+bool UsesShaderVaryings(const PipelineState &state) {
+  if (!IsDriverPcoTrianglesCase(state.functional_case))
+    return UsesShaderVaryings(state.functional_case);
+  return state.varying_output_count != 0 ||
+         state.fragment_varying_count != 0;
 }
 
 std::uint32_t VaryingVectorCount(FunctionalCase functional_case) {
@@ -171,10 +295,21 @@ std::uint32_t VaryingVectorCount(FunctionalCase functional_case) {
   case FunctionalCase::kFillTexTrilinearLinear01:
   case FunctionalCase::kFillTexTrilinearLinear04:
   case FunctionalCase::kFillTexTrilinearLinear05:
+  case FunctionalCase::kDriverTexturedTriangles:
     return 1;
   default:
     return 0;
   }
+}
+
+std::uint32_t VaryingVectorCount(const PipelineState &state) {
+  if (!IsDriverPcoTrianglesCase(state.functional_case))
+    return VaryingVectorCount(state.functional_case);
+  if (!UsesShaderVaryings(state))
+    return 0;
+  return (state.varying_output_count +
+          kVaryingVectorComponentCount - 1U) /
+         kVaryingVectorComponentCount;
 }
 
 std::uint32_t VaryingCoefficientSetCount(FunctionalCase functional_case) {
@@ -184,9 +319,32 @@ std::uint32_t VaryingCoefficientSetCount(FunctionalCase functional_case) {
   return vectors == 0 ? 0 : 1 + vectors * kVaryingVectorComponentCount;
 }
 
+std::uint32_t VaryingCoefficientSetCount(const PipelineState &state) {
+  if (!IsDriverPcoTrianglesCase(state.functional_case))
+    return VaryingCoefficientSetCount(state.functional_case);
+  const std::uint32_t dwords = VaryingCoefficientDwordCount(state);
+  return dwords == 0 || dwords % kCoefficientSetDwordCount != 0
+             ? 0
+             : dwords / kCoefficientSetDwordCount;
+}
+
 std::uint32_t VaryingCoefficientDwordCount(FunctionalCase functional_case) {
   return VaryingCoefficientSetCount(functional_case) *
          kCoefficientSetDwordCount;
+}
+
+std::uint32_t VaryingCoefficientDwordCount(const PipelineState &state) {
+  if (!IsDriverPcoTrianglesCase(state.functional_case))
+    return VaryingCoefficientDwordCount(state.functional_case);
+  if (!UsesShaderVaryings(state) || state.fragment_position_start != 0 ||
+      state.fragment_position_count != kCoefficientSetDwordCount ||
+      state.fragment_varying_start != state.fragment_position_count ||
+      state.fragment_varying_count >
+          std::numeric_limits<std::uint32_t>::max() -
+              state.fragment_position_count) {
+    return 0;
+  }
+  return state.fragment_position_count + state.fragment_varying_count;
 }
 
 std::uint32_t VaryingVertexOutputDwordCount(FunctionalCase functional_case) {
@@ -194,6 +352,20 @@ std::uint32_t VaryingVertexOutputDwordCount(FunctionalCase functional_case) {
     return kFillTexNearestVertexOutputDwordCount;
   const std::uint32_t vectors = VaryingVectorCount(functional_case);
   return vectors == 0 ? 0 : 4 + vectors * kVaryingVectorComponentCount;
+}
+
+std::uint32_t VaryingVertexOutputDwordCount(const PipelineState &state) {
+  if (!IsDriverPcoTrianglesCase(state.functional_case))
+    return VaryingVertexOutputDwordCount(state.functional_case);
+  if (!UsesShaderVaryings(state) || state.position_output_start != 0 ||
+      state.position_output_count != 4 ||
+      state.varying_output_start != state.position_output_count ||
+      state.varying_output_count >
+          std::numeric_limits<std::uint32_t>::max() -
+              state.position_output_count) {
+    return 0;
+  }
+  return state.position_output_count + state.varying_output_count;
 }
 
 bool IsExactVaryingBinding(FunctionalCase functional_case,
@@ -217,6 +389,50 @@ bool IsExactVaryingBinding(FunctionalCase functional_case,
          binding.reserved[0] == 0 && binding.reserved[1] == 0;
 }
 
+bool IsExactVaryingBinding(const PipelineState &state,
+                           const ShaderVaryingBinding &binding,
+                           std::size_t binding_index) {
+  if (!IsDriverPcoTrianglesCase(state.functional_case)) {
+    return IsExactVaryingBinding(state.functional_case, binding,
+                                 binding_index);
+  }
+  const std::uint32_t components = state.varying_output_count;
+  const std::uint32_t binding_count = VaryingVectorCount(state);
+  if (components == 0 || binding_count == 0 ||
+      binding_index >= binding_count ||
+      components > kDriverPcoMaximumVaryingComponents)
+    return false;
+
+  const std::uint32_t component_offset =
+      static_cast<std::uint32_t>(binding_index) *
+      kVaryingVectorComponentCount;
+  const std::uint32_t binding_components =
+      std::min(kVaryingVectorComponentCount, components - component_offset);
+  return
+         state.position_output_start == 0 &&
+         state.position_output_count == 4 &&
+         state.varying_output_start == 4 &&
+         state.fragment_position_start == 0 &&
+         state.fragment_position_count == kCoefficientSetDwordCount &&
+         state.fragment_varying_start == kCoefficientSetDwordCount &&
+         state.fragment_varying_count ==
+             components * kCoefficientSetDwordCount &&
+         state.vertex_pco_abi.vertex_outputs == 4 + components &&
+         state.fragment_pco_abi.coefficients ==
+             kCoefficientSetDwordCount +
+                 components * kCoefficientSetDwordCount &&
+         binding.vertex_output_base ==
+             state.varying_output_start + component_offset &&
+         binding.coefficient_set_base ==
+             state.fragment_varying_start / kCoefficientSetDwordCount +
+                 component_offset &&
+         binding.w_coefficient_set ==
+             state.fragment_position_start / kCoefficientSetDwordCount &&
+         binding.component_count == binding_components &&
+         binding.interpolation == InterpolationMode::kSmooth &&
+         binding.reserved[0] == 0 && binding.reserved[1] == 0;
+}
+
 bool IsIndexedTriangleRasterCase(FunctionalCase functional_case) {
   return IsTriangleSetupFamily(functional_case) ||
          IsAttributeFetchFamily(functional_case) ||
@@ -232,7 +448,8 @@ bool RequiresBackCcwFaceCull(FunctionalCase functional_case) {
 bool IsSolidColorRasterCase(FunctionalCase functional_case) {
   return IsFillSolidFamily(functional_case) ||
          IsTriangleSetupFamily(functional_case) ||
-         IsAttributeFetchFamily(functional_case);
+         IsAttributeFetchFamily(functional_case) ||
+         IsDriverPcoTrianglesCase(functional_case);
 }
 
 bool IsRasterFunctionalCase(FunctionalCase functional_case) {
@@ -254,6 +471,10 @@ const char *PipelineStageName(PipelineStage stage) {
     return "vertex-decoded";
   case PipelineStage::kVertexIssued:
     return "vertex-issued";
+  case PipelineStage::kVertexTexturePending:
+    return "vertex-texture-pending";
+  case PipelineStage::kVertexTextureSamplesReady:
+    return "vertex-texture-samples-ready";
   case PipelineStage::kVertexShaded:
     return "vertex-shaded";
   case PipelineStage::kClipCullComplete:
@@ -335,6 +556,12 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
     for (const TextureResource &resource : resources)
       release_unique(resource.data);
   }
+  if (HasPoolHandle(state.vertex_texture_resources)) {
+    const std::vector<TextureResource> resources = LoadArray<TextureResource>(
+        pool, state.vertex_texture_resources);
+    for (const TextureResource &resource : resources)
+      release_unique(resource.data);
+  }
 
   const PoolHandle handles[] = {
       state.drawlist_stats,
@@ -345,6 +572,8 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
       state.vertex_lane_refs,
       state.vertex_shared_registers,
       state.shader_varying_bindings,
+      state.vertex_texture_resources,
+      state.vertex_sampler_states,
       state.texture_resources,
       state.sampler_states,
       state.fragment_shared_registers,
@@ -359,6 +588,10 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
       state.parameter_triangles,
       state.parameter_coefficients,
       state.fragment_candidates,
+      state.color_attachment_load,
+      state.depth_attachment_load,
+      state.isp_depth_attachment,
+      state.depth_attachment,
       state.fragment_invocations,
       state.fragment_shader_lanes,
       state.fragment_quads,
@@ -366,6 +599,7 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
       state.usc_coefficient_banks,
       state.texture_sample_requests,
       state.texture_sample_responses,
+      state.vertex_continuations,
       state.fragment_continuations,
       state.fragment_outputs,
       state.pbe_framebuffer,

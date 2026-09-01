@@ -9,6 +9,57 @@ from pathlib import Path
 import sys
 from typing import Any
 
+
+def _ensure_ui_python() -> None:
+    """Re-exec direct launches with the configured PySide6 interpreter."""
+    try:
+        import PySide6  # noqa: F401
+    except ModuleNotFoundError as error:
+        if error.name != "PySide6":
+            raise
+    else:
+        return
+
+    work_root = Path(
+        os.environ.get(
+            "PVRGPU_WORK_ROOT",
+            str(Path.home() / "Downloads" / "_Codex" / "Working" / "PvrGPU"),
+        )
+    ).expanduser()
+    configured_python = os.environ.get("PVRGPU_UI_PYTHON", "").strip()
+    configured_venv = Path(
+        os.environ.get("PVRGPU_UI_VENV", str(work_root / "venv"))
+    ).expanduser()
+    candidates = [
+        Path(configured_python).expanduser() if configured_python else None,
+        configured_venv / "bin" / "python",
+    ]
+    # Keep the venv path distinct from the base interpreter even when its
+    # executable is a symlink to that same binary. Python uses the invocation
+    # path to discover pyvenv.cfg and site-packages.
+    current_python = Path(os.path.abspath(sys.executable))
+    for candidate in candidates:
+        if candidate is None or not candidate.is_file() or not os.access(candidate, os.X_OK):
+            continue
+        candidate = Path(os.path.abspath(candidate))
+        if candidate == current_python:
+            continue
+        os.execv(
+            str(candidate),
+            [str(candidate), str(Path(__file__).resolve()), *sys.argv[1:]],
+        )
+
+    raise SystemExit(
+        "PySide6 is not installed for the current python3 and no usable UI "
+        "interpreter was found. Set PVRGPU_UI_PYTHON or install "
+        "requirements-ui.txt into the project venv."
+    )
+
+
+if __name__ == "__main__":
+    _ensure_ui_python()
+
+
 from PySide6.QtCore import QProcess, QProcessEnvironment, QSettings, QTimer, QUrl, Qt
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
@@ -251,7 +302,7 @@ class MainWindow(QMainWindow):
 
     def _restore_settings(self) -> None:
         default_input = os.environ.get("PVRGPU_RDC_ROOT") or str(
-            WORK_ROOT.parent / "deqp"
+            WORK_ROOT.parent / "GPU_TestPatterns" / "1.GLBench"
         )
         default_output = os.environ.get(
             "PVRGPU_RDC_COUNTER_OUTPUT",
@@ -265,9 +316,12 @@ class MainWindow(QMainWindow):
             "PVRGPU_RDC_GOLDEN_RUNNER",
             str(DEFAULT_LLVMPIPE_RUNNER),
         )
-        self.input_dir_edit.setText(
-            str(self.settings.value("input_dir", default_input))
-        )
+        saved_input = str(self.settings.value("input_dir", default_input))
+        legacy_default = str(WORK_ROOT.parent / "deqp")
+        if not os.environ.get("PVRGPU_RDC_ROOT") and saved_input == legacy_default:
+            saved_input = default_input
+            self.settings.setValue("input_dir", saved_input)
+        self.input_dir_edit.setText(saved_input)
         self.output_dir_edit.setText(
             str(self.settings.value("output_dir", default_output))
         )

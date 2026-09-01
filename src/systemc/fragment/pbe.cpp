@@ -31,13 +31,12 @@ std::uint8_t FloatValueToUnorm8(float value) {
     throw std::runtime_error("PBE cannot convert a non-finite PIXOUT value");
   const float clamped = std::clamp(value, 0.0f, 1.0f);
   const float scaled = clamped * 255.0F;
-  const float lower = std::floor(scaled);
-  const float fraction = scaled - lower;
-  std::uint32_t rounded = static_cast<std::uint32_t>(lower);
-  if (fraction > 0.5F ||
-      (fraction == 0.5F && (rounded & 1U) != 0U)) {
-    ++rounded;
-  }
+  // The Gallivm/Mesa RGBA8 store path uses the UNORM conversion
+  // floor(value * 255 + 0.5), including exact half-way values.  This is not
+  // IEEE round-to-nearest-even: for example the real Shadow PIXOUT value
+  // 0.3f scales to exactly 76.5f and must serialize as 77, not 76.
+  const std::uint32_t rounded =
+      static_cast<std::uint32_t>(std::floor(scaled + 0.5F));
   return static_cast<std::uint8_t>(std::min<std::uint32_t>(rounded, 255U));
 }
 
@@ -168,12 +167,30 @@ void Pbe::Run() {
       throw std::runtime_error("PBE fragment input/output count mismatch");
     }
 
-    std::vector<std::uint8_t> framebuffer(
-        static_cast<std::size_t>(pixel_count) * 4, 0);
-    for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
-      for (std::size_t component = 0; component < 4; ++component) {
-        framebuffer[pixel * 4 + component] =
-            FloatValueToUnorm8(state.raster_state.clear_color[component]);
+    const std::uint64_t framebuffer_bytes = pixel_count * 4U;
+    if (state.color_attachment_load_enable > 1 ||
+        (state.color_attachment_load_enable != 0) !=
+            HasPoolHandle(state.color_attachment_load) ||
+        (state.color_attachment_load_enable == 0 &&
+         state.color_attachment_load_bytes != 0)) {
+      throw std::runtime_error("PBE color attachment LOAD state is invalid");
+    }
+    std::vector<std::uint8_t> framebuffer;
+    if (state.color_attachment_load_enable != 0) {
+      framebuffer =
+          LoadArray<std::uint8_t>(pool_, state.color_attachment_load);
+      if (state.color_attachment_load_bytes != framebuffer_bytes ||
+          framebuffer.size() != framebuffer_bytes) {
+        throw std::runtime_error(
+            "PBE color attachment LOAD byte count mismatch");
+      }
+    } else {
+      framebuffer.assign(static_cast<std::size_t>(framebuffer_bytes), 0);
+      for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
+        for (std::size_t component = 0; component < 4; ++component) {
+          framebuffer[pixel * 4 + component] =
+              FloatValueToUnorm8(state.raster_state.clear_color[component]);
+        }
       }
     }
     std::vector<std::uint32_t> written_map(

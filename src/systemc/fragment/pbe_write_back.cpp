@@ -58,7 +58,20 @@ void PbeWriteBack::Run() {
     if (expected_bytes > std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("PbeWriteBack framebuffer is too large");
 
-    state.framebuffer_gpu_address = kFramebufferGpuAddress;
+    if (state.framebuffer_gpu_address == 0) {
+      state.framebuffer_gpu_address = kFramebufferGpuAddress;
+    } else {
+      const std::uint64_t sequence_offset =
+          state.framebuffer_gpu_address - kDriverPcoSequenceColorAddressBase;
+      if (state.framebuffer_gpu_address <
+              kDriverPcoSequenceColorAddressBase ||
+          sequence_offset % kDriverPcoSequenceAttachmentStride != 0 ||
+          sequence_offset / kDriverPcoSequenceAttachmentStride >=
+              kDriverPcoMaximumNestedSequenceCommands) {
+        throw std::runtime_error(
+            "PbeWriteBack sequence framebuffer address is invalid");
+      }
+    }
     state.counters.pixel_data_master_transactions = 1;
     state.counters.pixel_data_master_bytes = expected_bytes;
     state.counters.pixel_data_master_cycles = kPbeWriteBackLatency;

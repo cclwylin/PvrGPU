@@ -5,6 +5,7 @@ files_pvrgpu = files(
   'pvrgpu_cmd.c',
   'pvrgpu_context.c',
   'pvrgpu_counter.c',
+  'pvrgpu_pco.c',
   'pvrgpu_resource.c',
   'pvrgpu_screen.c',
   'pvrgpu_state.c',
@@ -13,7 +14,13 @@ files_pvrgpu = files(
 libpvrgpu = static_library(
   'pvrgpu',
   files_pvrgpu,
-  include_directories : [inc_gallium_aux, inc_gallium, inc_include, inc_src],
+  include_directories : [
+    inc_gallium_aux,
+    inc_gallium,
+    inc_imagination,
+    inc_include,
+    inc_src,
+  ],
   c_args : [c_msvc_compat_args],
   gnu_symbol_visibility : 'hidden',
   dependencies : [idep_nir, idep_mesautil],
@@ -21,5 +28,25 @@ libpvrgpu = static_library(
 
 driver_pvrgpu = declare_dependency(
   compile_args : '-DGALLIUM_PVRGPU',
-  link_with : libpvrgpu,
+  link_with : [libpvrgpu, libpowervr_compiler, libpowervr_common],
 )
+
+if with_tests
+  test(
+    'pvrgpu_pco_lowering',
+    executable(
+      'pvrgpu_pco_lowering_test',
+      files('tests/pvrgpu_pco_lowering_test.c'),
+      include_directories : [
+        inc_gallium_aux,
+        inc_gallium,
+        inc_imagination,
+        inc_include,
+        inc_src,
+      ],
+      link_with : [libpvrgpu, libpowervr_compiler, libpowervr_common],
+      dependencies : [idep_nir, idep_mesautil],
+    ),
+    suite : ['compiler', 'pvrgpu'],
+  )
+endif

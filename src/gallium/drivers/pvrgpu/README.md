@@ -15,12 +15,12 @@ Current status:
 - simple GLES2 vertex/fragment shader creation, vertex element state, client vertex buffers, viewport/scissor state, and one non-indexed `GL_TRIANGLES` draw are observable through `draw_triangles` counters.
 - Phase 3 fixed-function state objects for blend, depth/stencil/alpha, and rasterizer are copied, bound, and reported through counters.
 - one indexed `GL_TRIANGLES` draw with user indices is observable through `draw_indexed_triangles` counters.
-- Phase 4 sampler state, sampler views, 2D RGBA8 texture upload, and one textured triangle are observable through `draw_textured_triangles` counters.
+- Phase 4 sampler state, sampler views, 2D RGBA8 texture upload, and textured triangles are observable through counters. The exact glmark2 `effect2d` full-screen six-vertex profile also emits a model-consumed `draw_textured_triangles` command and tight RGBA8 sidecar.
 - Phase 5 texture-backed FBO color attachment traffic, FBO clear/readback, same-format 2D copy/blit traffic, and flush/finish visibility are observable through driver counters.
 - Phase 6 GLES2 uniform uploads are retained as Gallium constant-buffer state and one uniform-driven triangle is observable through `draw_uniform_triangles` counters.
 - Mesa's upload manager is initialized for state-tracker internal uploads, and resource release hooks are wired so teardown is clean.
-- real draw lowering/rasterization is not implemented yet; unsupported draw shapes still record `unsupported_draw`.
-- real texture sampling, shader lowering, scaled/format-converting blits, resolves, FBO draw pixels, UBO layout correctness, EGL image import/export, depth/stencil/blend pixel behavior, compute, and real synchronization paths are still intentionally fail-closed, tracked-only, or no-op.
+- narrow draw lowering/rasterization exists for the supported command profiles; all other draw shapes still record `unsupported_draw`.
+- arbitrary texture sampling and shader lowering, scaled/format-converting blits, resolves, FBO draw pixels, UBO layout correctness, EGL image import/export, general depth/stencil/blend pixel behavior, compute, and real synchronization paths are still intentionally fail-closed, tracked-only, or no-op.
 - `meson.build` is the Mesa source/build seam; the repository CMake build
   produces the native `pvrgpu` replay entry point, which consumes the
   separately configured Mesa install prefix at runtime.
@@ -74,7 +74,12 @@ The Phase 4 texture smoke uploads a 2x2 RGBA8 texture with `glTexImage2D`,
 configures nearest/clamp sampling, binds a `sampler2D` fragment shader, and
 issues `glDrawArrays(GL_TRIANGLES, 0, 3)`. The expected proof is
 `texture_subdata`, sampler state/view events, and `event=draw_textured_triangles`.
-It does not prove texture sampling pixels are correct yet.
+That generic smoke remains a state-plumbing check. Separately, the strict
+glmark2 `effect2d` profile validates exact VS/FS NIR and fixed-function state,
+skips the validated 1x1 replay probe, exports the selected RGBX texture as
+tight RGBA8, and runs the requested-size draw through SystemC. The native
+runner rejects any `unsupported_draw`; batch comparison then requires exact
+17-counter and decoded-RGBA PNG equality.
 
 The Phase 5 FBO smoke creates an 8x8 texture-backed FBO, verifies
 `glCheckFramebufferStatus(GL_FRAMEBUFFER)` returns complete, clears the FBO,

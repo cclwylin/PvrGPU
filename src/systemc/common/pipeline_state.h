@@ -54,6 +54,8 @@ struct PipelineState {
   PoolHandle vertex_lane_refs;
   PoolHandle vertex_shared_registers;
   PoolHandle shader_varying_bindings;
+  PoolHandle vertex_texture_resources;
+  PoolHandle vertex_sampler_states;
   PoolHandle texture_resources;
   PoolHandle sampler_states;
   PoolHandle fragment_shared_registers;
@@ -68,6 +70,22 @@ struct PipelineState {
   PoolHandle parameter_triangles;
   PoolHandle parameter_coefficients;
   PoolHandle fragment_candidates;
+  // Initial attachment payloads for API-v7 alias+LOAD render passes. The
+  // Submitter obtains these from the authoritative DRAM allocation at the
+  // ordered sequence barrier; ISP/PBE consume them as initial destination
+  // state rather than re-clearing the aliased target.
+  PoolHandle color_attachment_load;
+  PoolHandle depth_attachment_load;
+  // ISP owns the complete post-depth-test surface (including untouched LOAD
+  // pixels). Entries retain the exact encoded UNORM integer so an untouched
+  // Z32 LOAD pixel is not rounded through float before the DRAM commit.
+  PoolHandle isp_depth_attachment;
+  // Optional Z32_UNORM attachment materialized from the same ISP-visible work
+  // that
+  // feeds FragmentFrontend.  Native multi-pass commands use this handle at a
+  // completion barrier before the next draw binds it as a sampled resource.
+  // It is never populated for ordinary single-draw submissions.
+  PoolHandle depth_attachment;
   PoolHandle fragment_invocations;
   PoolHandle fragment_shader_lanes;
   PoolHandle fragment_quads;
@@ -75,6 +93,7 @@ struct PipelineState {
   PoolHandle usc_coefficient_banks;
   PoolHandle texture_sample_requests;
   PoolHandle texture_sample_responses;
+  PoolHandle vertex_continuations;
   PoolHandle fragment_continuations;
   PoolHandle fragment_outputs;
   PoolHandle pbe_framebuffer;
@@ -82,8 +101,38 @@ struct PipelineState {
   PoolHandle dram_framebuffer;
   PcoProgramSummary vertex_program_summary;
   PcoProgramSummary fragment_program_summary;
+  // Producer-declared PCO resource ABI and exact VS-to-FS linkage. Keeping
+  // these in the per-draw control block lets every downstream module validate
+  // dynamic driver payloads without recognizing a shader name or binary.
+  DriverPcoStageAbi vertex_pco_abi;
+  DriverPcoStageAbi fragment_pco_abi;
+  std::uint32_t position_output_start = 0;
+  std::uint32_t position_output_count = 0;
+  std::uint32_t fragment_position_start = 0;
+  std::uint32_t fragment_position_count = 0;
+  std::uint32_t varying_output_start = 0;
+  std::uint32_t varying_output_count = 0;
+  std::uint32_t fragment_varying_start = 0;
+  std::uint32_t fragment_varying_count = 0;
+  // Number of exact descriptor-set resources bound by this physical draw.
+  // TextureUnit cross-checks each raw 20-dword combined descriptor against
+  // the correspondingly numbered owned resource and sampler.
+  std::uint32_t vertex_sampled_texture_count = 0;
+  std::uint32_t sampled_texture_count = 0;
+  // Internal stage-bank accounting.  Public counters remain aggregate, while
+  // these totals prove that VS and FS FIFO traffic cannot be silently charged
+  // to the other stage and that multi-round SMP continuations are not lost.
+  std::uint64_t vertex_texture_request_count = 0;
+  std::uint64_t fragment_texture_request_count = 0;
+  std::uint64_t vertex_texel_fetch_count = 0;
+  std::uint64_t fragment_texel_fetch_count = 0;
   std::uint64_t framebuffer_gpu_address = 0;
   std::uint64_t framebuffer_bytes = 0;
+  std::uint64_t depth_attachment_gpu_address = 0;
+  std::uint64_t depth_attachment_bytes = 0;
+  std::uint64_t color_attachment_load_bytes = 0;
+  std::uint64_t depth_attachment_load_bytes = 0;
+  std::uint32_t depth_attachment_format = 0;
   std::uint64_t index_buffer_gpu_address = 0;
   std::uint64_t index_buffer_bytes = 0;
   std::uint64_t parameter_triangles_gpu_address = 0;
@@ -96,6 +145,10 @@ struct PipelineState {
   std::uint32_t fragment_shader_lane_count = 0;
   std::uint32_t scheduled_tiles = 0;
   std::uint8_t fragment_early_hsr_safe = 0;
+  std::uint8_t color_attachment_load_enable = 0;
+  std::uint8_t depth_attachment_load_enable = 0;
+  std::uint8_t capture_depth_attachment = 0;
+  std::uint8_t depth_attachment_ready = 0;
   MemoryMode memory_mode = MemoryMode::kCache;
   std::uint8_t cache_bypass = 0;
   std::uint8_t framebuffer_from_dram = 0;

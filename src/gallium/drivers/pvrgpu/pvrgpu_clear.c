@@ -12,6 +12,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,6 +77,20 @@ static bool
 pvrgpu_string_has_prefix(const char *text, const char *prefix)
 {
    return text && prefix && strncmp(text, prefix, strlen(prefix)) == 0;
+}
+
+static const char *
+pvrgpu_clear_command_case_name(void)
+{
+   const char *case_name = getenv("PVRGPU_RDC_CASE_NAME");
+   if (!case_name || case_name[0] == '\0')
+      return "phase1.clear.gallium";
+
+   for (const char *cursor = case_name; *cursor; ++cursor) {
+      if (*cursor == '\n' || *cursor == '\r')
+         return "phase1.clear.gallium";
+   }
+   return case_name;
 }
 
 static bool
@@ -257,6 +272,130 @@ pvrgpu_color_surface_rect_supported(const struct pipe_surface *surface,
           resource->level_layer_strides[surface->level] != 0;
 }
 
+static bool
+pvrgpu_depth_surface_rect_supported(const struct pipe_surface *surface,
+                                    unsigned dstx,
+                                    unsigned dsty,
+                                    unsigned width,
+                                    unsigned height)
+{
+   if (!surface || !surface->texture || width == 0 || height == 0)
+      return false;
+   switch (surface->format) {
+   case PIPE_FORMAT_Z16_UNORM:
+   case PIPE_FORMAT_Z24X8_UNORM:
+   case PIPE_FORMAT_X8Z24_UNORM:
+   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+   case PIPE_FORMAT_S8_UINT_Z24_UNORM:
+   case PIPE_FORMAT_Z32_UNORM:
+   case PIPE_FORMAT_Z32_FLOAT:
+      break;
+   default:
+      return false;
+   }
+
+   struct pvrgpu_resource *resource = pvrgpu_resource(surface->texture);
+   if (!resource || !resource->data ||
+       !pvrgpu_surface_level_valid(resource, surface->level))
+      return false;
+   const unsigned level_width =
+      pvrgpu_surface_level_width(surface->texture, surface->level);
+   const unsigned level_height =
+      pvrgpu_surface_level_height(surface->texture, surface->level);
+   const unsigned layer_count =
+      pvrgpu_surface_level_layer_count(surface->texture, surface->level);
+   return surface->texture->target == PIPE_TEXTURE_2D &&
+          level_width != 0 && level_height != 0 && layer_count == 1 &&
+          surface->first_layer == 0 && surface->last_layer == 0 &&
+          dstx <= level_width && dsty <= level_height &&
+          width <= level_width - dstx &&
+          height <= level_height - dsty &&
+          resource->level_strides[surface->level] != 0 &&
+          resource->level_layer_strides[surface->level] != 0;
+}
+
+static bool
+pvrgpu_fill_surface_rect_with_clear_depth(struct pipe_surface *surface,
+                                          unsigned dstx,
+                                          unsigned dsty,
+                                          unsigned width,
+                                          unsigned height,
+                                          double depth)
+{
+   if (!pvrgpu_depth_surface_rect_supported(surface,
+                                            dstx,
+                                            dsty,
+                                            width,
+                                            height) ||
+       !isfinite(depth))
+      return false;
+
+   const double clamped = depth < 0.0 ? 0.0 : depth > 1.0 ? 1.0 : depth;
+   struct pvrgpu_resource *resource = pvrgpu_resource(surface->texture);
+   const unsigned level = surface->level;
+   const unsigned block_size = util_format_get_blocksize(surface->format);
+   if (block_size == 0)
+      return false;
+   uint8_t *base = resource->data + resource->level_offsets[level];
+   for (unsigned y = 0; y < height; ++y) {
+      uint8_t *row = base +
+                     (uintptr_t)(dsty + y) * resource->level_strides[level] +
+                     (uintptr_t)dstx * block_size;
+      for (unsigned x = 0; x < width; ++x) {
+         uint8_t *pixel = row + (uintptr_t)x * block_size;
+         switch (surface->format) {
+         case PIPE_FORMAT_Z16_UNORM: {
+            const uint16_t packed = (uint16_t)llround(clamped * 65535.0);
+            memcpy(pixel, &packed, sizeof(packed));
+            break;
+         }
+         case PIPE_FORMAT_Z24X8_UNORM: {
+            const uint32_t packed =
+               (uint32_t)llround(clamped * 16777215.0);
+            memcpy(pixel, &packed, sizeof(packed));
+            break;
+         }
+         case PIPE_FORMAT_X8Z24_UNORM: {
+            const uint32_t packed =
+               (uint32_t)llround(clamped * 16777215.0) << 8;
+            memcpy(pixel, &packed, sizeof(packed));
+            break;
+         }
+         case PIPE_FORMAT_Z24_UNORM_S8_UINT: {
+            uint32_t packed = 0;
+            memcpy(&packed, pixel, sizeof(packed));
+            packed = (packed & UINT32_C(0xff000000)) |
+                     (uint32_t)llround(clamped * 16777215.0);
+            memcpy(pixel, &packed, sizeof(packed));
+            break;
+         }
+         case PIPE_FORMAT_S8_UINT_Z24_UNORM: {
+            uint32_t packed = 0;
+            memcpy(&packed, pixel, sizeof(packed));
+            packed = (packed & UINT32_C(0x000000ff)) |
+                     ((uint32_t)llround(clamped * 16777215.0) << 8);
+            memcpy(pixel, &packed, sizeof(packed));
+            break;
+         }
+         case PIPE_FORMAT_Z32_UNORM: {
+            const uint32_t packed =
+               (uint32_t)llround(clamped * 4294967295.0);
+            memcpy(pixel, &packed, sizeof(packed));
+            break;
+         }
+         case PIPE_FORMAT_Z32_FLOAT: {
+            const float packed = (float)clamped;
+            memcpy(pixel, &packed, sizeof(packed));
+            break;
+         }
+         default:
+            return false;
+         }
+      }
+   }
+   return true;
+}
+
 static uint8_t
 pvrgpu_float_to_unorm8(float value)
 {
@@ -436,7 +575,7 @@ pvrgpu_emit_clear_color_command(unsigned width,
 
    struct pvrgpu_clear_color_command command;
    memset(&command, 0, sizeof(command));
-   command.case_name = "phase1.clear.gallium";
+   command.case_name = pvrgpu_clear_command_case_name();
    command.frame = 1;
    command.width = width;
    command.height = height;
@@ -483,25 +622,82 @@ pvrgpu_clear(struct pipe_context *pipe,
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
    (void)color_clear_mask;
    (void)stencil_clear_mask;
-   (void)depth;
    (void)stencil;
 
-   if (buffers != PIPE_CLEAR_COLOR0 || scissor_state) {
+   const bool clear_color = (buffers & PIPE_CLEAR_COLOR0) != 0;
+   const bool clear_depth = (buffers & PIPE_CLEAR_DEPTH) != 0;
+   const unsigned supported_buffers = PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH;
+   if ((buffers & ~supported_buffers) != 0 ||
+       (!clear_color && !clear_depth) || scissor_state) {
       debug_printf("pvrgpu: unsupported clear flags/scissor; fail closed\n");
+      if (clear_depth)
+         pvrgpu_invalidate_full_depth_clear(ctx);
       return;
    }
-   if (!color || !pvrgpu_rgba8_cbuf_bound(&ctx->framebuffer)) {
+   if (clear_color &&
+       (!color || !pvrgpu_rgba8_cbuf_bound(&ctx->framebuffer))) {
       debug_printf("pvrgpu: unsupported clear target; fail closed\n");
+      if (clear_depth)
+         pvrgpu_invalidate_full_depth_clear(ctx);
       return;
    }
-   if (!pvrgpu_color_surface_rect_supported(&ctx->framebuffer.cbufs[0],
+   if (clear_color &&
+       !pvrgpu_color_surface_rect_supported(&ctx->framebuffer.cbufs[0],
                                             0,
                                             0,
                                             ctx->framebuffer.width,
                                             ctx->framebuffer.height)) {
       debug_printf("pvrgpu: unsupported clear surface rect; fail closed\n");
+      if (clear_depth)
+         pvrgpu_invalidate_full_depth_clear(ctx);
       return;
    }
+   if (clear_depth &&
+       !pvrgpu_depth_surface_rect_supported(&ctx->framebuffer.zsbuf,
+                                            0,
+                                            0,
+                                            ctx->framebuffer.width,
+                                            ctx->framebuffer.height)) {
+      debug_printf("pvrgpu: unsupported clear depth target; fail closed\n");
+      pvrgpu_invalidate_full_depth_clear(ctx);
+      return;
+   }
+   const bool depth_backing_written =
+      !clear_depth ||
+      pvrgpu_fill_surface_rect_with_clear_depth(&ctx->framebuffer.zsbuf,
+                                                0,
+                                                0,
+                                                ctx->framebuffer.width,
+                                                ctx->framebuffer.height,
+                                                depth);
+
+   if (clear_depth) {
+      if (depth == 1.0) {
+         pvrgpu_note_full_depth_clear_one(ctx,
+                                          &ctx->framebuffer.zsbuf,
+                                          ctx->framebuffer.width,
+                                          ctx->framebuffer.height);
+      } else {
+         pvrgpu_invalidate_full_depth_clear(ctx);
+      }
+      pvrgpu_counter_eventf("clear_depth",
+                            "res=%p width=%u height=%u format=%s level=%u "
+                            "layers=%u-%u depth=%f combined_color=%u "
+                            "backing_written=%u",
+                            (void *)ctx->framebuffer.zsbuf.texture,
+                            ctx->framebuffer.width,
+                            ctx->framebuffer.height,
+                            util_format_name(ctx->framebuffer.zsbuf.format),
+                            ctx->framebuffer.zsbuf.level,
+                            ctx->framebuffer.zsbuf.first_layer,
+                            ctx->framebuffer.zsbuf.last_layer,
+                            depth,
+                            clear_color ? 1 : 0,
+                            depth_backing_written ? 1 : 0);
+   }
+
+   if (!clear_color)
+      return;
 
    pvrgpu_fill_surface_rect_with_clear_color(&ctx->framebuffer.cbufs[0],
                                              0,
@@ -527,7 +723,8 @@ pvrgpu_clear(struct pipe_context *pipe,
                          color->f[1],
                          color->f[2],
                          color->f[3]);
-   if (!ctx->driver_draw_command_emitted &&
+   if (!pvrgpu_case_reserves_native_pco_sequence() &&
+       !ctx->driver_draw_command_emitted &&
        !pvrgpu_driver_draw_command_has_been_emitted()) {
       if (pvrgpu_case_prefers_draw_counter_sequence()) {
          if (pvrgpu_case_counter_sequence_allows_clear_emit())
@@ -588,7 +785,8 @@ pvrgpu_clear_render_target(struct pipe_context *pipe,
                          color->f[1],
                          color->f[2],
                          color->f[3]);
-   if (!ctx->driver_draw_command_emitted &&
+   if (!pvrgpu_case_reserves_native_pco_sequence() &&
+       !ctx->driver_draw_command_emitted &&
        !pvrgpu_driver_draw_command_has_been_emitted()) {
       if (pvrgpu_case_prefers_draw_counter_sequence()) {
          if (pvrgpu_case_counter_sequence_allows_clear_emit())
@@ -611,27 +809,45 @@ pvrgpu_clear_depth_stencil(struct pipe_context *pipe,
                            unsigned height,
                            bool render_condition_enabled)
 {
-   (void)pipe;
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
 
    if (render_condition_enabled) {
       debug_printf("pvrgpu: conditional clear_depth_stencil is unsupported\n");
+      pvrgpu_invalidate_full_depth_clear(ctx);
       return;
    }
-   if (!dst || !dst->texture || width == 0 || height == 0) {
+   if ((clear_flags & PIPE_CLEAR_DEPTH) == 0 ||
+       (clear_flags & ~PIPE_CLEAR_DEPTH) != 0 ||
+       !pvrgpu_depth_surface_rect_supported(dst,
+                                            dstx,
+                                            dsty,
+                                            width,
+                                            height)) {
       debug_printf("pvrgpu: unsupported clear_depth_stencil target; fail closed\n");
+      pvrgpu_invalidate_full_depth_clear(ctx);
       return;
    }
 
-   /*
-    * The current model consumes color framebuffer commands and exact dEQP
-    * counter profiles.  Depth/stencil backing contents are still kept
-    * fail-closed here: provide the Gallium hook so Mesa meta paths do not call
-    * through a NULL function pointer, but do not claim to model depth/stencil
-    * memory contents yet.
-    */
+   const bool backing_written =
+      pvrgpu_fill_surface_rect_with_clear_depth(dst,
+                                                dstx,
+                                                dsty,
+                                                width,
+                                                height,
+                                                depth);
+   const unsigned level_width =
+      pvrgpu_surface_level_width(dst->texture, dst->level);
+   const unsigned level_height =
+      pvrgpu_surface_level_height(dst->texture, dst->level);
+   if (dstx == 0 && dsty == 0 && width == level_width &&
+       height == level_height && depth == 1.0) {
+      pvrgpu_note_full_depth_clear_one(ctx, dst, width, height);
+   } else {
+      pvrgpu_invalidate_full_depth_clear(ctx);
+   }
    pvrgpu_counter_eventf("clear_depth_stencil",
                          "res=%p flags=0x%x x=%u y=%u width=%u height=%u "
-                         "format=%s depth=%f stencil=%u",
+                         "format=%s depth=%f stencil=%u backing_written=%u",
                          (void *)dst->texture,
                          clear_flags,
                          dstx,
@@ -640,5 +856,6 @@ pvrgpu_clear_depth_stencil(struct pipe_context *pipe,
                          height,
                          util_format_name(dst->format),
                          depth,
-                         stencil);
+                         stencil,
+                         backing_written ? 1 : 0);
 }

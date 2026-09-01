@@ -178,6 +178,78 @@ scaling the topology counters with `draw_count` and the viewport dimensions.
 `semantic_texel_fetches` is the Gallium/RenderDoc counter semantic for the whole
 captured batch; it is intentionally not an ISA instruction count.
 
+Required fields for `command=draw_textured_triangles`:
+
+```text
+schema=pvrgpu.driver-command.v1
+producer=pvrgpu-gallium-driver
+command=draw_textured_triangles
+case=<non-empty case name>
+frame=1
+framebuffer_width=<positive uint32>
+framebuffer_height=<positive uint32>
+width=<positive uint32>
+height=<positive uint32>
+format=PIPE_FORMAT_R8G8B8A8_UNORM
+clear_color_bits=<uint32>,<uint32>,<uint32>,<uint32>
+vertex0_bits=<uint32>,<uint32>
+vertex1_bits=<uint32>,<uint32>
+vertex2_bits=<uint32>,<uint32>
+vertex3_bits=<uint32>,<uint32>
+vertex4_bits=<uint32>,<uint32>
+vertex5_bits=<uint32>,<uint32>
+texcoord0_bits=<uint32>,<uint32>
+texcoord1_bits=<uint32>,<uint32>
+texcoord2_bits=<uint32>,<uint32>
+texcoord3_bits=<uint32>,<uint32>
+texcoord4_bits=<uint32>,<uint32>
+texcoord5_bits=<uint32>,<uint32>
+texture_width=<1..16384>
+texture_height=<1..16384>
+texture_rgba8_path=<non-empty path>
+```
+
+This is a narrow real-draw contract for the glmark2 `effect2d` capture, not a
+general shader command stream. The Gallium matcher fails closed unless the
+draw is the exact ordered six-vertex full-screen triangle list, the VS derives
+UV as `position.xy * 0.5 + 0.5`, the FS performs one 2D sample, and the
+framebuffer, depth, blend, rasterizer, sampler, and texture-view state match
+the supported profile. The captured 1x1 replay preflight is validated and
+skipped; only the requested output-size draw owns the command.
+
+`texture_rgba8_path` names a tightly packed, top-to-bottom RGBA8 sidecar. The
+driver applies the sampler-view swizzle while exporting the selected RGBX
+texture level. Its byte size must be exactly
+`texture_width * texture_height * 4`. The model accepts one mip level,
+normalized nearest filtering, and clamp-to-edge U/V for this path.
+
+The text command schema remains `pvrgpu.driver-command.v1`. The in-process C
+bridge ABI is separately versioned as `PVRGPU_SYSTEMC_API_VERSION=3`; it
+synchronously copies the sidecar bytes during submission so deferred model
+execution does not depend on the producer retaining or preserving the file.
+
+Required audit metadata for `command=draw_pco_triangles` records the strict
+80x60 glmark2 `conditionals` draw: a 6144-vertex non-indexed TRIANGLES list,
+12-byte `R32G32B32_FLOAT` stride, 73,728 raw VBO bytes, the 520/520-byte public
+Mesa PCO VS/FS profiles, 16/4 shared-register dwords, compiler ABI records,
+position linkage, viewport, raster, color, and depth state. The parser requires
+the exact field set and rejects wrong sizes, counts, ABI, or fixed state.
+The ABI field order is `temps,vertex_inputs,vertex_outputs,coefficients,shareds,`
+`push_constant_start,push_constant_count,entry_offset`; the pinned VS record is
+`10,4,4,0,16,0,16,0` and the pinned FS record is `4,0,0,0,4,0,4,0`.
+The position linkage is VS start/count `0/4` and FS start/count `0/0`:
+`gl_FragCoord` comes from the rasterizer's window position and does not consume
+an interpolated varying/coefficient range.
+
+The text record intentionally does not serialize executable VBO or shader
+bytes. It is an audit artifact and therefore cannot drive a standalone model
+run. Execution uses `PVRGPU_SYSTEMC_API_VERSION=3`; the API command supplies
+`raw_vertex_data`, `vertex_pco`, `fragment_pco`, `vertex_shared`, and
+`fragment_shared` pointer/size spans. The bridge validates the pinned binary
+profile and deep-copies all five spans before returning, because SystemC runs
+later from the registered process-exit flush. Producer pointers may be freed or
+reused immediately after a successful submit.
+
 ## Current Phase 1 behavior: clear color
 
 The model maps this command to the `driver_clear_color` functional case. The
@@ -282,13 +354,17 @@ such as `create_blend_state`, `bind_depth_stencil_alpha_state`,
 `draw_indexed_triangles`. No Phase 3 draw/state command is consumed by the
 model yet.
 
-The Phase 4 texture smoke is counter-only too. It exercises `glTexImage2D`
-RGBA8 upload, fragment sampler view binding, nearest/clamp sampler state, and
-one `sampler2D` fragment shader draw. The expected evidence is driver-counter
-events such as `texture_subdata`, `create_sampler_state`,
-`bind_sampler_states`, `create_sampler_view`, `set_sampler_views`, and
-`draw_textured_triangles`. No Phase 4 texture command is consumed by the model
-yet.
+The generic Phase 4 texture smoke still proves state plumbing through counters.
+In addition, the strictly matched glmark2 `effect2d` workload is model-consumed:
+the driver emits `draw_textured_triangles` plus a tight RGBA8 sidecar, and the
+SystemC path runs the six-vertex draw, depth test/write, varying interpolation,
+nearest texture sampling, and framebuffer readback. Unsupported texture draws
+still emit `unsupported_draw`; they are never replaced by presentation pixels.
+Batch acceptance requires both the exact normalized 17 counters and an exact
+decoded-RGBA PNG match. The command-specific interpolation setup also preserves
+llvmpipe's BACK/CW v0/v1 normalization, binary32 coefficient order, and integer
+pixel-offset evaluation; those details are observable at exact nearest-texel
+boundaries and are covered by the SystemC API bridge regression test.
 
 The Phase 5 FBO smoke creates a texture-backed FBO, verifies
 `glCheckFramebufferStatus(GL_FRAMEBUFFER)` is complete, clears the FBO and

@@ -25,6 +25,17 @@ struct pvrgpu_transfer {
    void *displaytarget_map;
 };
 
+static uint64_t
+pvrgpu_resource_debug_fnv1a64(const uint8_t *data, size_t size)
+{
+   uint64_t hash = UINT64_C(14695981039346656037);
+   for (size_t i = 0; i < size; ++i) {
+      hash ^= data[i];
+      hash *= UINT64_C(1099511628211);
+   }
+   return hash;
+}
+
 static void
 pvrgpu_emit_resource_copy_framebuffer_blit_command(struct pipe_context *pipe,
                                                    struct pipe_resource *dst,
@@ -79,6 +90,8 @@ pvrgpu_string_contains(const char *text, const char *needle)
 static bool
 pvrgpu_case_suppresses_driver_commands(void)
 {
+   if (pvrgpu_case_reserves_native_pco_sequence())
+      return true;
    const char *case_name = pvrgpu_rdc_case_name();
    return case_name &&
           strcmp(case_name,
@@ -368,6 +381,33 @@ pvrgpu_resource_level_height(const struct pipe_resource *resource,
    default:
       return u_minify(resource->height0, level);
    }
+}
+
+static bool
+pvrgpu_destination_box_matches_rdc_output(
+   const struct pipe_resource *resource,
+   unsigned level,
+   int64_t origin_x,
+   int64_t origin_y,
+   int64_t origin_z,
+   int64_t width,
+   int64_t height,
+   int64_t depth)
+{
+   unsigned output_width = 0;
+   unsigned output_height = 0;
+   if (!pvrgpu_rdc_output_extent(&output_width, &output_height))
+      return true;
+
+   return resource &&
+          resource->target == PIPE_TEXTURE_2D &&
+          level < pvrgpu_resource_level_count(resource) &&
+          origin_x == 0 && origin_y == 0 && origin_z == 0 &&
+          width == (int64_t)output_width &&
+          height == (int64_t)output_height &&
+          depth == 1 &&
+          pvrgpu_resource_level_width(resource, level) == output_width &&
+          pvrgpu_resource_level_height(resource, level) == output_height;
 }
 
 static unsigned
@@ -925,7 +965,6 @@ pvrgpu_transfer_map(struct pipe_context *pipe,
                     const struct pipe_box *box,
                     struct pipe_transfer **out_transfer)
 {
-   (void)pipe;
    struct pvrgpu_resource *pvrgpu = pvrgpu_resource(resource);
    if (!out_transfer || !pvrgpu || !pvrgpu->data ||
        !pvrgpu_transfer_box_in_bounds(resource, level, box))
@@ -965,6 +1004,9 @@ pvrgpu_transfer_map(struct pipe_context *pipe,
 
    if (resource->target == PIPE_BUFFER) {
       *out_transfer = transfer;
+      if (usage & PIPE_MAP_WRITE)
+         pvrgpu_invalidate_full_depth_clear_for_resource(
+            pvrgpu_context(pipe), resource);
       return pvrgpu->data + box->x;
    }
 
@@ -1001,12 +1043,18 @@ pvrgpu_transfer_map(struct pipe_context *pipe,
          (uintptr_t)pvrgpu->displaytarget_stride *
          pvrgpu_resource_level_height(resource, level);
       *out_transfer = transfer;
+      if (usage & PIPE_MAP_WRITE)
+         pvrgpu_invalidate_full_depth_clear_for_resource(
+            pvrgpu_context(pipe), resource);
       return (uint8_t *)pvrgpu_transfer->displaytarget_map +
              (uintptr_t)box->y * transfer->stride +
              (uintptr_t)box->x * block_size;
    }
 
    *out_transfer = transfer;
+   if (usage & PIPE_MAP_WRITE)
+      pvrgpu_invalidate_full_depth_clear_for_resource(
+         pvrgpu_context(pipe), resource);
    return pvrgpu->data + pvrgpu->level_offsets[level] +
           (uintptr_t)box->z * pvrgpu->level_layer_strides[level] +
           (uintptr_t)box->y * pvrgpu->level_strides[level] +
@@ -1048,6 +1096,29 @@ pvrgpu_transfer_unmap(struct pipe_context *pipe,
                             transfer->level,
                             transfer->usage,
                             pvrgpu_transfer->displaytarget_map ? 1 : 0);
+      if (transfer->resource->target != PIPE_BUFFER &&
+          getenv("PVRGPU_RESOURCE_DEBUG_HASHES") &&
+          pvrgpu && pvrgpu->data &&
+          transfer->level < pvrgpu->level_count) {
+         const size_t level_size =
+            pvrgpu->level_layer_strides[transfer->level] *
+            pvrgpu_resource_level_layer_count(transfer->resource,
+                                              transfer->level);
+         const uint8_t *level_data =
+            pvrgpu->data + pvrgpu->level_offsets[transfer->level];
+         size_t nonzero = 0;
+         for (size_t i = 0; i < level_size; ++i)
+            nonzero += level_data[i] != 0;
+         pvrgpu_counter_eventf(
+            "texture_unmap_hash",
+            "res=%p level=%u bytes=%zu nonzero=%zu fnv1a64=%016llx",
+            (void *)transfer->resource,
+            transfer->level,
+            level_size,
+            nonzero,
+            (unsigned long long)pvrgpu_resource_debug_fnv1a64(
+               level_data, level_size));
+      }
    }
    pipe_resource_reference(&transfer->resource, NULL);
    FREE(transfer);
@@ -1061,12 +1132,13 @@ pvrgpu_buffer_subdata(struct pipe_context *pipe,
                       unsigned size,
                       const void *data)
 {
-   (void)pipe;
    (void)usage;
    struct pvrgpu_resource *pvrgpu = pvrgpu_resource(resource);
    if (!pvrgpu || !data || resource->target != PIPE_BUFFER ||
        (uint64_t)offset + (uint64_t)size > pvrgpu->size)
       return;
+   pvrgpu_invalidate_full_depth_clear_for_resource(pvrgpu_context(pipe),
+                                                    resource);
    memcpy(pvrgpu->data + offset, data, size);
    pvrgpu_counter_eventf("buffer_subdata",
                          "offset=%u size=%u",
@@ -1084,12 +1156,13 @@ pvrgpu_texture_subdata(struct pipe_context *pipe,
                        unsigned stride,
                        uintptr_t layer_stride)
 {
-   (void)pipe;
    (void)usage;
    struct pvrgpu_resource *pvrgpu = pvrgpu_resource(resource);
    if (!pvrgpu || !data ||
        !pvrgpu_transfer_box_in_bounds(resource, level, box))
       return;
+   pvrgpu_invalidate_full_depth_clear_for_resource(pvrgpu_context(pipe),
+                                                    resource);
 
    const unsigned block_size = util_format_get_blocksize(resource->format);
    const unsigned row_bytes =
@@ -1151,13 +1224,13 @@ pvrgpu_clear_buffer(struct pipe_context *pipe,
                     const void *clear_value,
                     int clear_value_size)
 {
-   (void)pipe;
-
    struct pvrgpu_resource *pvrgpu = pvrgpu_resource(resource);
    if (!pvrgpu || !pvrgpu->data || resource->target != PIPE_BUFFER ||
        size == 0 || !clear_value || clear_value_size <= 0 ||
        (uint64_t)offset + (uint64_t)size > pvrgpu->size)
       return;
+   pvrgpu_invalidate_full_depth_clear_for_resource(pvrgpu_context(pipe),
+                                                    resource);
 
    uint8_t *dst = pvrgpu->data + offset;
    const uint8_t *value = (const uint8_t *)clear_value;
@@ -1190,8 +1263,6 @@ pvrgpu_clear_texture(struct pipe_context *pipe,
                      const struct pipe_box *box,
                      const void *data)
 {
-   (void)pipe;
-
    struct pvrgpu_resource *pvrgpu = pvrgpu_resource(resource);
    if (!pvrgpu || !pvrgpu->data || !data ||
        !pvrgpu_transfer_box_in_bounds(resource, level, box))
@@ -1210,6 +1281,8 @@ pvrgpu_clear_texture(struct pipe_context *pipe,
                             block_size);
       return;
    }
+   pvrgpu_invalidate_full_depth_clear_for_resource(pvrgpu_context(pipe),
+                                                    resource);
 
    uint8_t *dst_base = pvrgpu->data + pvrgpu->level_offsets[level] +
                        (uintptr_t)box->z *
@@ -1535,6 +1608,8 @@ pvrgpu_resource_copy_region(struct pipe_context *pipe,
 {
    if (pvrgpu_can_copy_buffer_region(dst, dst_level, dstx, dsty, dstz,
                                      src, src_level, src_box)) {
+      pvrgpu_invalidate_full_depth_clear_for_resource(pvrgpu_context(pipe),
+                                                       dst);
       pvrgpu_copy_buffer_region_unchecked(dst, dstx, src, src_box);
       pvrgpu_counter_eventf("buffer_copy_region",
                             "dst_width=%u dst_offset=%u src_width=%u "
@@ -1563,6 +1638,8 @@ pvrgpu_resource_copy_region(struct pipe_context *pipe,
       return;
    }
 
+   pvrgpu_invalidate_full_depth_clear_for_resource(pvrgpu_context(pipe),
+                                                    dst);
    pvrgpu_copy_texture_region_unchecked(dst,
                                         dst_level,
                                         dstx,
@@ -1971,23 +2048,9 @@ pvrgpu_command_format_for_resource(const struct pipe_resource *resource,
 }
 
 static unsigned
-pvrgpu_max_unsigned(unsigned a, unsigned b)
-{
-   return a > b ? a : b;
-}
-
-static unsigned
 pvrgpu_positive_extent_to_unsigned(int extent)
 {
    return extent > 0 ? (unsigned)extent : 0;
-}
-
-static unsigned
-pvrgpu_box_end_unsigned(int origin, int extent)
-{
-   if (origin < 0 || extent <= 0)
-      return pvrgpu_positive_extent_to_unsigned(extent);
-   return (unsigned)origin + (unsigned)extent;
 }
 
 static uint64_t
@@ -2017,8 +2080,6 @@ pvrgpu_emit_resource_copy_framebuffer_blit_command(struct pipe_context *pipe,
                                                    unsigned src_level,
                                                    const struct pipe_box *src_box)
 {
-   (void)dst_level;
-   (void)dstz;
    (void)src_level;
 
    if (!pvrgpu_deqp_fbo_default_framebuffer_blit_to_default_case())
@@ -2047,6 +2108,20 @@ pvrgpu_emit_resource_copy_framebuffer_blit_command(struct pipe_context *pipe,
    if (blit_width == 0 || blit_height == 0)
       return;
 
+   if (!pvrgpu_destination_box_matches_rdc_output(dst,
+                                                   dst_level,
+                                                   dstx,
+                                                   dsty,
+                                                   dstz,
+                                                   blit_width,
+                                                   blit_height,
+                                                   src_box->depth)) {
+      pvrgpu_counter_eventf(
+         "resource_copy_framebuffer_blit_command_skip",
+         "reason=destination_extent_mismatch");
+      return;
+   }
+
    const char *path = pvrgpu_command_output_path();
    if (!path) {
       pvrgpu_counter_eventf("resource_copy_framebuffer_blit_command_skip",
@@ -2054,35 +2129,10 @@ pvrgpu_emit_resource_copy_framebuffer_blit_command(struct pipe_context *pipe,
       return;
    }
 
-   unsigned framebuffer_width = blit_width;
-   unsigned framebuffer_height = blit_height;
-   unsigned output_width = 0;
-   unsigned output_height = 0;
-   if (pvrgpu_rdc_output_extent(&output_width, &output_height)) {
-      framebuffer_width = pvrgpu_max_unsigned(framebuffer_width, output_width);
-      framebuffer_height =
-         pvrgpu_max_unsigned(framebuffer_height, output_height);
-   }
-   framebuffer_width = pvrgpu_max_unsigned(framebuffer_width, dst->width0);
-   framebuffer_height = pvrgpu_max_unsigned(framebuffer_height, dst->height0);
-   framebuffer_width =
-      pvrgpu_max_unsigned(framebuffer_width,
-                          pvrgpu_box_end_unsigned((int)dstx,
-                                                  src_box->width));
-   framebuffer_height =
-      pvrgpu_max_unsigned(framebuffer_height,
-                          pvrgpu_box_end_unsigned((int)dsty,
-                                                  src_box->height));
-   if (ctx) {
-      framebuffer_width = pvrgpu_max_unsigned(framebuffer_width,
-                                              ctx->framebuffer.width);
-      framebuffer_height = pvrgpu_max_unsigned(framebuffer_height,
-                                               ctx->framebuffer.height);
-      framebuffer_width = pvrgpu_max_unsigned(framebuffer_width,
-                                              ctx->max_framebuffer_width);
-      framebuffer_height = pvrgpu_max_unsigned(framebuffer_height,
-                                               ctx->max_framebuffer_height);
-   }
+   const unsigned framebuffer_width =
+      pvrgpu_resource_level_width(dst, dst_level);
+   const unsigned framebuffer_height =
+      pvrgpu_resource_level_height(dst, dst_level);
 
    const bool direct_color_fbo_blit =
       pvrgpu_deqp_fbo_default_framebuffer_direct_color_counter_case();
@@ -2147,7 +2197,8 @@ pvrgpu_emit_framebuffer_blit_command(struct pipe_context *pipe,
       return;
 
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
-   if (ctx && ctx->driver_draw_command_emitted)
+   if ((ctx && ctx->driver_draw_command_emitted) ||
+       pvrgpu_driver_draw_command_has_been_emitted())
       return;
    if (pvrgpu_case_suppresses_driver_commands())
       return;
@@ -2168,28 +2219,23 @@ pvrgpu_emit_framebuffer_blit_command(struct pipe_context *pipe,
    if (blit_width == 0 || blit_height == 0)
       return;
 
-   unsigned framebuffer_width =
-      info->dst.resource ? info->dst.resource->width0 : blit_width;
-   unsigned framebuffer_height =
-      info->dst.resource ? info->dst.resource->height0 : blit_height;
-   framebuffer_width =
-      pvrgpu_max_unsigned(framebuffer_width,
-                          pvrgpu_box_end_unsigned(info->dst.box.x,
-                                                  info->dst.box.width));
-   framebuffer_height =
-      pvrgpu_max_unsigned(framebuffer_height,
-                          pvrgpu_box_end_unsigned(info->dst.box.y,
-                                                  info->dst.box.height));
-   if (ctx) {
-      framebuffer_width = pvrgpu_max_unsigned(framebuffer_width,
-                                              ctx->framebuffer.width);
-      framebuffer_height = pvrgpu_max_unsigned(framebuffer_height,
-                                               ctx->framebuffer.height);
-      framebuffer_width = pvrgpu_max_unsigned(framebuffer_width,
-                                              ctx->max_framebuffer_width);
-      framebuffer_height = pvrgpu_max_unsigned(framebuffer_height,
-                                               ctx->max_framebuffer_height);
+   if (!pvrgpu_destination_box_matches_rdc_output(info->dst.resource,
+                                                   info->dst.level,
+                                                   info->dst.box.x,
+                                                   info->dst.box.y,
+                                                   info->dst.box.z,
+                                                   blit_width,
+                                                   blit_height,
+                                                   info->dst.box.depth)) {
+      pvrgpu_counter_eventf("framebuffer_blit_command_skip",
+                            "reason=destination_extent_mismatch");
+      return;
    }
+
+   const unsigned framebuffer_width =
+      pvrgpu_resource_level_width(info->dst.resource, info->dst.level);
+   const unsigned framebuffer_height =
+      pvrgpu_resource_level_height(info->dst.resource, info->dst.level);
 
    struct pvrgpu_draw_indexed_quad_command command;
    memset(&command, 0, sizeof(command));
@@ -2231,6 +2277,8 @@ pvrgpu_emit_framebuffer_blit_command(struct pipe_context *pipe,
       return;
    }
 
+   if (ctx)
+      ctx->driver_draw_command_emitted = true;
    pvrgpu_note_driver_draw_command_emitted();
    pvrgpu_counter_eventf("framebuffer_blit_command",
                          "framebuffer=%ux%u viewport=%ux%u "
@@ -2270,6 +2318,8 @@ pvrgpu_blit(struct pipe_context *pipe,
                                    info);
       return;
    }
+   pvrgpu_invalidate_full_depth_clear_for_resource(
+      pvrgpu_context(pipe), info->dst.resource);
 
    uint8_t src_first[4] = {0, 0, 0, 0};
    uint8_t src_center[4] = {0, 0, 0, 0};

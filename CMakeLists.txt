@@ -74,6 +74,7 @@ add_executable(pvrgpu-model-stub
     model_stub/json_reporter.cpp
     model_stub/memory_pool.cpp
     model_stub/model_types.cpp
+    model_stub/pco_sequence_profiles.cpp
     model_stub/pvrgpu_model_stub.cpp
     model_stub/submitter.cpp
     src/support/png_writer.cpp
@@ -133,6 +134,7 @@ add_library(pvrgpu-systemc-bridge SHARED
     model_stub/json_reporter.cpp
     model_stub/memory_pool.cpp
     model_stub/model_types.cpp
+    model_stub/pco_sequence_profiles.cpp
     model_stub/pvrgpu_model_stub.cpp
     model_stub/pvrgpu_systemc_bridge.cpp
     model_stub/submitter.cpp
@@ -202,9 +204,140 @@ install(TARGETS pvrgpu-model-stub pvrgpu-systemc-bridge
     LIBRARY DESTINATION lib
 )
 
+# Optional live dEQP integration.  VK-GL-CTS remains an external, pinned
+# checkout, but its EGL/GLES packages, the PvrGPU Mesa frontend, and the
+# SystemC bridge are exposed through one directly linked executable.
+set(PVRGPU_DEQP_SOURCE_DIR "$ENV{PVRGPU_DEQP_SOURCE_DIR}" CACHE PATH
+    "Path to a fetched VK-GL-CTS source checkout")
+set(PVRGPU_DEQP_MESA_PREFIX "$ENV{PVRGPU_MESA_PVRGPU_PREFIX}" CACHE PATH
+    "Mesa install prefix containing the PvrGPU Gallium driver")
+set(PVRGPU_DEQP_BUILD_DIR "${CMAKE_BINARY_DIR}/_deps/pvrgpu-deqp-build"
+    CACHE PATH "Out-of-tree VK-GL-CTS build used by pvrgpu-deqp")
+set(pvrgpu_live_deqp_default OFF)
+if(PVRGPU_DEQP_SOURCE_DIR AND PVRGPU_DEQP_MESA_PREFIX)
+    set(pvrgpu_live_deqp_default ON)
+endif()
+option(PVRGPU_ENABLE_LIVE_DEQP
+    "Build one live EGL/GLES dEQP executable linked to Mesa PvrGPU"
+    ${pvrgpu_live_deqp_default})
+
+if(PVRGPU_ENABLE_LIVE_DEQP)
+    if(NOT EXISTS "${PVRGPU_DEQP_SOURCE_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "PVRGPU_DEQP_SOURCE_DIR is not a VK-GL-CTS checkout: "
+            "${PVRGPU_DEQP_SOURCE_DIR}")
+    endif()
+    if(NOT EXISTS "${PVRGPU_DEQP_MESA_PREFIX}/include/EGL/egl.h")
+        message(FATAL_ERROR
+            "PVRGPU_DEQP_MESA_PREFIX has no EGL headers: "
+            "${PVRGPU_DEQP_MESA_PREFIX}")
+    endif()
+
+    unset(PVRGPU_DEQP_EGL_LIBRARY CACHE)
+    find_library(PVRGPU_DEQP_EGL_LIBRARY
+        NAMES EGL libEGL
+        PATHS
+            "${PVRGPU_DEQP_MESA_PREFIX}/lib"
+            "${PVRGPU_DEQP_MESA_PREFIX}/lib64"
+        NO_DEFAULT_PATH REQUIRED)
+    unset(PVRGPU_DEQP_GLES_LIBRARY CACHE)
+    find_library(PVRGPU_DEQP_GLES_LIBRARY
+        NAMES GLESv2 libGLESv2
+        PATHS
+            "${PVRGPU_DEQP_MESA_PREFIX}/lib"
+            "${PVRGPU_DEQP_MESA_PREFIX}/lib64"
+        NO_DEFAULT_PATH REQUIRED)
+
+    include(ExternalProject)
+    set(pvrgpu_deqp_build_type "${CMAKE_BUILD_TYPE}")
+    if(NOT pvrgpu_deqp_build_type)
+        set(pvrgpu_deqp_build_type Release)
+    endif()
+    get_filename_component(pvrgpu_cxx_compiler_dir
+        "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(pvrgpu_cxx_compiler_name
+        "${CMAKE_CXX_COMPILER}" NAME)
+    if(pvrgpu_cxx_compiler_name MATCHES "^clang\\+\\+(\\.exe)?$")
+        set(pvrgpu_deqp_c_compiler_names clang)
+    elseif(pvrgpu_cxx_compiler_name MATCHES "^(g\\+\\+|gcc)(-[0-9.]+)?(\\.exe)?$")
+        set(pvrgpu_deqp_c_compiler_names gcc)
+    elseif(pvrgpu_cxx_compiler_name MATCHES "^cl(\\.exe)?$")
+        set(pvrgpu_deqp_c_compiler_names cl)
+    else()
+        set(pvrgpu_deqp_c_compiler_names cc clang gcc cl)
+    endif()
+    find_program(PVRGPU_DEQP_C_COMPILER
+        NAMES ${pvrgpu_deqp_c_compiler_names}
+        HINTS "${pvrgpu_cxx_compiler_dir}"
+        REQUIRED)
+    set(PVRGPU_DEQP_CXX_COMPILER "${CMAKE_CXX_COMPILER}" CACHE FILEPATH
+        "C++ compiler used for the VK-GL-CTS composite executable")
+
+    ExternalProject_Add(pvrgpu-deqp
+        SOURCE_DIR "${PVRGPU_DEQP_SOURCE_DIR}"
+        BINARY_DIR "${PVRGPU_DEQP_BUILD_DIR}"
+        DOWNLOAD_COMMAND ""
+        UPDATE_COMMAND ""
+        PATCH_COMMAND ""
+        CMAKE_ARGS
+            "-DCMAKE_BUILD_TYPE:STRING=${pvrgpu_deqp_build_type}"
+            "-DCMAKE_C_COMPILER:FILEPATH=${PVRGPU_DEQP_C_COMPILER}"
+            "-DCMAKE_CXX_COMPILER:FILEPATH=${PVRGPU_DEQP_CXX_COMPILER}"
+            "-DCMAKE_PROJECT_INCLUDE:FILEPATH=${CMAKE_SOURCE_DIR}/cmake/PvrGPUDeqpSingleBinary.cmake"
+            "-DDEQP_TARGET:STRING=nullws"
+            "-DGLES_ALLOW_DIRECT_LINK:BOOL=ON"
+            "-DSELECTED_BUILD_TARGETS:STRING=pvrgpu-deqp"
+            "-DCMAKE_PREFIX_PATH:PATH=${PVRGPU_DEQP_MESA_PREFIX}"
+            "-DEGL_LIBRARY:FILEPATH=${PVRGPU_DEQP_EGL_LIBRARY}"
+            "-DGLES2_LIBRARY:FILEPATH=${PVRGPU_DEQP_GLES_LIBRARY}"
+            "-DGLES3_LIBRARY:FILEPATH=${PVRGPU_DEQP_GLES_LIBRARY}"
+            "-DEGL_INCLUDE_PATH:PATH=${PVRGPU_DEQP_MESA_PREFIX}/include"
+            "-DGLES2_INCLUDE_PATH:PATH=${PVRGPU_DEQP_MESA_PREFIX}/include"
+            "-DGLES3_INCLUDE_PATH:PATH=${PVRGPU_DEQP_MESA_PREFIX}/include"
+            "-DGLES31_INCLUDE_PATH:PATH=${PVRGPU_DEQP_MESA_PREFIX}/include"
+            "-DGLES32_INCLUDE_PATH:PATH=${PVRGPU_DEQP_MESA_PREFIX}/include"
+            "-DPVRGPU_DEQP_RUNNER_MAIN:FILEPATH=${CMAKE_SOURCE_DIR}/src/deqp_runner/main.cpp"
+            "-DPVRGPU_DEQP_OUTPUT_DIR:PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
+            "-DPVRGPU_DEQP_SYSTEMC_BRIDGE:FILEPATH=$<TARGET_FILE:pvrgpu-systemc-bridge>"
+            "-DPVRGPU_DEQP_SYSTEMC_API_INCLUDE_DIR:PATH=${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu"
+        BUILD_COMMAND
+            "${CMAKE_COMMAND}" --build <BINARY_DIR>
+                --target pvrgpu-deqp --parallel
+        INSTALL_COMMAND ""
+        BUILD_ALWAYS TRUE
+        BUILD_BYPRODUCTS
+            "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/pvrgpu-deqp${CMAKE_EXECUTABLE_SUFFIX}"
+        USES_TERMINAL_CONFIGURE TRUE
+        USES_TERMINAL_BUILD TRUE
+    )
+    add_dependencies(pvrgpu-deqp pvrgpu-systemc-bridge)
+
+    install(PROGRAMS
+        "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/pvrgpu-deqp${CMAKE_EXECUTABLE_SUFFIX}"
+        DESTINATION bin OPTIONAL)
+    install(DIRECTORY
+        "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/gles2"
+        "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/gles3"
+        "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/gles31"
+        DESTINATION bin OPTIONAL)
+endif()
+
 enable_testing()
 add_test(NAME llvmpipe-native-cli-help COMMAND llvmpipe --help)
 add_test(NAME pvrgpu-native-cli-help COMMAND pvrgpu --help)
+if(PVRGPU_ENABLE_LIVE_DEQP)
+    add_test(NAME pvrgpu-deqp-cli-help
+        COMMAND
+            "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/pvrgpu-deqp${CMAKE_EXECUTABLE_SUFFIX}"
+            --pvrgpu-help)
+    add_test(NAME pvrgpu-deqp-clear-smoke
+        COMMAND
+            "${CMAKE_COMMAND}"
+            "-DRUNNER=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/pvrgpu-deqp${CMAKE_EXECUTABLE_SUFFIX}"
+            "-DOUTPUT_DIR=${CMAKE_BINARY_DIR}/test-output/pvrgpu-deqp-clear-smoke"
+            -P "${CMAKE_SOURCE_DIR}/cmake/PvrGPUDeqpSmoke.cmake")
+    set_tests_properties(pvrgpu-deqp-clear-smoke PROPERTIES TIMEOUT 60)
+endif()
 
 add_executable(pco-iss-test
     tests/pco_iss_test.cpp
@@ -217,6 +350,16 @@ target_include_directories(pco-iss-test PRIVATE
 pvrgpu_target_warnings(pco-iss-test)
 add_test(NAME pco-iss-unit COMMAND pco-iss-test)
 
+add_executable(pco-sequence-profiles-test
+    tests/pco_sequence_profiles_test.cpp
+    model_stub/pco_sequence_profiles.cpp
+)
+target_include_directories(pco-sequence-profiles-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+)
+pvrgpu_target_warnings(pco-sequence-profiles-test)
+add_test(NAME pco-sequence-profiles-unit COMMAND pco-sequence-profiles-test)
+
 add_executable(driver-command-test
     tests/driver_command_test.cpp
     model_stub/driver_command.cpp
@@ -226,6 +369,49 @@ target_include_directories(driver-command-test PRIVATE
 )
 pvrgpu_target_warnings(driver-command-test)
 add_test(NAME driver-command-unit COMMAND driver-command-test)
+
+add_executable(systemc-api-bridge-test
+    tests/systemc_api_bridge_test.cpp
+)
+target_include_directories(systemc-api-bridge-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu"
+)
+target_link_libraries(systemc-api-bridge-test PRIVATE
+    pvrgpu-systemc-bridge
+    PkgConfig::LIBPNG
+)
+pvrgpu_target_warnings(systemc-api-bridge-test)
+add_test(NAME systemc-api-bridge-unit COMMAND systemc-api-bridge-test)
+
+add_executable(pco-systemc-api-bridge-test
+    tests/pco_systemc_api_bridge_test.cpp
+)
+target_include_directories(pco-systemc-api-bridge-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu"
+)
+target_link_libraries(pco-systemc-api-bridge-test PRIVATE
+    pvrgpu-systemc-bridge
+    PkgConfig::LIBPNG
+)
+pvrgpu_target_warnings(pco-systemc-api-bridge-test)
+add_test(NAME pco-systemc-api-bridge-unit COMMAND pco-systemc-api-bridge-test)
+
+add_executable(json-reporter-opcode-test
+    tests/json_reporter_opcode_test.cpp
+)
+target_include_directories(json-reporter-opcode-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(json-reporter-opcode-test PRIVATE
+    pvrgpu-systemc-bridge
+    PkgConfig::SYSTEMC
+)
+pvrgpu_target_warnings(json-reporter-opcode-test)
+add_test(NAME json-reporter-opcode-unit COMMAND json-reporter-opcode-test)
 
 add_executable(cache-array-test
     tests/cache_array_test.cpp
@@ -284,6 +470,37 @@ target_link_libraries(texture-unit-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(texture-unit-test)
 add_test(NAME texture-unit-unit COMMAND texture-unit-test)
 
+add_executable(usc-cluster-texture-continuation-test
+    tests/usc_cluster_texture_continuation_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/shader/pco_iss.cpp
+    src/systemc/shader/usc_cluster.cpp
+)
+target_include_directories(usc-cluster-texture-continuation-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(usc-cluster-texture-continuation-test PRIVATE
+    PkgConfig::SYSTEMC
+)
+pvrgpu_target_warnings(usc-cluster-texture-continuation-test)
+add_test(
+    NAME usc-cluster-texture-continuation-unit
+    COMMAND usc-cluster-texture-continuation-test
+)
+add_test(
+    NAME usc-cluster-texture-request-limit-fail-closed
+    COMMAND usc-cluster-texture-continuation-test request-limit
+)
+add_test(
+    NAME usc-cluster-texture-response-order-fail-closed
+    COMMAND usc-cluster-texture-continuation-test response-order
+)
+
 add_executable(pbe-blend-test
     tests/pbe_blend_test.cpp
     model_stub/memory_pool.cpp
@@ -302,6 +519,23 @@ target_include_directories(pbe-blend-test PRIVATE
 target_link_libraries(pbe-blend-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(pbe-blend-test)
 add_test(NAME pbe-blend-unit COMMAND pbe-blend-test)
+
+add_executable(isp-depth-attachment-test
+    tests/isp_depth_attachment_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/fragment/isp.cpp
+)
+target_include_directories(isp-depth-attachment-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(isp-depth-attachment-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(isp-depth-attachment-test)
+add_test(NAME isp-depth-attachment-unit COMMAND isp-depth-attachment-test)
 
 add_executable(ordered-blend-pipeline-test
     tests/ordered_blend_pipeline_test.cpp
@@ -355,6 +589,52 @@ target_include_directories(indexed-geometry-test PRIVATE
 target_link_libraries(indexed-geometry-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(indexed-geometry-test)
 add_test(NAME indexed-geometry-unit COMMAND indexed-geometry-test)
+
+add_executable(nonindexed-triangle-geometry-test
+    tests/nonindexed_triangle_geometry_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/geometry/clip_cull.cpp
+    src/systemc/geometry/parameter_buffer.cpp
+    src/systemc/geometry/tiler.cpp
+    src/systemc/geometry/vdm.cpp
+    src/systemc/geometry/vertex_fetch.cpp
+    src/systemc/shader/pco_decoder.cpp
+    src/systemc/shader/pco_iss.cpp
+    src/systemc/shader/usc_cluster.cpp
+    src/systemc/shader/usc_slot.cpp
+)
+target_include_directories(nonindexed-triangle-geometry-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(nonindexed-triangle-geometry-test PRIVATE
+    PkgConfig::SYSTEMC
+)
+pvrgpu_target_warnings(nonindexed-triangle-geometry-test)
+add_test(
+    NAME nonindexed-triangle-geometry-unit
+    COMMAND nonindexed-triangle-geometry-test
+)
+add_test(
+    NAME nonindexed-triangle-count-fail-closed
+    COMMAND nonindexed-triangle-geometry-test invalid-count
+)
+add_test(
+    NAME nonindexed-triangle-front-cull-reflection
+    COMMAND nonindexed-triangle-geometry-test front-cull
+)
+add_test(
+    NAME nonindexed-triangle-homogeneous-clip
+    COMMAND nonindexed-triangle-geometry-test clip-w
+)
+add_test(
+    NAME nonindexed-triangle-driver-viewport-fma
+    COMMAND nonindexed-triangle-geometry-test viewport-fma
+)
 
 add_executable(all-culled-geometry-test
     tests/all_culled_geometry_test.cpp

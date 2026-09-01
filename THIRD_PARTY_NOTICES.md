@@ -1,5 +1,19 @@
 # Third-party notices
 
+## VK-GL-CTS / dEQP
+
+The optional `pvrgpu-deqp` target builds the EGL, GLES2, GLES3, and GLES31
+packages from the official
+[VK-GL-CTS repository](https://github.com/KhronosGroup/VK-GL-CTS) at commit
+`067e8832315e79817ede1c4863804e440f5d1c80`. The external checkout and build
+tree are not vendored in this workspace. `src/deqp_runner/main.cpp` is derived
+from the upstream `framework/platform/tcuMain.cpp` entry point and retains its
+Android Open Source Project copyright and Apache License 2.0 header.
+
+`third_party/vk-gl-cts.lock` records the source pin and the four linked package
+targets. Preserve upstream notices and license texts when redistributing a
+binary containing those packages or their adjacent test data.
+
 ## ChromeOS GLBench
 
 The optional external GLBench runner is built from the official

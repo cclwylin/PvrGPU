@@ -334,7 +334,8 @@ RasterTriangle BuildRasterTriangle(const std::array<ClipVertex, 3> &vertices,
                                    std::uint32_t width, std::uint32_t height,
                                    bool front_facing,
                                    std::vector<std::uint32_t> &vertex_outputs,
-                                   bool depth_clamp_enable) {
+                                   bool depth_clamp_enable,
+                                   bool mesa_viewport_order) {
   RasterTriangle triangle;
   triangle.front_facing = front_facing ? 1U : 0U;
   const std::uint16_t output_count = vertices[0].output_count;
@@ -359,11 +360,23 @@ RasterTriangle BuildRasterTriangle(const std::array<ClipVertex, 3> &vertices,
     if (depth_clamp_enable) {
       ndc_z = std::max(std::min(ndc_z, 1.0F), -1.0F);
     }
-    triangle.x[index] =
-        (ndc_x * 0.5F + 0.5F) * static_cast<float>(width);
-    triangle.y[index] =
-        (ndc_y * 0.5F + 0.5F) * static_cast<float>(height);
-    triangle.window_z[index] = ndc_z * 0.5F + 0.5F;
+    if (mesa_viewport_order) {
+      const float scale_x = static_cast<float>(width) * 0.5F;
+      const float scale_y = static_cast<float>(height) * 0.5F;
+      // Gallivm's do_rhw_viewport emits data * reciprocal_w first, then
+      // contracts the viewport multiply/add.  Keep that public driver-PCO
+      // ordering exact: splitting the final operation changes setup-plane
+      // coefficients at half-precision interpolation boundaries.
+      triangle.x[index] = std::fma(ndc_x, scale_x, scale_x);
+      triangle.y[index] = std::fma(ndc_y, scale_y, scale_y);
+      triangle.window_z[index] = std::fma(ndc_z, 0.5F, 0.5F);
+    } else {
+      triangle.x[index] =
+          (ndc_x * 0.5F + 0.5F) * static_cast<float>(width);
+      triangle.y[index] =
+          (ndc_y * 0.5F + 0.5F) * static_cast<float>(height);
+      triangle.window_z[index] = ndc_z * 0.5F + 0.5F;
+    }
     if (!std::isfinite(triangle.x[index]) ||
         !std::isfinite(triangle.y[index]) ||
         !std::isfinite(triangle.window_z[index]) ||
@@ -444,7 +457,7 @@ void ClipCull::Run() {
     const std::vector<VertexLane> lanes =
         LoadArray<VertexLane>(pool_, state.vertex_lanes);
     std::uint16_t active_vertex_output_dwords = 4;
-    if (UsesShaderVaryings(state.functional_case)) {
+    if (UsesShaderVaryings(state)) {
       if (!HasPoolHandle(state.shader_varying_bindings)) {
         throw std::runtime_error(
             "ClipCull varying case has no shader linkage payload");
@@ -453,20 +466,19 @@ void ClipCull::Run() {
           LoadArray<ShaderVaryingBinding>(pool_,
                                           state.shader_varying_bindings);
       const std::uint32_t varying_count =
-          VaryingVectorCount(state.functional_case);
+          VaryingVectorCount(state);
       if (varying_count == 0 || bindings.size() != varying_count) {
         throw std::runtime_error(
             "ClipCull varying linkage count is invalid");
       }
       for (std::size_t index = 0; index < bindings.size(); ++index) {
-        if (!IsExactVaryingBinding(state.functional_case, bindings[index],
-                                   index)) {
+        if (!IsExactVaryingBinding(state, bindings[index], index)) {
           throw std::runtime_error(
               "ClipCull varying linkage is not exact");
         }
       }
       active_vertex_output_dwords = static_cast<std::uint16_t>(
-          VaryingVertexOutputDwordCount(state.functional_case));
+          VaryingVertexOutputDwordCount(state));
       if (active_vertex_output_dwords > kPcoVertexOutputRegisterCount)
         throw std::runtime_error("ClipCull varying VTXOUT range is too large");
     } else if (HasPoolHandle(state.shader_varying_bindings)) {
@@ -475,77 +487,158 @@ void ClipCull::Run() {
     }
     std::vector<RasterTriangle> triangles;
     std::vector<std::uint32_t> raster_vertex_outputs;
+    const bool driver_pco_triangles =
+        IsDriverPcoTrianglesCase(state.functional_case);
     if (IsFillSolidFamily(state.functional_case) ||
         IsTextureFamily(state.functional_case)) {
-      if (lanes.size() != 4 || HasPoolHandle(state.vertex_lane_refs))
+      const bool driver_textured_triangles =
+          state.functional_case == FunctionalCase::kDriverTexturedTriangles;
+      const std::size_t expected_lane_count =
+          driver_textured_triangles ? 6U : 4U;
+      if (lanes.size() != expected_lane_count ||
+          HasPoolHandle(state.vertex_lane_refs))
         throw std::runtime_error(
-          "ClipCull fullscreen strip requires four direct shaded vertices");
+            "ClipCull direct raster lane count is invalid");
       for (const VertexLane &lane : lanes) {
         if (!IsInsideHomogeneousClip(lane, active_vertex_output_dwords, depth_clamp)) {
           throw std::runtime_error(
-              "ClipCull Fill.Solid vertex is outside homogeneous clip space");
+              "ClipCull direct raster vertex is outside homogeneous clip space");
         }
       }
-      constexpr std::size_t kTriangleIndices[2][3] = {
-          {0, 1, 2},
-          {2, 1, 3},
+      constexpr std::size_t kStripTriangleIndices[2][3] = {
+          {0, 1, 2}, {2, 1, 3},
       };
+      constexpr std::size_t kListTriangleIndices[2][3] = {
+          {0, 1, 2}, {3, 4, 5},
+      };
+      ValidateFaceCullState(state.raster_state.face_cull);
+      if (driver_textured_triangles) {
+        if (state.raster_state.face_cull.enable != 1 ||
+            state.raster_state.face_cull.mode != CullFaceMode::kBack ||
+            state.raster_state.face_cull.front_face !=
+                FrontFaceWinding::kClockwise) {
+          throw std::runtime_error(
+              "ClipCull driver textured-triangle cull state is invalid");
+        }
+      } else if (state.raster_state.face_cull.enable != 0) {
+        throw std::runtime_error(
+            "ClipCull fullscreen strip unexpectedly enables face culling");
+      }
       triangles.reserve(2);
       for (std::size_t primitive = 0; primitive < 2; ++primitive) {
         std::array<ClipVertex, 3> vertices;
-        for (std::size_t vertex = 0; vertex < 3; ++vertex)
+        for (std::size_t vertex = 0; vertex < 3; ++vertex) {
+          const std::size_t lane =
+              driver_textured_triangles
+                  ? kListTriangleIndices[primitive][vertex]
+                  : kStripTriangleIndices[primitive][vertex];
           vertices[vertex] = ReadClipVertex(
-              lanes[kTriangleIndices[primitive][vertex]],
-              active_vertex_output_dwords);
+              lanes[lane], active_vertex_output_dwords);
+        }
+        // Gallium's clockwise front-face bit is defined after its window-Y
+        // convention, while this model keeps NDC +Y upward through the
+        // viewport transform. Account for that single axis reflection when
+        // classifying the validated driver command; retain the public state
+        // itself as BACK/CW for reporting and fixed-function validation.
+        const FrontFaceWinding classification_winding =
+            driver_textured_triangles
+                ? FrontFaceWinding::kCounterClockwise
+                : state.raster_state.face_cull.front_face;
+        const bool front_facing =
+            ClassifyFrontFacing(vertices, classification_winding, true);
+        const bool face_culled =
+            IsFaceCulled(state.raster_state.face_cull, front_facing);
         RasterTriangle triangle = BuildRasterTriangle(
-            vertices, state.width, state.height, true,
-            raster_vertex_outputs, depth_clamp);
+            vertices, state.width, state.height, front_facing,
+            raster_vertex_outputs, depth_clamp, driver_textured_triangles);
         if (!triangle.rasterizable)
           throw std::runtime_error(
-              "ClipCull Fill.Solid produced a degenerate triangle");
+              "ClipCull direct raster draw produced a degenerate triangle");
         triangle.key.submit_ordinal = primitive;
         triangle.key.api_primitive_id = primitive;
+        triangle.face_culled = face_culled ? 1U : 0U;
+        if (face_culled)
+          triangle.rasterizable = 0;
         triangles.push_back(triangle);
       }
       state.counters.c_invocations = 2;
     } else {
-      if (!IsIndexedTriangleRasterCase(state.functional_case) ||
+      const bool indexed_triangle =
+          IsIndexedTriangleRasterCase(state.functional_case);
+      if ((!driver_pco_triangles && !indexed_triangle) ||
           state.draw.topology != PrimitiveTopology::kTriangleList ||
-          !HasPoolHandle(state.vertex_indices) ||
           !HasPoolHandle(state.vertex_lane_refs)) {
         throw std::runtime_error(
-            "ClipCull indexed-triangle payload is incomplete");
+            "ClipCull triangle-list payload is incomplete");
       }
-      const std::vector<std::uint16_t> indices =
-          LoadArray<std::uint16_t>(pool_, state.vertex_indices);
+      std::vector<std::uint16_t> indices;
+      if (driver_pco_triangles) {
+        if (state.draw.vertex_count == 0 ||
+            state.draw.vertex_count % 3 != 0 ||
+            state.draw.first_index != 0 || state.draw.index_count != 0 ||
+            state.draw.base_vertex != 0 ||
+            state.draw.index_format != IndexFormat::kNone ||
+            state.primitive_restart_enable != 0 ||
+            HasPoolHandle(state.vertex_indices) ||
+            state.index_buffer_gpu_address != 0 ||
+            state.index_buffer_bytes != 0) {
+          throw std::runtime_error(
+              "ClipCull direct triangle-list state is invalid");
+        }
+      } else {
+        if (!HasPoolHandle(state.vertex_indices)) {
+          throw std::runtime_error(
+              "ClipCull indexed triangle-list has no index payload");
+        }
+        indices = LoadArray<std::uint16_t>(pool_, state.vertex_indices);
+      }
       const std::vector<VertexLaneRef> lane_refs =
           LoadArray<VertexLaneRef>(pool_, state.vertex_lane_refs);
-      if (state.draw.first_index != 0 ||
-          lane_refs.size() != state.draw.index_count ||
-          indices.size() != state.draw.index_count ||
-          lane_refs.size() % 3 != 0) {
+      const std::size_t occurrence_count = driver_pco_triangles
+                                               ? state.draw.vertex_count
+                                               : state.draw.index_count;
+      if (lane_refs.size() != occurrence_count ||
+          lane_refs.size() % 3 != 0 ||
+          (driver_pco_triangles && lanes.size() != occurrence_count) ||
+          (!driver_pco_triangles &&
+           (state.draw.first_index != 0 ||
+            indices.size() != occurrence_count))) {
         throw std::runtime_error(
-            "ClipCull indexed-triangle index/lane-ref ranges disagree");
+            "ClipCull triangle-list occurrence/lane-ref ranges disagree");
       }
       const std::size_t primitive_count = lane_refs.size() / 3;
       triangles.reserve(primitive_count);
       ValidateFaceCullState(state.raster_state.face_cull);
-      const bool expects_face_culling =
-          RequiresBackCcwFaceCull(state.functional_case);
-      if ((!expects_face_culling &&
-           state.raster_state.face_cull.enable != 0) ||
-          (expects_face_culling &&
-           (state.raster_state.face_cull.enable == 0 ||
-            state.raster_state.face_cull.mode != CullFaceMode::kBack ||
-            state.raster_state.face_cull.front_face !=
-                FrontFaceWinding::kCounterClockwise))) {
-        throw std::runtime_error(
-            "ClipCull indexed-triangle case/cull state is inconsistent");
+      if (indexed_triangle) {
+        const bool expects_face_culling =
+            RequiresBackCcwFaceCull(state.functional_case);
+        if ((!expects_face_culling &&
+             state.raster_state.face_cull.enable != 0) ||
+            (expects_face_culling &&
+             (state.raster_state.face_cull.enable == 0 ||
+              state.raster_state.face_cull.mode != CullFaceMode::kBack ||
+              state.raster_state.face_cull.front_face !=
+                  FrontFaceWinding::kCounterClockwise))) {
+          throw std::runtime_error(
+              "ClipCull indexed-triangle case/cull state is inconsistent");
+        }
       }
+      // Gallium records the application's clockwise front-face after its
+      // window-Y convention.  This model retains NDC +Y upward until viewport
+      // conversion, which is one axis reflection.  That reflection changes
+      // winding independently of whether the application culls front or back
+      // faces, so classify every validated driver PCO CULL/CW draw as CCW.
+      const bool driver_window_y_reflection =
+          driver_pco_triangles && state.raster_state.face_cull.enable == 1 &&
+          state.raster_state.face_cull.front_face ==
+              FrontFaceWinding::kClockwise;
+      const FrontFaceWinding classification_winding =
+          driver_window_y_reflection ? FrontFaceWinding::kCounterClockwise
+                                     : state.raster_state.face_cull.front_face;
       if (kReferenceUarch.index_segment_max_indices == 0 ||
           kReferenceUarch.index_segment_max_indices % 3 != 0) {
         throw std::runtime_error(
-            "ClipCull indexed segment configuration is invalid");
+            "ClipCull triangle segment configuration is invalid");
       }
 
       std::uint64_t next_submit_ordinal = 0;
@@ -555,7 +648,8 @@ void ClipCull::Run() {
             kReferenceUarch.index_segment_max_indices,
             lane_refs.size() - segment_begin);
         if (segment_count == 0 || segment_count % 3 != 0)
-          throw std::runtime_error("ClipCull index segment split a triangle");
+          throw std::runtime_error(
+              "ClipCull occurrence segment split a triangle");
         const std::size_t segment_end = segment_begin + segment_count;
 
         // Mesa's VS middle-end ORs every fetched lane's clipmask across one
@@ -584,19 +678,48 @@ void ClipCull::Run() {
             if (ref.lane_index >= lanes.size())
               throw std::runtime_error(
                   "ClipCull lane reference is outside shaded lanes");
-            const std::int64_t resolved =
-                static_cast<std::int64_t>(indices[vertex_occurrence]) +
-                state.draw.base_vertex;
-            if (resolved < 0 ||
-                static_cast<std::uint64_t>(resolved) != ref.vertex_index) {
+            std::uint64_t resolved = 0;
+            if (driver_pco_triangles) {
+              resolved = static_cast<std::uint64_t>(state.draw.first_vertex) +
+                         vertex_occurrence;
+              if (ref.lane_index != vertex_occurrence ||
+                  resolved > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::runtime_error(
+                    "ClipCull direct lane reference is not sequential");
+              }
+            } else {
+              const std::int64_t indexed_resolved =
+                  static_cast<std::int64_t>(indices[vertex_occurrence]) +
+                  state.draw.base_vertex;
+              if (indexed_resolved < 0) {
+                throw std::runtime_error(
+                    "ClipCull indexed lane reference resolved negative");
+              }
+              resolved = static_cast<std::uint64_t>(indexed_resolved);
+            }
+            if (resolved != ref.vertex_index) {
               throw std::runtime_error(
-                  "ClipCull lane reference lost index identity");
+                  "ClipCull lane reference lost vertex identity");
             }
             vertices[vertex] = ReadClipVertex(
                 lanes[ref.lane_index], active_vertex_output_dwords);
           }
-          (void)ClassifyFrontFacing(
-              vertices, state.raster_state.face_cull.front_face, true);
+          /* Expanded Gallium strips legitimately contain zero-area
+           * primitives.  They still enter the driver PCO clip stage and
+           * contribute to its invocation accounting, but fixed setup marks
+           * them non-rasterizable below.  Legacy fixture inputs remain
+           * fail-closed on an accidental degenerate triangle. */
+          const bool preclip_ndc_defined = std::all_of(
+              vertices.begin(), vertices.end(), [](const ClipVertex &vertex) {
+                return vertex.output[3] > 0.0F;
+              });
+          if (preclip_ndc_defined) {
+            (void)ClassifyFrontFacing(
+                vertices, classification_winding, !driver_pco_triangles);
+          } else if (!generic_clip_path) {
+            throw std::runtime_error(
+                "ClipCull clean segment has non-positive homogeneous W");
+          }
           const std::vector<ClipVertex> polygon = ClipTriangle(vertices, depth_clamp, clip_dist_mask, clip_dist_reg);
           for (std::size_t fan = 2; fan < polygon.size(); ++fan) {
             if (fan - 2 > std::numeric_limits<std::uint16_t>::max())
@@ -604,7 +727,7 @@ void ClipCull::Run() {
             const std::array<ClipVertex, 3> fan_triangle = {
                 polygon[0], polygon[fan - 1], polygon[fan]};
             const bool front_facing = ClassifyFrontFacing(
-                fan_triangle, state.raster_state.face_cull.front_face, false);
+                fan_triangle, classification_winding, false);
             const bool face_culled =
                 IsFaceCulled(state.raster_state.face_cull, front_facing);
             const std::uint64_t submit_ordinal = next_submit_ordinal++;
@@ -615,7 +738,7 @@ void ClipCull::Run() {
               continue;
             RasterTriangle triangle = BuildRasterTriangle(
                 fan_triangle, state.width, state.height, front_facing,
-                raster_vertex_outputs, depth_clamp);
+                raster_vertex_outputs, depth_clamp, driver_pco_triangles);
             triangle.key.submit_ordinal = submit_ordinal;
             triangle.key.api_primitive_id =
                 static_cast<std::uint32_t>(primitive);

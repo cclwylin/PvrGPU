@@ -1,4 +1,5 @@
 #include "driver_command.h"
+#include "shader/pco_iss.h"
 
 #include <algorithm>
 #include <array>
@@ -19,6 +20,9 @@ constexpr const char *kDriverCommandProducer = "pvrgpu-gallium-driver";
 constexpr const char *kClearColorCommand = "clear_color";
 constexpr const char *kDrawTriangleCommand = "draw_triangle";
 constexpr const char *kDrawIndexedQuadCommand = "draw_indexed_quad";
+constexpr const char *kDrawTexturedTrianglesCommand =
+    "draw_textured_triangles";
+constexpr const char *kDrawPcoTrianglesCommand = "draw_pco_triangles";
 constexpr const char *kDrawPrimitiveSequenceCommand = "draw_primitive_sequence";
 constexpr const char *kRgba8Format = "PIPE_FORMAT_R8G8B8A8_UNORM";
 constexpr const char *kRgbx8Format = "PIPE_FORMAT_R8G8B8X8_UNORM";
@@ -34,6 +38,22 @@ const std::set<std::string> &KnownFields() {
       "framebuffer_width", "framebuffer_height", "width",
       "height", "format", "clear_color_bits", "fragment_color_bits",
       "vertex0_bits", "vertex1_bits", "vertex2_bits",
+      "vertex3_bits", "vertex4_bits", "vertex5_bits",
+      "texcoord0_bits", "texcoord1_bits", "texcoord2_bits",
+      "texcoord3_bits", "texcoord4_bits", "texcoord5_bits",
+      "texture_width", "texture_height", "texture_rgba8_path",
+      "raw_vertex_data_size", "vertex_stride", "vertex_count",
+      "first_vertex", "instance_count", "primitive_mode", "indexed",
+      "vertex_pco_size", "fragment_pco_size", "vertex_shared_count",
+      "vertex_shared_words", "fragment_shared_count",
+      "fragment_shared_words", "vertex_pco_abi", "fragment_pco_abi",
+      "position_linkage", "varying_linkage", "viewport_scale_bits",
+      "viewport_translate_bits", "raster_state", "sample_mask",
+      "color_state", "depth_state",
+      "sampled_texture_count", "sampled_texture_bytes_size",
+      "sampled_texture_width", "sampled_texture_height",
+      "sampled_texture_row_pitch", "sampled_texture_format",
+      "sampled_texture_mip_count",
       "draw_count", "index_count", "unique_vertices", "primitive_count",
       "clip_primitives", "setup_triangles", "semantic_texel_fetches",
       "ia_vertices", "ia_primitives", "vs_invocations", "clip_invocations",
@@ -80,6 +100,37 @@ const std::set<std::string> &DrawIndexedQuadFields() {
       "format",             "clear_color_bits",   "draw_count",
       "index_count",        "unique_vertices",    "primitive_count",
       "clip_primitives",    "setup_triangles",    "semantic_texel_fetches",
+  };
+  return fields;
+}
+
+const std::set<std::string> &DrawTexturedTrianglesFields() {
+  static const std::set<std::string> fields = {
+      "schema",              "producer",           "command",
+      "case",                "frame",              "framebuffer_width",
+      "framebuffer_height",  "width",              "height",
+      "format",              "clear_color_bits",   "vertex0_bits",
+      "vertex1_bits",        "vertex2_bits",       "vertex3_bits",
+      "vertex4_bits",        "vertex5_bits",       "texcoord0_bits",
+      "texcoord1_bits",      "texcoord2_bits",     "texcoord3_bits",
+      "texcoord4_bits",      "texcoord5_bits",     "texture_width",
+      "texture_height",      "texture_rgba8_path",
+  };
+  return fields;
+}
+
+const std::set<std::string> &DrawPcoTrianglesFields() {
+  static const std::set<std::string> fields = {
+      "schema", "producer", "command", "case", "frame",
+      "framebuffer_width", "framebuffer_height", "width", "height",
+      "format", "clear_color_bits", "raw_vertex_data_size",
+      "vertex_stride", "vertex_count", "first_vertex", "instance_count",
+      "primitive_mode", "indexed", "vertex_pco_size", "fragment_pco_size",
+      "vertex_shared_count", "vertex_shared_words",
+      "fragment_shared_count", "fragment_shared_words", "vertex_pco_abi",
+      "fragment_pco_abi", "position_linkage", "viewport_scale_bits",
+      "viewport_translate_bits", "raster_state", "sample_mask",
+      "color_state", "depth_state",
   };
   return fields;
 }
@@ -148,6 +199,27 @@ bool ParseU32List(const std::string &text,
   return !std::getline(input, part, ',');
 }
 
+bool ParseU32Vector(const std::string &text, std::size_t count,
+                    std::vector<std::uint32_t> *values) {
+  if (!values)
+    return false;
+  values->clear();
+  if (count == 0)
+    return text.empty();
+  if (text.empty())
+    return false;
+  std::istringstream input(text);
+  std::string part;
+  values->reserve(count);
+  for (std::size_t index = 0; index < count; ++index) {
+    std::uint32_t value = 0;
+    if (!std::getline(input, part, ',') || !ParseU32(part, &value))
+      return false;
+    values->push_back(value);
+  }
+  return !std::getline(input, part, ',');
+}
+
 bool RequireExactFields(const std::map<std::string, std::string> &fields,
                         const std::set<std::string> &required,
                         const std::string &command,
@@ -170,13 +242,42 @@ bool RequireExactFields(const std::map<std::string, std::string> &fields,
   }
 
   for (const auto &entry : fields) {
+    const bool optional_pco_counter =
+        command == kDrawPcoTrianglesCommand &&
+        (entry.first == "draw_count" || entry.first == "ia_vertices" ||
+         entry.first == "ia_primitives" ||
+         entry.first == "vs_invocations" ||
+         entry.first == "gs_invocations" ||
+         entry.first == "gs_primitives" ||
+         entry.first == "clip_invocations" ||
+         entry.first == "clip_primitives" ||
+         entry.first == "hs_invocations" ||
+         entry.first == "ds_invocations" ||
+         entry.first == "cs_invocations" ||
+         entry.first == "ps_invocations" ||
+         entry.first == "setup_triangles" ||
+         entry.first == "semantic_texel_fetches");
+    const bool optional_pco_texture =
+        command == kDrawPcoTrianglesCommand &&
+        (entry.first == "sampled_texture_count" ||
+         entry.first == "sampled_texture_bytes_size" ||
+         entry.first == "sampled_texture_width" ||
+         entry.first == "sampled_texture_height" ||
+         entry.first == "sampled_texture_row_pitch" ||
+         entry.first == "sampled_texture_format" ||
+         entry.first == "sampled_texture_mip_count");
+    const bool optional_pco_linkage =
+        command == kDrawPcoTrianglesCommand &&
+        entry.first == "varying_linkage";
     const bool optional_primitive_sequence_counter =
         command == kDrawPrimitiveSequenceCommand &&
         (entry.first == "gs_invocations" || entry.first == "gs_primitives" ||
          entry.first == "hs_invocations" || entry.first == "ds_invocations" ||
          entry.first == "cs_invocations" ||
          entry.first == "framebuffer_rgba8_path");
-    if (!required.count(entry.first) && !optional_primitive_sequence_counter) {
+    if (!required.count(entry.first) && !optional_pco_counter &&
+        !optional_pco_texture && !optional_pco_linkage &&
+        !optional_primitive_sequence_counter) {
       *error = "field is not valid for " + command +
                " driver command: " + entry.first;
       return false;
@@ -236,13 +337,19 @@ bool ReadFields(const std::string &path,
       return false;
     }
     const std::size_t separator = line.find('=');
+    const std::string key =
+        separator == std::string::npos ? std::string{} :
+                                         line.substr(0, separator);
+    const bool empty_shared_words =
+        separator != std::string::npos && separator + 1 == line.size() &&
+        (key == "vertex_shared_words" ||
+         key == "fragment_shared_words");
     if (separator == std::string::npos || separator == 0 ||
-        separator + 1 == line.size()) {
+        (separator + 1 == line.size() && !empty_shared_words)) {
       *error = "invalid key=value at driver command line " +
                std::to_string(line_number);
       return false;
     }
-    const std::string key = line.substr(0, separator);
     const std::string value = line.substr(separator + 1);
     if (!KnownFields().count(key)) {
       *error = "unknown driver command field: " + key;
@@ -291,6 +398,8 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
   if (parsed.command != kClearColorCommand &&
       parsed.command != kDrawTriangleCommand &&
       parsed.command != kDrawIndexedQuadCommand &&
+      parsed.command != kDrawTexturedTrianglesCommand &&
+      parsed.command != kDrawPcoTrianglesCommand &&
       parsed.command != kDrawPrimitiveSequenceCommand) {
     *error = "unsupported driver command: " + parsed.command;
     return false;
@@ -315,21 +424,23 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     *error = "driver command height must be positive";
     return false;
   }
-  if (parsed.command == kDrawIndexedQuadCommand) {
+  if (parsed.command == kDrawIndexedQuadCommand ||
+      parsed.command == kDrawTexturedTrianglesCommand ||
+      parsed.command == kDrawPcoTrianglesCommand) {
     if (!ParseU32(fields["framebuffer_width"], &parsed.framebuffer_width) ||
         parsed.framebuffer_width == 0) {
-      *error = "draw_indexed_quad framebuffer_width must be positive";
+      *error = parsed.command + " framebuffer_width must be positive";
       return false;
     }
     if (!ParseU32(fields["framebuffer_height"], &parsed.framebuffer_height) ||
         parsed.framebuffer_height == 0) {
-      *error = "draw_indexed_quad framebuffer_height must be positive";
+      *error = parsed.command + " framebuffer_height must be positive";
       return false;
     }
     if (parsed.width > parsed.framebuffer_width ||
         parsed.height > parsed.framebuffer_height) {
-      *error =
-          "draw_indexed_quad viewport width/height must fit framebuffer";
+      *error = parsed.command +
+               " viewport width/height must fit framebuffer";
       return false;
     }
   } else {
@@ -343,7 +454,11 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
                 ? DrawTriangleFields()
                 : parsed.command == kDrawIndexedQuadCommand
                       ? DrawIndexedQuadFields()
-                      : DrawPrimitiveSequenceFields();
+                      : parsed.command == kDrawTexturedTrianglesCommand
+                            ? DrawTexturedTrianglesFields()
+                            : parsed.command == kDrawPcoTrianglesCommand
+                                  ? DrawPcoTrianglesFields()
+                                  : DrawPrimitiveSequenceFields();
   if (!RequireExactFields(fields, required, parsed.command, error))
     return false;
 
@@ -402,6 +517,329 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     if (!ParseU64(fields["semantic_texel_fetches"],
                   &parsed.semantic_texel_fetches)) {
       *error = "driver command semantic_texel_fetches must be a uint64 value";
+      return false;
+    }
+  }
+  if (parsed.command == kDrawTexturedTrianglesCommand) {
+    for (std::size_t vertex = 0; vertex < parsed.vertex_bits.size(); ++vertex) {
+      const std::string suffix = std::to_string(vertex) + "_bits";
+      if (!ParseU32List(fields["vertex" + suffix],
+                        &parsed.vertex_bits[vertex]) ||
+          !ParseU32List(fields["texcoord" + suffix],
+                        &parsed.texcoord_bits[vertex])) {
+        *error =
+            "draw_textured_triangles vertexN_bits and texcoordN_bits must "
+            "contain two uint32 values";
+        return false;
+      }
+    }
+    if (!ParseU32(fields["texture_width"], &parsed.texture_width) ||
+        parsed.texture_width == 0 || parsed.texture_width > 16384U ||
+        !ParseU32(fields["texture_height"], &parsed.texture_height) ||
+        parsed.texture_height == 0 || parsed.texture_height > 16384U) {
+      *error =
+          "draw_textured_triangles texture dimensions must be within 1..16384";
+      return false;
+    }
+    if (fields["texture_rgba8_path"].empty()) {
+      *error = "draw_textured_triangles texture_rgba8_path is empty";
+      return false;
+    }
+    parsed.texture_rgba8_path = fields["texture_rgba8_path"];
+  }
+  if (parsed.command == kDrawPcoTrianglesCommand) {
+    std::uint32_t vertex_shared_count = 0;
+    std::uint32_t fragment_shared_count = 0;
+    std::array<std::uint32_t, 8> vertex_abi{};
+    std::array<std::uint32_t, 8> fragment_abi{};
+    std::array<std::uint32_t, 4> position_linkage{};
+    std::array<std::uint32_t, 4> varying_linkage{};
+    std::array<std::uint32_t, 13> raster_state{};
+    std::array<std::uint32_t, 3> color_state{};
+    std::array<std::uint32_t, 5> depth_state{};
+    if (!ParseU64(fields["raw_vertex_data_size"],
+                  &parsed.declared_raw_vertex_data_size) ||
+        !ParseU32(fields["vertex_stride"], &parsed.vertex_stride) ||
+        parsed.vertex_stride == 0 ||
+        !ParseU32(fields["vertex_count"], &parsed.vertex_count) ||
+        parsed.vertex_count == 0 ||
+        !ParseU32(fields["first_vertex"], &parsed.first_vertex) ||
+        !ParseU32(fields["instance_count"], &parsed.instance_count) ||
+        parsed.instance_count != 1 ||
+        !ParseU32(fields["primitive_mode"], &parsed.primitive_mode) ||
+        (parsed.primitive_mode != 4 && parsed.primitive_mode != 5 &&
+         parsed.primitive_mode != 6) ||
+        !ParseU32(fields["indexed"], &parsed.indexed) || parsed.indexed != 0 ||
+        !ParseU64(fields["vertex_pco_size"],
+                  &parsed.declared_vertex_pco_size) ||
+        parsed.declared_vertex_pco_size == 0 ||
+        parsed.declared_vertex_pco_size > kDriverPcoMaximumBinaryBytes ||
+        !ParseU64(fields["fragment_pco_size"],
+                  &parsed.declared_fragment_pco_size) ||
+        parsed.declared_fragment_pco_size == 0 ||
+        parsed.declared_fragment_pco_size > kDriverPcoMaximumBinaryBytes ||
+        !ParseU32(fields["vertex_shared_count"], &vertex_shared_count) ||
+        vertex_shared_count > kPcoMaximumSharedCount ||
+        !ParseU32Vector(fields["vertex_shared_words"], vertex_shared_count,
+                        &parsed.vertex_shared) ||
+        !ParseU32(fields["fragment_shared_count"], &fragment_shared_count) ||
+        fragment_shared_count > kPcoMaximumSharedCount ||
+        !ParseU32Vector(fields["fragment_shared_words"],
+                        fragment_shared_count, &parsed.fragment_shared) ||
+        !ParseU32List(fields["vertex_pco_abi"], &vertex_abi) ||
+        !ParseU32List(fields["fragment_pco_abi"], &fragment_abi) ||
+        !ParseU32List(fields["position_linkage"], &position_linkage) ||
+        !ParseU32List(fields["viewport_scale_bits"],
+                      &parsed.viewport_scale_bits) ||
+        !ParseU32List(fields["viewport_translate_bits"],
+                      &parsed.viewport_translate_bits) ||
+        !ParseU32List(fields["raster_state"], &raster_state) ||
+        !ParseU32(fields["sample_mask"], &parsed.sample_mask) ||
+        !ParseU32List(fields["color_state"], &color_state) ||
+        !ParseU32List(fields["depth_state"], &depth_state)) {
+      *error = "draw_pco_triangles metadata is malformed or outside the "
+               "bounded native PCO profile";
+      return false;
+    }
+    const auto varying = fields.find("varying_linkage");
+    if (varying != fields.end() &&
+        !ParseU32List(varying->second, &varying_linkage)) {
+      *error = "draw_pco_triangles varying_linkage must contain four uint32 "
+               "values";
+      return false;
+    }
+    parsed.vertex_pco_abi = {vertex_abi[0], vertex_abi[1], vertex_abi[2],
+                             vertex_abi[3], vertex_abi[4], vertex_abi[5],
+                             vertex_abi[6], vertex_abi[7]};
+    parsed.fragment_pco_abi = {
+        fragment_abi[0], fragment_abi[1], fragment_abi[2], fragment_abi[3],
+        fragment_abi[4], fragment_abi[5], fragment_abi[6], fragment_abi[7]};
+    parsed.position_output_start = position_linkage[0];
+    parsed.position_output_count = position_linkage[1];
+    parsed.fragment_position_start = position_linkage[2];
+    parsed.fragment_position_count = position_linkage[3];
+    parsed.varying_output_start = varying_linkage[0];
+    parsed.varying_output_count = varying_linkage[1];
+    parsed.fragment_varying_start = varying_linkage[2];
+    parsed.fragment_varying_count = varying_linkage[3];
+    parsed.front_ccw = raster_state[0];
+    parsed.cull_face = raster_state[1];
+    parsed.fill_front = raster_state[2];
+    parsed.fill_back = raster_state[3];
+    parsed.scissor = raster_state[4];
+    parsed.rasterizer_discard = raster_state[5];
+    parsed.multisample = raster_state[6];
+    parsed.half_pixel_center = raster_state[7];
+    parsed.bottom_edge_rule = raster_state[8];
+    parsed.clip_halfz = raster_state[9];
+    parsed.depth_clip_near = raster_state[10];
+    parsed.depth_clip_far = raster_state[11];
+    parsed.depth_clamp = raster_state[12];
+    parsed.color_mask = color_state[0];
+    parsed.blend_enable = color_state[1];
+    parsed.dither = color_state[2];
+    parsed.depth_enable = depth_state[0];
+    parsed.depth_write = depth_state[1];
+    parsed.depth_func = depth_state[2];
+    parsed.depth_clear_bits = depth_state[3];
+    parsed.depth_format = depth_state[4];
+    const std::uint64_t end_vertex =
+        static_cast<std::uint64_t>(parsed.first_vertex) +
+        parsed.vertex_count;
+    const std::uint64_t expected_vertex_bytes =
+        end_vertex * parsed.vertex_stride;
+    const bool conditionals_geometry =
+        parsed.width == 80 && parsed.height == 60 &&
+        parsed.framebuffer_width == 80 && parsed.framebuffer_height == 60 &&
+        parsed.vertex_stride == 12 && parsed.vertex_count == 6144 &&
+        parsed.first_vertex == 0 && parsed.primitive_mode == 4;
+    const auto abi_bounded = [](const DriverPcoStageAbi &abi,
+                                bool allow_zero_temps) {
+      return (allow_zero_temps || abi.temps != 0) &&
+             abi.temps <= kPcoTemporaryCount &&
+             abi.vertex_inputs <= kPcoVertexInputCount &&
+             abi.vertex_outputs <= kPcoVertexOutputCount &&
+             abi.coefficients <= kPcoMaximumVaryingCoefficientCount &&
+             abi.shareds <= kPcoMaximumSharedCount &&
+             abi.push_constant_start <= abi.shareds &&
+             abi.push_constant_count <=
+                 abi.shareds - abi.push_constant_start &&
+             abi.entry_offset == 0;
+    };
+    if (end_vertex > std::numeric_limits<std::uint32_t>::max() ||
+        parsed.vertex_stride >
+            std::numeric_limits<std::uint64_t>::max() / end_vertex ||
+        expected_vertex_bytes != parsed.declared_raw_vertex_data_size ||
+        vertex_shared_count != parsed.vertex_pco_abi.shareds ||
+        fragment_shared_count != parsed.fragment_pco_abi.shareds ||
+        !abi_bounded(parsed.vertex_pco_abi, false) ||
+        !abi_bounded(parsed.fragment_pco_abi, true) ||
+        parsed.position_output_start != 0 ||
+        parsed.position_output_count != 4 ||
+        parsed.vertex_pco_abi.vertex_outputs !=
+            parsed.position_output_count + parsed.varying_output_count ||
+        (parsed.varying_output_count != 0 &&
+         parsed.varying_output_start != parsed.position_output_count) ||
+        parsed.varying_output_count > kDriverPcoMaximumVaryingComponents ||
+        parsed.fragment_position_start != 0 ||
+        parsed.fragment_pco_abi.coefficients !=
+            parsed.fragment_position_count +
+                parsed.fragment_varying_count ||
+        (parsed.fragment_varying_count != 0 &&
+         parsed.fragment_varying_start !=
+             parsed.fragment_position_count) ||
+        parsed.fragment_varying_count !=
+            parsed.varying_output_count * 4U ||
+        parsed.front_ccw > 1 || parsed.cull_face > 3 ||
+        parsed.fill_front != 0 || parsed.fill_back != 0 ||
+        parsed.scissor != 0 || parsed.rasterizer_discard != 0 ||
+        parsed.multisample != 0 || parsed.half_pixel_center != 1 ||
+        parsed.bottom_edge_rule != 0 || parsed.clip_halfz != 0 ||
+        parsed.depth_clip_near != 1 || parsed.depth_clip_far != 1 ||
+        parsed.depth_clamp != 0 || parsed.sample_mask != UINT32_MAX ||
+        parsed.color_mask != 0x0f || parsed.blend_enable != 0 ||
+        parsed.dither != 1 || parsed.depth_enable > 1 ||
+        parsed.depth_write > 1 || parsed.depth_func > 7 ||
+        parsed.depth_format == 0) {
+      *error = conditionals_geometry
+                   ? "draw_pco_triangles metadata is malformed or outside "
+                     "the strict conditionals profile (strict 80x60 "
+                     "conditionals profile)"
+                   : "draw_pco_triangles ABI/raster metadata is outside "
+                     "model bounds";
+      return false;
+    }
+
+    if (conditionals_geometry) {
+      const std::array<std::uint32_t, 3> expected_viewport = {
+          UINT32_C(0x42200000), UINT32_C(0x41f00000),
+          UINT32_C(0x3f000000)};
+      if (parsed.declared_vertex_pco_size != 520 ||
+          parsed.declared_fragment_pco_size != 520 ||
+          !DriverPcoStageAbiMatches(parsed.vertex_pco_abi,
+                                    kConditionalsVertexPcoAbi) ||
+          !DriverPcoStageAbiMatches(parsed.fragment_pco_abi,
+                                    kConditionalsFragmentPcoAbi) ||
+          parsed.varying_output_count != 0 ||
+          parsed.fragment_position_count != 0 ||
+          parsed.fragment_varying_count != 0 ||
+          parsed.viewport_scale_bits != expected_viewport ||
+          parsed.viewport_translate_bits != expected_viewport ||
+          parsed.cull_face != 2 || parsed.depth_enable != 1 ||
+          parsed.depth_write != 1 || parsed.depth_func != 3 ||
+          parsed.depth_clear_bits != UINT32_C(0x3f800000)) {
+        *error = "draw_pco_triangles ABI/raster metadata does not match the "
+                 "strict conditionals profile (strict 80x60 conditionals "
+                 "profile)";
+        return false;
+      }
+    }
+
+    const auto sampled_count = fields.find("sampled_texture_count");
+    if (sampled_count != fields.end()) {
+      if (!ParseU32(sampled_count->second,
+                    &parsed.sampled_texture_count) ||
+          parsed.sampled_texture_count > 1) {
+        *error = "draw_pco_triangles sampled_texture_count must be 0 or 1";
+        return false;
+      }
+      const std::array<const char *, 6> texture_fields = {
+          "sampled_texture_bytes_size", "sampled_texture_width",
+          "sampled_texture_height", "sampled_texture_row_pitch",
+          "sampled_texture_format", "sampled_texture_mip_count"};
+      for (const char *field : texture_fields) {
+        if ((parsed.sampled_texture_count == 1) !=
+            (fields.find(field) != fields.end())) {
+          *error = "draw_pco_triangles sampled texture fields are incomplete";
+          return false;
+        }
+      }
+      if (parsed.sampled_texture_count == 1 &&
+          (!ParseU64(fields.at("sampled_texture_bytes_size"),
+                     &parsed.declared_sampled_texture_bytes_size) ||
+           !ParseU32(fields.at("sampled_texture_width"),
+                     &parsed.sampled_texture_width) ||
+           !ParseU32(fields.at("sampled_texture_height"),
+                     &parsed.sampled_texture_height) ||
+           !ParseU32(fields.at("sampled_texture_row_pitch"),
+                     &parsed.sampled_texture_row_pitch) ||
+           !ParseU32(fields.at("sampled_texture_mip_count"),
+                     &parsed.sampled_texture_mip_count) ||
+           fields.at("sampled_texture_format").empty())) {
+        *error = "draw_pco_triangles sampled texture metadata is malformed";
+        return false;
+      }
+      if (parsed.sampled_texture_count == 1)
+        parsed.sampled_texture_format = fields.at("sampled_texture_format");
+      if (parsed.sampled_texture_count == 1) {
+        const std::uint64_t tight_pitch =
+            static_cast<std::uint64_t>(parsed.sampled_texture_width) * 4U;
+        const std::uint64_t expected_bytes =
+            static_cast<std::uint64_t>(parsed.sampled_texture_row_pitch) *
+            parsed.sampled_texture_height;
+        if (parsed.sampled_texture_width == 0 ||
+            parsed.sampled_texture_height == 0 ||
+            parsed.sampled_texture_row_pitch < tight_pitch ||
+            parsed.sampled_texture_mip_count == 0 ||
+            expected_bytes == 0 ||
+            expected_bytes !=
+                parsed.declared_sampled_texture_bytes_size) {
+          *error = "draw_pco_triangles sampled texture layout is invalid";
+          return false;
+        }
+      }
+    } else {
+      const std::array<const char *, 6> texture_fields = {
+          "sampled_texture_bytes_size", "sampled_texture_width",
+          "sampled_texture_height", "sampled_texture_row_pitch",
+          "sampled_texture_format", "sampled_texture_mip_count"};
+      for (const char *field : texture_fields) {
+        if (fields.find(field) != fields.end()) {
+          *error = "draw_pco_triangles sampled texture fields require "
+                   "sampled_texture_count";
+          return false;
+        }
+      }
+    }
+    if (!ParseOptionalU32(fields, "draw_count", &parsed.draw_count, error) ||
+        !ParseOptionalU32(fields, "ia_vertices", &parsed.ia_vertices,
+                          error) ||
+        !ParseOptionalU32(fields, "ia_primitives", &parsed.ia_primitives,
+                          error) ||
+        !ParseOptionalU32(fields, "vs_invocations", &parsed.vs_invocations,
+                          error) ||
+        !ParseOptionalU32(fields, "gs_invocations", &parsed.gs_invocations,
+                          error) ||
+        !ParseOptionalU32(fields, "gs_primitives", &parsed.gs_primitives,
+                          error) ||
+        !ParseOptionalU32(fields, "clip_invocations",
+                          &parsed.clip_invocations, error) ||
+        !ParseOptionalU32(fields, "clip_primitives", &parsed.clip_primitives,
+                          error) ||
+        !ParseOptionalU32(fields, "hs_invocations", &parsed.hs_invocations,
+                          error) ||
+        !ParseOptionalU32(fields, "ds_invocations", &parsed.ds_invocations,
+                          error) ||
+        !ParseOptionalU32(fields, "cs_invocations", &parsed.cs_invocations,
+                          error) ||
+        !ParseOptionalU32(fields, "setup_triangles", &parsed.setup_triangles,
+                          error)) {
+      return false;
+    }
+    const auto parse_optional_u64 =
+        [&](const char *field, std::uint64_t *value) {
+          const auto entry = fields.find(field);
+          if (entry == fields.end())
+            return true;
+          if (ParseU64(entry->second, value))
+            return true;
+          *error = std::string("driver command ") + field +
+                   " must be a uint64 value";
+          return false;
+        };
+    if (!parse_optional_u64("ps_invocations", &parsed.ps_invocations) ||
+        !parse_optional_u64("semantic_texel_fetches",
+                            &parsed.semantic_texel_fetches)) {
       return false;
     }
   }

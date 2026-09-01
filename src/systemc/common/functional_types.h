@@ -7,6 +7,7 @@
 #pragma once
 
 #include "common/reference_uarch.h"
+#include "common/shader_stage.h"
 #include "memory_pool.h"
 
 #include <cstddef>
@@ -77,7 +78,11 @@ enum class FunctionalCase : std::uint32_t {
   kDriverClearColor = 21,
   kDriverTriangleSolid = 22,
   kDriverIndexedQuad = 23,
+  kDriverTexturedTriangles = 24,
+  kDriverPcoTriangles = 25,
 };
+
+struct PipelineState;
 
 FunctionalCase FunctionalCaseFromName(std::string_view name);
 const char *FunctionalCaseName(FunctionalCase functional_case);
@@ -86,15 +91,24 @@ bool IsTriangleSetupFamily(FunctionalCase functional_case);
 bool IsAttributeFetchFamily(FunctionalCase functional_case);
 bool IsVaryingsFamily(FunctionalCase functional_case);
 bool IsTextureFamily(FunctionalCase functional_case);
+bool IsDriverPcoTrianglesCase(FunctionalCase functional_case);
+bool UsesTextureSampling(FunctionalCase functional_case);
+bool UsesTextureSampling(const PipelineState &state);
+bool UsesTextureSampling(const PipelineState &state, ShaderStage stage);
 bool UsesShaderVaryings(FunctionalCase functional_case);
+bool UsesShaderVaryings(const PipelineState &state);
 bool IsIndexedTriangleRasterCase(FunctionalCase functional_case);
 bool RequiresBackCcwFaceCull(FunctionalCase functional_case);
 bool IsSolidColorRasterCase(FunctionalCase functional_case);
 bool IsRasterFunctionalCase(FunctionalCase functional_case);
 std::uint32_t VaryingVectorCount(FunctionalCase functional_case);
+std::uint32_t VaryingVectorCount(const PipelineState &state);
 std::uint32_t VaryingCoefficientSetCount(FunctionalCase functional_case);
+std::uint32_t VaryingCoefficientSetCount(const PipelineState &state);
 std::uint32_t VaryingCoefficientDwordCount(FunctionalCase functional_case);
+std::uint32_t VaryingCoefficientDwordCount(const PipelineState &state);
 std::uint32_t VaryingVertexOutputDwordCount(FunctionalCase functional_case);
+std::uint32_t VaryingVertexOutputDwordCount(const PipelineState &state);
 
 enum class PipelineStage : std::uint32_t {
   kSubmitted = 0,
@@ -103,6 +117,8 @@ enum class PipelineStage : std::uint32_t {
   kVertexPdsReady,
   kVertexDecoded,
   kVertexIssued,
+  kVertexTexturePending,
+  kVertexTextureSamplesReady,
   kVertexShaded,
   kClipCullComplete,
   kTiled,
@@ -197,6 +213,18 @@ struct DepthState {
   std::uint8_t write_enable = 0;
   std::uint8_t reserved[2]{};
 };
+
+// Public pipe-format values are transported verbatim by the native sequence
+// ABI. These helpers centralize the exact little-endian UNORM attachment
+// conversion used by Submitter, ISP and FragmentFrontend.
+std::size_t DepthAttachmentBytesPerPixel(std::uint32_t format);
+std::uint32_t EncodeDepthAttachmentUnorm(float depth, std::uint32_t format);
+float DecodeDepthAttachmentUnorm(std::uint32_t encoded,
+                                 std::uint32_t format);
+std::vector<std::uint32_t> DecodeDepthAttachmentUnormBytes(
+    const std::vector<std::uint8_t> &bytes, std::uint32_t format);
+std::vector<std::uint8_t> EncodeDepthAttachmentUnormBytes(
+    const std::vector<std::uint32_t> &encoded, std::uint32_t format);
 
 enum class BlendEquation : std::uint8_t {
   kAdd = 0,
@@ -341,6 +369,13 @@ struct ShaderSharedRegister {
 
 enum class TextureFormat : std::uint8_t {
   kRgba8Unorm = 0,
+  // The fourth stored byte is padding. The public image descriptor selects
+  // SRC_ONE for alpha, so the texture datapath must never expose that byte.
+  kRgbx8Unorm,
+  // Public Rogue U32 sampled through SMP.FCNORM.  Refract binds this format
+  // as a Z32_UNORM image with XXX1 swizzle; storage remains one little-endian
+  // uint32 per texel and filtering is restricted to nearest.
+  kZ32Unorm,
 };
 
 enum class TextureLayout : std::uint8_t {
@@ -375,7 +410,9 @@ struct TextureResource {
   std::uint8_t mip_count = 0;
   TextureFormat format = TextureFormat::kRgba8Unorm;
   TextureLayout layout = TextureLayout::kLinear;
-  std::uint8_t reserved = 0;
+  std::uint8_t descriptor_set = 0;
+  std::uint8_t binding = 0;
+  std::uint8_t reserved[3]{};
   TextureMipLevel mip[kMaximumTextureMipLevels]{};
 };
 
@@ -385,9 +422,13 @@ struct SamplerState {
   TextureFilter mip_filter = TextureFilter::kNearest;
   TextureWrapMode wrap_u = TextureWrapMode::kRepeat;
   TextureWrapMode wrap_v = TextureWrapMode::kRepeat;
+  std::uint16_t min_lod_u4_6 = 0;
+  std::uint16_t max_lod_u4_6 = 0;
   std::uint8_t normalized_coordinates = 1;
   std::uint8_t base_mip_level = 0;
-  std::uint8_t reserved = 0;
+  std::uint8_t descriptor_set = 0;
+  std::uint8_t binding = 0;
+  std::uint8_t reserved[2]{};
 };
 
 // Interpolation qualifier carried by the exact VS-to-FS linkage. The binding
@@ -414,6 +455,9 @@ struct ShaderVaryingBinding {
 // Keeping the contract in one helper lets every hardware module validate the
 // same producer/consumer ABI without branching on a shader name or color.
 bool IsExactVaryingBinding(FunctionalCase functional_case,
+                           const ShaderVaryingBinding &binding,
+                           std::size_t binding_index);
+bool IsExactVaryingBinding(const PipelineState &state,
                            const ShaderVaryingBinding &binding,
                            std::size_t binding_index);
 
@@ -480,6 +524,13 @@ struct ParameterTriangle {
   std::int32_t max_x = 0;
   std::int32_t max_y = 0;
   float window_z[3]{};
+  // Native driver-PCO depth follows llvmpipe's position-slot setup ABI, not
+  // the 24.8 coverage barycentrics above.  A/B/C are raw binary32 dwords for
+  // the plane evaluated as fma(B, y, fma(A, x, C)); PAD is kept explicit so
+  // the serialized payload has the same fail-closed shape as varying planes.
+  std::uint32_t depth_plane[4]{};
+  std::uint8_t depth_plane_valid = 0;
+  std::uint8_t depth_plane_reserved[3]{};
   // Contiguous A/B/C/PAD sets in parameter_coefficients. A non-rasterizable
   // placeholder owns no sets and therefore has coefficient_set_count == 0.
   std::uint32_t first_coefficient_set = 0;
@@ -489,6 +540,30 @@ struct ParameterTriangle {
   std::uint8_t face_culled = 0;
   std::uint8_t reserved[3]{};
 };
+
+inline bool HasCanonicalDepthPlaneMetadata(
+    FunctionalCase functional_case, const ParameterTriangle &triangle) {
+  const bool expected = IsDriverPcoTrianglesCase(functional_case) &&
+                        triangle.rasterizable != 0;
+  if ((triangle.depth_plane_valid != 0) != expected ||
+      triangle.depth_plane_valid > 1 || triangle.depth_plane[3] != 0 ||
+      triangle.depth_plane_reserved[0] != 0 ||
+      triangle.depth_plane_reserved[1] != 0 ||
+      triangle.depth_plane_reserved[2] != 0) {
+    return false;
+  }
+  if (!expected) {
+    return triangle.depth_plane[0] == 0 && triangle.depth_plane[1] == 0 &&
+           triangle.depth_plane[2] == 0;
+  }
+  for (std::size_t component = 0; component < 3; ++component) {
+    if ((triangle.depth_plane[component] & UINT32_C(0x7f800000)) ==
+        UINT32_C(0x7f800000)) {
+      return false;
+    }
+  }
+  return true;
+}
 
 // One public Rogue coefficient set consists of raw IEEE-754 binary32 plane
 // coefficients A/B/C plus the architectural padding dword.
@@ -594,13 +669,15 @@ struct TextureSampleRequest {
   std::uint8_t normalized = 0;
   std::uint8_t data_request = 0;
   std::uint8_t quad_lane = 0;
-  std::uint8_t reserved = 0;
+  ShaderStage shader_stage = ShaderStage::kFragment;
+  std::uint8_t reserved[3]{};
 };
 
 struct TextureSampleResponse {
   std::uint32_t shader_lane_index = 0;
   std::uint32_t rgba[4]{};
   std::uint64_t request_id = 0;
+  ShaderStage shader_stage = ShaderStage::kFragment;
 };
 
 struct FragmentOutput {
@@ -634,7 +711,6 @@ std::size_t GetComponentTypeBytes(VertexComponentType type);
 void RequireStage(PipelineStage actual, PipelineStage expected,
                   const char *module_name);
 
-struct PipelineState;
 void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state);
 
 inline bool HasPoolHandle(PoolHandle handle) { return handle.generation != 0; }
