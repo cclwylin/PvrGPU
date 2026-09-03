@@ -11772,6 +11772,7 @@ pvrgpu_emit_color_primitive_pco_command(
                                           ctx->fs->nir,
                                           pos_format,
                                           color_format,
+                                          info->mode == MESA_PRIM_POINTS,
                                           &binary,
                                           error,
                                           sizeof(error))) {

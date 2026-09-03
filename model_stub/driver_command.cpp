@@ -704,7 +704,8 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         expected_vertex_bytes != parsed.declared_raw_vertex_data_size ||
         vertex_shared_count != parsed.vertex_pco_abi.shareds ||
         fragment_shared_count != parsed.fragment_pco_abi.shareds ||
-        !abi_bounded(parsed.vertex_pco_abi, false) ||
+        /* A pass-through VS forwarding position and colour uses no temps. */
+        !abi_bounded(parsed.vertex_pco_abi, true) ||
         !abi_bounded(parsed.fragment_pco_abi, true) ||
         parsed.position_output_start != 0 ||
         parsed.position_output_count != 4 ||

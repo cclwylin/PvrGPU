@@ -326,7 +326,7 @@ bool DriverPcoTrianglesCommandSupported(const DriverCommand &command) {
       command.fragment_pco.size() > kDriverPcoMaximumBinaryBytes ||
       command.vertex_shared.size() != command.vertex_pco_abi.shareds ||
       command.fragment_shared.size() != command.fragment_pco_abi.shareds ||
-      !DriverPcoStageAbiIsBounded(command.vertex_pco_abi) ||
+      !DriverPcoStageAbiIsBounded(command.vertex_pco_abi, color_layout) ||
       !DriverPcoStageAbiIsBounded(command.fragment_pco_abi, color_layout)) {
     return false;
   }

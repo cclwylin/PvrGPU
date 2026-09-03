@@ -127,6 +127,7 @@ bool pvrgpu_pco_compile_color_triangle(
    const struct nir_shader *fragment_nir,
    enum pipe_format position_format,
    enum pipe_format color_format,
+   bool topology_uses_point_size,
    struct pvrgpu_pco_graphics_binary *out,
    char *error,
    size_t error_size);

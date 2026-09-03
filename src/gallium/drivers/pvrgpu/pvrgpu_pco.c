@@ -3603,12 +3603,71 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
    return true;
 }
 
+/*
+ * GL point size only affects POINTS rasterization.  The dEQP rasterization
+ * shaders share one vertex shader across every topology, so a triangle or
+ * line draw still carries a `gl_PointSize` export fed by a uniform.  Remove
+ * that dead store for the topologies it cannot affect: the uniform load then
+ * dies with it and the shader collapses onto the plain position/color
+ * signature this profile lowers.
+ */
+static bool pvrgpu_strip_dead_point_size(nir_shader *nir)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, nir)
+   {
+      bool impl_progress = false;
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr_safe (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_store_output) {
+               if (nir_intrinsic_io_semantics(intr).location !=
+                   VARYING_SLOT_PSIZ)
+                  continue;
+            } else if (intr->intrinsic == nir_intrinsic_store_deref) {
+               nir_variable *var = nir_intrinsic_get_var(intr, 0);
+               if (!var || var->data.location != VARYING_SLOT_PSIZ)
+                  continue;
+            } else {
+               continue;
+            }
+            nir_instr_remove(instr);
+            impl_progress = true;
+         }
+      }
+      if (impl_progress) {
+         nir_progress(true, impl, nir_metadata_control_flow);
+         progress = true;
+      }
+   }
+
+   if (!progress)
+      return false;
+
+   nir_foreach_variable_with_modes_safe (var, nir, nir_var_shader_out) {
+      if (var->data.location == VARYING_SLOT_PSIZ)
+         exec_node_remove(&var->node);
+   }
+   nir->info.outputs_written &= ~VARYING_BIT_PSIZ;
+
+   /* The uniform that fed the export is now dead; collect it and its load. */
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_out, NULL);
+   NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_uniform, NULL);
+   nir->num_uniforms = 0;
+   return true;
+}
+
 bool pvrgpu_pco_compile_color_triangle(
    struct pvrgpu_pco_compiler *compiler,
    const struct nir_shader *vertex_nir,
    const struct nir_shader *fragment_nir,
    enum pipe_format position_format,
    enum pipe_format color_format,
+   bool topology_uses_point_size,
    struct pvrgpu_pco_graphics_binary *out,
    char *error,
    size_t error_size)
@@ -3623,17 +3682,6 @@ bool pvrgpu_pco_compile_color_triangle(
       return pvrgpu_pco_fail(error,
                              error_size,
                              "missing compiler or NIR stage for color triangle");
-   }
-
-   if (!pvrgpu_validate_color_primitive_nir(vertex_nir,
-                                            MESA_SHADER_VERTEX,
-                                            error,
-                                            error_size) ||
-       !pvrgpu_validate_color_primitive_nir(fragment_nir,
-                                            MESA_SHADER_FRAGMENT,
-                                            error,
-                                            error_size)) {
-      return false;
    }
 
    void *compile_mem_ctx = ralloc_context(compiler->mem_ctx);
@@ -3651,6 +3699,26 @@ bool pvrgpu_pco_compile_color_triangle(
    fs->info.internal = true;
    vs->options = pco_nir_options();
    fs->options = pco_nir_options();
+
+   if (!topology_uses_point_size)
+      pvrgpu_strip_dead_point_size(vs);
+
+   /*
+    * Validate the shader this profile will actually hand to PCO.  pco_trans_nir
+    * aborts the process on a signature it cannot translate, so anything outside
+    * the position/color layout has to be rejected before that point.
+    */
+   if (!pvrgpu_validate_color_primitive_nir(vs,
+                                            MESA_SHADER_VERTEX,
+                                            error,
+                                            error_size) ||
+       !pvrgpu_validate_color_primitive_nir(fs,
+                                            MESA_SHADER_FRAGMENT,
+                                            error,
+                                            error_size)) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
 
    nir_lower_fragcolor(fs, 1);
 

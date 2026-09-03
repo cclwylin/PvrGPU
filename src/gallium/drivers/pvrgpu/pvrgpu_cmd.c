@@ -76,10 +76,14 @@ pvrgpu_pco_single_draw_resolution_supported(uint32_t framebuffer_width,
                                             uint32_t width,
                                             uint32_t height)
 {
+   /*
+    * The model's rasterizer is resolution independent, so the single-draw
+    * profile only needs a full-surface render target inside the addressable
+    * extent the nested PCO sequence header already enforces.
+    */
    return width == framebuffer_width && height == framebuffer_height &&
-          ((framebuffer_width == 80 && framebuffer_height == 60) ||
-           (framebuffer_width == 800 && framebuffer_height == 600) ||
-           (framebuffer_width == 512 && framebuffer_height == 512));
+          framebuffer_width != 0 && framebuffer_height != 0 &&
+          framebuffer_width <= 4096 && framebuffer_height <= 4096;
 }
 
 static void
@@ -555,8 +559,8 @@ pvrgpu_cmd_validate_draw_pco_triangles(
           cmd->height) ||
        strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8) != 0) {
       pvrgpu_cmd_error(error, error_size,
-                       "draw PCO triangles requires a framebuffer-sized "
-                       "80x60 or 800x600 RGBA8 profile");
+                       "draw PCO triangles requires a full-surface RGBA8 "
+                       "render target within the model extent");
       return false;
    }
    if (cmd->clear_color_bits[0] != 0 ||
@@ -701,7 +705,11 @@ pvrgpu_cmd_validate_draw_pco_triangles(
                        "payload");
       return false;
    }
-   if (cmd->vertex_pco_abi.temps == 0 ||
+   /*
+    * A pass-through vertex shader that only forwards position and colour uses
+    * no temporaries, exactly as the color layout's fragment stage may.
+    */
+   if ((!color_layout && cmd->vertex_pco_abi.temps == 0) ||
        cmd->vertex_pco_abi.temps > 256 ||
        cmd->vertex_pco_abi.shareds > 64 ||
        cmd->vertex_pco_abi.coefficients != 0 ||
