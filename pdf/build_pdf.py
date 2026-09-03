@@ -75,6 +75,16 @@ def build_pdf(md_path, pdf_path):
         keepWithNext=True
     ))
     styles.add(ParagraphStyle(
+        name='Heading4_Custom',
+        fontName=body_font,
+        fontSize=9.5,
+        leading=13,
+        textColor=colors.HexColor('#2B6CB0'),
+        spaceBefore=6,
+        spaceAfter=3,
+        keepWithNext=True
+    ))
+    styles.add(ParagraphStyle(
         name='BodyText_Custom',
         fontName=body_font,
         fontSize=8.5,
@@ -153,19 +163,60 @@ def build_pdf(md_path, pdf_path):
         textColor=colors.HexColor('#4A5568'),
         alignment=1
     ))
+    styles.add(ParagraphStyle(
+        name='Formula_Custom',
+        fontName=code_font,
+        fontSize=9,
+        leading=12,
+        textColor=colors.HexColor('#1A365D'),
+        alignment=1,
+    ))
+
+    def format_latex_math(m_str):
+        m_str = re.sub(r'\\text\{([^}]+)\}', r'\1', m_str)
+        m_str = m_str.replace(r'\left(', '(').replace(r'\right)', ')')
+        m_str = m_str.replace(r'\_', '_')
+        m_str = m_str.replace(r'\&', '&')
+        m_str = re.sub(r'\\(sin|cos|tan|log|min|max)\b', r'\1', m_str)
+        m_str = m_str.replace(r'\leftarrow', '←')
+        m_str = m_str.replace(r'\rightarrow', '→')
+        m_str = m_str.replace(r'\to', '→')
+        m_str = m_str.replace(r'\le', '≤')
+        m_str = m_str.replace(r'\ge', '≥')
+        m_str = m_str.replace(r'\times', '×')
+        m_str = m_str.replace(r'\cdot', '·')
+        m_str = re.sub(r'\\sqrt\{([^}]+)\}', r'√\1', m_str)
+        m_str = m_str.replace('\\', '')
+        escaped = html.escape(m_str)
+        escaped = escaped.replace('←', '&larr;').replace('→', '&rarr;')
+        escaped = escaped.replace('≤', '&le;').replace('≥', '&ge;')
+        escaped = escaped.replace('×', '&times;').replace('·', '&middot;')
+        escaped = escaped.replace('√', '&radic;')
+        return f'<font face="Courier" color="#1A365D"><b>{escaped.strip()}</b></font>'
 
     def format_inline(raw):
         parts = []
         last_end = 0
-        for m in re.finditer(r'`([^`]+)`', raw):
+        pattern = re.compile(r'(`[^`]+`|\$\$[^$]+\$\$|\$[^$]+\$)')
+        for m in pattern.finditer(raw):
             plain = raw[last_end:m.start()]
             plain = html.escape(plain)
             plain = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', plain)
             plain = plain.replace(r'$\to$', ' &rarr; ').replace(r'->', ' &rarr; ')
             parts.append(plain)
-            code_val = html.escape(m.group(1))
-            parts.append(f'<font face="Courier" color="#C53030">{code_val}</font>')
+
+            token = m.group(1)
+            if token.startswith('`'):
+                code_val = html.escape(token[1:-1])
+                parts.append(f'<font face="Courier" color="#C53030">{code_val}</font>')
+            elif token.startswith('$$'):
+                math_val = token[2:-2]
+                parts.append(format_latex_math(math_val))
+            elif token.startswith('$'):
+                math_val = token[1:-1]
+                parts.append(format_latex_math(math_val))
             last_end = m.end()
+
         rem = raw[last_end:]
         rem = html.escape(rem)
         rem = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', rem)
@@ -375,16 +426,24 @@ def build_pdf(md_path, pdf_path):
 
         # 3. Headings
         if stripped.startswith('# '):
-            flowables.append(Paragraph(stripped[2:], styles['MainTitle']))
+            flowables.append(Paragraph(format_inline(stripped[2:]), styles['MainTitle']))
             flowables.append(Spacer(1, 6))
             i += 1
             continue
         elif stripped.startswith('## '):
-            flowables.append(Paragraph(stripped[3:], styles['Heading2_Custom']))
+            flowables.append(Paragraph(format_inline(stripped[3:]), styles['Heading2_Custom']))
             i += 1
             continue
         elif stripped.startswith('### '):
-            flowables.append(Paragraph(stripped[4:], styles['Heading3_Custom']))
+            flowables.append(Paragraph(format_inline(stripped[4:]), styles['Heading3_Custom']))
+            i += 1
+            continue
+        elif stripped.startswith('#### '):
+            flowables.append(Paragraph(format_inline(stripped[5:]), styles['Heading4_Custom']))
+            i += 1
+            continue
+        elif stripped.startswith('##### '):
+            flowables.append(Paragraph(format_inline(stripped[6:]), styles['Heading4_Custom']))
             i += 1
             continue
 
@@ -400,6 +459,37 @@ def build_pdf(md_path, pdf_path):
             flowables.append(divider)
             flowables.append(Spacer(1, 4))
             i += 1
+            continue
+
+        # 4.5 Math Block: $$ ... $$
+        if stripped.startswith('$$'):
+            math_lines = []
+            if stripped.endswith('$$') and len(stripped) > 2:
+                math_lines.append(stripped[2:-2].strip())
+                i += 1
+            else:
+                i += 1
+                while i < len(lines) and not lines[i].strip().endswith('$$'):
+                    math_lines.append(lines[i].strip())
+                    i += 1
+                if i < len(lines):
+                    last_l = lines[i].strip()
+                    if last_l != '$$':
+                        math_lines.append(last_l[:-2].strip())
+                    i += 1
+            formula_raw = ' '.join(math_lines)
+            formula_html = format_latex_math(formula_raw)
+            f_table = Table([[Paragraph(formula_html, styles['Formula_Custom'])]], colWidths=[content_width])
+            f_table.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#F7FAFC')),
+                ('BOX', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E0')),
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                ('PADDING', (0,0), (-1,-1), 4),
+            ]))
+            flowables.append(Spacer(1, 3))
+            flowables.append(f_table)
+            flowables.append(Spacer(1, 3))
             continue
 
         # 5. List items

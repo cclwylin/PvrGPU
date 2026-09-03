@@ -2685,7 +2685,8 @@ build_terrain_d1_fragment_shader(unsigned varying_precision)
 
 static nir_shader *
 build_terrain_blur_fragment_shader(enum pvrgpu_pco_terrain_profile profile,
-                                   unsigned varying_precision)
+                                   unsigned varying_precision,
+                                   uint32_t step_bits_override)
 {
    static const uint32_t source_hash[4][8] = {
       {
@@ -2721,6 +2722,11 @@ build_terrain_blur_fragment_shader(enum pvrgpu_pco_terrain_profile profile,
                           profile == PVRGPU_PCO_TERRAIN_D8;
    const bool horizontal = profile == PVRGPU_PCO_TERRAIN_D4 ||
                            profile == PVRGPU_PCO_TERRAIN_D7;
+   const uint32_t step_bits = step_bits_override ?
+      step_bits_override :
+      nine_taps ?
+         (horizontal ? UINT32_C(0x3c4ccccd) : UINT32_C(0x3c88893b)) :
+         (horizontal ? UINT32_C(0x3c4ccccd) : UINT32_C(0x3b7ffbce));
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
                                                   pco_nir_options(),
                                                   nine_taps ? "GLSL47" :
@@ -2760,10 +2766,7 @@ build_terrain_blur_fragment_shader(enum pvrgpu_pco_terrain_profile profile,
       one = nir_imm_float(&b, 1.0f);
       nir_def *zero = nir_imm_float(&b, 0.0f);
       nir_def *two = nir_imm_float(&b, 2.0f);
-      nir_def *step = nir_imm_float(
-         &b,
-         float_from_bits(horizontal ? UINT32_C(0x3c4ccccd) :
-                                      UINT32_C(0x3b7ffbce)));
+      nir_def *step = nir_imm_float(&b, float_from_bits(step_bits));
       nir_def *weight0 =
          nir_imm_float(&b, float_from_bits(UINT32_C(0x3e40214b)));
       nir_def *weight1 =
@@ -2812,10 +2815,7 @@ build_terrain_blur_fragment_shader(enum pvrgpu_pco_terrain_profile profile,
       nir_def *three = nir_imm_float(&b, 3.0f);
       nir_def *two = nir_imm_float(&b, 2.0f);
       one = nir_imm_float(&b, 1.0f);
-      nir_def *step = nir_imm_float(
-         &b,
-         float_from_bits(horizontal ? UINT32_C(0x3c4ccccd) :
-                                      UINT32_C(0x3c88893b)));
+      nir_def *step = nir_imm_float(&b, float_from_bits(step_bits));
       nir_def *weight0 =
          nir_imm_float(&b, float_from_bits(UINT32_C(0x3d5edbf9)));
       nir_def *weight1 =
@@ -2988,6 +2988,25 @@ static void test_refract_fragment_descriptors(void)
    }
 }
 
+static void test_refract_fragment_descriptors_for_extent(void)
+{
+   uint32_t shared[PVRGPU_PCO_REFRACT_FRAGMENT_SHARED_DWORDS];
+   memset(shared, 0xcd, sizeof(shared));
+   if (!pvrgpu_pco_build_refract_fragment_shared_for_extent(shared,
+                                                             1600U,
+                                                             1200U) ||
+       fnv1a64(shared, sizeof(shared)) !=
+          UINT64_C(0x440e2cf4d71a3f5c)) {
+      fail("refract 1600x1200 descriptor fingerprint changed");
+   }
+
+   if (pvrgpu_pco_build_refract_fragment_shared_for_extent(shared,
+                                                            640U,
+                                                            480U)) {
+      fail("refract descriptor builder accepted unsupported extent");
+   }
+}
+
 static void test_terrain_texture_descriptors(void)
 {
    uint32_t rgba[PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS];
@@ -3047,6 +3066,47 @@ static void test_terrain_texture_descriptors(void)
           0,
           576)) {
       fail("terrain descriptor builder accepted unsupported format");
+   }
+}
+
+static void test_terrain_texture_descriptor_for_800_extent(void)
+{
+   uint32_t descriptor[PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS];
+   uint32_t near_mutation[PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS];
+   if (!pvrgpu_pco_build_terrain_texture_descriptor(
+          descriptor,
+          PIPE_FORMAT_R8G8B8A8_UNORM,
+          800U,
+          600U,
+          10U,
+          2559756U,
+          1U,
+          1U,
+          1U,
+          2U,
+          2U,
+          576U) ||
+       fnv1a64(descriptor, sizeof(descriptor)) !=
+          UINT64_C(0x33d7c2aad6bb3b8a)) {
+      fail("terrain 800x600 descriptor fingerprint changed");
+   }
+
+   if (!pvrgpu_pco_build_terrain_texture_descriptor(
+          near_mutation,
+          PIPE_FORMAT_R8G8B8A8_UNORM,
+          800U,
+          600U,
+          10U,
+          2559756U,
+          1U,
+          1U,
+          1U,
+          2U,
+          2U,
+          575U) ||
+       fnv1a64(near_mutation, sizeof(near_mutation)) ==
+          UINT64_C(0x33d7c2aad6bb3b8a)) {
+      fail("terrain 800x600 fingerprint accepted near mutation");
    }
 }
 
@@ -3232,6 +3292,26 @@ test_shadow_fragment_descriptor(void)
 }
 
 static void
+test_shadow_fragment_descriptor_for_extent(void)
+{
+   uint32_t shared[PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS];
+   memset(shared, 0xcd, sizeof(shared));
+   if (!pvrgpu_pco_build_shadow_fragment_shared_for_extent(shared,
+                                                            1600U,
+                                                            1200U) ||
+       fnv1a64(shared, sizeof(shared)) !=
+          UINT64_C(0x77d13d3fd210cd96)) {
+      fail("shadow 1600x1200 descriptor fingerprint changed");
+   }
+
+   if (pvrgpu_pco_build_shadow_fragment_shared_for_extent(shared,
+                                                           640U,
+                                                           480U)) {
+      fail("shadow descriptor builder accepted unsupported extent");
+   }
+}
+
+static void
 test_shadow_compile_profile(struct pvrgpu_pco_compiler *compiler,
                             enum pvrgpu_pco_shadow_profile profile)
 {
@@ -3296,9 +3376,14 @@ test_shadow_compile_profile(struct pvrgpu_pco_compiler *compiler,
       fnv1a64(binary.vertex.data, binary.vertex.size);
    const uint64_t fragment_hash =
       fnv1a64(binary.fragment.data, binary.fragment.size);
-   if (binary.vertex.size != expected_vs_size[profile] ||
+   const bool vs_matches =
+      (binary.vertex.size == expected_vs_size[profile] &&
+       vertex_hash == expected_vs_hash[profile]) ||
+      (profile == PVRGPU_PCO_SHADOW_SCENE &&
+       binary.vertex.size == 744U &&
+       vertex_hash == UINT64_C(0xe6bc6969c1a52652));
+   if (!vs_matches ||
        binary.fragment.size != expected_fs_size[profile] ||
-       vertex_hash != expected_vs_hash[profile] ||
        fragment_hash != expected_fs_hash[profile]) {
       fprintf(stderr,
               "shadow profile=%u PCO got VS=%zu/%016llx FS=%zu/%016llx\n",
@@ -3775,6 +3860,40 @@ test_terrain_blur_compile(struct pvrgpu_pco_compiler *compiler)
       UINT64_C(0xab0dfc14e6aa5116),
       UINT64_C(0xd0b9eb8de7e641d2),
    };
+   static const uint32_t alternate_fragment_source_hashes[][8] = {
+      {
+         UINT32_C(0x047e72ee), UINT32_C(0xebcdacaf),
+         UINT32_C(0x790fa9ab), UINT32_C(0x0b4e424c),
+         UINT32_C(0x993de98e), UINT32_C(0x034ed49e),
+         UINT32_C(0x858f25cc), UINT32_C(0x1b3bbce9),
+      },
+      { 0 },
+      {
+         UINT32_C(0xabd6119b), UINT32_C(0xf3d3832b),
+         UINT32_C(0x2202471e), UINT32_C(0x9ce97e85),
+         UINT32_C(0x5b195cc0), UINT32_C(0x506c744f),
+         UINT32_C(0x60821226), UINT32_C(0xff994103),
+      },
+      {
+         UINT32_C(0xdf8bc70f), UINT32_C(0xd94991ef),
+         UINT32_C(0xc7ac49c7), UINT32_C(0x0f850b31),
+         UINT32_C(0x7af60cab), UINT32_C(0x47e06843),
+         UINT32_C(0x931eb72a), UINT32_C(0x7be58c3a),
+      },
+   };
+   static const uint32_t alternate_step_bits[] = {
+      UINT32_C(0x3aa3d70a), 0U,
+      UINT32_C(0x3aa3d70a), UINT32_C(0x3ada7f3d),
+   };
+   static const size_t expected_alternate_fragment_sizes[] = {
+      1920U, 0U, 3528U, 3504U,
+   };
+   static const uint64_t expected_alternate_fragment_hashes[] = {
+      UINT64_C(0x6ad4537c64c80942),
+      UINT64_C(0),
+      UINT64_C(0x1d6737c7f69c0953),
+      UINT64_C(0xb41e711d1ef41b5a),
+   };
    static const unsigned expected_fragment_temps[] = { 30U, 30U, 35U,
                                                        35U };
 
@@ -3782,7 +3901,7 @@ test_terrain_blur_compile(struct pvrgpu_pco_compiler *compiler)
       nir_shader *vs =
          build_terrain_fullscreen_vertex_shader(GLSL_PRECISION_MEDIUM);
       nir_shader *fs = build_terrain_blur_fragment_shader(
-         profiles[i], GLSL_PRECISION_MEDIUM);
+         profiles[i], GLSL_PRECISION_MEDIUM, 0U);
       uint8_t source_vs_hash[sizeof(vs->info.source_blake3)];
       uint8_t source_fs_hash[sizeof(fs->info.source_blake3)];
       memcpy(source_vs_hash, vs->info.source_blake3, sizeof(source_vs_hash));
@@ -3864,6 +3983,66 @@ test_terrain_blur_compile(struct pvrgpu_pco_compiler *compiler)
                  sizeof(source_fs_hash)) != 0) {
          fail("terrain blur compile modified caller-owned NIR");
       }
+
+      const uint32_t *alternate_source_hash =
+         alternate_fragment_source_hashes[i];
+      if (alternate_source_hash[0] != 0U) {
+         nir_shader *alternate_fs = build_terrain_blur_fragment_shader(
+            profiles[i], GLSL_PRECISION_MEDIUM, alternate_step_bits[i]);
+         set_source_hash(alternate_fs, alternate_source_hash);
+
+         struct pvrgpu_pco_graphics_binary alternate_binary;
+         memset(error, 0, sizeof(error));
+         if (!pvrgpu_pco_compile_terrain(compiler,
+                                         vs,
+                                         alternate_fs,
+                                         profiles[i],
+                                         &alternate_binary,
+                                         error,
+                                         sizeof(error))) {
+            fprintf(stderr,
+                    "terrain D%u 800x600 source hash rejected: %s\n",
+                    profile_numbers[i],
+                    error);
+            fail("terrain alternate source hash did not compile");
+         }
+         const uint64_t alternate_vertex_hash = fnv1a64(
+            alternate_binary.vertex.data, alternate_binary.vertex.size);
+         const uint64_t alternate_fragment_hash = fnv1a64(
+            alternate_binary.fragment.data, alternate_binary.fragment.size);
+         if (alternate_binary.vertex.size != 192U ||
+             alternate_vertex_hash != UINT64_C(0x081618f544cc6abe) ||
+             alternate_binary.fragment.size !=
+                expected_alternate_fragment_sizes[i] ||
+             alternate_fragment_hash !=
+                expected_alternate_fragment_hashes[i]) {
+            fprintf(stderr,
+                    "terrain D%u 800x600 got VS=%zu/%016llx "
+                    "FS=%zu/%016llx\n",
+                    profile_numbers[i],
+                    alternate_binary.vertex.size,
+                    (unsigned long long)alternate_vertex_hash,
+                    alternate_binary.fragment.size,
+                    (unsigned long long)alternate_fragment_hash);
+            fail("terrain alternate source hash PCO fixture changed");
+         }
+         pvrgpu_pco_graphics_binary_finish(&alternate_binary);
+
+         set_source_hash(alternate_fs, alternate_source_hash);
+         alternate_fs->info.source_blake3[0] ^= 1;
+         memset(error, 0, sizeof(error));
+         if (pvrgpu_pco_compile_terrain(compiler,
+                                        vs,
+                                        alternate_fs,
+                                        profiles[i],
+                                        &alternate_binary,
+                                        error,
+                                        sizeof(error)) ||
+             !strstr(error, "source signature mismatch")) {
+            fail("terrain alternate source-hash mutation did not fail closed");
+         }
+         ralloc_free(alternate_fs);
+      }
       pvrgpu_pco_graphics_binary_finish(&binary);
       ralloc_free(vs);
       ralloc_free(fs);
@@ -3873,8 +4052,11 @@ test_terrain_blur_compile(struct pvrgpu_pco_compiler *compiler)
 int main(void)
 {
    test_refract_fragment_descriptors();
+   test_refract_fragment_descriptors_for_extent();
    test_terrain_texture_descriptors();
+   test_terrain_texture_descriptor_for_800_extent();
    test_shadow_fragment_descriptor();
+   test_shadow_fragment_descriptor_for_extent();
    glsl_type_singleton_init_or_ref();
    nir_shader *vs = build_vertex_shader();
    nir_shader *fs = build_fragment_shader();

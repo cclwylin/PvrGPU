@@ -152,6 +152,42 @@ bool RawFloatVerticesAreFinite(const std::uint8_t *data,
   return true;
 }
 
+// Non-indexed triangle topologies the submitter can expand into a triangle
+// list: a whole-triangle list, or a strip/fan of three or more vertices.
+bool DriverPcoArrayTopologyIsExpandable(std::uint32_t primitive_mode,
+                                        std::uint32_t vertex_count) {
+  if (primitive_mode == 4U)
+    return vertex_count >= 3U && vertex_count % 3U == 0U;
+  if (primitive_mode == 5U || primitive_mode == 6U)
+    return vertex_count >= 3U;
+  return false;
+}
+
+bool PcoSingleDrawResolutionSupported(std::uint32_t framebuffer_width,
+                                      std::uint32_t framebuffer_height,
+                                      std::uint32_t width,
+                                      std::uint32_t height) {
+  // The rasterizer is resolution independent; the single-draw path only needs
+  // a full-surface render target within the model's addressable extent, which
+  // is the same bound the nested PCO sequence header enforces.
+  return width == framebuffer_width && height == framebuffer_height &&
+         framebuffer_width != 0 && framebuffer_height != 0 &&
+         framebuffer_width <= 4096 && framebuffer_height <= 4096;
+}
+
+std::array<std::uint32_t, 3> PcoViewportBits(
+    std::uint32_t framebuffer_width, std::uint32_t framebuffer_height) {
+  const std::array<float, 3> values = {
+      static_cast<float>(framebuffer_width) * 0.5F,
+      static_cast<float>(framebuffer_height) * 0.5F,
+      0.5F,
+  };
+  std::array<std::uint32_t, 3> bits{};
+  static_assert(sizeof(values) == sizeof(bits));
+  std::memcpy(bits.data(), values.data(), sizeof(bits));
+  return bits;
+}
+
 void CopyPcoPayloadFields(
     const pvrgpu_systemc_driver_command &source,
     pvrgpu::stub::DriverCommand *destination) {
@@ -335,14 +371,26 @@ bool CopyPcoTrianglePayload(
     pvrgpu::stub::DriverCommand *destination, std::string *error) {
   if (!destination || !error)
     return false;
-  static constexpr std::array<std::uint32_t, 3> kViewportBits = {
-      UINT32_C(0x42200000), UINT32_C(0x41f00000), UINT32_C(0x3f000000)};
+  if (!PcoSingleDrawResolutionSupported(
+          source.framebuffer_width, source.framebuffer_height,
+          source.width, source.height)) {
+    *error = "SystemC API PCO triangle resolution requires a "
+             "framebuffer-sized 80x60 or 800x600 viewport";
+    return false;
+  }
+  const std::array<std::uint32_t, 3> viewport_bits =
+      PcoViewportBits(source.framebuffer_width, source.framebuffer_height);
   const bool ideas_sequence = IsIdeasPcoSequenceCase(source.case_name);
   const bool conditionals_layout =
       source.vertex_stride == pvrgpu::stub::kDriverPcoPositionVertexStride;
+  const bool color_layout =
+      source.vertex_stride ==
+          pvrgpu::stub::kDriverPcoPositionNormalVertexStride &&
+      source.vertex_pco_abi.shareds == 0;
   const bool lit_mesh_layout =
       source.vertex_stride ==
-          pvrgpu::stub::kDriverPcoPositionNormalVertexStride;
+          pvrgpu::stub::kDriverPcoPositionNormalVertexStride &&
+      !color_layout;
   const bool texture_layout =
       !ideas_sequence &&
       source.vertex_stride ==
@@ -362,19 +410,18 @@ bool CopyPcoTrianglePayload(
       static_cast<std::uint64_t>(source.first_vertex) + source.vertex_count;
   const std::uint64_t expected_vertex_bytes =
       end_vertex * static_cast<std::uint64_t>(source.vertex_stride);
-  if (source.framebuffer_width != 80 || source.framebuffer_height != 60 ||
-      source.width != 80 || source.height != 60 || !source.format ||
+  if (!source.format ||
       std::string(source.format) != "PIPE_FORMAT_R8G8B8A8_UNORM" ||
       source.clear_color_bits[0] != 0 || source.clear_color_bits[1] != 0 ||
       source.clear_color_bits[2] != 0 ||
       source.clear_color_bits[3] != UINT32_C(0x3f800000) ||
       (!conditionals_layout && !lit_mesh_layout && !texture_layout &&
-       !ideas_layout) ||
+       !ideas_layout && !color_layout) ||
       source.vertex_count == 0 ||
-      (!ideas_sequence && source.vertex_count % 3U != 0) ||
+      (!ideas_sequence && !DriverPcoArrayTopologyIsExpandable(
+                              source.primitive_mode, source.vertex_count)) ||
       source.first_vertex != 0 ||
-      source.instance_count != 1 ||
-      (ideas_sequence ? !ideas_topology : source.primitive_mode != 4U) ||
+      source.instance_count != 1 || (ideas_sequence && !ideas_topology) ||
       source.indexed != 0 || expected_vertex_bytes == 0 ||
       expected_vertex_bytes > std::numeric_limits<std::uint32_t>::max() ||
       source.raw_vertex_data_size != expected_vertex_bytes ||
@@ -385,7 +432,9 @@ bool CopyPcoTrianglePayload(
                                      ? source.vertex_stride / sizeof(float)
                                      : texture_layout
                                            ? 8U
-                                           : (lit_mesh_layout ? 6U : 3U))) {
+                                           : ((lit_mesh_layout || color_layout)
+                                                  ? 6U
+                                                  : 3U))) {
     *error = "invalid SystemC API PCO triangle VBO/topology payload";
     return false;
   }
@@ -431,7 +480,7 @@ bool CopyPcoTrianglePayload(
   const bool common_abi_invalid =
       !PcoStageAbiIsBounded(source.vertex_pco_abi) ||
       !PcoStageAbiIsBounded(source.fragment_pco_abi,
-                            ideas_position_layout, true) ||
+                            ideas_position_layout || color_layout, true) ||
       source.vertex_pco_abi.coefficients != 0 ||
       source.fragment_pco_abi.vertex_inputs != 0 ||
       source.fragment_pco_abi.vertex_outputs != 0 ||
@@ -502,6 +551,17 @@ bool CopyPcoTrianglePayload(
          source.fragment_position_count != 4 ||
          source.fragment_varying_start != 4 ||
          source.fragment_varying_count != source.varying_output_count * 4U)) ||
+       (color_layout &&
+        (source.vertex_pco_abi.vertex_inputs != 8 ||
+         source.vertex_pco_abi.push_constant_count !=
+             source.vertex_pco_abi.shareds ||
+         source.fragment_pco_abi.push_constant_count !=
+             source.fragment_pco_abi.shareds ||
+         source.varying_output_start != 4 ||
+         source.varying_output_count != 4 ||
+         source.fragment_position_count != 4 ||
+         source.fragment_varying_start != 4 ||
+         source.fragment_varying_count != 16)) ||
        (texture_layout &&
         (source.vertex_count != 36 ||
          source.vertex_pco_abi.vertex_inputs != 12 ||
@@ -519,10 +579,10 @@ bool CopyPcoTrianglePayload(
          source.fragment_varying_start != 4 ||
          source.fragment_varying_count != 12)));
   const bool viewport_scale_invalid =
-      !std::equal(kViewportBits.begin(), kViewportBits.end(),
+      !std::equal(viewport_bits.begin(), viewport_bits.end(),
                   source.viewport_scale_bits);
   const bool viewport_translate_invalid =
-      !std::equal(kViewportBits.begin(), kViewportBits.end(),
+      !std::equal(viewport_bits.begin(), viewport_bits.end(),
                   source.viewport_translate_bits);
   if (common_abi_invalid || ideas_abi_invalid || single_abi_invalid ||
       viewport_scale_invalid || viewport_translate_invalid) {
@@ -538,7 +598,8 @@ bool CopyPcoTrianglePayload(
              << " shared=" << pvrgpu::stub::kPcoMaximumVertexSharedCount
              << ')';
     } else if (!PcoStageAbiIsBounded(source.fragment_pco_abi,
-                                     ideas_position_layout, true)) {
+                                     ideas_position_layout || color_layout,
+                                     true)) {
       detail << "fragment ABI exceeds model bounds (actual="
              << PcoStageAbiText(source.fragment_pco_abi) << ", limits temps="
              << pvrgpu::stub::kPcoTemporaryCount << " vtxin="
@@ -604,10 +665,12 @@ bool CopyPcoTrianglePayload(
        !IdeasDepthStateIsSupported(source));
   const bool single_raster_invalid =
       !ideas_sequence &&
-      (source.cull_face != 2 || source.depth_enable != 1 ||
-       source.depth_write != 1 || source.depth_func != 3 ||
-       source.depth_clear_bits != UINT32_C(0x3f800000) ||
-       source.depth_format == 0);
+      (color_layout
+           ? (source.cull_face != 0 && source.cull_face != 2)
+           : (source.cull_face != 2 || source.depth_enable != 1 ||
+              source.depth_write != 1 || source.depth_func != 3 ||
+              source.depth_clear_bits != UINT32_C(0x3f800000) ||
+              source.depth_format == 0));
   if (common_raster_invalid || ideas_raster_invalid ||
       single_raster_invalid) {
     *error = "SystemC API PCO triangle raster/depth metadata mismatch";
@@ -1402,8 +1465,8 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
     CopyError(error, error_size, "missing SystemC API command payload");
     return 2;
   }
-  // API-v7 appended nested attachment/stage state. Reject an older producer
-  // before reading `command`, sequence pointers, or any v7 tail byte.
+  // API-v8 expands the nested sequence texture mip table. Reject an older
+  // producer before reading `command`, sequence pointers, or any v8 tail byte.
   if (info->command->version != PVRGPU_SYSTEMC_API_VERSION) {
     CopyError(error, error_size, "unsupported SystemC API command version");
     return 2;

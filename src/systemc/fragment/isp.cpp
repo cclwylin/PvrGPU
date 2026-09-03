@@ -39,7 +39,8 @@ bool CoversSample(const ParameterTriangle &triangle, std::int64_t sample_x,
   return true;
 }
 
-bool DepthPass(DepthCompareOp compare_op, float incoming, float stored) {
+template <typename T>
+bool DepthPass(DepthCompareOp compare_op, T incoming, T stored) {
   switch (compare_op) {
   case DepthCompareOp::kNever:
     return false;
@@ -280,10 +281,24 @@ void Isp::Run() {
               ++covered_pixels;
             }
             bool passes = true;
+            std::uint32_t incoming_encoded_depth = 0;
             if (state.raster_state.depth.test_enable) {
               ++depth_tested;
-              passes = DepthPass(state.raster_state.depth.compare_op,
-                                 candidate.depth, depth[pixel_index]);
+              if (state.depth_attachment_format == 0) {
+                passes = DepthPass(state.raster_state.depth.compare_op,
+                                   candidate.depth, depth[pixel_index]);
+              } else {
+                // llvmpipe converts an incoming floating-point fragment Z to
+                // the attachment's integer UNORM domain before testing it.
+                // Comparing the raw float against a decoded stored value can
+                // incorrectly reject two depths that quantize to the same
+                // Z16/Z24/Z32 value under LEQUAL/EQUAL.
+                incoming_encoded_depth = EncodeDepthAttachmentUnorm(
+                    candidate.depth, state.depth_attachment_format);
+                passes = DepthPass(state.raster_state.depth.compare_op,
+                                   incoming_encoded_depth,
+                                   encoded_depth[pixel_index]);
+              }
               if (!passes)
                 ++depth_rejected;
             }
@@ -304,8 +319,7 @@ void Isp::Run() {
               if (state.depth_attachment_format == 0) {
                 depth[pixel_index] = candidate.depth;
               } else {
-                encoded_depth[pixel_index] = EncodeDepthAttachmentUnorm(
-                    candidate.depth, state.depth_attachment_format);
+                encoded_depth[pixel_index] = incoming_encoded_depth;
                 depth[pixel_index] = DecodeDepthAttachmentUnorm(
                     encoded_depth[pixel_index],
                     state.depth_attachment_format);

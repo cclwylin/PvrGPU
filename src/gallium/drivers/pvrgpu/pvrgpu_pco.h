@@ -117,6 +117,21 @@ bool pvrgpu_pco_compile_conditionals(struct pvrgpu_pco_compiler *compiler,
                                      size_t error_size);
 
 /*
+ * Compile a basic color triangle or color mesh profile (Position + Color varying).
+ * Position attribute is GENERIC0, Color attribute is GENERIC1.
+ * Exports position and smooth color varying (4 scalar components).
+ */
+bool pvrgpu_pco_compile_color_triangle(
+   struct pvrgpu_pco_compiler *compiler,
+   const struct nir_shader *vertex_nir,
+   const struct nir_shader *fragment_nir,
+   enum pipe_format position_format,
+   enum pipe_format color_format,
+   struct pvrgpu_pco_graphics_binary *out,
+   char *error,
+   size_t error_size);
+
+/*
  * Compile one of the fail-closed GLMark2 lit-mesh profiles.  These profiles
  * share two R32G32B32_FLOAT attributes (position and normal), a 32-DWORD VS
  * constant-buffer ABI, and one smooth scalar/vec3 varying.  The profile enum
@@ -174,8 +189,13 @@ bool pvrgpu_pco_compile_refract(
 void pvrgpu_pco_build_refract_fragment_shared(
    uint32_t out[PVRGPU_PCO_REFRACT_FRAGMENT_SHARED_DWORDS]);
 
+bool pvrgpu_pco_build_refract_fragment_shared_for_extent(
+   uint32_t out[PVRGPU_PCO_REFRACT_FRAGMENT_SHARED_DWORDS],
+   unsigned width,
+   unsigned height);
+
 /* Compile one draw of the strict three-draw GLMark2 shadow pipeline.  DEPTH
- * writes the native 160x120 Z32 shadow attachment, MASK samples that
+ * writes the native 2x-output Z32 shadow attachment, MASK samples that
  * attachment while drawing the four-vertex screen strip, and SCENE shades
  * the 21,516-vertex mesh into the final target.  Source hashes, NIR graphs,
  * precision, uniform slots and linkage are all fail-closed. */
@@ -193,6 +213,11 @@ bool pvrgpu_pco_compile_shadow(
  * and relocation after validating every non-address field. */
 void pvrgpu_pco_build_shadow_fragment_shared(
    uint32_t out[PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS]);
+
+bool pvrgpu_pco_build_shadow_fragment_shared_for_extent(
+   uint32_t out[PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS],
+   unsigned width,
+   unsigned height);
 
 /* Compile one shader pair from the strict eight-profile GLMark2 terrain
  * sequence.  Texture indices are validated in their captured GL order, then

@@ -9,6 +9,11 @@ Current status:
 - Mesa software-loader selection is explicit through `GALLIUM_DRIVER=pvrgpu`.
 - GLES2 context creation works through the Mesa software DRI loader.
 - full-frame RGBA8/BGRA8 color clear lowers to `pvrgpu.driver-command.v1`.
+- scissored and color-masked clears are lowered in the driver (`clear_scissored` /
+  `clear_masked` caps) instead of being rewritten by the state tracker into internal
+  quad draws the driver would have to reject. Only a clear that leaves the whole
+  surface one color can be described by the v1 `clear_color` capsule; the others still
+  update the surface but record `clear_color_command_skip`.
 - CPU-backed resource storage and `buffer_map` / `texture_map` / subdata hooks are present for bring-up readback/upload.
 - fence callbacks are no-op-complete because this driver currently flushes synchronously and does not create real fences.
 - `PVRGPU_DRIVER_COUNTER_OUT=/path/to/counter.txt` emits lightweight driver-side event records for clear/resource/transfer/shader/vertex/state/draw visibility.

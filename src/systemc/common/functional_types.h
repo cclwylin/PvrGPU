@@ -25,6 +25,13 @@ inline constexpr std::uint32_t kTileWidth = kReferenceUarch.tile_width;
 inline constexpr std::uint32_t kTileHeight = kReferenceUarch.tile_height;
 inline constexpr std::uint32_t kSubpixelBits = kReferenceUarch.subpixel_bits;
 inline constexpr std::int64_t kSubpixelScale = 1LL << kSubpixelBits;
+
+// Match llvmpipe SSE's round-to-nearest-even rule at the 24.8 boundary for
+// post-clip viewport coordinates. In that bounded domain, llvmpipe's
+// half-pixel translation and this model's translated sample coordinates are
+// equivalent. Keep clip-area classification and parameter edge setup on one
+// deterministic conversion instead of inheriting half-away library behavior.
+std::int64_t QuantizeRasterSubpixel(float value);
 inline constexpr std::uint32_t kPcoVertexInputRegisterCount = 32;
 // Public Rogue implementations expose at least 64 user vertex-output dwords.
 // Keep this common payload limit aligned with shader/pco_iss.h's
@@ -49,7 +56,7 @@ inline constexpr std::uint32_t kFillTexNearestCoefficientDwordCount =
     kCoefficientSetDwordCount * kFillTexNearestCoefficientSetCount;
 inline constexpr std::uint32_t kFillTexNearestVertexOutputDwordCount = 6;
 inline constexpr std::uint32_t kFillTexNearestSharedDwordCount = 20;
-inline constexpr std::uint32_t kMaximumTextureMipLevels = 10;
+inline constexpr std::uint32_t kMaximumTextureMipLevels = 15;
 inline constexpr std::uint32_t kInvalidFragmentInvocationIndex =
     std::numeric_limits<std::uint32_t>::max();
 
@@ -487,7 +494,11 @@ struct RasterTriangle {
   // Fast-path triangles that reach fixed setup before face culling remain
   // serialized for exact setup accounting but never enter a tile bin.
   std::uint8_t face_culled = 0;
-  std::uint8_t reserved[3]{};
+  // RasterTriangle is normalized independently for the model's edge walker.
+  // Keep Mesa's actual setup-JIT vertex order so binary32 coefficient
+  // construction still uses the same anchor/subtraction sequence.  The three
+  // entries are a permutation of the serialized raster vertices.
+  std::uint8_t setup_vertex_order[3]{};
 };
 
 // TileRecord owns a contiguous range in TilePrimitiveRef. This preserves

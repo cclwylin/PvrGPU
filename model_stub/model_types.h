@@ -64,6 +64,8 @@ struct DriverPcoTextureMipLayout {
   std::uint32_t offset_bytes = 0;
 };
 
+inline constexpr std::size_t kDriverPcoMaximumTextureMipLevels = 15;
+
 // Owned descriptor-backed resource for a native PCO sequence.  The raw Rogue
 // image/sampler descriptor dwords remain in fragment_shared; this redundant
 // structured metadata bounds every byte copy and lets Submitter/TextureUnit
@@ -78,7 +80,8 @@ struct DriverPcoSampledTexture {
   std::vector<std::uint8_t> bytes;
   std::uint64_t declared_bytes_size = 0;
   std::uint32_t mip_count = 0;
-  std::array<DriverPcoTextureMipLayout, 10> mip{};
+  std::array<DriverPcoTextureMipLayout,
+             kDriverPcoMaximumTextureMipLevels> mip{};
   std::uint32_t min_filter = 0;
   std::uint32_t mag_filter = 0;
   std::uint32_t mip_filter = 0;
@@ -117,14 +120,13 @@ inline constexpr std::uint32_t kDriverPcoTextureHeight = 512;
 inline constexpr std::uint32_t kDriverPcoTextureRowPitch = 2048;
 inline constexpr std::uint64_t kDriverPcoTextureBytes =
     UINT64_C(1048576);
-// Mesa 26.2.1 pipe_format values transported verbatim by the v7 API.
+// Mesa 26.2.1 pipe_format values transported verbatim by the v8 API.
 inline constexpr std::uint32_t kDriverPcoDepthFormatZ16Unorm = 268;
 inline constexpr std::uint32_t kDriverPcoDepthFormatZ32Unorm = 270;
 inline constexpr std::uint32_t kDriverPcoDepthFormatZ24X8Unorm = 276;
 inline constexpr std::uint32_t kDriverPcoNewAttachment = UINT32_MAX;
 inline constexpr std::size_t kDriverPcoRefractSequenceCommands = 2;
 inline constexpr std::size_t kDriverPcoRefractSampledTextures = 3;
-inline constexpr std::size_t kDriverPcoMaximumTextureMipLevels = 10;
 inline constexpr std::uint64_t kDriverPcoSequenceAttachmentStride =
     UINT64_C(0x01000000);
 inline constexpr std::uint64_t kDriverPcoSequenceColorAddressBase =

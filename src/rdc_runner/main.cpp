@@ -1425,6 +1425,10 @@ int main(int argc, char **argv) {
   RuntimeConfig config(options.project_root);
   ApplyManifestMetadata(config.project_root() / "config" / "rdc-glbench-v1.tsv",
                         digest, &options);
+  ApplyManifestMetadata(config.project_root() / "config" / "rdc-glmark2-80x60-v1.tsv",
+                        digest, &options);
+  ApplyManifestMetadata(config.project_root() / "config" / "rdc-glmark2-800x600-v1.tsv",
+                        digest, &options);
   const std::filesystem::path work_root =
       config.Path("PVRGPU_WORK_ROOT", DefaultWorkRoot());
   if (options.renderdoc_root.empty()) {

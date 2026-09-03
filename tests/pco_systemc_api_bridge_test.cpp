@@ -242,8 +242,28 @@ void VerifyDepthAttachmentFormats() {
 
 int main() {
   using namespace pvrgpu::stub;
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 7U,
-                "native sequence bridge test requires API-v7");
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 8U,
+                "native sequence bridge test requires API-v8");
+  static_assert(PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS == 15U);
+  static_assert(kDriverPcoMaximumTextureMipLevels == 15U);
+  static_assert(kMaximumTextureMipLevels == 15U);
+  static_assert(
+      sizeof(pvrgpu_systemc_pco_sequence_texture::mip) /
+              sizeof(pvrgpu_systemc_pco_texture_mip) ==
+          PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS,
+      "SystemC API texture ABI does not expose all 15 mip slots");
+  static_assert(
+      sizeof(void *) != 8U ||
+          sizeof(pvrgpu_systemc_pco_sequence_texture) == 336U,
+      "64-bit SystemC API-v8 sequence texture ABI size changed");
+  static_assert(
+      std::tuple_size<decltype(DriverPcoSampledTexture{}.mip)>::value ==
+          kDriverPcoMaximumTextureMipLevels,
+      "owned model texture ABI does not expose all 15 mip slots");
+  static_assert(
+      sizeof(TextureResource::mip) / sizeof(TextureMipLevel) ==
+          kMaximumTextureMipLevels,
+      "functional texture payload does not expose all 15 mip slots");
   VerifyIdeasTopologyExpansion();
   VerifyGenericFloat2StripExpansion();
   VerifyDepthAttachmentFormats();
@@ -356,6 +376,23 @@ int main() {
   command.depth_func = 3;
   command.depth_clear_bits = UINT32_C(0x3f800000);
   command.depth_format = 1;
+  const auto set_pco_resolution = [&](std::uint32_t width,
+                                      std::uint32_t height) {
+    command.framebuffer_width = width;
+    command.framebuffer_height = height;
+    command.width = width;
+    command.height = height;
+    const std::array<float, 3> viewport = {
+        static_cast<float>(width) * 0.5F,
+        static_cast<float>(height) * 0.5F,
+        0.5F,
+    };
+    static_assert(sizeof(viewport) == sizeof(command.viewport_scale_bits));
+    std::memcpy(command.viewport_scale_bits, viewport.data(),
+                sizeof(command.viewport_scale_bits));
+    std::memcpy(command.viewport_translate_bits, viewport.data(),
+                sizeof(command.viewport_translate_bits));
+  };
 
   const std::string jsonl = (g_test_root / "model.jsonl").string();
   const std::string stderr_log = (g_test_root / "model.stderr.log").string();
@@ -373,7 +410,7 @@ int main() {
   if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) ==
           0 ||
       std::string(error.data()).find("submit version") == std::string::npos) {
-    Fail("API-v6 submit envelope was not rejected");
+    Fail("previous-version submit envelope was not rejected");
   }
   info.version = PVRGPU_SYSTEMC_API_VERSION;
   command.version = PVRGPU_SYSTEMC_API_VERSION - 1U;
@@ -381,10 +418,47 @@ int main() {
   if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) ==
           0 ||
       std::string(error.data()).find("command version") == std::string::npos) {
-    Fail("API-v6 command was not rejected before the API-v7 tail");
+    Fail("previous-version command was not rejected before the API-v8 tail");
   }
   command.version = PVRGPU_SYSTEMC_API_VERSION;
   error.fill(0);
+
+  set_pco_resolution(640, 480);
+  if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) ==
+          0 ||
+      std::string(error.data()).find("80x60 or 800x600") ==
+          std::string::npos) {
+    Fail("unsupported 640x480 PCO API resolution was not rejected");
+  }
+  set_pco_resolution(800, 600);
+  command.width = 80;
+  error.fill(0);
+  if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) ==
+          0 ||
+      std::string(error.data()).find("framebuffer-sized") ==
+          std::string::npos) {
+    Fail("non-framebuffer-sized PCO API viewport extent was not rejected");
+  }
+  set_pco_resolution(800, 600);
+  command.viewport_translate_bits[0] = UINT32_C(0x42200000);
+  error.fill(0);
+  if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) ==
+          0 ||
+      std::string(error.data()).find("ABI/viewport metadata") ==
+          std::string::npos) {
+    Fail("80x60 viewport state was accepted for an 800x600 PCO API command");
+  }
+  set_pco_resolution(800, 600);
+  if (std::atexit(VerifyDeferredModelAtExit) != 0)
+    Fail("cannot register deferred verifier");
+  error.fill(0);
+  if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) !=
+      0) {
+    Fail("valid 800x600 generic PCO API submit was rejected: " +
+         std::string(error.data()));
+  }
+  set_pco_resolution(80, 60);
+
   using AbiMember =
       std::uint32_t pvrgpu_systemc_pco_stage_abi::*;
   static constexpr std::array<AbiMember, 8> kAbiMembers = {
@@ -624,8 +698,22 @@ int main() {
   command.depth_enable = 0;
   command.depth_write = 0;
   command.depth_func = 0;
-  if (std::atexit(VerifyDeferredModelAtExit) != 0)
-    Fail("cannot register deferred verifier");
+  set_pco_resolution(800, 600);
+  error.fill(0);
+  if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) !=
+      0) {
+    Fail("valid 800x600 Ideas PCO API submit was rejected: " +
+         std::string(error.data()));
+  }
+  set_pco_resolution(640, 480);
+  error.fill(0);
+  if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) ==
+          0 ||
+      std::string(error.data()).find("80x60 or 800x600") ==
+          std::string::npos) {
+    Fail("unsupported 640x480 Ideas PCO API resolution was not rejected");
+  }
+  set_pco_resolution(80, 60);
   error.fill(0);
   if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) !=
       0) {
@@ -674,7 +762,7 @@ int main() {
   error.fill(0);
   if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) !=
       0) {
-    Fail("valid PCO API-v7 submit failed: " + std::string(error.data()));
+    Fail("valid PCO API-v8 submit failed: " + std::string(error.data()));
   }
 
   // The bridge contract promises that none of these producer allocations are

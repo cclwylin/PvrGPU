@@ -18,6 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Widest packed color block the driver lowers (32-bit RGBA/10:10:10:2). */
+#define PVRGPU_MAX_COLOR_BLOCK_SIZE 4u
+
 static const char *
 pvrgpu_command_output_path(void)
 {
@@ -505,11 +508,36 @@ pvrgpu_store_clear_color_pixel(enum pipe_format format,
 }
 
 static void
+pvrgpu_clear_color_write_mask(enum pipe_format format,
+                              unsigned colormask,
+                              uint8_t *mask_pixel)
+{
+   /*
+    * Every lowered color format packs its channels into disjoint bit ranges,
+    * so storing the maximum value for the enabled channels and zero for the
+    * disabled ones yields the exact write mask of the packed pixel.  The
+    * ignored alpha lane of an X8 format always reads back as one, so its mask
+    * bits stay set regardless of the requested colormask.
+    */
+   pvrgpu_store_clear_color_pixel(format,
+                                  mask_pixel,
+                                  (colormask & PIPE_MASK_R) ? 255 : 0,
+                                  (colormask & PIPE_MASK_G) ? 255 : 0,
+                                  (colormask & PIPE_MASK_B) ? 255 : 0,
+                                  (colormask & PIPE_MASK_A) ? 255 : 0,
+                                  (colormask & PIPE_MASK_R) ? 1023 : 0,
+                                  (colormask & PIPE_MASK_G) ? 1023 : 0,
+                                  (colormask & PIPE_MASK_B) ? 1023 : 0,
+                                  (colormask & PIPE_MASK_A) ? 3 : 0);
+}
+
+static void
 pvrgpu_fill_surface_rect_with_clear_color(struct pipe_surface *surface,
                                           unsigned dstx,
                                           unsigned dsty,
                                           unsigned width,
                                           unsigned height,
+                                          unsigned colormask,
                                           const union pipe_color_union *color)
 {
    struct pvrgpu_resource *resource = pvrgpu_resource(surface->texture);
@@ -518,17 +546,27 @@ pvrgpu_fill_surface_rect_with_clear_color(struct pipe_surface *surface,
        !pvrgpu_color_surface_rect_supported(surface, dstx, dsty, width, height))
       return;
 
-   const uint8_t r = pvrgpu_float_to_unorm8(color->f[0]);
-   const uint8_t g = pvrgpu_float_to_unorm8(color->f[1]);
-   const uint8_t b = pvrgpu_float_to_unorm8(color->f[2]);
-   const uint8_t a = pvrgpu_float_to_unorm8(color->f[3]);
-   const uint32_t r10 = pvrgpu_float_to_unorm10(color->f[0]);
-   const uint32_t g10 = pvrgpu_float_to_unorm10(color->f[1]);
-   const uint32_t b10 = pvrgpu_float_to_unorm10(color->f[2]);
-   const uint32_t a2 = pvrgpu_float_to_unorm2(color->f[3]);
-
    const unsigned level = surface->level;
    const unsigned block_size = util_format_get_blocksize(surface->format);
+   if (block_size == 0 || block_size > PVRGPU_MAX_COLOR_BLOCK_SIZE)
+      return;
+
+   uint8_t value_pixel[PVRGPU_MAX_COLOR_BLOCK_SIZE] = {0};
+   uint8_t mask_pixel[PVRGPU_MAX_COLOR_BLOCK_SIZE] = {0};
+   pvrgpu_store_clear_color_pixel(surface->format,
+                                  value_pixel,
+                                  pvrgpu_float_to_unorm8(color->f[0]),
+                                  pvrgpu_float_to_unorm8(color->f[1]),
+                                  pvrgpu_float_to_unorm8(color->f[2]),
+                                  pvrgpu_float_to_unorm8(color->f[3]),
+                                  pvrgpu_float_to_unorm10(color->f[0]),
+                                  pvrgpu_float_to_unorm10(color->f[1]),
+                                  pvrgpu_float_to_unorm10(color->f[2]),
+                                  pvrgpu_float_to_unorm2(color->f[3]));
+   pvrgpu_clear_color_write_mask(surface->format, colormask, mask_pixel);
+   for (unsigned byte = 0; byte < block_size; ++byte)
+      value_pixel[byte] &= mask_pixel[byte];
+
    const unsigned stride = resource->level_strides[level];
    const uintptr_t layer_stride = resource->level_layer_strides[level];
    const uintptr_t level_offset = resource->level_offsets[level];
@@ -541,19 +579,58 @@ pvrgpu_fill_surface_rect_with_clear_color(struct pipe_surface *surface,
                         (uintptr_t)dstx * block_size;
          for (unsigned x = 0; x < width; ++x) {
             uint8_t *pixel = row + (uintptr_t)x * block_size;
-            pvrgpu_store_clear_color_pixel(surface->format,
-                                           pixel,
-                                           r,
-                                           g,
-                                           b,
-                                           a,
-                                           r10,
-                                           g10,
-                                           b10,
-                                           a2);
+            for (unsigned byte = 0; byte < block_size; ++byte) {
+               pixel[byte] = (uint8_t)((pixel[byte] & ~mask_pixel[byte]) |
+                                       value_pixel[byte]);
+            }
          }
       }
    }
+}
+
+/*
+ * The v1 clear_color capsule can only describe a framebuffer that holds a
+ * single color.  A scissored or channel-masked clear still leaves the surface
+ * uniform in the common dEQP color_clear sequences, so read the resolved color
+ * back from the surface the driver just wrote instead of guessing it from the
+ * requested clear value.
+ */
+static bool
+pvrgpu_surface_uniform_color(const struct pipe_surface *surface,
+                             unsigned width,
+                             unsigned height,
+                             float *rgba)
+{
+   if (!surface || !rgba || width == 0 || height == 0 ||
+       surface->first_layer != surface->last_layer ||
+       !pvrgpu_color_surface_rect_supported(surface, 0, 0, width, height))
+      return false;
+
+   const struct pvrgpu_resource *resource =
+      pvrgpu_resource((struct pipe_resource *)surface->texture);
+   const unsigned level = surface->level;
+   const unsigned block_size = util_format_get_blocksize(surface->format);
+   const unsigned stride = resource->level_strides[level];
+   const uint8_t *base = resource->data + resource->level_offsets[level] +
+                         (uintptr_t)surface->first_layer *
+                            resource->level_layer_strides[level];
+
+   const size_t row_size = (size_t)width * block_size;
+   uint8_t *reference = malloc(row_size);
+   if (!reference)
+      return false;
+   for (unsigned x = 0; x < width; ++x)
+      memcpy(reference + (size_t)x * block_size, base, block_size);
+
+   bool uniform = true;
+   for (unsigned y = 0; uniform && y < height; ++y)
+      uniform = memcmp(base + (uintptr_t)y * stride, reference, row_size) == 0;
+   free(reference);
+   if (!uniform)
+      return false;
+
+   util_format_unpack_rgba(surface->format, rgba, base, 1);
+   return true;
 }
 
 static void
@@ -609,6 +686,43 @@ pvrgpu_emit_clear_color_command(unsigned width,
                          output_target_changed ? 1 : 0);
 }
 
+/*
+ * Reduce the requested clear region to the surface rectangle the driver will
+ * write.  Mesa hands the scissor box in Gallium's Y=0=top convention, already
+ * clamped against the framebuffer on the state-tracker side, so the only work
+ * left is a defensive clamp and an empty-region test.
+ */
+static bool
+pvrgpu_clear_rect(const struct pipe_framebuffer_state *fb,
+                  const struct pipe_scissor_state *scissor,
+                  unsigned *x,
+                  unsigned *y,
+                  unsigned *width,
+                  unsigned *height)
+{
+   if (!fb || fb->width == 0 || fb->height == 0)
+      return false;
+
+   unsigned minx = 0;
+   unsigned miny = 0;
+   unsigned maxx = fb->width;
+   unsigned maxy = fb->height;
+   if (scissor) {
+      minx = MIN2(scissor->minx, fb->width);
+      miny = MIN2(scissor->miny, fb->height);
+      maxx = MIN2(scissor->maxx, fb->width);
+      maxy = MIN2(scissor->maxy, fb->height);
+   }
+   if (minx >= maxx || miny >= maxy)
+      return false;
+
+   *x = minx;
+   *y = miny;
+   *width = maxx - minx;
+   *height = maxy - miny;
+   return true;
+}
+
 void
 pvrgpu_clear(struct pipe_context *pipe,
              unsigned buffers,
@@ -620,20 +734,44 @@ pvrgpu_clear(struct pipe_context *pipe,
              unsigned stencil)
 {
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
-   (void)color_clear_mask;
    (void)stencil_clear_mask;
    (void)stencil;
 
    const bool clear_color = (buffers & PIPE_CLEAR_COLOR0) != 0;
    const bool clear_depth = (buffers & PIPE_CLEAR_DEPTH) != 0;
    const unsigned supported_buffers = PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH;
-   if ((buffers & ~supported_buffers) != 0 ||
-       (!clear_color && !clear_depth) || scissor_state) {
-      debug_printf("pvrgpu: unsupported clear flags/scissor; fail closed\n");
+   /* Gallium packs four colormask bits per draw buffer; only cbuf0 is lowered. */
+   const unsigned colormask = color_clear_mask & PIPE_MASK_RGBA;
+   if ((buffers & ~supported_buffers) != 0 || (!clear_color && !clear_depth)) {
+      debug_printf("pvrgpu: unsupported clear flags; fail closed\n");
       if (clear_depth)
          pvrgpu_invalidate_full_depth_clear(ctx);
       return;
    }
+
+   unsigned rect_x = 0;
+   unsigned rect_y = 0;
+   unsigned rect_width = 0;
+   unsigned rect_height = 0;
+   if (!pvrgpu_clear_rect(&ctx->framebuffer,
+                          scissor_state,
+                          &rect_x,
+                          &rect_y,
+                          &rect_width,
+                          &rect_height)) {
+      pvrgpu_counter_eventf("clear_scissored_empty",
+                            "framebuffer=%ux%u buffers=0x%x",
+                            ctx->framebuffer.width,
+                            ctx->framebuffer.height,
+                            buffers);
+      if (clear_depth)
+         pvrgpu_invalidate_full_depth_clear(ctx);
+      return;
+   }
+   const bool full_surface_rect = rect_x == 0 && rect_y == 0 &&
+                                  rect_width == ctx->framebuffer.width &&
+                                  rect_height == ctx->framebuffer.height;
+
    if (clear_color &&
        (!color || !pvrgpu_rgba8_cbuf_bound(&ctx->framebuffer))) {
       debug_printf("pvrgpu: unsupported clear target; fail closed\n");
@@ -643,10 +781,10 @@ pvrgpu_clear(struct pipe_context *pipe,
    }
    if (clear_color &&
        !pvrgpu_color_surface_rect_supported(&ctx->framebuffer.cbufs[0],
-                                            0,
-                                            0,
-                                            ctx->framebuffer.width,
-                                            ctx->framebuffer.height)) {
+                                            rect_x,
+                                            rect_y,
+                                            rect_width,
+                                            rect_height)) {
       debug_printf("pvrgpu: unsupported clear surface rect; fail closed\n");
       if (clear_depth)
          pvrgpu_invalidate_full_depth_clear(ctx);
@@ -654,10 +792,10 @@ pvrgpu_clear(struct pipe_context *pipe,
    }
    if (clear_depth &&
        !pvrgpu_depth_surface_rect_supported(&ctx->framebuffer.zsbuf,
-                                            0,
-                                            0,
-                                            ctx->framebuffer.width,
-                                            ctx->framebuffer.height)) {
+                                            rect_x,
+                                            rect_y,
+                                            rect_width,
+                                            rect_height)) {
       debug_printf("pvrgpu: unsupported clear depth target; fail closed\n");
       pvrgpu_invalidate_full_depth_clear(ctx);
       return;
@@ -665,14 +803,14 @@ pvrgpu_clear(struct pipe_context *pipe,
    const bool depth_backing_written =
       !clear_depth ||
       pvrgpu_fill_surface_rect_with_clear_depth(&ctx->framebuffer.zsbuf,
-                                                0,
-                                                0,
-                                                ctx->framebuffer.width,
-                                                ctx->framebuffer.height,
+                                                rect_x,
+                                                rect_y,
+                                                rect_width,
+                                                rect_height,
                                                 depth);
 
    if (clear_depth) {
-      if (depth == 1.0) {
+      if (depth == 1.0 && full_surface_rect) {
          pvrgpu_note_full_depth_clear_one(ctx,
                                           &ctx->framebuffer.zsbuf,
                                           ctx->framebuffer.width,
@@ -681,12 +819,14 @@ pvrgpu_clear(struct pipe_context *pipe,
          pvrgpu_invalidate_full_depth_clear(ctx);
       }
       pvrgpu_counter_eventf("clear_depth",
-                            "res=%p width=%u height=%u format=%s level=%u "
-                            "layers=%u-%u depth=%f combined_color=%u "
+                            "res=%p x=%u y=%u width=%u height=%u format=%s "
+                            "level=%u layers=%u-%u depth=%f combined_color=%u "
                             "backing_written=%u",
                             (void *)ctx->framebuffer.zsbuf.texture,
-                            ctx->framebuffer.width,
-                            ctx->framebuffer.height,
+                            rect_x,
+                            rect_y,
+                            rect_width,
+                            rect_height,
                             util_format_name(ctx->framebuffer.zsbuf.format),
                             ctx->framebuffer.zsbuf.level,
                             ctx->framebuffer.zsbuf.first_layer,
@@ -698,23 +838,37 @@ pvrgpu_clear(struct pipe_context *pipe,
 
    if (!clear_color)
       return;
+   if (colormask == 0) {
+      pvrgpu_counter_eventf("clear_color_masked_out",
+                            "res=%p width=%u height=%u",
+                            (void *)ctx->framebuffer.cbufs[0].texture,
+                            rect_width,
+                            rect_height);
+      return;
+   }
 
    pvrgpu_fill_surface_rect_with_clear_color(&ctx->framebuffer.cbufs[0],
-                                             0,
-                                             0,
-                                             ctx->framebuffer.width,
-                                             ctx->framebuffer.height,
+                                             rect_x,
+                                             rect_y,
+                                             rect_width,
+                                             rect_height,
+                                             colormask,
                                              color);
    pvrgpu_counter_eventf("clear_color",
-                         "res=%p width=%u height=%u format=%s level=%u "
-                         "layers=%u-%u rgba=%u,%u,%u,%u floats=%f,%f,%f,%f",
+                         "res=%p x=%u y=%u width=%u height=%u format=%s "
+                         "level=%u layers=%u-%u colormask=0x%x scissored=%u "
+                         "rgba=%u,%u,%u,%u floats=%f,%f,%f,%f",
                          (void *)ctx->framebuffer.cbufs[0].texture,
-                         ctx->framebuffer.width,
-                         ctx->framebuffer.height,
+                         rect_x,
+                         rect_y,
+                         rect_width,
+                         rect_height,
                          util_format_name(ctx->framebuffer.cbufs[0].format),
                          ctx->framebuffer.cbufs[0].level,
                          ctx->framebuffer.cbufs[0].first_layer,
                          ctx->framebuffer.cbufs[0].last_layer,
+                         colormask,
+                         full_surface_rect ? 0 : 1,
                          pvrgpu_float_to_unorm8(color->f[0]),
                          pvrgpu_float_to_unorm8(color->f[1]),
                          pvrgpu_float_to_unorm8(color->f[2]),
@@ -723,19 +877,43 @@ pvrgpu_clear(struct pipe_context *pipe,
                          color->f[1],
                          color->f[2],
                          color->f[3]);
-   if (!pvrgpu_case_reserves_native_pco_sequence() &&
-       !ctx->driver_draw_command_emitted &&
-       !pvrgpu_driver_draw_command_has_been_emitted()) {
-      if (pvrgpu_case_prefers_draw_counter_sequence()) {
-         if (pvrgpu_case_counter_sequence_allows_clear_emit())
-            (void)pvrgpu_emit_case_counter_sequence_command(ctx);
-      } else {
-         pvrgpu_emit_clear_color_command(ctx->framebuffer.width,
-                                         ctx->framebuffer.height,
-                                         ctx->framebuffer.cbufs[0].format,
-                                         color);
-      }
+   if (pvrgpu_case_reserves_native_pco_sequence() ||
+       ctx->driver_draw_command_emitted ||
+       pvrgpu_driver_draw_command_has_been_emitted())
+      return;
+   if (pvrgpu_case_prefers_draw_counter_sequence()) {
+      if (pvrgpu_case_counter_sequence_allows_clear_emit())
+         (void)pvrgpu_emit_case_counter_sequence_command(ctx);
+      return;
    }
+   if (full_surface_rect && colormask == PIPE_MASK_RGBA) {
+      pvrgpu_emit_clear_color_command(ctx->framebuffer.width,
+                                      ctx->framebuffer.height,
+                                      ctx->framebuffer.cbufs[0].format,
+                                      color);
+      return;
+   }
+
+   union pipe_color_union resolved;
+   memset(&resolved, 0, sizeof(resolved));
+   if (pvrgpu_surface_uniform_color(&ctx->framebuffer.cbufs[0],
+                                    ctx->framebuffer.width,
+                                    ctx->framebuffer.height,
+                                    resolved.f)) {
+      pvrgpu_emit_clear_color_command(ctx->framebuffer.width,
+                                      ctx->framebuffer.height,
+                                      ctx->framebuffer.cbufs[0].format,
+                                      &resolved);
+      return;
+   }
+   pvrgpu_counter_eventf("clear_color_command_skip",
+                         "reason=non_uniform_color_surface x=%u y=%u "
+                         "width=%u height=%u colormask=0x%x",
+                         rect_x,
+                         rect_y,
+                         rect_width,
+                         rect_height,
+                         colormask);
 }
 
 void
@@ -763,6 +941,7 @@ pvrgpu_clear_render_target(struct pipe_context *pipe,
                                              dsty,
                                              width,
                                              height,
+                                             PIPE_MASK_RGBA,
                                              color);
    pvrgpu_counter_eventf("clear_render_target",
                          "res=%p x=%u y=%u width=%u height=%u format=%s "

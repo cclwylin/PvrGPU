@@ -113,20 +113,66 @@ pvrgpu_build_refract_descriptor(uint32_t descriptor[20],
    pvrgpu_refract_descriptor_store_u64(descriptor, 16, gather_word0);
 }
 
-void
-pvrgpu_pco_build_refract_fragment_shared(
-   uint32_t out[PVRGPU_PCO_REFRACT_FRAGMENT_SHARED_DWORDS])
+static bool
+pvrgpu_pco_refract_extent_layout(unsigned width,
+                                 unsigned height,
+                                 unsigned *mip_count,
+                                 uint32_t *depth_bytes,
+                                 uint32_t *color_bytes)
 {
-   if (!out)
-      return;
+   if (!mip_count || !depth_bytes || !color_bytes ||
+       !((width == 160U && height == 120U) ||
+         (width == 1600U && height == 1200U)))
+      return false;
+
+   uint64_t total = 0;
+   unsigned levels = 0;
+   unsigned level_width = width;
+   unsigned level_height = height;
+   for (;;) {
+      total += (uint64_t)level_width * level_height * sizeof(uint32_t);
+      levels++;
+      if (total > UINT32_MAX || levels > 15U)
+         return false;
+      if (level_width == 1U && level_height == 1U)
+         break;
+      level_width = MAX2(level_width >> 1U, 1U);
+      level_height = MAX2(level_height >> 1U, 1U);
+   }
+
+   const uint64_t depth_size =
+      (uint64_t)width * height * sizeof(uint32_t);
+   if (depth_size > UINT32_MAX)
+      return false;
+   *mip_count = levels;
+   *depth_bytes = (uint32_t)depth_size;
+   *color_bytes = (uint32_t)total;
+   return true;
+}
+
+bool
+pvrgpu_pco_build_refract_fragment_shared_for_extent(
+   uint32_t out[PVRGPU_PCO_REFRACT_FRAGMENT_SHARED_DWORDS],
+   unsigned width,
+   unsigned height)
+{
+   unsigned mip_count = 0;
+   uint32_t depth_bytes = 0;
+   uint32_t color_bytes = 0;
+   if (!out || !pvrgpu_pco_refract_extent_layout(width,
+                                                  height,
+                                                  &mip_count,
+                                                  &depth_bytes,
+                                                  &color_bytes))
+      return false;
    pvrgpu_build_refract_descriptor(&out[0],
                                     24U,
                                     true,
                                     false,
-                                    160U,
-                                    120U,
+                                    width,
+                                    height,
                                     1U,
-                                    76800U,
+                                    depth_bytes,
                                     0U,
                                     0U,
                                     0U,
@@ -137,16 +183,16 @@ pvrgpu_pco_build_refract_fragment_shared(
                                     12U,
                                     false,
                                     false,
-                                    160U,
-                                    120U,
-                                    8U,
-                                    102352U,
+                                    width,
+                                    height,
+                                    mip_count,
+                                    color_bytes,
                                     1U,
                                     1U,
                                     1U,
                                     2U,
                                     2U,
-                                    448U);
+                                    (mip_count - 1U) * 64U);
    pvrgpu_build_refract_descriptor(&out[40],
                                     12U,
                                     false,
@@ -161,28 +207,55 @@ pvrgpu_pco_build_refract_fragment_shared(
                                     2U,
                                     2U,
                                     0U);
+   return true;
 }
 
 void
-pvrgpu_pco_build_shadow_fragment_shared(
-   uint32_t out[PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS])
+pvrgpu_pco_build_refract_fragment_shared(
+   uint32_t out[PVRGPU_PCO_REFRACT_FRAGMENT_SHARED_DWORDS])
 {
-   if (!out)
-      return;
+   (void)pvrgpu_pco_build_refract_fragment_shared_for_extent(out,
+                                                              160U,
+                                                              120U);
+}
+
+bool
+pvrgpu_pco_build_shadow_fragment_shared_for_extent(
+   uint32_t out[PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS],
+   unsigned width,
+   unsigned height)
+{
+   if (!out || !((width == 160U && height == 120U) ||
+                 (width == 1600U && height == 1200U)))
+      return false;
+   const uint64_t depth_bytes =
+      (uint64_t)width * height * sizeof(uint32_t);
+   if (depth_bytes > UINT32_MAX)
+      return false;
    pvrgpu_build_refract_descriptor(out,
                                     24U,
                                     true,
                                     false,
-                                    160U,
-                                    120U,
+                                    width,
+                                    height,
                                     1U,
-                                    76800U,
+                                    (uint32_t)depth_bytes,
                                     0U,
                                     0U,
                                     0U,
                                     2U,
                                     2U,
                                     0U);
+   return true;
+}
+
+void
+pvrgpu_pco_build_shadow_fragment_shared(
+   uint32_t out[PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS])
+{
+   (void)pvrgpu_pco_build_shadow_fragment_shared_for_extent(out,
+                                                             160U,
+                                                             120U);
 }
 
 bool
@@ -432,6 +505,7 @@ struct pvrgpu_terrain_pco_desc {
    const char *name;
    const uint32_t *vertex_source_hash;
    uint32_t fragment_source_hash[8];
+   uint32_t fragment_source_hash_800x600[8];
    unsigned vertex_uniform_dwords;
    unsigned vertex_uniform_used_dwords;
    unsigned vertex_uniform_loads;
@@ -524,6 +598,12 @@ static const struct pvrgpu_terrain_pco_desc pvrgpu_terrain_profiles[] = {
          UINT32_C(0xa30fa19d), UINT32_C(0xc6c7159a),
          UINT32_C(0xba654c0a), UINT32_C(0x6d39f49c),
       },
+      .fragment_source_hash_800x600 = {
+         UINT32_C(0x047e72ee), UINT32_C(0xebcdacaf),
+         UINT32_C(0x790fa9ab), UINT32_C(0x0b4e424c),
+         UINT32_C(0x993de98e), UINT32_C(0x034ed49e),
+         UINT32_C(0x858f25cc), UINT32_C(0x1b3bbce9),
+      },
       .vertex_uniform_dwords = PVRGPU_TERRAIN_FULLSCREEN_VS_UNIFORM_DWORDS,
       .vertex_uniform_used_dwords = 6,
       .vertex_uniform_loads = 2,
@@ -575,6 +655,12 @@ static const struct pvrgpu_terrain_pco_desc pvrgpu_terrain_profiles[] = {
          UINT32_C(0x90641bf4), UINT32_C(0xc10a2fc3),
          UINT32_C(0x3207cac2), UINT32_C(0x56282ca8),
       },
+      .fragment_source_hash_800x600 = {
+         UINT32_C(0xabd6119b), UINT32_C(0xf3d3832b),
+         UINT32_C(0x2202471e), UINT32_C(0x9ce97e85),
+         UINT32_C(0x5b195cc0), UINT32_C(0x506c744f),
+         UINT32_C(0x60821226), UINT32_C(0xff994103),
+      },
       .vertex_uniform_dwords = PVRGPU_TERRAIN_FULLSCREEN_VS_UNIFORM_DWORDS,
       .vertex_uniform_used_dwords = 6,
       .vertex_uniform_loads = 2,
@@ -590,6 +676,12 @@ static const struct pvrgpu_terrain_pco_desc pvrgpu_terrain_profiles[] = {
          UINT32_C(0x054a182f), UINT32_C(0xb0b5363f),
          UINT32_C(0x69b62005), UINT32_C(0x3c8b1b0f),
          UINT32_C(0xef2f4a55), UINT32_C(0x48f9a4f9),
+      },
+      .fragment_source_hash_800x600 = {
+         UINT32_C(0xdf8bc70f), UINT32_C(0xd94991ef),
+         UINT32_C(0xc7ac49c7), UINT32_C(0x0f850b31),
+         UINT32_C(0x7af60cab), UINT32_C(0x47e06843),
+         UINT32_C(0x931eb72a), UINT32_C(0x7be58c3a),
       },
       .vertex_uniform_dwords = PVRGPU_TERRAIN_FULLSCREEN_VS_UNIFORM_DWORDS,
       .vertex_uniform_used_dwords = 6,
@@ -3374,1390 +3466,147 @@ bool pvrgpu_pco_compile_conditionals(struct pvrgpu_pco_compiler *compiler,
    return true;
 }
 
-static bool
-pvrgpu_validate_lit_mesh_variables(const nir_shader *nir,
-                                   unsigned varying_components,
-                                   const char *profile_name,
-                                   char *error,
-                                   size_t error_size)
+static bool pvrgpu_color_primitive_allowed_intrinsic(nir_intrinsic_op op)
 {
-   unsigned inputs = 0;
-   unsigned outputs = 0;
+   switch (op) {
+   case nir_intrinsic_load_deref:
+   case nir_intrinsic_store_deref:
+   case nir_intrinsic_load_input:
+   case nir_intrinsic_load_interpolated_input:
+   case nir_intrinsic_store_output:
+      return true;
+   default:
+      return false;
+   }
+}
 
-   nir_foreach_variable_with_modes (var, nir, nir_var_shader_in) {
-      ++inputs;
-      if (nir->info.stage == MESA_SHADER_VERTEX) {
-         if ((var->data.location != VERT_ATTRIB_GENERIC0 &&
-              var->data.location != VERT_ATTRIB_GENERIC1) ||
-             glsl_get_components(var->type) != 4) {
-            return pvrgpu_pco_fail(error,
-                                   error_size,
-                                   "%s VS input ABI mismatch",
-                                   profile_name);
-         }
-      } else if (var->data.location != VARYING_SLOT_VAR0 ||
-                 glsl_get_components(var->type) != varying_components) {
+/*
+ * The color-primitive PCO data below hard-wires one vec4 position plus one
+ * vec4 color attribute into VTXIN0..7, and one vec4 varying between
+ * VARYING_SLOT_VAR0 and the fragment color output.  A shader that reads a
+ * uniform, writes gl_PointSize, samples a texture, or otherwise steps outside
+ * that signature has no place in this layout, and pco_trans_nir() aborts the
+ * process rather than reporting it.  Reject it here so the driver fails
+ * closed on the draw instead.
+ */
+static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
+                                                mesa_shader_stage expected_stage,
+                                                char *error,
+                                                size_t error_size)
+{
+   if (!nir || nir->info.stage != expected_stage) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "color primitive shader stage mismatch");
+   }
+
+   const uint64_t expected_inputs =
+      expected_stage == MESA_SHADER_VERTEX
+         ? (VERT_BIT_GENERIC0 | VERT_BIT_GENERIC1)
+         : VARYING_BIT_VAR0;
+   const uint64_t expected_outputs =
+      expected_stage == MESA_SHADER_VERTEX
+         ? (VARYING_BIT_POS | VARYING_BIT_VAR0)
+         : 0;
+
+   if (nir->info.inputs_read != expected_inputs) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "color primitive %s reads unsupported inputs "
+                             "0x%llx",
+                             expected_stage == MESA_SHADER_VERTEX ? "VS" : "FS",
+                             (unsigned long long)nir->info.inputs_read);
+   }
+   if (expected_stage == MESA_SHADER_VERTEX) {
+      if (nir->info.outputs_written != expected_outputs) {
          return pvrgpu_pco_fail(error,
                                 error_size,
-                                "%s FS varying ABI mismatch",
-                                profile_name);
+                                "color primitive VS writes unsupported "
+                                "outputs 0x%llx",
+                                (unsigned long long)nir->info.outputs_written);
       }
-   }
-
-   nir_foreach_variable_with_modes (var, nir, nir_var_shader_out) {
-      ++outputs;
-      if (nir->info.stage == MESA_SHADER_VERTEX) {
-         if (var->data.location == VARYING_SLOT_POS) {
-            if (glsl_get_components(var->type) != 4) {
-               return pvrgpu_pco_fail(error,
-                                      error_size,
-                                      "%s VS position ABI mismatch",
-                                      profile_name);
-            }
-         } else if (var->data.location != VARYING_SLOT_VAR0 ||
-                    glsl_get_components(var->type) != varying_components) {
-            return pvrgpu_pco_fail(error,
-                                   error_size,
-                                   "%s VS varying ABI mismatch",
-                                   profile_name);
-         }
-      } else if ((var->data.location != FRAG_RESULT_COLOR &&
-                  var->data.location != FRAG_RESULT_DATA0) ||
-                 glsl_get_components(var->type) != 4) {
+   } else {
+      const uint64_t allowed_fs_outputs =
+         BITFIELD64_BIT(FRAG_RESULT_COLOR) | BITFIELD64_BIT(FRAG_RESULT_DATA0);
+      if (nir->info.outputs_written == 0 ||
+          (nir->info.outputs_written & ~allowed_fs_outputs) != 0) {
          return pvrgpu_pco_fail(error,
                                 error_size,
-                                "%s FS output ABI mismatch",
-                                profile_name);
+                                "color primitive FS writes unsupported "
+                                "outputs 0x%llx",
+                                (unsigned long long)nir->info.outputs_written);
       }
    }
 
-   const unsigned expected_inputs =
-      nir->info.stage == MESA_SHADER_VERTEX ? 2U : 1U;
-   const unsigned expected_outputs =
-      nir->info.stage == MESA_SHADER_VERTEX ? 2U : 1U;
-   if (inputs != expected_inputs || outputs != expected_outputs) {
+   if (nir->info.num_ubos != 0 || nir->info.num_ssbos != 0 ||
+       nir->info.num_images != 0 || nir->info.num_textures != 0 ||
+       nir->info.shared_size != 0 || nir->info.uses_discard ||
+       nir->num_uniforms != 0) {
       return pvrgpu_pco_fail(error,
                              error_size,
-                             "%s %s I/O count mismatch (%u/%u)",
-                             profile_name,
-                             nir->info.stage == MESA_SHADER_VERTEX ? "VS" :
-                                                                    "FS",
-                             inputs,
-                             outputs);
-   }
-   return true;
-}
-
-/* GLES mediump permits an implementation to retain fp32 precision.  Keep the
- * captured fp32 SSA values intact so the PCO backend and llvmpipe golden run
- * consume the same arithmetic; these gates validate the strict store shape
- * without injecting an implementation-specific f16 round trip. */
-static bool
-pvrgpu_validate_lit_mesh_varying_store(nir_shader *nir,
-                                       unsigned varying_components,
-                                       const char *profile_name,
-                                       char *error,
-                                       size_t error_size)
-{
-   unsigned stores = 0;
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block (block, impl) {
-         nir_foreach_instr_safe (instr, block) {
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-            if (intr->intrinsic != nir_intrinsic_store_deref)
-               continue;
-            nir_variable *var = nir_intrinsic_get_var(intr, 0);
-            if (!var || var->data.mode != nir_var_shader_out ||
-                var->data.location != VARYING_SLOT_VAR0)
-               continue;
-            if (stores++ || intr->src[1].ssa->bit_size != 32 ||
-                intr->src[1].ssa->num_components != varying_components) {
-               return pvrgpu_pco_fail(error,
-                                      error_size,
-                                      "%s floating-point varying store changed",
-                                      profile_name);
-            }
-         }
-      }
-   }
-   if (stores != 1) {
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "%s requires one floating-point varying store",
-                             profile_name);
-   }
-   return true;
-}
-
-static bool
-pvrgpu_validate_lit_mesh_fragment_output(nir_shader *nir,
-                                         const char *profile_name,
-                                         char *error,
-                                         size_t error_size)
-{
-   unsigned stores = 0;
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block (block, impl) {
-         nir_foreach_instr_safe (instr, block) {
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-            if (intr->intrinsic != nir_intrinsic_store_deref)
-               continue;
-            nir_variable *var = nir_intrinsic_get_var(intr, 0);
-            if (!var || var->data.mode != nir_var_shader_out ||
-                (var->data.location != FRAG_RESULT_COLOR &&
-                 var->data.location != FRAG_RESULT_DATA0))
-               continue;
-            if (stores++ || intr->src[1].ssa->bit_size != 32 ||
-                intr->src[1].ssa->num_components != 4) {
-               return pvrgpu_pco_fail(error,
-                                      error_size,
-                                      "%s floating-point fragment store changed",
-                                      profile_name);
-            }
-         }
-      }
-   }
-   if (stores != 1) {
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "%s requires one floating-point fragment store",
-                             profile_name);
-   }
-   return true;
-}
-
-/* The texture fragment source is mediump, and Gallivm's GLES lowering keeps
- * the architectural half-precision boundaries visible in its generated IR:
- * all four UNORM sample channels convert to binary16 with RTZ, the scalar
- * lighting varying converts with RTNE, and each of the three RGB products is
- * rounded to binary16 with RTNE before conversion back to the fp32 fragment
- * output ABI.  Alpha is the RTZ-rounded sample alpha and is not multiplied.
- *
- * Preserve that operation-level graph explicitly.  This is intentionally
- * narrower than blanket fragment quantization: texture coordinates and the
- * interpolation machinery remain fp32, as do unrelated shader profiles. */
-static bool
-pvrgpu_lower_texture_fragment_mediump(nir_shader *nir,
-                                      char *error,
-                                      size_t error_size)
-{
-   nir_intrinsic_instr *varying_load = NULL;
-   nir_intrinsic_instr *color_store = NULL;
-   nir_tex_instr *sample = NULL;
-
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block (block, impl) {
-         nir_foreach_instr (instr, block) {
-            if (instr->type == nir_instr_type_intrinsic) {
-               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-               if (intr->intrinsic == nir_intrinsic_load_deref) {
-                  nir_variable *var = nir_intrinsic_get_var(intr, 0);
-                  if (var && var->data.mode == nir_var_shader_in &&
-                      var->data.location == VARYING_SLOT_VAR0) {
-                     if (varying_load)
-                        return pvrgpu_pco_fail(
-                           error,
-                           error_size,
-                           "texture mediump has duplicate varying load");
-                     varying_load = intr;
-                  }
-               } else if (intr->intrinsic == nir_intrinsic_store_deref) {
-                  nir_variable *var = nir_intrinsic_get_var(intr, 0);
-                  if (var && var->data.mode == nir_var_shader_out &&
-                      (var->data.location == FRAG_RESULT_COLOR ||
-                       var->data.location == FRAG_RESULT_DATA0)) {
-                     if (color_store)
-                        return pvrgpu_pco_fail(
-                           error,
-                           error_size,
-                           "texture mediump has duplicate color store");
-                     color_store = intr;
-                  }
-               }
-            } else if (instr->type == nir_instr_type_tex) {
-               if (sample)
-                  return pvrgpu_pco_fail(error,
-                                         error_size,
-                                         "texture mediump has duplicate sample");
-               sample = nir_instr_as_tex(instr);
-            }
-         }
-      }
+                             "color primitive %s uses unsupported resources",
+                             expected_stage == MESA_SHADER_VERTEX ? "VS" : "FS");
    }
 
-   if (!varying_load || varying_load->def.bit_size != 32 ||
-       varying_load->def.num_components != 3 || !sample ||
-       sample->def.bit_size != 32 || sample->def.num_components != 4 ||
-       !color_store || color_store->src[1].ssa->bit_size != 32 ||
-       color_store->src[1].ssa->num_components != 4) {
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "texture mediump I/O graph changed");
-   }
-
-   nir_builder b = nir_builder_at(nir_before_instr(&color_store->instr));
-   nir_def *light = nir_f2f32(
-      &b,
-      nir_f2f16_rtne(&b, nir_channel(&b, &varying_load->def, 0)));
-   nir_def *sample_half[4];
-   for (unsigned component = 0; component < 4; ++component) {
-      sample_half[component] = nir_f2f32(
-         &b,
-         nir_f2f16_rtz(&b, nir_channel(&b, &sample->def, component)));
-   }
-
-   nir_def *color[4];
-   for (unsigned component = 0; component < 3; ++component) {
-      nir_def *product = nir_fmul(&b, sample_half[component], light);
-      color[component] =
-         nir_f2f32(&b, nir_f2f16_rtne(&b, product));
-   }
-   color[3] = sample_half[3];
-   nir_src_rewrite(&color_store->src[1], nir_vec(&b, color, 4));
-
-   nir_progress(true,
-                nir_shader_get_entrypoint(nir),
-                nir_metadata_control_flow);
-   return true;
-}
-
-/* The bump fragment source has a default mediump float precision.  Its vertex
- * shader intentionally remains fp32, including the smooth varying producer,
- * while the fragment consumer and every fragment arithmetic result round to
- * binary16.  The incoming and outgoing ABI is still fp32, so express each
- * fragment precision boundary explicitly as an RTNE f16 round trip before the
- * PCO backend lowers the fail-closed graph. */
-static bool
-pvrgpu_lower_bump_fragment_mediump(nir_shader *nir,
-                                   char *error,
-                                   size_t error_size)
-{
-   nir_lower_alu(nir);
-   nir_lower_alu_to_scalar(nir, NULL, NULL);
-
-   unsigned varying_loads = 0;
-   unsigned stores = 0;
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block (block, impl) {
-         nir_foreach_instr_safe (instr, block) {
-            nir_def *value = NULL;
-            if (instr->type == nir_instr_type_load_const) {
-               nir_load_const_instr *constant =
-                  nir_instr_as_load_const(instr);
-               if (constant->def.bit_size != 32) {
-                  return pvrgpu_pco_fail(
-                     error,
-                     error_size,
-                     "bump fragment constant precision changed");
-               }
-               value = &constant->def;
-            } else if (instr->type == nir_instr_type_intrinsic) {
-               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-               if (intr->intrinsic == nir_intrinsic_load_deref) {
-                  nir_variable *var = nir_intrinsic_get_var(intr, 0);
-                  if (!var || var->data.mode != nir_var_shader_in ||
-                      var->data.location != VARYING_SLOT_VAR0 ||
-                      varying_loads++ || intr->def.bit_size != 32 ||
-                      intr->def.num_components != 3) {
-                     return pvrgpu_pco_fail(
-                        error,
-                        error_size,
-                        "bump fragment varying load changed");
-                  }
-                  value = &intr->def;
-               } else if (intr->intrinsic == nir_intrinsic_store_deref) {
-                  nir_variable *var = nir_intrinsic_get_var(intr, 0);
-                  if (!var || var->data.mode != nir_var_shader_out ||
-                      (var->data.location != FRAG_RESULT_COLOR &&
-                       var->data.location != FRAG_RESULT_DATA0))
-                     continue;
-                  if (stores++ || intr->src[1].ssa->bit_size != 32 ||
-                      intr->src[1].ssa->num_components != 4) {
-                     return pvrgpu_pco_fail(
-                        error,
-                        error_size,
-                        "bump fragment result assignment changed");
-                  }
-               }
-            } else if (instr->type == nir_instr_type_alu) {
-               nir_alu_instr *alu = nir_instr_as_alu(instr);
-               switch (alu->op) {
-               case nir_op_fadd:
-               case nir_op_fmul:
-               case nir_op_fmax:
-               case nir_op_frcp:
-               case nir_op_frsq:
-               case nir_op_flog2:
-               case nir_op_fexp2:
-                  if (alu->def.bit_size != 32) {
-                     return pvrgpu_pco_fail(
-                        error,
-                        error_size,
-                        "bump fragment arithmetic precision changed");
-                  }
-                  value = &alu->def;
-                  break;
-               case nir_op_ffma:
-               case nir_op_ffma_weak:
-                  return pvrgpu_pco_fail(
-                     error,
-                     error_size,
-                     "bump fragment fused arithmetic changed");
-               default:
-                  break;
-               }
-            }
-
-            if (!value)
-               continue;
-            nir_builder b = nir_builder_at(nir_after_instr(instr));
-            if (instr->type == nir_instr_type_alu &&
-                nir_instr_as_alu(instr)->op == nir_op_frsq) {
-               /* LLVM's f16 frsq is a rounded half sqrt followed by a rounded
-                * half reciprocal.  Preserve both architectural boundaries
-                * while using the public fp32 Rogue operations. */
-               nir_def *sqrt_value = nir_frcp(&b, value);
-               nir_def *sqrt_rounded =
-                  nir_f2f32(&b, nir_f2f16_rtne(&b, sqrt_value));
-               nir_def *reciprocal = nir_frcp(&b, sqrt_rounded);
-               nir_def *rounded =
-                  nir_f2f32(&b, nir_f2f16_rtne(&b, reciprocal));
-               nir_def_rewrite_uses_after(value, rounded);
-               continue;
-            }
-            nir_def *half =
-               instr->type == nir_instr_type_load_const
-                  ? nir_f2f16_rtz(&b, value)
-                  : nir_f2f16_rtne(&b, value);
-            nir_def *rounded = nir_f2f32(&b, half);
-            nir_def_rewrite_uses_after(value, rounded);
-         }
-      }
-   }
-   if (varying_loads != 1 || stores != 1) {
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "bump mediump I/O signature changed");
-   }
-   return true;
-}
-
-/* Gallivm lowers the strict Refract composite fragment shader to an fp16
- * arithmetic graph even though the Gallium-facing NIR and the PCO fragment
- * ABI are fp32.  Keep those two interfaces unchanged and make each
- * architectural half boundary explicit on the private compile clone:
- *
- *  - interpolated mediump varyings enter the graph through RTNE f16;
- *  - every arithmetic result is rounded to f16 with RTNE;
- *  - normalized texture results enter the graph through RTZ f16; and
- *  - texture coordinates and the final color leave the graph as fp32.
- *
- * The source signature is validated before this profile-local pass runs.  In
- * particular, this is not a generic fragment-output quantizer: fdot is first
- * expanded in Gallivm's reverse component order, fpow exposes its half
- * log2/multiply/exp2 boundaries, and half frsq preserves the rounded sqrt and
- * reciprocal steps observed in the reference NIR/LLVM pipeline. */
-static bool
-pvrgpu_lower_refract_composite_fragment_mediump(nir_shader *nir,
-                                                 char *error,
-                                                 size_t error_size)
-{
-   if (!nir || nir->info.stage != MESA_SHADER_FRAGMENT) {
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "refract mediump requires a fragment shader");
-   }
-
-   nir_function_impl *entrypoint = NULL;
+   unsigned implemented_functions = 0;
    nir_foreach_function (function, nir) {
       if (!function->impl)
          continue;
-      if (entrypoint) {
+      if (!function->is_entrypoint || ++implemented_functions != 1) {
          return pvrgpu_pco_fail(error,
                                 error_size,
-                                "refract mediump requires one entrypoint");
+                                "color primitive requires one entrypoint");
       }
-      entrypoint = function->impl;
-   }
-   if (!entrypoint) {
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "refract mediump entrypoint is missing");
-   }
-
-   /* The captured Gallium NIR distributes the source-level scalar
-    * `2.0 * dot(normal, view)` into a vec3 splat multiply.  If that form were
-    * scalarized directly, it would introduce three independent fp16 rounding
-    * boundaries.  Gallivm's mediump NIR instead computes the scalar multiply
-    * once and then uses it for all three normal components.  Recognize only
-    * that exact dot3-times-2.0 splat and restore its source-level scalar
-    * boundary before general ALU scalarization. */
-   unsigned reconstructed_reflection_scales = 0;
-   nir_foreach_block (block, entrypoint) {
-      nir_foreach_instr_safe (instr, block) {
-         if (instr->type != nir_instr_type_alu)
-            continue;
-         nir_alu_instr *alu = nir_instr_as_alu(instr);
-         if (alu->op != nir_op_fmul || alu->def.bit_size != 32 ||
-             alu->def.num_components != 3)
-            continue;
-
-         bool splat[2] = { true, true };
-         for (unsigned src = 0; src < 2; ++src) {
-            for (unsigned component = 1; component < 3; ++component) {
-               if (alu->src[src].swizzle[component] !=
-                   alu->src[src].swizzle[0])
-                  splat[src] = false;
-            }
-         }
-         if (!splat[0] || !splat[1])
-            continue;
-
-         uint64_t src_bits[2] = { 0, 0 };
-         const bool src_is_const[2] = {
-            nir_alu_src_comp_get_uint(alu->src[0], 0, &src_bits[0]),
-            nir_alu_src_comp_get_uint(alu->src[1], 0, &src_bits[1]),
-         };
-         int factor_src = -1;
-         if (src_is_const[0] && src_bits[0] == UINT32_C(0x40000000))
-            factor_src = 0;
-         if (src_is_const[1] && src_bits[1] == UINT32_C(0x40000000)) {
-            if (factor_src >= 0)
-               continue;
-            factor_src = 1;
-         }
-         if (factor_src < 0)
-            continue;
-
-         const unsigned dot_src = 1U - (unsigned)factor_src;
-         nir_def *dot_def = alu->src[dot_src].src.ssa;
-         if (!dot_def || dot_def->bit_size != 32 ||
-             dot_def->num_components != 1 ||
-             nir_def_instr(dot_def)->type != nir_instr_type_alu ||
-             nir_instr_as_alu(nir_def_instr(dot_def))->op != nir_op_fdot3) {
-            continue;
-         }
-         if (reconstructed_reflection_scales++) {
-            return pvrgpu_pco_fail(
-               error,
-               error_size,
-               "refract mediump reflection scale is ambiguous");
-         }
-
-         nir_builder b = nir_builder_at(nir_before_instr(instr));
-         nir_def *dot = nir_channel(&b,
-                                    dot_def,
-                                    alu->src[dot_src].swizzle[0]);
-         nir_def *factor = nir_channel(
-            &b,
-            alu->src[factor_src].src.ssa,
-            alu->src[factor_src].swizzle[0]);
-         nir_def *scalar_scale = nir_fmul(&b, dot, factor);
-         nir_def_replace(&alu->def,
-                         nir_replicate(&b, scalar_scale, 3));
-      }
-   }
-   if (reconstructed_reflection_scales != 1) {
-      return pvrgpu_pco_fail(
-         error,
-         error_size,
-         "refract mediump reflection scale graph changed");
-   }
-
-   /* This expands each fdot3 as z*z + y*y + x*x, matching Gallivm's lowered
-    * mediump NIR.  The profile's prefers_split compiler option keeps the
-    * products and adds distinct. */
-   nir_lower_alu_to_scalar(nir, NULL, NULL);
-
-   /* PCO normally lowers fpow after this profile pass.  Expose the reference
-    * implementation here so the three fp16 operation boundaries are not
-    * collapsed into one final conversion. */
-   unsigned powers = 0;
-   nir_foreach_block (block, entrypoint) {
-      nir_foreach_instr_safe (instr, block) {
-         if (instr->type != nir_instr_type_alu)
-            continue;
-         nir_alu_instr *alu = nir_instr_as_alu(instr);
-         if (alu->op != nir_op_fpow)
-            continue;
-         if (powers++ || alu->def.bit_size != 32 ||
-             alu->def.num_components != 1) {
-            return pvrgpu_pco_fail(error,
-                                   error_size,
-                                   "refract mediump power graph changed");
-         }
-
-         nir_builder b = nir_builder_at(nir_before_instr(instr));
-         nir_def *base = nir_ssa_for_alu_src(&b, alu, 0);
-         nir_def *exponent = nir_ssa_for_alu_src(&b, alu, 1);
-         nir_def *zero = nir_imm_float(&b, 0.0f);
-         nir_def *is_zero = nir_feq(&b, base, zero);
-         nir_def *logarithm = nir_flog2(&b, base);
-         nir_def *scaled = nir_fmul(&b, logarithm, exponent);
-         nir_def *power = nir_fexp2(&b, scaled);
-         nir_def *selected = nir_bcsel(&b, is_zero, zero, power);
-         nir_def_replace(&alu->def, selected);
-      }
-   }
-   if (powers != 1) {
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "refract mediump power graph is missing");
-   }
-
-   unsigned input_mask = 0;
-   unsigned input_loads = 0;
-   unsigned textures = 0;
-   unsigned stores = 0;
-   unsigned rounded_arithmetic = 0;
-   unsigned rounded_constants = 0;
-   unsigned reconstructed_constants = 0;
-   nir_foreach_block (block, entrypoint) {
-      nir_foreach_instr_safe (instr, block) {
-         nir_def *value = NULL;
-         bool texture_value = false;
-         bool reconstruct_inverse_ior_squared = false;
-
-         switch (instr->type) {
-         case nir_instr_type_load_const: {
-            nir_load_const_instr *constant =
-               nir_instr_as_load_const(instr);
-            if (constant->def.bit_size != 32) {
-               return pvrgpu_pco_fail(
-                  error,
-                  error_size,
-                  "refract mediump constant precision changed");
-            }
-            value = &constant->def;
-            /* The GLES precision pass sees (1.0 / 1.2)^2 before the fp32
-             * optimizer folds it to 0x3f31c71c.  It therefore rounds 1/1.2
-             * to half first and folds the half product to 0x398f.  Rebuild
-             * that one source-level provenance boundary explicitly. */
-            if (constant->def.num_components == 1 &&
-                constant->value[0].u32 == UINT32_C(0x3f31c71c)) {
-               reconstruct_inverse_ior_squared = true;
-               ++reconstructed_constants;
-            }
-            ++rounded_constants;
-            break;
-         }
-         case nir_instr_type_intrinsic: {
-            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-            if (intr->intrinsic == nir_intrinsic_load_deref) {
-               nir_variable *var = nir_intrinsic_get_var(intr, 0);
-               if (!var || var->data.mode != nir_var_shader_in ||
-                   var->data.location < VARYING_SLOT_VAR0 ||
-                   var->data.location > VARYING_SLOT_VAR2 ||
-                   intr->def.bit_size != 32) {
-                  return pvrgpu_pco_fail(
-                     error,
-                     error_size,
-                     "refract mediump varying load changed");
-               }
-               const unsigned index =
-                  var->data.location - VARYING_SLOT_VAR0;
-               const unsigned expected_components = index < 2 ? 4 : 3;
-               if ((input_mask & BITFIELD_BIT(index)) ||
-                   intr->def.num_components != expected_components) {
-                  return pvrgpu_pco_fail(
-                     error,
-                     error_size,
-                     "refract mediump varying signature changed");
-               }
-               input_mask |= BITFIELD_BIT(index);
-               ++input_loads;
-               value = &intr->def;
-            } else if (intr->intrinsic == nir_intrinsic_store_deref) {
-               nir_variable *var = nir_intrinsic_get_var(intr, 0);
-               if (!var || var->data.mode != nir_var_shader_out ||
-                   (var->data.location != FRAG_RESULT_COLOR &&
-                    var->data.location != FRAG_RESULT_DATA0))
-                  continue;
-               if (stores++ || intr->src[1].ssa->bit_size != 32 ||
-                   intr->src[1].ssa->num_components != 4) {
-                  return pvrgpu_pco_fail(
-                     error,
-                     error_size,
-                     "refract mediump fragment store changed");
-               }
-            }
-            break;
-         }
-         case nir_instr_type_tex: {
-            nir_tex_instr *tex = nir_instr_as_tex(instr);
-            if (tex->texture_index >= PVRGPU_REFRACT_TEXTURE_COUNT ||
-                tex->sampler_index != tex->texture_index ||
-                (textures & BITFIELD_BIT(tex->texture_index)) ||
-                tex->def.bit_size != 32 || tex->def.num_components != 4) {
-               return pvrgpu_pco_fail(error,
-                                      error_size,
-                                      "refract mediump texture graph changed");
-            }
-            textures |= BITFIELD_BIT(tex->texture_index);
-            value = &tex->def;
-            texture_value = true;
-            break;
-         }
-         case nir_instr_type_alu: {
-            nir_alu_instr *alu = nir_instr_as_alu(instr);
-            switch (alu->op) {
-            case nir_op_fadd:
-            case nir_op_fmul:
-            case nir_op_fdiv:
-            case nir_op_fsqrt:
-            case nir_op_flog2:
-            case nir_op_fexp2:
-               if (alu->def.bit_size != 32) {
-                  return pvrgpu_pco_fail(
-                     error,
-                     error_size,
-                     "refract mediump arithmetic precision changed");
-               }
-               value = &alu->def;
-               ++rounded_arithmetic;
-               break;
-            case nir_op_frsq: {
-               if (alu->def.bit_size != 32 ||
-                   alu->def.num_components != 1) {
-                  return pvrgpu_pco_fail(
-                     error,
-                     error_size,
-                     "refract mediump reciprocal sqrt changed");
-               }
-               /* LLVM implements half frsq as a rounded half sqrt followed
-                * by a rounded half division of 1.0 by that sqrt. */
-               nir_builder b = nir_builder_at(nir_after_instr(instr));
-               nir_def *sqrt_value = nir_frcp(&b, &alu->def);
-               nir_def *sqrt_rounded = nir_f2f32(
-                  &b, nir_f2f16_rtne(&b, sqrt_value));
-               nir_def *reciprocal = nir_frcp(&b, sqrt_rounded);
-               nir_def *rounded = nir_f2f32(
-                  &b, nir_f2f16_rtne(&b, reciprocal));
-               nir_def_rewrite_uses_after(&alu->def, rounded);
-               ++rounded_arithmetic;
-               continue;
-            }
-            case nir_op_fneg:
-            case nir_op_fmax:
-            case nir_op_flt:
-            case nir_op_feq:
-            case nir_op_bcsel:
-            case nir_op_mov:
-            case nir_op_vec2:
-            case nir_op_vec3:
-            case nir_op_vec4:
-               /* These either produce a Boolean or select/rearrange an
-                * already representable half value without new rounding. */
-               break;
-            case nir_op_ffma:
-            case nir_op_ffma_weak:
-            case nir_op_fdot3:
-            case nir_op_fpow:
-               return pvrgpu_pco_fail(
-                  error,
-                  error_size,
-                  "refract mediump retained fused arithmetic %s",
-                  nir_op_infos[alu->op].name);
-            default:
-               return pvrgpu_pco_fail(
-                  error,
-                  error_size,
-                  "refract mediump contains unsupported arithmetic %s",
-                  nir_op_infos[alu->op].name);
-            }
-            break;
-         }
-         case nir_instr_type_deref:
-            break;
-         default:
-            return pvrgpu_pco_fail(
-               error,
-               error_size,
-               "refract mediump contains unsupported instruction type %u",
-               instr->type);
-         }
-
-         if (!value)
-            continue;
-
-         nir_builder b = nir_builder_at(nir_after_instr(instr));
-         nir_def *rounded;
-         if (texture_value) {
-            nir_def *channels[4];
-            for (unsigned component = 0; component < 4; ++component) {
-               channels[component] = nir_f2f32(
-                  &b,
-                  nir_f2f16_rtz(
-                     &b, nir_channel(&b, value, component)));
-            }
-            rounded = nir_vec(&b, channels, 4);
-         } else {
-            nir_def *round_source = value;
-            if (reconstruct_inverse_ior_squared) {
-               round_source =
-                  nir_imm_float(&b, 0.69482421875f); /* binary16 0x398f */
-            }
-            rounded = nir_f2f32(
-               &b, nir_f2f16_rtne(&b, round_source));
-         }
-         nir_def_rewrite_uses_after(value, rounded);
-      }
-   }
-
-   if (input_loads != 3 || input_mask != 0x7 || textures != 0x7 ||
-       stores != 1 || rounded_constants != 13 ||
-       rounded_arithmetic != 127 || reconstructed_constants != 1) {
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "refract mediump lowered graph signature changed "
-                             "(inputs=%u/%x textures=%x stores=%u constants=%u "
-                             "arithmetic=%u reconstructed=%u)",
-                             input_loads,
-                             input_mask,
-                             textures,
-                             stores,
-                             rounded_constants,
-                             rounded_arithmetic,
-                             reconstructed_constants);
-   }
-
-   nir_progress(true, entrypoint, nir_metadata_control_flow);
-   return true;
-}
-
-static void
-pvrgpu_init_lit_mesh_shader_data(pco_data *vertex_data,
-                                 pco_data *fragment_data,
-                                 unsigned varying_components)
-{
-   vertex_data->vs.attrib_formats[VERT_ATTRIB_GENERIC0] =
-      PIPE_FORMAT_R32G32B32_FLOAT;
-   vertex_data->vs.attrib_formats[VERT_ATTRIB_GENERIC1] =
-      PIPE_FORMAT_R32G32B32_FLOAT;
-   vertex_data->vs.attribs[VERT_ATTRIB_GENERIC0] = (pco_range){
-      .start = 0,
-      .count = 4,
-   };
-   vertex_data->vs.attribs[VERT_ATTRIB_GENERIC1] = (pco_range){
-      .start = 4,
-      .count = 4,
-   };
-   vertex_data->common.vtxins = 8;
-   vertex_data->vs.varyings[VARYING_SLOT_POS] = (pco_range){
-      .start = 0,
-      .count = 4,
-   };
-   vertex_data->vs.varyings[VARYING_SLOT_VAR0] = (pco_range){
-      .start = 4,
-      .count = varying_components,
-   };
-   vertex_data->vs.vtxouts = 4 + varying_components;
-   vertex_data->vs.f32_smooth = varying_components;
-
-   /* Smooth interpolation consumes one four-DWORD W plane followed by one
-    * four-DWORD coefficient set per scalar varying component. */
-   fragment_data->fs.uses.w = true;
-   fragment_data->fs.varyings[VARYING_SLOT_POS] = (pco_range){
-      .start = 0,
-      .count = 4,
-   };
-   fragment_data->fs.varyings[VARYING_SLOT_VAR0] = (pco_range){
-      .start = 4,
-      .count = varying_components * 4,
-   };
-   fragment_data->common.coeffs = 4 + varying_components * 4;
-   fragment_data->fs.z_replicate = ~0U;
-   fragment_data->fs.rasterization_samples = 1;
-}
-
-static bool
-pvrgpu_init_texture_shader_data(pco_data *vertex_data,
-                                pco_data *fragment_data,
-                                void *compile_mem_ctx,
-                                char *error,
-                                size_t error_size)
-{
-   pvrgpu_init_lit_mesh_shader_data(vertex_data, fragment_data, 3);
-   vertex_data->vs.attrib_formats[VERT_ATTRIB_GENERIC2] =
-      PIPE_FORMAT_R32G32_FLOAT;
-   vertex_data->vs.attribs[VERT_ATTRIB_GENERIC2] = (pco_range){
-      .start = 8,
-      .count = 4,
-   };
-   vertex_data->common.vtxins = 12;
-
-   pco_descriptor_set_data *set = &fragment_data->common.desc_sets[0];
-   set->binding_count = 1;
-   set->bindings = rzalloc_array(compile_mem_ctx, pco_binding_data, 1);
-   if (!set->bindings)
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "out of memory allocating texture descriptor ABI");
-
-   set->range = (pco_range){
-      .start = 0,
-      .count = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
-   };
-   set->used = true;
-   set->bindings[0].range = (pco_range){
-      .start = 0,
-      .count = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
-      .stride = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
-   };
-   set->bindings[0].used = true;
-   set->bindings[0].is_img_smp = true;
-   fragment_data->common.shareds = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
-   return true;
-}
-
-static bool
-pvrgpu_init_refract_shader_data(enum pvrgpu_pco_refract_profile profile,
-                                pco_data *vertex_data,
-                                pco_data *fragment_data,
-                                void *compile_mem_ctx,
-                                char *error,
-                                size_t error_size)
-{
-   if (profile == PVRGPU_PCO_REFRACT_PREPASS) {
-      pvrgpu_init_lit_mesh_shader_data(vertex_data, fragment_data, 3);
-      return true;
-   }
-
-   vertex_data->vs.attrib_formats[VERT_ATTRIB_GENERIC0] =
-      PIPE_FORMAT_R32G32B32_FLOAT;
-   vertex_data->vs.attrib_formats[VERT_ATTRIB_GENERIC1] =
-      PIPE_FORMAT_R32G32B32_FLOAT;
-   vertex_data->vs.attribs[VERT_ATTRIB_GENERIC0] = (pco_range){
-      .start = 0,
-      .count = 4,
-   };
-   vertex_data->vs.attribs[VERT_ATTRIB_GENERIC1] = (pco_range){
-      .start = 4,
-      .count = 4,
-   };
-   vertex_data->common.vtxins = 8;
-   vertex_data->vs.varyings[VARYING_SLOT_POS] = (pco_range){
-      .start = 0,
-      .count = 4,
-   };
-   vertex_data->vs.varyings[VARYING_SLOT_VAR0] = (pco_range){
-      .start = 4,
-      .count = 4,
-   };
-   vertex_data->vs.varyings[VARYING_SLOT_VAR1] = (pco_range){
-      .start = 8,
-      .count = 4,
-   };
-   vertex_data->vs.varyings[VARYING_SLOT_VAR2] = (pco_range){
-      .start = 12,
-      .count = 3,
-   };
-   vertex_data->vs.vtxouts = 15;
-   vertex_data->vs.f32_smooth = 11;
-
-   fragment_data->fs.uses.w = true;
-   fragment_data->fs.varyings[VARYING_SLOT_POS] = (pco_range){
-      .start = 0,
-      .count = 4,
-   };
-   fragment_data->fs.varyings[VARYING_SLOT_VAR0] = (pco_range){
-      .start = 4,
-      .count = 16,
-   };
-   fragment_data->fs.varyings[VARYING_SLOT_VAR1] = (pco_range){
-      .start = 20,
-      .count = 16,
-   };
-   fragment_data->fs.varyings[VARYING_SLOT_VAR2] = (pco_range){
-      .start = 36,
-      .count = 12,
-   };
-   fragment_data->common.coeffs = 48;
-   fragment_data->fs.z_replicate = ~0U;
-   fragment_data->fs.rasterization_samples = 1;
-
-   /* Gallium NIR represents texture unit N as descriptor set N, binding 0.
-    * Keep the three image/sampler descriptors contiguous in shared storage,
-    * while describing that set layout exactly to PCO lowering. */
-   for (unsigned texture = 0; texture < PVRGPU_REFRACT_TEXTURE_COUNT;
-        ++texture) {
-      pco_descriptor_set_data *set =
-         &fragment_data->common.desc_sets[texture];
-      set->binding_count = 1;
-      set->bindings = rzalloc_array(compile_mem_ctx, pco_binding_data, 1);
-      if (!set->bindings) {
-         return pvrgpu_pco_fail(
-            error,
-            error_size,
-            "out of memory allocating refract descriptor set %u",
-            texture);
-      }
-      set->range = (pco_range){
-         .start = texture * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
-         .count = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
-      };
-      set->used = true;
-      set->bindings[0].range = (pco_range){
-         .start = texture * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
-         .count = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
-         .stride = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
-      };
-      set->bindings[0].used = true;
-      set->bindings[0].is_img_smp = true;
-   }
-   fragment_data->common.shareds = PVRGPU_REFRACT_DESCRIPTOR_DWORDS;
-   return true;
-}
-
-static bool
-pvrgpu_init_shadow_shader_data(enum pvrgpu_pco_shadow_profile profile,
-                               pco_data *vertex_data,
-                               pco_data *fragment_data,
-                               void *compile_mem_ctx,
-                               char *error,
-                               size_t error_size)
-{
-   if (profile == PVRGPU_PCO_SHADOW_SCENE) {
-      pvrgpu_init_lit_mesh_shader_data(vertex_data, fragment_data, 1);
-      return true;
-   }
-   if (profile != PVRGPU_PCO_SHADOW_MASK)
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "invalid non-depth shadow shader-data profile");
-
-   vertex_data->vs.attrib_formats[VERT_ATTRIB_GENERIC0] =
-      PIPE_FORMAT_R32G32_FLOAT;
-   vertex_data->vs.attribs[VERT_ATTRIB_GENERIC0] = (pco_range){
-      .start = 0,
-      .count = 4,
-   };
-   vertex_data->common.vtxins = 4;
-   vertex_data->vs.varyings[VARYING_SLOT_POS] = (pco_range){
-      .start = 0,
-      .count = 4,
-   };
-   vertex_data->vs.varyings[VARYING_SLOT_VAR0] = (pco_range){
-      .start = 4,
-      .count = 4,
-   };
-   vertex_data->vs.vtxouts = 8;
-   vertex_data->vs.f32_smooth = 4;
-
-   fragment_data->fs.uses.w = true;
-   fragment_data->fs.varyings[VARYING_SLOT_POS] = (pco_range){
-      .start = 0,
-      .count = 4,
-   };
-   fragment_data->fs.varyings[VARYING_SLOT_VAR0] = (pco_range){
-      .start = 4,
-      .count = 16,
-   };
-   fragment_data->common.coeffs = 20;
-   fragment_data->fs.z_replicate = ~0U;
-   fragment_data->fs.rasterization_samples = 1;
-
-   pco_descriptor_set_data *set = &fragment_data->common.desc_sets[0];
-   set->binding_count = 1;
-   set->bindings = rzalloc_array(compile_mem_ctx, pco_binding_data, 1);
-   if (!set->bindings)
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "out of memory allocating shadow descriptor ABI");
-   set->range = (pco_range){
-      .start = 0,
-      .count = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
-   };
-   set->used = true;
-   set->bindings[0].range = (pco_range){
-      .start = 0,
-      .count = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
-      .stride = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
-   };
-   set->bindings[0].used = true;
-   set->bindings[0].is_img_smp = true;
-   fragment_data->common.shareds = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
-   return true;
-}
-
-static bool
-pvrgpu_init_terrain_descriptors(pco_data *data,
-                                unsigned texture_count,
-                                void *compile_mem_ctx,
-                                const char *profile_name,
-                                const char *stage,
-                                char *error,
-                                size_t error_size)
-{
-   if (!texture_count)
-      return true;
-   pco_descriptor_set_data *set = &data->common.desc_sets[0];
-   set->binding_count = texture_count;
-   set->bindings =
-      rzalloc_array(compile_mem_ctx, pco_binding_data, texture_count);
-   if (!set->bindings) {
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "out of memory allocating %s %s descriptors",
-                             profile_name,
-                             stage);
-   }
-   set->range = (pco_range){
-      .start = 0,
-      .count = texture_count * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
-   };
-   set->used = true;
-   for (unsigned texture = 0; texture < texture_count; ++texture) {
-      set->bindings[texture].range = (pco_range){
-         .start = texture * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
-         .count = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
-         .stride = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
-      };
-      set->bindings[texture].used = true;
-      set->bindings[texture].is_img_smp = true;
-   }
-   data->common.shareds =
-      texture_count * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
-   return true;
-}
-
-static bool
-pvrgpu_init_terrain_shader_data(enum pvrgpu_pco_terrain_profile profile,
-                                pco_data *vertex_data,
-                                pco_data *fragment_data,
-                                void *compile_mem_ctx,
-                                char *error,
-                                size_t error_size)
-{
-   const struct pvrgpu_terrain_pco_desc *desc =
-      &pvrgpu_terrain_profiles[profile];
-   const bool main = profile == PVRGPU_PCO_TERRAIN_D3;
-   const unsigned vertex_inputs = main ? 4U : 1U;
-   for (unsigned input = 0; input < vertex_inputs; ++input) {
-      const enum pipe_format format =
-         main && input == 3U ? PIPE_FORMAT_R32G32_FLOAT :
-                               PIPE_FORMAT_R32G32B32_FLOAT;
-      const unsigned start = input * 4U;
-      vertex_data->vs.attrib_formats[VERT_ATTRIB_GENERIC0 + input] = format;
-      vertex_data->vs.attribs[VERT_ATTRIB_GENERIC0 + input] = (pco_range){
-         .start = start,
-         .count = 4,
-      };
-   }
-   vertex_data->common.vtxins = vertex_inputs * 4U;
-   vertex_data->vs.varyings[VARYING_SLOT_POS] = (pco_range){
-      .start = 0,
-      .count = 4,
-   };
-   if (main) {
-      vertex_data->vs.varyings[VARYING_SLOT_VAR0] = (pco_range){ 4, 4 };
-      vertex_data->vs.varyings[VARYING_SLOT_VAR1] = (pco_range){ 8, 4 };
-      vertex_data->vs.varyings[VARYING_SLOT_VAR2] = (pco_range){ 12, 4 };
-      vertex_data->vs.varyings[VARYING_SLOT_VAR3] = (pco_range){ 16, 2 };
-      vertex_data->vs.vtxouts = 18;
-      vertex_data->vs.f32_smooth = 14;
-   } else {
-      vertex_data->vs.varyings[VARYING_SLOT_VAR0] = (pco_range){ 4, 2 };
-      vertex_data->vs.vtxouts = 6;
-      vertex_data->vs.f32_smooth = 2;
-   }
-
-   fragment_data->fs.uses.w = true;
-   fragment_data->fs.varyings[VARYING_SLOT_POS] = (pco_range){ 0, 4 };
-   if (main) {
-      fragment_data->fs.varyings[VARYING_SLOT_VAR0] = (pco_range){ 4, 16 };
-      fragment_data->fs.varyings[VARYING_SLOT_VAR1] = (pco_range){ 20, 16 };
-      fragment_data->fs.varyings[VARYING_SLOT_VAR2] = (pco_range){ 36, 16 };
-      fragment_data->fs.varyings[VARYING_SLOT_VAR3] = (pco_range){ 52, 8 };
-   } else {
-      fragment_data->fs.varyings[VARYING_SLOT_VAR0] = (pco_range){ 4, 8 };
-   }
-   fragment_data->common.coeffs = 4 + desc->varying_components * 4U;
-   fragment_data->fs.z_replicate = ~0U;
-   fragment_data->fs.rasterization_samples = 1;
-
-   return pvrgpu_init_terrain_descriptors(vertex_data,
-                                           desc->vertex_texture_count,
-                                           compile_mem_ctx,
-                                           desc->name,
-                                           "VS",
-                                           error,
-                                           error_size) &&
-          pvrgpu_init_terrain_descriptors(fragment_data,
-                                           desc->fragment_texture_count,
-                                           compile_mem_ctx,
-                                           desc->name,
-                                           "FS",
-                                           error,
-                                           error_size);
-}
-
-static bool
-pvrgpu_pack_terrain_texture_bindings(nir_shader *nir,
-                                     unsigned texture_count,
-                                     unsigned expected_texture_ops,
-                                     const char *profile_name,
-                                     char *error,
-                                     size_t error_size)
-{
-   /* The driver command packs sampled resources in first-use order.  PCO
-    * descriptor sets must use the same order; raw GLSL binding numbers are
-    * not necessarily monotonic (Terrain D3 uses VS {1, 0} and FS
-    * {2, 0, 1, 4, 3}). */
-   uint16_t binding_to_set[9];
-   if (texture_count > ARRAY_SIZE(binding_to_set)) {
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "%s has too many unique texture bindings",
-                             profile_name);
-   }
-   for (unsigned binding = 0; binding < ARRAY_SIZE(binding_to_set);
-        ++binding)
-      binding_to_set[binding] = UINT16_MAX;
-
-   unsigned rewritten = 0;
-   unsigned unique_bindings = 0;
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block (block, impl) {
+      nir_foreach_block (block, function->impl) {
          nir_foreach_instr (instr, block) {
-            if (instr->type != nir_instr_type_tex)
-               continue;
-            nir_tex_instr *tex = nir_instr_as_tex(instr);
-            if (tex->texture_index != tex->sampler_index ||
-                tex->texture_index >= texture_count ||
-                tex->texture_index > UINT16_MAX) {
+            switch (instr->type) {
+            case nir_instr_type_alu:
+            case nir_instr_type_load_const:
+            case nir_instr_type_deref:
+               break;
+            case nir_instr_type_intrinsic: {
+               const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (!pvrgpu_color_primitive_allowed_intrinsic(intr->intrinsic)) {
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "color primitive contains unsupported NIR intrinsic %s",
+                     nir_intrinsic_infos[intr->intrinsic].name);
+               }
+               break;
+            }
+            case nir_instr_type_jump:
+               if (nir_instr_as_jump(instr)->type != nir_jump_return) {
+                  return pvrgpu_pco_fail(error,
+                                         error_size,
+                                         "color primitive contains "
+                                         "unsupported control flow");
+               }
+               break;
+            default:
                return pvrgpu_pco_fail(error,
                                       error_size,
-                                      "%s texture binding is out of range",
-                                      profile_name);
+                                      "color primitive contains unsupported "
+                                      "NIR instruction type %u",
+                                      instr->type);
             }
-            const unsigned binding = tex->texture_index;
-            if (binding_to_set[binding] == UINT16_MAX)
-               binding_to_set[binding] = unique_bindings++;
-            const uint32_t packed = binding_to_set[binding] << 16U;
-            tex->texture_index = packed;
-            tex->sampler_index = packed;
-            ++rewritten;
          }
       }
-      nir_progress(rewritten != 0, impl, nir_metadata_control_flow);
    }
-   if (rewritten != expected_texture_ops ||
-       unique_bindings != texture_count) {
+   if (implemented_functions != 1) {
       return pvrgpu_pco_fail(error,
                              error_size,
-                             "%s rewrote %u texture ops/%u bindings, "
-                             "expected %u/%u",
-                             profile_name,
-                             rewritten,
-                             unique_bindings,
-                             expected_texture_ops,
-                             texture_count);
+                             "color primitive requires one entrypoint");
    }
    return true;
 }
 
-bool pvrgpu_pco_compile_lit_mesh(
+bool pvrgpu_pco_compile_color_triangle(
    struct pvrgpu_pco_compiler *compiler,
-   const nir_shader *vertex_nir,
-   const nir_shader *fragment_nir,
-   enum pvrgpu_pco_lit_mesh_profile profile,
-   struct pvrgpu_pco_graphics_binary *out,
-   char *error,
-   size_t error_size)
-{
-   if (error && error_size)
-      error[0] = '\0';
-   if (!out)
-      return pvrgpu_pco_fail(error, error_size, "missing PCO output object");
-   memset(out, 0, sizeof(*out));
-
-   if (!compiler || !compiler->pco || !vertex_nir || !fragment_nir ||
-       profile < PVRGPU_PCO_LIT_MESH_BUILD ||
-       profile > PVRGPU_PCO_LIT_MESH_SHADING) {
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "missing compiler or invalid lit-mesh profile");
-   }
-   const struct pvrgpu_lit_mesh_desc *desc =
-      &pvrgpu_lit_mesh_profiles[profile];
-   if (vertex_nir->info.stage != MESA_SHADER_VERTEX ||
-       fragment_nir->info.stage != MESA_SHADER_FRAGMENT ||
-       !pvrgpu_source_hash_matches(vertex_nir, desc->vertex_source_hash) ||
-       !pvrgpu_source_hash_matches(fragment_nir, desc->fragment_source_hash) ||
-       !pvrgpu_validate_lit_mesh_variables(vertex_nir,
-                                           desc->varying_components,
-                                           desc->name,
-                                           error,
-                                           error_size) ||
-       !pvrgpu_validate_lit_mesh_variables(fragment_nir,
-                                           desc->varying_components,
-                                           desc->name,
-                                           error,
-                                           error_size)) {
-      if (error && error_size && error[0] == '\0')
-         snprintf(error, error_size, "%s NIR source signature mismatch", desc->name);
-      return false;
-   }
-
-   void *compile_mem_ctx = ralloc_context(compiler->mem_ctx);
-   if (!compile_mem_ctx)
-      return pvrgpu_pco_fail(error, error_size, "out of memory cloning NIR");
-   nir_shader *vs = nir_shader_clone(compile_mem_ctx, vertex_nir);
-   nir_shader *fs = nir_shader_clone(compile_mem_ctx, fragment_nir);
-   if (!vs || !fs) {
-      ralloc_free(compile_mem_ctx);
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "failed to clone %s NIR",
-                             desc->name);
-   }
-
-   vs->info.internal = true;
-   fs->info.internal = true;
-   vs->options = pco_nir_options();
-   fs->options = pco_nir_options();
-   nir_shader_compiler_options bump_fragment_options;
-   if (profile == PVRGPU_PCO_LIT_MESH_BUMP) {
-      bump_fragment_options = *pco_nir_options();
-      bump_fragment_options.float_mul_add32 &=
-         ~nir_float_muladd_support_fuse;
-      bump_fragment_options.float_mul_add32 |=
-         nir_float_muladd_support_prefers_split;
-      fs->options = &bump_fragment_options;
-   }
-   nir_lower_fragcolor(fs, 1);
-
-   if (!pvrgpu_validate_lit_mesh_varying_store(vs,
-                                               desc->varying_components,
-                                               desc->name,
-                                               error,
-                                               error_size) ||
-       !pvrgpu_validate_lit_mesh_fragment_output(fs,
-                                                 desc->name,
-                                                 error,
-                                                 error_size) ||
-       (profile == PVRGPU_PCO_LIT_MESH_BUMP &&
-        !pvrgpu_lower_bump_fragment_mediump(fs, error, error_size)) ||
-       !pvrgpu_canonicalize_fragment_output(fs,
-                                            desc->name,
-                                            error,
-                                            error_size) ||
-       !pvrgpu_lower_uniform_slots_to_push_constants(
-          vs,
-          PVRGPU_LIT_MESH_VS_UNIFORM_DWORDS,
-          8,
-          desc->name,
-          error,
-          error_size)) {
-      ralloc_free(compile_mem_ctx);
-      return false;
-   }
-
-   pco_data vertex_data = { 0 };
-   pco_data fragment_data = { 0 };
-   pvrgpu_init_lit_mesh_shader_data(&vertex_data,
-                                    &fragment_data,
-                                    desc->varying_components);
-
-   pco_preprocess_nir(compiler->pco, vs);
-   pco_preprocess_nir(compiler->pco, fs);
-   pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
-   pco_rev_link_nir(compiler->pco, vs, fs);
-   pco_lower_nir(compiler->pco, vs, &vertex_data);
-   pco_lower_nir(compiler->pco, fs, &fragment_data);
-   pco_postprocess_nir(compiler->pco, vs, &vertex_data);
-   pco_postprocess_nir(compiler->pco, fs, &fragment_data);
-
-   if (!pvrgpu_allocate_push_constants(&vertex_data,
-                                       PVRGPU_LIT_MESH_VS_UNIFORM_DWORDS,
-                                       31,
-                                       desc->name,
-                                       "VS",
-                                       error,
-                                       error_size)) {
-      ralloc_free(compile_mem_ctx);
-      return false;
-   }
-
-   pco_shader *vertex =
-      pco_trans_nir(compiler->pco, vs, &vertex_data, compile_mem_ctx);
-   pco_shader *fragment =
-      pco_trans_nir(compiler->pco, fs, &fragment_data, compile_mem_ctx);
-   if (!vertex || !fragment) {
-      ralloc_free(compile_mem_ctx);
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "PCO failed to translate %s NIR",
-                             desc->name);
-   }
-   pco_process_ir(compiler->pco, vertex);
-   pco_process_ir(compiler->pco, fragment);
-   pco_encode_ir(compiler->pco, vertex);
-   pco_encode_ir(compiler->pco, fragment);
-
-   if (!pvrgpu_copy_pco_stage(vertex, true, &out->vertex, error, error_size) ||
-       !pvrgpu_copy_pco_stage(fragment,
-                              false,
-                              &out->fragment,
-                              error,
-                              error_size)) {
-      pvrgpu_pco_graphics_binary_finish(out);
-      ralloc_free(compile_mem_ctx);
-      return false;
-   }
-
-   out->position_output_start =
-      vertex_data.vs.varyings[VARYING_SLOT_POS].start;
-   out->position_output_count =
-      vertex_data.vs.varyings[VARYING_SLOT_POS].count;
-   out->fragment_position_start =
-      fragment_data.fs.varyings[VARYING_SLOT_POS].start;
-   out->fragment_position_count =
-      fragment_data.fs.varyings[VARYING_SLOT_POS].count;
-   out->varying_output_start =
-      vertex_data.vs.varyings[VARYING_SLOT_VAR0].start;
-   out->varying_output_count =
-      vertex_data.vs.varyings[VARYING_SLOT_VAR0].count;
-   out->fragment_varying_start =
-      fragment_data.fs.varyings[VARYING_SLOT_VAR0].start;
-   out->fragment_varying_count =
-      fragment_data.fs.varyings[VARYING_SLOT_VAR0].count;
-
-   if (out->vertex.abi.vertex_inputs != 8 ||
-       out->vertex.abi.vertex_outputs != 4 + desc->varying_components ||
-       out->vertex.abi.shareds != PVRGPU_LIT_MESH_VS_UNIFORM_DWORDS ||
-       out->vertex.abi.push_constant_count !=
-          PVRGPU_LIT_MESH_VS_UNIFORM_DWORDS ||
-       out->fragment.abi.shareds != 0 ||
-       out->fragment.abi.push_constant_count != 0 ||
-       out->position_output_start != 0 || out->position_output_count != 4 ||
-       out->varying_output_start != 4 ||
-       out->varying_output_count != desc->varying_components ||
-       out->fragment_position_start != 0 ||
-       out->fragment_position_count != 4 ||
-       out->fragment_varying_start != 4 ||
-       out->fragment_varying_count != desc->varying_components * 4) {
-      pvrgpu_pco_graphics_binary_finish(out);
-      ralloc_free(compile_mem_ctx);
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "compiled %s PCO ABI changed",
-                             desc->name);
-   }
-
-   ralloc_free(compile_mem_ctx);
-   return true;
-}
-
-bool pvrgpu_pco_compile_texture(
-   struct pvrgpu_pco_compiler *compiler,
-   const nir_shader *vertex_nir,
-   const nir_shader *fragment_nir,
+   const struct nir_shader *vertex_nir,
+   const struct nir_shader *fragment_nir,
+   enum pipe_format position_format,
+   enum pipe_format color_format,
    struct pvrgpu_pco_graphics_binary *out,
    char *error,
    size_t error_size)
@@ -4771,78 +3620,85 @@ bool pvrgpu_pco_compile_texture(
    if (!compiler || !compiler->pco || !vertex_nir || !fragment_nir) {
       return pvrgpu_pco_fail(error,
                              error_size,
-                             "missing compiler or texture NIR stage");
+                             "missing compiler or NIR stage for color triangle");
    }
-   if (!pvrgpu_source_hash_matches(vertex_nir,
-                                   pvrgpu_texture_vertex_source_hash) ||
-       !pvrgpu_source_hash_matches(fragment_nir,
-                                   pvrgpu_texture_fragment_source_hash) ||
-       !pvrgpu_validate_texture_nir(vertex_nir,
-                                    MESA_SHADER_VERTEX,
-                                    error,
-                                    error_size) ||
-       !pvrgpu_validate_texture_nir(fragment_nir,
-                                    MESA_SHADER_FRAGMENT,
-                                    error,
-                                    error_size)) {
-      if (error && error_size && error[0] == '\0')
-         snprintf(error, error_size, "texture NIR source signature mismatch");
+
+   if (!pvrgpu_validate_color_primitive_nir(vertex_nir,
+                                            MESA_SHADER_VERTEX,
+                                            error,
+                                            error_size) ||
+       !pvrgpu_validate_color_primitive_nir(fragment_nir,
+                                            MESA_SHADER_FRAGMENT,
+                                            error,
+                                            error_size)) {
       return false;
    }
 
    void *compile_mem_ctx = ralloc_context(compiler->mem_ctx);
    if (!compile_mem_ctx)
       return pvrgpu_pco_fail(error, error_size, "out of memory cloning NIR");
+
    nir_shader *vs = nir_shader_clone(compile_mem_ctx, vertex_nir);
    nir_shader *fs = nir_shader_clone(compile_mem_ctx, fragment_nir);
    if (!vs || !fs) {
       ralloc_free(compile_mem_ctx);
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "failed to clone texture NIR");
+      return pvrgpu_pco_fail(error, error_size, "failed to clone color triangle NIR");
    }
 
    vs->info.internal = true;
    fs->info.internal = true;
    vs->options = pco_nir_options();
    fs->options = pco_nir_options();
-   nir_lower_fragcolor(fs, 1);
 
-   if (!pvrgpu_validate_lit_mesh_varying_store(vs,
-                                               3,
-                                               "texture",
-                                               error,
-                                               error_size) ||
-       !pvrgpu_validate_lit_mesh_fragment_output(fs,
-                                                 "texture",
-                                                 error,
-                                                 error_size) ||
-       !pvrgpu_lower_texture_fragment_mediump(fs, error, error_size) ||
-       !pvrgpu_canonicalize_fragment_output(fs,
-                                            "texture",
-                                            error,
-                                            error_size) ||
-       !pvrgpu_lower_uniform_slots_to_push_constants(
-          vs,
-          PVRGPU_TEXTURE_VS_UNIFORM_DWORDS,
-          8,
-          "texture",
-          error,
-          error_size)) {
-      ralloc_free(compile_mem_ctx);
-      return false;
-   }
+   nir_lower_fragcolor(fs, 1);
 
    pco_data vertex_data = { 0 };
    pco_data fragment_data = { 0 };
-   if (!pvrgpu_init_texture_shader_data(&vertex_data,
-                                        &fragment_data,
-                                        compile_mem_ctx,
-                                        error,
-                                        error_size)) {
-      ralloc_free(compile_mem_ctx);
-      return false;
-   }
+
+   vertex_data.vs.attrib_formats[VERT_ATTRIB_GENERIC0] = position_format;
+   vertex_data.vs.attrib_formats[VERT_ATTRIB_GENERIC1] = color_format;
+   vertex_data.vs.attribs[VERT_ATTRIB_GENERIC0] = (pco_range){
+      .start = 0,
+      .count = 4,
+   };
+   vertex_data.vs.attribs[VERT_ATTRIB_GENERIC1] = (pco_range){
+      .start = 4,
+      .count = 4,
+   };
+   vertex_data.common.vtxins = 8;
+   vertex_data.vs.varyings[VARYING_SLOT_POS] = (pco_range){
+      .start = 0,
+      .count = 4,
+   };
+   vertex_data.vs.varyings[VARYING_SLOT_VAR0] = (pco_range){
+      .start = 4,
+      .count = 4,
+   };
+   vertex_data.vs.vtxouts = 8;
+   vertex_data.vs.f32_smooth = 4;
+
+   fragment_data.fs.uses.w = true;
+   fragment_data.fs.varyings[VARYING_SLOT_POS] = (pco_range){
+      .start = 0,
+      .count = 4,
+   };
+   fragment_data.fs.varyings[VARYING_SLOT_VAR0] = (pco_range){
+      .start = 4,
+      .count = 16,
+   };
+   fragment_data.common.coeffs = 20;
+   fragment_data.fs.z_replicate = ~0U;
+   fragment_data.fs.rasterization_samples = 1;
+   fragment_data.fs.outputs[FRAG_RESULT_DATA0] = (pco_range){
+      .start = 0,
+      .count = 4,
+   };
+   fragment_data.fs.output_formats[FRAG_RESULT_DATA0] = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   fragment_data.fs.outputs[FRAG_RESULT_COLOR] = (pco_range){
+      .start = 0,
+      .count = 4,
+   };
+   fragment_data.fs.output_formats[FRAG_RESULT_COLOR] = PIPE_FORMAT_R32G32B32A32_FLOAT;
 
    pco_preprocess_nir(compiler->pco, vs);
    pco_preprocess_nir(compiler->pco, fs);
@@ -4853,17 +3709,6 @@ bool pvrgpu_pco_compile_texture(
    pco_postprocess_nir(compiler->pco, vs, &vertex_data);
    pco_postprocess_nir(compiler->pco, fs, &fragment_data);
 
-   if (!pvrgpu_allocate_push_constants(&vertex_data,
-                                       PVRGPU_TEXTURE_VS_UNIFORM_DWORDS,
-                                       31,
-                                       "texture",
-                                       "VS",
-                                       error,
-                                       error_size)) {
-      ralloc_free(compile_mem_ctx);
-      return false;
-   }
-
    pco_shader *vertex =
       pco_trans_nir(compiler->pco, vs, &vertex_data, compile_mem_ctx);
    pco_shader *fragment =
@@ -4872,240 +3717,16 @@ bool pvrgpu_pco_compile_texture(
       ralloc_free(compile_mem_ctx);
       return pvrgpu_pco_fail(error,
                              error_size,
-                             "PCO failed to translate texture NIR");
+                             "PCO failed to translate color triangle NIR");
    }
+
    pco_process_ir(compiler->pco, vertex);
    pco_process_ir(compiler->pco, fragment);
    pco_encode_ir(compiler->pco, vertex);
    pco_encode_ir(compiler->pco, fragment);
 
    if (!pvrgpu_copy_pco_stage(vertex, true, &out->vertex, error, error_size) ||
-       !pvrgpu_copy_pco_stage(fragment,
-                              false,
-                              &out->fragment,
-                              error,
-                              error_size)) {
-      pvrgpu_pco_graphics_binary_finish(out);
-      ralloc_free(compile_mem_ctx);
-      return false;
-   }
-
-   out->position_output_start =
-      vertex_data.vs.varyings[VARYING_SLOT_POS].start;
-   out->position_output_count =
-      vertex_data.vs.varyings[VARYING_SLOT_POS].count;
-   out->fragment_position_start =
-      fragment_data.fs.varyings[VARYING_SLOT_POS].start;
-   out->fragment_position_count =
-      fragment_data.fs.varyings[VARYING_SLOT_POS].count;
-   out->varying_output_start =
-      vertex_data.vs.varyings[VARYING_SLOT_VAR0].start;
-   out->varying_output_count =
-      vertex_data.vs.varyings[VARYING_SLOT_VAR0].count;
-   out->fragment_varying_start =
-      fragment_data.fs.varyings[VARYING_SLOT_VAR0].start;
-   out->fragment_varying_count =
-      fragment_data.fs.varyings[VARYING_SLOT_VAR0].count;
-   out->fragment_texture_descriptor_start =
-      fragment_data.common.desc_sets[0].bindings[0].range.start;
-   out->fragment_texture_descriptor_count =
-      fragment_data.common.desc_sets[0].bindings[0].range.count;
-   out->fragment_texture_descriptor_stride =
-      fragment_data.common.desc_sets[0].bindings[0].range.stride;
-
-   if (out->vertex.abi.vertex_inputs != 12 ||
-       out->vertex.abi.vertex_outputs != 7 ||
-       out->vertex.abi.coefficients != 0 ||
-       out->vertex.abi.shareds != PVRGPU_TEXTURE_VS_UNIFORM_DWORDS ||
-       out->vertex.abi.push_constant_start != 0 ||
-       out->vertex.abi.push_constant_count !=
-          PVRGPU_TEXTURE_VS_UNIFORM_DWORDS ||
-       out->fragment.abi.coefficients != 16 ||
-       out->fragment.abi.shareds != PVRGPU_TEXTURE_DESCRIPTOR_DWORDS ||
-       out->fragment.abi.push_constant_count != 0 ||
-       out->position_output_start != 0 || out->position_output_count != 4 ||
-       out->varying_output_start != 4 || out->varying_output_count != 3 ||
-       out->fragment_position_start != 0 ||
-       out->fragment_position_count != 4 ||
-       out->fragment_varying_start != 4 ||
-       out->fragment_varying_count != 12 ||
-       out->fragment_texture_descriptor_start != 0 ||
-       out->fragment_texture_descriptor_count !=
-          PVRGPU_TEXTURE_DESCRIPTOR_DWORDS ||
-       out->fragment_texture_descriptor_stride !=
-          PVRGPU_TEXTURE_DESCRIPTOR_DWORDS) {
-      pvrgpu_pco_graphics_binary_finish(out);
-      ralloc_free(compile_mem_ctx);
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "compiled texture PCO ABI changed");
-   }
-
-   ralloc_free(compile_mem_ctx);
-   return true;
-}
-
-bool pvrgpu_pco_compile_refract(
-   struct pvrgpu_pco_compiler *compiler,
-   const nir_shader *vertex_nir,
-   const nir_shader *fragment_nir,
-   enum pvrgpu_pco_refract_profile profile,
-   struct pvrgpu_pco_graphics_binary *out,
-   char *error,
-   size_t error_size)
-{
-   if (error && error_size)
-      error[0] = '\0';
-   if (!out)
-      return pvrgpu_pco_fail(error, error_size, "missing PCO output object");
-   memset(out, 0, sizeof(*out));
-
-   if (!compiler || !compiler->pco || !vertex_nir || !fragment_nir ||
-       profile < PVRGPU_PCO_REFRACT_PREPASS ||
-       profile > PVRGPU_PCO_REFRACT_COMPOSITE) {
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "missing compiler or invalid refract profile");
-   }
-   const struct pvrgpu_refract_pco_desc *desc =
-      &pvrgpu_refract_profiles[profile];
-   if (!pvrgpu_source_hash_matches(vertex_nir, desc->vertex_source_hash) ||
-       !pvrgpu_source_hash_matches(fragment_nir,
-                                   desc->fragment_source_hash) ||
-       !pvrgpu_validate_refract_nir(vertex_nir,
-                                    profile,
-                                    MESA_SHADER_VERTEX,
-                                    error,
-                                    error_size) ||
-       !pvrgpu_validate_refract_nir(fragment_nir,
-                                    profile,
-                                    MESA_SHADER_FRAGMENT,
-                                    error,
-                                    error_size)) {
-      if (error && error_size && error[0] == '\0') {
-         snprintf(error,
-                  error_size,
-                  "%s NIR source signature mismatch",
-                  desc->name);
-      }
-      return false;
-   }
-
-   void *compile_mem_ctx = ralloc_context(compiler->mem_ctx);
-   if (!compile_mem_ctx)
-      return pvrgpu_pco_fail(error, error_size, "out of memory cloning NIR");
-   nir_shader *vs = nir_shader_clone(compile_mem_ctx, vertex_nir);
-   nir_shader *fs = nir_shader_clone(compile_mem_ctx, fragment_nir);
-   if (!vs || !fs) {
-      ralloc_free(compile_mem_ctx);
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "failed to clone %s NIR",
-                             desc->name);
-   }
-
-   vs->info.internal = true;
-   fs->info.internal = true;
-   vs->options = pco_nir_options();
-   fs->options = pco_nir_options();
-   nir_shader_compiler_options vertex_options;
-   nir_shader_compiler_options fragment_options;
-   /* Gallivm preserves both Refract vertex shaders' matrix and normal chains
-    * as distinct multiply and add operations.  Keep that boundary local to
-    * these strict profiles instead of changing global PCO policy. */
-   vertex_options = *pco_nir_options();
-   vertex_options.float_mul_add32 &= ~nir_float_muladd_support_fuse;
-   vertex_options.float_mul_add32 |=
-      nir_float_muladd_support_prefers_split;
-   vs->options = &vertex_options;
-   if (profile == PVRGPU_PCO_REFRACT_COMPOSITE) {
-      /* The GLES source spells every product and sum separately.  Retain
-       * those IEEE operation boundaries through generic NIR optimization. */
-      fragment_options = *pco_nir_options();
-      fragment_options.float_mul_add32 &= ~nir_float_muladd_support_fuse;
-      fragment_options.float_mul_add32 |=
-         nir_float_muladd_support_prefers_split;
-      fs->options = &fragment_options;
-   }
-   nir_lower_fragcolor(fs, 1);
-
-   if (!pvrgpu_validate_lit_mesh_fragment_output(fs,
-                                                 desc->name,
-                                                 error,
-                                                 error_size) ||
-       (profile == PVRGPU_PCO_REFRACT_COMPOSITE &&
-        !pvrgpu_lower_refract_composite_fragment_mediump(fs,
-                                                         error,
-                                                         error_size)) ||
-       !pvrgpu_canonicalize_fragment_output(fs,
-                                            desc->name,
-                                            error,
-                                            error_size) ||
-       !pvrgpu_lower_uniform_slots_to_push_constants(
-          vs,
-          desc->vertex_uniform_dwords,
-          desc->vertex_uniform_loads,
-          desc->name,
-          error,
-          error_size)) {
-      ralloc_free(compile_mem_ctx);
-      return false;
-   }
-
-   pco_data vertex_data = { 0 };
-   pco_data fragment_data = { 0 };
-   if (!pvrgpu_init_refract_shader_data(profile,
-                                        &vertex_data,
-                                        &fragment_data,
-                                        compile_mem_ctx,
-                                        error,
-                                        error_size)) {
-      ralloc_free(compile_mem_ctx);
-      return false;
-   }
-
-   pco_preprocess_nir(compiler->pco, vs);
-   pco_preprocess_nir(compiler->pco, fs);
-   pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
-   pco_rev_link_nir(compiler->pco, vs, fs);
-   pco_lower_nir(compiler->pco, vs, &vertex_data);
-   pco_lower_nir(compiler->pco, fs, &fragment_data);
-   pco_postprocess_nir(compiler->pco, vs, &vertex_data);
-   pco_postprocess_nir(compiler->pco, fs, &fragment_data);
-
-   if (!pvrgpu_allocate_push_constants(&vertex_data,
-                                       desc->vertex_uniform_dwords,
-                                       desc->vertex_uniform_dwords,
-                                       desc->name,
-                                       "VS",
-                                       error,
-                                       error_size)) {
-      ralloc_free(compile_mem_ctx);
-      return false;
-   }
-
-   pco_shader *vertex =
-      pco_trans_nir(compiler->pco, vs, &vertex_data, compile_mem_ctx);
-   pco_shader *fragment =
-      pco_trans_nir(compiler->pco, fs, &fragment_data, compile_mem_ctx);
-   if (!vertex || !fragment) {
-      ralloc_free(compile_mem_ctx);
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "PCO failed to translate %s NIR",
-                             desc->name);
-   }
-   pco_process_ir(compiler->pco, vertex);
-   pco_process_ir(compiler->pco, fragment);
-   pco_encode_ir(compiler->pco, vertex);
-   pco_encode_ir(compiler->pco, fragment);
-
-   if (!pvrgpu_copy_pco_stage(vertex, true, &out->vertex, error, error_size) ||
-       !pvrgpu_copy_pco_stage(fragment,
-                              false,
-                              &out->fragment,
-                              error,
-                              error_size)) {
+       !pvrgpu_copy_pco_stage(fragment, false, &out->fragment, error, error_size)) {
       pvrgpu_pco_graphics_binary_finish(out);
       ralloc_free(compile_mem_ctx);
       return false;
@@ -5116,258 +3737,9 @@ bool pvrgpu_pco_compile_refract(
    out->fragment_position_start = 0;
    out->fragment_position_count = 4;
    out->varying_output_start = 4;
-   out->varying_output_count = desc->varying_components;
+   out->varying_output_count = 4;
    out->fragment_varying_start = 4;
-   out->fragment_varying_count = desc->varying_components * 4;
-   if (profile == PVRGPU_PCO_REFRACT_COMPOSITE) {
-      out->fragment_texture_descriptor_start = 0;
-      out->fragment_texture_descriptor_count =
-         PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
-      out->fragment_texture_descriptor_stride =
-         PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
-   }
-
-   const unsigned expected_fragment_shareds =
-      profile == PVRGPU_PCO_REFRACT_COMPOSITE ?
-         PVRGPU_REFRACT_DESCRIPTOR_DWORDS : 0;
-   if (out->vertex.abi.vertex_inputs != 8 ||
-       out->vertex.abi.vertex_outputs != 4 + desc->varying_components ||
-       out->vertex.abi.coefficients != 0 ||
-       out->vertex.abi.shareds != desc->vertex_uniform_dwords ||
-       out->vertex.abi.push_constant_start != 0 ||
-       out->vertex.abi.push_constant_count != desc->vertex_uniform_dwords ||
-       out->fragment.abi.coefficients !=
-          4 + desc->varying_components * 4 ||
-       out->fragment.abi.shareds != expected_fragment_shareds ||
-       out->fragment.abi.push_constant_count != 0 ||
-       out->position_output_start != 0 || out->position_output_count != 4 ||
-       out->varying_output_start != 4 ||
-       out->varying_output_count != desc->varying_components ||
-       out->fragment_position_start != 0 ||
-       out->fragment_position_count != 4 ||
-       out->fragment_varying_start != 4 ||
-       out->fragment_varying_count != desc->varying_components * 4 ||
-       (profile == PVRGPU_PCO_REFRACT_COMPOSITE &&
-        (out->fragment_texture_descriptor_start != 0 ||
-         out->fragment_texture_descriptor_count !=
-            PVRGPU_TEXTURE_DESCRIPTOR_DWORDS ||
-         out->fragment_texture_descriptor_stride !=
-            PVRGPU_TEXTURE_DESCRIPTOR_DWORDS))) {
-      pvrgpu_pco_graphics_binary_finish(out);
-      ralloc_free(compile_mem_ctx);
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "compiled %s PCO ABI changed",
-                             desc->name);
-   }
-
-   ralloc_free(compile_mem_ctx);
-   return true;
-}
-
-bool pvrgpu_pco_compile_shadow(
-   struct pvrgpu_pco_compiler *compiler,
-   const nir_shader *vertex_nir,
-   const nir_shader *fragment_nir,
-   enum pvrgpu_pco_shadow_profile profile,
-   struct pvrgpu_pco_graphics_binary *out,
-   char *error,
-   size_t error_size)
-{
-   if (error && error_size)
-      error[0] = '\0';
-   if (!out)
-      return pvrgpu_pco_fail(error, error_size, "missing PCO output object");
-   memset(out, 0, sizeof(*out));
-
-   if (!compiler || !compiler->pco || !vertex_nir || !fragment_nir ||
-       profile < PVRGPU_PCO_SHADOW_DEPTH ||
-       profile > PVRGPU_PCO_SHADOW_SCENE) {
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "missing compiler or invalid shadow profile");
-   }
-   if (profile == PVRGPU_PCO_SHADOW_DEPTH) {
-      return pvrgpu_pco_compile_refract(compiler,
-                                        vertex_nir,
-                                        fragment_nir,
-                                        PVRGPU_PCO_REFRACT_PREPASS,
-                                        out,
-                                        error,
-                                        error_size);
-   }
-
-   const struct pvrgpu_shadow_pco_desc *desc =
-      &pvrgpu_shadow_profiles[profile];
-   if (!pvrgpu_source_hash_matches(vertex_nir, desc->vertex_source_hash) ||
-       !pvrgpu_source_hash_matches(fragment_nir,
-                                   desc->fragment_source_hash) ||
-       !pvrgpu_validate_shadow_nir(vertex_nir,
-                                   profile,
-                                   MESA_SHADER_VERTEX,
-                                   error,
-                                   error_size) ||
-       !pvrgpu_validate_shadow_nir(fragment_nir,
-                                   profile,
-                                   MESA_SHADER_FRAGMENT,
-                                   error,
-                                   error_size)) {
-      if (error && error_size && error[0] == '\0') {
-         snprintf(error,
-                  error_size,
-                  "%s NIR source signature mismatch",
-                  desc->name);
-      }
-      return false;
-   }
-
-   void *compile_mem_ctx = ralloc_context(compiler->mem_ctx);
-   if (!compile_mem_ctx)
-      return pvrgpu_pco_fail(error, error_size, "out of memory cloning NIR");
-   nir_shader *vs = nir_shader_clone(compile_mem_ctx, vertex_nir);
-   nir_shader *fs = nir_shader_clone(compile_mem_ctx, fragment_nir);
-   if (!vs || !fs) {
-      ralloc_free(compile_mem_ctx);
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "failed to clone %s NIR",
-                             desc->name);
-   }
-
-   vs->info.internal = true;
-   fs->info.internal = true;
-   vs->options = pco_nir_options();
-   fs->options = pco_nir_options();
-   nir_lower_fragcolor(fs, 1);
-   if (!pvrgpu_validate_lit_mesh_fragment_output(fs,
-                                                 desc->name,
-                                                 error,
-                                                 error_size) ||
-       !pvrgpu_canonicalize_fragment_output(fs,
-                                            desc->name,
-                                            error,
-                                            error_size) ||
-       !pvrgpu_lower_uniform_slots_to_push_constants(
-          vs,
-          desc->vertex_uniform_dwords,
-          desc->vertex_uniform_loads,
-          desc->name,
-          error,
-          error_size)) {
-      ralloc_free(compile_mem_ctx);
-      return false;
-   }
-
-   pco_data vertex_data = { 0 };
-   pco_data fragment_data = { 0 };
-   if (!pvrgpu_init_shadow_shader_data(profile,
-                                       &vertex_data,
-                                       &fragment_data,
-                                       compile_mem_ctx,
-                                       error,
-                                       error_size)) {
-      ralloc_free(compile_mem_ctx);
-      return false;
-   }
-
-   pco_preprocess_nir(compiler->pco, vs);
-   pco_preprocess_nir(compiler->pco, fs);
-   pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
-   pco_rev_link_nir(compiler->pco, vs, fs);
-   pco_lower_nir(compiler->pco, vs, &vertex_data);
-   pco_lower_nir(compiler->pco, fs, &fragment_data);
-   pco_postprocess_nir(compiler->pco, vs, &vertex_data);
-   pco_postprocess_nir(compiler->pco, fs, &fragment_data);
-
-   if (!pvrgpu_allocate_push_constants(&vertex_data,
-                                       desc->vertex_uniform_dwords,
-                                       desc->vertex_uniform_used_dwords,
-                                       desc->name,
-                                       "VS",
-                                       error,
-                                       error_size)) {
-      ralloc_free(compile_mem_ctx);
-      return false;
-   }
-
-   pco_shader *vertex =
-      pco_trans_nir(compiler->pco, vs, &vertex_data, compile_mem_ctx);
-   pco_shader *fragment =
-      pco_trans_nir(compiler->pco, fs, &fragment_data, compile_mem_ctx);
-   if (!vertex || !fragment) {
-      ralloc_free(compile_mem_ctx);
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "PCO failed to translate %s NIR",
-                             desc->name);
-   }
-   pco_process_ir(compiler->pco, vertex);
-   pco_process_ir(compiler->pco, fragment);
-   pco_encode_ir(compiler->pco, vertex);
-   pco_encode_ir(compiler->pco, fragment);
-
-   if (!pvrgpu_copy_pco_stage(vertex, true, &out->vertex, error, error_size) ||
-       !pvrgpu_copy_pco_stage(fragment,
-                              false,
-                              &out->fragment,
-                              error,
-                              error_size)) {
-      pvrgpu_pco_graphics_binary_finish(out);
-      ralloc_free(compile_mem_ctx);
-      return false;
-   }
-
-   out->position_output_start = 0;
-   out->position_output_count = 4;
-   out->fragment_position_start = 0;
-   out->fragment_position_count = 4;
-   out->varying_output_start = 4;
-   out->varying_output_count = desc->varying_components;
-   out->fragment_varying_start = 4;
-   out->fragment_varying_count = desc->varying_components * 4;
-   if (profile == PVRGPU_PCO_SHADOW_MASK) {
-      out->fragment_texture_descriptor_start = 0;
-      out->fragment_texture_descriptor_count =
-         PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
-      out->fragment_texture_descriptor_stride =
-         PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
-   }
-
-   const unsigned expected_vertex_inputs =
-      profile == PVRGPU_PCO_SHADOW_MASK ? 4U : 8U;
-   const unsigned expected_fragment_shareds =
-      profile == PVRGPU_PCO_SHADOW_MASK ?
-         PVRGPU_TEXTURE_DESCRIPTOR_DWORDS : 0U;
-   if (out->vertex.abi.vertex_inputs != expected_vertex_inputs ||
-       out->vertex.abi.vertex_outputs != 4 + desc->varying_components ||
-       out->vertex.abi.coefficients != 0 ||
-       out->vertex.abi.shareds != desc->vertex_uniform_dwords ||
-       out->vertex.abi.push_constant_start != 0 ||
-       out->vertex.abi.push_constant_count != desc->vertex_uniform_dwords ||
-       out->fragment.abi.coefficients !=
-          4 + desc->varying_components * 4 ||
-       out->fragment.abi.shareds != expected_fragment_shareds ||
-       out->fragment.abi.push_constant_count != 0 ||
-       out->position_output_start != 0 || out->position_output_count != 4 ||
-       out->varying_output_start != 4 ||
-       out->varying_output_count != desc->varying_components ||
-       out->fragment_position_start != 0 ||
-       out->fragment_position_count != 4 ||
-       out->fragment_varying_start != 4 ||
-       out->fragment_varying_count != desc->varying_components * 4 ||
-       (profile == PVRGPU_PCO_SHADOW_MASK &&
-        (out->fragment_texture_descriptor_start != 0 ||
-         out->fragment_texture_descriptor_count !=
-            PVRGPU_TEXTURE_DESCRIPTOR_DWORDS ||
-         out->fragment_texture_descriptor_stride !=
-            PVRGPU_TEXTURE_DESCRIPTOR_DWORDS))) {
-      pvrgpu_pco_graphics_binary_finish(out);
-      ralloc_free(compile_mem_ctx);
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "compiled %s PCO ABI changed",
-                             desc->name);
-   }
+   out->fragment_varying_count = 16;
 
    ralloc_free(compile_mem_ctx);
    return true;
@@ -6800,6 +5172,2182 @@ pvrgpu_lower_terrain_d3_vertex_mediump(nir_shader *nir,
    return true;
 }
 
+
+static bool
+pvrgpu_validate_lit_mesh_variables(const nir_shader *nir,
+                                   unsigned varying_components,
+                                   const char *profile_name,
+                                   char *error,
+                                   size_t error_size)
+{
+   unsigned inputs = 0;
+   unsigned outputs = 0;
+
+   nir_foreach_variable_with_modes (var, nir, nir_var_shader_in) {
+      ++inputs;
+      if (nir->info.stage == MESA_SHADER_VERTEX) {
+         if ((var->data.location != VERT_ATTRIB_GENERIC0 &&
+              var->data.location != VERT_ATTRIB_GENERIC1) ||
+             glsl_get_components(var->type) != 4) {
+            return pvrgpu_pco_fail(error,
+                                   error_size,
+                                   "%s VS input ABI mismatch",
+                                   profile_name);
+         }
+      } else if (var->data.location != VARYING_SLOT_VAR0 ||
+                 glsl_get_components(var->type) != varying_components) {
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "%s FS varying ABI mismatch",
+                                profile_name);
+      }
+   }
+
+   nir_foreach_variable_with_modes (var, nir, nir_var_shader_out) {
+      ++outputs;
+      if (nir->info.stage == MESA_SHADER_VERTEX) {
+         if (var->data.location == VARYING_SLOT_POS) {
+            if (glsl_get_components(var->type) != 4) {
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "%s VS position ABI mismatch",
+                                      profile_name);
+            }
+         } else if (var->data.location != VARYING_SLOT_VAR0 ||
+                    glsl_get_components(var->type) != varying_components) {
+            return pvrgpu_pco_fail(error,
+                                   error_size,
+                                   "%s VS varying ABI mismatch",
+                                   profile_name);
+         }
+      } else if ((var->data.location != FRAG_RESULT_COLOR &&
+                  var->data.location != FRAG_RESULT_DATA0) ||
+                 glsl_get_components(var->type) != 4) {
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "%s FS output ABI mismatch",
+                                profile_name);
+      }
+   }
+
+   const unsigned expected_inputs =
+      nir->info.stage == MESA_SHADER_VERTEX ? 2U : 1U;
+   const unsigned expected_outputs =
+      nir->info.stage == MESA_SHADER_VERTEX ? 2U : 1U;
+   if (inputs != expected_inputs || outputs != expected_outputs) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "%s %s I/O count mismatch (%u/%u)",
+                             profile_name,
+                             nir->info.stage == MESA_SHADER_VERTEX ? "VS" :
+                                                                    "FS",
+                             inputs,
+                             outputs);
+   }
+   return true;
+}
+
+/* GLES mediump permits an implementation to retain fp32 precision.  Keep the
+ * captured fp32 SSA values intact so the PCO backend and llvmpipe golden run
+ * consume the same arithmetic; these gates validate the strict store shape
+ * without injecting an implementation-specific f16 round trip. */
+static bool
+pvrgpu_validate_lit_mesh_varying_store(nir_shader *nir,
+                                       unsigned varying_components,
+                                       const char *profile_name,
+                                       char *error,
+                                       size_t error_size)
+{
+   unsigned stores = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr_safe (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_deref)
+               continue;
+            nir_variable *var = nir_intrinsic_get_var(intr, 0);
+            if (!var || var->data.mode != nir_var_shader_out ||
+                var->data.location != VARYING_SLOT_VAR0)
+               continue;
+            if (stores++ || intr->src[1].ssa->bit_size != 32 ||
+                intr->src[1].ssa->num_components != varying_components) {
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "%s floating-point varying store changed",
+                                      profile_name);
+            }
+         }
+      }
+   }
+   if (stores != 1) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "%s requires one floating-point varying store",
+                             profile_name);
+   }
+   return true;
+}
+
+/* Gallivm lowers the captured GLSL dot products as a z/y/x sequence of
+ * individually rounded binary32 multiplies and adds.  PCO normally contracts
+ * those adds back into FMADs.  Keep only the profile-selected reductions
+ * split: applying prefers_split to the whole vertex shader also changes the
+ * otherwise bit-exact position matrix arithmetic and can move triangle edges.
+ */
+static bool
+pvrgpu_split_lit_mesh_dot3(nir_shader *nir,
+                           unsigned split_mask,
+                           unsigned expected_dots,
+                           const char *profile_name,
+                           char *error,
+                           size_t error_size)
+{
+   unsigned dot_index = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr_safe (instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *dot = nir_instr_as_alu(instr);
+            if (dot->op != nir_op_fdot3)
+               continue;
+
+            const bool split = split_mask & BITFIELD_BIT(dot_index++);
+            if (!split)
+               continue;
+            if (dot->def.bit_size != 32 || dot->def.num_components != 1) {
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "%s dot3 precision changed",
+                                      profile_name);
+            }
+
+            nir_builder builder = nir_builder_at(nir_before_instr(instr));
+            builder.fp_math_ctrl = dot->fp_math_ctrl | nir_fp_exact;
+            nir_def *left = nir_ssa_for_alu_src(&builder, dot, 0);
+            nir_def *right = nir_ssa_for_alu_src(&builder, dot, 1);
+            if (!left || !right || left->num_components != 3 ||
+                right->num_components != 3) {
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "%s dot3 sources changed",
+                                      profile_name);
+            }
+
+            nir_def *sum = NULL;
+            for (int component = 2; component >= 0; --component) {
+               nir_def *product = nir_fmul(
+                  &builder,
+                  nir_channel(&builder, left, (unsigned)component),
+                  nir_channel(&builder, right, (unsigned)component));
+               sum = sum ? nir_fadd(&builder, product, sum) : product;
+            }
+            nir_def_replace(&dot->def, sum);
+         }
+      }
+   }
+
+   if (dot_index != expected_dots ||
+       (split_mask & ~BITFIELD_MASK(dot_index))) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "%s dot3 graph changed (%u)",
+                             profile_name,
+                             dot_index);
+   }
+   return true;
+}
+
+static bool
+pvrgpu_split_shadow_scene_dot2(nir_shader *nir,
+                               const char *profile_name,
+                               char *error,
+                               size_t error_size)
+{
+   nir_alu_instr *lighting_dot = NULL;
+   unsigned dots = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->op == nir_op_fdot2) {
+               lighting_dot = alu;
+               ++dots;
+            }
+         }
+      }
+   }
+   if (dots != 1U || !lighting_dot || lighting_dot->def.bit_size != 32 ||
+       lighting_dot->def.num_components != 1) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "%s lighting dot2 graph changed (%u)",
+                             profile_name,
+                             dots);
+   }
+
+   nir_builder builder =
+      nir_builder_at(nir_before_instr(&lighting_dot->instr));
+   builder.fp_math_ctrl = lighting_dot->fp_math_ctrl | nir_fp_exact;
+   nir_def *left = nir_ssa_for_alu_src(&builder, lighting_dot, 0);
+   nir_def *right = nir_ssa_for_alu_src(&builder, lighting_dot, 1);
+   if (!left || !right || left->num_components != 2 ||
+       right->num_components != 2) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "%s lighting dot2 sources changed",
+                             profile_name);
+   }
+
+   nir_def *high = nir_fmul(&builder,
+                            nir_channel(&builder, left, 1),
+                            nir_channel(&builder, right, 1));
+   nir_def *low = nir_fmul(&builder,
+                           nir_channel(&builder, left, 0),
+                           nir_channel(&builder, right, 0));
+   nir_def *sum = nir_fadd(&builder, low, high);
+   nir_def_replace(&lighting_dot->def, sum);
+   return true;
+}
+
+static bool
+pvrgpu_validate_lit_mesh_fragment_output(nir_shader *nir,
+                                         const char *profile_name,
+                                         char *error,
+                                         size_t error_size)
+{
+   unsigned stores = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr_safe (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_deref)
+               continue;
+            nir_variable *var = nir_intrinsic_get_var(intr, 0);
+            if (!var || var->data.mode != nir_var_shader_out ||
+                (var->data.location != FRAG_RESULT_COLOR &&
+                 var->data.location != FRAG_RESULT_DATA0))
+               continue;
+            if (stores++ || intr->src[1].ssa->bit_size != 32 ||
+                intr->src[1].ssa->num_components != 4) {
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "%s floating-point fragment store changed",
+                                      profile_name);
+            }
+         }
+      }
+   }
+   if (stores != 1) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "%s requires one floating-point fragment store",
+                             profile_name);
+   }
+   return true;
+}
+
+/* The texture fragment source is mediump, and Gallivm's GLES lowering keeps
+ * the architectural half-precision boundaries visible in its generated IR:
+ * all four UNORM sample channels convert to binary16 with RTZ, the scalar
+ * lighting varying converts with RTNE, and each of the three RGB products is
+ * rounded to binary16 with RTNE before conversion back to the fp32 fragment
+ * output ABI.  Alpha is the RTZ-rounded sample alpha and is not multiplied.
+ *
+ * Preserve that operation-level graph explicitly.  This is intentionally
+ * narrower than blanket fragment quantization: texture coordinates and the
+ * interpolation machinery remain fp32, as do unrelated shader profiles. */
+static bool
+pvrgpu_lower_texture_fragment_mediump(nir_shader *nir,
+                                      char *error,
+                                      size_t error_size)
+{
+   nir_intrinsic_instr *varying_load = NULL;
+   nir_intrinsic_instr *color_store = NULL;
+   nir_tex_instr *sample = NULL;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type == nir_instr_type_intrinsic) {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_load_deref) {
+                  nir_variable *var = nir_intrinsic_get_var(intr, 0);
+                  if (var && var->data.mode == nir_var_shader_in &&
+                      var->data.location == VARYING_SLOT_VAR0) {
+                     if (varying_load)
+                        return pvrgpu_pco_fail(
+                           error,
+                           error_size,
+                           "texture mediump has duplicate varying load");
+                     varying_load = intr;
+                  }
+               } else if (intr->intrinsic == nir_intrinsic_store_deref) {
+                  nir_variable *var = nir_intrinsic_get_var(intr, 0);
+                  if (var && var->data.mode == nir_var_shader_out &&
+                      (var->data.location == FRAG_RESULT_COLOR ||
+                       var->data.location == FRAG_RESULT_DATA0)) {
+                     if (color_store)
+                        return pvrgpu_pco_fail(
+                           error,
+                           error_size,
+                           "texture mediump has duplicate color store");
+                     color_store = intr;
+                  }
+               }
+            } else if (instr->type == nir_instr_type_tex) {
+               if (sample)
+                  return pvrgpu_pco_fail(error,
+                                         error_size,
+                                         "texture mediump has duplicate sample");
+               sample = nir_instr_as_tex(instr);
+            }
+         }
+      }
+   }
+
+   if (!varying_load || varying_load->def.bit_size != 32 ||
+       varying_load->def.num_components != 3 || !sample ||
+       sample->def.bit_size != 32 || sample->def.num_components != 4 ||
+       !color_store || color_store->src[1].ssa->bit_size != 32 ||
+       color_store->src[1].ssa->num_components != 4) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "texture mediump I/O graph changed");
+   }
+
+   nir_builder b = nir_builder_at(nir_before_instr(&color_store->instr));
+   nir_def *light = nir_f2f32(
+      &b,
+      nir_f2f16_rtne(&b, nir_channel(&b, &varying_load->def, 0)));
+   nir_def *sample_half[4];
+   for (unsigned component = 0; component < 4; ++component) {
+      sample_half[component] = nir_f2f32(
+         &b,
+         nir_f2f16_rtz(&b, nir_channel(&b, &sample->def, component)));
+   }
+
+   nir_def *color[4];
+   for (unsigned component = 0; component < 3; ++component) {
+      nir_def *product = nir_fmul(&b, sample_half[component], light);
+      color[component] =
+         nir_f2f32(&b, nir_f2f16_rtne(&b, product));
+   }
+   color[3] = sample_half[3];
+   nir_src_rewrite(&color_store->src[1], nir_vec(&b, color, 4));
+
+   nir_progress(true,
+                nir_shader_get_entrypoint(nir),
+                nir_metadata_control_flow);
+   return true;
+}
+
+/* The bump fragment source has a default mediump float precision.  Its vertex
+ * shader intentionally remains fp32, including the smooth varying producer,
+ * while the fragment consumer and every fragment arithmetic result round to
+ * binary16.  The incoming and outgoing ABI is still fp32, so express each
+ * fragment precision boundary explicitly as an RTNE f16 round trip before the
+ * PCO backend lowers the fail-closed graph. */
+static bool
+pvrgpu_lower_bump_fragment_mediump(nir_shader *nir,
+                                   char *error,
+                                   size_t error_size)
+{
+   nir_lower_alu(nir);
+   nir_lower_alu_to_scalar(nir, NULL, NULL);
+
+   /* PCO expands fpow after this profile pass.  Expand the single captured
+    * power here so Gallivm's mediump boundaries are applied independently to
+    * log2, exponent multiplication, and exp2 rather than only to the result. */
+   unsigned powers = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr_safe (instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->op != nir_op_fpow)
+               continue;
+            if (powers++ || alu->def.bit_size != 32 ||
+                alu->def.num_components != 1) {
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "bump mediump power graph changed");
+            }
+
+            nir_builder b = nir_builder_at(nir_before_instr(instr));
+            nir_def *base = nir_ssa_for_alu_src(&b, alu, 0);
+            nir_def *exponent = nir_ssa_for_alu_src(&b, alu, 1);
+            nir_def *zero = nir_imm_float(&b, 0.0f);
+            nir_def *is_zero = nir_feq(&b, base, zero);
+            nir_def *logarithm = nir_flog2(&b, base);
+            nir_def *scaled = nir_fmul(&b, logarithm, exponent);
+            nir_def *power = nir_fexp2(&b, scaled);
+            nir_def *selected = nir_bcsel(&b, is_zero, zero, power);
+            nir_def_replace(&alu->def, selected);
+         }
+      }
+   }
+   if (powers != 1U) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "bump mediump power graph is missing");
+   }
+
+   unsigned varying_loads = 0;
+   unsigned stores = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr_safe (instr, block) {
+            nir_def *value = NULL;
+            if (instr->type == nir_instr_type_load_const) {
+               nir_load_const_instr *constant =
+                  nir_instr_as_load_const(instr);
+               if (constant->def.bit_size != 32) {
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "bump fragment constant precision changed");
+               }
+               value = &constant->def;
+            } else if (instr->type == nir_instr_type_intrinsic) {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_load_deref) {
+                  nir_variable *var = nir_intrinsic_get_var(intr, 0);
+                  if (!var || var->data.mode != nir_var_shader_in ||
+                      var->data.location != VARYING_SLOT_VAR0 ||
+                      varying_loads++ || intr->def.bit_size != 32 ||
+                      intr->def.num_components != 3) {
+                     return pvrgpu_pco_fail(
+                        error,
+                        error_size,
+                        "bump fragment varying load changed");
+                  }
+                  value = &intr->def;
+               } else if (intr->intrinsic == nir_intrinsic_store_deref) {
+                  nir_variable *var = nir_intrinsic_get_var(intr, 0);
+                  if (!var || var->data.mode != nir_var_shader_out ||
+                      (var->data.location != FRAG_RESULT_COLOR &&
+                       var->data.location != FRAG_RESULT_DATA0))
+                     continue;
+                  if (stores++ || intr->src[1].ssa->bit_size != 32 ||
+                      intr->src[1].ssa->num_components != 4) {
+                     return pvrgpu_pco_fail(
+                        error,
+                        error_size,
+                        "bump fragment result assignment changed");
+                  }
+               }
+            } else if (instr->type == nir_instr_type_alu) {
+               nir_alu_instr *alu = nir_instr_as_alu(instr);
+               switch (alu->op) {
+               case nir_op_fadd:
+               case nir_op_fmul:
+               case nir_op_fmax:
+               case nir_op_frcp:
+               case nir_op_frsq:
+               case nir_op_flog2:
+               case nir_op_fexp2:
+                  if (alu->def.bit_size != 32) {
+                     return pvrgpu_pco_fail(
+                        error,
+                        error_size,
+                        "bump fragment arithmetic precision changed");
+                  }
+                  value = &alu->def;
+                  break;
+               case nir_op_ffma:
+               case nir_op_ffma_weak:
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "bump fragment fused arithmetic changed");
+               default:
+                  break;
+               }
+            }
+
+            if (!value)
+               continue;
+            nir_builder b = nir_builder_at(nir_after_instr(instr));
+            if (instr->type == nir_instr_type_alu &&
+                nir_instr_as_alu(instr)->op == nir_op_frsq) {
+               /* LLVM's f16 frsq is a rounded half sqrt followed by a rounded
+                * half reciprocal.  Preserve both architectural boundaries
+                * while using the public fp32 Rogue operations. */
+               nir_def *sqrt_value = nir_frcp(&b, value);
+               nir_def *sqrt_rounded =
+                  nir_f2f32(&b, nir_f2f16_rtne(&b, sqrt_value));
+               nir_def *reciprocal = nir_frcp(&b, sqrt_rounded);
+               nir_def *rounded =
+                  nir_f2f32(&b, nir_f2f16_rtne(&b, reciprocal));
+               nir_def_rewrite_uses_after(value, rounded);
+               continue;
+            }
+            nir_def *half =
+               instr->type == nir_instr_type_load_const
+                  ? nir_f2f16_rtz(&b, value)
+                  : nir_f2f16_rtne(&b, value);
+            nir_def *rounded = nir_f2f32(&b, half);
+            nir_def_rewrite_uses_after(value, rounded);
+         }
+      }
+   }
+   if (varying_loads != 1 || stores != 1) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "bump mediump I/O signature changed");
+   }
+   return true;
+}
+
+/* Gallivm lowers the strict Refract composite fragment shader to an fp16
+ * arithmetic graph even though the Gallium-facing NIR and the PCO fragment
+ * ABI are fp32.  Keep those two interfaces unchanged and make each
+ * architectural half boundary explicit on the private compile clone:
+ *
+ *  - interpolated mediump varyings enter the graph through RTNE f16;
+ *  - every arithmetic result is rounded to f16 with RTNE;
+ *  - normalized texture results enter the graph through RTZ f16; and
+ *  - texture coordinates and the final color leave the graph as fp32.
+ *
+ * The source signature is validated before this profile-local pass runs.  In
+ * particular, this is not a generic fragment-output quantizer: fdot is first
+ * expanded in Gallivm's reverse component order, fpow exposes its half
+ * log2/multiply/exp2 boundaries, and half frsq preserves the rounded sqrt and
+ * reciprocal steps observed in the reference NIR/LLVM pipeline. */
+static bool
+pvrgpu_lower_refract_composite_fragment_mediump(nir_shader *nir,
+                                                 char *error,
+                                                 size_t error_size)
+{
+   if (!nir || nir->info.stage != MESA_SHADER_FRAGMENT) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "refract mediump requires a fragment shader");
+   }
+
+   nir_function_impl *entrypoint = NULL;
+   nir_foreach_function (function, nir) {
+      if (!function->impl)
+         continue;
+      if (entrypoint) {
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "refract mediump requires one entrypoint");
+      }
+      entrypoint = function->impl;
+   }
+   if (!entrypoint) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "refract mediump entrypoint is missing");
+   }
+
+   /* The captured Gallium NIR distributes the source-level scalar
+    * `2.0 * dot(normal, view)` into a vec3 splat multiply.  If that form were
+    * scalarized directly, it would introduce three independent fp16 rounding
+    * boundaries.  Gallivm's mediump NIR instead computes the scalar multiply
+    * once and then uses it for all three normal components.  Recognize only
+    * that exact dot3-times-2.0 splat and restore its source-level scalar
+    * boundary before general ALU scalarization. */
+   unsigned reconstructed_reflection_scales = 0;
+   nir_foreach_block (block, entrypoint) {
+      nir_foreach_instr_safe (instr, block) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         if (alu->op != nir_op_fmul || alu->def.bit_size != 32 ||
+             alu->def.num_components != 3)
+            continue;
+
+         bool splat[2] = { true, true };
+         for (unsigned src = 0; src < 2; ++src) {
+            for (unsigned component = 1; component < 3; ++component) {
+               if (alu->src[src].swizzle[component] !=
+                   alu->src[src].swizzle[0])
+                  splat[src] = false;
+            }
+         }
+         if (!splat[0] || !splat[1])
+            continue;
+
+         uint64_t src_bits[2] = { 0, 0 };
+         const bool src_is_const[2] = {
+            nir_alu_src_comp_get_uint(alu->src[0], 0, &src_bits[0]),
+            nir_alu_src_comp_get_uint(alu->src[1], 0, &src_bits[1]),
+         };
+         int factor_src = -1;
+         if (src_is_const[0] && src_bits[0] == UINT32_C(0x40000000))
+            factor_src = 0;
+         if (src_is_const[1] && src_bits[1] == UINT32_C(0x40000000)) {
+            if (factor_src >= 0)
+               continue;
+            factor_src = 1;
+         }
+         if (factor_src < 0)
+            continue;
+
+         const unsigned dot_src = 1U - (unsigned)factor_src;
+         nir_def *dot_def = alu->src[dot_src].src.ssa;
+         if (!dot_def || dot_def->bit_size != 32 ||
+             dot_def->num_components != 1 ||
+             nir_def_instr(dot_def)->type != nir_instr_type_alu ||
+             nir_instr_as_alu(nir_def_instr(dot_def))->op != nir_op_fdot3) {
+            continue;
+         }
+         if (reconstructed_reflection_scales++) {
+            return pvrgpu_pco_fail(
+               error,
+               error_size,
+               "refract mediump reflection scale is ambiguous");
+         }
+
+         nir_builder b = nir_builder_at(nir_before_instr(instr));
+         nir_def *dot = nir_channel(&b,
+                                    dot_def,
+                                    alu->src[dot_src].swizzle[0]);
+         nir_def *factor = nir_channel(
+            &b,
+            alu->src[factor_src].src.ssa,
+            alu->src[factor_src].swizzle[0]);
+         nir_def *scalar_scale = nir_fmul(&b, dot, factor);
+         nir_def_replace(&alu->def,
+                         nir_replicate(&b, scalar_scale, 3));
+      }
+   }
+   if (reconstructed_reflection_scales != 1) {
+      return pvrgpu_pco_fail(
+         error,
+         error_size,
+         "refract mediump reflection scale graph changed");
+   }
+
+   /* This expands each fdot3 as z*z + y*y + x*x, matching Gallivm's lowered
+    * mediump NIR.  The profile's prefers_split compiler option keeps the
+    * products and adds distinct. */
+   nir_lower_alu_to_scalar(nir, NULL, NULL);
+
+   /* PCO normally lowers fpow after this profile pass.  Expose the reference
+    * implementation here so the three fp16 operation boundaries are not
+    * collapsed into one final conversion. */
+   unsigned powers = 0;
+   nir_foreach_block (block, entrypoint) {
+      nir_foreach_instr_safe (instr, block) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         if (alu->op != nir_op_fpow)
+            continue;
+         if (powers++ || alu->def.bit_size != 32 ||
+             alu->def.num_components != 1) {
+            return pvrgpu_pco_fail(error,
+                                   error_size,
+                                   "refract mediump power graph changed");
+         }
+
+         nir_builder b = nir_builder_at(nir_before_instr(instr));
+         nir_def *base = nir_ssa_for_alu_src(&b, alu, 0);
+         nir_def *exponent = nir_ssa_for_alu_src(&b, alu, 1);
+         nir_def *zero = nir_imm_float(&b, 0.0f);
+         nir_def *is_zero = nir_feq(&b, base, zero);
+         nir_def *logarithm = nir_flog2(&b, base);
+         nir_def *scaled = nir_fmul(&b, logarithm, exponent);
+         nir_def *power = nir_fexp2(&b, scaled);
+         nir_def *selected = nir_bcsel(&b, is_zero, zero, power);
+         nir_def_replace(&alu->def, selected);
+      }
+   }
+   if (powers != 1) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "refract mediump power graph is missing");
+   }
+
+   unsigned input_mask = 0;
+   unsigned input_loads = 0;
+   unsigned textures = 0;
+   unsigned stores = 0;
+   unsigned rounded_arithmetic = 0;
+   unsigned rounded_constants = 0;
+   unsigned reconstructed_constants = 0;
+   nir_foreach_block (block, entrypoint) {
+      nir_foreach_instr_safe (instr, block) {
+         nir_def *value = NULL;
+         bool texture_value = false;
+         bool reconstruct_inverse_ior_squared = false;
+
+         switch (instr->type) {
+         case nir_instr_type_load_const: {
+            nir_load_const_instr *constant =
+               nir_instr_as_load_const(instr);
+            if (constant->def.bit_size != 32) {
+               return pvrgpu_pco_fail(
+                  error,
+                  error_size,
+                  "refract mediump constant precision changed");
+            }
+            value = &constant->def;
+            /* The GLES precision pass sees (1.0 / 1.2)^2 before the fp32
+             * optimizer folds it to 0x3f31c71c.  It therefore rounds 1/1.2
+             * to half first and folds the half product to 0x398f.  Rebuild
+             * that one source-level provenance boundary explicitly. */
+            if (constant->def.num_components == 1 &&
+                constant->value[0].u32 == UINT32_C(0x3f31c71c)) {
+               reconstruct_inverse_ior_squared = true;
+               ++reconstructed_constants;
+            }
+            ++rounded_constants;
+            break;
+         }
+         case nir_instr_type_intrinsic: {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_load_deref) {
+               nir_variable *var = nir_intrinsic_get_var(intr, 0);
+               if (!var || var->data.mode != nir_var_shader_in ||
+                   var->data.location < VARYING_SLOT_VAR0 ||
+                   var->data.location > VARYING_SLOT_VAR2 ||
+                   intr->def.bit_size != 32) {
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "refract mediump varying load changed");
+               }
+               const unsigned index =
+                  var->data.location - VARYING_SLOT_VAR0;
+               const unsigned expected_components = index < 2 ? 4 : 3;
+               if ((input_mask & BITFIELD_BIT(index)) ||
+                   intr->def.num_components != expected_components) {
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "refract mediump varying signature changed");
+               }
+               input_mask |= BITFIELD_BIT(index);
+               ++input_loads;
+               value = &intr->def;
+            } else if (intr->intrinsic == nir_intrinsic_store_deref) {
+               nir_variable *var = nir_intrinsic_get_var(intr, 0);
+               if (!var || var->data.mode != nir_var_shader_out ||
+                   (var->data.location != FRAG_RESULT_COLOR &&
+                    var->data.location != FRAG_RESULT_DATA0))
+                  continue;
+               if (stores++ || intr->src[1].ssa->bit_size != 32 ||
+                   intr->src[1].ssa->num_components != 4) {
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "refract mediump fragment store changed");
+               }
+            }
+            break;
+         }
+         case nir_instr_type_tex: {
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            if (tex->texture_index >= PVRGPU_REFRACT_TEXTURE_COUNT ||
+                tex->sampler_index != tex->texture_index ||
+                (textures & BITFIELD_BIT(tex->texture_index)) ||
+                tex->def.bit_size != 32 || tex->def.num_components != 4) {
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "refract mediump texture graph changed");
+            }
+            textures |= BITFIELD_BIT(tex->texture_index);
+            value = &tex->def;
+            texture_value = true;
+            break;
+         }
+         case nir_instr_type_alu: {
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            switch (alu->op) {
+            case nir_op_fadd:
+            case nir_op_fmul:
+            case nir_op_fdiv:
+            case nir_op_fsqrt:
+            case nir_op_flog2:
+            case nir_op_fexp2:
+               if (alu->def.bit_size != 32) {
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "refract mediump arithmetic precision changed");
+               }
+               value = &alu->def;
+               ++rounded_arithmetic;
+               break;
+            case nir_op_frsq: {
+               if (alu->def.bit_size != 32 ||
+                   alu->def.num_components != 1) {
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "refract mediump reciprocal sqrt changed");
+               }
+               /* LLVM implements half frsq as a rounded half sqrt followed
+                * by a rounded half division of 1.0 by that sqrt. */
+               nir_builder b = nir_builder_at(nir_after_instr(instr));
+               nir_def *sqrt_value = nir_frcp(&b, &alu->def);
+               nir_def *sqrt_rounded = nir_f2f32(
+                  &b, nir_f2f16_rtne(&b, sqrt_value));
+               nir_def *reciprocal = nir_frcp(&b, sqrt_rounded);
+               nir_def *rounded = nir_f2f32(
+                  &b, nir_f2f16_rtne(&b, reciprocal));
+               nir_def_rewrite_uses_after(&alu->def, rounded);
+               ++rounded_arithmetic;
+               continue;
+            }
+            case nir_op_fneg:
+            case nir_op_fmax:
+            case nir_op_flt:
+            case nir_op_feq:
+            case nir_op_bcsel:
+            case nir_op_mov:
+            case nir_op_vec2:
+            case nir_op_vec3:
+            case nir_op_vec4:
+               /* These either produce a Boolean or select/rearrange an
+                * already representable half value without new rounding. */
+               break;
+            case nir_op_ffma:
+            case nir_op_ffma_weak:
+            case nir_op_fdot3:
+            case nir_op_fpow:
+               return pvrgpu_pco_fail(
+                  error,
+                  error_size,
+                  "refract mediump retained fused arithmetic %s",
+                  nir_op_infos[alu->op].name);
+            default:
+               return pvrgpu_pco_fail(
+                  error,
+                  error_size,
+                  "refract mediump contains unsupported arithmetic %s",
+                  nir_op_infos[alu->op].name);
+            }
+            break;
+         }
+         case nir_instr_type_deref:
+            break;
+         default:
+            return pvrgpu_pco_fail(
+               error,
+               error_size,
+               "refract mediump contains unsupported instruction type %u",
+               instr->type);
+         }
+
+         if (!value)
+            continue;
+
+         nir_builder b = nir_builder_at(nir_after_instr(instr));
+         nir_def *rounded;
+         if (texture_value) {
+            nir_def *channels[4];
+            for (unsigned component = 0; component < 4; ++component) {
+               channels[component] = nir_f2f32(
+                  &b,
+                  nir_f2f16_rtz(
+                     &b, nir_channel(&b, value, component)));
+            }
+            rounded = nir_vec(&b, channels, 4);
+         } else {
+            nir_def *round_source = value;
+            if (reconstruct_inverse_ior_squared) {
+               round_source =
+                  nir_imm_float(&b, 0.69482421875f); /* binary16 0x398f */
+            }
+            rounded = nir_f2f32(
+               &b, nir_f2f16_rtne(&b, round_source));
+         }
+         nir_def_rewrite_uses_after(value, rounded);
+      }
+   }
+
+   if (input_loads != 3 || input_mask != 0x7 || textures != 0x7 ||
+       stores != 1 || rounded_constants != 13 ||
+       rounded_arithmetic != 127 || reconstructed_constants != 1) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "refract mediump lowered graph signature changed "
+                             "(inputs=%u/%x textures=%x stores=%u constants=%u "
+                             "arithmetic=%u reconstructed=%u)",
+                             input_loads,
+                             input_mask,
+                             textures,
+                             stores,
+                             rounded_constants,
+                             rounded_arithmetic,
+                             reconstructed_constants);
+   }
+
+   nir_progress(true, entrypoint, nir_metadata_control_flow);
+   return true;
+}
+
+static void
+pvrgpu_init_lit_mesh_shader_data(pco_data *vertex_data,
+                                 pco_data *fragment_data,
+                                 unsigned varying_components)
+{
+   vertex_data->vs.attrib_formats[VERT_ATTRIB_GENERIC0] =
+      PIPE_FORMAT_R32G32B32_FLOAT;
+   vertex_data->vs.attrib_formats[VERT_ATTRIB_GENERIC1] =
+      PIPE_FORMAT_R32G32B32_FLOAT;
+   vertex_data->vs.attribs[VERT_ATTRIB_GENERIC0] = (pco_range){
+      .start = 0,
+      .count = 4,
+   };
+   vertex_data->vs.attribs[VERT_ATTRIB_GENERIC1] = (pco_range){
+      .start = 4,
+      .count = 4,
+   };
+   vertex_data->common.vtxins = 8;
+   vertex_data->vs.varyings[VARYING_SLOT_POS] = (pco_range){
+      .start = 0,
+      .count = 4,
+   };
+   vertex_data->vs.varyings[VARYING_SLOT_VAR0] = (pco_range){
+      .start = 4,
+      .count = varying_components,
+   };
+   vertex_data->vs.vtxouts = 4 + varying_components;
+   vertex_data->vs.f32_smooth = varying_components;
+
+   /* Smooth interpolation consumes one four-DWORD W plane followed by one
+    * four-DWORD coefficient set per scalar varying component. */
+   fragment_data->fs.uses.w = true;
+   fragment_data->fs.varyings[VARYING_SLOT_POS] = (pco_range){
+      .start = 0,
+      .count = 4,
+   };
+   fragment_data->fs.varyings[VARYING_SLOT_VAR0] = (pco_range){
+      .start = 4,
+      .count = varying_components * 4,
+   };
+   fragment_data->common.coeffs = 4 + varying_components * 4;
+   fragment_data->fs.z_replicate = ~0U;
+   fragment_data->fs.rasterization_samples = 1;
+}
+
+static bool
+pvrgpu_init_texture_shader_data(pco_data *vertex_data,
+                                pco_data *fragment_data,
+                                void *compile_mem_ctx,
+                                char *error,
+                                size_t error_size)
+{
+   pvrgpu_init_lit_mesh_shader_data(vertex_data, fragment_data, 3);
+   vertex_data->vs.attrib_formats[VERT_ATTRIB_GENERIC2] =
+      PIPE_FORMAT_R32G32_FLOAT;
+   vertex_data->vs.attribs[VERT_ATTRIB_GENERIC2] = (pco_range){
+      .start = 8,
+      .count = 4,
+   };
+   vertex_data->common.vtxins = 12;
+
+   pco_descriptor_set_data *set = &fragment_data->common.desc_sets[0];
+   set->binding_count = 1;
+   set->bindings = rzalloc_array(compile_mem_ctx, pco_binding_data, 1);
+   if (!set->bindings)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "out of memory allocating texture descriptor ABI");
+
+   set->range = (pco_range){
+      .start = 0,
+      .count = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+   };
+   set->used = true;
+   set->bindings[0].range = (pco_range){
+      .start = 0,
+      .count = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+      .stride = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+   };
+   set->bindings[0].used = true;
+   set->bindings[0].is_img_smp = true;
+   fragment_data->common.shareds = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
+   return true;
+}
+
+static bool
+pvrgpu_init_refract_shader_data(enum pvrgpu_pco_refract_profile profile,
+                                pco_data *vertex_data,
+                                pco_data *fragment_data,
+                                void *compile_mem_ctx,
+                                char *error,
+                                size_t error_size)
+{
+   if (profile == PVRGPU_PCO_REFRACT_PREPASS) {
+      pvrgpu_init_lit_mesh_shader_data(vertex_data, fragment_data, 3);
+      return true;
+   }
+
+   vertex_data->vs.attrib_formats[VERT_ATTRIB_GENERIC0] =
+      PIPE_FORMAT_R32G32B32_FLOAT;
+   vertex_data->vs.attrib_formats[VERT_ATTRIB_GENERIC1] =
+      PIPE_FORMAT_R32G32B32_FLOAT;
+   vertex_data->vs.attribs[VERT_ATTRIB_GENERIC0] = (pco_range){
+      .start = 0,
+      .count = 4,
+   };
+   vertex_data->vs.attribs[VERT_ATTRIB_GENERIC1] = (pco_range){
+      .start = 4,
+      .count = 4,
+   };
+   vertex_data->common.vtxins = 8;
+   vertex_data->vs.varyings[VARYING_SLOT_POS] = (pco_range){
+      .start = 0,
+      .count = 4,
+   };
+   vertex_data->vs.varyings[VARYING_SLOT_VAR0] = (pco_range){
+      .start = 4,
+      .count = 4,
+   };
+   vertex_data->vs.varyings[VARYING_SLOT_VAR1] = (pco_range){
+      .start = 8,
+      .count = 4,
+   };
+   vertex_data->vs.varyings[VARYING_SLOT_VAR2] = (pco_range){
+      .start = 12,
+      .count = 3,
+   };
+   vertex_data->vs.vtxouts = 15;
+   vertex_data->vs.f32_smooth = 11;
+
+   fragment_data->fs.uses.w = true;
+   fragment_data->fs.varyings[VARYING_SLOT_POS] = (pco_range){
+      .start = 0,
+      .count = 4,
+   };
+   fragment_data->fs.varyings[VARYING_SLOT_VAR0] = (pco_range){
+      .start = 4,
+      .count = 16,
+   };
+   fragment_data->fs.varyings[VARYING_SLOT_VAR1] = (pco_range){
+      .start = 20,
+      .count = 16,
+   };
+   fragment_data->fs.varyings[VARYING_SLOT_VAR2] = (pco_range){
+      .start = 36,
+      .count = 12,
+   };
+   fragment_data->common.coeffs = 48;
+   fragment_data->fs.z_replicate = ~0U;
+   fragment_data->fs.rasterization_samples = 1;
+
+   /* Gallium NIR represents texture unit N as descriptor set N, binding 0.
+    * Keep the three image/sampler descriptors contiguous in shared storage,
+    * while describing that set layout exactly to PCO lowering. */
+   for (unsigned texture = 0; texture < PVRGPU_REFRACT_TEXTURE_COUNT;
+        ++texture) {
+      pco_descriptor_set_data *set =
+         &fragment_data->common.desc_sets[texture];
+      set->binding_count = 1;
+      set->bindings = rzalloc_array(compile_mem_ctx, pco_binding_data, 1);
+      if (!set->bindings) {
+         return pvrgpu_pco_fail(
+            error,
+            error_size,
+            "out of memory allocating refract descriptor set %u",
+            texture);
+      }
+      set->range = (pco_range){
+         .start = texture * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+         .count = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+      };
+      set->used = true;
+      set->bindings[0].range = (pco_range){
+         .start = texture * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+         .count = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+         .stride = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+      };
+      set->bindings[0].used = true;
+      set->bindings[0].is_img_smp = true;
+   }
+   fragment_data->common.shareds = PVRGPU_REFRACT_DESCRIPTOR_DWORDS;
+   return true;
+}
+
+static bool
+pvrgpu_init_shadow_shader_data(enum pvrgpu_pco_shadow_profile profile,
+                               pco_data *vertex_data,
+                               pco_data *fragment_data,
+                               void *compile_mem_ctx,
+                               char *error,
+                               size_t error_size)
+{
+   if (profile == PVRGPU_PCO_SHADOW_SCENE) {
+      pvrgpu_init_lit_mesh_shader_data(vertex_data, fragment_data, 1);
+      return true;
+   }
+   if (profile != PVRGPU_PCO_SHADOW_MASK)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "invalid non-depth shadow shader-data profile");
+
+   vertex_data->vs.attrib_formats[VERT_ATTRIB_GENERIC0] =
+      PIPE_FORMAT_R32G32_FLOAT;
+   vertex_data->vs.attribs[VERT_ATTRIB_GENERIC0] = (pco_range){
+      .start = 0,
+      .count = 4,
+   };
+   vertex_data->common.vtxins = 4;
+   vertex_data->vs.varyings[VARYING_SLOT_POS] = (pco_range){
+      .start = 0,
+      .count = 4,
+   };
+   vertex_data->vs.varyings[VARYING_SLOT_VAR0] = (pco_range){
+      .start = 4,
+      .count = 4,
+   };
+   vertex_data->vs.vtxouts = 8;
+   vertex_data->vs.f32_smooth = 4;
+
+   fragment_data->fs.uses.w = true;
+   fragment_data->fs.varyings[VARYING_SLOT_POS] = (pco_range){
+      .start = 0,
+      .count = 4,
+   };
+   fragment_data->fs.varyings[VARYING_SLOT_VAR0] = (pco_range){
+      .start = 4,
+      .count = 16,
+   };
+   fragment_data->common.coeffs = 20;
+   fragment_data->fs.z_replicate = ~0U;
+   fragment_data->fs.rasterization_samples = 1;
+
+   pco_descriptor_set_data *set = &fragment_data->common.desc_sets[0];
+   set->binding_count = 1;
+   set->bindings = rzalloc_array(compile_mem_ctx, pco_binding_data, 1);
+   if (!set->bindings)
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "out of memory allocating shadow descriptor ABI");
+   set->range = (pco_range){
+      .start = 0,
+      .count = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+   };
+   set->used = true;
+   set->bindings[0].range = (pco_range){
+      .start = 0,
+      .count = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+      .stride = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+   };
+   set->bindings[0].used = true;
+   set->bindings[0].is_img_smp = true;
+   fragment_data->common.shareds = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
+   return true;
+}
+
+static bool
+pvrgpu_init_terrain_descriptors(pco_data *data,
+                                unsigned texture_count,
+                                void *compile_mem_ctx,
+                                const char *profile_name,
+                                const char *stage,
+                                char *error,
+                                size_t error_size)
+{
+   if (!texture_count)
+      return true;
+   pco_descriptor_set_data *set = &data->common.desc_sets[0];
+   set->binding_count = texture_count;
+   set->bindings =
+      rzalloc_array(compile_mem_ctx, pco_binding_data, texture_count);
+   if (!set->bindings) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "out of memory allocating %s %s descriptors",
+                             profile_name,
+                             stage);
+   }
+   set->range = (pco_range){
+      .start = 0,
+      .count = texture_count * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+   };
+   set->used = true;
+   for (unsigned texture = 0; texture < texture_count; ++texture) {
+      set->bindings[texture].range = (pco_range){
+         .start = texture * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+         .count = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+         .stride = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+      };
+      set->bindings[texture].used = true;
+      set->bindings[texture].is_img_smp = true;
+   }
+   data->common.shareds =
+      texture_count * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
+   return true;
+}
+
+static bool
+pvrgpu_init_terrain_shader_data(enum pvrgpu_pco_terrain_profile profile,
+                                pco_data *vertex_data,
+                                pco_data *fragment_data,
+                                void *compile_mem_ctx,
+                                char *error,
+                                size_t error_size)
+{
+   const struct pvrgpu_terrain_pco_desc *desc =
+      &pvrgpu_terrain_profiles[profile];
+   const bool main = profile == PVRGPU_PCO_TERRAIN_D3;
+   const unsigned vertex_inputs = main ? 4U : 1U;
+   for (unsigned input = 0; input < vertex_inputs; ++input) {
+      const enum pipe_format format =
+         main && input == 3U ? PIPE_FORMAT_R32G32_FLOAT :
+                               PIPE_FORMAT_R32G32B32_FLOAT;
+      const unsigned start = input * 4U;
+      vertex_data->vs.attrib_formats[VERT_ATTRIB_GENERIC0 + input] = format;
+      vertex_data->vs.attribs[VERT_ATTRIB_GENERIC0 + input] = (pco_range){
+         .start = start,
+         .count = 4,
+      };
+   }
+   vertex_data->common.vtxins = vertex_inputs * 4U;
+   vertex_data->vs.varyings[VARYING_SLOT_POS] = (pco_range){
+      .start = 0,
+      .count = 4,
+   };
+   if (main) {
+      vertex_data->vs.varyings[VARYING_SLOT_VAR0] = (pco_range){ 4, 4 };
+      vertex_data->vs.varyings[VARYING_SLOT_VAR1] = (pco_range){ 8, 4 };
+      vertex_data->vs.varyings[VARYING_SLOT_VAR2] = (pco_range){ 12, 4 };
+      vertex_data->vs.varyings[VARYING_SLOT_VAR3] = (pco_range){ 16, 2 };
+      vertex_data->vs.vtxouts = 18;
+      vertex_data->vs.f32_smooth = 14;
+   } else {
+      vertex_data->vs.varyings[VARYING_SLOT_VAR0] = (pco_range){ 4, 2 };
+      vertex_data->vs.vtxouts = 6;
+      vertex_data->vs.f32_smooth = 2;
+   }
+
+   fragment_data->fs.uses.w = true;
+   fragment_data->fs.varyings[VARYING_SLOT_POS] = (pco_range){ 0, 4 };
+   if (main) {
+      fragment_data->fs.varyings[VARYING_SLOT_VAR0] = (pco_range){ 4, 16 };
+      fragment_data->fs.varyings[VARYING_SLOT_VAR1] = (pco_range){ 20, 16 };
+      fragment_data->fs.varyings[VARYING_SLOT_VAR2] = (pco_range){ 36, 16 };
+      fragment_data->fs.varyings[VARYING_SLOT_VAR3] = (pco_range){ 52, 8 };
+   } else {
+      fragment_data->fs.varyings[VARYING_SLOT_VAR0] = (pco_range){ 4, 8 };
+   }
+   fragment_data->common.coeffs = 4 + desc->varying_components * 4U;
+   fragment_data->fs.z_replicate = ~0U;
+   fragment_data->fs.rasterization_samples = 1;
+
+   return pvrgpu_init_terrain_descriptors(vertex_data,
+                                           desc->vertex_texture_count,
+                                           compile_mem_ctx,
+                                           desc->name,
+                                           "VS",
+                                           error,
+                                           error_size) &&
+          pvrgpu_init_terrain_descriptors(fragment_data,
+                                           desc->fragment_texture_count,
+                                           compile_mem_ctx,
+                                           desc->name,
+                                           "FS",
+                                           error,
+                                           error_size);
+}
+
+static bool
+pvrgpu_pack_terrain_texture_bindings(nir_shader *nir,
+                                     unsigned texture_count,
+                                     unsigned expected_texture_ops,
+                                     const char *profile_name,
+                                     char *error,
+                                     size_t error_size)
+{
+   /* The driver command packs sampled resources in first-use order.  PCO
+    * descriptor sets must use the same order; raw GLSL binding numbers are
+    * not necessarily monotonic (Terrain D3 uses VS {1, 0} and FS
+    * {2, 0, 1, 4, 3}). */
+   uint16_t binding_to_set[9];
+   if (texture_count > ARRAY_SIZE(binding_to_set)) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "%s has too many unique texture bindings",
+                             profile_name);
+   }
+   for (unsigned binding = 0; binding < ARRAY_SIZE(binding_to_set);
+        ++binding)
+      binding_to_set[binding] = UINT16_MAX;
+
+   unsigned rewritten = 0;
+   unsigned unique_bindings = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            if (tex->texture_index != tex->sampler_index ||
+                tex->texture_index >= texture_count ||
+                tex->texture_index > UINT16_MAX) {
+               return pvrgpu_pco_fail(error,
+                                      error_size,
+                                      "%s texture binding is out of range",
+                                      profile_name);
+            }
+            const unsigned binding = tex->texture_index;
+            if (binding_to_set[binding] == UINT16_MAX)
+               binding_to_set[binding] = unique_bindings++;
+            const uint32_t packed = binding_to_set[binding] << 16U;
+            tex->texture_index = packed;
+            tex->sampler_index = packed;
+            ++rewritten;
+         }
+      }
+      nir_progress(rewritten != 0, impl, nir_metadata_control_flow);
+   }
+   if (rewritten != expected_texture_ops ||
+       unique_bindings != texture_count) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "%s rewrote %u texture ops/%u bindings, "
+                             "expected %u/%u",
+                             profile_name,
+                             rewritten,
+                             unique_bindings,
+                             expected_texture_ops,
+                             texture_count);
+   }
+   return true;
+}
+
+bool pvrgpu_pco_compile_lit_mesh(
+   struct pvrgpu_pco_compiler *compiler,
+   const nir_shader *vertex_nir,
+   const nir_shader *fragment_nir,
+   enum pvrgpu_pco_lit_mesh_profile profile,
+   struct pvrgpu_pco_graphics_binary *out,
+   char *error,
+   size_t error_size)
+{
+   if (error && error_size)
+      error[0] = '\0';
+   if (!out)
+      return pvrgpu_pco_fail(error, error_size, "missing PCO output object");
+   memset(out, 0, sizeof(*out));
+
+   if (!compiler || !compiler->pco || !vertex_nir || !fragment_nir ||
+       profile < PVRGPU_PCO_LIT_MESH_BUILD ||
+       profile > PVRGPU_PCO_LIT_MESH_SHADING) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "missing compiler or invalid lit-mesh profile");
+   }
+   const struct pvrgpu_lit_mesh_desc *desc =
+      &pvrgpu_lit_mesh_profiles[profile];
+   if (vertex_nir->info.stage != MESA_SHADER_VERTEX ||
+       fragment_nir->info.stage != MESA_SHADER_FRAGMENT ||
+       !pvrgpu_source_hash_matches(vertex_nir, desc->vertex_source_hash) ||
+       !pvrgpu_source_hash_matches(fragment_nir, desc->fragment_source_hash) ||
+       !pvrgpu_validate_lit_mesh_variables(vertex_nir,
+                                           desc->varying_components,
+                                           desc->name,
+                                           error,
+                                           error_size) ||
+       !pvrgpu_validate_lit_mesh_variables(fragment_nir,
+                                           desc->varying_components,
+                                           desc->name,
+                                           error,
+                                           error_size)) {
+      if (error && error_size && error[0] == '\0')
+         snprintf(error, error_size, "%s NIR source signature mismatch", desc->name);
+      return false;
+   }
+
+   void *compile_mem_ctx = ralloc_context(compiler->mem_ctx);
+   if (!compile_mem_ctx)
+      return pvrgpu_pco_fail(error, error_size, "out of memory cloning NIR");
+   nir_shader *vs = nir_shader_clone(compile_mem_ctx, vertex_nir);
+   nir_shader *fs = nir_shader_clone(compile_mem_ctx, fragment_nir);
+   if (!vs || !fs) {
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "failed to clone %s NIR",
+                             desc->name);
+   }
+
+   vs->info.internal = true;
+   fs->info.internal = true;
+   vs->options = pco_nir_options();
+   fs->options = pco_nir_options();
+   nir_shader_compiler_options bump_fragment_options;
+   if (profile == PVRGPU_PCO_LIT_MESH_BUMP) {
+      bump_fragment_options = *pco_nir_options();
+      bump_fragment_options.float_mul_add32 &=
+         ~nir_float_muladd_support_fuse;
+      bump_fragment_options.float_mul_add32 |=
+         nir_float_muladd_support_prefers_split;
+      fs->options = &bump_fragment_options;
+   }
+   nir_lower_fragcolor(fs, 1);
+
+   if (!pvrgpu_validate_lit_mesh_varying_store(vs,
+                                               desc->varying_components,
+                                               desc->name,
+                                               error,
+                                               error_size) ||
+       ((profile == PVRGPU_PCO_LIT_MESH_BUILD ||
+         profile == PVRGPU_PCO_LIT_MESH_BUMP) &&
+        !pvrgpu_split_lit_mesh_dot3(
+           vs,
+           BITFIELD_BIT(0),
+           profile == PVRGPU_PCO_LIT_MESH_BUILD ? 2U : 1U,
+           desc->name,
+           error,
+           error_size)) ||
+       !pvrgpu_validate_lit_mesh_fragment_output(fs,
+                                                 desc->name,
+                                                 error,
+                                                 error_size) ||
+       (profile == PVRGPU_PCO_LIT_MESH_BUMP &&
+        !pvrgpu_lower_bump_fragment_mediump(fs, error, error_size)) ||
+       !pvrgpu_canonicalize_fragment_output(fs,
+                                            desc->name,
+                                            error,
+                                            error_size) ||
+       !pvrgpu_lower_uniform_slots_to_push_constants(
+          vs,
+          PVRGPU_LIT_MESH_VS_UNIFORM_DWORDS,
+          8,
+          desc->name,
+          error,
+          error_size)) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+
+   pco_data vertex_data = { 0 };
+   pco_data fragment_data = { 0 };
+   pvrgpu_init_lit_mesh_shader_data(&vertex_data,
+                                    &fragment_data,
+                                    desc->varying_components);
+
+   pco_preprocess_nir(compiler->pco, vs);
+   pco_preprocess_nir(compiler->pco, fs);
+   pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
+   pco_rev_link_nir(compiler->pco, vs, fs);
+   pco_lower_nir(compiler->pco, vs, &vertex_data);
+   pco_lower_nir(compiler->pco, fs, &fragment_data);
+   pco_postprocess_nir(compiler->pco, vs, &vertex_data);
+   pco_postprocess_nir(compiler->pco, fs, &fragment_data);
+
+   if (!pvrgpu_allocate_push_constants(&vertex_data,
+                                       PVRGPU_LIT_MESH_VS_UNIFORM_DWORDS,
+                                       31,
+                                       desc->name,
+                                       "VS",
+                                       error,
+                                       error_size)) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+
+   pco_shader *vertex =
+      pco_trans_nir(compiler->pco, vs, &vertex_data, compile_mem_ctx);
+   pco_shader *fragment =
+      pco_trans_nir(compiler->pco, fs, &fragment_data, compile_mem_ctx);
+   if (!vertex || !fragment) {
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "PCO failed to translate %s NIR",
+                             desc->name);
+   }
+   pco_process_ir(compiler->pco, vertex);
+   pco_process_ir(compiler->pco, fragment);
+   pco_encode_ir(compiler->pco, vertex);
+   pco_encode_ir(compiler->pco, fragment);
+
+   if (!pvrgpu_copy_pco_stage(vertex, true, &out->vertex, error, error_size) ||
+       !pvrgpu_copy_pco_stage(fragment,
+                              false,
+                              &out->fragment,
+                              error,
+                              error_size)) {
+      pvrgpu_pco_graphics_binary_finish(out);
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+
+   out->position_output_start =
+      vertex_data.vs.varyings[VARYING_SLOT_POS].start;
+   out->position_output_count =
+      vertex_data.vs.varyings[VARYING_SLOT_POS].count;
+   out->fragment_position_start =
+      fragment_data.fs.varyings[VARYING_SLOT_POS].start;
+   out->fragment_position_count =
+      fragment_data.fs.varyings[VARYING_SLOT_POS].count;
+   out->varying_output_start =
+      vertex_data.vs.varyings[VARYING_SLOT_VAR0].start;
+   out->varying_output_count =
+      vertex_data.vs.varyings[VARYING_SLOT_VAR0].count;
+   out->fragment_varying_start =
+      fragment_data.fs.varyings[VARYING_SLOT_VAR0].start;
+   out->fragment_varying_count =
+      fragment_data.fs.varyings[VARYING_SLOT_VAR0].count;
+
+   if (out->vertex.abi.vertex_inputs != 8 ||
+       out->vertex.abi.vertex_outputs != 4 + desc->varying_components ||
+       out->vertex.abi.shareds != PVRGPU_LIT_MESH_VS_UNIFORM_DWORDS ||
+       out->vertex.abi.push_constant_count !=
+          PVRGPU_LIT_MESH_VS_UNIFORM_DWORDS ||
+       out->fragment.abi.shareds != 0 ||
+       out->fragment.abi.push_constant_count != 0 ||
+       out->position_output_start != 0 || out->position_output_count != 4 ||
+       out->varying_output_start != 4 ||
+       out->varying_output_count != desc->varying_components ||
+       out->fragment_position_start != 0 ||
+       out->fragment_position_count != 4 ||
+       out->fragment_varying_start != 4 ||
+       out->fragment_varying_count != desc->varying_components * 4) {
+      pvrgpu_pco_graphics_binary_finish(out);
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "compiled %s PCO ABI changed",
+                             desc->name);
+   }
+
+   ralloc_free(compile_mem_ctx);
+   return true;
+}
+
+bool pvrgpu_pco_compile_texture(
+   struct pvrgpu_pco_compiler *compiler,
+   const nir_shader *vertex_nir,
+   const nir_shader *fragment_nir,
+   struct pvrgpu_pco_graphics_binary *out,
+   char *error,
+   size_t error_size)
+{
+   if (error && error_size)
+      error[0] = '\0';
+   if (!out)
+      return pvrgpu_pco_fail(error, error_size, "missing PCO output object");
+   memset(out, 0, sizeof(*out));
+
+   if (!compiler || !compiler->pco || !vertex_nir || !fragment_nir) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "missing compiler or texture NIR stage");
+   }
+   if (!pvrgpu_source_hash_matches(vertex_nir,
+                                   pvrgpu_texture_vertex_source_hash) ||
+       !pvrgpu_source_hash_matches(fragment_nir,
+                                   pvrgpu_texture_fragment_source_hash) ||
+       !pvrgpu_validate_texture_nir(vertex_nir,
+                                    MESA_SHADER_VERTEX,
+                                    error,
+                                    error_size) ||
+       !pvrgpu_validate_texture_nir(fragment_nir,
+                                    MESA_SHADER_FRAGMENT,
+                                    error,
+                                    error_size)) {
+      if (error && error_size && error[0] == '\0')
+         snprintf(error, error_size, "texture NIR source signature mismatch");
+      return false;
+   }
+
+   void *compile_mem_ctx = ralloc_context(compiler->mem_ctx);
+   if (!compile_mem_ctx)
+      return pvrgpu_pco_fail(error, error_size, "out of memory cloning NIR");
+   nir_shader *vs = nir_shader_clone(compile_mem_ctx, vertex_nir);
+   nir_shader *fs = nir_shader_clone(compile_mem_ctx, fragment_nir);
+   if (!vs || !fs) {
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "failed to clone texture NIR");
+   }
+
+   vs->info.internal = true;
+   fs->info.internal = true;
+   vs->options = pco_nir_options();
+   fs->options = pco_nir_options();
+   nir_lower_fragcolor(fs, 1);
+
+   if (!pvrgpu_validate_lit_mesh_varying_store(vs,
+                                               3,
+                                               "texture",
+                                               error,
+                                               error_size) ||
+       !pvrgpu_validate_lit_mesh_fragment_output(fs,
+                                                 "texture",
+                                                 error,
+                                                 error_size) ||
+       !pvrgpu_lower_texture_fragment_mediump(fs, error, error_size) ||
+       !pvrgpu_canonicalize_fragment_output(fs,
+                                            "texture",
+                                            error,
+                                            error_size) ||
+       !pvrgpu_lower_uniform_slots_to_push_constants(
+          vs,
+          PVRGPU_TEXTURE_VS_UNIFORM_DWORDS,
+          8,
+          "texture",
+          error,
+          error_size)) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+
+   pco_data vertex_data = { 0 };
+   pco_data fragment_data = { 0 };
+   if (!pvrgpu_init_texture_shader_data(&vertex_data,
+                                        &fragment_data,
+                                        compile_mem_ctx,
+                                        error,
+                                        error_size)) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+
+   pco_preprocess_nir(compiler->pco, vs);
+   pco_preprocess_nir(compiler->pco, fs);
+   pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
+   pco_rev_link_nir(compiler->pco, vs, fs);
+   pco_lower_nir(compiler->pco, vs, &vertex_data);
+   pco_lower_nir(compiler->pco, fs, &fragment_data);
+   pco_postprocess_nir(compiler->pco, vs, &vertex_data);
+   pco_postprocess_nir(compiler->pco, fs, &fragment_data);
+
+   if (!pvrgpu_allocate_push_constants(&vertex_data,
+                                       PVRGPU_TEXTURE_VS_UNIFORM_DWORDS,
+                                       31,
+                                       "texture",
+                                       "VS",
+                                       error,
+                                       error_size)) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+
+   pco_shader *vertex =
+      pco_trans_nir(compiler->pco, vs, &vertex_data, compile_mem_ctx);
+   pco_shader *fragment =
+      pco_trans_nir(compiler->pco, fs, &fragment_data, compile_mem_ctx);
+   if (!vertex || !fragment) {
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "PCO failed to translate texture NIR");
+   }
+   pco_process_ir(compiler->pco, vertex);
+   pco_process_ir(compiler->pco, fragment);
+   pco_encode_ir(compiler->pco, vertex);
+   pco_encode_ir(compiler->pco, fragment);
+
+   if (!pvrgpu_copy_pco_stage(vertex, true, &out->vertex, error, error_size) ||
+       !pvrgpu_copy_pco_stage(fragment,
+                              false,
+                              &out->fragment,
+                              error,
+                              error_size)) {
+      pvrgpu_pco_graphics_binary_finish(out);
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+
+   out->position_output_start =
+      vertex_data.vs.varyings[VARYING_SLOT_POS].start;
+   out->position_output_count =
+      vertex_data.vs.varyings[VARYING_SLOT_POS].count;
+   out->fragment_position_start =
+      fragment_data.fs.varyings[VARYING_SLOT_POS].start;
+   out->fragment_position_count =
+      fragment_data.fs.varyings[VARYING_SLOT_POS].count;
+   out->varying_output_start =
+      vertex_data.vs.varyings[VARYING_SLOT_VAR0].start;
+   out->varying_output_count =
+      vertex_data.vs.varyings[VARYING_SLOT_VAR0].count;
+   out->fragment_varying_start =
+      fragment_data.fs.varyings[VARYING_SLOT_VAR0].start;
+   out->fragment_varying_count =
+      fragment_data.fs.varyings[VARYING_SLOT_VAR0].count;
+   out->fragment_texture_descriptor_start =
+      fragment_data.common.desc_sets[0].bindings[0].range.start;
+   out->fragment_texture_descriptor_count =
+      fragment_data.common.desc_sets[0].bindings[0].range.count;
+   out->fragment_texture_descriptor_stride =
+      fragment_data.common.desc_sets[0].bindings[0].range.stride;
+
+   if (out->vertex.abi.vertex_inputs != 12 ||
+       out->vertex.abi.vertex_outputs != 7 ||
+       out->vertex.abi.coefficients != 0 ||
+       out->vertex.abi.shareds != PVRGPU_TEXTURE_VS_UNIFORM_DWORDS ||
+       out->vertex.abi.push_constant_start != 0 ||
+       out->vertex.abi.push_constant_count !=
+          PVRGPU_TEXTURE_VS_UNIFORM_DWORDS ||
+       out->fragment.abi.coefficients != 16 ||
+       out->fragment.abi.shareds != PVRGPU_TEXTURE_DESCRIPTOR_DWORDS ||
+       out->fragment.abi.push_constant_count != 0 ||
+       out->position_output_start != 0 || out->position_output_count != 4 ||
+       out->varying_output_start != 4 || out->varying_output_count != 3 ||
+       out->fragment_position_start != 0 ||
+       out->fragment_position_count != 4 ||
+       out->fragment_varying_start != 4 ||
+       out->fragment_varying_count != 12 ||
+       out->fragment_texture_descriptor_start != 0 ||
+       out->fragment_texture_descriptor_count !=
+          PVRGPU_TEXTURE_DESCRIPTOR_DWORDS ||
+       out->fragment_texture_descriptor_stride !=
+          PVRGPU_TEXTURE_DESCRIPTOR_DWORDS) {
+      pvrgpu_pco_graphics_binary_finish(out);
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "compiled texture PCO ABI changed");
+   }
+
+   ralloc_free(compile_mem_ctx);
+   return true;
+}
+
+bool pvrgpu_pco_compile_refract(
+   struct pvrgpu_pco_compiler *compiler,
+   const nir_shader *vertex_nir,
+   const nir_shader *fragment_nir,
+   enum pvrgpu_pco_refract_profile profile,
+   struct pvrgpu_pco_graphics_binary *out,
+   char *error,
+   size_t error_size)
+{
+   if (error && error_size)
+      error[0] = '\0';
+   if (!out)
+      return pvrgpu_pco_fail(error, error_size, "missing PCO output object");
+   memset(out, 0, sizeof(*out));
+
+   if (!compiler || !compiler->pco || !vertex_nir || !fragment_nir ||
+       profile < PVRGPU_PCO_REFRACT_PREPASS ||
+       profile > PVRGPU_PCO_REFRACT_COMPOSITE) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "missing compiler or invalid refract profile");
+   }
+   const struct pvrgpu_refract_pco_desc *desc =
+      &pvrgpu_refract_profiles[profile];
+   if (!pvrgpu_source_hash_matches(vertex_nir, desc->vertex_source_hash) ||
+       !pvrgpu_source_hash_matches(fragment_nir,
+                                   desc->fragment_source_hash) ||
+       !pvrgpu_validate_refract_nir(vertex_nir,
+                                    profile,
+                                    MESA_SHADER_VERTEX,
+                                    error,
+                                    error_size) ||
+       !pvrgpu_validate_refract_nir(fragment_nir,
+                                    profile,
+                                    MESA_SHADER_FRAGMENT,
+                                    error,
+                                    error_size)) {
+      if (error && error_size && error[0] == '\0') {
+         snprintf(error,
+                  error_size,
+                  "%s NIR source signature mismatch",
+                  desc->name);
+      }
+      return false;
+   }
+
+   void *compile_mem_ctx = ralloc_context(compiler->mem_ctx);
+   if (!compile_mem_ctx)
+      return pvrgpu_pco_fail(error, error_size, "out of memory cloning NIR");
+   nir_shader *vs = nir_shader_clone(compile_mem_ctx, vertex_nir);
+   nir_shader *fs = nir_shader_clone(compile_mem_ctx, fragment_nir);
+   if (!vs || !fs) {
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "failed to clone %s NIR",
+                             desc->name);
+   }
+
+   vs->info.internal = true;
+   fs->info.internal = true;
+   vs->options = pco_nir_options();
+   fs->options = pco_nir_options();
+   nir_shader_compiler_options vertex_options;
+   nir_shader_compiler_options fragment_options;
+   /* Gallivm preserves both Refract vertex shaders' matrix and normal chains
+    * as distinct multiply and add operations.  Keep that boundary local to
+    * these strict profiles instead of changing global PCO policy. */
+   vertex_options = *pco_nir_options();
+   vertex_options.float_mul_add32 &= ~nir_float_muladd_support_fuse;
+   vertex_options.float_mul_add32 |=
+      nir_float_muladd_support_prefers_split;
+   vs->options = &vertex_options;
+   if (profile == PVRGPU_PCO_REFRACT_COMPOSITE) {
+      /* The GLES source spells every product and sum separately.  Retain
+       * those IEEE operation boundaries through generic NIR optimization. */
+      fragment_options = *pco_nir_options();
+      fragment_options.float_mul_add32 &= ~nir_float_muladd_support_fuse;
+      fragment_options.float_mul_add32 |=
+         nir_float_muladd_support_prefers_split;
+      fs->options = &fragment_options;
+   }
+   nir_lower_fragcolor(fs, 1);
+
+   if (!pvrgpu_validate_lit_mesh_fragment_output(fs,
+                                                 desc->name,
+                                                 error,
+                                                 error_size) ||
+       (profile == PVRGPU_PCO_REFRACT_COMPOSITE &&
+        !pvrgpu_lower_refract_composite_fragment_mediump(fs,
+                                                         error,
+                                                         error_size)) ||
+       !pvrgpu_canonicalize_fragment_output(fs,
+                                            desc->name,
+                                            error,
+                                            error_size) ||
+       !pvrgpu_lower_uniform_slots_to_push_constants(
+          vs,
+          desc->vertex_uniform_dwords,
+          desc->vertex_uniform_loads,
+          desc->name,
+          error,
+          error_size)) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+
+   pco_data vertex_data = { 0 };
+   pco_data fragment_data = { 0 };
+   if (!pvrgpu_init_refract_shader_data(profile,
+                                        &vertex_data,
+                                        &fragment_data,
+                                        compile_mem_ctx,
+                                        error,
+                                        error_size)) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+
+   pco_preprocess_nir(compiler->pco, vs);
+   pco_preprocess_nir(compiler->pco, fs);
+   pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
+   pco_rev_link_nir(compiler->pco, vs, fs);
+   pco_lower_nir(compiler->pco, vs, &vertex_data);
+   pco_lower_nir(compiler->pco, fs, &fragment_data);
+   pco_postprocess_nir(compiler->pco, vs, &vertex_data);
+   pco_postprocess_nir(compiler->pco, fs, &fragment_data);
+
+   if (!pvrgpu_allocate_push_constants(&vertex_data,
+                                       desc->vertex_uniform_dwords,
+                                       desc->vertex_uniform_dwords,
+                                       desc->name,
+                                       "VS",
+                                       error,
+                                       error_size)) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+
+   pco_shader *vertex =
+      pco_trans_nir(compiler->pco, vs, &vertex_data, compile_mem_ctx);
+   pco_shader *fragment =
+      pco_trans_nir(compiler->pco, fs, &fragment_data, compile_mem_ctx);
+   if (!vertex || !fragment) {
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "PCO failed to translate %s NIR",
+                             desc->name);
+   }
+   pco_process_ir(compiler->pco, vertex);
+   pco_process_ir(compiler->pco, fragment);
+   pco_encode_ir(compiler->pco, vertex);
+   pco_encode_ir(compiler->pco, fragment);
+
+   if (!pvrgpu_copy_pco_stage(vertex, true, &out->vertex, error, error_size) ||
+       !pvrgpu_copy_pco_stage(fragment,
+                              false,
+                              &out->fragment,
+                              error,
+                              error_size)) {
+      pvrgpu_pco_graphics_binary_finish(out);
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+
+   out->position_output_start = 0;
+   out->position_output_count = 4;
+   out->fragment_position_start = 0;
+   out->fragment_position_count = 4;
+   out->varying_output_start = 4;
+   out->varying_output_count = desc->varying_components;
+   out->fragment_varying_start = 4;
+   out->fragment_varying_count = desc->varying_components * 4;
+   if (profile == PVRGPU_PCO_REFRACT_COMPOSITE) {
+      out->fragment_texture_descriptor_start = 0;
+      out->fragment_texture_descriptor_count =
+         PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
+      out->fragment_texture_descriptor_stride =
+         PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
+   }
+
+   const unsigned expected_fragment_shareds =
+      profile == PVRGPU_PCO_REFRACT_COMPOSITE ?
+         PVRGPU_REFRACT_DESCRIPTOR_DWORDS : 0;
+   if (out->vertex.abi.vertex_inputs != 8 ||
+       out->vertex.abi.vertex_outputs != 4 + desc->varying_components ||
+       out->vertex.abi.coefficients != 0 ||
+       out->vertex.abi.shareds != desc->vertex_uniform_dwords ||
+       out->vertex.abi.push_constant_start != 0 ||
+       out->vertex.abi.push_constant_count != desc->vertex_uniform_dwords ||
+       out->fragment.abi.coefficients !=
+          4 + desc->varying_components * 4 ||
+       out->fragment.abi.shareds != expected_fragment_shareds ||
+       out->fragment.abi.push_constant_count != 0 ||
+       out->position_output_start != 0 || out->position_output_count != 4 ||
+       out->varying_output_start != 4 ||
+       out->varying_output_count != desc->varying_components ||
+       out->fragment_position_start != 0 ||
+       out->fragment_position_count != 4 ||
+       out->fragment_varying_start != 4 ||
+       out->fragment_varying_count != desc->varying_components * 4 ||
+       (profile == PVRGPU_PCO_REFRACT_COMPOSITE &&
+        (out->fragment_texture_descriptor_start != 0 ||
+         out->fragment_texture_descriptor_count !=
+            PVRGPU_TEXTURE_DESCRIPTOR_DWORDS ||
+         out->fragment_texture_descriptor_stride !=
+            PVRGPU_TEXTURE_DESCRIPTOR_DWORDS))) {
+      pvrgpu_pco_graphics_binary_finish(out);
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "compiled %s PCO ABI changed",
+                             desc->name);
+   }
+
+   ralloc_free(compile_mem_ctx);
+   return true;
+}
+
+bool pvrgpu_pco_compile_shadow(
+   struct pvrgpu_pco_compiler *compiler,
+   const nir_shader *vertex_nir,
+   const nir_shader *fragment_nir,
+   enum pvrgpu_pco_shadow_profile profile,
+   struct pvrgpu_pco_graphics_binary *out,
+   char *error,
+   size_t error_size)
+{
+   if (error && error_size)
+      error[0] = '\0';
+   if (!out)
+      return pvrgpu_pco_fail(error, error_size, "missing PCO output object");
+   memset(out, 0, sizeof(*out));
+
+   if (!compiler || !compiler->pco || !vertex_nir || !fragment_nir ||
+       profile < PVRGPU_PCO_SHADOW_DEPTH ||
+       profile > PVRGPU_PCO_SHADOW_SCENE) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "missing compiler or invalid shadow profile");
+   }
+   if (profile == PVRGPU_PCO_SHADOW_DEPTH) {
+      return pvrgpu_pco_compile_refract(compiler,
+                                        vertex_nir,
+                                        fragment_nir,
+                                        PVRGPU_PCO_REFRACT_PREPASS,
+                                        out,
+                                        error,
+                                        error_size);
+   }
+
+   const struct pvrgpu_shadow_pco_desc *desc =
+      &pvrgpu_shadow_profiles[profile];
+   if (!pvrgpu_source_hash_matches(vertex_nir, desc->vertex_source_hash) ||
+       !pvrgpu_source_hash_matches(fragment_nir,
+                                   desc->fragment_source_hash) ||
+       !pvrgpu_validate_shadow_nir(vertex_nir,
+                                   profile,
+                                   MESA_SHADER_VERTEX,
+                                   error,
+                                   error_size) ||
+       !pvrgpu_validate_shadow_nir(fragment_nir,
+                                   profile,
+                                   MESA_SHADER_FRAGMENT,
+                                   error,
+                                   error_size)) {
+      if (error && error_size && error[0] == '\0') {
+         snprintf(error,
+                  error_size,
+                  "%s NIR source signature mismatch",
+                  desc->name);
+      }
+      return false;
+   }
+
+   void *compile_mem_ctx = ralloc_context(compiler->mem_ctx);
+   if (!compile_mem_ctx)
+      return pvrgpu_pco_fail(error, error_size, "out of memory cloning NIR");
+   nir_shader *vs = nir_shader_clone(compile_mem_ctx, vertex_nir);
+   nir_shader *fs = nir_shader_clone(compile_mem_ctx, fragment_nir);
+   if (!vs || !fs) {
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "failed to clone %s NIR",
+                             desc->name);
+   }
+
+   vs->info.internal = true;
+   fs->info.internal = true;
+   vs->options = pco_nir_options();
+   fs->options = pco_nir_options();
+   nir_lower_fragcolor(fs, 1);
+   if (!pvrgpu_validate_lit_mesh_fragment_output(fs,
+                                                 desc->name,
+                                                 error,
+                                                 error_size) ||
+       (profile == PVRGPU_PCO_SHADOW_SCENE &&
+        !pvrgpu_split_shadow_scene_dot2(vs,
+                                        desc->name,
+                                        error,
+                                        error_size)) ||
+       !pvrgpu_canonicalize_fragment_output(fs,
+                                            desc->name,
+                                            error,
+                                            error_size) ||
+       !pvrgpu_lower_uniform_slots_to_push_constants(
+          vs,
+          desc->vertex_uniform_dwords,
+          desc->vertex_uniform_loads,
+          desc->name,
+          error,
+          error_size)) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+
+   pco_data vertex_data = { 0 };
+   pco_data fragment_data = { 0 };
+   if (!pvrgpu_init_shadow_shader_data(profile,
+                                       &vertex_data,
+                                       &fragment_data,
+                                       compile_mem_ctx,
+                                       error,
+                                       error_size)) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+
+   pco_preprocess_nir(compiler->pco, vs);
+   pco_preprocess_nir(compiler->pco, fs);
+   pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
+   pco_rev_link_nir(compiler->pco, vs, fs);
+   pco_lower_nir(compiler->pco, vs, &vertex_data);
+   pco_lower_nir(compiler->pco, fs, &fragment_data);
+   pco_postprocess_nir(compiler->pco, vs, &vertex_data);
+   pco_postprocess_nir(compiler->pco, fs, &fragment_data);
+
+   if (!pvrgpu_allocate_push_constants(&vertex_data,
+                                       desc->vertex_uniform_dwords,
+                                       desc->vertex_uniform_used_dwords,
+                                       desc->name,
+                                       "VS",
+                                       error,
+                                       error_size)) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+
+   pco_shader *vertex =
+      pco_trans_nir(compiler->pco, vs, &vertex_data, compile_mem_ctx);
+   pco_shader *fragment =
+      pco_trans_nir(compiler->pco, fs, &fragment_data, compile_mem_ctx);
+   if (!vertex || !fragment) {
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "PCO failed to translate %s NIR",
+                             desc->name);
+   }
+   pco_process_ir(compiler->pco, vertex);
+   pco_process_ir(compiler->pco, fragment);
+   pco_encode_ir(compiler->pco, vertex);
+   pco_encode_ir(compiler->pco, fragment);
+
+   if (!pvrgpu_copy_pco_stage(vertex, true, &out->vertex, error, error_size) ||
+       !pvrgpu_copy_pco_stage(fragment,
+                              false,
+                              &out->fragment,
+                              error,
+                              error_size)) {
+      pvrgpu_pco_graphics_binary_finish(out);
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+
+   out->position_output_start = 0;
+   out->position_output_count = 4;
+   out->fragment_position_start = 0;
+   out->fragment_position_count = 4;
+   out->varying_output_start = 4;
+   out->varying_output_count = desc->varying_components;
+   out->fragment_varying_start = 4;
+   out->fragment_varying_count = desc->varying_components * 4;
+   if (profile == PVRGPU_PCO_SHADOW_MASK) {
+      out->fragment_texture_descriptor_start = 0;
+      out->fragment_texture_descriptor_count =
+         PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
+      out->fragment_texture_descriptor_stride =
+         PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
+   }
+
+   const unsigned expected_vertex_inputs =
+      profile == PVRGPU_PCO_SHADOW_MASK ? 4U : 8U;
+   const unsigned expected_fragment_shareds =
+      profile == PVRGPU_PCO_SHADOW_MASK ?
+         PVRGPU_TEXTURE_DESCRIPTOR_DWORDS : 0U;
+   if (out->vertex.abi.vertex_inputs != expected_vertex_inputs ||
+       out->vertex.abi.vertex_outputs != 4 + desc->varying_components ||
+       out->vertex.abi.coefficients != 0 ||
+       out->vertex.abi.shareds != desc->vertex_uniform_dwords ||
+       out->vertex.abi.push_constant_start != 0 ||
+       out->vertex.abi.push_constant_count != desc->vertex_uniform_dwords ||
+       out->fragment.abi.coefficients !=
+          4 + desc->varying_components * 4 ||
+       out->fragment.abi.shareds != expected_fragment_shareds ||
+       out->fragment.abi.push_constant_count != 0 ||
+       out->position_output_start != 0 || out->position_output_count != 4 ||
+       out->varying_output_start != 4 ||
+       out->varying_output_count != desc->varying_components ||
+       out->fragment_position_start != 0 ||
+       out->fragment_position_count != 4 ||
+       out->fragment_varying_start != 4 ||
+       out->fragment_varying_count != desc->varying_components * 4 ||
+       (profile == PVRGPU_PCO_SHADOW_MASK &&
+        (out->fragment_texture_descriptor_start != 0 ||
+         out->fragment_texture_descriptor_count !=
+            PVRGPU_TEXTURE_DESCRIPTOR_DWORDS ||
+         out->fragment_texture_descriptor_stride !=
+            PVRGPU_TEXTURE_DESCRIPTOR_DWORDS))) {
+      pvrgpu_pco_graphics_binary_finish(out);
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "compiled %s PCO ABI changed",
+                             desc->name);
+   }
+
+   ralloc_free(compile_mem_ctx);
+   return true;
+}
+
 #define PVRGPU_TERRAIN_D3_FS_VARYINGS 4U
 #define PVRGPU_TERRAIN_D3_FS_PUSH_SLOTS 16U
 #define PVRGPU_TERRAIN_D3_FS_TEXTURES 5U
@@ -8114,6 +8662,8 @@ pvrgpu_terrain_d4_d5_collect_graph(
    const uint32_t step_bits =
       profile == PVRGPU_PCO_TERRAIN_D4 ? UINT32_C(0x3c4ccccd) :
                                         UINT32_C(0x3b7ffbce);
+   const uint32_t step_bits_800x600 =
+      profile == PVRGPU_PCO_TERRAIN_D4 ? UINT32_C(0x3aa3d70a) : step_bits;
    unsigned constants = 0;
    unsigned textures = 0;
    unsigned frag_stores = 0;
@@ -8157,7 +8707,8 @@ pvrgpu_terrain_d4_d5_collect_graph(
                slot = &graph->weight[2];
                break;
             default:
-               if (constant->value[0].u32 == step_bits)
+               if (constant->value[0].u32 == step_bits ||
+                   constant->value[0].u32 == step_bits_800x600)
                   slot = &graph->step;
                break;
             }
@@ -8937,6 +9488,7 @@ struct pvrgpu_terrain_d7d8_graph {
    nir_alu_instr *offset_vecs[8];
    nir_alu_instr *products[PVRGPU_TERRAIN_D7D8_TAPS];
    nir_alu_instr *accumulator_adds[PVRGPU_TERRAIN_D7D8_TAPS - 1U];
+   bool step_800x600;
 };
 
 struct pvrgpu_terrain_d7d8_lower_counts {
@@ -9053,6 +9605,8 @@ static bool
 pvrgpu_terrain_d7d8_check_constant_set(const nir_shader *nir, bool horizontal,
                                        char *error, size_t error_size)
 {
+   const uint32_t step_800x600 =
+      horizontal ? UINT32_C(0x3aa3d70a) : UINT32_C(0x3ada7f3d);
    const uint32_t expected[12] = {
       UINT32_C(0x00000000), /* 0 */
       horizontal ? UINT32_C(0x3c4ccccd) : UINT32_C(0x3c88893b),
@@ -9084,8 +9638,12 @@ pvrgpu_terrain_d7d8_check_constant_set(const nir_shader *nir, bool horizontal,
                return pvrgpu_pco_fail(error, error_size,
                                       "terrain D7/D8 constant shape changed");
             }
-            unsigned match = ARRAY_SIZE(expected);
-            for (unsigned i = 0; i < ARRAY_SIZE(expected); ++i) {
+            unsigned match =
+               constant->value[0].u32 == step_800x600 ? 1U :
+                                                        ARRAY_SIZE(expected);
+            for (unsigned i = 0;
+                 match == ARRAY_SIZE(expected) && i < ARRAY_SIZE(expected);
+                 ++i) {
                if (constant->value[0].u32 == expected[i]) {
                   match = i;
                   break;
@@ -9298,6 +9856,8 @@ pvrgpu_terrain_d7d8_match_source(nir_shader *nir,
    const unsigned active = horizontal ? 0U : 1U;
    const uint32_t source_step =
       horizontal ? UINT32_C(0x3c4ccccd) : UINT32_C(0x3c88893b);
+   const uint32_t source_step_800x600 =
+      horizontal ? UINT32_C(0x3aa3d70a) : UINT32_C(0x3ada7f3d);
    static const uint32_t source_weights[PVRGPU_TERRAIN_D7D8_TAPS] = {
       UINT32_C(0x3d5edbf9), UINT32_C(0x3db4195d), UINT32_C(0x3dfdc619),
       UINT32_C(0x3e1be059), UINT32_C(0x3e26f156), UINT32_C(0x3e1be059),
@@ -9328,10 +9888,17 @@ pvrgpu_terrain_d7d8_match_source(nir_shader *nir,
       goto graph_changed;
    graph->scale_mul = pvrgpu_terrain_d7d8_scalar_alu(
       pvrgpu_terrain_d7d8_alu_scalar(&graph->fdiv->src[0], 0), nir_op_fmul, 1);
-   if (!graph->scale_mul ||
-       !pvrgpu_terrain_d7d8_match_def_and_bits(
-          graph->scale_mul, &graph->fabs->def, source_step, 1))
+   if (!graph->scale_mul)
       goto graph_changed;
+   const bool source_step_matches =
+      pvrgpu_terrain_d7d8_match_def_and_bits(
+         graph->scale_mul, &graph->fabs->def, source_step, 1);
+   const bool source_step_800x600_matches =
+      pvrgpu_terrain_d7d8_match_def_and_bits(
+         graph->scale_mul, &graph->fabs->def, source_step_800x600, 1);
+   if (source_step_matches == source_step_800x600_matches)
+      goto graph_changed;
+   graph->step_800x600 = source_step_800x600_matches;
    nir_scalar abs_source =
       pvrgpu_terrain_d7d8_alu_scalar(&graph->fabs->src[0], 0);
    graph->tilt_add = pvrgpu_terrain_d7d8_scalar_alu(abs_source, nir_op_fadd, 1);
@@ -9700,8 +10267,11 @@ pvrgpu_lower_terrain_d7d8_fragment_mediump(
    nir_def *minus_two = nir_imm_float(&head, -2.0f);   /* 0xc000 */
    nir_def *minus_three = nir_imm_float(&head, -3.0f); /* 0xc200 */
    nir_def *minus_four = nir_imm_float(&head, -4.0f);  /* 0xc400 */
-   nir_def *step_constant = nir_imm_float(
-      &head, horizontal ? 0x1.998p-7f : 0x1.110p-6f); /* 0x2266 / 0x2444 */
+   const float step_constant_value =
+      graph.step_800x600
+         ? (horizontal ? 0x1.47cp-10f : 0x1.b50p-10f) /* 0x151f / 0x16d4 */
+         : (horizontal ? 0x1.998p-7f : 0x1.110p-6f); /* 0x2266 / 0x2444 */
+   nir_def *step_constant = nir_imm_float(&head, step_constant_value);
    nir_def *weight_constants[ARRAY_SIZE(half_weight_constants)];
    for (unsigned weight = 0; weight < ARRAY_SIZE(half_weight_constants);
         ++weight) {
@@ -9825,9 +10395,14 @@ bool pvrgpu_pco_compile_terrain(
 
    const struct pvrgpu_terrain_pco_desc *desc =
       &pvrgpu_terrain_profiles[profile];
+   const bool fragment_source_matches =
+      pvrgpu_source_hash_matches(fragment_nir,
+                                 desc->fragment_source_hash) ||
+      (desc->fragment_source_hash_800x600[0] != 0U &&
+       pvrgpu_source_hash_matches(fragment_nir,
+                                  desc->fragment_source_hash_800x600));
    if (!pvrgpu_source_hash_matches(vertex_nir, desc->vertex_source_hash) ||
-       !pvrgpu_source_hash_matches(fragment_nir,
-                                   desc->fragment_source_hash) ||
+       !fragment_source_matches ||
        !pvrgpu_validate_terrain_nir(vertex_nir,
                                     profile,
                                     MESA_SHADER_VERTEX,

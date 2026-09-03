@@ -205,7 +205,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("full_depth_clear_resource", context_header)
         self.assertIn("pvrgpu_note_full_depth_clear_one", clear)
         self.assertIn("pvrgpu_invalidate_full_depth_clear_for_resource", resource)
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 7u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 8u", systemc_api)
         for field in (
             "const uint8_t *raw_vertex_data;",
             "size_t raw_vertex_data_size;",
@@ -569,8 +569,10 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("0x4fecdd1ce1feb997", native_test)
         self.assertIn("0x76fac56a9fbc5918", native_test)
         self.assertIn("0x956d5ea59737b66f", native_test)
-        self.assertIn("0xd0b9eb8de7e641d2", native_test)
         self.assertIn("0xab0dfc14e6aa5116", native_test)
+        self.assertIn("0xd0b9eb8de7e641d2", native_test)
+        self.assertIn("0x1d6737c7f69c0953", native_test)
+        self.assertIn("0xb41e711d1ef41b5a", native_test)
         self.assertIn("terrain compile modified caller-owned NIR", native_test)
         self.assertIn("terrain D1 compile modified caller-owned NIR", native_test)
         self.assertIn("terrain blur compile modified caller-owned NIR", native_test)
@@ -786,7 +788,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 7u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 8u", systemc_api)
         for field in (
             "uint32_t vertex_stride;",
             "uint32_t position_output_start;",
@@ -893,8 +895,11 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("draw_pco_lit_mesh_probe_skip", route)
         self.assertIn("pvrgpu_emit_lit_mesh_command(ctx, &lit_mesh)", route)
         self.assertIn('"lit_mesh_command_failed"', route)
-        self.assertIn("requested_width == 80", route)
-        self.assertIn("requested_height == 60", route)
+        self.assertIn("requested_glmark_extent", route)
+        self.assertIn("lit_mesh.framebuffer_width == requested_width", route)
+        self.assertIn("lit_mesh.framebuffer_height == requested_height", route)
+        self.assertIn("lit_mesh.viewport_width == requested_width", route)
+        self.assertIn("lit_mesh.viewport_height == requested_height", route)
         self.assertNotIn("pvrgpu_cpu_", route)
 
     def test_conditionals_pco_command_is_strict_and_api_v5_backed(self) -> None:
@@ -907,7 +912,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 7u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 8u", systemc_api)
         self.assertIn("command=draw_pco_triangles", command)
         self.assertIn("pvrgpu_write_draw_pco_triangles_command", command_header)
         self.assertIn("PVRGPU_DRAW_PCO_TRIANGLES_VERTEX_COUNT 6144u", command_header)

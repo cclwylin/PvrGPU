@@ -567,6 +567,16 @@ void UscCluster::Run() {
 
       std::vector<FragmentOutput> outputs(invocations.size());
       std::vector<std::uint8_t> output_written(invocations.size(), 0);
+      const bool debug_fragment =
+          std::getenv("PVRGPU_SEQUENCE_DEBUG_FRAGMENT") != nullptr;
+      const std::uint32_t debug_x =
+          debug_fragment
+              ? DebugFragmentCoordinate("PVRGPU_SEQUENCE_DEBUG_X", 37U)
+              : 37U;
+      const std::uint32_t debug_y =
+          debug_fragment
+              ? DebugFragmentCoordinate("PVRGPU_SEQUENCE_DEBUG_Y", 46U)
+              : 46U;
       const auto execute_invocation =
           [&](std::size_t invocation_index,
               const PcoFragmentExecutionContext *context) {
@@ -581,6 +591,40 @@ void UscCluster::Run() {
                                          instructions, *context)
                     : ExecuteFragmentPco(state.fragment_program_summary,
                                          instructions);
+        if (debug_fragment && invocation.x == debug_x &&
+            invocation.y == debug_y) {
+          std::cerr << "sequence-fragment-usc phase=execution invocation="
+                    << invocation_index
+                    << " primitive=" << invocation.primitive_id
+                    << " parameter=" << invocation.parameter_index
+                    << " submit=" << invocation.submit_ordinal
+                    << " quad=" << invocation.quad_id;
+          if (context) {
+            std::cerr << " sample=0x" << std::hex << std::setw(8)
+                      << std::setfill('0') << context->sample_x << ",0x"
+                      << std::setw(8) << context->sample_y << std::dec
+                      << std::setfill(' ') << " coefficients=";
+            for (std::size_t coefficient = 0;
+                 coefficient < context->coefficient_count; ++coefficient) {
+              if (coefficient)
+                std::cerr << ',';
+              std::cerr << "0x" << std::hex << std::setw(8)
+                        << std::setfill('0')
+                        << context->coefficients[coefficient] << std::dec
+                        << std::setfill(' ');
+            }
+          }
+          std::cerr << " pixout=";
+          for (std::size_t component = 0; component < 4; ++component) {
+            if (component)
+              std::cerr << ',';
+            std::cerr << "0x" << std::hex << std::setw(8)
+                      << std::setfill('0')
+                      << execution.pixel_outputs[component] << std::dec
+                      << std::setfill(' ');
+          }
+          std::cerr << '\n';
+        }
         FragmentOutput fragment_output;
         fragment_output.x = invocation.x;
         fragment_output.y = invocation.y;
@@ -598,16 +642,6 @@ void UscCluster::Run() {
       };
 
       std::uint64_t fragment_execution_lanes = invocations.size();
-      const bool debug_fragment =
-          std::getenv("PVRGPU_SEQUENCE_DEBUG_FRAGMENT") != nullptr;
-      const std::uint32_t debug_x =
-          debug_fragment
-              ? DebugFragmentCoordinate("PVRGPU_SEQUENCE_DEBUG_X", 37U)
-              : 37U;
-      const std::uint32_t debug_y =
-          debug_fragment
-              ? DebugFragmentCoordinate("PVRGPU_SEQUENCE_DEBUG_Y", 46U)
-              : 46U;
       if (UsesTextureSampling(state, ShaderStage::kFragment)) {
         const bool driver_pco_texture =
             IsDriverPcoTrianglesCase(state.functional_case);
@@ -709,7 +743,11 @@ void UscCluster::Run() {
               shader_lane.y == debug_y &&
               shader_lane.helper == 0) {
             std::cerr << "sequence-fragment-usc phase=final lane="
-                      << shader_lane_index << " pixout=";
+                      << shader_lane_index
+                      << " primitive=" << shader_lane.primitive_id
+                      << " parameter=" << shader_lane.parameter_index
+                      << " submit=" << shader_lane.submit_ordinal
+                      << " quad=" << shader_lane.quad_id << " pixout=";
             for (std::size_t component = 0; component < 4; ++component) {
               if (component)
                 std::cerr << ',';

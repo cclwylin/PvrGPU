@@ -420,7 +420,7 @@ RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
       descriptor.mip_filter == TextureFilter::kLinear &&
       descriptor.min_lod_u4_6 == 0U &&
       (((descriptor.max_lod_u4_6 >= 64U &&
-         descriptor.max_lod_u4_6 <= 576U &&
+         descriptor.max_lod_u4_6 <= 640U &&
          descriptor.max_lod_u4_6 % 64U == 0U)) ||
        descriptor.max_lod_u4_6 == 959U) &&
       descriptor.min_filter == TextureFilter::kLinear &&
@@ -596,21 +596,23 @@ TextureImplicitLod ComputeTextureImplicitLod(
   const float rho_x_squared = dsdx * dsdx + dtdx * dtdx;
   const float rho_y_squared = dsdy * dsdy + dtdy * dtdy;
   const float rho_squared = std::max(rho_x_squared, rho_y_squared);
-  if (!(rho_squared > 0.0F) || !std::isfinite(rho_squared))
+  if (rho_squared < 0.0F || !std::isfinite(rho_squared))
     throw std::runtime_error("TextureUnit implicit derivative rho is invalid");
-
-  int binary_exponent = 0;
-  const float half_open_mantissa =
-      std::frexp(rho_squared, &binary_exponent); // [0.5, 1.0)
-  const float normalized_mantissa = half_open_mantissa * 2.0F;
-  const float approximate_log2_squared =
-      static_cast<float>(binary_exponent - 2) + normalized_mantissa;
 
   const float min_lod = static_cast<float>(sampler.min_lod_u4_6) / 64.0F;
   const float max_lod = static_cast<float>(sampler.max_lod_u4_6) / 64.0F;
   const float last_level = static_cast<float>(image.mip_count - 1U);
-  const float lambda = std::clamp(approximate_log2_squared * 0.5F, min_lod,
-                                  std::min(max_lod, last_level));
+  float lambda = min_lod;
+  if (rho_squared > 0.0F) {
+    int binary_exponent = 0;
+    const float half_open_mantissa =
+        std::frexp(rho_squared, &binary_exponent); // [0.5, 1.0)
+    const float normalized_mantissa = half_open_mantissa * 2.0F;
+    const float approximate_log2_squared =
+        static_cast<float>(binary_exponent - 2) + normalized_mantissa;
+    lambda = std::clamp(approximate_log2_squared * 0.5F, min_lod,
+                        std::min(max_lod, last_level));
+  }
   const float level0_float = std::floor(lambda);
   const float level1_float = std::min(level0_float + 1.0F, last_level);
 

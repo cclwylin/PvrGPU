@@ -20,9 +20,12 @@
 
 #include <systemc>
 
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -49,6 +52,13 @@ std::uint32_t FloatBits(float value) {
   static_assert(sizeof(bits) == sizeof(value));
   std::memcpy(&bits, &value, sizeof(bits));
   return bits;
+}
+
+void CheckPlane(const ParameterCoefficientSet &plane, std::uint32_t a,
+                std::uint32_t b, std::uint32_t c,
+                const std::string &description) {
+  Check(plane.a == a && plane.b == b && plane.c == c && plane.pad == 0,
+        description);
 }
 
 float BitsFloat(std::uint32_t bits) {
@@ -184,6 +194,15 @@ VertexLane MakeClipLane(float x, float y, float z, float w) {
   return lane;
 }
 
+VertexLane MakeClipLane(const std::array<std::uint32_t, 6> &outputs) {
+  VertexLane lane;
+  for (std::size_t component = 0; component < outputs.size(); ++component)
+    lane.vertex_output[component] = outputs[component];
+  lane.emitted = 1;
+  lane.ended = 1;
+  return lane;
+}
+
 void CheckHomogeneousWClipping() {
   MemoryPool pool;
   PipelineState state;
@@ -314,6 +333,314 @@ void CheckDriverViewportFma() {
         "driver viewport-FMA payload ownership cleanup");
 }
 
+void CheckDriverClippedSetupPrecision() {
+  MemoryPool pool;
+  PipelineState state;
+  state.width = 800;
+  state.height = 600;
+  state.sequence = 1;
+  state.functional_case = FunctionalCase::kDriverPcoTriangles;
+  state.stage = PipelineStage::kVertexShaded;
+  state.draw.topology = PrimitiveTopology::kTriangleList;
+  state.draw.vertex_count = 6;
+  state.draw.index_format = IndexFormat::kNone;
+  state.position_output_start = 0;
+  state.position_output_count = 4;
+  state.varying_output_start = 4;
+  state.varying_output_count = 2;
+  state.fragment_position_start = 0;
+  state.fragment_position_count = 4;
+  state.fragment_varying_start = 4;
+  state.fragment_varying_count = 8;
+  state.vertex_pco_abi.vertex_outputs = 6;
+  state.fragment_pco_abi.coefficients = 12;
+  state.raster_state.face_cull.enable = 1;
+  state.raster_state.face_cull.mode = CullFaceMode::kBack;
+  state.raster_state.face_cull.front_face = FrontFaceWinding::kClockwise;
+
+  ShaderVaryingBinding binding;
+  binding.vertex_output_base = 4;
+  binding.coefficient_set_base = 1;
+  binding.w_coefficient_set = 0;
+  binding.component_count = 2;
+  binding.interpolation = InterpolationMode::kSmooth;
+  state.shader_varying_bindings = StoreNewArray(
+      pool, std::vector<ShaderVaryingBinding>{binding});
+
+  // GLMark2 Terrain primitive 56151.  Two vertices cross the right clip
+  // plane.  Mesa fan piece one contains two CPU-generated intersections and
+  // one original Gallivm vertex; their distinct viewport arithmetic and the
+  // clipper's cyclic fan order are both visible in the U/V setup planes.  A
+  // second, fully-inside primitive shares the dirty middle-end segment and
+  // proves Mesa's per-primitive trivial accept does not cyclically fan-emit
+  // an otherwise clean triangle.
+  state.vertex_lanes = StoreNewArray(
+      pool, std::vector<VertexLane>{
+                MakeClipLane({UINT32_C(0x44557020), UINT32_C(0xc4226a58),
+                              UINT32_C(0x444f8bbc), UINT32_C(0x44505680),
+                              UINT32_C(0x3eda0000), UINT32_C(0x3ea80000)}),
+                MakeClipLane({UINT32_C(0x44557020), UINT32_C(0xc41d4219),
+                              UINT32_C(0x4457d488), UINT32_C(0x44589d2e),
+                              UINT32_C(0x3edc0000), UINT32_C(0x3eaa0000)}),
+                MakeClipLane({UINT32_C(0x444ce685), UINT32_C(0xc41ca6c4),
+                              UINT32_C(0x44532415), UINT32_C(0x4453edee),
+                              UINT32_C(0x3eda0000), UINT32_C(0x3eaa0000)}),
+                MakeClipLane({FloatBits(-0.5F), FloatBits(-0.5F),
+                              FloatBits(0.0F), FloatBits(1.0F),
+                              FloatBits(0.1F), FloatBits(0.4F)}),
+                MakeClipLane({FloatBits(0.5F), FloatBits(-0.5F),
+                              FloatBits(0.0F), FloatBits(1.0F),
+                              FloatBits(0.2F), FloatBits(0.5F)}),
+                MakeClipLane({FloatBits(0.0F), FloatBits(0.5F),
+                              FloatBits(0.0F), FloatBits(1.0F),
+                              FloatBits(0.3F), FloatBits(0.6F)})});
+  state.vertex_lane_refs = StoreNewArray(
+      pool, std::vector<VertexLaneRef>{{0, 0}, {1, 1}, {2, 2},
+                                      {3, 3}, {4, 4}, {5, 5}});
+
+  const PoolHandle handle = pool.Allocate(sizeof(PipelineState));
+  StorePipelineState(pool, handle, state);
+  sc_core::sc_fifo<PipelineTxn> input("clipped_setup_input", 1);
+  sc_core::sc_fifo<PipelineTxn> clip_to_tiler("clipped_setup_clip_tiler", 1);
+  sc_core::sc_fifo<PipelineTxn> tiler_to_parameter(
+      "clipped_setup_tiler_parameter", 1);
+  sc_core::sc_fifo<PipelineTxn> output("clipped_setup_output", 1);
+  ClipCull clip("clipped_setup_clip", pool);
+  Tiler tiler("clipped_setup_tiler", pool);
+  ParameterBuffer parameter("clipped_setup_parameter", pool);
+  clip.input(input);
+  clip.output(clip_to_tiler);
+  tiler.input(clip_to_tiler);
+  tiler.output(tiler_to_parameter);
+  parameter.input(tiler_to_parameter);
+  parameter.output(output);
+  input.write(PipelineTxn{handle, 1, 1});
+  sc_core::sc_start(sc_core::sc_time(100, sc_core::SC_US));
+
+  PipelineTxn completed;
+  Check(output.nb_read(completed) && completed.state.slot == handle.slot &&
+            completed.state.generation == handle.generation,
+        "clipped Terrain setup completion identity");
+  const PipelineState result = LoadPipelineState(pool, handle);
+  const std::vector<RasterTriangle> triangles =
+      LoadArray<RasterTriangle>(pool, result.raster_triangles);
+  const std::vector<ParameterTriangle> parameters =
+      LoadArray<ParameterTriangle>(pool, result.parameter_triangles);
+  const std::vector<ParameterCoefficientSet> coefficients =
+      LoadArray<ParameterCoefficientSet>(pool, result.parameter_coefficients);
+  const std::vector<std::uint32_t> raster_outputs =
+      LoadArray<std::uint32_t>(pool, result.raster_vertex_outputs);
+  Check(result.stage == PipelineStage::kParameterBufferReady &&
+            triangles.size() == parameters.size(),
+        "clipped Terrain reaches parameter setup");
+
+  std::size_t piece = triangles.size();
+  for (std::size_t index = 0; index < triangles.size(); ++index) {
+    if (triangles[index].key.api_primitive_id == 0 &&
+        triangles[index].key.clip_piece == 1) {
+      piece = index;
+      break;
+    }
+  }
+  Check(piece < triangles.size() && triangles[piece].rasterizable == 1,
+        "Terrain right-clipped fan piece one is rasterizable");
+  const RasterTriangle &triangle = triangles[piece];
+  Check(FloatBits(triangle.x[0]) == UINT32_C(0x44480000) &&
+            FloatBits(triangle.y[0]) == UINT32_C(0x42985d5c) &&
+            FloatBits(triangle.x[1]) == UINT32_C(0x4444aef1) &&
+            FloatBits(triangle.y[1]) == UINT32_C(0x429c7fcc) &&
+            FloatBits(triangle.x[2]) == UINT32_C(0x44480000) &&
+            FloatBits(triangle.y[2]) == UINT32_C(0x428e8cc2),
+        "generated intersections use CPU viewport while original uses FMA");
+  Check(triangle.setup_vertex_order[0] == 2 &&
+            triangle.setup_vertex_order[1] == 1 &&
+            triangle.setup_vertex_order[2] == 0,
+        "Mesa clipped fan setup order survives raster normalization");
+
+  const std::size_t coefficient = parameters[piece].first_coefficient_set;
+  Check(coefficient + 2 < coefficients.size(),
+        "Terrain fan piece owns W/U/V coefficient sets");
+  CheckPlane(coefficients[coefficient], UINT32_C(0xb5a9bfb0),
+             UINT32_C(0xb68901ca), UINT32_C(0x3b2347ef),
+             "Terrain reciprocal-W plane matches llvmpipe setup");
+  CheckPlane(coefficients[coefficient + 1], UINT32_C(0xb47de000),
+             UINT32_C(0xb59c39ae), UINT32_C(0x3a4c1f2a),
+             "Terrain U/W plane matches llvmpipe setup");
+  CheckPlane(coefficients[coefficient + 2], UINT32_C(0xb50c3af1),
+             UINT32_C(0xb59c39ae), UINT32_C(0x3a6a11a2),
+             "Terrain V/W plane matches llvmpipe setup");
+
+  std::size_t clean = triangles.size();
+  for (std::size_t index = 0; index < triangles.size(); ++index) {
+    if (triangles[index].key.api_primitive_id == 1) {
+      clean = index;
+      break;
+    }
+  }
+  Check(clean < triangles.size() && triangles[clean].key.clip_piece == 0 &&
+            triangles[clean].rasterizable == 1,
+        "clean primitive in dirty segment remains a trivial accept");
+  const RasterTriangle &clean_triangle = triangles[clean];
+  const auto setup_u = [&](std::size_t setup_vertex) {
+    const std::size_t serialized =
+        clean_triangle.setup_vertex_order[setup_vertex];
+    return raster_outputs.at(
+        clean_triangle.first_vertex_output_dword +
+        serialized * clean_triangle.vertex_output_stride_dwords + 4);
+  };
+  Check(setup_u(0) == FloatBits(0.2F) &&
+            setup_u(1) == FloatBits(0.1F) &&
+            setup_u(2) == FloatBits(0.3F),
+        "dirty-segment trivial accept preserves clean Mesa setup order");
+
+  ReleaseFunctionalPayloads(pool, result);
+  pool.Release(handle);
+  Check(pool.bytes_in_flight() == 0 &&
+            pool.allocations() == pool.releases(),
+        "clipped Terrain setup payload ownership cleanup");
+}
+
+void CheckTerrainSubpixelRoundToEven() {
+  // Terrain's shared vertex is exactly 32336.5 in 24.8 space. llvmpipe's
+  // _mm_cvtps_epi32 keeps the even endpoint; half-away rounding moves the
+  // edge by one subpixel and gives the pixel to the adjacent primitive.
+  const float terrain_tie = BitsFloat(UINT32_C(0x42fca100));
+  Check(QuantizeRasterSubpixel(terrain_tie) == 32336,
+        "Terrain positive even tie rounds down to even");
+  Check(QuantizeRasterSubpixel(32337.5F / 256.0F) == 32338,
+        "positive odd tie rounds up to even");
+  Check(QuantizeRasterSubpixel(-1.5F / 256.0F) == -2 &&
+            QuantizeRasterSubpixel(-2.5F / 256.0F) == -2 &&
+            QuantizeRasterSubpixel(0.5F / 256.0F) == 0 &&
+            QuantizeRasterSubpixel(-0.5F / 256.0F) == 0,
+        "negative and signed-zero-adjacent ties round to even");
+  Check(QuantizeRasterSubpixel(std::nextafter(
+            terrain_tie, -std::numeric_limits<float>::infinity())) == 32336 &&
+            QuantizeRasterSubpixel(std::nextafter(
+                terrain_tie, std::numeric_limits<float>::infinity())) ==
+                32337,
+        "values on either side of Terrain tie keep nearest endpoints");
+  Check(QuantizeRasterSubpixel(-0x1p55F) ==
+            std::numeric_limits<std::int64_t>::min(),
+        "negative int64 endpoint remains representable");
+
+  const auto check_overflow = [](float value) {
+    try {
+      (void)QuantizeRasterSubpixel(value);
+    } catch (const std::overflow_error &) {
+      return true;
+    }
+    return false;
+  };
+  Check(check_overflow(0x1p55F) &&
+            check_overflow(std::numeric_limits<float>::max()) &&
+            check_overflow(-std::numeric_limits<float>::max()) &&
+            check_overflow(std::numeric_limits<float>::infinity()) &&
+            check_overflow(-std::numeric_limits<float>::infinity()) &&
+            check_overflow(std::numeric_limits<float>::quiet_NaN()),
+        "non-finite and out-of-range subpixels fail closed");
+
+  MemoryPool pool;
+  PipelineState state;
+  state.width = 800;
+  state.height = 600;
+  state.sequence = 1;
+  state.functional_case = FunctionalCase::kDriverPcoTriangles;
+  state.stage = PipelineStage::kTiled;
+  state.counters.c_primitives = 2;
+
+  const auto make_triangle = [](std::uint32_t primitive,
+                                std::array<std::uint32_t, 3> x,
+                                std::array<std::uint32_t, 3> y,
+                                std::uint32_t output_offset) {
+    RasterTriangle triangle;
+    triangle.key.submit_ordinal = primitive;
+    triangle.key.api_primitive_id = primitive;
+    for (std::size_t vertex = 0; vertex < 3; ++vertex) {
+      triangle.x[vertex] = BitsFloat(x[vertex]);
+      triangle.y[vertex] = BitsFloat(y[vertex]);
+      triangle.window_z[vertex] = 0.5F;
+      triangle.reciprocal_w[vertex] = 1.0F;
+    }
+    triangle.first_vertex_output_dword = output_offset;
+    triangle.vertex_output_stride_dwords = 4;
+    triangle.front_facing = 1;
+    triangle.rasterizable = 1;
+    triangle.setup_vertex_order[0] = 1;
+    triangle.setup_vertex_order[1] = 0;
+    triangle.setup_vertex_order[2] = 2;
+    return triangle;
+  };
+
+  // GLMark2 Terrain primitives 55622 and 55623 share A-C. Native RNE puts
+  // sample (628.5,113.5) on primitive 55622's side by 104 fixed units.
+  const RasterTriangle neighbor = make_triangle(
+      55622,
+      {UINT32_C(0x441d59e1), UINT32_C(0x441fea0d),
+       UINT32_C(0x441b7edc)},
+      {UINT32_C(0x42df7002), UINT32_C(0x42ed4340),
+       UINT32_C(0x42fca100)},
+      0);
+  const RasterTriangle target = make_triangle(
+      55623,
+      {UINT32_C(0x441d59e1), UINT32_C(0x441b7edc),
+       UINT32_C(0x4418ef0b)},
+      {UINT32_C(0x42df7002), UINT32_C(0x42fca100),
+       UINT32_C(0x42f14eff)},
+      12);
+  state.raster_triangles = StoreNewArray(
+      pool, std::vector<RasterTriangle>{neighbor, target});
+  state.raster_vertex_outputs =
+      StoreNewArray(pool, std::vector<std::uint32_t>(24));
+
+  const PoolHandle handle = pool.Allocate(sizeof(PipelineState));
+  StorePipelineState(pool, handle, state);
+  sc_core::sc_fifo<PipelineTxn> input("subpixel_rne_input", 1);
+  sc_core::sc_fifo<PipelineTxn> output("subpixel_rne_output", 1);
+  ParameterBuffer parameter("subpixel_rne_parameter", pool);
+  parameter.input(input);
+  parameter.output(output);
+  input.write(PipelineTxn{handle, 1, 1});
+  sc_core::sc_start(sc_core::sc_time(20, sc_core::SC_US));
+
+  PipelineTxn completed;
+  Check(output.nb_read(completed) && completed.state.slot == handle.slot &&
+            completed.state.generation == handle.generation,
+        "Terrain RNE parameter completion identity");
+  const PipelineState result = LoadPipelineState(pool, handle);
+  const std::vector<ParameterTriangle> parameters =
+      LoadArray<ParameterTriangle>(pool, result.parameter_triangles);
+  Check(parameters.size() == 2 && parameters[0].rasterizable == 1 &&
+            parameters[1].rasterizable == 1,
+        "Terrain shared-edge primitives remain rasterizable");
+
+  constexpr std::int64_t sample_x = 628 * kSubpixelScale +
+                                    kSubpixelScale / 2;
+  constexpr std::int64_t sample_y = 113 * kSubpixelScale +
+                                    kSubpixelScale / 2;
+  const auto edge_value = [](const EdgeEquation &edge) {
+    return edge.a * sample_x + edge.b * sample_y + edge.c;
+  };
+  const auto covers = [&](const ParameterTriangle &triangle) {
+    for (const EdgeEquation &edge : triangle.edge) {
+      const std::int64_t value = edge_value(edge);
+      if (value < 0 || (value == 0 && edge.inclusive == 0))
+        return false;
+    }
+    return true;
+  };
+  Check(edge_value(parameters[0].edge[2]) == 104 &&
+            edge_value(parameters[1].edge[0]) == -104 &&
+            covers(parameters[0]) && !covers(parameters[1]),
+        "RNE shared edge assigns pixel to native primitive 55622");
+
+  ReleaseFunctionalPayloads(pool, result);
+  pool.Release(handle);
+  Check(pool.bytes_in_flight() == 0 &&
+            pool.allocations() == pool.releases(),
+        "Terrain RNE payload ownership cleanup");
+}
+
 } // namespace
 
 int sc_main(int argc, char **argv) {
@@ -327,12 +654,17 @@ int sc_main(int argc, char **argv) {
     const bool clip_w = argc == 2 && std::string(argv[1]) == "clip-w";
     const bool viewport_fma =
         argc == 2 && std::string(argv[1]) == "viewport-fma";
+    const bool clipped_setup =
+        argc == 2 && std::string(argv[1]) == "clipped-setup";
+    const bool subpixel_rne =
+        argc == 2 && std::string(argv[1]) == "subpixel-rne";
     if (argc > 2 ||
         (argc == 2 && !invalid_count && !texture_fetch && !front_cull &&
-         !clip_w && !viewport_fma)) {
+         !clip_w && !viewport_fma && !clipped_setup && !subpixel_rne)) {
       throw std::runtime_error(
           "usage: nonindexed-triangle-geometry-test "
-          "[invalid-count|texture-fetch|front-cull|clip-w|viewport-fma]");
+          "[invalid-count|texture-fetch|front-cull|clip-w|viewport-fma|"
+          "clipped-setup|subpixel-rne]");
     }
 
     if (texture_fetch) {
@@ -350,6 +682,18 @@ int sc_main(int argc, char **argv) {
       CheckDriverViewportFma();
       std::cout <<
           "nonindexed_triangle_geometry_test: PASS (viewport-fma)\n";
+      return 0;
+    }
+    if (clipped_setup) {
+      CheckDriverClippedSetupPrecision();
+      std::cout <<
+          "nonindexed_triangle_geometry_test: PASS (clipped-setup)\n";
+      return 0;
+    }
+    if (subpixel_rne) {
+      CheckTerrainSubpixelRoundToEven();
+      std::cout <<
+          "nonindexed_triangle_geometry_test: PASS (subpixel-rne)\n";
       return 0;
     }
 

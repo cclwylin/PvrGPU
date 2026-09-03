@@ -245,6 +245,91 @@ int main() {
           "wrong PCO audit-metadata command payload"))
     return failed;
 
+  const std::filesystem::path pco_800 = TempFile("pco-800.txt");
+  std::string pco_800_text = pco_text;
+  if (!ReplaceOnce(&pco_800_text, "framebuffer_width=80",
+                   "framebuffer_width=800") ||
+      !ReplaceOnce(&pco_800_text, "framebuffer_height=60",
+                   "framebuffer_height=600") ||
+      !ReplaceOnce(&pco_800_text, "\nwidth=80\n", "\nwidth=800\n") ||
+      !ReplaceOnce(&pco_800_text, "\nheight=60\n", "\nheight=600\n") ||
+      !ReplaceOnce(&pco_800_text,
+                   "1109393408,1106247680,1056964608",
+                   "1137180672,1133903872,1056964608") ||
+      !ReplaceOnce(&pco_800_text,
+                   "1109393408,1106247680,1056964608",
+                   "1137180672,1133903872,1056964608")) {
+    return 1;
+  }
+  WriteText(pco_800, pco_800_text);
+  error.clear();
+  if (int failed =
+          Expect(LoadDriverCommand(pco_800.string(), &command, &error), error))
+    return failed;
+  if (int failed = Expect(
+          command.framebuffer_width == 800 &&
+              command.framebuffer_height == 600 && command.width == 800 &&
+              command.height == 600 &&
+              command.viewport_scale_bits[0] == UINT32_C(1137180672) &&
+              command.viewport_scale_bits[1] == UINT32_C(1133903872),
+          "valid 800x600 PCO audit metadata was not preserved"))
+    return failed;
+
+  const std::filesystem::path pco_bad_resolution =
+      TempFile("pco-bad-resolution.txt");
+  std::string pco_bad_resolution_text = pco_text;
+  if (!ReplaceOnce(&pco_bad_resolution_text, "framebuffer_width=80",
+                   "framebuffer_width=640") ||
+      !ReplaceOnce(&pco_bad_resolution_text, "framebuffer_height=60",
+                   "framebuffer_height=480") ||
+      !ReplaceOnce(&pco_bad_resolution_text, "\nwidth=80\n",
+                   "\nwidth=640\n") ||
+      !ReplaceOnce(&pco_bad_resolution_text, "\nheight=60\n",
+                   "\nheight=480\n")) {
+    return 1;
+  }
+  WriteText(pco_bad_resolution, pco_bad_resolution_text);
+  error.clear();
+  if (int failed = Expect(
+          !LoadDriverCommand(pco_bad_resolution.string(), &command, &error) &&
+              error.find("80x60 or 800x600") != std::string::npos,
+          "unsupported 640x480 PCO resolution was accepted"))
+    return failed;
+
+  const std::filesystem::path pco_bad_viewport_extent =
+      TempFile("pco-bad-viewport-extent.txt");
+  std::string pco_bad_viewport_extent_text = pco_800_text;
+  if (!ReplaceOnce(&pco_bad_viewport_extent_text, "\nwidth=800\n",
+                   "\nwidth=80\n")) {
+    return 1;
+  }
+  WriteText(pco_bad_viewport_extent, pco_bad_viewport_extent_text);
+  error.clear();
+  if (int failed = Expect(
+          !LoadDriverCommand(pco_bad_viewport_extent.string(), &command,
+                             &error) &&
+              error.find("framebuffer-sized") != std::string::npos,
+          "non-framebuffer-sized PCO viewport extent was accepted"))
+    return failed;
+
+  const std::filesystem::path pco_bad_800_viewport =
+      TempFile("pco-bad-800-viewport.txt");
+  std::string pco_bad_800_viewport_text = pco_800_text;
+  if (!ReplaceOnce(&pco_bad_800_viewport_text,
+                   "viewport_scale_bits=1137180672,1133903872,1056964608",
+                   "viewport_scale_bits=1109393408,1106247680,1056964608")) {
+    return 1;
+  }
+  WriteText(pco_bad_800_viewport, pco_bad_800_viewport_text);
+  error.clear();
+  if (int failed = Expect(
+          !LoadDriverCommand(pco_bad_800_viewport.string(), &command,
+                             &error) &&
+              error.find("strict supported-resolution conditionals profile") !=
+                  std::string::npos,
+          "80x60 viewport bits were accepted for an 800x600 PCO command"))
+    return failed;
+
   const std::filesystem::path pco_counters =
       TempFile("pco-counters.txt");
   WriteText(pco_counters,
@@ -344,7 +429,7 @@ int main() {
   error.clear();
   if (int failed = Expect(
           !LoadDriverCommand(bad_pco.string(), &command, &error) &&
-              error.find("strict 80x60 conditionals profile") !=
+              error.find("strict supported-resolution conditionals profile") !=
                   std::string::npos,
           "malformed PCO VBO byte count was accepted"))
     return failed;
@@ -361,7 +446,7 @@ int main() {
   error.clear();
   if (int failed = Expect(
           !LoadDriverCommand(bad_pco.string(), &command, &error) &&
-              error.find("strict 80x60 conditionals profile") !=
+              error.find("strict supported-resolution conditionals profile") !=
                   std::string::npos,
           "wrong 519-byte conditionals VS profile was accepted"))
     return failed;
@@ -378,7 +463,7 @@ int main() {
   error.clear();
   if (int failed = Expect(
           !LoadDriverCommand(bad_pco.string(), &command, &error) &&
-              error.find("strict 80x60 conditionals profile") !=
+              error.find("strict supported-resolution conditionals profile") !=
                   std::string::npos,
           "wrong 519-byte conditionals FS profile was accepted"))
     return failed;
@@ -397,7 +482,8 @@ int main() {
   error.clear();
   if (int failed = Expect(
           !LoadDriverCommand(bad_pco_linkage.string(), &command, &error) &&
-              error.find("strict conditionals profile") != std::string::npos,
+              error.find("strict supported-resolution conditionals profile") !=
+                  std::string::npos,
           "interpolated fragment-position linkage was accepted"))
     return failed;
 
@@ -415,7 +501,8 @@ int main() {
   error.clear();
   if (int failed = Expect(
           !LoadDriverCommand(bad_pco_abi.string(), &command, &error) &&
-              error.find("strict conditionals profile") != std::string::npos,
+              error.find("strict supported-resolution conditionals profile") !=
+                  std::string::npos,
           "wrong fragment temporary ABI count was accepted"))
     return failed;
 

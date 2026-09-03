@@ -48,6 +48,142 @@ constexpr std::array<std::uint32_t, 4> kTerrainClear = {
     UINT32_C(0x3f533333), UINT32_C(0x3f3e147b),
     UINT32_C(0x3f1e6666), UINT32_C(0x3f800000)};
 
+constexpr std::uint32_t FullMipCount(std::uint32_t width,
+                                     std::uint32_t height) {
+  std::uint32_t count = 0;
+  while (width != 0 || height != 0) {
+    ++count;
+    width >>= 1U;
+    height >>= 1U;
+  }
+  return count;
+}
+
+constexpr std::uint64_t TightRgba8MipBytes(std::uint32_t width,
+                                           std::uint32_t height,
+                                           std::uint32_t mip_count) {
+  std::uint64_t bytes = 0;
+  for (std::uint32_t level = 0; level < mip_count; ++level) {
+    bytes += static_cast<std::uint64_t>(width) * height * 4U;
+    width = width > 1U ? width >> 1U : 1U;
+    height = height > 1U ? height >> 1U : 1U;
+  }
+  return bytes;
+}
+
+struct SequenceResolutionProfile {
+  std::uint32_t width;
+  std::uint32_t height;
+  std::uint32_t offscreen_width;
+  std::uint32_t offscreen_height;
+  std::array<std::uint32_t, 3> viewport;
+  std::array<std::uint32_t, 3> offscreen_viewport;
+  std::uint32_t output_mip_count;
+  std::uint32_t offscreen_mip_count;
+  std::uint64_t output_rgba8_bytes;
+  std::uint64_t offscreen_rgba8_bytes;
+  std::uint64_t offscreen_depth_bytes;
+  std::uint32_t output_max_lod_u4_6;
+  std::uint32_t offscreen_max_lod_u4_6;
+  std::uint64_t refract_fragment_shared_fnv;
+  std::uint64_t shadow_fragment_shared_fnv;
+  std::uint64_t terrain_output_fragment_shared_fnv;
+  std::array<std::uint64_t, 8> terrain_fragment_pco_fnv;
+  std::uint32_t refract_drawlists;
+  std::uint64_t refract_ps_invocations;
+  std::uint64_t refract_texel_fetches;
+  std::uint32_t shadow_drawlists;
+  std::uint64_t shadow_ps_invocations;
+  std::uint64_t shadow_texel_fetches;
+  std::uint32_t terrain_drawlists;
+  std::uint64_t terrain_ps_invocations;
+  std::uint64_t terrain_texel_fetches;
+};
+
+constexpr std::array<SequenceResolutionProfile, 2>
+    kSequenceResolutionProfiles = {{
+        {80,
+         60,
+         160,
+         120,
+         {UINT32_C(0x42200000), UINT32_C(0x41f00000),
+          UINT32_C(0x3f000000)},
+         {UINT32_C(0x42a00000), UINT32_C(0x42700000),
+          UINT32_C(0x3f000000)},
+         FullMipCount(80, 60),
+         FullMipCount(160, 120),
+         TightRgba8MipBytes(80, 60, FullMipCount(80, 60)),
+         TightRgba8MipBytes(160, 120, FullMipCount(160, 120)),
+         UINT64_C(160) * 120U * 4U,
+         (FullMipCount(80, 60) - 1U) * 64U,
+         (FullMipCount(160, 120) - 1U) * 64U,
+         UINT64_C(0x26536c76cbc158b5),
+         UINT64_C(0x5d306f7625b3e88e),
+         UINT64_C(0x2d423f9c5838f4fd),
+         {UINT64_C(0x9e1c3ea2dfa1d8a5), UINT64_C(0x9711b79a7b5b63a6),
+          UINT64_C(0x4fecdd1ce1feb997), UINT64_C(0x956d5ea59737b66f),
+          UINT64_C(0x76fac56a9fbc5918), UINT64_C(0x412b9e844c3de073),
+          UINT64_C(0xab0dfc14e6aa5116), UINT64_C(0xd0b9eb8de7e641d2)},
+         9,
+         15675,
+         130272,
+         3,
+         3463,
+         2104,
+         42,
+         329330,
+         5413856},
+        {800,
+         600,
+         1600,
+         1200,
+         {UINT32_C(0x43c80000), UINT32_C(0x43960000),
+          UINT32_C(0x3f000000)},
+         {UINT32_C(0x44480000), UINT32_C(0x44160000),
+          UINT32_C(0x3f000000)},
+         FullMipCount(800, 600),
+         FullMipCount(1600, 1200),
+         TightRgba8MipBytes(800, 600, FullMipCount(800, 600)),
+         TightRgba8MipBytes(1600, 1200, FullMipCount(1600, 1200)),
+         UINT64_C(1600) * 1200U * 4U,
+         (FullMipCount(800, 600) - 1U) * 64U,
+         (FullMipCount(1600, 1200) - 1U) * 64U,
+         UINT64_C(0x440e2cf4d71a3f5c),
+         UINT64_C(0x77d13d3fd210cd96),
+         UINT64_C(0x33d7c2aad6bb3b8a),
+         {UINT64_C(0x9e1c3ea2dfa1d8a5), UINT64_C(0x9711b79a7b5b63a6),
+          UINT64_C(0x4fecdd1ce1feb997), UINT64_C(0x6ad4537c64c80942),
+          UINT64_C(0x76fac56a9fbc5918), UINT64_C(0x412b9e844c3de073),
+          UINT64_C(0x1d6737c7f69c0953), UINT64_C(0xb41e711d1ef41b5a)},
+         12,
+         1568167,
+         8261280,
+         3,
+         348735,
+         168960,
+         51,
+         2658615,
+         91927520},
+    }};
+
+static_assert(FullMipCount(1600, 1200) == 11);
+static_assert(TightRgba8MipBytes(1600, 1200, 11) == UINT64_C(10239756));
+static_assert(FullMipCount(800, 600) == 10);
+static_assert(TightRgba8MipBytes(800, 600, 10) == UINT64_C(2559756));
+
+const SequenceResolutionProfile *SequenceResolutionProfileFor(
+    const DriverCommand &logical) {
+  for (const SequenceResolutionProfile &profile :
+       kSequenceResolutionProfiles) {
+    if (logical.framebuffer_width == profile.width &&
+        logical.framebuffer_height == profile.height &&
+        logical.width == profile.width && logical.height == profile.height) {
+      return &profile;
+    }
+  }
+  return nullptr;
+}
+
 bool Reject(std::string *error, const std::string &reason) {
   if (error)
     *error = reason;
@@ -88,15 +224,16 @@ bool RootPayloadIsEmpty(const DriverCommand &command) {
 
 bool SequenceEnvelopeMatches(const Options &options, const char *case_name,
                              std::size_t physical_draw_count,
+                             const SequenceResolutionProfile **resolution,
                              std::string *error) {
   const DriverCommand &logical = options.driver_command;
+  const SequenceResolutionProfile *profile =
+      SequenceResolutionProfileFor(logical);
   if (!logical.enabled || logical.schema != kDriverCommandSchema ||
       logical.producer != kDriverCommandProducer ||
       logical.command != kDrawPcoSequence || logical.test_case != case_name ||
-      logical.frame != 1 || logical.framebuffer_width != 80 ||
-      logical.framebuffer_height != 60 || logical.width != 80 ||
-      logical.height != 60 || logical.format != kRgba8 ||
-      !RootPayloadIsEmpty(logical)) {
+      logical.frame != 1 || !profile || logical.format != kRgba8 ||
+      !RootPayloadIsEmpty(logical) || !resolution) {
     return Reject(error, std::string(case_name) +
                              " PCO logical command envelope is invalid");
   }
@@ -105,6 +242,7 @@ bool SequenceEnvelopeMatches(const Options &options, const char *case_name,
                              std::to_string(physical_draw_count) +
                              " physical draws");
   }
+  *resolution = profile;
   return true;
 }
 
@@ -189,9 +327,15 @@ bool DrawHeaderAndPayloadMatch(const DriverCommand &command,
       Fnv1a64(command.raw_vertex_data) != spec.vertex_fnv) {
     return Reject(error, DrawReason(profile, ordinal, "VBO/topology"));
   }
-  if (command.vertex_pco.size() != spec.vertex_pco_bytes ||
-      command.declared_vertex_pco_size != spec.vertex_pco_bytes ||
-      Fnv1a64(command.vertex_pco) != spec.vertex_pco_fnv ||
+  const bool vertex_pco_matches =
+      (command.vertex_pco.size() == spec.vertex_pco_bytes &&
+       command.declared_vertex_pco_size == spec.vertex_pco_bytes &&
+       Fnv1a64(command.vertex_pco) == spec.vertex_pco_fnv) ||
+      (std::strcmp(spec.case_name, kShadowCase) == 0 && ordinal == 2 &&
+       command.vertex_pco.size() == 744U &&
+       command.declared_vertex_pco_size == 744U &&
+       Fnv1a64(command.vertex_pco) == UINT64_C(0xe6bc6969c1a52652));
+  if (!vertex_pco_matches ||
       command.fragment_pco.size() != spec.fragment_pco_bytes ||
       command.declared_fragment_pco_size != spec.fragment_pco_bytes ||
       Fnv1a64(command.fragment_pco) != spec.fragment_pco_fnv ||
@@ -424,7 +568,21 @@ constexpr std::array<DrawSpec, 2> kRefractDraws = {{
      3},
 }};
 
+DrawSpec RefractDrawSpec(std::size_t ordinal,
+                         const SequenceResolutionProfile &resolution) {
+  DrawSpec spec = kRefractDraws[ordinal];
+  const bool prepass = ordinal == 0;
+  spec.width = prepass ? resolution.offscreen_width : resolution.width;
+  spec.height = prepass ? resolution.offscreen_height : resolution.height;
+  spec.viewport =
+      prepass ? resolution.offscreen_viewport : resolution.viewport;
+  if (!prepass)
+    spec.fragment_shared_fnv = resolution.refract_fragment_shared_fnv;
+  return spec;
+}
+
 bool RefractResourcesMatch(const std::vector<DriverCommand> &commands,
+                           const SequenceResolutionProfile &resolution,
                            std::string *error) {
   if (!commands[0].sampled_textures.empty() ||
       commands[1].sampled_textures.size() != 3) {
@@ -435,12 +593,19 @@ bool RefractResourcesMatch(const std::vector<DriverCommand> &commands,
   const auto &external = commands[1].sampled_textures[2];
   if (!TextureMatches(depth,
                       DriverPcoTextureSource::kPreviousDepthAttachment,
-                      DriverPcoShaderStage::kFragment, 0, 0, 160, 120, 1,
-                      76800, kMipNone, kWrapClamp, 0, 0, false, kZ32) ||
+                      DriverPcoShaderStage::kFragment, 0, 0,
+                      resolution.offscreen_width,
+                      resolution.offscreen_height, 1,
+                      resolution.offscreen_depth_bytes, kMipNone, kWrapClamp,
+                      0, 0, false, kZ32) ||
       !TextureMatches(color,
                       DriverPcoTextureSource::kPreviousColorAttachment,
-                      DriverPcoShaderStage::kFragment, 0, 1, 160, 120, 8,
-                      102352, kMipLinear, kWrapClamp, 448) ||
+                      DriverPcoShaderStage::kFragment, 0, 1,
+                      resolution.offscreen_width,
+                      resolution.offscreen_height,
+                      resolution.offscreen_mip_count,
+                      resolution.offscreen_rgba8_bytes, kMipLinear,
+                      kWrapClamp, resolution.offscreen_max_lod_u4_6) ||
       !TextureMatches(external,
                       DriverPcoTextureSource::kExternalPayload,
                       DriverPcoShaderStage::kFragment, 0, 2, 512, 512, 1,
@@ -452,28 +617,32 @@ bool RefractResourcesMatch(const std::vector<DriverCommand> &commands,
 }
 
 bool RefractSupported(const Options &options, std::string *error) {
+  const SequenceResolutionProfile *resolution = nullptr;
   if (!SequenceEnvelopeMatches(options, kRefractCase, kRefractDraws.size(),
-                               error)) {
+                               &resolution, error)) {
     return false;
   }
   const DriverCommand &logical = options.driver_command;
-  if (logical.clear_color_bits != kOpaqueBlack || logical.draw_count != 9 ||
+  if (logical.clear_color_bits != kOpaqueBlack ||
+      logical.draw_count != resolution->refract_drawlists ||
       logical.ia_vertices != 417996 || logical.ia_primitives != 139332 ||
       logical.vs_invocations != 417996 ||
       logical.clip_invocations != 139332 ||
-      logical.clip_primitives != 108310 || logical.ps_invocations != 15675 ||
+      logical.clip_primitives != 108310 ||
+      logical.ps_invocations != resolution->refract_ps_invocations ||
       logical.setup_triangles != 108310 ||
-      logical.semantic_texel_fetches != 130272 ||
+      logical.semantic_texel_fetches != resolution->refract_texel_fetches ||
       !LogicalUnusedCountersAreZero(logical)) {
     return Reject(error, "Refract PCO logical counters are invalid");
   }
   for (std::size_t ordinal = 0; ordinal < kRefractDraws.size(); ++ordinal) {
-    if (!DrawMatches(options.driver_commands[ordinal], kRefractDraws[ordinal],
+    const DrawSpec spec = RefractDrawSpec(ordinal, *resolution);
+    if (!DrawMatches(options.driver_commands[ordinal], spec,
                      "Refract", ordinal, error)) {
       return false;
     }
   }
-  return RefractResourcesMatch(options.driver_commands, error);
+  return RefractResourcesMatch(options.driver_commands, *resolution, error);
 }
 
 constexpr std::uint64_t kShadowMeshVertexFnv =
@@ -597,23 +766,39 @@ constexpr std::array<DrawSpec, 3> kShadowDraws = {{
      0},
 }};
 
+DrawSpec ShadowDrawSpec(std::size_t ordinal,
+                        const SequenceResolutionProfile &resolution) {
+  DrawSpec spec = kShadowDraws[ordinal];
+  const bool depth = ordinal == 0;
+  spec.width = depth ? resolution.offscreen_width : resolution.width;
+  spec.height = depth ? resolution.offscreen_height : resolution.height;
+  spec.viewport = depth ? resolution.offscreen_viewport : resolution.viewport;
+  if (ordinal == 1)
+    spec.fragment_shared_fnv = resolution.shadow_fragment_shared_fnv;
+  return spec;
+}
+
 bool ShadowSupported(const Options &options, std::string *error) {
+  const SequenceResolutionProfile *resolution = nullptr;
   if (!SequenceEnvelopeMatches(options, kShadowCase, kShadowDraws.size(),
-                               error)) {
+                               &resolution, error)) {
     return false;
   }
   const DriverCommand &logical = options.driver_command;
-  if (logical.clear_color_bits != kOpaqueBlack || logical.draw_count != 3 ||
+  if (logical.clear_color_bits != kOpaqueBlack ||
+      logical.draw_count != resolution->shadow_drawlists ||
       logical.ia_vertices != 43036 || logical.ia_primitives != 14346 ||
       logical.vs_invocations != 43036 || logical.clip_invocations != 14346 ||
-      logical.clip_primitives != 14349 || logical.ps_invocations != 3463 ||
+      logical.clip_primitives != 14349 ||
+      logical.ps_invocations != resolution->shadow_ps_invocations ||
       logical.setup_triangles != 14349 ||
-      logical.semantic_texel_fetches != 2104 ||
+      logical.semantic_texel_fetches != resolution->shadow_texel_fetches ||
       !LogicalUnusedCountersAreZero(logical)) {
     return Reject(error, "Shadow PCO logical counters are invalid");
   }
   for (std::size_t ordinal = 0; ordinal < kShadowDraws.size(); ++ordinal) {
-    if (!DrawMatches(options.driver_commands[ordinal], kShadowDraws[ordinal],
+    const DrawSpec spec = ShadowDrawSpec(ordinal, *resolution);
+    if (!DrawMatches(options.driver_commands[ordinal], spec,
                      "Shadow", ordinal, error)) {
       return false;
     }
@@ -624,8 +809,10 @@ bool ShadowSupported(const Options &options, std::string *error) {
       !TextureMatches(
           options.driver_commands[1].sampled_textures[0],
           DriverPcoTextureSource::kPreviousDepthAttachment,
-          DriverPcoShaderStage::kFragment, 0, 0, 160, 120, 1, 76800,
-          kMipNone, kWrapClamp, 0, 0, false, kZ32)) {
+          DriverPcoShaderStage::kFragment, 0, 0,
+          resolution->offscreen_width, resolution->offscreen_height, 1,
+          resolution->offscreen_depth_bytes, kMipNone, kWrapClamp, 0, 0,
+          false, kZ32)) {
     return Reject(error, "Shadow PCO sampled-depth contract is invalid");
   }
   return true;
@@ -664,11 +851,6 @@ constexpr std::array<std::uint64_t, 8> kTerrainVertexPcoFnv = {
     UINT64_C(0x081618f544cc6abe), UINT64_C(0x081618f544cc6abe)};
 constexpr std::array<std::size_t, 8> kTerrainFragmentPcoBytes = {
     38832, 1208, 7328, 1920, 1880, 448, 3528, 3504};
-constexpr std::array<std::uint64_t, 8> kTerrainFragmentPcoFnv = {
-    UINT64_C(0x9e1c3ea2dfa1d8a5), UINT64_C(0x9711b79a7b5b63a6),
-    UINT64_C(0x4fecdd1ce1feb997), UINT64_C(0x956d5ea59737b66f),
-    UINT64_C(0x76fac56a9fbc5918), UINT64_C(0x412b9e844c3de073),
-    UINT64_C(0xab0dfc14e6aa5116), UINT64_C(0xd0b9eb8de7e641d2)};
 constexpr std::array<DriverPcoStageAbi, 8> kTerrainVertexAbi = {{
     {7, 4, 6, 0, 8, 0, 8, 0},
     {6, 4, 6, 0, 8, 0, 8, 0},
@@ -694,15 +876,17 @@ constexpr std::array<std::size_t, 8> kTerrainVertexSharedDwords = {
 constexpr std::array<std::size_t, 8> kTerrainFragmentSharedDwords = {
     4, 28, 164, 20, 20, 24, 20, 20};
 
-DrawSpec TerrainDrawSpec(std::size_t ordinal) {
+DrawSpec TerrainDrawSpec(std::size_t ordinal,
+                         const SequenceResolutionProfile &resolution) {
   const bool main = ordinal == 2;
   const bool extent_256 = ordinal == 0 || ordinal == 1 || ordinal == 3 ||
                           ordinal == 4;
-  const std::uint32_t width = extent_256 ? 256U : 80U;
-  const std::uint32_t height = extent_256 ? 256U : 60U;
+  const std::uint32_t width = extent_256 ? 256U : resolution.width;
+  const std::uint32_t height = extent_256 ? 256U : resolution.height;
   const bool depth = ordinal == 2 || ordinal == 5 || ordinal == 7;
   const bool z24 = ordinal == 7;
   const bool d6 = ordinal == 5;
+  const bool output_descriptor = ordinal == 3 || ordinal == 6 || ordinal == 7;
   const std::uint32_t vertex_textures = main ? 2U : 0U;
   const std::uint32_t fragment_textures =
       ordinal == 0 ? 0U : (main ? 5U : 1U);
@@ -717,17 +901,19 @@ DrawSpec TerrainDrawSpec(std::size_t ordinal) {
           kTerrainVertexPcoBytes[ordinal],
           kTerrainVertexPcoFnv[ordinal],
           kTerrainFragmentPcoBytes[ordinal],
-          kTerrainFragmentPcoFnv[ordinal],
+          resolution.terrain_fragment_pco_fnv[ordinal],
           kTerrainVertexAbi[ordinal],
           kTerrainFragmentAbi[ordinal],
           kTerrainVertexSharedDwords[ordinal],
           kTerrainVertexSharedFnv[ordinal],
           kTerrainFragmentSharedDwords[ordinal],
-          kTerrainFragmentSharedFnv[ordinal],
+          output_descriptor ? resolution.terrain_output_fragment_shared_fnv :
+                              kTerrainFragmentSharedFnv[ordinal],
           main ? 14U : 2U,
-          {extent_256 ? UINT32_C(0x43000000) : UINT32_C(0x42200000),
-           extent_256 ? UINT32_C(0x43000000) : UINT32_C(0x41f00000),
-           UINT32_C(0x3f000000)},
+          extent_256 ? std::array<std::uint32_t, 3>{
+                           UINT32_C(0x43000000), UINT32_C(0x43000000),
+                           UINT32_C(0x3f000000)} :
+                       resolution.viewport,
           kCullBack,
           0x0f,
           d6 ? 1U : 0U,
@@ -747,6 +933,7 @@ DrawSpec TerrainDrawSpec(std::size_t ordinal) {
 }
 
 bool TerrainResourcesMatch(const std::vector<DriverCommand> &commands,
+                           const SequenceResolutionProfile &resolution,
                            std::string *error) {
   if (!commands[0].sampled_textures.empty())
     return Reject(error, "Terrain D1 must not have sampled resources");
@@ -807,16 +994,22 @@ bool TerrainResourcesMatch(const std::vector<DriverCommand> &commands,
     std::uint64_t bytes;
     std::uint32_t max_lod;
   };
-  static constexpr std::array<PreviousSpec, 5> kPrevious = {{
-      {2, 80, 60, 7, 25552, 384},
+  const std::array<PreviousSpec, 5> previous = {{
+      {2, resolution.width, resolution.height,
+       resolution.output_mip_count, resolution.output_rgba8_bytes,
+       resolution.output_max_lod_u4_6},
       {3, 256, 256, 9, 349524, 512},
       {4, 256, 256, 9, 349524, 512},
-      {5, 80, 60, 7, 25552, 384},
-      {6, 80, 60, 7, 25552, 384},
+      {5, resolution.width, resolution.height,
+       resolution.output_mip_count, resolution.output_rgba8_bytes,
+       resolution.output_max_lod_u4_6},
+      {6, resolution.width, resolution.height,
+       resolution.output_mip_count, resolution.output_rgba8_bytes,
+       resolution.output_max_lod_u4_6},
   }};
-  for (std::size_t offset = 0; offset < kPrevious.size(); ++offset) {
+  for (std::size_t offset = 0; offset < previous.size(); ++offset) {
     const std::size_t ordinal = offset + 3;
-    const auto &spec = kPrevious[offset];
+    const auto &spec = previous[offset];
     if (commands[ordinal].sampled_textures.size() != 1 ||
         !TextureMatches(
             commands[ordinal].sampled_textures[0],
@@ -832,33 +1025,45 @@ bool TerrainResourcesMatch(const std::vector<DriverCommand> &commands,
 }
 
 bool TerrainPhysicalContractMatches(const Options &options,
+                                    const SequenceResolutionProfile &resolution,
                                     std::string *error) {
-  if (!SequenceEnvelopeMatches(options, kTerrainCase, 8, error))
-    return false;
   for (std::size_t ordinal = 0; ordinal < 8; ++ordinal) {
-    const DrawSpec spec = TerrainDrawSpec(ordinal);
+    const DrawSpec spec = TerrainDrawSpec(ordinal, resolution);
     if (!DrawMatches(options.driver_commands[ordinal], spec, "Terrain",
                      ordinal, error)) {
       return false;
     }
   }
-  return TerrainResourcesMatch(options.driver_commands, error);
+  return TerrainResourcesMatch(options.driver_commands, resolution, error);
 }
 
-bool TerrainLogicalCountersMatch(const DriverCommand &logical) {
+bool TerrainLogicalCountersMatch(
+    const DriverCommand &logical,
+    const SequenceResolutionProfile &resolution) {
   return logical.clear_color_bits == kTerrainClear &&
-         logical.draw_count == 42 && logical.ia_vertices == 393258 &&
+         logical.draw_count == resolution.terrain_drawlists &&
+         logical.ia_vertices == 393258 &&
          logical.ia_primitives == 131086 &&
          logical.vs_invocations == 393258 && logical.gs_invocations == 0 &&
          logical.gs_primitives == 0 &&
          logical.clip_invocations == 131086 &&
          logical.clip_primitives == 25496 &&
-         logical.ps_invocations == 329330 && logical.hs_invocations == 0 &&
+         logical.ps_invocations == resolution.terrain_ps_invocations &&
+         logical.hs_invocations == 0 &&
          logical.ds_invocations == 0 && logical.cs_invocations == 0 &&
          logical.setup_triangles == 25496 &&
-         logical.semantic_texel_fetches == 5413856 &&
+         logical.semantic_texel_fetches == resolution.terrain_texel_fetches &&
          logical.index_count == 0 && logical.unique_vertices == 0 &&
          logical.primitive_count == 0;
+}
+
+bool TerrainSupported(const Options &options, std::string *error) {
+  const SequenceResolutionProfile *resolution = nullptr;
+  if (!SequenceEnvelopeMatches(options, kTerrainCase, 8, &resolution, error))
+    return false;
+  if (!TerrainLogicalCountersMatch(options.driver_command, *resolution))
+    return Reject(error, "Terrain PCO logical counters are invalid");
+  return TerrainPhysicalContractMatches(options, *resolution, error);
 }
 
 }  // namespace
@@ -868,6 +1073,20 @@ bool DriverPcoTerrainExternalPayloadHashMatches(
   return texture_index < kTerrainMainTextureFnv.size() &&
          kTerrainMainTextureFnv[texture_index] != 0 &&
          payload_hash == kTerrainMainTextureFnv[texture_index];
+}
+
+bool DriverPcoTerrainFragmentBinaryHashMatches(
+    std::uint32_t width, std::uint32_t height, std::size_t draw_index,
+    std::uint64_t binary_hash) {
+  if (draw_index >= kTerrainFragmentPcoBytes.size())
+    return false;
+  for (const SequenceResolutionProfile &profile :
+       kSequenceResolutionProfiles) {
+    if (profile.width == width && profile.height == height) {
+      return profile.terrain_fragment_pco_fnv[draw_index] == binary_hash;
+    }
+  }
+  return false;
 }
 
 bool DriverPcoSequenceSupported(const Options &options, std::string *error) {
@@ -881,13 +1100,8 @@ bool DriverPcoSequenceSupported(const Options &options, std::string *error) {
     return RefractSupported(options, error);
   if (logical.test_case == kShadowCase)
     return ShadowSupported(options, error);
-  if (logical.test_case == kTerrainCase) {
-    if (!TerrainPhysicalContractMatches(options, error))
-      return false;
-    if (!TerrainLogicalCountersMatch(logical))
-      return Reject(error, "Terrain PCO logical counters are invalid");
-    return true;
-  }
+  if (logical.test_case == kTerrainCase)
+    return TerrainSupported(options, error);
   return Reject(error, "native PCO sequence profile is unsupported");
 }
 

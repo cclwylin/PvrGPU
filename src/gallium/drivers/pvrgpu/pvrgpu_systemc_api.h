@@ -9,10 +9,11 @@
 extern "C" {
 #endif
 
-#define PVRGPU_SYSTEMC_API_VERSION 7u
+/* API-v8 expands the by-value sequence-texture mip table from 10 to 15. */
+#define PVRGPU_SYSTEMC_API_VERSION 8u
 #define PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_COMMANDS 64u
 #define PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_TEXTURES 16u
-#define PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS 10u
+#define PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS 15u
 #define PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR UINT32_MAX
 
 struct pvrgpu_systemc_pco_stage_abi {
@@ -224,7 +225,7 @@ struct pvrgpu_systemc_driver_command {
    uint32_t depth_format;
 
    /*
-    * API-v7 render-pass continuity. UINT32_MAX creates and clears a new
+    * API-v8 render-pass continuity. UINT32_MAX creates and clears a new
     * attachment; any other value aliases and LOADs the exact attachment
     * produced by that earlier nested command ordinal.  Alias dimensions and
     * formats are validated before any SystemC work is queued.
@@ -241,7 +242,7 @@ struct pvrgpu_systemc_driver_command {
    uint32_t blend_destination_alpha_factor;
 
    /*
-    * API-v7 native PCO sequence.  The outer logical command carries captured
+    * API-v8 native PCO sequence.  The outer logical command carries captured
     * counter metadata; each nested command uses the ordinary PCO draw fields
     * above and must leave its own sequence tail zero.  Resources may be
     * immutable external payloads or actual color/depth attachments produced

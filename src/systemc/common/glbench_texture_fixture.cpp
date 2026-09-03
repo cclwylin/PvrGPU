@@ -36,6 +36,8 @@ inline constexpr std::uint64_t kBilinearSamplerWord0 =
     UINT64_C(0x0000005000000fff);
 inline constexpr std::uint64_t kTrilinearSamplerWord0 =
     UINT64_C(0x00000151df800fff);
+inline constexpr std::uint32_t kGlbenchTextureMipLevels = 10;
+static_assert(kGlbenchTextureMipLevels <= kMaximumTextureMipLevels);
 static_assert(kNearestSamplerWord0 == Bits(4095U, 0, 12));
 static_assert(kBilinearSamplerWord0 ==
               (Bits(4095U, 0, 12) | Bits(1U, 36, 37) |
@@ -99,11 +101,11 @@ MakeGlbenchFillTextureFixture(FunctionalCase functional_case) {
   fixture.vertex_scale_bits = config.vertex_scale_bits;
 
   fixture.resource.gpu_address = kGlbenchTextureGpuAddress;
-  fixture.resource.mip_count = kMaximumTextureMipLevels;
+  fixture.resource.mip_count = kGlbenchTextureMipLevels;
   fixture.resource.format = TextureFormat::kRgba8Unorm;
   fixture.resource.layout = TextureLayout::kLinear;
   std::uint32_t size = 512;
-  for (std::uint32_t level = 0; level < kMaximumTextureMipLevels; ++level) {
+  for (std::uint32_t level = 0; level < kGlbenchTextureMipLevels; ++level) {
     TextureMipLevel &mip = fixture.resource.mip[level];
     mip.width = size;
     mip.height = size;
@@ -151,7 +153,8 @@ MakeGlbenchFillTextureFixture(FunctionalCase functional_case) {
   // 2048-byte row stride encoded as stride-1, ten uploaded levels.
   const std::uint64_t image_word1 =
       Bits((kGlbenchTextureGpuAddress >> 2U), 16, 53) |
-      Bits(1U, 15, 15) | Bits(2047U, 0, 14) | Bits(10U, 60, 63);
+      Bits(1U, 15, 15) | Bits(2047U, 0, 14) |
+      Bits(kGlbenchTextureMipLevels, 60, 63);
   StoreU64(fixture.fragment_shared, 2, image_word1);
 
   // Dwords 4..7 are the public image meta area. The texture is non-arrayed,

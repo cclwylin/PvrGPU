@@ -1377,6 +1377,10 @@ void NormalizeDriverPcoTrianglesApiCounters(const Options &options,
     counters.texel_fetches = command.semantic_texel_fetches;
     return;
   }
+  if (command.depth_enable == 0) {
+    counters.ps_invocations = counters.pbe_fragment_writes;
+    return;
+  }
   if (command.depth_enable != 1 || command.depth_write != 1 ||
       counters.depth_written_fragments > counters.depth_tested_fragments ||
       counters.depth_written_fragments < counters.pbe_fragment_writes) {

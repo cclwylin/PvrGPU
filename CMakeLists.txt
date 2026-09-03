@@ -635,6 +635,14 @@ add_test(
     NAME nonindexed-triangle-driver-viewport-fma
     COMMAND nonindexed-triangle-geometry-test viewport-fma
 )
+add_test(
+    NAME nonindexed-triangle-driver-clipped-setup-precision
+    COMMAND nonindexed-triangle-geometry-test clipped-setup
+)
+add_test(
+    NAME nonindexed-triangle-driver-subpixel-rne
+    COMMAND nonindexed-triangle-geometry-test subpixel-rne
+)
 
 add_executable(all-culled-geometry-test
     tests/all_culled_geometry_test.cpp

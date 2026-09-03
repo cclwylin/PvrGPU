@@ -132,6 +132,17 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    caps->vertex_color_unclamped = true;
    caps->fragment_color_clamped = true;
    caps->fs_coord_origin_upper_left = true;
+   /*
+    * Lower scissored and channel-masked clears in the driver.  Without these
+    * the state tracker rewrites every such glClear into an internal
+    * triangle-fan quad draw, which this bring-up driver cannot lower and has
+    * to reject as an unsupported draw.  Gallium has no separate cap for the
+    * stencil write mask, so a masked stencil clear now also reaches
+    * pvrgpu_clear(); it stays fail-closed there exactly as the quad lowering
+    * was.
+    */
+   caps->clear_scissored = true;
+   caps->clear_masked = true;
    caps->fs_coord_pixel_center_half_integer = true;
    caps->max_texture_2d_size = 4096;
    caps->max_texture_3d_levels = 9;

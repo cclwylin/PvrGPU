@@ -49,7 +49,21 @@ std::uint32_t FloatBits(float value) {
 struct ClipVertex {
   float output[pvrgpu::stub::kPcoVertexOutputRegisterCount]{};
   std::uint16_t output_count = 0;
+  // Mesa's LLVM vertex path contracts the viewport multiply/add for original
+  // vertices.  draw_pipe_clip.c recomputes window coordinates for generated
+  // intersections with three separate CPU operations instead.
+  bool generated_intersection = false;
 };
+
+float StrictMultiply(float left, float right) {
+  volatile float result = left * right;
+  return result;
+}
+
+float StrictAdd(float left, float right) {
+  volatile float result = left + right;
+  return result;
+}
 
 ClipVertex ReadClipVertex(const VertexLane &vertex,
                           std::uint16_t output_count) {
@@ -127,6 +141,7 @@ ClipVertex Interpolate(float t, const ClipVertex &outside,
   }
   ClipVertex result;
   result.output_count = outside.output_count;
+  result.generated_intersection = true;
   for (std::size_t component = 0; component < result.output_count;
        ++component) {
     result.output[component] =
@@ -228,24 +243,19 @@ std::int64_t CheckedMul(std::int64_t lhs, std::int64_t rhs,
   return result;
 }
 
-std::int64_t Quantize(float value) {
-  const double scaled =
-      static_cast<double>(value) * pvrgpu::stub::kSubpixelScale;
-  if (!std::isfinite(scaled) ||
-      scaled < static_cast<double>(std::numeric_limits<std::int64_t>::min()) ||
-      scaled > static_cast<double>(std::numeric_limits<std::int64_t>::max())) {
-    throw std::overflow_error("ClipCull fixed-point coordinate overflow");
-  }
-  return static_cast<std::int64_t>(std::llround(scaled));
-}
-
 std::int64_t QuantizedArea(const RasterTriangle &triangle) {
-  const std::int64_t x0 = Quantize(triangle.x[0]);
-  const std::int64_t y0 = Quantize(triangle.y[0]);
-  const std::int64_t x1 = Quantize(triangle.x[1]);
-  const std::int64_t y1 = Quantize(triangle.y[1]);
-  const std::int64_t x2 = Quantize(triangle.x[2]);
-  const std::int64_t y2 = Quantize(triangle.y[2]);
+  const std::int64_t x0 =
+      pvrgpu::stub::QuantizeRasterSubpixel(triangle.x[0]);
+  const std::int64_t y0 =
+      pvrgpu::stub::QuantizeRasterSubpixel(triangle.y[0]);
+  const std::int64_t x1 =
+      pvrgpu::stub::QuantizeRasterSubpixel(triangle.x[1]);
+  const std::int64_t y1 =
+      pvrgpu::stub::QuantizeRasterSubpixel(triangle.y[1]);
+  const std::int64_t x2 =
+      pvrgpu::stub::QuantizeRasterSubpixel(triangle.x[2]);
+  const std::int64_t y2 =
+      pvrgpu::stub::QuantizeRasterSubpixel(triangle.y[2]);
   const std::int64_t dx10 = CheckedSub(x1, x0, "ClipCull x delta overflow");
   const std::int64_t dy20 = CheckedSub(y2, y0, "ClipCull y delta overflow");
   const std::int64_t dy10 = CheckedSub(y1, y0, "ClipCull y delta overflow");
@@ -335,7 +345,12 @@ RasterTriangle BuildRasterTriangle(const std::array<ClipVertex, 3> &vertices,
                                    bool front_facing,
                                    std::vector<std::uint32_t> &vertex_outputs,
                                    bool depth_clamp_enable,
-                                   bool mesa_viewport_order) {
+                                   bool mesa_viewport_order,
+                                   bool mesa_clipper_emit_order) {
+  if (mesa_clipper_emit_order && !mesa_viewport_order) {
+    throw std::runtime_error(
+        "ClipCull Mesa clipper order requires Mesa viewport semantics");
+  }
   RasterTriangle triangle;
   triangle.front_facing = front_facing ? 1U : 0U;
   const std::uint16_t output_count = vertices[0].output_count;
@@ -363,13 +378,23 @@ RasterTriangle BuildRasterTriangle(const std::array<ClipVertex, 3> &vertices,
     if (mesa_viewport_order) {
       const float scale_x = static_cast<float>(width) * 0.5F;
       const float scale_y = static_cast<float>(height) * 0.5F;
-      // Gallivm's do_rhw_viewport emits data * reciprocal_w first, then
-      // contracts the viewport multiply/add.  Keep that public driver-PCO
-      // ordering exact: splitting the final operation changes setup-plane
-      // coefficients at half-precision interpolation boundaries.
-      triangle.x[index] = std::fma(ndc_x, scale_x, scale_x);
-      triangle.y[index] = std::fma(ndc_y, scale_y, scale_y);
-      triangle.window_z[index] = std::fma(ndc_z, 0.5F, 0.5F);
+      if (vertices[index].generated_intersection) {
+        // draw_pipe_clip.c's CPU intersection path is compiled as distinct
+        // MUL/MUL/ADD operations.  A one-ULP window coordinate difference is
+        // observable in setup coefficients and half-precision texture LOD.
+        triangle.x[index] =
+            StrictAdd(StrictMultiply(ndc_x, scale_x), scale_x);
+        triangle.y[index] =
+            StrictAdd(StrictMultiply(ndc_y, scale_y), scale_y);
+        triangle.window_z[index] =
+            StrictAdd(StrictMultiply(ndc_z, 0.5F), 0.5F);
+      } else {
+        // Gallivm's do_rhw_viewport emits data * reciprocal_w first, then
+        // contracts the viewport multiply/add for original shader vertices.
+        triangle.x[index] = std::fma(ndc_x, scale_x, scale_x);
+        triangle.y[index] = std::fma(ndc_y, scale_y, scale_y);
+        triangle.window_z[index] = std::fma(ndc_z, 0.5F, 0.5F);
+      }
     } else {
       triangle.x[index] =
           (ndc_x * 0.5F + 0.5F) * static_cast<float>(width);
@@ -397,6 +422,28 @@ RasterTriangle BuildRasterTriangle(const std::array<ClipVertex, 3> &vertices,
       throw std::runtime_error("ClipCull failed to normalize raster winding");
   }
   triangle.rasterizable = area > 0 ? 1U : 0U;
+
+  // The GL driver command uses last-vertex provoking semantics.  Clean
+  // primitives enter llvmpipe setup in application order; the generic Mesa
+  // clip stage fan-emits them as {fan-1, fan, 0}.  llvmpipe then exchanges
+  // its first two vertices while normalizing the validated CW command for
+  // setup, yielding {1,0,2} and {2,1,0}, respectively.  Translate that input
+  // order through this model's independent raster-winding normalization.
+  const std::array<std::size_t, 3> setup_input_order =
+      mesa_viewport_order
+          ? (mesa_clipper_emit_order
+                 ? std::array<std::size_t, 3>{2, 1, 0}
+                 : std::array<std::size_t, 3>{1, 0, 2})
+          : std::array<std::size_t, 3>{0, 1, 2};
+  for (std::size_t setup_index = 0; setup_index < setup_input_order.size();
+       ++setup_index) {
+    const auto serialized = std::find(output_order.begin(), output_order.end(),
+                                      setup_input_order[setup_index]);
+    if (serialized == output_order.end())
+      throw std::runtime_error("ClipCull lost Mesa setup vertex identity");
+    triangle.setup_vertex_order[setup_index] = static_cast<std::uint8_t>(
+        std::distance(output_order.begin(), serialized));
+  }
   if (vertex_outputs.size() > std::numeric_limits<std::uint32_t>::max())
     throw std::overflow_error("ClipCull raster VTXOUT offset overflow");
   triangle.first_vertex_output_dword =
@@ -550,7 +597,8 @@ void ClipCull::Run() {
             IsFaceCulled(state.raster_state.face_cull, front_facing);
         RasterTriangle triangle = BuildRasterTriangle(
             vertices, state.width, state.height, front_facing,
-            raster_vertex_outputs, depth_clamp, driver_textured_triangles);
+            raster_vertex_outputs, depth_clamp, driver_textured_triangles,
+            false);
         if (!triangle.rasterizable)
           throw std::runtime_error(
               "ClipCull direct raster draw produced a degenerate triangle");
@@ -720,6 +768,13 @@ void ClipCull::Run() {
             throw std::runtime_error(
                 "ClipCull clean segment has non-positive homogeneous W");
           }
+          const bool primitive_clipped = std::any_of(
+              vertices.begin(), vertices.end(),
+              [depth_clamp, clip_dist_mask,
+               clip_dist_reg](const ClipVertex &vertex) {
+                return ClipMask(vertex, depth_clamp, clip_dist_mask,
+                                clip_dist_reg) != 0;
+              });
           const std::vector<ClipVertex> polygon = ClipTriangle(vertices, depth_clamp, clip_dist_mask, clip_dist_reg);
           for (std::size_t fan = 2; fan < polygon.size(); ++fan) {
             if (fan - 2 > std::numeric_limits<std::uint16_t>::max())
@@ -738,7 +793,8 @@ void ClipCull::Run() {
               continue;
             RasterTriangle triangle = BuildRasterTriangle(
                 fan_triangle, state.width, state.height, front_facing,
-                raster_vertex_outputs, depth_clamp, driver_pco_triangles);
+                raster_vertex_outputs, depth_clamp, driver_pco_triangles,
+                driver_pco_triangles && primitive_clipped);
             triangle.key.submit_ordinal = submit_ordinal;
             triangle.key.api_primitive_id =
                 static_cast<std::uint32_t>(primitive);

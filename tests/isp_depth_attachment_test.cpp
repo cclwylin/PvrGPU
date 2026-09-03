@@ -134,6 +134,77 @@ CasePayload MakeDriverDepthPlaneCase(MemoryPool &pool,
   return payload;
 }
 
+CasePayload MakeQuantizedDepthCompareCase(MemoryPool &pool,
+                                          std::uint64_t sequence) {
+  PipelineState state;
+  state.width = 1;
+  state.height = 1;
+  state.sequence = sequence;
+  state.functional_case = FunctionalCase::kDriverPcoTriangles;
+  state.stage = PipelineStage::kTilesScheduled;
+  state.raster_state.sample_count = 1;
+  state.raster_state.depth.test_enable = 1;
+  state.raster_state.depth.write_enable = 1;
+  state.raster_state.depth.compare_op = DepthCompareOp::kLessOrEqual;
+  state.raster_state.depth.clear_depth = 1.0F;
+  state.fragment_early_hsr_safe = 1;
+  state.depth_attachment_format = kDriverPcoDepthFormatZ16Unorm;
+  state.capture_depth_attachment = 1;
+  state.scheduled_tiles = 1;
+
+  constexpr float first_depth = 0.9999373555F;
+  constexpr float later_depth = 0.9999454021F;
+  Check(first_depth < later_depth,
+        "quantized compare fixture preserves raw depth order");
+  Check(EncodeDepthAttachmentUnorm(first_depth,
+                                   kDriverPcoDepthFormatZ16Unorm) ==
+            EncodeDepthAttachmentUnorm(later_depth,
+                                       kDriverPcoDepthFormatZ16Unorm),
+        "quantized compare fixture aliases one Z16 value");
+
+  auto make_triangle = [](std::uint64_t submit_ordinal,
+                          std::uint32_t primitive_id,
+                          float depth) {
+    ParameterTriangle triangle;
+    triangle.key.submit_ordinal = submit_ordinal;
+    triangle.key.api_primitive_id = primitive_id;
+    triangle.rasterizable = 1;
+    triangle.signed_area = 512LL * 512LL;
+    triangle.min_x = 0;
+    triangle.min_y = 0;
+    triangle.max_x = 1;
+    triangle.max_y = 1;
+    triangle.window_z[0] = depth;
+    triangle.window_z[1] = depth;
+    triangle.window_z[2] = depth;
+    triangle.edge[0] = {0, 512, 0, 1, {}};
+    triangle.edge[1] = {-512, -512, 512LL * 512LL, 0, {}};
+    triangle.edge[2] = {512, 0, 0, 0, {}};
+    triangle.depth_plane[0] = FloatBits(0.0F);
+    triangle.depth_plane[1] = FloatBits(0.0F);
+    triangle.depth_plane[2] = FloatBits(depth);
+    triangle.depth_plane_valid = 1;
+    return triangle;
+  };
+  const std::vector<ParameterTriangle> triangles = {
+      make_triangle(10, 100, first_depth),
+      make_triangle(11, 101, later_depth),
+  };
+  state.tile_records =
+      StoreNewArray(pool, std::vector<TileRecord>{{0, 0, 1, 1, 0, 2}});
+  state.tile_primitive_refs = StoreNewArray(
+      pool, std::vector<TilePrimitiveRef>{{0, 0, 10}, {1, 0, 11}});
+  state.parameter_triangles = StoreNewArray(pool, triangles);
+
+  CasePayload payload;
+  payload.state = pool.Allocate(sizeof(PipelineState));
+  StorePipelineState(pool, payload.state, state);
+  payload.txn.state = payload.state;
+  payload.txn.frame = static_cast<std::uint32_t>(sequence);
+  payload.txn.sequence = sequence;
+  return payload;
+}
+
 void CheckCase(MemoryPool &pool, const CasePayload &payload,
                const std::vector<std::uint32_t> &expected) {
   const PipelineState state = LoadPipelineState(pool, payload.state);
@@ -165,6 +236,27 @@ void CheckDriverDepthPlaneCase(MemoryPool &pool,
   pool.Release(payload.state);
 }
 
+void CheckQuantizedDepthCompareCase(MemoryPool &pool,
+                                    const CasePayload &payload) {
+  const PipelineState state = LoadPipelineState(pool, payload.state);
+  Check(state.stage == PipelineStage::kVisibilityReady,
+        "quantized compare completion");
+  Check(state.active_fragment_invocations == 1,
+        "quantized compare retained one owner");
+  Check(LoadArray<std::uint32_t>(pool, state.isp_depth_attachment) ==
+            std::vector<std::uint32_t>{UINT32_C(0xfffb)},
+        "quantized compare stored aliased Z16 value");
+  const std::vector<FragmentCandidate> candidates =
+      LoadArray<FragmentCandidate>(pool, state.fragment_candidates);
+  Check(candidates.size() == 2 &&
+            candidates[0].visibility == FragmentVisibility::kRejected &&
+            candidates[1].visibility == FragmentVisibility::kVisible &&
+            candidates[1].primitive_id == 101,
+        "LEQUAL compared encoded Z16 and selected the later owner");
+  ReleaseFunctionalPayloads(pool, state);
+  pool.Release(payload.state);
+}
+
 } // namespace
 
 int sc_main(int, char **) {
@@ -182,9 +274,12 @@ int sc_main(int, char **) {
     const CasePayload z24 = MakeCase(
         pool, 2, kDriverPcoDepthFormatZ24X8Unorm, 0.5F, {});
     const CasePayload depth_plane = MakeDriverDepthPlaneCase(pool, 3);
+    const CasePayload quantized_compare =
+        MakeQuantizedDepthCompareCase(pool, 4);
     input.write(z16.txn);
     input.write(z24.txn);
     input.write(depth_plane.txn);
+    input.write(quantized_compare.txn);
     sc_core::sc_start(sc_core::sc_time(100, sc_core::SC_NS));
     sc_core::sc_start(sc_core::SC_ZERO_TIME);
 
@@ -195,9 +290,12 @@ int sc_main(int, char **) {
           "Z24 FIFO order");
     Check(output.nb_read(completed) && completed.sequence == 3,
           "driver depth-plane FIFO order");
+    Check(output.nb_read(completed) && completed.sequence == 4,
+          "quantized depth-compare FIFO order");
     CheckCase(pool, z16, z16_load);
     CheckCase(pool, z24, {0x800000U, 0x800000U, 0x800000U});
     CheckDriverDepthPlaneCase(pool, depth_plane);
+    CheckQuantizedDepthCompareCase(pool, quantized_compare);
     Check(pool.bytes_in_flight() == 0 &&
               pool.allocations() == pool.releases(),
           "MemoryPool balance");

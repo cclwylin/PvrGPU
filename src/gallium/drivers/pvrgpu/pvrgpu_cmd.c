@@ -70,6 +70,31 @@ pvrgpu_cmd_format_supported(const char *format)
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_B10G10R10A2) == 0);
 }
 
+static bool
+pvrgpu_pco_single_draw_resolution_supported(uint32_t framebuffer_width,
+                                            uint32_t framebuffer_height,
+                                            uint32_t width,
+                                            uint32_t height)
+{
+   return width == framebuffer_width && height == framebuffer_height &&
+          ((framebuffer_width == 80 && framebuffer_height == 60) ||
+           (framebuffer_width == 800 && framebuffer_height == 600) ||
+           (framebuffer_width == 512 && framebuffer_height == 512));
+}
+
+static void
+pvrgpu_pco_viewport_bits(uint32_t framebuffer_width,
+                         uint32_t framebuffer_height,
+                         uint32_t bits[3])
+{
+   const float values[3] = {
+      (float)framebuffer_width * 0.5f,
+      (float)framebuffer_height * 0.5f,
+      0.5f,
+   };
+   memcpy(bits, values, sizeof(values));
+}
+
 static const char *
 pvrgpu_nonempty_env(const char *name)
 {
@@ -523,12 +548,15 @@ pvrgpu_cmd_validate_draw_pco_triangles(
                                    error_size))
       return false;
 
-   if (cmd->framebuffer_width != 80 || cmd->framebuffer_height != 60 ||
-       cmd->width != 80 || cmd->height != 60 ||
+   if (!pvrgpu_pco_single_draw_resolution_supported(
+          cmd->framebuffer_width,
+          cmd->framebuffer_height,
+          cmd->width,
+          cmd->height) ||
        strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8) != 0) {
       pvrgpu_cmd_error(error, error_size,
-                       "draw PCO triangles requires the validated 80x60 "
-                       "RGBA8 profile family");
+                       "draw PCO triangles requires a framebuffer-sized "
+                       "80x60 or 800x600 RGBA8 profile");
       return false;
    }
    if (cmd->clear_color_bits[0] != 0 ||
@@ -545,8 +573,12 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       end_vertex * (uint64_t)cmd->vertex_stride;
    const bool conditionals_layout =
       cmd->vertex_stride == 12 && cmd->vertex_pco_abi.vertex_inputs == 4;
+   const bool color_layout =
+      cmd->vertex_stride == 24 && cmd->vertex_pco_abi.vertex_inputs == 8 &&
+      cmd->vertex_pco_abi.shareds == 0;
    const bool lit_mesh_layout =
-      cmd->vertex_stride == 24 && cmd->vertex_pco_abi.vertex_inputs == 8;
+      cmd->vertex_stride == 24 && cmd->vertex_pco_abi.vertex_inputs == 8 &&
+      !color_layout;
    const bool texture_layout =
       cmd->vertex_stride == 32 && cmd->vertex_pco_abi.vertex_inputs == 12;
    const bool ideas_case =
@@ -563,13 +595,21 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       (cmd->primitive_mode == 5 &&
        (cmd->vertex_count == 18 || cmd->vertex_count == 26)) ||
       (cmd->primitive_mode == 6 && cmd->vertex_count == 12);
+   /*
+    * Non-indexed triangle topologies the SystemC submitter expands itself:
+    * a triangle list of whole triangles, or a strip/fan of three or more
+    * vertices.
+    */
    const bool ordinary_topology =
-      cmd->primitive_mode == 4 && cmd->vertex_count % 3 == 0;
+      (cmd->primitive_mode == 4 && cmd->vertex_count % 3 == 0 &&
+       cmd->vertex_count >= 3) ||
+      ((cmd->primitive_mode == 5 || cmd->primitive_mode == 6) &&
+       cmd->vertex_count >= 3);
    if (!cmd->raw_vertex_data || cmd->vertex_count == 0 ||
        (!ideas_layout && !ordinary_topology) ||
        (ideas_layout && !ideas_topology) ||
        (!conditionals_layout && !lit_mesh_layout && !texture_layout &&
-        !ideas_layout) ||
+        !ideas_layout && !color_layout) ||
        expected_vertex_bytes == 0 || expected_vertex_bytes > SIZE_MAX ||
        cmd->raw_vertex_data_size != (size_t)expected_vertex_bytes ||
        cmd->first_vertex != 0 || cmd->instance_count != 1 ||
@@ -635,7 +675,10 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       cmd->gs_invocations == 0 && cmd->gs_primitives == 0 &&
       cmd->clip_invocations == 3010 && cmd->clip_primitives == 3004 &&
       cmd->hs_invocations == 0 && cmd->ds_invocations == 0 &&
-      cmd->cs_invocations == 0 && cmd->ps_invocations == UINT64_C(1553) &&
+      cmd->cs_invocations == 0 &&
+      cmd->ps_invocations ==
+         (cmd->framebuffer_width == 80 ? UINT64_C(1553)
+                                       : UINT64_C(155163)) &&
       cmd->setup_triangles == 3004 && cmd->semantic_texel_fetches == 0;
    if ((!ideas_layout && !empty_sequence_counters) ||
        (ideas_layout && !empty_sequence_counters &&
@@ -666,7 +709,8 @@ pvrgpu_cmd_validate_draw_pco_triangles(
        cmd->vertex_pco_abi.push_constant_count !=
           cmd->vertex_pco_abi.shareds ||
        cmd->vertex_pco_abi.entry_offset != 0 ||
-       (!ideas_position_layout && cmd->fragment_pco_abi.temps == 0) ||
+       (!ideas_position_layout && !color_layout &&
+        cmd->fragment_pco_abi.temps == 0) ||
        cmd->fragment_pco_abi.temps > 256 ||
        cmd->fragment_pco_abi.shareds > 64 ||
        cmd->fragment_pco_abi.vertex_inputs != 0 ||
@@ -693,6 +737,10 @@ pvrgpu_cmd_validate_draw_pco_triangles(
          cmd->varying_output_count > 4 ||
          cmd->fragment_position_count != 4 ||
          cmd->fragment_varying_count != cmd->varying_output_count * 4)) ||
+       ((color_layout) &&
+        (cmd->varying_output_count != 4 ||
+         cmd->fragment_position_count != 4 ||
+         cmd->fragment_varying_count != 16)) ||
        (ideas_position_layout &&
         (cmd->vertex_pco_abi.vertex_outputs != 4 ||
          cmd->vertex_pco_abi.shareds != 32 ||
@@ -730,14 +778,26 @@ pvrgpu_cmd_validate_draw_pco_triangles(
          cmd->fragment_position_count != 4 ||
          cmd->fragment_varying_start != 4 ||
          cmd->fragment_varying_count != 12))) {
-      pvrgpu_cmd_error(error, error_size,
-                       "draw PCO triangles has incompatible PCO ABI metadata");
+      snprintf(error, error_size,
+               "draw PCO triangles has incompatible PCO ABI metadata: "
+               "vs_outputs=%u (pos=%u+var=%u) vs_shared=%u "
+               "fs_coeffs=%u (pos=%u+var=%u) fs_shared=%u "
+               "vs_temps=%u fs_temps=%u lit_mesh=%d cond=%d",
+               cmd->vertex_pco_abi.vertex_outputs,
+               cmd->position_output_count, cmd->varying_output_count,
+               cmd->vertex_pco_abi.shareds,
+               cmd->fragment_pco_abi.coefficients,
+               cmd->fragment_position_count, cmd->fragment_varying_count,
+               cmd->fragment_pco_abi.shareds,
+               cmd->vertex_pco_abi.temps, cmd->fragment_pco_abi.temps,
+               lit_mesh_layout ? 1 : 0, conditionals_layout ? 1 : 0);
       return false;
    }
 
-   static const uint32_t viewport_scale_bits[3] = {
-      UINT32_C(0x42200000), UINT32_C(0x41f00000), UINT32_C(0x3f000000),
-   };
+   uint32_t viewport_bits[3];
+   pvrgpu_pco_viewport_bits(cmd->framebuffer_width,
+                            cmd->framebuffer_height,
+                            viewport_bits);
    const bool ideas_depth_state_matches =
       cmd->depth_format != 0 &&
       ((cmd->depth_enable == 0 && cmd->depth_write == 0 &&
@@ -747,21 +807,26 @@ pvrgpu_cmd_validate_draw_pco_triangles(
    const bool depth_state_matches =
       ideas_layout ?
          ideas_depth_state_matches :
-         (cmd->depth_enable == 1 && cmd->depth_write == 1 &&
-          cmd->depth_func == 3 && cmd->depth_format != 0);
+         (color_layout ?
+          ((cmd->depth_enable == 0 && cmd->depth_write == 0) ||
+           (cmd->depth_enable == 1 && cmd->depth_write == 1 &&
+            cmd->depth_func == 3)) :
+          (cmd->depth_enable == 1 && cmd->depth_write == 1 &&
+           cmd->depth_func == 3 && cmd->depth_format != 0));
    if (memcmp(cmd->viewport_scale_bits,
-              viewport_scale_bits,
-              sizeof(viewport_scale_bits)) != 0 ||
+              viewport_bits,
+              sizeof(viewport_bits)) != 0 ||
        memcmp(cmd->viewport_translate_bits,
-              viewport_scale_bits,
-              sizeof(viewport_scale_bits)) != 0) {
+              viewport_bits,
+              sizeof(viewport_bits)) != 0) {
       pvrgpu_cmd_error(error, error_size,
                        "draw PCO triangles has incompatible viewport state");
       return false;
    }
    if (cmd->front_ccw != 0 ||
-       ((!ideas_layout && cmd->cull_face != 2) ||
-        (ideas_layout && cmd->cull_face != 0 && cmd->cull_face != 2)) ||
+       ((!ideas_layout && !color_layout && cmd->cull_face != 2) ||
+        ((ideas_layout || color_layout) && cmd->cull_face != 0 &&
+         cmd->cull_face != 2)) ||
        cmd->fill_front != 0 || cmd->fill_back != 0 || cmd->scissor != 0 ||
        cmd->rasterizer_discard != 0 || cmd->multisample != 0 ||
        cmd->half_pixel_center != 1 || cmd->bottom_edge_rule != 0 ||

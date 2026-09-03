@@ -80,6 +80,29 @@ float FloatFromBits(std::uint32_t bits) {
   return value;
 }
 
+bool PcoSingleDrawResolutionSupported(const DriverCommand &command) {
+  // The rasterizer is resolution independent; the single-draw path only needs
+  // a full-surface render target within the model's addressable extent.
+  return command.width == command.framebuffer_width &&
+         command.height == command.framebuffer_height &&
+         command.framebuffer_width != 0 && command.framebuffer_height != 0 &&
+         command.framebuffer_width <= 4096 &&
+         command.framebuffer_height <= 4096;
+}
+
+std::array<std::uint32_t, 3> PcoViewportBits(
+    std::uint32_t framebuffer_width, std::uint32_t framebuffer_height) {
+  const std::array<float, 3> values = {
+      static_cast<float>(framebuffer_width) * 0.5F,
+      static_cast<float>(framebuffer_height) * 0.5F,
+      0.5F,
+  };
+  std::array<std::uint32_t, 3> bits{};
+  static_assert(sizeof(values) == sizeof(bits));
+  std::memcpy(bits.data(), values.data(), sizeof(bits));
+  return bits;
+}
+
 bool DriverTriangleFragmentColorSupported(const DriverCommand &command) {
   static constexpr std::array<std::uint32_t, 4> kOpaqueRed = {
       UINT32_C(0x3f800000), 0U, 0U, UINT32_C(0x3f800000)};
@@ -97,6 +120,18 @@ bool DriverIndexedQuadCommandSupported(const DriverCommand &command) {
 inline constexpr std::uint32_t kPipePrimTriangles = 4;
 inline constexpr std::uint32_t kPipePrimTriangleStrip = 5;
 inline constexpr std::uint32_t kPipePrimTriangleFan = 6;
+
+// Non-indexed triangle topologies ExpandDriverPcoTopologyImpl can turn into a
+// triangle list: a whole-triangle list, or a strip/fan of three or more
+// vertices.
+bool DriverPcoArrayTopologyIsExpandable(const DriverCommand &command) {
+  if (command.primitive_mode == kPipePrimTriangles)
+    return command.vertex_count >= 3U && command.vertex_count % 3U == 0U;
+  if (command.primitive_mode == kPipePrimTriangleStrip ||
+      command.primitive_mode == kPipePrimTriangleFan)
+    return command.vertex_count >= 3U;
+  return false;
+}
 
 bool IsIdeasPcoSequenceCommand(const DriverCommand &command) {
   const std::string_view name(command.test_case);
@@ -138,8 +173,9 @@ bool DriverPcoStageAbiIsBounded(const DriverPcoStageAbi &abi,
 bool DriverIdeasPcoSequenceCommandSupported(const DriverCommand &command) {
   static constexpr std::array<std::uint32_t, 4> kOpaqueBlack = {
       0, 0, 0, UINT32_C(0x3f800000)};
-  static constexpr std::array<std::uint32_t, 3> kViewportBits = {
-      UINT32_C(0x42200000), UINT32_C(0x41f00000), UINT32_C(0x3f000000)};
+  const std::array<std::uint32_t, 3> viewport_bits =
+      PcoViewportBits(command.framebuffer_width,
+                      command.framebuffer_height);
   const bool position_layout =
       command.vertex_stride == 4U * sizeof(float);
   const bool two_attribute_layout =
@@ -151,8 +187,7 @@ bool DriverIdeasPcoSequenceCommandSupported(const DriverCommand &command) {
       (command.primitive_mode == kPipePrimTriangleFan &&
        command.vertex_count == 12U);
   if (!layout || !topology ||
-      command.framebuffer_width != 80 || command.framebuffer_height != 60 ||
-      command.width != 80 || command.height != 60 ||
+      !PcoSingleDrawResolutionSupported(command) ||
       command.format != "PIPE_FORMAT_R8G8B8A8_UNORM" ||
       command.clear_color_bits != kOpaqueBlack || command.first_vertex != 0 ||
       command.instance_count != 1 || command.indexed != 0 ||
@@ -204,8 +239,8 @@ bool DriverIdeasPcoSequenceCommandSupported(const DriverCommand &command) {
                  command.fragment_varying_start != 4 ||
                  command.fragment_varying_count != 40 ||
                  command.fragment_pco_abi.coefficients != 44) ||
-      command.viewport_scale_bits != kViewportBits ||
-      command.viewport_translate_bits != kViewportBits ||
+      command.viewport_scale_bits != viewport_bits ||
+      command.viewport_translate_bits != viewport_bits ||
       command.front_ccw != 0 ||
       (command.cull_face != 0 && command.cull_face != 2) ||
       command.fill_front != 0 || command.fill_back != 0 ||
@@ -257,33 +292,42 @@ bool DriverPcoTrianglesCommandSupported(const DriverCommand &command) {
     return DriverIdeasPcoSequenceCommandSupported(command);
   static constexpr std::array<std::uint32_t, 4> kOpaqueBlack = {
       0, 0, 0, UINT32_C(0x3f800000)};
-  static constexpr std::array<std::uint32_t, 3> kViewportBits = {
-      UINT32_C(0x42200000), UINT32_C(0x41f00000), UINT32_C(0x3f000000)};
+  const std::array<std::uint32_t, 3> viewport_bits =
+      PcoViewportBits(command.framebuffer_width,
+                      command.framebuffer_height);
   const bool conditionals_layout =
       command.vertex_stride == kDriverPcoPositionVertexStride &&
       command.vertex_pco_abi.vertex_inputs == 4;
+  const bool color_layout =
+      command.vertex_stride == 6U * sizeof(float) &&
+      command.vertex_pco_abi.vertex_inputs == 8 &&
+      command.varying_output_count == 4 &&
+      command.fragment_varying_count == 16 &&
+      command.vertex_pco_abi.shareds == 0;
   const bool lit_mesh_layout =
       command.vertex_stride == kDriverPcoPositionNormalVertexStride &&
-      command.vertex_pco_abi.vertex_inputs == 8;
+      command.vertex_pco_abi.vertex_inputs == 8 &&
+      !color_layout;
   const bool texture_layout =
       command.vertex_stride ==
           kDriverPcoPositionNormalTexcoordVertexStride &&
       command.vertex_pco_abi.vertex_inputs == 12;
-  if (command.framebuffer_width != 80 || command.framebuffer_height != 60 ||
-      command.width != 80 || command.height != 60 ||
+  if (!PcoSingleDrawResolutionSupported(command) ||
       command.format != "PIPE_FORMAT_R8G8B8A8_UNORM" ||
       command.clear_color_bits != kOpaqueBlack ||
-      (!conditionals_layout && !lit_mesh_layout && !texture_layout) ||
-      command.vertex_count == 0 || command.vertex_count % 3U != 0 ||
+      (!conditionals_layout && !lit_mesh_layout && !texture_layout &&
+       !color_layout) ||
+      command.vertex_count == 0 ||
+      !DriverPcoArrayTopologyIsExpandable(command) ||
       command.first_vertex != 0 || command.instance_count != 1 ||
-      command.primitive_mode != kPipePrimTriangles || command.indexed != 0 ||
+      command.indexed != 0 ||
       command.vertex_pco.empty() || command.fragment_pco.empty() ||
       command.vertex_pco.size() > kDriverPcoMaximumBinaryBytes ||
       command.fragment_pco.size() > kDriverPcoMaximumBinaryBytes ||
       command.vertex_shared.size() != command.vertex_pco_abi.shareds ||
       command.fragment_shared.size() != command.fragment_pco_abi.shareds ||
       !DriverPcoStageAbiIsBounded(command.vertex_pco_abi) ||
-      !DriverPcoStageAbiIsBounded(command.fragment_pco_abi)) {
+      !DriverPcoStageAbiIsBounded(command.fragment_pco_abi, color_layout)) {
     return false;
   }
   const std::uint64_t end_vertex =
@@ -346,9 +390,16 @@ bool DriverPcoTrianglesCommandSupported(const DriverCommand &command) {
         command.fragment_position_count != 4 ||
         command.fragment_varying_start != 4 ||
         command.fragment_varying_count != 12)) ||
-      command.viewport_scale_bits != kViewportBits ||
-      command.viewport_translate_bits != kViewportBits ||
-      command.front_ccw != 0 || command.cull_face != 2 ||
+      (color_layout &&
+       (command.varying_output_start != 4 ||
+        command.varying_output_count != 4 ||
+        command.fragment_position_count != 4 ||
+        command.fragment_varying_start != 4 ||
+        command.fragment_varying_count != 16)) ||
+      command.viewport_scale_bits != viewport_bits ||
+      command.viewport_translate_bits != viewport_bits ||
+      command.front_ccw != 0 ||
+      (!color_layout && command.cull_face != 2) ||
       command.fill_front != 0 || command.fill_back != 0 ||
       command.scissor != 0 || command.rasterizer_discard != 0 ||
       command.multisample != 0 || command.half_pixel_center != 1 ||
@@ -356,10 +407,12 @@ bool DriverPcoTrianglesCommandSupported(const DriverCommand &command) {
       command.depth_clip_near != 1 || command.depth_clip_far != 1 ||
       command.depth_clamp != 0 || command.sample_mask != UINT32_MAX ||
       command.color_mask != 0x0f || command.blend_enable != 0 ||
-      command.dither != 1 || command.depth_enable != 1 ||
-      command.depth_write != 1 || command.depth_func != 3 ||
-      command.depth_clear_bits != UINT32_C(0x3f800000) ||
-      command.depth_format == 0) {
+      command.dither != 1 ||
+      (!color_layout &&
+       (command.depth_enable != 1 || command.depth_write != 1 ||
+        command.depth_func != 3 ||
+        command.depth_clear_bits != UINT32_C(0x3f800000) ||
+        command.depth_format == 0))) {
     return false;
   }
   if (texture_layout) {
@@ -843,6 +896,23 @@ VertexAttributeBinding MakeDriverPcoFloat2Binding(
   binding.destination_register = destination_register;
   binding.component_type = VertexComponentType::kFloat32;
   binding.source_components = 2;
+  binding.destination_components = 4;
+  binding.normalized = 0;
+  binding.integer = 0;
+  binding.instance_divisor = 0;
+  return binding;
+}
+
+VertexAttributeBinding MakeDriverPcoFloat4Binding(
+    std::uint32_t offset_bytes, std::uint32_t stride_bytes,
+    std::uint16_t destination_register) {
+  VertexAttributeBinding binding;
+  binding.buffer_index = 0;
+  binding.offset_bytes = offset_bytes;
+  binding.stride_bytes = stride_bytes;
+  binding.destination_register = destination_register;
+  binding.component_type = VertexComponentType::kFloat32;
+  binding.source_components = 4;
   binding.destination_components = 4;
   binding.normalized = 0;
   binding.integer = 0;
@@ -1463,10 +1533,22 @@ void Submitter::Run() {
         const bool float2_position =
             command.vertex_stride == 2U * sizeof(float) &&
             command.vertex_pco_abi.vertex_inputs == 4;
+        const bool color_layout =
+            command.vertex_stride == 6U * sizeof(float) &&
+            command.vertex_pco_abi.vertex_inputs == 8 &&
+            command.varying_output_count == 4 &&
+            command.fragment_varying_count == 16 &&
+            command.vertex_pco_abi.shareds == 0;
         const bool terrain_main_layout =
             command.vertex_stride == 11U * sizeof(float) &&
             command.vertex_pco_abi.vertex_inputs == 16;
-        if (terrain_main_layout) {
+        if (color_layout) {
+          bindings = {
+              MakeDriverPcoFloat2Binding(0, command.vertex_stride, 0),
+              MakeDriverPcoFloat4Binding(
+                  2U * sizeof(float), command.vertex_stride, 4),
+          };
+        } else if (terrain_main_layout) {
           // Terrain D3 is captured from four separate Gallium VBOs and
           // deep-copied into one occurrence stream as float3 position,
           // float3 normal, float3 tangent and float2 texcoord.  Preserve the

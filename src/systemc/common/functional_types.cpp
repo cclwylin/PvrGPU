@@ -13,6 +13,27 @@
 
 namespace pvrgpu::stub {
 
+std::int64_t QuantizeRasterSubpixel(float value) {
+  const double scaled = static_cast<double>(value) * kSubpixelScale;
+  if (!std::isfinite(scaled))
+    throw std::overflow_error("raster fixed-point coordinate is non-finite");
+
+  const double lower = std::floor(scaled);
+  const double fraction = scaled - lower;
+  double rounded = lower;
+  if (fraction > 0.5 ||
+      (fraction == 0.5 && std::fmod(std::fabs(lower), 2.0) == 1.0)) {
+    rounded = lower + 1.0;
+  }
+  // INT64_MAX is not exactly representable as double: converting it yields
+  // +2^63. Use a half-open upper bound so +2^63 cannot reach the
+  // out-of-range double-to-integer conversion below; -2^63 remains valid.
+  if (rounded < -0x1p63 || rounded >= 0x1p63) {
+    throw std::overflow_error("raster fixed-point coordinate overflow");
+  }
+  return static_cast<std::int64_t>(rounded);
+}
+
 std::size_t DepthAttachmentBytesPerPixel(std::uint32_t format) {
   if (format == kDriverPcoDepthFormatZ16Unorm)
     return sizeof(std::uint16_t);

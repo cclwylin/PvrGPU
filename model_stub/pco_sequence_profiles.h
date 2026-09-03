@@ -21,4 +21,11 @@ bool DriverPcoSequenceSupported(const Options &options, std::string *error);
 bool DriverPcoTerrainExternalPayloadHashMatches(std::size_t texture_index,
                                                 std::uint64_t payload_hash);
 
+// Terrain D4/D7/D8 embed resolution-dependent texel steps.  Keep the exact
+// post-lowering binary fingerprints independently testable so an 800x600
+// source cannot silently regress to the 80x60 program.
+bool DriverPcoTerrainFragmentBinaryHashMatches(
+    std::uint32_t width, std::uint32_t height, std::size_t draw_index,
+    std::uint64_t binary_hash);
+
 }  // namespace pvrgpu::stub

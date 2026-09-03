@@ -12,26 +12,18 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <iomanip>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <vector>
 
 namespace {
-
-std::int64_t Quantize(float value) {
-  const double scaled =
-      static_cast<double>(value) * pvrgpu::stub::kSubpixelScale;
-  if (!std::isfinite(scaled) ||
-      scaled < static_cast<double>(std::numeric_limits<std::int64_t>::min()) ||
-      scaled > static_cast<double>(std::numeric_limits<std::int64_t>::max())) {
-    throw std::overflow_error(
-        "ParameterBuffer fixed-point coordinate overflow");
-  }
-  return static_cast<std::int64_t>(std::llround(scaled));
-}
 
 std::int64_t CheckedSub(std::int64_t lhs, std::int64_t rhs,
                         const char *description) {
@@ -75,6 +67,21 @@ std::uint32_t FloatBits(float value) {
   return bits;
 }
 
+std::size_t DebugParameterIndex() {
+  const char *text = std::getenv("PVRGPU_PARAMETER_DEBUG_INDEX");
+  if (!text)
+    return std::numeric_limits<std::size_t>::max();
+  errno = 0;
+  char *end = nullptr;
+  const unsigned long long value = std::strtoull(text, &end, 10);
+  if (errno != 0 || end == text || *end != '\0' ||
+      value > std::numeric_limits<std::size_t>::max()) {
+    throw std::runtime_error(
+        "PVRGPU_PARAMETER_DEBUG_INDEX must be an unsigned integer");
+  }
+  return static_cast<std::size_t>(value);
+}
+
 pvrgpu::stub::ParameterCoefficientSet
 BuildPlane(const pvrgpu::stub::RasterTriangle &triangle,
            const float value[3]) {
@@ -112,21 +119,17 @@ BuildPlane(const pvrgpu::stub::RasterTriangle &triangle,
   return coefficient;
 }
 
-/* The validated Gallium driver command uses BACK/CW culling.  llvmpipe
- * normalizes those clockwise triangles by exchanging v0/v1 before its JIT
- * setup function computes interpolation coefficients.  Its coefficient
- * arithmetic is binary32 and is anchored at (v0 - 0.5), while fragment
- * interpolation is evaluated at integer pixel offsets.  This ordering is
- * observable when a nearest-filtered coordinate lands exactly on a texel
- * boundary, so preserve it for that narrow command instead of weakening the
- * reference-uArch plane construction used by every other functional case. */
+/* llvmpipe's coefficient arithmetic is binary32 and is anchored at
+ * (v0 - 0.5), while fragment interpolation is evaluated at integer pixel
+ * offsets.  RasterTriangle keeps the actual Mesa setup-JIT vertex order
+ * separately from the model's edge-walker normalization: clean primitives
+ * and clipper fan pieces have observably different subtraction sequences. */
 pvrgpu::stub::ParameterCoefficientSet
 BuildLlvmPipeDriverPlane(const pvrgpu::stub::RasterTriangle &triangle,
                          const float value[3]) {
-  constexpr std::array<std::size_t, 3> order{1, 0, 2};
-  const std::size_t i0 = order[0];
-  const std::size_t i1 = order[1];
-  const std::size_t i2 = order[2];
+  const std::size_t i0 = triangle.setup_vertex_order[0];
+  const std::size_t i1 = triangle.setup_vertex_order[1];
+  const std::size_t i2 = triangle.setup_vertex_order[2];
 
   const float x0_center = triangle.x[i0] - 0.5F;
   const float y0_center = triangle.y[i0] - 0.5F;
@@ -237,10 +240,13 @@ void ParameterBuffer::Run() {
           "ParameterBuffer solid-color case has varying payload state");
     }
 
+    const std::size_t debug_parameter_index = DebugParameterIndex();
     std::vector<ParameterTriangle> parameters;
     std::vector<ParameterCoefficientSet> coefficients;
     parameters.reserve(triangles.size());
-    for (const RasterTriangle &triangle : triangles) {
+    for (std::size_t triangle_index = 0; triangle_index < triangles.size();
+         ++triangle_index) {
+      const RasterTriangle &triangle = triangles[triangle_index];
       const std::uint16_t expected_stride =
           UsesShaderVaryings(state)
               ? static_cast<std::uint16_t>(
@@ -249,11 +255,20 @@ void ParameterBuffer::Run() {
       if (triangle.vertex_output_stride_dwords != expected_stride ||
           triangle.front_facing > 1 || triangle.rasterizable > 1 ||
           triangle.face_culled > 1 ||
-          (triangle.face_culled != 0 && triangle.rasterizable != 0) ||
-          triangle.reserved[0] != 0 || triangle.reserved[1] != 0 ||
-          triangle.reserved[2] != 0) {
+          (triangle.face_culled != 0 && triangle.rasterizable != 0)) {
         throw std::runtime_error(
             "ParameterBuffer received invalid RasterTriangle metadata");
+      }
+      if (state.functional_case == FunctionalCase::kDriverTexturedTriangles ||
+          IsDriverPcoTrianglesCase(state.functional_case)) {
+        bool setup_vertex_seen[3]{};
+        for (std::uint8_t vertex : triangle.setup_vertex_order) {
+          if (vertex >= 3 || setup_vertex_seen[vertex]) {
+            throw std::runtime_error(
+                "ParameterBuffer received invalid Mesa setup vertex order");
+          }
+          setup_vertex_seen[vertex] = true;
+        }
       }
       const std::uint64_t vertex_output_end =
           static_cast<std::uint64_t>(triangle.first_vertex_output_dword) +
@@ -281,10 +296,10 @@ void ParameterBuffer::Run() {
       }
       for (std::size_t edge = 0; edge < 3; ++edge) {
         const std::size_t next = (edge + 1) % 3;
-        const std::int64_t x0 = Quantize(triangle.x[edge]);
-        const std::int64_t y0 = Quantize(triangle.y[edge]);
-        const std::int64_t x1 = Quantize(triangle.x[next]);
-        const std::int64_t y1 = Quantize(triangle.y[next]);
+        const std::int64_t x0 = QuantizeRasterSubpixel(triangle.x[edge]);
+        const std::int64_t y0 = QuantizeRasterSubpixel(triangle.y[edge]);
+        const std::int64_t x1 = QuantizeRasterSubpixel(triangle.x[next]);
+        const std::int64_t y1 = QuantizeRasterSubpixel(triangle.y[next]);
         EdgeEquation &equation = parameter.edge[edge];
         equation.a = CheckedSub(
             y0, y1, "ParameterBuffer edge A overflow");
@@ -302,12 +317,12 @@ void ParameterBuffer::Run() {
             y1, y0, "ParameterBuffer edge dy overflow");
         equation.inclusive = (dy < 0 || (dy == 0 && dx > 0)) ? 1 : 0;
       }
-      const std::int64_t x0 = Quantize(triangle.x[0]);
-      const std::int64_t y0 = Quantize(triangle.y[0]);
-      const std::int64_t x1 = Quantize(triangle.x[1]);
-      const std::int64_t y1 = Quantize(triangle.y[1]);
-      const std::int64_t x2 = Quantize(triangle.x[2]);
-      const std::int64_t y2 = Quantize(triangle.y[2]);
+      const std::int64_t x0 = QuantizeRasterSubpixel(triangle.x[0]);
+      const std::int64_t y0 = QuantizeRasterSubpixel(triangle.y[0]);
+      const std::int64_t x1 = QuantizeRasterSubpixel(triangle.x[1]);
+      const std::int64_t y1 = QuantizeRasterSubpixel(triangle.y[1]);
+      const std::int64_t x2 = QuantizeRasterSubpixel(triangle.x[2]);
+      const std::int64_t y2 = QuantizeRasterSubpixel(triangle.y[2]);
       const std::int64_t dx10 = CheckedSub(
           x1, x0, "ParameterBuffer x delta overflow");
       const std::int64_t dy20 = CheckedSub(
@@ -418,6 +433,54 @@ void ParameterBuffer::Run() {
             }
           }
         }
+      }
+      if (triangle_index == debug_parameter_index) {
+        std::cerr << "parameter-debug index=" << triangle_index
+                  << " submit=" << triangle.key.submit_ordinal
+                  << " draw=" << triangle.key.draw_id
+                  << " api_primitive=" << triangle.key.api_primitive_id
+                  << " instance=" << triangle.key.instance_id
+                  << " clip_piece=" << triangle.key.clip_piece
+                  << " setup_order="
+                  << static_cast<unsigned>(triangle.setup_vertex_order[0])
+                  << ','
+                  << static_cast<unsigned>(triangle.setup_vertex_order[1])
+                  << ','
+                  << static_cast<unsigned>(triangle.setup_vertex_order[2]);
+        for (std::size_t vertex = 0; vertex < 3; ++vertex) {
+          std::cerr << " v" << vertex << "=(0x" << std::hex
+                    << std::setw(8) << std::setfill('0')
+                    << FloatBits(triangle.x[vertex]) << ",0x" << std::setw(8)
+                    << FloatBits(triangle.y[vertex]) << ",0x" << std::setw(8)
+                    << FloatBits(triangle.window_z[vertex]) << ",0x"
+                    << std::setw(8) << FloatBits(triangle.reciprocal_w[vertex])
+                    << std::dec << std::setfill(' ') << ')';
+          std::cerr << " out" << vertex << '=';
+          const std::size_t output_base =
+              triangle.first_vertex_output_dword +
+              vertex * triangle.vertex_output_stride_dwords;
+          for (std::size_t component = 0;
+               component < triangle.vertex_output_stride_dwords; ++component) {
+            if (component)
+              std::cerr << ',';
+            std::cerr << "0x" << std::hex << std::setw(8)
+                      << std::setfill('0')
+                      << raster_vertex_outputs[output_base + component]
+                      << std::dec << std::setfill(' ');
+          }
+        }
+        std::cerr << " coefficients=";
+        for (std::size_t coefficient = parameter.first_coefficient_set;
+             coefficient < coefficients.size(); ++coefficient) {
+          if (coefficient != parameter.first_coefficient_set)
+            std::cerr << ',';
+          const ParameterCoefficientSet &set = coefficients[coefficient];
+          std::cerr << "[0x" << std::hex << std::setw(8)
+                    << std::setfill('0') << set.a << ",0x" << std::setw(8)
+                    << set.b << ",0x" << std::setw(8) << set.c << "]"
+                    << std::dec << std::setfill(' ');
+        }
+        std::cerr << '\n';
       }
       parameters.push_back(parameter);
     }

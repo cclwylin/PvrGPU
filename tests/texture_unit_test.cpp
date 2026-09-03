@@ -19,6 +19,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -214,22 +215,23 @@ void CheckDescriptorAndArithmetic() {
             trilinear_sampler.max_lod_u4_6 == 959 &&
             trilinear_sampler.normalized_coordinates == 1,
         "Gate 18 raw sampler enables implicit trilinear filtering");
-  for (const std::uint16_t terrain_max_lod : {384U, 448U, 512U, 576U}) {
+  for (const std::uint16_t sequence_max_lod :
+       {384U, 448U, 512U, 576U, 640U}) {
     auto terrain_sampler_words = DescriptorDwords(trilinear, 8);
     std::uint64_t terrain_word0 =
         static_cast<std::uint64_t>(terrain_sampler_words[0]) |
         (static_cast<std::uint64_t>(terrain_sampler_words[1]) << 32U);
     terrain_word0 &= ~(UINT64_C(0x3ff) << 23U);
-    terrain_word0 |= static_cast<std::uint64_t>(terrain_max_lod) << 23U;
+    terrain_word0 |= static_cast<std::uint64_t>(sequence_max_lod) << 23U;
     terrain_sampler_words[0] = static_cast<std::uint32_t>(terrain_word0);
     terrain_sampler_words[1] =
         static_cast<std::uint32_t>(terrain_word0 >> 32U);
     const RogueTextureSamplerDescriptor terrain_sampler =
         DecodeRogueTextureSamplerDescriptor(terrain_sampler_words);
-    Check(terrain_sampler.max_lod_u4_6 == terrain_max_lod &&
+    Check(terrain_sampler.max_lod_u4_6 == sequence_max_lod &&
               terrain_sampler.wrap_u == TextureWrapMode::kRepeat &&
               terrain_sampler.wrap_v == TextureWrapMode::kRepeat,
-          "bounded Terrain mip LOD and repeat sampler are accepted");
+          "bounded sequence mip LOD and repeat sampler are accepted");
   }
   auto non_step_lod_words = DescriptorDwords(trilinear, 8);
   std::uint64_t non_step_word0 =
@@ -242,6 +244,19 @@ void CheckDescriptorAndArithmetic() {
   ExpectFailure(
       [&] { DecodeRogueTextureSamplerDescriptor(non_step_lod_words); },
       "non-64-step native mip LOD");
+
+  auto excessive_lod_words = DescriptorDwords(trilinear, 8);
+  std::uint64_t excessive_lod_word0 =
+      static_cast<std::uint64_t>(excessive_lod_words[0]) |
+      (static_cast<std::uint64_t>(excessive_lod_words[1]) << 32U);
+  excessive_lod_word0 &= ~(UINT64_C(0x3ff) << 23U);
+  excessive_lod_word0 |= UINT64_C(704) << 23U;
+  excessive_lod_words[0] = static_cast<std::uint32_t>(excessive_lod_word0);
+  excessive_lod_words[1] =
+      static_cast<std::uint32_t>(excessive_lod_word0 >> 32U);
+  ExpectFailure(
+      [&] { DecodeRogueTextureSamplerDescriptor(excessive_lod_words); },
+      "sequence mip LOD above the Refract 800 ceiling");
 
   // Terrain D3's real external resources are ten-level RGBX8 chains.  Pin
   // the exact address-zero producer words, then relocate IMAGE_WORD1 exactly
@@ -283,6 +298,49 @@ void CheckDescriptorAndArithmetic() {
   Check(!DriverPcoTextureDescriptorClassSupported(
             mipped_depth, terrain_d3_sampler, 5),
         "Terrain D3 mipped-depth near mutation remains fail-closed");
+
+  // Terrain 800 D3's first fragment SMP reaches a finite helper quad whose
+  // four detail coordinates are bit-identical.  Its exact zero derivative is
+  // a valid limiting case and selects the sampler's minimum LOD.
+  constexpr std::uint32_t kTerrainD3DegenerateU = UINT32_C(0x3ff8a000);
+  constexpr std::uint32_t kTerrainD3DegenerateV = UINT32_C(0x401c4000);
+  const std::array<std::array<float, 2>, 4> terrain_d3_zero_rho = {{
+      {{BitsFloat(kTerrainD3DegenerateU),
+        BitsFloat(kTerrainD3DegenerateV)}},
+      {{BitsFloat(kTerrainD3DegenerateU),
+        BitsFloat(kTerrainD3DegenerateV)}},
+      {{BitsFloat(kTerrainD3DegenerateU),
+        BitsFloat(kTerrainD3DegenerateV)}},
+      {{BitsFloat(kTerrainD3DegenerateU),
+        BitsFloat(kTerrainD3DegenerateV)}},
+  }};
+  const TextureImplicitLod terrain_d3_zero_lod = ComputeTextureImplicitLod(
+      terrain_d3_zero_rho, terrain_d3_image, terrain_d3_sampler);
+  Check(FloatBits(terrain_d3_zero_lod.dsdx) == 0 &&
+            FloatBits(terrain_d3_zero_lod.dtdx) == 0 &&
+            FloatBits(terrain_d3_zero_lod.dsdy) == 0 &&
+            FloatBits(terrain_d3_zero_lod.dtdy) == 0 &&
+            FloatBits(terrain_d3_zero_lod.rho_squared) == 0 &&
+            FloatBits(terrain_d3_zero_lod.lambda) == 0 &&
+            terrain_d3_zero_lod.level0 == 0 &&
+            terrain_d3_zero_lod.level1 == 1 &&
+            terrain_d3_zero_lod.mip_weight_u8 == 0 &&
+            FloatBits(terrain_d3_zero_lod.mip_weight) == 0,
+        "Terrain D3 finite zero-rho quad selects minimum LOD");
+
+  const float maximum_finite = std::numeric_limits<float>::max();
+  const std::array<std::array<float, 2>, 4> overflowing_derivatives = {{
+      {{0.0F, 0.0F}},
+      {{maximum_finite, 0.0F}},
+      {{0.0F, maximum_finite}},
+      {{maximum_finite, maximum_finite}},
+  }};
+  ExpectFailure(
+      [&] {
+        ComputeTextureImplicitLod(overflowing_derivatives, terrain_d3_image,
+                                  terrain_d3_sampler);
+      },
+      "Terrain D3 non-finite implicit derivative remains fail-closed");
 
   // One screen-pixel derivative across the 64x64 Gate 18 quad after its
   // float32 0.933 vertex scale.  The selected LODM=NORMAL datapath must expose

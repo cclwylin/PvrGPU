@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -158,6 +159,29 @@ bool IsSupportedDriverCommandFormat(const std::string &format) {
          format == kBgrx8Format || format == kR5G6B5Format ||
          format == kB5G6R5Format || format == kR10G10B10A2Format ||
          format == kB10G10R10A2Format;
+}
+
+bool PcoSingleDrawResolutionSupported(std::uint32_t framebuffer_width,
+                                      std::uint32_t framebuffer_height,
+                                      std::uint32_t width,
+                                      std::uint32_t height) {
+  return width == framebuffer_width && height == framebuffer_height &&
+         ((framebuffer_width == 80 && framebuffer_height == 60) ||
+          (framebuffer_width == 800 && framebuffer_height == 600) ||
+          (framebuffer_width == 512 && framebuffer_height == 512));
+}
+
+std::array<std::uint32_t, 3> PcoViewportBits(
+    std::uint32_t framebuffer_width, std::uint32_t framebuffer_height) {
+  const std::array<float, 3> values = {
+      static_cast<float>(framebuffer_width) * 0.5F,
+      static_cast<float>(framebuffer_height) * 0.5F,
+      0.5F,
+  };
+  std::array<std::uint32_t, 3> bits{};
+  static_assert(sizeof(values) == sizeof(bits));
+  std::memcpy(bits.data(), values.data(), sizeof(bits));
+  return bits;
 }
 
 bool ParseU64(const std::string &text, std::uint64_t *value) {
@@ -643,14 +667,22 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     parsed.depth_func = depth_state[2];
     parsed.depth_clear_bits = depth_state[3];
     parsed.depth_format = depth_state[4];
+    if (!PcoSingleDrawResolutionSupported(
+            parsed.framebuffer_width, parsed.framebuffer_height,
+            parsed.width, parsed.height)) {
+      *error = "draw_pco_triangles resolution must use a framebuffer-sized "
+               "80x60 or 800x600 viewport";
+      return false;
+    }
+    const std::array<std::uint32_t, 3> expected_viewport =
+        PcoViewportBits(parsed.framebuffer_width,
+                        parsed.framebuffer_height);
     const std::uint64_t end_vertex =
         static_cast<std::uint64_t>(parsed.first_vertex) +
         parsed.vertex_count;
     const std::uint64_t expected_vertex_bytes =
         end_vertex * parsed.vertex_stride;
     const bool conditionals_geometry =
-        parsed.width == 80 && parsed.height == 60 &&
-        parsed.framebuffer_width == 80 && parsed.framebuffer_height == 60 &&
         parsed.vertex_stride == 12 && parsed.vertex_count == 6144 &&
         parsed.first_vertex == 0 && parsed.primitive_mode == 4;
     const auto abi_bounded = [](const DriverPcoStageAbi &abi,
@@ -700,20 +732,19 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         parsed.color_mask != 0x0f || parsed.blend_enable != 0 ||
         parsed.dither != 1 || parsed.depth_enable > 1 ||
         parsed.depth_write > 1 || parsed.depth_func > 7 ||
-        parsed.depth_format == 0) {
+        parsed.depth_format == 0 ||
+        parsed.viewport_scale_bits != expected_viewport ||
+        parsed.viewport_translate_bits != expected_viewport) {
       *error = conditionals_geometry
                    ? "draw_pco_triangles metadata is malformed or outside "
-                     "the strict conditionals profile (strict 80x60 "
-                     "conditionals profile)"
+                     "the strict supported-resolution conditionals profile "
+                     "(80x60 or 800x600)"
                    : "draw_pco_triangles ABI/raster metadata is outside "
                      "model bounds";
       return false;
     }
 
     if (conditionals_geometry) {
-      const std::array<std::uint32_t, 3> expected_viewport = {
-          UINT32_C(0x42200000), UINT32_C(0x41f00000),
-          UINT32_C(0x3f000000)};
       if (parsed.declared_vertex_pco_size != 520 ||
           parsed.declared_fragment_pco_size != 520 ||
           !DriverPcoStageAbiMatches(parsed.vertex_pco_abi,
@@ -729,8 +760,8 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
           parsed.depth_write != 1 || parsed.depth_func != 3 ||
           parsed.depth_clear_bits != UINT32_C(0x3f800000)) {
         *error = "draw_pco_triangles ABI/raster metadata does not match the "
-                 "strict conditionals profile (strict 80x60 conditionals "
-                 "profile)";
+                 "strict supported-resolution conditionals profile "
+                 "(80x60 or 800x600)";
         return false;
       }
     }
