@@ -298,8 +298,11 @@ bool DriverPcoTrianglesCommandSupported(const DriverCommand &command) {
   const bool conditionals_layout =
       command.vertex_stride == kDriverPcoPositionVertexStride &&
       command.vertex_pco_abi.vertex_inputs == 4;
+  // Untextured position/colour layout: six floats for a vec2 position, eight
+  // for a vec4 one.
   const bool color_layout =
-      command.vertex_stride == 6U * sizeof(float) &&
+      (command.vertex_stride == 6U * sizeof(float) ||
+       command.vertex_stride == 8U * sizeof(float)) &&
       command.vertex_pco_abi.vertex_inputs == 8 &&
       command.varying_output_count == 4 &&
       command.fragment_varying_count == 16 &&
@@ -1539,6 +1542,13 @@ void Submitter::Run() {
             command.varying_output_count == 4 &&
             command.fragment_varying_count == 16 &&
             command.vertex_pco_abi.shareds == 0;
+        // The same layout with a full-width vec4 position.
+        const bool color4_layout =
+            command.vertex_stride == 8U * sizeof(float) &&
+            command.vertex_pco_abi.vertex_inputs == 8 &&
+            command.varying_output_count == 4 &&
+            command.fragment_varying_count == 16 &&
+            command.vertex_pco_abi.shareds == 0;
         const bool terrain_main_layout =
             command.vertex_stride == 11U * sizeof(float) &&
             command.vertex_pco_abi.vertex_inputs == 16;
@@ -1547,6 +1557,12 @@ void Submitter::Run() {
               MakeDriverPcoFloat2Binding(0, command.vertex_stride, 0),
               MakeDriverPcoFloat4Binding(
                   2U * sizeof(float), command.vertex_stride, 4),
+          };
+        } else if (color4_layout) {
+          bindings = {
+              MakeDriverPcoFloat4Binding(0, command.vertex_stride, 0),
+              MakeDriverPcoFloat4Binding(
+                  4U * sizeof(float), command.vertex_stride, 4),
           };
         } else if (terrain_main_layout) {
           // Terrain D3 is captured from four separate Gallium VBOs and

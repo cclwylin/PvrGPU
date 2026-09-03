@@ -10,6 +10,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/*
+ * Upper bound on the draws one generic array-primitive sequence carries.  The
+ * public SystemC sequence header enforces its own limit; this keeps the
+ * driver-side accumulation bounded independently of it.
+ */
+#define PVRGPU_ARRAY_PRIMITIVE_SEQUENCE_MAX 64u
+
+struct pvrgpu_array_primitive_draw;
 struct pvrgpu_deqp_primitive_sequence_profile;
 struct pvrgpu_pco_compiler;
 struct pvrgpu_pco_graphics_binary;
@@ -83,6 +91,11 @@ struct pvrgpu_context {
    struct pvrgpu_shadow_pco_observation *shadow_pco_mask;
    struct pvrgpu_shadow_pco_observation *shadow_pco_scene;
    bool shadow_pco_warmup_skipped;
+   struct pvrgpu_array_primitive_draw
+      *array_primitive_draws[PVRGPU_ARRAY_PRIMITIVE_SEQUENCE_MAX];
+   unsigned array_primitive_draw_count;
+   bool array_primitive_sequence_overflow;
+   bool array_primitive_sequence_owns_command;
    unsigned terrain_pco_probe_draws;
    unsigned terrain_pco_draw_count;
    bool terrain_pco_warmup_skipped;
@@ -107,6 +120,12 @@ pvrgpu_case_counter_sequence_allows_clear_emit(void);
 
 bool
 pvrgpu_emit_case_counter_sequence_command(struct pvrgpu_context *ctx);
+
+bool
+pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx);
+
+void
+pvrgpu_array_primitive_sequence_reset(struct pvrgpu_context *ctx);
 
 void
 pvrgpu_note_full_depth_clear_one(struct pvrgpu_context *ctx,

@@ -11707,16 +11707,238 @@ pvrgpu_read_vertex_attribute(const struct pvrgpu_context *ctx,
    return true;
 }
 
+bool
+pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx);
+
+struct pvrgpu_array_primitive_draw {
+   struct pvrgpu_systemc_driver_command command;
+   float *vertex_data;
+   struct pvrgpu_pco_graphics_binary binary;
+};
+
+static void
+pvrgpu_array_primitive_draw_destroy(struct pvrgpu_array_primitive_draw **slot)
+{
+   if (!slot || !*slot)
+      return;
+   struct pvrgpu_array_primitive_draw *draw = *slot;
+   pvrgpu_pco_graphics_binary_finish(&draw->binary);
+   free(draw->vertex_data);
+   FREE(draw);
+   *slot = NULL;
+}
+
+void
+pvrgpu_array_primitive_sequence_reset(struct pvrgpu_context *ctx)
+{
+   if (!ctx)
+      return;
+   for (unsigned ordinal = 0; ordinal < ctx->array_primitive_draw_count;
+        ++ordinal)
+      pvrgpu_array_primitive_draw_destroy(&ctx->array_primitive_draws[ordinal]);
+   ctx->array_primitive_draw_count = 0;
+   ctx->array_primitive_sequence_overflow = false;
+}
+
+/*
+ * Submit every recorded array-primitive draw as one native PCO sequence.  The
+ * whole-sequence counter fields are deliberately left zero: SystemC measures
+ * them from the geometry it actually rasterizes, which is the point of routing
+ * these draws through the model instead of a captured counter profile.
+ */
+bool
+pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
+{
+   const char *path = pvrgpu_command_output_path();
+   if (!path || !ctx || ctx->array_primitive_draw_count == 0)
+      return false;
+   if (ctx->driver_draw_command_emitted ||
+       pvrgpu_driver_draw_command_has_been_emitted()) {
+      pvrgpu_counter_eventf("draw_array_primitive_sequence_error",
+                            "stage=own reason=command_owned_elsewhere "
+                            "draws=%u local=%u global=%u",
+                            ctx->array_primitive_draw_count,
+                            ctx->driver_draw_command_emitted ? 1u : 0u,
+                            pvrgpu_driver_draw_command_has_been_emitted() ? 1u
+                                                                          : 0u);
+      return false;
+   }
+   if (ctx->array_primitive_sequence_overflow) {
+      pvrgpu_counter_eventf("draw_array_primitive_sequence_error",
+                            "stage=record reason=sequence_overflow draws=%u",
+                            ctx->array_primitive_draw_count);
+      return false;
+   }
+
+   struct pvrgpu_systemc_driver_command *draws =
+      calloc(ctx->array_primitive_draw_count, sizeof(*draws));
+   if (!draws)
+      return false;
+
+   const struct pvrgpu_systemc_driver_command *first =
+      &ctx->array_primitive_draws[0]->command;
+   for (unsigned ordinal = 0; ordinal < ctx->array_primitive_draw_count;
+        ++ordinal) {
+      const struct pvrgpu_array_primitive_draw *recorded =
+         ctx->array_primitive_draws[ordinal];
+      /*
+       * One sequence describes one render target, so every draw has to agree
+       * on the surface it writes.  A trace that retargets mid-frame is left
+       * for the caller to reject rather than silently flattened.
+       */
+      if (!recorded ||
+          recorded->command.framebuffer_width != first->framebuffer_width ||
+          recorded->command.framebuffer_height != first->framebuffer_height ||
+          recorded->command.width != first->width ||
+          recorded->command.height != first->height) {
+         pvrgpu_counter_eventf("draw_array_primitive_sequence_error",
+                               "stage=assemble ordinal=%u "
+                               "reason=framebuffer_mismatch",
+                               ordinal);
+         free(draws);
+         return false;
+      }
+      draws[ordinal] = recorded->command;
+      if (draws[ordinal].blend_enable == 0) {
+         /* Disabled blending still has to carry its canonical ONE/ZERO ABI. */
+         draws[ordinal].blend_rgb_equation =
+            PVRGPU_SYSTEMC_PCO_BLEND_EQUATION_ADD;
+         draws[ordinal].blend_alpha_equation =
+            PVRGPU_SYSTEMC_PCO_BLEND_EQUATION_ADD;
+         draws[ordinal].blend_source_rgb_factor =
+            PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE;
+         draws[ordinal].blend_destination_rgb_factor =
+            PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ZERO;
+         draws[ordinal].blend_source_alpha_factor =
+            PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE;
+         draws[ordinal].blend_destination_alpha_factor =
+            PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ZERO;
+      }
+      /*
+       * The first draw starts from a fresh clear; each later draw continues
+       * from the surfaces the previous ordinal produced, which is what makes
+       * the sequence accumulate instead of each draw clearing the frame.
+       */
+      draws[ordinal].color_attachment_source_command_index =
+         ordinal == 0 ? PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR : ordinal - 1u;
+      if (draws[ordinal].depth_enable == 0 &&
+          draws[ordinal].depth_write == 0) {
+         /* A draw that neither tests nor writes depth needs no attachment. */
+         draws[ordinal].depth_format = 0;
+         draws[ordinal].depth_attachment_source_command_index =
+            PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR;
+      } else {
+         draws[ordinal].depth_attachment_source_command_index =
+            ordinal == 0 ? PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR : ordinal - 1u;
+      }
+   }
+
+   struct pvrgpu_systemc_driver_command command;
+   memset(&command, 0, sizeof(command));
+   command.version = PVRGPU_SYSTEMC_API_VERSION;
+   command.schema = PVRGPU_DRIVER_COMMAND_SCHEMA;
+   command.producer = PVRGPU_DRIVER_COMMAND_PRODUCER;
+   command.command = "draw_pco_sequence";
+   command.case_name = first->case_name;
+   command.format = first->format;
+   command.frame = 1;
+   command.framebuffer_width = first->framebuffer_width;
+   command.framebuffer_height = first->framebuffer_height;
+   command.width = first->width;
+   command.height = first->height;
+   memcpy(command.clear_color_bits,
+          first->clear_color_bits,
+          sizeof(command.clear_color_bits));
+   /*
+    * Input-assembly totals follow directly from the draws that were lowered,
+    * so the driver states them exactly.  Everything past clipping is left
+    * unset on purpose: SystemC measures it from the geometry it rasterizes.
+    */
+   uint32_t ia_vertices = 0;
+   uint32_t ia_primitives = 0;
+   for (unsigned ordinal = 0; ordinal < ctx->array_primitive_draw_count;
+        ++ordinal) {
+      const struct pvrgpu_systemc_driver_command *draw = &draws[ordinal];
+      ia_vertices += draw->vertex_count;
+      ia_primitives +=
+         pvrgpu_array_primitive_triangle_count(draw->primitive_mode,
+                                               draw->vertex_count);
+   }
+   if (ia_vertices == 0 || ia_primitives == 0) {
+      pvrgpu_counter_eventf("draw_array_primitive_sequence_error",
+                            "stage=assemble reason=empty_input_assembly");
+      free(draws);
+      return false;
+   }
+   command.draw_count = ctx->array_primitive_draw_count;
+   command.ia_vertices = ia_vertices;
+   command.ia_primitives = ia_primitives;
+   /* Non-indexed draws shade every submitted vertex exactly once. */
+   command.vs_invocations = ia_vertices;
+   command.clip_invocations = ia_primitives;
+   command.pco_sequence_command_count = ctx->array_primitive_draw_count;
+   command.pco_sequence_commands = draws;
+
+   char error[512] = { 0 };
+   const bool emitted = pvrgpu_write_draw_pco_sequence_command(path,
+                                                               &command,
+                                                               error,
+                                                               sizeof(error));
+   free(draws);
+   if (!emitted) {
+      remove(path);
+      debug_printf("pvrgpu: %s\n", error);
+      pvrgpu_counter_eventf("draw_array_primitive_sequence_error",
+                            "stage=command_submit reason=%s",
+                            error[0] ? error : "unknown");
+      return false;
+   }
+
+   ctx->driver_draw_command_emitted = true;
+   ctx->array_primitive_sequence_owns_command = true;
+   pvrgpu_note_driver_draw_command_emitted();
+   pvrgpu_counter_eventf("draw_array_primitive_sequence_command",
+                         "draws=%u framebuffer=%ux%u",
+                         command.pco_sequence_command_count,
+                         command.framebuffer_width,
+                         command.framebuffer_height);
+   return true;
+}
+
+/*
+ * Record one lowered array-primitive draw.  The v1 capsule carries a single
+ * draw, so an accumulating sequence is the only way a trace with more than one
+ * draw reaches the model; the draws are submitted together by
+ * pvrgpu_emit_array_primitive_sequence_command() when the frame flushes.
+ */
 static bool
-pvrgpu_emit_color_primitive_pco_command(
+pvrgpu_record_color_primitive_pco_draw(
    struct pvrgpu_context *ctx,
    const struct pipe_draw_info *info,
    const struct pipe_draw_start_count_bias *draw)
 {
    const char *path = pvrgpu_command_output_path();
-   if (!path || !ctx || !info || !draw || ctx->driver_draw_command_emitted ||
+   if (!path || !ctx || !info || !draw)
+      return false;
+   if (ctx->driver_draw_command_emitted ||
        pvrgpu_driver_draw_command_has_been_emitted()) {
       return false;
+   }
+   if (ctx->array_primitive_draw_count >=
+       PVRGPU_ARRAY_PRIMITIVE_SEQUENCE_MAX) {
+      ctx->array_primitive_sequence_overflow = true;
+      return false;
+   }
+   /*
+    * RenderDoc replays the captured frames more than once, so the driver sees
+    * each API draw several times.  The trace reports how many draw actions it
+    * actually contains; stop recording there so the sequence describes the
+    * workload once instead of once per replay pass.
+    */
+   unsigned trace_draw_actions = 0;
+   if (pvrgpu_trace_draw_actions(&trace_draw_actions) &&
+       ctx->array_primitive_draw_count >= trace_draw_actions) {
+      return true;
    }
 
    if (!ctx->vertex_elements || ctx->vertex_elements->num_elements < 2 ||
@@ -11726,11 +11948,16 @@ pvrgpu_emit_color_primitive_pco_command(
    const unsigned vertex_count = draw->count;
    if (pvrgpu_array_primitive_triangle_count(info->mode, vertex_count) == 0)
       return false;
-   /* Six interleaved floats per vertex: float2 position, float4 color. */
-   if (vertex_count > UINT_MAX / (6u * sizeof(float)))
+   /*
+    * Eight interleaved floats per vertex: float4 position, float4 color.  The
+    * position is carried at full width because a shader declaring vec4
+    * gl_Position reads all four VTXIN components, and the model matches the
+    * shader's vertex-input mask against the attribute bindings exactly.
+    */
+   if (vertex_count > UINT_MAX / (8u * sizeof(float)))
       return false;
 
-   float *interleaved = malloc((size_t)vertex_count * 6u * sizeof(float));
+   float *interleaved = malloc((size_t)vertex_count * 8u * sizeof(float));
    if (!interleaved)
       return false;
    for (unsigned v = 0; v < vertex_count; ++v) {
@@ -11738,13 +11965,13 @@ pvrgpu_emit_color_primitive_pco_command(
       if (!pvrgpu_read_vertex_attribute(ctx,
                                         &ctx->vertex_elements->elements[0],
                                         v_idx,
-                                        2,
-                                        &interleaved[v * 6 + 0]) ||
+                                        4,
+                                        &interleaved[v * 8 + 0]) ||
           !pvrgpu_read_vertex_attribute(ctx,
                                         &ctx->vertex_elements->elements[1],
                                         v_idx,
                                         4,
-                                        &interleaved[v * 6 + 2])) {
+                                        &interleaved[v * 8 + 4])) {
          free(interleaved);
          return false;
       }
@@ -11794,8 +12021,8 @@ pvrgpu_emit_color_primitive_pco_command(
    command.format = PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8;
    command.clear_color_bits[3] = UINT32_C(0x3f800000);
    command.raw_vertex_data = (const uint8_t *)interleaved;
-   command.raw_vertex_data_size = (size_t)vertex_count * 6u * sizeof(float);
-   command.vertex_stride = 6u * sizeof(float);
+   command.raw_vertex_data_size = (size_t)vertex_count * 8u * sizeof(float);
+   command.vertex_stride = 8u * sizeof(float);
    command.vertex_count = vertex_count;
    command.first_vertex = 0;
    command.instance_count = 1;
@@ -11857,31 +12084,77 @@ pvrgpu_emit_color_primitive_pco_command(
    command.depth_clear_bits = UINT32_C(0x3f800000);
    command.depth_format = ctx->framebuffer.zsbuf.format;
 
-   const bool emitted = pvrgpu_write_draw_pco_triangles_command(path,
-                                                                &command,
-                                                                error,
-                                                                sizeof(error));
-   pvrgpu_pco_graphics_binary_finish(&binary);
-   free(interleaved);
-   if (!emitted) {
-      remove(path);
+   if (!pvrgpu_validate_draw_pco_triangles_command(path,
+                                                  &command,
+                                                  error,
+                                                  sizeof(error))) {
+      pvrgpu_pco_graphics_binary_finish(&binary);
+      free(interleaved);
       debug_printf("pvrgpu: %s\n", error);
-      pvrgpu_counter_eventf("draw_color_triangle_pco_command_error",
-                            "stage=command_submit reason=%s",
+      pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                            "stage=validate reason=%s",
                             error[0] ? error : "unknown");
       return false;
    }
 
-   ctx->driver_draw_command_emitted = true;
-   pvrgpu_note_driver_draw_command_emitted();
-   pvrgpu_counter_eventf("draw_color_triangle_pco_command",
-                         "framebuffer=%ux%u vertices=%u vs_bytes=%zu "
-                         "fs_bytes=%zu",
+   struct pvrgpu_array_primitive_draw *recorded =
+      CALLOC_STRUCT(pvrgpu_array_primitive_draw);
+   if (!recorded) {
+      pvrgpu_pco_graphics_binary_finish(&binary);
+      free(interleaved);
+      return false;
+   }
+   /* The nested draw points at payloads this record owns until submission. */
+   recorded->vertex_data = interleaved;
+   recorded->binary = binary;
+   pvrgpu_pco_triangles_command_to_systemc(&command, &recorded->command);
+   ctx->array_primitive_draws[ctx->array_primitive_draw_count++] = recorded;
+
+   /*
+    * The trace reports how many draw actions it contains, so the sequence is
+    * complete the moment the last one is recorded.  Submit it here: waiting
+    * for teardown would let the present path claim the command file first and
+    * describe the frame as a flat colour instead of the geometry.
+    */
+   unsigned expected_draws = 0;
+   if (pvrgpu_trace_draw_actions(&expected_draws) && expected_draws != 0 &&
+       ctx->array_primitive_draw_count == expected_draws)
+      (void)pvrgpu_emit_array_primitive_sequence_command(ctx);
+
+   pvrgpu_counter_eventf("draw_array_primitive_recorded",
+                         "ordinal=%u framebuffer=%ux%u vertices=%u mode=%u "
+                         "vs_bytes=%zu fs_bytes=%zu fill=%u,%u scissor=%u "
+                         "discard=%u multisample=%u halfpixel=%u "
+                         "bottomedge=%u halfz=%u clip=%u,%u clamp=%u "
+                         "samplemask=0x%x colormask=0x%x blend=%u dither=%u "
+                         "depth=%u,%u,%u cull=%u ccw=%u",
+                         ctx->array_primitive_draw_count - 1u,
                          command.framebuffer_width,
                          command.framebuffer_height,
                          command.vertex_count,
+                         command.primitive_mode,
                          command.vertex_pco_size,
-                         command.fragment_pco_size);
+                         command.fragment_pco_size,
+                         command.fill_front,
+                         command.fill_back,
+                         command.scissor,
+                         command.rasterizer_discard,
+                         command.multisample,
+                         command.half_pixel_center,
+                         command.bottom_edge_rule,
+                         command.clip_halfz,
+                         command.depth_clip_near,
+                         command.depth_clip_far,
+                         command.depth_clamp,
+                         command.sample_mask,
+                         command.color_mask,
+                         command.blend_enable,
+                         command.dither,
+                         command.depth_enable,
+                         command.depth_write,
+                         command.depth_func,
+                         command.cull_face,
+                         command.front_ccw);
    return true;
 }
 
@@ -12695,6 +12968,15 @@ pvrgpu_destroy(struct pipe_context *pipe)
       pvrgpu_pco_graphics_binary_finish(ctx->ideas_pco_binaries[profile]);
       FREE(ctx->ideas_pco_binaries[profile]);
    }
+   /*
+    * The accumulated draws are this frame's geometry: a frame-start clear
+    * retires the previous frame's records, so what survives to teardown is
+    * the last complete frame.  The ordered sequence protocol accepts one
+    * submission, so this is the single point that can submit it.
+    */
+   if (ctx->array_primitive_draw_count != 0)
+      (void)pvrgpu_emit_array_primitive_sequence_command(ctx);
+   pvrgpu_array_primitive_sequence_reset(ctx);
    pvrgpu_refract_pco_observation_destroy(&ctx->refract_pco_prepass);
    pvrgpu_refract_pco_observation_destroy(&ctx->refract_pco_composite);
    pvrgpu_shadow_pco_observation_destroy(&ctx->shadow_pco_depth);
@@ -14065,7 +14347,7 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
                             ctx->framebuffer.height,
                             ctx->observed_draws);
       if (ctx->vertex_elements->num_elements >= 2) {
-         if (!pvrgpu_emit_color_primitive_pco_command(ctx, info, &draws[0]) &&
+         if (!pvrgpu_record_color_primitive_pco_draw(ctx, info, &draws[0]) &&
              !ctx->driver_draw_command_emitted &&
              !pvrgpu_driver_draw_command_has_been_emitted() &&
              pvrgpu_framebuffer_matches_rdc_output(ctx))
@@ -14210,8 +14492,23 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
                             ctx->framebuffer.width,
                             ctx->framebuffer.height,
                             ctx->observed_draws);
-      if (pvrgpu_emit_color_primitive_pco_command(ctx, info, &draws[0]))
+      if (pvrgpu_record_color_primitive_pco_draw(ctx, info, &draws[0]))
          return;
+      /*
+       * RenderDoc replays the captured frames again once the sequence has
+       * already described this trace's workload.  Those repeats are
+       * observations, not draws the driver failed to lower.
+       */
+      if (ctx->array_primitive_sequence_owns_command ||
+          pvrgpu_driver_draw_command_has_been_emitted()) {
+         pvrgpu_counter_eventf("draw_array_primitive_duplicate_skip",
+                               "start=%u count=%u mode=%u total=%u",
+                               draws[0].start,
+                               draws[0].count,
+                               info->mode,
+                               ctx->observed_draws);
+         return;
+      }
       pvrgpu_note_unsupported_draw(ctx,
                                    info,
                                    indirect,

@@ -6,6 +6,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "pvrgpu_systemc_api.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -251,6 +253,21 @@ pvrgpu_write_draw_pco_triangles_command(
    const struct pvrgpu_draw_pco_triangles_command *cmd,
    char *error,
    size_t error_size);
+
+/* Validate one PCO triangles command without submitting it. */
+bool
+pvrgpu_validate_draw_pco_triangles_command(
+   const char *path,
+   const struct pvrgpu_draw_pco_triangles_command *cmd,
+   char *error,
+   size_t error_size);
+
+/* Project one PCO triangles command onto the public SystemC command layout so
+ * a caller can embed it as a nested sequence draw instead of submitting it. */
+void
+pvrgpu_pco_triangles_command_to_systemc(
+   const struct pvrgpu_draw_pco_triangles_command *cmd,
+   struct pvrgpu_systemc_driver_command *out);
 
 /* Submit one API-v6 logical PCO sequence.  The public SystemC command is used
  * directly so nested draw/resource pointers have one authoritative layout;

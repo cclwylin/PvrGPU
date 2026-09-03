@@ -1089,6 +1089,80 @@ bool DriverPcoTerrainFragmentBinaryHashMatches(
   return false;
 }
 
+// A native PCO sequence that is described by its shape instead of a captured
+// case name: every nested draw uses the untextured position/colour vertex
+// layout, writes the same render target, and continues from the surface the
+// previous ordinal produced.  SystemC rasterizes the geometry and measures the
+// counters itself, so no profile constants are involved.
+bool GenericColorSequenceSupported(const Options &options, std::string *error) {
+  const DriverCommand &logical = options.driver_command;
+  if (!logical.enabled || logical.schema != kDriverCommandSchema ||
+      logical.producer != kDriverCommandProducer ||
+      logical.command != kDrawPcoSequence || logical.frame != 1 ||
+      logical.format != kRgba8 || !RootPayloadIsEmpty(logical)) {
+    return Reject(error, "generic PCO logical command envelope is invalid");
+  }
+  if (logical.framebuffer_width == 0 || logical.framebuffer_height == 0 ||
+      logical.framebuffer_width > 4096 || logical.framebuffer_height > 4096 ||
+      logical.width != logical.framebuffer_width ||
+      logical.height != logical.framebuffer_height) {
+    return Reject(error, "generic PCO sequence render target is invalid");
+  }
+  if (options.driver_commands.empty()) {
+    return Reject(error, "generic PCO sequence has no physical draws");
+  }
+
+  for (std::size_t ordinal = 0; ordinal < options.driver_commands.size();
+       ++ordinal) {
+    const DriverCommand &draw = options.driver_commands[ordinal];
+    if (draw.command != kDrawPcoTriangles || draw.test_case != logical.test_case ||
+        draw.format != kRgba8 || draw.frame != 1 ||
+        draw.framebuffer_width != logical.framebuffer_width ||
+        draw.framebuffer_height != logical.framebuffer_height ||
+        draw.width != logical.width || draw.height != logical.height) {
+      return Reject(error, "generic PCO sequence draw envelope is invalid");
+    }
+    // Untextured position/colour layout: float2 position + float4 colour.
+    if ((draw.vertex_stride != 6U * sizeof(float) &&
+         draw.vertex_stride != 8U * sizeof(float)) ||
+        draw.vertex_pco_abi.vertex_inputs != 8 ||
+        !draw.sampled_textures.empty() || draw.sampled_texture_count != 0) {
+      return Reject(error, "generic PCO sequence draw is not the colour layout");
+    }
+    // Non-indexed triangle topologies the submitter expands into a list.
+    const bool topology_expandable =
+        draw.indexed == 0 && draw.first_vertex == 0 &&
+        draw.instance_count == 1 &&
+        ((draw.primitive_mode == 4U && draw.vertex_count >= 3U &&
+          draw.vertex_count % 3U == 0U) ||
+         ((draw.primitive_mode == 5U || draw.primitive_mode == 6U) &&
+          draw.vertex_count >= 3U));
+    if (!topology_expandable) {
+      return Reject(error, "generic PCO sequence draw topology is invalid");
+    }
+    // The first draw starts from a clear; later draws continue from the
+    // surface an earlier ordinal produced, never from a forward reference.
+    const std::uint32_t expected_source =
+        ordinal == 0 ? kDriverPcoNewAttachment
+                     : static_cast<std::uint32_t>(ordinal - 1);
+    if (draw.color_attachment_source_command_index != expected_source) {
+      return Reject(error, "generic PCO sequence colour attachment chain is invalid");
+    }
+    const bool uses_depth = draw.depth_enable != 0 || draw.depth_write != 0;
+    if (!uses_depth &&
+        (draw.depth_format != 0 ||
+         draw.depth_attachment_source_command_index !=
+             kDriverPcoNewAttachment)) {
+      return Reject(error, "generic PCO sequence depth attachment is invalid");
+    }
+    if (uses_depth &&
+        draw.depth_attachment_source_command_index != expected_source) {
+      return Reject(error, "generic PCO sequence depth attachment chain is invalid");
+    }
+  }
+  return true;
+}
+
 bool DriverPcoSequenceSupported(const Options &options, std::string *error) {
   if (error)
     error->clear();
@@ -1102,7 +1176,7 @@ bool DriverPcoSequenceSupported(const Options &options, std::string *error) {
     return ShadowSupported(options, error);
   if (logical.test_case == kTerrainCase)
     return TerrainSupported(options, error);
-  return Reject(error, "native PCO sequence profile is unsupported");
+  return GenericColorSequenceSupported(options, error);
 }
 
 }  // namespace pvrgpu::stub

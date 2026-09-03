@@ -380,9 +380,12 @@ bool CopyPcoTrianglePayload(
   const bool ideas_sequence = IsIdeasPcoSequenceCase(source.case_name);
   const bool conditionals_layout =
       source.vertex_stride == pvrgpu::stub::kDriverPcoPositionVertexStride;
+  // Untextured position/colour layout: six floats for a vec2 position, eight
+  // for a vec4 one.
   const bool color_layout =
-      source.vertex_stride ==
-          pvrgpu::stub::kDriverPcoPositionNormalVertexStride &&
+      (source.vertex_stride ==
+           pvrgpu::stub::kDriverPcoPositionNormalVertexStride ||
+       source.vertex_stride == 8U * sizeof(float)) &&
       source.vertex_pco_abi.shareds == 0;
   const bool lit_mesh_layout =
       source.vertex_stride ==
@@ -764,7 +767,8 @@ bool CopyPcoSequenceDraw(
           pvrgpu::stub::kDriverPcoMaximumBinaryBytes ||
       (source.vertex_shared_count != 0 && !source.vertex_shared) ||
       (source.fragment_shared_count != 0 && !source.fragment_shared) ||
-      !PcoStageAbiIsBounded(source.vertex_pco_abi) ||
+      /* A pass-through VS forwarding position and colour uses no temps. */
+      !PcoStageAbiIsBounded(source.vertex_pco_abi, true) ||
       !PcoStageAbiIsBounded(source.fragment_pco_abi, true, true) ||
       source.vertex_shared_count != source.vertex_pco_abi.shareds ||
       source.fragment_shared_count != source.fragment_pco_abi.shareds ||

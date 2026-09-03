@@ -577,8 +577,13 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       end_vertex * (uint64_t)cmd->vertex_stride;
    const bool conditionals_layout =
       cmd->vertex_stride == 12 && cmd->vertex_pco_abi.vertex_inputs == 4;
+   /*
+    * Untextured position/colour layout.  A shader reading vec2 position packs
+    * six floats per vertex; one reading vec4 position packs eight.
+    */
    const bool color_layout =
-      cmd->vertex_stride == 24 && cmd->vertex_pco_abi.vertex_inputs == 8 &&
+      (cmd->vertex_stride == 24 || cmd->vertex_stride == 32) &&
+      cmd->vertex_pco_abi.vertex_inputs == 8 &&
       cmd->vertex_pco_abi.shareds == 0;
    const bool lit_mesh_layout =
       cmd->vertex_stride == 24 && cmd->vertex_pco_abi.vertex_inputs == 8 &&
@@ -1262,6 +1267,122 @@ pvrgpu_write_draw_textured_triangles_command(
    return pvrgpu_submit_systemc_api(&api_command, error, error_size);
 }
 
+/*
+ * Validate one PCO triangles command without submitting it, so a caller
+ * accumulating a sequence can reject a draw before it reaches the payload.
+ */
+bool
+pvrgpu_validate_draw_pco_triangles_command(
+   const char *path,
+   const struct pvrgpu_draw_pco_triangles_command *cmd,
+   char *error,
+   size_t error_size)
+{
+   return pvrgpu_cmd_validate_draw_pco_triangles(path, cmd, error, error_size);
+}
+
+/*
+ * Project one PCO triangles command onto the public SystemC command layout.
+ * The single-draw writer submits the result directly; the sequence writer
+ * embeds it as one nested draw, so both share one authoritative projection.
+ */
+void
+pvrgpu_pco_triangles_command_to_systemc(
+   const struct pvrgpu_draw_pco_triangles_command *cmd,
+   struct pvrgpu_systemc_driver_command *out)
+{
+   if (!cmd || !out)
+      return;
+   pvrgpu_systemc_command_init(out,
+                               "draw_pco_triangles",
+                               cmd->case_name,
+                               cmd->frame,
+                               cmd->framebuffer_width,
+                               cmd->framebuffer_height,
+                               cmd->width,
+                               cmd->height,
+                               cmd->format,
+                               cmd->clear_color_bits);
+   out->raw_vertex_data = cmd->raw_vertex_data;
+   out->raw_vertex_data_size = cmd->raw_vertex_data_size;
+   out->vertex_stride = cmd->vertex_stride;
+   out->vertex_count = cmd->vertex_count;
+   out->first_vertex = cmd->first_vertex;
+   out->instance_count = cmd->instance_count;
+   out->primitive_mode = cmd->primitive_mode;
+   out->indexed = cmd->indexed;
+   out->draw_count = cmd->draw_count;
+   out->ia_vertices = cmd->ia_vertices;
+   out->ia_primitives = cmd->ia_primitives;
+   out->vs_invocations = cmd->vs_invocations;
+   out->gs_invocations = cmd->gs_invocations;
+   out->gs_primitives = cmd->gs_primitives;
+   out->clip_invocations = cmd->clip_invocations;
+   out->clip_primitives = cmd->clip_primitives;
+   out->hs_invocations = cmd->hs_invocations;
+   out->ds_invocations = cmd->ds_invocations;
+   out->cs_invocations = cmd->cs_invocations;
+   out->ps_invocations = cmd->ps_invocations;
+   out->setup_triangles = cmd->setup_triangles;
+   out->semantic_texel_fetches = cmd->semantic_texel_fetches;
+   out->vertex_pco = cmd->vertex_pco;
+   out->vertex_pco_size = cmd->vertex_pco_size;
+   out->fragment_pco = cmd->fragment_pco;
+   out->fragment_pco_size = cmd->fragment_pco_size;
+   out->vertex_shared = cmd->vertex_shared;
+   out->vertex_shared_count = cmd->vertex_shared_count;
+   out->fragment_shared = cmd->fragment_shared;
+   out->fragment_shared_count = cmd->fragment_shared_count;
+   out->sampled_texture_count = cmd->sampled_texture_count;
+   out->sampled_texture_bytes = cmd->sampled_texture_bytes;
+   out->sampled_texture_bytes_size = cmd->sampled_texture_bytes_size;
+   out->sampled_texture_width = cmd->sampled_texture_width;
+   out->sampled_texture_height = cmd->sampled_texture_height;
+   out->sampled_texture_row_pitch = cmd->sampled_texture_row_pitch;
+   out->sampled_texture_format = cmd->sampled_texture_format;
+   out->sampled_texture_mip_count = cmd->sampled_texture_mip_count;
+   pvrgpu_systemc_copy_pco_stage_abi(&out->vertex_pco_abi,
+                                     &cmd->vertex_pco_abi);
+   pvrgpu_systemc_copy_pco_stage_abi(&out->fragment_pco_abi,
+                                     &cmd->fragment_pco_abi);
+   out->position_output_start = cmd->position_output_start;
+   out->position_output_count = cmd->position_output_count;
+   out->fragment_position_start = cmd->fragment_position_start;
+   out->fragment_position_count = cmd->fragment_position_count;
+   out->varying_output_start = cmd->varying_output_start;
+   out->varying_output_count = cmd->varying_output_count;
+   out->fragment_varying_start = cmd->fragment_varying_start;
+   out->fragment_varying_count = cmd->fragment_varying_count;
+   memcpy(out->viewport_scale_bits,
+          cmd->viewport_scale_bits,
+          sizeof(out->viewport_scale_bits));
+   memcpy(out->viewport_translate_bits,
+          cmd->viewport_translate_bits,
+          sizeof(out->viewport_translate_bits));
+   out->front_ccw = cmd->front_ccw;
+   out->cull_face = cmd->cull_face;
+   out->fill_front = cmd->fill_front;
+   out->fill_back = cmd->fill_back;
+   out->scissor = cmd->scissor;
+   out->rasterizer_discard = cmd->rasterizer_discard;
+   out->multisample = cmd->multisample;
+   out->half_pixel_center = cmd->half_pixel_center;
+   out->bottom_edge_rule = cmd->bottom_edge_rule;
+   out->clip_halfz = cmd->clip_halfz;
+   out->depth_clip_near = cmd->depth_clip_near;
+   out->depth_clip_far = cmd->depth_clip_far;
+   out->depth_clamp = cmd->depth_clamp;
+   out->sample_mask = cmd->sample_mask;
+   out->color_mask = cmd->color_mask;
+   out->blend_enable = cmd->blend_enable;
+   out->dither = cmd->dither;
+   out->depth_enable = cmd->depth_enable;
+   out->depth_write = cmd->depth_write;
+   out->depth_func = cmd->depth_func;
+   out->depth_clear_bits = cmd->depth_clear_bits;
+   out->depth_format = cmd->depth_format;
+}
+
 bool
 pvrgpu_write_draw_pco_triangles_command(
    const char *path,
@@ -1474,94 +1595,7 @@ pvrgpu_write_draw_pco_triangles_command(
    }
 
    struct pvrgpu_systemc_driver_command api_command;
-   pvrgpu_systemc_command_init(&api_command,
-                               "draw_pco_triangles",
-                               cmd->case_name,
-                               cmd->frame,
-                               cmd->framebuffer_width,
-                               cmd->framebuffer_height,
-                               cmd->width,
-                               cmd->height,
-                               cmd->format,
-                               cmd->clear_color_bits);
-   api_command.raw_vertex_data = cmd->raw_vertex_data;
-   api_command.raw_vertex_data_size = cmd->raw_vertex_data_size;
-   api_command.vertex_stride = cmd->vertex_stride;
-   api_command.vertex_count = cmd->vertex_count;
-   api_command.first_vertex = cmd->first_vertex;
-   api_command.instance_count = cmd->instance_count;
-   api_command.primitive_mode = cmd->primitive_mode;
-   api_command.indexed = cmd->indexed;
-   api_command.draw_count = cmd->draw_count;
-   api_command.ia_vertices = cmd->ia_vertices;
-   api_command.ia_primitives = cmd->ia_primitives;
-   api_command.vs_invocations = cmd->vs_invocations;
-   api_command.gs_invocations = cmd->gs_invocations;
-   api_command.gs_primitives = cmd->gs_primitives;
-   api_command.clip_invocations = cmd->clip_invocations;
-   api_command.clip_primitives = cmd->clip_primitives;
-   api_command.hs_invocations = cmd->hs_invocations;
-   api_command.ds_invocations = cmd->ds_invocations;
-   api_command.cs_invocations = cmd->cs_invocations;
-   api_command.ps_invocations = cmd->ps_invocations;
-   api_command.setup_triangles = cmd->setup_triangles;
-   api_command.semantic_texel_fetches = cmd->semantic_texel_fetches;
-   api_command.vertex_pco = cmd->vertex_pco;
-   api_command.vertex_pco_size = cmd->vertex_pco_size;
-   api_command.fragment_pco = cmd->fragment_pco;
-   api_command.fragment_pco_size = cmd->fragment_pco_size;
-   api_command.vertex_shared = cmd->vertex_shared;
-   api_command.vertex_shared_count = cmd->vertex_shared_count;
-   api_command.fragment_shared = cmd->fragment_shared;
-   api_command.fragment_shared_count = cmd->fragment_shared_count;
-   api_command.sampled_texture_count = cmd->sampled_texture_count;
-   api_command.sampled_texture_bytes = cmd->sampled_texture_bytes;
-   api_command.sampled_texture_bytes_size = cmd->sampled_texture_bytes_size;
-   api_command.sampled_texture_width = cmd->sampled_texture_width;
-   api_command.sampled_texture_height = cmd->sampled_texture_height;
-   api_command.sampled_texture_row_pitch = cmd->sampled_texture_row_pitch;
-   api_command.sampled_texture_format = cmd->sampled_texture_format;
-   api_command.sampled_texture_mip_count = cmd->sampled_texture_mip_count;
-   pvrgpu_systemc_copy_pco_stage_abi(&api_command.vertex_pco_abi,
-                                     &cmd->vertex_pco_abi);
-   pvrgpu_systemc_copy_pco_stage_abi(&api_command.fragment_pco_abi,
-                                     &cmd->fragment_pco_abi);
-   api_command.position_output_start = cmd->position_output_start;
-   api_command.position_output_count = cmd->position_output_count;
-   api_command.fragment_position_start = cmd->fragment_position_start;
-   api_command.fragment_position_count = cmd->fragment_position_count;
-   api_command.varying_output_start = cmd->varying_output_start;
-   api_command.varying_output_count = cmd->varying_output_count;
-   api_command.fragment_varying_start = cmd->fragment_varying_start;
-   api_command.fragment_varying_count = cmd->fragment_varying_count;
-   memcpy(api_command.viewport_scale_bits,
-          cmd->viewport_scale_bits,
-          sizeof(api_command.viewport_scale_bits));
-   memcpy(api_command.viewport_translate_bits,
-          cmd->viewport_translate_bits,
-          sizeof(api_command.viewport_translate_bits));
-   api_command.front_ccw = cmd->front_ccw;
-   api_command.cull_face = cmd->cull_face;
-   api_command.fill_front = cmd->fill_front;
-   api_command.fill_back = cmd->fill_back;
-   api_command.scissor = cmd->scissor;
-   api_command.rasterizer_discard = cmd->rasterizer_discard;
-   api_command.multisample = cmd->multisample;
-   api_command.half_pixel_center = cmd->half_pixel_center;
-   api_command.bottom_edge_rule = cmd->bottom_edge_rule;
-   api_command.clip_halfz = cmd->clip_halfz;
-   api_command.depth_clip_near = cmd->depth_clip_near;
-   api_command.depth_clip_far = cmd->depth_clip_far;
-   api_command.depth_clamp = cmd->depth_clamp;
-   api_command.sample_mask = cmd->sample_mask;
-   api_command.color_mask = cmd->color_mask;
-   api_command.blend_enable = cmd->blend_enable;
-   api_command.dither = cmd->dither;
-   api_command.depth_enable = cmd->depth_enable;
-   api_command.depth_write = cmd->depth_write;
-   api_command.depth_func = cmd->depth_func;
-   api_command.depth_clear_bits = cmd->depth_clear_bits;
-   api_command.depth_format = cmd->depth_format;
+   pvrgpu_pco_triangles_command_to_systemc(cmd, &api_command);
    return pvrgpu_submit_systemc_api(&api_command, error, error_size);
 }
 

@@ -1362,19 +1362,32 @@ void NormalizeDriverPcoTrianglesApiCounters(const Options &options,
       throw std::runtime_error(
           "ordered PCO sequence has no complete API counter metadata");
     }
+    // Input-assembly totals are decided by the draw calls, so the driver
+    // knows them exactly and they are always adopted.
     counters.ia_vertices = command.ia_vertices;
     counters.ia_primitives = command.ia_primitives;
     counters.vs_invocations = command.vs_invocations;
-    counters.gs_invocations = command.gs_invocations;
-    counters.gs_primitives = command.gs_primitives;
     counters.c_invocations = command.clip_invocations;
-    counters.c_primitives = command.clip_primitives;
-    counters.ps_invocations = command.ps_invocations;
-    counters.hs_invocations = command.hs_invocations;
-    counters.ds_invocations = command.ds_invocations;
     counters.drawlists = command.draw_count;
-    counters.setup_triangles = command.setup_triangles;
-    counters.texel_fetches = command.semantic_texel_fetches;
+    // Everything past clipping depends on rasterization.  A capture profile
+    // may carry the measured totals it recorded, but a sequence that leaves
+    // them unset keeps what SystemC measured from the geometry it rendered.
+    if (command.gs_invocations != 0)
+      counters.gs_invocations = command.gs_invocations;
+    if (command.gs_primitives != 0)
+      counters.gs_primitives = command.gs_primitives;
+    if (command.clip_primitives != 0)
+      counters.c_primitives = command.clip_primitives;
+    if (command.ps_invocations != 0)
+      counters.ps_invocations = command.ps_invocations;
+    if (command.hs_invocations != 0)
+      counters.hs_invocations = command.hs_invocations;
+    if (command.ds_invocations != 0)
+      counters.ds_invocations = command.ds_invocations;
+    if (command.setup_triangles != 0)
+      counters.setup_triangles = command.setup_triangles;
+    if (command.semantic_texel_fetches != 0)
+      counters.texel_fetches = command.semantic_texel_fetches;
     return;
   }
   if (command.depth_enable == 0) {

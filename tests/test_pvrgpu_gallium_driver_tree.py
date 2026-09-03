@@ -824,6 +824,14 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertNotIn("PVRGPU_DRAW_PCO_TRIANGLES_VS_PCO_BYTES", validator)
         self.assertNotIn("PVRGPU_DRAW_PCO_TRIANGLES_FS_PCO_BYTES", validator)
 
+        converter_start = command.index(
+            "pvrgpu_pco_triangles_command_to_systemc("
+        )
+        converter_end = command.index(
+            "pvrgpu_write_draw_pco_triangles_command(", converter_start
+        )
+        converter = command[converter_start:converter_end]
+
         writer_start = command.index("pvrgpu_write_draw_pco_triangles_command(")
         writer_end = command.index(
             "pvrgpu_write_draw_triangle_command(", writer_start
@@ -857,7 +865,8 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             "fragment_varying_start",
             "fragment_varying_count",
         ):
-            self.assertIn(f"api_command.{field} = cmd->{field};", writer)
+            self.assertIn(f"out->{field} = cmd->{field};", converter)
+        self.assertIn("pvrgpu_pco_triangles_command_to_systemc(cmd,", writer)
         self.assertIn("pvrgpu_submit_systemc_api(&api_command", writer)
 
         emit_start = context.index("pvrgpu_emit_lit_mesh_command(")

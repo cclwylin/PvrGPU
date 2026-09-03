@@ -49,11 +49,14 @@ void TestRejectsNonSequenceAndClearsStaleError() {
 }
 
 void TestRejectsUnknownProfile() {
+  // A sequence outside the captured profiles is no longer rejected for its
+  // name: it is judged on its shape.  This envelope carries no physical
+  // draws, so the generic gate rejects it for that instead.
   Options options = SequenceEnvelope("unknown.capture.1");
   std::string error;
   Check(!DriverPcoSequenceSupported(options, &error),
-        "unknown PCO sequence profile unexpectedly accepted");
-  Check(error == "native PCO sequence profile is unsupported",
+        "structurally invalid PCO sequence unexpectedly accepted");
+  Check(error == "generic PCO sequence has no physical draws",
         "unknown profile rejection reason changed");
 }
 
