@@ -125,11 +125,14 @@ inline constexpr std::uint32_t kPipePrimTriangleFan = 6;
 // triangle list: a whole-triangle list, or a strip/fan of three or more
 // vertices.
 bool DriverPcoArrayTopologyIsExpandable(const DriverCommand &command) {
+  // An indexed draw assembles its primitives from the index buffer.
+  const std::uint32_t count =
+      command.indexed != 0 ? command.index_count : command.vertex_count;
   if (command.primitive_mode == kPipePrimTriangles)
-    return command.vertex_count >= 3U && command.vertex_count % 3U == 0U;
+    return count >= 3U && count % 3U == 0U;
   if (command.primitive_mode == kPipePrimTriangleStrip ||
       command.primitive_mode == kPipePrimTriangleFan)
-    return command.vertex_count >= 3U;
+    return count >= 3U;
   return false;
 }
 
@@ -190,7 +193,7 @@ bool DriverIdeasPcoSequenceCommandSupported(const DriverCommand &command) {
       !PcoSingleDrawResolutionSupported(command) ||
       command.format != "PIPE_FORMAT_R8G8B8A8_UNORM" ||
       command.clear_color_bits != kOpaqueBlack || command.first_vertex != 0 ||
-      command.instance_count != 1 || command.indexed != 0 ||
+      command.instance_count != 1 || command.indexed > 1 ||
       command.vertex_pco.empty() || command.fragment_pco.empty() ||
       command.vertex_pco.size() > kDriverPcoMaximumBinaryBytes ||
       command.fragment_pco.size() > kDriverPcoMaximumBinaryBytes ||
@@ -323,7 +326,7 @@ bool DriverPcoTrianglesCommandSupported(const DriverCommand &command) {
       command.vertex_count == 0 ||
       !DriverPcoArrayTopologyIsExpandable(command) ||
       command.first_vertex != 0 || command.instance_count != 1 ||
-      command.indexed != 0 ||
+      command.indexed > 1 ||
       command.vertex_pco.empty() || command.fragment_pco.empty() ||
       command.vertex_pco.size() > kDriverPcoMaximumBinaryBytes ||
       command.fragment_pco.size() > kDriverPcoMaximumBinaryBytes ||
@@ -741,6 +744,17 @@ VertexBufferResource StoreRawVertexBuffer(
 DriverPcoTopologyExpansion ExpandDriverPcoTopologyImpl(
     const DriverCommand &command) {
   DriverPcoTopologyExpansion result;
+  if (command.indexed != 0) {
+    // Vertex fetch walks the index buffer and expands the topology itself, so
+    // the vertex stream is forwarded untouched and index reuse stays visible.
+    result.vertices = command.raw_vertex_data;
+    result.input_primitives =
+        command.primitive_mode == kPipePrimTriangles
+            ? command.index_count / 3U
+            : (command.index_count >= 3U ? command.index_count - 2U : 0U);
+    result.emitted_primitives = result.input_primitives;
+    return result;
+  }
   if (command.primitive_mode == kPipePrimTriangles) {
     result.vertices = command.raw_vertex_data;
     result.input_primitives = command.vertex_count / 3U;
@@ -852,6 +866,60 @@ void StoreIndexBuffer(MemoryPool &pool, GpuMemorySystem *memory,
     state->index_buffer_bytes = indices.size() * sizeof(T);
   } else {
     state->vertex_indices = StoreNewArray(pool, indices);
+  }
+}
+
+PrimitiveTopology DriverPcoTopologyFor(std::uint32_t primitive_mode) {
+  switch (primitive_mode) {
+    case kPipePrimTriangles:
+      return PrimitiveTopology::kTriangleList;
+    case kPipePrimTriangleStrip:
+      return PrimitiveTopology::kTriangleStrip;
+    case kPipePrimTriangleFan:
+      return PrimitiveTopology::kTriangleFan;
+    default:
+      throw std::runtime_error("Submitter driver PCO topology is unsupported");
+  }
+}
+
+IndexFormat DriverPcoIndexFormatFor(std::uint32_t index_size) {
+  switch (index_size) {
+    case 1:
+      return IndexFormat::kUint8;
+    case 2:
+      return IndexFormat::kUint16;
+    case 4:
+      return IndexFormat::kUint32;
+    default:
+      throw std::runtime_error("Submitter driver PCO index size is invalid");
+  }
+}
+
+// Republish the capsule's index payload as the typed buffer vertex fetch reads.
+void StoreDriverPcoIndexBuffer(MemoryPool &pool, GpuMemorySystem *memory,
+                               const DriverCommand &command,
+                               PipelineState *state) {
+  const std::uint64_t index_end =
+      static_cast<std::uint64_t>(command.first_index) + command.index_count;
+  if (command.index_size == 0 ||
+      index_end * command.index_size != command.raw_index_data.size()) {
+    throw std::runtime_error("Submitter driver PCO index payload is invalid");
+  }
+  const std::size_t count = static_cast<std::size_t>(index_end);
+  if (command.index_size == 1) {
+    std::vector<std::uint8_t> indices(command.raw_index_data.begin(),
+                                      command.raw_index_data.end());
+    StoreIndexBuffer(pool, memory, indices, state);
+  } else if (command.index_size == 2) {
+    std::vector<std::uint16_t> indices(count);
+    std::memcpy(indices.data(), command.raw_index_data.data(),
+                command.raw_index_data.size());
+    StoreIndexBuffer(pool, memory, indices, state);
+  } else {
+    std::vector<std::uint32_t> indices(count);
+    std::memcpy(indices.data(), command.raw_index_data.data(),
+                command.raw_index_data.size());
+    StoreIndexBuffer(pool, memory, indices, state);
   }
 }
 
@@ -1476,6 +1544,18 @@ void Submitter::Run() {
       state.draw.base_vertex = 0;
       state.draw.index_format = IndexFormat::kUint16;
       StoreIndexBuffer(pool_, memory_, indices, &state);
+    } else if (driver_pco_triangles && command.indexed != 0) {
+      // Hand the real index buffer to vertex fetch: it walks the indices,
+      // expands the topology and reuses post-transform vertices, so the
+      // reported vs_invocations reflect actual shading work.
+      state.draw.topology = DriverPcoTopologyFor(command.primitive_mode);
+      state.draw.first_vertex = 0;
+      state.draw.vertex_count = command.vertex_count;
+      state.draw.first_index = command.first_index;
+      state.draw.index_count = command.index_count;
+      state.draw.base_vertex = command.base_vertex;
+      state.draw.index_format = DriverPcoIndexFormatFor(command.index_size);
+      StoreDriverPcoIndexBuffer(pool_, memory_, command, &state);
     } else if (driver_pco_triangles) {
       state.draw.topology = PrimitiveTopology::kTriangleList;
       state.draw.first_vertex = 0;

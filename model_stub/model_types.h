@@ -217,6 +217,12 @@ struct DriverCommand {
   std::uint32_t instance_count = 0;
   std::uint32_t primitive_mode = 0;
   std::uint32_t indexed = 0;
+  // Index payload for an indexed draw; empty for a non-indexed one.
+  std::vector<std::uint8_t> raw_index_data;
+  std::uint64_t declared_raw_index_data_size = 0;
+  std::uint32_t index_size = 0;
+  std::uint32_t first_index = 0;
+  std::int32_t base_vertex = 0;
   DriverPcoStageAbi vertex_pco_abi;
   DriverPcoStageAbi fragment_pco_abi;
   std::uint32_t position_output_start = 0;

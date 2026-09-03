@@ -36,6 +36,7 @@ constexpr const char *kB10G10R10A2Format = "PIPE_FORMAT_B10G10R10A2_UNORM";
 const std::set<std::string> &KnownFields() {
   static const std::set<std::string> fields = {
       "schema", "producer", "command", "case", "frame",
+      "raw_index_data_size", "index_size", "first_index", "base_vertex",
       "framebuffer_width", "framebuffer_height", "width",
       "height", "format", "clear_color_bits", "fragment_color_bits",
       "vertex0_bits", "vertex1_bits", "vertex2_bits",
@@ -209,6 +210,42 @@ bool ParseU32(const std::string &text, std::uint32_t *value) {
   return true;
 }
 
+bool ParseI32(const std::string &text, std::int32_t *value) {
+  if (text.empty())
+    return false;
+  const bool negative = text[0] == '-';
+  std::uint64_t magnitude = 0;
+  if (!ParseU64(negative ? text.substr(1) : text, &magnitude))
+    return false;
+  // Two's complement allows one more magnitude on the negative side.
+  const std::uint64_t limit = negative ? 2147483648ULL : 2147483647ULL;
+  if (magnitude > limit)
+    return false;
+  *value = negative
+               ? static_cast<std::int32_t>(-static_cast<std::int64_t>(magnitude))
+               : static_cast<std::int32_t>(magnitude);
+  return true;
+}
+
+// An absent optional field keeps the caller's default rather than failing.
+bool ParseOptionalU64(const std::map<std::string, std::string> &fields,
+                      const char *name, std::uint64_t *value) {
+  const auto entry = fields.find(name);
+  return entry == fields.end() || ParseU64(entry->second, value);
+}
+
+bool ParseOptionalU32(const std::map<std::string, std::string> &fields,
+                      const char *name, std::uint32_t *value) {
+  const auto entry = fields.find(name);
+  return entry == fields.end() || ParseU32(entry->second, value);
+}
+
+bool ParseOptionalI32(const std::map<std::string, std::string> &fields,
+                      const char *name, std::int32_t *value) {
+  const auto entry = fields.find(name);
+  return entry == fields.end() || ParseI32(entry->second, value);
+}
+
 template <std::size_t N>
 bool ParseU32List(const std::string &text,
                   std::array<std::uint32_t, N> *values) {
@@ -293,6 +330,12 @@ bool RequireExactFields(const std::map<std::string, std::string> &fields,
     const bool optional_pco_linkage =
         command == kDrawPcoTrianglesCommand &&
         entry.first == "varying_linkage";
+    // Index payload: present only on an indexed PCO triangles draw.
+    const bool optional_pco_index =
+        command == kDrawPcoTrianglesCommand &&
+        (entry.first == "raw_index_data_size" ||
+         entry.first == "index_size" || entry.first == "index_count" ||
+         entry.first == "first_index" || entry.first == "base_vertex");
     const bool optional_primitive_sequence_counter =
         command == kDrawPrimitiveSequenceCommand &&
         (entry.first == "gs_invocations" || entry.first == "gs_primitives" ||
@@ -301,7 +344,7 @@ bool RequireExactFields(const std::map<std::string, std::string> &fields,
          entry.first == "framebuffer_rgba8_path");
     if (!required.count(entry.first) && !optional_pco_counter &&
         !optional_pco_texture && !optional_pco_linkage &&
-        !optional_primitive_sequence_counter) {
+        !optional_pco_index && !optional_primitive_sequence_counter) {
       *error = "field is not valid for " + command +
                " driver command: " + entry.first;
       return false;
@@ -593,7 +636,13 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         !ParseU32(fields["primitive_mode"], &parsed.primitive_mode) ||
         (parsed.primitive_mode != 4 && parsed.primitive_mode != 5 &&
          parsed.primitive_mode != 6) ||
-        !ParseU32(fields["indexed"], &parsed.indexed) || parsed.indexed != 0 ||
+        !ParseU32(fields["indexed"], &parsed.indexed) || parsed.indexed > 1 ||
+        !ParseOptionalU64(fields, "raw_index_data_size",
+                          &parsed.declared_raw_index_data_size) ||
+        !ParseOptionalU32(fields, "index_size", &parsed.index_size) ||
+        !ParseOptionalU32(fields, "index_count", &parsed.index_count) ||
+        !ParseOptionalU32(fields, "first_index", &parsed.first_index) ||
+        !ParseOptionalI32(fields, "base_vertex", &parsed.base_vertex) ||
         !ParseU64(fields["vertex_pco_size"],
                   &parsed.declared_vertex_pco_size) ||
         parsed.declared_vertex_pco_size == 0 ||

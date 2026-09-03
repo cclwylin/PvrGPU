@@ -1356,8 +1356,7 @@ void NormalizeDriverPcoTrianglesApiCounters(const Options &options,
         (generic_sequence ||
          command.draw_count == options.driver_commands.size()) &&
         command.draw_count != 0 && command.ia_vertices != 0 &&
-        command.ia_primitives != 0 && command.vs_invocations != 0 &&
-        command.clip_invocations != 0;
+        command.ia_primitives != 0 && command.clip_invocations != 0;
     if (!has_captured_totals) {
       throw std::runtime_error(
           "ordered PCO sequence has no complete API counter metadata");
@@ -1366,9 +1365,12 @@ void NormalizeDriverPcoTrianglesApiCounters(const Options &options,
     // knows them exactly and they are always adopted.
     counters.ia_vertices = command.ia_vertices;
     counters.ia_primitives = command.ia_primitives;
-    counters.vs_invocations = command.vs_invocations;
     counters.c_invocations = command.clip_invocations;
     counters.drawlists = command.draw_count;
+    // Vertex shading work depends on post-transform reuse, so an indexed
+    // sequence leaves it unset and keeps what the vertex cache measured.
+    if (command.vs_invocations != 0)
+      counters.vs_invocations = command.vs_invocations;
     // Everything past clipping depends on rasterization.  A capture profile
     // may carry the measured totals it recorded, but a sequence that leaves
     // them unset keeps what SystemC measured from the geometry it rendered.

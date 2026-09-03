@@ -1129,14 +1129,17 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
         !draw.sampled_textures.empty() || draw.sampled_texture_count != 0) {
       return Reject(error, "generic PCO sequence draw is not the colour layout");
     }
-    // Non-indexed triangle topologies the submitter expands into a list.
+    // Triangle topologies the submitter expands into a list.  An indexed
+    // draw assembles its primitives from the index buffer.
+    const std::uint32_t assembled =
+        draw.indexed != 0 ? draw.index_count : draw.vertex_count;
     const bool topology_expandable =
-        draw.indexed == 0 && draw.first_vertex == 0 &&
+        draw.indexed <= 1U && draw.first_vertex == 0 &&
         draw.instance_count == 1 &&
-        ((draw.primitive_mode == 4U && draw.vertex_count >= 3U &&
-          draw.vertex_count % 3U == 0U) ||
+        ((draw.primitive_mode == 4U && assembled >= 3U &&
+          assembled % 3U == 0U) ||
          ((draw.primitive_mode == 5U || draw.primitive_mode == 6U) &&
-          draw.vertex_count >= 3U));
+          assembled >= 3U));
     if (!topology_expandable) {
       return Reject(error, "generic PCO sequence draw topology is invalid");
     }

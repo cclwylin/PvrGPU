@@ -162,6 +162,15 @@ struct pvrgpu_systemc_driver_command {
    uint32_t instance_count;
    uint32_t primitive_mode;
    uint32_t indexed;
+   /*
+    * Index payload for an indexed draw.  The bridge deep-copies the buffer
+    * before returning, exactly as it does for the vertex payload.
+    */
+   const uint8_t *raw_index_data;
+   size_t raw_index_data_size;
+   uint32_t index_size;
+   uint32_t first_index;
+   int32_t base_vertex;
 
    const uint8_t *vertex_pco;
    size_t vertex_pco_size;

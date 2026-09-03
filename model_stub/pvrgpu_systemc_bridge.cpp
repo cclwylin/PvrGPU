@@ -154,6 +154,26 @@ bool RawFloatVerticesAreFinite(const std::uint8_t *data,
 
 // Non-indexed triangle topologies the submitter can expand into a triangle
 // list: a whole-triangle list, or a strip/fan of three or more vertices.
+// An indexed draw carries a whole number of 8/16/32-bit indices covering
+// first_index + index_count; a non-indexed one carries no index payload.
+bool DriverPcoIndexPayloadIsValid(
+    const pvrgpu_systemc_driver_command &source) {
+  if (source.indexed == 0) {
+    return source.raw_index_data == nullptr &&
+           source.raw_index_data_size == 0 && source.index_size == 0 &&
+           source.index_count == 0 && source.first_index == 0 &&
+           source.base_vertex == 0;
+  }
+  if (source.index_size != 1 && source.index_size != 2 &&
+      source.index_size != 4)
+    return false;
+  if (!source.raw_index_data || source.index_count == 0)
+    return false;
+  const std::uint64_t index_end =
+      static_cast<std::uint64_t>(source.first_index) + source.index_count;
+  return index_end * source.index_size == source.raw_index_data_size;
+}
+
 bool DriverPcoArrayTopologyIsExpandable(std::uint32_t primitive_mode,
                                         std::uint32_t vertex_count) {
   if (primitive_mode == 4U)
@@ -191,6 +211,18 @@ void CopyPcoPayloadFields(
   destination->raw_vertex_data.assign(
       source.raw_vertex_data,
       source.raw_vertex_data + source.raw_vertex_data_size);
+  if (source.raw_index_data && source.raw_index_data_size != 0) {
+    destination->raw_index_data.assign(
+        source.raw_index_data,
+        source.raw_index_data + source.raw_index_data_size);
+  } else {
+    destination->raw_index_data.clear();
+  }
+  destination->declared_raw_index_data_size = source.raw_index_data_size;
+  destination->index_size = source.index_size;
+  destination->index_count = source.index_count;
+  destination->first_index = source.first_index;
+  destination->base_vertex = source.base_vertex;
   destination->vertex_pco.assign(source.vertex_pco,
                                  source.vertex_pco + source.vertex_pco_size);
   destination->fragment_pco.assign(
@@ -418,11 +450,14 @@ bool CopyPcoTrianglePayload(
       (!conditionals_layout && !lit_mesh_layout && !texture_layout &&
        !ideas_layout && !color_layout) ||
       source.vertex_count == 0 ||
-      (!ideas_sequence && !DriverPcoArrayTopologyIsExpandable(
-                              source.primitive_mode, source.vertex_count)) ||
+      (!ideas_sequence &&
+       !DriverPcoArrayTopologyIsExpandable(source.primitive_mode,
+                                           source.indexed != 0
+                                               ? source.index_count
+                                               : source.vertex_count)) ||
       source.first_vertex != 0 ||
       source.instance_count != 1 || (ideas_sequence && !ideas_topology) ||
-      source.indexed != 0 || expected_vertex_bytes == 0 ||
+      !DriverPcoIndexPayloadIsValid(source) || expected_vertex_bytes == 0 ||
       expected_vertex_bytes > std::numeric_limits<std::uint32_t>::max() ||
       source.raw_vertex_data_size != expected_vertex_bytes ||
       !source.raw_vertex_data ||
@@ -746,9 +781,12 @@ bool CopyPcoSequenceDraw(
       source.vertex_stride > 256 || source.vertex_stride % sizeof(float) != 0 ||
       source.vertex_count == 0 || source.first_vertex != 0 ||
       source.instance_count != 1 || (!triangles && !strip_or_fan) ||
-      source.vertex_count < 3 ||
-      (triangles && source.vertex_count % 3U != 0) ||
-      source.indexed != 0 || end_vertex == 0 ||
+      // An indexed draw assembles primitives from its indices.
+      !DriverPcoArrayTopologyIsExpandable(source.primitive_mode,
+                                          source.indexed != 0
+                                              ? source.index_count
+                                              : source.vertex_count) ||
+      !DriverPcoIndexPayloadIsValid(source) || end_vertex == 0 ||
       end_vertex > std::numeric_limits<std::uint32_t>::max() ||
       end_vertex > std::numeric_limits<std::uint64_t>::max() /
                        source.vertex_stride ||

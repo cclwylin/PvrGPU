@@ -245,6 +245,46 @@ int main() {
           "wrong PCO audit-metadata command payload"))
     return failed;
 
+  // An indexed PCO draw carries its index payload; the loader keeps the
+  // fields verbatim so vertex fetch can walk the real index buffer.
+  const std::filesystem::path pco_indexed = TempFile("pco-indexed.txt");
+  std::string pco_indexed_text = pco_text;
+  if (!ReplaceOnce(&pco_indexed_text, "indexed=0\n",
+                   "indexed=1\n"
+                   "raw_index_data_size=24\n"
+                   "index_size=2\n"
+                   "index_count=12\n"
+                   "first_index=0\n"
+                   "base_vertex=0\n")) {
+    return 1;
+  }
+  WriteText(pco_indexed, pco_indexed_text);
+  error.clear();
+  if (int failed = Expect(
+          LoadDriverCommand(pco_indexed.string(), &command, &error), error))
+    return failed;
+  if (int failed = Expect(command.indexed == 1 && command.index_size == 2 &&
+                              command.index_count == 12 &&
+                              command.first_index == 0 &&
+                              command.base_vertex == 0 &&
+                              command.declared_raw_index_data_size == 24,
+                          "wrong indexed PCO draw index payload"))
+    return failed;
+
+  // A non-indexed capsule omits the payload entirely and still loads.
+  const std::filesystem::path pco_plain = TempFile("pco-plain.txt");
+  WriteText(pco_plain, pco_text);
+  error.clear();
+  if (int failed =
+          Expect(LoadDriverCommand(pco_plain.string(), &command, &error),
+                 error))
+    return failed;
+  if (int failed = Expect(command.indexed == 0 && command.index_size == 0 &&
+                              command.index_count == 0 &&
+                              command.raw_index_data.empty(),
+                          "non-indexed PCO draw gained an index payload"))
+    return failed;
+
   const std::filesystem::path pco_800 = TempFile("pco-800.txt");
   std::string pco_800_text = pco_text;
   if (!ReplaceOnce(&pco_800_text, "framebuffer_width=80",

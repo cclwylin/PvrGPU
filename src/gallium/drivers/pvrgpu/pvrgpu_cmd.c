@@ -70,6 +70,20 @@ pvrgpu_cmd_format_supported(const char *format)
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_B10G10R10A2) == 0);
 }
 
+/*
+ * Non-indexed triangle topologies the SystemC submitter expands itself: a
+ * triangle list of whole triangles, or a strip/fan of three or more vertices.
+ */
+static bool
+pvrgpu_array_topology_expandable(uint32_t primitive_mode, uint32_t count)
+{
+   if (primitive_mode == 4)
+      return count >= 3 && count % 3 == 0;
+   if (primitive_mode == 5 || primitive_mode == 6)
+      return count >= 3;
+   return false;
+}
+
 static bool
 pvrgpu_pco_single_draw_resolution_supported(uint32_t framebuffer_width,
                                             uint32_t framebuffer_height,
@@ -609,11 +623,39 @@ pvrgpu_cmd_validate_draw_pco_triangles(
     * a triangle list of whole triangles, or a strip/fan of three or more
     * vertices.
     */
+   /* An indexed draw assembles primitives from its indices, not its vertices. */
    const bool ordinary_topology =
-      (cmd->primitive_mode == 4 && cmd->vertex_count % 3 == 0 &&
-       cmd->vertex_count >= 3) ||
-      ((cmd->primitive_mode == 5 || cmd->primitive_mode == 6) &&
-       cmd->vertex_count >= 3);
+      pvrgpu_array_topology_expandable(cmd->primitive_mode,
+                                       cmd->indexed != 0 ? cmd->index_count
+                                                         : cmd->vertex_count);
+   /*
+    * A non-indexed draw must carry no index payload; an indexed one needs a
+    * whole number of 8/16/32-bit indices covering first_index + index_count.
+    */
+   if (cmd->indexed == 0) {
+      if (cmd->raw_index_data || cmd->raw_index_data_size != 0 ||
+          cmd->index_size != 0 || cmd->index_count != 0 ||
+          cmd->first_index != 0 || cmd->base_vertex != 0) {
+         pvrgpu_cmd_error(error, error_size,
+                          "draw PCO triangles has index state on a "
+                          "non-indexed draw");
+         return false;
+      }
+   } else {
+      const uint64_t index_end =
+         (uint64_t)cmd->first_index + cmd->index_count;
+      if ((cmd->index_size != 1 && cmd->index_size != 2 &&
+           cmd->index_size != 4) ||
+          !cmd->raw_index_data || cmd->index_count == 0 ||
+          index_end * cmd->index_size != (uint64_t)cmd->raw_index_data_size ||
+          !pvrgpu_array_topology_expandable(cmd->primitive_mode,
+                                            cmd->index_count)) {
+         pvrgpu_cmd_error(error, error_size,
+                          "draw PCO triangles has a malformed index payload");
+         return false;
+      }
+   }
+
    if (!cmd->raw_vertex_data || cmd->vertex_count == 0 ||
        (!ideas_layout && !ordinary_topology) ||
        (ideas_layout && !ideas_topology) ||
@@ -621,10 +663,9 @@ pvrgpu_cmd_validate_draw_pco_triangles(
         !ideas_layout && !color_layout) ||
        expected_vertex_bytes == 0 || expected_vertex_bytes > SIZE_MAX ||
        cmd->raw_vertex_data_size != (size_t)expected_vertex_bytes ||
-       cmd->first_vertex != 0 || cmd->instance_count != 1 ||
-       cmd->indexed != 0) {
+       cmd->first_vertex != 0 || cmd->instance_count != 1) {
       pvrgpu_cmd_error(error, error_size,
-                       "draw PCO triangles has malformed nonindexed vertex "
+                       "draw PCO triangles has malformed vertex "
                        "payload/topology");
       return false;
    }
@@ -1311,6 +1352,12 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->instance_count = cmd->instance_count;
    out->primitive_mode = cmd->primitive_mode;
    out->indexed = cmd->indexed;
+   out->raw_index_data = cmd->raw_index_data;
+   out->raw_index_data_size = cmd->raw_index_data_size;
+   out->index_size = cmd->index_size;
+   out->index_count = cmd->index_count;
+   out->first_index = cmd->first_index;
+   out->base_vertex = cmd->base_vertex;
    out->draw_count = cmd->draw_count;
    out->ia_vertices = cmd->ia_vertices;
    out->ia_primitives = cmd->ia_primitives;
@@ -1425,6 +1472,11 @@ pvrgpu_write_draw_pco_triangles_command(
       "instance_count=%u\n"
       "primitive_mode=%u\n"
       "indexed=%u\n"
+      "raw_index_data_size=%zu\n"
+      "index_size=%u\n"
+      "index_count=%u\n"
+      "first_index=%u\n"
+      "base_vertex=%d\n"
       "draw_count=%u\n"
       "ia_vertices=%u\n"
       "ia_primitives=%u\n"
@@ -1462,6 +1514,11 @@ pvrgpu_write_draw_pco_triangles_command(
       cmd->instance_count,
       cmd->primitive_mode,
       cmd->indexed,
+      cmd->raw_index_data_size,
+      cmd->index_size,
+      cmd->index_count,
+      cmd->first_index,
+      cmd->base_vertex,
       cmd->draw_count,
       cmd->ia_vertices,
       cmd->ia_primitives,

@@ -11713,6 +11713,7 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx);
 struct pvrgpu_array_primitive_draw {
    struct pvrgpu_systemc_driver_command command;
    float *vertex_data;
+   uint8_t *index_data;
    struct pvrgpu_pco_graphics_binary binary;
 };
 
@@ -11724,6 +11725,7 @@ pvrgpu_array_primitive_draw_destroy(struct pvrgpu_array_primitive_draw **slot)
    struct pvrgpu_array_primitive_draw *draw = *slot;
    pvrgpu_pco_graphics_binary_finish(&draw->binary);
    free(draw->vertex_data);
+   free(draw->index_data);
    FREE(draw);
    *slot = NULL;
 }
@@ -11859,10 +11861,16 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
    for (unsigned ordinal = 0; ordinal < ctx->array_primitive_draw_count;
         ++ordinal) {
       const struct pvrgpu_systemc_driver_command *draw = &draws[ordinal];
-      ia_vertices += draw->vertex_count;
+      /*
+       * Input assembly counts what the draw submits: an indexed draw submits
+       * its indices, so vertex reuse shows up as vs_invocations below
+       * ia_vertices once SystemC has run the post-transform cache.
+       */
+      const uint32_t assembled =
+         draw->indexed != 0 ? draw->index_count : draw->vertex_count;
+      ia_vertices += assembled;
       ia_primitives +=
-         pvrgpu_array_primitive_triangle_count(draw->primitive_mode,
-                                               draw->vertex_count);
+         pvrgpu_array_primitive_triangle_count(draw->primitive_mode, assembled);
    }
    if (ia_vertices == 0 || ia_primitives == 0) {
       pvrgpu_counter_eventf("draw_array_primitive_sequence_error",
@@ -11875,6 +11883,14 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
    command.ia_primitives = ia_primitives;
    /* Non-indexed draws shade every submitted vertex exactly once. */
    command.vs_invocations = ia_vertices;
+   for (unsigned ordinal = 0; ordinal < ctx->array_primitive_draw_count;
+        ++ordinal) {
+      if (draws[ordinal].indexed != 0) {
+         /* Let SystemC report shading work measured through the vertex cache. */
+         command.vs_invocations = 0;
+         break;
+      }
+   }
    command.clip_invocations = ia_primitives;
    command.pco_sequence_command_count = ctx->array_primitive_draw_count;
    command.pco_sequence_commands = draws;
@@ -11903,6 +11919,53 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
                          command.framebuffer_width,
                          command.framebuffer_height);
    return true;
+}
+
+/*
+ * Copy the index range a draw references into an owned buffer and report the
+ * highest index it uses.  The indices are rebased onto the packed vertex array
+ * the capsule carries, so the command's first_index and base_vertex are zero
+ * while the reuse pattern inside the buffer stays exactly as the application
+ * submitted it.
+ */
+static uint8_t *
+pvrgpu_copy_draw_indices(const struct pipe_draw_info *info,
+                         const struct pipe_draw_start_count_bias *draw,
+                         uint32_t *out_max_index)
+{
+   if (!info || !draw || info->index_size == 0 || !out_max_index)
+      return NULL;
+
+   const size_t bytes = (size_t)draw->count * info->index_size;
+   uint8_t *indices = malloc(bytes);
+   if (!indices)
+      return NULL;
+
+   uint32_t max_index = 0;
+   for (unsigned i = 0; i < draw->count; ++i) {
+      uint32_t index = 0;
+      if (!pvrgpu_read_draw_index(info, draw->start, i, &index)) {
+         free(indices);
+         return NULL;
+      }
+      if (index > max_index)
+         max_index = index;
+      switch (info->index_size) {
+      case 1:
+         indices[i] = (uint8_t)index;
+         break;
+      case 2: {
+         const uint16_t narrow = (uint16_t)index;
+         memcpy(indices + (size_t)i * 2u, &narrow, sizeof(narrow));
+         break;
+      }
+      default:
+         memcpy(indices + (size_t)i * 4u, &index, sizeof(index));
+         break;
+      }
+   }
+   *out_max_index = max_index;
+   return indices;
 }
 
 /*
@@ -11945,9 +12008,34 @@ pvrgpu_record_color_primitive_pco_draw(
        ctx->num_vertex_buffers == 0 || !ctx->vs || !ctx->fs) {
       return false;
    }
-   const unsigned vertex_count = draw->count;
-   if (pvrgpu_array_primitive_triangle_count(info->mode, vertex_count) == 0)
+   if (pvrgpu_array_primitive_triangle_count(info->mode, draw->count) == 0)
       return false;
+
+   /*
+    * An indexed draw forwards its index buffer so the model performs the
+    * fetch.  The vertices are packed for the range those indices reference,
+    * and any index bias is folded in while packing, so the capsule's indices
+    * address the packed array directly.
+    */
+   uint8_t *index_data = NULL;
+   size_t index_data_size = 0;
+   unsigned vertex_count = draw->count;
+   unsigned vertex_bias = 0;
+   if (info->index_size != 0) {
+      uint32_t max_index = 0;
+      index_data = pvrgpu_copy_draw_indices(info, draw, &max_index);
+      if (!index_data)
+         return false;
+      index_data_size = (size_t)draw->count * info->index_size;
+      if (max_index == UINT32_MAX ||
+          draw->index_bias < 0 ||
+          (uint64_t)max_index + 1u + (uint64_t)draw->index_bias > UINT_MAX) {
+         free(index_data);
+         return false;
+      }
+      vertex_count = max_index + 1u;
+      vertex_bias = (unsigned)draw->index_bias;
+   }
    /*
     * Eight interleaved floats per vertex: float4 position, float4 color.  The
     * position is carried at full width because a shader declaring vec4
@@ -11958,10 +12046,13 @@ pvrgpu_record_color_primitive_pco_draw(
       return false;
 
    float *interleaved = malloc((size_t)vertex_count * 8u * sizeof(float));
-   if (!interleaved)
+   if (!interleaved) {
+      free(index_data);
       return false;
+   }
    for (unsigned v = 0; v < vertex_count; ++v) {
-      const unsigned v_idx = draw->start + v;
+      const unsigned v_idx =
+         info->index_size != 0 ? v + vertex_bias : draw->start + v;
       if (!pvrgpu_read_vertex_attribute(ctx,
                                         &ctx->vertex_elements->elements[0],
                                         v_idx,
@@ -11973,6 +12064,7 @@ pvrgpu_record_color_primitive_pco_draw(
                                         4,
                                         &interleaved[v * 8 + 4])) {
          free(interleaved);
+         free(index_data);
          return false;
       }
    }
@@ -11985,6 +12077,7 @@ pvrgpu_record_color_primitive_pco_draw(
                                "stage=compiler_create reason=%s",
                                error[0] ? error : "unknown");
          free(interleaved);
+         free(index_data);
          return false;
       }
    }
@@ -12007,6 +12100,7 @@ pvrgpu_record_color_primitive_pco_draw(
                             "stage=pco_compile reason=%s",
                             error[0] ? error : "unknown");
       free(interleaved);
+      free(index_data);
       return false;
    }
 
@@ -12027,7 +12121,13 @@ pvrgpu_record_color_primitive_pco_draw(
    command.first_vertex = 0;
    command.instance_count = 1;
    command.primitive_mode = (uint32_t)info->mode;
-   command.indexed = 0;
+   command.indexed = info->index_size != 0 ? 1u : 0u;
+   command.raw_index_data = index_data;
+   command.raw_index_data_size = index_data_size;
+   command.index_size = info->index_size;
+   command.index_count = info->index_size != 0 ? draw->count : 0u;
+   command.first_index = 0;
+   command.base_vertex = 0;
    command.vertex_pco = binary.vertex.data;
    command.vertex_pco_size = binary.vertex.size;
    command.fragment_pco = binary.fragment.data;
@@ -12090,6 +12190,7 @@ pvrgpu_record_color_primitive_pco_draw(
                                                   sizeof(error))) {
       pvrgpu_pco_graphics_binary_finish(&binary);
       free(interleaved);
+      free(index_data);
       debug_printf("pvrgpu: %s\n", error);
       pvrgpu_counter_eventf("draw_array_primitive_record_error",
                             "stage=validate reason=%s",
@@ -12102,10 +12203,12 @@ pvrgpu_record_color_primitive_pco_draw(
    if (!recorded) {
       pvrgpu_pco_graphics_binary_finish(&binary);
       free(interleaved);
+      free(index_data);
       return false;
    }
    /* The nested draw points at payloads this record owns until submission. */
    recorded->vertex_data = interleaved;
+   recorded->index_data = index_data;
    recorded->binary = binary;
    pvrgpu_pco_triangles_command_to_systemc(&command, &recorded->command);
    ctx->array_primitive_draws[ctx->array_primitive_draw_count++] = recorded;
@@ -12839,7 +12942,11 @@ pvrgpu_draw_is_lowerable_array_primitive(
 {
    if (!ctx || !info || indirect || !draws || num_draws != 1)
       return false;
-   if (info->index_size != 0 || info->has_user_indices)
+   /* An indexed draw assembles its primitives from the index buffer. */
+   if (info->index_size != 0 &&
+       info->index_size != 1 && info->index_size != 2 && info->index_size != 4)
+      return false;
+   if (info->index_size != 0 && info->primitive_restart)
       return false;
    if (pvrgpu_array_primitive_triangle_count(info->mode, draws[0].count) == 0)
       return false;

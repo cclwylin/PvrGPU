@@ -122,6 +122,20 @@ struct pvrgpu_draw_pco_triangles_command {
    uint32_t primitive_mode;
    uint32_t indexed;
 
+   /*
+    * Index payload for an indexed draw.  The model fetches through these
+    * indices itself, so the driver forwards the buffer rather than
+    * dereferencing it: that keeps index reuse visible to the vertex cache and
+    * lets SystemC report vs_invocations below ia_vertices as real hardware
+    * does.  All four fields are zero for a non-indexed draw.
+    */
+   const uint8_t *raw_index_data;
+   size_t raw_index_data_size;
+   uint32_t index_size;
+   uint32_t index_count;
+   uint32_t first_index;
+   int32_t base_vertex;
+
    /* Optional whole-sequence API counter contract.  A multi-draw lowering
     * carries these totals on its first command only; single-draw profiles
     * leave them zero and use the counters measured by SystemC directly. */
