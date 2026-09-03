@@ -3502,11 +3502,11 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
 
    const uint64_t expected_inputs =
       expected_stage == MESA_SHADER_VERTEX
-         ? (VERT_BIT_GENERIC0 | VERT_BIT_GENERIC1)
-         : VARYING_BIT_VAR0;
+         ? (BITFIELD64_BIT(VERT_ATTRIB_GENERIC0) | BITFIELD64_BIT(VERT_ATTRIB_GENERIC1))
+         : BITFIELD64_BIT(VARYING_SLOT_VAR0);
    const uint64_t expected_outputs =
       expected_stage == MESA_SHADER_VERTEX
-         ? (VARYING_BIT_POS | VARYING_BIT_VAR0)
+         ? (BITFIELD64_BIT(VARYING_SLOT_POS) | BITFIELD64_BIT(VARYING_SLOT_VAR0))
          : 0;
 
    if (nir->info.inputs_read != expected_inputs) {
@@ -3538,9 +3538,11 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
       }
    }
 
+   const bool stage_uses_discard =
+      expected_stage == MESA_SHADER_FRAGMENT && nir->info.fs.uses_discard;
    if (nir->info.num_ubos != 0 || nir->info.num_ssbos != 0 ||
        nir->info.num_images != 0 || nir->info.num_textures != 0 ||
-       nir->info.shared_size != 0 || nir->info.uses_discard ||
+       nir->info.shared_size != 0 || stage_uses_discard ||
        nir->num_uniforms != 0) {
       return pvrgpu_pco_fail(error,
                              error_size,

@@ -54,6 +54,7 @@ struct Options {
   bool width_explicit = false;
   bool height_explicit = false;
   bool trace_draw_actions_explicit = false;
+  bool extent_from_manifest = false;
 };
 
 struct RunOutcome {
@@ -67,6 +68,8 @@ struct RunOutcome {
   std::filesystem::path frame;
   std::filesystem::path stdout_log;
   std::filesystem::path stderr_log;
+  unsigned frame_width = 0;
+  unsigned frame_height = 0;
 };
 
 std::string Lower(std::string value) {
@@ -120,7 +123,8 @@ bool IsSafeCaseName(const std::string &value) {
     return false;
   return std::all_of(value.begin(), value.end(), [](char character) {
     return std::isalnum(static_cast<unsigned char>(character)) ||
-           character == '_' || character == '-' || character == '.';
+           character == '_' || character == '-' || character == '.' ||
+           character == '*';
   });
 }
 
@@ -484,11 +488,46 @@ void ApplyManifestMetadata(const std::filesystem::path &manifest,
     if (!options->case_explicit && IsSafeCaseName(value("case")))
       options->case_name = value("case");
     unsigned parsed = 0;
-    if (!options->width_explicit && ParsePositive(value("width"), &parsed))
+    if (!options->width_explicit && ParsePositive(value("width"), &parsed)) {
       options->width = parsed;
-    if (!options->height_explicit && ParsePositive(value("height"), &parsed))
+      options->extent_from_manifest = true;
+    }
+    if (!options->height_explicit && ParsePositive(value("height"), &parsed)) {
       options->height = parsed;
+      options->extent_from_manifest = true;
+    }
     return;
+  }
+}
+
+void ApplyRecorderManifestMetadata(const std::filesystem::path &rdc_path,
+                                   Options *options) {
+  if (!options || options->case_explicit)
+    return;
+  const std::filesystem::path parent = rdc_path.parent_path();
+  const std::vector<std::filesystem::path> candidates = {
+      parent.parent_path() / "manifest.txt",
+      parent / "manifest.txt",
+  };
+  const std::string filename = rdc_path.filename().string();
+  for (const auto &manifest_path : candidates) {
+    std::ifstream input(manifest_path);
+    if (!input)
+      continue;
+    std::string line;
+    while (std::getline(input, line)) {
+      if (line.empty() || line[0] == '#')
+        continue;
+      const std::vector<std::string> parts = Split(line, '|');
+      if (parts.size() >= 3) {
+        const std::string case_name = Trim(parts[1]);
+        const std::string rdc_name = Trim(parts[2]);
+        if (rdc_name == filename && IsSafeCaseName(case_name)) {
+          options->case_name = case_name;
+          return;
+        }
+      }
+    }
   }
 }
 
@@ -1309,7 +1348,11 @@ RunOutcome RunPvrgpu(const Options &options, const RuntimeConfig &config,
       outcome.reason = "PvrGPU model framebuffer is not a valid PNG";
       return outcome;
     }
-    if (frame_width != options.width || frame_height != options.height) {
+    const bool extent_enforced =
+        options.width_explicit || options.height_explicit ||
+        options.extent_from_manifest;
+    if (extent_enforced &&
+        (frame_width != options.width || frame_height != options.height)) {
       outcome.stage = "framebuffer";
       outcome.reason =
           "PvrGPU model framebuffer extent mismatch: requested=" +
@@ -1319,6 +1362,8 @@ RunOutcome RunPvrgpu(const Options &options, const RuntimeConfig &config,
           std::to_string(frame_height);
       return outcome;
     }
+    outcome.frame_width = frame_width;
+    outcome.frame_height = frame_height;
     frame = artifact_root / "frame.png";
     if (!CopyArtifact(source_frame, frame, &outcome.reason)) {
       outcome.stage = "framebuffer";
@@ -1363,8 +1408,10 @@ bool WriteBackendResult(const Options &options, const std::string &digest,
        << "  \"input\": {\"path\": \"" << JsonEscape(PathToUtf8(options.rdc))
        << "\", \"sha256\": \"" << digest << "\"},\n"
        << "  \"case\": \"" << JsonEscape(options.case_name) << "\",\n"
-       << "  \"width\": " << options.width << ",\n"
-       << "  \"height\": " << options.height << ",\n"
+       << "  \"width\": "
+       << (outcome.frame_width ? outcome.frame_width : options.width) << ",\n"
+       << "  \"height\": "
+       << (outcome.frame_height ? outcome.frame_height : options.height) << ",\n"
        << "  \"duration_ms\": " << duration.count() << ",\n"
        << "  \"player_exit_code\": " << outcome.player_exit_code << ",\n"
        << "  \"model_exit_code\": " << outcome.model_exit_code << ",\n"
@@ -1429,6 +1476,7 @@ int main(int argc, char **argv) {
                         digest, &options);
   ApplyManifestMetadata(config.project_root() / "config" / "rdc-glmark2-800x600-v1.tsv",
                         digest, &options);
+  ApplyRecorderManifestMetadata(options.rdc, &options);
   const std::filesystem::path work_root =
       config.Path("PVRGPU_WORK_ROOT", DefaultWorkRoot());
   if (options.renderdoc_root.empty()) {

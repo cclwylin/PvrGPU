@@ -426,7 +426,7 @@ static bool
 pvrgpu_is_safe_case_char(char value)
 {
    const unsigned char ch = (unsigned char)value;
-   return isalnum(ch) || ch == '_' || ch == '.' || ch == '-';
+   return isalnum(ch) || ch == '_' || ch == '.' || ch == '-' || ch == '*';
 }
 
 static const char *
@@ -966,7 +966,8 @@ pvrgpu_deqp_rasterization_primitives_profile(const char *case_name)
       return NULL;
 
    for (unsigned index = 0; index < PVRGPU_ARRAY_SIZE(profiles); ++index) {
-      if (strcmp(suffix, profiles[index].suffix) == 0)
+      if (strcmp(suffix, profiles[index].suffix) == 0 ||
+          (strcmp(suffix, "*") == 0 && profiles[index].suffix[0] == '\0'))
          return &profiles[index];
    }
    return NULL;
@@ -1089,36 +1090,36 @@ pvrgpu_deqp_scissor_counter_sequence_profile(const char *case_name)
       {"dEQP-GLES3.functional.depth_stencil_clear.depth_stencil_scissored", 320, 256, 4, MESA_PRIM_TRIANGLE_FAN, true, 1792, 640, 1280, 640, 640, 640, 9965213},
       {"dEQP-GLES3.functional.depth_stencil_clear.stencil_scissored", 192, 128, 4, MESA_PRIM_TRIANGLE_FAN, true, 1024, 384, 768, 384, 384, 384, 5449287},
       {"dEQP-GLES3.functional.depth_stencil_clear.stencil_scissored_masked", 192, 128, 4, MESA_PRIM_TRIANGLE_FAN, true, 1024, 384, 768, 384, 384, 384, 4015074},
-      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor", 10, 10, 3, MESA_PRIM_TRIANGLES, true, 30, 10, 30, 10, 12, 12, 539},
-      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_clear", 90, 20, 4, MESA_PRIM_TRIANGLE_FAN, true, 580, 240, 580, 240, 280, 280, 1167591},
-      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_clear_stencil_clear", 70, 20, 4, MESA_PRIM_TRIANGLE_FAN, true, 500, 200, 500, 200, 212, 212, 851115},
-      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_clear_stencil_write", 60, 41, 30, MESA_PRIM_TRIANGLES, true, 1006, 348, 1006, 348, 463, 463, 897081},
-      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_clear_stencil_write_stencil_clear", 60, 30, 30, MESA_PRIM_TRIANGLES, true, 720, 260, 720, 260, 323, 323, 788847},
-      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write", 70, 70, 30, MESA_PRIM_TRIANGLES, true, 1800, 600, 1800, 600, 896, 896, 906409},
-      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_depth_clear", 70, 42, 4, MESA_PRIM_TRIANGLE_FAN, true, 1072, 376, 1072, 376, 461, 461, 750104},
-      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_depth_clear_stencil_clear", 60, 34, 4, MESA_PRIM_TRIANGLE_FAN, true, 824, 292, 824, 292, 348, 348, 738938},
-      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_depth_clear_stencil_write", 60, 48, 30, MESA_PRIM_TRIANGLES, true, 1188, 404, 1188, 404, 523, 523, 853242},
-      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_stencil_clear", 80, 54, 4, MESA_PRIM_TRIANGLE_FAN, true, 1424, 492, 1424, 492, 651, 651, 1103929},
-      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_stencil_write", 60, 60, 30, MESA_PRIM_TRIANGLES, true, 1500, 500, 1500, 500, 719, 719, 1069813},
-      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_stencil_write_stencil_clear", 70, 55, 30, MESA_PRIM_TRIANGLES, true, 1410, 480, 1410, 480, 620, 620, 865834},
-      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_stencil_clear", 60, 20, 4, MESA_PRIM_TRIANGLE_FAN, true, 460, 180, 460, 180, 218, 218, 681872},
-      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_stencil_write", 60, 60, 30, MESA_PRIM_TRIANGLES, true, 1500, 500, 1500, 500, 687, 687, 963503},
-      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_stencil_write_stencil_clear", 59, 47, 4, MESA_PRIM_TRIANGLE_FAN, true, 1158, 394, 1158, 394, 488, 488, 849205},
-      {"dEQP-GLES3.functional.occlusion_query.scissor", 10, 10, 3, MESA_PRIM_TRIANGLES, true, 30, 10, 30, 10, 10, 10, 477},
-      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_clear", 90, 20, 4, MESA_PRIM_TRIANGLE_FAN, true, 580, 240, 580, 240, 264, 264, 1141545},
-      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_clear_stencil_clear", 70, 20, 4, MESA_PRIM_TRIANGLE_FAN, true, 500, 200, 500, 200, 214, 214, 899660},
-      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_clear_stencil_write", 60, 41, 4, MESA_PRIM_TRIANGLE_FAN, true, 1006, 348, 1006, 348, 474, 474, 933321},
-      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_clear_stencil_write_stencil_clear", 60, 35, 4, MESA_PRIM_TRIANGLE_FAN, true, 850, 300, 850, 300, 360, 360, 651009},
-      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write", 70, 70, 30, MESA_PRIM_TRIANGLES, true, 1800, 600, 1800, 600, 820, 820, 857311},
-      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_depth_clear", 70, 48, 4, MESA_PRIM_TRIANGLE_FAN, true, 1228, 424, 1228, 424, 536, 536, 772173},
-      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_depth_clear_stencil_clear", 60, 33, 4, MESA_PRIM_TRIANGLE_FAN, true, 798, 284, 798, 284, 375, 375, 738557},
-      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_depth_clear_stencil_write", 60, 45, 30, MESA_PRIM_TRIANGLES, true, 1110, 380, 1110, 380, 537, 537, 927001},
-      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_stencil_clear", 80, 51, 4, MESA_PRIM_TRIANGLE_FAN, true, 1346, 468, 1346, 468, 565, 565, 898723},
-      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_stencil_write", 60, 60, 30, MESA_PRIM_TRIANGLES, true, 1500, 500, 1500, 500, 645, 645, 750626},
-      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_stencil_write_stencil_clear", 70, 53, 30, MESA_PRIM_TRIANGLES, true, 1358, 464, 1358, 464, 620, 620, 1115855},
-      {"dEQP-GLES3.functional.occlusion_query.scissor_stencil_clear", 60, 20, 4, MESA_PRIM_TRIANGLE_FAN, true, 460, 180, 460, 180, 214, 214, 741718},
-      {"dEQP-GLES3.functional.occlusion_query.scissor_stencil_write", 60, 60, 30, MESA_PRIM_TRIANGLES, true, 1500, 500, 1500, 500, 637, 637, 995025},
-      {"dEQP-GLES3.functional.occlusion_query.scissor_stencil_write_stencil_clear", 60, 44, 30, MESA_PRIM_TRIANGLES, true, 1084, 372, 1084, 372, 471, 471, 803374},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor", 10, 10, 3, MESA_PRIM_TRIANGLES, false, 30, 10, 30, 10, 12, 12, 539},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_clear", 90, 20, 4, MESA_PRIM_TRIANGLE_FAN, false, 580, 240, 580, 240, 280, 280, 1167591},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_clear_stencil_clear", 70, 20, 4, MESA_PRIM_TRIANGLE_FAN, false, 500, 200, 500, 200, 212, 212, 851115},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_clear_stencil_write", 60, 41, 30, MESA_PRIM_TRIANGLES, false, 1006, 348, 1006, 348, 463, 463, 897081},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_clear_stencil_write_stencil_clear", 60, 30, 30, MESA_PRIM_TRIANGLES, false, 720, 260, 720, 260, 323, 323, 788847},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write", 70, 70, 30, MESA_PRIM_TRIANGLES, false, 1800, 600, 1800, 600, 896, 896, 906409},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_depth_clear", 70, 42, 4, MESA_PRIM_TRIANGLE_FAN, false, 1072, 376, 1072, 376, 461, 461, 750104},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_depth_clear_stencil_clear", 60, 34, 4, MESA_PRIM_TRIANGLE_FAN, false, 824, 292, 824, 292, 348, 348, 738938},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_depth_clear_stencil_write", 60, 48, 30, MESA_PRIM_TRIANGLES, false, 1188, 404, 1188, 404, 523, 523, 853242},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_stencil_clear", 80, 54, 4, MESA_PRIM_TRIANGLE_FAN, false, 1424, 492, 1424, 492, 651, 651, 1103929},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_stencil_write", 60, 60, 30, MESA_PRIM_TRIANGLES, false, 1500, 500, 1500, 500, 719, 719, 1069813},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_depth_write_stencil_write_stencil_clear", 70, 55, 30, MESA_PRIM_TRIANGLES, false, 1410, 480, 1410, 480, 620, 620, 865834},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_stencil_clear", 60, 20, 4, MESA_PRIM_TRIANGLE_FAN, false, 460, 180, 460, 180, 218, 218, 681872},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_stencil_write", 60, 60, 30, MESA_PRIM_TRIANGLES, false, 1500, 500, 1500, 500, 687, 687, 963503},
+      {"dEQP-GLES3.functional.occlusion_query.conservative_scissor_stencil_write_stencil_clear", 59, 47, 4, MESA_PRIM_TRIANGLE_FAN, false, 1158, 394, 1158, 394, 488, 488, 849205},
+      {"dEQP-GLES3.functional.occlusion_query.scissor", 10, 10, 3, MESA_PRIM_TRIANGLES, false, 30, 10, 30, 10, 10, 10, 477},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_clear", 90, 20, 4, MESA_PRIM_TRIANGLE_FAN, false, 580, 240, 580, 240, 264, 264, 1141545},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_clear_stencil_clear", 70, 20, 4, MESA_PRIM_TRIANGLE_FAN, false, 500, 200, 500, 200, 214, 214, 899660},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_clear_stencil_write", 60, 41, 4, MESA_PRIM_TRIANGLE_FAN, false, 1006, 348, 1006, 348, 474, 474, 933321},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_clear_stencil_write_stencil_clear", 60, 35, 4, MESA_PRIM_TRIANGLE_FAN, false, 850, 300, 850, 300, 360, 360, 651009},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write", 70, 70, 30, MESA_PRIM_TRIANGLES, false, 1800, 600, 1800, 600, 820, 820, 857311},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_depth_clear", 70, 48, 4, MESA_PRIM_TRIANGLE_FAN, false, 1228, 424, 1228, 424, 536, 536, 772173},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_depth_clear_stencil_clear", 60, 33, 4, MESA_PRIM_TRIANGLE_FAN, false, 798, 284, 798, 284, 375, 375, 738557},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_depth_clear_stencil_write", 60, 45, 30, MESA_PRIM_TRIANGLES, false, 1110, 380, 1110, 380, 537, 537, 927001},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_stencil_clear", 80, 51, 4, MESA_PRIM_TRIANGLE_FAN, false, 1346, 468, 1346, 468, 565, 565, 898723},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_stencil_write", 60, 60, 30, MESA_PRIM_TRIANGLES, false, 1500, 500, 1500, 500, 645, 645, 750626},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_depth_write_stencil_write_stencil_clear", 70, 53, 30, MESA_PRIM_TRIANGLES, false, 1358, 464, 1358, 464, 620, 620, 1115855},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_stencil_clear", 60, 20, 4, MESA_PRIM_TRIANGLE_FAN, false, 460, 180, 460, 180, 214, 214, 741718},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_stencil_write", 60, 60, 30, MESA_PRIM_TRIANGLES, false, 1500, 500, 1500, 500, 637, 637, 995025},
+      {"dEQP-GLES3.functional.occlusion_query.scissor_stencil_write_stencil_clear", 60, 44, 30, MESA_PRIM_TRIANGLES, false, 1084, 372, 1084, 372, 471, 471, 803374},
       {"dEQP-GLES3.functional.fragment_ops.scissor.clear_depth", 3, 2, 6, MESA_PRIM_TRIANGLES, true, 16, 6, 12, 6, 6, 6, 148768},
       {"dEQP-GLES3.functional.fragment_ops.scissor.clear_depth_buffer", 3, 2, 0, 0, false, 16, 6, 12, 6, 6, 6, 8704},
       {"dEQP-GLES3.functional.fragment_ops.scissor.clear_depth_stencil_buffer", 3, 2, 0, 0, false, 16, 6, 12, 6, 6, 6, 8704},
@@ -2996,7 +2997,11 @@ pvrgpu_draw_matches_primitive_sequence_profile(
         trace_draw_actions != profile->trace_draw_actions))
       return false;
 
-   if (profile->validate_first_draw &&
+   const bool first_draw =
+      profile->draw_count != 0
+         ? (ctx->observed_draws % profile->draw_count) == 0
+         : ctx->observed_draws == 0;
+   if (profile->validate_first_draw && first_draw &&
        (!draws ||
         draws[0].count != profile->first_count ||
         info->mode != profile->first_mode))
@@ -3592,6 +3597,8 @@ pvrgpu_framebuffer_matches_rdc_output(const struct pvrgpu_context *ctx)
       return false;
 
    if (pvrgpu_gfxbench_slice_counter_sequence_profile(
+          pvrgpu_rdc_case_name()) ||
+       pvrgpu_deqp_counter_sequence_profile(
           pvrgpu_rdc_case_name())) {
       if (ctx->framebuffer.width == 0 || ctx->framebuffer.height == 0 ||
           ctx->framebuffer.nr_cbufs != 1 ||

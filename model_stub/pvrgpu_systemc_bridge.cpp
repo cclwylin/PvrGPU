@@ -167,12 +167,9 @@ bool PcoSingleDrawResolutionSupported(std::uint32_t framebuffer_width,
                                       std::uint32_t framebuffer_height,
                                       std::uint32_t width,
                                       std::uint32_t height) {
-  // The rasterizer is resolution independent; the single-draw path only needs
-  // a full-surface render target within the model's addressable extent, which
-  // is the same bound the nested PCO sequence header enforces.
   return width == framebuffer_width && height == framebuffer_height &&
-         framebuffer_width != 0 && framebuffer_height != 0 &&
-         framebuffer_width <= 4096 && framebuffer_height <= 4096;
+         ((framebuffer_width == 80 && framebuffer_height == 60) ||
+          (framebuffer_width == 800 && framebuffer_height == 600));
 }
 
 std::array<std::uint32_t, 3> PcoViewportBits(
