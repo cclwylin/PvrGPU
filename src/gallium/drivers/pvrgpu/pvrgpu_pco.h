@@ -127,6 +127,9 @@ bool pvrgpu_pco_compile_conditionals(struct pvrgpu_pco_compiler *compiler,
 /* Varying slots one generically lowered draw can pass between stages. */
 #define PVRGPU_PCO_MAX_VARYINGS 8u
 
+/* Combined image/sampler descriptors one generically lowered draw can bind. */
+#define PVRGPU_PCO_MAX_TEXTURES 5u
+
 /* Reports the component width the vertex shader declares for each generic
  * attribute, so the driver can pack them at the width the program reads. */
 bool pvrgpu_pco_vertex_attribute_components(const struct nir_shader *vertex_nir,
@@ -143,6 +146,7 @@ bool pvrgpu_pco_compile_color_triangle(
    unsigned vertex_uniform_dwords,
    unsigned fragment_uniform_dwords,
    unsigned attribute_count,
+   unsigned texture_count,
    struct pvrgpu_pco_graphics_binary *out,
    char *error,
    size_t error_size);

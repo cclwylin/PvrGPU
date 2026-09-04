@@ -12107,6 +12107,10 @@ pvrgpu_record_color_primitive_pco_draw(
    if (!pvrgpu_pco_vertex_attribute_components(ctx->vs->nir,
                                                attribute_count,
                                                attribute_components)) {
+      pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                            "stage=attributes reason=shader_layout "
+                            "attributes=%u",
+                            attribute_count);
       free(index_data);
       return false;
    }
@@ -12145,6 +12149,14 @@ pvrgpu_record_color_primitive_pco_draw(
                 attribute_components[attribute],
                 &interleaved[(size_t)v * packed_floats +
                              attribute_offsets[attribute]])) {
+            pvrgpu_counter_eventf(
+               "draw_array_primitive_record_error",
+               "stage=attributes reason=source_format attribute=%u "
+               "format=%s components=%u",
+               attribute,
+               util_format_name(
+                  ctx->vertex_elements->elements[attribute].src_format),
+               attribute_components[attribute]);
             free(interleaved);
             free(index_data);
             return false;
@@ -12185,6 +12197,8 @@ pvrgpu_record_color_primitive_pco_draw(
                                           vertex_uniform_dwords,
                                           fragment_uniform_dwords,
                                           attribute_count,
+                                          ctx->num_sampler_views
+                                             [MESA_SHADER_FRAGMENT],
                                           &binary,
                                           error,
                                           sizeof(error))) {
@@ -13094,8 +13108,20 @@ pvrgpu_draw_is_lowerable_array_primitive(
        ctx->vertex_elements->num_elements > PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES ||
        ctx->num_vertex_buffers == 0)
       return false;
-   if (ctx->num_sampler_views[MESA_SHADER_FRAGMENT] != 0)
+   /* Fragment textures are bound as combined image/sampler descriptors. */
+   if (ctx->num_sampler_views[MESA_SHADER_VERTEX] != 0 ||
+       ctx->num_sampler_views[MESA_SHADER_FRAGMENT] >
+          PVRGPU_PCO_MAX_TEXTURES)
       return false;
+   for (unsigned texture = 0;
+        texture < ctx->num_sampler_views[MESA_SHADER_FRAGMENT]; ++texture) {
+      const struct pipe_sampler_view *view =
+         ctx->sampler_views[MESA_SHADER_FRAGMENT][texture];
+      if (!view || !view->texture ||
+          view->texture->target != PIPE_TEXTURE_2D ||
+          !ctx->samplers[MESA_SHADER_FRAGMENT][texture])
+         return false;
+   }
    /*
     * One to four colour attachments, every one present and sharing the
     * format the capsule states for the pass.

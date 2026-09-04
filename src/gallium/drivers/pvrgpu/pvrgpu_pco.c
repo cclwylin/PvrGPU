@@ -3524,6 +3524,47 @@ static bool pvrgpu_allocate_generic_push_constants(pco_data *data,
    return true;
 }
 
+/*
+ * Reserve the stage's constant buffer after a descriptor block that already
+ * owns the first shared registers.
+ */
+static bool pvrgpu_allocate_generic_push_constants_after(pco_data *data,
+                                                         unsigned prefix_dwords,
+                                                         unsigned dwords,
+                                                         const char *stage,
+                                                         char *error,
+                                                         size_t error_size)
+{
+   if (data->common.shareds != prefix_dwords ||
+       dwords == 0 ||
+       dwords > PVRGPU_COLOR_PRIMITIVE_MAX_UNIFORM_DWORDS ||
+       data->common.push_consts.used > dwords) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "color primitive %s uniform range is "
+                             "unsupported after its descriptors",
+                             stage);
+   }
+   data->common.push_consts.range = (pco_range){
+      .start = prefix_dwords,
+      .count = dwords,
+   };
+   data->common.shareds = prefix_dwords + dwords;
+   return true;
+}
+
+/*
+ * Rewrites each texture reference onto its own descriptor set so a shader
+ * sampling several textures fits the public PCO descriptor ABI.
+ */
+static bool
+pvrgpu_pack_terrain_texture_bindings(nir_shader *nir,
+                                     unsigned texture_count,
+                                     unsigned expected_texture_ops,
+                                     const char *profile_name,
+                                     char *error,
+                                     size_t error_size);
+
 static bool pvrgpu_color_primitive_allowed_intrinsic(nir_intrinsic_op op)
 {
    switch (op) {
@@ -3553,6 +3594,7 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                                                 unsigned render_target_count,
                                                 unsigned attribute_count,
                                                 unsigned varying_slot_count,
+                                                unsigned texture_count,
                                                 char *error,
                                                 size_t error_size)
 {
@@ -3612,8 +3654,9 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
     * Anything reached through a descriptor is not.
     */
    if (nir->info.num_ubos != 0 || nir->info.num_ssbos != 0 ||
-       nir->info.num_images != 0 || nir->info.num_textures != 0 ||
-       nir->info.shared_size != 0 || stage_uses_discard) {
+       nir->info.num_images != 0 || nir->info.shared_size != 0 ||
+       stage_uses_discard ||
+       nir->info.num_textures != texture_count) {
       return pvrgpu_pco_fail(error,
                              error_size,
                              "color primitive %s uses unsupported resources",
@@ -3636,6 +3679,21 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
             case nir_instr_type_load_const:
             case nir_instr_type_deref:
                break;
+            case nir_instr_type_tex: {
+               /* Only plain sampling of a bound 2D texture is lowered. */
+               const nir_tex_instr *tex = nir_instr_as_tex(instr);
+               if (texture_count == 0 || tex->op != nir_texop_tex ||
+                   tex->is_array || tex->is_shadow ||
+                   tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+                   tex->texture_index != tex->sampler_index ||
+                   tex->texture_index >= texture_count) {
+                  return pvrgpu_pco_fail(error,
+                                         error_size,
+                                         "color primitive contains an "
+                                         "unsupported texture operation");
+               }
+               break;
+            }
             case nir_instr_type_intrinsic: {
                const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
                if (!pvrgpu_color_primitive_allowed_intrinsic(intr->intrinsic)) {
@@ -3821,10 +3879,17 @@ bool pvrgpu_pco_compile_color_triangle(
    unsigned vertex_uniform_dwords,
    unsigned fragment_uniform_dwords,
    unsigned attribute_count,
+   unsigned texture_count,
    struct pvrgpu_pco_graphics_binary *out,
    char *error,
    size_t error_size)
 {
+   const unsigned expected_stage_textures_vs = 0;
+   if (texture_count > PVRGPU_PCO_MAX_TEXTURES) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "color primitive texture count is unsupported");
+   }
    if (!attribute_formats || attribute_count == 0 ||
        attribute_count > PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES) {
       return pvrgpu_pco_fail(error,
@@ -3887,6 +3952,7 @@ bool pvrgpu_pco_compile_color_triangle(
                                             render_target_count,
                                             attribute_count,
                                             probe_varyings,
+                                            expected_stage_textures_vs,
                                             error,
                                             error_size) ||
        !pvrgpu_validate_color_primitive_nir(fs,
@@ -3894,6 +3960,7 @@ bool pvrgpu_pco_compile_color_triangle(
                                             render_target_count,
                                             attribute_count,
                                             probe_varyings,
+                                            texture_count,
                                             error,
                                             error_size)) {
       ralloc_free(compile_mem_ctx);
@@ -3999,6 +4066,61 @@ bool pvrgpu_pco_compile_color_triangle(
 
    fragment_data.fs.uses.w = true;
    fragment_data.common.coeffs = fragment_coefficient;
+
+   /*
+    * Each bound texture becomes its own descriptor set holding one combined
+    * image/sampler binding, and the descriptor block precedes any constant
+    * buffer in shared registers.
+    */
+   unsigned descriptor_dwords = 0;
+   if (texture_count != 0) {
+      unsigned texture_ops = 0;
+      nir_foreach_function_impl(impl, fs)
+      {
+         nir_foreach_block (block, impl) {
+            nir_foreach_instr (instr, block) {
+               if (instr->type == nir_instr_type_tex)
+                  ++texture_ops;
+            }
+         }
+      }
+      if (!pvrgpu_pack_terrain_texture_bindings(fs,
+                                                texture_count,
+                                                texture_ops,
+                                                "color primitive",
+                                                error,
+                                                error_size)) {
+         ralloc_free(compile_mem_ctx);
+         return false;
+      }
+      for (unsigned texture = 0; texture < texture_count; ++texture) {
+         pco_descriptor_set_data *set =
+            &fragment_data.common.desc_sets[texture];
+         set->binding_count = 1;
+         set->bindings = rzalloc_array(compile_mem_ctx, pco_binding_data, 1);
+         if (!set->bindings) {
+            ralloc_free(compile_mem_ctx);
+            return pvrgpu_pco_fail(error,
+                                   error_size,
+                                   "out of memory allocating texture "
+                                   "descriptor ABI");
+         }
+         set->range = (pco_range){
+            .start = texture * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+            .count = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+         };
+         set->used = true;
+         set->bindings[0].range = (pco_range){
+            .start = texture * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+            .count = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+            .stride = PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+         };
+         set->bindings[0].used = true;
+         set->bindings[0].is_img_smp = true;
+      }
+      descriptor_dwords = texture_count * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
+      fragment_data.common.shareds = descriptor_dwords;
+   }
    fragment_data.fs.z_replicate = ~0U;
    fragment_data.fs.rasterization_samples = 1;
    /*
@@ -4039,11 +4161,12 @@ bool pvrgpu_pco_compile_color_triangle(
                                                 error,
                                                 error_size)) ||
        (fragment_uniform_loads != 0 &&
-        !pvrgpu_allocate_generic_push_constants(&fragment_data,
-                                                fragment_uniform_dwords,
-                                                "FS",
-                                                error,
-                                                error_size))) {
+        !pvrgpu_allocate_generic_push_constants_after(&fragment_data,
+                                                      descriptor_dwords,
+                                                      fragment_uniform_dwords,
+                                                      "FS",
+                                                      error,
+                                                      error_size))) {
       ralloc_free(compile_mem_ctx);
       return false;
    }
