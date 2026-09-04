@@ -143,7 +143,7 @@ struct pvrgpu_draw_pco_triangles_command {
     * against these widths exactly.
     */
    uint32_t vertex_attribute_count;
-   uint32_t vertex_attribute_components[8];
+   uint32_t vertex_attribute_components[16];
 
    const uint8_t *raw_index_data;
    size_t raw_index_data_size;

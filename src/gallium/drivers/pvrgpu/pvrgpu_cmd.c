@@ -9,6 +9,8 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
+#define PVRGPU_ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
+
 #include <math.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -772,9 +774,12 @@ pvrgpu_cmd_validate_draw_pco_triangles(
          const uint32_t components =
             cmd->vertex_attribute_components[attribute];
          if (components == 0 || components > 4) {
-            pvrgpu_cmd_error(error, error_size,
-                             "draw PCO triangles vertex attribute width is "
-                             "unsupported");
+            if (error && error_size != 0) {
+               snprintf(error, error_size,
+                        "draw PCO triangles vertex attribute width is "
+                        "unsupported: attribute %u has %u components of %u",
+                        attribute, components, cmd->vertex_attribute_count);
+            }
             return false;
          }
          packed_floats += components;
@@ -1473,7 +1478,9 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->indexed = cmd->indexed;
    out->render_target_count = cmd->render_target_count;
    out->vertex_attribute_count = cmd->vertex_attribute_count;
-   for (uint32_t attribute = 0; attribute < 8; ++attribute) {
+   for (uint32_t attribute = 0;
+        attribute < PVRGPU_ARRAY_SIZE(cmd->vertex_attribute_components);
+        ++attribute) {
       out->vertex_attribute_components[attribute] =
          cmd->vertex_attribute_components[attribute];
    }

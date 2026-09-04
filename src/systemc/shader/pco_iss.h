@@ -57,8 +57,11 @@ inline constexpr std::size_t kPcoVaryingOneCoefficientCount = 20;
 inline constexpr std::size_t kPcoVaryingTwoCoefficientCount = 36;
 inline constexpr std::size_t kPcoVaryingFourCoefficientCount = 68;
 inline constexpr std::size_t kPcoVaryingEightCoefficientCount = 132;
-inline constexpr std::size_t kPcoMaximumVaryingCoefficientCount =
-    kPcoVaryingEightCoefficientCount;
+/* Coefficient registers the fragment file holds: four for position plus four
+ * per smooth-varying component.  Sized for the sixty-four components a
+ * generically lowered draw may pass, not for the eight-varying capture that
+ * named the constants above. */
+inline constexpr std::size_t kPcoMaximumVaryingCoefficientCount = 260;
 
 /* Public PCO register-bank encodings used by the supported instructions. */
 enum class PcoRegisterBank : std::uint8_t {

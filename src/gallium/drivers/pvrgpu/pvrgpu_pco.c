@@ -3818,6 +3818,23 @@ bool pvrgpu_pco_vertex_attribute_components(const struct nir_shader *vertex_nir,
       const unsigned index = var->data.location - VERT_ATTRIB_GENERIC0;
       if (index >= attribute_count)
          return false;
+      /*
+       * A matrix attribute occupies one location per column, each holding as
+       * many components as the matrix has rows -- which is how the
+       * application bound it, one vertex element per column.  Treating it as
+       * a single wide attribute is what made every draw using one
+       * unlowerable.
+       */
+      if (glsl_type_is_matrix(var->type)) {
+         const unsigned columns = glsl_get_matrix_columns(var->type);
+         const unsigned rows = glsl_get_vector_elements(var->type);
+         if (columns == 0 || rows == 0 || rows > 4 ||
+             index + columns > attribute_count)
+            return false;
+         for (unsigned column = 0; column < columns; ++column)
+            components[index + column] = rows;
+         continue;
+      }
       const unsigned count = glsl_get_components(var->type);
       if (count == 0 || count > 4 || !glsl_type_is_vector_or_scalar(var->type))
          return false;
