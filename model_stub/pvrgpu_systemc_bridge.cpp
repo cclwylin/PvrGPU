@@ -67,13 +67,14 @@ bool IdeasDepthStateIsSupported(const Command &command) {
 
 bool IsIdeasPcoSequenceRoot(
     const pvrgpu::stub::DriverCommand &command) {
+  // The root is identified by what it is -- the case, the command kind, the
+  // member count it announces and its depth state -- not by counters it
+  // states.  Those are the sequence's totals, summed once every member has
+  // arrived.
   return command.enabled && command.command == "draw_pco_triangles" &&
          IsIdeasPcoSequenceCase(command.test_case.c_str()) &&
          command.draw_count ==
              pvrgpu::stub::kDriverPcoIdeasSequenceCommands &&
-         command.ia_vertices != 0U &&
-         command.ia_primitives != 0U && command.vs_invocations != 0U &&
-         command.clip_invocations != 0U &&
          IdeasDepthStateMatchesOrdinal(command, 0U);
 }
 

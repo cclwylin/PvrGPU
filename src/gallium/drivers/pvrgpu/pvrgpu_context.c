@@ -11114,8 +11114,12 @@ pvrgpu_emit_ideas_pco_command(
    /*
     * Every ideas draw is one member of a 180-draw sequence, so none of them
     * states a counter: the totals are the sequence's, and the bridge sums
-    * them once every member has arrived.
+    * them once every member has arrived.  The first draw does state how many
+    * members to expect, which is how the bridge recognises the sequence root
+    * -- a structural fact the driver knows, not a rasterization result.
     */
+   if (ctx->ideas_pco_draws == 0)
+      command.draw_count = PVRGPU_IDEAS_PCO_DRAW_COUNT;
    command.vertex_pco = binary->vertex.data;
    command.vertex_pco_size = binary->vertex.size;
    command.fragment_pco = binary->fragment.data;

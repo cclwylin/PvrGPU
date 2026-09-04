@@ -883,8 +883,13 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       }
    }
 
+   /*
+    * draw_count states how many members the sequence has, which the driver
+    * knows; it is not a rasterization result and is not part of what a
+    * sequence member must leave unset.
+    */
    const bool empty_sequence_counters =
-      cmd->draw_count == 0 && cmd->ia_vertices == 0 &&
+      cmd->ia_vertices == 0 &&
       cmd->ia_primitives == 0 && cmd->vs_invocations == 0 &&
       cmd->gs_invocations == 0 && cmd->gs_primitives == 0 &&
       cmd->clip_invocations == 0 && cmd->clip_primitives == 0 &&
