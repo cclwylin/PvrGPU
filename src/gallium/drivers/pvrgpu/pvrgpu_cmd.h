@@ -293,6 +293,17 @@ pvrgpu_write_draw_pco_sequence_command(
    char *error,
    size_t error_size);
 
+/*
+ * True when the model's ISS can decode this compiled binary.  A draw whose
+ * shader it cannot execute must be declined before the driver claims it.
+ */
+bool
+pvrgpu_pco_binary_is_executable(uint32_t stage,
+                                const uint8_t *binary,
+                                size_t binary_size,
+                                char *error,
+                                size_t error_size);
+
 bool
 pvrgpu_driver_draw_command_has_been_emitted(void);
 

@@ -1655,6 +1655,32 @@ void FlushPendingSubmitAtExit() {
 
 }  // namespace
 
+extern "C" int pvrgpu_systemc_can_execute_pco_binary(std::uint32_t stage,
+                                                    const std::uint8_t *binary,
+                                                    std::size_t binary_size,
+                                                    char *error,
+                                                    std::size_t error_size) {
+  if (!binary || binary_size == 0) {
+    CopyError(error, error_size, "empty PCO binary");
+    return 2;
+  }
+  const pvrgpu::stub::ShaderStage shader_stage =
+      stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_VERTEX
+          ? pvrgpu::stub::ShaderStage::kVertex
+          : pvrgpu::stub::ShaderStage::kFragment;
+  try {
+    const std::vector<std::uint8_t> bytes(binary, binary + binary_size);
+    (void)pvrgpu::stub::DecodePcoProgram(shader_stage, bytes);
+  } catch (const std::exception &failure) {
+    CopyError(error, error_size, failure.what());
+    return 2;
+  } catch (...) {
+    CopyError(error, error_size, "PCO binary could not be decoded");
+    return 2;
+  }
+  return 0;
+}
+
 extern "C" int pvrgpu_systemc_submit_driver_command(
     const pvrgpu_systemc_submit_info *info, char *error,
     std::size_t error_size) {

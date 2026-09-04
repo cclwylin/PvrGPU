@@ -298,6 +298,32 @@ typedef int (*pvrgpu_systemc_submit_driver_command_fn)(
    char *error,
    size_t error_size);
 
+/*
+ * Ask the model whether it can execute a compiled PCO binary.
+ *
+ * The compiler emits the whole PowerVR instruction set; the model implements
+ * the subset its ISS decodes.  A draw whose shader falls outside that subset
+ * has to be declined before the driver claims it, because a sequence is
+ * submitted only once every draw has been recorded -- by which point there is
+ * no other path left to describe the frame.  Returns 0 when the binary is
+ * executable, and fills `error` with the first instruction it could not
+ * decode otherwise.
+ */
+typedef int (*pvrgpu_systemc_can_execute_pco_binary_fn)(
+   uint32_t stage,
+   const uint8_t *binary,
+   size_t binary_size,
+   char *error,
+   size_t error_size);
+
+int
+pvrgpu_systemc_can_execute_pco_binary(
+   uint32_t stage,
+   const uint8_t *binary,
+   size_t binary_size,
+   char *error,
+   size_t error_size);
+
 int
 pvrgpu_systemc_submit_driver_command(
    const struct pvrgpu_systemc_submit_info *info,

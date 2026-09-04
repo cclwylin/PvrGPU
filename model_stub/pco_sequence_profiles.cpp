@@ -1,6 +1,7 @@
 #include "pco_sequence_profiles.h"
 
 #include "model_types.h"
+#include "shader/pco_iss.h"
 
 #include <array>
 #include <cstddef>
@@ -1162,7 +1163,9 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
         draw.height > draw.framebuffer_height) {
       return Reject(error, "generic PCO sequence draw envelope is invalid");
     }
-    // Untextured position/colour layout: float2 position + float4 colour.
+    // A draw either states its own attribute layout or matches the pinned
+    // position/colour one.  Sampled textures are carried by the sequence, and
+    // each draw takes the slice its descriptor count names.
     const bool describes_attributes =
         draw.vertex_attribute_count != 0 &&
         draw.vertex_pco_abi.vertex_inputs ==
@@ -1171,7 +1174,9 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
          ((draw.vertex_stride != 6U * sizeof(float) &&
            draw.vertex_stride != 8U * sizeof(float)) ||
           draw.vertex_pco_abi.vertex_inputs != 8)) ||
-        !draw.sampled_textures.empty() || draw.sampled_texture_count != 0) {
+        draw.sampled_textures.size() != draw.sampled_texture_count ||
+        draw.sampled_texture_count >
+            2U * pvrgpu::stub::kPcoMaximumTextureDescriptorSets) {
       return Reject(error, "generic PCO sequence draw is not the colour layout");
     }
     // Topologies the submitter expands for setup.  An indexed draw assembles

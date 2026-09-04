@@ -201,6 +201,57 @@ pvrgpu_systemc_submit_info_init(
    info->memory_mode = pvrgpu_nonempty_env("PVRGPU_MODEL_MEMORY_MODE");
 }
 
+/*
+ * True when the model can execute this compiled binary.
+ *
+ * The compiler emits the whole PowerVR instruction set and the model's ISS
+ * decodes a subset of it.  A draw whose shader falls outside that subset has
+ * to be turned down before the driver claims it: a sequence is submitted only
+ * after every draw has been recorded, so discovering the gap at submission
+ * leaves the frame with nothing to describe it.
+ *
+ * Answers true when the model cannot be asked at all -- there is nothing to
+ * be conservative about when no model will run the binary.
+ */
+bool
+pvrgpu_pco_binary_is_executable(uint32_t stage,
+                                const uint8_t *binary,
+                                size_t binary_size,
+                                char *error,
+                                size_t error_size)
+{
+   const char *library_path = pvrgpu_nonempty_env("PVRGPU_SYSTEMC_API_LIB");
+   if (!library_path || !binary || binary_size == 0)
+      return true;
+
+   static void *decode_handle;
+   static pvrgpu_systemc_can_execute_pco_binary_fn can_execute;
+   static const char *decode_library_path;
+   if (!decode_handle || decode_library_path != library_path) {
+      dlerror();
+      decode_handle = dlopen(library_path, RTLD_NOW | RTLD_GLOBAL);
+      if (!decode_handle)
+         return true;
+      decode_library_path = library_path;
+      dlerror();
+      can_execute = (pvrgpu_systemc_can_execute_pco_binary_fn)
+         dlsym(decode_handle, "pvrgpu_systemc_can_execute_pco_binary");
+      if (dlerror())
+         can_execute = NULL;
+   }
+   if (!can_execute)
+      return true;
+
+   char detail[512] = { 0 };
+   if (can_execute(stage, binary, binary_size, detail, sizeof(detail)) == 0)
+      return true;
+   if (error && error_size != 0) {
+      snprintf(error, error_size, "%s",
+               detail[0] ? detail : "model cannot execute the PCO binary");
+   }
+   return false;
+}
+
 static bool
 pvrgpu_submit_systemc_api(const struct pvrgpu_systemc_driver_command *command,
                           char *error,

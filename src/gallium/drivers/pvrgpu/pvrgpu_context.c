@@ -9720,10 +9720,141 @@ pvrgpu_read_vertex_attribute(const struct pvrgpu_context *ctx,
 bool
 pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx);
 
+/*
+ * Describe one bound fragment texture for the sequence capsule, copying the
+ * image so the record owns it until submission.
+ *
+ * The pinned capture profiles each have their own marshaller keyed to the
+ * layout they expect; this one reads whatever the application bound, which is
+ * what a generically lowered draw needs.  A texture the model cannot sample --
+ * anything but a tightly packed 2D RGBA8 mip chain -- is reported by name so
+ * the gap is visible rather than silently rendered without it.
+ */
+static bool
+pvrgpu_capture_generic_sequence_texture(
+   const struct pvrgpu_context *ctx,
+   unsigned slot,
+   unsigned descriptor_set,
+   struct pvrgpu_systemc_pco_sequence_texture *destination,
+   uint8_t **out_bytes,
+   const char **reason)
+{
+   const char *ignored = NULL;
+   if (!reason)
+      reason = &ignored;
+   if (!ctx || !destination || !out_bytes) {
+      *reason = "arguments";
+      return false;
+   }
+
+   const struct pipe_sampler_view *view =
+      ctx->sampler_views[MESA_SHADER_FRAGMENT][slot];
+   const struct pvrgpu_sampler_state *sampler =
+      ctx->samplers[MESA_SHADER_FRAGMENT][slot];
+   if (!view || !view->texture || !sampler) {
+      *reason = "binding";
+      return false;
+   }
+   if (view->target != PIPE_TEXTURE_2D) {
+      *reason = "view_target";
+      return false;
+   }
+
+   const enum pipe_format format = view->format;
+   if (format != PIPE_FORMAT_R8G8B8A8_UNORM &&
+       format != PIPE_FORMAT_R8G8B8X8_UNORM) {
+      *reason = "format";
+      return false;
+   }
+
+   const struct pvrgpu_resource *resource = pvrgpu_resource(view->texture);
+   const unsigned width = view->texture->width0;
+   const unsigned height = view->texture->height0;
+   const unsigned mip_count = resource ? resource->level_count : 0;
+   if (!resource || !resource->data || width == 0 || height == 0 ||
+       mip_count == 0 || mip_count > PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS) {
+      *reason = "resource";
+      return false;
+   }
+
+   /* The model reads a tightly packed mip chain from one allocation. */
+   uintptr_t expected_offset = 0;
+   for (unsigned level = 0; level < mip_count; ++level) {
+      const unsigned level_width = MAX2(width >> level, 1U);
+      const unsigned level_height = MAX2(height >> level, 1U);
+      const unsigned row_pitch = level_width * 4U;
+      if (resource->level_offsets[level] != expected_offset ||
+          resource->level_strides[level] != row_pitch) {
+         *reason = "mip_layout";
+         return false;
+      }
+      expected_offset += (uintptr_t)row_pitch * level_height;
+   }
+   if (expected_offset == 0 || expected_offset != (uintptr_t)resource->size) {
+      *reason = "image_size";
+      return false;
+   }
+
+   const struct pipe_sampler_state *state = &sampler->state;
+   if (state->compare_mode != PIPE_TEX_COMPARE_NONE ||
+       state->unnormalized_coords || state->max_anisotropy > 1) {
+      *reason = "sampler_state";
+      return false;
+   }
+
+   uint8_t *bytes = malloc((size_t)expected_offset);
+   if (!bytes) {
+      *reason = "allocation";
+      return false;
+   }
+   memcpy(bytes, resource->data, (size_t)expected_offset);
+
+   memset(destination, 0, sizeof(*destination));
+   destination->source = PVRGPU_SYSTEMC_PCO_TEXTURE_EXTERNAL_PAYLOAD;
+   destination->stage = PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT;
+   destination->producer_command_index = 0;
+   destination->descriptor_set = descriptor_set;
+   destination->binding = 0;
+   destination->format = util_format_name(format);
+   destination->bytes = bytes;
+   destination->bytes_size = (size_t)expected_offset;
+   destination->declared_bytes_size = (size_t)expected_offset;
+   destination->mip_count = mip_count;
+   for (unsigned level = 0; level < mip_count; ++level) {
+      destination->mip[level].width = MAX2(width >> level, 1U);
+      destination->mip[level].height = MAX2(height >> level, 1U);
+      destination->mip[level].row_pitch = resource->level_strides[level];
+      destination->mip[level].offset =
+         (uint32_t)resource->level_offsets[level];
+   }
+   destination->min_filter = state->min_img_filter;
+   destination->mag_filter = state->mag_img_filter;
+   destination->mip_filter = state->min_mip_filter;
+   destination->wrap_u = state->wrap_s;
+   destination->wrap_v = state->wrap_t;
+   destination->normalized_coordinates = 1;
+   destination->min_lod_u4_6 = 0;
+   destination->max_lod_u4_6 =
+      state->min_mip_filter == PIPE_TEX_MIPFILTER_NONE ?
+         0U : (mip_count - 1U) * 64U;
+
+   *out_bytes = bytes;
+   return true;
+}
+
 struct pvrgpu_array_primitive_draw {
    struct pvrgpu_systemc_driver_command command;
    float *vertex_data;
    uint8_t *index_data;
+   /*
+    * Images the draw samples.  The sequence carries them in one flat array
+    * that each nested draw consumes a slice of, so the record owns its own
+    * copy until the whole sequence is submitted.
+    */
+   struct pvrgpu_systemc_pco_sequence_texture
+      textures[PVRGPU_PCO_MAX_TEXTURES];
+   uint8_t *texture_bytes[PVRGPU_PCO_MAX_TEXTURES];
+   unsigned texture_count;
    struct pvrgpu_pco_graphics_binary binary;
 };
 
@@ -9736,6 +9867,8 @@ pvrgpu_array_primitive_draw_destroy(struct pvrgpu_array_primitive_draw **slot)
    pvrgpu_pco_graphics_binary_finish(&draw->binary);
    free(draw->vertex_data);
    free(draw->index_data);
+   for (unsigned texture = 0; texture < PVRGPU_PCO_MAX_TEXTURES; ++texture)
+      free(draw->texture_bytes[texture]);
    FREE(draw);
    *slot = NULL;
 }
@@ -9793,6 +9926,48 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
    if (!draws)
       return false;
 
+   /*
+    * One flat texture array that the nested draws consume slices of, in draw
+    * order: that is the layout the sequence protocol specifies.
+    */
+   unsigned sequence_texture_count = 0;
+   for (unsigned ordinal = 0; ordinal < ctx->array_primitive_draw_count;
+        ++ordinal) {
+      const struct pvrgpu_array_primitive_draw *recorded =
+         ctx->array_primitive_draws[ordinal];
+      sequence_texture_count += recorded ? recorded->texture_count : 0;
+   }
+   if (sequence_texture_count > PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_TEXTURES) {
+      pvrgpu_counter_eventf("draw_array_primitive_sequence_error",
+                            "stage=assemble reason=too_many_textures "
+                            "textures=%u limit=%u",
+                            sequence_texture_count,
+                            PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_TEXTURES);
+      free(draws);
+      return false;
+   }
+   struct pvrgpu_systemc_pco_sequence_texture *sequence_textures = NULL;
+   if (sequence_texture_count != 0) {
+      sequence_textures =
+         calloc(sequence_texture_count, sizeof(*sequence_textures));
+      if (!sequence_textures) {
+         free(draws);
+         return false;
+      }
+   }
+   unsigned texture_offset = 0;
+   for (unsigned ordinal = 0; ordinal < ctx->array_primitive_draw_count;
+        ++ordinal) {
+      const struct pvrgpu_array_primitive_draw *recorded =
+         ctx->array_primitive_draws[ordinal];
+      if (!recorded)
+         continue;
+      for (unsigned texture = 0; texture < recorded->texture_count;
+           ++texture) {
+         sequence_textures[texture_offset++] = recorded->textures[texture];
+      }
+   }
+
    const struct pvrgpu_systemc_driver_command *first =
       &ctx->array_primitive_draws[0]->command;
    for (unsigned ordinal = 0; ordinal < ctx->array_primitive_draw_count;
@@ -9815,6 +9990,7 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
                                "stage=assemble ordinal=%u "
                                "reason=framebuffer_mismatch",
                                ordinal);
+         free(sequence_textures);
          free(draws);
          return false;
       }
@@ -9893,6 +10069,7 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
    if (ia_vertices == 0 || ia_primitives == 0) {
       pvrgpu_counter_eventf("draw_array_primitive_sequence_error",
                             "stage=assemble reason=empty_input_assembly");
+      free(sequence_textures);
       free(draws);
       return false;
    }
@@ -9913,12 +10090,15 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
    command.render_target_count = first->render_target_count;
    command.pco_sequence_command_count = ctx->array_primitive_draw_count;
    command.pco_sequence_commands = draws;
+   command.pco_sequence_texture_count = sequence_texture_count;
+   command.pco_sequence_textures = sequence_textures;
 
    char error[512] = { 0 };
    const bool emitted = pvrgpu_write_draw_pco_sequence_command(path,
                                                                &command,
                                                                error,
                                                                sizeof(error));
+   free(sequence_textures);
    free(draws);
    if (!emitted) {
       remove(path);
@@ -10283,6 +10463,33 @@ pvrgpu_record_color_primitive_pco_draw(
       return false;
    }
 
+   /*
+    * The compiler will emit anything the shader asks for; the model executes a
+    * subset.  Ask before claiming the draw, so a shader outside that subset
+    * falls through to a path that can describe it instead of being discovered
+    * at submission, when the sequence is already committed.
+    */
+   char decode_error[512] = { 0 };
+   if (!pvrgpu_pco_binary_is_executable(PVRGPU_SYSTEMC_PCO_SHADER_STAGE_VERTEX,
+                                        binary.vertex.data,
+                                        binary.vertex.size,
+                                        decode_error,
+                                        sizeof(decode_error)) ||
+       !pvrgpu_pco_binary_is_executable(
+          PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT,
+          binary.fragment.data,
+          binary.fragment.size,
+          decode_error,
+          sizeof(decode_error))) {
+      pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                            "stage=decode reason=%s",
+                            decode_error[0] ? decode_error : "unknown");
+      pvrgpu_pco_graphics_binary_finish(&binary);
+      free(interleaved);
+      free(index_data);
+      return false;
+   }
+
    struct pvrgpu_draw_pco_triangles_command command;
    memset(&command, 0, sizeof(command));
    command.case_name = pvrgpu_command_case_name("color_triangle.gallium.pco");
@@ -10482,6 +10689,26 @@ pvrgpu_record_color_primitive_pco_draw(
    /* The nested draw points at payloads this record owns until submission. */
    recorded->vertex_data = interleaved;
    recorded->index_data = index_data;
+   for (unsigned texture = 0;
+        texture < ctx->num_sampler_views[MESA_SHADER_FRAGMENT]; ++texture) {
+      const char *texture_reason = NULL;
+      if (!pvrgpu_capture_generic_sequence_texture(
+             ctx,
+             texture,
+             texture,
+             &recorded->textures[texture],
+             &recorded->texture_bytes[texture],
+             &texture_reason)) {
+         pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                               "stage=textures reason=%s slot=%u",
+                               texture_reason ? texture_reason : "unknown",
+                               texture);
+         pvrgpu_array_primitive_draw_destroy(&recorded);
+         return false;
+      }
+      ++recorded->texture_count;
+   }
+   command.sampled_texture_count = recorded->texture_count;
    recorded->binary = binary;
    pvrgpu_pco_triangles_command_to_systemc(&command, &recorded->command);
    ctx->array_primitive_draws[ctx->array_primitive_draw_count++] = recorded;
