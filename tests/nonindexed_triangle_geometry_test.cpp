@@ -804,7 +804,8 @@ int sc_main(int argc, char **argv) {
         sc_core::sc_start(sc_core::sc_time(20, sc_core::SC_US));
       } catch (const std::exception &error) {
         Check(std::string(error.what()).find(
-                  "unsupported topology or range") != std::string::npos,
+                  "vertex_count_not_a_triangle_multiple") !=
+                  std::string::npos,
               std::string("unexpected fail-closed diagnostic: ") +
                   error.what());
         const PipelineState failed =

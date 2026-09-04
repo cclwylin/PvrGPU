@@ -3,6 +3,7 @@
 #define PVRGPU_CONTEXT_H
 
 #include "pvrgpu_state.h"
+#include "pvrgpu_systemc_api.h"
 
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"
@@ -16,11 +17,12 @@
  * driver-side accumulation bounded independently of it.
  */
 /*
- * Draws one generic sequence can describe.  dEQP's scissor and fragment-op
- * groups submit well over sixty draws per frame, and a sequence that fills up
- * stops describing the workload it was recording.
+ * Draws one generic sequence can record, matching what the capsule can carry.
+ * A trace with more draws than this is reported unsupported rather than
+ * truncated: half a workload is not a smaller workload.
  */
-#define PVRGPU_ARRAY_PRIMITIVE_SEQUENCE_MAX 256u
+#define PVRGPU_ARRAY_PRIMITIVE_SEQUENCE_MAX \
+   PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_COMMANDS
 
 /* Colour attachments one lowered draw can write. */
 #define PVRGPU_MAX_RENDER_TARGETS 4u

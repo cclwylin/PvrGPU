@@ -696,6 +696,15 @@ void ClipCull::Run() {
     } else {
       const bool indexed_triangle =
           IsIndexedTriangleRasterCase(state.functional_case);
+      /*
+       * A lowered draw may be indexed.  Vertex fetch has already resolved its
+       * indices into lane references, so what distinguishes the two here is
+       * only whether an index payload is expected to be present.
+       */
+      const bool driver_pco_indexed =
+          driver_pco_triangles &&
+          state.draw.index_format != IndexFormat::kNone;
+      const bool direct_pco = driver_pco_triangles && !driver_pco_indexed;
       if ((!driver_pco_triangles && !indexed_triangle) ||
           state.draw.topology != PrimitiveTopology::kTriangleList ||
           !HasPoolHandle(state.vertex_lane_refs)) {
@@ -703,7 +712,7 @@ void ClipCull::Run() {
             "ClipCull triangle-list payload is incomplete");
       }
       std::vector<std::uint16_t> indices;
-      if (driver_pco_triangles) {
+      if (direct_pco) {
         if (state.draw.vertex_count == 0 ||
             state.draw.vertex_count % 3 != 0 ||
             state.draw.first_index != 0 || state.draw.index_count != 0 ||
@@ -716,24 +725,24 @@ void ClipCull::Run() {
           throw std::runtime_error(
               "ClipCull direct triangle-list state is invalid");
         }
-      } else {
-        if (!HasPoolHandle(state.vertex_indices)) {
-          throw std::runtime_error(
-              "ClipCull indexed triangle-list has no index payload");
-        }
+      } else if (!HasPoolHandle(state.vertex_indices)) {
+        throw std::runtime_error(
+            "ClipCull indexed triangle-list has no index payload");
+      } else if (!driver_pco_indexed) {
+        // The pinned indexed cases are uint16; a lowered draw states its own
+        // index width, and its occurrence count is checked against the lane
+        // references rather than against a re-decoded index array.
         indices = LoadArray<std::uint16_t>(pool_, state.vertex_indices);
       }
       const std::vector<VertexLaneRef> lane_refs =
           LoadArray<VertexLaneRef>(pool_, state.vertex_lane_refs);
-      const std::size_t occurrence_count = driver_pco_triangles
-                                               ? state.draw.vertex_count
-                                               : state.draw.index_count;
+      const std::size_t occurrence_count =
+          direct_pco ? state.draw.vertex_count : state.draw.index_count;
       if (lane_refs.size() != occurrence_count ||
           lane_refs.size() % 3 != 0 ||
-          (driver_pco_triangles && lanes.size() != occurrence_count) ||
-          (!driver_pco_triangles &&
-           (state.draw.first_index != 0 ||
-            indices.size() != occurrence_count))) {
+          (direct_pco && lanes.size() != occurrence_count) ||
+          state.draw.first_index != 0 ||
+          (indexed_triangle && indices.size() != occurrence_count)) {
         throw std::runtime_error(
             "ClipCull triangle-list occurrence/lane-ref ranges disagree");
       }
@@ -810,7 +819,7 @@ void ClipCull::Run() {
               throw std::runtime_error(
                   "ClipCull lane reference is outside shaded lanes");
             std::uint64_t resolved = 0;
-            if (driver_pco_triangles) {
+            if (direct_pco) {
               resolved = static_cast<std::uint64_t>(state.draw.first_vertex) +
                          vertex_occurrence;
               if (ref.lane_index != vertex_occurrence ||
@@ -818,6 +827,14 @@ void ClipCull::Run() {
                 throw std::runtime_error(
                     "ClipCull direct lane reference is not sequential");
               }
+            } else if (driver_pco_indexed) {
+              /*
+               * Vertex fetch resolved this occurrence through the index
+               * buffer, so the lane reference already carries the vertex it
+               * shaded; re-deriving it here would mean decoding the indices a
+               * second time in a width this stage does not know.
+               */
+              resolved = ref.vertex_index;
             } else {
               const std::int64_t indexed_resolved =
                   static_cast<std::int64_t>(indices[vertex_occurrence]) +

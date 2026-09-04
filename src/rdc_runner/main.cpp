@@ -1051,6 +1051,14 @@ RunOutcome RunPvrgpu(const Options &options, const RuntimeConfig &config,
       artifact_root / "model.stdout.jsonl";
   const std::filesystem::path model_stderr =
       artifact_root / "model.stderr.log";
+  /*
+   * The in-process bridge runs the model from an atexit handler, so its
+   * diagnosis lands in model.stderr.log after the replay has finished.  The
+   * fallback stub must not write over it: when the bridge produced nothing,
+   * the reason it produced nothing is the only thing worth reading.
+   */
+  const std::filesystem::path model_stub_stderr =
+      artifact_root / "model-stub.stderr.log";
   std::filesystem::path probe_png_name = options.rdc.stem();
   probe_png_name += "_trace_probe.png";
   const std::filesystem::path probe_png =
@@ -1135,6 +1143,7 @@ RunOutcome RunPvrgpu(const Options &options, const RuntimeConfig &config,
   for (const auto &stale : {player_png, probe_png, command, driver_counter,
                             player_stdout, player_stderr, probe_stdout,
                             probe_stderr, model_stdout, model_stderr,
+                            model_stub_stderr,
                             artifact_root / "counter.txt",
                             artifact_root / "frame.png"}) {
     std::filesystem::remove(stale, cleanup_error);
@@ -1266,15 +1275,42 @@ RunOutcome RunPvrgpu(const Options &options, const RuntimeConfig &config,
       native_bridge_output.find("\"type\":\"done\"") !=
           std::string::npos;
   if (!bridge_completed && !bridge_started) {
+    /*
+     * Only the in-process bridge can consume a draw_pco_sequence capsule; the
+     * standalone stub reads the text form, which carries the outer command
+     * without its nested draws.  Running it here would replace the bridge's
+     * diagnosis with a parse error about a field it was never meant to see.
+     */
+    std::string capsule;
+    if (ReadText(command, &capsule) &&
+        capsule.find("command=draw_pco_sequence") != std::string::npos) {
+      outcome.stage = "model";
+      outcome.stdout_log = model_stdout;
+      outcome.stderr_log = model_stderr;
+      std::string bridge_error;
+      ReadText(model_stderr, &bridge_error);
+      const std::size_t last = bridge_error.find_last_not_of(" \t\r\n");
+      if (last != std::string::npos)
+        bridge_error.resize(last + 1);
+      const std::size_t line = bridge_error.rfind('\n');
+      outcome.reason =
+          "PvrGPU SystemC model produced no output for the PCO sequence" +
+          (bridge_error.empty()
+               ? std::string()
+               : ": " + bridge_error.substr(line == std::string::npos
+                                                ? 0
+                                                : line + 1));
+      return outcome;
+    }
     outcome.stage = "model";
     outcome.stdout_log = model_stdout;
-    outcome.stderr_log = model_stderr;
+    outcome.stderr_log = model_stub_stderr;
     ProcessRequest model_request;
     model_request.executable = ResolveExecutable(options.model);
     model_request.arguments = {"--driver-command", PathToUtf8(command),
                                "--outdir", PathToUtf8(model_png_dir)};
     model_request.stdout_path = model_stdout;
-    model_request.stderr_path = model_stderr;
+    model_request.stderr_path = model_stub_stderr;
     const ProcessResult model_result = RunProcess(model_request);
     outcome.model_exit_code = model_result.exit_code;
     if (!model_result.started) {

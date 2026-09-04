@@ -135,8 +135,19 @@ void Vdm::Run() {
 
     const bool driver_pco_triangles =
         IsDriverPcoTrianglesCase(state.functional_case);
+    /*
+     * A lowered draw that carries an index buffer belongs on the indexed path
+     * below, which fetches the indices and assembles every GLES topology from
+     * them.  Routing it to the direct-raster branch instead was what made an
+     * indexed draw unrepresentable: that branch reads vertices in order and
+     * rejects an index buffer outright.
+     */
+    const bool driver_pco_indexed =
+        driver_pco_triangles &&
+        state.draw.index_format != IndexFormat::kNone;
     if (IsFillSolidFamily(state.functional_case) ||
-        IsTextureFamily(state.functional_case) || driver_pco_triangles) {
+        IsTextureFamily(state.functional_case) ||
+        (driver_pco_triangles && !driver_pco_indexed)) {
       const bool driver_textured_triangles =
           state.functional_case == FunctionalCase::kDriverTexturedTriangles;
       const PrimitiveTopology expected_topology =
@@ -144,24 +155,49 @@ void Vdm::Run() {
                                     : PrimitiveTopology::kTriangleStrip;
       const std::uint32_t expected_vertex_count =
           driver_textured_triangles ? 6U : 4U;
-      const bool direct_geometry_invalid =
-          driver_pco_triangles
-              ? state.draw.topology != PrimitiveTopology::kTriangleList ||
-                    state.draw.vertex_count == 0 ||
-                    state.draw.vertex_count % 3 != 0 ||
-                    state.primitive_restart_enable != 0
-              : state.draw.topology != expected_topology ||
-                    state.draw.first_vertex != 0 ||
-                    state.draw.vertex_count != expected_vertex_count;
-      if (direct_geometry_invalid ||
-          state.draw.first_index != 0 || state.draw.index_count != 0 ||
-          state.draw.base_vertex != 0 ||
-          state.draw.index_format != IndexFormat::kNone ||
-          HasPoolHandle(state.vertex_indices) ||
-          state.index_buffer_gpu_address != 0 ||
-          state.index_buffer_bytes != 0) {
+      // Name the property that is wrong.  "unsupported topology or range"
+      // covers eight conditions, and a capture that trips one of them gives
+      // no indication which pipeline feature it actually needs.
+      const char *direct_reason = nullptr;
+      if (driver_pco_triangles) {
+        if (state.draw.topology != PrimitiveTopology::kTriangleList)
+          direct_reason = "topology_not_triangle_list";
+        else if (state.draw.vertex_count == 0)
+          direct_reason = "empty_draw";
+        else if (state.draw.vertex_count % 3 != 0)
+          direct_reason = "vertex_count_not_a_triangle_multiple";
+        else if (state.primitive_restart_enable != 0)
+          direct_reason = "primitive_restart";
+      } else if (state.draw.topology != expected_topology) {
+        direct_reason = "topology";
+      } else if (state.draw.first_vertex != 0) {
+        direct_reason = "first_vertex";
+      } else if (state.draw.vertex_count != expected_vertex_count) {
+        direct_reason = "vertex_count";
+      }
+      if (!direct_reason) {
+        if (state.draw.first_index != 0)
+          direct_reason = "first_index";
+        else if (state.draw.index_count != 0)
+          direct_reason = "index_count";
+        else if (state.draw.base_vertex != 0)
+          direct_reason = "base_vertex";
+        else if (state.draw.index_format != IndexFormat::kNone)
+          direct_reason = "index_format";
+        else if (HasPoolHandle(state.vertex_indices))
+          direct_reason = "vertex_indices";
+        else if (state.index_buffer_gpu_address != 0)
+          direct_reason = "index_buffer_address";
+        else if (state.index_buffer_bytes != 0)
+          direct_reason = "index_buffer_bytes";
+      }
+      if (direct_reason) {
         throw std::runtime_error(
-            "VDM direct raster draw has unsupported topology or range");
+            std::string("VDM direct raster draw is unsupported: ") +
+            direct_reason + " (topology=" +
+            std::to_string(static_cast<int>(state.draw.topology)) +
+            " vertices=" + std::to_string(state.draw.vertex_count) +
+            " indices=" + std::to_string(state.draw.index_count) + ")");
       }
       const std::uint64_t vertex_end =
           static_cast<std::uint64_t>(state.draw.first_vertex) +
@@ -172,7 +208,8 @@ void Vdm::Run() {
       state.counters.ia_primitives =
           driver_pco_triangles ? state.draw.vertex_count / 3U : 2U;
     } else {
-      if (!IsIndexedTriangleRasterCase(state.functional_case) ||
+      if ((!IsIndexedTriangleRasterCase(state.functional_case) &&
+           !driver_pco_indexed) ||
           (state.draw.topology != PrimitiveTopology::kTriangleList &&
            state.draw.topology != PrimitiveTopology::kTriangleStrip &&
            state.draw.topology != PrimitiveTopology::kPoints &&

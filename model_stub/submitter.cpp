@@ -49,6 +49,22 @@ inline constexpr std::uint64_t kBuiltinIndexBufferGpuAddress =
 inline constexpr std::uint64_t kDriverSequenceVertexAddressStride =
     UINT64_C(0x00100000);
 
+// Attachment slot for a sequence ordinal that starts a new surface.
+//
+// Each region holds kDriverPcoSequenceAttachmentSlots strides before it runs
+// into the next one, so an ordinal past that would silently place a colour
+// attachment on top of a depth attachment.  A sequence may still be longer
+// than the slot count: ordinals that continue from an earlier surface consume
+// no slot at all.
+std::size_t SequenceAttachmentSlot(std::size_t ordinal, const char *region) {
+  if (ordinal >= kDriverPcoSequenceAttachmentSlots) {
+    throw std::runtime_error(
+        std::string("Submitter sequence ") + region +
+        " attachment slot is outside its address region");
+  }
+  return ordinal;
+}
+
 std::uint64_t SequenceExternalTextureAddress(
     std::size_t submission, DriverPcoShaderStage stage,
     std::uint32_t descriptor_set) {
@@ -1239,7 +1255,8 @@ void Submitter::Run() {
       if (color_source == kDriverPcoNewAttachment) {
         sequence_color_addresses[ordinal] =
             kDriverPcoSequenceColorAddressBase +
-            ordinal * kDriverPcoSequenceAttachmentStride;
+            SequenceAttachmentSlot(ordinal, "color") *
+                kDriverPcoSequenceAttachmentStride;
       } else if (color_source < ordinal) {
         sequence_color_addresses[ordinal] =
             sequence_color_addresses[color_source];
@@ -1256,7 +1273,8 @@ void Submitter::Run() {
       } else if (depth_source == kDriverPcoNewAttachment) {
         sequence_depth_addresses[ordinal] =
             kDriverPcoSequenceDepthAddressBase +
-            ordinal * kDriverPcoSequenceAttachmentStride;
+            SequenceAttachmentSlot(ordinal, "depth") *
+                kDriverPcoSequenceAttachmentStride;
       } else if (depth_source < ordinal &&
                  sequence_depth_addresses[depth_source] != 0) {
         sequence_depth_addresses[ordinal] =

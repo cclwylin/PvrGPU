@@ -410,8 +410,13 @@ void VertexFetch::Run() {
     std::vector<VertexLane> lanes;
     const bool driver_pco_triangles =
         IsDriverPcoTrianglesCase(state.functional_case);
+    /* An indexed draw fetches through its index buffer; see VDM. */
+    const bool driver_pco_indexed =
+        driver_pco_triangles &&
+        state.draw.index_format != IndexFormat::kNone;
     if (IsFillSolidFamily(state.functional_case) ||
-        IsTextureFamily(state.functional_case) || driver_pco_triangles) {
+        IsTextureFamily(state.functional_case) ||
+        (driver_pco_triangles && !driver_pco_indexed)) {
       const std::uint32_t expected_vertex_count =
           state.functional_case == FunctionalCase::kDriverTexturedTriangles
               ? 6U
@@ -452,7 +457,8 @@ void VertexFetch::Run() {
       }
       if (driver_pco_triangles)
         state.vertex_lane_refs = StoreNewArray(pool_, lane_refs);
-    } else if (IsIndexedTriangleRasterCase(state.functional_case)) {
+    } else if (IsIndexedTriangleRasterCase(state.functional_case) ||
+               driver_pco_indexed) {
       if ((state.draw.topology != PrimitiveTopology::kTriangleList &&
            state.draw.topology != PrimitiveTopology::kTriangleStrip &&
            state.draw.topology != PrimitiveTopology::kPoints &&

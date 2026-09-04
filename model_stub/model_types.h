@@ -111,6 +111,11 @@ inline constexpr std::size_t kDriverPcoIdeasDepthEnabledEndCommand = 168;
 inline constexpr std::uint32_t kDriverPcoMaximumBinaryBytes =
     16U * 1024U * 1024U;
 inline constexpr std::size_t kDriverPcoMaximumSequenceCommands = 4096;
+/*
+ * Draws one nested sequence capsule may carry.  This must match the driver's
+ * PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_COMMANDS: a sequence the driver is willing
+ * to build but the model refuses leaves the frame with no output at all.
+ */
 inline constexpr std::size_t kDriverPcoMaximumNestedSequenceCommands = 64;
 inline constexpr std::size_t kDriverPcoMaximumSequenceTextures = 16;
 inline constexpr std::uint64_t kDriverPcoMaximumSequencePayloadBytes =
@@ -130,6 +135,9 @@ inline constexpr std::uint32_t kDriverPcoDepthFormatZ24UnormS8Uint = 272;
 inline constexpr std::uint32_t kDriverPcoNewAttachment = UINT32_MAX;
 inline constexpr std::size_t kDriverPcoRefractSequenceCommands = 2;
 inline constexpr std::size_t kDriverPcoRefractSampledTextures = 3;
+// One attachment-stride slot per sequence ordinal.  The regions are one
+// stride-times-kDriverPcoMaximumNestedSequenceCommands apart, so a sequence
+// longer than that would place a colour attachment on top of a depth one.
 inline constexpr std::uint64_t kDriverPcoSequenceAttachmentStride =
     UINT64_C(0x01000000);
 inline constexpr std::uint64_t kDriverPcoSequenceColorAddressBase =
@@ -138,6 +146,18 @@ inline constexpr std::uint64_t kDriverPcoSequenceDepthAddressBase =
     UINT64_C(0x60000000);
 inline constexpr std::uint64_t kDriverPcoSequenceExternalAddressBase =
     UINT64_C(0x70000000);
+// Slots available to attachments before a region runs into the next one.  A
+// sequence may be longer than this: only an ordinal that starts a new
+// attachment consumes a slot, and the rest alias an earlier one by design.
+inline constexpr std::size_t kDriverPcoSequenceAttachmentSlots =
+    static_cast<std::size_t>((kDriverPcoSequenceDepthAddressBase -
+                              kDriverPcoSequenceColorAddressBase) /
+                             kDriverPcoSequenceAttachmentStride);
+static_assert(kDriverPcoSequenceExternalAddressBase -
+                      kDriverPcoSequenceDepthAddressBase >=
+                  kDriverPcoSequenceDepthAddressBase -
+                      kDriverPcoSequenceColorAddressBase,
+              "sequence depth region is smaller than the colour region");
 // Colour attachments past the first of a multiple-render-target draw. Each
 // (command, attachment) pair owns one attachment-stride slot so no two
 // attachments of a sequence overlap in DRAM.
