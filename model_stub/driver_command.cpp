@@ -828,7 +828,7 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         parsed.bottom_edge_rule != 0 || parsed.clip_halfz != 0 ||
         parsed.depth_clip_near != 1 || parsed.depth_clip_far != 1 ||
         parsed.depth_clamp != 0 || parsed.sample_mask != UINT32_MAX ||
-        parsed.color_mask > 0x0f || parsed.blend_enable != 0 ||
+        parsed.color_mask > 0x0f || parsed.blend_enable > 1 ||
         parsed.dither != 1 || parsed.depth_enable > 1 ||
         parsed.depth_write > 1 || parsed.depth_func > 7 ||
         parsed.depth_format == 0 ||

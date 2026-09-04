@@ -761,7 +761,7 @@ bool CopyPcoTrianglePayload(
       source.depth_clip_near != 1 || source.depth_clip_far != 1 ||
       source.depth_clamp != 0 || source.sample_mask != UINT32_MAX ||
       // The PBE honours a partial write mask, so any four-bit mask is valid.
-      source.color_mask > 0x0f || source.blend_enable != 0 ||
+      source.color_mask > 0x0f || source.blend_enable > 1 ||
       source.dither != 1;
   const bool ideas_raster_invalid =
       ideas_sequence &&

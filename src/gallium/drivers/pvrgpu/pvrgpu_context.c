@@ -10711,6 +10711,44 @@ pvrgpu_record_color_primitive_pco_draw(
    command.sampled_texture_count = recorded->texture_count;
    recorded->binary = binary;
    pvrgpu_pco_triangles_command_to_systemc(&command, &recorded->command);
+   /*
+    * The pixel back end blends, so a draw that asks for it carries the whole
+    * GLES equation rather than only the enable bit; a disabled one still
+    * states the canonical ONE/ZERO ABI.
+    */
+   {
+      /*
+       * A draw with blending disabled leaves whatever equation the
+       * application last set in its blend state; the capsule states the
+       * canonical ONE/ZERO ADD for it, because nothing reads the rest.  Only
+       * an enabled blend has an equation worth translating, and one the model
+       * cannot express is a reason to decline the draw.
+       */
+      const struct pipe_rt_blend_state *rt =
+         ctx->blend ? &ctx->blend->state.rt[0] : NULL;
+      const bool blending = rt && rt->blend_enable;
+      if (!pvrgpu_init_systemc_blend_state(
+             &recorded->command,
+             blending,
+             blending ? rt->rgb_func : PIPE_BLEND_ADD,
+             blending ? rt->rgb_src_factor : PIPE_BLENDFACTOR_ONE,
+             blending ? rt->rgb_dst_factor : PIPE_BLENDFACTOR_ZERO,
+             blending ? rt->alpha_func : PIPE_BLEND_ADD,
+             blending ? rt->alpha_src_factor : PIPE_BLENDFACTOR_ONE,
+             blending ? rt->alpha_dst_factor : PIPE_BLENDFACTOR_ZERO)) {
+         pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                               "stage=blend reason=unsupported_equation "
+                               "rgb=%u,%u,%u alpha=%u,%u,%u",
+                               blending ? rt->rgb_func : 0,
+                               blending ? rt->rgb_src_factor : 0,
+                               blending ? rt->rgb_dst_factor : 0,
+                               blending ? rt->alpha_func : 0,
+                               blending ? rt->alpha_src_factor : 0,
+                               blending ? rt->alpha_dst_factor : 0);
+         pvrgpu_array_primitive_draw_destroy(&recorded);
+         return false;
+      }
+   }
    ctx->array_primitive_draws[ctx->array_primitive_draw_count++] = recorded;
 
    /*

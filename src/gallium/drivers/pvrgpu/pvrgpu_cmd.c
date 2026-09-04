@@ -1114,7 +1114,7 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       raster_reason = "sample_mask";
    else if (cmd->color_mask > 0xf)
       raster_reason = "color_mask";
-   else if (cmd->blend_enable != 0)
+   else if (cmd->blend_enable > 1)
       raster_reason = "blend";
    else if (cmd->dither != 1)
       raster_reason = "dither";
