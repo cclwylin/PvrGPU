@@ -713,6 +713,16 @@ PcoRegisterRef DecodeOneLowerSource(const std::vector<std::uint8_t> &binary,
     if (source.index >= kPcoMaximumSharedCount)
       DecodeError(source_offset,
                   "shared register exceeds the modeled USC file");
+  } else if (source.bank == PcoRegisterBank::kCoefficient) {
+    /*
+     * Reading a coefficient register directly is how a flat or otherwise
+     * uninterpolated varying arrives: the plane's C term is its value, and no
+     * FITRP is emitted for it.  The runtime bound is the coefficient count the
+     * draw supplied; this is the file the encoding can name.
+     */
+    if (source.index >= kPcoMaximumVaryingCoefficientCount)
+      DecodeError(source_offset,
+                  "coefficient register exceeds the modeled USC file");
   } else {
     DecodeError(source_offset,
                 "source register bank is outside this PCO subset");
@@ -826,6 +836,12 @@ TwoLowerSources DecodeTwoLowerSources(
     if (bank == PcoRegisterBank::kShared) {
       if (index >= kPcoMaximumSharedCount)
         DecodeError(offset, "two-source shared register exceeds USC file");
+      return;
+    }
+    if (bank == PcoRegisterBank::kCoefficient) {
+      /* An uninterpolated varying is read straight out of its plane. */
+      if (index >= kPcoMaximumVaryingCoefficientCount)
+        DecodeError(offset, "two-source coefficient exceeds the USC file");
       return;
     }
     DecodeError(offset, "two-source register bank is outside this PCO subset");
@@ -1030,11 +1046,30 @@ PcoInstruction DecodeFragmentFitrpGroup(
   const std::uint8_t reserved1 = backend1 >> 5U;
   const bool saturate = (backend1 & 0x10U) != 0;
   const std::uint8_t component_count = backend1 & 0x0fU;
+  /*
+   * PIXEL and CENTROID iteration both name a position inside the pixel to
+   * evaluate the coefficient planes at.  With one sample per pixel the
+   * centroid of the covered area is the pixel centre, so the two coincide and
+   * the executor evaluates either at the sample it was given.  SAMPLE
+   * iteration picks a different position per sample and stays fail-closed
+   * until the model rasterizes more than one.
+   */
+  const bool supported_iteration =
+      iteration_mode == 0 || iteration_mode == 2;
   if (backend_op != kBackendOpFitr || !perspective || drc != 0 ||
-      reserved0 != 0 || iteration_mode != 0 || reserved1 != 0 || saturate ||
+      reserved0 != 0 || !supported_iteration || reserved1 != 0 || saturate ||
       component_count < 1 || component_count > 4) {
     DecodeError(header.offset + 3,
-                "FITRP must be perspective PIXEL/count1..4/drc0/no-saturate");
+                "FITRP must be perspective PIXEL or CENTROID with "
+                "count1..4/drc0/no-saturate"
+                " [op=" + std::to_string(backend_op) +
+                " persp=" + std::to_string(perspective ? 1 : 0) +
+                " drc=" + std::to_string(drc) +
+                " r0=" + std::to_string(reserved0) +
+                " mode=" + std::to_string(iteration_mode) +
+                " r1=" + std::to_string(reserved1) +
+                " sat=" + std::to_string(saturate ? 1 : 0) +
+                " count=" + std::to_string(component_count) + "]");
   }
 
   /* Public coefficient/temp source map used by the pinned varying programs:
@@ -1049,6 +1084,24 @@ PcoInstruction DecodeFragmentFitrpGroup(
   const std::uint8_t source1_byte = binary[cursor++];
   const std::uint8_t coefficient_high_byte = binary[cursor++];
   const std::uint8_t source3_byte = binary[cursor++];
+  /*
+   * Bit 7 of the coefficient high byte is the extended-encoding flag the
+   * other source forms use, and it inserts one more byte before the
+   * destination.  The compiler reaches for it once a program addresses enough
+   * registers; the field it carries is pinned to the single value observed so
+   * an unfamiliar one still fails closed rather than being misread.
+   */
+  const bool extended_source = (coefficient_high_byte & 0x80U) != 0;
+  if (extended_source) {
+    if (group_end - cursor < 3)
+      DecodeError(cursor, "truncated extended FITRP source encoding");
+    const std::uint8_t extended_byte = binary[cursor++];
+    if (extended_byte != 0x02U) {
+      DecodeError(cursor - 1,
+                  "FITRP extended source control is not canonical [" +
+                      std::to_string(extended_byte) + "]");
+    }
+  }
   const std::uint16_t coefficient_index = static_cast<std::uint16_t>(
       (coefficient_byte & 0x3fU) |
       ((coefficient_high_byte & 0x04U) != 0 ? 0x40U : 0x00U));
@@ -1057,10 +1110,25 @@ PcoInstruction DecodeFragmentFitrpGroup(
       static_cast<std::size_t>(coefficient_index) + component_count * 4U >
           kPcoMaximumVaryingCoefficientCount ||
       source1_byte != 0x40U ||
-      (coefficient_high_byte != 0x10U &&
-       coefficient_high_byte != 0x14U) ||
+      (coefficient_high_byte & ~0x84U) != 0x10U ||
       source3_byte != 0xc0U) {
-    DecodeError(cursor - 1, "FITRP coefficient source encoding changed");
+    DecodeError(cursor - 1,
+                "FITRP coefficient source encoding changed [cf=" +
+                    std::to_string(coefficient_byte) +
+                    " s1=" + std::to_string(source1_byte) +
+                    " cfhi=" + std::to_string(coefficient_high_byte) +
+                    " s3=" + std::to_string(source3_byte) +
+                    " index=" + std::to_string(coefficient_index) +
+                    " count=" + std::to_string(component_count) +
+                    " next=" +
+                    std::to_string(cursor < group_end ? binary[cursor] : 999) +
+                    "," +
+                    std::to_string(cursor + 1 < group_end ? binary[cursor + 1]
+                                                          : 999) +
+                    "," +
+                    std::to_string(cursor + 2 < group_end ? binary[cursor + 2]
+                                                          : 999) +
+                    " total=" + std::to_string(header.total_bytes) + "]");
   }
   const std::uint8_t destination_byte = binary[cursor++];
   const std::uint16_t destination_index = destination_byte & 0x3fU;
@@ -1082,7 +1150,9 @@ PcoInstruction DecodeFragmentFitrpGroup(
   instruction.output_index = destination_index;
   instruction.component_count = component_count;
   instruction.data_request = 0;
-  instruction.iteration_mode = PcoIterationMode::kPixel;
+  instruction.iteration_mode = iteration_mode == 2
+                                   ? PcoIterationMode::kCentroid
+                                   : PcoIterationMode::kPixel;
   instruction.perspective = 1;
   instruction.saturate = 0;
   instruction.source_count = 2;
@@ -1469,14 +1539,32 @@ PcoInstruction DecodeGenericSimpleAluGroup(
     opcode = PcoOpcode::kFloatMadNegateSource0Source2;
     source_count = 3;
     break;
-  case 0x9c:
-    if (cursor >= group_end || binary[cursor++] != 0x0eU)
-      DecodeError(cursor - 1, "unsupported scalar PCK/UNPCK format");
-    opcode = PcoOpcode::kFloatUnpackHalf;
+  case 0x9c: {
+    /*
+     * UNPCK's format selector, as the compiler's own PCO_PCK_FORMAT_* values:
+     * 6 is U32, 7 is S32 and 14 is F16F16.  A whole-word format makes the
+     * unpack an integer-to-float conversion; the half format takes the low
+     * sixteen bits.  Every other format stays fail-closed by number.
+     */
+    if (cursor >= group_end)
+      DecodeError(cursor, "truncated scalar PCK/UNPCK format");
+    const std::uint8_t pck_format = binary[cursor++];
+    if (pck_format == 0x06U)
+      opcode = PcoOpcode::kUnpackUnsignedToFloat;
+    else if (pck_format == 0x07U)
+      opcode = PcoOpcode::kUnpackSignedToFloat;
+    else if (pck_format == 0x0eU)
+      opcode = PcoOpcode::kFloatUnpackHalf;
+    else
+      DecodeError(cursor - 1, "unsupported scalar PCK/UNPCK format [" +
+                                  std::to_string(pck_format) + "]");
     source_count = 1;
     break;
+  }
   default:
-    DecodeError(cursor - 1, "unsupported public scalar ALU operation");
+    DecodeError(cursor - 1,
+                "unsupported public scalar ALU operation [" +
+                    std::to_string(main) + "]");
   }
 
   PcoRegisterRef source0{};
@@ -3422,6 +3510,8 @@ void ValidateVertexTemporaryProgram(
     case PcoOpcode::kFloatPackHalfRtne:
     case PcoOpcode::kFloatPackHalfRtz:
     case PcoOpcode::kFloatUnpackHalf:
+    case PcoOpcode::kUnpackUnsignedToFloat:
+    case PcoOpcode::kUnpackSignedToFloat:
       if (instruction.target != PcoWriteTarget::kTemporary ||
           instruction.source_count != 1 || instruction.repeat_count != 1)
         DecodeError(instruction.binary_offset,
@@ -3868,6 +3958,12 @@ void ValidateFragmentProgram(
                       "generic fragment shared source is out of bounds");
         return;
       }
+      if (source.bank == PcoRegisterBank::kCoefficient) {
+        if (source.index >= kPcoMaximumVaryingCoefficientCount)
+          DecodeError(instruction.binary_offset,
+                      "generic fragment coefficient source is out of bounds");
+        return;
+      }
       DecodeError(instruction.binary_offset,
                   "generic fragment source bank is unsupported");
     };
@@ -3881,7 +3977,8 @@ void ValidateFragmentProgram(
           instruction.source1.index != 0 ||
           !IsDefaultUnusedRegister(instruction.source2) ||
           instruction.data_request != 0 ||
-          instruction.iteration_mode != PcoIterationMode::kPixel ||
+          (instruction.iteration_mode != PcoIterationMode::kPixel &&
+           instruction.iteration_mode != PcoIterationMode::kCentroid) ||
           instruction.perspective != 1 || instruction.saturate != 0 ||
           instruction.immediate != 0 ||
           !HasDefaultControlFields(instruction) ||
@@ -3995,6 +4092,8 @@ void ValidateFragmentProgram(
     case PcoOpcode::kFloatPackHalfRtne:
     case PcoOpcode::kFloatPackHalfRtz:
     case PcoOpcode::kFloatUnpackHalf:
+    case PcoOpcode::kUnpackUnsignedToFloat:
+    case PcoOpcode::kUnpackSignedToFloat:
       writes_temporary = instruction.target == PcoWriteTarget::kTemporary &&
                          instruction.source_count == 1;
       break;
@@ -4088,6 +4187,49 @@ std::uint32_t ReadSource(const PcoRegisterRef &source,
   default:
     ExecuteError("source register bank is outside this PCO subset");
   }
+}
+
+/*
+ * Integer to binary32 with the round-to-nearest-even the hardware and every
+ * public driver use.  A 32-bit integer does not always fit the 24-bit
+ * significand, so the rounding is explicit rather than left to a host cast.
+ */
+std::uint32_t FloatFromUnsigned(std::uint32_t value) {
+  if (value == 0)
+    return UINT32_C(0);
+  std::uint32_t exponent = 31;
+  while ((value & (UINT32_C(1) << exponent)) == 0)
+    --exponent;
+  std::uint32_t significand;
+  if (exponent <= 23) {
+    significand = (value << (23 - exponent)) & UINT32_C(0x7fffff);
+  } else {
+    const std::uint32_t shift = exponent - 23;
+    significand = (value >> shift) & UINT32_C(0x7fffff);
+    const std::uint32_t discarded = value & ((UINT32_C(1) << shift) - 1);
+    const std::uint32_t halfway = UINT32_C(1) << (shift - 1);
+    const bool round_up =
+        discarded > halfway ||
+        (discarded == halfway && (significand & UINT32_C(1)) != 0);
+    if (round_up) {
+      ++significand;
+      if (significand > UINT32_C(0x7fffff)) {
+        significand = 0;
+        ++exponent;
+      }
+    }
+  }
+  return ((exponent + 127U) << 23U) | significand;
+}
+
+std::uint32_t FloatFromSigned(std::int32_t value) {
+  if (value >= 0)
+    return FloatFromUnsigned(static_cast<std::uint32_t>(value));
+  const std::uint32_t magnitude =
+      value == std::numeric_limits<std::int32_t>::min()
+          ? UINT32_C(0x80000000)
+          : static_cast<std::uint32_t>(-value);
+  return FloatFromUnsigned(magnitude) | UINT32_C(0x80000000);
 }
 
 std::uint64_t ShiftRightJam(std::uint64_t value, std::uint32_t distance) {
@@ -5018,6 +5160,8 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
     case PcoOpcode::kFloatPackHalfRtne:
     case PcoOpcode::kFloatPackHalfRtz:
     case PcoOpcode::kFloatUnpackHalf:
+    case PcoOpcode::kUnpackUnsignedToFloat:
+    case PcoOpcode::kUnpackSignedToFloat:
     case PcoOpcode::kFloatInterpolatePerspective:
       counts.alu += amount;
       break;
@@ -6501,6 +6645,14 @@ PcoFragmentExecution ExecuteFragmentPco(
             ExecuteError("generic fragment shared source is absent");
           return context.shared_registers[index];
         }
+        if (source.bank == PcoRegisterBank::kCoefficient) {
+          // The stored plane term itself, not an interpolated value: that is
+          // what an uninterpolated varying reads.
+          const std::size_t index = source.index + repeat;
+          if (index >= context.coefficient_count)
+            ExecuteError("generic fragment coefficient source is absent");
+          return context.coefficients[index];
+        }
         return ReadSource(source, no_vertex_inputs, temporaries,
                           temporary_written_mask, repeat,
                           ShaderStage::kFragment);
@@ -6602,6 +6754,10 @@ PcoFragmentExecution ExecuteFragmentPco(
       } else if (instruction.opcode == PcoOpcode::kFloatUnpackHalf) {
         result_val = HalfToFloat(
             static_cast<std::uint16_t>(src0 & UINT32_C(0xffff)));
+      } else if (instruction.opcode == PcoOpcode::kUnpackUnsignedToFloat) {
+        result_val = FloatFromUnsigned(src0);
+      } else if (instruction.opcode == PcoOpcode::kUnpackSignedToFloat) {
+        result_val = FloatFromSigned(static_cast<std::int32_t>(src0));
       } else if (instruction.opcode == PcoOpcode::kFloatSine) {
         result_val = FloatSineBits(src0);
       } else if (instruction.opcode == PcoOpcode::kFloatCosine) {

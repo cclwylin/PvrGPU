@@ -142,6 +142,11 @@ enum class PcoOpcode : std::uint8_t {
   kFloatPackHalfRtne,
   kFloatPackHalfRtz,
   kFloatUnpackHalf,
+  /* UNPCK.U32 / UNPCK.S32: the packed source is a whole 32-bit integer, so
+   * the unpack is the integer-to-float conversion GLSL spells uint(x) and
+   * int(x).  Named for the format the encoding selects. */
+  kUnpackUnsignedToFloat,
+  kUnpackSignedToFloat,
   /* Mesa fcsel_gt lowered as TST.F32.GZ + MOVC.  Keep this distinct from
    * Boolean BCSEL: the condition is an ordered float comparison with +0. */
   kConditionalSelectGreaterZero,
