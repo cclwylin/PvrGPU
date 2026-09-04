@@ -1550,7 +1550,14 @@ void TestTwoAttributeFetchFailsClosed() {
   expect_byte_failure(5, 0x82, "FADD ext1 cleared");
   expect_byte_failure(6, 0x98, "FADD ext2 enabled");
   expect_byte_failure(6, 0x38, "FADD lower-source mux changed");
-  expect_byte_failure(4, 0xbf, "FADD source0 exceeds vi31");
+  // The source index field is six bits, so vi63 is the highest register this
+  // encoding can name and the modeled file covers all of it.  A bound below
+  // that rejected shaders the encoding says are valid.
+  {
+    auto binary = AttributeFetchTwoAttributeVertexPcoBinary();
+    binary[4] = 0xbf;
+    (void)Decode(ShaderStage::kVertex, binary);
+  }
   expect_byte_failure(7, 0x01, "FADD upper-source encoding changed");
   expect_byte_failure(8, 0x01, "FADD ISS selection changed");
   expect_byte_failure(9, 0x44, "FADD destination exceeds temp3");

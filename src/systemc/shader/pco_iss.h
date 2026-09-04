@@ -20,7 +20,10 @@
 
 namespace pvrgpu::stub {
 
-inline constexpr std::size_t kPcoVertexInputCount = 32;
+/* VTXIN0..63.  Each bound attribute occupies four registers, so this is the
+ * sixteen attributes a generically lowered draw may bind.  Like the temporary
+ * file below, it is an explicit ABI bound rather than a Rogue hardware limit. */
+inline constexpr std::size_t kPcoVertexInputCount = 64;
 inline constexpr std::size_t kPcoVertexOutputCount = 64;
 inline constexpr std::size_t kPcoPixelOutputCount = 4;
 /* Public PCO programs may declare and address TEMP0..63.  Keep the execution
