@@ -2086,8 +2086,6 @@ pvrgpu_emit_resource_copy_framebuffer_blit_command(struct pipe_context *pipe,
       return;
    if (pvrgpu_case_suppresses_driver_commands())
       return;
-   if (pvrgpu_case_prefers_draw_counter_sequence())
-      return;
    if (!dst || !src || !src_box ||
        !pvrgpu_blit_box_has_positive_extent(src_box))
       return;
@@ -2201,8 +2199,6 @@ pvrgpu_emit_framebuffer_blit_command(struct pipe_context *pipe,
        pvrgpu_driver_draw_command_has_been_emitted())
       return;
    if (pvrgpu_case_suppresses_driver_commands())
-      return;
-   if (pvrgpu_case_prefers_draw_counter_sequence())
       return;
 
    const char *path = pvrgpu_command_output_path();

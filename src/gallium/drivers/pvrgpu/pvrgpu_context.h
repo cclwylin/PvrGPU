@@ -85,8 +85,6 @@ struct pvrgpu_context {
    bool driver_draw_command_emitted;
    bool driver_indexed_quad_command_locked;
    bool driver_counter_sequence_command_emitted;
-   const struct pvrgpu_deqp_primitive_sequence_profile
-      *pending_primitive_sequence_profile;
    struct pvrgpu_pco_compiler *pco_compiler;
    unsigned ideas_pco_probe_draws;
    unsigned ideas_pco_draws;
@@ -118,11 +116,7 @@ struct pipe_context *
 pvrgpu_create_context(struct pipe_screen *screen, void *priv,
                       unsigned flags);
 
-bool
-pvrgpu_case_prefers_draw_counter_sequence(void);
 
-bool
-pvrgpu_case_counter_sequence_allows_clear_emit(void);
 
 bool
 pvrgpu_emit_case_counter_sequence_command(struct pvrgpu_context *ctx);

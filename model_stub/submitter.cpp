@@ -1100,9 +1100,6 @@ void Submitter::Run() {
   const bool driver_pco_sequence_command =
       driver_command &&
       options_.driver_command.command == "draw_pco_sequence";
-  const bool driver_primitive_sequence_command =
-      driver_command &&
-      options_.driver_command.command == "draw_primitive_sequence";
   const FunctionalCase functional_case =
       FunctionalCaseFromName(options_.test_case);
   if (!IsRasterFunctionalCase(functional_case))
@@ -1134,8 +1131,7 @@ void Submitter::Run() {
        (!driver_clear_command && !driver_triangle_command &&
         !driver_indexed_quad_command &&
         !driver_textured_triangles_command &&
-        !driver_pco_triangles_command &&
-        !driver_primitive_sequence_command))) {
+        !driver_pco_triangles_command))) {
     throw std::runtime_error(
         "Submitter driver command options do not match the one-frame command");
   }
@@ -1483,12 +1479,7 @@ void Submitter::Run() {
     const bool driver_pco_triangles = driver_pco_triangles_command;
     const bool driver_pco_texture =
         driver_pco_triangles && UsesTextureSampling(state);
-    const bool driver_primitive_sequence = driver_primitive_sequence_command;
-    const bool driver_counter_only_primitive_sequence =
-        driver_primitive_sequence &&
-        functional_case == FunctionalCase::kDriverClearColor;
-    const bool driver_clear_like =
-        driver_clear || driver_counter_only_primitive_sequence;
+    const bool driver_clear_like = driver_clear;
     const bool depth_case =
         driver_clear_like || driver_textured_triangles ||
         functional_case == FunctionalCase::kFillSolidDepthNotEqual ||

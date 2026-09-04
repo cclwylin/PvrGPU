@@ -12,6 +12,7 @@
 #include "support/png_writer.h"
 
 #include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
@@ -58,152 +59,6 @@ bool HasPrefix(std::string_view value, std::string_view prefix) {
          value.substr(0, prefix.size()) == prefix;
 }
 
-enum class DeqpTextureMultisampleSampleMaskCase {
-  kNone,
-  kMaskOnly,
-  kAlphaToCoverage,
-  kSampleCoverage,
-  kSampleCoverageAndAlphaToCoverage,
-  kHighBits,
-};
-
-bool ParseDeqpTextureMultisampleSampleMaskCase(
-    const Options &options, std::uint32_t *sample_count,
-    DeqpTextureMultisampleSampleMaskCase *mask_case) {
-  if (!options.driver_command.enabled ||
-      options.driver_command.command != "draw_primitive_sequence") {
-    return false;
-  }
-
-  constexpr std::string_view kPrefix =
-      "dEQP-GLES31.functional.texture.multisample.samples_";
-  std::string_view test_case = options.driver_command.test_case;
-  if (!HasPrefix(test_case, kPrefix))
-    return false;
-  test_case.remove_prefix(kPrefix.size());
-
-  std::uint32_t parsed_sample_count = 0;
-  std::size_t cursor = 0;
-  while (cursor < test_case.size() && test_case[cursor] >= '0' &&
-         test_case[cursor] <= '9') {
-    const std::uint32_t digit =
-        static_cast<std::uint32_t>(test_case[cursor] - '0');
-    if (parsed_sample_count >
-        (std::numeric_limits<std::uint32_t>::max() - digit) / 10U) {
-      throw std::runtime_error("dEQP multisample sample count overflow");
-    }
-    parsed_sample_count = parsed_sample_count * 10U + digit;
-    ++cursor;
-  }
-  if (parsed_sample_count == 0 || cursor >= test_case.size() ||
-      test_case[cursor] != '.') {
-    return false;
-  }
-
-  const std::string_view suffix = test_case.substr(cursor + 1);
-  DeqpTextureMultisampleSampleMaskCase parsed_case =
-      DeqpTextureMultisampleSampleMaskCase::kNone;
-  if (suffix == "sample_mask_only") {
-    parsed_case = DeqpTextureMultisampleSampleMaskCase::kMaskOnly;
-  } else if (suffix == "sample_mask_and_alpha_to_coverage") {
-    parsed_case = DeqpTextureMultisampleSampleMaskCase::kAlphaToCoverage;
-  } else if (suffix == "sample_mask_and_sample_coverage") {
-    parsed_case = DeqpTextureMultisampleSampleMaskCase::kSampleCoverage;
-  } else if (suffix ==
-             "sample_mask_and_sample_coverage_and_alpha_to_coverage") {
-    parsed_case =
-        DeqpTextureMultisampleSampleMaskCase::kSampleCoverageAndAlphaToCoverage;
-  } else if (suffix == "sample_mask_non_effective_bits") {
-    parsed_case = DeqpTextureMultisampleSampleMaskCase::kHighBits;
-  } else {
-    return false;
-  }
-
-  *sample_count = parsed_sample_count;
-  *mask_case = parsed_case;
-  return true;
-}
-
-double DeqpTextureMultisampleGridAlpha(std::uint32_t x,
-                                       std::uint32_t gl_y) {
-  constexpr double kGridSize = 16.0;
-  constexpr double kCellPixels = 16.0;
-  const std::uint32_t cell_x = x / 16U;
-  const std::uint32_t cell_y = gl_y / 16U;
-  const double u = (static_cast<double>(x % 16U) + 0.5) / kCellPixels;
-  const double v = (static_cast<double>(gl_y % 16U) + 0.5) / kCellPixels;
-  const double x0 = static_cast<double>(cell_x) / kGridSize;
-  const double y0 = static_cast<double>(cell_y) / kGridSize;
-  const double x1 = static_cast<double>(cell_x + 1U) / kGridSize;
-  const double y1 = static_cast<double>(cell_y + 1U) / kGridSize;
-  const double alpha00 = x0 * y0;
-  const double alpha01 = x0 * y1;
-  const double alpha11 = x1 * y1;
-  const double alpha10 = x1 * y0;
-
-  // dEQP's SampleMaskCase uploads each 16x16 cell as two triangles:
-  // (x0,y0)-(x0,y1)-(x1,y1), then (x0,y0)-(x1,y1)-(x1,y0).
-  // The alpha varying is therefore triangle-linear, not a bilinear x*y
-  // surface across the quad.  The strict framebuffer compare lands on these
-  // edge pixels, so mirror the same split instead of evaluating x*y directly.
-  if (u <= v) {
-    return alpha00 + v * (alpha01 - alpha00) +
-           u * (alpha11 - alpha01);
-  }
-  return alpha00 + v * (alpha11 - alpha10) +
-         u * (alpha10 - alpha00);
-}
-
-bool DeqpTextureMultisampleSampleOnePixelVisible(
-    std::uint32_t x, std::uint32_t gl_y, std::uint32_t sample_count,
-    DeqpTextureMultisampleSampleMaskCase mask_case) {
-  constexpr std::uint32_t kGridSize = 16;
-  constexpr std::uint32_t kCanvasSize = 256;
-  constexpr std::uint32_t kCoverageSamples = 4;
-  if (sample_count == 0 || sample_count > kCoverageSamples)
-    return false;
-
-  const std::uint32_t sample_index = sample_count - 1U;
-
-  if (mask_case == DeqpTextureMultisampleSampleMaskCase::kSampleCoverage ||
-      mask_case ==
-          DeqpTextureMultisampleSampleMaskCase::
-              kSampleCoverageAndAlphaToCoverage) {
-    const std::uint32_t grid_x = x / (kCanvasSize / kGridSize);
-    const std::uint32_t grid_y = gl_y / (kCanvasSize / kGridSize);
-    const double sample_coverage =
-        static_cast<double>(grid_y * kGridSize + grid_x) /
-        static_cast<double>(kGridSize * kGridSize);
-    const std::uint32_t enabled_samples =
-        static_cast<std::uint32_t>(sample_coverage * kCoverageSamples);
-    if (enabled_samples <= sample_index)
-      return false;
-  }
-
-  if (mask_case == DeqpTextureMultisampleSampleMaskCase::kAlphaToCoverage ||
-      mask_case ==
-          DeqpTextureMultisampleSampleMaskCase::
-              kSampleCoverageAndAlphaToCoverage) {
-    constexpr std::array<double, 4> kDitherThreshold = {
-        0.125 / kCoverageSamples,
-        0.625 / kCoverageSamples,
-        0.875 / kCoverageSamples,
-        0.375 / kCoverageSamples,
-    };
-    const std::uint32_t dither_index =
-        (x & 1U) | ((gl_y & 1U) << 1U);
-    const double sample_threshold =
-        static_cast<double>(sample_index) /
-            static_cast<double>(kCoverageSamples) +
-        kDitherThreshold[dither_index];
-    if (!(DeqpTextureMultisampleGridAlpha(x, gl_y) > sample_threshold)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
 void ResetOpaqueBlackFramebuffer(std::uint32_t width,
                                  std::uint32_t height,
                                  std::vector<std::uint8_t> *framebuffer) {
@@ -248,114 +103,6 @@ bool LoadDriverFramebufferSnapshot(const Options &options,
   char extra = 0;
   if (input.read(&extra, 1) || input.gcount() != 0) {
     throw std::runtime_error("driver framebuffer snapshot has extra bytes");
-  }
-  return true;
-}
-
-bool BuildDeqpTextureMultisampleSampleMaskFramebuffer(
-    const Options &options, std::uint32_t width, std::uint32_t height,
-    std::vector<std::uint8_t> *framebuffer) {
-  std::uint32_t sample_count = 0;
-  DeqpTextureMultisampleSampleMaskCase mask_case =
-      DeqpTextureMultisampleSampleMaskCase::kNone;
-  if (!ParseDeqpTextureMultisampleSampleMaskCase(options, &sample_count,
-                                                 &mask_case)) {
-    return false;
-  }
-
-  // The captured dEQP group reaches samples_1 and samples_2 as conformant
-  // paths.  Larger advertised sample-count cases are unsupported on this
-  // Gallium profile and stay on the normal clear/skip path.
-  if (sample_count != 1 && sample_count != 2)
-    return false;
-
-  constexpr std::uint32_t kCanvasSize = 256;
-  if (width < kCanvasSize || height < kCanvasSize)
-    throw std::runtime_error(
-        "dEQP texture.multisample framebuffer requires at least 256x256");
-
-  ResetOpaqueBlackFramebuffer(width, height, framebuffer);
-
-  const std::uint32_t output_y0 = height - kCanvasSize;
-  for (std::uint32_t image_y = output_y0; image_y < height; ++image_y) {
-    const std::uint32_t canvas_y_from_top = image_y - output_y0;
-    const std::uint32_t gl_y = kCanvasSize - 1U - canvas_y_from_top;
-    const std::uint32_t storage_y = height - 1U - image_y;
-    for (std::uint32_t x = 0; x < kCanvasSize; ++x) {
-      if (!DeqpTextureMultisampleSampleOnePixelVisible(x, gl_y, sample_count,
-                                                       mask_case))
-        continue;
-      const std::size_t offset =
-          (static_cast<std::size_t>(storage_y) * width + x) * 4U;
-      (*framebuffer)[offset] = 255;
-      (*framebuffer)[offset + 1U] = 0;
-      (*framebuffer)[offset + 2U] = 0;
-      (*framebuffer)[offset + 3U] = 255;
-    }
-  }
-  return true;
-}
-
-bool ParseDeqpTextureMultisampleUseTextureCase(const Options &options) {
-  if (!options.driver_command.enabled ||
-      options.driver_command.command != "draw_primitive_sequence") {
-    return false;
-  }
-
-  constexpr std::string_view kPrefix =
-      "dEQP-GLES31.functional.texture.multisample.samples_";
-  std::string_view test_case = options.driver_command.test_case;
-  if (!HasPrefix(test_case, kPrefix))
-    return false;
-  test_case.remove_prefix(kPrefix.size());
-
-  std::uint32_t sample_count = 0;
-  std::size_t cursor = 0;
-  while (cursor < test_case.size() && test_case[cursor] >= '0' &&
-         test_case[cursor] <= '9') {
-    const std::uint32_t digit =
-        static_cast<std::uint32_t>(test_case[cursor] - '0');
-    if (sample_count >
-        (std::numeric_limits<std::uint32_t>::max() - digit) / 10U) {
-      throw std::runtime_error("dEQP multisample use_texture sample overflow");
-    }
-    sample_count = sample_count * 10U + digit;
-    ++cursor;
-  }
-  if ((sample_count != 1 && sample_count != 2) ||
-      cursor >= test_case.size() || test_case[cursor] != '.') {
-    return false;
-  }
-
-  const std::string_view suffix = test_case.substr(cursor + 1);
-  return HasPrefix(suffix, "use_texture_");
-}
-
-bool BuildDeqpTextureMultisampleUseTextureFramebuffer(
-    const Options &options, std::uint32_t width, std::uint32_t height,
-    std::vector<std::uint8_t> *framebuffer) {
-  if (!ParseDeqpTextureMultisampleUseTextureCase(options))
-    return false;
-
-  constexpr std::uint32_t kTextureSize = 256;
-  if (width < kTextureSize || height < kTextureSize)
-    throw std::runtime_error(
-        "dEQP texture.multisample use_texture framebuffer requires at least "
-        "256x256");
-
-  ResetOpaqueBlackFramebuffer(width, height, framebuffer);
-
-  const std::uint32_t output_y0 = height - kTextureSize;
-  for (std::uint32_t image_y = output_y0; image_y < height; ++image_y) {
-    const std::uint32_t storage_y = height - 1U - image_y;
-    for (std::uint32_t x = 0; x < kTextureSize; ++x) {
-      const std::size_t offset =
-          (static_cast<std::size_t>(storage_y) * width + x) * 4U;
-      (*framebuffer)[offset] = 0;
-      (*framebuffer)[offset + 1U] = 255;
-      (*framebuffer)[offset + 2U] = 0;
-      (*framebuffer)[offset + 3U] = 255;
-    }
   }
   return true;
 }
@@ -1336,15 +1083,45 @@ bool IsDriverIndexedQuadCounterView(const Options &options) {
              FunctionalCase::kDriverIndexedQuad;
 }
 
-bool IsDriverPrimitiveSequenceCounterView(const Options &options) {
-  return options.driver_command.enabled &&
-         options.driver_command.command == "draw_primitive_sequence";
-}
-
 bool IsDriverPcoTrianglesCounterView(const Options &options) {
   return options.driver_command.enabled &&
          (options.driver_command.command == "draw_pco_triangles" ||
           options.driver_command.command == "draw_pco_sequence");
+}
+
+// Compares the counters a driver command carries against what SystemC
+// measured.  Nothing is adopted; the comparison exists so a regression run can
+// enumerate exactly which cases still disagree with the model, which is the
+// list of pipeline features that remain to be implemented.
+void ReportAdoptedCounterDrift(const Options &options,
+                               const CounterTxn &counters) {
+  const DriverCommand &command = options.driver_command;
+  struct Field {
+    const char *name;
+    std::uint64_t claimed;
+    std::uint64_t measured;
+  };
+  const Field fields[] = {
+      {"vs_invocations", command.vs_invocations, counters.vs_invocations},
+      {"gs_invocations", command.gs_invocations, counters.gs_invocations},
+      {"gs_primitives", command.gs_primitives, counters.gs_primitives},
+      {"c_primitives", command.clip_primitives, counters.c_primitives},
+      {"ps_invocations", command.ps_invocations, counters.ps_invocations},
+      {"hs_invocations", command.hs_invocations, counters.hs_invocations},
+      {"ds_invocations", command.ds_invocations, counters.ds_invocations},
+      {"setup_triangles", command.setup_triangles, counters.setup_triangles},
+      {"texel_fetches", command.semantic_texel_fetches, counters.texel_fetches},
+  };
+  for (const Field &field : fields) {
+    if (field.claimed == 0 || field.claimed == field.measured)
+      continue;
+    std::fprintf(stderr,
+                 "pvrgpu-counter-drift case=%s field=%s claimed=%llu "
+                 "measured=%llu\n",
+                 options.test_case.c_str(), field.name,
+                 static_cast<unsigned long long>(field.claimed),
+                 static_cast<unsigned long long>(field.measured));
+  }
 }
 
 void NormalizeDriverPcoTrianglesApiCounters(const Options &options,
@@ -1361,35 +1138,20 @@ void NormalizeDriverPcoTrianglesApiCounters(const Options &options,
       throw std::runtime_error(
           "ordered PCO sequence has no complete API counter metadata");
     }
-    // Input-assembly totals are decided by the draw calls, so the driver
-    // knows them exactly and they are always adopted.
+    // Input-assembly totals are decided by the draw calls themselves, so the
+    // driver knows them exactly and they are adopted.  These are facts about
+    // the submitted geometry, not about what the hardware did with it.
     counters.ia_vertices = command.ia_vertices;
     counters.ia_primitives = command.ia_primitives;
     counters.c_invocations = command.clip_invocations;
     counters.drawlists = command.draw_count;
-    // Vertex shading work depends on post-transform reuse, so an indexed
-    // sequence leaves it unset and keeps what the vertex cache measured.
-    if (command.vs_invocations != 0)
-      counters.vs_invocations = command.vs_invocations;
-    // Everything past clipping depends on rasterization.  A capture profile
-    // may carry the measured totals it recorded, but a sequence that leaves
-    // them unset keeps what SystemC measured from the geometry it rendered.
-    if (command.gs_invocations != 0)
-      counters.gs_invocations = command.gs_invocations;
-    if (command.gs_primitives != 0)
-      counters.gs_primitives = command.gs_primitives;
-    if (command.clip_primitives != 0)
-      counters.c_primitives = command.clip_primitives;
-    if (command.ps_invocations != 0)
-      counters.ps_invocations = command.ps_invocations;
-    if (command.hs_invocations != 0)
-      counters.hs_invocations = command.hs_invocations;
-    if (command.ds_invocations != 0)
-      counters.ds_invocations = command.ds_invocations;
-    if (command.setup_triangles != 0)
-      counters.setup_triangles = command.setup_triangles;
-    if (command.semantic_texel_fetches != 0)
-      counters.texel_fetches = command.semantic_texel_fetches;
+
+    // Everything from vertex shading onwards is what the pipeline actually
+    // did, and only SystemC can know it.  A driver-supplied value is treated
+    // as a cross-check against the measurement, never as a substitute for it:
+    // adopting one would let a capture profile decide the answer without any
+    // rasterization taking place.
+    ReportAdoptedCounterDrift(options, counters);
     return;
   }
   if (command.depth_enable == 0) {
@@ -1456,31 +1218,9 @@ void NormalizeDriverIndexedQuadApiCounters(const Options &options,
   counters.setup_triangles =
       CheckedMul(command.setup_triangles, command.draw_count,
                  "setup_triangles");
-  counters.texel_fetches = command.semantic_texel_fetches;
-}
-
-void NormalizeDriverPrimitiveSequenceApiCounters(const Options &options,
-                                                 CounterTxn &counters) {
-  const DriverCommand &command = options.driver_command;
-  counters.ia_vertices = command.ia_vertices;
-  counters.ia_primitives = command.ia_primitives;
-  counters.vs_invocations = command.vs_invocations;
-  counters.gs_invocations = command.gs_invocations;
-  counters.gs_primitives = command.gs_primitives;
-  counters.c_invocations = command.clip_invocations;
-  counters.c_primitives = command.clip_primitives;
-  counters.ps_invocations = command.ps_invocations;
-  counters.hs_invocations = command.hs_invocations;
-  counters.ds_invocations = command.ds_invocations;
-  counters.drawlists = command.draw_count;
-  counters.setup_triangles = command.setup_triangles;
-  counters.texel_fetches = command.semantic_texel_fetches;
-  counters.vs_alu_instructions = 0;
-  counters.vs_tex_instructions = 0;
-  counters.vs_memory_instructions = 0;
-  counters.fs_alu_instructions = 0;
-  counters.fs_tex_instructions = 0;
-  counters.fs_memory_instructions = 0;
+  // texel_fetches stays at what the texture unit measured.  The driver can
+  // estimate the figure from the sampler state it saw, but an estimate is not
+  // an observation and must not replace one.
 }
 
 std::uint64_t ScaleCounterByInvocations(std::uint64_t value,
@@ -1547,23 +1287,6 @@ void ScaleDriverIndexedQuadShaderCounters(const Options &options,
     copy.fragment.executed_tex_instructions = per_draw_fs_tex;
     copy.fragment.executed_memory_instructions = per_draw_fs_memory;
     drawlists.push_back(copy);
-  }
-}
-
-void PopulateDriverPrimitiveSequenceDrawLists(
-    const Options &options, std::vector<DrawListStats> &drawlists) {
-  const std::uint32_t draw_count = options.driver_command.draw_count;
-  if (draw_count == 0)
-    throw std::runtime_error(
-        "driver primitive sequence requires at least one API drawlist");
-
-  drawlists.clear();
-  drawlists.reserve(draw_count);
-  for (std::uint32_t draw = 0; draw < draw_count; ++draw) {
-    DrawListStats stats;
-    stats.drawlist_index = draw;
-    stats.draw_id = draw;
-    drawlists.push_back(stats);
   }
 }
 
@@ -2271,16 +1994,10 @@ void JsonReporter::Run() {
       if (!options_.output_dir.empty()) {
         artifact_path = FramePath(options_, state.counters.frame);
         std::vector<std::uint8_t> artifact_framebuffer = framebuffer;
-        if (!BuildDeqpTextureMultisampleSampleMaskFramebuffer(
-                options_, state.width, state.height, &artifact_framebuffer)) {
-          if (!BuildDeqpTextureMultisampleUseTextureFramebuffer(
-                  options_, state.width, state.height, &artifact_framebuffer)) {
-            LoadDriverFramebufferSnapshot(options_,
-                                          state.width,
-                                          state.height,
-                                          &artifact_framebuffer);
-          }
-        }
+        LoadDriverFramebufferSnapshot(options_,
+                                      state.width,
+                                      state.height,
+                                      &artifact_framebuffer);
         WriteRgbaPngAtomic(artifact_path, artifact_framebuffer, state.width,
                            state.height);
       }
@@ -2295,9 +2012,6 @@ void JsonReporter::Run() {
       if (IsDriverClearColorApiCounterView(options_)) {
         NormalizeClearOnlyApiCounters(counters);
         emitted_drawlists.clear();
-      } else if (IsDriverPrimitiveSequenceCounterView(options_)) {
-        NormalizeDriverPrimitiveSequenceApiCounters(options_, counters);
-        PopulateDriverPrimitiveSequenceDrawLists(options_, emitted_drawlists);
       } else if (IsDriverIndexedQuadCounterView(options_)) {
         NormalizeDriverIndexedQuadApiCounters(options_, counters);
         ScaleDriverIndexedQuadShaderCounters(options_, counters,

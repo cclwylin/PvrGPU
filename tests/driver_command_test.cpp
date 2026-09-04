@@ -576,6 +576,12 @@ int main() {
           "wrong fragment temporary ABI count was accepted"))
     return failed;
 
+  /*
+   * draw_primitive_sequence used to let a capsule state its own API counters,
+   * which is how case-name profiles reported totals no rasterization had
+   * produced.  The command is gone; a capsule that still carries it must be
+   * rejected rather than silently accepted with those counters.
+   */
   const std::filesystem::path primitives = TempFile("primitives.txt");
   WriteText(primitives,
             "schema=pvrgpu.driver-command.v1\n"
@@ -591,67 +597,16 @@ int main() {
             "ia_vertices=12\n"
             "ia_primitives=12\n"
             "vs_invocations=12\n"
-            "gs_invocations=6\n"
-            "gs_primitives=9\n"
             "clip_invocations=12\n"
             "clip_primitives=12\n"
             "setup_triangles=0\n"
             "ps_invocations=1052\n"
-            "hs_invocations=2\n"
-            "ds_invocations=8\n"
-            "cs_invocations=13\n"
             "semantic_texel_fetches=0\n");
   error.clear();
-  if (int failed =
-          Expect(LoadDriverCommand(primitives.string(), &command, &error),
-                 error))
-    return failed;
-  if (int failed =
-          Expect(command.command == "draw_primitive_sequence" &&
-                     command.draw_count == 3 &&
-                     command.ia_vertices == 12 &&
-                     command.gs_invocations == 6 &&
-                     command.gs_primitives == 9 &&
-                     command.clip_primitives == 12 &&
-                     command.ps_invocations == 1052 &&
-                     command.hs_invocations == 2 &&
-                     command.ds_invocations == 8 &&
-                     command.cs_invocations == 13 &&
-                     command.semantic_texel_fetches == 0,
-                 "wrong primitive sequence metadata"))
-    return failed;
-
-  const std::filesystem::path discard = TempFile("discard.txt");
-  WriteText(discard,
-            "schema=pvrgpu.driver-command.v1\n"
-            "producer=pvrgpu-gallium-driver\n"
-            "command=draw_primitive_sequence\n"
-            "case=dEQP-GLES3.functional.rasterizer_discard.scissor.write_depth_triangle_fan\n"
-            "frame=1\n"
-            "width=512\n"
-            "height=512\n"
-            "format=PIPE_FORMAT_R8G8B8A8_UNORM\n"
-            "clear_color_bits=0,0,0,1065353216\n"
-            "draw_count=1\n"
-            "ia_vertices=6\n"
-            "ia_primitives=4\n"
-            "vs_invocations=6\n"
-            "clip_invocations=0\n"
-            "clip_primitives=0\n"
-            "setup_triangles=0\n"
-            "ps_invocations=0\n"
-            "semantic_texel_fetches=0\n");
-  error.clear();
-  if (int failed =
-          Expect(LoadDriverCommand(discard.string(), &command, &error),
-                 error))
-    return failed;
-  if (int failed =
-          Expect(command.command == "draw_primitive_sequence" &&
-                     command.draw_count == 1 &&
-                     command.clip_invocations == 0 &&
-                     command.ps_invocations == 0,
-                 "wrong discard primitive sequence metadata"))
+  if (int failed = Expect(
+          !LoadDriverCommand(primitives.string(), &command, &error) &&
+              error.find("unsupported driver command") != std::string::npos,
+          "a retired draw_primitive_sequence capsule was accepted"))
     return failed;
 
   const std::filesystem::path bad = TempFile("bad.txt");
@@ -685,7 +640,6 @@ int main() {
   std::filesystem::remove(bad_pco_linkage);
   std::filesystem::remove(bad_pco_abi);
   std::filesystem::remove(primitives);
-  std::filesystem::remove(discard);
   std::filesystem::remove(bad);
   return 0;
 }

@@ -24,7 +24,6 @@ constexpr const char *kDrawIndexedQuadCommand = "draw_indexed_quad";
 constexpr const char *kDrawTexturedTrianglesCommand =
     "draw_textured_triangles";
 constexpr const char *kDrawPcoTrianglesCommand = "draw_pco_triangles";
-constexpr const char *kDrawPrimitiveSequenceCommand = "draw_primitive_sequence";
 constexpr const char *kRgba8Format = "PIPE_FORMAT_R8G8B8A8_UNORM";
 constexpr const char *kRgbx8Format = "PIPE_FORMAT_R8G8B8X8_UNORM";
 constexpr const char *kBgrx8Format = "PIPE_FORMAT_B8G8R8X8_UNORM";
@@ -134,18 +133,6 @@ const std::set<std::string> &DrawPcoTrianglesFields() {
       "fragment_pco_abi", "position_linkage", "viewport_scale_bits",
       "viewport_translate_bits", "raster_state", "sample_mask",
       "color_state", "depth_state",
-  };
-  return fields;
-}
-
-const std::set<std::string> &DrawPrimitiveSequenceFields() {
-  static const std::set<std::string> fields = {
-      "schema",           "producer",        "command",
-      "case",             "frame",           "width",
-      "height",           "format",          "clear_color_bits",
-      "draw_count",       "ia_vertices",     "ia_primitives",
-      "vs_invocations",   "clip_invocations", "clip_primitives",
-      "setup_triangles",  "ps_invocations",  "semantic_texel_fetches",
   };
   return fields;
 }
@@ -341,16 +328,9 @@ bool RequireExactFields(const std::map<std::string, std::string> &fields,
         (entry.first == "raw_index_data_size" ||
          entry.first == "index_size" || entry.first == "index_count" ||
          entry.first == "first_index" || entry.first == "base_vertex");
-    const bool optional_primitive_sequence_counter =
-        command == kDrawPrimitiveSequenceCommand &&
-        (entry.first == "gs_invocations" || entry.first == "gs_primitives" ||
-         entry.first == "hs_invocations" || entry.first == "ds_invocations" ||
-         entry.first == "cs_invocations" ||
-         entry.first == "framebuffer_rgba8_path");
     if (!required.count(entry.first) && !optional_pco_counter &&
         !optional_pco_texture && !optional_pco_linkage &&
-        !optional_pco_index && !optional_pco_render_targets &&
-        !optional_primitive_sequence_counter) {
+        !optional_pco_index && !optional_pco_render_targets) {
       *error = "field is not valid for " + command +
                " driver command: " + entry.first;
       return false;
@@ -472,8 +452,7 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
       parsed.command != kDrawTriangleCommand &&
       parsed.command != kDrawIndexedQuadCommand &&
       parsed.command != kDrawTexturedTrianglesCommand &&
-      parsed.command != kDrawPcoTrianglesCommand &&
-      parsed.command != kDrawPrimitiveSequenceCommand) {
+      parsed.command != kDrawPcoTrianglesCommand) {
     *error = "unsupported driver command: " + parsed.command;
     return false;
   }
@@ -529,9 +508,7 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
                       ? DrawIndexedQuadFields()
                       : parsed.command == kDrawTexturedTrianglesCommand
                             ? DrawTexturedTrianglesFields()
-                            : parsed.command == kDrawPcoTrianglesCommand
-                                  ? DrawPcoTrianglesFields()
-                                  : DrawPrimitiveSequenceFields();
+                            : DrawPcoTrianglesFields();
   if (!RequireExactFields(fields, required, parsed.command, error))
     return false;
 
@@ -936,48 +913,6 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
       return false;
     }
   }
-  if (parsed.command == kDrawPrimitiveSequenceCommand) {
-    if (!ParseU32(fields["draw_count"], &parsed.draw_count) ||
-        parsed.draw_count == 0) {
-      *error = "draw primitive sequence draw_count must be positive";
-      return false;
-    }
-    if (!ParseU32(fields["ia_vertices"], &parsed.ia_vertices) ||
-        !ParseU32(fields["ia_primitives"], &parsed.ia_primitives) ||
-        !ParseU32(fields["vs_invocations"], &parsed.vs_invocations) ||
-        !ParseU32(fields["clip_invocations"], &parsed.clip_invocations) ||
-        !ParseU32(fields["clip_primitives"], &parsed.clip_primitives) ||
-        !ParseU32(fields["setup_triangles"], &parsed.setup_triangles) ||
-        parsed.setup_triangles > parsed.clip_primitives ||
-        !ParseU64(fields["ps_invocations"], &parsed.ps_invocations) ||
-        !ParseU64(fields["semantic_texel_fetches"],
-                  &parsed.semantic_texel_fetches)) {
-      *error =
-          "draw primitive sequence contains invalid semantic counter metadata";
-      return false;
-    }
-    if (!ParseOptionalU32(fields, "gs_invocations", &parsed.gs_invocations,
-                          error) ||
-        !ParseOptionalU32(fields, "gs_primitives", &parsed.gs_primitives,
-                          error) ||
-        !ParseOptionalU32(fields, "hs_invocations", &parsed.hs_invocations,
-                          error) ||
-        !ParseOptionalU32(fields, "ds_invocations", &parsed.ds_invocations,
-                          error) ||
-        !ParseOptionalU32(fields, "cs_invocations", &parsed.cs_invocations,
-                          error)) {
-      return false;
-    }
-    const auto framebuffer_path = fields.find("framebuffer_rgba8_path");
-    if (framebuffer_path != fields.end()) {
-      if (framebuffer_path->second.empty()) {
-        *error = "draw primitive sequence framebuffer_rgba8_path is empty";
-        return false;
-      }
-      parsed.framebuffer_rgba8_path = framebuffer_path->second;
-    }
-  }
-
   *command = parsed;
   return true;
 }

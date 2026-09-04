@@ -21,7 +21,6 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             "pvrgpu_context.h",
             "pvrgpu_counter.c",
             "pvrgpu_counter.h",
-            "pvrgpu_deqp_tessellation_profiles.h",
             "pvrgpu_pco.c",
             "pvrgpu_pco.h",
             "pvrgpu_public.h",
@@ -82,7 +81,6 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
 
         self.assertNotIn("ctx->driver_counter_sequence_command_emitted ||", body)
         self.assertNotIn("ctx->driver_counter_sequence_command_emitted = true;", body)
-        self.assertIn("pvrgpu_case_prefers_draw_counter_sequence()", body)
         self.assertIn("pvrgpu_indexed_quad_lock_draw_count", body)
         self.assertIn("ctx->driver_indexed_quad_command_locked = true;", body)
 
@@ -317,50 +315,8 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("pvrgpu_counter_eventf(\"draw_textured_triangles\"", context)
         self.assertIn("pvrgpu_has_observable_fragment_constants", context)
         self.assertIn("pvrgpu_counter_eventf(\"draw_uniform_triangles\"", context)
-        self.assertIn("pvrgpu_deqp_rasterization_counter_sequence_profile", context)
-        self.assertIn("pvrgpu_glbench_counter_sequence_profile", context)
-        self.assertIn("fill_tex_trilinear_linear_05", context)
-        self.assertIn("UINT64_C(1083136)", context)
-        self.assertIn("model_has_builtin_framebuffer", context)
-        self.assertIn(
-            "pvrgpu_deqp_texture_multisample_counter_sequence_profile", context
-        )
-        self.assertIn("sample_mask_and_alpha_to_coverage", context)
-        self.assertIn("{2, \"sample_mask_only\", UINT64_C(327680)}", context)
-        self.assertIn("sample_position_profiles", context)
-        self.assertIn("pvrgpu_string_has_prefix(suffix, \"use_texture_\")", context)
-        self.assertIn(
-            "pvrgpu_texture_multisample_framebuffer_ready_for_counter_sequence",
-            context,
-        )
-        self.assertIn("pvrgpu_deqp_geometry_shading_counter_sequence_profile", context)
-        self.assertIn("gs_invocations", context)
-        self.assertIn("hs_invocations", context)
-        self.assertIn(
-            "pvrgpu_deqp_gles31_shader_counter_sequence_profile", context
-        )
-        self.assertIn("arrays_of_arrays.es31", context)
-        self.assertIn("multisample_interpolation", context)
-        self.assertIn("sample_variables", context)
-        self.assertIn("pvrgpu_profile_set_repeated_quad_counters", context)
-        self.assertIn(
-            "pvrgpu_deqp_tessellation_counter_sequence_profile", context
-        )
-        self.assertIn("pvrgpu_deqp_tessellation_profiles.h", context)
-        self.assertIn("ds_invocations", context)
-        tessellation_profiles = (
-            DRIVER_ROOT / "pvrgpu_deqp_tessellation_profiles.h"
-        ).read_text(encoding="utf-8")
-        self.assertIn(
-            "dEQP-GLES31.functional.tessellation.common_edge.quads_equal_spacing",
-            tessellation_profiles,
-        )
-        self.assertIn("hs_invocations", tessellation_profiles)
-        self.assertIn("ds_invocations", tessellation_profiles)
-        self.assertIn("dEQP-GLES31.functional.geometry_shading.basic.primitive_id", context)
         self.assertIn("pvrgpu_case_suppresses_draw_commands", context)
         self.assertIn("pvrgpu_counter_eventf(\"draw_suppressed\"", context)
-        self.assertIn("rbo_multisample_4", context)
         self.assertIn("pvrgpu_counter_eventf(\"set_framebuffer_state\"", context)
         self.assertIn("pvrgpu_counter_eventf(\"flush\"", context)
         self.assertIn("pvrgpu_counter_eventf(\"context_destroy_begin\"", context)
@@ -416,17 +372,6 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("PVRGPU_RDC_OUTPUT_HEIGHT", clear)
         self.assertIn("PVRGPU_DRIVER_COUNTER_OUT", counter)
         self.assertIn("pvrgpu.driver-counter.v1", (DRIVER_ROOT / "pvrgpu_counter.h").read_text(encoding="utf-8"))
-        self.assertIn("BuildDeqpTextureMultisampleSampleMaskFramebuffer", reporter)
-        self.assertIn("BuildDeqpTextureMultisampleUseTextureFramebuffer", reporter)
-        self.assertIn("options->test_case = IsRasterFunctionalCase(command_case)", model)
-        self.assertIn("driver_counter_only_primitive_sequence", submitter)
-        self.assertIn(
-            'options.driver_command.command == "draw_primitive_sequence";',
-            reporter,
-        )
-        self.assertIn("sample_index = sample_count - 1U", reporter)
-        self.assertIn("0.125 / kCoverageSamples", reporter)
-        self.assertIn("(*framebuffer)[offset + 1U] = 255", reporter)
         state = (DRIVER_ROOT / "pvrgpu_state.c").read_text(encoding="utf-8")
         state_header = (DRIVER_ROOT / "pvrgpu_state.h").read_text(encoding="utf-8")
         self.assertIn("pvrgpu_create_vs_state", state)
@@ -804,7 +749,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
 
         validator_start = command.index("pvrgpu_cmd_validate_draw_pco_triangles(")
         validator_end = command.index(
-            "pvrgpu_cmd_validate_draw_primitive_sequence", validator_start
+            "pvrgpu_write_draw_pco_triangles_command", validator_start
         )
         validator = command[validator_start:validator_end]
         self.assertIn(
@@ -961,6 +906,64 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("draw_pco_triangles_probe_skip", context)
         self.assertIn("pvrgpu_pco_compile_conditionals", context)
         self.assertIn("pvrgpu_pco_graphics_binary_finish", context)
+
+
+    def test_case_name_counter_profiles_stay_deleted(self) -> None:
+        """The driver must not report counters it did not rasterize.
+
+        Case-name keyed tables used to answer dEQP with baked
+        ps_invocations/setup_triangles/texel_fetches constants, and the
+        draw_primitive_sequence capsule carried them to the model verbatim.
+        Both are gone; the counters they used to supply are now measured by
+        SystemC.  These assertions exist so the shortcut cannot come back
+        unnoticed.
+        """
+        context = (DRIVER_ROOT / "pvrgpu_context.c").read_text(encoding="utf-8")
+        command = (DRIVER_ROOT / "pvrgpu_cmd.c").read_text(encoding="utf-8")
+        command_header = (DRIVER_ROOT / "pvrgpu_cmd.h").read_text(encoding="utf-8")
+
+        for retired in (
+            "pvrgpu_deqp_counter_sequence_profile",
+            "pvrgpu_deqp_primitive_sequence_profile",
+            "pvrgpu_case_prefers_draw_counter_sequence",
+            "pvrgpu_emit_draw_primitive_sequence_command",
+            "pvrgpu_deqp_tessellation_counter_sequence_profile",
+            "pvrgpu_glbench_counter_sequence_profile",
+            "pvrgpu_gfxbench_slice_counter_sequence_profile",
+        ):
+            self.assertNotIn(retired, context, f"{retired} was reintroduced")
+
+        self.assertNotIn("draw_primitive_sequence", command)
+        self.assertNotIn("pvrgpu_draw_primitive_sequence_command", command_header)
+        self.assertFalse(
+            (DRIVER_ROOT / "pvrgpu_deqp_tessellation_profiles.h").exists()
+        )
+
+        # The glmark2 PCO sequences submit real geometry, so their input
+        # assembly totals are summed from the draws they actually emit and the
+        # rasterization results are left for SystemC to measure.
+        self.assertIn("pvrgpu_sequence_input_assembly_totals", context)
+        self.assertNotIn("requested_width == 800u ?", context)
+        for baked in ("command.setup_triangles = 25496;",
+                      "command.setup_triangles = 14349;",
+                      "command.setup_triangles = 108310;",
+                      "command.ia_vertices = 393258;"):
+            self.assertNotIn(baked, context, f"baked counter {baked} is back")
+
+    def test_measured_counters_are_not_adopted_from_the_capsule(self) -> None:
+        """SystemC owns every counter downstream of input assembly."""
+        reporter = (
+            PROJECT_ROOT / "model_stub" / "json_reporter.cpp"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("ReportAdoptedCounterDrift", reporter)
+        for adoption in (
+            "counters.ps_invocations = command.ps_invocations;",
+            "counters.setup_triangles = command.setup_triangles;",
+            "counters.texel_fetches = command.semantic_texel_fetches;",
+            "counters.vs_invocations = command.vs_invocations;",
+        ):
+            self.assertNotIn(adoption, reporter, f"{adoption} was reintroduced")
 
 
 if __name__ == "__main__":
