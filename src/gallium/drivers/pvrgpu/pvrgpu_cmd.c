@@ -858,7 +858,15 @@ pvrgpu_cmd_validate_draw_pco_triangles(
          cmd->varying_output_count > 4 ||
          cmd->fragment_position_count != 4 ||
          cmd->fragment_varying_count != cmd->varying_output_count * 4)) ||
-       ((color_layout) &&
+       /*
+        * A command that states its own layout reports the varying width it
+        * built; the pinned colour profile is pinned to one vec4.
+        */
+       (color_layout && cmd->vertex_attribute_count != 0 &&
+        (cmd->varying_output_count == 0 ||
+         cmd->fragment_position_count != 4 ||
+         cmd->fragment_varying_count != cmd->varying_output_count * 4u)) ||
+       (color_layout && cmd->vertex_attribute_count == 0 &&
         (cmd->varying_output_count != 4 ||
          cmd->fragment_position_count != 4 ||
          cmd->fragment_varying_count != 16)) ||

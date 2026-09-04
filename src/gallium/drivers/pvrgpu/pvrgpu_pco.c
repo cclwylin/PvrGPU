@@ -3552,6 +3552,7 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                                                 mesa_shader_stage expected_stage,
                                                 unsigned render_target_count,
                                                 unsigned attribute_count,
+                                                unsigned varying_slot_count,
                                                 char *error,
                                                 size_t error_size)
 {
@@ -3564,12 +3565,14 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
    uint64_t vertex_inputs = 0;
    for (unsigned attribute = 0; attribute < attribute_count; ++attribute)
       vertex_inputs |= BITFIELD64_BIT(VERT_ATTRIB_GENERIC0 + attribute);
+   uint64_t varying_slots = 0;
+   for (unsigned slot = 0; slot < varying_slot_count; ++slot)
+      varying_slots |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + slot);
    const uint64_t expected_inputs =
-      expected_stage == MESA_SHADER_VERTEX ? vertex_inputs
-                                           : BITFIELD64_BIT(VARYING_SLOT_VAR0);
+      expected_stage == MESA_SHADER_VERTEX ? vertex_inputs : varying_slots;
    const uint64_t expected_outputs =
       expected_stage == MESA_SHADER_VERTEX
-         ? (BITFIELD64_BIT(VARYING_SLOT_POS) | BITFIELD64_BIT(VARYING_SLOT_VAR0))
+         ? (BITFIELD64_BIT(VARYING_SLOT_POS) | varying_slots)
          : 0;
 
    if (nir->info.inputs_read != expected_inputs) {
@@ -3765,6 +3768,49 @@ bool pvrgpu_pco_vertex_attribute_components(const struct nir_shader *vertex_nir,
    return true;
 }
 
+/*
+ * Components of each varying slot the vertex shader passes to the fragment
+ * shader, starting at VARYING_SLOT_VAR0 and packed consecutively.  Returns
+ * the number of slots, or zero when the stages disagree or use a slot the
+ * generic path cannot place.
+ */
+static unsigned pvrgpu_color_primitive_varyings(const nir_shader *vs,
+                                                const nir_shader *fs,
+                                                unsigned *components)
+{
+   if (!vs || !fs || !components)
+      return 0;
+   const uint64_t vs_varyings =
+      vs->info.outputs_written & ~BITFIELD64_BIT(VARYING_SLOT_POS);
+   const uint64_t fs_varyings = fs->info.inputs_read;
+   if (vs_varyings != fs_varyings || vs_varyings == 0)
+      return 0;
+
+   unsigned slots = 0;
+   for (unsigned slot = 0; slot < PVRGPU_PCO_MAX_VARYINGS; ++slot) {
+      if ((vs_varyings & BITFIELD64_BIT(VARYING_SLOT_VAR0 + slot)) == 0)
+         continue;
+      if (slot != slots)
+         return 0; /* Slots must be consecutive from VAR0. */
+      components[slots] = 0;
+      nir_foreach_variable_with_modes (var, fs, nir_var_shader_in) {
+         if (var->data.location != (int)(VARYING_SLOT_VAR0 + slot))
+            continue;
+         if (!glsl_type_is_vector_or_scalar(var->type))
+            return 0;
+         components[slots] = glsl_get_components(var->type);
+      }
+      if (components[slots] == 0 || components[slots] > 4)
+         return 0;
+      ++slots;
+   }
+   /* Every written varying has to be one this loop placed. */
+   uint64_t placed = 0;
+   for (unsigned slot = 0; slot < slots; ++slot)
+      placed |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + slot);
+   return placed == vs_varyings ? slots : 0;
+}
+
 bool pvrgpu_pco_compile_color_triangle(
    struct pvrgpu_pco_compiler *compiler,
    const struct nir_shader *vertex_nir,
@@ -3827,16 +3873,27 @@ bool pvrgpu_pco_compile_color_triangle(
     * aborts the process on a signature it cannot translate, so anything outside
     * the position/color layout has to be rejected before that point.
     */
+   unsigned probe_components[PVRGPU_PCO_MAX_VARYINGS] = {0};
+   const unsigned probe_varyings =
+      pvrgpu_color_primitive_varyings(vs, fs, probe_components);
+   if (probe_varyings == 0) {
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "color primitive varyings are unsupported");
+   }
    if (!pvrgpu_validate_color_primitive_nir(vs,
                                             MESA_SHADER_VERTEX,
                                             render_target_count,
                                             attribute_count,
+                                            probe_varyings,
                                             error,
                                             error_size) ||
        !pvrgpu_validate_color_primitive_nir(fs,
                                             MESA_SHADER_FRAGMENT,
                                             render_target_count,
                                             attribute_count,
+                                            probe_varyings,
                                             error,
                                             error_size)) {
       ralloc_free(compile_mem_ctx);
@@ -3897,27 +3954,51 @@ bool pvrgpu_pco_compile_color_triangle(
          };
    }
    vertex_data.common.vtxins = attribute_count * 4;
+   unsigned varying_components[PVRGPU_PCO_MAX_VARYINGS] = {0};
+   const unsigned varying_slots =
+      pvrgpu_color_primitive_varyings(vs, fs, varying_components);
+   if (varying_slots == 0) {
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "color primitive varyings are unsupported");
+   }
+   unsigned varying_component_total = 0;
+   for (unsigned slot = 0; slot < varying_slots; ++slot)
+      varying_component_total += varying_components[slot];
+
+   /*
+    * Position occupies the first four VTXOUTs; the varyings follow it packed
+    * in slot order.  The fragment stage sees four interpolation coefficients
+    * per component, after its own four for position.
+    */
    vertex_data.vs.varyings[VARYING_SLOT_POS] = (pco_range){
       .start = 0,
       .count = 4,
    };
-   vertex_data.vs.varyings[VARYING_SLOT_VAR0] = (pco_range){
-      .start = 4,
-      .count = 4,
-   };
-   vertex_data.vs.vtxouts = 8;
-   vertex_data.vs.f32_smooth = 4;
-
-   fragment_data.fs.uses.w = true;
    fragment_data.fs.varyings[VARYING_SLOT_POS] = (pco_range){
       .start = 0,
       .count = 4,
    };
-   fragment_data.fs.varyings[VARYING_SLOT_VAR0] = (pco_range){
-      .start = 4,
-      .count = 16,
-   };
-   fragment_data.common.coeffs = 20;
+   unsigned vertex_output = 4;
+   unsigned fragment_coefficient = 4;
+   for (unsigned slot = 0; slot < varying_slots; ++slot) {
+      vertex_data.vs.varyings[VARYING_SLOT_VAR0 + slot] = (pco_range){
+         .start = vertex_output,
+         .count = varying_components[slot],
+      };
+      fragment_data.fs.varyings[VARYING_SLOT_VAR0 + slot] = (pco_range){
+         .start = fragment_coefficient,
+         .count = varying_components[slot] * 4,
+      };
+      vertex_output += varying_components[slot];
+      fragment_coefficient += varying_components[slot] * 4;
+   }
+   vertex_data.vs.vtxouts = vertex_output;
+   vertex_data.vs.f32_smooth = varying_component_total;
+
+   fragment_data.fs.uses.w = true;
+   fragment_data.common.coeffs = fragment_coefficient;
    fragment_data.fs.z_replicate = ~0U;
    fragment_data.fs.rasterization_samples = 1;
    /*
@@ -3995,9 +4076,9 @@ bool pvrgpu_pco_compile_color_triangle(
    out->fragment_position_start = 0;
    out->fragment_position_count = 4;
    out->varying_output_start = 4;
-   out->varying_output_count = 4;
+   out->varying_output_count = varying_component_total;
    out->fragment_varying_start = 4;
-   out->fragment_varying_count = 16;
+   out->fragment_varying_count = varying_component_total * 4;
 
    ralloc_free(compile_mem_ctx);
    return true;

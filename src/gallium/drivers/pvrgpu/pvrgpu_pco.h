@@ -124,6 +124,9 @@ bool pvrgpu_pco_compile_conditionals(struct pvrgpu_pco_compiler *compiler,
 /* Vertex attributes one generically lowered draw can bind. */
 #define PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES 8u
 
+/* Varying slots one generically lowered draw can pass between stages. */
+#define PVRGPU_PCO_MAX_VARYINGS 8u
+
 /* Reports the component width the vertex shader declares for each generic
  * attribute, so the driver can pack them at the width the program reads. */
 bool pvrgpu_pco_vertex_attribute_components(const struct nir_shader *vertex_nir,
