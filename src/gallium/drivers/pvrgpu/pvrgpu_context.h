@@ -15,7 +15,12 @@
  * public SystemC sequence header enforces its own limit; this keeps the
  * driver-side accumulation bounded independently of it.
  */
-#define PVRGPU_ARRAY_PRIMITIVE_SEQUENCE_MAX 64u
+/*
+ * Draws one generic sequence can describe.  dEQP's scissor and fragment-op
+ * groups submit well over sixty draws per frame, and a sequence that fills up
+ * stops describing the workload it was recording.
+ */
+#define PVRGPU_ARRAY_PRIMITIVE_SEQUENCE_MAX 256u
 
 /* Colour attachments one lowered draw can write. */
 #define PVRGPU_MAX_RENDER_TARGETS 4u
@@ -123,6 +128,14 @@ pvrgpu_emit_case_counter_sequence_command(struct pvrgpu_context *ctx);
 
 bool
 pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx);
+
+/*
+ * True once the generic path has lowered geometry this frame.  A framebuffer
+ * blit describes a copy of the result, not the workload that produced it, so
+ * it must not claim the driver command away from a sequence that is recording.
+ */
+bool
+pvrgpu_context_has_recorded_geometry(const struct pvrgpu_context *ctx);
 
 void
 pvrgpu_array_primitive_sequence_reset(struct pvrgpu_context *ctx);

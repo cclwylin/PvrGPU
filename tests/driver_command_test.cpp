@@ -224,6 +224,7 @@ int main() {
       "viewport_scale_bits=1109393408,1106247680,1056964608\n"
       "viewport_translate_bits=1109393408,1106247680,1056964608\n"
       "raster_state=0,2,0,0,0,0,0,1,0,0,1,1,0\n"
+      "scissor_rect=0,0,0,0\n"
       "sample_mask=4294967295\n"
       "color_state=15,0,1\n"
       "depth_state=1,1,3,1065353216,1\n";

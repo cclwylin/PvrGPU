@@ -563,14 +563,14 @@ int main() {
     std::array<pvrgpu_systemc_driver_command, 2> draws = {
         make_sequence_draw(), make_sequence_draw()};
     draws[0].color_attachment_source_command_index = 0;
-    expect_sequence_rejected(draws, "raster/resource state",
+    expect_sequence_rejected(draws, "color_attachment_source",
                              "self-referencing color attachment alias");
   }
   {
     std::array<pvrgpu_systemc_driver_command, 2> draws = {
         make_sequence_draw(), make_sequence_draw()};
     draws[0].depth_attachment_source_command_index = 1;
-    expect_sequence_rejected(draws, "raster/resource state",
+    expect_sequence_rejected(draws, "depth_attachment_source",
                              "future depth attachment alias");
   }
   {
@@ -595,7 +595,7 @@ int main() {
         make_sequence_draw(), make_sequence_draw()};
     draws[0].blend_source_rgb_factor =
         PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ZERO;
-    expect_sequence_rejected(draws, "raster/resource state",
+    expect_sequence_rejected(draws, "unsupported: blend",
                              "noncanonical disabled blend state");
   }
 

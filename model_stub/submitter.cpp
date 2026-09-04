@@ -1555,6 +1555,13 @@ void Submitter::Run() {
                                  : FrontFaceWinding::kCounterClockwise;
       state.raster_state.color_mask =
           static_cast<std::uint8_t>(command.color_mask);
+      state.raster_state.scissor.enable =
+          command.scissor == 0 ? 0U : 1U;
+      state.raster_state.scissor.x0 = command.scissor_x;
+      state.raster_state.scissor.y0 = command.scissor_y;
+      state.raster_state.scissor.x1 = command.scissor_x + command.scissor_width;
+      state.raster_state.scissor.y1 =
+          command.scissor_y + command.scissor_height;
     }
     if (driver_clear_like || driver_triangle || driver_indexed_quad ||
         driver_textured_triangles || driver_pco_triangles) {

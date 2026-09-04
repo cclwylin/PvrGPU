@@ -124,6 +124,9 @@ inline constexpr std::uint64_t kDriverPcoTextureBytes =
 inline constexpr std::uint32_t kDriverPcoDepthFormatZ16Unorm = 268;
 inline constexpr std::uint32_t kDriverPcoDepthFormatZ32Unorm = 270;
 inline constexpr std::uint32_t kDriverPcoDepthFormatZ24X8Unorm = 276;
+// A packed depth-stencil attachment carries the same 24-bit depth as Z24X8;
+// the model has no stencil unit, so the stencil byte is simply not read.
+inline constexpr std::uint32_t kDriverPcoDepthFormatZ24UnormS8Uint = 272;
 inline constexpr std::uint32_t kDriverPcoNewAttachment = UINT32_MAX;
 inline constexpr std::size_t kDriverPcoRefractSequenceCommands = 2;
 inline constexpr std::size_t kDriverPcoRefractSampledTextures = 3;
@@ -253,6 +256,10 @@ struct DriverCommand {
   std::uint32_t fill_front = 0;
   std::uint32_t fill_back = 0;
   std::uint32_t scissor = 0;
+  std::uint32_t scissor_x = 0;
+  std::uint32_t scissor_y = 0;
+  std::uint32_t scissor_width = 0;
+  std::uint32_t scissor_height = 0;
   std::uint32_t rasterizer_discard = 0;
   std::uint32_t multisample = 0;
   std::uint32_t half_pixel_center = 0;

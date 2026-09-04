@@ -3828,45 +3828,55 @@ bool pvrgpu_pco_vertex_attribute_components(const struct nir_shader *vertex_nir,
 
 /*
  * Components of each varying slot the vertex shader passes to the fragment
- * shader, starting at VARYING_SLOT_VAR0 and packed consecutively.  Returns
- * the number of slots, or zero when the stages disagree or use a slot the
- * generic path cannot place.
+ * shader, starting at VARYING_SLOT_VAR0 and packed consecutively.
+ *
+ * Reports the slot count separately from success so that a shader passing no
+ * varyings at all -- a shape coloured from a uniform, which is most of what
+ * the scissor and fragment-op groups draw -- is a valid layout rather than an
+ * unsupported one.  Position still occupies the first four outputs.
  */
-static unsigned pvrgpu_color_primitive_varyings(const nir_shader *vs,
-                                                const nir_shader *fs,
-                                                unsigned *components)
+static bool pvrgpu_color_primitive_varyings(const nir_shader *vs,
+                                            const nir_shader *fs,
+                                            unsigned *components,
+                                            unsigned *out_slots)
 {
-   if (!vs || !fs || !components)
-      return 0;
+   if (!vs || !fs || !components || !out_slots)
+      return false;
+   *out_slots = 0;
    const uint64_t vs_varyings =
       vs->info.outputs_written & ~BITFIELD64_BIT(VARYING_SLOT_POS);
    const uint64_t fs_varyings = fs->info.inputs_read;
-   if (vs_varyings != fs_varyings || vs_varyings == 0)
-      return 0;
+   if (vs_varyings != fs_varyings)
+      return false;
+   if (vs_varyings == 0)
+      return true;
 
    unsigned slots = 0;
    for (unsigned slot = 0; slot < PVRGPU_PCO_MAX_VARYINGS; ++slot) {
       if ((vs_varyings & BITFIELD64_BIT(VARYING_SLOT_VAR0 + slot)) == 0)
          continue;
       if (slot != slots)
-         return 0; /* Slots must be consecutive from VAR0. */
+         return false; /* Slots must be consecutive from VAR0. */
       components[slots] = 0;
       nir_foreach_variable_with_modes (var, fs, nir_var_shader_in) {
          if (var->data.location != (int)(VARYING_SLOT_VAR0 + slot))
             continue;
          if (!glsl_type_is_vector_or_scalar(var->type))
-            return 0;
+            return false;
          components[slots] = glsl_get_components(var->type);
       }
       if (components[slots] == 0 || components[slots] > 4)
-         return 0;
+         return false;
       ++slots;
    }
    /* Every written varying has to be one this loop placed. */
    uint64_t placed = 0;
    for (unsigned slot = 0; slot < slots; ++slot)
       placed |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + slot);
-   return placed == vs_varyings ? slots : 0;
+   if (placed != vs_varyings)
+      return false;
+   *out_slots = slots;
+   return true;
 }
 
 bool pvrgpu_pco_compile_color_triangle(
@@ -3939,9 +3949,9 @@ bool pvrgpu_pco_compile_color_triangle(
     * the position/color layout has to be rejected before that point.
     */
    unsigned probe_components[PVRGPU_PCO_MAX_VARYINGS] = {0};
-   const unsigned probe_varyings =
-      pvrgpu_color_primitive_varyings(vs, fs, probe_components);
-   if (probe_varyings == 0) {
+   unsigned probe_varyings = 0;
+   if (!pvrgpu_color_primitive_varyings(vs, fs, probe_components,
+                                        &probe_varyings)) {
       ralloc_free(compile_mem_ctx);
       return pvrgpu_pco_fail(error,
                              error_size,
@@ -4022,9 +4032,9 @@ bool pvrgpu_pco_compile_color_triangle(
    }
    vertex_data.common.vtxins = attribute_count * 4;
    unsigned varying_components[PVRGPU_PCO_MAX_VARYINGS] = {0};
-   const unsigned varying_slots =
-      pvrgpu_color_primitive_varyings(vs, fs, varying_components);
-   if (varying_slots == 0) {
+   unsigned varying_slots = 0;
+   if (!pvrgpu_color_primitive_varyings(vs, fs, varying_components,
+                                        &varying_slots)) {
       ralloc_free(compile_mem_ctx);
       return pvrgpu_pco_fail(error,
                              error_size,

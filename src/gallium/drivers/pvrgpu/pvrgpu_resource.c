@@ -2091,6 +2091,8 @@ pvrgpu_emit_resource_copy_framebuffer_blit_command(struct pipe_context *pipe,
       return;
 
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   if (pvrgpu_context_has_recorded_geometry(ctx))
+      return;
    if ((ctx && ctx->driver_draw_command_emitted) ||
        pvrgpu_driver_draw_command_has_been_emitted())
       return;
@@ -2199,6 +2201,8 @@ pvrgpu_emit_framebuffer_blit_command(struct pipe_context *pipe,
        pvrgpu_driver_draw_command_has_been_emitted())
       return;
    if (pvrgpu_case_suppresses_driver_commands())
+      return;
+   if (pvrgpu_context_has_recorded_geometry(ctx))
       return;
 
    const char *path = pvrgpu_command_output_path();

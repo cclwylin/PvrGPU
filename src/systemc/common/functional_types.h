@@ -291,10 +291,21 @@ struct FaceCullState {
 // Explicit state keeps HSR (Hidden Surface Removal) legality separate from
 // shader decoding, so discard/depth/sample-mask/blend support can extend the
 // same ISP payload contract instead of replacing it.
+// The scissor rectangle in framebuffer pixels, half-open on the upper bound.
+// A disabled scissor leaves rasterization bounded only by the render target.
+struct ScissorState {
+  std::uint8_t enable = 0;
+  std::uint32_t x0 = 0;
+  std::uint32_t y0 = 0;
+  std::uint32_t x1 = 0;
+  std::uint32_t y1 = 0;
+};
+
 struct RasterState {
   DepthState depth;
   BlendState blend;
   FaceCullState face_cull;
+  ScissorState scissor;
   float clear_color[4] = {0.0F, 0.0F, 0.0F, 1.0F};
   std::uint32_t sample_count = 1;
   std::uint8_t shader_may_discard = 0;

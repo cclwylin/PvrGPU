@@ -9701,6 +9701,12 @@ pvrgpu_array_primitive_draw_destroy(struct pvrgpu_array_primitive_draw **slot)
    *slot = NULL;
 }
 
+bool
+pvrgpu_context_has_recorded_geometry(const struct pvrgpu_context *ctx)
+{
+   return ctx && ctx->array_primitive_draw_count != 0;
+}
+
 void
 pvrgpu_array_primitive_sequence_reset(struct pvrgpu_context *ctx)
 {
@@ -10003,11 +10009,8 @@ pvrgpu_record_color_primitive_pco_draw(
       return false;
    if (ctx->driver_draw_command_emitted ||
        pvrgpu_driver_draw_command_has_been_emitted()) {
-      return false;
-   }
-   if (ctx->array_primitive_draw_count >=
-       PVRGPU_ARRAY_PRIMITIVE_SEQUENCE_MAX) {
-      ctx->array_primitive_sequence_overflow = true;
+      pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                            "stage=own reason=command_already_emitted");
       return false;
    }
    /*
@@ -10015,19 +10018,52 @@ pvrgpu_record_color_primitive_pco_draw(
     * each API draw several times.  The trace reports how many draw actions it
     * actually contains; stop recording there so the sequence describes the
     * workload once instead of once per replay pass.
+    *
+    * This has to be decided before the capacity check below.  A trace with
+    * exactly as many draws as the sequence holds fills it on the first pass,
+    * and the repeats from the second would otherwise be mistaken for a
+    * sequence that ran out of room -- poisoning a recording that was in fact
+    * complete.
     */
    unsigned trace_draw_actions = 0;
    if (pvrgpu_trace_draw_actions(&trace_draw_actions) &&
        ctx->array_primitive_draw_count >= trace_draw_actions) {
       return true;
    }
-
-   if (!ctx->vertex_elements || ctx->vertex_elements->num_elements < 2 ||
-       ctx->num_vertex_buffers == 0 || !ctx->vs || !ctx->fs) {
+   if (ctx->array_primitive_draw_count >=
+       PVRGPU_ARRAY_PRIMITIVE_SEQUENCE_MAX) {
+      ctx->array_primitive_sequence_overflow = true;
+      pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                            "stage=own reason=sequence_full draws=%u",
+                            ctx->array_primitive_draw_count);
       return false;
    }
-   if (pvrgpu_array_primitive_count(info->mode, draw->count) == 0)
+
+   /*
+    * A draw needs somewhere to read positions from, but nothing more: a shape
+    * shaded from a uniform has a single position attribute, and requiring two
+    * left every such draw unlowerable.
+    */
+   if (!ctx->vertex_elements || ctx->vertex_elements->num_elements == 0 ||
+       ctx->num_vertex_buffers == 0 || !ctx->vs || !ctx->fs) {
+      pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                            "stage=state reason=vertex_layout attributes=%u "
+                            "buffers=%u has_vs=%u has_fs=%u",
+                            ctx->vertex_elements ?
+                               ctx->vertex_elements->num_elements : 0,
+                            ctx->num_vertex_buffers,
+                            ctx->vs ? 1u : 0u,
+                            ctx->fs ? 1u : 0u);
       return false;
+   }
+   if (pvrgpu_array_primitive_count(info->mode, draw->count) == 0) {
+      pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                            "stage=state reason=primitive_mode mode=%u "
+                            "count=%u",
+                            info->mode,
+                            draw->count);
+      return false;
+   }
 
    /*
     * An indexed draw forwards its index buffer so the model performs the
@@ -10254,6 +10290,52 @@ pvrgpu_record_color_primitive_pco_draw(
    command.fill_front = ctx->rasterizer ? ctx->rasterizer->state.fill_front : 0;
    command.fill_back = ctx->rasterizer ? ctx->rasterizer->state.fill_back : 0;
    command.scissor = ctx->rasterizer ? ctx->rasterizer->state.scissor : 0;
+   if (command.scissor) {
+      /*
+       * Gallium hands the scissor as an inclusive min/max box already clipped
+       * to the render target.  The capsule states it as an origin and extent,
+       * and an empty box means the draw covers nothing.
+       */
+      /*
+       * GL starts the scissor box at the whole window, so a draw that enables
+       * the test before setting a rectangle scissors to the render target.
+       */
+      if (!ctx->has_scissor) {
+         command.scissor_x = 0;
+         command.scissor_y = 0;
+         command.scissor_width = command.framebuffer_width;
+         command.scissor_height = command.framebuffer_height;
+      } else {
+         const struct pipe_scissor_state *box = &ctx->scissor;
+         const unsigned max_x =
+            MIN2((unsigned)box->maxx, command.framebuffer_width);
+         const unsigned max_y =
+            MIN2((unsigned)box->maxy, command.framebuffer_height);
+         command.scissor_x = MIN2((unsigned)box->minx, max_x);
+         command.scissor_y = MIN2((unsigned)box->miny, max_y);
+         command.scissor_width = max_x - command.scissor_x;
+         command.scissor_height = max_y - command.scissor_y;
+      }
+      if (command.scissor_width == 0 || command.scissor_height == 0) {
+         /*
+          * An empty scissor rejects every fragment.  The capsule states a
+          * non-empty rectangle, so describe the draw as covering nothing by
+          * leaving the test off and letting the geometry cull itself is not
+          * available -- decline instead, and let a later path report it.
+          */
+         pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                               "stage=scissor reason=empty_rectangle "
+                               "box=%d,%d,%d,%d framebuffer=%ux%u",
+                               ctx->scissor.minx, ctx->scissor.miny,
+                               ctx->scissor.maxx, ctx->scissor.maxy,
+                               command.framebuffer_width,
+                               command.framebuffer_height);
+         pvrgpu_pco_graphics_binary_finish(&binary);
+         free(interleaved);
+         free(index_data);
+         return false;
+      }
+   }
    command.rasterizer_discard =
       ctx->rasterizer ? ctx->rasterizer->state.rasterizer_discard : 0;
    command.multisample = ctx->rasterizer ? ctx->rasterizer->state.multisample : 0;
@@ -11035,18 +11117,36 @@ pvrgpu_draw_is_lowerable_array_primitive(
    const struct pipe_draw_info *info,
    const struct pipe_draw_indirect_info *indirect,
    const struct pipe_draw_start_count_bias *draws,
-   unsigned num_draws)
+   unsigned num_draws,
+   const char **reason)
 {
-   if (!ctx || !info || indirect || !draws || num_draws != 1)
+   const char *ignored = NULL;
+   if (!reason)
+      reason = &ignored;
+   *reason = NULL;
+
+   if (!ctx || !info || !draws || num_draws != 1) {
+      *reason = "draw_shape";
       return false;
+   }
+   if (indirect) {
+      *reason = "indirect_draw";
+      return false;
+   }
    /* An indexed draw assembles its primitives from the index buffer. */
    if (info->index_size != 0 &&
-       info->index_size != 1 && info->index_size != 2 && info->index_size != 4)
+       info->index_size != 1 && info->index_size != 2 && info->index_size != 4) {
+      *reason = "index_size";
       return false;
-   if (info->index_size != 0 && info->primitive_restart)
+   }
+   if (info->index_size != 0 && info->primitive_restart) {
+      *reason = "primitive_restart";
       return false;
-   if (pvrgpu_array_primitive_count(info->mode, draws[0].count) == 0)
+   }
+   if (pvrgpu_array_primitive_count(info->mode, draws[0].count) == 0) {
+      *reason = "primitive_mode";
       return false;
+   }
    /*
     * The model widens a line or point to the GLES-guaranteed minimum of one
     * device pixel.  A draw that asks for a wider line or a larger point would
@@ -11055,50 +11155,83 @@ pvrgpu_draw_is_lowerable_array_primitive(
     */
    if (info->mode == MESA_PRIM_LINES || info->mode == MESA_PRIM_LINE_LOOP ||
        info->mode == MESA_PRIM_LINE_STRIP) {
-      if (!ctx->rasterizer || ctx->rasterizer->state.line_width != 1.0f)
+      if (!ctx->rasterizer || ctx->rasterizer->state.line_width != 1.0f) {
+         *reason = "line_width";
          return false;
+      }
    }
    if (info->mode == MESA_PRIM_POINTS) {
       if (!ctx->rasterizer || ctx->rasterizer->state.point_size != 1.0f ||
-          ctx->rasterizer->state.point_size_per_vertex)
+          ctx->rasterizer->state.point_size_per_vertex) {
+         *reason = "point_size";
          return false;
+      }
    }
-   if (!ctx->vs || !ctx->fs || ctx->tcs || ctx->tes || ctx->gs)
+   if (!ctx->vs || !ctx->fs) {
+      *reason = "missing_shader";
       return false;
-   if (!ctx->vertex_elements ||
-       ctx->vertex_elements->num_elements == 0 ||
-       ctx->vertex_elements->num_elements > PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES ||
-       ctx->num_vertex_buffers == 0)
+   }
+   if (ctx->tcs || ctx->tes) {
+      *reason = "tessellation_stage";
       return false;
+   }
+   if (ctx->gs) {
+      *reason = "geometry_stage";
+      return false;
+   }
+   if (!ctx->vertex_elements || ctx->vertex_elements->num_elements == 0 ||
+       ctx->num_vertex_buffers == 0) {
+      *reason = "no_vertex_layout";
+      return false;
+   }
+   if (ctx->vertex_elements->num_elements > PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES) {
+      *reason = "too_many_attributes";
+      return false;
+   }
    /* Fragment textures are bound as combined image/sampler descriptors. */
-   if (ctx->num_sampler_views[MESA_SHADER_VERTEX] != 0 ||
-       ctx->num_sampler_views[MESA_SHADER_FRAGMENT] >
-          PVRGPU_PCO_MAX_TEXTURES)
+   if (ctx->num_sampler_views[MESA_SHADER_VERTEX] != 0) {
+      *reason = "vertex_texture";
       return false;
+   }
+   if (ctx->num_sampler_views[MESA_SHADER_FRAGMENT] > PVRGPU_PCO_MAX_TEXTURES) {
+      *reason = "too_many_textures";
+      return false;
+   }
    for (unsigned texture = 0;
         texture < ctx->num_sampler_views[MESA_SHADER_FRAGMENT]; ++texture) {
       const struct pipe_sampler_view *view =
          ctx->sampler_views[MESA_SHADER_FRAGMENT][texture];
       if (!view || !view->texture ||
           view->texture->target != PIPE_TEXTURE_2D ||
-          !ctx->samplers[MESA_SHADER_FRAGMENT][texture])
+          !ctx->samplers[MESA_SHADER_FRAGMENT][texture]) {
+         *reason = "texture_binding";
          return false;
+      }
    }
    /*
     * One to four colour attachments, every one present and sharing the
     * format the capsule states for the pass.
     */
-   if (ctx->framebuffer.nr_cbufs == 0 ||
-       ctx->framebuffer.nr_cbufs > PVRGPU_MAX_RENDER_TARGETS)
+   if (ctx->framebuffer.nr_cbufs == 0) {
+      *reason = "no_colour_attachment";
       return false;
+   }
+   if (ctx->framebuffer.nr_cbufs > PVRGPU_MAX_RENDER_TARGETS) {
+      *reason = "too_many_render_targets";
+      return false;
+   }
    for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target) {
       if (!ctx->framebuffer.cbufs[target].texture ||
           ctx->framebuffer.cbufs[target].format !=
-             ctx->framebuffer.cbufs[0].format)
+             ctx->framebuffer.cbufs[0].format) {
+         *reason = "mixed_render_targets";
          return false;
+      }
    }
-   if (ctx->framebuffer.width == 0 || ctx->framebuffer.height == 0)
+   if (ctx->framebuffer.width == 0 || ctx->framebuffer.height == 0) {
+      *reason = "empty_framebuffer";
       return false;
+   }
    return true;
 }
 
@@ -12429,8 +12562,10 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
     * shape instead.  Try the real lowering first and let the shape paths
     * handle only what it turns down.
     */
+   const char *lowering_reason = NULL;
    if (pvrgpu_draw_is_lowerable_array_primitive(ctx, info, indirect, draws,
-                                                num_draws)) {
+                                                num_draws,
+                                                &lowering_reason)) {
       ctx->observed_draws++;
       pvrgpu_counter_eventf("draw_array_primitive",
                             "start=%u count=%u mode=%u primitives=%u "
@@ -12695,6 +12830,17 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
     * shape the PCO path can lower for any vertex count, so lower it here
     * instead of rejecting it.
     */
+   pvrgpu_counter_eventf("draw_not_lowerable",
+                         "reason=%s mode=%u count=%u index_size=%u "
+                         "attributes=%u textures=%u nr_cbufs=%u",
+                         lowering_reason ? lowering_reason : "unknown",
+                         info ? info->mode : 0,
+                         draws && num_draws ? draws[0].count : 0,
+                         info ? info->index_size : 0,
+                         ctx->vertex_elements ?
+                            ctx->vertex_elements->num_elements : 0,
+                         ctx->num_sampler_views[MESA_SHADER_FRAGMENT],
+                         ctx->framebuffer.nr_cbufs);
    pvrgpu_note_unsupported_draw(ctx,
                                 info,
                                 indirect,

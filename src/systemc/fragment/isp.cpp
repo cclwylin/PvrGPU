@@ -244,14 +244,29 @@ void Isp::Run() {
           throw std::runtime_error("ISP depth plane metadata is invalid");
         }
 
-        const std::uint32_t y_begin = std::max<std::uint32_t>(
-            tile.y0, static_cast<std::uint32_t>(std::max(0, triangle.min_y)));
-        const std::uint32_t y_end = std::min<std::uint32_t>(
-            tile.y1, static_cast<std::uint32_t>(std::max(0, triangle.max_y)));
-        const std::uint32_t x_begin = std::max<std::uint32_t>(
-            tile.x0, static_cast<std::uint32_t>(std::max(0, triangle.min_x)));
-        const std::uint32_t x_end = std::min<std::uint32_t>(
-            tile.x1, static_cast<std::uint32_t>(std::max(0, triangle.max_x)));
+        // The scissor test rejects a fragment before any other per-fragment
+        // work, so it narrows the span the ISP walks rather than being
+        // evaluated per sample.
+        const ScissorState &scissor = state.raster_state.scissor;
+        const std::uint32_t scissor_x0 = scissor.enable ? scissor.x0 : 0U;
+        const std::uint32_t scissor_y0 = scissor.enable ? scissor.y0 : 0U;
+        const std::uint32_t scissor_x1 =
+            scissor.enable ? scissor.x1 : state.width;
+        const std::uint32_t scissor_y1 =
+            scissor.enable ? scissor.y1 : state.height;
+
+        const std::uint32_t y_begin = std::max({
+            tile.y0, scissor_y0,
+            static_cast<std::uint32_t>(std::max(0, triangle.min_y))});
+        const std::uint32_t y_end = std::min({
+            tile.y1, scissor_y1,
+            static_cast<std::uint32_t>(std::max(0, triangle.max_y))});
+        const std::uint32_t x_begin = std::max({
+            tile.x0, scissor_x0,
+            static_cast<std::uint32_t>(std::max(0, triangle.min_x))});
+        const std::uint32_t x_end = std::min({
+            tile.x1, scissor_x1,
+            static_cast<std::uint32_t>(std::max(0, triangle.max_x))});
         for (std::uint32_t y = y_begin; y < y_end; ++y) {
           for (std::uint32_t x = x_begin; x < x_end; ++x) {
             const std::int64_t sample_x =

@@ -862,9 +862,12 @@ pvrgpu_cmd_validate_draw_pco_triangles(
         * A command that states its own layout reports the varying width it
         * built; the pinned colour profile is pinned to one vec4.
         */
+       /*
+        * A shape shaded from a uniform passes no varyings at all, so zero is
+        * a layout the generic path builds rather than one it failed to.
+        */
        (color_layout && cmd->vertex_attribute_count != 0 &&
-        (cmd->varying_output_count == 0 ||
-         cmd->fragment_position_count != 4 ||
+        (cmd->fragment_position_count != 4 ||
          cmd->fragment_varying_count != cmd->varying_output_count * 4u)) ||
        (color_layout && cmd->vertex_attribute_count == 0 &&
         (cmd->varying_output_count != 4 ||
@@ -937,9 +940,15 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       ideas_layout ?
          ideas_depth_state_matches :
          (color_layout ?
-          ((cmd->depth_enable == 0 && cmd->depth_write == 0) ||
-           (cmd->depth_enable == 1 && cmd->depth_write == 1 &&
-            cmd->depth_func == 3)) :
+          /*
+           * The ISP evaluates every compare op and honours the write mask
+           * independently, so a self-describing command may state any depth
+           * configuration; it just needs an attachment to test against.
+           */
+          (cmd->depth_enable <= 1 && cmd->depth_write <= 1 &&
+           cmd->depth_func <= 7 &&
+           (cmd->depth_write == 0 || cmd->depth_enable == 1) &&
+           (cmd->depth_enable == 0 || cmd->depth_format != 0)) :
           (cmd->depth_enable == 1 && cmd->depth_write == 1 &&
            cmd->depth_func == 3 && cmd->depth_format != 0));
    if (memcmp(cmd->viewport_scale_bits,
@@ -952,21 +961,70 @@ pvrgpu_cmd_validate_draw_pco_triangles(
                        "draw PCO triangles has incompatible viewport state");
       return false;
    }
-   if (cmd->front_ccw != 0 ||
-       ((!ideas_layout && !color_layout && cmd->cull_face != 2) ||
-        ((ideas_layout || color_layout) && cmd->cull_face != 0 &&
-         cmd->cull_face != 2)) ||
-       cmd->fill_front != 0 || cmd->fill_back != 0 || cmd->scissor != 0 ||
-       cmd->rasterizer_discard != 0 || cmd->multisample != 0 ||
-       cmd->half_pixel_center != 1 || cmd->bottom_edge_rule != 0 ||
-       cmd->clip_halfz != 0 || cmd->depth_clip_near != 1 ||
-       cmd->depth_clip_far != 1 || cmd->depth_clamp != 0 ||
-       cmd->sample_mask != UINT32_MAX || cmd->color_mask != 0xf ||
-       cmd->blend_enable != 0 || cmd->dither != 1 ||
-       cmd->depth_clear_bits != UINT32_C(0x3f800000) ||
-       !depth_state_matches) {
+   /*
+    * Name the state that is unsupported rather than the group it belongs to;
+    * "incompatible raster/depth state" gives no way to tell which feature a
+    * capture actually needs.
+    */
+   const char *raster_reason = NULL;
+   if (cmd->front_ccw != 0)
+      raster_reason = "front_ccw";
+   else if ((!ideas_layout && !color_layout && cmd->cull_face != 2) ||
+            ((ideas_layout || color_layout) && cmd->cull_face != 0 &&
+             cmd->cull_face != 2))
+      raster_reason = "cull_face";
+   else if (cmd->fill_front != 0 || cmd->fill_back != 0)
+      raster_reason = "polygon_fill_mode";
+   else if (cmd->rasterizer_discard != 0)
+      raster_reason = "rasterizer_discard";
+   else if (cmd->multisample != 0)
+      raster_reason = "multisample";
+   else if (cmd->half_pixel_center != 1)
+      raster_reason = "half_pixel_center";
+   else if (cmd->bottom_edge_rule != 0)
+      raster_reason = "bottom_edge_rule";
+   else if (cmd->clip_halfz != 0)
+      raster_reason = "clip_halfz";
+   else if (cmd->depth_clip_near != 1 || cmd->depth_clip_far != 1)
+      raster_reason = "depth_clip";
+   else if (cmd->depth_clamp != 0)
+      raster_reason = "depth_clamp";
+   else if (cmd->sample_mask != UINT32_MAX)
+      raster_reason = "sample_mask";
+   else if (cmd->color_mask > 0xf)
+      raster_reason = "color_mask";
+   else if (cmd->blend_enable != 0)
+      raster_reason = "blend";
+   else if (cmd->dither != 1)
+      raster_reason = "dither";
+   else if (cmd->depth_clear_bits != UINT32_C(0x3f800000))
+      raster_reason = "depth_clear_value";
+   else if (!depth_state_matches)
+      raster_reason = "depth_state";
+   if (raster_reason) {
+      if (error && error_size != 0) {
+         snprintf(error, error_size,
+                  "draw PCO triangles has unsupported raster state: %s",
+                  raster_reason);
+      }
+      return false;
+   }
+   if (cmd->scissor != 0) {
+      if (cmd->scissor_width == 0 || cmd->scissor_height == 0 ||
+          (uint64_t)cmd->scissor_x + cmd->scissor_width >
+             cmd->framebuffer_width ||
+          (uint64_t)cmd->scissor_y + cmd->scissor_height >
+             cmd->framebuffer_height) {
+         pvrgpu_cmd_error(error, error_size,
+                          "draw PCO triangles scissor rectangle is not inside "
+                          "the render target");
+         return false;
+      }
+   } else if (cmd->scissor_x != 0 || cmd->scissor_y != 0 ||
+              cmd->scissor_width != 0 || cmd->scissor_height != 0) {
       pvrgpu_cmd_error(error, error_size,
-                       "draw PCO triangles has incompatible raster/depth state");
+                       "draw PCO triangles carries a scissor rectangle with "
+                       "scissor disabled");
       return false;
    }
    return true;
@@ -1344,6 +1402,10 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->fill_front = cmd->fill_front;
    out->fill_back = cmd->fill_back;
    out->scissor = cmd->scissor;
+   out->scissor_x = cmd->scissor_x;
+   out->scissor_y = cmd->scissor_y;
+   out->scissor_width = cmd->scissor_width;
+   out->scissor_height = cmd->scissor_height;
    out->rasterizer_discard = cmd->rasterizer_discard;
    out->multisample = cmd->multisample;
    out->half_pixel_center = cmd->half_pixel_center;
@@ -1523,6 +1585,7 @@ pvrgpu_write_draw_pco_triangles_command(
       "viewport_scale_bits=%u,%u,%u\n"
       "viewport_translate_bits=%u,%u,%u\n"
       "raster_state=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n"
+      "scissor_rect=%u,%u,%u,%u\n"
       "sample_mask=%u\n"
       "color_state=%u,%u,%u\n"
       "depth_state=%u,%u,%u,%u,%u\n",
@@ -1569,6 +1632,10 @@ pvrgpu_write_draw_pco_triangles_command(
       cmd->depth_clip_near,
       cmd->depth_clip_far,
       cmd->depth_clamp,
+      cmd->scissor_x,
+      cmd->scissor_y,
+      cmd->scissor_width,
+      cmd->scissor_height,
       cmd->sample_mask,
       cmd->color_mask,
       cmd->blend_enable,

@@ -38,6 +38,7 @@ std::size_t DepthAttachmentBytesPerPixel(std::uint32_t format) {
   if (format == kDriverPcoDepthFormatZ16Unorm)
     return sizeof(std::uint16_t);
   if (format == kDriverPcoDepthFormatZ24X8Unorm ||
+      format == kDriverPcoDepthFormatZ24UnormS8Uint ||
       format == kDriverPcoDepthFormatZ32Unorm) {
     return sizeof(std::uint32_t);
   }
@@ -51,7 +52,8 @@ std::uint32_t EncodeDepthAttachmentUnorm(float depth,
   const std::uint64_t maximum =
       format == kDriverPcoDepthFormatZ16Unorm
           ? UINT64_C(0xffff)
-          : format == kDriverPcoDepthFormatZ24X8Unorm
+          : (format == kDriverPcoDepthFormatZ24X8Unorm ||
+             format == kDriverPcoDepthFormatZ24UnormS8Uint)
                 ? UINT64_C(0xffffff)
                 : format == kDriverPcoDepthFormatZ32Unorm
                       ? UINT64_C(0xffffffff)
@@ -73,7 +75,8 @@ float DecodeDepthAttachmentUnorm(std::uint32_t encoded,
   const std::uint32_t maximum =
       format == kDriverPcoDepthFormatZ16Unorm
           ? UINT32_C(0xffff)
-          : format == kDriverPcoDepthFormatZ24X8Unorm
+          : (format == kDriverPcoDepthFormatZ24X8Unorm ||
+             format == kDriverPcoDepthFormatZ24UnormS8Uint)
                 ? UINT32_C(0xffffff)
                 : format == kDriverPcoDepthFormatZ32Unorm
                       ? UINT32_MAX

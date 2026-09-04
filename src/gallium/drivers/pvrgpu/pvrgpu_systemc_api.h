@@ -11,7 +11,7 @@ extern "C" {
 
 /* API-v8 expands the by-value sequence-texture mip table from 10 to 15. */
 #define PVRGPU_SYSTEMC_API_VERSION 8u
-#define PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_COMMANDS 64u
+#define PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_COMMANDS 256u
 #define PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_TEXTURES 16u
 #define PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS 15u
 #define PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR UINT32_MAX
@@ -220,6 +220,11 @@ struct pvrgpu_systemc_driver_command {
    uint32_t fill_front;
    uint32_t fill_back;
    uint32_t scissor;
+   /* Scissor rectangle in framebuffer pixels; only read when scissor is set. */
+   uint32_t scissor_x;
+   uint32_t scissor_y;
+   uint32_t scissor_width;
+   uint32_t scissor_height;
    uint32_t rasterizer_discard;
    uint32_t multisample;
    uint32_t half_pixel_center;

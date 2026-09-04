@@ -326,6 +326,10 @@ void CopyPcoPayloadFields(
   destination->fill_front = source.fill_front;
   destination->fill_back = source.fill_back;
   destination->scissor = source.scissor;
+  destination->scissor_x = source.scissor_x;
+  destination->scissor_y = source.scissor_y;
+  destination->scissor_width = source.scissor_width;
+  destination->scissor_height = source.scissor_height;
   destination->rasterizer_discard = source.rasterizer_discard;
   destination->multisample = source.multisample;
   destination->half_pixel_center = source.half_pixel_center;
@@ -723,12 +727,13 @@ bool CopyPcoTrianglePayload(
   const bool common_raster_invalid =
       source.front_ccw != 0 ||
       source.fill_front != 0 || source.fill_back != 0 ||
-      source.scissor != 0 || source.rasterizer_discard != 0 ||
+      source.rasterizer_discard != 0 ||
       source.multisample != 0 || source.half_pixel_center != 1 ||
       source.bottom_edge_rule != 0 || source.clip_halfz != 0 ||
       source.depth_clip_near != 1 || source.depth_clip_far != 1 ||
       source.depth_clamp != 0 || source.sample_mask != UINT32_MAX ||
-      source.color_mask != 0x0f || source.blend_enable != 0 ||
+      // The PBE honours a partial write mask, so any four-bit mask is valid.
+      source.color_mask > 0x0f || source.blend_enable != 0 ||
       source.dither != 1;
   const bool ideas_raster_invalid =
       ideas_sequence &&
@@ -857,7 +862,8 @@ bool CopyPcoSequenceDraw(
       source.vertex_pco_abi.vertex_outputs !=
           source.position_output_count + source.varying_output_count ||
       source.varying_output_start != source.position_output_count ||
-      source.varying_output_count == 0 ||
+      // A shape shaded from a uniform passes no varyings; position still
+      // occupies the first four outputs and coefficients.
       source.varying_output_count >
           pvrgpu::stub::kDriverPcoMaximumVaryingComponents ||
       source.fragment_position_start != 0 ||
@@ -908,7 +914,9 @@ bool CopyPcoSequenceDraw(
       source.depth_format ==
           pvrgpu::stub::kDriverPcoDepthFormatZ32Unorm ||
       source.depth_format ==
-          pvrgpu::stub::kDriverPcoDepthFormatZ24X8Unorm;
+          pvrgpu::stub::kDriverPcoDepthFormatZ24X8Unorm ||
+      source.depth_format ==
+          pvrgpu::stub::kDriverPcoDepthFormatZ24UnormS8Uint;
   const bool color_attachment_source_valid =
       source.color_attachment_source_command_index ==
           PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR ||
@@ -917,31 +925,70 @@ bool CopyPcoSequenceDraw(
       source.depth_attachment_source_command_index ==
           PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR ||
       source.depth_attachment_source_command_index < ordinal;
+  // Name the field that is unsupported: "raster/resource state is invalid"
+  // covers two dozen conditions and gives no way to tell which feature a
+  // capture actually needs.
+  const char *nested_reason = nullptr;
   if (source.sampled_texture_count >
-          2U * pvrgpu::stub::kPcoMaximumTextureDescriptorSets ||
-      source.sampled_texture_bytes ||
-      source.sampled_texture_bytes_size != 0 ||
-      source.sampled_texture_width != 0 ||
-      source.sampled_texture_height != 0 ||
-      source.sampled_texture_row_pitch != 0 ||
-      source.sampled_texture_format ||
-      source.sampled_texture_mip_count != 0 || source.front_ccw > 1 ||
-      source.cull_face > 3 || source.fill_front != 0 ||
-      source.fill_back != 0 || source.scissor != 0 ||
-      source.rasterizer_discard != 0 || source.multisample != 0 ||
-      source.half_pixel_center != 1 || source.bottom_edge_rule != 0 ||
-      source.clip_halfz != 0 || source.depth_clip_near != 1 ||
-      source.depth_clip_far != 1 || source.depth_clamp != 0 ||
-      source.sample_mask != UINT32_MAX || source.color_mask > 0x0f ||
-      source.blend_enable > 1 || !blend_enums_valid ||
-      !disabled_blend_is_canonical || source.dither != 1 ||
-      source.depth_enable > 1 || source.depth_write > 1 ||
-      (source.depth_write != 0 && source.depth_enable == 0) ||
-      source.depth_func > 7 || !std::isfinite(depth_clear) ||
-      depth_clear < 0.0F || depth_clear > 1.0F ||
-      !depth_format_supported || !color_attachment_source_valid ||
-      !depth_attachment_source_valid) {
-    *error = "SystemC API nested PCO sequence raster/resource state is invalid";
+      2U * pvrgpu::stub::kPcoMaximumTextureDescriptorSets)
+    nested_reason = "sampled_texture_count";
+  else if (source.sampled_texture_bytes ||
+           source.sampled_texture_bytes_size != 0 ||
+           source.sampled_texture_width != 0 ||
+           source.sampled_texture_height != 0 ||
+           source.sampled_texture_row_pitch != 0 ||
+           source.sampled_texture_format ||
+           source.sampled_texture_mip_count != 0)
+    nested_reason = "legacy_texture_payload";
+  else if (source.front_ccw > 1)
+    nested_reason = "front_ccw";
+  else if (source.cull_face > 3)
+    nested_reason = "cull_face";
+  else if (source.fill_front != 0 || source.fill_back != 0)
+    nested_reason = "polygon_fill_mode";
+  else if (source.rasterizer_discard != 0)
+    nested_reason = "rasterizer_discard";
+  else if (source.multisample != 0)
+    nested_reason = "multisample";
+  else if (source.half_pixel_center != 1)
+    nested_reason = "half_pixel_center";
+  else if (source.bottom_edge_rule != 0)
+    nested_reason = "bottom_edge_rule";
+  else if (source.clip_halfz != 0)
+    nested_reason = "clip_halfz";
+  else if (source.depth_clip_near != 1 || source.depth_clip_far != 1)
+    nested_reason = "depth_clip";
+  else if (source.depth_clamp != 0)
+    nested_reason = "depth_clamp";
+  else if (source.sample_mask != UINT32_MAX)
+    nested_reason = "sample_mask";
+  else if (source.color_mask > 0x0f)
+    nested_reason = "color_mask";
+  else if (source.blend_enable > 1 || !blend_enums_valid ||
+           !disabled_blend_is_canonical)
+    nested_reason = "blend";
+  else if (source.dither != 1)
+    nested_reason = "dither";
+  else if (source.depth_enable > 1 || source.depth_write > 1 ||
+           (source.depth_write != 0 && source.depth_enable == 0) ||
+           source.depth_func > 7)
+    nested_reason = "depth_test_state";
+  else if (!std::isfinite(depth_clear) || depth_clear < 0.0F ||
+           depth_clear > 1.0F)
+    nested_reason = "depth_clear_value";
+  else if (!depth_format_supported)
+    nested_reason = "depth_format";
+  else if (!color_attachment_source_valid)
+    nested_reason = "color_attachment_source";
+  else if (!depth_attachment_source_valid)
+    nested_reason = "depth_attachment_source";
+  if (nested_reason) {
+    std::ostringstream detail;
+    detail << "SystemC API nested PCO sequence state is unsupported: "
+           << nested_reason;
+    if (std::string_view(nested_reason) == "depth_format")
+      detail << " (" << source.depth_format << ")";
+    *error = detail.str();
     return false;
   }
 

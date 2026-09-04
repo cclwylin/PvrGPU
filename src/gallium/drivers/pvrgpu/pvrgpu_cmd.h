@@ -206,6 +206,10 @@ struct pvrgpu_draw_pco_triangles_command {
    uint32_t fill_front;
    uint32_t fill_back;
    uint32_t scissor;
+   uint32_t scissor_x;
+   uint32_t scissor_y;
+   uint32_t scissor_width;
+   uint32_t scissor_height;
    uint32_t rasterizer_discard;
    uint32_t multisample;
    uint32_t half_pixel_center;

@@ -50,7 +50,8 @@ const std::set<std::string> &KnownFields() {
       "vertex_shared_words", "fragment_shared_count",
       "fragment_shared_words", "vertex_pco_abi", "fragment_pco_abi",
       "position_linkage", "varying_linkage", "viewport_scale_bits",
-      "viewport_translate_bits", "raster_state", "sample_mask",
+      "viewport_translate_bits", "raster_state", "scissor_rect",
+      "sample_mask",
       "color_state", "depth_state",
       "sampled_texture_count", "sampled_texture_bytes_size",
       "sampled_texture_width", "sampled_texture_height",
@@ -131,7 +132,8 @@ const std::set<std::string> &DrawPcoTrianglesFields() {
       "vertex_shared_count", "vertex_shared_words",
       "fragment_shared_count", "fragment_shared_words", "vertex_pco_abi",
       "fragment_pco_abi", "position_linkage", "viewport_scale_bits",
-      "viewport_translate_bits", "raster_state", "sample_mask",
+      "viewport_translate_bits", "raster_state", "scissor_rect",
+      "sample_mask",
       "color_state", "depth_state",
   };
   return fields;
@@ -605,6 +607,7 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     std::array<std::uint32_t, 4> position_linkage{};
     std::array<std::uint32_t, 4> varying_linkage{};
     std::array<std::uint32_t, 13> raster_state{};
+    std::array<std::uint32_t, 4> scissor_rect{};
     std::array<std::uint32_t, 3> color_state{};
     std::array<std::uint32_t, 5> depth_state{};
     if (!ParseU64(fields["raw_vertex_data_size"],
@@ -656,6 +659,7 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         !ParseU32List(fields["viewport_translate_bits"],
                       &parsed.viewport_translate_bits) ||
         !ParseU32List(fields["raster_state"], &raster_state) ||
+        !ParseU32List(fields["scissor_rect"], &scissor_rect) ||
         !ParseU32(fields["sample_mask"], &parsed.sample_mask) ||
         !ParseU32List(fields["color_state"], &color_state) ||
         !ParseU32List(fields["depth_state"], &depth_state)) {
@@ -689,6 +693,28 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     parsed.fill_front = raster_state[2];
     parsed.fill_back = raster_state[3];
     parsed.scissor = raster_state[4];
+    parsed.scissor_x = scissor_rect[0];
+    parsed.scissor_y = scissor_rect[1];
+    parsed.scissor_width = scissor_rect[2];
+    parsed.scissor_height = scissor_rect[3];
+    if (parsed.scissor != 0) {
+      // An enabled scissor must name a non-empty rectangle inside the render
+      // target; the model bounds rasterization by it directly.
+      if (parsed.scissor_width == 0 || parsed.scissor_height == 0 ||
+          static_cast<std::uint64_t>(parsed.scissor_x) + parsed.scissor_width >
+              parsed.framebuffer_width ||
+          static_cast<std::uint64_t>(parsed.scissor_y) + parsed.scissor_height >
+              parsed.framebuffer_height) {
+        *error = "driver command scissor rectangle is not inside the render "
+                 "target";
+        return false;
+      }
+    } else if (parsed.scissor_x != 0 || parsed.scissor_y != 0 ||
+               parsed.scissor_width != 0 || parsed.scissor_height != 0) {
+      *error = "driver command carries a scissor rectangle with scissor "
+               "disabled";
+      return false;
+    }
     parsed.rasterizer_discard = raster_state[5];
     parsed.multisample = raster_state[6];
     parsed.half_pixel_center = raster_state[7];
@@ -763,12 +789,12 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
             parsed.varying_output_count * 4U ||
         parsed.front_ccw > 1 || parsed.cull_face > 3 ||
         parsed.fill_front != 0 || parsed.fill_back != 0 ||
-        parsed.scissor != 0 || parsed.rasterizer_discard != 0 ||
+        parsed.rasterizer_discard != 0 ||
         parsed.multisample != 0 || parsed.half_pixel_center != 1 ||
         parsed.bottom_edge_rule != 0 || parsed.clip_halfz != 0 ||
         parsed.depth_clip_near != 1 || parsed.depth_clip_far != 1 ||
         parsed.depth_clamp != 0 || parsed.sample_mask != UINT32_MAX ||
-        parsed.color_mask != 0x0f || parsed.blend_enable != 0 ||
+        parsed.color_mask > 0x0f || parsed.blend_enable != 0 ||
         parsed.dither != 1 || parsed.depth_enable > 1 ||
         parsed.depth_write > 1 || parsed.depth_func > 7 ||
         parsed.depth_format == 0 ||
