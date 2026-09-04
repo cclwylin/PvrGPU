@@ -80,8 +80,12 @@ ClipVertex ReadClipVertex(const VertexLane &vertex,
         "ClipCull received a vertex without UVSW emit/end-task");
   }
   for (std::size_t component = 0; component < output_count; ++component) {
-    if (!std::isfinite(result.output[component]))
-      throw std::runtime_error("ClipCull received a non-finite clip vertex");
+    if (!std::isfinite(result.output[component])) {
+      throw std::runtime_error(
+          "ClipCull received a non-finite clip vertex: component " +
+          std::to_string(component) + " of " + std::to_string(output_count) +
+          " bits=" + std::to_string(vertex.vertex_output[component]));
+    }
   }
   return result;
 }

@@ -806,23 +806,15 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       cmd->hs_invocations == 0 && cmd->ds_invocations == 0 &&
       cmd->cs_invocations == 0 && cmd->ps_invocations == 0 &&
       cmd->setup_triangles == 0 && cmd->semantic_texel_fetches == 0;
-   const bool ideas_sequence_counters =
-      cmd->draw_count == 180 && cmd->ia_vertices == 3370 &&
-      cmd->ia_primitives == 3010 && cmd->vs_invocations == 3370 &&
-      cmd->gs_invocations == 0 && cmd->gs_primitives == 0 &&
-      cmd->clip_invocations == 3010 && cmd->clip_primitives == 3004 &&
-      cmd->hs_invocations == 0 && cmd->ds_invocations == 0 &&
-      cmd->cs_invocations == 0 &&
-      cmd->ps_invocations ==
-         (cmd->framebuffer_width == 80 ? UINT64_C(1553)
-                                       : UINT64_C(155163)) &&
-      cmd->setup_triangles == 3004 && cmd->semantic_texel_fetches == 0;
-   if ((!ideas_layout && !empty_sequence_counters) ||
-       (ideas_layout && !empty_sequence_counters &&
-        !ideas_sequence_counters)) {
+   /*
+    * A draw that is one member of a sequence states no counters of its own.
+    * The totals belong to the sequence, and only once every member has been
+    * submitted can they be summed -- which is why the ideas profile used to
+    * carry a pinned set here instead.  The bridge derives them now.
+    */
+   if (!empty_sequence_counters) {
       pvrgpu_cmd_error(error, error_size,
-                       "draw PCO triangles has incompatible sequence "
-                       "counter metadata");
+                       "a sequence draw must not state its own counters");
       return false;
    }
 

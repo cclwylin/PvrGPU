@@ -10806,19 +10806,11 @@ pvrgpu_emit_ideas_pco_command(
    command.primitive_mode = observation->primitive_mode;
    command.indexed = 0;
    command.render_target_count = 1;
-   if (ctx->ideas_pco_draws == 0) {
-      command.draw_count = PVRGPU_IDEAS_PCO_DRAW_COUNT;
-      command.ia_vertices = command.vertex_count;
-      command.ia_primitives =
-         pvrgpu_array_primitive_count(command.primitive_mode,
-                                      command.vertex_count);
-      command.clip_invocations = command.ia_primitives;
-      /* Rasterization results are measured; see the sequence emitters. */
-      command.vs_invocations = 0;
-      command.clip_primitives = 0;
-      command.setup_triangles = 0;
-      command.ps_invocations = 0;
-   }
+   /*
+    * Every ideas draw is one member of a 180-draw sequence, so none of them
+    * states a counter: the totals are the sequence's, and the bridge sums
+    * them once every member has arrived.
+    */
    command.vertex_pco = binary->vertex.data;
    command.vertex_pco_size = binary->vertex.size;
    command.fragment_pco = binary->fragment.data;

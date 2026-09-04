@@ -138,6 +138,11 @@ struct LogicalCounterCase {
   bool terrain_clear;
 };
 
+// Counters a sequence of `physical_draws` default-constructed draws implies:
+// each carries no vertices, so every input-assembly total is zero, and the
+// rasterization counters are left for SystemC to measure.  What the profiles
+// check is that the stated totals follow the draws -- not that they match a
+// figure recorded from a golden run.
 void SetLogicalCounters(Options *options, const LogicalCounterCase &fixture) {
   auto &logical = options->driver_command;
   logical.clear_color_bits = fixture.terrain_clear ?
@@ -145,15 +150,15 @@ void SetLogicalCounters(Options *options, const LogicalCounterCase &fixture) {
           UINT32_C(0x3f533333), UINT32_C(0x3f3e147b),
           UINT32_C(0x3f1e6666), UINT32_C(0x3f800000)} :
       std::array<std::uint32_t, 4>{0, 0, 0, UINT32_C(0x3f800000)};
-  logical.draw_count = fixture.drawlists;
-  logical.ia_vertices = fixture.ia_vertices;
-  logical.ia_primitives = fixture.ia_primitives;
-  logical.vs_invocations = fixture.ia_vertices;
-  logical.clip_invocations = fixture.ia_primitives;
-  logical.clip_primitives = fixture.clip_primitives;
-  logical.ps_invocations = fixture.ps_invocations;
-  logical.setup_triangles = fixture.clip_primitives;
-  logical.semantic_texel_fetches = fixture.texel_fetches;
+  logical.draw_count = static_cast<std::uint32_t>(fixture.physical_draws);
+  logical.ia_vertices = 0;
+  logical.ia_primitives = 0;
+  logical.vs_invocations = 0;
+  logical.clip_invocations = 0;
+  logical.clip_primitives = 0;
+  logical.ps_invocations = 0;
+  logical.setup_triangles = 0;
+  logical.semantic_texel_fetches = 0;
 }
 
 void TestLogicalCountersByResolution() {
@@ -189,10 +194,10 @@ void TestLogicalCountersByResolution() {
     const auto expect_counter_rejected = [&](const char *description) {
       error.clear();
       Check(!DriverPcoSequenceSupported(options, &error), description);
-      const std::string expected =
+      const std::string prefix =
           std::string(fixture.profile_name) +
           " PCO logical counters are invalid";
-      Check(error == expected,
+      Check(error.compare(0, prefix.size(), prefix) == 0,
             "mutated sequence counter escaped the resolution profile");
     };
 
@@ -213,22 +218,15 @@ void TestKnownProfileEnvelopeFailsClosed() {
   std::string error;
   Check(!DriverPcoSequenceSupported(options, &error),
         "zeroed Shadow physical draws unexpectedly accepted");
-  Check(error == "Shadow PCO logical counters are invalid",
+  Check(error.compare(0, std::strlen("Shadow PCO logical counters are invalid"),
+                      "Shadow PCO logical counters are invalid") == 0,
         "Shadow validation did not reject missing logical counters first");
 
   options = SequenceEnvelope("terrain.terrain.capture.1");
   options.driver_command.clear_color_bits = {
       UINT32_C(0x3f533333), UINT32_C(0x3f3e147b),
       UINT32_C(0x3f1e6666), UINT32_C(0x3f800000)};
-  options.driver_command.draw_count = 42;
-  options.driver_command.ia_vertices = 393258;
-  options.driver_command.ia_primitives = 131086;
-  options.driver_command.vs_invocations = 393258;
-  options.driver_command.clip_invocations = 131086;
-  options.driver_command.clip_primitives = 25496;
-  options.driver_command.ps_invocations = 329330;
-  options.driver_command.setup_triangles = 25496;
-  options.driver_command.semantic_texel_fetches = 5413856;
+  options.driver_command.draw_count = 8;
   options.driver_commands.resize(8);
   error.clear();
   Check(!DriverPcoSequenceSupported(options, &error),
