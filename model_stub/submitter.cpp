@@ -1589,6 +1589,10 @@ void Submitter::Run() {
           command.point_size_bits == 0
               ? 1.0F
               : FloatFromBits(command.point_size_bits);
+      state.raster_state.point_size_output_start =
+          command.point_size_output_start;
+      state.raster_state.point_size_output_count =
+          command.point_size_output_count;
       // The viewport transform the draw states.  Clip/cull falls back to the
       // whole attachment when the scale is unstated.
       for (std::size_t axis = 0; axis < 3; ++axis) {

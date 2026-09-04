@@ -51,7 +51,7 @@ const std::set<std::string> &KnownFields() {
       "fragment_shared_words", "vertex_pco_abi", "fragment_pco_abi",
       "position_linkage", "varying_linkage", "viewport_scale_bits",
       "viewport_translate_bits", "raster_state", "scissor_rect",
-      "primitive_width", "sample_mask",
+      "primitive_width", "point_size_output", "sample_mask",
       "color_state", "depth_state",
       "sampled_texture_count", "sampled_texture_bytes_size",
       "sampled_texture_width", "sampled_texture_height",
@@ -147,7 +147,7 @@ const std::set<std::string> &DrawPcoTrianglesFields() {
       "fragment_shared_count", "fragment_shared_words", "vertex_pco_abi",
       "fragment_pco_abi", "position_linkage", "viewport_scale_bits",
       "viewport_translate_bits", "raster_state", "scissor_rect",
-      "primitive_width", "sample_mask",
+      "primitive_width", "point_size_output", "sample_mask",
       "color_state", "depth_state",
   };
   return fields;
@@ -623,6 +623,7 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     std::array<std::uint32_t, 13> raster_state{};
     std::array<std::uint32_t, 4> scissor_rect{};
     std::array<std::uint32_t, 2> primitive_width{};
+    std::array<std::uint32_t, 2> point_size_output{};
     std::array<std::uint32_t, 3> color_state{};
     std::array<std::uint32_t, 5> depth_state{};
     if (!ParseU64(fields["raw_vertex_data_size"],
@@ -640,7 +641,7 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         !ParseU32(fields["indexed"], &parsed.indexed) || parsed.indexed > 1 ||
         !ParseOptionalU32(fields, "vertex_attribute_count",
                           &parsed.vertex_attribute_count) ||
-        parsed.vertex_attribute_count > 8 ||
+        parsed.vertex_attribute_count > 16 ||
         !ParseOptionalU32(fields, "render_target_count",
                           &parsed.render_target_count) ||
         parsed.render_target_count == 0 || parsed.render_target_count > 4 ||
@@ -676,6 +677,7 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         !ParseU32List(fields["raster_state"], &raster_state) ||
         !ParseU32List(fields["scissor_rect"], &scissor_rect) ||
         !ParseU32List(fields["primitive_width"], &primitive_width) ||
+        !ParseU32List(fields["point_size_output"], &point_size_output) ||
         !ParseU32(fields["sample_mask"], &parsed.sample_mask) ||
         !ParseU32List(fields["color_state"], &color_state) ||
         !ParseU32List(fields["depth_state"], &depth_state)) {
@@ -715,6 +717,14 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     parsed.scissor_height = scissor_rect[3];
     parsed.line_width_bits = primitive_width[0];
     parsed.point_size_bits = primitive_width[1];
+    parsed.point_size_output_start = point_size_output[0];
+    parsed.point_size_output_count = point_size_output[1];
+    if (parsed.point_size_output_count > 1 ||
+        (parsed.point_size_output_count == 0 &&
+         parsed.point_size_output_start != 0)) {
+      *error = "driver command point size output span is invalid";
+      return false;
+    }
     if (!DriverPrimitiveWidthIsValid(parsed.line_width_bits) ||
         !DriverPrimitiveWidthIsValid(parsed.point_size_bits)) {
       *error = "driver command line width or point size is not a supported "

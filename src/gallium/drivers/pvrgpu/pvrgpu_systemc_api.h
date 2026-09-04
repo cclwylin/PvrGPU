@@ -167,7 +167,7 @@ struct pvrgpu_systemc_driver_command {
    uint32_t render_target_count;
    /* Packed vertex attribute widths; attribute N lands in VTXIN 4 * N. */
    uint32_t vertex_attribute_count;
-   uint32_t vertex_attribute_components[8];
+   uint32_t vertex_attribute_components[16];
    /*
     * Index payload for an indexed draw.  The bridge deep-copies the buffer
     * before returning, exactly as it does for the vertex payload.
@@ -229,6 +229,12 @@ struct pvrgpu_systemc_driver_command {
    /* Line width and point size as IEEE-754 bits; 1.0f when unset. */
    uint32_t line_width_bits;
    uint32_t point_size_bits;
+   /*
+    * Vertex output holding gl_PointSize when the shader sizes each point.
+    * A count of zero means every point uses point_size_bits instead.
+    */
+   uint32_t point_size_output_start;
+   uint32_t point_size_output_count;
    uint32_t rasterizer_discard;
    uint32_t multisample;
    uint32_t half_pixel_center;

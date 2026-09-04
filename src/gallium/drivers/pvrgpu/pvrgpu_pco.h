@@ -44,6 +44,9 @@ struct pvrgpu_pco_owned_binary {
 struct pvrgpu_pco_graphics_binary {
    struct pvrgpu_pco_owned_binary vertex;
    struct pvrgpu_pco_owned_binary fragment;
+   /* Vertex output holding gl_PointSize, when the shader writes one. */
+   uint32_t point_size_output_start;
+   uint32_t point_size_output_count;
    uint32_t position_output_start;
    uint32_t position_output_count;
    uint32_t fragment_position_start;
@@ -122,10 +125,10 @@ bool pvrgpu_pco_compile_conditionals(struct pvrgpu_pco_compiler *compiler,
  * Exports position and smooth color varying (4 scalar components).
  */
 /* Vertex attributes one generically lowered draw can bind. */
-#define PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES 8u
+#define PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES 16u
 
 /* Varying slots one generically lowered draw can pass between stages. */
-#define PVRGPU_PCO_MAX_VARYINGS 8u
+#define PVRGPU_PCO_MAX_VARYINGS 16u
 
 /* Combined image/sampler descriptors one generically lowered draw can bind. */
 #define PVRGPU_PCO_MAX_TEXTURES 8u

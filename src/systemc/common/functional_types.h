@@ -311,6 +311,10 @@ struct RasterState {
   // clip/cull rather than approximated.
   float line_width = 1.0f;
   float point_size = 1.0f;
+  // Vertex output holding gl_PointSize.  A count of zero means every point
+  // rasterizes at point_size instead of sizing itself.
+  std::uint32_t point_size_output_start = 0;
+  std::uint32_t point_size_output_count = 0;
   // Viewport transform applied to normalized device coordinates.  A draw that
   // renders to part of its attachment states a scale and offset that are not
   // half the surface, so clip/cull cannot derive them from the extent.  Zero

@@ -332,6 +332,8 @@ void CopyPcoPayloadFields(
   destination->scissor_height = source.scissor_height;
   destination->line_width_bits = source.line_width_bits;
   destination->point_size_bits = source.point_size_bits;
+  destination->point_size_output_start = source.point_size_output_start;
+  destination->point_size_output_count = source.point_size_output_count;
   destination->rasterizer_discard = source.rasterizer_discard;
   destination->multisample = source.multisample;
   destination->half_pixel_center = source.half_pixel_center;
@@ -885,9 +887,12 @@ bool CopyPcoSequenceDraw(
       source.fragment_pco_abi.vertex_outputs != 0 ||
       source.position_output_start != 0 ||
       source.position_output_count != 4 ||
+      // Position, then gl_PointSize when the shader writes it, then varyings.
       source.vertex_pco_abi.vertex_outputs !=
-          source.position_output_count + source.varying_output_count ||
-      source.varying_output_start != source.position_output_count ||
+          source.position_output_count + source.point_size_output_count +
+              source.varying_output_count ||
+      source.varying_output_start !=
+          source.position_output_count + source.point_size_output_count ||
       // A shape shaded from a uniform passes no varyings; position still
       // occupies the first four outputs and coefficients.
       source.varying_output_count >

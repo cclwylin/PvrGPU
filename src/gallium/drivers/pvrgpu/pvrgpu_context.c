@@ -9304,6 +9304,8 @@ pvrgpu_emit_draw_pco_triangles_command(
                                         &binary.vertex.abi);
    pvrgpu_copy_pco_stage_abi_to_command(&command.fragment_pco_abi,
                                         &binary.fragment.abi);
+   command.point_size_output_start = binary.point_size_output_start;
+   command.point_size_output_count = binary.point_size_output_count;
    command.position_output_start = binary.position_output_start;
    command.position_output_count = binary.position_output_count;
    command.fragment_position_start = binary.fragment_position_start;
@@ -9469,6 +9471,8 @@ pvrgpu_emit_lit_mesh_command(
                                         &binary.vertex.abi);
    pvrgpu_copy_pco_stage_abi_to_command(&command.fragment_pco_abi,
                                         &binary.fragment.abi);
+   command.point_size_output_start = binary.point_size_output_start;
+   command.point_size_output_count = binary.point_size_output_count;
    command.position_output_start = binary.position_output_start;
    command.position_output_count = binary.position_output_count;
    command.fragment_position_start = binary.fragment_position_start;
@@ -10109,12 +10113,12 @@ pvrgpu_record_color_primitive_pco_draw(
       return false;
    }
    if (pvrgpu_array_primitive_count(info->mode, draw->count) == 0) {
-      pvrgpu_counter_eventf("draw_array_primitive_record_error",
-                            "stage=state reason=primitive_mode mode=%u "
-                            "count=%u",
+      /* Too few vertices to complete a primitive: the draw renders nothing. */
+      pvrgpu_counter_eventf("draw_array_primitive_empty",
+                            "mode=%u count=%u",
                             info->mode,
                             draw->count);
-      return false;
+      return true;
    }
 
    /*
@@ -10348,6 +10352,8 @@ pvrgpu_record_color_primitive_pco_draw(
                                         &binary.vertex.abi);
    pvrgpu_copy_pco_stage_abi_to_command(&command.fragment_pco_abi,
                                         &binary.fragment.abi);
+   command.point_size_output_start = binary.point_size_output_start;
+   command.point_size_output_count = binary.point_size_output_count;
    command.position_output_start = binary.position_output_start;
    command.position_output_count = binary.position_output_count;
    command.fragment_position_start = binary.fragment_position_start;
@@ -10665,6 +10671,8 @@ pvrgpu_emit_texture_pco_command(
                                         &binary.vertex.abi);
    pvrgpu_copy_pco_stage_abi_to_command(&command.fragment_pco_abi,
                                         &binary.fragment.abi);
+   command.point_size_output_start = binary.point_size_output_start;
+   command.point_size_output_count = binary.point_size_output_count;
    command.position_output_start = binary.position_output_start;
    command.position_output_count = binary.position_output_count;
    command.fragment_position_start = binary.fragment_position_start;
@@ -11225,7 +11233,22 @@ pvrgpu_draw_is_lowerable_array_primitive(
       *reason = "primitive_restart";
       return false;
    }
-   if (pvrgpu_array_primitive_count(info->mode, draws[0].count) == 0) {
+   /*
+    * A draw with too few vertices to complete a primitive is a no-op in GLES,
+    * not an error: DrawArrays(TRIANGLES, 0, 2) renders nothing.  Accept it
+    * here and let the recorder skip it, rather than reporting the whole
+    * capture as containing a draw the driver could not lower.
+    */
+   switch (info->mode) {
+   case MESA_PRIM_POINTS:
+   case MESA_PRIM_LINES:
+   case MESA_PRIM_LINE_LOOP:
+   case MESA_PRIM_LINE_STRIP:
+   case MESA_PRIM_TRIANGLES:
+   case MESA_PRIM_TRIANGLE_STRIP:
+   case MESA_PRIM_TRIANGLE_FAN:
+      break;
+   default:
       *reason = "primitive_mode";
       return false;
    }
@@ -11252,11 +11275,13 @@ pvrgpu_draw_is_lowerable_array_primitive(
    if (info->mode == MESA_PRIM_POINTS) {
       const float size = ctx->rasterizer ? ctx->rasterizer->state.point_size
                                          : 1.0f;
-      if (ctx->rasterizer && ctx->rasterizer->state.point_size_per_vertex) {
-         *reason = "point_size_per_vertex";
-         return false;
-      }
-      if (!(size >= 1.0f) || !(size <= 1024.0f)) {
+      /*
+       * A shader that writes gl_PointSize sizes each point itself; the capsule
+       * names the vertex output it lands in and the rasterizer reads it per
+       * vertex, so only the fixed size needs to be in range.
+       */
+      if ((!ctx->rasterizer || !ctx->rasterizer->state.point_size_per_vertex) &&
+          (!(size >= 1.0f) || !(size <= 1024.0f))) {
          *reason = "point_size";
          return false;
       }

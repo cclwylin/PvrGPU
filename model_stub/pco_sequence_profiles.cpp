@@ -1138,10 +1138,12 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
       logical.format != kRgba8 || !RootPayloadIsEmpty(logical)) {
     return Reject(error, "generic PCO logical command envelope is invalid");
   }
+  // The viewport may cover part of the attachment; it just has to fit.
   if (logical.framebuffer_width == 0 || logical.framebuffer_height == 0 ||
       logical.framebuffer_width > 4096 || logical.framebuffer_height > 4096 ||
-      logical.width != logical.framebuffer_width ||
-      logical.height != logical.framebuffer_height) {
+      logical.width == 0 || logical.height == 0 ||
+      logical.width > logical.framebuffer_width ||
+      logical.height > logical.framebuffer_height) {
     return Reject(error, "generic PCO sequence render target is invalid");
   }
   if (options.driver_commands.empty()) {
@@ -1155,7 +1157,9 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
         draw.format != kRgba8 || draw.frame != 1 ||
         draw.framebuffer_width != logical.framebuffer_width ||
         draw.framebuffer_height != logical.framebuffer_height ||
-        draw.width != logical.width || draw.height != logical.height) {
+        draw.width != logical.width || draw.height != logical.height ||
+        draw.width > draw.framebuffer_width ||
+        draw.height > draw.framebuffer_height) {
       return Reject(error, "generic PCO sequence draw envelope is invalid");
     }
     // Untextured position/colour layout: float2 position + float4 colour.

@@ -3593,7 +3593,8 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                                                 mesa_shader_stage expected_stage,
                                                 unsigned render_target_count,
                                                 unsigned attribute_count,
-                                                unsigned varying_slot_count,
+                                                uint64_t varying_mask,
+                                                bool writes_point_size,
                                                 unsigned texture_count,
                                                 char *error,
                                                 size_t error_size)
@@ -3607,14 +3608,18 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
    uint64_t vertex_inputs = 0;
    for (unsigned attribute = 0; attribute < attribute_count; ++attribute)
       vertex_inputs |= BITFIELD64_BIT(VERT_ATTRIB_GENERIC0 + attribute);
-   uint64_t varying_slots = 0;
-   for (unsigned slot = 0; slot < varying_slot_count; ++slot)
-      varying_slots |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + slot);
+   /*
+    * Varyings occupy whichever slots the shaders agreed on, not VAR0 upwards:
+    * the placement into registers is this profile's choice, so a shader that
+    * writes VAR3..VAR5 is as lowerable as one that writes VAR0..VAR2.
+    */
+   const uint64_t varying_slots = varying_mask;
    const uint64_t expected_inputs =
       expected_stage == MESA_SHADER_VERTEX ? vertex_inputs : varying_slots;
    const uint64_t expected_outputs =
       expected_stage == MESA_SHADER_VERTEX
-         ? (BITFIELD64_BIT(VARYING_SLOT_POS) | varying_slots)
+         ? (BITFIELD64_BIT(VARYING_SLOT_POS) | varying_slots |
+            (writes_point_size ? BITFIELD64_BIT(VARYING_SLOT_PSIZ) : 0))
          : 0;
 
    if (nir->info.inputs_read != expected_inputs) {
@@ -3819,9 +3824,15 @@ bool pvrgpu_pco_vertex_attribute_components(const struct nir_shader *vertex_nir,
       components[index] = count;
    }
 
+   /*
+    * An application may bind an attribute its shader never reads.  Give the
+    * unread binding a single placeholder component so the packed layout keeps
+    * one entry per bound attribute; the shader ignores it, and the draw stays
+    * lowerable instead of being dropped for a binding nothing consumes.
+    */
    for (unsigned attribute = 0; attribute < attribute_count; ++attribute) {
       if (components[attribute] == 0)
-         return false;
+         components[attribute] = 1;
    }
    return true;
 }
@@ -3838,28 +3849,47 @@ bool pvrgpu_pco_vertex_attribute_components(const struct nir_shader *vertex_nir,
 static bool pvrgpu_color_primitive_varyings(const nir_shader *vs,
                                             const nir_shader *fs,
                                             unsigned *components,
-                                            unsigned *out_slots)
+                                            unsigned *locations,
+                                            unsigned *out_slots,
+                                            uint64_t *out_mask)
 {
-   if (!vs || !fs || !components || !out_slots)
+   if (!vs || !fs || !components || !locations || !out_slots || !out_mask)
       return false;
    *out_slots = 0;
-   const uint64_t vs_varyings =
-      vs->info.outputs_written & ~BITFIELD64_BIT(VARYING_SLOT_POS);
+   *out_mask = 0;
+   /*
+    * gl_PointSize is a vertex output the rasterizer consumes, not a value the
+    * fragment stage interpolates, so it is not part of the varying set the
+    * two stages have to agree on.
+    */
+   const uint64_t vs_varyings = vs->info.outputs_written &
+                                ~BITFIELD64_BIT(VARYING_SLOT_POS) &
+                                ~BITFIELD64_BIT(VARYING_SLOT_PSIZ);
    const uint64_t fs_varyings = fs->info.inputs_read;
    if (vs_varyings != fs_varyings)
       return false;
    if (vs_varyings == 0)
       return true;
 
+   /*
+    * Slots are packed in ascending order rather than required to start at
+    * VAR0 and run consecutively.  Which registers a varying occupies is this
+    * profile's choice, so a shader that writes VAR3..VAR5 is placed at the
+    * first three slots; only the two stages agreeing on the set matters.
+    */
    unsigned slots = 0;
-   for (unsigned slot = 0; slot < PVRGPU_PCO_MAX_VARYINGS; ++slot) {
-      if ((vs_varyings & BITFIELD64_BIT(VARYING_SLOT_VAR0 + slot)) == 0)
+   uint64_t placed = 0;
+   for (unsigned slot = 0; slot < 64; ++slot) {
+      const unsigned location = VARYING_SLOT_VAR0 + slot;
+      if (location >= 64)
+         break;
+      if ((vs_varyings & BITFIELD64_BIT(location)) == 0)
          continue;
-      if (slot != slots)
-         return false; /* Slots must be consecutive from VAR0. */
+      if (slots >= PVRGPU_PCO_MAX_VARYINGS)
+         return false;
       components[slots] = 0;
       nir_foreach_variable_with_modes (var, fs, nir_var_shader_in) {
-         if (var->data.location != (int)(VARYING_SLOT_VAR0 + slot))
+         if (var->data.location != (int)location)
             continue;
          if (!glsl_type_is_vector_or_scalar(var->type))
             return false;
@@ -3867,15 +3897,15 @@ static bool pvrgpu_color_primitive_varyings(const nir_shader *vs,
       }
       if (components[slots] == 0 || components[slots] > 4)
          return false;
+      locations[slots] = location;
+      placed |= BITFIELD64_BIT(location);
       ++slots;
    }
    /* Every written varying has to be one this loop placed. */
-   uint64_t placed = 0;
-   for (unsigned slot = 0; slot < slots; ++slot)
-      placed |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + slot);
    if (placed != vs_varyings)
       return false;
    *out_slots = slots;
+   *out_mask = placed;
    return true;
 }
 
@@ -3949,19 +3979,26 @@ bool pvrgpu_pco_compile_color_triangle(
     * the position/color layout has to be rejected before that point.
     */
    unsigned probe_components[PVRGPU_PCO_MAX_VARYINGS] = {0};
+   unsigned probe_locations[PVRGPU_PCO_MAX_VARYINGS] = {0};
    unsigned probe_varyings = 0;
+   uint64_t probe_varying_mask = 0;
    if (!pvrgpu_color_primitive_varyings(vs, fs, probe_components,
-                                        &probe_varyings)) {
+                                        probe_locations, &probe_varyings,
+                                        &probe_varying_mask)) {
       ralloc_free(compile_mem_ctx);
       return pvrgpu_pco_fail(error,
                              error_size,
                              "color primitive varyings are unsupported");
    }
+   const bool probe_writes_point_size =
+      topology_uses_point_size &&
+      (vs->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_PSIZ)) != 0;
    if (!pvrgpu_validate_color_primitive_nir(vs,
                                             MESA_SHADER_VERTEX,
                                             render_target_count,
                                             attribute_count,
-                                            probe_varyings,
+                                            probe_varying_mask,
+                                            probe_writes_point_size,
                                             expected_stage_textures_vs,
                                             error,
                                             error_size) ||
@@ -3969,7 +4006,8 @@ bool pvrgpu_pco_compile_color_triangle(
                                             MESA_SHADER_FRAGMENT,
                                             render_target_count,
                                             attribute_count,
-                                            probe_varyings,
+                                            probe_varying_mask,
+                                            false,
                                             texture_count,
                                             error,
                                             error_size)) {
@@ -4032,9 +4070,12 @@ bool pvrgpu_pco_compile_color_triangle(
    }
    vertex_data.common.vtxins = attribute_count * 4;
    unsigned varying_components[PVRGPU_PCO_MAX_VARYINGS] = {0};
+   unsigned varying_locations[PVRGPU_PCO_MAX_VARYINGS] = {0};
    unsigned varying_slots = 0;
+   uint64_t varying_mask = 0;
    if (!pvrgpu_color_primitive_varyings(vs, fs, varying_components,
-                                        &varying_slots)) {
+                                        varying_locations, &varying_slots,
+                                        &varying_mask)) {
       ralloc_free(compile_mem_ctx);
       return pvrgpu_pco_fail(error,
                              error_size,
@@ -4059,12 +4100,31 @@ bool pvrgpu_pco_compile_color_triangle(
    };
    unsigned vertex_output = 4;
    unsigned fragment_coefficient = 4;
+   /*
+    * A point draw whose shader sizes each point writes gl_PointSize; give it
+    * the output immediately after position so the capsule can name one index
+    * and the rasterizer can read it per vertex.
+    */
+   const bool writes_point_size =
+      topology_uses_point_size &&
+      (vs->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_PSIZ)) != 0;
+   if (writes_point_size) {
+      vertex_data.vs.varyings[VARYING_SLOT_PSIZ] = (pco_range){
+         .start = vertex_output,
+         .count = 1,
+      };
+      out->point_size_output_start = vertex_output;
+      out->point_size_output_count = 1;
+      vertex_output += 1;
+   }
    for (unsigned slot = 0; slot < varying_slots; ++slot) {
-      vertex_data.vs.varyings[VARYING_SLOT_VAR0 + slot] = (pco_range){
+      /* Keyed by the slot the shaders actually use, packed in that order. */
+      const unsigned location = varying_locations[slot];
+      vertex_data.vs.varyings[location] = (pco_range){
          .start = vertex_output,
          .count = varying_components[slot],
       };
-      fragment_data.fs.varyings[VARYING_SLOT_VAR0 + slot] = (pco_range){
+      fragment_data.fs.varyings[location] = (pco_range){
          .start = fragment_coefficient,
          .count = varying_components[slot] * 4,
       };
@@ -4204,11 +4264,12 @@ bool pvrgpu_pco_compile_color_triangle(
       return false;
    }
 
+   /* Position, then gl_PointSize when the shader writes it, then varyings. */
    out->position_output_start = 0;
    out->position_output_count = 4;
    out->fragment_position_start = 0;
    out->fragment_position_count = 4;
-   out->varying_output_start = 4;
+   out->varying_output_start = 4 + out->point_size_output_count;
    out->varying_output_count = varying_component_total;
    out->fragment_varying_start = 4;
    out->fragment_varying_count = varying_component_total * 4;

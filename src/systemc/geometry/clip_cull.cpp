@@ -435,6 +435,26 @@ struct ViewportTransform {
   float offset_z;
 };
 
+// Size a point rasterizes at.  A shader that writes gl_PointSize sizes each
+// point itself, and the capsule names the vertex output it lands in; otherwise
+// every point is the fixed size the draw stated.
+float PointSizeFor(const pvrgpu::stub::PipelineState &state,
+                   const ClipVertex &vertex) {
+  const pvrgpu::stub::RasterState &raster = state.raster_state;
+  if (raster.point_size_output_count == 0)
+    return raster.point_size;
+  if (raster.point_size_output_start >= vertex.output_count) {
+    throw std::runtime_error(
+        "ClipCull point size output is outside the vertex output span");
+  }
+  const float size = vertex.output[raster.point_size_output_start];
+  if (!std::isfinite(size) || size < 1.0F || size > 1024.0F) {
+    throw std::runtime_error(
+        "ClipCull per-vertex point size is outside the supported range");
+  }
+  return size;
+}
+
 ViewportTransform ResolveViewport(const pvrgpu::stub::PipelineState &state) {
   const float half_width = static_cast<float>(state.width) * 0.5F;
   const float half_height = static_cast<float>(state.height) * 0.5F;
@@ -890,7 +910,7 @@ void ClipCull::Run() {
           const bool width_expanded =
               (source_is_point &&
                BuildPointQuadCorners(vertices[0],
-                                     0.5F * state.raster_state.point_size,
+                                     0.5F * PointSizeFor(state, vertices[0]),
                                      state.width, state.height,
                                      quad_corners)) ||
               (source_is_line &&

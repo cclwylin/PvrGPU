@@ -100,10 +100,9 @@ inline constexpr std::uint32_t kDriverPcoPositionVertexStride = 12;
 inline constexpr std::uint32_t kDriverPcoPositionNormalVertexStride = 24;
 inline constexpr std::uint32_t kDriverPcoPositionNormalTexcoordVertexStride =
     32;
-// One public PCO command may link several vec4 coefficient slots.  Sixteen is
-// deliberately below both the 64-dword VTXOUT bank (after four position
-// dwords) and the public coefficient-bank bound, while covering Ideas' 10
-// scalar smooth-varying components.
+// Smooth-varying components one command may link.  Bounded by the 64-dword
+// VTXOUT bank, which position and gl_PointSize take five of; the rest are
+// available to varyings.
 inline constexpr std::uint32_t kDriverPcoMaximumVaryingComponents = 16;
 inline constexpr std::size_t kDriverPcoIdeasSequenceCommands = 180;
 inline constexpr std::size_t kDriverPcoIdeasDepthEnabledFirstCommand = 162;
@@ -249,7 +248,7 @@ struct DriverCommand {
   std::uint32_t render_target_count = 1;
   // Packed vertex attribute widths; attribute N lands in VTXIN 4 * N.
   std::uint32_t vertex_attribute_count = 0;
-  std::array<std::uint32_t, 8> vertex_attribute_components{};
+  std::array<std::uint32_t, 16> vertex_attribute_components{};
   // Index payload for an indexed draw; empty for a non-indexed one.
   std::vector<std::uint8_t> raw_index_data;
   std::uint64_t declared_raw_index_data_size = 0;
@@ -282,6 +281,8 @@ struct DriverCommand {
   std::uint32_t scissor_height = 0;
   std::uint32_t line_width_bits = 0x3f800000U;
   std::uint32_t point_size_bits = 0x3f800000U;
+  std::uint32_t point_size_output_start = 0;
+  std::uint32_t point_size_output_count = 0;
   std::uint32_t rasterizer_discard = 0;
   std::uint32_t multisample = 0;
   std::uint32_t half_pixel_center = 0;

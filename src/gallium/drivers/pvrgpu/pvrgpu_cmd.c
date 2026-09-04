@@ -708,7 +708,7 @@ pvrgpu_cmd_validate_draw_pco_triangles(
     * profiles do not, and are matched on their stride instead; when the
     * widths are stated they must account for exactly the stride packed.
     */
-   if (cmd->vertex_attribute_count > 8) {
+   if (cmd->vertex_attribute_count > 16) {
       pvrgpu_cmd_error(error, error_size,
                        "draw PCO triangles vertex attribute count is "
                        "unsupported");
@@ -888,10 +888,16 @@ pvrgpu_cmd_validate_draw_pco_triangles(
        cmd->fragment_pco_abi.entry_offset != 0 ||
        cmd->position_output_start != 0 ||
        cmd->position_output_count != 4 ||
+       /*
+        * Position occupies the first outputs, gl_PointSize the next one when
+        * the shader sizes its points, and the varyings follow.
+        */
        cmd->vertex_pco_abi.vertex_outputs !=
-          cmd->position_output_count + cmd->varying_output_count ||
+          cmd->position_output_count + cmd->point_size_output_count +
+             cmd->varying_output_count ||
        (cmd->varying_output_count != 0 &&
-        cmd->varying_output_start != cmd->position_output_count) ||
+        cmd->varying_output_start !=
+           cmd->position_output_count + cmd->point_size_output_count) ||
        cmd->fragment_position_start != 0 ||
        (cmd->fragment_varying_count != 0 &&
         cmd->fragment_varying_start != cmd->fragment_position_count) ||
@@ -965,7 +971,7 @@ pvrgpu_cmd_validate_draw_pco_triangles(
                "draw PCO triangles has incompatible PCO ABI metadata: "
                "vs_outputs=%u (pos=%u+var=%u) vs_shared=%u "
                "fs_coeffs=%u (pos=%u+var=%u) fs_shared=%u "
-               "vs_temps=%u fs_temps=%u lit_mesh=%d cond=%d",
+               "vs_temps=%u fs_temps=%u psize=%u@%u lit_mesh=%d cond=%d",
                cmd->vertex_pco_abi.vertex_outputs,
                cmd->position_output_count, cmd->varying_output_count,
                cmd->vertex_pco_abi.shareds,
@@ -973,6 +979,7 @@ pvrgpu_cmd_validate_draw_pco_triangles(
                cmd->fragment_position_count, cmd->fragment_varying_count,
                cmd->fragment_pco_abi.shareds,
                cmd->vertex_pco_abi.temps, cmd->fragment_pco_abi.temps,
+               cmd->point_size_output_count, cmd->point_size_output_start,
                lit_mesh_layout ? 1 : 0, conditionals_layout ? 1 : 0);
       return false;
    }
@@ -1064,6 +1071,18 @@ pvrgpu_cmd_validate_draw_pco_triangles(
                   "draw PCO triangles has unsupported raster state: %s",
                   raster_reason);
       }
+      return false;
+   }
+   if (cmd->point_size_output_count > 1 ||
+       (cmd->point_size_output_count == 0 &&
+        cmd->point_size_output_start != 0) ||
+       (cmd->point_size_output_count != 0 &&
+        (cmd->point_size_output_start < cmd->position_output_count ||
+         cmd->point_size_output_start + cmd->point_size_output_count >
+            cmd->vertex_pco_abi.vertex_outputs))) {
+      pvrgpu_cmd_error(error, error_size,
+                       "draw PCO triangles point size output is not inside "
+                       "the vertex output span");
       return false;
    }
    if (!pvrgpu_cmd_primitive_width_is_valid(cmd->line_width_bits) ||
@@ -1472,6 +1491,8 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->scissor_height = cmd->scissor_height;
    out->line_width_bits = cmd->line_width_bits;
    out->point_size_bits = cmd->point_size_bits;
+   out->point_size_output_start = cmd->point_size_output_start;
+   out->point_size_output_count = cmd->point_size_output_count;
    out->rasterizer_discard = cmd->rasterizer_discard;
    out->multisample = cmd->multisample;
    out->half_pixel_center = cmd->half_pixel_center;
@@ -1653,6 +1674,7 @@ pvrgpu_write_draw_pco_triangles_command(
       "raster_state=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n"
       "scissor_rect=%u,%u,%u,%u\n"
       "primitive_width=%u,%u\n"
+      "point_size_output=%u,%u\n"
       "sample_mask=%u\n"
       "color_state=%u,%u,%u\n"
       "depth_state=%u,%u,%u,%u,%u\n",
@@ -1705,6 +1727,8 @@ pvrgpu_write_draw_pco_triangles_command(
       cmd->scissor_height,
       cmd->line_width_bits,
       cmd->point_size_bits,
+      cmd->point_size_output_start,
+      cmd->point_size_output_count,
       cmd->sample_mask,
       cmd->color_mask,
       cmd->blend_enable,
