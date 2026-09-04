@@ -756,7 +756,9 @@ bool CopyPcoTrianglePayload(
       source.front_ccw != 0 ||
       source.fill_front != 0 || source.fill_back != 0 ||
       source.rasterizer_discard != 0 ||
-      source.multisample != 0 || source.half_pixel_center != 1 ||
+      // GL_MULTISAMPLE on a single-sample attachment rasterizes as
+      // single-sample; a multi-sampled attachment never reaches here.
+      source.multisample > 1 || source.half_pixel_center != 1 ||
       source.bottom_edge_rule != 0 || source.clip_halfz != 0 ||
       source.depth_clip_near != 1 || source.depth_clip_far != 1 ||
       source.depth_clamp != 0 || source.sample_mask != UINT32_MAX ||
@@ -997,7 +999,7 @@ bool CopyPcoSequenceDraw(
     nested_reason = "polygon_fill_mode";
   else if (source.rasterizer_discard != 0)
     nested_reason = "rasterizer_discard";
-  else if (source.multisample != 0)
+  else if (source.multisample > 1)
     nested_reason = "multisample";
   else if (source.half_pixel_center != 1)
     nested_reason = "half_pixel_center";

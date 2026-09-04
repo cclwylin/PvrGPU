@@ -1098,7 +1098,7 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       raster_reason = "polygon_fill_mode";
    else if (cmd->rasterizer_discard != 0)
       raster_reason = "rasterizer_discard";
-   else if (cmd->multisample != 0)
+   else if (cmd->multisample > 1)
       raster_reason = "multisample";
    else if (cmd->half_pixel_center != 1)
       raster_reason = "half_pixel_center";

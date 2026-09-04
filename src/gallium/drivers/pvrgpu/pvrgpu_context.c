@@ -11617,6 +11617,23 @@ pvrgpu_draw_is_lowerable_array_primitive(
          *reason = "mixed_render_targets";
          return false;
       }
+      /*
+       * GL_MULTISAMPLE on a single-sample attachment rasterizes exactly as
+       * single-sample does, so the flag alone is no reason to decline a draw.
+       * A genuinely multi-sampled attachment needs per-sample coverage the
+       * model does not rasterize, and stays declined by name.
+       */
+      if (ctx->framebuffer.cbufs[target].texture->nr_samples > 1 ||
+          ctx->framebuffer.cbufs[target].texture->nr_storage_samples > 1) {
+         *reason = "multisample_attachment";
+         return false;
+      }
+   }
+   if (ctx->framebuffer.zsbuf.texture &&
+       (ctx->framebuffer.zsbuf.texture->nr_samples > 1 ||
+        ctx->framebuffer.zsbuf.texture->nr_storage_samples > 1)) {
+      *reason = "multisample_depth_attachment";
+      return false;
    }
    if (ctx->framebuffer.width == 0 || ctx->framebuffer.height == 0) {
       *reason = "empty_framebuffer";

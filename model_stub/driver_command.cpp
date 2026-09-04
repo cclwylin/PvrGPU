@@ -824,7 +824,7 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         parsed.front_ccw > 1 || parsed.cull_face > 3 ||
         parsed.fill_front != 0 || parsed.fill_back != 0 ||
         parsed.rasterizer_discard != 0 ||
-        parsed.multisample != 0 || parsed.half_pixel_center != 1 ||
+        parsed.multisample > 1 || parsed.half_pixel_center != 1 ||
         parsed.bottom_edge_rule != 0 || parsed.clip_halfz != 0 ||
         parsed.depth_clip_near != 1 || parsed.depth_clip_far != 1 ||
         parsed.depth_clamp != 0 || parsed.sample_mask != UINT32_MAX ||
