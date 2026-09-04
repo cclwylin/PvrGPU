@@ -839,7 +839,14 @@ pvrgpu_cmd_validate_draw_pco_triangles(
        cmd->vertex_pco_abi.shareds > 64 ||
        cmd->vertex_pco_abi.coefficients != 0 ||
        cmd->vertex_pco_abi.push_constant_start != 0 ||
-       cmd->vertex_pco_abi.push_constant_count !=
+       /*
+        * Shared registers hold texture descriptors first and push constants
+        * after, so the two are only equal for a stage that samples nothing.
+        * What has to hold either way is that the push-constant window lies
+        * inside the shared span.
+        */
+       (uint64_t)cmd->vertex_pco_abi.push_constant_start +
+             cmd->vertex_pco_abi.push_constant_count >
           cmd->vertex_pco_abi.shareds ||
        cmd->vertex_pco_abi.entry_offset != 0 ||
        (!ideas_position_layout && !color_layout &&
@@ -906,7 +913,10 @@ pvrgpu_cmd_validate_draw_pco_triangles(
          cmd->fragment_varying_start != 4 ||
          cmd->fragment_varying_count != 40 ||
          cmd->fragment_pco_abi.coefficients != 44)) ||
-       ((!texture_layout) &&
+       (uint64_t)cmd->fragment_pco_abi.push_constant_start +
+             cmd->fragment_pco_abi.push_constant_count >
+          cmd->fragment_pco_abi.shareds ||
+       ((!texture_layout && !color_layout) &&
         cmd->fragment_pco_abi.push_constant_count !=
            cmd->fragment_pco_abi.shareds) ||
        (texture_layout &&

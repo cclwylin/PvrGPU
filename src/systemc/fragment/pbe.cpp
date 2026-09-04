@@ -209,16 +209,30 @@ void Pbe::Run() {
     for (std::size_t index = 0; index < outputs.size(); ++index) {
       const FragmentInvocation &invocation = invocations[index];
       const FragmentOutput &output = outputs[index];
-      if (output.x != invocation.x || output.y != invocation.y ||
-          output.primitive_id != invocation.primitive_id ||
-          output.parameter_index != invocation.parameter_index ||
-          output.submit_ordinal != invocation.submit_ordinal ||
-          output.render_target_count != render_target_count) {
-        throw std::runtime_error("PBE lost fragment identity or PIXOUT lanes");
+      // Name the property that broke: fragment identity and PIXOUT lane
+      // coverage are different failures with different causes.
+      const char *identity_reason = nullptr;
+      if (output.x != invocation.x || output.y != invocation.y)
+        identity_reason = "coordinate";
+      else if (output.primitive_id != invocation.primitive_id)
+        identity_reason = "primitive_id";
+      else if (output.parameter_index != invocation.parameter_index)
+        identity_reason = "parameter_index";
+      else if (output.submit_ordinal != invocation.submit_ordinal)
+        identity_reason = "submit_ordinal";
+      else if (output.render_target_count != render_target_count)
+        identity_reason = "render_target_count";
+      if (identity_reason) {
+        throw std::runtime_error(std::string("PBE lost fragment identity: ") +
+                                 identity_reason);
       }
       for (std::uint32_t target = 0; target < render_target_count; ++target) {
-        if (output.written_mask[target] != 0x0f)
-          throw std::runtime_error("PBE lost fragment identity or PIXOUT lanes");
+        if (output.written_mask[target] != 0x0f) {
+          throw std::runtime_error(
+              "PBE fragment did not write every PIXOUT lane of target " +
+              std::to_string(target) + ": mask 0x" +
+              std::to_string(output.written_mask[target]));
+        }
       }
       if (output.x >= state.width || output.y >= state.height)
         throw std::runtime_error("PBE fragment coordinate is out of bounds");

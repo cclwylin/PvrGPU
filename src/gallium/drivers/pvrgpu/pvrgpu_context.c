@@ -10008,23 +10008,35 @@ pvrgpu_stage_uniform_dwords(const struct pvrgpu_context *ctx,
 static bool
 pvrgpu_copy_stage_uniform_words(const struct pvrgpu_context *ctx,
                                 mesa_shader_stage stage,
-                                unsigned dwords,
+                                const struct pvrgpu_pco_stage_abi *abi,
                                 uint32_t *words)
 {
-   if (dwords == 0)
+   /*
+    * Shared registers hold the texture descriptors first and the stage's push
+    * constants after them, so only the push-constant window is filled from the
+    * constant buffer.  Copying the whole shared span asked for uniform data a
+    * shader that samples a texture but declares none does not have, which made
+    * every textured draw without uniforms unlowerable.
+    */
+   if (!abi || !words)
+      return false;
+   if (abi->push_constant_count == 0)
       return true;
+   if ((uint64_t)abi->push_constant_start + abi->push_constant_count >
+       abi->shareds)
+      return false;
+
    size_t available = 0;
    const uint8_t *bytes =
       pvrgpu_constant_buffer_bytes(ctx, stage, 0, &available);
-   if (!bytes || !words)
+   if (!bytes)
       return false;
-   for (unsigned word = 0; word < dwords; ++word) {
+   for (unsigned word = 0; word < abi->push_constant_count; ++word) {
       const size_t offset = (size_t)word * sizeof(uint32_t);
-      if (offset + sizeof(uint32_t) > available) {
-         words[word] = 0;
-         continue;
-      }
-      memcpy(&words[word], bytes + offset, sizeof(words[word]));
+      uint32_t value = 0;
+      if (offset + sizeof(uint32_t) <= available)
+         memcpy(&value, bytes + offset, sizeof(value));
+      words[abi->push_constant_start + word] = value;
    }
    return true;
 }
@@ -10042,8 +10054,11 @@ pvrgpu_record_color_primitive_pco_draw(
    const struct pipe_draw_start_count_bias *draw)
 {
    const char *path = pvrgpu_command_output_path();
-   if (!path || !ctx || !info || !draw)
+   if (!path || !ctx || !info || !draw) {
+      pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                            "stage=entry reason=no_output_path");
       return false;
+   }
    if (ctx->driver_draw_command_emitted ||
        pvrgpu_driver_draw_command_has_been_emitted()) {
       pvrgpu_counter_eventf("draw_array_primitive_record_error",
@@ -10123,8 +10138,14 @@ pvrgpu_record_color_primitive_pco_draw(
       uint32_t max_index = 0;
       index_data =
          pvrgpu_copy_draw_indices(info, draw, assembled_count, &max_index);
-      if (!index_data)
+      if (!index_data) {
+         pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                               "stage=indices reason=index_copy count=%u "
+                               "index_size=%u",
+                               assembled_count,
+                               info->index_size);
          return false;
+      }
       index_data_size = (size_t)assembled_count * info->index_size;
       if (max_index == UINT32_MAX ||
           draw->index_bias < 0 ||
@@ -10167,6 +10188,11 @@ pvrgpu_record_color_primitive_pco_draw(
    }
    if (packed_floats == 0 ||
        vertex_count > UINT_MAX / (packed_floats * sizeof(float))) {
+      pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                            "stage=pack reason=vertex_extent floats=%u "
+                            "vertices=%u",
+                            packed_floats,
+                            vertex_count);
       free(index_data);
       return false;
    }
@@ -10296,12 +10322,18 @@ pvrgpu_record_color_primitive_pco_draw(
        fragment_shared_count > PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS ||
        !pvrgpu_copy_stage_uniform_words(ctx,
                                         MESA_SHADER_VERTEX,
-                                        vertex_shared_count,
+                                        &binary.vertex.abi,
                                         vertex_uniform_words) ||
        !pvrgpu_copy_stage_uniform_words(ctx,
                                         MESA_SHADER_FRAGMENT,
-                                        fragment_shared_count,
+                                        &binary.fragment.abi,
                                         fragment_uniform_words)) {
+      pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                            "stage=uniforms reason=shared_transport "
+                            "vs_shared=%u fs_shared=%u limit=%u",
+                            vertex_shared_count,
+                            fragment_shared_count,
+                            PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS);
       pvrgpu_pco_graphics_binary_finish(&binary);
       free(interleaved);
       free(index_data);
