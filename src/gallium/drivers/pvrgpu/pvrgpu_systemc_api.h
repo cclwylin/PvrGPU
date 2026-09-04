@@ -226,6 +226,9 @@ struct pvrgpu_systemc_driver_command {
    uint32_t scissor_y;
    uint32_t scissor_width;
    uint32_t scissor_height;
+   /* Line width and point size as IEEE-754 bits; 1.0f when unset. */
+   uint32_t line_width_bits;
+   uint32_t point_size_bits;
    uint32_t rasterizer_discard;
    uint32_t multisample;
    uint32_t half_pixel_center;

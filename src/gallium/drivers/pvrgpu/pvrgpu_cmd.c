@@ -9,6 +9,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -55,6 +56,19 @@ pvrgpu_cmd_error(char *error, size_t error_size, const char *message)
    if (!error || error_size == 0)
       return;
    snprintf(error, error_size, "%s", message ? message : "unknown error");
+}
+
+/*
+ * A line width or point size the model can widen to: finite, at least one
+ * device pixel, and bounded so the expanded quad stays inside the surface
+ * arithmetic that clip/cull performs.
+ */
+static bool
+pvrgpu_cmd_primitive_width_is_valid(uint32_t bits)
+{
+   float width = 0.0f;
+   memcpy(&width, &bits, sizeof(width));
+   return isfinite(width) && width >= 1.0f && width <= 1024.0f;
 }
 
 static bool
@@ -1009,6 +1023,13 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       }
       return false;
    }
+   if (!pvrgpu_cmd_primitive_width_is_valid(cmd->line_width_bits) ||
+       !pvrgpu_cmd_primitive_width_is_valid(cmd->point_size_bits)) {
+      pvrgpu_cmd_error(error, error_size,
+                       "draw PCO triangles line width or point size is not a "
+                       "supported positive value");
+      return false;
+   }
    if (cmd->scissor != 0) {
       if (cmd->scissor_width == 0 || cmd->scissor_height == 0 ||
           (uint64_t)cmd->scissor_x + cmd->scissor_width >
@@ -1406,6 +1427,8 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->scissor_y = cmd->scissor_y;
    out->scissor_width = cmd->scissor_width;
    out->scissor_height = cmd->scissor_height;
+   out->line_width_bits = cmd->line_width_bits;
+   out->point_size_bits = cmd->point_size_bits;
    out->rasterizer_discard = cmd->rasterizer_discard;
    out->multisample = cmd->multisample;
    out->half_pixel_center = cmd->half_pixel_center;
@@ -1586,6 +1609,7 @@ pvrgpu_write_draw_pco_triangles_command(
       "viewport_translate_bits=%u,%u,%u\n"
       "raster_state=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n"
       "scissor_rect=%u,%u,%u,%u\n"
+      "primitive_width=%u,%u\n"
       "sample_mask=%u\n"
       "color_state=%u,%u,%u\n"
       "depth_state=%u,%u,%u,%u,%u\n",
@@ -1636,6 +1660,8 @@ pvrgpu_write_draw_pco_triangles_command(
       cmd->scissor_y,
       cmd->scissor_width,
       cmd->scissor_height,
+      cmd->line_width_bits,
+      cmd->point_size_bits,
       cmd->sample_mask,
       cmd->color_mask,
       cmd->blend_enable,

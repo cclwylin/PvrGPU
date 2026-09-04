@@ -7026,6 +7026,9 @@ pvrgpu_init_refract_systemc_texture(
 static unsigned
 pvrgpu_array_primitive_count(unsigned mode, unsigned count);
 
+static unsigned
+pvrgpu_array_assembled_vertex_count(unsigned mode, unsigned count);
+
 /*
  * Sum the input-assembly totals a PCO sequence actually submits.
  *
@@ -9552,18 +9555,41 @@ pvrgpu_array_primitive_count(unsigned mode, unsigned count)
    case MESA_PRIM_POINTS:
       return count;
    case MESA_PRIM_LINES:
-      return count >= 2 && count % 2 == 0 ? count / 2 : 0;
+      /*
+       * GLES assembles as many complete primitives as the vertices allow and
+       * ignores the remainder, so an odd count draws one fewer line rather
+       * than nothing at all.
+       */
+      return count / 2;
    case MESA_PRIM_LINE_LOOP:
       return count >= 2 ? count : 0;
    case MESA_PRIM_LINE_STRIP:
       return count >= 2 ? count - 1 : 0;
    case MESA_PRIM_TRIANGLES:
-      return count >= 3 && count % 3 == 0 ? count / 3 : 0;
+      return count / 3;
    case MESA_PRIM_TRIANGLE_STRIP:
    case MESA_PRIM_TRIANGLE_FAN:
       return count >= 3 ? count - 2 : 0;
    default:
       return 0;
+   }
+}
+
+/*
+ * Vertices that form complete primitives, which is what the capsule carries.
+ * A list topology drops the leftover vertices GLES ignores; the others
+ * consume every vertex they were given.
+ */
+static unsigned
+pvrgpu_array_assembled_vertex_count(unsigned mode, unsigned count)
+{
+   switch (mode) {
+   case MESA_PRIM_LINES:
+      return (count / 2) * 2;
+   case MESA_PRIM_TRIANGLES:
+      return (count / 3) * 3;
+   default:
+      return count;
    }
 }
 
@@ -9911,18 +9937,20 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
 static uint8_t *
 pvrgpu_copy_draw_indices(const struct pipe_draw_info *info,
                          const struct pipe_draw_start_count_bias *draw,
+                         unsigned index_count,
                          uint32_t *out_max_index)
 {
-   if (!info || !draw || info->index_size == 0 || !out_max_index)
+   if (!info || !draw || info->index_size == 0 || index_count == 0 ||
+       !out_max_index)
       return NULL;
 
-   const size_t bytes = (size_t)draw->count * info->index_size;
+   const size_t bytes = (size_t)index_count * info->index_size;
    uint8_t *indices = malloc(bytes);
    if (!indices)
       return NULL;
 
    uint32_t max_index = 0;
-   for (unsigned i = 0; i < draw->count; ++i) {
+   for (unsigned i = 0; i < index_count; ++i) {
       uint32_t index = 0;
       if (!pvrgpu_read_draw_index(info, draw->start, i, &index)) {
          free(indices);
@@ -10073,14 +10101,22 @@ pvrgpu_record_color_primitive_pco_draw(
     */
    uint8_t *index_data = NULL;
    size_t index_data_size = 0;
-   unsigned vertex_count = draw->count;
+   /*
+    * A list topology assembles from complete primitives only, so the capsule
+    * describes exactly those vertices; the leftovers GLES ignores never reach
+    * the model.
+    */
+   const unsigned assembled_count =
+      pvrgpu_array_assembled_vertex_count(info->mode, draw->count);
+   unsigned vertex_count = assembled_count;
    unsigned vertex_bias = 0;
    if (info->index_size != 0) {
       uint32_t max_index = 0;
-      index_data = pvrgpu_copy_draw_indices(info, draw, &max_index);
+      index_data =
+         pvrgpu_copy_draw_indices(info, draw, assembled_count, &max_index);
       if (!index_data)
          return false;
-      index_data_size = (size_t)draw->count * info->index_size;
+      index_data_size = (size_t)assembled_count * info->index_size;
       if (max_index == UINT32_MAX ||
           draw->index_bias < 0 ||
           (uint64_t)max_index + 1u + (uint64_t)draw->index_bias > UINT_MAX) {
@@ -10236,7 +10272,7 @@ pvrgpu_record_color_primitive_pco_draw(
    command.raw_index_data = index_data;
    command.raw_index_data_size = index_data_size;
    command.index_size = info->index_size;
-   command.index_count = info->index_size != 0 ? draw->count : 0u;
+   command.index_count = info->index_size != 0 ? assembled_count : 0u;
    command.first_index = 0;
    command.base_vertex = 0;
    command.vertex_pco = binary.vertex.data;
@@ -10289,6 +10325,19 @@ pvrgpu_record_color_primitive_pco_draw(
    command.cull_face = ctx->rasterizer ? ctx->rasterizer->state.cull_face : 0;
    command.fill_front = ctx->rasterizer ? ctx->rasterizer->state.fill_front : 0;
    command.fill_back = ctx->rasterizer ? ctx->rasterizer->state.fill_back : 0;
+   /*
+    * The model widens a line or point into real screen-space geometry, so the
+    * width it should use travels with the draw.  GLES guarantees 1.0 and that
+    * is what an unset rasterizer means.
+    */
+   {
+      const float line_width =
+         ctx->rasterizer ? ctx->rasterizer->state.line_width : 1.0f;
+      const float point_size =
+         ctx->rasterizer ? ctx->rasterizer->state.point_size : 1.0f;
+      memcpy(&command.line_width_bits, &line_width, sizeof(line_width));
+      memcpy(&command.point_size_bits, &point_size, sizeof(point_size));
+   }
    command.scissor = ctx->rasterizer ? ctx->rasterizer->state.scissor : 0;
    if (command.scissor) {
       /*
@@ -11153,16 +11202,28 @@ pvrgpu_draw_is_lowerable_array_primitive(
     * be rasterized at the wrong size, so leave it fail-closed until the width
     * is carried through the capsule.
     */
+   /*
+    * The capsule states the line width and point size, so any fixed width the
+    * model can widen to is lowerable.  A per-vertex point size comes from the
+    * shader instead and still is not.
+    */
    if (info->mode == MESA_PRIM_LINES || info->mode == MESA_PRIM_LINE_LOOP ||
        info->mode == MESA_PRIM_LINE_STRIP) {
-      if (!ctx->rasterizer || ctx->rasterizer->state.line_width != 1.0f) {
+      const float width = ctx->rasterizer ? ctx->rasterizer->state.line_width
+                                          : 1.0f;
+      if (!(width >= 1.0f) || !(width <= 1024.0f)) {
          *reason = "line_width";
          return false;
       }
    }
    if (info->mode == MESA_PRIM_POINTS) {
-      if (!ctx->rasterizer || ctx->rasterizer->state.point_size != 1.0f ||
-          ctx->rasterizer->state.point_size_per_vertex) {
+      const float size = ctx->rasterizer ? ctx->rasterizer->state.point_size
+                                         : 1.0f;
+      if (ctx->rasterizer && ctx->rasterizer->state.point_size_per_vertex) {
+         *reason = "point_size_per_vertex";
+         return false;
+      }
+      if (!(size >= 1.0f) || !(size <= 1024.0f)) {
          *reason = "point_size";
          return false;
       }

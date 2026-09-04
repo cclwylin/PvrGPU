@@ -1580,6 +1580,8 @@ void Submitter::Run() {
       state.raster_state.scissor.x1 = command.scissor_x + command.scissor_width;
       state.raster_state.scissor.y1 =
           command.scissor_y + command.scissor_height;
+      state.raster_state.line_width = FloatFromBits(command.line_width_bits);
+      state.raster_state.point_size = FloatFromBits(command.point_size_bits);
     }
     if (driver_clear_like || driver_triangle || driver_indexed_quad ||
         driver_textured_triangles || driver_pco_triangles) {

@@ -330,6 +330,8 @@ void CopyPcoPayloadFields(
   destination->scissor_y = source.scissor_y;
   destination->scissor_width = source.scissor_width;
   destination->scissor_height = source.scissor_height;
+  destination->line_width_bits = source.line_width_bits;
+  destination->point_size_bits = source.point_size_bits;
   destination->rasterizer_discard = source.rasterizer_discard;
   destination->multisample = source.multisample;
   destination->half_pixel_center = source.half_pixel_center;

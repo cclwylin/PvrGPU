@@ -306,6 +306,11 @@ struct RasterState {
   BlendState blend;
   FaceCullState face_cull;
   ScissorState scissor;
+  // Width a line or point rasterizes at, in device pixels.  GLES guarantees
+  // 1.0; anything wider is widened into real screen-space geometry by
+  // clip/cull rather than approximated.
+  float line_width = 1.0f;
+  float point_size = 1.0f;
   float clear_color[4] = {0.0F, 0.0F, 0.0F, 1.0F};
   std::uint32_t sample_count = 1;
   std::uint8_t shader_may_discard = 0;

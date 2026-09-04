@@ -51,7 +51,7 @@ const std::set<std::string> &KnownFields() {
       "fragment_shared_words", "vertex_pco_abi", "fragment_pco_abi",
       "position_linkage", "varying_linkage", "viewport_scale_bits",
       "viewport_translate_bits", "raster_state", "scissor_rect",
-      "sample_mask",
+      "primitive_width", "sample_mask",
       "color_state", "depth_state",
       "sampled_texture_count", "sampled_texture_bytes_size",
       "sampled_texture_width", "sampled_texture_height",
@@ -65,6 +65,16 @@ const std::set<std::string> &KnownFields() {
       "framebuffer_rgba8_path",
   };
   return fields;
+}
+
+// A line width or point size the model can widen to: finite, at least one
+// device pixel, and bounded so the expanded quad stays inside the surface
+// arithmetic clip/cull performs.
+bool DriverPrimitiveWidthIsValid(std::uint32_t bits) {
+  float width = 0.0F;
+  static_assert(sizeof(width) == sizeof(bits));
+  std::memcpy(&width, &bits, sizeof(width));
+  return std::isfinite(width) && width >= 1.0F && width <= 1024.0F;
 }
 
 const std::set<std::string> &BaseFields() {
@@ -133,7 +143,7 @@ const std::set<std::string> &DrawPcoTrianglesFields() {
       "fragment_shared_count", "fragment_shared_words", "vertex_pco_abi",
       "fragment_pco_abi", "position_linkage", "viewport_scale_bits",
       "viewport_translate_bits", "raster_state", "scissor_rect",
-      "sample_mask",
+      "primitive_width", "sample_mask",
       "color_state", "depth_state",
   };
   return fields;
@@ -608,6 +618,7 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     std::array<std::uint32_t, 4> varying_linkage{};
     std::array<std::uint32_t, 13> raster_state{};
     std::array<std::uint32_t, 4> scissor_rect{};
+    std::array<std::uint32_t, 2> primitive_width{};
     std::array<std::uint32_t, 3> color_state{};
     std::array<std::uint32_t, 5> depth_state{};
     if (!ParseU64(fields["raw_vertex_data_size"],
@@ -660,6 +671,7 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
                       &parsed.viewport_translate_bits) ||
         !ParseU32List(fields["raster_state"], &raster_state) ||
         !ParseU32List(fields["scissor_rect"], &scissor_rect) ||
+        !ParseU32List(fields["primitive_width"], &primitive_width) ||
         !ParseU32(fields["sample_mask"], &parsed.sample_mask) ||
         !ParseU32List(fields["color_state"], &color_state) ||
         !ParseU32List(fields["depth_state"], &depth_state)) {
@@ -697,6 +709,14 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     parsed.scissor_y = scissor_rect[1];
     parsed.scissor_width = scissor_rect[2];
     parsed.scissor_height = scissor_rect[3];
+    parsed.line_width_bits = primitive_width[0];
+    parsed.point_size_bits = primitive_width[1];
+    if (!DriverPrimitiveWidthIsValid(parsed.line_width_bits) ||
+        !DriverPrimitiveWidthIsValid(parsed.point_size_bits)) {
+      *error = "driver command line width or point size is not a supported "
+               "positive value";
+      return false;
+    }
     if (parsed.scissor != 0) {
       // An enabled scissor must name a non-empty rectangle inside the render
       // target; the model bounds rasterization by it directly.

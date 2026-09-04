@@ -340,13 +340,9 @@ bool IsFaceCulled(const FaceCullState &state, bool front_facing) {
   throw std::runtime_error("ClipCull received an invalid cull-face mode");
 }
 
-// Fixed 1-device-pixel line width / point size. Neither glLineWidth nor
-// gl_PointSize is threaded through the model yet, so every line/point
-// primitive rasterizes at the GLES-guaranteed minimum (aliased line width
-// 1.0, and a 1x1 point) instead of the degenerate zero-area triangle this
-// stage previously produced for every line/point primitive.
-constexpr float kLineHalfWidthPixels = 0.5F;
-constexpr float kPointHalfSizePixels = 0.5F;
+// glLineWidth and a fixed gl_PointSize travel with the draw and are widened
+// into real screen-space geometry here.  A per-vertex point size comes from
+// the shader and is still not lowered.
 
 // Offsets a clip-space vertex by a screen-pixel delta, leaving every other
 // VTXOUT component (z, w, varyings) unchanged. The delta is converted from
@@ -861,12 +857,14 @@ void ClipCull::Run() {
           std::array<ClipVertex, 4> quad_corners{};
           const bool width_expanded =
               (source_is_point &&
-               BuildPointQuadCorners(vertices[0], kPointHalfSizePixels,
+               BuildPointQuadCorners(vertices[0],
+                                     0.5F * state.raster_state.point_size,
                                      state.width, state.height,
                                      quad_corners)) ||
               (source_is_line &&
                BuildLineQuadCorners(vertices[0], vertices[1],
-                                    kLineHalfWidthPixels, state.width,
+                                    0.5F * state.raster_state.line_width,
+                                    state.width,
                                     state.height, quad_corners));
 
           // Emits one already-non-degenerate triangle through the same

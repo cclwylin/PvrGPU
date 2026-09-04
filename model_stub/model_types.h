@@ -280,6 +280,8 @@ struct DriverCommand {
   std::uint32_t scissor_y = 0;
   std::uint32_t scissor_width = 0;
   std::uint32_t scissor_height = 0;
+  std::uint32_t line_width_bits = 0x3f800000U;
+  std::uint32_t point_size_bits = 0x3f800000U;
   std::uint32_t rasterizer_discard = 0;
   std::uint32_t multisample = 0;
   std::uint32_t half_pixel_center = 0;
