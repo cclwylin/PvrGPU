@@ -11262,10 +11262,16 @@ pvrgpu_draw_is_lowerable_array_primitive(
         texture < ctx->num_sampler_views[MESA_SHADER_FRAGMENT]; ++texture) {
       const struct pipe_sampler_view *view =
          ctx->sampler_views[MESA_SHADER_FRAGMENT][texture];
-      if (!view || !view->texture ||
-          view->texture->target != PIPE_TEXTURE_2D ||
-          !ctx->samplers[MESA_SHADER_FRAGMENT][texture]) {
-         *reason = "texture_binding";
+      if (!view || !view->texture) {
+         *reason = "texture_view_missing";
+         return false;
+      }
+      if (view->texture->target != PIPE_TEXTURE_2D) {
+         *reason = "texture_target";
+         return false;
+      }
+      if (!ctx->samplers[MESA_SHADER_FRAGMENT][texture]) {
+         *reason = "texture_sampler_missing";
          return false;
       }
    }

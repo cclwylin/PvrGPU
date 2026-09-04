@@ -31,16 +31,18 @@ inline constexpr std::size_t kPcoTemporaryCount = 64;
  * shared-register slot.  Descriptor count, sequential SMP count, and the
  * transported shared-register span are independent bounds.  The captured
  * terrain main draw transports 56 VS push DWORDs plus two descriptors (96
- * total), and 64 FS push DWORDs plus five descriptors (164 total).  These are
- * current public workload/transport gates, not Rogue hardware-file limits. */
+ * total), and 64 FS push DWORDs plus five descriptors (164 total).  GFXBench
+ * Manhattan samples six textures in one fragment stage, so the descriptor
+ * bound is eight and the fragment transport 256 DWORDs.  These are current
+ * public workload/transport gates, not Rogue hardware-file limits. */
 inline constexpr std::size_t kPcoTextureDescriptorDwordCount = 20;
-inline constexpr std::size_t kPcoMaximumTextureDescriptorSets = 5;
+inline constexpr std::size_t kPcoMaximumTextureDescriptorSets = 8;
 /* Sequential SMP instructions are not descriptor sets.  The captured
  * terrain post-process shaders issue as many as nine samples from one set,
  * so continuation depth has its own strict program bound. */
 inline constexpr std::size_t kPcoMaximumTextureSampleInstructions = 9;
 inline constexpr std::size_t kPcoMaximumVertexSharedCount = 96;
-inline constexpr std::size_t kPcoMaximumFragmentSharedCount = 164;
+inline constexpr std::size_t kPcoMaximumFragmentSharedCount = 256;
 inline constexpr std::size_t kPcoMaximumSharedCount =
     kPcoMaximumFragmentSharedCount;
 inline constexpr std::size_t kPcoConditionalsVertexSharedCount = 16;

@@ -128,7 +128,7 @@ bool pvrgpu_pco_compile_conditionals(struct pvrgpu_pco_compiler *compiler,
 #define PVRGPU_PCO_MAX_VARYINGS 8u
 
 /* Combined image/sampler descriptors one generically lowered draw can bind. */
-#define PVRGPU_PCO_MAX_TEXTURES 5u
+#define PVRGPU_PCO_MAX_TEXTURES 8u
 
 /* Reports the component width the vertex shader declares for each generic
  * attribute, so the driver can pack them at the width the program reads. */
