@@ -300,7 +300,8 @@ void CheckShaderAndDramPath(const MemoryPool &pool,
   std::vector<std::uint8_t> pixel_seen(kInvocationCount, 0);
   for (const FragmentOutput &output : outputs) {
     Check(output.x < kWidth && output.y < kHeight &&
-              output.written_mask == 0x0f,
+              output.written_mask[0] == 0x0f &&
+              output.render_target_count == 1,
           "fragment output identity");
     const std::size_t pixel = output.y * kWidth + output.x;
     Check(pixel_seen[pixel]++ == 0, "HSR shades each opaque pixel once");

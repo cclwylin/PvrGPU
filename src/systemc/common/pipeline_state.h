@@ -45,6 +45,14 @@ struct PipelineState {
   FunctionalCase functional_case = FunctionalCase::kNone;
   PipelineStage stage = PipelineStage::kSubmitted;
   DrawCommand draw;
+  // Topology as originally submitted, before VertexFetch expands lines
+  // and points into a TriangleList index buffer for the fixed
+  // triangle-only downstream stages. ClipCull reads this to know which
+  // "triangles" are a line/point that still needs real width expansion
+  // rather than a genuine shaded triangle. Defaults to kTriangleStrip,
+  // matching DrawCommand::topology's own default; every non-indexed
+  // path never reads this field.
+  PrimitiveTopology source_topology = PrimitiveTopology::kTriangleStrip;
   RasterState raster_state;
   PoolHandle drawlist_stats;
   PoolHandle vertex_buffer_resources;
@@ -126,8 +134,17 @@ struct PipelineState {
   std::uint64_t fragment_texture_request_count = 0;
   std::uint64_t vertex_texel_fetch_count = 0;
   std::uint64_t fragment_texel_fetch_count = 0;
+  // Colour attachment 0.  A multiple-render-target pass keeps attachment 0
+  // on these fields so every single-target path stays byte identical, and
+  // describes attachments 1..render_target_count-1 alongside them.
   std::uint64_t framebuffer_gpu_address = 0;
   std::uint64_t framebuffer_bytes = 0;
+  std::uint32_t render_target_count = 1;
+  // Resolved attachments 1..render_target_count-1; attachment 0 stays in
+  // pbe_framebuffer so every single-target consumer is unchanged.
+  PoolHandle extra_pbe_framebuffer[kMaxRenderTargets - 1]{};
+  std::uint64_t extra_framebuffer_gpu_address[kMaxRenderTargets - 1]{};
+  std::uint64_t extra_framebuffer_bytes[kMaxRenderTargets - 1]{};
   std::uint64_t depth_attachment_gpu_address = 0;
   std::uint64_t depth_attachment_bytes = 0;
   std::uint64_t color_attachment_load_bytes = 0;

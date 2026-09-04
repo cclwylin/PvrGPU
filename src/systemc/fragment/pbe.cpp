@@ -175,20 +175,29 @@ void Pbe::Run() {
          state.color_attachment_load_bytes != 0)) {
       throw std::runtime_error("PBE color attachment LOAD state is invalid");
     }
-    std::vector<std::uint8_t> framebuffer;
-    if (state.color_attachment_load_enable != 0) {
-      framebuffer =
-          LoadArray<std::uint8_t>(pool_, state.color_attachment_load);
-      if (state.color_attachment_load_bytes != framebuffer_bytes ||
-          framebuffer.size() != framebuffer_bytes) {
-        throw std::runtime_error(
-            "PBE color attachment LOAD byte count mismatch");
+    const std::uint32_t render_target_count =
+        state.render_target_count == 0 ? 1U : state.render_target_count;
+    if (render_target_count > kMaxRenderTargets)
+      throw std::runtime_error("PBE render target count is unsupported");
+
+    // Attachment 0 honours the API-v7 LOAD payload; the remaining attachments
+    // of a multiple-render-target pass start from the clear colour.
+    std::vector<std::vector<std::uint8_t>> framebuffers(render_target_count);
+    for (std::uint32_t target = 0; target < render_target_count; ++target) {
+      std::vector<std::uint8_t> &attachment = framebuffers[target];
+      if (target == 0 && state.color_attachment_load_enable != 0) {
+        attachment = LoadArray<std::uint8_t>(pool_, state.color_attachment_load);
+        if (state.color_attachment_load_bytes != framebuffer_bytes ||
+            attachment.size() != framebuffer_bytes) {
+          throw std::runtime_error(
+              "PBE color attachment LOAD byte count mismatch");
+        }
+        continue;
       }
-    } else {
-      framebuffer.assign(static_cast<std::size_t>(framebuffer_bytes), 0);
+      attachment.assign(static_cast<std::size_t>(framebuffer_bytes), 0);
       for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
         for (std::size_t component = 0; component < 4; ++component) {
-          framebuffer[pixel * 4 + component] =
+          attachment[pixel * 4 + component] =
               FloatValueToUnorm8(state.raster_state.clear_color[component]);
         }
       }
@@ -204,8 +213,12 @@ void Pbe::Run() {
           output.primitive_id != invocation.primitive_id ||
           output.parameter_index != invocation.parameter_index ||
           output.submit_ordinal != invocation.submit_ordinal ||
-          output.written_mask != 0x0f) {
+          output.render_target_count != render_target_count) {
         throw std::runtime_error("PBE lost fragment identity or PIXOUT lanes");
+      }
+      for (std::uint32_t target = 0; target < render_target_count; ++target) {
+        if (output.written_mask[target] != 0x0f)
+          throw std::runtime_error("PBE lost fragment identity or PIXOUT lanes");
       }
       if (output.x >= state.width || output.y >= state.height)
         throw std::runtime_error("PBE fragment coordinate is out of bounds");
@@ -220,9 +233,13 @@ void Pbe::Run() {
       ++written_map[pixel_index];
       last_submit_ordinal[pixel_index] = output.submit_ordinal;
       const std::size_t byte_offset = pixel_index * 4;
+      for (std::uint32_t target = 0; target < render_target_count; ++target) {
+      std::vector<std::uint8_t> &framebuffer = framebuffers[target];
       std::array<std::uint8_t, 4> source{};
-      for (std::size_t component = 0; component < 4; ++component)
-        source[component] = FloatBitsToUnorm8(output.pixel_output[component]);
+      for (std::size_t component = 0; component < 4; ++component) {
+        source[component] =
+            FloatBitsToUnorm8(output.pixel_output[target * 4 + component]);
+      }
 
       if (state.raster_state.blend.enable) {
         const BlendState &blend = state.raster_state.blend;
@@ -257,6 +274,7 @@ void Pbe::Run() {
           }
         }
       }
+      }
     }
     const std::uint64_t pixels_touched = static_cast<std::uint64_t>(
         std::count_if(written_map.begin(), written_map.end(),
@@ -266,9 +284,14 @@ void Pbe::Run() {
         outputs.size() != state.active_fragment_invocations)
       throw std::runtime_error("PBE fragment write count mismatch");
 
-    state.pbe_framebuffer = StoreNewArray(pool_, framebuffer);
-    state.framebuffer_bytes = framebuffer.size();
-    state.counters.pbe_pixels_written = pixel_count;
+    state.pbe_framebuffer = StoreNewArray(pool_, framebuffers[0]);
+    state.framebuffer_bytes = framebuffers[0].size();
+    for (std::uint32_t target = 1; target < render_target_count; ++target) {
+      state.extra_pbe_framebuffer[target - 1] =
+          StoreNewArray(pool_, framebuffers[target]);
+    }
+    // Every attachment is written for each covered pixel.
+    state.counters.pbe_pixels_written = pixel_count * render_target_count;
     state.counters.pbe_fragment_writes = outputs.size();
     if (state.raster_state.blend.enable) {
       state.counters.pbe_color_reads = outputs.size();

@@ -484,7 +484,8 @@ void CheckCompletedCase(MemoryPool &pool, const CasePayload &payload,
   Check(HasPoolHandle(state.fragment_outputs), "fragment output exists");
   const auto outputs = LoadArray<FragmentOutput>(pool, state.fragment_outputs);
   const auto expected = ResponseForRound(sample_count - 1U);
-  Check(outputs.size() == 1 && outputs[0].written_mask == 0x0f &&
+  Check(outputs.size() == 1 && outputs[0].written_mask[0] == 0x0f &&
+            outputs[0].render_target_count == 1 &&
             std::equal(expected.begin(), expected.end(),
                        outputs[0].pixel_output),
         "final response alone reaches PIXOUT");

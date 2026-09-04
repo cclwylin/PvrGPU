@@ -691,6 +691,9 @@ struct TextureSampleResponse {
   ShaderStage shader_stage = ShaderStage::kFragment;
 };
 
+// Colour attachments one fragment shader can write in a single pass.
+inline constexpr std::size_t kMaxRenderTargets = 4;
+
 struct FragmentOutput {
   std::uint32_t x = 0;
   std::uint32_t y = 0;
@@ -698,8 +701,11 @@ struct FragmentOutput {
   std::uint32_t parameter_index = 0;
   std::uint64_t submit_ordinal = 0;
   float depth = 0.0f;
-  std::uint32_t pixel_output[4]{};
-  std::uint8_t written_mask = 0;
+  // Render-target major: attachment N occupies [4 * N, 4 * N + 4).
+  std::uint32_t pixel_output[4 * kMaxRenderTargets]{};
+  // PIXOUT channel mask per attachment; entries past the count stay zero.
+  std::uint8_t written_mask[kMaxRenderTargets]{};
+  std::uint8_t render_target_count = 1;
   std::uint8_t reserved[3]{};
 };
 

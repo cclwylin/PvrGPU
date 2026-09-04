@@ -80,7 +80,8 @@ FragmentOutput MakeOutput(const FragmentInvocation &invocation,
   output.primitive_id = invocation.primitive_id;
   output.parameter_index = invocation.parameter_index;
   output.submit_ordinal = invocation.submit_ordinal;
-  output.written_mask = execution.written_mask;
+  output.written_mask[0] = execution.written_mask;
+  output.render_target_count = 1;
   for (std::size_t component = 0; component < 4; ++component)
     output.pixel_output[component] = execution.pixel_outputs[component];
   return output;
@@ -184,11 +185,58 @@ void CheckResult(MemoryPool &pool, const TestStateHandles &handles,
 
 } // namespace
 
+
+// A multiple-render-target pass: one fragment writes a different colour to
+// each attachment, so a PBE that ignored attachments past the first would
+// leave the second at its clear colour.
+TestStateHandles MakeMrtState(MemoryPool &pool, std::uint32_t sequence,
+                              std::uint32_t render_target_count) {
+  const FragmentInvocation invocation = MakeInvocation(1);
+  FragmentOutput output;
+  output.x = invocation.x;
+  output.y = invocation.y;
+  output.primitive_id = invocation.primitive_id;
+  output.parameter_index = invocation.parameter_index;
+  output.submit_ordinal = invocation.submit_ordinal;
+  output.render_target_count =
+      static_cast<std::uint8_t>(render_target_count);
+  for (std::uint32_t target = 0; target < render_target_count; ++target) {
+    output.written_mask[target] = 0x0f;
+    for (std::size_t component = 0; component < 4; ++component) {
+      // Attachment N gets N+1 quarters in every channel.
+      output.pixel_output[target * 4 + component] =
+          FloatBits(static_cast<float>(target + 1) / 4.0F);
+    }
+  }
+
+  PipelineState state;
+  state.width = 1;
+  state.height = 1;
+  state.sequence = sequence;
+  state.functional_case = FunctionalCase::kFillSolid;
+  state.stage = PipelineStage::kTextureComplete;
+  state.active_fragment_invocations = 1;
+  state.render_target_count = render_target_count;
+  state.raster_state.clear_color[0] = 0.0F;
+  state.raster_state.clear_color[1] = 0.0F;
+  state.raster_state.clear_color[2] = 0.0F;
+  state.raster_state.clear_color[3] = 0.0F;
+  state.raster_state.blend.enable = 0;
+  state.raster_state.color_mask = 0x0f;
+  const std::vector<FragmentInvocation> invocations = {invocation};
+  const std::vector<FragmentOutput> outputs = {output};
+  state.fragment_invocations = StoreNewArray(pool, invocations);
+  state.fragment_outputs = StoreNewArray(pool, outputs);
+  const PoolHandle state_handle = pool.Allocate(sizeof(PipelineState));
+  StorePipelineState(pool, state_handle, state);
+  return {state_handle, state.fragment_invocations, state.fragment_outputs};
+}
+
 int sc_main(int, char **) {
   try {
     MemoryPool pool;
-    sc_core::sc_fifo<PipelineTxn> input("input", 8);
-    sc_core::sc_fifo<PipelineTxn> output("output", 8);
+    sc_core::sc_fifo<PipelineTxn> input("input", 16);
+    sc_core::sc_fifo<PipelineTxn> output("output", 16);
     Pbe pbe("pbe", pool);
     pbe.input(input);
     pbe.output(output);
@@ -246,7 +294,10 @@ int sc_main(int, char **) {
     input.write({subtract_test.state, 5, 5});
     input.write({colormask_test.state, 6, 6});
     input.write({max_test.state, 7, 7});
+    const TestStateHandles mrt = MakeMrtState(pool, 9, 3);
+
     input.write({loaded_additive.state, 8, 8});
+    input.write({mrt.state, 9, 9});
 
     sc_core::sc_start(sc_core::sc_time(200, sc_core::SC_NS));
     sc_core::sc_start(sc_core::SC_ZERO_TIME);
@@ -268,6 +319,8 @@ int sc_main(int, char **) {
           "max-test FIFO completion order");
     Check(output.nb_read(completed) && completed.sequence == 8,
           "attachment-LOAD FIFO completion order");
+    Check(output.nb_read(completed) && completed.sequence == 9,
+          "multiple-render-target FIFO completion order");
 
     CheckResult(pool, single, {128, 0, 127, 191}, 1);
     CheckResult(pool, red_green, {64, 128, 63, 159}, 2);
@@ -277,6 +330,36 @@ int sc_main(int, char **) {
     CheckResult(pool, colormask_test, {255, 0, 0, 255}, 1, false);
     CheckResult(pool, max_test, {255, 0, 255, 191}, 1);
     CheckResult(pool, loaded_additive, {138, 20, 30, 104}, 1);
+    // Each attachment keeps the colour its own PIXOUT lane produced.
+    {
+      const PipelineState resolved = LoadPipelineState(pool, mrt.state);
+      Check(resolved.render_target_count == 3,
+            "MRT render target count survived the PBE");
+      const auto attachment0 =
+          LoadArray<std::uint8_t>(pool, resolved.pbe_framebuffer);
+      const auto attachment1 =
+          LoadArray<std::uint8_t>(pool, resolved.extra_pbe_framebuffer[0]);
+      const auto attachment2 =
+          LoadArray<std::uint8_t>(pool, resolved.extra_pbe_framebuffer[1]);
+      Check(attachment0.size() == 4 && attachment1.size() == 4 &&
+                attachment2.size() == 4,
+            "every MRT attachment was resolved");
+      Check(attachment0[0] == 64 && attachment0[3] == 64,
+            "MRT attachment 0 colour");
+      Check(attachment1[0] == 128 && attachment1[3] == 128,
+            "MRT attachment 1 colour");
+      Check(attachment2[0] == 191 && attachment2[3] == 191,
+            "MRT attachment 2 colour");
+      Check(resolved.counters.pbe_pixels_written == 3,
+            "MRT pixel writes counted per attachment");
+      pool.Release(resolved.pbe_framebuffer);
+      pool.Release(resolved.extra_pbe_framebuffer[0]);
+      pool.Release(resolved.extra_pbe_framebuffer[1]);
+      pool.Release(mrt.invocations);
+      pool.Release(mrt.outputs);
+      pool.Release(mrt.state);
+    }
+
     Check(pool.bytes_in_flight() == 0 && pool.allocations() == pool.releases(),
           "MemoryPool balanced");
     std::cout << "pbe_blend_test: PASS\n";

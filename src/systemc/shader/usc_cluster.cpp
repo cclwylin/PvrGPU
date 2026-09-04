@@ -636,7 +636,8 @@ void UscCluster::Run() {
           fragment_output.pixel_output[component] =
               execution.pixel_outputs[component];
         }
-        fragment_output.written_mask = execution.written_mask;
+        fragment_output.written_mask[0] = execution.written_mask;
+        fragment_output.render_target_count = 1;
         outputs[invocation_index] = fragment_output;
         output_written[invocation_index] = 1;
       };
@@ -779,7 +780,8 @@ void UscCluster::Run() {
             fragment_output.pixel_output[component] =
                 execution.pixel_outputs[component];
           }
-          fragment_output.written_mask = execution.written_mask;
+          fragment_output.written_mask[0] = execution.written_mask;
+        fragment_output.render_target_count = 1;
           outputs[invocation_index] = fragment_output;
           output_written[invocation_index] = 1;
         };

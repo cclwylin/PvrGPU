@@ -331,7 +331,8 @@ void CheckFragmentOutputs(const MemoryPool &pool,
               output.primitive_id == invocation.primitive_id &&
               output.parameter_index == invocation.parameter_index &&
               output.submit_ordinal == invocation.submit_ordinal &&
-              output.written_mask == 0x0f,
+              output.written_mask[0] == 0x0f &&
+              output.render_target_count == 1,
           "fragment USC output preserves invocation identity");
     Check(output.x < kWidth && output.y < kHeight,
           "fragment output coordinate is on the surface");
