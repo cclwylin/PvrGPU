@@ -3683,6 +3683,14 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
             case nir_instr_type_alu:
             case nir_instr_type_load_const:
             case nir_instr_type_deref:
+            /*
+             * An undefined SSA value is ordinary NIR -- it stands for a value
+             * the language leaves unspecified, such as an uninitialised
+             * variable or a lane that cannot be reached.  PCO lowers it to
+             * whatever register it allocates; nothing reads a defined result
+             * from it.
+             */
+            case nir_instr_type_undef:
                break;
             case nir_instr_type_tex: {
                /* Only plain sampling of a bound 2D texture is lowered. */

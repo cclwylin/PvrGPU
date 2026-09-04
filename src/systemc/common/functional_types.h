@@ -32,7 +32,10 @@ inline constexpr std::int64_t kSubpixelScale = 1LL << kSubpixelBits;
 // equivalent. Keep clip-area classification and parameter edge setup on one
 // deterministic conversion instead of inheriting half-away library behavior.
 std::int64_t QuantizeRasterSubpixel(float value);
-inline constexpr std::uint32_t kPcoVertexInputRegisterCount = 32;
+// Keep aligned with shader/pco_iss.h's kPcoVertexInputCount; the two headers
+// cannot include each other.  Sixteen bound attributes occupy four registers
+// each, which is what the instruction encoding's six-bit index can name.
+inline constexpr std::uint32_t kPcoVertexInputRegisterCount = 64;
 // Public Rogue implementations expose at least 64 user vertex-output dwords.
 // Keep this common payload limit aligned with shader/pco_iss.h's
 // kPcoVertexOutputCount; the two headers cannot include each other.

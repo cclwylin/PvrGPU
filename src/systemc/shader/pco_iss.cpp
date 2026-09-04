@@ -725,7 +725,9 @@ PcoRegisterRef DecodeOneLowerSource(const std::vector<std::uint8_t> &binary,
                   "coefficient register exceeds the modeled USC file");
   } else {
     DecodeError(source_offset,
-                "source register bank is outside this PCO subset");
+                "source register bank is outside this PCO subset [bank=" +
+                    std::to_string(static_cast<unsigned>(source.bank)) +
+                    " index=" + std::to_string(source.index) + "]");
   }
 
   return source;

@@ -900,10 +900,28 @@ bool CopyPcoSequenceDraw(
       source.fragment_position_start != 0 ||
       source.fragment_position_count != 4 ||
       source.fragment_varying_start != source.fragment_position_count ||
-      source.fragment_varying_count != source.varying_output_count * 4U ||
+      // The fragment stage interpolates the varyings it reads, which may be
+      // fewer than the vertex stage writes.
+      source.fragment_varying_count > source.varying_output_count * 4U ||
+      (source.fragment_varying_count & 3U) != 0 ||
       source.fragment_pco_abi.coefficients !=
           source.fragment_position_count + source.fragment_varying_count) {
-    *error = "SystemC API nested PCO sequence ABI/payload is invalid";
+    std::ostringstream detail;
+    detail << "SystemC API nested PCO sequence ABI/payload is invalid:"
+           << " vs_out=" << source.vertex_pco_abi.vertex_outputs
+           << " pos=" << source.position_output_count
+           << " psize=" << source.point_size_output_count
+           << " var=" << source.varying_output_count
+           << " var_start=" << source.varying_output_start
+           << " fs_pos=" << source.fragment_position_count
+           << " fs_var=" << source.fragment_varying_count
+           << " fs_var_start=" << source.fragment_varying_start
+           << " fs_coeff=" << source.fragment_pco_abi.coefficients
+           << " vs_sh=" << source.vertex_shared_count << "/"
+           << source.vertex_pco_abi.shareds
+           << " fs_sh=" << source.fragment_shared_count << "/"
+           << source.fragment_pco_abi.shareds;
+    *error = detail.str();
     return false;
   }
   float depth_clear = 0.0F;
