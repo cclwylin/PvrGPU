@@ -11,8 +11,12 @@ extern "C" {
 
 /* API-v8 expands the by-value sequence-texture mip table from 10 to 15. */
 #define PVRGPU_SYSTEMC_API_VERSION 8u
-/* Draws one sequence may describe; must match the model's own bound. */
-#define PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_COMMANDS 64u
+/*
+ * Draws one sequence may describe; must match the model's own bound.  This is
+ * independent of how many attachments the sequence creates, which the model's
+ * address map bounds separately.
+ */
+#define PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_COMMANDS 256u
 #define PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_TEXTURES 16u
 #define PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS 15u
 #define PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR UINT32_MAX

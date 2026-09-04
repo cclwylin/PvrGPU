@@ -115,7 +115,7 @@ inline constexpr std::size_t kDriverPcoMaximumSequenceCommands = 4096;
  * PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_COMMANDS: a sequence the driver is willing
  * to build but the model refuses leaves the frame with no output at all.
  */
-inline constexpr std::size_t kDriverPcoMaximumNestedSequenceCommands = 64;
+inline constexpr std::size_t kDriverPcoMaximumNestedSequenceCommands = 256;
 inline constexpr std::size_t kDriverPcoMaximumSequenceTextures = 16;
 inline constexpr std::uint64_t kDriverPcoMaximumSequencePayloadBytes =
     UINT64_C(512) * 1024U * 1024U;
@@ -355,6 +355,62 @@ struct Options {
   // physical draw that must traverse the SystemC pipeline in order.
   std::vector<DriverCommand> driver_commands;
 };
+
+/*
+ * DRAM addresses a PCO sequence's attachments occupy.
+ *
+ * Slots are handed out as surfaces are created, not indexed by ordinal: a
+ * sequence of any length is fine as long as the surfaces it creates fit in the
+ * region, and a draw continuing from an earlier surface creates none.  The
+ * submitter and the reporter both need this, and deriving it twice is how they
+ * came to disagree.
+ *
+ * Returns false when the sequence creates more attachments than a region
+ * holds, or names a source that does not precede it.
+ */
+inline bool ResolveSequenceAttachmentAddresses(
+    const std::vector<DriverCommand> &draws,
+    std::vector<std::uint64_t> *color_addresses,
+    std::vector<std::uint64_t> *depth_addresses) {
+  if (!color_addresses || !depth_addresses)
+    return false;
+  color_addresses->assign(draws.size(), 0);
+  depth_addresses->assign(draws.size(), 0);
+  std::size_t next_color_slot = 0;
+  std::size_t next_depth_slot = 0;
+  for (std::size_t ordinal = 0; ordinal < draws.size(); ++ordinal) {
+    const DriverCommand &draw = draws[ordinal];
+    if (draw.color_attachment_source_command_index == kDriverPcoNewAttachment) {
+      if (next_color_slot >= kDriverPcoSequenceAttachmentSlots)
+        return false;
+      (*color_addresses)[ordinal] = kDriverPcoSequenceColorAddressBase +
+                                    next_color_slot++ *
+                                        kDriverPcoSequenceAttachmentStride;
+    } else if (draw.color_attachment_source_command_index < ordinal) {
+      (*color_addresses)[ordinal] =
+          (*color_addresses)[draw.color_attachment_source_command_index];
+    } else {
+      return false;
+    }
+    if (draw.depth_format == 0)
+      continue;
+    if (draw.depth_attachment_source_command_index == kDriverPcoNewAttachment) {
+      if (next_depth_slot >= kDriverPcoSequenceAttachmentSlots)
+        return false;
+      (*depth_addresses)[ordinal] = kDriverPcoSequenceDepthAddressBase +
+                                    next_depth_slot++ *
+                                        kDriverPcoSequenceAttachmentStride;
+    } else if (draw.depth_attachment_source_command_index < ordinal &&
+               (*depth_addresses)[draw.depth_attachment_source_command_index] !=
+                   0) {
+      (*depth_addresses)[ordinal] =
+          (*depth_addresses)[draw.depth_attachment_source_command_index];
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
 
 bool ParseOptions(int argc, char **argv, Options *options);
 std::string JsonEscape(const std::string &value);

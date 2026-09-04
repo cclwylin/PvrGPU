@@ -49,20 +49,21 @@ inline constexpr std::uint64_t kBuiltinIndexBufferGpuAddress =
 inline constexpr std::uint64_t kDriverSequenceVertexAddressStride =
     UINT64_C(0x00100000);
 
-// Attachment slot for a sequence ordinal that starts a new surface.
+// Take the next attachment slot in a region.
 //
 // Each region holds kDriverPcoSequenceAttachmentSlots strides before it runs
-// into the next one, so an ordinal past that would silently place a colour
-// attachment on top of a depth attachment.  A sequence may still be longer
-// than the slot count: ordinals that continue from an earlier surface consume
-// no slot at all.
-std::size_t SequenceAttachmentSlot(std::size_t ordinal, const char *region) {
-  if (ordinal >= kDriverPcoSequenceAttachmentSlots) {
+// into the next one, so running past that would silently place a colour
+// attachment on top of a depth attachment.  Slots are handed out as surfaces
+// are created rather than indexed by ordinal: a sequence of any length is fine
+// as long as the surfaces it creates fit, and a draw that continues from an
+// earlier surface creates none.
+std::size_t TakeSequenceAttachmentSlot(std::size_t *next, const char *region) {
+  if (!next || *next >= kDriverPcoSequenceAttachmentSlots) {
     throw std::runtime_error(
-        std::string("Submitter sequence ") + region +
-        " attachment slot is outside its address region");
+        std::string("Submitter sequence creates more ") + region +
+        " attachments than its address region holds");
   }
-  return ordinal;
+  return (*next)++;
 }
 
 std::uint64_t SequenceExternalTextureAddress(
@@ -1247,43 +1248,13 @@ void Submitter::Run() {
                                            : options_.driver_commands.size();
   std::vector<std::uint64_t> sequence_color_addresses(submission_count, 0);
   std::vector<std::uint64_t> sequence_depth_addresses(submission_count, 0);
-  if (driver_pco_sequence_command) {
-    for (std::size_t ordinal = 0; ordinal < submission_count; ++ordinal) {
-      const DriverCommand &nested = options_.driver_commands[ordinal];
-      const auto color_source = nested.color_attachment_source_command_index;
-      const auto depth_source = nested.depth_attachment_source_command_index;
-      if (color_source == kDriverPcoNewAttachment) {
-        sequence_color_addresses[ordinal] =
-            kDriverPcoSequenceColorAddressBase +
-            SequenceAttachmentSlot(ordinal, "color") *
-                kDriverPcoSequenceAttachmentStride;
-      } else if (color_source < ordinal) {
-        sequence_color_addresses[ordinal] =
-            sequence_color_addresses[color_source];
-      } else {
-        throw std::runtime_error(
-            "Submitter sequence color attachment dependency is invalid");
-      }
-      if (nested.depth_format == 0) {
-        if (depth_source != kDriverPcoNewAttachment ||
-            nested.depth_enable != 0 || nested.depth_write != 0) {
-          throw std::runtime_error(
-              "Submitter absent depth attachment state is invalid");
-        }
-      } else if (depth_source == kDriverPcoNewAttachment) {
-        sequence_depth_addresses[ordinal] =
-            kDriverPcoSequenceDepthAddressBase +
-            SequenceAttachmentSlot(ordinal, "depth") *
-                kDriverPcoSequenceAttachmentStride;
-      } else if (depth_source < ordinal &&
-                 sequence_depth_addresses[depth_source] != 0) {
-        sequence_depth_addresses[ordinal] =
-            sequence_depth_addresses[depth_source];
-      } else {
-        throw std::runtime_error(
-            "Submitter sequence depth attachment dependency is invalid");
-      }
-    }
+  if (driver_pco_sequence_command &&
+      !ResolveSequenceAttachmentAddresses(options_.driver_commands,
+                                          &sequence_color_addresses,
+                                          &sequence_depth_addresses)) {
+    throw std::runtime_error(
+        "Submitter sequence attachment dependencies do not fit the address "
+        "map");
   }
   for (std::size_t submission = 0; submission < submission_count;
        ++submission) {

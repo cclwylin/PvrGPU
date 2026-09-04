@@ -1683,27 +1683,13 @@ void JsonReporter::Run() {
         options_.driver_commands.size(), 0);
     std::vector<std::uint64_t> sequence_depth_addresses(
         options_.driver_commands.size(), 0);
-    if (generic_sequence) {
-      for (std::size_t ordinal = 0; ordinal < options_.driver_commands.size();
-           ++ordinal) {
-        const DriverCommand &command = options_.driver_commands[ordinal];
-        sequence_color_addresses[ordinal] =
-            command.color_attachment_source_command_index ==
-                    kDriverPcoNewAttachment
-                ? kDriverPcoSequenceColorAddressBase +
-                      ordinal * kDriverPcoSequenceAttachmentStride
-                : sequence_color_addresses.at(
-                      command.color_attachment_source_command_index);
-        if (command.depth_format != 0) {
-          sequence_depth_addresses[ordinal] =
-              command.depth_attachment_source_command_index ==
-                      kDriverPcoNewAttachment
-                  ? kDriverPcoSequenceDepthAddressBase +
-                        ordinal * kDriverPcoSequenceAttachmentStride
-                  : sequence_depth_addresses.at(
-                        command.depth_attachment_source_command_index);
-        }
-      }
+    if (generic_sequence &&
+        !ResolveSequenceAttachmentAddresses(options_.driver_commands,
+                                            &sequence_color_addresses,
+                                            &sequence_depth_addresses)) {
+      throw std::runtime_error(
+          "JsonReporter PCO sequence attachment dependencies do not fit the "
+          "address map");
     }
 
     for (std::size_t completed = 0;
