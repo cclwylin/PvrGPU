@@ -1548,6 +1548,56 @@ int RunModelToFiles(const pvrgpu::stub::Options &options,
   return result;
 }
 
+/*
+ * Recompute a sequence's input-assembly totals from the draws it accumulated.
+ *
+ * The driver states these on the first draw it submits, which for a sequence
+ * built up over many submissions is before it can know the totals.  They used
+ * to be constants recorded from a golden run; deriving them here means the
+ * numbers follow the geometry the sequence actually carries, and no stage has
+ * to be told them in advance.
+ */
+void DeriveSequenceInputAssembly(pvrgpu::stub::Options *options) {
+  if (!options || options->driver_commands.empty())
+    return;
+  std::uint64_t vertices = 0;
+  std::uint64_t primitives = 0;
+  bool any_indexed = false;
+  for (const pvrgpu::stub::DriverCommand &draw : options->driver_commands) {
+    const std::uint64_t assembled =
+        draw.indexed != 0 ? draw.index_count : draw.vertex_count;
+    const std::uint64_t instances =
+        draw.instance_count != 0 ? draw.instance_count : 1U;
+    any_indexed = any_indexed || draw.indexed != 0;
+    vertices += assembled * instances;
+    switch (draw.primitive_mode) {
+      case 0U: primitives += assembled * instances; break;
+      case 1U: primitives += (assembled / 2U) * instances; break;
+      case 2U: primitives += assembled * instances; break;
+      case 3U:
+        primitives += (assembled >= 2U ? assembled - 1U : 0U) * instances;
+        break;
+      case 4U: primitives += (assembled / 3U) * instances; break;
+      case 5U:
+      case 6U:
+        primitives += (assembled >= 3U ? assembled - 2U : 0U) * instances;
+        break;
+      default:
+        return;  // An unknown topology is rejected by the profile checks.
+    }
+  }
+  pvrgpu::stub::DriverCommand &logical = options->driver_command;
+  logical.draw_count =
+      static_cast<std::uint32_t>(options->driver_commands.size());
+  logical.ia_vertices = static_cast<std::uint32_t>(vertices);
+  logical.ia_primitives = static_cast<std::uint32_t>(primitives);
+  logical.clip_invocations = static_cast<std::uint32_t>(primitives);
+  // Vertex shading follows the vertex count exactly unless post-transform
+  // reuse decides it, which only an indexed draw can do.
+  logical.vs_invocations =
+      any_indexed ? 0U : static_cast<std::uint32_t>(vertices);
+}
+
 int FlushPendingSubmitLocked(std::string *error) {
   if (!g_pending_submit.valid || g_pending_submit.executed)
     return 0;
@@ -1559,6 +1609,7 @@ int FlushPendingSubmitLocked(std::string *error) {
       *error = "Ideas PCO profile requires exactly 180 ordered draws";
     return 2;
   }
+  DeriveSequenceInputAssembly(&g_pending_submit.options);
   return RunModelToFiles(g_pending_submit.options, g_pending_submit.jsonl_path,
                          g_pending_submit.stderr_path, error);
 }

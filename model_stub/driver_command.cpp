@@ -71,6 +71,10 @@ const std::set<std::string> &KnownFields() {
 // device pixel, and bounded so the expanded quad stays inside the surface
 // arithmetic clip/cull performs.
 bool DriverPrimitiveWidthIsValid(std::uint32_t bits) {
+  // All-zero bits mean the command states no width, which is the GLES default
+  // of one device pixel.
+  if (bits == 0)
+    return true;
   float width = 0.0F;
   static_assert(sizeof(width) == sizeof(bits));
   std::memcpy(&width, &bits, sizeof(width));

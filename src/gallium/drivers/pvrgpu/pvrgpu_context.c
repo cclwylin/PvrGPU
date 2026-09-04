@@ -7042,10 +7042,12 @@ pvrgpu_sequence_input_assembly_totals(
    const struct pvrgpu_systemc_driver_command *draws,
    unsigned draw_count,
    uint32_t *out_vertices,
-   uint32_t *out_primitives)
+   uint32_t *out_primitives,
+   uint32_t *out_vs_invocations)
 {
    uint32_t vertices = 0;
    uint32_t primitives = 0;
+   bool any_indexed = false;
 
    for (unsigned index = 0; index < draw_count; ++index) {
       const struct pvrgpu_systemc_driver_command *draw = &draws[index];
@@ -7054,6 +7056,7 @@ pvrgpu_sequence_input_assembly_totals(
       const unsigned assembled =
          draw->indexed ? draw->index_count : draw->vertex_count;
 
+      any_indexed = any_indexed || draw->indexed != 0;
       vertices += assembled * instances;
       primitives +=
          pvrgpu_array_primitive_count(draw->primitive_mode, assembled) *
@@ -7062,6 +7065,12 @@ pvrgpu_sequence_input_assembly_totals(
 
    *out_vertices = vertices;
    *out_primitives = primitives;
+   /*
+    * A non-indexed draw shades every vertex it submits, which the driver knows
+    * exactly.  An indexed one depends on post-transform reuse, so it is left
+    * for the vertex cache to measure.
+    */
+   *out_vs_invocations = any_indexed ? 0u : vertices;
 }
 
 static bool
@@ -7124,14 +7133,14 @@ pvrgpu_emit_refract_pco_sequence_command(struct pvrgpu_context *ctx)
    pvrgpu_sequence_input_assembly_totals(draws,
                                          PVRGPU_ARRAY_SIZE(draws),
                                          &command.ia_vertices,
-                                         &command.ia_primitives);
+                                         &command.ia_primitives,
+                                         &command.vs_invocations);
    command.clip_invocations = command.ia_primitives;
    /*
-    * Everything past input assembly is measured by SystemC from the geometry
-    * this sequence actually rasterizes.  Leaving these at zero is what makes
-    * the reported totals a result rather than a replayed constant.
+    * Everything past clipping is measured by SystemC from the geometry this
+    * sequence actually rasterizes.  Leaving these at zero is what makes the
+    * reported totals a result rather than a replayed constant.
     */
-   command.vs_invocations = 0;
    command.clip_primitives = 0;
    command.setup_triangles = 0;
    command.ps_invocations = 0;
@@ -7347,14 +7356,14 @@ pvrgpu_emit_shadow_pco_sequence_command(struct pvrgpu_context *ctx)
    pvrgpu_sequence_input_assembly_totals(draws,
                                          PVRGPU_ARRAY_SIZE(draws),
                                          &command.ia_vertices,
-                                         &command.ia_primitives);
+                                         &command.ia_primitives,
+                                         &command.vs_invocations);
    command.clip_invocations = command.ia_primitives;
    /*
-    * Everything past input assembly is measured by SystemC from the geometry
-    * this sequence actually rasterizes.  Leaving these at zero is what makes
-    * the reported totals a result rather than a replayed constant.
+    * Everything past clipping is measured by SystemC from the geometry this
+    * sequence actually rasterizes.  Leaving these at zero is what makes the
+    * reported totals a result rather than a replayed constant.
     */
-   command.vs_invocations = 0;
    command.clip_primitives = 0;
    command.setup_triangles = 0;
    command.ps_invocations = 0;
@@ -9173,14 +9182,14 @@ pvrgpu_emit_terrain_pco_sequence_command(struct pvrgpu_context *ctx)
    pvrgpu_sequence_input_assembly_totals(draws,
                                          PVRGPU_ARRAY_SIZE(draws),
                                          &command.ia_vertices,
-                                         &command.ia_primitives);
+                                         &command.ia_primitives,
+                                         &command.vs_invocations);
    command.clip_invocations = command.ia_primitives;
    /*
-    * Everything past input assembly is measured by SystemC from the geometry
-    * this sequence actually rasterizes.  Leaving these at zero is what makes
-    * the reported totals a result rather than a replayed constant.
+    * Everything past clipping is measured by SystemC from the geometry this
+    * sequence actually rasterizes.  Leaving these at zero is what makes the
+    * reported totals a result rather than a replayed constant.
     */
-   command.vs_invocations = 0;
    command.clip_primitives = 0;
    command.setup_triangles = 0;
    command.ps_invocations = 0;

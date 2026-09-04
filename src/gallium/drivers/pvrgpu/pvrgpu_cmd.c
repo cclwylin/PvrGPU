@@ -62,10 +62,16 @@ pvrgpu_cmd_error(char *error, size_t error_size, const char *message)
  * A line width or point size the model can widen to: finite, at least one
  * device pixel, and bounded so the expanded quad stays inside the surface
  * arithmetic that clip/cull performs.
+ *
+ * All-zero bits mean the command does not state a width, which is the GLES
+ * default of one pixel.  A command that only ever draws triangles has no
+ * reason to say anything about line width.
  */
 static bool
 pvrgpu_cmd_primitive_width_is_valid(uint32_t bits)
 {
+   if (bits == 0)
+      return true;
    float width = 0.0f;
    memcpy(&width, &bits, sizeof(width));
    return isfinite(width) && width >= 1.0f && width <= 1024.0f;

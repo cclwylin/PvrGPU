@@ -246,6 +246,62 @@ bool SequenceEnvelopeMatches(const Options &options, const char *case_name,
   return true;
 }
 
+/*
+ * Input-assembly totals a sequence's draws add up to, and the rule that
+ * everything downstream of clipping is left for SystemC to measure.
+ *
+ * These profiles used to pin the whole counter set to constants recorded from
+ * a golden run, which meant a capture reported a rasterization result whether
+ * or not the model produced one.  The contract now is narrower and checkable:
+ * the driver states what the draws submit, and states nothing else.
+ */
+bool LogicalUnusedCountersAreZero(const DriverCommand &command);
+
+bool SequenceLogicalCountersAreDerived(const Options &options,
+                                       std::string *error) {
+  const DriverCommand &logical = options.driver_command;
+  if (logical.draw_count != options.driver_commands.size())
+    return Reject(error, "sequence draw count does not match its draws");
+
+  std::uint64_t vertices = 0;
+  std::uint64_t primitives = 0;
+  bool any_indexed = false;
+  for (const DriverCommand &draw : options.driver_commands) {
+    const std::uint64_t assembled =
+        draw.indexed != 0 ? draw.index_count : draw.vertex_count;
+    any_indexed = any_indexed || draw.indexed != 0;
+    vertices += assembled;
+    switch (draw.primitive_mode) {
+      case 0U: primitives += assembled; break;
+      case 1U: primitives += assembled / 2U; break;
+      case 2U: primitives += assembled; break;
+      case 3U: primitives += assembled >= 2U ? assembled - 1U : 0U; break;
+      case 4U: primitives += assembled / 3U; break;
+      case 5U:
+      case 6U: primitives += assembled >= 3U ? assembled - 2U : 0U; break;
+      default:
+        return Reject(error, "sequence draw has an unknown topology");
+    }
+  }
+
+  if (logical.ia_vertices != vertices || logical.ia_primitives != primitives ||
+      logical.clip_invocations != primitives) {
+    return Reject(error,
+                  "sequence input-assembly totals do not match its draws");
+  }
+  // Vertex shading follows the vertex count exactly unless the post-transform
+  // cache decides it, which only an indexed draw can do.
+  const std::uint64_t expected_vs = any_indexed ? 0U : vertices;
+  if (logical.vs_invocations != expected_vs)
+    return Reject(error, "sequence vertex-shading total is not derived");
+  if (logical.clip_primitives != 0 || logical.setup_triangles != 0 ||
+      logical.ps_invocations != 0 || logical.semantic_texel_fetches != 0) {
+    return Reject(error,
+                  "sequence states a rasterization result the model measures");
+  }
+  return LogicalUnusedCountersAreZero(logical);
+}
+
 bool LogicalUnusedCountersAreZero(const DriverCommand &command) {
   return command.index_count == 0 && command.unique_vertices == 0 &&
          command.primitive_count == 0 && command.gs_invocations == 0 &&
@@ -624,16 +680,11 @@ bool RefractSupported(const Options &options, std::string *error) {
   }
   const DriverCommand &logical = options.driver_command;
   if (logical.clear_color_bits != kOpaqueBlack ||
-      logical.draw_count != resolution->refract_drawlists ||
-      logical.ia_vertices != 417996 || logical.ia_primitives != 139332 ||
-      logical.vs_invocations != 417996 ||
-      logical.clip_invocations != 139332 ||
-      logical.clip_primitives != 108310 ||
-      logical.ps_invocations != resolution->refract_ps_invocations ||
-      logical.setup_triangles != 108310 ||
-      logical.semantic_texel_fetches != resolution->refract_texel_fetches ||
-      !LogicalUnusedCountersAreZero(logical)) {
-    return Reject(error, "Refract PCO logical counters are invalid");
+      !SequenceLogicalCountersAreDerived(options, error)) {
+    return Reject(error,
+                  error && !error->empty()
+                      ? "Refract PCO logical counters are invalid: " + *error
+                      : std::string("Refract PCO logical counters are invalid"));
   }
   for (std::size_t ordinal = 0; ordinal < kRefractDraws.size(); ++ordinal) {
     const DrawSpec spec = RefractDrawSpec(ordinal, *resolution);
@@ -786,15 +837,11 @@ bool ShadowSupported(const Options &options, std::string *error) {
   }
   const DriverCommand &logical = options.driver_command;
   if (logical.clear_color_bits != kOpaqueBlack ||
-      logical.draw_count != resolution->shadow_drawlists ||
-      logical.ia_vertices != 43036 || logical.ia_primitives != 14346 ||
-      logical.vs_invocations != 43036 || logical.clip_invocations != 14346 ||
-      logical.clip_primitives != 14349 ||
-      logical.ps_invocations != resolution->shadow_ps_invocations ||
-      logical.setup_triangles != 14349 ||
-      logical.semantic_texel_fetches != resolution->shadow_texel_fetches ||
-      !LogicalUnusedCountersAreZero(logical)) {
-    return Reject(error, "Shadow PCO logical counters are invalid");
+      !SequenceLogicalCountersAreDerived(options, error)) {
+    return Reject(error,
+                  error && !error->empty()
+                      ? "Shadow PCO logical counters are invalid: " + *error
+                      : std::string("Shadow PCO logical counters are invalid"));
   }
   for (std::size_t ordinal = 0; ordinal < kShadowDraws.size(); ++ordinal) {
     const DrawSpec spec = ShadowDrawSpec(ordinal, *resolution);
@@ -1037,32 +1084,21 @@ bool TerrainPhysicalContractMatches(const Options &options,
   return TerrainResourcesMatch(options.driver_commands, resolution, error);
 }
 
-bool TerrainLogicalCountersMatch(
-    const DriverCommand &logical,
-    const SequenceResolutionProfile &resolution) {
-  return logical.clear_color_bits == kTerrainClear &&
-         logical.draw_count == resolution.terrain_drawlists &&
-         logical.ia_vertices == 393258 &&
-         logical.ia_primitives == 131086 &&
-         logical.vs_invocations == 393258 && logical.gs_invocations == 0 &&
-         logical.gs_primitives == 0 &&
-         logical.clip_invocations == 131086 &&
-         logical.clip_primitives == 25496 &&
-         logical.ps_invocations == resolution.terrain_ps_invocations &&
-         logical.hs_invocations == 0 &&
-         logical.ds_invocations == 0 && logical.cs_invocations == 0 &&
-         logical.setup_triangles == 25496 &&
-         logical.semantic_texel_fetches == resolution.terrain_texel_fetches &&
-         logical.index_count == 0 && logical.unique_vertices == 0 &&
-         logical.primitive_count == 0;
+bool TerrainLogicalCountersMatch(const Options &options,
+                                 std::string *error) {
+  return options.driver_command.clear_color_bits == kTerrainClear &&
+         SequenceLogicalCountersAreDerived(options, error);
 }
 
 bool TerrainSupported(const Options &options, std::string *error) {
   const SequenceResolutionProfile *resolution = nullptr;
   if (!SequenceEnvelopeMatches(options, kTerrainCase, 8, &resolution, error))
     return false;
-  if (!TerrainLogicalCountersMatch(options.driver_command, *resolution))
-    return Reject(error, "Terrain PCO logical counters are invalid");
+  if (!TerrainLogicalCountersMatch(options, error))
+    return Reject(error,
+                  error && !error->empty()
+                      ? "Terrain PCO logical counters are invalid: " + *error
+                      : std::string("Terrain PCO logical counters are invalid"));
   return TerrainPhysicalContractMatches(options, *resolution, error);
 }
 
