@@ -67,6 +67,34 @@ pvrgpu_cmd_error(char *error, size_t error_size, const char *message)
  * default of one pixel.  A command that only ever draws triangles has no
  * reason to say anything about line width.
  */
+/*
+ * True when a viewport of the stated extent, centred on the stated offset,
+ * lies inside the render target.  The offset is the window coordinate the
+ * centre of normalized device space maps to, so the viewport spans
+ * [offset - extent/2, offset + extent/2].
+ */
+static bool
+pvrgpu_cmd_viewport_offset_is_inside(const uint32_t offset_bits[3],
+                                     uint32_t width,
+                                     uint32_t height,
+                                     uint32_t framebuffer_width,
+                                     uint32_t framebuffer_height)
+{
+   float offset[3];
+   memcpy(offset, offset_bits, sizeof(offset));
+   if (!isfinite(offset[0]) || !isfinite(offset[1]) || !isfinite(offset[2]))
+      return false;
+   /* Depth maps to [0, 1] through a half-scale, half-offset transform. */
+   if (offset[2] != 0.5f)
+      return false;
+   const float half_width = (float)width * 0.5f;
+   const float half_height = (float)height * 0.5f;
+   return offset[0] - half_width >= -0.5f &&
+          offset[1] - half_height >= -0.5f &&
+          offset[0] + half_width <= (float)framebuffer_width + 0.5f &&
+          offset[1] + half_height <= (float)framebuffer_height + 0.5f;
+}
+
 static bool
 pvrgpu_cmd_primitive_width_is_valid(uint32_t bits)
 {
@@ -123,11 +151,12 @@ pvrgpu_pco_single_draw_resolution_supported(uint32_t framebuffer_width,
                                             uint32_t height)
 {
    /*
-    * The model's rasterizer is resolution independent, so the single-draw
-    * profile only needs a full-surface render target inside the addressable
-    * extent the nested PCO sequence header already enforces.
+    * The model's rasterizer is resolution independent and applies the stated
+    * viewport transform, so a draw may render to part of its attachment.  The
+    * viewport just has to fit inside it.
     */
-   return width == framebuffer_width && height == framebuffer_height &&
+   return width != 0 && height != 0 &&
+          width <= framebuffer_width && height <= framebuffer_height &&
           framebuffer_width != 0 && framebuffer_height != 0 &&
           framebuffer_width <= 4096 && framebuffer_height <= 4096;
 }
@@ -949,9 +978,7 @@ pvrgpu_cmd_validate_draw_pco_triangles(
    }
 
    uint32_t viewport_bits[3];
-   pvrgpu_pco_viewport_bits(cmd->framebuffer_width,
-                            cmd->framebuffer_height,
-                            viewport_bits);
+   pvrgpu_pco_viewport_bits(cmd->width, cmd->height, viewport_bits);
    const bool ideas_depth_state_matches =
       cmd->depth_format != 0 &&
       ((cmd->depth_enable == 0 && cmd->depth_write == 0 &&
@@ -973,12 +1000,20 @@ pvrgpu_cmd_validate_draw_pco_triangles(
            (cmd->depth_enable == 0 || cmd->depth_format != 0)) :
           (cmd->depth_enable == 1 && cmd->depth_write == 1 &&
            cmd->depth_func == 3 && cmd->depth_format != 0));
+   /*
+    * Scale is half the viewport extent in each axis; the offset places that
+    * extent inside the attachment.  A pinned capture renders to the whole
+    * surface, where offset equals scale, but a draw that does not is only
+    * required to stay inside the render target.
+    */
    if (memcmp(cmd->viewport_scale_bits,
               viewport_bits,
               sizeof(viewport_bits)) != 0 ||
-       memcmp(cmd->viewport_translate_bits,
-              viewport_bits,
-              sizeof(viewport_bits)) != 0) {
+       !pvrgpu_cmd_viewport_offset_is_inside(cmd->viewport_translate_bits,
+                                             cmd->width,
+                                             cmd->height,
+                                             cmd->framebuffer_width,
+                                             cmd->framebuffer_height)) {
       pvrgpu_cmd_error(error, error_size,
                        "draw PCO triangles has incompatible viewport state");
       return false;

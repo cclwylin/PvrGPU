@@ -206,9 +206,10 @@ bool DriverPcoStageAbiIsBounded(const DriverPcoStageAbi &abi,
 bool DriverIdeasPcoSequenceCommandSupported(const DriverCommand &command) {
   static constexpr std::array<std::uint32_t, 4> kOpaqueBlack = {
       0, 0, 0, UINT32_C(0x3f800000)};
+  // Scale is half the viewport extent, which is the attachment only when the
+  // draw renders to the whole of it.
   const std::array<std::uint32_t, 3> viewport_bits =
-      PcoViewportBits(command.framebuffer_width,
-                      command.framebuffer_height);
+      PcoViewportBits(command.width, command.height);
   const bool position_layout =
       command.vertex_stride == 4U * sizeof(float);
   const bool two_attribute_layout =
@@ -273,7 +274,6 @@ bool DriverIdeasPcoSequenceCommandSupported(const DriverCommand &command) {
                  command.fragment_varying_count != 40 ||
                  command.fragment_pco_abi.coefficients != 44) ||
       command.viewport_scale_bits != viewport_bits ||
-      command.viewport_translate_bits != viewport_bits ||
       command.front_ccw != 0 ||
       (command.cull_face != 0 && command.cull_face != 2) ||
       command.fill_front != 0 || command.fill_back != 0 ||
@@ -325,9 +325,10 @@ bool DriverPcoTrianglesCommandSupported(const DriverCommand &command) {
     return DriverIdeasPcoSequenceCommandSupported(command);
   static constexpr std::array<std::uint32_t, 4> kOpaqueBlack = {
       0, 0, 0, UINT32_C(0x3f800000)};
+  // Scale is half the viewport extent, which is the attachment only when the
+  // draw renders to the whole of it.
   const std::array<std::uint32_t, 3> viewport_bits =
-      PcoViewportBits(command.framebuffer_width,
-                      command.framebuffer_height);
+      PcoViewportBits(command.width, command.height);
   const bool conditionals_layout =
       command.vertex_stride == kDriverPcoPositionVertexStride &&
       command.vertex_pco_abi.vertex_inputs == 4;
@@ -438,7 +439,6 @@ bool DriverPcoTrianglesCommandSupported(const DriverCommand &command) {
         command.fragment_varying_start != 4 ||
         command.fragment_varying_count != 16)) ||
       command.viewport_scale_bits != viewport_bits ||
-      command.viewport_translate_bits != viewport_bits ||
       command.front_ccw != 0 ||
       (!color_layout && command.cull_face != 2) ||
       command.fill_front != 0 || command.fill_back != 0 ||
@@ -1589,6 +1589,14 @@ void Submitter::Run() {
           command.point_size_bits == 0
               ? 1.0F
               : FloatFromBits(command.point_size_bits);
+      // The viewport transform the draw states.  Clip/cull falls back to the
+      // whole attachment when the scale is unstated.
+      for (std::size_t axis = 0; axis < 3; ++axis) {
+        state.raster_state.viewport_scale[axis] =
+            FloatFromBits(command.viewport_scale_bits[axis]);
+        state.raster_state.viewport_translate[axis] =
+            FloatFromBits(command.viewport_translate_bits[axis]);
+      }
     }
     if (driver_clear_like || driver_triangle || driver_indexed_quad ||
         driver_textured_triangles || driver_pco_triangles) {

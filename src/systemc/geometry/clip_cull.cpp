@@ -423,8 +423,35 @@ bool BuildPointQuadCorners(const ClipVertex &p, float half_size_px,
   return true;
 }
 
+// Viewport transform a draw renders through.  An unstated transform is the
+// whole attachment, which is what every pinned capture uses and what the
+// arithmetic below reduces to exactly when scale equals offset.
+struct ViewportTransform {
+  float scale_x;
+  float scale_y;
+  float scale_z;
+  float offset_x;
+  float offset_y;
+  float offset_z;
+};
+
+ViewportTransform ResolveViewport(const pvrgpu::stub::PipelineState &state) {
+  const float half_width = static_cast<float>(state.width) * 0.5F;
+  const float half_height = static_cast<float>(state.height) * 0.5F;
+  const bool stated = state.raster_state.viewport_scale[0] != 0.0F ||
+                      state.raster_state.viewport_scale[1] != 0.0F;
+  if (!stated)
+    return {half_width, half_height, 0.5F, half_width, half_height, 0.5F};
+  return {state.raster_state.viewport_scale[0],
+          state.raster_state.viewport_scale[1],
+          state.raster_state.viewport_scale[2],
+          state.raster_state.viewport_translate[0],
+          state.raster_state.viewport_translate[1],
+          state.raster_state.viewport_translate[2]};
+}
+
 RasterTriangle BuildRasterTriangle(const std::array<ClipVertex, 3> &vertices,
-                                   std::uint32_t width, std::uint32_t height,
+                                   const ViewportTransform &viewport,
                                    bool front_facing,
                                    std::vector<std::uint32_t> &vertex_outputs,
                                    bool depth_clamp_enable,
@@ -459,31 +486,31 @@ RasterTriangle BuildRasterTriangle(const std::array<ClipVertex, 3> &vertices,
       ndc_z = std::max(std::min(ndc_z, 1.0F), -1.0F);
     }
     if (mesa_viewport_order) {
-      const float scale_x = static_cast<float>(width) * 0.5F;
-      const float scale_y = static_cast<float>(height) * 0.5F;
       if (vertices[index].generated_intersection) {
         // draw_pipe_clip.c's CPU intersection path is compiled as distinct
         // MUL/MUL/ADD operations.  A one-ULP window coordinate difference is
         // observable in setup coefficients and half-precision texture LOD.
-        triangle.x[index] =
-            StrictAdd(StrictMultiply(ndc_x, scale_x), scale_x);
-        triangle.y[index] =
-            StrictAdd(StrictMultiply(ndc_y, scale_y), scale_y);
-        triangle.window_z[index] =
-            StrictAdd(StrictMultiply(ndc_z, 0.5F), 0.5F);
+        triangle.x[index] = StrictAdd(
+            StrictMultiply(ndc_x, viewport.scale_x), viewport.offset_x);
+        triangle.y[index] = StrictAdd(
+            StrictMultiply(ndc_y, viewport.scale_y), viewport.offset_y);
+        triangle.window_z[index] = StrictAdd(
+            StrictMultiply(ndc_z, viewport.scale_z), viewport.offset_z);
       } else {
         // Gallivm's do_rhw_viewport emits data * reciprocal_w first, then
         // contracts the viewport multiply/add for original shader vertices.
-        triangle.x[index] = std::fma(ndc_x, scale_x, scale_x);
-        triangle.y[index] = std::fma(ndc_y, scale_y, scale_y);
-        triangle.window_z[index] = std::fma(ndc_z, 0.5F, 0.5F);
+        triangle.x[index] =
+            std::fma(ndc_x, viewport.scale_x, viewport.offset_x);
+        triangle.y[index] =
+            std::fma(ndc_y, viewport.scale_y, viewport.offset_y);
+        triangle.window_z[index] =
+            std::fma(ndc_z, viewport.scale_z, viewport.offset_z);
       }
     } else {
-      triangle.x[index] =
-          (ndc_x * 0.5F + 0.5F) * static_cast<float>(width);
-      triangle.y[index] =
-          (ndc_y * 0.5F + 0.5F) * static_cast<float>(height);
-      triangle.window_z[index] = ndc_z * 0.5F + 0.5F;
+      triangle.x[index] = ndc_x * viewport.scale_x + viewport.offset_x;
+      triangle.y[index] = ndc_y * viewport.scale_y + viewport.offset_y;
+      triangle.window_z[index] =
+          ndc_z * viewport.scale_z + viewport.offset_z;
     }
     if (!std::isfinite(triangle.x[index]) ||
         !std::isfinite(triangle.y[index]) ||
@@ -615,6 +642,7 @@ void ClipCull::Run() {
       throw std::runtime_error(
           "ClipCull solid-color case has unexpected varying linkage");
     }
+    const ViewportTransform viewport = ResolveViewport(state);
     std::vector<RasterTriangle> triangles;
     std::vector<std::uint32_t> raster_vertex_outputs;
     const bool driver_pco_triangles =
@@ -679,7 +707,7 @@ void ClipCull::Run() {
         const bool face_culled =
             IsFaceCulled(state.raster_state.face_cull, front_facing);
         RasterTriangle triangle = BuildRasterTriangle(
-            vertices, state.width, state.height, front_facing,
+            vertices, viewport, front_facing,
             raster_vertex_outputs, depth_clamp, driver_textured_triangles,
             false);
         if (!triangle.rasterizable)
@@ -906,7 +934,7 @@ void ClipCull::Run() {
               if (generic_clip_path && face_culled)
                 continue;
               RasterTriangle triangle = BuildRasterTriangle(
-                  fan_triangle, state.width, state.height, front_facing,
+                  fan_triangle, viewport, front_facing,
                   raster_vertex_outputs, depth_clamp, driver_pco_triangles,
                   driver_pco_triangles && primitive_clipped);
               triangle.key.submit_ordinal = submit_ordinal;

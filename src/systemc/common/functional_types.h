@@ -311,6 +311,12 @@ struct RasterState {
   // clip/cull rather than approximated.
   float line_width = 1.0f;
   float point_size = 1.0f;
+  // Viewport transform applied to normalized device coordinates.  A draw that
+  // renders to part of its attachment states a scale and offset that are not
+  // half the surface, so clip/cull cannot derive them from the extent.  Zero
+  // means unstated, and the full surface is used.
+  float viewport_scale[3] = {0.0f, 0.0f, 0.0f};
+  float viewport_translate[3] = {0.0f, 0.0f, 0.0f};
   float clear_color[4] = {0.0F, 0.0F, 0.0F, 1.0F};
   std::uint32_t sample_count = 1;
   std::uint8_t shader_may_discard = 0;

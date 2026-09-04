@@ -426,6 +426,26 @@ bool CopyTextureSidecarBytes(
   return true;
 }
 
+// True when a viewport of the stated extent, centred on the stated offset,
+// lies inside the render target.
+bool ViewportOffsetIsInside(const std::uint32_t offset_bits[3],
+                            std::uint32_t width, std::uint32_t height,
+                            std::uint32_t framebuffer_width,
+                            std::uint32_t framebuffer_height) {
+  float offset[3];
+  std::memcpy(offset, offset_bits, sizeof(offset));
+  if (!std::isfinite(offset[0]) || !std::isfinite(offset[1]) ||
+      !std::isfinite(offset[2]) || offset[2] != 0.5F) {
+    return false;
+  }
+  const float half_width = static_cast<float>(width) * 0.5F;
+  const float half_height = static_cast<float>(height) * 0.5F;
+  return offset[0] - half_width >= -0.5F &&
+         offset[1] - half_height >= -0.5F &&
+         offset[0] + half_width <= static_cast<float>(framebuffer_width) + 0.5F &&
+         offset[1] + half_height <= static_cast<float>(framebuffer_height) + 0.5F;
+}
+
 bool CopyPcoTrianglePayload(
     const pvrgpu_systemc_driver_command &source,
     pvrgpu::stub::DriverCommand *destination, std::string *error) {
@@ -655,12 +675,16 @@ bool CopyPcoTrianglePayload(
          source.fragment_position_count != 4 ||
          source.fragment_varying_start != 4 ||
          source.fragment_varying_count != 12)));
+  // Scale is half the viewport extent; the offset places it in the
+  // attachment.  A draw rendering to part of its target states an offset that
+  // is not the scale, which is only wrong if it leaves the render target.
   const bool viewport_scale_invalid =
       !std::equal(viewport_bits.begin(), viewport_bits.end(),
                   source.viewport_scale_bits);
   const bool viewport_translate_invalid =
-      !std::equal(viewport_bits.begin(), viewport_bits.end(),
-                  source.viewport_translate_bits);
+      !ViewportOffsetIsInside(source.viewport_translate_bits, source.width,
+                              source.height, source.framebuffer_width,
+                              source.framebuffer_height);
   if (common_abi_invalid || ideas_abi_invalid || single_abi_invalid ||
       viewport_scale_invalid || viewport_translate_invalid) {
     std::ostringstream detail;
