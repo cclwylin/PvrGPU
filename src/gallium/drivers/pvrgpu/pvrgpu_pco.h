@@ -121,14 +121,25 @@ bool pvrgpu_pco_compile_conditionals(struct pvrgpu_pco_compiler *compiler,
  * Position attribute is GENERIC0, Color attribute is GENERIC1.
  * Exports position and smooth color varying (4 scalar components).
  */
+/* Vertex attributes one generically lowered draw can bind. */
+#define PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES 8u
+
+/* Reports the component width the vertex shader declares for each generic
+ * attribute, so the driver can pack them at the width the program reads. */
+bool pvrgpu_pco_vertex_attribute_components(const struct nir_shader *vertex_nir,
+                                            unsigned attribute_count,
+                                            unsigned *components);
+
 bool pvrgpu_pco_compile_color_triangle(
    struct pvrgpu_pco_compiler *compiler,
    const struct nir_shader *vertex_nir,
    const struct nir_shader *fragment_nir,
-   enum pipe_format position_format,
-   enum pipe_format color_format,
+   const enum pipe_format *attribute_formats,
    bool topology_uses_point_size,
    unsigned render_target_count,
+   unsigned vertex_uniform_dwords,
+   unsigned fragment_uniform_dwords,
+   unsigned attribute_count,
    struct pvrgpu_pco_graphics_binary *out,
    char *error,
    size_t error_size);

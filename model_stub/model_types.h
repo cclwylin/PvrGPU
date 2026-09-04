@@ -224,6 +224,9 @@ struct DriverCommand {
   std::uint32_t indexed = 0;
   // Colour attachments this draw writes; one for an ordinary draw.
   std::uint32_t render_target_count = 1;
+  // Packed vertex attribute widths; attribute N lands in VTXIN 4 * N.
+  std::uint32_t vertex_attribute_count = 0;
+  std::array<std::uint32_t, 8> vertex_attribute_components{};
   // Index payload for an indexed draw; empty for a non-indexed one.
   std::vector<std::uint8_t> raw_index_data;
   std::uint64_t declared_raw_index_data_size = 0;

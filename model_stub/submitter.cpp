@@ -317,13 +317,18 @@ bool DriverPcoTrianglesCommandSupported(const DriverCommand &command) {
       command.vertex_pco_abi.vertex_inputs == 4;
   // Untextured position/colour layout: six floats for a vec2 position, eight
   // for a vec4 one.
+  const bool generic_attribute_layout =
+      command.vertex_attribute_count != 0 &&
+      command.vertex_pco_abi.vertex_inputs ==
+          command.vertex_attribute_count * 4U;
   const bool color_layout =
-      (command.vertex_stride == 6U * sizeof(float) ||
-       command.vertex_stride == 8U * sizeof(float)) &&
-      command.vertex_pco_abi.vertex_inputs == 8 &&
-      command.varying_output_count == 4 &&
-      command.fragment_varying_count == 16 &&
-      command.vertex_pco_abi.shareds == 0;
+      generic_attribute_layout ||
+      (((command.vertex_stride == 6U * sizeof(float) &&
+         command.vertex_pco_abi.shareds == 0) ||
+        command.vertex_stride == 8U * sizeof(float)) &&
+       command.vertex_pco_abi.vertex_inputs == 8 &&
+       command.varying_output_count == 4 &&
+       command.fragment_varying_count == 16);
   const bool lit_mesh_layout =
       command.vertex_stride == kDriverPcoPositionNormalVertexStride &&
       command.vertex_pco_abi.vertex_inputs == 8 &&
@@ -1717,12 +1722,44 @@ void Submitter::Run() {
             command.vertex_stride == 8U * sizeof(float) &&
             command.vertex_pco_abi.vertex_inputs == 8 &&
             command.varying_output_count == 4 &&
-            command.fragment_varying_count == 16 &&
-            command.vertex_pco_abi.shareds == 0;
+            command.fragment_varying_count == 16;
         const bool terrain_main_layout =
             command.vertex_stride == 11U * sizeof(float) &&
             command.vertex_pco_abi.vertex_inputs == 16;
-        if (color_layout) {
+        if (command.vertex_attribute_count != 0) {
+          // The capsule states each attribute's width, so build the bindings
+          // it describes rather than inferring a layout from the stride.
+          state.driver_describes_attributes = 1;
+          std::uint32_t offset_bytes = 0;
+          for (std::uint32_t attribute = 0;
+               attribute < command.vertex_attribute_count; ++attribute) {
+            const std::uint32_t components =
+                command.vertex_attribute_components[attribute];
+            if (components == 0 || components > 4) {
+              throw std::runtime_error(
+                  "Submitter driver PCO attribute width is invalid");
+            }
+            VertexAttributeBinding binding;
+            binding.buffer_index = 0;
+            binding.offset_bytes = offset_bytes;
+            binding.stride_bytes = command.vertex_stride;
+            binding.destination_register =
+                static_cast<std::uint16_t>(attribute * 4U);
+            binding.component_type = VertexComponentType::kFloat32;
+            binding.source_components =
+                static_cast<std::uint8_t>(components);
+            binding.destination_components = 4;
+            binding.normalized = 0;
+            binding.integer = 0;
+            binding.instance_divisor = 0;
+            bindings.push_back(binding);
+            offset_bytes += components * sizeof(float);
+          }
+          if (offset_bytes != command.vertex_stride) {
+            throw std::runtime_error(
+                "Submitter driver PCO attribute widths do not fill the stride");
+          }
+        } else if (color_layout) {
           bindings = {
               MakeDriverPcoFloat2Binding(0, command.vertex_stride, 0),
               MakeDriverPcoFloat4Binding(

@@ -37,7 +37,7 @@ const std::set<std::string> &KnownFields() {
   static const std::set<std::string> fields = {
       "schema", "producer", "command", "case", "frame",
       "raw_index_data_size", "index_size", "first_index", "base_vertex",
-      "render_target_count",
+      "render_target_count", "vertex_attribute_count",
       "framebuffer_width", "framebuffer_height", "width",
       "height", "format", "clear_color_bits", "fragment_color_bits",
       "vertex0_bits", "vertex1_bits", "vertex2_bits",
@@ -334,7 +334,8 @@ bool RequireExactFields(const std::map<std::string, std::string> &fields,
     // Index payload: present only on an indexed PCO triangles draw.
     const bool optional_pco_render_targets =
         command == kDrawPcoTrianglesCommand &&
-        entry.first == "render_target_count";
+        (entry.first == "render_target_count" ||
+         entry.first == "vertex_attribute_count");
     const bool optional_pco_index =
         command == kDrawPcoTrianglesCommand &&
         (entry.first == "raw_index_data_size" ||
@@ -642,6 +643,9 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         (parsed.primitive_mode != 4 && parsed.primitive_mode != 5 &&
          parsed.primitive_mode != 6) ||
         !ParseU32(fields["indexed"], &parsed.indexed) || parsed.indexed > 1 ||
+        !ParseOptionalU32(fields, "vertex_attribute_count",
+                          &parsed.vertex_attribute_count) ||
+        parsed.vertex_attribute_count > 8 ||
         !ParseOptionalU32(fields, "render_target_count",
                           &parsed.render_target_count) ||
         parsed.render_target_count == 0 || parsed.render_target_count > 4 ||

@@ -11985,6 +11985,50 @@ pvrgpu_copy_draw_indices(const struct pipe_draw_info *info,
 }
 
 /*
+ * DWORDs of constant buffer 0 a stage binds, rounded to the vec4 granularity
+ * Gallium addresses uniforms with.  Zero when the stage binds nothing.
+ */
+static unsigned
+pvrgpu_stage_uniform_dwords(const struct pvrgpu_context *ctx,
+                            mesa_shader_stage stage)
+{
+   size_t available = 0;
+   if (!pvrgpu_constant_buffer_bytes(ctx, stage, 0, &available))
+      return 0;
+   const unsigned dwords = (unsigned)(available / sizeof(uint32_t));
+   return (dwords + 3u) & ~3u;
+}
+
+/*
+ * Copies a stage's constant buffer into the shared-register words a lowered
+ * draw carries.  A stage may reserve more than it binds, so the tail is
+ * zero filled rather than left undefined.
+ */
+static bool
+pvrgpu_copy_stage_uniform_words(const struct pvrgpu_context *ctx,
+                                mesa_shader_stage stage,
+                                unsigned dwords,
+                                uint32_t *words)
+{
+   if (dwords == 0)
+      return true;
+   size_t available = 0;
+   const uint8_t *bytes =
+      pvrgpu_constant_buffer_bytes(ctx, stage, 0, &available);
+   if (!bytes || !words)
+      return false;
+   for (unsigned word = 0; word < dwords; ++word) {
+      const size_t offset = (size_t)word * sizeof(uint32_t);
+      if (offset + sizeof(uint32_t) > available) {
+         words[word] = 0;
+         continue;
+      }
+      memcpy(&words[word], bytes + offset, sizeof(words[word]));
+   }
+   return true;
+}
+
+/*
  * Record one lowered array-primitive draw.  The v1 capsule carries a single
  * draw, so an accumulating sequence is the only way a trace with more than one
  * draw reaches the model; the draws are submitted together by
@@ -12053,15 +12097,39 @@ pvrgpu_record_color_primitive_pco_draw(
       vertex_bias = (unsigned)draw->index_bias;
    }
    /*
-    * Eight interleaved floats per vertex: float4 position, float4 color.  The
-    * position is carried at full width because a shader declaring vec4
-    * gl_Position reads all four VTXIN components, and the model matches the
-    * shader's vertex-input mask against the attribute bindings exactly.
+    * Pack each attribute at the width its vertex shader declares.  The model
+    * matches a program's VTXIN read mask against the attribute bindings
+    * exactly, so supplying a uniform four components would not line up with a
+    * shader that declares a narrower attribute.
     */
-   if (vertex_count > UINT_MAX / (8u * sizeof(float)))
+   const unsigned attribute_count = ctx->vertex_elements->num_elements;
+   unsigned attribute_components[PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES] = {0};
+   if (!pvrgpu_pco_vertex_attribute_components(ctx->vs->nir,
+                                               attribute_count,
+                                               attribute_components)) {
+      free(index_data);
       return false;
+   }
+   enum pipe_format attribute_formats[PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES] = {
+      PIPE_FORMAT_NONE};
+   for (unsigned attribute = 0; attribute < attribute_count; ++attribute) {
+      attribute_formats[attribute] =
+         ctx->vertex_elements->elements[attribute].src_format;
+   }
+   unsigned packed_floats = 0;
+   unsigned attribute_offsets[PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES] = {0};
+   for (unsigned attribute = 0; attribute < attribute_count; ++attribute) {
+      attribute_offsets[attribute] = packed_floats;
+      packed_floats += attribute_components[attribute];
+   }
+   if (packed_floats == 0 ||
+       vertex_count > UINT_MAX / (packed_floats * sizeof(float))) {
+      free(index_data);
+      return false;
+   }
 
-   float *interleaved = malloc((size_t)vertex_count * 8u * sizeof(float));
+   float *interleaved =
+      malloc((size_t)vertex_count * packed_floats * sizeof(float));
    if (!interleaved) {
       free(index_data);
       return false;
@@ -12069,21 +12137,25 @@ pvrgpu_record_color_primitive_pco_draw(
    for (unsigned v = 0; v < vertex_count; ++v) {
       const unsigned v_idx =
          info->index_size != 0 ? v + vertex_bias : draw->start + v;
-      if (!pvrgpu_read_vertex_attribute(ctx,
-                                        &ctx->vertex_elements->elements[0],
-                                        v_idx,
-                                        4,
-                                        &interleaved[v * 8 + 0]) ||
-          !pvrgpu_read_vertex_attribute(ctx,
-                                        &ctx->vertex_elements->elements[1],
-                                        v_idx,
-                                        4,
-                                        &interleaved[v * 8 + 4])) {
-         free(interleaved);
-         free(index_data);
-         return false;
+      for (unsigned attribute = 0; attribute < attribute_count; ++attribute) {
+         if (!pvrgpu_read_vertex_attribute(
+                ctx,
+                &ctx->vertex_elements->elements[attribute],
+                v_idx,
+                attribute_components[attribute],
+                &interleaved[(size_t)v * packed_floats +
+                             attribute_offsets[attribute]])) {
+            free(interleaved);
+            free(index_data);
+            return false;
+         }
       }
    }
+
+   const unsigned vertex_uniform_dwords =
+      pvrgpu_stage_uniform_dwords(ctx, MESA_SHADER_VERTEX);
+   const unsigned fragment_uniform_dwords =
+      pvrgpu_stage_uniform_dwords(ctx, MESA_SHADER_FRAGMENT);
 
    char error[512] = {0};
    if (!ctx->pco_compiler) {
@@ -12098,21 +12170,21 @@ pvrgpu_record_color_primitive_pco_draw(
       }
    }
 
-   enum pipe_format pos_format = ctx->vertex_elements->elements[0].src_format;
-   enum pipe_format color_format = ctx->vertex_elements->elements[1].src_format;
 
    struct pvrgpu_pco_graphics_binary binary;
    memset(&binary, 0, sizeof(binary));
    if (!pvrgpu_pco_compile_color_triangle(ctx->pco_compiler,
                                           ctx->vs->nir,
                                           ctx->fs->nir,
-                                          pos_format,
-                                          color_format,
+                                          attribute_formats,
                                           info->mode == MESA_PRIM_POINTS &&
                                              ctx->rasterizer &&
                                              ctx->rasterizer->state
                                                 .point_size_per_vertex,
                                           ctx->framebuffer.nr_cbufs,
+                                          vertex_uniform_dwords,
+                                          fragment_uniform_dwords,
+                                          attribute_count,
                                           &binary,
                                           error,
                                           sizeof(error))) {
@@ -12135,8 +12207,14 @@ pvrgpu_record_color_primitive_pco_draw(
    command.format = PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8;
    command.clear_color_bits[3] = UINT32_C(0x3f800000);
    command.raw_vertex_data = (const uint8_t *)interleaved;
-   command.raw_vertex_data_size = (size_t)vertex_count * 8u * sizeof(float);
-   command.vertex_stride = 8u * sizeof(float);
+   command.raw_vertex_data_size =
+      (size_t)vertex_count * packed_floats * sizeof(float);
+   command.vertex_stride = packed_floats * sizeof(float);
+   command.vertex_attribute_count = attribute_count;
+   for (unsigned attribute = 0; attribute < attribute_count; ++attribute) {
+      command.vertex_attribute_components[attribute] =
+         attribute_components[attribute];
+   }
    command.vertex_count = vertex_count;
    command.first_vertex = 0;
    command.instance_count = 1;
@@ -12153,10 +12231,30 @@ pvrgpu_record_color_primitive_pco_draw(
    command.vertex_pco_size = binary.vertex.size;
    command.fragment_pco = binary.fragment.data;
    command.fragment_pco_size = binary.fragment.size;
-   command.vertex_shared = NULL;
-   command.vertex_shared_count = 0;
-   command.fragment_shared = NULL;
-   command.fragment_shared_count = 0;
+   uint32_t vertex_uniform_words[PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS] = {0};
+   uint32_t fragment_uniform_words[PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS] = {0};
+   const unsigned vertex_shared_count = binary.vertex.abi.shareds;
+   const unsigned fragment_shared_count = binary.fragment.abi.shareds;
+   if (vertex_shared_count > PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS ||
+       fragment_shared_count > PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS ||
+       !pvrgpu_copy_stage_uniform_words(ctx,
+                                        MESA_SHADER_VERTEX,
+                                        vertex_shared_count,
+                                        vertex_uniform_words) ||
+       !pvrgpu_copy_stage_uniform_words(ctx,
+                                        MESA_SHADER_FRAGMENT,
+                                        fragment_shared_count,
+                                        fragment_uniform_words)) {
+      pvrgpu_pco_graphics_binary_finish(&binary);
+      free(interleaved);
+      free(index_data);
+      return false;
+   }
+   command.vertex_shared = vertex_shared_count ? vertex_uniform_words : NULL;
+   command.vertex_shared_count = vertex_shared_count;
+   command.fragment_shared =
+      fragment_shared_count ? fragment_uniform_words : NULL;
+   command.fragment_shared_count = fragment_shared_count;
    pvrgpu_copy_pco_stage_abi_to_command(&command.vertex_pco_abi,
                                         &binary.vertex.abi);
    pvrgpu_copy_pco_stage_abi_to_command(&command.fragment_pco_abi,
@@ -12991,7 +13089,9 @@ pvrgpu_draw_is_lowerable_array_primitive(
    }
    if (!ctx->vs || !ctx->fs || ctx->tcs || ctx->tes || ctx->gs)
       return false;
-   if (!ctx->vertex_elements || ctx->vertex_elements->num_elements != 2 ||
+   if (!ctx->vertex_elements ||
+       ctx->vertex_elements->num_elements == 0 ||
+       ctx->vertex_elements->num_elements > PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES ||
        ctx->num_vertex_buffers == 0)
       return false;
    if (ctx->num_sampler_views[MESA_SHADER_FRAGMENT] != 0)

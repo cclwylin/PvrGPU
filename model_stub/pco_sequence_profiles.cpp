@@ -1123,9 +1123,14 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
       return Reject(error, "generic PCO sequence draw envelope is invalid");
     }
     // Untextured position/colour layout: float2 position + float4 colour.
-    if ((draw.vertex_stride != 6U * sizeof(float) &&
-         draw.vertex_stride != 8U * sizeof(float)) ||
-        draw.vertex_pco_abi.vertex_inputs != 8 ||
+    const bool describes_attributes =
+        draw.vertex_attribute_count != 0 &&
+        draw.vertex_pco_abi.vertex_inputs ==
+            draw.vertex_attribute_count * 4U;
+    if ((!describes_attributes &&
+         ((draw.vertex_stride != 6U * sizeof(float) &&
+           draw.vertex_stride != 8U * sizeof(float)) ||
+          draw.vertex_pco_abi.vertex_inputs != 8)) ||
         !draw.sampled_textures.empty() || draw.sampled_texture_count != 0) {
       return Reject(error, "generic PCO sequence draw is not the colour layout");
     }

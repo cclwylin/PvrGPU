@@ -236,6 +236,13 @@ void CopyPcoPayloadFields(
   }
   destination->render_target_count =
       source.render_target_count == 0 ? 1U : source.render_target_count;
+  destination->vertex_attribute_count = source.vertex_attribute_count;
+  for (std::size_t attribute = 0;
+       attribute < destination->vertex_attribute_components.size();
+       ++attribute) {
+    destination->vertex_attribute_components[attribute] =
+        source.vertex_attribute_components[attribute];
+  }
   destination->declared_raw_index_data_size = source.raw_index_data_size;
   destination->index_size = source.index_size;
   destination->index_count = source.index_count;
@@ -432,11 +439,21 @@ bool CopyPcoTrianglePayload(
       source.vertex_stride == pvrgpu::stub::kDriverPcoPositionVertexStride;
   // Untextured position/colour layout: six floats for a vec2 position, eight
   // for a vec4 one.
+  // The six-float form shares a stride with the lit-mesh profile and is told
+  // apart by owning no shared registers; the eight-float form is unambiguous
+  // and may carry the draw's constant buffer.
+  // Eight floats per vertex is also the texture profile's stride, so the
+  // untextured form is told apart by its VTXIN count.
   const bool color_layout =
       (source.vertex_stride ==
-           pvrgpu::stub::kDriverPcoPositionNormalVertexStride ||
-       source.vertex_stride == 8U * sizeof(float)) &&
-      source.vertex_pco_abi.shareds == 0;
+           pvrgpu::stub::kDriverPcoPositionNormalVertexStride &&
+       source.vertex_pco_abi.shareds == 0) ||
+      (!ideas_sequence && source.vertex_stride == 8U * sizeof(float) &&
+       source.vertex_pco_abi.vertex_inputs == 8) ||
+      // A command that states its attribute widths describes itself.
+      (source.vertex_attribute_count != 0 &&
+       source.vertex_pco_abi.vertex_inputs ==
+           source.vertex_attribute_count * 4U);
   const bool lit_mesh_layout =
       source.vertex_stride ==
           pvrgpu::stub::kDriverPcoPositionNormalVertexStride &&

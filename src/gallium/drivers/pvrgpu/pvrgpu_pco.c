@@ -3466,9 +3466,68 @@ bool pvrgpu_pco_compile_conditionals(struct pvrgpu_pco_compiler *compiler,
    return true;
 }
 
+/* Shared registers one lowered stage may reserve for its constant buffer. */
+#define PVRGPU_COLOR_PRIMITIVE_MAX_UNIFORM_DWORDS 64u
+
+// Uniform loads a stage still performs once dead code has been removed.
+static unsigned pvrgpu_count_uniform_loads(const nir_shader *nir)
+{
+   unsigned loads = 0;
+   nir_foreach_function_impl(impl, (nir_shader *)nir)
+   {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            if (nir_instr_as_intrinsic(instr)->intrinsic ==
+                nir_intrinsic_load_uniform)
+               ++loads;
+         }
+      }
+   }
+   return loads;
+}
+
+/*
+ * Reserve shared registers for the whole constant buffer the draw binds.  The
+ * pinned profiles assert an exact used-DWORD count because their shader is
+ * fixed; a generic shader only has to stay inside the buffer it was given.
+ */
+static bool pvrgpu_allocate_generic_push_constants(pco_data *data,
+                                                   unsigned dwords,
+                                                   const char *stage,
+                                                   char *error,
+                                                   size_t error_size)
+{
+   if (data->common.shareds != 0) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "color primitive %s already owns shared "
+                             "registers",
+                             stage);
+   }
+   if (dwords == 0 || dwords > PVRGPU_COLOR_PRIMITIVE_MAX_UNIFORM_DWORDS ||
+       data->common.push_consts.used > dwords) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "color primitive %s uniform range is "
+                             "unsupported (used=%u available=%u)",
+                             stage,
+                             data->common.push_consts.used,
+                             dwords);
+   }
+   data->common.push_consts.range = (pco_range){
+      .start = 0,
+      .count = dwords,
+   };
+   data->common.shareds = dwords;
+   return true;
+}
+
 static bool pvrgpu_color_primitive_allowed_intrinsic(nir_intrinsic_op op)
 {
    switch (op) {
+   case nir_intrinsic_load_uniform:
    case nir_intrinsic_load_deref:
    case nir_intrinsic_store_deref:
    case nir_intrinsic_load_input:
@@ -3492,6 +3551,7 @@ static bool pvrgpu_color_primitive_allowed_intrinsic(nir_intrinsic_op op)
 static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                                                 mesa_shader_stage expected_stage,
                                                 unsigned render_target_count,
+                                                unsigned attribute_count,
                                                 char *error,
                                                 size_t error_size)
 {
@@ -3501,10 +3561,12 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                              "color primitive shader stage mismatch");
    }
 
+   uint64_t vertex_inputs = 0;
+   for (unsigned attribute = 0; attribute < attribute_count; ++attribute)
+      vertex_inputs |= BITFIELD64_BIT(VERT_ATTRIB_GENERIC0 + attribute);
    const uint64_t expected_inputs =
-      expected_stage == MESA_SHADER_VERTEX
-         ? (BITFIELD64_BIT(VERT_ATTRIB_GENERIC0) | BITFIELD64_BIT(VERT_ATTRIB_GENERIC1))
-         : BITFIELD64_BIT(VARYING_SLOT_VAR0);
+      expected_stage == MESA_SHADER_VERTEX ? vertex_inputs
+                                           : BITFIELD64_BIT(VARYING_SLOT_VAR0);
    const uint64_t expected_outputs =
       expected_stage == MESA_SHADER_VERTEX
          ? (BITFIELD64_BIT(VARYING_SLOT_POS) | BITFIELD64_BIT(VARYING_SLOT_VAR0))
@@ -3542,10 +3604,13 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
 
    const bool stage_uses_discard =
       expected_stage == MESA_SHADER_FRAGMENT && nir->info.fs.uses_discard;
+   /*
+    * Default-block uniforms become push constants, so they are allowed.
+    * Anything reached through a descriptor is not.
+    */
    if (nir->info.num_ubos != 0 || nir->info.num_ssbos != 0 ||
        nir->info.num_images != 0 || nir->info.num_textures != 0 ||
-       nir->info.shared_size != 0 || stage_uses_discard ||
-       nir->num_uniforms != 0) {
+       nir->info.shared_size != 0 || stage_uses_discard) {
       return pvrgpu_pco_fail(error,
                              error_size,
                              "color primitive %s uses unsupported resources",
@@ -3664,18 +3729,62 @@ static bool pvrgpu_strip_dead_point_size(nir_shader *nir)
    return true;
 }
 
+/*
+ * Components the vertex shader declares for each generic attribute.  The model
+ * matches a program's VTXIN read mask against the attribute bindings exactly,
+ * so the driver has to supply each attribute at the width its shader declares
+ * rather than a uniform four.  Returns false when an attribute the draw binds
+ * is absent from the shader or is not a plain float vector.
+ */
+bool pvrgpu_pco_vertex_attribute_components(const struct nir_shader *vertex_nir,
+                                            unsigned attribute_count,
+                                            unsigned *components)
+{
+   if (!vertex_nir || !components || attribute_count == 0 ||
+       attribute_count > PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES)
+      return false;
+   for (unsigned attribute = 0; attribute < attribute_count; ++attribute)
+      components[attribute] = 0;
+
+   nir_foreach_variable_with_modes (var, vertex_nir, nir_var_shader_in) {
+      if (var->data.location < VERT_ATTRIB_GENERIC0)
+         return false;
+      const unsigned index = var->data.location - VERT_ATTRIB_GENERIC0;
+      if (index >= attribute_count)
+         return false;
+      const unsigned count = glsl_get_components(var->type);
+      if (count == 0 || count > 4 || !glsl_type_is_vector_or_scalar(var->type))
+         return false;
+      components[index] = count;
+   }
+
+   for (unsigned attribute = 0; attribute < attribute_count; ++attribute) {
+      if (components[attribute] == 0)
+         return false;
+   }
+   return true;
+}
+
 bool pvrgpu_pco_compile_color_triangle(
    struct pvrgpu_pco_compiler *compiler,
    const struct nir_shader *vertex_nir,
    const struct nir_shader *fragment_nir,
-   enum pipe_format position_format,
-   enum pipe_format color_format,
+   const enum pipe_format *attribute_formats,
    bool topology_uses_point_size,
    unsigned render_target_count,
+   unsigned vertex_uniform_dwords,
+   unsigned fragment_uniform_dwords,
+   unsigned attribute_count,
    struct pvrgpu_pco_graphics_binary *out,
    char *error,
    size_t error_size)
 {
+   if (!attribute_formats || attribute_count == 0 ||
+       attribute_count > PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "color primitive attribute count is unsupported");
+   }
    if (render_target_count == 0 || render_target_count > 4) {
       return pvrgpu_pco_fail(error,
                              error_size,
@@ -3721,11 +3830,13 @@ bool pvrgpu_pco_compile_color_triangle(
    if (!pvrgpu_validate_color_primitive_nir(vs,
                                             MESA_SHADER_VERTEX,
                                             render_target_count,
+                                            attribute_count,
                                             error,
                                             error_size) ||
        !pvrgpu_validate_color_primitive_nir(fs,
                                             MESA_SHADER_FRAGMENT,
                                             render_target_count,
+                                            attribute_count,
                                             error,
                                             error_size)) {
       ralloc_free(compile_mem_ctx);
@@ -3734,20 +3845,58 @@ bool pvrgpu_pco_compile_color_triangle(
 
    nir_lower_fragcolor(fs, 1);
 
+   /*
+    * Whatever uniform loads survive dead-code removal address the draw's
+    * constant buffer, so rewrite them onto push constants sized by the buffer
+    * the driver bound for that stage.
+    */
+   const unsigned vertex_uniform_loads = pvrgpu_count_uniform_loads(vs);
+   const unsigned fragment_uniform_loads = pvrgpu_count_uniform_loads(fs);
+   if ((vertex_uniform_loads != 0 &&
+        !pvrgpu_lower_uniform_slots_to_push_constants(vs,
+                                                      vertex_uniform_dwords,
+                                                      vertex_uniform_loads,
+                                                      "color primitive",
+                                                      error,
+                                                      error_size)) ||
+       (fragment_uniform_loads != 0 &&
+        !pvrgpu_lower_uniform_slots_to_push_constants(fs,
+                                                      fragment_uniform_dwords,
+                                                      fragment_uniform_loads,
+                                                      "color primitive",
+                                                      error,
+                                                      error_size))) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+
    pco_data vertex_data = { 0 };
    pco_data fragment_data = { 0 };
 
-   vertex_data.vs.attrib_formats[VERT_ATTRIB_GENERIC0] = position_format;
-   vertex_data.vs.attrib_formats[VERT_ATTRIB_GENERIC1] = color_format;
-   vertex_data.vs.attribs[VERT_ATTRIB_GENERIC0] = (pco_range){
-      .start = 0,
-      .count = 4,
-   };
-   vertex_data.vs.attribs[VERT_ATTRIB_GENERIC1] = (pco_range){
-      .start = 4,
-      .count = 4,
-   };
-   vertex_data.common.vtxins = 8;
+   /*
+    * One vec4-aligned VTXIN slot per attribute, each with the source format
+    * it is fetched from.  PCO's vertex-input lowering dereferences the format
+    * of every attribute it is told about, so leaving one unset is not an
+    * option.
+    */
+   for (unsigned attribute = 0; attribute < attribute_count; ++attribute) {
+      if (attribute_formats[attribute] == PIPE_FORMAT_NONE) {
+         ralloc_free(compile_mem_ctx);
+         return pvrgpu_pco_fail(error,
+                                error_size,
+                                "color primitive attribute %u has no source "
+                                "format",
+                                attribute);
+      }
+      vertex_data.vs.attrib_formats[VERT_ATTRIB_GENERIC0 + attribute] =
+         attribute_formats[attribute];
+      vertex_data.vs.attribs[VERT_ATTRIB_GENERIC0 + attribute] =
+         (pco_range){
+            .start = attribute * 4,
+            .count = 4,
+         };
+   }
+   vertex_data.common.vtxins = attribute_count * 4;
    vertex_data.vs.varyings[VARYING_SLOT_POS] = (pco_range){
       .start = 0,
       .count = 4,
@@ -3801,6 +3950,22 @@ bool pvrgpu_pco_compile_color_triangle(
    pco_lower_nir(compiler->pco, fs, &fragment_data);
    pco_postprocess_nir(compiler->pco, vs, &vertex_data);
    pco_postprocess_nir(compiler->pco, fs, &fragment_data);
+
+   if ((vertex_uniform_loads != 0 &&
+        !pvrgpu_allocate_generic_push_constants(&vertex_data,
+                                                vertex_uniform_dwords,
+                                                "VS",
+                                                error,
+                                                error_size)) ||
+       (fragment_uniform_loads != 0 &&
+        !pvrgpu_allocate_generic_push_constants(&fragment_data,
+                                                fragment_uniform_dwords,
+                                                "FS",
+                                                error,
+                                                error_size))) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
 
    pco_shader *vertex =
       pco_trans_nir(compiler->pco, vs, &vertex_data, compile_mem_ctx);

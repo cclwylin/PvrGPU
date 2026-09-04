@@ -101,8 +101,19 @@ void PcoDecoder::Run() {
         throw std::runtime_error(
             "vertex PCO reads VTXIN registers absent from attribute bindings");
       }
+      // A pinned capture layout is held to an exact match, which catches a
+      // driver substituting a different one. A command that states its own
+      // attribute widths is instead required to bind everything the program
+      // reads: a shader that declares a vec4 and uses only its xy leaves the
+      // remaining components bound but unread, which is not an error.
+      const bool mask_matches =
+          state.driver_describes_attributes != 0
+              ? (decoded.summary.vertex_input_mask &
+                 ~driver_readable_vertex_inputs) == 0
+              : decoded.summary.vertex_input_mask ==
+                    driver_readable_vertex_inputs;
       if (driver_pco_triangles &&
-          (decoded.summary.vertex_input_mask != driver_readable_vertex_inputs ||
+          (!mask_matches ||
            (state.vertex_pco_abi.vertex_inputs != 0 &&
             state.vertex_pco_abi.vertex_inputs !=
                 declared_vertex_input_count))) {

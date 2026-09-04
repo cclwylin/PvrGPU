@@ -53,6 +53,9 @@ struct PipelineState {
   // matching DrawCommand::topology's own default; every non-indexed
   // path never reads this field.
   PrimitiveTopology source_topology = PrimitiveTopology::kTriangleStrip;
+  // Set when the draw command stated its own vertex attribute widths rather
+  // than matching one of the pinned capture layouts.
+  std::uint32_t driver_describes_attributes = 0;
   RasterState raster_state;
   PoolHandle drawlist_stats;
   PoolHandle vertex_buffer_resources;

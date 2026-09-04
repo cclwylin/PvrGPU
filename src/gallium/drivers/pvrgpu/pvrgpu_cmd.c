@@ -607,10 +607,24 @@ pvrgpu_cmd_validate_draw_pco_triangles(
     * Untextured position/colour layout.  A shader reading vec2 position packs
     * six floats per vertex; one reading vec4 position packs eight.
     */
+   /*
+    * Untextured position/colour layout.  The six-float form predates the
+    * generic path and shares its stride with the lit-mesh profile, so it is
+    * still told apart by owning no shared registers; the eight-float form is
+    * unambiguous and may carry the draw's constant buffer.
+    */
+   /* Ideas' two-attribute profile shares the eight-float stride. */
+   const bool ideas_case_name =
+      strcmp(cmd->case_name, "ideas.ideas.capture.1") == 0;
    const bool color_layout =
-      (cmd->vertex_stride == 24 || cmd->vertex_stride == 32) &&
-      cmd->vertex_pco_abi.vertex_inputs == 8 &&
-      cmd->vertex_pco_abi.shareds == 0;
+      (cmd->vertex_stride == 24 && cmd->vertex_pco_abi.vertex_inputs == 8 &&
+       cmd->vertex_pco_abi.shareds == 0) ||
+      (!ideas_case_name && cmd->vertex_stride == 32 &&
+       cmd->vertex_pco_abi.vertex_inputs == 8) ||
+      /* A command that states its attribute widths describes itself. */
+      (cmd->vertex_attribute_count != 0 &&
+       cmd->vertex_pco_abi.vertex_inputs ==
+          cmd->vertex_attribute_count * 4u);
    const bool lit_mesh_layout =
       cmd->vertex_stride == 24 && cmd->vertex_pco_abi.vertex_inputs == 8 &&
       !color_layout;
@@ -640,6 +654,39 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       pvrgpu_array_topology_expandable(cmd->primitive_mode,
                                        cmd->indexed != 0 ? cmd->index_count
                                                          : cmd->vertex_count);
+   /*
+    * A command may describe its own attribute layout.  The pinned capture
+    * profiles do not, and are matched on their stride instead; when the
+    * widths are stated they must account for exactly the stride packed.
+    */
+   if (cmd->vertex_attribute_count > 8) {
+      pvrgpu_cmd_error(error, error_size,
+                       "draw PCO triangles vertex attribute count is "
+                       "unsupported");
+      return false;
+   }
+   if (cmd->vertex_attribute_count != 0) {
+      uint32_t packed_floats = 0;
+      for (uint32_t attribute = 0; attribute < cmd->vertex_attribute_count;
+           ++attribute) {
+         const uint32_t components =
+            cmd->vertex_attribute_components[attribute];
+         if (components == 0 || components > 4) {
+            pvrgpu_cmd_error(error, error_size,
+                             "draw PCO triangles vertex attribute width is "
+                             "unsupported");
+            return false;
+         }
+         packed_floats += components;
+      }
+      if (packed_floats * sizeof(float) != cmd->vertex_stride) {
+         pvrgpu_cmd_error(error, error_size,
+                          "draw PCO triangles vertex stride does not match "
+                          "its attribute widths");
+         return false;
+      }
+   }
+
    /* One to four colour attachments, all sharing the command's format. */
    if (cmd->render_target_count == 0 || cmd->render_target_count > 4) {
       pvrgpu_cmd_error(error, error_size,
@@ -1373,6 +1420,11 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->primitive_mode = cmd->primitive_mode;
    out->indexed = cmd->indexed;
    out->render_target_count = cmd->render_target_count;
+   out->vertex_attribute_count = cmd->vertex_attribute_count;
+   for (uint32_t attribute = 0; attribute < 8; ++attribute) {
+      out->vertex_attribute_components[attribute] =
+         cmd->vertex_attribute_components[attribute];
+   }
    out->raw_index_data = cmd->raw_index_data;
    out->raw_index_data_size = cmd->raw_index_data_size;
    out->index_size = cmd->index_size;
@@ -1494,6 +1546,7 @@ pvrgpu_write_draw_pco_triangles_command(
       "primitive_mode=%u\n"
       "indexed=%u\n"
       "render_target_count=%u\n"
+      "vertex_attribute_count=%u\n"
       "raw_index_data_size=%zu\n"
       "index_size=%u\n"
       "index_count=%u\n"
@@ -1537,6 +1590,7 @@ pvrgpu_write_draw_pco_triangles_command(
       cmd->primitive_mode,
       cmd->indexed,
       cmd->render_target_count,
+      cmd->vertex_attribute_count,
       cmd->raw_index_data_size,
       cmd->index_size,
       cmd->index_count,
