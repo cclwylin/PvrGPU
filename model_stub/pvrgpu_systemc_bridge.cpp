@@ -176,11 +176,22 @@ bool DriverPcoIndexPayloadIsValid(
 
 bool DriverPcoArrayTopologyIsExpandable(std::uint32_t primitive_mode,
                                         std::uint32_t vertex_count) {
-  if (primitive_mode == 4U)
-    return vertex_count >= 3U && vertex_count % 3U == 0U;
-  if (primitive_mode == 5U || primitive_mode == 6U)
-    return vertex_count >= 3U;
-  return false;
+  switch (primitive_mode) {
+    case 0U:  // points
+      return vertex_count >= 1U;
+    case 1U:  // lines
+      return vertex_count >= 2U && vertex_count % 2U == 0U;
+    case 2U:  // line loop
+    case 3U:  // line strip
+      return vertex_count >= 2U;
+    case 4U:  // triangles
+      return vertex_count >= 3U && vertex_count % 3U == 0U;
+    case 5U:  // triangle strip
+    case 6U:  // triangle fan
+      return vertex_count >= 3U;
+    default:
+      return false;
+  }
 }
 
 bool PcoSingleDrawResolutionSupported(std::uint32_t framebuffer_width,
@@ -772,6 +783,7 @@ bool CopyPcoSequenceDraw(
   const bool triangles = source.primitive_mode == 4;
   const bool strip_or_fan =
       source.primitive_mode == 5 || source.primitive_mode == 6;
+  const bool line_or_point = source.primitive_mode <= 3;
   if (source.framebuffer_width == 0 || source.framebuffer_height == 0 ||
       source.width == 0 || source.height == 0 ||
       source.width > source.framebuffer_width ||
@@ -780,7 +792,8 @@ bool CopyPcoSequenceDraw(
       source.vertex_stride < 2U * sizeof(float) ||
       source.vertex_stride > 256 || source.vertex_stride % sizeof(float) != 0 ||
       source.vertex_count == 0 || source.first_vertex != 0 ||
-      source.instance_count != 1 || (!triangles && !strip_or_fan) ||
+      source.instance_count != 1 ||
+      (!triangles && !strip_or_fan && !line_or_point) ||
       // An indexed draw assembles primitives from its indices.
       !DriverPcoArrayTopologyIsExpandable(source.primitive_mode,
                                           source.indexed != 0

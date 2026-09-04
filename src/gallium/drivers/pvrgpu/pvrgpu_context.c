@@ -11620,15 +11620,23 @@ pvrgpu_emit_lit_mesh_command(
 }
 
 /*
- * Number of triangles a non-indexed array topology expands to, or zero when
- * the driver cannot lower it.  Only the topologies the SystemC submitter can
- * expand itself are accepted here; lines and points would have to be widened
- * into real geometry, which the model does not rasterize yet.
+ * Number of primitives an array topology assembles, or zero when the driver
+ * cannot lower it.  Lines and points are included: the model widens them into
+ * real screen-space geometry, so they rasterize rather than collapsing to the
+ * zero-area triangles the topology expansion encodes them as.
  */
 static unsigned
-pvrgpu_array_primitive_triangle_count(unsigned mode, unsigned count)
+pvrgpu_array_primitive_count(unsigned mode, unsigned count)
 {
    switch (mode) {
+   case MESA_PRIM_POINTS:
+      return count;
+   case MESA_PRIM_LINES:
+      return count >= 2 && count % 2 == 0 ? count / 2 : 0;
+   case MESA_PRIM_LINE_LOOP:
+      return count >= 2 ? count : 0;
+   case MESA_PRIM_LINE_STRIP:
+      return count >= 2 ? count - 1 : 0;
    case MESA_PRIM_TRIANGLES:
       return count >= 3 && count % 3 == 0 ? count / 3 : 0;
    case MESA_PRIM_TRIANGLE_STRIP:
@@ -11870,7 +11878,7 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
          draw->indexed != 0 ? draw->index_count : draw->vertex_count;
       ia_vertices += assembled;
       ia_primitives +=
-         pvrgpu_array_primitive_triangle_count(draw->primitive_mode, assembled);
+         pvrgpu_array_primitive_count(draw->primitive_mode, assembled);
    }
    if (ia_vertices == 0 || ia_primitives == 0) {
       pvrgpu_counter_eventf("draw_array_primitive_sequence_error",
@@ -12008,7 +12016,7 @@ pvrgpu_record_color_primitive_pco_draw(
        ctx->num_vertex_buffers == 0 || !ctx->vs || !ctx->fs) {
       return false;
    }
-   if (pvrgpu_array_primitive_triangle_count(info->mode, draw->count) == 0)
+   if (pvrgpu_array_primitive_count(info->mode, draw->count) == 0)
       return false;
 
    /*
@@ -12092,7 +12100,10 @@ pvrgpu_record_color_primitive_pco_draw(
                                           ctx->fs->nir,
                                           pos_format,
                                           color_format,
-                                          info->mode == MESA_PRIM_POINTS,
+                                          info->mode == MESA_PRIM_POINTS &&
+                                             ctx->rasterizer &&
+                                             ctx->rasterizer->state
+                                                .point_size_per_vertex,
                                           &binary,
                                           error,
                                           sizeof(error))) {
@@ -12948,8 +12959,24 @@ pvrgpu_draw_is_lowerable_array_primitive(
       return false;
    if (info->index_size != 0 && info->primitive_restart)
       return false;
-   if (pvrgpu_array_primitive_triangle_count(info->mode, draws[0].count) == 0)
+   if (pvrgpu_array_primitive_count(info->mode, draws[0].count) == 0)
       return false;
+   /*
+    * The model widens a line or point to the GLES-guaranteed minimum of one
+    * device pixel.  A draw that asks for a wider line or a larger point would
+    * be rasterized at the wrong size, so leave it fail-closed until the width
+    * is carried through the capsule.
+    */
+   if (info->mode == MESA_PRIM_LINES || info->mode == MESA_PRIM_LINE_LOOP ||
+       info->mode == MESA_PRIM_LINE_STRIP) {
+      if (!ctx->rasterizer || ctx->rasterizer->state.line_width != 1.0f)
+         return false;
+   }
+   if (info->mode == MESA_PRIM_POINTS) {
+      if (!ctx->rasterizer || ctx->rasterizer->state.point_size != 1.0f ||
+          ctx->rasterizer->state.point_size_per_vertex)
+         return false;
+   }
    if (!ctx->vs || !ctx->fs || ctx->tcs || ctx->tes || ctx->gs)
       return false;
    if (!ctx->vertex_elements || ctx->vertex_elements->num_elements != 2 ||
@@ -14586,13 +14613,13 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
                                                 num_draws)) {
       ctx->observed_draws++;
       pvrgpu_counter_eventf("draw_array_primitive",
-                            "start=%u count=%u mode=%u triangles=%u "
+                            "start=%u count=%u mode=%u primitives=%u "
                             "vertex_elements=%u vertex_buffers=%u "
                             "framebuffer=%ux%u total=%u",
                             draws[0].start,
                             draws[0].count,
                             info->mode,
-                            pvrgpu_array_primitive_triangle_count(
+                            pvrgpu_array_primitive_count(
                                info->mode, draws[0].count),
                             ctx->vertex_elements->num_elements,
                             ctx->num_vertex_buffers,

@@ -465,6 +465,11 @@ void VertexFetch::Run() {
         throw std::runtime_error(
             "VertexFetch indexed raster state is invalid");
       }
+      // Snapshot the topology as submitted before any expansion below
+      // rewrites state.draw.topology to kTriangleList. ClipCull uses
+      // this to widen lines/points into real geometry instead of the
+      // degenerate zero-area triangle ExpandTopology encodes them as.
+      state.source_topology = state.draw.topology;
 
       std::vector<std::uint32_t> indices;
       if (state.draw.index_format == IndexFormat::kUint8) {

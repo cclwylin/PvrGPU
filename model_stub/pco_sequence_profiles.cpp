@@ -1129,17 +1129,38 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
         !draw.sampled_textures.empty() || draw.sampled_texture_count != 0) {
       return Reject(error, "generic PCO sequence draw is not the colour layout");
     }
-    // Triangle topologies the submitter expands into a list.  An indexed
-    // draw assembles its primitives from the index buffer.
+    // Topologies the submitter expands for setup.  An indexed draw assembles
+    // its primitives from the index buffer.  Lines and points are included:
+    // the model widens them into real screen-space geometry.
     const std::uint32_t assembled =
         draw.indexed != 0 ? draw.index_count : draw.vertex_count;
-    const bool topology_expandable =
-        draw.indexed <= 1U && draw.first_vertex == 0 &&
-        draw.instance_count == 1 &&
-        ((draw.primitive_mode == 4U && assembled >= 3U &&
-          assembled % 3U == 0U) ||
-         ((draw.primitive_mode == 5U || draw.primitive_mode == 6U) &&
-          assembled >= 3U));
+    bool topology_assembles = false;
+    switch (draw.primitive_mode) {
+      case 0U:
+        topology_assembles = assembled >= 1U;
+        break;
+      case 1U:
+        topology_assembles = assembled >= 2U && assembled % 2U == 0U;
+        break;
+      case 2U:
+      case 3U:
+        topology_assembles = assembled >= 2U;
+        break;
+      case 4U:
+        topology_assembles = assembled >= 3U && assembled % 3U == 0U;
+        break;
+      case 5U:
+      case 6U:
+        topology_assembles = assembled >= 3U;
+        break;
+      default:
+        topology_assembles = false;
+        break;
+    }
+    const bool topology_expandable = draw.indexed <= 1U &&
+                                     draw.first_vertex == 0 &&
+                                     draw.instance_count == 1 &&
+                                     topology_assembles;
     if (!topology_expandable) {
       return Reject(error, "generic PCO sequence draw topology is invalid");
     }

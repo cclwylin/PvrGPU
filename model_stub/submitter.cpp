@@ -117,6 +117,10 @@ bool DriverIndexedQuadCommandSupported(const DriverCommand &command) {
 // Gallium's pipe_prim_type value for PIPE_PRIM_TRIANGLES.  The API command
 // carries the producer enum as an integer so unsupported topology cannot be
 // silently reinterpreted by the model.
+inline constexpr std::uint32_t kPipePrimPoints = 0;
+inline constexpr std::uint32_t kPipePrimLines = 1;
+inline constexpr std::uint32_t kPipePrimLineLoop = 2;
+inline constexpr std::uint32_t kPipePrimLineStrip = 3;
 inline constexpr std::uint32_t kPipePrimTriangles = 4;
 inline constexpr std::uint32_t kPipePrimTriangleStrip = 5;
 inline constexpr std::uint32_t kPipePrimTriangleFan = 6;
@@ -128,12 +132,22 @@ bool DriverPcoArrayTopologyIsExpandable(const DriverCommand &command) {
   // An indexed draw assembles its primitives from the index buffer.
   const std::uint32_t count =
       command.indexed != 0 ? command.index_count : command.vertex_count;
-  if (command.primitive_mode == kPipePrimTriangles)
-    return count >= 3U && count % 3U == 0U;
-  if (command.primitive_mode == kPipePrimTriangleStrip ||
-      command.primitive_mode == kPipePrimTriangleFan)
-    return count >= 3U;
-  return false;
+  switch (command.primitive_mode) {
+    case kPipePrimPoints:
+      return count >= 1U;
+    case kPipePrimLines:
+      return count >= 2U && count % 2U == 0U;
+    case kPipePrimLineLoop:
+    case kPipePrimLineStrip:
+      return count >= 2U;
+    case kPipePrimTriangles:
+      return count >= 3U && count % 3U == 0U;
+    case kPipePrimTriangleStrip:
+    case kPipePrimTriangleFan:
+      return count >= 3U;
+    default:
+      return false;
+  }
 }
 
 bool IsIdeasPcoSequenceCommand(const DriverCommand &command) {
@@ -761,6 +775,55 @@ DriverPcoTopologyExpansion ExpandDriverPcoTopologyImpl(
     result.emitted_primitives = result.input_primitives;
     return result;
   }
+  if (command.primitive_mode <= kPipePrimLineStrip) {
+    // Lines and points enter setup as the degenerate triangles the topology
+    // expansion encodes them as -- a line as (a, b, b) and a point as
+    // (p, p, p) -- so ClipCull reads endpoint a from vertex 0 and endpoint b
+    // from vertex 1 and widens them into a real screen-space quad.
+    if (command.vertex_stride == 0)
+      throw std::runtime_error("Submitter driver PCO topology is empty");
+    const std::uint32_t vertices_per_primitive =
+        command.primitive_mode == kPipePrimPoints ? 1U : 2U;
+    std::vector<std::uint32_t> starts;
+    if (command.primitive_mode == kPipePrimPoints) {
+      for (std::uint32_t v = 0; v < command.vertex_count; ++v)
+        starts.push_back(v);
+    } else if (command.primitive_mode == kPipePrimLines) {
+      for (std::uint32_t v = 0; v + 1 < command.vertex_count; v += 2)
+        starts.push_back(v);
+    } else {
+      for (std::uint32_t v = 0; v + 1 < command.vertex_count; ++v)
+        starts.push_back(v);
+    }
+    const bool closes_loop =
+        command.primitive_mode == kPipePrimLineLoop && command.vertex_count >= 2;
+    result.input_primitives =
+        static_cast<std::uint32_t>(starts.size()) + (closes_loop ? 1U : 0U);
+    const auto append_vertex = [&](std::uint32_t vertex) {
+      const std::size_t begin =
+          static_cast<std::size_t>(vertex) * command.vertex_stride;
+      const std::size_t end = begin + command.vertex_stride;
+      if (end > command.raw_vertex_data.size())
+        throw std::runtime_error("Submitter PCO topology index is out of range");
+      result.vertices.insert(result.vertices.end(),
+                             command.raw_vertex_data.begin() + begin,
+                             command.raw_vertex_data.begin() + end);
+    };
+    for (std::uint32_t start : starts) {
+      const std::uint32_t second =
+          vertices_per_primitive == 1U ? start : start + 1U;
+      append_vertex(start);
+      append_vertex(second);
+      append_vertex(second);
+    }
+    if (closes_loop) {
+      append_vertex(command.vertex_count - 1U);
+      append_vertex(0U);
+      append_vertex(0U);
+    }
+    result.emitted_primitives = result.input_primitives;
+    return result;
+  }
   if (command.primitive_mode != kPipePrimTriangleStrip &&
       command.primitive_mode != kPipePrimTriangleFan) {
     throw std::runtime_error(
@@ -871,6 +934,14 @@ void StoreIndexBuffer(MemoryPool &pool, GpuMemorySystem *memory,
 
 PrimitiveTopology DriverPcoTopologyFor(std::uint32_t primitive_mode) {
   switch (primitive_mode) {
+    case kPipePrimPoints:
+      return PrimitiveTopology::kPoints;
+    case kPipePrimLines:
+      return PrimitiveTopology::kLines;
+    case kPipePrimLineLoop:
+      return PrimitiveTopology::kLineLoop;
+    case kPipePrimLineStrip:
+      return PrimitiveTopology::kLineStrip;
     case kPipePrimTriangles:
       return PrimitiveTopology::kTriangleList;
     case kPipePrimTriangleStrip:
@@ -1562,6 +1633,9 @@ void Submitter::Run() {
       state.draw.vertex_count = static_cast<std::uint32_t>(
           expanded_pco_vertices.size() / command.vertex_stride);
       state.draw.index_format = IndexFormat::kNone;
+      // The expansion above already encoded lines and points as degenerate
+      // triangles, so record what was submitted for ClipCull to widen.
+      state.source_topology = DriverPcoTopologyFor(command.primitive_mode);
     } else if (driver_textured_triangles) {
       vertex_buffer = texture_fixture.positions;
       state.draw.topology = PrimitiveTopology::kTriangleList;

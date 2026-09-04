@@ -3604,10 +3604,11 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
 }
 
 /*
- * GL point size only affects POINTS rasterization.  The dEQP rasterization
- * shaders share one vertex shader across every topology, so a triangle or
- * line draw still carries a `gl_PointSize` export fed by a uniform.  Remove
- * that dead store for the topologies it cannot affect: the uniform load then
+ * A `gl_PointSize` export only reaches rasterization for POINTS, and then only
+ * when the pipeline is asked to take the size from the shader.  The dEQP
+ * rasterization shaders share one vertex shader across every topology, so a
+ * triangle, line, or fixed-size point draw still carries the export fed by a
+ * uniform.  Remove that dead store when nothing consumes it: the uniform load
  * dies with it and the shader collapses onto the plain position/color
  * signature this profile lowers.
  */

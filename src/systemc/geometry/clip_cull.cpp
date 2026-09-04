@@ -340,6 +340,89 @@ bool IsFaceCulled(const FaceCullState &state, bool front_facing) {
   throw std::runtime_error("ClipCull received an invalid cull-face mode");
 }
 
+// Fixed 1-device-pixel line width / point size. Neither glLineWidth nor
+// gl_PointSize is threaded through the model yet, so every line/point
+// primitive rasterizes at the GLES-guaranteed minimum (aliased line width
+// 1.0, and a 1x1 point) instead of the degenerate zero-area triangle this
+// stage previously produced for every line/point primitive.
+constexpr float kLineHalfWidthPixels = 0.5F;
+constexpr float kPointHalfSizePixels = 0.5F;
+
+// Offsets a clip-space vertex by a screen-pixel delta, leaving every other
+// VTXOUT component (z, w, varyings) unchanged. The delta is converted from
+// pixels to a clip-space delta using that vertex's own w, so the offset
+// still lands at the requested pixel distance after the perspective divide
+// and viewport transform BuildRasterTriangle performs later.
+ClipVertex OffsetClipVertexScreenPixels(const ClipVertex &vertex,
+                                        float delta_screen_x,
+                                        float delta_screen_y,
+                                        std::uint32_t width,
+                                        std::uint32_t height) {
+  ClipVertex result = vertex;
+  const float w = vertex.output[3];
+  const float delta_ndc_x = delta_screen_x * 2.0F / static_cast<float>(width);
+  const float delta_ndc_y = delta_screen_y * 2.0F / static_cast<float>(height);
+  result.output[0] += delta_ndc_x * w;
+  result.output[1] += delta_ndc_y * w;
+  return result;
+}
+
+// Widens a line segment's two shaded endpoints into the four corners of a
+// screen-space quad, offset perpendicular to the segment by half_width_px on
+// each side. Both endpoints must have positive homogeneous W: the model does
+// not clip-space-widen a line with an endpoint behind the eye point, and the
+// caller falls back to the pre-existing degenerate-triangle path when this
+// returns false. Also returns false when the segment is too short in screen
+// space to have a well-defined perpendicular.
+bool BuildLineQuadCorners(const ClipVertex &a, const ClipVertex &b,
+                          float half_width_px, std::uint32_t width,
+                          std::uint32_t height,
+                          std::array<ClipVertex, 4> &corners) {
+  const float wa = a.output[3];
+  const float wb = b.output[3];
+  if (!(wa > 0.0F) || !(wb > 0.0F))
+    return false;
+  const float screen_ax =
+      (a.output[0] / wa * 0.5F + 0.5F) * static_cast<float>(width);
+  const float screen_ay =
+      (a.output[1] / wa * 0.5F + 0.5F) * static_cast<float>(height);
+  const float screen_bx =
+      (b.output[0] / wb * 0.5F + 0.5F) * static_cast<float>(width);
+  const float screen_by =
+      (b.output[1] / wb * 0.5F + 0.5F) * static_cast<float>(height);
+  const float dx = screen_bx - screen_ax;
+  const float dy = screen_by - screen_ay;
+  const float length = std::sqrt(dx * dx + dy * dy);
+  if (!(length > 1.0e-6F))
+    return false;
+  const float nx = -dy / length * half_width_px;
+  const float ny = dx / length * half_width_px;
+  corners[0] = OffsetClipVertexScreenPixels(a, nx, ny, width, height);
+  corners[1] = OffsetClipVertexScreenPixels(a, -nx, -ny, width, height);
+  corners[2] = OffsetClipVertexScreenPixels(b, -nx, -ny, width, height);
+  corners[3] = OffsetClipVertexScreenPixels(b, nx, ny, width, height);
+  return true;
+}
+
+// Widens one shaded point vertex into the four corners of an axis-aligned
+// half_size_px x half_size_px screen-space square centered on it. Requires
+// positive homogeneous W for the same reason as BuildLineQuadCorners.
+bool BuildPointQuadCorners(const ClipVertex &p, float half_size_px,
+                           std::uint32_t width, std::uint32_t height,
+                           std::array<ClipVertex, 4> &corners) {
+  if (!(p.output[3] > 0.0F))
+    return false;
+  corners[0] =
+      OffsetClipVertexScreenPixels(p, -half_size_px, -half_size_px, width, height);
+  corners[1] =
+      OffsetClipVertexScreenPixels(p, half_size_px, -half_size_px, width, height);
+  corners[2] =
+      OffsetClipVertexScreenPixels(p, half_size_px, half_size_px, width, height);
+  corners[3] =
+      OffsetClipVertexScreenPixels(p, -half_size_px, half_size_px, width, height);
+  return true;
+}
+
 RasterTriangle BuildRasterTriangle(const std::array<ClipVertex, 3> &vertices,
                                    std::uint32_t width, std::uint32_t height,
                                    bool front_facing,
@@ -752,57 +835,104 @@ void ClipCull::Run() {
             vertices[vertex] = ReadClipVertex(
                 lanes[ref.lane_index], active_vertex_output_dwords);
           }
-          /* Expanded Gallium strips legitimately contain zero-area
-           * primitives.  They still enter the driver PCO clip stage and
-           * contribute to its invocation accounting, but fixed setup marks
-           * them non-rasterizable below.  Legacy fixture inputs remain
-           * fail-closed on an accidental degenerate triangle. */
-          const bool preclip_ndc_defined = std::all_of(
-              vertices.begin(), vertices.end(), [](const ClipVertex &vertex) {
-                return vertex.output[3] > 0.0F;
-              });
-          if (preclip_ndc_defined) {
-            (void)ClassifyFrontFacing(
-                vertices, classification_winding, !driver_pco_triangles);
-          } else if (!generic_clip_path) {
-            throw std::runtime_error(
-                "ClipCull clean segment has non-positive homogeneous W");
-          }
-          const bool primitive_clipped = std::any_of(
-              vertices.begin(), vertices.end(),
-              [depth_clamp, clip_dist_mask,
-               clip_dist_reg](const ClipVertex &vertex) {
-                return ClipMask(vertex, depth_clamp, clip_dist_mask,
-                                clip_dist_reg) != 0;
-              });
-          const std::vector<ClipVertex> polygon = ClipTriangle(vertices, depth_clamp, clip_dist_mask, clip_dist_reg);
-          for (std::size_t fan = 2; fan < polygon.size(); ++fan) {
-            if (fan - 2 > std::numeric_limits<std::uint16_t>::max())
-              throw std::overflow_error("ClipCull clip-piece index overflow");
-            const std::array<ClipVertex, 3> fan_triangle = {
-                polygon[0], polygon[fan - 1], polygon[fan]};
-            const bool front_facing = ClassifyFrontFacing(
-                fan_triangle, classification_winding, false);
-            const bool face_culled =
-                IsFaceCulled(state.raster_state.face_cull, front_facing);
-            const std::uint64_t submit_ordinal = next_submit_ordinal++;
-            // Generic clip-path culling happens before setup. Clean segments
-            // enter fixed setup first, so retain a non-rasterizable slot for
-            // the setup/c_primitives counters before rejecting the backface.
-            if (generic_clip_path && face_culled)
-              continue;
-            RasterTriangle triangle = BuildRasterTriangle(
-                fan_triangle, state.width, state.height, front_facing,
-                raster_vertex_outputs, depth_clamp, driver_pco_triangles,
-                driver_pco_triangles && primitive_clipped);
-            triangle.key.submit_ordinal = submit_ordinal;
-            triangle.key.api_primitive_id =
-                static_cast<std::uint32_t>(primitive);
-            triangle.key.clip_piece = static_cast<std::uint16_t>(fan - 2);
-            triangle.face_culled = face_culled ? 1U : 0U;
-            if (face_culled)
-              triangle.rasterizable = 0;
-            triangles.push_back(triangle);
+          const bool source_is_point =
+              state.source_topology == PrimitiveTopology::kPoints;
+          const bool source_is_line =
+              state.source_topology == PrimitiveTopology::kLines ||
+              state.source_topology == PrimitiveTopology::kLineStrip ||
+              state.source_topology == PrimitiveTopology::kLineLoop;
+          std::array<ClipVertex, 4> quad_corners{};
+          const bool width_expanded =
+              (source_is_point &&
+               BuildPointQuadCorners(vertices[0], kPointHalfSizePixels,
+                                     state.width, state.height,
+                                     quad_corners)) ||
+              (source_is_line &&
+               BuildLineQuadCorners(vertices[0], vertices[1],
+                                    kLineHalfWidthPixels, state.width,
+                                    state.height, quad_corners));
+
+          // Emits one already-non-degenerate triangle through the same
+          // homogeneous clip + fan-emission + fixed-setup path every
+          // triangle in this model goes through, so a width-expanded
+          // line/point quad is clipped, counted and serialized identically
+          // to real geometry instead of taking a shortcut around it.
+          const auto emit_triangle = [&](const std::array<ClipVertex, 3> &tri,
+                                         bool allow_face_cull) {
+            const bool primitive_clipped = std::any_of(
+                tri.begin(), tri.end(),
+                [depth_clamp, clip_dist_mask,
+                 clip_dist_reg](const ClipVertex &vertex) {
+                  return ClipMask(vertex, depth_clamp, clip_dist_mask,
+                                  clip_dist_reg) != 0;
+                });
+            const std::vector<ClipVertex> polygon =
+                ClipTriangle(tri, depth_clamp, clip_dist_mask, clip_dist_reg);
+            for (std::size_t fan = 2; fan < polygon.size(); ++fan) {
+              if (fan - 2 > std::numeric_limits<std::uint16_t>::max())
+                throw std::overflow_error(
+                    "ClipCull clip-piece index overflow");
+              const std::array<ClipVertex, 3> fan_triangle = {
+                  polygon[0], polygon[fan - 1], polygon[fan]};
+              const bool front_facing = ClassifyFrontFacing(
+                  fan_triangle, classification_winding, false);
+              const bool face_culled =
+                  allow_face_cull &&
+                  IsFaceCulled(state.raster_state.face_cull, front_facing);
+              const std::uint64_t submit_ordinal = next_submit_ordinal++;
+              // Generic clip-path culling happens before setup. Clean
+              // segments enter fixed setup first, so retain a
+              // non-rasterizable slot for the setup/c_primitives counters
+              // before rejecting the backface.
+              if (generic_clip_path && face_culled)
+                continue;
+              RasterTriangle triangle = BuildRasterTriangle(
+                  fan_triangle, state.width, state.height, front_facing,
+                  raster_vertex_outputs, depth_clamp, driver_pco_triangles,
+                  driver_pco_triangles && primitive_clipped);
+              triangle.key.submit_ordinal = submit_ordinal;
+              triangle.key.api_primitive_id =
+                  static_cast<std::uint32_t>(primitive);
+              triangle.key.clip_piece = static_cast<std::uint16_t>(fan - 2);
+              triangle.face_culled = face_culled ? 1U : 0U;
+              if (face_culled)
+                triangle.rasterizable = 0;
+              triangles.push_back(triangle);
+            }
+          };
+
+          if (width_expanded) {
+            // GLES culling applies only to polygons: lines and points are
+            // never face-culled regardless of the current cull state.
+            const std::array<ClipVertex, 3> quad_tri_a = {
+                quad_corners[0], quad_corners[1], quad_corners[2]};
+            const std::array<ClipVertex, 3> quad_tri_b = {
+                quad_corners[0], quad_corners[2], quad_corners[3]};
+            emit_triangle(quad_tri_a, /*allow_face_cull=*/false);
+            emit_triangle(quad_tri_b, /*allow_face_cull=*/false);
+          } else {
+            /* Expanded Gallium strips legitimately contain zero-area
+             * primitives.  They still enter the driver PCO clip stage and
+             * contribute to its invocation accounting, but fixed setup marks
+             * them non-rasterizable below.  Legacy fixture inputs remain
+             * fail-closed on an accidental degenerate triangle.  A
+             * line/point primitive whose endpoint(s) fail the positive-W
+             * precondition BuildLineQuadCorners/BuildPointQuadCorners require
+             * also lands here, still encoded as vertices[1]/[2] duplicating
+             * the last endpoint the way ExpandTopology built it. */
+            const bool preclip_ndc_defined = std::all_of(
+                vertices.begin(), vertices.end(),
+                [](const ClipVertex &vertex) {
+                  return vertex.output[3] > 0.0F;
+                });
+            if (preclip_ndc_defined) {
+              (void)ClassifyFrontFacing(
+                  vertices, classification_winding, !driver_pco_triangles);
+            } else if (!generic_clip_path) {
+              throw std::runtime_error(
+                  "ClipCull clean segment has non-positive homogeneous W");
+            }
+            emit_triangle(vertices, /*allow_face_cull=*/true);
           }
         }
         segment_begin = segment_end;

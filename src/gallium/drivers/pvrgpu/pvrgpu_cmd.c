@@ -71,17 +71,29 @@ pvrgpu_cmd_format_supported(const char *format)
 }
 
 /*
- * Non-indexed triangle topologies the SystemC submitter expands itself: a
- * triangle list of whole triangles, or a strip/fan of three or more vertices.
+ * Primitives an array topology assembles.  Lines and points are widened into
+ * real screen-space geometry by the model, so they are lowered like any other
+ * topology rather than rejected.
  */
 static bool
 pvrgpu_array_topology_expandable(uint32_t primitive_mode, uint32_t count)
 {
-   if (primitive_mode == 4)
+   switch (primitive_mode) {
+   case 0: /* points */
+      return count >= 1;
+   case 1: /* lines */
+      return count >= 2 && count % 2 == 0;
+   case 2: /* line loop */
+   case 3: /* line strip */
+      return count >= 2;
+   case 4: /* triangles */
       return count >= 3 && count % 3 == 0;
-   if (primitive_mode == 5 || primitive_mode == 6)
+   case 5: /* triangle strip */
+   case 6: /* triangle fan */
       return count >= 3;
-   return false;
+   default:
+      return false;
+   }
 }
 
 static bool
