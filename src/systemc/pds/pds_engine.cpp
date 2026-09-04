@@ -78,6 +78,14 @@ void PdsEngine::Run() {
     }
 
     const bool varying_case = UsesShaderVaryings(state);
+    // Coefficients are emitted per rasterizable triangle, so a draw whose
+    // primitives were all culled or degenerate legitimately produces none.
+    // Varying linkage is shader state and is required either way.
+    const bool has_rasterizable_geometry =
+        std::any_of(parameters.begin(), parameters.end(),
+                    [](const ParameterTriangle &triangle) {
+                      return triangle.rasterizable != 0;
+                    });
     std::vector<ParameterCoefficientSet> parameter_coefficients;
     if (varying_case) {
       const bool has_coefficients =
@@ -86,7 +94,7 @@ void PdsEngine::Run() {
                      state.parameter_coefficients_bytes != 0)
                   : HasPoolHandle(state.parameter_coefficients);
       if (!HasPoolHandle(state.shader_varying_bindings) ||
-          !has_coefficients) {
+          (has_rasterizable_geometry && !has_coefficients)) {
         throw std::runtime_error(
             "PDS varying case has no linkage/coefficient payload");
       }
@@ -104,7 +112,9 @@ void PdsEngine::Run() {
           throw std::runtime_error("PDS varying linkage is not exact");
         }
       }
-      if (memory_) {
+      if (!has_coefficients) {
+        parameter_coefficients.clear();
+      } else if (memory_) {
         auto read = ReadMemoryArray<ParameterCoefficientSet>(
             *memory_, state.parameter_coefficients_gpu_address,
             state.parameter_coefficients_bytes, MemoryClient::kParameterRead);

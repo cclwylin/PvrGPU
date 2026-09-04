@@ -9568,36 +9568,72 @@ pvrgpu_array_primitive_count(unsigned mode, unsigned count)
 }
 
 /*
- * Read one float component of a vertex attribute.  The model's color layout
- * binds a float2 position and a float4 color, so an attribute that carries
- * more components than that is only lowerable when the extra lanes hold the
- * GLES defaults the model synthesizes (z = 0, w = 1).
+ * Read one vertex attribute as the float vector the shader declares.
+ *
+ * GLES feeds float inputs from any of the normalized, scaled and float source
+ * formats, so the unpack is delegated to the format description rather than
+ * enumerated here: restricting the driver to a handful of float formats is
+ * what made vertex_arrays.input_types unlowerable.  Pure integer sources need
+ * an integer input path and stay fail-closed.
+ *
+ * Components the shader does not declare are not read.  They cannot influence
+ * the result, and the packed buffer carries only what the shader consumes.
  */
 static bool
 pvrgpu_read_vertex_attribute(const struct pvrgpu_context *ctx,
                              const struct pipe_vertex_element *element,
                              unsigned vertex,
                              unsigned wanted,
-                             float *out)
+                             float *out,
+                             const char **reason)
 {
-   if (!element || element->vertex_buffer_index >= ctx->num_vertex_buffers)
-      return false;
-   if (element->src_format != PIPE_FORMAT_R32_FLOAT &&
-       element->src_format != PIPE_FORMAT_R32G32_FLOAT &&
-       element->src_format != PIPE_FORMAT_R32G32B32_FLOAT &&
-       element->src_format != PIPE_FORMAT_R32G32B32A32_FLOAT)
-      return false;
+   const char *ignored = NULL;
+   if (!reason)
+      reason = &ignored;
 
-   const unsigned components =
-      util_format_get_nr_components(element->src_format);
+   if (!element || element->vertex_buffer_index >= ctx->num_vertex_buffers) {
+      *reason = "buffer_index";
+      return false;
+   }
+   if (wanted == 0 || wanted > 4) {
+      *reason = "component_count";
+      return false;
+   }
+
+   const enum pipe_format format = element->src_format;
+   const struct util_format_description *description =
+      util_format_description(format);
+   if (!description || description->layout != UTIL_FORMAT_LAYOUT_PLAIN ||
+       description->colorspace != UTIL_FORMAT_COLORSPACE_RGB) {
+      *reason = "source_layout";
+      return false;
+   }
+   if (util_format_is_pure_integer(format)) {
+      *reason = "pure_integer_source";
+      return false;
+   }
+
+   const struct util_format_unpack_description *unpack =
+      util_format_unpack_description(format);
+   if (!unpack || !unpack->unpack_rgba) {
+      *reason = "source_format";
+      return false;
+   }
+
+   const unsigned components = util_format_get_nr_components(format);
+   const unsigned blocksize = util_format_get_blocksize(format);
    const struct pipe_vertex_buffer *buffer =
       &ctx->vertex_buffers[element->vertex_buffer_index];
    const unsigned stride =
-      element->src_stride ? element->src_stride
-                          : util_format_get_blocksize(element->src_format);
-   if (stride == 0)
+      element->src_stride ? element->src_stride : blocksize;
+   if (stride == 0) {
+      *reason = "stride";
       return false;
+   }
 
+   const uint64_t offset = (uint64_t)buffer->buffer_offset +
+                           element->src_offset +
+                           (uint64_t)vertex * stride;
    const uint8_t *base = NULL;
    if (buffer->is_user_buffer) {
       base = (const uint8_t *)buffer->buffer.user;
@@ -9606,31 +9642,38 @@ pvrgpu_read_vertex_attribute(const struct pvrgpu_context *ctx,
          pvrgpu_resource(buffer->buffer.resource);
       base = resource->data;
       /* Only a resource-backed buffer carries a size the driver can trust. */
-      const uint64_t offset = (uint64_t)buffer->buffer_offset +
-                              element->src_offset +
-                              (uint64_t)vertex * stride;
-      if (!base ||
-          offset + util_format_get_blocksize(element->src_format) >
-             (uint64_t)resource->size)
+      if (!base) {
+         *reason = "no_backing_store";
          return false;
+      }
+      /*
+       * A draw may address more vertices than the bound array holds; GLES
+       * leaves the fetched value undefined but requires the draw to complete,
+       * and hardware returns the default attribute rather than faulting.  Do
+       * the same: refusing the whole draw would report geometry the app did
+       * submit as unlowerable.
+       */
+      if (offset + blocksize > (uint64_t)resource->size) {
+         for (unsigned component = 0; component < wanted; ++component)
+            out[component] = component == 3 ? 1.0f : 0.0f;
+         return true;
+      }
    }
-   if (!base)
+   if (!base) {
+      *reason = "no_backing_store";
       return false;
-
-   const float *source = (const float *)(base + buffer->buffer_offset +
-                                         element->src_offset +
-                                         (uintptr_t)vertex * stride);
-   for (unsigned component = 0; component < wanted; ++component) {
-      out[component] = component < components ? source[component]
-                                              : (component == 3 ? 1.0f : 0.0f);
-      if (!isfinite(out[component]))
-         return false;
    }
-   /* Components the model synthesizes must already hold the GLES defaults. */
-   for (unsigned component = wanted; component < components; ++component) {
-      const float expected = component == 3 ? 1.0f : 0.0f;
-      if (source[component] != expected)
+
+   float rgba[4];
+   unpack->unpack_rgba(rgba, base + offset, 1);
+
+   for (unsigned component = 0; component < wanted; ++component) {
+      out[component] = component < components ? rgba[component]
+                                              : (component == 3 ? 1.0f : 0.0f);
+      if (!isfinite(out[component])) {
+         *reason = "non_finite";
          return false;
+      }
    }
    return true;
 }
@@ -10057,21 +10100,25 @@ pvrgpu_record_color_primitive_pco_draw(
       const unsigned v_idx =
          info->index_size != 0 ? v + vertex_bias : draw->start + v;
       for (unsigned attribute = 0; attribute < attribute_count; ++attribute) {
+         const char *attribute_reason = NULL;
          if (!pvrgpu_read_vertex_attribute(
                 ctx,
                 &ctx->vertex_elements->elements[attribute],
                 v_idx,
                 attribute_components[attribute],
                 &interleaved[(size_t)v * packed_floats +
-                             attribute_offsets[attribute]])) {
+                             attribute_offsets[attribute]],
+                &attribute_reason)) {
             pvrgpu_counter_eventf(
                "draw_array_primitive_record_error",
-               "stage=attributes reason=source_format attribute=%u "
-               "format=%s components=%u",
+               "stage=attributes reason=%s attribute=%u "
+               "format=%s components=%u vertex=%u",
+               attribute_reason ? attribute_reason : "unknown",
                attribute,
                util_format_name(
                   ctx->vertex_elements->elements[attribute].src_format),
-               attribute_components[attribute]);
+               attribute_components[attribute],
+               v_idx);
             free(interleaved);
             free(index_data);
             return false;

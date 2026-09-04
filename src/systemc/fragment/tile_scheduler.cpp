@@ -56,11 +56,17 @@ void TileScheduler::Run() {
                       [](const ParameterTriangle &triangle) {
                         return triangle.rasterizable == 0;
                       });
-      if (!state.raster_state.face_cull.enable ||
-          parameters.size() != state.counters.c_primitives ||
+      // No tile reference is only consistent with nothing having been
+      // rasterizable.  Face culling is one way to get there, but so is a
+      // zero-area triangle -- which is what a draw addressing more vertices
+      // than its array holds produces, since the out-of-range fetches all
+      // return the default attribute.  Check the property that matters
+      // rather than the particular cause.
+      if (parameters.size() != state.counters.c_primitives ||
           !all_non_rasterizable) {
         throw std::runtime_error(
-            "TileScheduler empty refs lack face-cull invariants");
+            "TileScheduler has no primitive references but rasterizable "
+            "geometry");
       }
     }
     state.scheduled_tiles = static_cast<std::uint32_t>(tiles.size());
