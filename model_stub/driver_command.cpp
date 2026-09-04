@@ -37,6 +37,7 @@ const std::set<std::string> &KnownFields() {
   static const std::set<std::string> fields = {
       "schema", "producer", "command", "case", "frame",
       "raw_index_data_size", "index_size", "first_index", "base_vertex",
+      "render_target_count",
       "framebuffer_width", "framebuffer_height", "width",
       "height", "format", "clear_color_bits", "fragment_color_bits",
       "vertex0_bits", "vertex1_bits", "vertex2_bits",
@@ -331,6 +332,9 @@ bool RequireExactFields(const std::map<std::string, std::string> &fields,
         command == kDrawPcoTrianglesCommand &&
         entry.first == "varying_linkage";
     // Index payload: present only on an indexed PCO triangles draw.
+    const bool optional_pco_render_targets =
+        command == kDrawPcoTrianglesCommand &&
+        entry.first == "render_target_count";
     const bool optional_pco_index =
         command == kDrawPcoTrianglesCommand &&
         (entry.first == "raw_index_data_size" ||
@@ -344,7 +348,8 @@ bool RequireExactFields(const std::map<std::string, std::string> &fields,
          entry.first == "framebuffer_rgba8_path");
     if (!required.count(entry.first) && !optional_pco_counter &&
         !optional_pco_texture && !optional_pco_linkage &&
-        !optional_pco_index && !optional_primitive_sequence_counter) {
+        !optional_pco_index && !optional_pco_render_targets &&
+        !optional_primitive_sequence_counter) {
       *error = "field is not valid for " + command +
                " driver command: " + entry.first;
       return false;
@@ -637,6 +642,9 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         (parsed.primitive_mode != 4 && parsed.primitive_mode != 5 &&
          parsed.primitive_mode != 6) ||
         !ParseU32(fields["indexed"], &parsed.indexed) || parsed.indexed > 1 ||
+        !ParseOptionalU32(fields, "render_target_count",
+                          &parsed.render_target_count) ||
+        parsed.render_target_count == 0 || parsed.render_target_count > 4 ||
         !ParseOptionalU64(fields, "raw_index_data_size",
                           &parsed.declared_raw_index_data_size) ||
         !ParseOptionalU32(fields, "index_size", &parsed.index_size) ||

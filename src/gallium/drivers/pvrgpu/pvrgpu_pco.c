@@ -3491,6 +3491,7 @@ static bool pvrgpu_color_primitive_allowed_intrinsic(nir_intrinsic_op op)
  */
 static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                                                 mesa_shader_stage expected_stage,
+                                                unsigned render_target_count,
                                                 char *error,
                                                 size_t error_size)
 {
@@ -3526,8 +3527,9 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                                 (unsigned long long)nir->info.outputs_written);
       }
    } else {
-      const uint64_t allowed_fs_outputs =
-         BITFIELD64_BIT(FRAG_RESULT_COLOR) | BITFIELD64_BIT(FRAG_RESULT_DATA0);
+      uint64_t allowed_fs_outputs = BITFIELD64_BIT(FRAG_RESULT_COLOR);
+      for (unsigned target = 0; target < render_target_count; ++target)
+         allowed_fs_outputs |= BITFIELD64_BIT(FRAG_RESULT_DATA0 + target);
       if (nir->info.outputs_written == 0 ||
           (nir->info.outputs_written & ~allowed_fs_outputs) != 0) {
          return pvrgpu_pco_fail(error,
@@ -3669,10 +3671,17 @@ bool pvrgpu_pco_compile_color_triangle(
    enum pipe_format position_format,
    enum pipe_format color_format,
    bool topology_uses_point_size,
+   unsigned render_target_count,
    struct pvrgpu_pco_graphics_binary *out,
    char *error,
    size_t error_size)
 {
+   if (render_target_count == 0 || render_target_count > 4) {
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "color primitive render target count is "
+                             "unsupported");
+   }
    if (error && error_size)
       error[0] = '\0';
    if (!out)
@@ -3711,10 +3720,12 @@ bool pvrgpu_pco_compile_color_triangle(
     */
    if (!pvrgpu_validate_color_primitive_nir(vs,
                                             MESA_SHADER_VERTEX,
+                                            render_target_count,
                                             error,
                                             error_size) ||
        !pvrgpu_validate_color_primitive_nir(fs,
                                             MESA_SHADER_FRAGMENT,
+                                            render_target_count,
                                             error,
                                             error_size)) {
       ralloc_free(compile_mem_ctx);
@@ -3760,16 +3771,27 @@ bool pvrgpu_pco_compile_color_triangle(
    fragment_data.common.coeffs = 20;
    fragment_data.fs.z_replicate = ~0U;
    fragment_data.fs.rasterization_samples = 1;
-   fragment_data.fs.outputs[FRAG_RESULT_DATA0] = (pco_range){
-      .start = 0,
-      .count = 4,
-   };
-   fragment_data.fs.output_formats[FRAG_RESULT_DATA0] = PIPE_FORMAT_R32G32B32A32_FLOAT;
-   fragment_data.fs.outputs[FRAG_RESULT_COLOR] = (pco_range){
-      .start = 0,
-      .count = 4,
-   };
-   fragment_data.fs.output_formats[FRAG_RESULT_COLOR] = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   /*
+    * One PIXOUT range per colour attachment.  A single-attachment shader also
+    * declares FRAG_RESULT_COLOR at the same range, because a shader writing
+    * gl_FragColor lands there rather than on a numbered output.
+    */
+   for (unsigned target = 0; target < render_target_count; ++target) {
+      fragment_data.fs.outputs[FRAG_RESULT_DATA0 + target] = (pco_range){
+         .start = target * 4,
+         .count = 4,
+      };
+      fragment_data.fs.output_formats[FRAG_RESULT_DATA0 + target] =
+         PIPE_FORMAT_R32G32B32A32_FLOAT;
+   }
+   if (render_target_count == 1) {
+      fragment_data.fs.outputs[FRAG_RESULT_COLOR] = (pco_range){
+         .start = 0,
+         .count = 4,
+      };
+      fragment_data.fs.output_formats[FRAG_RESULT_COLOR] =
+         PIPE_FORMAT_R32G32B32A32_FLOAT;
+   }
 
    pco_preprocess_nir(compiler->pco, vs);
    pco_preprocess_nir(compiler->pco, fs);

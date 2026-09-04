@@ -1313,6 +1313,22 @@ void Submitter::Run() {
     state.stage = PipelineStage::kSubmitted;
     state.memory_mode = options_.memory_mode;
     state.cache_bypass = options_.cache_bypass ? 1U : 0U;
+    // Colour attachments this draw writes.  Attachment 0 keeps whatever
+    // address the single-target paths already chose; the rest are placed in
+    // their own DRAM slots so no two attachments of a pass overlap.
+    state.render_target_count =
+        command.render_target_count == 0 ? 1U : command.render_target_count;
+    if (state.render_target_count > kMaxRenderTargets)
+      throw std::runtime_error("Submitter render target count is unsupported");
+    for (std::uint32_t target = 1; target < state.render_target_count;
+         ++target) {
+      const std::uint64_t slot =
+          static_cast<std::uint64_t>(submission) * kMaxRenderTargets + target;
+      state.extra_framebuffer_gpu_address[target - 1] =
+          kDriverPcoMrtColorAddressBase + slot * kDriverPcoSequenceAttachmentStride;
+      state.extra_framebuffer_bytes[target - 1] =
+          static_cast<std::uint64_t>(state.width) * state.height * 4U;
+    }
     if (driver_pco_sequence_command) {
       state.framebuffer_gpu_address = sequence_color_addresses[submission];
       const std::uint64_t color_bytes =

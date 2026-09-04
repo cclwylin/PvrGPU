@@ -72,8 +72,21 @@ void PbeWriteBack::Run() {
             "PbeWriteBack sequence framebuffer address is invalid");
       }
     }
-    state.counters.pixel_data_master_transactions = 1;
-    state.counters.pixel_data_master_bytes = expected_bytes;
+    const std::uint32_t render_target_count =
+        state.render_target_count == 0 ? 1U : state.render_target_count;
+    if (render_target_count > kMaxRenderTargets)
+      throw std::runtime_error("PbeWriteBack render target count is invalid");
+    for (std::uint32_t target = 1; target < render_target_count; ++target) {
+      if (!HasPoolHandle(state.extra_pbe_framebuffer[target - 1]) ||
+          state.extra_framebuffer_gpu_address[target - 1] == 0 ||
+          state.extra_framebuffer_bytes[target - 1] != expected_bytes) {
+        throw std::runtime_error(
+            "PbeWriteBack extra colour attachment state is invalid");
+      }
+    }
+    // Every attachment is a separate DRAM transaction of the same size.
+    state.counters.pixel_data_master_transactions = render_target_count;
+    state.counters.pixel_data_master_bytes = expected_bytes * render_target_count;
     state.counters.pixel_data_master_cycles = kPbeWriteBackLatency;
     state.counters.renderer_cycles += kPbeWriteBackLatency;
     state.stage = PipelineStage::kPixelDataMasterComplete;
@@ -97,6 +110,20 @@ void PbeWriteBack::Run() {
       MemoryAccessStats memory_stats =
           memory_->Write(state.framebuffer_gpu_address, source.data(),
                          source.size(), MemoryClient::kFramebuffer);
+      // Attachments past the first reach DRAM at their own addresses. Only
+      // attachment 0 is read back, because it is the one the frame is
+      // published from.
+      for (std::uint32_t target = 1; target < render_target_count; ++target) {
+        const std::vector<std::uint8_t> extra = LoadArray<std::uint8_t>(
+            pool_, state.extra_pbe_framebuffer[target - 1]);
+        if (extra.size() != static_cast<std::size_t>(expected_bytes)) {
+          throw std::runtime_error(
+              "PbeWriteBack extra colour attachment size mismatch");
+        }
+        memory_stats += memory_->Write(
+            state.extra_framebuffer_gpu_address[target - 1], extra.data(),
+            extra.size(), MemoryClient::kFramebuffer);
+      }
       MemoryReadResult readback = memory_->Readback(
           state.framebuffer_gpu_address, source.size(),
           MemoryClient::kFramebufferReadback);

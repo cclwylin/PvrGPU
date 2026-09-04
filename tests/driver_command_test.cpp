@@ -271,6 +271,36 @@ int main() {
                           "wrong indexed PCO draw index payload"))
     return failed;
 
+  // A capsule may state how many colour attachments the draw writes.
+  const std::filesystem::path pco_mrt = TempFile("pco-mrt.txt");
+  std::string pco_mrt_text = pco_text;
+  if (!ReplaceOnce(&pco_mrt_text, "indexed=0\n",
+                   "indexed=0\nrender_target_count=4\n")) {
+    return 1;
+  }
+  WriteText(pco_mrt, pco_mrt_text);
+  error.clear();
+  if (int failed =
+          Expect(LoadDriverCommand(pco_mrt.string(), &command, &error), error))
+    return failed;
+  if (int failed = Expect(command.render_target_count == 4,
+                          "wrong PCO draw render target count"))
+    return failed;
+
+  // More attachments than the pipeline resolves is rejected, not clamped.
+  const std::filesystem::path pco_mrt_bad = TempFile("pco-mrt-bad.txt");
+  std::string pco_mrt_bad_text = pco_text;
+  if (!ReplaceOnce(&pco_mrt_bad_text, "indexed=0\n",
+                   "indexed=0\nrender_target_count=5\n")) {
+    return 1;
+  }
+  WriteText(pco_mrt_bad, pco_mrt_bad_text);
+  error.clear();
+  if (int failed = Expect(!LoadDriverCommand(pco_mrt_bad.string(), &command,
+                                             &error),
+                          "oversized render target count was accepted"))
+    return failed;
+
   // A non-indexed capsule omits the payload entirely and still loads.
   const std::filesystem::path pco_plain = TempFile("pco-plain.txt");
   WriteText(pco_plain, pco_text);

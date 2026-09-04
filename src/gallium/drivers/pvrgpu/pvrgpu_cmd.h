@@ -129,6 +129,13 @@ struct pvrgpu_draw_pco_triangles_command {
     * lets SystemC report vs_invocations below ia_vertices as real hardware
     * does.  All four fields are zero for a non-indexed draw.
     */
+   /*
+    * Colour attachments this draw writes.  One for an ordinary draw; a
+    * deferred pass writing a G-buffer states how many its fragment shader
+    * produces.  Every attachment shares the command's format and extent.
+    */
+   uint32_t render_target_count;
+
    const uint8_t *raw_index_data;
    size_t raw_index_data_size;
    uint32_t index_size;

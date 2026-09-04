@@ -135,6 +135,11 @@ inline constexpr std::uint64_t kDriverPcoSequenceDepthAddressBase =
     UINT64_C(0x60000000);
 inline constexpr std::uint64_t kDriverPcoSequenceExternalAddressBase =
     UINT64_C(0x70000000);
+// Colour attachments past the first of a multiple-render-target draw. Each
+// (command, attachment) pair owns one attachment-stride slot so no two
+// attachments of a sequence overlap in DRAM.
+inline constexpr std::uint64_t kDriverPcoMrtColorAddressBase =
+    UINT64_C(0x80000000);
 inline constexpr std::uint64_t kDriverPcoRefractVertexFnv1a64 =
     UINT64_C(0x83920b2733098afa);
 inline constexpr std::uint64_t kDriverPcoRefractPrepassSharedFnv1a64 =
@@ -217,6 +222,8 @@ struct DriverCommand {
   std::uint32_t instance_count = 0;
   std::uint32_t primitive_mode = 0;
   std::uint32_t indexed = 0;
+  // Colour attachments this draw writes; one for an ordinary draw.
+  std::uint32_t render_target_count = 1;
   // Index payload for an indexed draw; empty for a non-indexed one.
   std::vector<std::uint8_t> raw_index_data;
   std::uint64_t declared_raw_index_data_size = 0;

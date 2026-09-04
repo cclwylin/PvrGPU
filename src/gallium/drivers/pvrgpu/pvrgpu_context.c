@@ -9026,6 +9026,7 @@ pvrgpu_init_refract_systemc_draw(
    command->instance_count = 1;
    command->primitive_mode = MESA_PRIM_TRIANGLES;
    command->indexed = 0;
+   command->render_target_count = 1;
 
    command->vertex_pco = binary->vertex.data;
    command->vertex_pco_size = binary->vertex.size;
@@ -9287,6 +9288,7 @@ pvrgpu_init_shadow_systemc_draw(
    command->instance_count = 1;
    command->primitive_mode = observation->primitive_mode;
    command->indexed = 0;
+   command->render_target_count = 1;
 
    command->vertex_pco = binary->vertex.data;
    command->vertex_pco_size = binary->vertex.size;
@@ -10970,6 +10972,7 @@ pvrgpu_init_terrain_systemc_draw(
    command->instance_count = 1;
    command->primitive_mode = observation->primitive_mode;
    command->indexed = 0;
+   command->render_target_count = 1;
 
    command->vertex_pco = binary->vertex.data;
    command->vertex_pco_size = binary->vertex.size;
@@ -11360,6 +11363,7 @@ pvrgpu_emit_draw_pco_triangles_command(
    command.instance_count = 1;
    command.primitive_mode = (uint32_t)MESA_PRIM_TRIANGLES;
    command.indexed = 0;
+   command.render_target_count = 1;
    command.vertex_pco = binary.vertex.data;
    command.vertex_pco_size = binary.vertex.size;
    command.fragment_pco = binary.fragment.data;
@@ -11525,6 +11529,7 @@ pvrgpu_emit_lit_mesh_command(
    command.instance_count = 1;
    command.primitive_mode = (uint32_t)MESA_PRIM_TRIANGLES;
    command.indexed = 0;
+   command.render_target_count = 1;
    command.vertex_pco = binary.vertex.data;
    command.vertex_pco_size = binary.vertex.size;
    command.fragment_pco = binary.fragment.data;
@@ -11800,7 +11805,9 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
           recorded->command.framebuffer_width != first->framebuffer_width ||
           recorded->command.framebuffer_height != first->framebuffer_height ||
           recorded->command.width != first->width ||
-          recorded->command.height != first->height) {
+          recorded->command.height != first->height ||
+          recorded->command.render_target_count !=
+             first->render_target_count) {
          pvrgpu_counter_eventf("draw_array_primitive_sequence_error",
                                "stage=assemble ordinal=%u "
                                "reason=framebuffer_mismatch",
@@ -11900,6 +11907,7 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
       }
    }
    command.clip_invocations = ia_primitives;
+   command.render_target_count = first->render_target_count;
    command.pco_sequence_command_count = ctx->array_primitive_draw_count;
    command.pco_sequence_commands = draws;
 
@@ -12104,6 +12112,7 @@ pvrgpu_record_color_primitive_pco_draw(
                                              ctx->rasterizer &&
                                              ctx->rasterizer->state
                                                 .point_size_per_vertex,
+                                          ctx->framebuffer.nr_cbufs,
                                           &binary,
                                           error,
                                           sizeof(error))) {
@@ -12133,6 +12142,7 @@ pvrgpu_record_color_primitive_pco_draw(
    command.instance_count = 1;
    command.primitive_mode = (uint32_t)info->mode;
    command.indexed = info->index_size != 0 ? 1u : 0u;
+   command.render_target_count = ctx->framebuffer.nr_cbufs;
    command.raw_index_data = index_data;
    command.raw_index_data_size = index_data_size;
    command.index_size = info->index_size;
@@ -12388,6 +12398,7 @@ pvrgpu_emit_texture_pco_command(
    command.instance_count = 1;
    command.primitive_mode = (uint32_t)MESA_PRIM_TRIANGLES;
    command.indexed = 0;
+   command.render_target_count = 1;
    command.vertex_pco = binary.vertex.data;
    command.vertex_pco_size = binary.vertex.size;
    command.fragment_pco = binary.fragment.data;
@@ -12580,6 +12591,7 @@ pvrgpu_emit_ideas_pco_command(
    command.instance_count = 1;
    command.primitive_mode = observation->primitive_mode;
    command.indexed = 0;
+   command.render_target_count = 1;
    if (ctx->ideas_pco_draws == 0) {
       command.draw_count = PVRGPU_IDEAS_PCO_DRAW_COUNT;
       command.ia_vertices = 3370;
@@ -12984,8 +12996,19 @@ pvrgpu_draw_is_lowerable_array_primitive(
       return false;
    if (ctx->num_sampler_views[MESA_SHADER_FRAGMENT] != 0)
       return false;
-   if (ctx->framebuffer.nr_cbufs != 1 || !ctx->framebuffer.cbufs[0].texture)
+   /*
+    * One to four colour attachments, every one present and sharing the
+    * format the capsule states for the pass.
+    */
+   if (ctx->framebuffer.nr_cbufs == 0 ||
+       ctx->framebuffer.nr_cbufs > PVRGPU_MAX_RENDER_TARGETS)
       return false;
+   for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target) {
+      if (!ctx->framebuffer.cbufs[target].texture ||
+          ctx->framebuffer.cbufs[target].format !=
+             ctx->framebuffer.cbufs[0].format)
+         return false;
+   }
    if (ctx->framebuffer.width == 0 || ctx->framebuffer.height == 0)
       return false;
    return true;

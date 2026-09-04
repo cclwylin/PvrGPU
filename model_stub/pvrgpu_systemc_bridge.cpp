@@ -156,6 +156,11 @@ bool RawFloatVerticesAreFinite(const std::uint8_t *data,
 // list: a whole-triangle list, or a strip/fan of three or more vertices.
 // An indexed draw carries a whole number of 8/16/32-bit indices covering
 // first_index + index_count; a non-indexed one carries no index payload.
+// One to four colour attachments; zero is read as the single-target default.
+bool DriverPcoRenderTargetCountIsValid(std::uint32_t render_target_count) {
+  return render_target_count <= 4U;
+}
+
 bool DriverPcoIndexPayloadIsValid(
     const pvrgpu_systemc_driver_command &source) {
   if (source.indexed == 0) {
@@ -229,6 +234,8 @@ void CopyPcoPayloadFields(
   } else {
     destination->raw_index_data.clear();
   }
+  destination->render_target_count =
+      source.render_target_count == 0 ? 1U : source.render_target_count;
   destination->declared_raw_index_data_size = source.raw_index_data_size;
   destination->index_size = source.index_size;
   destination->index_count = source.index_count;
@@ -468,7 +475,8 @@ bool CopyPcoTrianglePayload(
                                                : source.vertex_count)) ||
       source.first_vertex != 0 ||
       source.instance_count != 1 || (ideas_sequence && !ideas_topology) ||
-      !DriverPcoIndexPayloadIsValid(source) || expected_vertex_bytes == 0 ||
+      !DriverPcoIndexPayloadIsValid(source) ||
+      !DriverPcoRenderTargetCountIsValid(source.render_target_count) || expected_vertex_bytes == 0 ||
       expected_vertex_bytes > std::numeric_limits<std::uint32_t>::max() ||
       source.raw_vertex_data_size != expected_vertex_bytes ||
       !source.raw_vertex_data ||
@@ -799,7 +807,8 @@ bool CopyPcoSequenceDraw(
                                           source.indexed != 0
                                               ? source.index_count
                                               : source.vertex_count) ||
-      !DriverPcoIndexPayloadIsValid(source) || end_vertex == 0 ||
+      !DriverPcoIndexPayloadIsValid(source) ||
+      !DriverPcoRenderTargetCountIsValid(source.render_target_count) || end_vertex == 0 ||
       end_vertex > std::numeric_limits<std::uint32_t>::max() ||
       end_vertex > std::numeric_limits<std::uint64_t>::max() /
                        source.vertex_stride ||

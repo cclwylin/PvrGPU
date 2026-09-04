@@ -128,6 +128,7 @@ bool pvrgpu_pco_compile_color_triangle(
    enum pipe_format position_format,
    enum pipe_format color_format,
    bool topology_uses_point_size,
+   unsigned render_target_count,
    struct pvrgpu_pco_graphics_binary *out,
    char *error,
    size_t error_size);

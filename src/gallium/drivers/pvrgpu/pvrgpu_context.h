@@ -17,6 +17,9 @@
  */
 #define PVRGPU_ARRAY_PRIMITIVE_SEQUENCE_MAX 64u
 
+/* Colour attachments one lowered draw can write. */
+#define PVRGPU_MAX_RENDER_TARGETS 4u
+
 struct pvrgpu_array_primitive_draw;
 struct pvrgpu_deqp_primitive_sequence_profile;
 struct pvrgpu_pco_compiler;

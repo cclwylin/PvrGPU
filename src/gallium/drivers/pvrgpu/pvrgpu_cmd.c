@@ -640,6 +640,14 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       pvrgpu_array_topology_expandable(cmd->primitive_mode,
                                        cmd->indexed != 0 ? cmd->index_count
                                                          : cmd->vertex_count);
+   /* One to four colour attachments, all sharing the command's format. */
+   if (cmd->render_target_count == 0 || cmd->render_target_count > 4) {
+      pvrgpu_cmd_error(error, error_size,
+                       "draw PCO triangles render target count is "
+                       "unsupported");
+      return false;
+   }
+
    /*
     * A non-indexed draw must carry no index payload; an indexed one needs a
     * whole number of 8/16/32-bit indices covering first_index + index_count.
@@ -1364,6 +1372,7 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->instance_count = cmd->instance_count;
    out->primitive_mode = cmd->primitive_mode;
    out->indexed = cmd->indexed;
+   out->render_target_count = cmd->render_target_count;
    out->raw_index_data = cmd->raw_index_data;
    out->raw_index_data_size = cmd->raw_index_data_size;
    out->index_size = cmd->index_size;
@@ -1484,6 +1493,7 @@ pvrgpu_write_draw_pco_triangles_command(
       "instance_count=%u\n"
       "primitive_mode=%u\n"
       "indexed=%u\n"
+      "render_target_count=%u\n"
       "raw_index_data_size=%zu\n"
       "index_size=%u\n"
       "index_count=%u\n"
@@ -1526,6 +1536,7 @@ pvrgpu_write_draw_pco_triangles_command(
       cmd->instance_count,
       cmd->primitive_mode,
       cmd->indexed,
+      cmd->render_target_count,
       cmd->raw_index_data_size,
       cmd->index_size,
       cmd->index_count,
