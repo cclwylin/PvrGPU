@@ -786,13 +786,23 @@ void ClipCull::Run() {
           LoadArray<VertexLaneRef>(pool_, state.vertex_lane_refs);
       const std::size_t occurrence_count =
           direct_pco ? state.draw.vertex_count : state.draw.index_count;
+      // A direct PCO draw carries one lane reference per expanded vertex. The
+      // lanes behind them are one-to-one for a submitted triangle list, but an
+      // expanded strip or fan shades each source vertex once and points its
+      // repeats at that lane, so check the references resolve rather than
+      // requiring a lane per occurrence.
       if (lane_refs.size() != occurrence_count ||
           lane_refs.size() % 3 != 0 ||
-          (direct_pco && lanes.size() != occurrence_count) ||
+          (direct_pco && lanes.size() > occurrence_count) ||
           state.draw.first_index != 0 ||
           (indexed_triangle && indices.size() != occurrence_count)) {
         throw std::runtime_error(
             "ClipCull triangle-list occurrence/lane-ref ranges disagree");
+      }
+      for (const VertexLaneRef &ref : lane_refs) {
+        if (ref.lane_index >= lanes.size())
+          throw std::runtime_error(
+              "ClipCull triangle-list lane reference is out of range");
       }
       const std::size_t primitive_count = lane_refs.size() / 3;
       triangles.reserve(primitive_count);
@@ -868,9 +878,13 @@ void ClipCull::Run() {
                   "ClipCull lane reference is outside shaded lanes");
             std::uint64_t resolved = 0;
             if (direct_pco) {
+              // Each occurrence still reads its own vertex in submission
+              // order; only the shading lane behind it may be shared, because
+              // an expanded strip or fan repeats whole vertices and vertex
+              // fetch shades each distinct source once.
               resolved = static_cast<std::uint64_t>(state.draw.first_vertex) +
                          vertex_occurrence;
-              if (ref.lane_index != vertex_occurrence ||
+              if (ref.vertex_index != resolved ||
                   resolved > std::numeric_limits<std::uint32_t>::max()) {
                 throw std::runtime_error(
                     "ClipCull direct lane reference is not sequential");

@@ -594,6 +594,7 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
       state.vertex_indices,
       state.vertex_lanes,
       state.vertex_lane_refs,
+      state.expanded_source_vertices,
       state.vertex_shared_registers,
       state.shader_varying_bindings,
       state.vertex_texture_resources,

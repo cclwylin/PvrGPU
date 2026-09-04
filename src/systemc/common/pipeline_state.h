@@ -63,6 +63,10 @@ struct PipelineState {
   PoolHandle vertex_indices;
   PoolHandle vertex_lanes;
   PoolHandle vertex_lane_refs;
+  // One source vertex index per entry in the expanded vertex buffer, set only
+  // when the submitter expanded a strip or fan into a triangle list. Vertex
+  // fetch reuses a single shading lane per distinct source index.
+  PoolHandle expanded_source_vertices;
   PoolHandle vertex_shared_registers;
   PoolHandle shader_varying_bindings;
   PoolHandle vertex_texture_resources;

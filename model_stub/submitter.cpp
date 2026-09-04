@@ -870,6 +870,7 @@ DriverPcoTopologyExpansion ExpandDriverPcoTopologyImpl(
     result.vertices.insert(result.vertices.end(),
                            command.raw_vertex_data.begin() + begin,
                            command.raw_vertex_data.begin() + end);
+    result.source_vertices.push_back(vertex);
   };
   const auto same_position = [&](std::uint32_t lhs, std::uint32_t rhs) {
     // Duplicate-position accounting is part of the locked Ideas counter
@@ -928,6 +929,8 @@ DriverPcoTopologyExpansion ExpandDriverPcoTopologyImpl(
     }
   }
   if (result.emitted_primitives != result.input_primitives ||
+      result.source_vertices.size() !=
+          static_cast<std::uint64_t>(result.emitted_primitives) * 3U ||
       result.vertices.size() !=
           static_cast<std::uint64_t>(result.emitted_primitives) * 3U *
               command.vertex_stride) {
@@ -1662,6 +1665,13 @@ void Submitter::Run() {
       state.draw.vertex_count = static_cast<std::uint32_t>(
           expanded_pco_vertices.size() / command.vertex_stride);
       state.draw.index_format = IndexFormat::kNone;
+      if (!expanded_pco.source_vertices.empty()) {
+        if (expanded_pco.source_vertices.size() != state.draw.vertex_count)
+          throw std::runtime_error(
+              "Submitter PCO source vertex map does not cover the draw");
+        state.expanded_source_vertices =
+            StoreNewArray(pool_, expanded_pco.source_vertices);
+      }
       // The expansion above already encoded lines and points as degenerate
       // triangles, so record what was submitted for ClipCull to widen.
       state.source_topology = DriverPcoTopologyFor(command.primitive_mode);

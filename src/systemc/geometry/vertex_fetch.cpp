@@ -16,6 +16,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace pvrgpu::stub {
@@ -437,10 +438,28 @@ void VertexFetch::Run() {
         throw std::runtime_error(
             "VertexFetch direct raster draw has an invalid vertex range");
       }
+      // A strip or fan reaches vertex fetch already expanded into a triangle
+      // list, so adjacent triangles repeat whole vertices byte for byte. The
+      // submitter records where each expanded vertex came from; shading one
+      // lane per distinct source and pointing every occurrence at it keeps the
+      // assembled primitives identical while vs_invocations counts the
+      // vertices the draw actually submitted.
+      std::vector<std::uint32_t> source_vertices;
+      if (HasPoolHandle(state.expanded_source_vertices)) {
+        source_vertices =
+            LoadArray<std::uint32_t>(pool_, state.expanded_source_vertices);
+        if (!driver_pco_triangles ||
+            source_vertices.size() != state.draw.vertex_count ||
+            state.draw.first_vertex != 0) {
+          throw std::runtime_error(
+              "VertexFetch expanded source vertex map does not match the draw");
+        }
+      }
       std::vector<VertexLaneRef> lane_refs;
       if (driver_pco_triangles)
         lane_refs.reserve(state.draw.vertex_count);
       lanes.reserve(state.draw.vertex_count);
+      std::unordered_map<std::uint32_t, std::uint32_t> source_lane;
       for (std::uint32_t vertex = 0; vertex < state.draw.vertex_count;
            ++vertex) {
         const std::uint64_t resolved =
@@ -449,9 +468,18 @@ void VertexFetch::Run() {
           throw std::overflow_error("VertexFetch vertex index exceeds uint32");
         const std::uint32_t vertex_index =
             static_cast<std::uint32_t>(resolved);
-        const std::uint32_t lane_index =
-            static_cast<std::uint32_t>(lanes.size());
-        lanes.push_back(MakeLane(vertex_index, vertex_input));
+        std::uint32_t lane_index = static_cast<std::uint32_t>(lanes.size());
+        if (source_vertices.empty()) {
+          lanes.push_back(MakeLane(vertex_index, vertex_input));
+        } else {
+          const auto reused = source_lane.find(source_vertices[vertex]);
+          if (reused != source_lane.end()) {
+            lane_index = reused->second;
+          } else {
+            lanes.push_back(MakeLane(vertex_index, vertex_input));
+            source_lane.emplace(source_vertices[vertex], lane_index);
+          }
+        }
         if (driver_pco_triangles)
           lane_refs.push_back({lane_index, vertex_index});
       }

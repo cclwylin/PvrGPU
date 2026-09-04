@@ -37,6 +37,12 @@ struct DriverPcoStageAbi {
 
 struct DriverPcoTopologyExpansion {
   std::vector<std::uint8_t> vertices;
+  // One source vertex index per expanded vertex. A strip or fan repeats the
+  // same source vertex across adjacent triangles, so vertex fetch reuses one
+  // shading lane per distinct source and vs_invocations counts real work
+  // rather than the expansion's byte duplication. Empty when the stream was
+  // forwarded untouched (indexed draws and plain triangle lists).
+  std::vector<std::uint32_t> source_vertices;
   std::uint32_t input_primitives = 0;
   std::uint32_t emitted_primitives = 0;
   std::uint32_t duplicate_position_primitives = 0;
