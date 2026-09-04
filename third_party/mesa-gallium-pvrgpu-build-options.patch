@@ -1,0 +1,34 @@
+diff --git a/meson.build b/meson.build
+index d6e3a8b..d6f8d3b 100644
+--- a/meson.build
++++ b/meson.build
+@@ -207,7 +207,7 @@ elif gallium_drivers.contains('all')
+    gallium_drivers = [
+      'r300', 'r600', 'radeonsi', 'crocus', 'v3d', 'vc4', 'freedreno', 'etnaviv', 'i915',
+      'nouveau', 'svga', 'tegra', 'virgl', 'lima', 'panfrost', 'llvmpipe', 'softpipe', 'iris',
+-     'zink', 'd3d12', 'asahi', 'rocket', 'ethosu'
++     'zink', 'd3d12', 'asahi', 'rocket', 'ethosu', 'pvrgpu'
+    ]
+ endif
+ 
+@@ -223,6 +223,7 @@ with_gallium_llvmpipe = gallium_drivers.contains('llvmpipe')
+ with_gallium_vc4 = gallium_drivers.contains('vc4')
+ with_gallium_v3d = gallium_drivers.contains('v3d')
+ with_gallium_panfrost = gallium_drivers.contains('panfrost')
++with_gallium_pvrgpu = gallium_drivers.contains('pvrgpu')
+ with_gallium_etnaviv = gallium_drivers.contains('etnaviv')
+ with_gallium_tegra = gallium_drivers.contains('tegra')
+ with_gallium_crocus = gallium_drivers.contains('crocus')
+diff --git a/meson.options b/meson.options
+index 93a60e3..045ebc0 100644
+--- a/meson.options
++++ b/meson.options
+@@ -86,7 +86,7 @@ option(
+   choices : [
+     'all', 'auto',
+     'asahi', 'crocus', 'd3d12', 'ethosu', 'etnaviv', 'freedreno', 'i915', 'iris',
+-    'lima', 'llvmpipe', 'nouveau', 'panfrost', 'r300', 'r600', 'radeonsi',
++    'lima', 'llvmpipe', 'nouveau', 'panfrost', 'pvrgpu', 'r300', 'r600', 'radeonsi',
+     'rocket', 'softpipe', 'svga', 'tegra', 'v3d', 'vc4', 'virgl', 'zink',
+   ],
+   description : 'List of gallium drivers to build. If this is set to auto ' +

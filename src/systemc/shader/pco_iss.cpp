@@ -969,15 +969,33 @@ DecodedDestination DecodeGenericDestination(
     DecodeError(cursor, "missing ALU destination encoding");
   const std::size_t destination_offset = cursor;
   const std::uint8_t byte = binary[cursor++];
-  if ((byte & 0x80U) != 0)
-    DecodeError(destination_offset,
-                "extended ALU destinations exceed modeled register files");
-  const std::uint8_t bank = (byte >> 6U) & 1U;
-  const std::uint16_t index = byte & 0x3fU;
+  std::uint8_t bank = (byte >> 6U) & 1U;
+  std::uint16_t index = byte & 0x3fU;
+  if ((byte & 0x80U) != 0) {
+    /*
+     * Extended single destination (ISA `1_3b11i`): the one-byte form carries a
+     * 1-bit bank and a 6-bit index, which stops at temporary 63.  A second
+     * byte widens both -- bank to three bits and the index to eleven -- laid
+     * out as rsvd1[7] dN[10:8]=[6:4] dbN[2:1]=[3:2] dN[7:6]=[1:0].
+     */
+    if (cursor >= group_end)
+      DecodeError(destination_offset,
+                  "truncated extended ALU destination encoding");
+    const std::uint8_t extension = binary[cursor++];
+    if ((extension & 0x80U) != 0)
+      DecodeError(destination_offset,
+                  "extended ALU destination sets the reserved bit");
+    bank = static_cast<std::uint8_t>((((extension >> 2U) & 0x3U) << 1U) | bank);
+    index = static_cast<std::uint16_t>(
+        (static_cast<std::uint16_t>((extension >> 4U) & 0x7U) << 8U) |
+        (static_cast<std::uint16_t>(extension & 0x3U) << 6U) | index);
+  }
   if (bank == static_cast<std::uint8_t>(PcoRegisterBank::kTemporary)) {
     if (index >= kPcoTemporaryCount)
       DecodeError(destination_offset,
-                  "ALU destination exceeds the temporary register file");
+                  "ALU destination temporary " + std::to_string(index) +
+                      " exceeds the modeled file of " +
+                      std::to_string(kPcoTemporaryCount));
     return {PcoWriteTarget::kTemporary, index};
   }
   if (index >= kPixelOutput0SpecialIndex &&
@@ -985,8 +1003,25 @@ DecodedDestination DecodeGenericDestination(
     return {PcoWriteTarget::kPixelOutput,
             static_cast<std::uint16_t>(index - kPixelOutput0SpecialIndex)};
   }
+  std::string window;
+  const std::size_t window_begin =
+      destination_offset >= 6 ? destination_offset - 6 : 0;
+  const std::size_t window_end =
+      std::min(binary.size(), destination_offset + 6);
+  for (std::size_t at = window_begin; at < window_end; ++at) {
+    static const char kHex[] = "0123456789abcdef";
+    if (at == destination_offset)
+      window += '[';
+    window += kHex[(binary[at] >> 4U) & 0xfU];
+    window += kHex[binary[at] & 0xfU];
+    if (at == destination_offset)
+      window += ']';
+    window += ' ';
+  }
   DecodeError(destination_offset,
-              "ALU destination is neither TEMP nor PIXOUT");
+              "ALU destination is neither TEMP nor PIXOUT (bank " +
+                  std::to_string(bank) + " index " + std::to_string(index) +
+                  ", bytes " + window + ")");
 }
 
 void ValidateAlignmentPadding(const std::vector<std::uint8_t> &binary,
@@ -5303,6 +5338,16 @@ PcoDecodedProgram DecodePcoProgram(ShaderStage stage,
       CheckedU32(decoded.instructions.size(), "PCO group count");
   decoded.summary.instruction_count = decoded.summary.group_count;
   decoded.summary.ends_task = saw_end_task ? 1U : 0U;
+  // A shader that can kill its own fragment has not decided whether the pixel
+  // is covered until it has run, so opaque early HSR must not award the pixel
+  // to it beforehand. Read that off the program rather than trusting the
+  // submitter to declare it.
+  if (std::any_of(decoded.instructions.begin(), decoded.instructions.end(),
+                  [](const PcoInstruction &instruction) {
+                    return instruction.opcode == PcoOpcode::kDiscard;
+                  })) {
+    decoded.summary.early_hsr_safe = 0;
+  }
   return decoded;
 }
 
@@ -6095,9 +6140,20 @@ PcoFragmentExecution ExecuteFragmentPco(
     const PcoFragmentExecutionContext &context) {
   ValidateExecutionEnvelope(summary, instructions, ShaderStage::kFragment);
   ValidateFragmentProgram(instructions);
-  if (summary.vertex_input_mask != 0 || summary.vertex_output_mask != 0 ||
-      summary.early_hsr_safe == 0 || summary.ends_task != 0) {
-    ExecuteError("invalid fragment-program summary flags");
+  if (summary.vertex_input_mask != 0)
+    ExecuteError("fragment program summary declares vertex inputs");
+  if (summary.vertex_output_mask != 0)
+    ExecuteError("fragment program summary declares vertex outputs");
+  if (summary.ends_task != 0)
+    ExecuteError("fragment program summary ends the vertex task");
+  // `early_hsr_safe` is a property of the program, not a precondition for
+  // running it: a shader that discards clears the flag and still executes.
+  if (summary.early_hsr_safe == 0 &&
+      std::none_of(instructions.begin(), instructions.end(),
+                   [](const PcoInstruction &instruction) {
+                     return instruction.opcode == PcoOpcode::kDiscard;
+                   })) {
+    ExecuteError("fragment program is HSR-unsafe without discarding");
   }
   if (context.shared_count > kPcoMaximumFragmentSharedCount)
     ExecuteError("fragment shared-register count exceeds modeled USC file");

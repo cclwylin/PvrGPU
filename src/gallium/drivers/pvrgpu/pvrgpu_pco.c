@@ -3574,6 +3574,13 @@ static bool pvrgpu_color_primitive_allowed_intrinsic(nir_intrinsic_op op)
    case nir_intrinsic_load_input:
    case nir_intrinsic_load_interpolated_input:
    case nir_intrinsic_store_output:
+   /*
+    * A fragment kill, conditional or not. PCO emits it and the model's ISS
+    * executes it as kDiscard, which clears the program's early-HSR safety so
+    * the pixel is not awarded before the shader has decided.
+    */
+   case nir_intrinsic_terminate:
+   case nir_intrinsic_terminate_if:
       return true;
    default:
       return false;
@@ -3652,20 +3659,47 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
       }
    }
 
-   const bool stage_uses_discard =
-      expected_stage == MESA_SHADER_FRAGMENT && nir->info.fs.uses_discard;
    /*
     * Default-block uniforms become push constants, so they are allowed.
     * Anything reached through a descriptor is not.
     */
-   if (nir->info.num_ubos != 0 || nir->info.num_ssbos != 0 ||
-       nir->info.num_images != 0 || nir->info.shared_size != 0 ||
-       stage_uses_discard ||
-       nir->info.num_textures != texture_count) {
-      return pvrgpu_pco_fail(error,
-                             error_size,
-                             "color primitive %s uses unsupported resources",
-                             expected_stage == MESA_SHADER_VERTEX ? "VS" : "FS");
+   const char *stage_name =
+      expected_stage == MESA_SHADER_VERTEX ? "VS" : "FS";
+   if (nir->info.num_ubos != 0) {
+      return pvrgpu_pco_fail(error, error_size,
+                             "color primitive %s reads %u uniform buffer(s)",
+                             stage_name, nir->info.num_ubos);
+   }
+   if (nir->info.num_ssbos != 0) {
+      return pvrgpu_pco_fail(error, error_size,
+                             "color primitive %s reads %u shader storage "
+                             "buffer(s)",
+                             stage_name, nir->info.num_ssbos);
+   }
+   if (nir->info.num_images != 0) {
+      return pvrgpu_pco_fail(error, error_size,
+                             "color primitive %s uses %u image(s)",
+                             stage_name, nir->info.num_images);
+   }
+   if (nir->info.shared_size != 0) {
+      return pvrgpu_pco_fail(error, error_size,
+                             "color primitive %s uses %u byte(s) of shared "
+                             "memory",
+                             stage_name, nir->info.shared_size);
+   }
+   /*
+    * A discarding fragment shader is lowerable: PCO emits the kill and the
+    * model's ISS executes it, marking the lane discarded so the fragment
+    * never reaches the blend/write stage. The one thing it must not do is
+    * let opaque early HSR claim the pixel before the shader has decided,
+    * which the model already handles through `shader_may_discard`.
+    */
+   if (nir->info.num_textures != texture_count) {
+      return pvrgpu_pco_fail(error, error_size,
+                             "color primitive %s samples %u texture(s) but "
+                             "the command binds %u",
+                             stage_name, nir->info.num_textures,
+                             texture_count);
    }
 
    unsigned implemented_functions = 0;
