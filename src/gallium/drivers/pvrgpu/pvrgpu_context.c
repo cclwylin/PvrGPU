@@ -12371,6 +12371,66 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
       return;
    }
 
+   /*
+    * Generic PCO lowering runs before the shape-matched paths below.
+    *
+    * Those paths recognise particular draw shapes -- a textured triangle, an
+    * indexed quad -- and each one claims the draw outright, because a capsule
+    * describes a single workload and the first claimant writes it.  With the
+    * generic path last it never saw a draw that any shape recogniser could
+    * also accept, so geometry it was capable of rasterizing was reported by
+    * shape instead.  Try the real lowering first and let the shape paths
+    * handle only what it turns down.
+    */
+   if (pvrgpu_draw_is_lowerable_array_primitive(ctx, info, indirect, draws,
+                                                num_draws)) {
+      ctx->observed_draws++;
+      pvrgpu_counter_eventf("draw_array_primitive",
+                            "start=%u count=%u mode=%u primitives=%u "
+                            "vertex_elements=%u vertex_buffers=%u "
+                            "framebuffer=%ux%u total=%u",
+                            draws[0].start,
+                            draws[0].count,
+                            info->mode,
+                            pvrgpu_array_primitive_count(
+                               info->mode, draws[0].count),
+                            ctx->vertex_elements->num_elements,
+                            ctx->num_vertex_buffers,
+                            ctx->framebuffer.width,
+                            ctx->framebuffer.height,
+                            ctx->observed_draws);
+      if (pvrgpu_record_color_primitive_pco_draw(ctx, info, &draws[0]))
+         return;
+      /*
+       * RenderDoc replays the captured frames again once the sequence has
+       * already described this trace's workload.  Those repeats are
+       * observations, not draws the driver failed to lower.
+       */
+      if (ctx->array_primitive_sequence_owns_command ||
+          pvrgpu_driver_draw_command_has_been_emitted()) {
+         pvrgpu_counter_eventf("draw_array_primitive_duplicate_skip",
+                               "start=%u count=%u mode=%u total=%u",
+                               draws[0].start,
+                               draws[0].count,
+                               info->mode,
+                               ctx->observed_draws);
+         return;
+      }
+      /*
+       * The draw looked lowerable but the compiler or the capsule turned it
+       * down.  Undo the observation and fall through: a shape recogniser
+       * below may still be able to describe it, and reporting the draw
+       * unsupported here would hide that.
+       */
+      ctx->observed_draws--;
+      pvrgpu_counter_eventf("draw_array_primitive_fallthrough",
+                            "start=%u count=%u mode=%u index_size=%u",
+                            draws[0].start,
+                            draws[0].count,
+                            info->mode,
+                            info->index_size);
+   }
+
    if (pvrgpu_draw_is_observable_textured_triangle(ctx, info, indirect, draws,
                                                    num_draws)) {
       struct pipe_sampler_view *view =
@@ -12588,49 +12648,6 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
     * shape the PCO path can lower for any vertex count, so lower it here
     * instead of rejecting it.
     */
-   if (pvrgpu_draw_is_lowerable_array_primitive(ctx, info, indirect, draws,
-                                                num_draws)) {
-      ctx->observed_draws++;
-      pvrgpu_counter_eventf("draw_array_primitive",
-                            "start=%u count=%u mode=%u primitives=%u "
-                            "vertex_elements=%u vertex_buffers=%u "
-                            "framebuffer=%ux%u total=%u",
-                            draws[0].start,
-                            draws[0].count,
-                            info->mode,
-                            pvrgpu_array_primitive_count(
-                               info->mode, draws[0].count),
-                            ctx->vertex_elements->num_elements,
-                            ctx->num_vertex_buffers,
-                            ctx->framebuffer.width,
-                            ctx->framebuffer.height,
-                            ctx->observed_draws);
-      if (pvrgpu_record_color_primitive_pco_draw(ctx, info, &draws[0]))
-         return;
-      /*
-       * RenderDoc replays the captured frames again once the sequence has
-       * already described this trace's workload.  Those repeats are
-       * observations, not draws the driver failed to lower.
-       */
-      if (ctx->array_primitive_sequence_owns_command ||
-          pvrgpu_driver_draw_command_has_been_emitted()) {
-         pvrgpu_counter_eventf("draw_array_primitive_duplicate_skip",
-                               "start=%u count=%u mode=%u total=%u",
-                               draws[0].start,
-                               draws[0].count,
-                               info->mode,
-                               ctx->observed_draws);
-         return;
-      }
-      pvrgpu_note_unsupported_draw(ctx,
-                                   info,
-                                   indirect,
-                                   draws,
-                                   num_draws,
-                                   "array_primitive_pco_command_failed");
-      return;
-   }
-
    pvrgpu_note_unsupported_draw(ctx,
                                 info,
                                 indirect,
