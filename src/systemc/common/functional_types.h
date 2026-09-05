@@ -119,6 +119,12 @@ std::uint32_t VaryingCoefficientDwordCount(FunctionalCase functional_case);
 std::uint32_t VaryingCoefficientDwordCount(const PipelineState &state);
 std::uint32_t VaryingVertexOutputDwordCount(FunctionalCase functional_case);
 std::uint32_t VaryingVertexOutputDwordCount(const PipelineState &state);
+// The whole vertex-output span a draw writes: the position and varyings above,
+// widened to cover gl_PointSize when the shader writes one.  ClipCull copies
+// this many dwords per vertex and the parameter buffer expects exactly that
+// stride, so the two derive it from one place rather than each adding the
+// point size for themselves.
+std::uint32_t ActiveVertexOutputDwordCount(const PipelineState &state);
 
 enum class PipelineStage : std::uint32_t {
   kSubmitted = 0,
@@ -253,6 +259,29 @@ struct StencilFaceState {
   std::uint32_t write_mask = 0xFFU;
   std::uint32_t reference = 0;
 };
+
+/*
+ * Fixed DRAM regions the model writes for its own bookkeeping.
+ *
+ * DRAM is a sparse page map, so a region costs nothing until it is written and
+ * is sized for the largest workload the API accepts rather than for the corpus
+ * in hand.  These two used to sit 64 MiB apart, which a 645,160-triangle draw
+ * overran: the parameter triangles ran into the coefficients above them and the
+ * ISP read interpolation floats as primitive ordinals -- an "identity mismatch"
+ * whose ordinal was 0x8000000000000000, the bits of -0.0f.
+ *
+ * The rest of the map, for whoever adds the next region: the GLBench texture at
+ * 0x40000000, the sequence colour/depth/external attachments at 0x50000000,
+ * 0x60000000 and 0x70000000 (model_types.h), and the driver's per-submission
+ * vertex, index and texture-coordinate regions from 0x1'0000'0000 upwards
+ * (submitter.cpp).  Anything new belongs above these.
+ */
+inline constexpr std::uint64_t kParameterRegionBytes =
+    UINT64_C(0x10000000000);
+inline constexpr std::uint64_t kParameterTrianglesGpuAddress =
+    UINT64_C(0x100000000000);
+inline constexpr std::uint64_t kParameterCoefficientsGpuAddress =
+    kParameterTrianglesGpuAddress + kParameterRegionBytes;
 
 // Planes an AttachmentClearRect touches.
 inline constexpr std::uint32_t kClearAspectDepth = 0x1U;
@@ -576,9 +605,13 @@ struct ShaderVaryingBinding {
 bool IsExactVaryingBinding(FunctionalCase functional_case,
                            const ShaderVaryingBinding &binding,
                            std::size_t binding_index);
+// Names the field that refused through `out_refusal` when it returns false, so
+// a caller can say which part of the layout disagreed instead of only that one
+// did.
 bool IsExactVaryingBinding(const PipelineState &state,
                            const ShaderVaryingBinding &binding,
-                           std::size_t binding_index);
+                           std::size_t binding_index,
+                           const char **out_refusal = nullptr);
 
 struct PrimitiveKey {
   std::uint64_t submit_ordinal = 0;
@@ -587,6 +620,21 @@ struct PrimitiveKey {
   std::uint32_t instance_id = 0;
   std::uint16_t clip_piece = 0;
   std::uint16_t layer = 0;
+};
+
+// A width-1 line is widened into a quad so it clips, counts and serialises like
+// any other geometry, but a quad cannot express the rule GLES rasterises lines
+// by: at the steps where the rotated rectangle straddles a row it covers two
+// pixels where the diamond-exit rule wants one.  The segment travels with the
+// primitive so the ISP can apply that rule inside the quad -- the quad decides
+// the region, the segment decides the pixel.  Screen-space pixel units.
+struct LineSegment {
+  float x0 = 0.0F;
+  float y0 = 0.0F;
+  float x1 = 0.0F;
+  float y1 = 0.0F;
+  std::uint8_t valid = 0;
+  std::uint8_t reserved[3]{};
 };
 
 struct RasterTriangle {
@@ -611,6 +659,7 @@ struct RasterTriangle {
   // construction still uses the same anchor/subtraction sequence.  The three
   // entries are a permutation of the serialized raster vertices.
   std::uint8_t setup_vertex_order[3]{};
+  LineSegment line;
 };
 
 // TileRecord owns a contiguous range in TilePrimitiveRef. This preserves
@@ -662,6 +711,7 @@ struct ParameterTriangle {
   std::uint8_t rasterizable = 0;
   std::uint8_t face_culled = 0;
   std::uint8_t reserved[3]{};
+  LineSegment line;
 };
 
 inline bool HasCanonicalDepthPlaneMetadata(

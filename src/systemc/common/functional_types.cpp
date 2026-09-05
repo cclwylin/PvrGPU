@@ -452,15 +452,33 @@ std::uint32_t VaryingVertexOutputDwordCount(FunctionalCase functional_case) {
 std::uint32_t VaryingVertexOutputDwordCount(const PipelineState &state) {
   if (!IsDriverPcoTrianglesCase(state.functional_case))
     return VaryingVertexOutputDwordCount(state.functional_case);
+  /*
+   * gl_PointSize sits between the position and the varyings when the shader
+   * writes one, so the varyings do not always start at the end of the
+   * position.  Requiring that they do reported a span of zero for every
+   * point-sized shader, and the linkage check then refused its own ABI.
+   */
+  const std::uint32_t expected_varying_start =
+      state.position_output_count + state.raster_state.point_size_output_count;
   if (!UsesShaderVaryings(state) || state.position_output_start != 0 ||
       state.position_output_count != 4 ||
-      state.varying_output_start != state.position_output_count ||
+      state.varying_output_start != expected_varying_start ||
       state.varying_output_count >
           std::numeric_limits<std::uint32_t>::max() -
-              state.position_output_count) {
+              state.varying_output_start) {
     return 0;
   }
-  return state.position_output_count + state.varying_output_count;
+  return state.varying_output_start + state.varying_output_count;
+}
+
+std::uint32_t ActiveVertexOutputDwordCount(const PipelineState &state) {
+  std::uint32_t dwords =
+      UsesShaderVaryings(state) ? VaryingVertexOutputDwordCount(state) : 4U;
+  if (state.raster_state.point_size_output_count != 0) {
+    dwords = std::max(dwords, state.raster_state.point_size_output_start +
+                                  state.raster_state.point_size_output_count);
+  }
+  return dwords;
 }
 
 bool IsExactVaryingBinding(FunctionalCase functional_case,
@@ -486,46 +504,86 @@ bool IsExactVaryingBinding(FunctionalCase functional_case,
 
 bool IsExactVaryingBinding(const PipelineState &state,
                            const ShaderVaryingBinding &binding,
-                           std::size_t binding_index) {
+                           std::size_t binding_index,
+                           const char **out_refusal) {
+  if (out_refusal)
+    *out_refusal = nullptr;
   if (!IsDriverPcoTrianglesCase(state.functional_case)) {
-    return IsExactVaryingBinding(state.functional_case, binding,
-                                 binding_index);
+    const bool exact =
+        IsExactVaryingBinding(state.functional_case, binding, binding_index);
+    if (!exact && out_refusal)
+      *out_refusal = "fixture_profile_layout";
+    return exact;
   }
   const std::uint32_t components = state.varying_output_count;
   const std::uint32_t binding_count = VaryingVectorCount(state);
   if (components == 0 || binding_count == 0 ||
       binding_index >= binding_count ||
-      components > kDriverPcoMaximumVaryingComponents)
+      components > kDriverPcoMaximumVaryingComponents) {
+    if (out_refusal)
+      *out_refusal = "varying_component_range";
     return false;
+  }
 
   const std::uint32_t component_offset =
       static_cast<std::uint32_t>(binding_index) *
       kVaryingVectorComponentCount;
   const std::uint32_t binding_components =
       std::min(kVaryingVectorComponentCount, components - component_offset);
-  return
-         state.position_output_start == 0 &&
-         state.position_output_count == 4 &&
-         state.varying_output_start == 4 &&
-         state.fragment_position_start == 0 &&
-         state.fragment_position_count == kCoefficientSetDwordCount &&
-         state.fragment_varying_start == kCoefficientSetDwordCount &&
-         state.fragment_varying_count ==
-             components * kCoefficientSetDwordCount &&
-         state.vertex_pco_abi.vertex_outputs == 4 + components &&
-         state.fragment_pco_abi.coefficients ==
-             kCoefficientSetDwordCount +
-                 components * kCoefficientSetDwordCount &&
-         binding.vertex_output_base ==
-             state.varying_output_start + component_offset &&
-         binding.coefficient_set_base ==
-             state.fragment_varying_start / kCoefficientSetDwordCount +
-                 component_offset &&
-         binding.w_coefficient_set ==
-             state.fragment_position_start / kCoefficientSetDwordCount &&
-         binding.component_count == binding_components &&
-         binding.interpolation == InterpolationMode::kSmooth &&
-         binding.reserved[0] == 0 && binding.reserved[1] == 0;
+  /*
+   * gl_PointSize sits between the position and the varyings, so the varyings
+   * do not always start at dword four.  Reading that as a constant rejected
+   * every shader that writes a point size.
+   */
+  const std::uint32_t expected_varying_start =
+      state.position_output_count + state.raster_state.point_size_output_count;
+  const char *refusal = nullptr;
+  if (state.position_output_start != 0)
+    refusal = "position_output_start";
+  else if (state.position_output_count != 4)
+    refusal = "position_output_count";
+  else if (state.varying_output_start != expected_varying_start)
+    refusal = "varying_output_start";
+  else if (state.fragment_position_start != 0)
+    refusal = "fragment_position_start";
+  else if (state.fragment_position_count != kCoefficientSetDwordCount)
+    refusal = "fragment_position_count";
+  else if (state.fragment_varying_start != kCoefficientSetDwordCount)
+    refusal = "fragment_varying_start";
+  else if (state.fragment_varying_count !=
+           components * kCoefficientSetDwordCount)
+    refusal = "fragment_varying_count";
+  else if (state.vertex_pco_abi.vertex_outputs !=
+           ActiveVertexOutputDwordCount(state))
+    refusal = "vertex_outputs";
+  else if (state.fragment_pco_abi.coefficients !=
+           kCoefficientSetDwordCount + components * kCoefficientSetDwordCount)
+    refusal = "fragment_coefficients";
+  else if (binding.vertex_output_base !=
+           state.varying_output_start + component_offset)
+    refusal = "vertex_output_base";
+  else if (binding.coefficient_set_base !=
+           state.fragment_varying_start / kCoefficientSetDwordCount +
+               component_offset)
+    refusal = "coefficient_set_base";
+  else if (binding.w_coefficient_set !=
+           state.fragment_position_start / kCoefficientSetDwordCount)
+    refusal = "w_coefficient_set";
+  else if (binding.component_count != binding_components)
+    refusal = "component_count";
+  /*
+   * What this gate guards is the layout: which vertex outputs and coefficient
+   * sets a varying owns.  The interpolation mode is not part of that -- the
+   * capsule states it per varying, and a flat one is as valid as a smooth one.
+   */
+  else if (binding.interpolation != InterpolationMode::kSmooth &&
+           binding.interpolation != InterpolationMode::kFlat)
+    refusal = "interpolation";
+  else if (binding.reserved[0] != 0 || binding.reserved[1] != 0)
+    refusal = "reserved";
+  if (out_refusal)
+    *out_refusal = refusal;
+  return refusal == nullptr;
 }
 
 bool IsIndexedTriangleRasterCase(FunctionalCase functional_case) {

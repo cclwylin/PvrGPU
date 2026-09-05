@@ -292,6 +292,10 @@ struct DriverCommand {
   std::uint32_t varying_output_count = 0;
   std::uint32_t fragment_varying_start = 0;
   std::uint32_t fragment_varying_count = 0;
+  // Bit N set: varying slot N is flat-qualified and is not interpolated.
+  std::uint32_t varying_flat_mask = 0;
+  // PIXOUT lanes each colour attachment expects the shader to write.
+  std::array<std::uint32_t, 8> fragment_output_mask{};
   std::array<std::uint32_t, 3> viewport_scale_bits{};
   std::array<std::uint32_t, 3> viewport_translate_bits{};
   std::uint32_t front_ccw = 0;

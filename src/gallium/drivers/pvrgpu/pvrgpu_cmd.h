@@ -21,6 +21,12 @@ extern "C" {
 #define PVRGPU_DRIVER_COMMAND_FORMAT_B5G6R5 "PIPE_FORMAT_B5G6R5_UNORM"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_R10G10B10A2 "PIPE_FORMAT_R10G10B10A2_UNORM"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_B10G10R10A2 "PIPE_FORMAT_B10G10R10A2_UNORM"
+/*
+ * A single-channel 32-bit integer attachment.  Its pixel is the fragment
+ * shader's PIXOUT0 verbatim rather than four UNORM8 channels, which is what
+ * dEQP's shader tests render into.
+ */
+#define PVRGPU_DRIVER_COMMAND_FORMAT_R32UI "PIPE_FORMAT_R32_UINT"
 
 struct pvrgpu_clear_color_command {
    const char *case_name;
@@ -199,6 +205,8 @@ struct pvrgpu_draw_pco_triangles_command {
    uint32_t varying_output_count;
    uint32_t fragment_varying_start;
    uint32_t fragment_varying_count;
+   uint32_t varying_flat_mask;
+   uint32_t fragment_output_mask[8];
 
    uint32_t viewport_scale_bits[3];
    uint32_t viewport_translate_bits[3];

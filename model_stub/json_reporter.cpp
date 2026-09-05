@@ -138,6 +138,9 @@ struct VertexPcoEvidence {
   std::uint64_t fexp2 = 0;
   std::uint64_t pck_f16 = 0;
   std::uint64_t unpck_f16 = 0;
+  // UNPCK.U32 / UNPCK.S32: integer-to-float, which a shader reaches for the
+  // moment it uses gl_InstanceID or gl_VertexID as a number.
+  std::uint64_t unpck_int = 0;
   std::uint64_t smp = 0;
   std::uint64_t wdf = 0;
   std::uint64_t uvsw_write = 0;
@@ -178,6 +181,9 @@ struct FragmentPcoEvidence {
   std::uint64_t fexp2 = 0;
   std::uint64_t pck_f16 = 0;
   std::uint64_t unpck_f16 = 0;
+  // UNPCK.U32 / UNPCK.S32: integer-to-float, which a shader reaches for the
+  // moment it uses gl_InstanceID or gl_VertexID as a number.
+  std::uint64_t unpck_int = 0;
 };
 
 VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
@@ -292,6 +298,10 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kFloatUnpackHalf:
       ++evidence.unpck_f16;
       break;
+    case PcoOpcode::kUnpackUnsignedToFloat:
+    case PcoOpcode::kUnpackSignedToFloat:
+      ++evidence.unpck_int;
+      break;
     case PcoOpcode::kUvsWrite:
       ++evidence.uvsw_write;
       break;
@@ -319,7 +329,8 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
       evidence.fsub + evidence.fge + evidence.feq + evidence.flt +
       evidence.bitwise_and + evidence.csel + evidence.fmad + evidence.fmin + evidence.fmax +
       evidence.frcp + evidence.frsq + evidence.flog2 + evidence.fexp2 +
-      evidence.pck_f16 + evidence.unpck_f16 + evidence.smp + evidence.wdf;
+      evidence.pck_f16 + evidence.unpck_f16 + evidence.unpck_int +
+      evidence.smp + evidence.wdf;
   if (opcode_total != instructions.size()) {
     throw std::runtime_error(
         "JsonReporter vertex PCO opcode histogram mismatch");
@@ -447,6 +458,10 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kFloatUnpackHalf:
       ++evidence.unpck_f16;
       break;
+    case PcoOpcode::kUnpackUnsignedToFloat:
+    case PcoOpcode::kUnpackSignedToFloat:
+      ++evidence.unpck_int;
+      break;
     case PcoOpcode::kTextureSample:
       ++evidence.smp;
       break;
@@ -467,7 +482,7 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
           evidence.fmad +
           evidence.fmin + evidence.fmax + evidence.frcp + evidence.frsq +
           evidence.flog2 + evidence.fexp2 +
-          evidence.pck_f16 + evidence.unpck_f16 !=
+          evidence.pck_f16 + evidence.unpck_f16 + evidence.unpck_int !=
       instructions.size()) {
     throw std::runtime_error(
         "JsonReporter fragment PCO opcode histogram mismatch");
@@ -1447,6 +1462,8 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"pck_f16\":" << vertex_pco.pck_f16;
   if (vertex_pco.unpck_f16 != 0)
     std::cout << ",\"unpck_f16\":" << vertex_pco.unpck_f16;
+  if (vertex_pco.unpck_int != 0)
+    std::cout << ",\"unpck_int\":" << vertex_pco.unpck_int;
   if (vertex_pco.smp != 0)
     std::cout << ",\"smp\":" << vertex_pco.smp;
   if (vertex_pco.wdf != 0)
@@ -1534,6 +1551,8 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"pck_f16\":" << fragment_pco.pck_f16;
   if (fragment_pco.unpck_f16 != 0)
     std::cout << ",\"unpck_f16\":" << fragment_pco.unpck_f16;
+  if (fragment_pco.unpck_int != 0)
+    std::cout << ",\"unpck_int\":" << fragment_pco.unpck_int;
   if (fragment_pco.internal != 0)
     std::cout << ",\"internal\":" << fragment_pco.internal;
   if (fragment_pco.smp != 0)

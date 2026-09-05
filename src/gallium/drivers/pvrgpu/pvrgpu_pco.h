@@ -55,6 +55,15 @@ struct pvrgpu_pco_graphics_binary {
    uint32_t varying_output_count;
    uint32_t fragment_varying_start;
    uint32_t fragment_varying_count;
+   /*
+    * Bit N set: varying slot N is flat-qualified, so its coefficient set is
+    * the provoking vertex's value rather than an interpolation plane.  PCO
+    * already knows -- it emits MBYP from the coefficient instead of FITRP --
+    * and the model has to be told the same thing or it interpolates.
+    */
+   uint32_t varying_flat_mask;
+   /* PIXOUT lanes each colour attachment expects the shader to write. */
+   uint32_t fragment_output_mask[8];
    uint32_t fragment_texture_descriptor_start;
    uint32_t fragment_texture_descriptor_count;
    uint32_t fragment_texture_descriptor_stride;

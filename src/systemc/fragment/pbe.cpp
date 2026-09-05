@@ -195,10 +195,18 @@ void Pbe::Run() {
         continue;
       }
       attachment.assign(static_cast<std::size_t>(framebuffer_bytes), 0);
-      for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
-        for (std::size_t component = 0; component < 4; ++component) {
-          attachment[pixel * 4 + component] =
-              FloatValueToUnorm8(state.raster_state.clear_color[component]);
+      if (state.color_attachment_raw_dword != 0) {
+        // An integer attachment clears to the raw value, not a colour.
+        std::uint32_t raw = 0;
+        std::memcpy(&raw, &state.raster_state.clear_color[0], sizeof(raw));
+        for (std::size_t pixel = 0; pixel < pixel_count; ++pixel)
+          std::memcpy(attachment.data() + pixel * 4, &raw, sizeof(raw));
+      } else {
+        for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
+          for (std::size_t component = 0; component < 4; ++component) {
+            attachment[pixel * 4 + component] =
+                FloatValueToUnorm8(state.raster_state.clear_color[component]);
+          }
         }
       }
     }
@@ -226,12 +234,18 @@ void Pbe::Run() {
         throw std::runtime_error(std::string("PBE lost fragment identity: ") +
                                  identity_reason);
       }
+      // Every lane the attachment expects, which is four only when it has
+      // four channels.
+      const std::uint32_t expected_pixel_output_mask =
+          state.fragment_output_mask != 0 ? state.fragment_output_mask : 0x0fU;
       for (std::uint32_t target = 0; target < render_target_count; ++target) {
-        if (output.written_mask[target] != 0x0f) {
+        if (output.written_mask[target] != expected_pixel_output_mask) {
           throw std::runtime_error(
-              "PBE fragment did not write every PIXOUT lane of target " +
-              std::to_string(target) + ": mask 0x" +
-              std::to_string(output.written_mask[target]));
+              "PBE fragment did not write every expected PIXOUT lane of "
+              "target " +
+              std::to_string(target) + ": mask=" +
+              std::to_string(output.written_mask[target]) + " expected=" +
+              std::to_string(expected_pixel_output_mask));
         }
       }
       if (output.x >= state.width || output.y >= state.height)
@@ -249,6 +263,17 @@ void Pbe::Run() {
       const std::size_t byte_offset = pixel_index * 4;
       for (std::uint32_t target = 0; target < render_target_count; ++target) {
       std::vector<std::uint8_t> &framebuffer = framebuffers[target];
+      if (state.color_attachment_raw_dword != 0) {
+        /*
+         * A single-channel 32-bit integer attachment stores the shader's
+         * PIXOUT0 verbatim.  UNORM8 conversion would quantise a value that was
+         * never a colour, and GLES forbids blending on an integer format, so
+         * this path writes and returns.
+         */
+        const std::uint32_t raw = output.pixel_output[target * 4];
+        std::memcpy(framebuffer.data() + byte_offset, &raw, sizeof(raw));
+        continue;
+      }
       std::array<std::uint8_t, 4> source{};
       for (std::size_t component = 0; component < 4; ++component) {
         source[component] =

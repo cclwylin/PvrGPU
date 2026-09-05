@@ -293,7 +293,8 @@ bool DriverIdeasPcoSequenceCommandSupported(const DriverCommand &command) {
        command.vertex_count == 12U);
   if (!layout || !topology ||
       !PcoSingleDrawResolutionSupported(command) ||
-      command.format != "PIPE_FORMAT_R8G8B8A8_UNORM" ||
+      (command.format != "PIPE_FORMAT_R8G8B8A8_UNORM" &&
+       command.format != "PIPE_FORMAT_R32_UINT") ||
       command.clear_color_bits != kOpaqueBlack || command.first_vertex != 0 ||
       command.instance_count != 1 || command.indexed > 1 ||
       command.vertex_pco.empty() || command.fragment_pco.empty() ||
@@ -426,7 +427,8 @@ bool DriverPcoTrianglesCommandSupported(const DriverCommand &command) {
           kDriverPcoPositionNormalTexcoordVertexStride &&
       command.vertex_pco_abi.vertex_inputs == 12;
   if (!PcoSingleDrawResolutionSupported(command) ||
-      command.format != "PIPE_FORMAT_R8G8B8A8_UNORM" ||
+      (command.format != "PIPE_FORMAT_R8G8B8A8_UNORM" &&
+       command.format != "PIPE_FORMAT_R32_UINT") ||
       command.clear_color_bits != kOpaqueBlack ||
       (!conditionals_layout && !lit_mesh_layout && !texture_layout &&
        !color_layout) ||
@@ -1571,6 +1573,9 @@ void Submitter::RunJob() {
           command.fragment_varying_start;
       state.fragment_varying_count =
           command.fragment_varying_count;
+      state.fragment_output_mask = command.fragment_output_mask[0];
+      state.color_attachment_raw_dword =
+          command.format == "PIPE_FORMAT_R32_UINT" ? 1U : 0U;
       state.vertex_sampled_texture_count =
           command.vertex_sampled_texture_count;
       state.sampled_texture_count =
@@ -2066,9 +2071,22 @@ void Submitter::RunJob() {
                                         ? 2U
                                         : kVaryingVectorComponentCount;
         }
-        linkage.interpolation = InterpolationMode::kSmooth;
-        if (!IsExactVaryingBinding(state, linkage, varying))
-          throw std::runtime_error("Submitter varying linkage is invalid");
+        // A flat varying is not interpolated: its coefficient set carries the
+        // provoking vertex's value.  The capsule states which are flat because
+        // the model cannot tell from the linkage alone, and assuming smooth
+        // made a flat integer read back as the plane's first term.
+        linkage.interpolation =
+            (command.varying_flat_mask & (1U << varying)) != 0
+                ? InterpolationMode::kFlat
+                : InterpolationMode::kSmooth;
+        const char *linkage_refusal = nullptr;
+        if (!IsExactVaryingBinding(state, linkage, varying,
+                                   &linkage_refusal)) {
+          throw std::runtime_error(
+              "Submitter varying linkage is invalid: field=" +
+              std::string(linkage_refusal ? linkage_refusal : "unknown") +
+              " varying=" + std::to_string(varying));
+        }
         linkages.push_back(linkage);
       }
       state.shader_varying_bindings =

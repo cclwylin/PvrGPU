@@ -26,6 +26,7 @@ using pvrgpu::stub::DepthState;
 using pvrgpu::stub::EdgeEquation;
 using pvrgpu::stub::FragmentCandidate;
 using pvrgpu::stub::FragmentVisibility;
+using pvrgpu::stub::LineSegment;
 using pvrgpu::stub::ParameterTriangle;
 
 bool CoversSample(const ParameterTriangle &triangle, std::int64_t sample_x,
@@ -61,6 +62,33 @@ bool DepthPass(DepthCompareOp compare_op, T incoming, T stored) {
     return true;
   }
   throw std::runtime_error("ISP received an invalid depth compare operation");
+}
+
+/*
+ * Whether a width-1 line puts a fragment in this pixel.
+ *
+ * One fragment per step of the major axis, at the row (or column) the segment
+ * passes through at that step's centre, which is what the diamond-exit rule
+ * reduces to for a line one pixel wide.
+ */
+bool LineCoversPixel(const LineSegment &line, std::uint32_t x,
+                     std::uint32_t y) {
+  const float dx = line.x1 - line.x0;
+  const float dy = line.y1 - line.y0;
+  if (!std::isfinite(dx) || !std::isfinite(dy))
+    return false;
+  if (std::fabs(dx) >= std::fabs(dy)) {
+    if (dx == 0.0F)
+      return true;  // A point-length segment; the quad already bounds it.
+    const float centre = static_cast<float>(x) + 0.5F;
+    const float at = line.y0 + (centre - line.x0) * (dy / dx);
+    return static_cast<std::int64_t>(std::floor(at)) ==
+           static_cast<std::int64_t>(y);
+  }
+  const float centre = static_cast<float>(y) + 0.5F;
+  const float at = line.x0 + (centre - line.y0) * (dx / dy);
+  return static_cast<std::int64_t>(std::floor(at)) ==
+         static_cast<std::int64_t>(x);
 }
 
 float BitsFloat(std::uint32_t bits) {
@@ -309,8 +337,16 @@ void Isp::Run() {
         first_ref = false;
         previous_ordinal = ref.submit_ordinal;
         const ParameterTriangle &triangle = parameters[ref.parameter_index];
-        if (triangle.key.submit_ordinal != ref.submit_ordinal)
-          throw std::runtime_error("ISP primitive identity mismatch");
+        if (triangle.key.submit_ordinal != ref.submit_ordinal) {
+          throw std::runtime_error(
+              "ISP primitive identity mismatch: parameter_index=" +
+              std::to_string(ref.parameter_index) + " of " +
+              std::to_string(parameters.size()) + " ref_ordinal=" +
+              std::to_string(ref.submit_ordinal) + " triangle_ordinal=" +
+              std::to_string(triangle.key.submit_ordinal) +
+              " api_primitive_id=" +
+              std::to_string(triangle.key.api_primitive_id));
+        }
         if (!HasCanonicalDepthPlaneMetadata(state.functional_case,
                                             triangle)) {
           throw std::runtime_error("ISP depth plane metadata is invalid");
@@ -349,6 +385,19 @@ void Isp::Run() {
                 kSubpixelScale / 2;
             std::int64_t edge_values[3]{};
             if (!CoversSample(triangle, sample_x, sample_y, edge_values))
+              continue;
+            /*
+             * A width-1 line: the quad decided the region, the segment decides
+             * the pixel.  GLES rasterises such a line one fragment per step of
+             * its major axis, and the widened rectangle covers two wherever it
+             * straddles a row -- 323 fragments against the diamond-exit rule's
+             * 301, and fifty-three spans two pixels wide.  The quad's coverage
+             * is a superset of the right answer, so intersecting the two is
+             * exact; the fill rule already gives a shared edge to one of the
+             * quad's two triangles, so no pixel is produced twice.
+             */
+            if (triangle.line.valid != 0 &&
+                !LineCoversPixel(triangle.line, x, y))
               continue;
 
             FragmentCandidate candidate;

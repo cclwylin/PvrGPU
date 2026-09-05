@@ -800,6 +800,8 @@ pvrgpu_command_format_for_framebuffer(const struct pvrgpu_context *ctx)
       return PVRGPU_DRIVER_COMMAND_FORMAT_R10G10B10A2;
    case PIPE_FORMAT_B10G10R10A2_UNORM:
       return PVRGPU_DRIVER_COMMAND_FORMAT_B10G10R10A2;
+   case PIPE_FORMAT_R32_UINT:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_R32UI;
    default:
       return PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8;
    }
@@ -10602,8 +10604,11 @@ pvrgpu_record_color_primitive_pco_draw(
    }
    command.width = command_viewport_width;
    command.height = command_viewport_height;
-   command.format = PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8;
-   command.clear_color_bits[3] = UINT32_C(0x3f800000);
+   /* The attachment's own format, not an assumed RGBA8. */
+   command.format = pvrgpu_command_format_for_framebuffer(ctx);
+   /* The colour the surface was actually cleared to, not an assumed black. */
+   memcpy(command.clear_color_bits, ctx->color_clear_bits,
+          sizeof(command.clear_color_bits));
    command.raw_vertex_data = (const uint8_t *)interleaved;
    command.raw_vertex_data_size =
       (size_t)packed_vertex_count * packed_floats * sizeof(float);
@@ -10683,6 +10688,9 @@ pvrgpu_record_color_primitive_pco_draw(
    command.varying_output_count = binary.varying_output_count;
    command.fragment_varying_start = binary.fragment_varying_start;
    command.fragment_varying_count = binary.fragment_varying_count;
+   command.varying_flat_mask = binary.varying_flat_mask;
+   for (unsigned target = 0; target < 8; ++target)
+      command.fragment_output_mask[target] = binary.fragment_output_mask[target];
    for (unsigned component = 0; component < 3; ++component) {
       command.viewport_scale_bits[component] =
          pvrgpu_float_bits(ctx->viewport.scale[component]);

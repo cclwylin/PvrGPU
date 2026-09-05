@@ -662,6 +662,16 @@ void ClipCull::Run() {
       throw std::runtime_error(
           "ClipCull solid-color case has unexpected varying linkage");
     }
+    /*
+     * gl_PointSize is a vertex output too, and PointSizeFor reads it out of the
+     * span carried here.  A point shader that writes nothing else leaves the
+     * span at the four position dwords, which put the size one register past
+     * the end of what ClipCull had copied.
+     */
+    active_vertex_output_dwords =
+        static_cast<std::uint16_t>(ActiveVertexOutputDwordCount(state));
+    if (active_vertex_output_dwords > kPcoVertexOutputRegisterCount)
+      throw std::runtime_error("ClipCull VTXOUT range is too large");
     const ViewportTransform viewport = ResolveViewport(state);
     std::vector<RasterTriangle> triangles;
     std::vector<std::uint32_t> raster_vertex_outputs;
@@ -938,6 +948,37 @@ void ClipCull::Run() {
           // triangle in this model goes through, so a width-expanded
           // line/point quad is clipped, counted and serialized identically
           // to real geometry instead of taking a shortcut around it.
+          /*
+           * The segment the quad was widened from, in screen pixels.  Only a
+           * width-1 line carries one: a wider line is a real rectangle and the
+           * quad already describes it exactly.
+           */
+          LineSegment line_segment;
+          if (source_is_line && width_expanded &&
+              state.raster_state.line_width <= 1.0F) {
+            const float wa = vertices[0].output[3];
+            const float wb = vertices[1].output[3];
+            if (wa > 0.0F && wb > 0.0F) {
+              // The same viewport transform BuildRasterTriangle applies, so
+              // the endpoints land in the pixel space the ISP scans.  Deriving
+              // them straight from NDC instead put them in an unflipped space
+              // and the rule matched nothing.
+              const auto to_screen_x = [&](const ClipVertex &vertex, float w) {
+                return vertex.output[0] / w * viewport.scale_x +
+                       viewport.offset_x;
+              };
+              const auto to_screen_y = [&](const ClipVertex &vertex, float w) {
+                return vertex.output[1] / w * viewport.scale_y +
+                       viewport.offset_y;
+              };
+              line_segment.x0 = to_screen_x(vertices[0], wa);
+              line_segment.y0 = to_screen_y(vertices[0], wa);
+              line_segment.x1 = to_screen_x(vertices[1], wb);
+              line_segment.y1 = to_screen_y(vertices[1], wb);
+              line_segment.valid = 1;
+            }
+          }
+
           const auto emit_triangle = [&](const std::array<ClipVertex, 3> &tri,
                                          bool allow_face_cull) {
             const bool primitive_clipped = std::any_of(
@@ -975,6 +1016,7 @@ void ClipCull::Run() {
               triangle.key.api_primitive_id =
                   static_cast<std::uint32_t>(primitive);
               triangle.key.clip_piece = static_cast<std::uint16_t>(fan - 2);
+              triangle.line = line_segment;
               triangle.face_culled = face_culled ? 1U : 0U;
               if (face_culled)
                 triangle.rasterizable = 0;

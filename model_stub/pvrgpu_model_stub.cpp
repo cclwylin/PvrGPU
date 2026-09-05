@@ -519,6 +519,8 @@ int AnnounceModelConfiguration(pvrgpu::stub::Options &options) {
             << ",\"front_value_mask\":" << first_draw.stencil_value_mask[0]
             << ",\"front_write_mask\":" << first_draw.stencil_write_mask[0]
             << ",\"front_ref\":" << first_draw.stencil_ref[0]
+            << ",\"varying_flat_mask\":" << first_draw.varying_flat_mask
+            << ",\"varying_output_count\":" << first_draw.varying_output_count
             << ",\"inherited_clears\":" << first_draw.attachment_clears.size()
             << ",\"sequence_clears\":" << [&options]() {
                  std::size_t total = 0;

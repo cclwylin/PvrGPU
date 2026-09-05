@@ -334,6 +334,12 @@ void CopyPcoPayloadFields(
   destination->varying_output_count = source.varying_output_count;
   destination->fragment_varying_start = source.fragment_varying_start;
   destination->fragment_varying_count = source.fragment_varying_count;
+  destination->varying_flat_mask = source.varying_flat_mask;
+  for (std::size_t target = 0;
+       target < destination->fragment_output_mask.size(); ++target) {
+    destination->fragment_output_mask[target] =
+        source.fragment_output_mask[target];
+  }
   std::copy_n(source.viewport_scale_bits, 3,
               destination->viewport_scale_bits.begin());
   std::copy_n(source.viewport_translate_bits, 3,
@@ -874,8 +880,10 @@ bool CopyPcoSequenceDraw(
       !source.command || std::string_view(source.command) !=
                              "draw_pco_triangles" ||
       !source.case_name || !source.case_name[0] || !source.format ||
-      std::string_view(source.format) !=
-          "PIPE_FORMAT_R8G8B8A8_UNORM" ||
+      // The colour formats the PBE can write a draw into: four UNORM8
+      // channels, or one raw 32-bit integer.
+      (std::string_view(source.format) != "PIPE_FORMAT_R8G8B8A8_UNORM" &&
+       std::string_view(source.format) != "PIPE_FORMAT_R32_UINT") ||
       !PcoSequenceTailIsEmpty(source)) {
     if (error)
       *error = "SystemC API nested PCO sequence draw header is invalid";

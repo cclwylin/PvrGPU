@@ -177,11 +177,6 @@ namespace pvrgpu::stub {
 
 namespace {
 
-inline constexpr std::uint64_t kParameterTrianglesGpuAddress =
-    UINT64_C(0x30000000);
-inline constexpr std::uint64_t kParameterCoefficientsGpuAddress =
-    UINT64_C(0x34000000);
-
 } // namespace
 
 ParameterBuffer::ParameterBuffer(sc_core::sc_module_name name, MemoryPool &pool,
@@ -248,10 +243,7 @@ void ParameterBuffer::Run() {
          ++triangle_index) {
       const RasterTriangle &triangle = triangles[triangle_index];
       const std::uint16_t expected_stride =
-          UsesShaderVaryings(state)
-              ? static_cast<std::uint16_t>(
-                    VaryingVertexOutputDwordCount(state))
-              : 4;
+          static_cast<std::uint16_t>(ActiveVertexOutputDwordCount(state));
       if (triangle.vertex_output_stride_dwords != expected_stride ||
           triangle.front_facing > 1 || triangle.rasterizable > 1 ||
           triangle.face_culled > 1 ||
@@ -283,6 +275,7 @@ void ParameterBuffer::Run() {
       parameter.front_facing = triangle.front_facing;
       parameter.rasterizable = triangle.rasterizable;
       parameter.face_culled = triangle.face_culled;
+      parameter.line = triangle.line;
       if (coefficients.size() > std::numeric_limits<std::uint32_t>::max())
         throw std::overflow_error(
             "ParameterBuffer coefficient-set offset overflow");
@@ -500,6 +493,13 @@ void ParameterBuffer::Run() {
       state.parameter_triangles_bytes =
           static_cast<std::uint64_t>(parameters.size()) *
           sizeof(ParameterTriangle);
+      if (state.parameter_triangles_bytes > kParameterRegionBytes) {
+        throw std::runtime_error(
+            "ParameterBuffer triangle payload is larger than its DRAM region: "
+            "bytes=" + std::to_string(state.parameter_triangles_bytes) +
+            " region=" + std::to_string(kParameterRegionBytes) +
+            " triangles=" + std::to_string(parameters.size()));
+      }
       memory_stats += WriteMemoryArray(*memory_,
                                       state.parameter_triangles_gpu_address,
                                       parameters,
@@ -515,6 +515,14 @@ void ParameterBuffer::Run() {
         state.parameter_coefficients_bytes =
             static_cast<std::uint64_t>(coefficients.size()) *
             sizeof(ParameterCoefficientSet);
+        if (state.parameter_coefficients_bytes > kParameterRegionBytes) {
+          throw std::runtime_error(
+              "ParameterBuffer coefficient payload is larger than its DRAM "
+              "region: bytes=" +
+              std::to_string(state.parameter_coefficients_bytes) +
+              " region=" + std::to_string(kParameterRegionBytes) +
+              " sets=" + std::to_string(coefficients.size()));
+        }
         memory_stats += WriteMemoryArray(
             *memory_, state.parameter_coefficients_gpu_address, coefficients,
             MemoryClient::kParameterWrite);

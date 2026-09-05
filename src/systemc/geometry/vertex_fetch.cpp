@@ -520,34 +520,38 @@ void VertexFetch::Run() {
         throw std::runtime_error("VertexFetch received an unsupported index format");
       }
 
-      std::vector<std::uint16_t> expanded_indices_16;
-      bool needs_expansion = (state.draw.topology != PrimitiveTopology::kTriangleList ||
-                              state.primitive_restart_enable != 0 ||
-                              state.draw.index_format != IndexFormat::kUint16);
+      /*
+       * The working indices stay 32-bit.  They used to be narrowed to
+       * uint16_t here regardless of the draw's own index format, which
+       * silently wrapped any index past 65535: an instanced draw whose
+       * expanded stream held 327680 vertices had every instance after the
+       * fourth fold back onto the first one's slice, and the picture showed
+       * one of twenty bands.
+       */
+      std::vector<std::uint32_t> expanded_indices_32;
+      const bool needs_expansion =
+          state.draw.topology != PrimitiveTopology::kTriangleList ||
+          state.primitive_restart_enable != 0;
 
       if (needs_expansion) {
         // Expand topologies and restarts into a standard TriangleList
-        std::vector<std::uint32_t> expanded_indices = ExpandTopology(
+        expanded_indices_32 = ExpandTopology(
             indices, state.draw.topology, state.primitive_restart_enable != 0,
             state.primitive_restart_index);
 
-        // Reallocate and update state.vertex_indices
-        expanded_indices_16.reserve(expanded_indices.size());
-        for (std::uint32_t val : expanded_indices) {
-          expanded_indices_16.push_back(static_cast<std::uint16_t>(val));
-        }
+        // Reallocate and update state.vertex_indices.  The stored format is
+        // restated with the payload so a later reader cannot disagree with it.
         pool_.Release(state.vertex_indices);
-        state.vertex_indices = StoreNewArray(pool_, expanded_indices_16);
+        state.vertex_indices = StoreNewArray(pool_, expanded_indices_32);
 
         state.draw.topology = PrimitiveTopology::kTriangleList;
-        state.draw.index_count = expanded_indices_16.size();
+        state.draw.index_format = IndexFormat::kUint32;
+        state.draw.index_count = expanded_indices_32.size();
         state.draw.first_index = 0;
       } else {
-        // Direct conversion without pool allocation/release to maintain exact telemetry
-        expanded_indices_16.reserve(indices.size());
-        for (std::uint32_t val : indices) {
-          expanded_indices_16.push_back(static_cast<std::uint16_t>(val));
-        }
+        // Direct use without pool allocation/release to maintain exact
+        // telemetry.
+        expanded_indices_32 = indices;
       }
 
       const std::uint64_t index_end = state.draw.index_count;
@@ -572,7 +576,7 @@ void VertexFetch::Run() {
         const std::size_t segment_end = occurrence + segment_count;
         for (; occurrence < segment_end; ++occurrence) {
           const std::int64_t resolved =
-              static_cast<std::int64_t>(expanded_indices_16[occurrence]) +
+              static_cast<std::int64_t>(expanded_indices_32[occurrence]) +
               state.draw.base_vertex;
           if (resolved < 0 ||
               static_cast<std::uint64_t>(resolved) >

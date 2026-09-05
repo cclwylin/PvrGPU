@@ -145,20 +145,47 @@ void PcoDecoder::Run() {
     if (stage_ == ShaderStage::kVertex) {
       std::uint32_t expected_output_count = 4;
       if (driver_pco_triangles) {
+        /*
+         * gl_PointSize occupies the outputs between the position and the
+         * varyings, so the varyings start after both.  Requiring them to
+         * follow the position alone refused every point-sized shader.
+         */
+        const std::uint32_t expected_varying_start =
+            state.position_output_count +
+            state.raster_state.point_size_output_count;
         if (state.position_output_start != 0 ||
             state.position_output_count == 0 ||
             state.position_output_count >= 64 ||
             (state.varying_output_count != 0 &&
-             (state.varying_output_start != state.position_output_count ||
+             (state.varying_output_start != expected_varying_start ||
               state.varying_output_count >=
                   64 - state.varying_output_start))) {
           throw std::runtime_error(
-              "driver PCO vertex-output linkage is invalid");
+              "driver PCO vertex-output linkage is invalid: position=" +
+              std::to_string(state.position_output_start) + "+" +
+              std::to_string(state.position_output_count) + " point_size=" +
+              std::to_string(state.raster_state.point_size_output_start) + "+" +
+              std::to_string(state.raster_state.point_size_output_count) +
+              " varying=" + std::to_string(state.varying_output_start) + "+" +
+              std::to_string(state.varying_output_count));
         }
         expected_output_count = state.position_output_count;
         if (state.varying_output_count != 0) {
           expected_output_count =
               state.varying_output_start + state.varying_output_count;
+        }
+        /*
+         * gl_PointSize is a vertex output like any other and sits between the
+         * position and the varyings.  Deriving the range from position and
+         * varyings alone declared one output too few for a point shader, and
+         * the decoded program was rejected for writing the size it was asked
+         * for.
+         */
+        if (state.raster_state.point_size_output_count != 0) {
+          expected_output_count = std::max(
+              expected_output_count,
+              state.raster_state.point_size_output_start +
+                  state.raster_state.point_size_output_count);
         }
       } else if (varying_case) {
         expected_output_count = VaryingVertexOutputDwordCount(state);
@@ -194,9 +221,19 @@ void PcoDecoder::Run() {
                                        kReferenceUarch.usc_issue_lanes);
       state.stage = PipelineStage::kVertexDecoded;
     } else {
-      if (decoded.summary.pixel_output_mask != 0x0f) {
+      /*
+       * The lanes the attachment expects, which is four only when it has four
+       * channels.  Requiring PIXOUT0..3 outright rejected every shader whose
+       * output is narrower than a vec4.
+       */
+      const std::uint32_t expected_pixel_output_mask =
+          state.fragment_output_mask != 0 ? state.fragment_output_mask : 0x0fU;
+      if (decoded.summary.pixel_output_mask != expected_pixel_output_mask) {
         throw std::runtime_error(
-            "solid-color fragment PCO must write PIXOUT0..3");
+            "fragment PCO pixel output mask does not match the attachment: "
+            "decoded=" +
+            std::to_string(decoded.summary.pixel_output_mask) + " expected=" +
+            std::to_string(expected_pixel_output_mask));
       }
       state.fragment_program_summary = decoded.summary;
       state.fragment_instructions = StoreNewArray(pool_, decoded.instructions);

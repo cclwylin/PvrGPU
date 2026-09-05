@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "pvrgpu_pco.h"
+#include "pvrgpu_counter.h"
 
 #include "common/pvr_device_info.h"
 #include "nir/nir.h"
@@ -4059,10 +4060,11 @@ static bool pvrgpu_color_primitive_varyings(const nir_shader *vs,
                                             unsigned *components,
                                             unsigned *locations,
                                             bool *read_by_fragment,
+                                            bool *flat,
                                             unsigned *out_slots,
                                             uint64_t *out_mask)
 {
-   if (!vs || !fs || !components || !locations || !read_by_fragment ||
+   if (!vs || !fs || !components || !locations || !read_by_fragment || !flat ||
        !out_slots || !out_mask)
       return false;
    *out_slots = 0;
@@ -4103,12 +4105,14 @@ static bool pvrgpu_color_primitive_varyings(const nir_shader *vs,
       if (slots >= PVRGPU_PCO_MAX_VARYINGS)
          return false;
       components[slots] = 0;
+      flat[slots] = false;
       nir_foreach_variable_with_modes (var, fs, nir_var_shader_in) {
          if (var->data.location != (int)location)
             continue;
          if (!glsl_type_is_vector_or_scalar(var->type))
             return false;
          components[slots] = glsl_get_components(var->type);
+         flat[slots] = var->data.interpolation == INTERP_MODE_FLAT;
       }
       if (components[slots] == 0) {
          /*
@@ -4213,11 +4217,13 @@ bool pvrgpu_pco_compile_color_triangle(
    unsigned probe_components[PVRGPU_PCO_MAX_VARYINGS] = {0};
    unsigned probe_locations[PVRGPU_PCO_MAX_VARYINGS] = {0};
    bool probe_read_by_fragment[PVRGPU_PCO_MAX_VARYINGS] = {false};
+   bool probe_flat[PVRGPU_PCO_MAX_VARYINGS] = {false};
    unsigned probe_varyings = 0;
    uint64_t probe_varying_mask = 0;
    if (!pvrgpu_color_primitive_varyings(vs, fs, probe_components,
                                         probe_locations,
                                         probe_read_by_fragment,
+                                        probe_flat,
                                         &probe_varyings,
                                         &probe_varying_mask)) {
       ralloc_free(compile_mem_ctx);
@@ -4328,11 +4334,13 @@ bool pvrgpu_pco_compile_color_triangle(
    unsigned varying_components[PVRGPU_PCO_MAX_VARYINGS] = {0};
    unsigned varying_locations[PVRGPU_PCO_MAX_VARYINGS] = {0};
    bool varying_read_by_fragment[PVRGPU_PCO_MAX_VARYINGS] = {false};
+   bool varying_flat[PVRGPU_PCO_MAX_VARYINGS] = {false};
    unsigned varying_slots = 0;
    uint64_t varying_mask = 0;
    if (!pvrgpu_color_primitive_varyings(vs, fs, varying_components,
                                         varying_locations,
                                         varying_read_by_fragment,
+                                        varying_flat,
                                         &varying_slots, &varying_mask)) {
       ralloc_free(compile_mem_ctx);
       return pvrgpu_pco_fail(error,
@@ -4465,13 +4473,36 @@ bool pvrgpu_pco_compile_color_triangle(
     * declares FRAG_RESULT_COLOR at the same range, because a shader writing
     * gl_FragColor lands there rather than on a numbered output.
     */
+   /*
+    * The output format states how many channels the shader wrote, because PCO
+    * walks that format's swizzle to build the pixel: a four-channel format
+    * makes pco_nir_pfo emit `mov %n.z` and `mov %n.w` out of a value that has
+    * only two, which is invalid NIR and took the process down in a later
+    * copy-propagation pass.  Channels the format leaves out are filled with
+    * the constants the swizzle names, which is exactly the GLES rule for an
+    * output narrower than its attachment.
+    */
    for (unsigned target = 0; target < render_target_count; ++target) {
+      unsigned output_components = 4;
+      nir_foreach_variable_with_modes (var, fs, nir_var_shader_out) {
+         if (var->data.location != (int)(FRAG_RESULT_DATA0 + target))
+            continue;
+         if (glsl_type_is_vector_or_scalar(var->type))
+            output_components = glsl_get_components(var->type);
+      }
+      static const enum pipe_format kOutputFormats[5] = {
+         PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32_FLOAT,
+         PIPE_FORMAT_R32G32_FLOAT,       PIPE_FORMAT_R32G32B32_FLOAT,
+         PIPE_FORMAT_R32G32B32A32_FLOAT,
+      };
       fragment_data.fs.outputs[FRAG_RESULT_DATA0 + target] = (pco_range){
          .start = target * 4,
          .count = 4,
       };
       fragment_data.fs.output_formats[FRAG_RESULT_DATA0 + target] =
-         PIPE_FORMAT_R32G32B32A32_FLOAT;
+         kOutputFormats[output_components <= 4 ? output_components : 4];
+      out->fragment_output_mask[target] =
+         (1u << (output_components <= 4 ? output_components : 4)) - 1u;
    }
    if (render_target_count == 1) {
       fragment_data.fs.outputs[FRAG_RESULT_COLOR] = (pco_range){
@@ -4482,14 +4513,40 @@ bool pvrgpu_pco_compile_color_triangle(
          PIPE_FORMAT_R32G32B32A32_FLOAT;
    }
 
+   /*
+    * PCO aborts the process rather than reporting, so leave a breadcrumb at
+    * each stage: without one, a compiler crash reaches the log as a bare
+    * segmentation fault with nothing to say which shader or which pass.
+    */
+   pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=preprocess_vs");
    pco_preprocess_nir(compiler->pco, vs);
+   pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=preprocess_fs");
    pco_preprocess_nir(compiler->pco, fs);
+   pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=link");
    pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
+   pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=rev_link");
    pco_rev_link_nir(compiler->pco, vs, fs);
+   pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=lower_vs");
    pco_lower_nir(compiler->pco, vs, &vertex_data);
+   pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=lower_fs");
+   /*
+    * PCO aborts rather than reporting, so when it dies the only way to see
+    * what it was given is to print it first.  Mesa's own NIR_DEBUG is compiled
+    * out of this build.
+    */
+   if (getenv("PVRGPU_DEBUG_PCO_NIR")) {
+      fprintf(stderr, "=== pvrgpu: fragment NIR before pco_lower_nir ===\n");
+      nir_print_shader(fs, stderr);
+      fprintf(stderr, "=== pvrgpu: vertex NIR before pco_lower_nir ===\n");
+      nir_print_shader(vs, stderr);
+      fflush(stderr);
+   }
    pco_lower_nir(compiler->pco, fs, &fragment_data);
+   pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=postprocess_vs");
    pco_postprocess_nir(compiler->pco, vs, &vertex_data);
+   pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=postprocess_fs");
    pco_postprocess_nir(compiler->pco, fs, &fragment_data);
+   pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=nir_done");
 
    if ((vertex_uniform_loads != 0 &&
         !pvrgpu_allocate_generic_push_constants(&vertex_data,
@@ -4540,6 +4597,11 @@ bool pvrgpu_pco_compile_color_triangle(
    out->varying_output_count = varying_component_total;
    out->fragment_varying_start = 4;
    out->fragment_varying_count = fragment_varying_total * 4;
+   out->varying_flat_mask = 0;
+   for (unsigned slot = 0; slot < varying_slots; ++slot) {
+      if (varying_flat[slot])
+         out->varying_flat_mask |= 1u << slot;
+   }
 
    ralloc_free(compile_mem_ctx);
    return true;

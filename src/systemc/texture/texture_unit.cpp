@@ -1614,10 +1614,18 @@ void TextureUnit::Run() {
       throw std::runtime_error("TextureUnit memory mode mismatch");
     if (!IsRasterFunctionalCase(state.functional_case))
       throw std::runtime_error("texture unit received an unsupported case");
+    // The lanes the attachment expects, which is four only when it has four
+    // channels.
+    const std::uint32_t expected_pixel_output_mask =
+        state.fragment_output_mask != 0 ? state.fragment_output_mask : 0x0fU;
     if (!HasPoolHandle(state.fragment_outputs) ||
-        state.fragment_program_summary.pixel_output_mask != 0x0f) {
+        state.fragment_program_summary.pixel_output_mask !=
+            expected_pixel_output_mask) {
       throw std::runtime_error(
-          "solid-color texture bypass received no complete USC pixel outputs");
+          "texture bypass pixel output mask does not match the attachment: "
+          "summary=" +
+          std::to_string(state.fragment_program_summary.pixel_output_mask) +
+          " expected=" + std::to_string(expected_pixel_output_mask));
     }
     const bool vertex_texture_case =
         UsesTextureSampling(state, ShaderStage::kVertex);

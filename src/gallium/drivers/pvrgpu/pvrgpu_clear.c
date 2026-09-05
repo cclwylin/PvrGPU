@@ -963,6 +963,18 @@ pvrgpu_clear(struct pipe_context *pipe,
                                              colormask,
                                              color);
    /*
+    * A whole-surface RGBA clear is the colour every later draw starts from, so
+    * the capsule can state it instead of assuming black.
+    */
+   if (full_surface_rect && colormask == PIPE_MASK_RGBA) {
+      for (unsigned channel = 0; channel < 4; ++channel) {
+         const float value = color->f[channel];
+         memcpy(&ctx->color_clear_bits[channel], &value,
+                sizeof(ctx->color_clear_bits[channel]));
+      }
+   }
+
+   /*
     * Record whether the model can still describe this surface.  A whole-surface
     * RGBA clear it can: the sequence it runs starts from the same colour.  A
     * scissored or masked one it cannot, and until the model can be told about

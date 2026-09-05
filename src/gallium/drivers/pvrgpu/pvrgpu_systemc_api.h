@@ -9,8 +9,8 @@
 extern "C" {
 #endif
 
-/* API-v12 states each vertex attribute's integer-ness, not just its width. */
-#define PVRGPU_SYSTEMC_API_VERSION 12u
+/* API-v14 states the PIXOUT lanes each colour attachment expects. */
+#define PVRGPU_SYSTEMC_API_VERSION 14u
 /*
  * Draws one sequence may describe; must match the model's own bound.  This is
  * independent of how many attachments the sequence creates, which the model's
@@ -248,6 +248,20 @@ struct pvrgpu_systemc_driver_command {
    uint32_t varying_output_count;
    uint32_t fragment_varying_start;
    uint32_t fragment_varying_count;
+   /*
+    * Bit N set: varying slot N is flat-qualified.  Its coefficient set is the
+    * provoking vertex's value, not an interpolation plane; without this the
+    * model interpolated every varying and a flat integer read back as the
+    * plane's first term.
+    */
+   uint32_t varying_flat_mask;
+   /*
+    * PIXOUT lanes colour attachment N expects the fragment shader to write.
+    * A four-channel attachment wants 0xf; a single-channel one wants 0x1, and
+    * requiring all four rejected every shader whose output is narrower than a
+    * vec4.
+    */
+   uint32_t fragment_output_mask[8];
 
    uint32_t viewport_scale_bits[3];
    uint32_t viewport_translate_bits[3];

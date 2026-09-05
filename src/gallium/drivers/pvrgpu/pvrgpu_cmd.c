@@ -67,6 +67,21 @@ pvrgpu_case_reserves_native_pco_sequence(void)
            strcmp(case_name, "terrain.terrain.capture.1") == 0);
 }
 
+/*
+ * The depth the surface was cleared to.  This used to have to be 1.0, which
+ * held only while the driver assumed it: once the real value was carried, a
+ * draw over a surface cleared to anything else was declined here.  The model
+ * starts its sequence from whatever the capsule states, so only a value the
+ * depth range cannot hold is a reason to refuse.
+ */
+static bool
+pvrgpu_depth_clear_value_is_representable(uint32_t bits)
+{
+   float value = 0.0f;
+   memcpy(&value, &bits, sizeof(value));
+   return isfinite(value) && value >= 0.0f && value <= 1.0f;
+}
+
 static void
 pvrgpu_cmd_error(char *error, size_t error_size, const char *message)
 {
@@ -154,7 +169,8 @@ pvrgpu_cmd_format_supported(const char *format)
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R5G6B5) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_B5G6R5) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R10G10B10A2) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_B10G10R10A2) == 0);
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_B10G10R10A2) == 0 ||
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R32UI) == 0);
 }
 
 /*
@@ -804,8 +820,14 @@ pvrgpu_cmd_validate_draw_pco_triangles(
                                                   cmd->framebuffer_height,
                                                   cmd->width,
                                                   cmd->height);
+   /*
+    * The colour formats the model can write a draw into: four UNORM8 channels,
+    * or one raw 32-bit integer.  The others are describable in a clear capsule
+    * but the PBE has no packing for them yet.
+    */
    const bool format_ok =
-      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8) == 0;
+      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8) == 0 ||
+      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_R32UI) == 0;
    if (!resolution_ok || !format_ok) {
       /*
        * Say which half of the requirement failed and with what.  A
@@ -827,13 +849,22 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       pvrgpu_cmd_error(error, error_size, message);
       return false;
    }
-   if (cmd->clear_color_bits[0] != 0 ||
-       cmd->clear_color_bits[1] != 0 ||
-       cmd->clear_color_bits[2] != 0 ||
-       cmd->clear_color_bits[3] != UINT32_C(0x3f800000)) {
-      pvrgpu_cmd_error(error, error_size,
-                       "draw PCO triangles expects opaque black clear color");
-      return false;
+   /*
+    * The clear colour is the surface the draw starts from, and the model
+    * begins its sequence from whatever the capsule states.  This used to
+    * require opaque black, which was true only while the driver assumed it:
+    * once the real colour was carried, every draw over a surface cleared to
+    * anything else was declined here and fell through to a shape recogniser.
+    * Only a value the float bits cannot describe is a reason to refuse.
+    */
+   for (unsigned channel = 0; channel < 4; ++channel) {
+      float value = 0.0f;
+      memcpy(&value, &cmd->clear_color_bits[channel], sizeof(value));
+      if (!isfinite(value) || value < 0.0f || value > 1.0f) {
+         pvrgpu_cmd_error(error, error_size,
+                          "draw PCO triangles clear color is outside [0, 1]");
+         return false;
+      }
    }
    const uint64_t end_vertex =
       (uint64_t)cmd->first_vertex + cmd->vertex_count;
@@ -1283,7 +1314,7 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       raster_reason = "blend";
    else if (cmd->dither != 1)
       raster_reason = "dither";
-   else if (cmd->depth_clear_bits != UINT32_C(0x3f800000))
+   else if (!pvrgpu_depth_clear_value_is_representable(cmd->depth_clear_bits))
       raster_reason = "depth_clear_value";
    else if (!depth_state_matches)
       raster_reason = "depth_state";
@@ -1700,6 +1731,9 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->varying_output_count = cmd->varying_output_count;
    out->fragment_varying_start = cmd->fragment_varying_start;
    out->fragment_varying_count = cmd->fragment_varying_count;
+   out->varying_flat_mask = cmd->varying_flat_mask;
+   for (unsigned target = 0; target < 8; ++target)
+      out->fragment_output_mask[target] = cmd->fragment_output_mask[target];
    memcpy(out->viewport_scale_bits,
           cmd->viewport_scale_bits,
           sizeof(out->viewport_scale_bits));

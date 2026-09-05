@@ -109,6 +109,13 @@ struct pvrgpu_context {
     * the reference -- dEQP's stencil.depth_fail_replace never reached its
     * depth-fail operation.
     */
+   /*
+    * Float bits of the value the last whole-surface colour clear wrote.  The
+    * capsule used to state opaque black, so every pixel a draw did not cover
+    * came back black instead of the colour the application cleared to -- which
+    * is the whole of what dEQP's scissor tests look at outside the scissor.
+    */
+   uint32_t color_clear_bits[4];
    uint32_t depth_clear_bits;
    unsigned stencil_clear_value;
    /*

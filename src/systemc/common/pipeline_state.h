@@ -137,6 +137,12 @@ struct PipelineState {
   std::uint32_t varying_output_count = 0;
   std::uint32_t fragment_varying_start = 0;
   std::uint32_t fragment_varying_count = 0;
+  // PIXOUT lanes the colour attachment expects.  Zero means the pipeline has
+  // not been told, and the four-lane default applies.
+  std::uint32_t fragment_output_mask = 0;
+  // The colour attachment stores one raw 32-bit value per pixel -- the
+  // shader's PIXOUT0 verbatim -- rather than four UNORM8 channels.
+  std::uint8_t color_attachment_raw_dword = 0;
   // Number of exact descriptor-set resources bound by this physical draw.
   // TextureUnit cross-checks each raw 20-dword combined descriptor against
   // the correspondingly numbered owned resource and sampler.

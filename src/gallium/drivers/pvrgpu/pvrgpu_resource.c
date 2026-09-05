@@ -1002,6 +1002,12 @@ pvrgpu_resource_readback_format_is_supported(enum pipe_format format)
    case PIPE_FORMAT_R8G8B8X8_UNORM:
    case PIPE_FORMAT_B8G8R8A8_UNORM:
    case PIPE_FORMAT_B8G8R8X8_UNORM:
+   /*
+    * A single-channel 32-bit integer attachment: the model publishes the
+    * shader's PIXOUT0 verbatim, which is already the stored pixel, so it needs
+    * no reordering at all.
+    */
+   case PIPE_FORMAT_R32_UINT:
       return true;
    default:
       return false;
@@ -1022,6 +1028,10 @@ pvrgpu_resource_readback_store_row(enum pipe_format format,
                                    const uint8_t *rgba8,
                                    unsigned width)
 {
+   if (format == PIPE_FORMAT_R32_UINT) {
+      memcpy(destination, rgba8, (size_t)width * 4u);
+      return;
+   }
    const bool swap_red_blue = format == PIPE_FORMAT_B8G8R8A8_UNORM ||
                               format == PIPE_FORMAT_B8G8R8X8_UNORM;
    const bool opaque = format == PIPE_FORMAT_R8G8B8X8_UNORM ||
@@ -1071,8 +1081,19 @@ pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
       return;
    if (!pvrgpu_resource_is_current_color_attachment(ctx, resource))
       return;
-   if (!pvrgpu_resource_readback_format_is_supported(resource->format))
+   if (!pvrgpu_resource_readback_format_is_supported(resource->format)) {
+      /*
+       * Say so.  Returning quietly here left a case reading its own zeroed
+       * backing store with nothing in the log to say the model's output had
+       * been dropped -- dEQP's shader tests render into R32_UINT and every
+       * result came back as zero.
+       */
+      pvrgpu_counter_eventf("framebuffer_readback_declined",
+                            "reason=format res=%p format=%s",
+                            (void *)resource,
+                            util_format_name(resource->format));
       return;
+   }
    /*
     * The model's framebuffer only describes the surface while everything that
     * touched it went to the model.  A scissored or masked clear did not, so

@@ -20,6 +20,14 @@ constexpr char kDriverCommandProducer[] = "pvrgpu-gallium-driver";
 constexpr char kDrawPcoTriangles[] = "draw_pco_triangles";
 constexpr char kDrawPcoSequence[] = "draw_pco_sequence";
 constexpr char kRgba8[] = "PIPE_FORMAT_R8G8B8A8_UNORM";
+constexpr char kR32Ui[] = "PIPE_FORMAT_R32_UINT";
+
+// The colour formats the PBE can write a generic draw into: four UNORM8
+// channels, or one raw 32-bit integer.  dEQP's shader tests render into the
+// latter, and requiring RGBA8 refused every one of them.
+bool IsGenericDrawFormat(const std::string &format) {
+  return format == kRgba8 || format == kR32Ui;
+}
 constexpr char kRgbx8[] = "PIPE_FORMAT_R8G8B8X8_UNORM";
 constexpr char kZ32[] = "PIPE_FORMAT_Z32_UNORM";
 constexpr char kRefractCase[] = "refract.refract.capture.1";
@@ -234,7 +242,7 @@ bool SequenceEnvelopeMatches(const Options &options, const char *case_name,
   if (!logical.enabled || logical.schema != kDriverCommandSchema ||
       logical.producer != kDriverCommandProducer ||
       logical.command != kDrawPcoSequence || logical.test_case != case_name ||
-      logical.frame != 1 || !profile || logical.format != kRgba8 ||
+      logical.frame != 1 || !profile || !IsGenericDrawFormat(logical.format) ||
       !RootPayloadIsEmpty(logical) || !resolution) {
     return Reject(error, std::string(case_name) +
                              " PCO logical command envelope is invalid");
@@ -1137,7 +1145,8 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
   if (!logical.enabled || logical.schema != kDriverCommandSchema ||
       logical.producer != kDriverCommandProducer ||
       logical.command != kDrawPcoSequence || logical.frame != 1 ||
-      logical.format != kRgba8 || !RootPayloadIsEmpty(logical)) {
+      !IsGenericDrawFormat(logical.format) ||
+      !RootPayloadIsEmpty(logical)) {
     return Reject(error, "generic PCO logical command envelope is invalid");
   }
   // The viewport may cover part of the attachment; it just has to fit.
@@ -1156,7 +1165,7 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
        ++ordinal) {
     const DriverCommand &draw = options.driver_commands[ordinal];
     if (draw.command != kDrawPcoTriangles || draw.test_case != logical.test_case ||
-        draw.format != kRgba8 || draw.frame != 1 ||
+        !IsGenericDrawFormat(draw.format) || draw.frame != 1 ||
         draw.framebuffer_width != logical.framebuffer_width ||
         draw.framebuffer_height != logical.framebuffer_height ||
         draw.width != logical.width || draw.height != logical.height ||
