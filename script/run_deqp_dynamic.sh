@@ -385,7 +385,11 @@ if command -v strings >/dev/null 2>&1; then
     driver_hit=0
     for gallium_lib in "${mesa_prefix}"/lib/libgallium*.dylib "${mesa_prefix}"/lib/dri/*.dylib "${mesa_gles}"; do
         [[ -f "${gallium_lib}" ]] || continue
-        if strings -a "${gallium_lib}" 2>/dev/null | grep -q 'pvrgpu'; then
+        # A subshell with pipefail off: `grep -q` exits at the first match and
+        # SIGPIPEs `strings`, which under `set -o pipefail` makes the pipeline
+        # report failure -- so this check warned that the driver was missing
+        # precisely when it found it.
+        if ( set +o pipefail; strings -a "${gallium_lib}" 2>/dev/null | grep -q 'pvrgpu' ); then
             driver_hit=1
             break
         fi
