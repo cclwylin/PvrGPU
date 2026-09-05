@@ -88,7 +88,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from deqp_groups import GROUP_SPECS, exact_case_belongs_to_group, get_group
+from deqp_groups import GROUP_SPECS, es3_enabled, exact_case_belongs_to_group, get_group
 
 
 PROJECT_ROOT = Path(
@@ -143,7 +143,9 @@ SUITE_CASES: dict[str, tuple[tuple[str, str], ...]] = {
     ),
 }
 
-UNAVAILABLE_SUITES = {
+# Exact-case mode blocks these suites only in the ES2-only mode
+# (PVRGPU_DISABLE_ES3=1); the driver advertises ES 3.1 by default now.
+UNAVAILABLE_SUITES = {} if es3_enabled() else {
     "dEQP-GLES3": (
         "The package is compiled into the runner, but every current PvrGPU EGL "
         "config is ES2-only. Missing ES3 format/query/restart prerequisites keep "

@@ -143,9 +143,32 @@ class DeqpGroupCatalogTests(unittest.TestCase):
     def test_availability_reason_tracks_the_current_runtime_limit(self) -> None:
         self.assertTrue(get_group("egl-image").available)
         self.assertIsNone(get_group("egl-image").availability_reason)
-        self.assertFalse(get_group("gles3-fbo").available)
-        self.assertIn("EGL_OPENGL_ES3_BIT_KHR", get_group("gles3-fbo").availability_reason or "")
+        # The driver advertises ES 3.0/3.1 by default, so the GLES3 groups run.
+        self.assertTrue(get_group("gles3-fbo").available)
+        self.assertIsNone(get_group("gles3-fbo").availability_reason)
+        # ES 3.2 is still beyond the driver whatever the ES3 switch says.
         self.assertFalse(get_group("gles32-tessellation").available)
+
+    def test_disabling_es3_blocks_the_gles3_groups_again(self) -> None:
+        """PVRGPU_DISABLE_ES3 restores the ES 2.0-only catalog."""
+        import importlib
+        import os
+
+        import deqp_groups
+
+        previous = os.environ.get("PVRGPU_DISABLE_ES3")
+        os.environ["PVRGPU_DISABLE_ES3"] = "1"
+        try:
+            disabled = importlib.reload(deqp_groups)
+            group = disabled.get_group("gles3-fbo")
+            self.assertFalse(group.available)
+            self.assertIn("EGL_OPENGL_ES3_BIT_KHR", group.availability_reason or "")
+        finally:
+            if previous is None:
+                os.environ.pop("PVRGPU_DISABLE_ES3", None)
+            else:
+                os.environ["PVRGPU_DISABLE_ES3"] = previous
+            importlib.reload(deqp_groups)
 
 
 if __name__ == "__main__":

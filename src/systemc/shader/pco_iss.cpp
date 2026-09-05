@@ -562,8 +562,26 @@ inline constexpr std::uint16_t kSpecialConstantEighth = 77;
 inline constexpr std::uint16_t kSpecialConstantOneOver256 = 82;
 inline constexpr std::uint16_t kSpecialConstantOneThird = 152;
 inline constexpr std::uint16_t kSpecialConstantOneSixth = 153;
+/* Fragment-coordinate hardware special registers, numbered exactly as Mesa's
+ * public PCO ISA description does (x_p 97, x_s 98, y_p 100, y_s 101).  Unlike
+ * the constants above these are not compile-time values: they are read out of
+ * the fragment's own position.  "_p" is the pixel coordinate and "_s" the
+ * sample coordinate; the model rasterises one sample per pixel, so both name
+ * the same coordinate here. */
+inline constexpr std::uint16_t kSpecialFragmentXPixel = 97;
+inline constexpr std::uint16_t kSpecialFragmentXSample = 98;
+inline constexpr std::uint16_t kSpecialFragmentYPixel = 100;
+inline constexpr std::uint16_t kSpecialFragmentYSample = 101;
+/* sc143 is the public all-bits-one Boolean the compiler feeds into TST/BCMP
+ * groups.  It is consumed inside the group and never reaches a USC operand. */
+inline constexpr std::uint16_t kSpecialInternalTrue = 143;
 inline constexpr std::size_t kAttributeFetchTemporaryCount = 6;
 inline constexpr std::uint8_t kControlOpWdf = 0b0101;
+
+bool IsFragmentCoordinateSpecialRegister(std::uint16_t index) {
+  return index == kSpecialFragmentXPixel || index == kSpecialFragmentXSample ||
+         index == kSpecialFragmentYPixel || index == kSpecialFragmentYSample;
+}
 
 bool IsSupportedSpecialConstant(std::uint16_t index) {
   return index <= 31 || index == kSpecialConstantOne ||
@@ -697,7 +715,8 @@ PcoRegisterRef DecodeOneLowerSource(const std::vector<std::uint8_t> &binary,
   }
 
   if (source.bank == PcoRegisterBank::kSpecial) {
-    if (!IsSupportedSpecialConstant(source.index)) {
+    if (!IsSupportedSpecialConstant(source.index) &&
+        !IsFragmentCoordinateSpecialRegister(source.index)) {
       DecodeError(source_offset,
                   "unsupported public special-constant register");
     }
@@ -741,7 +760,8 @@ struct TwoLowerSources {
 void ValidateGenericSource(PcoRegisterRef source, std::size_t offset) {
   switch (source.bank) {
   case PcoRegisterBank::kSpecial:
-    if (!IsSupportedSpecialConstant(source.index))
+    if (!IsSupportedSpecialConstant(source.index) &&
+        !IsFragmentCoordinateSpecialRegister(source.index))
       DecodeError(offset, "unsupported public special-constant register");
     return;
   case PcoRegisterBank::kTemporary:
@@ -830,7 +850,8 @@ TwoLowerSources DecodeTwoLowerSources(
       return;
     }
     if (bank == PcoRegisterBank::kSpecial) {
-      if (!IsSupportedSpecialConstant(index)) {
+      if (!IsSupportedSpecialConstant(index) &&
+          !IsFragmentCoordinateSpecialRegister(index)) {
         DecodeError(offset, "unsupported two-source special constant");
       }
       return;
@@ -850,7 +871,8 @@ TwoLowerSources DecodeTwoLowerSources(
   };
   validate_source(source0_bank, index0, source_offset);
   if (allow_internal_true_source1 &&
-      source1_bank == PcoRegisterBank::kSpecial && index1 == 143) {
+      source1_bank == PcoRegisterBank::kSpecial &&
+      index1 == kSpecialInternalTrue) {
     /* sc143 is the public all-bits-one Boolean feed used internally by BCMP.
      * It is consumed inside the group and is never exposed as a generic USC
      * source operand. */
@@ -1672,6 +1694,50 @@ PcoInstruction DecodeGenericSimpleAluGroup(
   return instruction;
 }
 
+// PCK with format COV (16) packs the fragment's sample-coverage mask: Mesa's
+// public backend emits `pck.cov dst, 1.0` and then shifts and tests the result
+// to learn whether the shader is running single-sampled.  Structure mirrors the
+// F16F16 pack group (0x9c op, then sources, an ISS selector, and a
+// destination); the packed source is the fixed 1.0 feed the compiler always
+// emits, validated canonically so nothing else decodes here by accident.
+PcoInstruction DecodeFragmentCoverageMaskGroup(
+    const std::vector<std::uint8_t> &binary, const GroupHeader &header,
+    std::uint16_t group_index) {
+  const std::size_t group_end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  // 0x9c op byte and 0x10 format byte (COV) were already matched by the caller.
+  cursor += 2;
+  // The canonical packed-1.0 feed: the long three-source lower encoding, an
+  // all-zero upper selector, and the 0x2c ISS selection shared with F16 packs.
+  static constexpr std::uint8_t kCovSource[] = {0x80, 0x40, 0xa0,
+                                                0x00, 0x30, 0x00};
+  if (group_end - cursor < sizeof(kCovSource) + 2)
+    DecodeError(cursor, "truncated PCK.COV fragment-coordinate group");
+  for (std::uint8_t expected : kCovSource) {
+    if (binary[cursor++] != expected)
+      DecodeError(cursor - 1,
+                  "PCK.COV source is not the canonical 1.0 coverage feed");
+  }
+  if (binary[cursor++] != 0x2cU)
+    DecodeError(cursor - 1, "PCK.COV ISS selection is not canonical");
+  const DecodedDestination destination =
+      DecodeGenericDestination(binary, group_end, cursor);
+  if (destination.target != PcoWriteTarget::kTemporary)
+    DecodeError(header.offset, "PCK.COV destination must be temporary");
+  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
+
+  PcoInstruction instruction;
+  instruction.opcode = PcoOpcode::kPackCoverageMask;
+  instruction.target = PcoWriteTarget::kTemporary;
+  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
+  instruction.group_index = group_index;
+  instruction.output_index = destination.index;
+  instruction.source_count = 0;
+  instruction.repeat_count = 1;
+  instruction.end_group = header.end ? 1U : 0U;
+  return instruction;
+}
+
 PcoInstruction DecodeGenericPackHalfGroup(
     ShaderStage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
@@ -1686,14 +1752,29 @@ PcoInstruction DecodeGenericPackHalfGroup(
   if (group_end - cursor < 2 || binary[cursor++] != 0x9cU)
     DecodeError(header.offset + 3, "expected scalar PCK.F16F16 operation");
   const std::uint8_t rounding = binary[cursor++];
+  // Format 16 (bits 4:0 = 0b10000) is PCK_FORMAT_COV; the compiler uses it to
+  // read a fragment coordinate rather than to pack a binary16 value.
+  if ((rounding & 0x1fU) == 0x10U)
+    return DecodeFragmentCoverageMaskGroup(binary, header, group_index);
   PcoOpcode opcode = PcoOpcode::kInternal;
   if (rounding == 0x0eU)
     opcode = PcoOpcode::kFloatPackHalfRtne;
   else if (rounding == 0x4eU)
     opcode = PcoOpcode::kFloatPackHalfRtz;
-  else
+  else {
+    if (std::getenv("PVRGPU_PCO_DECODE_DUMP")) {
+      std::cerr << "PCO_DECODE_DUMP PCK.F16F16 rounding=0x" << std::hex
+                << static_cast<unsigned>(rounding) << " at offset "
+                << std::dec << (header.offset + 4) << " total_bytes="
+                << header.total_bytes << " window=";
+      for (std::size_t i = header.offset;
+           i < group_end && i < header.offset + 16; ++i)
+        std::cerr << "0x" << std::hex << static_cast<unsigned>(binary[i]) << ' ';
+      std::cerr << std::dec << '\n';
+    }
     DecodeError(header.offset + 4,
                 "unsupported scalar PCK.F16F16 rounding mode");
+  }
   const ThreeLowerSources sources =
       DecodeThreeLowerSources(binary, group_end, cursor);
   if (sources.input_selector != 5)
@@ -1830,14 +1911,24 @@ PcoInstruction DecodeGenericConditionalSelectGreaterZeroGroup(
   }
   const std::size_t group_end = header.offset + header.total_bytes;
   std::size_t cursor = header.offset + 3;
-  constexpr std::uint8_t kCanonicalPhases[] = {
-      0xd0, 0x3c, 0xf2, 0x10, 0x87, 0x87,
-  };
+  /* MOVC(ft0, eall) then TST.GZ; the fourth byte carries the test type and
+   * the phase-2 end flag.  Mesa emits the float form for FSIGN-style selects
+   * and the unsigned form for the Boolean select that picks a fragment's pixel
+   * or sample coordinate, so both decode -- to different semantics. */
+  constexpr std::uint8_t kCanonicalPhases[] = {0xd0, 0x3c, 0xf2};
   for (std::uint8_t expected : kCanonicalPhases) {
     if (cursor >= group_end || binary[cursor++] != expected) {
-      DecodeError(cursor - 1,
-                  "unsupported CSEL.F32.GZ TST/MOVC phase sequence");
+      DecodeError(cursor - 1, "unsupported CSEL.GZ TST/MOVC phase sequence");
     }
+  }
+  if (cursor >= group_end)
+    DecodeError(cursor, "missing CSEL.GZ test-type byte");
+  const std::uint8_t test_type = binary[cursor++];
+  if (test_type != 0x10U && test_type != 0xb0U)
+    DecodeError(cursor - 1, "unsupported CSEL.GZ test type");
+  for (unsigned phase = 0; phase < 2; ++phase) {
+    if (cursor >= group_end || binary[cursor++] != 0x87U)
+      DecodeError(cursor - 1, "unsupported CSEL.GZ MBYP phase");
   }
 
   /* P0 supplies the true value, is0/s1 supplies the floating-point
@@ -1860,7 +1951,12 @@ PcoInstruction DecodeGenericConditionalSelectGreaterZeroGroup(
   ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
 
   PcoInstruction instruction;
-  instruction.opcode = PcoOpcode::kConditionalSelectGreaterZero;
+  /* An unsigned "> 0" test on a Boolean is exactly "is non-zero", which is the
+   * generic conditional select; only the float form needs the sign-aware
+   * comparison. */
+  instruction.opcode = test_type == 0xb0U
+                           ? PcoOpcode::kConditionalSelect
+                           : PcoOpcode::kConditionalSelectGreaterZero;
   instruction.target = destination.target;
   instruction.source = lower.source1;
   instruction.source1 = lower.source0;
@@ -2373,6 +2469,178 @@ PcoInstruction DecodeGenericBitwiseXnorGroup(
   return instruction;
 }
 
+/* Mesa's public PCO backend lowers a gl_FragCoord.x/.y read into six groups:
+ *
+ *   pck.cov  t, 1.0          -- the sample-coverage mask (1 << samples) - 1
+ *   shr      t, t, 1         -- 0 only when the shader is single-sampled
+ *   tstz.u32 t, t            -- t = "single sampled"
+ *   movs1    ta, x_p/y_p     -- the pixel-centre coordinate
+ *   movs1    tb, x_s/y_s     -- the sample coordinate
+ *   csel.gz.u32 d, t, ta, tb -- pick pixel or sample by the test above
+ *
+ * (See pco_trans_nir.c, trans_load_input_fs, VARYING_SLOT_POS components 0/1.)
+ * Every one of those six is decoded on its own terms below; nothing here
+ * recognises the sequence as a whole, so the same encodings decode identically
+ * wherever else a shader uses them.
+ */
+
+/* SHR: the bitwise ALU running phases 0 and 2.  Phase 0 bypasses the value
+ * into the shifter (BBYP0BM with both count and bitmask bypassed) and phase 2
+ * shifts it right by the upper source. */
+PcoInstruction DecodeGenericShiftRightGroup(
+    ShaderStage, const std::vector<std::uint8_t> &binary,
+    const GroupHeader &header, std::uint16_t group_index) {
+  if (!header.bitwise || header.control || header.da != 5 ||
+      header.operation_origin != 5 || header.output_load_check ||
+      !header.write0_present || header.write1_present ||
+      header.repeat_count != 1 || header.end || header.total_bytes != 10) {
+    DecodeError(header.offset, "unsupported SHR instruction-group header");
+  }
+  const std::size_t group_end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  if (binary[cursor++] != 0x01U)
+    DecodeError(header.offset + 3, "expected the phase-2 SHR operation");
+  if (binary[cursor++] != 0x02U)
+    DecodeError(header.offset + 4, "expected the phase-0 BBYP0BM operation");
+
+  /* s0 is the unused bitmask feed; s1 carries the value being shifted. */
+  const TwoLowerSources lower =
+      DecodeTwoLowerSources(binary, group_end, cursor);
+  if (lower.source0.bank != PcoRegisterBank::kSpecial ||
+      lower.source0.index != kSpecialConstantZero) {
+    DecodeError(header.offset, "SHR bitmask feed is not the canonical sc0");
+  }
+
+  /* Upper sources 2up_1b6i_1b5i: s3 is unused and s4 is the shift count. */
+  if (group_end - cursor < 3)
+    DecodeError(cursor, "truncated SHR upper-source encoding");
+  if (binary[cursor++] != 0x80U)
+    DecodeError(cursor - 1, "SHR upper source s3 is not the canonical sc0");
+  const std::uint8_t count_byte = binary[cursor++];
+  if ((count_byte & 0xc0U) != 0x80U)
+    DecodeError(cursor - 1, "unsupported SHR upper-source selector");
+  PcoRegisterRef count;
+  count.bank =
+      static_cast<PcoRegisterBank>((count_byte >> 5U) & 1U);
+  count.index = static_cast<std::uint16_t>(count_byte & 0x1fU);
+  ValidateGenericSource(count, cursor - 1);
+
+  const DecodedDestination destination =
+      DecodeGenericDestination(binary, group_end, cursor);
+  if (destination.target != PcoWriteTarget::kTemporary)
+    DecodeError(header.offset, "SHR destination must be temporary");
+  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
+
+  PcoInstruction instruction;
+  instruction.opcode = PcoOpcode::kShiftRight;
+  instruction.target = destination.target;
+  instruction.source = lower.source1;
+  instruction.source1 = count;
+  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
+  instruction.group_index = group_index;
+  instruction.output_index = destination.index;
+  instruction.source_count = 2;
+  instruction.repeat_count = 1;
+  instruction.end_group = 0;
+  return instruction;
+}
+
+/* TSTZ: phases 0 and 2 of the main ALU.  Phase 0 bypasses the value, phase 2
+ * tests it against zero as u32, packs a zero, and moves the internal Boolean
+ * feed (sc143, all bits one) or that zero into the destination. */
+PcoInstruction DecodeGenericTestZeroGroup(
+    ShaderStage, const std::vector<std::uint8_t> &binary,
+    const GroupHeader &header, std::uint16_t group_index) {
+  if (header.bitwise || header.control || header.da != 9 ||
+      header.operation_origin != 4 || header.output_load_check ||
+      !header.write0_present || header.write1_present ||
+      header.repeat_count != 1 || header.end || header.total_bytes != 18) {
+    DecodeError(header.offset, "unsupported TSTZ instruction-group header");
+  }
+  const std::size_t group_end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  /* MOVC(fte/ft0, eall) + TST.Z.U32 + PCK.ZERO + MBYP. */
+  constexpr std::uint8_t kCanonicalPhases[] = {
+      0xd3, 0x3c, 0xf0, 0xa0, 0x9c, 0x1e, 0x87,
+  };
+  for (std::uint8_t expected : kCanonicalPhases) {
+    if (cursor >= group_end || binary[cursor++] != expected)
+      DecodeError(cursor - 1, "unsupported TSTZ.U32 phase sequence");
+  }
+  const TwoLowerSources lower =
+      DecodeTwoLowerSources(binary, group_end, cursor, true, true);
+  if (lower.source1.bank != PcoRegisterBank::kSpecial ||
+      lower.source1.index != kSpecialInternalTrue) {
+    DecodeError(header.offset, "TSTZ.U32 true feed is not the canonical sc143");
+  }
+  if (cursor >= group_end || binary[cursor++] != 0x00U)
+    DecodeError(cursor - 1, "unsupported TSTZ.U32 upper-source encoding");
+  if (cursor >= group_end || binary[cursor++] != 0x20U)
+    DecodeError(cursor - 1, "unsupported TSTZ.U32 ISS selection");
+  const DecodedDestination destination =
+      DecodeGenericDestination(binary, group_end, cursor);
+  if (destination.target != PcoWriteTarget::kTemporary)
+    DecodeError(header.offset, "TSTZ.U32 destination must be temporary");
+  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
+
+  PcoInstruction instruction;
+  instruction.opcode = PcoOpcode::kTestZero;
+  instruction.target = destination.target;
+  instruction.source = lower.source0;
+  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
+  instruction.group_index = group_index;
+  instruction.output_index = destination.index;
+  instruction.source_count = 1;
+  instruction.repeat_count = 1;
+  instruction.end_group = 0;
+  return instruction;
+}
+
+/* MOVS1: phase 2 alone, moving a register that only the s1 port can name --
+ * the fragment-coordinate special registers among them -- into a temporary. */
+PcoInstruction DecodeGenericMoveSpecialSourceGroup(
+    ShaderStage, const std::vector<std::uint8_t> &binary,
+    const GroupHeader &header, std::uint16_t group_index) {
+  if (header.bitwise || header.control || header.da != 5 ||
+      header.operation_origin != 1 || header.output_load_check ||
+      !header.write0_present || header.write1_present ||
+      header.repeat_count != 1 || header.end || header.total_bytes != 12) {
+    DecodeError(header.offset, "unsupported MOVS1 instruction-group header");
+  }
+  const std::size_t group_end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  /* MOVC with the s1 feed selected for write port 0 and phase 2 ending. */
+  if (binary[cursor++] != 0xd3U || binary[cursor++] != 0x3fU)
+    DecodeError(header.offset + 3, "expected the phase-2 MOVS1 operation");
+  const TwoLowerSources lower =
+      DecodeTwoLowerSources(binary, group_end, cursor, true, false);
+  if (lower.source0.bank != PcoRegisterBank::kSpecial ||
+      lower.source0.index != kSpecialConstantZero) {
+    DecodeError(header.offset, "MOVS1 unused s0 feed is not the canonical sc0");
+  }
+  if (cursor >= group_end || binary[cursor++] != 0x00U)
+    DecodeError(cursor - 1, "unsupported MOVS1 upper-source encoding");
+  if (cursor >= group_end || binary[cursor++] != 0x30U)
+    DecodeError(cursor - 1, "unsupported MOVS1 ISS selection");
+  const DecodedDestination destination =
+      DecodeGenericDestination(binary, group_end, cursor);
+  if (destination.target != PcoWriteTarget::kTemporary)
+    DecodeError(header.offset, "MOVS1 destination must be temporary");
+  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
+
+  PcoInstruction instruction;
+  instruction.opcode = PcoOpcode::kMoveBypass;
+  instruction.target = destination.target;
+  instruction.source = lower.source1;
+  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
+  instruction.group_index = group_index;
+  instruction.output_index = destination.index;
+  instruction.source_count = 1;
+  instruction.repeat_count = 1;
+  instruction.end_group = 0;
+  return instruction;
+}
+
 PcoInstruction DecodeFragmentGroup(const std::vector<std::uint8_t> &binary,
                                    const GroupHeader &header,
                                    std::uint16_t group_index) {
@@ -2397,8 +2665,23 @@ PcoInstruction DecodeFragmentGroup(const std::vector<std::uint8_t> &binary,
       DecodeError(operation_offset,
                   "logical phase operation is outside the public subset");
     }
+    if (header.operation_origin == 5) {
+      const std::size_t operation_offset = header.offset + 3;
+      if (operation_offset >= header.offset + header.total_bytes)
+        DecodeError(operation_offset, "missing phase-2 bitwise operation");
+      if (binary[operation_offset] == 0x01U) {
+        return DecodeGenericShiftRightGroup(ShaderStage::kFragment, binary,
+                                            header, group_index);
+      }
+      DecodeError(operation_offset,
+                  "phase-2 bitwise operation is outside the public subset");
+    }
     DecodeError(header.offset,
                 "bitwise operation is outside the fragment public subset");
+  }
+  if (header.operation_origin == 4) {
+    return DecodeGenericTestZeroGroup(ShaderStage::kFragment, binary, header,
+                                      group_index);
   }
   if (header.operation_origin == 2) {
     if (binary[header.offset + 3] >> 5U == kBackendOpDma)
@@ -2408,9 +2691,17 @@ PcoInstruction DecodeFragmentGroup(const std::vector<std::uint8_t> &binary,
   if (header.operation_origin == 0)
     return DecodeGenericSimpleAluGroup(ShaderStage::kFragment, binary, header,
                                       group_index);
-  if (header.operation_origin == 1)
+  if (header.operation_origin == 1) {
+    const std::size_t operation_offset = header.offset + 3;
+    if (operation_offset >= header.offset + header.total_bytes)
+      DecodeError(operation_offset, "missing phase-2 operation");
+    if (binary[operation_offset] == 0xd3U) {
+      return DecodeGenericMoveSpecialSourceGroup(ShaderStage::kFragment, binary,
+                                                 header, group_index);
+    }
     return DecodeGenericPackHalfGroup(ShaderStage::kFragment, binary, header,
                                       group_index);
+  }
   if (header.operation_origin == 5)
     return DecodeGenericPhase2Group(ShaderStage::kFragment, binary, header,
                                     group_index);
@@ -3168,7 +3459,8 @@ void ValidateFragmentProgram(
   for (const PcoInstruction &instruction : instructions) {
     const auto require_source = [&](const PcoRegisterRef &source) {
       if (source.bank == PcoRegisterBank::kSpecial) {
-        if (!IsSupportedSpecialConstant(source.index))
+        if (!IsSupportedSpecialConstant(source.index) &&
+            !IsFragmentCoordinateSpecialRegister(source.index))
           DecodeError(instruction.binary_offset,
                       "invalid generic fragment special source");
         return;
@@ -3297,6 +3589,7 @@ void ValidateFragmentProgram(
     bool writes_temporary = false;
     switch (instruction.opcode) {
     case PcoOpcode::kMoveImmediate:
+    case PcoOpcode::kPackCoverageMask:
       writes_temporary = instruction.target == PcoWriteTarget::kTemporary &&
                          instruction.source_count == 0;
       break;
@@ -3322,6 +3615,7 @@ void ValidateFragmentProgram(
     case PcoOpcode::kFloatUnpackHalf:
     case PcoOpcode::kUnpackUnsignedToFloat:
     case PcoOpcode::kUnpackSignedToFloat:
+    case PcoOpcode::kTestZero:
       writes_temporary = instruction.target == PcoWriteTarget::kTemporary &&
                          instruction.source_count == 1;
       break;
@@ -3335,6 +3629,7 @@ void ValidateFragmentProgram(
     case PcoOpcode::kFloatLess:
     case PcoOpcode::kBitwiseAnd:
     case PcoOpcode::kBitwiseXnor:
+    case PcoOpcode::kShiftRight:
       writes_temporary = instruction.target == PcoWriteTarget::kTemporary &&
                          instruction.source_count == 2;
       break;
@@ -4348,7 +4643,9 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
     case PcoOpcode::kFloatNegate:
     case PcoOpcode::kFloatAbs:
     case PcoOpcode::kMoveImmediate:
-    case PcoOpcode::kFragmentCoordinate:
+    case PcoOpcode::kPackCoverageMask:
+    case PcoOpcode::kShiftRight:
+    case PcoOpcode::kTestZero:
     case PcoOpcode::kFloatFloor:
     case PcoOpcode::kFloatSubtract:
     case PcoOpcode::kFloatGreaterEqual:
@@ -4428,6 +4725,14 @@ PcoDecodedProgram DecodePcoProgram(ShaderStage stage,
   PcoDecodedProgram decoded;
   decoded.summary.stage = stage;
   decoded.summary.binary_size = static_cast<std::uint32_t>(binary.size());
+  if (std::getenv("PVRGPU_PCO_DECODE_DUMP")) {
+    std::cerr << "PCO_DECODE_BINARY stage="
+              << (stage == ShaderStage::kFragment ? "fragment" : "vertex")
+              << " size=" << binary.size() << " bytes=";
+    for (std::uint8_t b : binary)
+      std::cerr << std::hex << (b < 16 ? "0" : "") << static_cast<unsigned>(b);
+    std::cerr << std::dec << '\n';
+  }
   decoded.summary.early_hsr_safe = stage == ShaderStage::kFragment ? 1U : 0U;
 
   std::size_t offset = 0;
@@ -4734,6 +5039,13 @@ PcoVertexExecution ExecuteVertexPco(
       ExecuteError("vertex dynamic instruction count overflow");
     }
     ++result.executed_instruction_count;
+
+    /* Only MOVI carries an encoded immediate.  Executing an instruction whose
+     * metadata contradicts its opcode would silently compute something the
+     * binary does not say, so refuse it. */
+    if (instruction.opcode != PcoOpcode::kMoveImmediate &&
+        instruction.immediate != 0)
+      ExecuteError("a vertex instruction carries an immediate but is not MOVI");
 
     if (instruction.opcode == PcoOpcode::kTextureSample) {
       const std::size_t coordinate_base = instruction.source.index;
@@ -5289,6 +5601,9 @@ PcoFragmentExecution ExecuteFragmentPco(
     case PcoOpcode::kBitwiseOr: return "OR";
     case PcoOpcode::kBitwiseXor: return "XOR";
     case PcoOpcode::kBitwiseXnor: return "XNOR";
+    case PcoOpcode::kShiftRight: return "SHR";
+    case PcoOpcode::kTestZero: return "TSTZ";
+    case PcoOpcode::kPackCoverageMask: return "PCK.COV";
     case PcoOpcode::kFloatInterpolatePerspective: return "FITRP";
     case PcoOpcode::kWaitDataFence: return "WDF";
     default: return "OTHER";
@@ -5398,6 +5713,13 @@ PcoFragmentExecution ExecuteFragmentPco(
       ExecuteError("fragment dynamic instruction count overflow");
     }
     ++result.executed_instruction_count;
+
+    /* Only MOVI carries an encoded immediate.  Executing an instruction whose
+     * metadata contradicts its opcode would silently compute something the
+     * binary does not say, so refuse it. */
+    if (instruction.opcode != PcoOpcode::kMoveImmediate &&
+        instruction.immediate != 0)
+      ExecuteError("a fragment instruction carries an immediate but is not MOVI");
 
     if (instruction.opcode == PcoOpcode::kBranch) {
       if (instruction.branch_target_index >= instructions.size())
@@ -5626,6 +5948,9 @@ PcoFragmentExecution ExecuteFragmentPco(
         instruction.opcode == PcoOpcode::kBitwiseOr ||
         instruction.opcode == PcoOpcode::kBitwiseXor ||
         instruction.opcode == PcoOpcode::kBitwiseXnor ||
+        instruction.opcode == PcoOpcode::kPackCoverageMask ||
+        instruction.opcode == PcoOpcode::kShiftRight ||
+        instruction.opcode == PcoOpcode::kTestZero ||
         instruction.opcode == PcoOpcode::kFloatSine ||
         instruction.opcode == PcoOpcode::kFloatCosine ||
         instruction.opcode == PcoOpcode::kBufferLoad ||
@@ -5657,6 +5982,17 @@ PcoFragmentExecution ExecuteFragmentPco(
           if (index >= context.coefficient_count)
             ExecuteError("generic fragment coefficient source is absent");
           return context.coefficients[index];
+        }
+        if (source.bank == PcoRegisterBank::kSpecial &&
+            IsFragmentCoordinateSpecialRegister(source.index)) {
+          if (repeat != 0)
+            ExecuteError("fragment coordinate registers cannot be repeated");
+          /* The model rasterises one sample per pixel, so the pixel-centre and
+           * sample coordinates are the same value. */
+          return (source.index == kSpecialFragmentXPixel ||
+                  source.index == kSpecialFragmentXSample)
+                     ? context.sample_x
+                     : context.sample_y;
         }
         return ReadSource(source, no_vertex_inputs, temporaries,
                           temporary_written_mask, repeat,
@@ -5819,6 +6155,19 @@ PcoFragmentExecution ExecuteFragmentPco(
             instruction.source1, no_vertex_inputs, temporaries,
             temporary_written_mask, 0, ShaderStage::kFragment);
         result_val = ~(src0 ^ src1);
+      } else if (instruction.opcode == PcoOpcode::kPackCoverageMask) {
+        /* PCK.COV packs the fragment's coverage mask, which for n samples is
+         * the low n bits set.  This model rasterises one sample per pixel. */
+        result_val = UINT32_C(1);
+      } else if (instruction.opcode == PcoOpcode::kShiftRight) {
+        const std::uint32_t src1 = read(instruction.source1);
+        if (src1 >= 32U)
+          ExecuteError("SHR shift count exceeds the register width");
+        result_val = src0 >> src1;
+      } else if (instruction.opcode == PcoOpcode::kTestZero) {
+        /* TST.Z selects between the internal all-ones Boolean and a packed
+         * zero, so a passing test reads back as every bit set. */
+        result_val = src0 == 0 ? UINT32_C(0xffffffff) : UINT32_C(0);
       }
       temporaries[instruction.output_index] = result_val;
       temporary_written_mask |= bit;

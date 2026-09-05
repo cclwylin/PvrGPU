@@ -222,6 +222,19 @@ std::array<std::uint32_t, 3> PcoViewportBits(
   return bits;
 }
 
+// True when the stated viewport scale is the expected extent up to the sign of
+// Y.  A window-system framebuffer is y-flipped, so GL states scale_y = -h/2
+// there; the clip/cull stage applies ndc * scale + offset as written, so the
+// reflection is honoured rather than special-cased.  Negating an IEEE float
+// toggles its sign bit only.
+bool PcoViewportScaleMatches(const std::array<std::uint32_t, 3> &expected,
+                             const std::uint32_t actual[3]) {
+  return actual[0] == expected[0] &&
+         (actual[1] == expected[1] ||
+          actual[1] == (expected[1] ^ UINT32_C(0x80000000))) &&
+         actual[2] == expected[2];
+}
+
 void CopyPcoPayloadFields(
     const pvrgpu_systemc_driver_command &source,
     pvrgpu::stub::DriverCommand *destination) {
@@ -682,8 +695,7 @@ bool CopyPcoTrianglePayload(
   // attachment.  A draw rendering to part of its target states an offset that
   // is not the scale, which is only wrong if it leaves the render target.
   const bool viewport_scale_invalid =
-      !std::equal(viewport_bits.begin(), viewport_bits.end(),
-                  source.viewport_scale_bits);
+      !PcoViewportScaleMatches(viewport_bits, source.viewport_scale_bits);
   const bool viewport_translate_invalid =
       !ViewportOffsetIsInside(source.viewport_translate_bits, source.width,
                               source.height, source.framebuffer_width,
@@ -754,13 +766,12 @@ bool CopyPcoTrianglePayload(
     return false;
   }
   const bool common_raster_invalid =
-      source.front_ccw != 0 ||
       source.fill_front != 0 || source.fill_back != 0 ||
       source.rasterizer_discard != 0 ||
       // GL_MULTISAMPLE on a single-sample attachment rasterizes as
       // single-sample; a multi-sampled attachment never reaches here.
       source.multisample > 1 || source.half_pixel_center != 1 ||
-      source.bottom_edge_rule != 0 || source.clip_halfz != 0 ||
+      source.bottom_edge_rule > 1 || source.clip_halfz != 0 ||
       source.depth_clip_near != 1 || source.depth_clip_far != 1 ||
       source.depth_clamp != 0 || source.sample_mask != UINT32_MAX ||
       // The PBE honours a partial write mask, so any four-bit mask is valid.
@@ -1004,7 +1015,7 @@ bool CopyPcoSequenceDraw(
     nested_reason = "multisample";
   else if (source.half_pixel_center != 1)
     nested_reason = "half_pixel_center";
-  else if (source.bottom_edge_rule != 0)
+  else if (source.bottom_edge_rule > 1)
     nested_reason = "bottom_edge_rule";
   else if (source.clip_halfz != 0)
     nested_reason = "clip_halfz";

@@ -210,13 +210,15 @@ The catalog follows the 24 capture categories but uses the locked CTS names:
 that zero-case slot is explicitly named and mapped as draw-indirect stress
 instead of silently running unrelated tests.
 
-Only the three EGL groups can start with the current driver. GLES3 and GLES31
-groups remain visible with a blocked reason: none of the current PvrGPU EGL
-configs advertises `EGL_OPENGL_ES3_BIT_KHR`. The driver is missing multiple ES3
-format/query/restart prerequisites, while ES3.1 additionally lacks a real
-compute/SSBO/image/atomic implementation. `MESA_GLES_VERSION_OVERRIDE` is useful
-for caselist discovery only; using it to execute tests bypasses Mesa's capability
-checks and currently fails during state reset.
+The driver advertises OpenGL ES 3.1 by default, so every group in the catalog
+can start. `PVRGPU_DISABLE_ES3=1` restores the earlier ES2-only surface, in
+which only the three EGL groups start and the GLES3/GLES31 groups show their
+blocked reason again. Two caveats remain for ES3: compute is advertised through
+no-op stubs (compute cases fail rather than crash), and because the SystemC
+bridge defers simulation to process exit, the model's framebuffer is never
+written back for `glReadPixels`, so image-comparison cases report Fail even
+when the model's own PNG matches dEQP's reference pixel for pixel. Judge those
+from the per-case `systemc/*.png` until readback is wired.
 
 Run an exact case on the fly; the executable configures the surfaceless PvrGPU
 runtime and artifact paths itself:

@@ -18,6 +18,24 @@ static const nir_shader_compiler_options pvrgpu_nir_options = {
    .max_unroll_iterations = 32,
 };
 
+/*
+ * OpenGL ES 3.0 / 3.1 advertisement.
+ *
+ * Mesa derives the reported ES version from screen caps and format support
+ * (see _mesa_compute_version -> compute_version_es2 and st_init_extensions).
+ * The caps below are what that computation needs; the driver still implements
+ * only its bring-up slice, so exposing them makes ES3 contexts and shaders
+ * reachable rather than making the whole feature set work.  Set
+ * PVRGPU_DISABLE_ES3=1 to fall back to the earlier ES2-only surface, which is
+ * the reference point when a regression has to be bisected.
+ */
+static bool
+pvrgpu_es3_enabled(void)
+{
+   const char *disabled = getenv("PVRGPU_DISABLE_ES3");
+   return !(disabled && disabled[0] != '\0' && disabled[0] != '0');
+}
+
 static void
 pvrgpu_init_single_shader_caps(struct pipe_screen *screen,
                                mesa_shader_stage shader)
@@ -37,6 +55,17 @@ pvrgpu_init_single_shader_caps(struct pipe_screen *screen,
    caps->max_temps = 256;
    caps->max_texture_samplers = 16;
    caps->max_sampler_views = 16;
+   if (pvrgpu_es3_enabled()) {
+      /*
+       * ES 3.1 needs shader storage, images and atomic counters in at least
+       * the fragment and compute stages.  Leaving max_hw_atomic_counters at 0
+       * makes Mesa carve the atomic counter buffers out of the SSBO budget
+       * (st_init_limits), which is the arrangement drivers without dedicated
+       * atomic hardware use.
+       */
+      caps->max_shader_buffers = 16;
+      caps->max_shader_images = 8;
+   }
    caps->supported_irs =
       (1 << PIPE_SHADER_IR_NIR) | (1 << PIPE_SHADER_IR_TGSI);
    caps->indirect_temp_addr = true;
@@ -52,12 +81,16 @@ pvrgpu_init_shader_caps(struct pipe_screen *screen)
    pvrgpu_init_single_shader_caps(screen, MESA_SHADER_GEOMETRY);
    pvrgpu_init_single_shader_caps(screen, MESA_SHADER_TESS_CTRL);
    pvrgpu_init_single_shader_caps(screen, MESA_SHADER_TESS_EVAL);
+   if (pvrgpu_es3_enabled())
+      pvrgpu_init_single_shader_caps(screen, MESA_SHADER_COMPUTE);
 
    screen->nir_options[MESA_SHADER_VERTEX] = &pvrgpu_nir_options;
    screen->nir_options[MESA_SHADER_FRAGMENT] = &pvrgpu_nir_options;
    screen->nir_options[MESA_SHADER_GEOMETRY] = &pvrgpu_nir_options;
    screen->nir_options[MESA_SHADER_TESS_CTRL] = &pvrgpu_nir_options;
    screen->nir_options[MESA_SHADER_TESS_EVAL] = &pvrgpu_nir_options;
+   if (pvrgpu_es3_enabled())
+      screen->nir_options[MESA_SHADER_COMPUTE] = &pvrgpu_nir_options;
 }
 
 static const char *
@@ -186,6 +219,57 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    caps->glsl_feature_level = 400;
    caps->glsl_feature_level_compatibility = 400;
    caps->essl_feature_level = 310;
+
+   if (!pvrgpu_es3_enabled())
+      return;
+
+   /*
+    * ES 3.0 gates, in the order compute_version_es2() checks them.
+    * primitive restart backs both NV_primitive_restart and the fixed-index
+    * form ES3 requires; mixed_framebuffer_sizes backs ARB_framebuffer_object;
+    * fragment_shader_texture_lod backs ARB_shader_texture_lod.
+    */
+   caps->primitive_restart = true;
+   caps->primitive_restart_fixed_index = true;
+   caps->mixed_framebuffer_sizes = true;
+   caps->fragment_shader_texture_lod = true;
+   caps->seamless_cube_map = true;
+   caps->occlusion_query = true;
+   caps->indep_blend_enable = true;
+
+   /* ES 3.1 gates that are not compute. */
+   caps->max_texture_gather_components = 4;
+   caps->image_store_formatted = true;
+   caps->shader_buffer_offset_alignment = 16;
+   caps->max_combined_shader_buffers = 16;
+   caps->max_combined_hw_atomic_counters = 0;
+   caps->max_combined_hw_atomic_counter_buffers = 0;
+
+   /*
+    * ES 3.1 compute.  ARB_compute_shader additionally requires
+    * max_threads_per_block >= 1024 (st_init_extensions), so the block limits
+    * are the smallest ones that clear that bar.  The dispatch path itself is
+    * still a stub -- see pvrgpu_launch_grid in pvrgpu_context.c.
+    */
+   caps->compute = true;
+
+   struct pipe_compute_caps *compute =
+      (struct pipe_compute_caps *)&screen->compute_caps;
+   compute->address_bits = 64;
+   compute->grid_dimension = 3;
+   compute->max_grid_size[0] = 65535;
+   compute->max_grid_size[1] = 65535;
+   compute->max_grid_size[2] = 65535;
+   compute->max_block_size[0] = 1024;
+   compute->max_block_size[1] = 1024;
+   compute->max_block_size[2] = 64;
+   compute->max_threads_per_block = 1024;
+   compute->max_variable_threads_per_block = 1024;
+   compute->max_local_size = 32 * 1024;
+   compute->max_compute_units = 1;
+   compute->max_clock_frequency = 1;
+   compute->max_mem_alloc_size = 1u << 30;
+   compute->max_global_size = 1u << 30;
 }
 
 static bool
@@ -256,6 +340,83 @@ pvrgpu_is_supported_color_format(enum pipe_format format)
    case PIPE_FORMAT_R32G32B32A32_SINT:
       return true;
    default:
+      break;
+   }
+
+   if (!pvrgpu_es3_enabled())
+      return false;
+
+   /*
+    * ES 3.0 colour-renderable and texturable formats.  ARB_texture_rg needs
+    * R8/RG8, EXT_packed_float needs R11G11B10, EXT_texture_snorm and
+    * EXT_render_snorm need the SNORM set, EXT_color_buffer_(half_)float needs
+    * the R/RG float set, and ARB_ES3_compatibility additionally checks
+    * R16/RG16 UNORM plus R16/RG16 SNORM as sampler formats.
+    */
+   switch (format) {
+   /* ARB_texture_rg */
+   case PIPE_FORMAT_R8_UNORM:
+   case PIPE_FORMAT_R8G8_UNORM:
+   /* EXT_texture_snorm / EXT_render_snorm */
+   case PIPE_FORMAT_R8_SNORM:
+   case PIPE_FORMAT_R8G8_SNORM:
+   case PIPE_FORMAT_R8G8B8A8_SNORM:
+   case PIPE_FORMAT_R16_SNORM:
+   case PIPE_FORMAT_R16G16_SNORM:
+   case PIPE_FORMAT_R16G16B16A16_SNORM:
+   /* EXT_packed_float */
+   case PIPE_FORMAT_R11G11B10_FLOAT:
+   /* EXT_color_buffer_half_float / EXT_color_buffer_float */
+   case PIPE_FORMAT_R16_FLOAT:
+   case PIPE_FORMAT_R16G16_FLOAT:
+   case PIPE_FORMAT_R32_FLOAT:
+   case PIPE_FORMAT_R32G32_FLOAT:
+   /* EXT_texture_integer and the ES3 integer texture set */
+   case PIPE_FORMAT_R8_UINT:
+   case PIPE_FORMAT_R8_SINT:
+   case PIPE_FORMAT_R8G8_UINT:
+   case PIPE_FORMAT_R8G8_SINT:
+   case PIPE_FORMAT_R16_UINT:
+   case PIPE_FORMAT_R16_SINT:
+   case PIPE_FORMAT_R16G16_UINT:
+   case PIPE_FORMAT_R16G16_SINT:
+   case PIPE_FORMAT_R16G16B16A16_UINT:
+   case PIPE_FORMAT_R32_UINT:
+   case PIPE_FORMAT_R32_SINT:
+   case PIPE_FORMAT_R32G32_UINT:
+   case PIPE_FORMAT_R32G32_SINT:
+   case PIPE_FORMAT_R32G32B32A32_UINT:
+   /* ARB_texture_rgb10_a2ui */
+   case PIPE_FORMAT_R10G10B10A2_UINT:
+   case PIPE_FORMAT_B10G10R10A2_UINT:
+   /* EXT_sRGB / EXT_texture_sRGB alternates */
+   case PIPE_FORMAT_A8B8G8R8_SRGB:
+   case PIPE_FORMAT_B8G8R8A8_SRGB:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/*
+ * Formats an ES3 context must be able to sample but never renders into.
+ * Keeping them out of the colour list is what stops Mesa from advertising
+ * them as colour-renderable.
+ */
+static bool
+pvrgpu_is_sampler_only_format(enum pipe_format format)
+{
+   if (!pvrgpu_es3_enabled())
+      return false;
+
+   switch (format) {
+   /* EXT_texture_shared_exponent */
+   case PIPE_FORMAT_R9G9B9E5_FLOAT:
+   /* ARB_stencil_texturing (ES 3.1) */
+   case PIPE_FORMAT_X24S8_UINT:
+   case PIPE_FORMAT_S8X24_UINT:
+      return true;
+   default:
       return false;
    }
 }
@@ -289,6 +450,71 @@ pvrgpu_is_supported_vertex_format(enum pipe_format format)
    case PIPE_FORMAT_R32G32_FLOAT:
    case PIPE_FORMAT_R32G32B32_FLOAT:
    case PIPE_FORMAT_R32G32B32A32_FLOAT:
+      return true;
+   default:
+      break;
+   }
+
+   if (!pvrgpu_es3_enabled())
+      return false;
+
+   /*
+    * ES 3.0 vertex attribute formats: the 8/16/32-bit integer and normalized
+    * sets, half floats (ARB_half_float_vertex), and the packed 2_10_10_10_REV
+    * and 10f_11f_11f_REV forms.
+    */
+   switch (format) {
+   case PIPE_FORMAT_R8_SINT:
+   case PIPE_FORMAT_R8_UNORM:
+   case PIPE_FORMAT_R8_SNORM:
+   case PIPE_FORMAT_R8G8_UINT:
+   case PIPE_FORMAT_R8G8_SINT:
+   case PIPE_FORMAT_R8G8_UNORM:
+   case PIPE_FORMAT_R8G8_SNORM:
+   case PIPE_FORMAT_R8G8B8_UINT:
+   case PIPE_FORMAT_R8G8B8_SINT:
+   case PIPE_FORMAT_R8G8B8_UNORM:
+   case PIPE_FORMAT_R8G8B8_SNORM:
+   case PIPE_FORMAT_R8G8B8A8_UINT:
+   case PIPE_FORMAT_R8G8B8A8_SINT:
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_SNORM:
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_R16_SINT:
+   case PIPE_FORMAT_R16_UNORM:
+   case PIPE_FORMAT_R16_SNORM:
+   case PIPE_FORMAT_R16_FLOAT:
+   case PIPE_FORMAT_R16G16_UINT:
+   case PIPE_FORMAT_R16G16_SINT:
+   case PIPE_FORMAT_R16G16_UNORM:
+   case PIPE_FORMAT_R16G16_SNORM:
+   case PIPE_FORMAT_R16G16_FLOAT:
+   case PIPE_FORMAT_R16G16B16_UINT:
+   case PIPE_FORMAT_R16G16B16_SINT:
+   case PIPE_FORMAT_R16G16B16_FLOAT:
+   case PIPE_FORMAT_R16G16B16A16_UINT:
+   case PIPE_FORMAT_R16G16B16A16_SINT:
+   case PIPE_FORMAT_R16G16B16A16_UNORM:
+   case PIPE_FORMAT_R16G16B16A16_SNORM:
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+   case PIPE_FORMAT_R32_SINT:
+   case PIPE_FORMAT_R32G32_UINT:
+   case PIPE_FORMAT_R32G32_SINT:
+   case PIPE_FORMAT_R32G32B32_UINT:
+   case PIPE_FORMAT_R32G32B32_SINT:
+   case PIPE_FORMAT_R32G32B32A32_UINT:
+   case PIPE_FORMAT_R32G32B32A32_SINT:
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+   case PIPE_FORMAT_R10G10B10A2_SNORM:
+   case PIPE_FORMAT_R10G10B10A2_UINT:
+   case PIPE_FORMAT_R10G10B10A2_USCALED:
+   case PIPE_FORMAT_R10G10B10A2_SSCALED:
+   case PIPE_FORMAT_B10G10R10A2_UNORM:
+   case PIPE_FORMAT_B10G10R10A2_SNORM:
+   case PIPE_FORMAT_B10G10R10A2_UINT:
+   case PIPE_FORMAT_B10G10R10A2_USCALED:
+   case PIPE_FORMAT_B10G10R10A2_SSCALED:
+   case PIPE_FORMAT_R11G11B10_FLOAT:
       return true;
    default:
       return false;
@@ -387,6 +613,12 @@ pvrgpu_is_format_supported(struct pipe_screen *screen,
             PIPE_BIND_BLENDABLE;
       }
       if (bind & ~supported_binds)
+         goto out;
+      supported = true;
+      goto out;
+   }
+   if (pvrgpu_is_sampler_only_format(format)) {
+      if (bind & ~(unsigned)PIPE_BIND_SAMPLER_VIEW)
          goto out;
       supported = true;
       goto out;

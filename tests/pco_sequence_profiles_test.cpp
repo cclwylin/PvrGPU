@@ -2,6 +2,7 @@
 
 #include "model_types.h"
 
+#include <cstring>
 #include <array>
 #include <iostream>
 #include <stdexcept>

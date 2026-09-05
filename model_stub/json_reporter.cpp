@@ -158,7 +158,9 @@ struct FragmentPcoEvidence {
   std::uint64_t fneg = 0;
   std::uint64_t fabs = 0;
   std::uint64_t movi = 0;
-  std::uint64_t fragcoord = 0;
+  std::uint64_t pck_cov = 0;
+  std::uint64_t shr = 0;
+  std::uint64_t tstz = 0;
   std::uint64_t ffloor = 0;
   std::uint64_t fsub = 0;
   std::uint64_t fge = 0;
@@ -299,7 +301,9 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kUvsEmitEndTask:
       ++evidence.uvsw_emit_endtask;
       break;
-    case PcoOpcode::kFragmentCoordinate:
+    case PcoOpcode::kPackCoverageMask:
+    case PcoOpcode::kShiftRight:
+    case PcoOpcode::kTestZero:
     case PcoOpcode::kFloatInterpolatePerspective:
     default:
       throw std::runtime_error(
@@ -377,8 +381,14 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kFloatAbs:
       ++evidence.fabs;
       break;
-    case PcoOpcode::kFragmentCoordinate:
-      ++evidence.fragcoord;
+    case PcoOpcode::kPackCoverageMask:
+      ++evidence.pck_cov;
+      break;
+    case PcoOpcode::kShiftRight:
+      ++evidence.shr;
+      break;
+    case PcoOpcode::kTestZero:
+      ++evidence.tstz;
       break;
     case PcoOpcode::kFloatFloor:
       ++evidence.ffloor;
@@ -450,7 +460,8 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
   if (evidence.fitrp + evidence.wdf + evidence.fadd + evidence.fmul +
           evidence.mbyp + evidence.smp + evidence.internal + evidence.fneg +
           evidence.fabs +
-          evidence.movi + evidence.fragcoord + evidence.ffloor +
+          evidence.movi + evidence.pck_cov + evidence.shr +
+          evidence.tstz + evidence.ffloor +
           evidence.fsub + evidence.fge + evidence.feq + evidence.flt +
           evidence.bitwise_and + evidence.bitwise_xnor + evidence.csel +
           evidence.fmad +
@@ -543,7 +554,9 @@ void AppendFragmentPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_FRAGMENT_EVIDENCE(fneg);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(fabs);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(movi);
-  PVRGPU_ADD_FRAGMENT_EVIDENCE(fragcoord);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(pck_cov);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(shr);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(tstz);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(ffloor);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(fsub);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(fge);
@@ -1492,8 +1505,12 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"fneg\":" << fragment_pco.fneg;
   if (fragment_pco.fabs != 0)
     std::cout << ",\"fabs\":" << fragment_pco.fabs;
-  if (fragment_pco.fragcoord != 0)
-    std::cout << ",\"fragcoord\":" << fragment_pco.fragcoord;
+  if (fragment_pco.pck_cov != 0)
+    std::cout << ",\"pck_cov\":" << fragment_pco.pck_cov;
+  if (fragment_pco.shr != 0)
+    std::cout << ",\"shr\":" << fragment_pco.shr;
+  if (fragment_pco.tstz != 0)
+    std::cout << ",\"tstz\":" << fragment_pco.tstz;
   if (fragment_pco.ffloor != 0)
     std::cout << ",\"ffloor\":" << fragment_pco.ffloor;
   if (fragment_pco.fsub != 0)

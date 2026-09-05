@@ -75,6 +75,28 @@ pvrgpu_cmd_error(char *error, size_t error_size, const char *message)
  * centre of normalized device space maps to, so the viewport spans
  * [offset - extent/2, offset + extent/2].
  */
+/*
+ * True when the stated viewport scale describes this draw's extent.
+ *
+ * The Y scale may be negative: a window-system framebuffer is y-flipped, so
+ * GL states scale_y = -height/2 there, and the model applies the transform as
+ * a plain ndc * scale + offset, which reflects correctly.  Only the magnitude
+ * has to agree with the extent the command claims.
+ */
+static bool
+pvrgpu_cmd_viewport_scale_matches(const uint32_t scale_bits[3],
+                                  uint32_t width,
+                                  uint32_t height)
+{
+   float scale[3];
+   memcpy(scale, scale_bits, sizeof(scale));
+   if (!isfinite(scale[0]) || !isfinite(scale[1]) || !isfinite(scale[2]))
+      return false;
+   return scale[0] == (float)width * 0.5f &&
+          fabsf(scale[1]) == (float)height * 0.5f &&
+          scale[2] == 0.5f;
+}
+
 static bool
 pvrgpu_cmd_viewport_offset_is_inside(const uint32_t offset_bits[3],
                                      uint32_t width,
@@ -680,15 +702,32 @@ pvrgpu_cmd_validate_draw_pco_triangles(
                                    error_size))
       return false;
 
-   if (!pvrgpu_pco_single_draw_resolution_supported(
-          cmd->framebuffer_width,
-          cmd->framebuffer_height,
-          cmd->width,
-          cmd->height) ||
-       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8) != 0) {
-      pvrgpu_cmd_error(error, error_size,
-                       "draw PCO triangles requires a full-surface RGBA8 "
-                       "render target within the model extent");
+   const bool resolution_ok =
+      pvrgpu_pco_single_draw_resolution_supported(cmd->framebuffer_width,
+                                                  cmd->framebuffer_height,
+                                                  cmd->width,
+                                                  cmd->height);
+   const bool format_ok =
+      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8) == 0;
+   if (!resolution_ok || !format_ok) {
+      /*
+       * Say which half of the requirement failed and with what.  A
+       * fail-closed path that only states the rule leaves the caller
+       * guessing between an out-of-extent viewport and a format the model
+       * cannot write.
+       */
+      char message[320];
+      snprintf(message, sizeof(message),
+               "draw PCO triangles requires a full-surface RGBA8 render "
+               "target within the model extent (%s%s%s: viewport=%ux%u "
+               "framebuffer=%ux%u format=%s)",
+               resolution_ok ? "" : "resolution",
+               (!resolution_ok && !format_ok) ? " and " : "",
+               format_ok ? "" : "format",
+               cmd->width, cmd->height,
+               cmd->framebuffer_width, cmd->framebuffer_height,
+               cmd->format ? cmd->format : "<none>");
+      pvrgpu_cmd_error(error, error_size, message);
       return false;
    }
    if (cmd->clear_color_bits[0] != 0 ||
@@ -1046,8 +1085,6 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       return false;
    }
 
-   uint32_t viewport_bits[3];
-   pvrgpu_pco_viewport_bits(cmd->width, cmd->height, viewport_bits);
    const bool ideas_depth_state_matches =
       cmd->depth_format != 0 &&
       ((cmd->depth_enable == 0 && cmd->depth_write == 0 &&
@@ -1075,16 +1112,35 @@ pvrgpu_cmd_validate_draw_pco_triangles(
     * surface, where offset equals scale, but a draw that does not is only
     * required to stay inside the render target.
     */
-   if (memcmp(cmd->viewport_scale_bits,
-              viewport_bits,
-              sizeof(viewport_bits)) != 0 ||
-       !pvrgpu_cmd_viewport_offset_is_inside(cmd->viewport_translate_bits,
-                                             cmd->width,
-                                             cmd->height,
-                                             cmd->framebuffer_width,
-                                             cmd->framebuffer_height)) {
-      pvrgpu_cmd_error(error, error_size,
-                       "draw PCO triangles has incompatible viewport state");
+   const bool viewport_scale_ok =
+      pvrgpu_cmd_viewport_scale_matches(cmd->viewport_scale_bits,
+                                        cmd->width,
+                                        cmd->height);
+   const bool viewport_offset_ok =
+      pvrgpu_cmd_viewport_offset_is_inside(cmd->viewport_translate_bits,
+                                           cmd->width,
+                                           cmd->height,
+                                           cmd->framebuffer_width,
+                                           cmd->framebuffer_height);
+   if (!viewport_scale_ok || !viewport_offset_ok) {
+      float scale[3];
+      float translate[3];
+      memcpy(scale, cmd->viewport_scale_bits, sizeof(scale));
+      memcpy(translate, cmd->viewport_translate_bits, sizeof(translate));
+      char message[320];
+      snprintf(message, sizeof(message),
+               "draw PCO triangles has incompatible viewport state (%s%s%s: "
+               "scale=%g,%g,%g translate=%g,%g,%g viewport=%ux%u "
+               "framebuffer=%ux%u)",
+               viewport_scale_ok ? "" : "scale",
+               (!viewport_scale_ok && !viewport_offset_ok) ? " and " : "",
+               viewport_offset_ok ? "" : "offset",
+               (double)scale[0], (double)scale[1], (double)scale[2],
+               (double)translate[0], (double)translate[1],
+               (double)translate[2],
+               cmd->width, cmd->height,
+               cmd->framebuffer_width, cmd->framebuffer_height);
+      pvrgpu_cmd_error(error, error_size, message);
       return false;
    }
    /*
@@ -1092,8 +1148,15 @@ pvrgpu_cmd_validate_draw_pco_triangles(
     * "incompatible raster/depth state" gives no way to tell which feature a
     * capture actually needs.
     */
+   /*
+    * Either front-face winding is accepted.  Mesa flips front_ccw together
+    * with the viewport Y sign (st_atom_rasterizer.c), and the model resolves
+    * the pair back to one winding, so a window-system framebuffer's
+    * (front_ccw=1, scale_y<0) is the same GL state as the (0, >0) the
+    * pinned captures use.
+    */
    const char *raster_reason = NULL;
-   if (cmd->front_ccw != 0)
+   if (cmd->front_ccw > 1)
       raster_reason = "front_ccw";
    else if ((!ideas_layout && !color_layout && cmd->cull_face != 2) ||
             ((ideas_layout || color_layout) && cmd->cull_face != 0 &&
@@ -1107,7 +1170,7 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       raster_reason = "multisample";
    else if (cmd->half_pixel_center != 1)
       raster_reason = "half_pixel_center";
-   else if (cmd->bottom_edge_rule != 0)
+   else if (cmd->bottom_edge_rule > 1)
       raster_reason = "bottom_edge_rule";
    else if (cmd->clip_halfz != 0)
       raster_reason = "clip_halfz";

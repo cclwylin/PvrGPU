@@ -4,6 +4,7 @@
 #include "shader/pco_iss.h"
 
 #include <array>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 #include <limits>

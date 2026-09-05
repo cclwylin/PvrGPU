@@ -331,6 +331,11 @@ struct RasterState {
   std::uint8_t shader_writes_sample_mask = 0;
   std::uint8_t depth_clamp_enable = 0;
   std::uint8_t color_mask = 0x0f;
+  // Fill convention for pixels exactly on an edge.  0 is Gallium's top-left
+  // rule; 1 is the bottom-left rule Mesa states for a y-flipped (window
+  // system, Y_0_TOP) framebuffer, where the reflected viewport turns the
+  // GL top edge into the bottom one.  Only the horizontal-edge tie moves.
+  std::uint8_t bottom_edge_rule = 0;
 };
 
 struct InputVertex {

@@ -315,7 +315,14 @@ void ParameterBuffer::Run() {
             x1, x0, "ParameterBuffer edge dx overflow");
         const std::int64_t dy = CheckedSub(
             y1, y0, "ParameterBuffer edge dy overflow");
-        equation.inclusive = (dy < 0 || (dy == 0 && dx > 0)) ? 1 : 0;
+        // Left edges are inclusive under both fill conventions; the
+        // horizontal tie is the top edge for the top-left rule and the
+        // bottom edge for the bottom-left rule (llvmpipe lp_setup_tri.c
+        // applies the same swap on dcdy for bottom_edge_rule).
+        const bool horizontal_inclusive =
+            state.raster_state.bottom_edge_rule ? dx < 0 : dx > 0;
+        equation.inclusive =
+            (dy < 0 || (dy == 0 && horizontal_inclusive)) ? 1 : 0;
       }
       const std::int64_t x0 = QuantizeRasterSubpixel(triangle.x[0]);
       const std::int64_t y0 = QuantizeRasterSubpixel(triangle.y[0]);

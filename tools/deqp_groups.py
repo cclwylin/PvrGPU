@@ -9,6 +9,7 @@ one-command-per-process contract.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import re
 from typing import Iterable
 
@@ -28,6 +29,27 @@ GLES31_UNAVAILABLE = (
     "ES3 bit. ES3.1 additionally needs a real compute, SSBO, shader-image, and "
     "atomic implementation that the current driver does not provide."
 )
+
+
+def es3_enabled() -> bool:
+    """Mirror the driver switch: ES 3.0/3.1 caps are on unless PVRGPU_DISABLE_ES3 is set.
+
+    The PCO driver advertises OpenGL ES 3.1 by default (pvrgpu_screen.c); the
+    blocked reasons above describe the ES2-only surface that
+    ``PVRGPU_DISABLE_ES3=1`` restores, so they apply only in that mode.
+    """
+    value = os.environ.get("PVRGPU_DISABLE_ES3", "")
+    return not (value and value != "0")
+
+
+GLES32_UNAVAILABLE = (
+    "Geometry and tessellation shaders are OpenGL ES 3.2 features. The PCO "
+    "driver advertises ES 3.1 at most, so these groups stay blocked whatever "
+    "the ES3 switch says."
+)
+
+_GLES3_BLOCKED = None if es3_enabled() else GLES3_UNAVAILABLE
+_GLES31_BLOCKED = None if es3_enabled() else GLES31_UNAVAILABLE
 
 
 @dataclass(frozen=True)
@@ -77,7 +99,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.0 · Color clear",
         "dEQP-GLES3",
         ("dEQP-GLES3.functional.color_clear.*",),
-        GLES3_UNAVAILABLE,
+        _GLES3_BLOCKED,
         locked_case_count=19,
     ),
     GroupSpec(
@@ -85,7 +107,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.0 · FBO",
         "dEQP-GLES3",
         ("dEQP-GLES3.functional.fbo.*",),
-        GLES3_UNAVAILABLE,
+        _GLES3_BLOCKED,
         locked_case_count=2077,
     ),
     GroupSpec(
@@ -93,7 +115,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.0 · Fragment operations",
         "dEQP-GLES3",
         ("dEQP-GLES3.functional.fragment_ops.*",),
-        GLES3_UNAVAILABLE,
+        _GLES3_BLOCKED,
         locked_case_count=3176,
     ),
     GroupSpec(
@@ -101,7 +123,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.0 · Instancing",
         "dEQP-GLES3",
         ("dEQP-GLES3.functional.instanced.*",),
-        GLES3_UNAVAILABLE,
+        _GLES3_BLOCKED,
         locked_case_count=45,
     ),
     GroupSpec(
@@ -109,7 +131,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.0 · Rasterization primitives",
         "dEQP-GLES3",
         ("dEQP-GLES3.functional.rasterization.primitives.*",),
-        GLES3_UNAVAILABLE,
+        _GLES3_BLOCKED,
         locked_case_count=10,
     ),
     GroupSpec(
@@ -117,7 +139,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.0 · Scissor",
         "dEQP-GLES3",
         ("dEQP-GLES3.functional.fragment_ops.scissor.*",),
-        GLES3_UNAVAILABLE,
+        _GLES3_BLOCKED,
         locked_case_count=26,
     ),
     GroupSpec(
@@ -125,7 +147,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.0 · Shader built-in functions",
         "dEQP-GLES3",
         ("dEQP-GLES3.functional.shaders.builtin_functions.*",),
-        GLES3_UNAVAILABLE,
+        _GLES3_BLOCKED,
         locked_case_count=1730,
     ),
     GroupSpec(
@@ -133,7 +155,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.0 · Compressed textures",
         "dEQP-GLES3",
         ("dEQP-GLES3.functional.texture.compressed.*",),
-        GLES3_UNAVAILABLE,
+        _GLES3_BLOCKED,
         locked_case_count=322,
     ),
     GroupSpec(
@@ -141,7 +163,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.0 · Texture filtering",
         "dEQP-GLES3",
         ("dEQP-GLES3.functional.texture.filtering.*",),
-        GLES3_UNAVAILABLE,
+        _GLES3_BLOCKED,
         locked_case_count=1124,
     ),
     GroupSpec(
@@ -149,7 +171,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.0 · Transform feedback",
         "dEQP-GLES3",
         ("dEQP-GLES3.functional.transform_feedback.*",),
-        GLES3_UNAVAILABLE,
+        _GLES3_BLOCKED,
         locked_case_count=1320,
     ),
     GroupSpec(
@@ -157,7 +179,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.0 · Uniform buffer objects",
         "dEQP-GLES3",
         ("dEQP-GLES3.functional.ubo.*",),
-        GLES3_UNAVAILABLE,
+        _GLES3_BLOCKED,
         locked_case_count=2357,
     ),
     GroupSpec(
@@ -165,7 +187,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.0 · Vertex arrays",
         "dEQP-GLES3",
         ("dEQP-GLES3.functional.vertex_arrays.*",),
-        GLES3_UNAVAILABLE,
+        _GLES3_BLOCKED,
         locked_case_count=1005,
     ),
     GroupSpec(
@@ -173,7 +195,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.0 · Stress draw",
         "dEQP-GLES3",
         ("dEQP-GLES3.stress.draw.*",),
-        GLES3_UNAVAILABLE,
+        _GLES3_BLOCKED,
         locked_case_count=74,
     ),
     GroupSpec(
@@ -181,7 +203,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.0 · Stress memory",
         "dEQP-GLES3",
         ("dEQP-GLES3.stress.memory.*",),
-        GLES3_UNAVAILABLE,
+        _GLES3_BLOCKED,
         locked_case_count=80,
     ),
     GroupSpec(
@@ -192,7 +214,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
             "dEQP-GLES3.stress.long_shaders.*",
             "dEQP-GLES3.stress.long_running_shaders.*",
         ),
-        GLES3_UNAVAILABLE,
+        _GLES3_BLOCKED,
         locked_case_count=40,
     ),
     GroupSpec(
@@ -200,7 +222,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.1 · Basic compute",
         "dEQP-GLES31",
         ("dEQP-GLES31.functional.compute.basic.*",),
-        GLES31_UNAVAILABLE,
+        _GLES31_BLOCKED,
         locked_case_count=41,
     ),
     GroupSpec(
@@ -208,7 +230,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.1 · Draw-indirect stress",
         "dEQP-GLES31",
         ("dEQP-GLES31.stress.draw_indirect.*",),
-        GLES31_UNAVAILABLE,
+        _GLES31_BLOCKED,
         locked_case_count=23,
     ),
     GroupSpec(
@@ -216,7 +238,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.1 · Shader storage buffer objects",
         "dEQP-GLES31",
         ("dEQP-GLES31.functional.ssbo.*",),
-        GLES31_UNAVAILABLE,
+        _GLES31_BLOCKED,
         locked_case_count=2061,
     ),
     GroupSpec(
@@ -224,7 +246,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.1 · Multisample textures",
         "dEQP-GLES31",
         ("dEQP-GLES31.functional.texture.multisample.*",),
-        GLES31_UNAVAILABLE,
+        _GLES31_BLOCKED,
         locked_case_count=157,
     ),
     GroupSpec(
@@ -232,7 +254,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.2 · Geometry shading",
         "dEQP-GLES31",
         ("dEQP-GLES31.functional.geometry_shading.*",),
-        GLES31_UNAVAILABLE,
+        GLES32_UNAVAILABLE,
         locked_case_count=207,
     ),
     GroupSpec(
@@ -240,7 +262,7 @@ GROUP_SPECS: tuple[GroupSpec, ...] = (
         "OpenGL ES 3.2 · Tessellation",
         "dEQP-GLES31",
         ("dEQP-GLES31.functional.tessellation.*",),
-        GLES31_UNAVAILABLE,
+        GLES32_UNAVAILABLE,
         locked_case_count=406,
     ),
 )

@@ -97,6 +97,31 @@ float FloatFromBits(std::uint32_t bits) {
   return value;
 }
 
+// The expected viewport scale up to the sign of Y: a window-system framebuffer
+// is y-flipped, so GL states scale_y = -h/2 there.  Negating an IEEE float
+// toggles only its sign bit.
+bool ViewportScaleMatches(const std::array<std::uint32_t, 3> &actual,
+                          const std::array<std::uint32_t, 3> &expected) {
+  return actual[0] == expected[0] &&
+         (actual[1] == expected[1] ||
+          actual[1] == (expected[1] ^ UINT32_C(0x80000000))) &&
+         actual[2] == expected[2];
+}
+
+// Mesa flips front_ccw together with the viewport Y sign
+// (st_atom_rasterizer.c: front_ccw ^= 1 for Y_0_BOTTOM targets, whose
+// viewport is not inverted), so front_ccw XOR (scale_y > 0) is invariant for
+// one GL front-face setting.  The validated slice is (front_ccw=0, scale_y>0)
+// -> clockwise; extend it by that invariant instead of re-deriving GL's
+// convention from scratch.
+FrontFaceWinding FrontFaceFromDriverCommand(std::uint32_t front_ccw,
+                                            std::uint32_t scale_y_bits) {
+  const bool scale_y_positive = FloatFromBits(scale_y_bits) > 0.0F;
+  const bool clockwise = (front_ccw == 0) == scale_y_positive;
+  return clockwise ? FrontFaceWinding::kClockwise
+                   : FrontFaceWinding::kCounterClockwise;
+}
+
 bool PcoSingleDrawResolutionSupported(const DriverCommand &command) {
   // The rasterizer is resolution independent; the single-draw path only needs
   // a full-surface render target within the model's addressable extent.
@@ -274,13 +299,13 @@ bool DriverIdeasPcoSequenceCommandSupported(const DriverCommand &command) {
                  command.fragment_varying_start != 4 ||
                  command.fragment_varying_count != 40 ||
                  command.fragment_pco_abi.coefficients != 44) ||
-      command.viewport_scale_bits != viewport_bits ||
-      command.front_ccw != 0 ||
+      !ViewportScaleMatches(command.viewport_scale_bits, viewport_bits) ||
+      command.front_ccw > 1 ||
       (command.cull_face != 0 && command.cull_face != 2) ||
       command.fill_front != 0 || command.fill_back != 0 ||
       command.scissor != 0 || command.rasterizer_discard != 0 ||
       command.multisample != 0 || command.half_pixel_center != 1 ||
-      command.bottom_edge_rule != 0 || command.clip_halfz != 0 ||
+      command.bottom_edge_rule > 1 || command.clip_halfz != 0 ||
       command.depth_clip_near != 1 || command.depth_clip_far != 1 ||
       command.depth_clamp != 0 || command.sample_mask != UINT32_MAX ||
       command.color_mask != 0x0f || command.blend_enable != 0 ||
@@ -439,13 +464,13 @@ bool DriverPcoTrianglesCommandSupported(const DriverCommand &command) {
         command.fragment_position_count != 4 ||
         command.fragment_varying_start != 4 ||
         command.fragment_varying_count != 16)) ||
-      command.viewport_scale_bits != viewport_bits ||
-      command.front_ccw != 0 ||
+      !ViewportScaleMatches(command.viewport_scale_bits, viewport_bits) ||
+      command.front_ccw > 1 ||
       (!color_layout && command.cull_face != 2) ||
       command.fill_front != 0 || command.fill_back != 0 ||
       command.scissor != 0 || command.rasterizer_discard != 0 ||
       command.multisample != 0 || command.half_pixel_center != 1 ||
-      command.bottom_edge_rule != 0 || command.clip_halfz != 0 ||
+      command.bottom_edge_rule > 1 || command.clip_halfz != 0 ||
       command.depth_clip_near != 1 || command.depth_clip_far != 1 ||
       command.depth_clamp != 0 || command.sample_mask != UINT32_MAX ||
       command.color_mask != 0x0f || command.blend_enable != 0 ||
@@ -1543,8 +1568,10 @@ void Submitter::Run() {
               : command.cull_face == 3 ? CullFaceMode::kFrontAndBack
                                        : CullFaceMode::kBack;
       state.raster_state.face_cull.front_face =
-          command.front_ccw == 0 ? FrontFaceWinding::kClockwise
-                                 : FrontFaceWinding::kCounterClockwise;
+          FrontFaceFromDriverCommand(command.front_ccw,
+                                     command.viewport_scale_bits[1]);
+      state.raster_state.bottom_edge_rule =
+          static_cast<std::uint8_t>(command.bottom_edge_rule);
       state.raster_state.color_mask =
           static_cast<std::uint8_t>(command.color_mask);
       state.raster_state.scissor.enable =

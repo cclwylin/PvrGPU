@@ -9732,6 +9732,14 @@ struct pvrgpu_array_primitive_draw {
    float *vertex_data;
    uint8_t *index_data;
    /*
+    * Shared-register words (push constants and texture descriptors) the
+    * nested command points at.  The record has to own them: the sequence is
+    * submitted at flush or process exit, long after the recording call's
+    * stack frame -- and the state tracker's user constant buffer -- are gone.
+    */
+   uint32_t vertex_shared_words[PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS];
+   uint32_t fragment_shared_words[PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS];
+   /*
     * Images the draw samples.  The sequence carries them in one flat array
     * that each nested draw consumes a slice of, so the record owns its own
     * copy until the whole sequence is submitted.
@@ -10381,8 +10389,32 @@ pvrgpu_record_color_primitive_pco_draw(
    command.frame = 1;
    command.framebuffer_width = ctx->framebuffer.width;
    command.framebuffer_height = ctx->framebuffer.height;
-   command.width = (uint32_t)(ctx->viewport.scale[0] * 2.0f);
-   command.height = (uint32_t)(ctx->viewport.scale[1] * 2.0f);
+   /*
+    * Derive the viewport extent through the shared helper rather than casting
+    * the scale directly.  A window-system framebuffer is y-flipped, so
+    * scale[1] is negative there and a raw cast wraps the height into a huge
+    * unsigned value, which the command validator then rejects as outside the
+    * model extent.
+    */
+   unsigned command_viewport_width = 0;
+   unsigned command_viewport_height = 0;
+   if (!pvrgpu_viewport_extent(ctx->viewport.scale[0],
+                               &command_viewport_width) ||
+       !pvrgpu_viewport_extent(ctx->viewport.scale[1],
+                               &command_viewport_height)) {
+      pvrgpu_counter_eventf("draw_color_triangle_pco_command_error",
+                            "stage=viewport reason=%s scale=%f,%f",
+                            "viewport scale does not describe a whole-pixel "
+                            "extent",
+                            (double)ctx->viewport.scale[0],
+                            (double)ctx->viewport.scale[1]);
+      pvrgpu_pco_graphics_binary_finish(&binary);
+      free(interleaved);
+      free(index_data);
+      return false;
+   }
+   command.width = command_viewport_width;
+   command.height = command_viewport_height;
    command.format = PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8;
    command.clear_color_bits[3] = UINT32_C(0x3f800000);
    command.raw_vertex_data = (const uint8_t *)interleaved;
@@ -10630,6 +10662,19 @@ pvrgpu_record_color_primitive_pco_draw(
    }
    command.sampled_texture_count = recorded->texture_count;
    recorded->binary = binary;
+   /*
+    * Re-point the command at storage the record owns before the pointer copy
+    * below; vertex_uniform_words / fragment_uniform_words are locals of this
+    * call and the sequence outlives it.
+    */
+   memcpy(recorded->vertex_shared_words, vertex_uniform_words,
+          sizeof(recorded->vertex_shared_words));
+   memcpy(recorded->fragment_shared_words, fragment_uniform_words,
+          sizeof(recorded->fragment_shared_words));
+   command.vertex_shared =
+      vertex_shared_count ? recorded->vertex_shared_words : NULL;
+   command.fragment_shared =
+      fragment_shared_count ? recorded->fragment_shared_words : NULL;
    pvrgpu_pco_triangles_command_to_systemc(&command, &recorded->command);
    /*
     * The pixel back end blends, so a draw that asks for it carries the whole
@@ -13162,6 +13207,105 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
                                 "unsupported_state");
 }
 
+/*
+ * Compute entry points.
+ *
+ * The screen advertises ES 3.1, which makes Mesa expose compute shaders,
+ * shader storage buffers and shader images.  The model has no compute
+ * pipeline yet, so these record what was asked for and decline the dispatch.
+ * They exist so an ES 3.1 context and its compute cases reach a reported
+ * failure instead of dereferencing a NULL pipe_context hook, which would take
+ * the whole dEQP process down and hide every other result in the same run.
+ */
+struct pvrgpu_compute_state {
+   unsigned static_shared_mem;
+};
+
+static void *
+pvrgpu_create_compute_state(struct pipe_context *pipe,
+                            const struct pipe_compute_state *state)
+{
+   (void)pipe;
+   struct pvrgpu_compute_state *compute =
+      CALLOC_STRUCT(pvrgpu_compute_state);
+   if (!compute)
+      return NULL;
+   compute->static_shared_mem = state ? state->static_shared_mem : 0;
+   pvrgpu_counter_eventf("compute_state_create",
+                         "static_shared_mem=%u",
+                         compute->static_shared_mem);
+   return compute;
+}
+
+static void
+pvrgpu_bind_compute_state(struct pipe_context *pipe, void *state)
+{
+   (void)pipe;
+   pvrgpu_counter_eventf("compute_state_bind", "bound=%u", state ? 1 : 0);
+}
+
+static void
+pvrgpu_delete_compute_state(struct pipe_context *pipe, void *state)
+{
+   (void)pipe;
+   FREE(state);
+}
+
+static void
+pvrgpu_launch_grid(struct pipe_context *pipe,
+                   const struct pipe_grid_info *info)
+{
+   (void)pipe;
+   pvrgpu_counter_eventf("compute_launch_unsupported",
+                         "grid=%ux%ux%u block=%ux%ux%u indirect=%u",
+                         info ? info->grid[0] : 0,
+                         info ? info->grid[1] : 0,
+                         info ? info->grid[2] : 0,
+                         info ? info->block[0] : 0,
+                         info ? info->block[1] : 0,
+                         info ? info->block[2] : 0,
+                         info && info->indirect ? 1 : 0);
+}
+
+static void
+pvrgpu_set_shader_buffers(struct pipe_context *pipe,
+                          mesa_shader_stage shader,
+                          unsigned start_slot,
+                          unsigned count,
+                          const struct pipe_shader_buffer *buffers,
+                          unsigned writable_bitmask)
+{
+   (void)pipe;
+   (void)buffers;
+   pvrgpu_counter_eventf("shader_buffers_unsupported",
+                         "stage=%u start=%u count=%u writable=0x%x",
+                         (unsigned)shader, start_slot, count,
+                         writable_bitmask);
+}
+
+static void
+pvrgpu_set_shader_images(struct pipe_context *pipe,
+                         mesa_shader_stage shader,
+                         unsigned start_slot,
+                         unsigned count,
+                         unsigned unbind_num_trailing_slots,
+                         const struct pipe_image_view *images)
+{
+   (void)pipe;
+   (void)images;
+   pvrgpu_counter_eventf("shader_images_unsupported",
+                         "stage=%u start=%u count=%u unbind=%u",
+                         (unsigned)shader, start_slot, count,
+                         unbind_num_trailing_slots);
+}
+
+static void
+pvrgpu_memory_barrier(struct pipe_context *pipe, unsigned flags)
+{
+   (void)pipe;
+   pvrgpu_counter_eventf("memory_barrier", "flags=0x%x", flags);
+}
+
 struct pipe_context *
 pvrgpu_create_context(struct pipe_screen *screen, void *priv,
                       unsigned flags)
@@ -13190,5 +13334,12 @@ pvrgpu_create_context(struct pipe_screen *screen, void *priv,
    ctx->base.set_framebuffer_state = pvrgpu_set_framebuffer_state;
    ctx->base.flush = pvrgpu_flush;
    ctx->base.draw_vbo = pvrgpu_draw_vbo;
+   ctx->base.create_compute_state = pvrgpu_create_compute_state;
+   ctx->base.bind_compute_state = pvrgpu_bind_compute_state;
+   ctx->base.delete_compute_state = pvrgpu_delete_compute_state;
+   ctx->base.launch_grid = pvrgpu_launch_grid;
+   ctx->base.set_shader_buffers = pvrgpu_set_shader_buffers;
+   ctx->base.set_shader_images = pvrgpu_set_shader_images;
+   ctx->base.memory_barrier = pvrgpu_memory_barrier;
    return &ctx->base;
 }

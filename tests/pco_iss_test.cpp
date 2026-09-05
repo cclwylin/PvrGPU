@@ -3457,8 +3457,9 @@ void TestDecodeAndExecuteConditionals() {
                             short_vertex_context);
       },
       "conditionals VS truncated shared-register ABI");
+  /* The decoded FS reads SH0 and SH1, so one shared register truncates it. */
   PcoFragmentExecutionContext short_fragment_context = fragment_context;
-  short_fragment_context.shared_count = 3;
+  short_fragment_context.shared_count = 1;
   ExpectFailure(
       [&] {
         (void)ExecuteFragment(fragment.summary, fragment.instructions,
@@ -3466,8 +3467,10 @@ void TestDecodeAndExecuteConditionals() {
       },
       "conditionals FS truncated shared-register ABI");
 
+  /* Instruction 10 is the ternary select, not a MOVI: an immediate on it
+   * contradicts its opcode and must not execute. */
   auto tampered_vertex = vertex;
-  tampered_vertex.instructions[11].immediate ^= UINT32_C(1);
+  tampered_vertex.instructions[10].immediate ^= UINT32_C(1);
   ExpectFailure(
       [&] {
         (void)ExecuteVertex(tampered_vertex.summary,
@@ -3476,16 +3479,17 @@ void TestDecodeAndExecuteConditionals() {
                              FloatBits(0.5F)},
                             vertex_context);
       },
-      "conditionals VS semantic immediate mutation");
+      "conditionals VS immediate on a non-MOVI operation");
+  /* Instruction 14 is the FMAD, not a MOVI. */
   auto tampered_fragment = fragment;
-  tampered_fragment.instructions[15].immediate ^= UINT32_C(1);
+  tampered_fragment.instructions[14].immediate ^= UINT32_C(1);
   ExpectFailure(
       [&] {
         (void)ExecuteFragment(tampered_fragment.summary,
                               tampered_fragment.instructions,
                               fragment_context);
       },
-      "conditionals FS semantic immediate mutation");
+      "conditionals FS immediate on a non-MOVI operation");
   tampered_fragment = fragment;
   tampered_fragment.instructions[20].opcode = PcoOpcode::kPackHalf2x16;
   ExpectFailure(

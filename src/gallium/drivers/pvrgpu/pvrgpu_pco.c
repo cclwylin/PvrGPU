@@ -3858,11 +3858,26 @@ static bool pvrgpu_strip_dead_point_size(nir_shader *nir)
    }
    nir->info.outputs_written &= ~VARYING_BIT_PSIZ;
 
-   /* The uniform that fed the export is now dead; collect it and its load. */
+   /* A uniform that only fed the export is now dead; collect it and its load. */
    NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_out, NULL);
    NIR_PASS(_, nir, nir_opt_dce);
    NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_uniform, NULL);
-   nir->num_uniforms = 0;
+
+   /*
+    * Only declare the shader uniform-free when nothing else reads a uniform.
+    * The pinned profile shader sized its points from its sole uniform, so
+    * zeroing num_uniforms was right there; a shader that also scales its
+    * position or colour through a uniform (dEQP's draw tests do) would lose
+    * its push-constant window and read every uniform as zero, which collapses
+    * its geometry onto one point.
+    */
+   bool uniform_remains = false;
+   nir_foreach_variable_with_modes (var, nir, nir_var_uniform) {
+      uniform_remains = true;
+      break;
+   }
+   if (!uniform_remains)
+      nir->num_uniforms = 0;
    return true;
 }
 
