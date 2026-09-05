@@ -239,6 +239,72 @@ DXTP 結構對齊不改變目前可執行模型的 profile。三個 layer 必須
 
 因此目前的兩個 stage-specific `UscCluster` instance 是 VS/FS logical execution instances，不代表 DXTP 的實體 USC 數量；單一 `Isp` 也是 functional abstraction，不代表 DXTP topology。`MemoryPool` 則是 simulator payload storage，不是 USC store、MCU/TCU、SLC、DRAM 或硬體 zero-copy memory。
 
+### 3.5 實作位置與「不得預備答案」規範
+
+這條規範的層級高於本節其他條目：**所有行為都必須由 PCO driver 與 PvrGPU model
+真的算出來，不得以測試名稱、capture 名稱或 workload 名稱作為條件。**
+
+§3.1 的證據等級管的是「這個數字的知識從哪裡來」。這一節管的是更前面的問題：
+**這個數字到底有沒有被算出來。** 一個 counter 若來自比對 case name 後查表，它的
+provenance 既不是 A 也不是 E，而是不存在——它不是對硬體的任何一種主張，只是對
+golden report 的複製。這種數字會在被記住的案例上報 PASS，在下一個案例上無界地錯，
+而從外部無法分辨兩者。
+
+#### 3.5.1 兩個元件各自的責任
+
+| 元件 | 必須做的事 | 不得做的事 |
+|---|---|---|
+| PCO driver | 把手上真實的 GL/Gallium 狀態——vertex buffer 內容、shader binary、format、topology、fixed-function state——lowering 成 `pvrgpu.driver-command.v1` | 依 case name 改變 lowering 結果、丟棄 draw、或直接填入 counter |
+| PvrGPU model | 讓該 command 實際流過 VertexFetch、USC ISS、ClipCull、Tiler、ISP、PBE 與 memory hierarchy，回報這些 stage 真正做了什麼 | 依 case name 選執行路徑、比對 shader binary 後回傳手寫指令表、或套用 per-case 常數 |
+
+`provenance` 欄位因此有其字面意義：`modeled` 表示模型跑過，`assumed` 表示 §3.1 的
+E 級推導且已標記。沒有第三種值可以用來描述「查表得到」。
+
+#### 3.5.2 判準
+
+**把 capture 改名再跑一次。** 只要有任何 counter、任何像素或任何分支結果改變，
+那段行為就是預備答案，不是實作。換一個問法：如果同樣的幾何來自一個沒人見過的
+應用程式，這段程式碼還會是對的嗎？
+
+#### 3.5.3 fail-closed narrowness 不是作弊
+
+這個分界必須清楚，否則規範會被誤讀成「不准有支援範圍」：
+
+- **拒絕**尚未實作的工作——回 `unsupported_draw`、`NotSupported` 或具名的拒絕
+  理由——是誠實的。它說「模型還做不到」，並且**付出一個 PASS 的代價**。
+- **供給**尚未實作之工作的答案才是違規。它說「模型做到了」而其實沒有，並且
+  **換到一個 PASS**。
+
+所以每一道 gate 都必須描述**它檢查什麼**，而不是**它為誰服務**，並且在拒絕時
+指名失敗的欄位（見 `name-the-failing-field` 慣例）。
+`vertex_stride == 32 && vertex_inputs == 12` 描述的是 lowering 路徑能處理的
+payload；`case_name == "ideas.ideas.capture.1"` 指名的是一個客戶。
+
+#### 3.5.4 誠實地失敗優於不誠實地通過
+
+這個代價已經付過，而且是刻意付的。移除十五個 shader 辨識 predicate（`3ed6fdf`）
+讓 `conditionals` 失效、glmark2 從 20/20 掉到 18/20，因為真正的 decoder 在一個它
+未實作的 PCK format 上停住。這是正確結果：**一個被定位的 bug，價值高於十七個來自
+手寫指令表的 counter。** `76d1e16` 同樣移除了 per-filter `texel_fetches` 常數、
+一條依名稱套用的公式、一個 draw suppressor，以及一個依名稱決定的 clear alpha。
+
+因此：**揭露出缺工的 regression 是進展，不得以還原答案表的方式「修好」它。**
+
+#### 3.5.5 目前仍存在的 name-keyed 路徑
+
+樹還沒清乾淨，假裝乾淨本身就是同一個問題的另一種形式。以下路徑仍在，列管待移除：
+
+| 位置 | 依據 | 影響 |
+|---|---|---|
+| `pvrgpu_cmd.c` `pvrgpu_case_reserves_native_pco_sequence()` | `PVRGPU_RDC_CASE_NAME` 等於 refract/shadow/terrain 的 capture 字面值 | 改變由哪條 lowering 路徑擁有該 frame |
+| `pvrgpu_resource.c` `pvrgpu_case_suppresses_driver_commands()` | 上者，加上一個 dEQP `negative_coverage` 精確比對 | 整段抑制 driver command |
+| `pvrgpu_resource.c` `pvrgpu_deqp_fbo_default_framebuffer_blit_to_default_case()` | dEQP case name 前綴 + 子字串 | 選擇 counter 路徑 |
+| `pvrgpu_cmd.c`、`pvrgpu_context.c` | `case_name == "ideas.ideas.capture.1"` | 選擇 vertex layout，並開啟一張 per-ordinal 的 expected-draw 表 |
+| `functional_types.h` `FunctionalCase` | 20 個 GLBench/glmark2 fixture 名稱加 5 個 driver-command 分類，以字串精確比對 workload 名 | 認不得的 workload 變成 `kNone`，submitter 直接 throw；PDS、fragment frontend 與 reporter 都依此 enum 分支 |
+| `model_types.h` `kDriverPcoIdeasSequenceCommands` | 單一 workload 的精確 draw 數（180） | 一個綁定 capture 的 sequence 長度契約 |
+
+往這張表**新增**不是選項；**移除**一列並承受隨之而來的誠實 regression，才是工作本身。
+
 ## 4. 端到端軟體架構
 
 ```mermaid

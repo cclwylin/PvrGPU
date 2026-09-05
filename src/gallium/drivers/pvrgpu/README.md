@@ -2,6 +2,56 @@
 
 This directory is the source-of-truth for the future Mesa Gallium driver.
 
+## Ground rule: lower what you were handed
+
+**This driver may only describe the GL/Gallium state it was actually given. It
+may not branch on the name of a test, a capture, or a workload.**
+
+A `pvrgpu.driver-command.v1` capsule is a claim about what the application asked
+for. If the vertex counts, the texel fetch count, or the decision to emit a draw
+at all came from recognising `ideas.ideas.capture.1` rather than from reading the
+bound vertex buffer, the capsule is a forgery and every counter the model derives
+from it is meaningless. The model cannot detect this -- it trusts the capsule --
+so the honesty has to live here.
+
+Concretely, for driver code:
+
+- Read the real `pipe_vertex_buffer`, `pipe_vertex_element`, shader binary,
+  `pipe_format`, primitive mode and fixed-function state. Those are the inputs.
+- A support gate states **what it checks**, never **who it is for**. The gate
+  `vertex_stride == 32 && vertex_pco_abi.vertex_inputs == 12` describes a payload
+  this lowering path can handle. The gate `strcmp(case_name, "...") == 0` names a
+  customer, and is the thing being removed.
+- When a gate declines, it must name the field that failed
+  (`event=..._miss reason=<field>`), so the next run says which condition to fix
+  rather than costing a ten-minute guess.
+- Declining is free and correct. `unsupported_draw` is an honest answer that
+  costs a PASS. Filling in the answer instead buys a PASS and is not.
+
+The full statement of the rule, with the test to apply and the cost already paid
+for it, is in the [top-level README](../../../../README.md) and
+[PvrGPU.md §3.5](../../../../PvrGPU.md).
+
+### Name-keyed gates still in this driver
+
+Listed so they are removed rather than copied:
+
+- `pvrgpu_case_reserves_native_pco_sequence()` in `pvrgpu_cmd.c` -- matches
+  `PVRGPU_RDC_CASE_NAME` against the `refract`, `shadow` and `terrain` capture
+  literals, and changes which lowering path owns the frame. Used from
+  `pvrgpu_context.c`, `pvrgpu_clear.c` and `pvrgpu_resource.c`.
+- `pvrgpu_case_suppresses_driver_commands()` in `pvrgpu_resource.c` -- the above
+  plus one exact dEQP `negative_coverage` case name, and it suppresses driver
+  commands outright.
+- `pvrgpu_deqp_fbo_default_framebuffer_blit_to_default_case()` in
+  `pvrgpu_resource.c` -- a dEQP case-name prefix plus substring, selecting a
+  counter path.
+- `case_name == "ideas.ideas.capture.1"` in `pvrgpu_cmd.c` and
+  `pvrgpu_context.c` -- selects vertex layouts and gates
+  `pvrgpu_ideas_pco_expected_draw()`, a per-ordinal table of the vertex count,
+  primitive mode, index size and cull state each draw is expected to have.
+
+
 Current status:
 
 - Phase 0/1/2/3/4/5/6 bring-up driver.

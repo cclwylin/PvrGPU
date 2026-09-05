@@ -9,6 +9,98 @@ The short version:
 - local configuration belongs in `config/local.env`, which is intentionally ignored;
 - checked-in defaults use `$HOME/Downloads/_Codex/Working/PvrGPU` unless overridden.
 
+## Ground Rule: No Prepared Answers
+
+**Every result must be produced by the PCO driver and the PvrGPU model doing the
+work. Nothing may be keyed to the name of a test, a capture, or a workload.**
+
+This is the project's first rule because it is the one that decides whether any
+number here means anything. A GPU model that recognises `fill_tex_bilinear` and
+replies with the counters `fill_tex_bilinear` is known to want has learned
+nothing about texture filtering; it has learned an answer key. It will report
+PASS on the case it memorised and be silently, unboundedly wrong on the next
+one, and there is no way to tell the two apart from the outside.
+
+So behaviour comes from one place only:
+
+- the **PCO driver** lowers the real GL/Gallium state it was handed --
+  the actual vertex buffers, shader binaries, formats, topology and
+  fixed-function state -- into `pvrgpu.driver-command.v1`; and
+- the **PvrGPU model** executes that command through VertexFetch, the USC ISS,
+  ClipCull, the tiler, ISP, PBE and the memory hierarchy, and reports what those
+  stages actually did.
+
+### Forbidden
+
+- Branching on a test, capture, or case name -- `strcmp`, prefix, or substring --
+  in a way that changes counters, geometry, pixels, or whether a draw runs.
+- Tables of expected counters, draw counts, vertex counts, or pixels, and
+  formulas fitted to a golden report.
+- Recognising a shader binary and returning a hand-written instruction list
+  instead of decoding it.
+- Per-case magic constants: a rounding threshold, a coefficient count, or a
+  clear-colour channel chosen because one case wanted it.
+- Dropping or suppressing a draw so a comparison stops disagreeing.
+- Tests that assert the presence of any of the above.
+
+### The test to apply
+
+**Rename the capture and run it again.** If any counter, any pixel, or any
+decision changes, the behaviour was a prepared answer, not an implementation.
+The same question, put differently: would this still be correct if the identical
+geometry arrived from an application nobody had ever seen?
+
+### What is still allowed
+
+Fail-closed narrowness is not cheating, and the difference matters:
+
+- **Declining** work that is not implemented -- returning `unsupported_draw`,
+  `NotSupported`, or a named refusal -- is honest. It says "the model cannot do
+  this yet" and costs a PASS.
+- **Supplying** the answer for work that is not implemented is the violation. It
+  says "the model did this" when it did not, and buys a PASS.
+
+Every gate must therefore state *what it checks*, not *who it is for*, and must
+name the field that failed when it declines. A gate that reads
+`vertex_stride == 32 && vertex_inputs == 12` describes a payload the lowering
+path can handle; a gate that reads `case_name == "ideas.ideas.capture.1"` names
+a customer.
+
+### Failing honestly beats passing dishonestly
+
+This has already been paid for, deliberately. Removing fifteen shader-recognition
+predicates (`3ed6fdf`) cost the `conditionals` workload and took glmark2 from
+20/20 to 18/20, because the real decoder stops on a PCK format it does not
+implement. That is the correct outcome: a located bug is worth more than
+seventeen counters that came from a hand-written list. Likewise `76d1e16`
+removed per-filter `texel_fetches` constants, a name-keyed formula, a draw
+suppressor and a name-keyed clear alpha.
+
+**A regression that reveals missing work is progress. Do not repair it by
+restoring the answer key.**
+
+### Known debt
+
+The tree is not clean yet, and pretending otherwise would be its own version of
+the same problem. These name-keyed paths still exist and are tracked for
+removal:
+
+| Where | What it keys on | Effect |
+| --- | --- | --- |
+| [`pvrgpu_cmd.c`](src/gallium/drivers/pvrgpu/pvrgpu_cmd.c) `pvrgpu_case_reserves_native_pco_sequence()` | `PVRGPU_RDC_CASE_NAME` equals `refract`/`shadow`/`terrain` capture literals | changes which lowering path owns the frame |
+| [`pvrgpu_resource.c`](src/gallium/drivers/pvrgpu/pvrgpu_resource.c) `pvrgpu_case_suppresses_driver_commands()` | the above, plus one exact dEQP `negative_coverage` case | suppresses driver commands entirely |
+| [`pvrgpu_resource.c`](src/gallium/drivers/pvrgpu/pvrgpu_resource.c) `pvrgpu_deqp_fbo_default_framebuffer_blit_to_default_case()` | dEQP case-name prefix + substring | selects a counter path |
+| [`pvrgpu_cmd.c`](src/gallium/drivers/pvrgpu/pvrgpu_cmd.c), [`pvrgpu_context.c`](src/gallium/drivers/pvrgpu/pvrgpu_context.c) | `case_name == "ideas.ideas.capture.1"` | selects vertex layouts, and gates a per-ordinal expected-draw table |
+| [`functional_types.h`](src/systemc/common/functional_types.h) `FunctionalCase` | 20 GLBench/glmark2 fixture names plus 5 driver-command buckets, matched as exact workload strings | an unrecognised workload becomes `kNone` and the submitter throws; PDS, the fragment frontend and the reporter all branch on the enum |
+| [`model_types.h`](model_stub/model_types.h) `kDriverPcoIdeasSequenceCommands` | one workload's exact draw count (180) | a sequence-length contract keyed to a capture |
+
+Adding to this table is not an option. Removing a row, and taking the honest
+regression that comes with it, is the work.
+
+Detail per component: [PvrGPU.md §3.5](PvrGPU.md), the
+[driver README](src/gallium/drivers/pvrgpu/README.md), and the
+[dEQP runner README](script/README.md).
+
 ## Current Status
 
 - GLBench/RDC counter infrastructure exists for fixed captured workloads.

@@ -5,6 +5,24 @@
 | `run_deqp_dynamic.sh` | 執行引擎：把已 build 好的 dEQP binary、PCO driver、PvrGPU bridge 在 runtime 串起來 |
 | `deqp_dynamic_ui.py` | PySide6 桌面前端：預設選單 → 即時 run status → 最後的 dashboard |
 
+## 讀一個 PASS 之前
+
+這裡跑出來的 PASS/FAIL 只有在**結果是 PCO driver 與 PvrGPU model 真的算出來的**
+前提下才有意義。專案的第一條規範是：不得以測試名稱、capture 名稱或 workload
+名稱決定 counter、像素或某個 draw 是否執行。完整規範見
+[根目錄 README](../README.md) 與 [PvrGPU.md §3.5](../PvrGPU.md)。
+
+實務上，讀這個 runner 的輸出時：
+
+- `NotSupported` 是誠實的結果，不是缺陷。dEQP 自己跳過驅動未宣告的能力
+  （例如 wide line / wide point），這與模型算錯是兩回事。
+- **失敗的形狀比失敗的數量重要。** `results.qpa` 說「N missing pixels，
+  0 incorrectly filled」代表回讀根本沒看到 draw；同時出現 missing 與
+  incorrectly filled 則代表回讀通了，剩下的是光柵化或狀態差異——那是不同的、
+  而且比較好的問題。
+- 一個案例從 FAIL 變 PASS 時，要能指出是**哪一段實作**讓它變的。如果指不出來，
+  它多半不是被修好的。
+
 ## `run_deqp_dynamic.sh`
 
 Runs a stock upstream dEQP module binary against the **already-built** PCO
