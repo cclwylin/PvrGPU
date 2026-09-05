@@ -33,7 +33,7 @@ The short version:
 
 - [PvrGPU.md](PvrGPU.md): main architecture and implementation plan.
 - [PrvGPU_rdc.md](PrvGPU_rdc.md): RDC counter comparison workflow.
-- [PrvGPU_deqp_gallium_driver.md](PrvGPU_deqp_gallium_driver.md): capture-first dEQP/Gallium bring-up plan through Phase 6.
+- [script/README.md](script/README.md): running dEQP against the built PCO driver and PvrGPU model.
 - [docs/COUNTER_PROTOCOL.md](docs/COUNTER_PROTOCOL.md): counter protocol contract.
 - [docs/PVRGPU_DRIVER_COMMAND.md](docs/PVRGPU_DRIVER_COMMAND.md): first Gallium-driver command contract consumed by the model.
 - [docs/RDC_COUNTER_UI.md](docs/RDC_COUNTER_UI.md): RDC counter UI notes.

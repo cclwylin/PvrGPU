@@ -11431,9 +11431,33 @@ pvrgpu_draw_is_observable_indexed_triangle(
 }
 
 /*
+ * Gallium's texture targets by name.  A decline that quotes the target number
+ * makes the reader count enum entries; quoting the name does not.
+ */
+static const char *pvrgpu_texture_target_name(enum pipe_texture_target target)
+{
+   switch (target) {
+   case PIPE_BUFFER: return "buffer";
+   case PIPE_TEXTURE_1D: return "1d";
+   case PIPE_TEXTURE_2D: return "2d";
+   case PIPE_TEXTURE_3D: return "3d";
+   case PIPE_TEXTURE_CUBE: return "cube";
+   case PIPE_TEXTURE_RECT: return "rect";
+   case PIPE_TEXTURE_1D_ARRAY: return "1d_array";
+   case PIPE_TEXTURE_2D_ARRAY: return "2d_array";
+   case PIPE_TEXTURE_CUBE_ARRAY: return "cube_array";
+   default: return NULL;
+   }
+}
+
+/*
  * A non-indexed triangle-topology draw the generic PCO color path can lower:
  * one draw, one color attachment, no textures and two float attributes that
  * map onto the model's float2-position / float4-color vertex layout.
+ *
+ * `reason` names the gate that turned the draw down; `detail` -- when the
+ * caller supplies a buffer -- carries the state that gate actually saw, so a
+ * declined draw can be read back from the counter log without another replay.
  */
 static bool
 pvrgpu_draw_is_lowerable_array_primitive(
@@ -11442,12 +11466,16 @@ pvrgpu_draw_is_lowerable_array_primitive(
    const struct pipe_draw_indirect_info *indirect,
    const struct pipe_draw_start_count_bias *draws,
    unsigned num_draws,
-   const char **reason)
+   const char **reason,
+   char *detail,
+   size_t detail_size)
 {
    const char *ignored = NULL;
    if (!reason)
       reason = &ignored;
    *reason = NULL;
+   if (detail && detail_size)
+      detail[0] = '\0';
 
    if (!ctx || !info || !draws || num_draws != 1) {
       *reason = "draw_shape";
@@ -11544,10 +11572,19 @@ pvrgpu_draw_is_lowerable_array_primitive(
    /* Fragment textures are bound as combined image/sampler descriptors. */
    if (ctx->num_sampler_views[MESA_SHADER_VERTEX] != 0) {
       *reason = "vertex_texture";
+      if (detail && detail_size) {
+         snprintf(detail, detail_size, "vertex_sampler_views=%u",
+                  ctx->num_sampler_views[MESA_SHADER_VERTEX]);
+      }
       return false;
    }
    if (ctx->num_sampler_views[MESA_SHADER_FRAGMENT] > PVRGPU_PCO_MAX_TEXTURES) {
       *reason = "too_many_textures";
+      if (detail && detail_size) {
+         snprintf(detail, detail_size, "fragment_sampler_views=%u limit=%u",
+                  ctx->num_sampler_views[MESA_SHADER_FRAGMENT],
+                  (unsigned)PVRGPU_PCO_MAX_TEXTURES);
+      }
       return false;
    }
    for (unsigned texture = 0;
@@ -11556,14 +11593,45 @@ pvrgpu_draw_is_lowerable_array_primitive(
          ctx->sampler_views[MESA_SHADER_FRAGMENT][texture];
       if (!view || !view->texture) {
          *reason = "texture_view_missing";
+         if (detail && detail_size) {
+            snprintf(detail, detail_size, "slot=%u view=%u texture=%u",
+                     texture, view ? 1u : 0u,
+                     (view && view->texture) ? 1u : 0u);
+         }
          return false;
       }
       if (view->texture->target != PIPE_TEXTURE_2D) {
          *reason = "texture_target";
+         if (detail && detail_size) {
+            const char *name =
+               pvrgpu_texture_target_name(view->texture->target);
+            char number[16];
+            if (!name) {
+               snprintf(number, sizeof(number), "target%u",
+                        (unsigned)view->texture->target);
+               name = number;
+            }
+            snprintf(detail, detail_size,
+                     "slot=%u target=%s target_value=%u width=%u height=%u "
+                     "depth=%u array_size=%u levels=%u view_format=%s "
+                     "texture_format=%s",
+                     texture,
+                     name,
+                     (unsigned)view->texture->target,
+                     view->texture->width0,
+                     view->texture->height0,
+                     view->texture->depth0,
+                     view->texture->array_size,
+                     view->texture->last_level + 1u,
+                     util_format_short_name(view->format),
+                     util_format_short_name(view->texture->format));
+         }
          return false;
       }
       if (!ctx->samplers[MESA_SHADER_FRAGMENT][texture]) {
          *reason = "texture_sampler_missing";
+         if (detail && detail_size)
+            snprintf(detail, detail_size, "slot=%u", texture);
          return false;
       }
    }
@@ -12930,9 +12998,12 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
     * handle only what it turns down.
     */
    const char *lowering_reason = NULL;
+   char lowering_detail[320] = "";
    if (pvrgpu_draw_is_lowerable_array_primitive(ctx, info, indirect, draws,
                                                 num_draws,
-                                                &lowering_reason)) {
+                                                &lowering_reason,
+                                                lowering_detail,
+                                                sizeof(lowering_detail))) {
       ctx->observed_draws++;
       pvrgpu_counter_eventf("draw_array_primitive",
                             "start=%u count=%u mode=%u primitives=%u "
@@ -12978,6 +13049,15 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
                             draws[0].count,
                             info->mode,
                             info->index_size);
+      /*
+       * The gate accepted this draw, so "unknown" would be wrong if no shape
+       * recogniser claims it below: the cause is in the record error this
+       * draw just emitted.
+       */
+      lowering_reason = "pco_record_declined";
+      snprintf(lowering_detail, sizeof(lowering_detail),
+               "see the draw_array_primitive_record_error event immediately "
+               "before this one");
    }
 
    if (pvrgpu_draw_is_observable_textured_triangle(ctx, info, indirect, draws,
@@ -13189,9 +13269,10 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
     * instead of rejecting it.
     */
    pvrgpu_counter_eventf("draw_not_lowerable",
-                         "reason=%s mode=%u count=%u index_size=%u "
+                         "reason=%s detail=[%s] mode=%u count=%u index_size=%u "
                          "attributes=%u textures=%u nr_cbufs=%u",
                          lowering_reason ? lowering_reason : "unknown",
+                         lowering_detail,
                          info ? info->mode : 0,
                          draws && num_draws ? draws[0].count : 0,
                          info ? info->index_size : 0,

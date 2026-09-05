@@ -3594,6 +3594,63 @@ pvrgpu_pack_terrain_texture_bindings(nir_shader *nir,
                                      char *error,
                                      size_t error_size);
 
+/*
+ * Names for the three NIR enumerations that appear in a decline message.
+ * Mesa exposes no public stringifier for any of them, so a message would
+ * otherwise have to quote a bare number and leave the reader to count enum
+ * entries.  Anything outside the table prints its value instead of guessing.
+ */
+static const char *pvrgpu_nir_instr_type_name(nir_instr_type type)
+{
+   switch (type) {
+   case nir_instr_type_alu: return "alu";
+   case nir_instr_type_deref: return "deref";
+   case nir_instr_type_call: return "call";
+   case nir_instr_type_tex: return "tex";
+   case nir_instr_type_intrinsic: return "intrinsic";
+   case nir_instr_type_load_const: return "load_const";
+   case nir_instr_type_jump: return "jump";
+   case nir_instr_type_undef: return "undef";
+   case nir_instr_type_phi: return "phi";
+   default: return NULL;
+   }
+}
+
+static const char *pvrgpu_nir_texop_name(nir_texop op)
+{
+   switch (op) {
+   case nir_texop_tex: return "tex";
+   case nir_texop_txb: return "txb";
+   case nir_texop_txl: return "txl";
+   case nir_texop_txd: return "txd";
+   case nir_texop_txf: return "txf";
+   case nir_texop_txf_ms: return "txf_ms";
+   case nir_texop_txs: return "txs";
+   case nir_texop_lod: return "lod";
+   case nir_texop_tg4: return "tg4";
+   case nir_texop_query_levels: return "query_levels";
+   case nir_texop_texture_samples: return "texture_samples";
+   default: return NULL;
+   }
+}
+
+static const char *pvrgpu_glsl_sampler_dim_name(enum glsl_sampler_dim dim)
+{
+   switch (dim) {
+   case GLSL_SAMPLER_DIM_1D: return "1d";
+   case GLSL_SAMPLER_DIM_2D: return "2d";
+   case GLSL_SAMPLER_DIM_3D: return "3d";
+   case GLSL_SAMPLER_DIM_CUBE: return "cube";
+   case GLSL_SAMPLER_DIM_RECT: return "rect";
+   case GLSL_SAMPLER_DIM_BUF: return "buf";
+   case GLSL_SAMPLER_DIM_EXTERNAL: return "external";
+   case GLSL_SAMPLER_DIM_MS: return "ms";
+   case GLSL_SAMPLER_DIM_SUBPASS: return "subpass";
+   case GLSL_SAMPLER_DIM_SUBPASS_MS: return "subpass_ms";
+   default: return NULL;
+   }
+}
+
 static bool pvrgpu_color_primitive_allowed_intrinsic(nir_intrinsic_op op)
 {
    switch (op) {
@@ -3763,10 +3820,42 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                    tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
                    tex->texture_index != tex->sampler_index ||
                    tex->texture_index >= texture_count) {
-                  return pvrgpu_pco_fail(error,
-                                         error_size,
-                                         "color primitive contains an "
-                                         "unsupported texture operation");
+                  const char *op_name = pvrgpu_nir_texop_name(tex->op);
+                  const char *dim_name =
+                     pvrgpu_glsl_sampler_dim_name(tex->sampler_dim);
+                  char op_number[16];
+                  char dim_number[16];
+                  if (!op_name) {
+                     snprintf(op_number, sizeof(op_number), "op%u",
+                              (unsigned)tex->op);
+                     op_name = op_number;
+                  }
+                  if (!dim_name) {
+                     snprintf(dim_number, sizeof(dim_number), "dim%u",
+                              (unsigned)tex->sampler_dim);
+                     dim_name = dim_number;
+                  }
+                  /*
+                   * Name every property the subset checks, not just the first
+                   * one that differs: a decline usually has more than one
+                   * cause and the next reader needs the whole shape.
+                   */
+                  return pvrgpu_pco_fail(
+                     error,
+                     error_size,
+                     "color primitive contains an unsupported texture "
+                     "operation (op=%s dim=%s array=%u shadow=%u "
+                     "texture_index=%u sampler_index=%u bound_textures=%u); "
+                     "the lowering covers plain tex on a non-array, "
+                     "non-shadow 2D sampler whose texture and sampler "
+                     "indices match and name a bound texture",
+                     op_name,
+                     dim_name,
+                     tex->is_array ? 1u : 0u,
+                     tex->is_shadow ? 1u : 0u,
+                     tex->texture_index,
+                     tex->sampler_index,
+                     texture_count);
                }
                break;
             }
@@ -3789,12 +3878,22 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                                          "unsupported control flow");
                }
                break;
-            default:
+            default: {
+               const char *type_name =
+                  pvrgpu_nir_instr_type_name(instr->type);
+               char type_number[16];
+               if (!type_name) {
+                  snprintf(type_number, sizeof(type_number), "type%u",
+                           (unsigned)instr->type);
+                  type_name = type_number;
+               }
                return pvrgpu_pco_fail(error,
                                       error_size,
                                       "color primitive contains unsupported "
-                                      "NIR instruction type %u",
+                                      "NIR instruction %s (type %u)",
+                                      type_name,
                                       instr->type);
+            }
             }
          }
       }

@@ -235,7 +235,14 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    caps->fragment_shader_texture_lod = true;
    caps->seamless_cube_map = true;
    caps->occlusion_query = true;
-   caps->indep_blend_enable = true;
+   /*
+    * indep_blend_enable is deliberately left off.  Mesa only needs it for
+    * ES 3.2 (EXT_draw_buffers2 / ARB_draw_buffers_blend), which is out of
+    * reach anyway, and the model has no per-render-target blend state to
+    * back it.  Advertising it made st_atom_blend set independent_blend_enable
+    * on a depth-only pass -- num_cb == 0 takes the promotion path and then
+    * leaves rt[0] untouched -- which is state the model cannot describe.
+    */
 
    /* ES 3.1 gates that are not compute. */
    caps->max_texture_gather_components = 4;
