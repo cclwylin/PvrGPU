@@ -148,7 +148,8 @@ python3 script/deqp_dynamic_ui.py
 
 ### 右側：run status 與 dashboard
 
-* 上方固定區：目前 case、進度條、`Total / Pass / Fail / Skip / Warn / Elapsed` 六格。
+* 上方固定區：目前 case、進度條、`Total / Pass / Fail / Skip / Warn / Elapsed` 六格,
+  右上角是 **複製診斷資訊**。
 * `Run status`：每個 case 一列（#、case、status、exit、duration、artifacts），
   status 依 pass/fail/skip/warning 上色；artifacts 欄顯示 `systemc✓ / png / cmd / link`
   代表這個 case 真的有產生模型輸出。雙擊可打開該 case 目錄。
@@ -157,6 +158,22 @@ python3 script/deqp_dynamic_ui.py
   （module / runner / archive / PCO driver / bridge / arch / output）、
   最慢的 10 個 case、未通過清單，以及開啟 `summary.tsv` 與輸出目錄的按鈕。
 * `Artifacts`：整個輸出目錄的檔案列表，雙擊開啟。
+
+### 複製診斷資訊
+
+右上角那個按鈕把一次執行收成一份純文字：選了什麼、UI 裡填的路徑、runner 回報
+的實際串接、完整的執行參數、每個 case 一行的結果表，然後是**每個未通過 case
+的細節** —— case 目錄、實際下的命令、`systemc.jsonl` 裡的 done/error 行、
+`stderr.log` 的尾巴、有沒有產出 PNG —— 最後接上 UI log 的尾巴。
+
+按下去會同時做兩件事：複製到剪貼簿,以及寫成這次 run 目錄裡的
+`diagnostics.txt`（剪貼簿內容的第一行就是那個檔案路徑）。要貼給別人看就用
+剪貼簿；如果對方本來就讀得到這台機器的檔案，給檔案路徑更好 —— 報告為了好貼
+會截斷（最多 `DIAGNOSTICS_MAX_CASES` 個失敗 case、`DIAGNOSTICS_LOG_LINES`
+行 log），但 run 目錄裡什麼都沒少。
+
+還沒跑過也可以按，那會得到一份只有設定與路徑的報告，適合用來問「我這樣設定
+對不對」。
 
 ### 版面與配色
 

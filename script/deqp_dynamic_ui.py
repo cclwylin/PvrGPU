@@ -17,6 +17,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import sys
 
@@ -132,6 +133,11 @@ except Exception:  # pragma: no cover - catalog missing or unreadable
 
 EVENT_PREFIX = "PVRGPU_DYN "
 LOG_LINE_LIMIT = 20_000
+# Diagnostics report bounds.  The report is meant to be pasted into a
+# conversation, so it stays readable rather than complete; the run
+# directory beside it holds everything that was trimmed.
+DIAGNOSTICS_MAX_CASES = 12
+DIAGNOSTICS_LOG_LINES = 200
 ARTIFACT_ROW_LIMIT = 5_000
 
 PASS_STATUSES = {"pass"}
@@ -397,6 +403,8 @@ class MainWindow(QMainWindow):
         self.state = RunState()
         self.pending_cases: list[str] = []
         self.run_dir: Path | None = None
+        self.last_exit_code: int | None = None
+        self.last_phase: str = ""
         self.current_group = None
         self.caselist_path: Path | None = None
         self.stdout_buffer = ""
@@ -782,7 +790,16 @@ class MainWindow(QMainWindow):
 
         self.current_case_label = QLabel("尚未執行")
         self.current_case_label.setObjectName("currentCase")
-        header_layout.addWidget(self.current_case_label, 0, 0, 1, 6)
+        header_layout.addWidget(self.current_case_label, 0, 0, 1, 5)
+
+        self.copy_diagnostics_button = QPushButton("複製診斷資訊")
+        self.copy_diagnostics_button.setToolTip(
+            "把這次執行的設定、解析後的路徑、每個 case 的結果、失敗 case 的\n"
+            "命令與 log 尾巴收成一份純文字，複製到剪貼簿,\n"
+            "同時寫成 run 目錄裡的 diagnostics.txt。"
+        )
+        self.copy_diagnostics_button.clicked.connect(self.copy_diagnostics)
+        header_layout.addWidget(self.copy_diagnostics_button, 0, 5)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -1457,6 +1474,8 @@ class MainWindow(QMainWindow):
             self._handle_line(self.stdout_buffer)
             self.stdout_buffer = ""
         phase = self.phase
+        self.last_phase = phase
+        self.last_exit_code = exit_code
         self.process = None
         self.phase = "idle"
 
@@ -1525,6 +1544,206 @@ class MainWindow(QMainWindow):
         self.run_button.setEnabled(True)
         self.check_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
+
+    # --------------------------------------------------------------------------
+    # Diagnostics
+    # --------------------------------------------------------------------------
+    @staticmethod
+    def _tail(text: str, lines: int) -> str:
+        """The last `lines` lines, marked when something was dropped."""
+        rows = text.splitlines()
+        if len(rows) <= lines:
+            return "\n".join(rows)
+        return "\n".join([f"... ({len(rows) - lines} earlier lines omitted)"] + rows[-lines:])
+
+    @staticmethod
+    def _read_tail(path: Path, lines: int, byte_cap: int = 262144) -> str:
+        """Read the end of a file without pulling a huge log into memory."""
+        try:
+            size = path.stat().st_size
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                if size > byte_cap:
+                    handle.seek(size - byte_cap)
+                    handle.readline()
+                return MainWindow._tail(handle.read(), lines)
+        except OSError as error:
+            return f"<unreadable: {error}>"
+
+    def _case_detail(self, row: CaseRow) -> list[str]:
+        """Everything about one case that a reader would otherwise have to
+        open four files to find."""
+        out = [f"-- [{row.index}] {row.case_name}",
+               f"   status={row.status} exit={row.exit_code} "
+               f"duration={format_duration(row.duration_ms)}"]
+        if row.case_dir is None or not row.case_dir.is_dir():
+            out.append("   case dir: <missing>")
+            return out
+        out.append(f"   case dir: {row.case_dir}")
+        command = row.case_dir / "command.txt"
+        if not command.is_file():
+            command = row.case_dir / "driver-command.txt"
+        if command.is_file():
+            out.append("   command:")
+            out += [f"     {line}" for line in
+                    self._read_tail(command, 12).splitlines()]
+        jsonl = row.case_dir / "systemc.jsonl"
+        if jsonl.is_file():
+            interesting: list[str] = []
+            for line in self._read_tail(jsonl, 400).splitlines():
+                if any(mark in line for mark in
+                       ('"type":"done"', '"type":"error"', '"error"', '"warning"')):
+                    interesting.append(line[:600])
+            if interesting:
+                out.append("   systemc.jsonl (done/error lines):")
+                out += [f"     {line}" for line in interesting[-6:]]
+            else:
+                out.append("   systemc.jsonl: no done/error line")
+        for name in ("stderr.log", "stdout.log", "case.log", "run.log"):
+            candidate = row.case_dir / name
+            if candidate.is_file() and candidate.stat().st_size:
+                out.append(f"   {name} (tail):")
+                out += [f"     {line}" for line in
+                        self._read_tail(candidate, 25).splitlines()]
+        pngs = sorted((row.case_dir / "systemc").glob("*.png"))
+        if pngs:
+            out.append(f"   systemc png: {len(pngs)} file(s), e.g. {pngs[0].name}")
+        return out
+
+    def build_diagnostics(self) -> str:
+        """One self-contained plain-text report: what was asked for, what the
+        wiring resolved to, what every case did, and the detail behind each
+        failure.  Written so it can be pasted somewhere and read on its own."""
+        now = datetime.now().astimezone()
+        lines: list[str] = []
+        add = lines.append
+
+        add("=== PvrGPU dEQP · Dynamic Link — diagnostics ===")
+        add(f"generated : {now.isoformat(timespec='seconds')}")
+        add(f"ui        : {Path(__file__).resolve()}")
+        add(f"host      : {platform.platform()} ({platform.machine()})")
+        add(f"python    : {sys.version.split()[0]}  Qt/PySide6: "
+            f"{getattr(__import__('PySide6'), '__version__', '?')}")
+        add(f"repo      : {REPO_ROOT}")
+        add("")
+
+        mode = self.mode_combo.currentText()
+        add("[selection]")
+        add(f"mode          : {mode}")
+        # Only the fields the active mode actually uses: the other combos keep
+        # their last value and would read as though they were in play.
+        if mode == MODE_GROUP and hasattr(self, "group_combo"):
+            add(f"group         : {self.group_combo.currentText()}")
+        elif mode == MODE_PRESET and hasattr(self, "preset_combo"):
+            add(f"preset        : {self.preset_combo.currentText()}")
+        elif mode == MODE_CUSTOM:
+            add(f"custom case   : {self._selected_case() or '<blank>'}")
+        if mode in (MODE_GROUP, MODE_CASELIST) and hasattr(self, "max_cases_spin"):
+            limit = self.max_cases_spin.value()
+            add(f"case limit    : {limit if limit else 'all'}")
+        if getattr(self, "caselist_path", None):
+            add(f"caselist      : {self.caselist_path}")
+        add("")
+
+        add("[paths as typed in the UI]  (blank = taken from config/local.env)")
+        for caption, widget in (
+            ("PCO driver (Mesa prefix)", getattr(self, "mesa_edit", None)),
+            ("SystemC bridge", getattr(self, "bridge_edit", None)),
+            ("dEQP binary", getattr(self, "deqp_binary_edit", None)),
+            ("dEQP build dir", getattr(self, "deqp_build_edit", None)),
+            ("Output root", getattr(self, "output_edit", None)),
+        ):
+            if widget is not None:
+                add(f"{caption:<26}: {widget.text().strip() or '<blank>'}")
+        add("")
+
+        add("[wiring the runner reported]")
+        for caption, value in (
+            ("Module", self.state.module),
+            ("dEQP runner", self.state.runner),
+            ("Archive dir", self.state.archive_dir),
+            ("PCO driver (Mesa)", self.state.mesa_prefix),
+            ("SystemC bridge", self.state.systemc_lib),
+            ("Host arch", self.state.host_arch),
+        ):
+            add(f"{caption:<26}: {value or '<not reported>'}")
+        add("")
+
+        add("[run parameters]")
+        add(f"arguments     : run_deqp_dynamic.sh {' '.join(self._run_arguments())}")
+        add(f"run dir       : {self.run_dir or '<none>'}")
+        add(f"output root   : {self.state.output_root or '<none>'}")
+        add(f"summary       : {self.state.summary_path or '<none>'}")
+        started = self.state.started_at
+        add(f"started       : {started.isoformat(timespec='seconds') if started else '<none>'}")
+        add(f"elapsed       : {format_duration(self.state.duration_ms)}")
+        add(f"last phase    : {self.last_phase or '<none>'}  "
+            f"exit={self.last_exit_code}")
+        add("")
+
+        finished = [row for row in self.state.rows if row.exit_code is not None]
+        buckets = {"pass": 0, "fail": 0, "skip": 0, "warn": 0}
+        for row in finished:
+            buckets[row.bucket] += 1
+        add("[totals]")
+        add(f"total={self.state.total} finished={len(finished)} "
+            f"pass={buckets['pass']} fail={buckets['fail']} "
+            f"skip={buckets['skip']} warn={buckets['warn']}")
+        add("")
+
+        add("[cases]")
+        add(f"{'#':>3}  {'status':<13} {'exit':>4} {'duration':>9}  "
+            f"{'artifacts':<24} case")
+        for row in self.state.rows:
+            add(f"{row.index:>3}  {row.status:<13} "
+                f"{('' if row.exit_code is None else row.exit_code):>4} "
+                f"{format_duration(row.duration_ms):>9}  "
+                f"{row.artifact_summary():<24} {row.case_name}")
+        add("")
+
+        failing = [row for row in self.state.rows if row.bucket in ("fail", "warn")]
+        add(f"[failing cases in detail]  ({len(failing)} of {len(self.state.rows)};"
+            f" first {min(len(failing), DIAGNOSTICS_MAX_CASES)} shown)")
+        if not failing:
+            add("(none)")
+        for row in failing[:DIAGNOSTICS_MAX_CASES]:
+            lines.extend(self._case_detail(row))
+            add("")
+
+        add("[UI log tail]")
+        add(self._tail(self.log_view.toPlainText(), DIAGNOSTICS_LOG_LINES))
+        add("")
+        add("=== end of diagnostics ===")
+        return "\n".join(lines)
+
+    def copy_diagnostics(self) -> None:
+        """Copy the report to the clipboard, and drop the same text in the run
+        directory so it can be read from disk instead of pasted."""
+        try:
+            report = self.build_diagnostics()
+        except Exception as error:  # noqa: BLE001 - a diagnostic must not crash the UI
+            QMessageBox.critical(self, "PvrGPU", f"產生診斷資訊失敗：{error}")
+            return
+
+        saved: Path | None = None
+        target_dir = self.run_dir or self.state.output_root
+        if target_dir:
+            candidate = Path(target_dir) / "diagnostics.txt"
+            try:
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.write_text(report, encoding="utf-8")
+                saved = candidate
+            except OSError:
+                saved = None
+
+        if saved is not None:
+            report = f"diagnostics file: {saved}\n\n{report}"
+        QApplication.clipboard().setText(report)
+
+        size = len(report.encode("utf-8"))
+        message = f"診斷資訊已複製（{format_bytes(size)}）"
+        if saved is not None:
+            message += f" · 也寫到 {saved}"
+        self.statusBar().showMessage(message, 8000)
 
     # --------------------------------------------------------------------------
     # Opening things
