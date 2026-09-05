@@ -1997,6 +1997,8 @@ void Submitter::Run() {
           resource.format =
               texture.format == "PIPE_FORMAT_Z32_UNORM"
                   ? TextureFormat::kZ32Unorm
+                  : texture.format == "PIPE_FORMAT_Z24_UNORM_S8_UINT"
+                        ? TextureFormat::kZ24UnormS8Uint
                   : texture.format == "PIPE_FORMAT_R8G8B8A8_UNORM"
                         ? TextureFormat::kRgba8Unorm
                         : texture.format == "PIPE_FORMAT_R8G8B8X8_UNORM"

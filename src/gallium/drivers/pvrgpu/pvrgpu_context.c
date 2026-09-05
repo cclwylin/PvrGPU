@@ -9730,6 +9730,29 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx);
  * anything but a tightly packed 2D RGBA8 mip chain -- is reported by name so
  * the gap is visible rather than silently rendered without it.
  */
+/* Gallium's pipe_tex_wrap ordering is not the capsule's. */
+static uint32_t
+pvrgpu_sequence_texture_wrap(unsigned gallium_wrap)
+{
+   switch (gallium_wrap) {
+   case PIPE_TEX_WRAP_REPEAT:
+      return PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT;
+   case PIPE_TEX_WRAP_CLAMP_TO_EDGE:
+      return PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_EDGE;
+   default:
+      /* Out of range for the capsule enum, so the caller fails closed. */
+      return PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT + 1U;
+   }
+}
+
+/* Back to the Rogue ADDRMODE domain the image descriptor encodes. */
+static unsigned
+pvrgpu_sequence_texture_addrmode(uint32_t capsule_wrap)
+{
+   return capsule_wrap == PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT ?
+             PIPE_TEX_WRAP_REPEAT : PIPE_TEX_WRAP_CLAMP_TO_EDGE;
+}
+
 static bool
 pvrgpu_capture_generic_sequence_texture(
    const struct pvrgpu_context *ctx,
@@ -9761,8 +9784,14 @@ pvrgpu_capture_generic_sequence_texture(
    }
 
    const enum pipe_format format = view->format;
+   /*
+    * A combined depth/stencil image sampled through a 2D view is depth-as-
+    * texture: the app renders depth and reads it back.  Its texel is the same
+    * four bytes as a colour texel, so the layout checks below hold unchanged.
+    */
    if (format != PIPE_FORMAT_R8G8B8A8_UNORM &&
-       format != PIPE_FORMAT_R8G8B8X8_UNORM) {
+       format != PIPE_FORMAT_R8G8B8X8_UNORM &&
+       format != PIPE_FORMAT_Z24_UNORM_S8_UINT) {
       *reason = "format";
       return false;
    }
@@ -9792,6 +9821,28 @@ pvrgpu_capture_generic_sequence_texture(
    }
    if (expected_offset == 0 || expected_offset != (uintptr_t)resource->size) {
       *reason = "image_size";
+      return false;
+   }
+
+   /*
+    * The image descriptor encodes one swizzle per format: identity for RGBA8,
+    * RGB1 for RGBX8 and GL's (depth, 0, 0, 1) for a sampled depth image.  A
+    * view asking for anything else would be sampled through the wrong one, so
+    * decline it instead of ignoring the request.
+    */
+   const bool depth_stencil_view = format == PIPE_FORMAT_Z24_UNORM_S8_UINT;
+   const unsigned expected_swizzle_g =
+      depth_stencil_view ? PIPE_SWIZZLE_0 : PIPE_SWIZZLE_Y;
+   const unsigned expected_swizzle_b =
+      depth_stencil_view ? PIPE_SWIZZLE_0 : PIPE_SWIZZLE_Z;
+   const unsigned expected_swizzle_a =
+      (depth_stencil_view || format == PIPE_FORMAT_R8G8B8X8_UNORM) ?
+         PIPE_SWIZZLE_1 : PIPE_SWIZZLE_W;
+   if (view->swizzle_r != PIPE_SWIZZLE_X ||
+       view->swizzle_g != expected_swizzle_g ||
+       view->swizzle_b != expected_swizzle_b ||
+       view->swizzle_a != expected_swizzle_a) {
+      *reason = "view_swizzle";
       return false;
    }
 
@@ -9829,9 +9880,25 @@ pvrgpu_capture_generic_sequence_texture(
    }
    destination->min_filter = state->min_img_filter;
    destination->mag_filter = state->mag_img_filter;
-   destination->mip_filter = state->min_mip_filter;
-   destination->wrap_u = state->wrap_s;
-   destination->wrap_v = state->wrap_t;
+   /*
+    * Gallium orders its wrap modes REPEAT, CLAMP, CLAMP_TO_EDGE, ...  while
+    * the capsule states CLAMP_TO_EDGE first; copying the raw value turned a
+    * repeating sampler into a clamping one.  PIPE_TEX_MIPFILTER_NONE (2)
+    * likewise had to become the capsule's NEAREST, since a mip filter of
+    * "none" samples the base level.
+    */
+   destination->mip_filter =
+      state->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR ?
+         PVRGPU_SYSTEMC_PCO_TEXTURE_MIP_FILTER_LINEAR :
+         PVRGPU_SYSTEMC_PCO_TEXTURE_MIP_FILTER_NONE;
+   destination->wrap_u = pvrgpu_sequence_texture_wrap(state->wrap_s);
+   destination->wrap_v = pvrgpu_sequence_texture_wrap(state->wrap_t);
+   if (destination->wrap_u > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT ||
+       destination->wrap_v > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT) {
+      *reason = "wrap_mode";
+      free(bytes);
+      return false;
+   }
    destination->normalized_coordinates = 1;
    destination->min_lod_u4_6 = 0;
    destination->max_lod_u4_6 =
@@ -10703,6 +10770,41 @@ pvrgpu_record_color_primitive_pco_draw(
                                "stage=textures reason=%s slot=%u",
                                texture_reason ? texture_reason : "unknown",
                                texture);
+         pvrgpu_array_primitive_draw_destroy(&recorded);
+         return false;
+      }
+      /*
+       * PCO lays each sampled image's descriptor at
+       * texture * PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS in the fragment shared
+       * file and reads the shader's push constants after them, so the
+       * uniform copy above left these words zero.  Fill them here: without a
+       * descriptor the model has no image state at all and rejects the draw.
+       */
+      const struct pvrgpu_systemc_pco_sequence_texture *captured =
+         &recorded->textures[texture];
+      const unsigned descriptor_start =
+         texture * PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS;
+      if (descriptor_start + PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS >
+             fragment_shared_count ||
+          !pvrgpu_pco_build_terrain_texture_descriptor(
+             &fragment_uniform_words[descriptor_start],
+             ctx->sampler_views[MESA_SHADER_FRAGMENT][texture]->format,
+             captured->mip[0].width,
+             captured->mip[0].height,
+             captured->mip_count,
+             (uint32_t)captured->declared_bytes_size,
+             captured->min_filter,
+             captured->mag_filter,
+             captured->mip_filter,
+             pvrgpu_sequence_texture_addrmode(captured->wrap_u),
+             pvrgpu_sequence_texture_addrmode(captured->wrap_v),
+             captured->max_lod_u4_6)) {
+         pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                               "stage=textures reason=descriptor slot=%u "
+                               "start=%u shared=%u",
+                               texture,
+                               descriptor_start,
+                               fragment_shared_count);
          pvrgpu_array_primitive_draw_destroy(&recorded);
          return false;
       }

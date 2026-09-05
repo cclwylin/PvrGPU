@@ -1211,33 +1211,55 @@ bool CopyPcoSequenceTexture(
   if (!destination || !error)
     return false;
   const std::string_view format = source.format ? source.format : "";
+  // A combined depth/stencil image sampled through a 2D view stores the same
+  // four bytes per texel as a colour image; the depth occupies the low 24
+  // bits and the texture unit masks the stencil byte off.
   const std::uint32_t bytes_per_texel =
       format == "PIPE_FORMAT_R8G8B8A8_UNORM" ||
               format == "PIPE_FORMAT_R8G8B8X8_UNORM" ||
-              format == "PIPE_FORMAT_Z32_UNORM"
+              format == "PIPE_FORMAT_Z32_UNORM" ||
+              format == "PIPE_FORMAT_Z24_UNORM_S8_UINT"
           ? 4U
           : 0U;
-  if (source.source >
-          PVRGPU_SYSTEMC_PCO_TEXTURE_PREVIOUS_DEPTH_ATTACHMENT ||
-      source.stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT ||
-      source.descriptor_set >=
-          pvrgpu::stub::kPcoMaximumTextureDescriptorSets ||
-      source.binding != 0 || bytes_per_texel == 0 ||
-      source.declared_bytes_size == 0 ||
-      source.declared_bytes_size >
-          pvrgpu::stub::kDriverPcoMaximumSequencePayloadBytes ||
-      source.mip_count == 0 ||
-      source.mip_count > PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS ||
-      source.min_filter > PVRGPU_SYSTEMC_PCO_TEXTURE_FILTER_LINEAR ||
-      source.mag_filter > PVRGPU_SYSTEMC_PCO_TEXTURE_FILTER_LINEAR ||
-      source.mip_filter > PVRGPU_SYSTEMC_PCO_TEXTURE_MIP_FILTER_LINEAR ||
-      source.wrap_u > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT ||
-      source.wrap_v > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT ||
-      source.normalized_coordinates != 1 ||
-      source.min_lod_u4_6 > source.max_lod_u4_6) {
-    *error = "SystemC API PCO sequence texture metadata is invalid";
+  // Each field names itself: a bundled predicate here only reports that some
+  // unspecified part of the metadata was rejected.
+  const auto reject = [&](const char *field) {
+    *error = std::string("SystemC API PCO sequence texture ") + field +
+             " is invalid";
     return false;
-  }
+  };
+  if (source.source > PVRGPU_SYSTEMC_PCO_TEXTURE_PREVIOUS_DEPTH_ATTACHMENT)
+    return reject("source");
+  if (source.stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT)
+    return reject("stage");
+  if (source.descriptor_set >=
+      pvrgpu::stub::kPcoMaximumTextureDescriptorSets)
+    return reject("descriptor set");
+  if (source.binding != 0)
+    return reject("binding");
+  if (bytes_per_texel == 0)
+    return reject("format");
+  if (source.declared_bytes_size == 0 ||
+      source.declared_bytes_size >
+          pvrgpu::stub::kDriverPcoMaximumSequencePayloadBytes)
+    return reject("declared byte size");
+  if (source.mip_count == 0 ||
+      source.mip_count > PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS)
+    return reject("mip count");
+  if (source.min_filter > PVRGPU_SYSTEMC_PCO_TEXTURE_FILTER_LINEAR)
+    return reject("min filter");
+  if (source.mag_filter > PVRGPU_SYSTEMC_PCO_TEXTURE_FILTER_LINEAR)
+    return reject("mag filter");
+  if (source.mip_filter > PVRGPU_SYSTEMC_PCO_TEXTURE_MIP_FILTER_LINEAR)
+    return reject("mip filter");
+  if (source.wrap_u > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT)
+    return reject("wrap u");
+  if (source.wrap_v > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT)
+    return reject("wrap v");
+  if (source.normalized_coordinates != 1)
+    return reject("normalized coordinates");
+  if (source.min_lod_u4_6 > source.max_lod_u4_6)
+    return reject("lod range");
 
   std::uint64_t previous_end = 0;
   for (std::size_t level = 0; level < source.mip_count; ++level) {

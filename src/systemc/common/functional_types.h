@@ -412,6 +412,12 @@ enum class TextureFormat : std::uint8_t {
   // as a Z32_UNORM image with XXX1 swizzle; storage remains one little-endian
   // uint32 per texel and filtering is restricted to nearest.
   kZ32Unorm,
+  // Depth-as-texture: a combined depth/stencil image sampled through a 2D
+  // view, stored as Rogue ST8U24.  One little-endian uint32 per texel holds
+  // the stencil in bits 24..31 and the depth in bits 0..23, normalized by
+  // 2^24-1, exactly as the driver's clear path packs it.  GL swizzles it to
+  // (depth, 0, 0, 1), and unlike kZ32Unorm it filters.
+  kZ24UnormS8Uint,
 };
 
 enum class TextureLayout : std::uint8_t {

@@ -59,11 +59,34 @@ pvrgpu_refract_descriptor_store_u64(uint32_t *words,
    words[first_dword + 1U] = (uint32_t)(value >> 32U);
 }
 
+/* Rogue TEXSTATE SWIZ: channels 0..3 select a source channel, 4 is SRC_ONE
+ * and 5 is SRC_ZERO. */
+#define PVRGPU_SWIZ_CHAN0 0U
+#define PVRGPU_SWIZ_CHAN1 1U
+#define PVRGPU_SWIZ_CHAN2 2U
+#define PVRGPU_SWIZ_CHAN3 3U
+#define PVRGPU_SWIZ_ONE   4U
+#define PVRGPU_SWIZ_ZERO  5U
+
+/* Identity RGBA for colour images, and the two depth swizzles in use:
+ * XXX1 broadcasts depth to RGB, X001 keeps it in red only. */
+static const unsigned pvrgpu_swizzle_rgba[4] = {
+   PVRGPU_SWIZ_CHAN0, PVRGPU_SWIZ_CHAN1, PVRGPU_SWIZ_CHAN2, PVRGPU_SWIZ_CHAN3,
+};
+static const unsigned pvrgpu_swizzle_rgb1[4] = {
+   PVRGPU_SWIZ_CHAN0, PVRGPU_SWIZ_CHAN1, PVRGPU_SWIZ_CHAN2, PVRGPU_SWIZ_ONE,
+};
+static const unsigned pvrgpu_swizzle_depth_xxx1[4] = {
+   PVRGPU_SWIZ_CHAN0, PVRGPU_SWIZ_CHAN0, PVRGPU_SWIZ_CHAN0, PVRGPU_SWIZ_ONE,
+};
+static const unsigned pvrgpu_swizzle_depth_x001[4] = {
+   PVRGPU_SWIZ_CHAN0, PVRGPU_SWIZ_ZERO, PVRGPU_SWIZ_ZERO, PVRGPU_SWIZ_ONE,
+};
+
 static void
 pvrgpu_build_refract_descriptor(uint32_t descriptor[20],
                                 unsigned tex_format,
-                                bool depth_swizzle,
-                                bool alpha_one,
+                                const unsigned swizzle[4],
                                 unsigned width,
                                 unsigned height,
                                 unsigned mip_count,
@@ -78,12 +101,10 @@ pvrgpu_build_refract_descriptor(uint32_t descriptor[20],
    memset(descriptor, 0, 20U * sizeof(descriptor[0]));
    const uint64_t image_word0 =
       pvrgpu_refract_descriptor_bits(4U, 0, 2) |
-      pvrgpu_refract_descriptor_bits(depth_swizzle || alpha_one ? 4U : 3U,
-                                     5,
-                                     7) |
-      pvrgpu_refract_descriptor_bits(depth_swizzle ? 0U : 2U, 8, 10) |
-      pvrgpu_refract_descriptor_bits(depth_swizzle ? 0U : 1U, 11, 13) |
-      pvrgpu_refract_descriptor_bits(0U, 14, 16) |
+      pvrgpu_refract_descriptor_bits(swizzle[3], 5, 7) |
+      pvrgpu_refract_descriptor_bits(swizzle[2], 8, 10) |
+      pvrgpu_refract_descriptor_bits(swizzle[1], 11, 13) |
+      pvrgpu_refract_descriptor_bits(swizzle[0], 14, 16) |
       pvrgpu_refract_descriptor_bits(tex_format, 27, 33) |
       pvrgpu_refract_descriptor_bits(width - 1U, 34, 47) |
       pvrgpu_refract_descriptor_bits(height - 1U, 48, 61);
@@ -102,8 +123,11 @@ pvrgpu_build_refract_descriptor(uint32_t descriptor[20],
       pvrgpu_refract_descriptor_bits(4095U, 0, 12) |
       pvrgpu_refract_descriptor_bits(max_lod_u4_6, 23, 32) |
       pvrgpu_refract_descriptor_bits(wrap_u, 33, 35) |
-      pvrgpu_refract_descriptor_bits(min_filter, 36, 37) |
-      pvrgpu_refract_descriptor_bits(mag_filter, 38, 39) |
+      /* Rogue TEXSTATE places magfilter at 36..37 and minfilter at 38..39;
+       * the two were transposed here, which stayed invisible only because
+       * every existing descriptor passes the same filter for both. */
+      pvrgpu_refract_descriptor_bits(mag_filter, 36, 37) |
+      pvrgpu_refract_descriptor_bits(min_filter, 38, 39) |
       pvrgpu_refract_descriptor_bits(mip_filter, 40, 40) |
       pvrgpu_refract_descriptor_bits(wrap_v, 41, 43);
    pvrgpu_refract_descriptor_store_u64(descriptor, 8, sampler_word0);
@@ -167,8 +191,7 @@ pvrgpu_pco_build_refract_fragment_shared_for_extent(
       return false;
    pvrgpu_build_refract_descriptor(&out[0],
                                     24U,
-                                    true,
-                                    false,
+                                    pvrgpu_swizzle_depth_xxx1,
                                     width,
                                     height,
                                     1U,
@@ -181,8 +204,7 @@ pvrgpu_pco_build_refract_fragment_shared_for_extent(
                                     0U);
    pvrgpu_build_refract_descriptor(&out[20],
                                     12U,
-                                    false,
-                                    false,
+                                    pvrgpu_swizzle_rgba,
                                     width,
                                     height,
                                     mip_count,
@@ -195,8 +217,7 @@ pvrgpu_pco_build_refract_fragment_shared_for_extent(
                                     (mip_count - 1U) * 64U);
    pvrgpu_build_refract_descriptor(&out[40],
                                     12U,
-                                    false,
-                                    false,
+                                    pvrgpu_swizzle_rgba,
                                     512U,
                                     512U,
                                     1U,
@@ -234,8 +255,7 @@ pvrgpu_pco_build_shadow_fragment_shared_for_extent(
       return false;
    pvrgpu_build_refract_descriptor(out,
                                     24U,
-                                    true,
-                                    false,
+                                    pvrgpu_swizzle_depth_xxx1,
                                     width,
                                     height,
                                     1U,
@@ -273,9 +293,10 @@ pvrgpu_pco_build_terrain_texture_descriptor(
    unsigned wrap_v,
    unsigned max_lod_u4_6)
 {
+   const bool depth_stencil = format == PIPE_FORMAT_Z24_UNORM_S8_UINT;
    if (!out ||
        (format != PIPE_FORMAT_R8G8B8A8_UNORM &&
-        format != PIPE_FORMAT_R8G8B8X8_UNORM) ||
+        format != PIPE_FORMAT_R8G8B8X8_UNORM && !depth_stencil) ||
        width == 0 || width > 16384U || height == 0 || height > 16384U ||
        mip_count == 0 || mip_count > 15U || byte_size == 0 ||
        min_filter > 1U || mag_filter > 1U || mip_filter > 1U ||
@@ -283,11 +304,19 @@ pvrgpu_pco_build_terrain_texture_descriptor(
        (wrap_v != 0U && wrap_v != 2U) || max_lod_u4_6 > 1023U)
       return false;
 
+   /*
+    * Rogue TEXSTATE FORMAT: U8U8U8U8 for colour, ST8U24 for a combined
+    * depth/stencil image, whose depth occupies the low 24 bits exactly as the
+    * driver's own clear path packs it.  A sampled depth image carries GL's
+    * (depth, 0, 0, 1) swizzle rather than the XXX1 the refract prepass uses.
+    */
    pvrgpu_build_refract_descriptor(
       out,
-      12U,
-      false,
-      format == PIPE_FORMAT_R8G8B8X8_UNORM,
+      depth_stencil ? 22U : 12U,
+      depth_stencil ? pvrgpu_swizzle_depth_x001
+                    : format == PIPE_FORMAT_R8G8B8X8_UNORM
+                         ? pvrgpu_swizzle_rgb1
+                         : pvrgpu_swizzle_rgba,
       width,
       height,
       mip_count,
