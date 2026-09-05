@@ -97,15 +97,6 @@ pvrgpu_clear_command_case_name(void)
 }
 
 static bool
-pvrgpu_negative_coverage_transparent_framebuffer_case(void)
-{
-   return pvrgpu_string_has_prefix(
-      getenv("PVRGPU_RDC_CASE_NAME"),
-      "dEQP-GLES31.functional.debug.negative_coverage.callbacks.buffer."
-      "framebuffer_");
-}
-
-static bool
 pvrgpu_rdc_output_extent(unsigned *width, unsigned *height)
 {
    return pvrgpu_parse_env_uint("PVRGPU_RDC_OUTPUT_WIDTH", 1, width) &&
@@ -661,10 +652,7 @@ pvrgpu_emit_clear_color_command(unsigned width,
       command.clear_color_bits[0] = 0;
       command.clear_color_bits[1] = 0;
       command.clear_color_bits[2] = 0;
-      command.clear_color_bits[3] =
-         pvrgpu_negative_coverage_transparent_framebuffer_case()
-            ? 0
-            : UINT32_C(0x3f800000);
+      command.clear_color_bits[3] = UINT32_C(0x3f800000);
    } else {
       command.clear_color_bits[0] = fui(color->f[0]);
       command.clear_color_bits[1] = fui(color->f[1]);

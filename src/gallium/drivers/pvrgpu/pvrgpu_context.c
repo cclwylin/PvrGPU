@@ -387,19 +387,8 @@ struct pvrgpu_ideas_pco_observation {
 #define PVRGPU_TEXTURE_PCO_BYTES UINT32_C(1048576)
 #define PVRGPU_TEXTURE_PCO_GPU_ADDRESS UINT64_C(0x40000000)
 
-static uint64_t
-pvrgpu_estimate_deqp_texture_filtering_texel_fetches(
-   const struct pvrgpu_indexed_quad_observation *observation,
-   unsigned draw_count);
 
-static uint64_t
-pvrgpu_estimate_indexed_quad_texel_fetches(
-   const struct pvrgpu_context *ctx,
-   const struct pvrgpu_indexed_quad_observation *observation,
-   unsigned draw_count);
 
-static unsigned
-pvrgpu_indexed_quad_lock_draw_count(bool has_fragment_texture);
 
 static bool
 pvrgpu_has_observable_fragment_texture(const struct pvrgpu_context *ctx);
@@ -462,25 +451,6 @@ pvrgpu_string_contains(const char *text, const char *needle)
 }
 
 static bool
-pvrgpu_case_suppresses_draw_commands(void)
-{
-   const char *case_name = pvrgpu_rdc_case_name();
-   return case_name &&
-          strcmp(case_name,
-                 "dEQP-GLES31.functional.debug.negative_coverage.callbacks."
-                 "advanced_blend.attachment_advanced_equation") == 0;
-}
-
-static bool
-pvrgpu_negative_coverage_transparent_framebuffer_case(void)
-{
-   return pvrgpu_string_has_prefix(
-      pvrgpu_rdc_case_name(),
-      "dEQP-GLES31.functional.debug.negative_coverage.callbacks.buffer."
-      "framebuffer_");
-}
-
-static bool
 pvrgpu_trace_draw_actions(unsigned *draw_actions)
 {
    const char *text = getenv("PVRGPU_RDC_TRACE_DRAW_ACTIONS");
@@ -534,65 +504,6 @@ pvrgpu_deqp_texture_filtering_suffix(const char *case_name,
       return false;
    *suffix = case_name + strlen(prefix);
    return true;
-}
-
-static bool
-pvrgpu_deqp_fbo_default_framebuffer_blit_case(const char *case_name)
-{
-   return pvrgpu_string_has_prefix(
-             case_name,
-             "dEQP-GLES3.functional.fbo.blit.default_framebuffer.") &&
-          pvrgpu_string_contains(case_name, "_blit_to_default");
-}
-
-static bool
-pvrgpu_deqp_fbo_default_framebuffer_direct_color_counter_case(
-   const char *case_name)
-{
-   return pvrgpu_deqp_fbo_default_framebuffer_blit_case(case_name) &&
-          (pvrgpu_string_contains(case_name, ".rgb8_") ||
-           pvrgpu_string_contains(case_name, ".rgba8_"));
-}
-
-static bool
-pvrgpu_deqp_fbo_default_framebuffer_blit_draw_count(unsigned *draw_count)
-{
-   const char *case_name = pvrgpu_rdc_case_name();
-   if (!draw_count || !pvrgpu_deqp_fbo_default_framebuffer_blit_case(case_name))
-      return false;
-
-   unsigned trace_draw_actions = 0;
-   if (!pvrgpu_trace_draw_actions(&trace_draw_actions) ||
-       trace_draw_actions == 0)
-      return false;
-
-   *draw_count = trace_draw_actions;
-   return true;
-}
-
-static uint64_t
-pvrgpu_estimate_deqp_fbo_default_framebuffer_blit_texel_fetches(
-   const struct pvrgpu_indexed_quad_observation *observation,
-   unsigned draw_count,
-   bool rgbx_framebuffer)
-{
-   if (!observation || draw_count == 0)
-      return 0;
-
-   /*
-    * RenderDoc lowers GLES FBO blits that target the visible/default
-    * framebuffer to a textured two-triangle quad.  Its API counter view counts
-    * one sampled fragment per destination pixel plus the row-edge footprint of
-    * the blit shader.  The dimensions come from the observed Gallium viewport,
-    * while draw_count comes from RenderDoc's API-visible draw action metadata.
-    */
-   const uint64_t pixels =
-      (uint64_t)observation->viewport_width *
-      (uint64_t)observation->viewport_height;
-   const uint64_t per_draw =
-      rgbx_framebuffer ? pixels
-                       : pixels + (uint64_t)observation->viewport_height * 4u;
-   return per_draw * (uint64_t)draw_count;
 }
 
 static int
@@ -1076,26 +987,18 @@ pvrgpu_emit_draw_indexed_quad_command(
    command.clear_color_bits[1] = 0;
    command.clear_color_bits[2] = 0;
    command.clear_color_bits[3] = UINT32_C(0x3f800000);
-   unsigned api_visible_draw_count = 0;
-   command.draw_count =
-      pvrgpu_deqp_fbo_default_framebuffer_blit_draw_count(
-         &api_visible_draw_count)
-         ? api_visible_draw_count
-         : ctx->indexed_quad_draws;
+   command.draw_count = ctx->indexed_quad_draws;
    command.index_count = observation->index_count;
    command.unique_vertices = observation->unique_vertices;
    command.primitive_count = observation->primitive_count;
-   const bool direct_color_fbo_blit =
-      pvrgpu_deqp_fbo_default_framebuffer_direct_color_counter_case(
-         pvrgpu_rdc_case_name());
-   command.clip_primitives =
-      direct_color_fbo_blit ? 0 : command.primitive_count;
-   command.setup_triangles =
-      direct_color_fbo_blit ? 0 : command.primitive_count;
-   command.semantic_texel_fetches =
-      pvrgpu_estimate_indexed_quad_texel_fetches(ctx,
-                                                 observation,
-                                                 command.draw_count);
+   command.clip_primitives = command.primitive_count;
+   command.setup_triangles = command.primitive_count;
+   /*
+    * texel_fetches is left for the texture unit to measure.  The driver used
+    * to fit it from a table of per-filter constants keyed on the dEQP case
+    * name, which reported sampling that never happened.
+    */
+   command.semantic_texel_fetches = 0;
 
    char error[256];
    if (!pvrgpu_write_draw_indexed_quad_command(path, &command, error,
@@ -1106,8 +1009,13 @@ pvrgpu_emit_draw_indexed_quad_command(
 
    ctx->driver_draw_command_emitted = true;
    pvrgpu_note_driver_draw_command_emitted();
+   /*
+    * The quad shape settles after its textured and untextured draws; the count
+    * used to come from RenderDoc's draw-action metadata for one named dEQP
+    * group, which let a capture's identity decide when to stop observing.
+    */
    const unsigned lock_draw_count =
-      pvrgpu_indexed_quad_lock_draw_count(observation->has_fragment_texture);
+      observation->has_fragment_texture ? 4u : 2u;
    if (ctx->indexed_quad_draws >= lock_draw_count)
       ctx->driver_indexed_quad_command_locked = true;
 }
@@ -1119,18 +1027,6 @@ pvrgpu_context_has_color_framebuffer(const struct pvrgpu_context *ctx)
           ctx->framebuffer.nr_cbufs != 0 &&
           ctx->framebuffer.cbufs[0].texture != NULL;
 }
-
-static bool
-pvrgpu_texture_multisample_case_name(const char *case_name)
-{
-   return pvrgpu_string_has_prefix(
-      case_name,
-      "dEQP-GLES31.functional.texture.multisample.samples_");
-}
-
-
-
-
 
 static void
 pvrgpu_emit_present_clear_color_command(struct pvrgpu_context *ctx,
@@ -1161,9 +1057,7 @@ pvrgpu_emit_present_clear_color_command(struct pvrgpu_context *ctx,
    command.width = width;
    command.height = height;
    command.format = pvrgpu_command_format_for_framebuffer(ctx);
-   uint8_t command_rgba[4] = {rgba[0], rgba[1], rgba[2], rgba[3]};
-   if (pvrgpu_negative_coverage_transparent_framebuffer_case())
-      command_rgba[3] = 0;
+   const uint8_t command_rgba[4] = {rgba[0], rgba[1], rgba[2], rgba[3]};
    command.clear_color_bits[0] =
       pvrgpu_float_bits((float)command_rgba[0] / 255.0f);
    command.clear_color_bits[1] =
@@ -2085,82 +1979,6 @@ pvrgpu_has_observable_fragment_texture(const struct pvrgpu_context *ctx)
           ctx->sampler_views[MESA_SHADER_FRAGMENT][0]->texture &&
           ctx->num_samplers[MESA_SHADER_FRAGMENT] > 0 &&
           ctx->samplers[MESA_SHADER_FRAGMENT][0];
-}
-
-static uint64_t
-pvrgpu_scale_64x64_counter(unsigned width,
-                           unsigned height,
-                           unsigned per_64x64_draw)
-{
-   const uint64_t pixels = (uint64_t)width * (uint64_t)height;
-   return (pixels * per_64x64_draw + UINT64_C(2048)) / UINT64_C(4096);
-}
-
-
-static unsigned
-pvrgpu_generic_texture_filtering_per_64x64_draw(
-   const struct pvrgpu_indexed_quad_observation *observation)
-{
-   if (observation->min_mip_filter == PIPE_TEX_MIPFILTER_NONE)
-      return observation->min_img_filter == PIPE_TEX_FILTER_LINEAR ? 18696
-                                                                   : 4548;
-
-   if (observation->min_mip_filter == PIPE_TEX_MIPFILTER_NEAREST)
-      return observation->min_img_filter == PIPE_TEX_FILTER_LINEAR ? 18312
-                                                                   : 11424;
-
-   if (observation->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR)
-      return observation->min_img_filter == PIPE_TEX_FILTER_LINEAR ? 27648
-                                                                   : 13964;
-
-   return 0;
-}
-
-static uint64_t
-pvrgpu_estimate_deqp_texture_filtering_texel_fetches(
-   const struct pvrgpu_indexed_quad_observation *observation,
-   unsigned draw_count)
-{
-   if (!observation || !observation->has_fragment_texture || draw_count == 0)
-      return 0;
-
-   const unsigned per_64x64_draw =
-      pvrgpu_generic_texture_filtering_per_64x64_draw(observation);
-
-   if (per_64x64_draw == 0)
-      return 0;
-
-   return pvrgpu_scale_64x64_counter(observation->viewport_width,
-                                     observation->viewport_height,
-                                     per_64x64_draw) *
-          (uint64_t)draw_count;
-}
-
-static uint64_t
-pvrgpu_estimate_indexed_quad_texel_fetches(
-   const struct pvrgpu_context *ctx,
-   const struct pvrgpu_indexed_quad_observation *observation,
-   unsigned draw_count)
-{
-   if (pvrgpu_deqp_fbo_default_framebuffer_blit_case(pvrgpu_rdc_case_name()))
-      return pvrgpu_estimate_deqp_fbo_default_framebuffer_blit_texel_fetches(
-         observation,
-         draw_count,
-         pvrgpu_deqp_fbo_default_framebuffer_direct_color_counter_case(
-            pvrgpu_rdc_case_name()));
-
-   return pvrgpu_estimate_deqp_texture_filtering_texel_fetches(observation,
-                                                               draw_count);
-}
-
-static unsigned
-pvrgpu_indexed_quad_lock_draw_count(bool has_fragment_texture)
-{
-   unsigned fbo_draw_count = 0;
-   if (pvrgpu_deqp_fbo_default_framebuffer_blit_draw_count(&fbo_draw_count))
-      return fbo_draw_count;
-
-   return has_fragment_texture ? 4 : 2;
 }
 
 static bool
@@ -12071,15 +11889,6 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
 {
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
 
-   if (pvrgpu_case_suppresses_draw_commands()) {
-      ctx->observed_draws++;
-      pvrgpu_counter_eventf("draw_suppressed",
-                            "case=%s total=%u",
-                            pvrgpu_command_case_name("none"),
-                            ctx->observed_draws);
-      return;
-   }
-
    unsigned requested_width = 0;
    unsigned requested_height = 0;
    const bool has_requested_extent =
@@ -13256,12 +13065,7 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
       }
       if (!ctx->driver_indexed_quad_command_locked)
          ctx->indexed_quad_draws++;
-      unsigned api_visible_draw_count = 0;
-      const unsigned logged_draw_count =
-         pvrgpu_deqp_fbo_default_framebuffer_blit_draw_count(
-            &api_visible_draw_count)
-            ? api_visible_draw_count
-            : ctx->indexed_quad_draws;
+      const unsigned logged_draw_count = ctx->indexed_quad_draws;
       pvrgpu_counter_eventf("draw_indexed_quad",
                             "start=%u count=%u mode=%u index_size=%u "
                             "case=%s "
@@ -13296,11 +13100,7 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
                             ctx->max_framebuffer_width,
                             ctx->max_framebuffer_height,
                             logged_draw_count,
-                            (unsigned long long)
-                               pvrgpu_estimate_indexed_quad_texel_fetches(
-                                  ctx,
-                                  &indexed_quad,
-                                  logged_draw_count),
+                            (unsigned long long)0,
                             ctx->observed_draws);
       if (ctx->indexed_quad_draws != 0)
          pvrgpu_emit_draw_indexed_quad_command(ctx, &indexed_quad);

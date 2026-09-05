@@ -81,7 +81,14 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
 
         self.assertNotIn("ctx->driver_counter_sequence_command_emitted ||", body)
         self.assertNotIn("ctx->driver_counter_sequence_command_emitted = true;", body)
-        self.assertIn("pvrgpu_indexed_quad_lock_draw_count", body)
+        # The lock count comes from the observed quad, never from the
+        # capture's name: a dEQP group used to supply it through RenderDoc's
+        # draw-action metadata.
+        self.assertIn("observation->has_fragment_texture ? 4u : 2u", body)
+        # The name may label the capsule, but must not decide a counter.
+        self.assertNotIn("blit_draw_count", body)
+        self.assertNotIn("direct_color_fbo_blit", body)
+        self.assertNotIn("estimate_indexed_quad_texel_fetches", body)
         self.assertIn("ctx->driver_indexed_quad_command_locked = true;", body)
 
     def test_rdc_output_extent_is_not_polluted_by_historical_framebuffers(self) -> None:
@@ -315,8 +322,12 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("pvrgpu_counter_eventf(\"draw_textured_triangles\"", context)
         self.assertIn("pvrgpu_has_observable_fragment_constants", context)
         self.assertIn("pvrgpu_counter_eventf(\"draw_uniform_triangles\"", context)
-        self.assertIn("pvrgpu_case_suppresses_draw_commands", context)
-        self.assertIn("pvrgpu_counter_eventf(\"draw_suppressed\"", context)
+        # No draw is dropped, and no counter is fitted, because of the
+        # capture's name.
+        self.assertNotIn("pvrgpu_case_suppresses_draw_commands", context)
+        self.assertNotIn("draw_suppressed", context)
+        self.assertNotIn("pvrgpu_estimate_indexed_quad_texel_fetches", context)
+        self.assertNotIn("per_64x64_draw", context)
         self.assertIn("pvrgpu_counter_eventf(\"set_framebuffer_state\"", context)
         self.assertIn("pvrgpu_counter_eventf(\"flush\"", context)
         self.assertIn("pvrgpu_counter_eventf(\"context_destroy_begin\"", context)
@@ -362,7 +373,9 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("pvrgpu_fill_surface_rect_with_clear_color", clear)
         self.assertIn("pvrgpu_apply_zero_draw_output_extent", clear)
         self.assertIn("output_target_changed", clear)
-        self.assertIn("negative_coverage.callbacks.buffer.", clear)
+        # A clear states the colour the application asked for; one dEQP group
+        # used to have its alpha forced to zero by name.
+        self.assertNotIn("negative_coverage", clear)
         self.assertIn("UINT32_C(0x3f800000)", clear)
         self.assertIn("PVRGPU_SYSTEMC_JSONL_OUT", clear)
         self.assertIn("PVRGPU_SYSTEMC_JSONL_OUT", context)

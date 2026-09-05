@@ -167,9 +167,7 @@ MemoryAccessStats MaterializeSequenceColorMipChain(
 
 namespace {
 
-inline constexpr float kDefaultLinearCoordinateRoundThreshold = 0.5F;
-inline constexpr float kGlbenchTrilinear04CoordinateRoundThreshold =
-    0.5F - 1.0F / 256.0F;
+inline constexpr float kLinearCoordinateRoundThreshold = 0.5F;
 
 std::uint32_t DebugFragmentCoordinate(const char *name,
                                       std::uint32_t fallback) {
@@ -557,7 +555,7 @@ TextureLinearAxis ComputeTextureLinearRepeat(float coordinate,
   const float remainder = scaled - scaled_floor;
   if (remainder > round_threshold ||
       (remainder == round_threshold &&
-       (round_threshold != kDefaultLinearCoordinateRoundThreshold ||
+       (round_threshold != kLinearCoordinateRoundThreshold ||
         (rounded & INT64_C(1)) != 0))) {
     ++rounded;
   }
@@ -961,9 +959,7 @@ void TextureUnit::SampleRunForStage(
     const bool mip_linear_requested =
         decoded_sampler.mip_filter == TextureFilter::kLinear;
     const float linear_coordinate_round_threshold =
-        state.functional_case == FunctionalCase::kFillTexTrilinearLinear04
-            ? kGlbenchTrilinear04CoordinateRoundThreshold
-            : kDefaultLinearCoordinateRoundThreshold;
+        kLinearCoordinateRoundThreshold;
 
     // LODM=NORMAL is a quad operation, not four unrelated scalar requests.
     // Preserve the PDS/USC spatial identity and compute one derivative result
