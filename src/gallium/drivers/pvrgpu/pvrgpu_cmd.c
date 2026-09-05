@@ -170,7 +170,9 @@ pvrgpu_cmd_format_supported(const char *format)
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_B5G6R5) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R10G10B10A2) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_B10G10R10A2) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R32UI) == 0);
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R32UI) == 0 ||
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RG32UI) == 0 ||
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32UI) == 0);
 }
 
 /*
@@ -446,17 +448,18 @@ pvrgpu_submit_systemc_api(const struct pvrgpu_systemc_driver_command *command,
  * is exactly the pre-existing behaviour.
  */
 bool
-pvrgpu_systemc_flush_readback_rgba8(uint32_t width,
-                                    uint32_t height,
-                                    uint8_t *pixels,
-                                    size_t pixels_size,
-                                    bool *out_written,
-                                    char *error,
-                                    size_t error_size)
+pvrgpu_systemc_flush_readback_pixels(uint32_t width,
+                                     uint32_t height,
+                                     uint32_t bytes_per_pixel,
+                                     uint8_t *pixels,
+                                     size_t pixels_size,
+                                     bool *out_written,
+                                     char *error,
+                                     size_t error_size)
 {
    if (out_written)
       *out_written = false;
-   if (!pixels || width == 0 || height == 0)
+   if (!pixels || width == 0 || height == 0 || bytes_per_pixel == 0)
       return false;
 
    const char *library_path = pvrgpu_nonempty_env("PVRGPU_SYSTEMC_API_LIB");
@@ -490,6 +493,7 @@ pvrgpu_systemc_flush_readback_rgba8(uint32_t width,
    readback.version = PVRGPU_SYSTEMC_API_VERSION;
    readback.width = width;
    readback.height = height;
+   readback.bytes_per_pixel = bytes_per_pixel;
    readback.pixels = pixels;
    readback.pixels_size = pixels_size;
 
@@ -822,12 +826,14 @@ pvrgpu_cmd_validate_draw_pco_triangles(
                                                   cmd->height);
    /*
     * The colour formats the model can write a draw into: four UNORM8 channels,
-    * or one raw 32-bit integer.  The others are describable in a clear capsule
-    * but the PBE has no packing for them yet.
+    * or one, two or four raw 32-bit integer channels.  The others are
+    * describable in a clear capsule but the PBE has no packing for them yet.
     */
    const bool format_ok =
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8) == 0 ||
-      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_R32UI) == 0;
+      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_R32UI) == 0 ||
+      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RG32UI) == 0 ||
+      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32UI) == 0;
    if (!resolution_ok || !format_ok) {
       /*
        * Say which half of the requirement failed and with what.  A

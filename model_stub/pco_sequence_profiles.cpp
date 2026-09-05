@@ -21,12 +21,17 @@ constexpr char kDrawPcoTriangles[] = "draw_pco_triangles";
 constexpr char kDrawPcoSequence[] = "draw_pco_sequence";
 constexpr char kRgba8[] = "PIPE_FORMAT_R8G8B8A8_UNORM";
 constexpr char kR32Ui[] = "PIPE_FORMAT_R32_UINT";
+constexpr char kRg32Ui[] = "PIPE_FORMAT_R32G32_UINT";
+constexpr char kRgba32Ui[] = "PIPE_FORMAT_R32G32B32A32_UINT";
 
 // The colour formats the PBE can write a generic draw into: four UNORM8
-// channels, or one raw 32-bit integer.  dEQP's shader tests render into the
-// latter, and requiring RGBA8 refused every one of them.
+// channels, or one, two or four raw 32-bit integer channels.  dEQP's shader
+// tests render into the integer ones -- a scalar result into R32_UINT, a vec2
+// into RG32UI, a vec3 or vec4 into RGBA32UI -- and requiring RGBA8 refused
+// every one of them.
 bool IsGenericDrawFormat(const std::string &format) {
-  return format == kRgba8 || format == kR32Ui;
+  return format == kRgba8 || format == kR32Ui || format == kRg32Ui ||
+         format == kRgba32Ui;
 }
 constexpr char kRgbx8[] = "PIPE_FORMAT_R8G8B8X8_UNORM";
 constexpr char kZ32[] = "PIPE_FORMAT_Z32_UNORM";

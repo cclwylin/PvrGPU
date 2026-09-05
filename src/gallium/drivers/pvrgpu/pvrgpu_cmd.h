@@ -22,11 +22,16 @@ extern "C" {
 #define PVRGPU_DRIVER_COMMAND_FORMAT_R10G10B10A2 "PIPE_FORMAT_R10G10B10A2_UNORM"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_B10G10R10A2 "PIPE_FORMAT_B10G10R10A2_UNORM"
 /*
- * A single-channel 32-bit integer attachment.  Its pixel is the fragment
- * shader's PIXOUT0 verbatim rather than four UNORM8 channels, which is what
- * dEQP's shader tests render into.
+ * The 32-bit integer attachments.  Their pixel is the fragment shader's PIXOUT
+ * lanes verbatim -- one dword per channel -- rather than four UNORM8 channels,
+ * which is what dEQP's shader tests render into: a scalar result goes to
+ * R32_UINT, a vec2 to RG32UI, and a vec3 or vec4 to RGBA32UI, GLES having no
+ * three-channel integer target.  A pixel is therefore 4, 8 or 16 bytes wide
+ * and nothing downstream may assume four.
  */
 #define PVRGPU_DRIVER_COMMAND_FORMAT_R32UI "PIPE_FORMAT_R32_UINT"
+#define PVRGPU_DRIVER_COMMAND_FORMAT_RG32UI "PIPE_FORMAT_R32G32_UINT"
+#define PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32UI "PIPE_FORMAT_R32G32B32A32_UINT"
 
 struct pvrgpu_clear_color_command {
    const char *case_name;
@@ -327,19 +332,23 @@ pvrgpu_pco_binary_is_executable(uint32_t stage,
                                 size_t error_size);
 
 /*
- * Run everything submitted since the last flush and copy the RGBA8 result into
- * `pixels`.  `*out_written` says whether the model actually published pixels
- * for this surface; when it did not, `pixels` is untouched.  Returns false
- * only when the flush itself failed.
+ * Run everything submitted since the last flush and copy the result into
+ * `pixels`.  `bytes_per_pixel` is the attachment's stored pixel width -- four
+ * for UNORM8, four per 32-bit channel for an integer attachment -- and a
+ * readback that does not name the width the model rendered publishes nothing.
+ * `*out_written` says whether the model actually published pixels for this
+ * surface; when it did not, `pixels` is untouched.  Returns false only when
+ * the flush itself failed.
  */
 bool
-pvrgpu_systemc_flush_readback_rgba8(uint32_t width,
-                                    uint32_t height,
-                                    uint8_t *pixels,
-                                    size_t pixels_size,
-                                    bool *out_written,
-                                    char *error,
-                                    size_t error_size);
+pvrgpu_systemc_flush_readback_pixels(uint32_t width,
+                                     uint32_t height,
+                                     uint32_t bytes_per_pixel,
+                                     uint8_t *pixels,
+                                     size_t pixels_size,
+                                     bool *out_written,
+                                     char *error,
+                                     size_t error_size);
 
 bool
 pvrgpu_driver_draw_command_has_been_emitted(void);

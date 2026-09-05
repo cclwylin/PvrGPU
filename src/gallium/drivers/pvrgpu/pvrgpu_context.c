@@ -802,6 +802,10 @@ pvrgpu_command_format_for_framebuffer(const struct pvrgpu_context *ctx)
       return PVRGPU_DRIVER_COMMAND_FORMAT_B10G10R10A2;
    case PIPE_FORMAT_R32_UINT:
       return PVRGPU_DRIVER_COMMAND_FORMAT_R32UI;
+   case PIPE_FORMAT_R32G32_UINT:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_RG32UI;
+   case PIPE_FORMAT_R32G32B32A32_UINT:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32UI;
    default:
       return PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8;
    }

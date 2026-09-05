@@ -84,6 +84,7 @@ SubmitAndFlushClear(pvrgpu_systemc_submit_info *info,
   readback.version = PVRGPU_SYSTEMC_API_VERSION;
   readback.width = kWidth;
   readback.height = kHeight;
+  readback.bytes_per_pixel = 4;
   readback.pixels = pixels.data();
   readback.pixels_size = pixels.size();
   error.fill(0);
@@ -150,6 +151,7 @@ int main() {
   idle.version = PVRGPU_SYSTEMC_API_VERSION;
   idle.width = kWidth;
   idle.height = kHeight;
+  idle.bytes_per_pixel = 4;
   idle.pixels = untouched.data();
   idle.pixels_size = untouched.size();
   std::array<char, 512> error{};
@@ -219,6 +221,7 @@ int main() {
   drawn_readback.version = PVRGPU_SYSTEMC_API_VERSION;
   drawn_readback.width = kWidth;
   drawn_readback.height = kHeight;
+  drawn_readback.bytes_per_pixel = 4;
   drawn_readback.pixels = drawn.data();
   drawn_readback.pixels_size = drawn.size();
   error.fill(0);
@@ -256,6 +259,7 @@ int main() {
   again.version = PVRGPU_SYSTEMC_API_VERSION;
   again.width = kWidth;
   again.height = kHeight;
+  again.bytes_per_pixel = 4;
   again.pixels = repeat.data();
   again.pixels_size = repeat.size();
   error.fill(0);

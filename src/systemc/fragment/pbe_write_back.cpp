@@ -48,8 +48,12 @@ void PbeWriteBack::Run() {
     if (!HasPoolHandle(state.pbe_framebuffer))
       throw std::runtime_error("PbeWriteBack received no PBE framebuffer");
 
+    // A pixel is four bytes only while the attachment packs UNORM8 channels.
+    // An integer attachment stores a dword per channel, and the byte counts
+    // this stage reports and moves have to follow it.
     const std::uint64_t expected_bytes =
-        static_cast<std::uint64_t>(state.width) * state.height * 4U;
+        static_cast<std::uint64_t>(state.width) * state.height *
+        ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
     if (expected_bytes == 0 || state.framebuffer_bytes != expected_bytes ||
         pool_.Read(state.pbe_framebuffer).size() != expected_bytes) {
       throw std::runtime_error(

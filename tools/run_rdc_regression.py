@@ -80,6 +80,19 @@ def find_pvrgpu_binary(explicit: Optional[Path] = None) -> Optional[Path]:
     return None
 
 
+# Suites this harness no longer discovers.
+#
+# The dEQP RDC captures are retired: dEQP is covered through the dEQP UI path
+# (script/deqp_dynamic_ui.py, and script/run_deqp_group_sample.sh for the
+# 24-group sweep), which reports dEQP's own Pass/Fail/NotSupported per case.
+# Replaying the 1809 captures here earned nothing in exchange for the time --
+# no pass/fail baseline was ever recorded for them, so a failure among them
+# could not be attributed to the change under test.
+RETIRED_SUITES = {
+    "2.dEQP": "dEQP is covered through the dEQP UI path; see script/README.md",
+}
+
+
 def discover_rdc_patterns(
     root: Path,
     out_root: Path,
@@ -88,6 +101,7 @@ def discover_rdc_patterns(
 ) -> List[TestCase]:
     cases: List[TestCase] = []
     regex = re.compile(pattern_regex) if pattern_regex else None
+    announced: set = set()
 
     if not root.is_dir():
         print(f"Warning: pattern root does not exist: {root}", file=sys.stderr)
@@ -103,6 +117,17 @@ def discover_rdc_patterns(
         rel_path = path.relative_to(root)
         parts = rel_path.parts
         suite = parts[0] if parts else "root"
+
+        # Say it once rather than per capture, and say it even when the suite
+        # was asked for by name -- a silent empty run reads as "nothing to do".
+        if suite in RETIRED_SUITES:
+            if suite not in announced:
+                announced.add(suite)
+                print(
+                    f"Skipping retired suite {suite}: {RETIRED_SUITES[suite]}",
+                    file=sys.stderr,
+                )
+            continue
 
         if suite_filter and suite_filter.lower() not in suite.lower():
             continue

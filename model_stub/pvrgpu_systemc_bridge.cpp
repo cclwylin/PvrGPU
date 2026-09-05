@@ -875,20 +875,40 @@ bool CopyPcoSequenceDraw(
     const pvrgpu_systemc_driver_command &source,
     std::size_t ordinal, pvrgpu::stub::DriverCommand *destination,
     std::string *error) {
-  if (!destination || !error ||
-      source.version != PVRGPU_SYSTEMC_API_VERSION ||
-      !source.command || std::string_view(source.command) !=
-                             "draw_pco_triangles" ||
-      !source.case_name || !source.case_name[0] || !source.format ||
-      // The colour formats the PBE can write a draw into: four UNORM8
-      // channels, or one raw 32-bit integer.
-      (std::string_view(source.format) != "PIPE_FORMAT_R8G8B8A8_UNORM" &&
-       std::string_view(source.format) != "PIPE_FORMAT_R32_UINT") ||
-      !PcoSequenceTailIsEmpty(source)) {
-    if (error)
-      *error = "SystemC API nested PCO sequence draw header is invalid";
+  if (!destination || !error)
     return false;
+  /*
+   * Name the field that failed.  Bundled into one boolean, every one of these
+   * reported the same sentence, so each new colour format or command shape
+   * cost a debugging cycle just to tell which half had refused.
+   */
+  const auto refuse = [&error](const std::string &what) {
+    *error = "SystemC API nested PCO sequence draw header is invalid: " + what;
+    return false;
+  };
+  if (source.version != PVRGPU_SYSTEMC_API_VERSION) {
+    return refuse("version=" + std::to_string(source.version) +
+                  " expected=" + std::to_string(PVRGPU_SYSTEMC_API_VERSION));
   }
+  if (!source.command ||
+      std::string_view(source.command) != "draw_pco_triangles") {
+    return refuse(std::string("command=") +
+                  (source.command ? source.command : "<none>"));
+  }
+  if (!source.case_name || !source.case_name[0])
+    return refuse("case_name is empty");
+  // The colour formats the PBE can write a draw into: four UNORM8 channels, or
+  // one, two or four raw 32-bit integer channels.
+  if (!source.format ||
+      (std::string_view(source.format) != "PIPE_FORMAT_R8G8B8A8_UNORM" &&
+       std::string_view(source.format) != "PIPE_FORMAT_R32_UINT" &&
+       std::string_view(source.format) != "PIPE_FORMAT_R32G32_UINT" &&
+       std::string_view(source.format) != "PIPE_FORMAT_R32G32B32A32_UINT")) {
+    return refuse(std::string("format=") +
+                  (source.format ? source.format : "<none>"));
+  }
+  if (!PcoSequenceTailIsEmpty(source))
+    return refuse("the command carries a nested PCO sequence tail");
   const std::uint64_t end_vertex =
       static_cast<std::uint64_t>(source.first_vertex) + source.vertex_count;
   const bool triangles = source.primitive_mode == 4;
@@ -1980,12 +2000,14 @@ extern "C" int pvrgpu_systemc_flush_readback(
     return 2;
   }
   readback->pixels_written = 0;
-  if (!readback->pixels || readback->width == 0 || readback->height == 0) {
+  if (!readback->pixels || readback->width == 0 || readback->height == 0 ||
+      readback->bytes_per_pixel == 0) {
     CopyError(error, error_size, "missing SystemC API readback destination");
     return 2;
   }
   const std::uint64_t required = static_cast<std::uint64_t>(readback->width) *
-                                 readback->height * 4U;
+                                 readback->height *
+                                 readback->bytes_per_pixel;
   if (static_cast<std::uint64_t>(readback->pixels_size) < required) {
     CopyError(error, error_size,
               "SystemC API readback destination is too small");
@@ -2014,7 +2036,8 @@ extern "C" int pvrgpu_systemc_flush_readback(
    * caller keep its own contents.
    */
   if (framebuffer.width != readback->width ||
-      framebuffer.height != readback->height)
+      framebuffer.height != readback->height ||
+      framebuffer.bytes_per_pixel != readback->bytes_per_pixel)
     return 0;
 
   std::memcpy(readback->pixels, framebuffer.pixels.data(),

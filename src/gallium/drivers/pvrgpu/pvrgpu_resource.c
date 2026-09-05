@@ -986,13 +986,14 @@ pvrgpu_resource_is_current_color_attachment(
 }
 
 /*
- * The colour surfaces the model's RGBA8 output can be stored into.
+ * The colour surfaces the model's output can be stored into.
  *
- * The model publishes R,G,B,A byte order.  A surface that names the same four
- * 8-bit channels in another order holds the same bytes rearranged, so it is
- * served by reordering them on the way in.  Anything else -- a wider channel,
- * a packed 5:6:5 -- would need a conversion nobody has specified, and is left
- * to the path that already serves it.
+ * For a UNORM8 surface the model publishes R,G,B,A byte order, and a surface
+ * that names the same four 8-bit channels in another order holds the same
+ * bytes rearranged, so it is served by reordering them on the way in.  For an
+ * integer surface it publishes the stored pixel itself.  Anything else -- a
+ * packed 5:6:5, a float channel -- would need a conversion nobody has
+ * specified, and is left to the path that already serves it.
  */
 static bool
 pvrgpu_resource_readback_format_is_supported(enum pipe_format format)
@@ -1003,11 +1004,13 @@ pvrgpu_resource_readback_format_is_supported(enum pipe_format format)
    case PIPE_FORMAT_B8G8R8A8_UNORM:
    case PIPE_FORMAT_B8G8R8X8_UNORM:
    /*
-    * A single-channel 32-bit integer attachment: the model publishes the
-    * shader's PIXOUT0 verbatim, which is already the stored pixel, so it needs
-    * no reordering at all.
+    * The 32-bit integer attachments: the model publishes the shader's PIXOUT
+    * lanes verbatim, one dword per channel, which is already the stored pixel,
+    * so they need no reordering at all -- only the right pixel width.
     */
    case PIPE_FORMAT_R32_UINT:
+   case PIPE_FORMAT_R32G32_UINT:
+   case PIPE_FORMAT_R32G32B32A32_UINT:
       return true;
    default:
       return false;
@@ -1015,21 +1018,47 @@ pvrgpu_resource_readback_format_is_supported(enum pipe_format format)
 }
 
 /*
- * Store one row of the model's RGBA8 output in the surface's byte order.
+ * The stored width of one of those pixels.
  *
- * The layout matches pvrgpu_store_clear_color_pixel() channel for channel,
- * including an X8 format's ignored alpha lane reading back as one.  A pixel a
- * draw covered and a pixel only the clear touched therefore agree, which they
- * would not if the draw's alpha were carried through verbatim.
+ * The model's framebuffer is as wide as the attachment it rendered, so this is
+ * what sizes the staging buffer, what the flush must be told, and what a row
+ * copies.  Deriving it in each of those places separately is how a buffer ends
+ * up read at a width nobody wrote it at.
+ */
+static unsigned
+pvrgpu_resource_readback_bytes_per_pixel(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R32G32_UINT:
+      return 8u;
+   case PIPE_FORMAT_R32G32B32A32_UINT:
+      return 16u;
+   default:
+      return 4u;
+   }
+}
+
+/*
+ * Store one row of the model's output in the surface's byte order.
+ *
+ * For a UNORM8 surface the layout matches pvrgpu_store_clear_color_pixel()
+ * channel for channel, including an X8 format's ignored alpha lane reading
+ * back as one.  A pixel a draw covered and a pixel only the clear touched
+ * therefore agree, which they would not if the draw's alpha were carried
+ * through verbatim.
  */
 static void
 pvrgpu_resource_readback_store_row(enum pipe_format format,
                                    uint8_t *destination,
-                                   const uint8_t *rgba8,
+                                   const uint8_t *source_row,
                                    unsigned width)
 {
-   if (format == PIPE_FORMAT_R32_UINT) {
-      memcpy(destination, rgba8, (size_t)width * 4u);
+   if (format == PIPE_FORMAT_R32_UINT ||
+       format == PIPE_FORMAT_R32G32_UINT ||
+       format == PIPE_FORMAT_R32G32B32A32_UINT) {
+      /* An integer pixel is already stored as the model published it. */
+      memcpy(destination, source_row,
+             (size_t)width * pvrgpu_resource_readback_bytes_per_pixel(format));
       return;
    }
    const bool swap_red_blue = format == PIPE_FORMAT_B8G8R8A8_UNORM ||
@@ -1038,12 +1067,12 @@ pvrgpu_resource_readback_store_row(enum pipe_format format,
                        format == PIPE_FORMAT_B8G8R8X8_UNORM;
 
    if (!swap_red_blue && !opaque) {
-      memcpy(destination, rgba8, (size_t)width * 4u);
+      memcpy(destination, source_row, (size_t)width * 4u);
       return;
    }
 
    for (unsigned x = 0; x < width; ++x) {
-      const uint8_t *source = rgba8 + (size_t)x * 4u;
+      const uint8_t *source = source_row + (size_t)x * 4u;
       uint8_t *pixel = destination + (size_t)x * 4u;
       const uint8_t r = source[0];
       const uint8_t b = source[2];
@@ -1117,7 +1146,10 @@ pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
    if (width == 0 || height == 0)
       return;
 
-   const size_t pixels_size = (size_t)width * (size_t)height * 4u;
+   const unsigned bytes_per_pixel =
+      pvrgpu_resource_readback_bytes_per_pixel(resource->format);
+   const size_t pixels_size =
+      (size_t)width * (size_t)height * (size_t)bytes_per_pixel;
    uint8_t *pixels = MALLOC(pixels_size);
    if (!pixels)
       return;
@@ -1127,8 +1159,9 @@ pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
    bool written = false;
    char error[512] = { 0 };
    const bool flushed =
-      pvrgpu_systemc_flush_readback_rgba8(width, height, pixels, pixels_size,
-                                          &written, error, sizeof(error));
+      pvrgpu_systemc_flush_readback_pixels(width, height, bytes_per_pixel,
+                                           pixels, pixels_size, &written,
+                                           error, sizeof(error));
    if (!flushed || !written) {
       if (!flushed) {
          debug_printf("pvrgpu: %s\n",
@@ -1145,10 +1178,11 @@ pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
    uint8_t *destination = pvrgpu->data + pvrgpu->level_offsets[level];
    const unsigned stride = pvrgpu->level_strides[level];
    for (unsigned row = 0; row < height; ++row) {
-      pvrgpu_resource_readback_store_row(resource->format,
-                                         destination + (size_t)row * stride,
-                                         pixels + (size_t)row * (size_t)width * 4u,
-                                         width);
+      pvrgpu_resource_readback_store_row(
+         resource->format,
+         destination + (size_t)row * stride,
+         pixels + (size_t)row * (size_t)width * (size_t)bytes_per_pixel,
+         width);
    }
    FREE(pixels);
 

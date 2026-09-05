@@ -31,6 +31,8 @@ config/*.env
 config/local.env
 
 # Generated runtime artifacts
+# CTest writes Testing/Temporary/ into whatever directory it was invoked from.
+Testing/
 *.log
 *.jsonl
 *.qpa

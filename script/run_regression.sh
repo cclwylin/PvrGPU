@@ -6,8 +6,12 @@
 #   ./script/run_regression.sh                       # Run all patterns (default: 4 jobs)
 #   ./script/run_regression.sh --suite GLBench       # Run only GLBench patterns
 #   ./script/run_regression.sh --suite glmark2       # Run only glmark2 patterns
-#   ./script/run_regression.sh --suite dEQP --limit 50 # Run first 50 dEQP patterns
 #   ./script/run_regression.sh --suite GFXBench      # Run only GFXBench patterns
+#
+# dEQP is not run from here.  The dEQP RDC captures are retired -- see
+# RETIRED_SUITES in tools/run_rdc_regression.py -- and dEQP is covered through
+# the dEQP UI path instead: script/deqp_dynamic_ui.py, and
+# script/run_deqp_group_sample.sh for the 24-group sweep.
 #   ./script/run_regression.sh --skip-passed         # Resume / skip already passed tests
 #   ./script/run_regression.sh --list-only           # Just list discovered patterns
 #   ./script/run_regression.sh -j 8                  # Run with 8 parallel workers

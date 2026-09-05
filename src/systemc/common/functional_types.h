@@ -320,6 +320,17 @@ bool StencilPass(DepthCompareOp op, std::uint8_t reference,
 // ABI. These helpers centralize the exact little-endian UNORM attachment
 // conversion used by Submitter, ISP and FragmentFrontend.
 std::size_t DepthAttachmentBytesPerPixel(std::uint32_t format);
+
+// One colour pixel's stored width, from the channel count in
+// PipelineState::color_attachment_raw_dwords.  An integer attachment stores
+// that many 32-bit channels verbatim; every other attachment the PBE packs is
+// four UNORM8 channels.  The PBE, its write-back and the readback all size
+// their framebuffer through here, so a wider attachment widens all three at
+// once instead of overrunning a buffer one of them still thought was 4 bytes
+// per pixel.
+constexpr std::size_t ColorAttachmentBytesPerPixel(std::uint8_t raw_dwords) {
+  return raw_dwords != 0 ? static_cast<std::size_t>(raw_dwords) * 4U : 4U;
+}
 std::uint32_t EncodeDepthAttachmentUnorm(float depth, std::uint32_t format);
 float DecodeDepthAttachmentUnorm(std::uint32_t encoded,
                                  std::uint32_t format);

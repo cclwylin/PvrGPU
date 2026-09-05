@@ -21,11 +21,14 @@ struct ModelFramebuffer {
   std::vector<std::uint8_t> pixels;
   std::uint32_t width = 0;
   std::uint32_t height = 0;
+  // Four while the attachment packs UNORM8 channels; an integer attachment
+  // stores one 32-bit channel per dword and is 8 or 16 bytes wide.
+  std::uint32_t bytes_per_pixel = 4;
 
   bool valid() const {
-    return width != 0 && height != 0 &&
+    return width != 0 && height != 0 && bytes_per_pixel != 0 &&
            static_cast<std::uint64_t>(pixels.size()) ==
-               static_cast<std::uint64_t>(width) * height * 4U;
+               static_cast<std::uint64_t>(width) * height * bytes_per_pixel;
   }
 };
 

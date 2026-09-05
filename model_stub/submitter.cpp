@@ -294,7 +294,9 @@ bool DriverIdeasPcoSequenceCommandSupported(const DriverCommand &command) {
   if (!layout || !topology ||
       !PcoSingleDrawResolutionSupported(command) ||
       (command.format != "PIPE_FORMAT_R8G8B8A8_UNORM" &&
-       command.format != "PIPE_FORMAT_R32_UINT") ||
+       command.format != "PIPE_FORMAT_R32_UINT" &&
+       command.format != "PIPE_FORMAT_R32G32_UINT" &&
+       command.format != "PIPE_FORMAT_R32G32B32A32_UINT") ||
       command.clear_color_bits != kOpaqueBlack || command.first_vertex != 0 ||
       command.instance_count != 1 || command.indexed > 1 ||
       command.vertex_pco.empty() || command.fragment_pco.empty() ||
@@ -428,7 +430,9 @@ bool DriverPcoTrianglesCommandSupported(const DriverCommand &command) {
       command.vertex_pco_abi.vertex_inputs == 12;
   if (!PcoSingleDrawResolutionSupported(command) ||
       (command.format != "PIPE_FORMAT_R8G8B8A8_UNORM" &&
-       command.format != "PIPE_FORMAT_R32_UINT") ||
+       command.format != "PIPE_FORMAT_R32_UINT" &&
+       command.format != "PIPE_FORMAT_R32G32_UINT" &&
+       command.format != "PIPE_FORMAT_R32G32B32A32_UINT") ||
       command.clear_color_bits != kOpaqueBlack ||
       (!conditionals_layout && !lit_mesh_layout && !texture_layout &&
        !color_layout) ||
@@ -1457,12 +1461,14 @@ void Submitter::RunJob() {
       state.extra_framebuffer_gpu_address[target - 1] =
           kDriverPcoMrtColorAddressBase + slot * kDriverPcoSequenceAttachmentStride;
       state.extra_framebuffer_bytes[target - 1] =
-          static_cast<std::uint64_t>(state.width) * state.height * 4U;
+          static_cast<std::uint64_t>(state.width) * state.height *
+          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
     }
     if (driver_pco_sequence_command) {
       state.framebuffer_gpu_address = sequence_color_addresses[submission];
       const std::uint64_t color_bytes =
-          static_cast<std::uint64_t>(state.width) * state.height * 4U;
+          static_cast<std::uint64_t>(state.width) * state.height *
+          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
       if (command.color_attachment_source_command_index !=
           kDriverPcoNewAttachment) {
         if (color_bytes == 0 ||
@@ -1574,8 +1580,18 @@ void Submitter::RunJob() {
       state.fragment_varying_count =
           command.fragment_varying_count;
       state.fragment_output_mask = command.fragment_output_mask[0];
-      state.color_attachment_raw_dword =
-          command.format == "PIPE_FORMAT_R32_UINT" ? 1U : 0U;
+      /*
+       * How many raw 32-bit channels the colour attachment stores, from the
+       * format the driver stated.  dEQP's shader executor renders a scalar
+       * result into R32_UINT, a vec2 into RG32UI and a vec3 or vec4 into
+       * RGBA32UI -- GLES has no three-channel integer target -- so this is
+       * also what widens the framebuffer past four bytes a pixel.
+       */
+      state.color_attachment_raw_dwords =
+          command.format == "PIPE_FORMAT_R32_UINT"            ? 1U
+          : command.format == "PIPE_FORMAT_R32G32_UINT"       ? 2U
+          : command.format == "PIPE_FORMAT_R32G32B32A32_UINT" ? 4U
+                                                              : 0U;
       state.vertex_sampled_texture_count =
           command.vertex_sampled_texture_count;
       state.sampled_texture_count =

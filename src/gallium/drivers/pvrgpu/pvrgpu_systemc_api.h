@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 /* API-v14 states the PIXOUT lanes each colour attachment expects. */
-#define PVRGPU_SYSTEMC_API_VERSION 14u
+#define PVRGPU_SYSTEMC_API_VERSION 15u
 /*
  * Draws one sequence may describe; must match the model's own bound.  This is
  * independent of how many attachments the sequence creates, which the model's
@@ -379,6 +379,13 @@ struct pvrgpu_systemc_readback_info {
    uint32_t version;
    uint32_t width;
    uint32_t height;
+   /*
+    * The stored width of one pixel.  Four for a UNORM8 attachment; an integer
+    * attachment stores one 32-bit channel per dword, so RG32UI is eight and
+    * RGBA32UI sixteen.  The model refuses a readback whose pixel width is not
+    * the one it rendered rather than reinterpreting the bytes.
+    */
+   uint32_t bytes_per_pixel;
    uint8_t *pixels;
    size_t pixels_size;
    uint32_t pixels_written;

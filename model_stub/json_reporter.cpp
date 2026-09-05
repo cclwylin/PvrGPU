@@ -622,16 +622,23 @@ void DebugSequenceAttachments(const MemoryPool &pool,
         "JsonReporter attachment debug has no DRAM framebuffer");
   const std::vector<std::uint8_t> color =
       LoadArray<std::uint8_t>(pool, state.dram_framebuffer);
+  // An integer attachment stores a dword per channel, so a pixel here is 4, 8
+  // or 16 bytes.  The RGB tallies and the sampled words below therefore read
+  // the pixel's first four bytes, which are a colour only on a UNORM8
+  // attachment and its first channel on an integer one.
+  const std::size_t debug_bytes_per_pixel = ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
   const std::uint64_t expected_color_bytes =
-      static_cast<std::uint64_t>(state.width) * state.height * 4U;
+      static_cast<std::uint64_t>(state.width) * state.height *
+      debug_bytes_per_pixel;
   if (color.size() != expected_color_bytes)
     throw std::runtime_error(
         "JsonReporter attachment debug color byte count mismatch");
 
   std::size_t nonzero_rgb_pixels = 0;
   std::size_t nonopaque_black_pixels = 0;
-  for (std::size_t pixel = 0; pixel < color.size() / 4U; ++pixel) {
-    const std::size_t offset = pixel * 4U;
+  for (std::size_t pixel = 0; pixel < color.size() / debug_bytes_per_pixel;
+       ++pixel) {
+    const std::size_t offset = pixel * debug_bytes_per_pixel;
     if (color[offset] != 0 || color[offset + 1U] != 0 ||
         color[offset + 2U] != 0) {
       ++nonzero_rgb_pixels;
@@ -670,7 +677,7 @@ void DebugSequenceAttachments(const MemoryPool &pool,
     if (x >= state.width || y >= state.height)
       continue;
     const std::size_t offset =
-        (static_cast<std::size_t>(y) * state.width + x) * 4U;
+        (static_cast<std::size_t>(y) * state.width + x) * debug_bytes_per_pixel;
     std::uint32_t rgba = 0;
     for (std::size_t component = 0; component < 4; ++component)
       rgba |= static_cast<std::uint32_t>(color[offset + component])
@@ -1766,6 +1773,7 @@ void JsonReporter::RunJob() {
     VertexPcoEvidence vertex_pco;
     FragmentPcoEvidence fragment_pco;
     std::vector<std::uint8_t> final_framebuffer;
+    std::uint32_t final_bytes_per_pixel = 4;
     std::uint32_t final_width = 0;
     std::uint32_t final_height = 0;
     std::vector<std::uint64_t> sequence_color_addresses(
@@ -1858,7 +1866,8 @@ void JsonReporter::RunJob() {
               physical_command.depth_attachment_source_command_index !=
                   kDriverPcoNewAttachment;
           const std::uint64_t expected_color_bytes =
-              static_cast<std::uint64_t>(state.width) * state.height * 4U;
+              static_cast<std::uint64_t>(state.width) * state.height *
+              ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
           if (state.color_attachment_load_enable != (color_load ? 1U : 0U) ||
               state.color_attachment_load_bytes !=
                   (color_load ? expected_color_bytes : 0U) ||
@@ -1891,7 +1900,8 @@ void JsonReporter::RunJob() {
         const std::vector<std::uint8_t> framebuffer =
             LoadArray<std::uint8_t>(pool_, state.dram_framebuffer);
         const std::uint64_t expected_framebuffer_bytes =
-            static_cast<std::uint64_t>(state.width) * state.height * 4U;
+            static_cast<std::uint64_t>(state.width) * state.height *
+            ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
         if (state.framebuffer_bytes != expected_framebuffer_bytes ||
             state.counters.framebuffer_dram_readback_bytes !=
                 expected_framebuffer_bytes ||
@@ -1919,6 +1929,8 @@ void JsonReporter::RunJob() {
           aggregate_drawlists.push_back(drawlist);
         }
         final_framebuffer = framebuffer;
+        final_bytes_per_pixel = static_cast<std::uint32_t>(
+            ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords));
         final_width = state.width;
         final_height = state.height;
 
@@ -1952,7 +1964,8 @@ void JsonReporter::RunJob() {
     try {
       if (final_width != options_.width || final_height != options_.height ||
           final_framebuffer.size() !=
-              static_cast<std::uint64_t>(final_width) * final_height * 4U) {
+              static_cast<std::uint64_t>(final_width) * final_height *
+                  final_bytes_per_pixel) {
         throw std::runtime_error(
             "JsonReporter PCO sequence final framebuffer is invalid");
       }
@@ -1977,9 +1990,13 @@ void JsonReporter::RunJob() {
       // before the artifact so a run with no output directory still answers
       // the driver.
       if (job_)
-        job_->PublishFramebuffer(final_framebuffer, final_width, final_height);
+        job_->PublishFramebuffer(final_framebuffer, final_width, final_height,
+                                 final_bytes_per_pixel);
       std::filesystem::path artifact_path;
-      if (!options_.output_dir.empty()) {
+      // An integer attachment's pixel is not an RGBA8 colour, so there is no
+      // PNG to write for one.  The readback above still carries its real
+      // bytes; only the human-facing artifact is skipped.
+      if (!options_.output_dir.empty() && final_bytes_per_pixel == 4U) {
         artifact_path = FramePath(options_, 1);
         // Ordered native PCO sequences publish only the final physical DRAM
         // readback.  No command sidecar/golden/CPU framebuffer is consulted.
@@ -2053,7 +2070,8 @@ void JsonReporter::RunJob() {
       const std::vector<std::uint8_t> framebuffer =
           LoadArray<std::uint8_t>(pool_, state.dram_framebuffer);
       const std::uint64_t expected_framebuffer_bytes =
-          static_cast<std::uint64_t>(state.width) * state.height * 4U;
+          static_cast<std::uint64_t>(state.width) * state.height *
+          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
       if (state.framebuffer_bytes != expected_framebuffer_bytes ||
           state.counters.framebuffer_dram_readback_bytes !=
               expected_framebuffer_bytes ||
@@ -2074,10 +2092,15 @@ void JsonReporter::RunJob() {
           BuildFragmentPcoEvidence(pool_, state);
       // What the driver reads back is the model's own DRAM contents, never the
       // command sidecar the artifact may be overlaid with below.
+      const std::uint32_t frame_bytes_per_pixel = static_cast<std::uint32_t>(
+          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords));
       if (job_)
-        job_->PublishFramebuffer(framebuffer, state.width, state.height);
+        job_->PublishFramebuffer(framebuffer, state.width, state.height,
+                                 frame_bytes_per_pixel);
       std::filesystem::path artifact_path;
-      if (!options_.output_dir.empty()) {
+      // As above: an integer attachment has no RGBA8 rendering, so it gets no
+      // PNG.  The pixels the driver reads back are unaffected.
+      if (!options_.output_dir.empty() && frame_bytes_per_pixel == 4U) {
         artifact_path = FramePath(options_, state.counters.frame);
         std::vector<std::uint8_t> artifact_framebuffer = framebuffer;
         LoadDriverFramebufferSnapshot(options_,

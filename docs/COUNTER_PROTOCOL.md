@@ -522,6 +522,11 @@ DRAM readback completes; for a successful
 RGBA8 frame, `framebuffer_dram_readback_bytes` therefore records the bytes
 actually returned for that artifact.
 
+An integer colour attachment stores one 32-bit channel per dword, so its pixel
+is 4, 8 or 16 bytes rather than four, and `framebuffer_dram_readback_bytes`
+follows the attachment's real width. Such a frame has no RGBA8 rendering and so
+publishes no PNG; the readback the driver copies is unaffected.
+
 `pco_instructions` is the static VS+FS semantic-program total. The six
 stage/class instruction counters are dynamic, repeat-expanded execution totals
 aggregated over DrawLists; `drawlist_stats[]` provides both views and their

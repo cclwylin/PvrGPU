@@ -4,6 +4,13 @@
 | --- | --- |
 | `run_deqp_dynamic.sh` | 執行引擎：把已 build 好的 dEQP binary、PCO driver、PvrGPU bridge 在 runtime 串起來 |
 | `deqp_dynamic_ui.py` | PySide6 桌面前端：預設選單 → 即時 run status → 最後的 dashboard |
+| `run_deqp_group_sample.sh` | 取 `tools/deqp_groups.py` 其中一組的樣本跑，列出 tally 與每個失敗的 QPA 理由（`--list` 列出 24 組）|
+
+**dEQP 一律走這條路。** `script/run_regression.sh` 不跑 dEQP：`2.dEQP` 的 RDC
+capture 已經退役（見 `tools/run_rdc_regression.py` 的 `RETIRED_SUITES`）。那
+1809 個 pattern 從來沒有記錄過 pass/fail 基準，所以其中出現失敗也無法歸因於當
+次改動；而這裡的 runner 回報的是 dEQP 主程式自己對每個 case 的
+Pass/Fail/NotSupported。RDC regression 留給有基準的 GLBench 與 glmark2。
 
 ## 讀一個 PASS 之前
 

@@ -156,7 +156,12 @@ void Pbe::Run() {
 
     const std::uint64_t pixel_count =
         static_cast<std::uint64_t>(state.width) * state.height;
-    if (pixel_count > std::numeric_limits<std::size_t>::max() / 4)
+    // An integer attachment stores one dword per channel, so a pixel is not
+    // always four bytes wide.  Everything below sizes and indexes through
+    // this rather than assuming.
+    const std::size_t bytes_per_pixel =
+        ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
+    if (pixel_count > std::numeric_limits<std::size_t>::max() / bytes_per_pixel)
       throw std::overflow_error("PBE framebuffer size overflow");
     const std::vector<FragmentInvocation> invocations =
         LoadArray<FragmentInvocation>(pool_, state.fragment_invocations);
@@ -167,7 +172,7 @@ void Pbe::Run() {
       throw std::runtime_error("PBE fragment input/output count mismatch");
     }
 
-    const std::uint64_t framebuffer_bytes = pixel_count * 4U;
+    const std::uint64_t framebuffer_bytes = pixel_count * bytes_per_pixel;
     if (state.color_attachment_load_enable > 1 ||
         (state.color_attachment_load_enable != 0) !=
             HasPoolHandle(state.color_attachment_load) ||
@@ -195,16 +200,23 @@ void Pbe::Run() {
         continue;
       }
       attachment.assign(static_cast<std::size_t>(framebuffer_bytes), 0);
-      if (state.color_attachment_raw_dword != 0) {
-        // An integer attachment clears to the raw value, not a colour.
-        std::uint32_t raw = 0;
-        std::memcpy(&raw, &state.raster_state.clear_color[0], sizeof(raw));
-        for (std::size_t pixel = 0; pixel < pixel_count; ++pixel)
-          std::memcpy(attachment.data() + pixel * 4, &raw, sizeof(raw));
+      if (state.color_attachment_raw_dwords != 0) {
+        // An integer attachment clears to the raw value, not a colour, and to
+        // one such value per channel it stores.
+        const std::size_t channels = state.color_attachment_raw_dwords;
+        std::array<std::uint32_t, 4> raw{};
+        for (std::size_t channel = 0; channel < channels; ++channel) {
+          std::memcpy(&raw[channel], &state.raster_state.clear_color[channel],
+                      sizeof(raw[channel]));
+        }
+        for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
+          std::memcpy(attachment.data() + pixel * bytes_per_pixel, raw.data(),
+                      channels * sizeof(std::uint32_t));
+        }
       } else {
         for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
           for (std::size_t component = 0; component < 4; ++component) {
-            attachment[pixel * 4 + component] =
+            attachment[pixel * bytes_per_pixel + component] =
                 FloatValueToUnorm8(state.raster_state.clear_color[component]);
           }
         }
@@ -260,18 +272,23 @@ void Pbe::Run() {
       }
       ++written_map[pixel_index];
       last_submit_ordinal[pixel_index] = output.submit_ordinal;
-      const std::size_t byte_offset = pixel_index * 4;
+      const std::size_t byte_offset = pixel_index * bytes_per_pixel;
       for (std::uint32_t target = 0; target < render_target_count; ++target) {
       std::vector<std::uint8_t> &framebuffer = framebuffers[target];
-      if (state.color_attachment_raw_dword != 0) {
+      if (state.color_attachment_raw_dwords != 0) {
         /*
-         * A single-channel 32-bit integer attachment stores the shader's
-         * PIXOUT0 verbatim.  UNORM8 conversion would quantise a value that was
-         * never a colour, and GLES forbids blending on an integer format, so
-         * this path writes and returns.
+         * A 32-bit integer attachment stores the shader's PIXOUT lanes
+         * verbatim, one dword per channel it holds.  UNORM8 conversion would
+         * quantise a value that was never a colour, and GLES forbids blending
+         * on an integer format, so this path writes and returns.
          */
-        const std::uint32_t raw = output.pixel_output[target * 4];
-        std::memcpy(framebuffer.data() + byte_offset, &raw, sizeof(raw));
+        const std::size_t channels = state.color_attachment_raw_dwords;
+        for (std::size_t channel = 0; channel < channels; ++channel) {
+          const std::uint32_t raw = output.pixel_output[target * 4 + channel];
+          std::memcpy(framebuffer.data() + byte_offset +
+                          channel * sizeof(raw),
+                      &raw, sizeof(raw));
+        }
         continue;
       }
       std::array<std::uint8_t, 4> source{};

@@ -431,8 +431,15 @@
 | `fragment_quads` | `FragmentQuad[]` | FragmentFrontend | PDS Engine |
 | `fragment_shader_lanes`| `FragmentShaderLane[]`| FragmentFrontend | USC Cluster, TextureUnit |
 | `fragment_outputs` | `FragmentOutput[]` | USC Cluster / TextureUnit | PBE |
-| `pbe_framebuffer` | `uint8_t[]` (RGBA8) | PBE | PbeWriteBack |
-| `dram_framebuffer` | `uint8_t[]` (RGBA8) | PbeWriteBack (DRAM Readback) | JsonReporter |
+| `pbe_framebuffer` | `uint8_t[]` (每像素 4/8/16 bytes) | PBE | PbeWriteBack |
+| `dram_framebuffer` | `uint8_t[]` (每像素 4/8/16 bytes) | PbeWriteBack (DRAM Readback) | JsonReporter |
+
+一個像素不一定是 4 bytes。UNORM8 attachment 是 RGBA8 四個通道共 4 bytes；
+整數 attachment 每個通道存一個 32-bit dword，所以 R32_UINT 是 4、RG32UI 是 8、
+RGBA32UI 是 16 bytes。像素寬度由 `PipelineState::color_attachment_raw_dwords`
+（該 attachment 存幾個 raw dword 通道，0 表示走 UNORM8）經
+`ColorAttachmentBytesPerPixel()` 得出，PBE、PbeWriteBack、JsonReporter 與
+driver readback 都必須經過它，不得自行假設 4。
 
 ### 7.2 FragmentCandidate 結構 (ISP 輸出)
 

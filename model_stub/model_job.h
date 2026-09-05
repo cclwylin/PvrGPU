@@ -44,11 +44,14 @@ struct ModelJob {
   bool failed = false;
   std::string error;
 
-  // The job's last physical DRAM readback, as RGBA8.  This is what a
-  // `glReadPixels` on a colour attachment ends up copying.
+  // The job's last physical DRAM readback.  This is what a `glReadPixels` on a
+  // colour attachment ends up copying.  It is RGBA8 only while the attachment
+  // packs UNORM8 channels: an integer attachment stores a dword per channel,
+  // so the pixel width travels with the pixels.
   std::vector<std::uint8_t> framebuffer;
   std::uint32_t framebuffer_width = 0;
   std::uint32_t framebuffer_height = 0;
+  std::uint32_t framebuffer_bytes_per_pixel = 4;
 
   void Begin(const Options &job_options) {
     options = job_options;
@@ -60,6 +63,7 @@ struct ModelJob {
     framebuffer.clear();
     framebuffer_width = 0;
     framebuffer_height = 0;
+    framebuffer_bytes_per_pixel = 4;
   }
 
   // Records the first failure only: a later stage failing because an earlier
@@ -72,14 +76,17 @@ struct ModelJob {
   }
 
   void PublishFramebuffer(const std::vector<std::uint8_t> &pixels,
-                          std::uint32_t width, std::uint32_t height) {
-    if (static_cast<std::uint64_t>(pixels.size()) !=
-        static_cast<std::uint64_t>(width) * height * 4U) {
+                          std::uint32_t width, std::uint32_t height,
+                          std::uint32_t bytes_per_pixel) {
+    if (bytes_per_pixel == 0 ||
+        static_cast<std::uint64_t>(pixels.size()) !=
+            static_cast<std::uint64_t>(width) * height * bytes_per_pixel) {
       return;
     }
     framebuffer = pixels;
     framebuffer_width = width;
     framebuffer_height = height;
+    framebuffer_bytes_per_pixel = bytes_per_pixel;
   }
 };
 
