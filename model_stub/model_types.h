@@ -35,13 +35,29 @@ struct DriverPcoStageAbi {
   std::uint32_t entry_offset = 0;
 };
 
+// Planes a DriverAttachmentClear touches.
+inline constexpr std::uint32_t kDriverClearAspectDepth = 0x1U;
+inline constexpr std::uint32_t kDriverClearAspectStencil = 0x2U;
+
+struct DriverAttachmentClear {
+  std::uint32_t x = 0;
+  std::uint32_t y = 0;
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  std::uint32_t aspects = 0;
+  std::uint32_t depth_bits = 0;
+  std::uint32_t stencil_value = 0;
+};
+
 struct DriverPcoTopologyExpansion {
   std::vector<std::uint8_t> vertices;
   // One source vertex index per expanded vertex. A strip or fan repeats the
-  // same source vertex across adjacent triangles, so vertex fetch reuses one
-  // shading lane per distinct source and vs_invocations counts real work
-  // rather than the expansion's byte duplication. Empty when the stream was
-  // forwarded untouched (indexed draws and plain triangle lists).
+  // same source vertex across adjacent triangles, and a line or point topology
+  // repeats it within the degenerate triangle it is encoded as, so vertex
+  // fetch reuses one shading lane per distinct source and vs_invocations
+  // counts real work rather than the expansion's byte duplication. Empty when
+  // the stream was forwarded untouched (indexed draws and plain triangle
+  // lists).
   std::vector<std::uint32_t> source_vertices;
   std::uint32_t input_primitives = 0;
   std::uint32_t emitted_primitives = 0;
@@ -255,6 +271,8 @@ struct DriverCommand {
   // Packed vertex attribute widths; attribute N lands in VTXIN 4 * N.
   std::uint32_t vertex_attribute_count = 0;
   std::array<std::uint32_t, 16> vertex_attribute_components{};
+  // Whether attribute N carries integers rather than floats.
+  std::array<std::uint32_t, 16> vertex_attribute_integer{};
   // Index payload for an indexed draw; empty for a non-indexed one.
   std::vector<std::uint8_t> raw_index_data;
   std::uint64_t declared_raw_index_data_size = 0;
@@ -312,6 +330,20 @@ struct DriverCommand {
   std::uint32_t depth_func = 0;
   std::uint32_t depth_clear_bits = 0;
   std::uint32_t depth_format = 0;
+  // Mirrors the API's stencil block; index 0 is the front face, 1 the back.
+  std::uint32_t stencil_enable = 0;
+  std::uint32_t stencil_clear = 0;
+  std::array<std::uint32_t, 2> stencil_func{};
+  std::array<std::uint32_t, 2> stencil_fail_op{};
+  std::array<std::uint32_t, 2> stencil_depth_fail_op{};
+  std::array<std::uint32_t, 2> stencil_pass_op{};
+  std::array<std::uint32_t, 2> stencil_value_mask{};
+  std::array<std::uint32_t, 2> stencil_write_mask{};
+  std::array<std::uint32_t, 2> stencil_ref{};
+  // Depth/stencil rectangles set before this draw, in issue order.  A whole
+  // surface clear is `depth_clear_bits`/`stencil_clear`; these are the
+  // scissored ones the v1 capsule cannot otherwise describe.
+  std::vector<DriverAttachmentClear> attachment_clears;
   std::uint32_t color_attachment_source_command_index =
       kDriverPcoNewAttachment;
   std::uint32_t depth_attachment_source_command_index =
@@ -562,6 +594,9 @@ struct CounterTxn {
   std::uint64_t covered_pixels = 0;
   std::uint64_t fragment_candidates = 0;
   std::uint64_t hsr_rejected_fragments = 0;
+  std::uint64_t stencil_tested_fragments = 0;
+  std::uint64_t stencil_rejected_fragments = 0;
+  std::uint64_t stencil_written_fragments = 0;
   std::uint64_t depth_tested_fragments = 0;
   std::uint64_t depth_rejected_fragments = 0;
   std::uint64_t depth_written_fragments = 0;

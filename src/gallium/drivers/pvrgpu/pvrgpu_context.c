@@ -9732,6 +9732,12 @@ struct pvrgpu_array_primitive_draw {
    float *vertex_data;
    uint8_t *index_data;
    /*
+    * Scissored depth/stencil clears this draw inherits.  The record owns them
+    * for the same reason it owns its vertices: the sequence is submitted long
+    * after the draw call returned.
+    */
+   struct pvrgpu_systemc_attachment_clear *attachment_clears;
+   /*
     * Shared-register words (push constants and texture descriptors) the
     * nested command points at.  The record has to own them: the sequence is
     * submitted at flush or process exit, long after the recording call's
@@ -9760,6 +9766,7 @@ pvrgpu_array_primitive_draw_destroy(struct pvrgpu_array_primitive_draw **slot)
    pvrgpu_pco_graphics_binary_finish(&draw->binary);
    free(draw->vertex_data);
    free(draw->index_data);
+   free(draw->attachment_clears);
    for (unsigned texture = 0; texture < PVRGPU_PCO_MAX_TEXTURES; ++texture)
       free(draw->texture_bytes[texture]);
    FREE(draw);
@@ -9770,6 +9777,51 @@ bool
 pvrgpu_context_has_recorded_geometry(const struct pvrgpu_context *ctx)
 {
    return ctx && ctx->array_primitive_draw_count != 0;
+}
+
+/*
+ * A readback is where a frame ends for an application that has no trace to
+ * declare its length.
+ *
+ * Submit whatever geometry has accumulated so the model can run it, then
+ * reopen the once-per-frame gates: the draws that follow describe the next
+ * frame, and leaving the gates shut would have them skipped as a replay of
+ * this one.  dEQP draws, reads back, checks, and draws again, so without this
+ * only a case's first frame would ever reach the model.
+ *
+ * An RDC replay is different, and is deliberately left alone.  The trace
+ * states how many draw actions the frame has, the sequence was already
+ * submitted the moment the last one arrived, and RenderDoc then replays the
+ * same frame again -- those repeats are observations, not a new frame.  There
+ * the gates stay shut and a readback only runs what is already pending.
+ */
+void
+pvrgpu_context_end_frame_at_readback(struct pvrgpu_context *ctx)
+{
+   if (!ctx)
+      return;
+
+   unsigned trace_draw_actions = 0;
+   const bool rdc_replay = pvrgpu_trace_draw_actions(&trace_draw_actions) &&
+                           trace_draw_actions != 0;
+
+   if (ctx->array_primitive_draw_count != 0) {
+      const unsigned recorded = ctx->array_primitive_draw_count;
+      const bool emitted = pvrgpu_emit_array_primitive_sequence_command(ctx);
+      pvrgpu_counter_eventf("readback_sequence_flush",
+                            "draws=%u emitted=%u replay=%u",
+                            recorded,
+                            emitted ? 1u : 0u,
+                            rdc_replay ? 1u : 0u);
+      pvrgpu_array_primitive_sequence_reset(ctx);
+   }
+
+   if (rdc_replay)
+      return;
+
+   ctx->driver_draw_command_emitted = false;
+   ctx->array_primitive_sequence_owns_command = false;
+   pvrgpu_reset_driver_draw_command_emitted();
 }
 
 void
@@ -9910,9 +9962,16 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
        */
       draws[ordinal].color_attachment_source_command_index =
          ordinal == 0 ? PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR : ordinal - 1u;
+      /*
+       * The stencil plane lives in the same attachment as the depth one, so a
+       * draw that only tests stencil still needs it.  Dropping the attachment
+       * on depth_enable/depth_write alone erased the plane every stencil draw
+       * depended on: dEQP's fragment_ops.stencil.* arrived at the model with
+       * depth_format zero and the stencil test never ran.
+       */
       if (draws[ordinal].depth_enable == 0 &&
-          draws[ordinal].depth_write == 0) {
-         /* A draw that neither tests nor writes depth needs no attachment. */
+          draws[ordinal].depth_write == 0 &&
+          draws[ordinal].stencil_enable == 0) {
          draws[ordinal].depth_format = 0;
          draws[ordinal].depth_attachment_source_command_index =
             PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR;
@@ -10005,11 +10064,23 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
    ctx->driver_draw_command_emitted = true;
    ctx->array_primitive_sequence_owns_command = true;
    pvrgpu_note_driver_draw_command_emitted();
+   unsigned stencil_draws = 0;
+   unsigned depth_attachment_draws = 0;
+   for (unsigned ordinal = 0; ordinal < command.pco_sequence_command_count;
+        ++ordinal) {
+      if (draws[ordinal].stencil_enable != 0)
+         ++stencil_draws;
+      if (draws[ordinal].depth_format != 0)
+         ++depth_attachment_draws;
+   }
    pvrgpu_counter_eventf("draw_array_primitive_sequence_command",
-                         "draws=%u framebuffer=%ux%u",
+                         "draws=%u framebuffer=%ux%u stencil_draws=%u "
+                         "depth_attachment_draws=%u",
                          command.pco_sequence_command_count,
                          command.framebuffer_width,
-                         command.framebuffer_height);
+                         command.framebuffer_height,
+                         stencil_draws,
+                         depth_attachment_draws);
    return true;
 }
 
@@ -10257,14 +10328,102 @@ pvrgpu_record_color_primitive_pco_draw(
       attribute_formats[attribute] =
          ctx->vertex_elements->elements[attribute].src_format;
    }
+   /*
+    * A shader reading gl_InstanceID takes it from a VTXIN register, so it is
+    * packed as one more attribute after the real ones.  Instancing itself is
+    * resolved here: the capsule describes a flat vertex stream, and the draw
+    * expands `instance_count` copies of it with each attribute already read at
+    * the index its divisor selects.  That is the same work this path already
+    * does for a client vertex array, and it keeps the model measuring
+    * ia_vertices and vs_invocations from the stream it is actually given.
+    */
+   const bool reads_instance_id =
+      ctx->vs->nir != NULL &&
+      BITSET_TEST(ctx->vs->nir->info.system_values_read,
+                  SYSTEM_VALUE_INSTANCE_ID);
+   const unsigned packed_attribute_count =
+      attribute_count + (reads_instance_id ? 1u : 0u);
+   if (packed_attribute_count > PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES) {
+      pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                            "stage=attributes reason=instance_id_slot "
+                            "attributes=%u",
+                            attribute_count);
+      free(index_data);
+      return false;
+   }
+   if (reads_instance_id) {
+      attribute_components[attribute_count] = 1;
+      attribute_formats[attribute_count] = PIPE_FORMAT_R32_UINT;
+   }
+   const unsigned instance_count =
+      info->instance_count != 0 ? info->instance_count : 1u;
    unsigned packed_floats = 0;
    unsigned attribute_offsets[PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES] = {0};
-   for (unsigned attribute = 0; attribute < attribute_count; ++attribute) {
+   for (unsigned attribute = 0; attribute < packed_attribute_count;
+        ++attribute) {
       attribute_offsets[attribute] = packed_floats;
       packed_floats += attribute_components[attribute];
    }
+   if (instance_count == 0 || vertex_count > UINT_MAX / instance_count) {
+      pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                            "stage=pack reason=instance_extent instances=%u "
+                            "vertices=%u",
+                            instance_count,
+                            vertex_count);
+      free(index_data);
+      return false;
+   }
+   const unsigned packed_vertex_count = vertex_count * instance_count;
+   /*
+    * An indexed draw repeats its indices per instance, each shifted onto that
+    * instance's slice of the expanded vertex stream.  The shifted values can
+    * leave the source index type's range, so the expansion is always 32-bit.
+    */
+   unsigned command_index_size = info->index_size;
+   if (info->index_size != 0 && instance_count > 1) {
+      if (assembled_count > UINT_MAX / instance_count) {
+         pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                               "stage=indices reason=instance_index_extent "
+                               "indices=%u instances=%u",
+                               assembled_count,
+                               instance_count);
+         free(index_data);
+         return false;
+      }
+      const unsigned expanded_count = assembled_count * instance_count;
+      uint32_t *expanded = malloc((size_t)expanded_count * sizeof(uint32_t));
+      if (!expanded) {
+         free(index_data);
+         return false;
+      }
+      for (unsigned instance = 0; instance < instance_count; ++instance) {
+         for (unsigned i = 0; i < assembled_count; ++i) {
+            uint32_t index = 0;
+            switch (info->index_size) {
+            case 1:
+               index = ((const uint8_t *)index_data)[i];
+               break;
+            case 2: {
+               uint16_t narrow = 0;
+               memcpy(&narrow, index_data + (size_t)i * 2u, sizeof(narrow));
+               index = narrow;
+               break;
+            }
+            default:
+               memcpy(&index, index_data + (size_t)i * 4u, sizeof(index));
+               break;
+            }
+            expanded[(size_t)instance * assembled_count + i] =
+               index + instance * vertex_count;
+         }
+      }
+      free(index_data);
+      index_data = (uint8_t *)expanded;
+      index_data_size = (size_t)expanded_count * sizeof(uint32_t);
+      command_index_size = 4;
+   }
    if (packed_floats == 0 ||
-       vertex_count > UINT_MAX / (packed_floats * sizeof(float))) {
+       packed_vertex_count > UINT_MAX / (packed_floats * sizeof(float))) {
       pvrgpu_counter_eventf("draw_array_primitive_record_error",
                             "stage=pack reason=vertex_extent floats=%u "
                             "vertices=%u",
@@ -10275,37 +10434,65 @@ pvrgpu_record_color_primitive_pco_draw(
    }
 
    float *interleaved =
-      malloc((size_t)vertex_count * packed_floats * sizeof(float));
+      malloc((size_t)packed_vertex_count * packed_floats * sizeof(float));
    if (!interleaved) {
       free(index_data);
       return false;
    }
-   for (unsigned v = 0; v < vertex_count; ++v) {
-      const unsigned v_idx =
-         info->index_size != 0 ? v + vertex_bias : draw->start + v;
-      for (unsigned attribute = 0; attribute < attribute_count; ++attribute) {
-         const char *attribute_reason = NULL;
-         if (!pvrgpu_read_vertex_attribute(
-                ctx,
-                &ctx->vertex_elements->elements[attribute],
-                v_idx,
-                attribute_components[attribute],
-                &interleaved[(size_t)v * packed_floats +
-                             attribute_offsets[attribute]],
-                &attribute_reason)) {
-            pvrgpu_counter_eventf(
-               "draw_array_primitive_record_error",
-               "stage=attributes reason=%s attribute=%u "
-               "format=%s components=%u vertex=%u",
-               attribute_reason ? attribute_reason : "unknown",
-               attribute,
-               util_format_name(
-                  ctx->vertex_elements->elements[attribute].src_format),
-               attribute_components[attribute],
-               v_idx);
-            free(interleaved);
-            free(index_data);
-            return false;
+   for (unsigned instance = 0; instance < instance_count; ++instance) {
+      for (unsigned v = 0; v < vertex_count; ++v) {
+         const unsigned v_idx =
+            info->index_size != 0 ? v + vertex_bias : draw->start + v;
+         const size_t packed_base =
+            ((size_t)instance * vertex_count + v) * packed_floats;
+         for (unsigned attribute = 0; attribute < attribute_count;
+              ++attribute) {
+            const struct pipe_vertex_element *element =
+               &ctx->vertex_elements->elements[attribute];
+            /*
+             * A divisor makes the attribute advance once per that many
+             * instances instead of per vertex, which is the whole of
+             * GL_ARB_instanced_arrays as far as fetch is concerned.
+             */
+            const unsigned source_index =
+               element->instance_divisor != 0
+                  ? info->start_instance + instance / element->instance_divisor
+                  : v_idx;
+            const char *attribute_reason = NULL;
+            if (!pvrgpu_read_vertex_attribute(
+                   ctx,
+                   element,
+                   source_index,
+                   attribute_components[attribute],
+                   &interleaved[packed_base + attribute_offsets[attribute]],
+                   &attribute_reason)) {
+               pvrgpu_counter_eventf(
+                  "draw_array_primitive_record_error",
+                  "stage=attributes reason=%s attribute=%u "
+                  "format=%s components=%u vertex=%u divisor=%u instance=%u",
+                  attribute_reason ? attribute_reason : "unknown",
+                  attribute,
+                  util_format_name(element->src_format),
+                  attribute_components[attribute],
+                  source_index,
+                  element->instance_divisor,
+                  instance);
+               free(interleaved);
+               free(index_data);
+               return false;
+            }
+         }
+         if (reads_instance_id) {
+            /*
+             * gl_InstanceID reaches the shader as raw bits in a VTXIN
+             * register, so the integer is stored verbatim rather than
+             * converted to float and back.
+             */
+            const uint32_t id = instance;
+            memcpy(&interleaved[packed_base +
+                                attribute_offsets[attribute_count]],
+                   &id,
+                   sizeof(id));
          }
       }
    }
@@ -10419,14 +10606,23 @@ pvrgpu_record_color_primitive_pco_draw(
    command.clear_color_bits[3] = UINT32_C(0x3f800000);
    command.raw_vertex_data = (const uint8_t *)interleaved;
    command.raw_vertex_data_size =
-      (size_t)vertex_count * packed_floats * sizeof(float);
+      (size_t)packed_vertex_count * packed_floats * sizeof(float);
    command.vertex_stride = packed_floats * sizeof(float);
-   command.vertex_attribute_count = attribute_count;
-   for (unsigned attribute = 0; attribute < attribute_count; ++attribute) {
+   command.vertex_attribute_count = packed_attribute_count;
+   for (unsigned attribute = 0; attribute < packed_attribute_count;
+        ++attribute) {
       command.vertex_attribute_components[attribute] =
          attribute_components[attribute];
+      /* Only the reserved gl_InstanceID slot carries integers so far. */
+      command.vertex_attribute_integer[attribute] =
+         (reads_instance_id && attribute == attribute_count) ? 1u : 0u;
    }
-   command.vertex_count = vertex_count;
+   /*
+    * The instances were expanded above, so the capsule describes one flat
+    * stream: instance_count is 1 and the vertex and index counts already
+    * cover every instance.
+    */
+   command.vertex_count = packed_vertex_count;
    command.first_vertex = 0;
    command.instance_count = 1;
    command.primitive_mode = (uint32_t)info->mode;
@@ -10434,8 +10630,9 @@ pvrgpu_record_color_primitive_pco_draw(
    command.render_target_count = ctx->framebuffer.nr_cbufs;
    command.raw_index_data = index_data;
    command.raw_index_data_size = index_data_size;
-   command.index_size = info->index_size;
-   command.index_count = info->index_size != 0 ? assembled_count : 0u;
+   command.index_size = command_index_size;
+   command.index_count =
+      info->index_size != 0 ? assembled_count * instance_count : 0u;
    command.first_index = 0;
    command.base_vertex = 0;
    command.vertex_pco = binary.vertex.data;
@@ -10578,8 +10775,44 @@ pvrgpu_record_color_primitive_pco_draw(
    command.depth_enable = ctx->dsa ? ctx->dsa->state.depth_enabled : 0;
    command.depth_write = ctx->dsa ? ctx->dsa->state.depth_writemask : 0;
    command.depth_func = ctx->dsa ? ctx->dsa->state.depth_func : 3;
-   command.depth_clear_bits = UINT32_C(0x3f800000);
+   /* The value the surface was actually cleared to, not an assumed 1.0. */
+   command.depth_clear_bits = ctx->depth_clear_bits;
    command.depth_format = ctx->framebuffer.zsbuf.format;
+
+   /*
+    * Gallium overloads `stencil[1].enabled`: it does not mean "the back face
+    * tests", it means "two-sided state is in use".  With it clear, both faces
+    * use the front state, so the capsule states the front twice rather than
+    * letting the model read an all-zero back face as KEEP/NEVER.
+    *
+    * The op and function values are PIPE_STENCIL_OP_* and PIPE_FUNC_*, which
+    * the model's StencilOp and DepthCompareOp are numbered to match, so they
+    * travel verbatim.
+    */
+   {
+      const struct pipe_stencil_state *front =
+         ctx->dsa ? &ctx->dsa->state.stencil[0] : NULL;
+      const struct pipe_stencil_state *back =
+         ctx->dsa && ctx->dsa->state.stencil[1].enabled
+            ? &ctx->dsa->state.stencil[1]
+            : front;
+      const struct pipe_stencil_state *faces[2] = { front, back };
+      command.stencil_enable = front && front->enabled ? 1u : 0u;
+      command.stencil_clear = ctx->stencil_clear_value;
+      for (unsigned face = 0; face < 2; ++face) {
+         const struct pipe_stencil_state *state = faces[face];
+         command.stencil_func[face] = state ? state->func : PIPE_FUNC_ALWAYS;
+         command.stencil_fail_op[face] =
+            state ? state->fail_op : PIPE_STENCIL_OP_KEEP;
+         command.stencil_depth_fail_op[face] =
+            state ? state->zfail_op : PIPE_STENCIL_OP_KEEP;
+         command.stencil_pass_op[face] =
+            state ? state->zpass_op : PIPE_STENCIL_OP_KEEP;
+         command.stencil_value_mask[face] = state ? state->valuemask : 0xffu;
+         command.stencil_write_mask[face] = state ? state->writemask : 0xffu;
+         command.stencil_ref[face] = ctx->stencil_ref.ref_value[face];
+      }
+   }
 
    if (!pvrgpu_validate_draw_pco_triangles_command(path,
                                                   &command,
@@ -10676,6 +10909,28 @@ pvrgpu_record_color_primitive_pco_draw(
    command.fragment_shared =
       fragment_shared_count ? recorded->fragment_shared_words : NULL;
    pvrgpu_pco_triangles_command_to_systemc(&command, &recorded->command);
+
+   /*
+    * Hand the pending stencil clears to this draw and start a fresh run: they
+    * happened before it, and the draws after it inherit only what follows.
+    * This has to come after the conversion above, which copies the (empty)
+    * clear list from the driver-side command over anything set earlier.
+    */
+   if (ctx->pending_attachment_clear_count != 0) {
+      const size_t bytes = (size_t)ctx->pending_attachment_clear_count *
+                           sizeof(*recorded->attachment_clears);
+      recorded->attachment_clears = malloc(bytes);
+      if (!recorded->attachment_clears) {
+         pvrgpu_array_primitive_draw_destroy(&recorded);
+         return false;
+      }
+      memcpy(recorded->attachment_clears, ctx->pending_attachment_clears,
+             bytes);
+      recorded->command.attachment_clears = recorded->attachment_clears;
+      recorded->command.attachment_clear_count =
+         ctx->pending_attachment_clear_count;
+      ctx->pending_attachment_clear_count = 0;
+   }
    /*
     * The pixel back end blends, so a draw that asks for it carries the whole
     * GLES equation rather than only the enable bit; a disabled one still
@@ -10733,7 +10988,8 @@ pvrgpu_record_color_primitive_pco_draw(
                          "discard=%u multisample=%u halfpixel=%u "
                          "bottomedge=%u halfz=%u clip=%u,%u clamp=%u "
                          "samplemask=0x%x colormask=0x%x blend=%u dither=%u "
-                         "depth=%u,%u,%u cull=%u ccw=%u",
+                         "depth=%u,%u,%u,%u stencil=%u,%u,%u,%u,%u,%u,%u "
+                         "cull=%u ccw=%u",
                          ctx->array_primitive_draw_count - 1u,
                          command.framebuffer_width,
                          command.framebuffer_height,
@@ -10759,6 +11015,14 @@ pvrgpu_record_color_primitive_pco_draw(
                          command.depth_enable,
                          command.depth_write,
                          command.depth_func,
+                         command.depth_format,
+                         command.stencil_enable,
+                         command.stencil_func[0],
+                         command.stencil_fail_op[0],
+                         command.stencil_depth_fail_op[0],
+                         command.stencil_pass_op[0],
+                         command.stencil_value_mask[0],
+                         command.stencil_ref[0],
                          command.cull_face,
                          command.front_ccw);
    return true;
@@ -11804,6 +12068,10 @@ pvrgpu_destroy(struct pipe_context *pipe)
    pvrgpu_shadow_pco_observation_destroy(&ctx->shadow_pco_mask);
    pvrgpu_shadow_pco_observation_destroy(&ctx->shadow_pco_scene);
    pvrgpu_terrain_pco_sequence_reset(ctx);
+   free(ctx->pending_attachment_clears);
+   ctx->pending_attachment_clears = NULL;
+   ctx->pending_attachment_clear_count = 0;
+   ctx->pending_attachment_clear_capacity = 0;
    pvrgpu_pco_compiler_destroy(ctx->pco_compiler);
    pvrgpu_invalidate_full_depth_clear(ctx);
    util_unreference_framebuffer_state(&ctx->framebuffer);
@@ -11840,7 +12108,8 @@ pvrgpu_set_framebuffer_state(struct pipe_context *pipe,
                          "width=%u height=%u nr_cbufs=%u has_cbuf0=%u "
                          "cbuf0_format=%s cbuf0_target=%u cbuf0_size=%ux%u "
                          "cbuf0_res=%p cbuf0_level=%u cbuf0_layers=%u-%u "
-                         "zs_res=%p has_zs=%u has_resolve=%u total=%u",
+                         "zs_res=%p has_zs=%u zs_format=%s "
+                         "has_resolve=%u total=%u",
                          ctx->framebuffer.width,
                          ctx->framebuffer.height,
                          ctx->framebuffer.nr_cbufs,
@@ -11855,8 +12124,59 @@ pvrgpu_set_framebuffer_state(struct pipe_context *pipe,
                          cbuf0 ? cbuf0->last_layer : 0,
                          (void *)ctx->framebuffer.zsbuf.texture,
                          ctx->framebuffer.zsbuf.texture ? 1 : 0,
+                         util_format_name(ctx->framebuffer.zsbuf.format),
                          ctx->framebuffer.resolve ? 1 : 0,
                          ctx->framebuffer_updates);
+}
+
+/*
+ * Remember a scissored depth/stencil clear until a draw inherits it.
+ *
+ * Returns false when the run of clears before a single draw outgrows what one
+ * capsule may carry, so the caller can say so rather than silently dropping
+ * the tail -- a dropped rectangle is a wrong plane, not a slow one.
+ */
+bool
+pvrgpu_note_pending_attachment_clear(struct pvrgpu_context *ctx,
+                                     unsigned x,
+                                     unsigned y,
+                                     unsigned width,
+                                     unsigned height,
+                                     unsigned aspects,
+                                     uint32_t depth_bits,
+                                     unsigned stencil_value)
+{
+   if (!ctx || width == 0 || height == 0 || aspects == 0)
+      return false;
+   if (ctx->pending_attachment_clear_count >=
+       PVRGPU_MAX_PENDING_ATTACHMENT_CLEARS)
+      return false;
+   if (ctx->pending_attachment_clear_count >=
+       ctx->pending_attachment_clear_capacity) {
+      const unsigned wanted =
+         ctx->pending_attachment_clear_capacity == 0
+            ? 16u
+            : ctx->pending_attachment_clear_capacity * 2u;
+      struct pvrgpu_systemc_attachment_clear *grown =
+         REALLOC(ctx->pending_attachment_clears,
+                 ctx->pending_attachment_clear_capacity *
+                    sizeof(*ctx->pending_attachment_clears),
+                 wanted * sizeof(*ctx->pending_attachment_clears));
+      if (!grown)
+         return false;
+      ctx->pending_attachment_clears = grown;
+      ctx->pending_attachment_clear_capacity = wanted;
+   }
+   struct pvrgpu_systemc_attachment_clear *record =
+      &ctx->pending_attachment_clears[ctx->pending_attachment_clear_count++];
+   record->x = x;
+   record->y = y;
+   record->width = width;
+   record->height = height;
+   record->aspects = aspects;
+   record->depth_bits = depth_bits;
+   record->stencil_value = stencil_value;
+   return true;
 }
 
 void
@@ -13007,6 +13327,8 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
       ctx->observed_draws++;
       pvrgpu_counter_eventf("draw_array_primitive",
                             "start=%u count=%u mode=%u primitives=%u "
+                            "index_size=%u user_indices=%u index_res=%p "
+                            "index_bias=%d "
                             "vertex_elements=%u vertex_buffers=%u "
                             "framebuffer=%ux%u total=%u",
                             draws[0].start,
@@ -13014,6 +13336,13 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
                             info->mode,
                             pvrgpu_array_primitive_count(
                                info->mode, draws[0].count),
+                            info->index_size,
+                            info->index_size != 0 && info->has_user_indices ? 1u
+                                                                            : 0u,
+                            info->index_size != 0 && !info->has_user_indices
+                               ? (void *)info->index.resource
+                               : NULL,
+                            draws[0].index_bias,
                             ctx->vertex_elements->num_elements,
                             ctx->num_vertex_buffers,
                             ctx->framebuffer.width,
@@ -13398,6 +13727,8 @@ pvrgpu_create_context(struct pipe_screen *screen, void *priv,
       return NULL;
 
    ctx->base.screen = screen;
+   /* GL's initial depth clear value is 1.0; the context is calloc'd to zero. */
+   ctx->depth_clear_bits = UINT32_C(0x3f800000);
    ctx->base.destroy = pvrgpu_destroy;
    ctx->base.priv = priv;
    ctx->sample_mask = UINT_MAX;

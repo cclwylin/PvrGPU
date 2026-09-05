@@ -1223,14 +1223,19 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
     if (draw.color_attachment_source_command_index != expected_source) {
       return Reject(error, "generic PCO sequence colour attachment chain is invalid");
     }
-    const bool uses_depth = draw.depth_enable != 0 || draw.depth_write != 0;
-    if (!uses_depth &&
+    // The stencil plane shares the depth attachment, so a draw that only tests
+    // stencil still needs it chained to the previous ordinal.  Reading this as
+    // "depth test or write" alone refused every stencil-only draw.
+    const bool uses_depth_attachment = draw.depth_enable != 0 ||
+                                       draw.depth_write != 0 ||
+                                       draw.stencil_enable != 0;
+    if (!uses_depth_attachment &&
         (draw.depth_format != 0 ||
          draw.depth_attachment_source_command_index !=
              kDriverPcoNewAttachment)) {
       return Reject(error, "generic PCO sequence depth attachment is invalid");
     }
-    if (uses_depth &&
+    if (uses_depth_attachment &&
         draw.depth_attachment_source_command_index != expected_source) {
       return Reject(error, "generic PCO sequence depth attachment chain is invalid");
     }

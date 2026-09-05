@@ -308,6 +308,53 @@ pvrgpu_depth_surface_rect_supported(const struct pipe_surface *surface,
           resource->level_layer_strides[surface->level] != 0;
 }
 
+/*
+ * Write the stencil plane of a combined attachment, leaving the depth alone.
+ *
+ * Only the packed 24/8 formats have one; every other depth format reports no
+ * stencil and is left untouched rather than being guessed at.
+ */
+static bool
+pvrgpu_fill_surface_rect_with_clear_stencil(struct pipe_surface *surface,
+                                            unsigned dstx,
+                                            unsigned dsty,
+                                            unsigned width,
+                                            unsigned height,
+                                            unsigned stencil)
+{
+   if (!pvrgpu_depth_surface_rect_supported(surface, dstx, dsty, width,
+                                            height))
+      return false;
+   if (surface->format != PIPE_FORMAT_Z24_UNORM_S8_UINT &&
+       surface->format != PIPE_FORMAT_S8_UINT_Z24_UNORM)
+      return false;
+
+   struct pvrgpu_resource *resource = pvrgpu_resource(surface->texture);
+   const unsigned level = surface->level;
+   const unsigned block_size = util_format_get_blocksize(surface->format);
+   if (block_size != sizeof(uint32_t))
+      return false;
+   const uint32_t value = stencil & 0xffu;
+   uint8_t *base = resource->data + resource->level_offsets[level];
+   for (unsigned y = 0; y < height; ++y) {
+      uint8_t *row = base +
+                     (uintptr_t)(dsty + y) * resource->level_strides[level] +
+                     (uintptr_t)dstx * block_size;
+      for (unsigned x = 0; x < width; ++x) {
+         uint8_t *pixel = row + (uintptr_t)x * block_size;
+         uint32_t packed = 0;
+         memcpy(&packed, pixel, sizeof(packed));
+         if (surface->format == PIPE_FORMAT_Z24_UNORM_S8_UINT) {
+            packed = (packed & UINT32_C(0x00ffffff)) | (value << 24);
+         } else {
+            packed = (packed & UINT32_C(0xffffff00)) | value;
+         }
+         memcpy(pixel, &packed, sizeof(packed));
+      }
+   }
+   return true;
+}
+
 static bool
 pvrgpu_fill_surface_rect_with_clear_depth(struct pipe_surface *surface,
                                           unsigned dstx,
@@ -722,15 +769,16 @@ pvrgpu_clear(struct pipe_context *pipe,
              unsigned stencil)
 {
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
-   (void)stencil_clear_mask;
-   (void)stencil;
 
    const bool clear_color = (buffers & PIPE_CLEAR_COLOR0) != 0;
    const bool clear_depth = (buffers & PIPE_CLEAR_DEPTH) != 0;
-   const unsigned supported_buffers = PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH;
+   const bool clear_stencil = (buffers & PIPE_CLEAR_STENCIL) != 0;
+   const unsigned supported_buffers =
+      PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL;
    /* Gallium packs four colormask bits per draw buffer; only cbuf0 is lowered. */
    const unsigned colormask = color_clear_mask & PIPE_MASK_RGBA;
-   if ((buffers & ~supported_buffers) != 0 || (!clear_color && !clear_depth)) {
+   if ((buffers & ~supported_buffers) != 0 ||
+       (!clear_color && !clear_depth && !clear_stencil)) {
       debug_printf("pvrgpu: unsupported clear flags; fail closed\n");
       if (clear_depth)
          pvrgpu_invalidate_full_depth_clear(ctx);
@@ -797,7 +845,79 @@ pvrgpu_clear(struct pipe_context *pipe,
                                                 rect_height,
                                                 depth);
 
+   /*
+    * The model starts a sequence's stencil plane from the value the last
+    * whole-surface clear wrote, so record it here.  A partial clear leaves the
+    * plane non-uniform, which the capsule cannot describe; it still updates the
+    * driver's own surface and is reported.
+    */
+   if (clear_stencil) {
+      (void)pvrgpu_fill_surface_rect_with_clear_stencil(&ctx->framebuffer.zsbuf,
+                                                        rect_x,
+                                                        rect_y,
+                                                        rect_width,
+                                                        rect_height,
+                                                        stencil);
+      if (full_surface_rect)
+         ctx->stencil_clear_value = stencil & 0xffu;
+      pvrgpu_counter_eventf("clear_stencil",
+                            "res=%p x=%u y=%u width=%u height=%u format=%s "
+                            "stencil=%u full_surface=%u mask=0x%x",
+                            (void *)ctx->framebuffer.zsbuf.texture,
+                            rect_x,
+                            rect_y,
+                            rect_width,
+                            rect_height,
+                            util_format_name(ctx->framebuffer.zsbuf.format),
+                            stencil,
+                            full_surface_rect ? 1u : 0u,
+                            stencil_clear_mask);
+   }
+
+   /*
+    * A whole-surface clear is stated as the draw's own clear value and
+    * supersedes every scissored one before it: the plane is uniform again, so
+    * replaying the earlier rectangles would only undo it.  A scissored one is
+    * remembered until a draw inherits it.
+    */
+   {
+      const float clamped_depth =
+         depth < 0.0 ? 0.0f : depth > 1.0 ? 1.0f : (float)depth;
+      uint32_t depth_bits = 0;
+      memcpy(&depth_bits, &clamped_depth, sizeof(depth_bits));
+      const unsigned aspects =
+         (clear_depth ? PVRGPU_SYSTEMC_CLEAR_ASPECT_DEPTH : 0u) |
+         (clear_stencil ? PVRGPU_SYSTEMC_CLEAR_ASPECT_STENCIL : 0u);
+      if (aspects != 0) {
+         if (full_surface_rect) {
+            ctx->pending_attachment_clear_count = 0;
+         } else if (!pvrgpu_note_pending_attachment_clear(ctx,
+                                                          rect_x,
+                                                          rect_y,
+                                                          rect_width,
+                                                          rect_height,
+                                                          aspects,
+                                                          depth_bits,
+                                                          stencil & 0xffu)) {
+            pvrgpu_counter_eventf("clear_attachment_pending_overflow",
+                                  "count=%u aspects=0x%x x=%u y=%u "
+                                  "width=%u height=%u",
+                                  ctx->pending_attachment_clear_count,
+                                  aspects,
+                                  rect_x,
+                                  rect_y,
+                                  rect_width,
+                                  rect_height);
+         }
+      }
+   }
+
    if (clear_depth) {
+      if (full_surface_rect) {
+         const float clamped =
+            depth < 0.0 ? 0.0f : depth > 1.0 ? 1.0f : (float)depth;
+         memcpy(&ctx->depth_clear_bits, &clamped, sizeof(ctx->depth_clear_bits));
+      }
       if (depth == 1.0 && full_surface_rect) {
          pvrgpu_note_full_depth_clear_one(ctx,
                                           &ctx->framebuffer.zsbuf,
@@ -842,6 +962,20 @@ pvrgpu_clear(struct pipe_context *pipe,
                                              rect_height,
                                              colormask,
                                              color);
+   /*
+    * Record whether the model can still describe this surface.  A whole-surface
+    * RGBA clear it can: the sequence it runs starts from the same colour.  A
+    * scissored or masked one it cannot, and until the model can be told about
+    * those, its framebuffer must not be copied back over them.
+    */
+   {
+      struct pvrgpu_resource *cbuf0 =
+         pvrgpu_resource(ctx->framebuffer.cbufs[0].texture);
+      if (cbuf0) {
+         cbuf0->driver_writes_model_cannot_reproduce =
+            !full_surface_rect || colormask != PIPE_MASK_RGBA;
+      }
+   }
    pvrgpu_counter_eventf("clear_color",
                          "res=%p x=%u y=%u width=%u height=%u format=%s "
                          "level=%u layers=%u-%u colormask=0x%x scissored=%u "

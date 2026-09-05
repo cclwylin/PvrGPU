@@ -620,6 +620,13 @@ bool ParsePvrgpuCounters(const std::string &jsonl,
     return false;
   std::istringstream input(jsonl);
   std::string line;
+  /*
+   * The model reports per flush now, so a workload that is read back more than
+   * once leaves more than one counter record.  The last one describes the
+   * frame as it finally stood, and that is what the golden report is compared
+   * against.
+   */
+  bool found = false;
   while (std::getline(input, line)) {
     if (line.find("\"type\":\"counter\"") == std::string::npos)
       continue;
@@ -639,8 +646,10 @@ bool ParsePvrgpuCounters(const std::string &jsonl,
         return false;
       }
     }
-    return true;
+    found = true;
   }
+  if (found)
+    return true;
   *error = "PvrGPU output has no counter message";
   return false;
 }
@@ -692,10 +701,17 @@ bool ValidatePvrgpuCompletion(const std::string &jsonl, std::string *error) {
       return false;
     }
   }
-  if (hello_count != 1 || counter_count != 1 || done_count != 1) {
+  /*
+   * A flush is one complete report: hello, counter, done.  A workload read
+   * back more than once therefore leaves more than one of each, and what has
+   * to hold is that they come in complete sets -- a missing counter or done
+   * still means a run that did not finish.
+   */
+  if (hello_count == 0 || hello_count != counter_count ||
+      hello_count != done_count) {
     std::ostringstream reason;
-    reason << "PvrGPU protocol requires exactly one hello, counter, and done "
-              "message (got hello="
+    reason << "PvrGPU protocol requires one complete hello/counter/done set "
+              "per flush (got hello="
            << hello_count << ", counter=" << counter_count
            << ", done=" << done_count << ')';
     *error = reason.str();

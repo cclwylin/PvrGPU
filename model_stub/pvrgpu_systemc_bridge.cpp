@@ -14,6 +14,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -256,6 +257,8 @@ void CopyPcoPayloadFields(
        ++attribute) {
     destination->vertex_attribute_components[attribute] =
         source.vertex_attribute_components[attribute];
+    destination->vertex_attribute_integer[attribute] =
+        source.vertex_attribute_integer[attribute];
   }
   destination->declared_raw_index_data_size = source.raw_index_data_size;
   destination->index_size = source.index_size;
@@ -373,6 +376,34 @@ void CopyPcoPayloadFields(
   destination->depth_func = source.depth_func;
   destination->depth_clear_bits = source.depth_clear_bits;
   destination->depth_format = source.depth_format;
+  destination->stencil_enable = source.stencil_enable;
+  destination->stencil_clear = source.stencil_clear;
+  for (std::size_t face = 0; face < 2; ++face) {
+    destination->stencil_func[face] = source.stencil_func[face];
+    destination->stencil_fail_op[face] = source.stencil_fail_op[face];
+    destination->stencil_depth_fail_op[face] =
+        source.stencil_depth_fail_op[face];
+    destination->stencil_pass_op[face] = source.stencil_pass_op[face];
+    destination->stencil_value_mask[face] = source.stencil_value_mask[face];
+    destination->stencil_write_mask[face] = source.stencil_write_mask[face];
+    destination->stencil_ref[face] = source.stencil_ref[face];
+  }
+  destination->attachment_clears.clear();
+  if (source.attachment_clears && source.attachment_clear_count != 0) {
+    destination->attachment_clears.reserve(source.attachment_clear_count);
+    for (std::uint32_t clear = 0; clear < source.attachment_clear_count;
+         ++clear) {
+      pvrgpu::stub::DriverAttachmentClear record;
+      record.x = source.attachment_clears[clear].x;
+      record.y = source.attachment_clears[clear].y;
+      record.width = source.attachment_clears[clear].width;
+      record.height = source.attachment_clears[clear].height;
+      record.aspects = source.attachment_clears[clear].aspects;
+      record.depth_bits = source.attachment_clears[clear].depth_bits;
+      record.stencil_value = source.attachment_clears[clear].stencil_value;
+      destination->attachment_clears.push_back(record);
+    }
+  }
   destination->color_attachment_source_command_index =
       source.color_attachment_source_command_index;
   destination->depth_attachment_source_command_index =
@@ -1593,11 +1624,32 @@ void AdoptCapturedCounterMetadata(
   destination->cs_invocations = source.cs_invocations;
 }
 
+/*
+ * Paths this process has already opened for a model run.
+ *
+ * A case that reads back three times runs the model three times, and each run
+ * writes its own hello/counter/done record set.  Truncating per run would
+ * leave only the last of them, so the first run of a path truncates and every
+ * run after it appends.  Consumers of `systemc.jsonl` therefore have to accept
+ * more than one record set per case.
+ */
+std::set<std::string> g_opened_jsonl_paths;
+std::set<std::string> g_opened_stderr_paths;
+
+std::ios::openmode ModelOutputMode(std::set<std::string> *opened,
+                                   const std::string &path) {
+  if (opened->insert(path).second)
+    return std::ios::out | std::ios::trunc;
+  return std::ios::out | std::ios::app;
+}
+
 int RunModelToFiles(const pvrgpu::stub::Options &options,
                     const std::string &jsonl_path,
                     const std::string &stderr_path,
+                    pvrgpu::stub::ModelFramebuffer *framebuffer,
                     std::string *error) {
-  std::ofstream jsonl(jsonl_path, std::ios::out | std::ios::trunc);
+  std::ofstream jsonl(jsonl_path,
+                      ModelOutputMode(&g_opened_jsonl_paths, jsonl_path));
   if (!jsonl) {
     if (error)
       *error = "cannot open SystemC API jsonl_path: " + jsonl_path;
@@ -1605,7 +1657,8 @@ int RunModelToFiles(const pvrgpu::stub::Options &options,
   }
   std::ofstream stderr_file;
   if (!stderr_path.empty()) {
-    stderr_file.open(stderr_path, std::ios::out | std::ios::trunc);
+    stderr_file.open(stderr_path,
+                     ModelOutputMode(&g_opened_stderr_paths, stderr_path));
     if (!stderr_file) {
       if (error)
         *error = "cannot open SystemC API stderr_path: " + stderr_path;
@@ -1616,7 +1669,7 @@ int RunModelToFiles(const pvrgpu::stub::Options &options,
   std::streambuf *old_stdout = std::cout.rdbuf(jsonl.rdbuf());
   std::streambuf *old_stderr =
       stderr_file ? std::cerr.rdbuf(stderr_file.rdbuf()) : nullptr;
-  const int result = pvrgpu::stub::RunConfiguredModel(options);
+  const int result = pvrgpu::stub::RunConfiguredModel(options, framebuffer);
   std::cout.rdbuf(old_stdout);
   if (old_stderr)
     std::cerr.rdbuf(old_stderr);
@@ -1681,7 +1734,8 @@ void DeriveSequenceInputAssembly(pvrgpu::stub::Options *options) {
       any_indexed ? 0U : static_cast<std::uint32_t>(vertices);
 }
 
-int FlushPendingSubmitLocked(std::string *error) {
+int FlushPendingSubmitLocked(pvrgpu::stub::ModelFramebuffer *framebuffer,
+                             std::string *error) {
   if (!g_pending_submit.valid || g_pending_submit.executed)
     return 0;
   g_pending_submit.executed = true;
@@ -1694,17 +1748,26 @@ int FlushPendingSubmitLocked(std::string *error) {
   }
   DeriveSequenceInputAssembly(&g_pending_submit.options);
   return RunModelToFiles(g_pending_submit.options, g_pending_submit.jsonl_path,
-                         g_pending_submit.stderr_path, error);
+                         g_pending_submit.stderr_path, framebuffer, error);
 }
 
+/*
+ * Last resort for work nobody read back.
+ *
+ * The explicit flush is the normal path now, but a submission that is never
+ * mapped for read -- a frame the application only presents, say -- would
+ * otherwise never run at all, and its counters and PNG would disappear.  So
+ * this stays, and runs only what the readback path left behind.
+ */
 void FlushPendingSubmitAtExit() {
   std::lock_guard<std::mutex> lock(g_bridge_mutex);
   std::string error;
-  const int result = FlushPendingSubmitLocked(&error);
+  const int result = FlushPendingSubmitLocked(nullptr, &error);
   if (result != 0) {
     std::cerr << "PvrGPU SystemC API deferred flush failed: " << error
               << '\n';
   }
+  pvrgpu::stub::ShutdownConfiguredModel();
 }
 
 }  // namespace
@@ -1787,16 +1850,17 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
     return 2;
   }
 
-  if (g_pending_submit.valid) {
+  /*
+   * A submission that has already run is finished business, not a conflict:
+   * the readback that ran it consumed it, and what arrives now is the next
+   * frame's work.  Only a submission still waiting to run can absorb another
+   * command into its ordered sequence.
+   */
+  if (g_pending_submit.valid && !g_pending_submit.executed) {
     const bool sequence_active =
         !g_pending_submit.options.driver_commands.empty();
     const bool sequence_root =
         IsIdeasPcoSequenceRoot(g_pending_submit.options.driver_command);
-    if ((sequence_active || sequence_root) && g_pending_submit.executed) {
-      CopyError(error, error_size,
-                "SystemC API deferred submission has already executed");
-      return 2;
-    }
     const std::string stderr_path =
         info->stderr_path && info->stderr_path[0] ? info->stderr_path : "";
     const bool compatible_sequence_member =
@@ -1892,5 +1956,61 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
   }
 
   g_pending_submit = std::move(pending);
+  return 0;
+}
+
+extern "C" int pvrgpu_systemc_flush_readback(
+    pvrgpu_systemc_readback_info *readback, char *error,
+    std::size_t error_size) {
+  std::lock_guard<std::mutex> lock(g_bridge_mutex);
+  if (!readback) {
+    CopyError(error, error_size, "missing SystemC API readback info");
+    return 2;
+  }
+  if (readback->version != PVRGPU_SYSTEMC_API_VERSION) {
+    CopyError(error, error_size, "unsupported SystemC API readback version");
+    return 2;
+  }
+  readback->pixels_written = 0;
+  if (!readback->pixels || readback->width == 0 || readback->height == 0) {
+    CopyError(error, error_size, "missing SystemC API readback destination");
+    return 2;
+  }
+  const std::uint64_t required = static_cast<std::uint64_t>(readback->width) *
+                                 readback->height * 4U;
+  if (static_cast<std::uint64_t>(readback->pixels_size) < required) {
+    CopyError(error, error_size,
+              "SystemC API readback destination is too small");
+    return 2;
+  }
+
+  // Nothing submitted, or the last submission already ran: there is no work to
+  // do and no pixels to claim, which is a success -- the caller keeps whatever
+  // it already has.
+  if (!g_pending_submit.valid || g_pending_submit.executed)
+    return 0;
+
+  pvrgpu::stub::ModelFramebuffer framebuffer;
+  std::string message;
+  const int result = FlushPendingSubmitLocked(&framebuffer, &message);
+  if (result != 0) {
+    CopyError(error, error_size,
+              message.empty() ? "SystemC API flush failed" : message);
+    return result;
+  }
+  if (!framebuffer.valid())
+    return 0;
+  /*
+   * A readback of a different surface than the one the model rendered is not
+   * something to paper over with a rescale: report no pixels and let the
+   * caller keep its own contents.
+   */
+  if (framebuffer.width != readback->width ||
+      framebuffer.height != readback->height)
+    return 0;
+
+  std::memcpy(readback->pixels, framebuffer.pixels.data(),
+              static_cast<std::size_t>(required));
+  readback->pixels_written = 1;
   return 0;
 }

@@ -15,6 +15,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -182,6 +183,11 @@ void Isp::Run() {
         static_cast<std::size_t>(pixel_count);
     std::vector<std::uint32_t> encoded_depth(pixel_count_size, 0);
     std::vector<float> depth(pixel_count_size, 0.0F);
+    // The stencil plane of a combined attachment.  Formats without one keep an
+    // all-zero plane that nothing reads and nothing writes back.
+    const bool has_stencil =
+        DepthAttachmentHasStencil(state.depth_attachment_format);
+    std::vector<std::uint8_t> stencil(pixel_count_size, 0);
     if (state.depth_attachment_load_enable != 0) {
       const std::size_t bytes_per_pixel =
           DepthAttachmentBytesPerPixel(state.depth_attachment_format);
@@ -194,7 +200,8 @@ void Isp::Run() {
             "ISP depth attachment LOAD byte count mismatch");
       }
       encoded_depth = DecodeDepthAttachmentUnormBytes(
-          encoded, state.depth_attachment_format);
+          encoded, state.depth_attachment_format,
+          has_stencil ? &stencil : nullptr);
       for (std::size_t pixel = 0; pixel < pixel_count_size; ++pixel) {
         depth[pixel] = DecodeDepthAttachmentUnorm(
             encoded_depth[pixel], state.depth_attachment_format);
@@ -207,14 +214,79 @@ void Isp::Run() {
           encoded_clear, state.depth_attachment_format);
       std::fill(encoded_depth.begin(), encoded_depth.end(), encoded_clear);
       std::fill(depth.begin(), depth.end(), quantized_clear);
+      if (has_stencil) {
+        std::fill(stencil.begin(), stencil.end(),
+                  static_cast<std::uint8_t>(
+                      state.raster_state.stencil.clear_stencil & 0xFFU));
+      }
     } else {
       std::fill(depth.begin(), depth.end(),
                 state.raster_state.depth.clear_depth);
     }
+    /*
+     * Scissored depth/stencil clears the draw inherits.  They happened before
+     * it, so they land on the planes before any fragment is tested; folding
+     * them into the whole-surface clear values is not possible, which is why
+     * they travel as rectangles.
+     */
+    if (HasPoolHandle(state.attachment_clears)) {
+      const std::vector<AttachmentClearRect> clears =
+          LoadArray<AttachmentClearRect>(pool_, state.attachment_clears);
+      for (const AttachmentClearRect &clear : clears) {
+        if (clear.width == 0 || clear.height == 0)
+          continue;
+        const std::uint64_t x_end =
+            static_cast<std::uint64_t>(clear.x) + clear.width;
+        const std::uint64_t y_end =
+            static_cast<std::uint64_t>(clear.y) + clear.height;
+        if (x_end > state.width || y_end > state.height) {
+          throw std::runtime_error(
+              "ISP inherited attachment clear leaves the attachment: x=" +
+              std::to_string(clear.x) + " y=" + std::to_string(clear.y) +
+              " width=" + std::to_string(clear.width) +
+              " height=" + std::to_string(clear.height) +
+              " extent=" + std::to_string(state.width) + "x" +
+              std::to_string(state.height));
+        }
+        const bool clears_depth =
+            (clear.aspects & kClearAspectDepth) != 0 &&
+            state.depth_attachment_format != 0;
+        const bool clears_stencil =
+            (clear.aspects & kClearAspectStencil) != 0 && has_stencil;
+        const std::uint32_t encoded_clear =
+            clears_depth ? EncodeDepthAttachmentUnorm(
+                               BitsFloat(clear.depth_bits),
+                               state.depth_attachment_format)
+                         : 0;
+        const float decoded_clear =
+            clears_depth ? DecodeDepthAttachmentUnorm(
+                               encoded_clear, state.depth_attachment_format)
+                         : 0.0F;
+        const std::uint8_t stencil_value =
+            static_cast<std::uint8_t>(clear.stencil_value & 0xFFU);
+        for (std::uint32_t y = clear.y; y < y_end; ++y) {
+          const std::size_t row = static_cast<std::size_t>(y) * state.width;
+          if (clears_stencil) {
+            std::fill_n(stencil.begin() + row + clear.x, clear.width,
+                        stencil_value);
+          }
+          if (clears_depth) {
+            std::fill_n(encoded_depth.begin() + row + clear.x, clear.width,
+                        encoded_clear);
+            std::fill_n(depth.begin() + row + clear.x, clear.width,
+                        decoded_clear);
+          }
+        }
+      }
+    }
+
     std::uint64_t covered_pixels = 0;
     std::uint64_t depth_tested = 0;
     std::uint64_t depth_rejected = 0;
     std::uint64_t depth_written = 0;
+    std::uint64_t stencil_tested = 0;
+    std::uint64_t stencil_rejected = 0;
+    std::uint64_t stencil_written = 0;
     const bool llvmpipe_driver_depth =
         IsDriverPcoTrianglesCase(state.functional_case);
 
@@ -295,9 +367,34 @@ void Isp::Run() {
               covered[pixel_index] = 1;
               ++covered_pixels;
             }
-            bool passes = true;
+            /*
+             * GLES 3.0 4.1.4: the stencil test runs before the depth test, and
+             * the operation applied depends on which of the two failed.  A
+             * fragment that fails the stencil test is discarded, but its
+             * stencil-fail operation still updates the plane.
+             */
+            const StencilState &stencil_state = state.raster_state.stencil;
+            const StencilFaceState &face =
+                triangle.front_facing != 0 ? stencil_state.front
+                                           : stencil_state.back;
+            bool stencil_passes = true;
+            if (stencil_state.test_enable && has_stencil) {
+              ++stencil_tested;
+              const std::uint8_t value_mask =
+                  static_cast<std::uint8_t>(face.value_mask & 0xFFU);
+              const std::uint8_t reference =
+                  static_cast<std::uint8_t>(face.reference & 0xFFU);
+              stencil_passes = StencilPass(
+                  face.compare_op,
+                  static_cast<std::uint8_t>(reference & value_mask),
+                  static_cast<std::uint8_t>(stencil[pixel_index] & value_mask));
+              if (!stencil_passes)
+                ++stencil_rejected;
+            }
+
+            bool passes = stencil_passes;
             std::uint32_t incoming_encoded_depth = 0;
-            if (state.raster_state.depth.test_enable) {
+            if (stencil_passes && state.raster_state.depth.test_enable) {
               ++depth_tested;
               if (state.depth_attachment_format == 0) {
                 passes = DepthPass(state.raster_state.depth.compare_op,
@@ -316,6 +413,24 @@ void Isp::Run() {
               }
               if (!passes)
                 ++depth_rejected;
+            }
+            if (stencil_state.test_enable && has_stencil) {
+              const StencilOp op = !stencil_passes  ? face.fail_op
+                                   : passes         ? face.pass_op
+                                                    : face.depth_fail_op;
+              const std::uint8_t write_mask =
+                  static_cast<std::uint8_t>(face.write_mask & 0xFFU);
+              if (write_mask != 0) {
+                const std::uint8_t updated = ApplyStencilOp(
+                    op, stencil[pixel_index],
+                    static_cast<std::uint8_t>(face.reference & 0xFFU));
+                const std::uint8_t written = static_cast<std::uint8_t>(
+                    (stencil[pixel_index] & ~write_mask) |
+                    (updated & write_mask));
+                if (written != stencil[pixel_index])
+                  ++stencil_written;
+                stencil[pixel_index] = written;
+              }
             }
             const std::size_t candidate_index = candidates.size();
             candidates.push_back(candidate);
@@ -364,6 +479,8 @@ void Isp::Run() {
             "ISP depth attachment capture state is invalid");
       }
       state.isp_depth_attachment = StoreNewArray(pool_, encoded_depth);
+      if (has_stencil)
+        state.isp_stencil_attachment = StoreNewArray(pool_, stencil);
     } else if (HasPoolHandle(state.isp_depth_attachment)) {
       throw std::runtime_error("ISP received an unexpected final depth payload");
     }
@@ -371,6 +488,9 @@ void Isp::Run() {
     state.counters.fragment_candidates = candidates.size();
     state.counters.hsr_rejected_fragments = candidates.size() - visible;
     state.counters.covered_pixels = covered_pixels;
+    state.counters.stencil_tested_fragments = stencil_tested;
+    state.counters.stencil_rejected_fragments = stencil_rejected;
+    state.counters.stencil_written_fragments = stencil_written;
     state.counters.depth_tested_fragments = depth_tested;
     state.counters.depth_rejected_fragments = depth_rejected;
     state.counters.depth_written_fragments = depth_written;

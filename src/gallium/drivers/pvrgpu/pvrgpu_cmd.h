@@ -144,6 +144,7 @@ struct pvrgpu_draw_pco_triangles_command {
     */
    uint32_t vertex_attribute_count;
    uint32_t vertex_attribute_components[16];
+   uint32_t vertex_attribute_integer[16];
 
    const uint8_t *raw_index_data;
    size_t raw_index_data_size;
@@ -231,6 +232,19 @@ struct pvrgpu_draw_pco_triangles_command {
    uint32_t depth_func;
    uint32_t depth_clear_bits;
    uint32_t depth_format;
+   /* Index 0 is the front face, index 1 the back. */
+   uint32_t stencil_enable;
+   uint32_t stencil_clear;
+   uint32_t stencil_func[2];
+   uint32_t stencil_fail_op[2];
+   uint32_t stencil_depth_fail_op[2];
+   uint32_t stencil_pass_op[2];
+   uint32_t stencil_value_mask[2];
+   uint32_t stencil_write_mask[2];
+   uint32_t stencil_ref[2];
+   /* Scissored depth/stencil clears issued since the previous draw. */
+   const struct pvrgpu_systemc_attachment_clear *attachment_clears;
+   uint32_t attachment_clear_count;
 };
 
 struct pvrgpu_systemc_driver_command;
@@ -304,11 +318,34 @@ pvrgpu_pco_binary_is_executable(uint32_t stage,
                                 char *error,
                                 size_t error_size);
 
+/*
+ * Run everything submitted since the last flush and copy the RGBA8 result into
+ * `pixels`.  `*out_written` says whether the model actually published pixels
+ * for this surface; when it did not, `pixels` is untouched.  Returns false
+ * only when the flush itself failed.
+ */
+bool
+pvrgpu_systemc_flush_readback_rgba8(uint32_t width,
+                                    uint32_t height,
+                                    uint8_t *pixels,
+                                    size_t pixels_size,
+                                    bool *out_written,
+                                    char *error,
+                                    size_t error_size);
+
 bool
 pvrgpu_driver_draw_command_has_been_emitted(void);
 
 void
 pvrgpu_note_driver_draw_command_emitted(void);
+
+/*
+ * Reopen the once-per-frame draw-command gate.  A readback has run the model,
+ * so the frame it described is finished and the draws that follow are the next
+ * one's.
+ */
+void
+pvrgpu_reset_driver_draw_command_emitted(void);
 
 bool
 pvrgpu_driver_counter_sequence_command_has_been_emitted(void);

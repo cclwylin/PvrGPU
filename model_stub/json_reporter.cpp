@@ -922,6 +922,9 @@ void AccumulatePhysicalCounters(CounterTxn *aggregate,
   PVRGPU_ADD_COUNTER(covered_pixels);
   PVRGPU_ADD_COUNTER(fragment_candidates);
   PVRGPU_ADD_COUNTER(hsr_rejected_fragments);
+  PVRGPU_ADD_COUNTER(stencil_tested_fragments);
+  PVRGPU_ADD_COUNTER(stencil_rejected_fragments);
+  PVRGPU_ADD_COUNTER(stencil_written_fragments);
   PVRGPU_ADD_COUNTER(depth_tested_fragments);
   PVRGPU_ADD_COUNTER(depth_rejected_fragments);
   PVRGPU_ADD_COUNTER(depth_written_fragments);
@@ -1640,6 +1643,11 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
       << ",\"covered_pixels\":" << counters.covered_pixels
       << ",\"fragment_candidates\":" << counters.fragment_candidates
       << ",\"hsr_rejected_fragments\":" << counters.hsr_rejected_fragments
+      << ",\"stencil_tested_fragments\":" << counters.stencil_tested_fragments
+      << ",\"stencil_rejected_fragments\":"
+      << counters.stencil_rejected_fragments
+      << ",\"stencil_written_fragments\":"
+      << counters.stencil_written_fragments
       << ",\"depth_tested_fragments\":" << counters.depth_tested_fragments
       << ",\"depth_rejected_fragments\":" << counters.depth_rejected_fragments
       << ",\"depth_written_fragments\":" << counters.depth_written_fragments
@@ -1676,13 +1684,58 @@ void EmitError(std::uint32_t frame, const std::string &message) {
 
 JsonReporter::JsonReporter(sc_core::sc_module_name name, const Options &options,
                            MemoryPool &pool,
-                           sc_core::sc_event *sequence_completion)
+                           sc_core::sc_event *sequence_completion,
+                           ModelJob *job)
     : sc_module(name), options_(options), pool_(pool),
-      sequence_completion_(sequence_completion) {
+      sequence_completion_(sequence_completion), job_(job) {
   SC_THREAD(Run);
 }
 
+/*
+ * End the current job.
+ *
+ * A single-shot run stops the kernel, which is how the simulation used to
+ * finish.  A persistent model must not: `sc_stop()` is one-way, and after it
+ * no `sc_start()` will run again, so the next readback would find a dead
+ * simulation.  The job's own flags carry the outcome instead.
+ */
+void JsonReporter::FinishJob(bool failed, const std::string &error) {
+  if (!job_) {
+    sc_core::sc_stop();
+    return;
+  }
+  if (failed)
+    job_->Fail(error.empty() ? "JsonReporter reported a failed job" : error);
+}
+
+/*
+ * Report per flush rather than once at the end.
+ *
+ * A case that reads back three times therefore emits three counter records.
+ * That is a protocol change, not an accident: the alternative is to hold the
+ * numbers until exit, which is exactly what kept the pixels from coming back.
+ */
 void JsonReporter::Run() {
+  if (!job_) {
+    RunJob();
+    return;
+  }
+  for (;;) {
+    wait(job_->start);
+    if (!job_->running || job_->complete)
+      continue;
+    options_ = job_->options;
+    try {
+      RunJob();
+    } catch (const std::exception &error) {
+      failed_ = true;
+      job_->Fail(error.what());
+    }
+    job_->complete = true;
+  }
+}
+
+void JsonReporter::RunJob() {
   if (!options_.driver_commands.empty()) {
     const bool generic_sequence =
         options_.driver_command.command == "draw_pco_sequence";
@@ -1872,7 +1925,7 @@ void JsonReporter::Run() {
         }
         failed_ = true;
         EmitError(static_cast<std::uint32_t>(completed + 1U), error.what());
-        sc_core::sc_stop();
+        FinishJob(true, error.what());
         return;
       }
     }
@@ -1900,6 +1953,12 @@ void JsonReporter::Run() {
       }
       ValidateDrawListStats(aggregate, aggregate_drawlists);
 
+      // The same final DRAM readback the PNG is written from is what a
+      // `glReadPixels` on this colour attachment has to see.  Publish it
+      // before the artifact so a run with no output directory still answers
+      // the driver.
+      if (job_)
+        job_->PublishFramebuffer(final_framebuffer, final_width, final_height);
       std::filesystem::path artifact_path;
       if (!options_.output_dir.empty()) {
         artifact_path = FramePath(options_, 1);
@@ -1919,7 +1978,7 @@ void JsonReporter::Run() {
     } catch (const std::exception &error) {
       failed_ = true;
       EmitError(1, error.what());
-      sc_core::sc_stop();
+      FinishJob(true, error.what());
       return;
     }
 
@@ -1940,7 +1999,8 @@ void JsonReporter::Run() {
     std::cout.flush();
     if (leaks != 0 || pool_.bytes_in_flight() != 0)
       failed_ = true;
-    sc_core::sc_stop();
+    FinishJob(leaks != 0 || pool_.bytes_in_flight() != 0,
+              "JsonReporter PCO sequence leaked MemoryPool payloads");
     return;
   }
 
@@ -1993,6 +2053,10 @@ void JsonReporter::Run() {
           BuildVertexPcoEvidence(pool_, state);
       const FragmentPcoEvidence fragment_pco =
           BuildFragmentPcoEvidence(pool_, state);
+      // What the driver reads back is the model's own DRAM contents, never the
+      // command sidecar the artifact may be overlaid with below.
+      if (job_)
+        job_->PublishFramebuffer(framebuffer, state.width, state.height);
       std::filesystem::path artifact_path;
       if (!options_.output_dir.empty()) {
         artifact_path = FramePath(options_, state.counters.frame);
@@ -2042,7 +2106,7 @@ void JsonReporter::Run() {
       }
       failed_ = true;
       EmitError(txn.frame, error.what());
-      sc_core::sc_stop();
+      FinishJob(true, error.what());
       return;
     }
   }
@@ -2060,7 +2124,8 @@ void JsonReporter::Run() {
   std::cout.flush();
   if (leaks != 0 || pool_.bytes_in_flight() != 0)
     failed_ = true;
-  sc_core::sc_stop();
+  FinishJob(leaks != 0 || pool_.bytes_in_flight() != 0,
+            "JsonReporter leaked MemoryPool payloads");
 }
 
 } // namespace pvrgpu::stub

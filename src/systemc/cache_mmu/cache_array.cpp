@@ -339,6 +339,38 @@ void CacheArray::InvalidateAll() noexcept {
   }
 }
 
+std::uint64_t CacheArray::InvalidateRange(std::uint64_t address,
+                                          std::size_t bytes,
+                                          const CacheLineWrite &lower_write) {
+  if (bytes == 0 || bypass_)
+    return 0;
+  if (bytes > std::numeric_limits<std::uint64_t>::max() - address)
+    throw std::overflow_error("CacheArray invalidate range overflows");
+  const std::uint64_t line_bytes = config_.line_size_bytes;
+  const std::uint64_t end = address + bytes;
+  std::uint64_t flushed = 0;
+  for (std::uint64_t line_address = address - address % line_bytes;
+       line_address < end; line_address += line_bytes) {
+    const AddressFields fields = DecodeAddress(line_address);
+    const std::size_t way = FindWay(fields);
+    if (way == CacheLineAccess::kNoCacheIndex)
+      continue;
+    Line &line = sets_[fields.bank * sets_per_bank_ + fields.set][way];
+    // Clean before dropping: a line the GPU dirtied may hold bytes outside the
+    // range the host is replacing, and they belong in DRAM either way.
+    if (line.dirty) {
+      WriteLower(line_address, line.data, lower_write);
+      ++flushed;
+    }
+    line.valid = false;
+    line.dirty = false;
+    line.tag = 0;
+    line.lru_rank = 0;
+    std::fill(line.data.begin(), line.data.end(), 0);
+  }
+  return flushed;
+}
+
 std::uint64_t CacheArray::SetBypass(bool bypass,
                                     const CacheLineWrite &lower_write) {
   if (bypass_ == bypass)

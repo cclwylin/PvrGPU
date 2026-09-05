@@ -121,6 +121,27 @@ void GpuMemorySystem::HostWrite(std::uint64_t address, const void *source,
                                 std::size_t bytes) {
   if (!source && bytes != 0)
     throw std::invalid_argument("GpuMemorySystem host source is null");
+  /*
+   * The model now outlives a single flush, so the SLC can still hold lines
+   * covering the range the host is about to replace.  Left resident they
+   * answer the next draw with the previous flush's bytes: a dEQP case that
+   * draws, reads back and draws again into the same vertex array hit in the
+   * SLC on every flush after the first and re-rendered the first flush's
+   * geometry, down to an identical ps_invocations.
+   *
+   * Clean the range first, so a line the GPU dirtied cannot later land on top
+   * of what the host is writing, then drop it so the next access refills from
+   * DRAM.  Host writes establish DRAM contents rather than model GPU traffic,
+   * and the maintenance that keeps them visible is part of that: like the
+   * write itself it is untimed and uncounted.
+   */
+  if (mode_ == MemoryMode::kCache) {
+    slc_.InvalidateRange(
+        address, bytes,
+        [this](std::uint64_t line_address, const CacheLineData &data) {
+          backing_.Write(line_address, data.data(), data.size());
+        });
+  }
   backing_.Write(address, static_cast<const std::uint8_t *>(source), bytes);
 }
 

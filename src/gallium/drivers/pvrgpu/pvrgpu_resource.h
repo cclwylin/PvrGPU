@@ -21,6 +21,17 @@ struct pvrgpu_resource {
    uintptr_t level_offsets[PIPE_MAX_TEXTURE_LEVELS];
    unsigned level_count;
    size_t size;
+   /*
+    * The driver has put content in `data` that the model cannot reproduce.
+    *
+    * A scissored or channel-masked clear is written here by the CPU and is not
+    * describable by the v1 `clear_color` capsule, so the model never sees it.
+    * Its framebuffer therefore no longer describes this surface, and a readback
+    * that copied it back would erase the region the application just cleared.
+    * A full-surface RGBA clear does not set this: the model starts a sequence
+    * from the same uniform state, so its output still agrees.
+    */
+   bool driver_writes_model_cannot_reproduce;
 };
 
 static inline struct pvrgpu_resource *

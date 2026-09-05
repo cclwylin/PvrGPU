@@ -3667,6 +3667,12 @@ static bool pvrgpu_color_primitive_allowed_intrinsic(nir_intrinsic_op op)
     */
    case nir_intrinsic_terminate:
    case nir_intrinsic_terminate_if:
+   /*
+    * gl_InstanceID.  PCO translates it as a vertex system value read from a
+    * VTXIN register, which is the same register class the attributes land in,
+    * so the driver reserves a slot for it and packs the value there.
+    */
+   case nir_intrinsic_load_instance_id:
       return true;
    default:
       return false;
@@ -4301,6 +4307,24 @@ bool pvrgpu_pco_compile_color_triangle(
          };
    }
    vertex_data.common.vtxins = attribute_count * 4;
+   /*
+    * A vertex shader that reads gl_InstanceID gets it from a VTXIN register.
+    * Reserve the slot immediately after the attributes and tell PCO where it
+    * is; the draw packs the instance index into that slot per vertex.
+    */
+   if (BITSET_TEST(vs->info.system_values_read, SYSTEM_VALUE_INSTANCE_ID)) {
+      vertex_data.common.sys_vals[SYSTEM_VALUE_INSTANCE_ID] = (pco_range){
+         .start = attribute_count * 4,
+         .count = 1,
+      };
+      /*
+       * The model lays attributes out four registers apart, so the reserved
+       * slot occupies a whole quad even though PCO reads one register of it.
+       * Declaring the smaller count would leave the binding writing past the
+       * ABI the capsule states.
+       */
+      vertex_data.common.vtxins = (attribute_count + 1) * 4;
+   }
    unsigned varying_components[PVRGPU_PCO_MAX_VARYINGS] = {0};
    unsigned varying_locations[PVRGPU_PCO_MAX_VARYINGS] = {0};
    bool varying_read_by_fragment[PVRGPU_PCO_MAX_VARYINGS] = {false};

@@ -210,7 +210,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("full_depth_clear_resource", context_header)
         self.assertIn("pvrgpu_note_full_depth_clear_one", clear)
         self.assertIn("pvrgpu_invalidate_full_depth_clear_for_resource", resource)
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 8u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 12u", systemc_api)
         for field in (
             "const uint8_t *raw_vertex_data;",
             "size_t raw_vertex_data_size;",
@@ -349,8 +349,17 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("context->resource_copy_region = pvrgpu_resource_copy_region", resource)
         self.assertIn("context->blit = pvrgpu_blit", resource)
         self.assertIn("util_format_is_pure_integer(format)", resource)
-        self.assertIn("PIPE_FORMAT_Z24_UNORM_S8_UINT", resource)
-        self.assertIn("PIPE_FORMAT_S8_UINT_Z24_UNORM", resource)
+        # Resource creation asks the screen what it can hold rather than
+        # keeping a second, shorter format list of its own: the two disagreed,
+        # so is_format_supported() advertised R8/RG8 while creation refused it.
+        self.assertIn(
+            "pvrgpu_is_supported_texture_resource_format", resource
+        )
+        self.assertIn("pvrgpu_is_supported_color_format(format)", resource)
+        self.assertIn(
+            "pvrgpu_is_supported_depth_stencil_format(format)", resource
+        )
+        self.assertNotIn("pvrgpu_is_supported_color_resource_format", resource)
         self.assertIn("pvrgpu_counter_eventf(\"resource_create\"", resource)
         self.assertIn("pvrgpu_counter_eventf(\"texture_subdata\"", resource)
         self.assertIn("pvrgpu_counter_eventf(\"resource_copy_region\"", resource)
@@ -746,7 +755,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 8u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 12u", systemc_api)
         for field in (
             "uint32_t vertex_stride;",
             "uint32_t position_output_start;",
@@ -879,7 +888,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 8u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 12u", systemc_api)
         self.assertIn("command=draw_pco_triangles", command)
         self.assertIn("pvrgpu_write_draw_pco_triangles_command", command_header)
         self.assertIn("PVRGPU_DRAW_PCO_TRIANGLES_VERTEX_COUNT 6144u", command_header)

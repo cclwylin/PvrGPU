@@ -224,6 +224,69 @@ struct DepthState {
   std::uint8_t reserved[2]{};
 };
 
+// What a face does to the stencil plane, per GLES 3.0 4.1.4.  The compare uses
+// DepthCompareOp: the eight functions are the same set, and giving stencil its
+// own enum would only invite the two to drift apart.
+// Numbered to match PIPE_STENCIL_OP_*, so the ABI carries the producer's value
+// verbatim rather than through a translation that can silently drift -- the
+// same arrangement DepthCompareOp has with PIPE_FUNC_*.  Note the order: the
+// wrapping forms come before invert.
+enum class StencilOp : std::uint32_t {
+  kKeep = 0,
+  kZero = 1,
+  kReplace = 2,
+  kIncrementClamp = 3,
+  kDecrementClamp = 4,
+  kIncrementWrap = 5,
+  kDecrementWrap = 6,
+  kInvert = 7,
+};
+
+struct StencilFaceState {
+  DepthCompareOp compare_op = DepthCompareOp::kAlways;
+  StencilOp fail_op = StencilOp::kKeep;
+  StencilOp depth_fail_op = StencilOp::kKeep;
+  StencilOp pass_op = StencilOp::kKeep;
+  // GLES masks and reference are eight bits wide for an S8 plane; they are held
+  // as 32 so the ABI can carry the value the application actually set.
+  std::uint32_t value_mask = 0xFFU;
+  std::uint32_t write_mask = 0xFFU;
+  std::uint32_t reference = 0;
+};
+
+// Planes an AttachmentClearRect touches.
+inline constexpr std::uint32_t kClearAspectDepth = 0x1U;
+inline constexpr std::uint32_t kClearAspectStencil = 0x2U;
+
+// A rectangle of the depth/stencil attachment set before the draw ran.  The
+// pipeline carries these because a scissored clear cannot be folded into
+// DepthState::clear_depth or StencilState::clear_stencil, which describe the
+// whole surface.
+struct AttachmentClearRect {
+  std::uint32_t x = 0;
+  std::uint32_t y = 0;
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  std::uint32_t aspects = 0;
+  std::uint32_t depth_bits = 0;
+  std::uint32_t stencil_value = 0;
+};
+
+struct StencilState {
+  StencilFaceState front;
+  StencilFaceState back;
+  std::uint32_t clear_stencil = 0;
+  std::uint8_t test_enable = 0;
+  std::uint8_t reserved[3]{};
+};
+
+// Applies one stencil operation to the stored value.  `reference` is the
+// face's reference, already masked to the plane's width by the caller.
+std::uint8_t ApplyStencilOp(StencilOp op, std::uint8_t stored,
+                            std::uint8_t reference);
+bool StencilPass(DepthCompareOp op, std::uint8_t reference,
+                 std::uint8_t stored);
+
 // Public pipe-format values are transported verbatim by the native sequence
 // ABI. These helpers centralize the exact little-endian UNORM attachment
 // conversion used by Submitter, ISP and FragmentFrontend.
@@ -231,10 +294,18 @@ std::size_t DepthAttachmentBytesPerPixel(std::uint32_t format);
 std::uint32_t EncodeDepthAttachmentUnorm(float depth, std::uint32_t format);
 float DecodeDepthAttachmentUnorm(std::uint32_t encoded,
                                  std::uint32_t format);
+// Z24_UNORM_S8_UINT packs the stencil in bits 24..31 of the same word.  The
+// depth codec refuses a nonzero value there, so the planes are split on the way
+// in and recombined on the way out.  Passing no stencil vector keeps the old
+// behaviour: the stencil plane reads as zero and is written back as zero, which
+// is what a format without one requires anyway.
+bool DepthAttachmentHasStencil(std::uint32_t format);
 std::vector<std::uint32_t> DecodeDepthAttachmentUnormBytes(
-    const std::vector<std::uint8_t> &bytes, std::uint32_t format);
+    const std::vector<std::uint8_t> &bytes, std::uint32_t format,
+    std::vector<std::uint8_t> *stencil = nullptr);
 std::vector<std::uint8_t> EncodeDepthAttachmentUnormBytes(
-    const std::vector<std::uint32_t> &encoded, std::uint32_t format);
+    const std::vector<std::uint32_t> &encoded, std::uint32_t format,
+    const std::vector<std::uint8_t> *stencil = nullptr);
 
 enum class BlendEquation : std::uint8_t {
   kAdd = 0,
@@ -306,6 +377,7 @@ struct ScissorState {
 
 struct RasterState {
   DepthState depth;
+  StencilState stencil;
   BlendState blend;
   FaceCullState face_cull;
   ScissorState scissor;

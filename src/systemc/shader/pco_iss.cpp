@@ -5282,8 +5282,23 @@ PcoVertexExecution ExecuteVertexPco(
         value = HalfToFloat(static_cast<std::uint16_t>(
             read(instruction.source) & UINT32_C(0xffff)));
         break;
+      /*
+       * Integer-to-float conversion, which a vertex shader reaches for the
+       * moment it uses gl_InstanceID or gl_VertexID as a number.  The fragment
+       * path has executed these since the generic lowering landed; the vertex
+       * path simply had no case for them.
+       */
+      case PcoOpcode::kUnpackUnsignedToFloat:
+        value = FloatFromUnsigned(read(instruction.source));
+        break;
+      case PcoOpcode::kUnpackSignedToFloat:
+        value = FloatFromSigned(
+            static_cast<std::int32_t>(read(instruction.source)));
+        break;
       default:
-        ExecuteError("unknown generic vertex ALU operation");
+        ExecuteError("unknown generic vertex ALU operation: opcode=" +
+                     std::to_string(
+                         static_cast<std::uint32_t>(instruction.opcode)));
       }
       temporaries[instruction.output_index] = value;
       temporary_written_mask |= UINT64_C(1) << instruction.output_index;
@@ -6214,14 +6229,29 @@ PcoFragmentExecution ExecuteFragmentPco(
       if (instruction.source.index >= temporaries.size()) {
         ExecuteError("fragment TEMP-to-PIXOUT index exceeds temporary register file");
       }
+    } else if (instruction.source.bank == PcoRegisterBank::kCoefficient) {
+      /*
+       * A flat varying passed straight to the output.  GLES 3 requires an
+       * integer varying to be flat-qualified, so a shader that forwards
+       * gl_InstanceID arrives here; PCO reads the plane's constant term rather
+       * than interpolating, which is what the generic ALU path above already
+       * does for the same bank.
+       */
+      if (instruction.source.index >= context.coefficient_count)
+        ExecuteError("fragment coefficient-to-PIXOUT source is absent");
     } else {
-      ExecuteError("fragment MBYP source bank is outside the gate");
+      ExecuteError("fragment MBYP source bank is outside the gate: bank=" +
+                   std::to_string(
+                       static_cast<std::uint32_t>(instruction.source.bank)) +
+                   " index=" + std::to_string(instruction.source.index));
     }
     const std::uint8_t output =
         static_cast<std::uint8_t>(instruction.output_index);
     result.pixel_outputs[output] =
-        ReadSource(instruction.source, no_vertex_inputs, temporaries,
-                   temporary_written_mask, 0, ShaderStage::kFragment);
+        instruction.source.bank == PcoRegisterBank::kCoefficient
+            ? context.coefficients[instruction.source.index]
+            : ReadSource(instruction.source, no_vertex_inputs, temporaries,
+                         temporary_written_mask, 0, ShaderStage::kFragment);
     result.written_mask |= static_cast<std::uint8_t>(1U << output);
     if (trace) {
       std::cerr << "pco-fragment-trace pc=" << pc << " off="

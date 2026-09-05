@@ -383,6 +383,18 @@ target_link_libraries(systemc-api-bridge-test PRIVATE
 pvrgpu_target_warnings(systemc-api-bridge-test)
 add_test(NAME systemc-api-bridge-unit COMMAND systemc-api-bridge-test)
 
+add_executable(systemc-readback-flush-test
+    tests/systemc_readback_flush_test.cpp
+)
+target_include_directories(systemc-readback-flush-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu"
+)
+target_link_libraries(systemc-readback-flush-test PRIVATE
+    pvrgpu-systemc-bridge
+)
+pvrgpu_target_warnings(systemc-readback-flush-test)
+add_test(NAME systemc-readback-flush-unit COMMAND systemc-readback-flush-test)
+
 add_executable(pco-systemc-api-bridge-test
     tests/pco_systemc_api_bridge_test.cpp
 )

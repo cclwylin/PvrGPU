@@ -86,8 +86,22 @@ void MaterializeDepthAttachment(MemoryPool &pool, GpuMemorySystem *memory,
     throw std::overflow_error(
         "FragmentFrontend depth attachment byte size overflow");
   const std::uint64_t attachment_bytes = pixel_count * bytes_per_pixel;
+  // A combined attachment carries the stencil plane the ISP left beside the
+  // depth one; writing back without it would erase every stencil op the draw
+  // performed.
+  std::vector<std::uint8_t> final_stencil;
+  const bool has_stencil =
+      DepthAttachmentHasStencil(state->depth_attachment_format);
+  if (has_stencil && HasPoolHandle(state->isp_stencil_attachment)) {
+    final_stencil = LoadArray<std::uint8_t>(pool, state->isp_stencil_attachment);
+    if (final_stencil.size() != pixel_count) {
+      throw std::runtime_error(
+          "FragmentFrontend final stencil value count mismatch");
+    }
+  }
   std::vector<std::uint8_t> attachment = EncodeDepthAttachmentUnormBytes(
-      final_depth, state->depth_attachment_format);
+      final_depth, state->depth_attachment_format,
+      final_stencil.empty() ? nullptr : &final_stencil);
   if (attachment.size() != attachment_bytes)
     throw std::runtime_error(
         "FragmentFrontend encoded depth attachment size mismatch");

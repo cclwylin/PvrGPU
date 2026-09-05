@@ -118,6 +118,15 @@ public:
   // the number of dirty lines written during the transition.
   std::uint64_t SetBypass(bool bypass, const CacheLineWrite &lower_write = {});
 
+  // Write back any dirty line intersecting [address, address + bytes) and then
+  // drop every line the range touches, so the next access refills from the
+  // level below.  This is maintenance for a store the array never saw -- a
+  // host or loader write that lands straight in DRAM -- and so, like that
+  // write, it is untimed and leaves the array's statistics alone.  Returns the
+  // number of dirty lines written back.
+  std::uint64_t InvalidateRange(std::uint64_t address, std::size_t bytes,
+                                const CacheLineWrite &lower_write = {});
+
   void ResetStats() noexcept { stats_ = {}; }
 
 private:

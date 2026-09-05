@@ -38,6 +38,14 @@ struct pvrgpu_refract_pco_observation;
 struct pvrgpu_shadow_pco_observation;
 struct pvrgpu_terrain_pco_observation;
 
+/*
+ * Scissored depth/stencil clears one draw may inherit.  dEQP's stencil.* paint
+ * a grid of 36 rectangles before their first draw; the bound is generous enough
+ * for that and small enough that overrunning it is reported rather than
+ * absorbed.
+ */
+#define PVRGPU_MAX_PENDING_ATTACHMENT_CLEARS 256u
+
 struct pvrgpu_context {
    struct pipe_context base;
    struct pipe_framebuffer_state framebuffer;
@@ -89,6 +97,29 @@ struct pvrgpu_context {
    unsigned full_depth_clear_width;
    unsigned full_depth_clear_height;
    bool full_depth_clear_is_one;
+   /*
+    * The value the last whole-surface stencil clear wrote, and whether one has
+    * happened since the surface was last described to the model.  The model
+    * starts a sequence's stencil plane from this rather than from zero.
+    */
+   /*
+    * Float bits of the value the last whole-surface depth clear wrote.  The
+    * capsule used to state a constant 1.0, so a case that cleared depth to 0
+    * and drew with GL_LESS had every fragment pass in the model and none in
+    * the reference -- dEQP's stencil.depth_fail_replace never reached its
+    * depth-fail operation.
+    */
+   uint32_t depth_clear_bits;
+   unsigned stencil_clear_value;
+   /*
+    * Scissored depth/stencil clears issued since the last recorded draw.  The
+    * v1 capsule states one whole-surface value per plane, so these travel with
+    * the draw that inherits them; without that, a draw tested against planes
+    * the application had already painted.
+    */
+   struct pvrgpu_systemc_attachment_clear *pending_attachment_clears;
+   unsigned pending_attachment_clear_count;
+   unsigned pending_attachment_clear_capacity;
    bool driver_draw_command_emitted;
    bool driver_indexed_quad_command_locked;
    bool driver_counter_sequence_command_emitted;
@@ -139,6 +170,15 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx);
 bool
 pvrgpu_context_has_recorded_geometry(const struct pvrgpu_context *ctx);
 
+/*
+ * Close the frame a readback has just observed: submit the geometry it
+ * accumulated so the model can run it, and let the draws that follow start a
+ * new frame.  An RDC replay, whose trace declares its own frame length, is
+ * left exactly as it was.
+ */
+void
+pvrgpu_context_end_frame_at_readback(struct pvrgpu_context *ctx);
+
 void
 pvrgpu_array_primitive_sequence_reset(struct pvrgpu_context *ctx);
 
@@ -147,6 +187,16 @@ pvrgpu_note_full_depth_clear_one(struct pvrgpu_context *ctx,
                                  const struct pipe_surface *surface,
                                  unsigned width,
                                  unsigned height);
+
+bool
+pvrgpu_note_pending_attachment_clear(struct pvrgpu_context *ctx,
+                                     unsigned x,
+                                     unsigned y,
+                                     unsigned width,
+                                     unsigned height,
+                                     unsigned aspects,
+                                     uint32_t depth_bits,
+                                     unsigned stencil_value);
 
 void
 pvrgpu_invalidate_full_depth_clear(struct pvrgpu_context *ctx);

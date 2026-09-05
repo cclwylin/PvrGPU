@@ -320,7 +320,7 @@ pvrgpu_debug_format_support_enabled(void)
    return enabled && enabled[0] != '\0' && enabled[0] != '0';
 }
 
-static bool
+bool
 pvrgpu_is_supported_color_format(enum pipe_format format)
 {
    switch (format) {
@@ -410,7 +410,7 @@ pvrgpu_is_supported_color_format(enum pipe_format format)
  * Keeping them out of the colour list is what stops Mesa from advertising
  * them as colour-renderable.
  */
-static bool
+bool
 pvrgpu_is_sampler_only_format(enum pipe_format format)
 {
    if (!pvrgpu_es3_enabled())
@@ -428,7 +428,7 @@ pvrgpu_is_sampler_only_format(enum pipe_format format)
    }
 }
 
-static bool
+bool
 pvrgpu_is_supported_depth_stencil_format(enum pipe_format format)
 {
    switch (format) {

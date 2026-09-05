@@ -38,6 +38,7 @@
 #include "memory/dram_model.h"
 #include "memory/on_chip_fabric.h"
 #include "memory_pool.h"
+#include "model_job.h"
 #include "model_runner.h"
 #include "model_types.h"
 #include "pds/pds_engine.h"
@@ -51,6 +52,7 @@
 #include <systemc>
 
 #include <iostream>
+#include <memory>
 #include <string>
 
 namespace pvrgpu::stub {
@@ -174,7 +176,28 @@ bool ConfigureDriverCommandOptions(Options *options, std::string *error) {
 
 }  // namespace pvrgpu::stub
 
-int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options) {
+namespace pvrgpu::stub {
+
+/*
+ * Validate the flush's options and announce it on the counter stream.
+ *
+ * This is per flush, not per process: a model that stays alive across
+ * readbacks still describes each submission it is given.
+ */
+int AnnounceModelConfiguration(pvrgpu::stub::Options &options) {
+  // A sequence carries its per-draw state in the nested commands; the root
+  // command is only the summary.  Report the first draw that enables the
+  // stencil test, because a sequence commonly opens with draws that do not and
+  // reporting those says nothing about the state the test runs under.
+  const pvrgpu::stub::DriverCommand &first_draw = [&options]()
+      -> const pvrgpu::stub::DriverCommand & {
+    for (const pvrgpu::stub::DriverCommand &draw : options.driver_commands) {
+      if (draw.stencil_enable != 0)
+        return draw;
+    }
+    return options.driver_commands.empty() ? options.driver_command
+                                           : options.driver_commands.front();
+  }();
   using pvrgpu::stub::ClipCull;
   using pvrgpu::stub::ComputeDataMaster;
   using pvrgpu::stub::ControlRegisterBus;
@@ -485,6 +508,27 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options) {
                       ? "clockwise"
                       : "counter-clockwise")
             << "\"}"
+            << ",\"stencil_state\":{"
+            // A sequence keeps its per-draw state in the nested commands; the
+            // root is only the summary, so report the first draw that has one.
+            << "\"enabled\":"
+              << (first_draw.stencil_enable != 0 ? "true" : "false")
+            << ",\"depth_format\":" << first_draw.depth_format
+            << ",\"clear\":" << first_draw.stencil_clear
+            << ",\"front_func\":" << first_draw.stencil_func[0]
+            << ",\"front_value_mask\":" << first_draw.stencil_value_mask[0]
+            << ",\"front_write_mask\":" << first_draw.stencil_write_mask[0]
+            << ",\"front_ref\":" << first_draw.stencil_ref[0]
+            << ",\"inherited_clears\":" << first_draw.attachment_clears.size()
+            << ",\"sequence_clears\":" << [&options]() {
+                 std::size_t total = 0;
+                 for (const pvrgpu::stub::DriverCommand &draw :
+                      options.driver_commands) {
+                   total += draw.attachment_clears.size();
+                 }
+                 return total;
+               }()
+            << "}"
             << ",\"tile_width\":" << pvrgpu::stub::kReferenceUarch.tile_width
             << ",\"tile_height\":" << pvrgpu::stub::kReferenceUarch.tile_height
             << ",\"warning\":\"";
@@ -553,117 +597,186 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options) {
             << ",\"workload\":\"" << JsonEscape(options.test_case) << "\""
             << ",\"frames\":" << options.frames << "}\n";
   std::cout.flush();
+  return 0;
+}
+
+} // namespace pvrgpu::stub
+
+namespace pvrgpu::stub {
+namespace {
+
+int ModelFifoDepth() {
+  return static_cast<int>(pvrgpu::stub::kReferenceUarch.fifo_depth);
+}
+
+/*
+ * The elaborated model.
+ *
+ * SystemC elaborates once per process.  Building the module set as locals and
+ * calling `sc_start()` once meant a second submission was answered with
+ *
+ *     Error: (E529) insert module failed: elaboration done
+ *
+ * so the whole simulation had to be deferred to `atexit` -- one process, one
+ * run, and it had to be last.  That is why a readback came back black: the
+ * draw had not happened yet.
+ *
+ * `sc_start()`, on the other hand, may be called as often as you like, as long
+ * as you elaborate once and do not `sc_stop()`.  Control returns to the caller
+ * each time and the simulation resumes with its state intact.  So the module
+ * and FIFO set lives here instead, outliving any one flush.  The wiring is
+ * unchanged; only where the objects live has moved.  This is also the more
+ * faithful arrangement: the model stays alive between draws rather than being
+ * rebuilt, which is what hardware does.
+ */
+class ModelSession {
+public:
+  explicit ModelSession(MemoryMode memory_mode, bool cache_bypass);
+
+  MemoryMode memory_mode() const { return memory_mode_; }
+
+  // Runs one flush.  Returns 0 when the reporter published the job's records
+  // and the MemoryPool balanced, and non-zero otherwise, with `error` set.
+  int Run(const Options &options, ModelFramebuffer *framebuffer,
+          std::string *error);
+
+  // True once a flush has failed.  A failure can leave a process part-way
+  // through a submission it will never finish, and there is no way to tell a
+  // SystemC process to start over, so the session refuses further work rather
+  // than reporting a later flush against a pipeline in an unknown state.
+  bool poisoned() const { return poisoned_; }
+
+  void Shutdown();
+
+private:
+  MemoryMode memory_mode_;
+  bool cache_bypass_;
+  bool started_ = false;
+  bool stopped_ = false;
+  bool poisoned_ = false;
 
   MemoryPool pool;
-  GpuMemorySystem memory(options.memory_mode);
+  GpuMemorySystem memory;
+  ModelJob job;
 
   // DXTP-aligned structural placeholders. They elaborate as distinct SystemC
   // modules but intentionally have no ports, process, timing, or functional
   // connection until their FIFO transaction contracts are defined.
-  SocBusInterface soc_bus_interface("soc_bus_interface");
-  XpuInterface xpu_interface("xpu_interface");
-  ControlRegisterBus control_register_bus("control_register_bus");
-  FirmwareScheduler firmware_scheduler("firmware_scheduler");
-  ComputeDataMaster compute_data_master("compute_data_master");
-  DomainDataMaster domain_data_master("domain_data_master");
-  PixelDataMaster pixel_data_master("pixel_data_master");
-  TwoDDataMaster two_d_data_master("two_d_data_master");
-  ImageCompression image_compression("image_compression");
+  SocBusInterface soc_bus_interface{"soc_bus_interface"};
+  XpuInterface xpu_interface{"xpu_interface"};
+  ControlRegisterBus control_register_bus{"control_register_bus"};
+  FirmwareScheduler firmware_scheduler{"firmware_scheduler"};
+  ComputeDataMaster compute_data_master{"compute_data_master"};
+  DomainDataMaster domain_data_master{"domain_data_master"};
+  PixelDataMaster pixel_data_master{"pixel_data_master"};
+  TwoDDataMaster two_d_data_master{"two_d_data_master"};
+  ImageCompression image_compression{"image_compression"};
 
   // MMU/fabric modules remain structural placeholders. MCU, TCU and USC-L2
   // bind idle traffic because active clients now use the shared GpuMemorySystem
   // API for DRAM backing plus optional SLC simulation.
-  MmuBif mmu_bif("mmu_bif");
-  MixedCache mixed_cache("mixed_cache", pool, options.cache_bypass);
-  TextureCache texture_cache("texture_cache", pool, options.cache_bypass);
-  UscL2Cache usc_l2_cache("usc_l2_cache", pool, options.cache_bypass);
-  OnChipFabric on_chip_fabric("on_chip_fabric");
-  MemFabric mem_fabric("mem_fabric");
+  MmuBif mmu_bif{"mmu_bif"};
+  MixedCache mixed_cache{"mixed_cache", pool, cache_bypass_};
+  TextureCache texture_cache{"texture_cache", pool, cache_bypass_};
+  UscL2Cache usc_l2_cache{"usc_l2_cache", pool, cache_bypass_};
+  OnChipFabric on_chip_fabric{"on_chip_fabric"};
+  MemFabric mem_fabric{"mem_fabric"};
 
-  const int fifo_depth =
-      static_cast<int>(pvrgpu::stub::kReferenceUarch.fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> submit_to_vdm("submit_to_vdm", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> vdm_to_vertex_fetch("vdm_to_vertex_fetch",
-                                                    fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> vertex_fetch_to_pds(
-      "vertex_fetch_to_pds", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> vertex_pds_to_decoder(
-      "vertex_pds_to_decoder", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> vertex_decoder_to_slot("vertex_decoder_to_slot",
-                                                       fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> vertex_slot_to_cluster("vertex_slot_to_cluster",
-                                                       fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> vertex_cluster_to_texture_samples(
-      "vertex_cluster_to_texture_samples", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> texture_samples_to_vertex_cluster(
-      "texture_samples_to_vertex_cluster", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> vertex_cluster_to_clip("vertex_cluster_to_clip",
-                                                       fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> clip_to_tiler("clip_to_tiler", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> tiler_to_parameter_buffer(
-      "tiler_to_parameter_buffer", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> parameter_buffer_to_fragment_decoder(
-      "parameter_buffer_to_fragment_decoder", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> fragment_decoder_to_tile_scheduler(
-      "fragment_decoder_to_tile_scheduler", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> tile_scheduler_to_isp("tile_scheduler_to_isp",
-                                                      fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> isp_to_fragment_frontend(
-      "isp_to_fragment_frontend", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> fragment_frontend_to_pds(
-      "fragment_frontend_to_pds", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> pds_to_fragment_slot(
-      "pds_to_fragment_slot", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> fragment_slot_to_cluster(
-      "fragment_slot_to_cluster", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> fragment_cluster_to_texture(
-      "fragment_cluster_to_texture", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> fragment_cluster_to_texture_samples(
-      "fragment_cluster_to_texture_samples", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> texture_samples_to_fragment_cluster(
-      "texture_samples_to_fragment_cluster", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> texture_to_pbe("texture_to_pbe", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> pbe_to_pbe_write_back(
-      "pbe_to_pbe_write_back", fifo_depth);
-  sc_core::sc_fifo<PipelineTxn> dram_to_reporter("dram_to_reporter",
-                                                 fifo_depth);
+  sc_core::sc_fifo<PipelineTxn> submit_to_vdm{"submit_to_vdm",
+                                              ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> vdm_to_vertex_fetch{"vdm_to_vertex_fetch",
+                                                    ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> vertex_fetch_to_pds{"vertex_fetch_to_pds",
+                                                    ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> vertex_pds_to_decoder{"vertex_pds_to_decoder",
+                                                      ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> vertex_decoder_to_slot{"vertex_decoder_to_slot",
+                                                       ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> vertex_slot_to_cluster{"vertex_slot_to_cluster",
+                                                       ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> vertex_cluster_to_texture_samples{
+      "vertex_cluster_to_texture_samples", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> texture_samples_to_vertex_cluster{
+      "texture_samples_to_vertex_cluster", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> vertex_cluster_to_clip{"vertex_cluster_to_clip",
+                                                       ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> clip_to_tiler{"clip_to_tiler",
+                                              ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> tiler_to_parameter_buffer{
+      "tiler_to_parameter_buffer", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> parameter_buffer_to_fragment_decoder{
+      "parameter_buffer_to_fragment_decoder", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> fragment_decoder_to_tile_scheduler{
+      "fragment_decoder_to_tile_scheduler", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> tile_scheduler_to_isp{"tile_scheduler_to_isp",
+                                                      ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> isp_to_fragment_frontend{
+      "isp_to_fragment_frontend", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> fragment_frontend_to_pds{
+      "fragment_frontend_to_pds", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> pds_to_fragment_slot{"pds_to_fragment_slot",
+                                                     ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> fragment_slot_to_cluster{
+      "fragment_slot_to_cluster", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> fragment_cluster_to_texture{
+      "fragment_cluster_to_texture", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> fragment_cluster_to_texture_samples{
+      "fragment_cluster_to_texture_samples", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> texture_samples_to_fragment_cluster{
+      "texture_samples_to_fragment_cluster", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> texture_to_pbe{"texture_to_pbe",
+                                               ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> pbe_to_pbe_write_back{"pbe_to_pbe_write_back",
+                                                      ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> dram_to_reporter{"dram_to_reporter",
+                                                 ModelFifoDepth()};
 
-  sc_core::sc_fifo<MemoryTxn> idle_mcu_input("idle_mcu_input", fifo_depth);
-  sc_core::sc_fifo<MemoryTxn> idle_mcu_output("idle_mcu_output", fifo_depth);
-  sc_core::sc_fifo<MemoryTxn> idle_tcu_input("idle_tcu_input", fifo_depth);
-  sc_core::sc_fifo<MemoryTxn> idle_tcu_output("idle_tcu_output", fifo_depth);
-  sc_core::sc_fifo<MemoryTxn> idle_usc_l2_input("idle_usc_l2_input",
-                                                fifo_depth);
-  sc_core::sc_fifo<MemoryTxn> idle_usc_l2_output("idle_usc_l2_output",
-                                                 fifo_depth);
+  sc_core::sc_fifo<MemoryTxn> idle_mcu_input{"idle_mcu_input",
+                                             ModelFifoDepth()};
+  sc_core::sc_fifo<MemoryTxn> idle_mcu_output{"idle_mcu_output",
+                                              ModelFifoDepth()};
+  sc_core::sc_fifo<MemoryTxn> idle_tcu_input{"idle_tcu_input",
+                                             ModelFifoDepth()};
+  sc_core::sc_fifo<MemoryTxn> idle_tcu_output{"idle_tcu_output",
+                                              ModelFifoDepth()};
+  sc_core::sc_fifo<MemoryTxn> idle_usc_l2_input{"idle_usc_l2_input",
+                                                ModelFifoDepth()};
+  sc_core::sc_fifo<MemoryTxn> idle_usc_l2_output{"idle_usc_l2_output",
+                                                 ModelFifoDepth()};
 
   sc_core::sc_event sequence_completion;
-  Submitter submitter("submitter", pool, options, &memory,
-                      &sequence_completion);
-  Vdm vdm("vdm", pool, &memory);
-  VertexFetch vertex_fetch("vertex_fetch", pool, &memory);
-  PcoDecoder vertex_decoder("vertex_pco_decoder", pool, ShaderStage::kVertex);
-  UscSlot vertex_slot("vertex_usc_slot", pool, ShaderStage::kVertex);
-  UscCluster vertex_cluster("vertex_usc_cluster", pool, ShaderStage::kVertex);
-  ClipCull clip_cull("clip_cull", pool);
-  Tiler tiler("tiler", pool);
-  ParameterBuffer parameter_buffer("parameter_buffer", pool, &memory);
-  TileScheduler tile_scheduler("tile_scheduler", pool, &memory);
-  Isp isp("isp", pool, &memory);
-  FragmentFrontend fragment_frontend("fragment_frontend", pool, &memory);
-  PdsEngine pds_engine("pds_engine", pool, &memory);
-  VertexPdsEngine vertex_pds_engine("vertex_pds_engine", pool);
-  PcoDecoder fragment_decoder("fragment_pco_decoder", pool,
-                              ShaderStage::kFragment);
-  UscSlot fragment_slot("fragment_usc_slot", pool, ShaderStage::kFragment);
-  UscCluster fragment_cluster("fragment_usc_cluster", pool,
-                              ShaderStage::kFragment);
-  TextureUnit texture_unit("texture_unit", pool, &memory);
-  Pbe pbe("pbe", pool);
-  PbeWriteBack pbe_write_back("pbe_write_back", pool, &memory);
-  JsonReporter reporter("json_reporter", options, pool,
-                        &sequence_completion);
+  Options elaboration_options_;
+  Submitter submitter{"submitter",     pool,
+                      elaboration_options_, &memory,
+                      &sequence_completion, &job};
+  Vdm vdm{"vdm", pool, &memory};
+  VertexFetch vertex_fetch{"vertex_fetch", pool, &memory};
+  PcoDecoder vertex_decoder{"vertex_pco_decoder", pool, ShaderStage::kVertex};
+  UscSlot vertex_slot{"vertex_usc_slot", pool, ShaderStage::kVertex};
+  UscCluster vertex_cluster{"vertex_usc_cluster", pool, ShaderStage::kVertex};
+  ClipCull clip_cull{"clip_cull", pool};
+  Tiler tiler{"tiler", pool};
+  ParameterBuffer parameter_buffer{"parameter_buffer", pool, &memory};
+  TileScheduler tile_scheduler{"tile_scheduler", pool, &memory};
+  Isp isp{"isp", pool, &memory};
+  FragmentFrontend fragment_frontend{"fragment_frontend", pool, &memory};
+  PdsEngine pds_engine{"pds_engine", pool, &memory};
+  VertexPdsEngine vertex_pds_engine{"vertex_pds_engine", pool};
+  PcoDecoder fragment_decoder{"fragment_pco_decoder", pool,
+                              ShaderStage::kFragment};
+  UscSlot fragment_slot{"fragment_usc_slot", pool, ShaderStage::kFragment};
+  UscCluster fragment_cluster{"fragment_usc_cluster", pool,
+                              ShaderStage::kFragment};
+  TextureUnit texture_unit{"texture_unit", pool, &memory};
+  Pbe pbe{"pbe", pool};
+  PbeWriteBack pbe_write_back{"pbe_write_back", pool, &memory};
+  JsonReporter reporter{"json_reporter", elaboration_options_, pool,
+                        &sequence_completion, &job};
+};
 
+ModelSession::ModelSession(MemoryMode memory_mode, bool cache_bypass)
+    : memory_mode_(memory_mode), cache_bypass_(cache_bypass),
+      memory(memory_mode) {
   mixed_cache.input(idle_mcu_input);
   mixed_cache.output(idle_mcu_output);
   texture_cache.input(idle_tcu_input);
@@ -721,17 +834,115 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options) {
   pbe_write_back.input(pbe_to_pbe_write_back);
   pbe_write_back.completion(dram_to_reporter);
   reporter.input(dram_to_reporter);
+}
 
-  sc_core::sc_start();
-  return !reporter.failed() && pool.allocations() == pool.releases() &&
-                 pool.bytes_in_flight() == 0
-             ? 0
-             : 1;
+int ModelSession::Run(const Options &options, ModelFramebuffer *framebuffer,
+                      std::string *error) {
+  const auto fail = [error](const std::string &message) {
+    if (error)
+      *error = message;
+    return 1;
+  };
+  if (stopped_)
+    return fail("SystemC model has been stopped");
+  if (poisoned_)
+    return fail("SystemC model is not usable after a failed flush");
+
+  const std::uint64_t allocations_before = pool.allocations();
+  const std::uint64_t releases_before = pool.releases();
+
+  // Every process must reach its first `wait` before any work is queued.
+  // Getting this the other way round is what cost the first job: the
+  // submitter wrote into a FIFO nobody was reading yet.
+  if (!started_) {
+    sc_core::sc_start(sc_core::SC_ZERO_TIME);
+    started_ = true;
+  }
+
+  job.Begin(options);
+  job.start.notify(sc_core::SC_ZERO_TIME);
+  while (!job.complete && sc_core::sc_pending_activity())
+    sc_core::sc_start(sc_core::sc_time_to_pending_activity());
+  job.running = false;
+
+  const bool balanced =
+      pool.allocations() - allocations_before ==
+          pool.releases() - releases_before &&
+      pool.bytes_in_flight() == 0;
+  if (!job.complete) {
+    poisoned_ = true;
+    return fail(job.failed && !job.error.empty()
+                    ? job.error
+                    : "SystemC model went idle before the flush completed");
+  }
+  if (job.failed) {
+    poisoned_ = true;
+    return fail(job.error.empty() ? "SystemC model flush failed" : job.error);
+  }
+  if (!balanced) {
+    poisoned_ = true;
+    return fail("SystemC model flush leaked MemoryPool payloads");
+  }
+  if (framebuffer) {
+    framebuffer->pixels = job.framebuffer;
+    framebuffer->width = job.framebuffer_width;
+    framebuffer->height = job.framebuffer_height;
+  }
+  return 0;
+}
+
+void ModelSession::Shutdown() {
+  if (stopped_ || !started_)
+    return;
+  // After `sc_stop()` no `sc_start()` will run again, so this is teardown
+  // only.  The processes are parked in `wait`, which is a clean place to stop.
+  sc_core::sc_stop();
+  stopped_ = true;
+}
+
+// One process, one elaboration -- so one session, created on the first flush
+// and reused by every flush after it.
+std::unique_ptr<ModelSession> g_session;
+
+} // namespace
+} // namespace pvrgpu::stub
+
+int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options,
+                                     pvrgpu::stub::ModelFramebuffer *out) {
+  const int announced = pvrgpu::stub::AnnounceModelConfiguration(options);
+  if (announced != 0)
+    return announced;
+
+  if (!pvrgpu::stub::g_session) {
+    pvrgpu::stub::g_session = std::make_unique<pvrgpu::stub::ModelSession>(
+        options.memory_mode, options.cache_bypass);
+  } else if (pvrgpu::stub::g_session->memory_mode() != options.memory_mode) {
+    // The caches and the DRAM backing are elaborated, so the memory mode is
+    // fixed for the life of the process.  Say so rather than silently running
+    // the flush against the mode the first submission asked for.
+    std::cerr << "SystemC model memory mode cannot change after elaboration\n";
+    return 1;
+  }
+
+  std::string error;
+  const int result =
+      pvrgpu::stub::g_session->Run(options, out, &error);
+  if (result != 0 && !error.empty())
+    std::cerr << error << '\n';
+  return result;
+}
+
+void pvrgpu::stub::ShutdownConfiguredModel() {
+  if (!pvrgpu::stub::g_session)
+    return;
+  pvrgpu::stub::g_session->Shutdown();
 }
 
 int sc_main(int argc, char **argv) {
   pvrgpu::stub::Options options;
   if (!pvrgpu::stub::ParseOptions(argc, argv, &options))
     return 2;
-  return pvrgpu::stub::RunConfiguredModel(options);
+  const int result = pvrgpu::stub::RunConfiguredModel(options);
+  pvrgpu::stub::ShutdownConfiguredModel();
+  return result;
 }

@@ -9,6 +9,7 @@
 #include "frontend/sw_winsys.h"
 #include "pipe/p_defines.h"
 #include "util/format/u_format.h"
+#include "util/u_debug.h"
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/u_math.h"
@@ -187,53 +188,23 @@ pvrgpu_rdc_output_extent(unsigned *width, unsigned *height)
    return true;
 }
 
+/*
+ * Whether a texture of this format can exist on this screen.
+ *
+ * The answer is the screen's, not a second opinion: `pvrgpu_resource.c` used to
+ * carry its own shorter colour list, so `is_format_supported()` would say yes
+ * to R8/RG8 and every other single- and dual-channel format while creation
+ * silently returned NULL and the application saw `GL_OUT_OF_MEMORY`.
+ *
+ * Sampler-only formats belong here too. A screen that advertises them for
+ * PIPE_BIND_SAMPLER_VIEW has to let the texture holding them be created.
+ */
 static bool
-pvrgpu_is_supported_color_resource_format(enum pipe_format format)
+pvrgpu_is_supported_texture_resource_format(enum pipe_format format)
 {
-   switch (format) {
-   case PIPE_FORMAT_R8G8B8A8_UNORM:
-   case PIPE_FORMAT_R8G8B8X8_UNORM:
-   case PIPE_FORMAT_R8G8B8A8_SRGB:
-   case PIPE_FORMAT_B8G8R8A8_UNORM:
-   case PIPE_FORMAT_B8G8R8X8_UNORM:
-   case PIPE_FORMAT_A8R8G8B8_UNORM:
-   case PIPE_FORMAT_A8B8G8R8_UNORM:
-   case PIPE_FORMAT_R5G6B5_UNORM:
-   case PIPE_FORMAT_B5G6R5_UNORM:
-   case PIPE_FORMAT_R10G10B10A2_UNORM:
-   case PIPE_FORMAT_B10G10R10A2_UNORM:
-   case PIPE_FORMAT_R16_UNORM:
-   case PIPE_FORMAT_R16G16_UNORM:
-   case PIPE_FORMAT_R16G16B16A16_UNORM:
-   case PIPE_FORMAT_R32G32B32A32_UNORM:
-   case PIPE_FORMAT_R16G16B16A16_FLOAT:
-   case PIPE_FORMAT_R32G32B32A32_FLOAT:
-   case PIPE_FORMAT_R8G8B8A8_UINT:
-   case PIPE_FORMAT_R8G8B8A8_SINT:
-   case PIPE_FORMAT_R16G16B16A16_SINT:
-   case PIPE_FORMAT_R32G32B32A32_SINT:
-      return true;
-   default:
-      return false;
-   }
-}
-
-static bool
-pvrgpu_is_supported_depth_stencil_resource_format(enum pipe_format format)
-{
-   switch (format) {
-   case PIPE_FORMAT_Z16_UNORM:
-   case PIPE_FORMAT_Z24X8_UNORM:
-   case PIPE_FORMAT_X8Z24_UNORM:
-   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
-   case PIPE_FORMAT_S8_UINT_Z24_UNORM:
-   case PIPE_FORMAT_Z32_FLOAT:
-   case PIPE_FORMAT_Z32_UNORM:
-   case PIPE_FORMAT_Z32_FLOAT_S8X24_UINT:
-      return true;
-   default:
-      return false;
-   }
+   return pvrgpu_is_supported_color_format(format) ||
+          pvrgpu_is_supported_depth_stencil_format(format) ||
+          pvrgpu_is_sampler_only_format(format);
 }
 
 static bool
@@ -321,9 +292,34 @@ pvrgpu_can_create_texture(const struct pipe_resource *template)
 {
    return template &&
           pvrgpu_can_create_texture_target(template) &&
-          (pvrgpu_is_supported_color_resource_format(template->format) ||
-           pvrgpu_is_supported_depth_stencil_resource_format(
-              template->format));
+          pvrgpu_is_supported_texture_resource_format(template->format);
+}
+
+/*
+ * Why a resource was refused, or NULL when it was not.
+ *
+ * `resource_create` can only answer NULL, which Mesa reports as
+ * `GL_OUT_OF_MEMORY` -- an answer that says nothing about which of the shape,
+ * the sample count or the format was the problem. Naming the field turns a
+ * guess into a reading.
+ */
+static const char *
+pvrgpu_resource_create_refusal(const struct pipe_resource *template)
+{
+   if (!template)
+      return "template";
+   if (pvrgpu_can_create_buffer(template) || pvrgpu_can_create_texture(template))
+      return NULL;
+   if (template->target == PIPE_BUFFER)
+      return "buffer_shape";
+   if (!pvrgpu_is_supported_texture_resource_format(template->format))
+      return "format";
+   if (template->width0 == 0 || template->height0 == 0)
+      return "extent";
+   if (!pvrgpu_is_supported_resource_sample_count(template->nr_samples) ||
+       !pvrgpu_is_supported_resource_sample_count(template->nr_storage_samples))
+      return "sample_count";
+   return "target";
 }
 
 static bool
@@ -331,8 +327,24 @@ pvrgpu_can_create_resource(struct pipe_screen *screen,
                            const struct pipe_resource *template)
 {
    (void)screen;
-   return pvrgpu_can_create_buffer(template) ||
-          pvrgpu_can_create_texture(template);
+   const char *refusal = pvrgpu_resource_create_refusal(template);
+   if (!refusal)
+      return true;
+   pvrgpu_counter_eventf("resource_create_declined",
+                         "reason=%s target=%u width=%u height=%u depth=%u "
+                         "array=%u samples=%u storage_samples=%u format=%s "
+                         "bind=0x%x",
+                         refusal,
+                         template ? template->target : 0,
+                         template ? template->width0 : 0,
+                         template ? template->height0 : 0,
+                         template ? template->depth0 : 0,
+                         template ? template->array_size : 0,
+                         template ? template->nr_samples : 0,
+                         template ? template->nr_storage_samples : 0,
+                         template ? util_format_name(template->format) : "none",
+                         template ? template->bind : 0);
+   return false;
 }
 
 static unsigned
@@ -957,6 +969,176 @@ pvrgpu_transfer_box_in_bounds(const struct pipe_resource *resource,
              level_layers;
 }
 
+/*
+ * True when this is the surface the model has been drawing into.
+ *
+ * A readback of anything else -- a texture the application uploaded, a
+ * staging buffer -- has nothing to do with the model's framebuffer and must
+ * not be overwritten with it.
+ */
+static bool
+pvrgpu_resource_is_current_color_attachment(
+   const struct pvrgpu_context *ctx,
+   const struct pipe_resource *resource)
+{
+   return ctx && resource && ctx->framebuffer.nr_cbufs != 0 &&
+          ctx->framebuffer.cbufs[0].texture == resource;
+}
+
+/*
+ * The colour surfaces the model's RGBA8 output can be stored into.
+ *
+ * The model publishes R,G,B,A byte order.  A surface that names the same four
+ * 8-bit channels in another order holds the same bytes rearranged, so it is
+ * served by reordering them on the way in.  Anything else -- a wider channel,
+ * a packed 5:6:5 -- would need a conversion nobody has specified, and is left
+ * to the path that already serves it.
+ */
+static bool
+pvrgpu_resource_readback_format_is_supported(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/*
+ * Store one row of the model's RGBA8 output in the surface's byte order.
+ *
+ * The layout matches pvrgpu_store_clear_color_pixel() channel for channel,
+ * including an X8 format's ignored alpha lane reading back as one.  A pixel a
+ * draw covered and a pixel only the clear touched therefore agree, which they
+ * would not if the draw's alpha were carried through verbatim.
+ */
+static void
+pvrgpu_resource_readback_store_row(enum pipe_format format,
+                                   uint8_t *destination,
+                                   const uint8_t *rgba8,
+                                   unsigned width)
+{
+   const bool swap_red_blue = format == PIPE_FORMAT_B8G8R8A8_UNORM ||
+                              format == PIPE_FORMAT_B8G8R8X8_UNORM;
+   const bool opaque = format == PIPE_FORMAT_R8G8B8X8_UNORM ||
+                       format == PIPE_FORMAT_B8G8R8X8_UNORM;
+
+   if (!swap_red_blue && !opaque) {
+      memcpy(destination, rgba8, (size_t)width * 4u);
+      return;
+   }
+
+   for (unsigned x = 0; x < width; ++x) {
+      const uint8_t *source = rgba8 + (size_t)x * 4u;
+      uint8_t *pixel = destination + (size_t)x * 4u;
+      const uint8_t r = source[0];
+      const uint8_t b = source[2];
+      pixel[0] = swap_red_blue ? b : r;
+      pixel[1] = source[1];
+      pixel[2] = swap_red_blue ? r : b;
+      pixel[3] = opaque ? 255u : source[3];
+   }
+}
+
+/*
+ * Bring what the model drew into the CPU backing store, before a read sees it.
+ *
+ * `pvrgpu->data` is the driver's own memory: clears write there, draws do not
+ * -- a draw goes to the model.  Until the model's output came back, every
+ * `glReadPixels` after a draw returned the clear, which is why dEQP reported
+ * missing pixels and never a wrong one while the model's own PNG showed the
+ * right geometry.  This is where the two are joined: the accumulated draws are
+ * submitted, the model runs them, and its DRAM readback lands here.
+ *
+ * Everything here is fail-closed.  A surface the model did not render, a
+ * format its RGBA8 output cannot be reordered into, or a flush that produced
+ * nothing all leave `pvrgpu->data` exactly as it was.
+ */
+static void
+pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
+                                           struct pipe_resource *resource,
+                                           unsigned level,
+                                           unsigned usage)
+{
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   struct pvrgpu_resource *pvrgpu = pvrgpu_resource(resource);
+   if (!(usage & PIPE_MAP_READ) || level != 0 || !ctx || !resource ||
+       !pvrgpu || !pvrgpu->data || resource->target == PIPE_BUFFER)
+      return;
+   if (!pvrgpu_resource_is_current_color_attachment(ctx, resource))
+      return;
+   if (!pvrgpu_resource_readback_format_is_supported(resource->format))
+      return;
+   /*
+    * The model's framebuffer only describes the surface while everything that
+    * touched it went to the model.  A scissored or masked clear did not, so
+    * copying the model's output back would erase it -- which is what a run of
+    * dEQP's color_clear.scissored_* showed: two full clears reached the model,
+    * thirteen scissored ones did not, and the readback published the uniform
+    * surface the model had.  Leave the driver's own content alone instead.
+    */
+   if (pvrgpu->driver_writes_model_cannot_reproduce) {
+      pvrgpu_counter_eventf("framebuffer_readback_declined",
+                            "reason=driver_writes_model_cannot_reproduce "
+                            "res=%p width=%u height=%u",
+                            (void *)resource,
+                            pvrgpu_resource_level_width(resource, level),
+                            pvrgpu_resource_level_height(resource, level));
+      return;
+   }
+
+   const unsigned width = pvrgpu_resource_level_width(resource, level);
+   const unsigned height = pvrgpu_resource_level_height(resource, level);
+   if (width == 0 || height == 0)
+      return;
+
+   const size_t pixels_size = (size_t)width * (size_t)height * 4u;
+   uint8_t *pixels = MALLOC(pixels_size);
+   if (!pixels)
+      return;
+
+   pvrgpu_context_end_frame_at_readback(ctx);
+
+   bool written = false;
+   char error[512] = { 0 };
+   const bool flushed =
+      pvrgpu_systemc_flush_readback_rgba8(width, height, pixels, pixels_size,
+                                          &written, error, sizeof(error));
+   if (!flushed || !written) {
+      if (!flushed) {
+         debug_printf("pvrgpu: %s\n",
+                      error[0] ? error : "readback flush failed");
+      }
+      FREE(pixels);
+      return;
+   }
+
+   /*
+    * The model's framebuffer is tightly packed; the resource's level may be
+    * padded, so store a row at a time rather than the whole block.
+    */
+   uint8_t *destination = pvrgpu->data + pvrgpu->level_offsets[level];
+   const unsigned stride = pvrgpu->level_strides[level];
+   for (unsigned row = 0; row < height; ++row) {
+      pvrgpu_resource_readback_store_row(resource->format,
+                                         destination + (size_t)row * stride,
+                                         pixels + (size_t)row * (size_t)width * 4u,
+                                         width);
+   }
+   FREE(pixels);
+
+   pvrgpu_counter_eventf("framebuffer_readback",
+                         "res=%p width=%u height=%u format=%s",
+                         (void *)resource,
+                         width,
+                         height,
+                         util_format_name(resource->format));
+}
+
 static void *
 pvrgpu_transfer_map(struct pipe_context *pipe,
                     struct pipe_resource *resource,
@@ -969,6 +1151,13 @@ pvrgpu_transfer_map(struct pipe_context *pipe,
    if (!out_transfer || !pvrgpu || !pvrgpu->data ||
        !pvrgpu_transfer_box_in_bounds(resource, level, box))
       return NULL;
+
+   /*
+    * Ahead of every path below, including the displaytarget one -- that path
+    * copies this shadow into the winsys surface on its way past, so the
+    * pixels have to be here before it runs.
+    */
+   pvrgpu_resource_read_back_color_attachment(pipe, resource, level, usage);
 
    struct pvrgpu_transfer *pvrgpu_transfer =
       CALLOC_STRUCT(pvrgpu_transfer);

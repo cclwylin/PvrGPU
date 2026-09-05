@@ -9,8 +9,8 @@
 extern "C" {
 #endif
 
-/* API-v8 expands the by-value sequence-texture mip table from 10 to 15. */
-#define PVRGPU_SYSTEMC_API_VERSION 8u
+/* API-v12 states each vertex attribute's integer-ness, not just its width. */
+#define PVRGPU_SYSTEMC_API_VERSION 12u
 /*
  * Draws one sequence may describe; must match the model's own bound.  This is
  * independent of how many attachments the sequence creates, which the model's
@@ -20,6 +20,30 @@ extern "C" {
 #define PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_TEXTURES 16u
 #define PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS 15u
 #define PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR UINT32_MAX
+
+/* Planes an attachment clear touches. */
+#define PVRGPU_SYSTEMC_CLEAR_ASPECT_DEPTH 0x1u
+#define PVRGPU_SYSTEMC_CLEAR_ASPECT_STENCIL 0x2u
+
+/*
+ * One rectangle of the depth/stencil attachment set before a draw ran.
+ *
+ * A whole-surface clear is stated once, as the draw's `depth_clear_bits` or
+ * `stencil_clear`.  A scissored one is not describable that way, and dropping
+ * it left the model testing against planes the application had already
+ * overwritten -- dEQP's fragment_ops.stencil.* paints a grid of 21x21
+ * rectangles into both planes and then draws over it.  Each draw therefore
+ * carries the clears issued since the previous one, in issue order.
+ */
+struct pvrgpu_systemc_attachment_clear {
+   uint32_t x;
+   uint32_t y;
+   uint32_t width;
+   uint32_t height;
+   uint32_t aspects;
+   uint32_t depth_bits;
+   uint32_t stencil_value;
+};
 
 struct pvrgpu_systemc_pco_stage_abi {
    uint32_t temps;
@@ -173,6 +197,13 @@ struct pvrgpu_systemc_driver_command {
    uint32_t vertex_attribute_count;
    uint32_t vertex_attribute_components[16];
    /*
+    * Whether attribute N carries integers rather than floats.  The width alone
+    * does not say: a shader reading gl_InstanceID or an ivec attribute needs
+    * the raw 32-bit value in its VTXIN register, and reading those bits as a
+    * float and writing them back is only exact by accident.
+    */
+   uint32_t vertex_attribute_integer[16];
+   /*
     * Index payload for an indexed draw.  The bridge deep-copies the buffer
     * before returning, exactly as it does for the vertex payload.
     */
@@ -258,6 +289,26 @@ struct pvrgpu_systemc_driver_command {
    uint32_t depth_format;
 
    /*
+    * Stencil state, per GLES 3.0 4.1.4.  Index 0 is the front face and index 1
+    * the back; a draw that does not enable the test still states them, so the
+    * model never has to infer a face's operation from a default.  Masks and the
+    * reference are carried at the width the application set them, and the model
+    * narrows them to the plane.
+    */
+   uint32_t stencil_enable;
+   uint32_t stencil_clear;
+   uint32_t stencil_func[2];
+   uint32_t stencil_fail_op[2];
+   uint32_t stencil_depth_fail_op[2];
+   uint32_t stencil_pass_op[2];
+   uint32_t stencil_value_mask[2];
+   uint32_t stencil_write_mask[2];
+   uint32_t stencil_ref[2];
+   /* Clears applied to the depth/stencil attachment before this draw. */
+   const struct pvrgpu_systemc_attachment_clear *attachment_clears;
+   uint32_t attachment_clear_count;
+
+   /*
     * API-v8 render-pass continuity. UINT32_MAX creates and clears a new
     * attachment; any other value aliases and LOADs the exact attachment
     * produced by that earlier nested command ordinal.  Alias dimensions and
@@ -303,6 +354,36 @@ typedef int (*pvrgpu_systemc_submit_driver_command_fn)(
    size_t error_size);
 
 /*
+ * A readback of whatever the submitted work left in the model's DRAM.
+ *
+ * `pixels` is the caller's RGBA8 destination and `pixels_size` its capacity in
+ * bytes; the model fills it only when its own framebuffer is exactly
+ * `width` x `height`.  `pixels_written` says whether it did, which is how a
+ * caller tells "nothing was pending" from "the model drew something".
+ */
+struct pvrgpu_systemc_readback_info {
+   uint32_t version;
+   uint32_t width;
+   uint32_t height;
+   uint8_t *pixels;
+   size_t pixels_size;
+   uint32_t pixels_written;
+};
+
+/*
+ * Run everything submitted since the last flush and hand back the pixels.
+ *
+ * The model is elaborated once and stays alive between flushes, so this may be
+ * called as often as the application reads back.  A flush with nothing pending
+ * succeeds with `pixels_written` zero and leaves `pixels` untouched.  Returns
+ * 0 on success and fills `error` otherwise.
+ */
+typedef int (*pvrgpu_systemc_flush_readback_fn)(
+   struct pvrgpu_systemc_readback_info *readback,
+   char *error,
+   size_t error_size);
+
+/*
  * Ask the model whether it can execute a compiled PCO binary.
  *
  * The compiler emits the whole PowerVR instruction set; the model implements
@@ -331,6 +412,12 @@ pvrgpu_systemc_can_execute_pco_binary(
 int
 pvrgpu_systemc_submit_driver_command(
    const struct pvrgpu_systemc_submit_info *info,
+   char *error,
+   size_t error_size);
+
+int
+pvrgpu_systemc_flush_readback(
+   struct pvrgpu_systemc_readback_info *readback,
    char *error,
    size_t error_size);
 

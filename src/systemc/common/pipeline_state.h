@@ -63,9 +63,10 @@ struct PipelineState {
   PoolHandle vertex_indices;
   PoolHandle vertex_lanes;
   PoolHandle vertex_lane_refs;
-  // One source vertex index per entry in the expanded vertex buffer, set only
-  // when the submitter expanded a strip or fan into a triangle list. Vertex
-  // fetch reuses a single shading lane per distinct source index.
+  // One source vertex index per entry in the expanded vertex buffer, set when
+  // the submitter expanded a strip, fan, line or point topology into a
+  // triangle list. Vertex fetch reuses a single shading lane per distinct
+  // source index.
   PoolHandle expanded_source_vertices;
   PoolHandle vertex_shared_registers;
   PoolHandle shader_varying_bindings;
@@ -95,6 +96,13 @@ struct PipelineState {
   // pixels). Entries retain the exact encoded UNORM integer so an untouched
   // Z32 LOAD pixel is not rounded through float before the DRAM commit.
   PoolHandle isp_depth_attachment;
+  // The stencil plane the ISP leaves behind for a Z24_UNORM_S8_UINT
+  // attachment, one byte per pixel.  It travels beside the depth plane rather
+  // than inside it because the depth codec refuses a nonzero high byte.
+  PoolHandle isp_stencil_attachment;
+  // Scissored depth/stencil clears the draw inherits, applied to the planes
+  // before any fragment work.  Empty when the draw inherits none.
+  PoolHandle attachment_clears;
   // Optional Z32_UNORM attachment materialized from the same ISP-visible work
   // that
   // feeds FragmentFrontend.  Native multi-pass commands use this handle at a

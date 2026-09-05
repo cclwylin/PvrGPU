@@ -40,14 +40,59 @@
 namespace pvrgpu::stub {
 namespace {
 
-inline constexpr std::uint64_t kBuiltinVertexBufferGpuAddress =
-    UINT64_C(0x20000000);
-inline constexpr std::uint64_t kBuiltinTexcoordBufferGpuAddress =
-    UINT64_C(0x21000000);
-inline constexpr std::uint64_t kBuiltinIndexBufferGpuAddress =
-    UINT64_C(0x22000000);
+/*
+ * Where a sequence's own buffers live in DRAM.
+ *
+ * Every submission of a sequence coexists in memory, so each needs its own
+ * vertex and index addresses; a shared one is not a tight packing but a
+ * corruption.  The index buffer used to be a single fixed address for the whole
+ * sequence, and the vertex region was sixteen strides long before it ran into
+ * the texture-coordinate and index regions above it.  A 33-draw indexed
+ * sequence therefore read submission 32's vertex bytes as its indices -- dEQP's
+ * fragment_ops.stencil.* aborted the model with a resolved index of 49024,
+ * which is the top half of the float -1.0f sitting at that address.
+ *
+ * The regions are now equal, disjoint and bounded, and running past one throws
+ * instead of aliasing into the next.
+ */
+// One slot per submission, with room for the largest single draw the corpus
+// carries several times over: glmark2's terrain expands one draw to 16.5 MiB.
+// A slot a draw can overrun is a slot that silently lands on its neighbour's
+// vertices, so the margin is deliberate and the overrun is refused by name.
 inline constexpr std::uint64_t kDriverSequenceVertexAddressStride =
-    UINT64_C(0x00100000);
+    UINT64_C(0x20000000);
+inline constexpr std::size_t kDriverSequenceAddressSlots =
+    kDriverPcoMaximumSequenceCommands;
+// DRAM is a sparse page map, so the regions cost nothing until written and are
+// sized for the longest sequence the API accepts rather than for the corpus in
+// hand.  Each is derived from the slot geometry so it cannot drift from it, and
+// they sit above the attachment regions of model_types.h.
+inline constexpr std::uint64_t kDriverSequenceAddressRegionBytes =
+    kDriverSequenceVertexAddressStride *
+    static_cast<std::uint64_t>(kDriverSequenceAddressSlots);
+inline constexpr std::uint64_t kBuiltinVertexBufferGpuAddress =
+    UINT64_C(0x100000000);
+inline constexpr std::uint64_t kBuiltinIndexBufferGpuAddress =
+    kBuiltinVertexBufferGpuAddress + kDriverSequenceAddressRegionBytes;
+inline constexpr std::uint64_t kBuiltinTexcoordBufferGpuAddress =
+    kBuiltinIndexBufferGpuAddress + kDriverSequenceAddressRegionBytes;
+
+// The address a submission's vertex or index buffer owns.  Sequences longer
+// than the region holds are refused by name rather than wrapped onto a
+// neighbour.
+std::uint64_t SequenceBufferAddress(std::uint64_t base,
+                                    std::size_t submission,
+                                    const char *what) {
+  if (submission >= kDriverSequenceAddressSlots) {
+    throw std::runtime_error(
+        std::string("Submitter sequence has more submissions than the ") +
+        what + " address region holds: submission=" +
+        std::to_string(submission) +
+        " slots=" + std::to_string(kDriverSequenceAddressSlots));
+  }
+  return base + static_cast<std::uint64_t>(submission) *
+                    kDriverSequenceVertexAddressStride;
+}
 
 // Take the next attachment slot in a region.
 //
@@ -792,6 +837,14 @@ VertexBufferResource StoreRawVertexBuffer(
       bytes.size() > std::numeric_limits<std::uint32_t>::max()) {
     throw std::runtime_error("Submitter raw VBO size is invalid");
   }
+  // Spilling past the slot would land on the next submission's vertices, which
+  // reads as corruption rather than as the size problem it is.
+  if (bytes.size() > kDriverSequenceVertexAddressStride) {
+    throw std::runtime_error(
+        "Submitter vertex buffer is larger than the address slot it owns: "
+        "bytes=" + std::to_string(bytes.size()) +
+        " slot=" + std::to_string(kDriverSequenceVertexAddressStride));
+  }
   VertexBufferResource resource;
   if (memory)
     HostWriteArray(*memory, gpu_address, bytes);
@@ -827,6 +880,13 @@ DriverPcoTopologyExpansion ExpandDriverPcoTopologyImpl(
     // expansion encodes them as -- a line as (a, b, b) and a point as
     // (p, p, p) -- so ClipCull reads endpoint a from vertex 0 and endpoint b
     // from vertex 1 and widens them into a real screen-space quad.
+    //
+    // That encoding repeats whole vertices, twice within a primitive and again
+    // between the adjacent segments of a strip or loop, so the source vertex
+    // behind each copy is recorded here for the same reason a strip or fan
+    // records it: vertex fetch shades one lane per distinct source, and
+    // vs_invocations counts the vertices the draw submitted rather than the
+    // expansion's duplication.
     if (command.vertex_stride == 0)
       throw std::runtime_error("Submitter driver PCO topology is empty");
     const std::uint32_t vertices_per_primitive =
@@ -855,6 +915,7 @@ DriverPcoTopologyExpansion ExpandDriverPcoTopologyImpl(
       result.vertices.insert(result.vertices.end(),
                              command.raw_vertex_data.begin() + begin,
                              command.raw_vertex_data.begin() + end);
+      result.source_vertices.push_back(vertex);
     };
     for (std::uint32_t start : starts) {
       const std::uint32_t second =
@@ -869,6 +930,14 @@ DriverPcoTopologyExpansion ExpandDriverPcoTopologyImpl(
       append_vertex(0U);
     }
     result.emitted_primitives = result.input_primitives;
+    if (result.source_vertices.size() !=
+            static_cast<std::uint64_t>(result.emitted_primitives) * 3U ||
+        result.vertices.size() !=
+            static_cast<std::uint64_t>(result.emitted_primitives) * 3U *
+                command.vertex_stride) {
+      throw std::runtime_error(
+          "Submitter PCO topology expansion accounting is inconsistent");
+    }
     return result;
   }
   if (command.primitive_mode != kPipePrimTriangleStrip &&
@@ -967,15 +1036,24 @@ DriverPcoTopologyExpansion ExpandDriverPcoTopologyImpl(
 
 template <typename T>
 void StoreIndexBuffer(MemoryPool &pool, GpuMemorySystem *memory,
-                      const std::vector<T> &indices, PipelineState *state) {
+                      const std::vector<T> &indices, PipelineState *state,
+                      std::uint64_t gpu_address) {
   static_assert(std::is_trivially_copyable_v<T>);
   if (!state || indices.empty() ||
       indices.size() > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
     throw std::runtime_error("Submitter index buffer size is invalid");
   }
+  const std::uint64_t bytes =
+      static_cast<std::uint64_t>(indices.size()) * sizeof(T);
+  if (bytes > kDriverSequenceVertexAddressStride) {
+    throw std::runtime_error(
+        "Submitter index buffer is larger than the address slot it owns: "
+        "bytes=" + std::to_string(bytes) +
+        " slot=" + std::to_string(kDriverSequenceVertexAddressStride));
+  }
   if (memory) {
-    HostWriteArray(*memory, kBuiltinIndexBufferGpuAddress, indices);
-    state->index_buffer_gpu_address = kBuiltinIndexBufferGpuAddress;
+    HostWriteArray(*memory, gpu_address, indices);
+    state->index_buffer_gpu_address = gpu_address;
     state->index_buffer_bytes = indices.size() * sizeof(T);
   } else {
     state->vertex_indices = StoreNewArray(pool, indices);
@@ -1019,7 +1097,8 @@ IndexFormat DriverPcoIndexFormatFor(std::uint32_t index_size) {
 // Republish the capsule's index payload as the typed buffer vertex fetch reads.
 void StoreDriverPcoIndexBuffer(MemoryPool &pool, GpuMemorySystem *memory,
                                const DriverCommand &command,
-                               PipelineState *state) {
+                               PipelineState *state,
+                               std::uint64_t gpu_address) {
   const std::uint64_t index_end =
       static_cast<std::uint64_t>(command.first_index) + command.index_count;
   if (command.index_size == 0 ||
@@ -1030,17 +1109,17 @@ void StoreDriverPcoIndexBuffer(MemoryPool &pool, GpuMemorySystem *memory,
   if (command.index_size == 1) {
     std::vector<std::uint8_t> indices(command.raw_index_data.begin(),
                                       command.raw_index_data.end());
-    StoreIndexBuffer(pool, memory, indices, state);
+    StoreIndexBuffer(pool, memory, indices, state, gpu_address);
   } else if (command.index_size == 2) {
     std::vector<std::uint16_t> indices(count);
     std::memcpy(indices.data(), command.raw_index_data.data(),
                 command.raw_index_data.size());
-    StoreIndexBuffer(pool, memory, indices, state);
+    StoreIndexBuffer(pool, memory, indices, state, gpu_address);
   } else {
     std::vector<std::uint32_t> indices(count);
     std::memcpy(indices.data(), command.raw_index_data.data(),
                 command.raw_index_data.size());
-    StoreIndexBuffer(pool, memory, indices, state);
+    StoreIndexBuffer(pool, memory, indices, state, gpu_address);
   }
 }
 
@@ -1121,13 +1200,44 @@ ExpandDriverPcoTopology(const DriverCommand &command) {
 
 Submitter::Submitter(sc_core::sc_module_name name, MemoryPool &pool,
                      const Options &options, GpuMemorySystem *memory,
-                     sc_core::sc_event *sequence_completion)
+                     sc_core::sc_event *sequence_completion, ModelJob *job)
     : sc_module(name), pool_(pool), options_(options), memory_(memory),
-      sequence_completion_(sequence_completion) {
+      sequence_completion_(sequence_completion), job_(job) {
   SC_THREAD(Run);
 }
 
+/*
+ * Outer loop for a model that outlives one submission.
+ *
+ * Without a job slot this is a single pass, exactly as before.  With one, the
+ * thread has to survive between flushes: it waits for work, adopts that
+ * flush's options, drains them, and returns to the wait.  A failure is handed
+ * to the job rather than thrown out of the process, because an exception
+ * escaping a SystemC process leaves the kernel with no way to run the next
+ * flush -- and the driver, which is still holding a mapped surface, with no
+ * way to hear why.
+ */
 void Submitter::Run() {
+  if (!job_) {
+    RunJob();
+    return;
+  }
+  for (;;) {
+    wait(job_->start);
+    if (!job_->running || job_->submitted)
+      continue;
+    options_ = job_->options;
+    fifo_stalls_ = 0;
+    try {
+      RunJob();
+    } catch (const std::exception &error) {
+      job_->Fail(error.what());
+    }
+    job_->submitted = true;
+  }
+}
+
+void Submitter::RunJob() {
   const bool driver_command = options_.driver_command.enabled;
   const bool driver_clear_command =
       driver_command && options_.driver_command.command == "clear_color";
@@ -1547,6 +1657,42 @@ void Submitter::Run() {
           static_cast<DepthCompareOp>(command.depth_func);
       state.raster_state.depth.clear_depth =
           FloatFromBits(command.depth_clear_bits);
+      state.raster_state.stencil.test_enable =
+          static_cast<std::uint8_t>(command.stencil_enable);
+      state.raster_state.stencil.clear_stencil = command.stencil_clear;
+      if (!command.attachment_clears.empty()) {
+        std::vector<AttachmentClearRect> clears;
+        clears.reserve(command.attachment_clears.size());
+        for (const DriverAttachmentClear &clear : command.attachment_clears) {
+          AttachmentClearRect rect;
+          rect.x = clear.x;
+          rect.y = clear.y;
+          rect.width = clear.width;
+          rect.height = clear.height;
+          rect.aspects = clear.aspects;
+          rect.depth_bits = clear.depth_bits;
+          rect.stencil_value = clear.stencil_value;
+          clears.push_back(rect);
+        }
+        state.attachment_clears = StoreNewArray(pool_, clears);
+      }
+      {
+        StencilFaceState *faces[2] = {&state.raster_state.stencil.front,
+                                      &state.raster_state.stencil.back};
+        for (std::size_t face = 0; face < 2; ++face) {
+          faces[face]->compare_op =
+              static_cast<DepthCompareOp>(command.stencil_func[face]);
+          faces[face]->fail_op =
+              static_cast<StencilOp>(command.stencil_fail_op[face]);
+          faces[face]->depth_fail_op =
+              static_cast<StencilOp>(command.stencil_depth_fail_op[face]);
+          faces[face]->pass_op =
+              static_cast<StencilOp>(command.stencil_pass_op[face]);
+          faces[face]->value_mask = command.stencil_value_mask[face];
+          faces[face]->write_mask = command.stencil_write_mask[face];
+          faces[face]->reference = command.stencil_ref[face];
+        }
+      }
       state.raster_state.blend.enable =
           static_cast<std::uint8_t>(command.blend_enable);
       state.raster_state.blend.rgb_equation =
@@ -1634,7 +1780,10 @@ void Submitter::Run() {
       state.draw.index_count = static_cast<std::uint32_t>(indices.size());
       state.draw.base_vertex = 0;
       state.draw.index_format = IndexFormat::kUint16;
-      StoreIndexBuffer(pool_, memory_, indices, &state);
+      StoreIndexBuffer(pool_, memory_, indices, &state,
+                       SequenceBufferAddress(
+                           kBuiltinIndexBufferGpuAddress, submission,
+                           "index"));
     } else if (driver_indexed_quad) {
       vertex_buffer = {
           -1.0F, -1.0F,
@@ -1648,7 +1797,10 @@ void Submitter::Run() {
       state.draw.index_count = static_cast<std::uint32_t>(indices.size());
       state.draw.base_vertex = 0;
       state.draw.index_format = IndexFormat::kUint16;
-      StoreIndexBuffer(pool_, memory_, indices, &state);
+      StoreIndexBuffer(pool_, memory_, indices, &state,
+                       SequenceBufferAddress(
+                           kBuiltinIndexBufferGpuAddress, submission,
+                           "index"));
     } else if (indexed_triangle) {
       const GlbenchTriangleMeshShape &mesh =
           varyings ? kGlbenchVaryingsMesh
@@ -1673,7 +1825,10 @@ void Submitter::Run() {
       state.draw.index_count = static_cast<std::uint32_t>(indices.size());
       state.draw.base_vertex = 0;
       state.draw.index_format = IndexFormat::kUint16;
-      StoreIndexBuffer(pool_, memory_, indices, &state);
+      StoreIndexBuffer(pool_, memory_, indices, &state,
+                       SequenceBufferAddress(
+                           kBuiltinIndexBufferGpuAddress, submission,
+                           "index"));
     } else if (driver_pco_triangles && command.indexed != 0) {
       // Hand the real index buffer to vertex fetch: it walks the indices,
       // expands the topology and reuses post-transform vertices, so the
@@ -1685,7 +1840,10 @@ void Submitter::Run() {
       state.draw.index_count = command.index_count;
       state.draw.base_vertex = command.base_vertex;
       state.draw.index_format = DriverPcoIndexFormatFor(command.index_size);
-      StoreDriverPcoIndexBuffer(pool_, memory_, command, &state);
+      StoreDriverPcoIndexBuffer(pool_, memory_, command, &state,
+                                SequenceBufferAddress(
+                                    kBuiltinIndexBufferGpuAddress,
+                                    submission, "index"));
     } else if (driver_pco_triangles) {
       state.draw.topology = PrimitiveTopology::kTriangleList;
       state.draw.first_vertex = 0;
@@ -1726,9 +1884,9 @@ void Submitter::Run() {
     const VertexBufferResource vertex_resource =
         driver_pco_triangles
             ? StoreRawVertexBuffer(pool_, expanded_pco_vertices,
-                                   kBuiltinVertexBufferGpuAddress +
-                                       submission *
-                                           kDriverSequenceVertexAddressStride,
+                                   SequenceBufferAddress(
+                                       kBuiltinVertexBufferGpuAddress,
+                                       submission, "vertex"),
                                    memory_)
             : StoreFloat2VertexBuffer(pool_, vertex_buffer,
                                       kBuiltinVertexBufferGpuAddress, memory_);
@@ -1790,12 +1948,18 @@ void Submitter::Run() {
             binding.stride_bytes = command.vertex_stride;
             binding.destination_register =
                 static_cast<std::uint16_t>(attribute * 4U);
-            binding.component_type = VertexComponentType::kFloat32;
+            // An integer attribute reaches the shader as raw 32-bit bits;
+            // reading them as a float and writing them back is only exact by
+            // accident, so the capsule states which it is.
+            const bool integer =
+                command.vertex_attribute_integer[attribute] != 0;
+            binding.component_type = integer ? VertexComponentType::kUint32
+                                             : VertexComponentType::kFloat32;
             binding.source_components =
                 static_cast<std::uint8_t>(components);
             binding.destination_components = 4;
             binding.normalized = 0;
-            binding.integer = 0;
+            binding.integer = integer ? 1U : 0U;
             binding.instance_divisor = 0;
             bindings.push_back(binding);
             offset_bytes += components * sizeof(float);

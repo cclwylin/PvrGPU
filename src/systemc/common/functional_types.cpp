@@ -88,32 +88,103 @@ float DecodeDepthAttachmentUnorm(std::uint32_t encoded,
                             static_cast<double>(maximum));
 }
 
+std::uint8_t ApplyStencilOp(StencilOp op, std::uint8_t stored,
+                            std::uint8_t reference) {
+  switch (op) {
+    case StencilOp::kKeep:
+      return stored;
+    case StencilOp::kZero:
+      return 0;
+    case StencilOp::kReplace:
+      return reference;
+    case StencilOp::kIncrementClamp:
+      return stored == 0xFFU ? stored : static_cast<std::uint8_t>(stored + 1U);
+    case StencilOp::kDecrementClamp:
+      return stored == 0 ? stored : static_cast<std::uint8_t>(stored - 1U);
+    case StencilOp::kInvert:
+      return static_cast<std::uint8_t>(~stored);
+    case StencilOp::kIncrementWrap:
+      return static_cast<std::uint8_t>(stored + 1U);
+    case StencilOp::kDecrementWrap:
+      return static_cast<std::uint8_t>(stored - 1U);
+  }
+  throw std::runtime_error("unsupported stencil operation");
+}
+
+bool StencilPass(DepthCompareOp op, std::uint8_t reference,
+                 std::uint8_t stored) {
+  switch (op) {
+    case DepthCompareOp::kNever:
+      return false;
+    case DepthCompareOp::kLess:
+      return reference < stored;
+    case DepthCompareOp::kEqual:
+      return reference == stored;
+    case DepthCompareOp::kLessOrEqual:
+      return reference <= stored;
+    case DepthCompareOp::kGreater:
+      return reference > stored;
+    case DepthCompareOp::kNotEqual:
+      return reference != stored;
+    case DepthCompareOp::kGreaterOrEqual:
+      return reference >= stored;
+    case DepthCompareOp::kAlways:
+      return true;
+  }
+  throw std::runtime_error("unsupported stencil compare operation");
+}
+
+bool DepthAttachmentHasStencil(std::uint32_t format) {
+  return format == kDriverPcoDepthFormatZ24UnormS8Uint;
+}
+
 std::vector<std::uint32_t> DecodeDepthAttachmentUnormBytes(
-    const std::vector<std::uint8_t> &bytes, std::uint32_t format) {
+    const std::vector<std::uint8_t> &bytes, std::uint32_t format,
+    std::vector<std::uint8_t> *stencil) {
   const std::size_t bytes_per_pixel = DepthAttachmentBytesPerPixel(format);
   if (bytes.empty() || bytes.size() % bytes_per_pixel != 0)
     throw std::runtime_error("native depth attachment byte count is invalid");
+  const bool has_stencil = DepthAttachmentHasStencil(format);
   std::vector<std::uint32_t> encoded(bytes.size() / bytes_per_pixel, 0);
+  if (stencil)
+    stencil->assign(encoded.size(), 0);
   for (std::size_t pixel = 0; pixel < encoded.size(); ++pixel) {
-    std::memcpy(&encoded[pixel], bytes.data() + pixel * bytes_per_pixel,
+    std::uint32_t word = 0;
+    std::memcpy(&word, bytes.data() + pixel * bytes_per_pixel,
                 bytes_per_pixel);
+    if (has_stencil) {
+      if (stencil)
+        (*stencil)[pixel] = static_cast<std::uint8_t>((word >> 24) & 0xFFU);
+      word &= UINT32_C(0x00ffffff);
+    }
+    encoded[pixel] = word;
     (void)DecodeDepthAttachmentUnorm(encoded[pixel], format);
   }
   return encoded;
 }
 
 std::vector<std::uint8_t> EncodeDepthAttachmentUnormBytes(
-    const std::vector<std::uint32_t> &encoded, std::uint32_t format) {
+    const std::vector<std::uint32_t> &encoded, std::uint32_t format,
+    const std::vector<std::uint8_t> *stencil) {
   const std::size_t bytes_per_pixel = DepthAttachmentBytesPerPixel(format);
   if (encoded.empty() ||
       encoded.size() >
           std::numeric_limits<std::size_t>::max() / bytes_per_pixel) {
     throw std::runtime_error("native depth attachment value count is invalid");
   }
+  const bool has_stencil = DepthAttachmentHasStencil(format);
+  if (stencil && (!has_stencil || stencil->size() != encoded.size())) {
+    throw std::runtime_error(
+        "native depth attachment stencil plane does not match its depth plane");
+  }
   std::vector<std::uint8_t> bytes(encoded.size() * bytes_per_pixel, 0);
   for (std::size_t pixel = 0; pixel < encoded.size(); ++pixel) {
     (void)DecodeDepthAttachmentUnorm(encoded[pixel], format);
-    std::memcpy(bytes.data() + pixel * bytes_per_pixel, &encoded[pixel],
+    std::uint32_t word = encoded[pixel];
+    if (has_stencil && stencil) {
+      word |= static_cast<std::uint32_t>((*stencil)[pixel]) << 24;
+    }
+    std::memcpy(bytes.data() + pixel * bytes_per_pixel, &word,
                 bytes_per_pixel);
   }
   return bytes;
@@ -616,6 +687,8 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
       state.color_attachment_load,
       state.depth_attachment_load,
       state.isp_depth_attachment,
+      state.isp_stencil_attachment,
+      state.attachment_clears,
       state.depth_attachment,
       state.fragment_invocations,
       state.fragment_shader_lanes,

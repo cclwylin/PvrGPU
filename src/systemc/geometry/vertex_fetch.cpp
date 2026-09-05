@@ -438,10 +438,12 @@ void VertexFetch::Run() {
         throw std::runtime_error(
             "VertexFetch direct raster draw has an invalid vertex range");
       }
-      // A strip or fan reaches vertex fetch already expanded into a triangle
-      // list, so adjacent triangles repeat whole vertices byte for byte. The
-      // submitter records where each expanded vertex came from; shading one
-      // lane per distinct source and pointing every occurrence at it keeps the
+      // A strip, fan, line or point topology reaches vertex fetch already
+      // expanded into a triangle list, so triangles repeat whole vertices byte
+      // for byte -- between adjacent triangles of a strip, and within the
+      // degenerate triangle a line or point is encoded as. The submitter
+      // records where each expanded vertex came from; shading one lane per
+      // distinct source and pointing every occurrence at it keeps the
       // assembled primitives identical while vs_invocations counts the
       // vertices the draw actually submitted.
       std::vector<std::uint32_t> source_vertices;

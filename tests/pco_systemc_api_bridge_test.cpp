@@ -242,8 +242,8 @@ void VerifyDepthAttachmentFormats() {
 
 int main() {
   using namespace pvrgpu::stub;
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 8U,
-                "native sequence bridge test requires API-v8");
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 12U,
+                "native sequence bridge test requires API-v12");
   static_assert(PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS == 15U);
   static_assert(kDriverPcoMaximumTextureMipLevels == 15U);
   static_assert(kMaximumTextureMipLevels == 15U);
@@ -255,7 +255,7 @@ int main() {
   static_assert(
       sizeof(void *) != 8U ||
           sizeof(pvrgpu_systemc_pco_sequence_texture) == 336U,
-      "64-bit SystemC API-v8 sequence texture ABI size changed");
+      "64-bit SystemC API-v10 sequence texture ABI size changed");
   static_assert(
       std::tuple_size<decltype(DriverPcoSampledTexture{}.mip)>::value ==
           kDriverPcoMaximumTextureMipLevels,
@@ -418,7 +418,7 @@ int main() {
   if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) ==
           0 ||
       std::string(error.data()).find("command version") == std::string::npos) {
-    Fail("previous-version command was not rejected before the API-v8 tail");
+    Fail("previous-version command was not rejected before the API-v10 tail");
   }
   command.version = PVRGPU_SYSTEMC_API_VERSION;
   error.fill(0);
@@ -762,7 +762,7 @@ int main() {
   error.fill(0);
   if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) !=
       0) {
-    Fail("valid PCO API-v8 submit failed: " + std::string(error.data()));
+    Fail("valid PCO API-v10 submit failed: " + std::string(error.data()));
   }
 
   // The bridge contract promises that none of these producer allocations are

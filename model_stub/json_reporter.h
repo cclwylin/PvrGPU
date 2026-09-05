@@ -8,7 +8,9 @@
 #pragma once
 
 #include "common/pipeline_state.h"
+#include "model_job.h"
 
+#include <string>
 #include <systemc>
 
 namespace pvrgpu::stub {
@@ -30,18 +32,26 @@ class JsonReporter final : public sc_core::sc_module {
 public:
   sc_core::sc_fifo_in<PipelineTxn> input{"input"};
 
+  // `job` is optional.  Without it the reporter publishes one run's records
+  // and stops the kernel, as a single-shot run expects.  With it the reporter
+  // publishes a record set per flush and leaves the simulation alive, so the
+  // draw that follows a readback still has a model to run on.
   JsonReporter(sc_core::sc_module_name name, const Options &options,
                MemoryPool &pool,
-               sc_core::sc_event *sequence_completion = nullptr);
+               sc_core::sc_event *sequence_completion = nullptr,
+               ModelJob *job = nullptr);
 
   bool failed() const { return failed_; }
 
 private:
   void Run();
+  void RunJob();
+  void FinishJob(bool failed, const std::string &error);
 
   Options options_;
   MemoryPool &pool_;
   sc_core::sc_event *sequence_completion_ = nullptr;
+  ModelJob *job_ = nullptr;
   bool failed_ = false;
 };
 

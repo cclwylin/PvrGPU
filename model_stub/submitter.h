@@ -11,6 +11,7 @@
 #pragma once
 
 #include "memory_pool.h"
+#include "model_job.h"
 #include "model_types.h"
 
 #include <systemc>
@@ -25,19 +26,28 @@ class Submitter final : public sc_core::sc_module {
 public:
   sc_core::sc_fifo_out<PipelineTxn> output{"output"};
 
+  // `job` is optional.  Without it the submitter queues the work `options`
+  // describes and its thread ends, which is what a single-shot run wants.
+  // With it the thread waits for each flush instead, adopts that flush's
+  // options, drains them, and goes back to waiting -- so the pipeline is idle
+  // rather than finished between draws, and a second draw can follow a
+  // readback.
   Submitter(sc_core::sc_module_name name, MemoryPool &pool,
             const Options &options, GpuMemorySystem *memory = nullptr,
-            sc_core::sc_event *sequence_completion = nullptr);
+            sc_core::sc_event *sequence_completion = nullptr,
+            ModelJob *job = nullptr);
 
   std::uint64_t fifo_stalls() const { return fifo_stalls_; }
 
 private:
   void Run();
+  void RunJob();
 
   MemoryPool &pool_;
   Options options_;
   GpuMemorySystem *memory_ = nullptr;
   sc_core::sc_event *sequence_completion_ = nullptr;
+  ModelJob *job_ = nullptr;
   std::uint64_t fifo_stalls_ = 0;
 };
 

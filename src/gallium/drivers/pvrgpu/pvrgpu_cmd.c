@@ -30,6 +30,21 @@ pvrgpu_note_driver_draw_command_emitted(void)
    pvrgpu_global_driver_draw_command_emitted = true;
 }
 
+/*
+ * Let the next frame describe itself.
+ *
+ * The flag exists because a single deferred run could only ever describe one
+ * frame, so the first command to arrive had to be the one that counted.  Once
+ * a readback has run the model, that frame is finished and reported, and the
+ * draws that follow belong to the next one.  Only the readback path calls
+ * this, and only for an application whose frames are not declared by a trace.
+ */
+void
+pvrgpu_reset_driver_draw_command_emitted(void)
+{
+   pvrgpu_global_driver_draw_command_emitted = false;
+}
+
 bool
 pvrgpu_driver_counter_sequence_command_has_been_emitted(void)
 {
@@ -398,6 +413,88 @@ pvrgpu_submit_systemc_api(const struct pvrgpu_systemc_driver_command *command,
                          "command=%s case=%s",
                          pvrgpu_safe_text(command ? command->command : NULL),
                          pvrgpu_safe_text(command ? command->case_name : NULL));
+   return true;
+}
+
+/*
+ * Run whatever has been submitted and copy back what it drew.
+ *
+ * A submission used to run only at `atexit`, so anything that read the colour
+ * attachment before then saw the driver's own CPU backing store -- a clear,
+ * never a draw.  The model is elaborated once and stays alive between flushes
+ * now, so a readback can ask for the pixels at the moment it needs them.
+ *
+ * Returns false only when the flush itself failed.  A flush with nothing
+ * pending, or one whose surface does not match, succeeds with `*out_written`
+ * false and leaves `pixels` alone: the caller keeps what it already had, which
+ * is exactly the pre-existing behaviour.
+ */
+bool
+pvrgpu_systemc_flush_readback_rgba8(uint32_t width,
+                                    uint32_t height,
+                                    uint8_t *pixels,
+                                    size_t pixels_size,
+                                    bool *out_written,
+                                    char *error,
+                                    size_t error_size)
+{
+   if (out_written)
+      *out_written = false;
+   if (!pixels || width == 0 || height == 0)
+      return false;
+
+   const char *library_path = pvrgpu_nonempty_env("PVRGPU_SYSTEMC_API_LIB");
+   if (!library_path)
+      return true;
+
+   static void *flush_handle;
+   static pvrgpu_systemc_flush_readback_fn flush;
+   static const char *flush_library_path;
+   if (!flush_handle || flush_library_path != library_path) {
+      dlerror();
+      flush_handle = dlopen(library_path, RTLD_NOW | RTLD_GLOBAL);
+      if (!flush_handle)
+         return true;
+      flush_library_path = library_path;
+      dlerror();
+      flush = (pvrgpu_systemc_flush_readback_fn)
+         dlsym(flush_handle, "pvrgpu_systemc_flush_readback");
+      if (dlerror())
+         flush = NULL;
+   }
+   /*
+    * A bridge without the entry point is not an error: it still defers to
+    * exit, and the caller falls back to its own contents.
+    */
+   if (!flush)
+      return true;
+
+   struct pvrgpu_systemc_readback_info readback;
+   memset(&readback, 0, sizeof(readback));
+   readback.version = PVRGPU_SYSTEMC_API_VERSION;
+   readback.width = width;
+   readback.height = height;
+   readback.pixels = pixels;
+   readback.pixels_size = pixels_size;
+
+   char detail[512] = { 0 };
+   const int result = flush(&readback, detail, sizeof(detail));
+   if (result != 0) {
+      if (error && error_size != 0) {
+         snprintf(error, error_size, "%s",
+                  detail[0] ? detail : "SystemC readback flush failed");
+      }
+      pvrgpu_counter_eventf("systemc_readback_error",
+                            "width=%u height=%u result=%d reason=%s",
+                            width, height, result,
+                            pvrgpu_safe_text(detail[0] ? detail : NULL));
+      return false;
+   }
+   if (out_written)
+      *out_written = readback.pixels_written != 0;
+   pvrgpu_counter_eventf("systemc_readback_flush",
+                         "width=%u height=%u pixels=%u",
+                         width, height, readback.pixels_written);
    return true;
 }
 
@@ -1552,6 +1649,8 @@ pvrgpu_pco_triangles_command_to_systemc(
         ++attribute) {
       out->vertex_attribute_components[attribute] =
          cmd->vertex_attribute_components[attribute];
+      out->vertex_attribute_integer[attribute] =
+         cmd->vertex_attribute_integer[attribute];
    }
    out->raw_index_data = cmd->raw_index_data;
    out->raw_index_data_size = cmd->raw_index_data_size;
@@ -1637,6 +1736,19 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->depth_func = cmd->depth_func;
    out->depth_clear_bits = cmd->depth_clear_bits;
    out->depth_format = cmd->depth_format;
+   out->stencil_enable = cmd->stencil_enable;
+   out->stencil_clear = cmd->stencil_clear;
+   for (unsigned face = 0; face < 2; ++face) {
+      out->stencil_func[face] = cmd->stencil_func[face];
+      out->stencil_fail_op[face] = cmd->stencil_fail_op[face];
+      out->stencil_depth_fail_op[face] = cmd->stencil_depth_fail_op[face];
+      out->stencil_pass_op[face] = cmd->stencil_pass_op[face];
+      out->stencil_value_mask[face] = cmd->stencil_value_mask[face];
+      out->stencil_write_mask[face] = cmd->stencil_write_mask[face];
+      out->stencil_ref[face] = cmd->stencil_ref[face];
+   }
+   out->attachment_clears = cmd->attachment_clears;
+   out->attachment_clear_count = cmd->attachment_clear_count;
 }
 
 bool

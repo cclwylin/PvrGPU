@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace pvrgpu::stub {
@@ -279,8 +280,16 @@ void Vdm::Run() {
               static_cast<std::int64_t>(idx) + state.draw.base_vertex;
           if (resolved < 0 ||
               static_cast<std::uint64_t>(resolved) >= vertex_capacity) {
+            // Say which index, from where, against what -- the numbers are the
+            // whole diagnosis, and without them this abort names no field.
             throw std::runtime_error(
-                "VDM resolved index is outside the vertex input capacity");
+                "VDM resolved index is outside the vertex input capacity: "
+                "index=" + std::to_string(idx) +
+                " base_vertex=" + std::to_string(state.draw.base_vertex) +
+                " resolved=" + std::to_string(resolved) +
+                " capacity=" + std::to_string(vertex_capacity) +
+                " occurrence=" + std::to_string(occurrence) +
+                " index_count=" + std::to_string(state.draw.index_count));
           }
           current_segment.push_back(idx);
           ia_vertices++;
