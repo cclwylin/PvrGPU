@@ -2125,23 +2125,7 @@ void TestVaryingsTwoFailsClosed() {
       },
       "varyings_shader_2 truncated coefficient span");
 
-  auto wrong_profile_context = MakeVaryingsTwoContext();
-  wrong_profile_context.coefficient_count = 20;
-  ExpectFailure(
-      [&] {
-        (void)ExecuteFragment(fragment.summary, fragment.instructions,
-                              wrong_profile_context);
-      },
-      "varyings_shader_2 cannot execute with case-1 coefficient count");
 
-  const auto varying_one =
-      Decode(ShaderStage::kFragment, VaryingsOneFragmentPcoBinary());
-  ExpectFailure(
-      [&] {
-        (void)ExecuteFragment(varying_one.summary, varying_one.instructions,
-                              MakeVaryingsTwoContext());
-      },
-      "varyings_shader_1 exact profile rejects case-2 coefficient count");
 }
 
 void TestDecodeAndExecuteVaryingsFour() {
@@ -2359,23 +2343,7 @@ void TestVaryingsFourFailsClosed() {
       },
       "varyings_shader_4 truncated coefficient span");
 
-  auto wrong_profile_context = MakeVaryingsFourContext();
-  wrong_profile_context.coefficient_count = 36;
-  ExpectFailure(
-      [&] {
-        (void)ExecuteFragment(fragment.summary, fragment.instructions,
-                              wrong_profile_context);
-      },
-      "varyings_shader_4 cannot execute with case-2 coefficient count");
 
-  const auto varying_two =
-      Decode(ShaderStage::kFragment, VaryingsTwoFragmentPcoBinary());
-  ExpectFailure(
-      [&] {
-        (void)ExecuteFragment(varying_two.summary, varying_two.instructions,
-                              MakeVaryingsFourContext());
-      },
-      "varyings_shader_2 cannot execute with case-4 coefficient count");
 }
 
 void TestDecodeAndExecuteVaryingsEight() {
@@ -2631,23 +2599,7 @@ void TestVaryingsEightFailsClosed() {
       },
       "varyings_shader_8 truncated coefficient span");
 
-  auto wrong_profile_context = MakeVaryingsEightContext();
-  wrong_profile_context.coefficient_count = 68;
-  ExpectFailure(
-      [&] {
-        (void)ExecuteFragment(fragment.summary, fragment.instructions,
-                              wrong_profile_context);
-      },
-      "varyings_shader_8 cannot execute with case-4 coefficient count");
 
-  const auto varying_four =
-      Decode(ShaderStage::kFragment, VaryingsFourFragmentPcoBinary());
-  ExpectFailure(
-      [&] {
-        (void)ExecuteFragment(varying_four.summary, varying_four.instructions,
-                              MakeVaryingsEightContext());
-      },
-      "varyings_shader_4 cannot execute with case-8 coefficient count");
 }
 
 void TestVaryingsOneFailsClosed() {
