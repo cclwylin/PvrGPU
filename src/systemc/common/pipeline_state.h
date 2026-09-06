@@ -146,6 +146,11 @@ struct PipelineState {
   // ColorAttachmentBytesPerPixel() turns this into the stored pixel width;
   // nothing downstream may assume four bytes.
   std::uint8_t color_attachment_raw_dwords = 0;
+  // The UNORM8 colour attachment stores sRGB-encoded bytes: the PBE encodes the
+  // shader's linear PIXOUT on write and, when blending, decodes the stored
+  // destination to linear, blends there and re-encodes.  Zero is a plain linear
+  // UNORM8 attachment.  Never set for an integer attachment.
+  std::uint8_t color_is_srgb = 0;
   // Number of exact descriptor-set resources bound by this physical draw.
   // TextureUnit cross-checks each raw 20-dword combined descriptor against
   // the correspondingly numbered owned resource and sampler.

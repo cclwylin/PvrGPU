@@ -120,6 +120,74 @@ std::uint8_t BlendEquationUnorm8(pvrgpu::stub::BlendEquation equation,
   return static_cast<std::uint8_t>(std::clamp(result, 0, 255));
 }
 
+// The linear-domain blend factor, for an sRGB attachment whose blending GLES
+// performs in linear space.  The values are already linear: colour channels
+// decoded from the stored sRGB destination and taken straight from the shader's
+// linear source, alpha and the (linear) blend constant unchanged.
+float FactorToFloat(pvrgpu::stub::BlendFactor factor,
+                    const std::array<float, 4> &source,
+                    const std::array<float, 4> &destination,
+                    const std::array<float, 4> &constant,
+                    std::size_t component) {
+  using pvrgpu::stub::BlendFactor;
+  switch (factor) {
+  case BlendFactor::kZero:
+    return 0.0F;
+  case BlendFactor::kOne:
+    return 1.0F;
+  case BlendFactor::kSourceAlpha:
+    return source[3];
+  case BlendFactor::kOneMinusSourceAlpha:
+    return 1.0F - source[3];
+  case BlendFactor::kSourceColor:
+    return source[component];
+  case BlendFactor::kOneMinusSourceColor:
+    return 1.0F - source[component];
+  case BlendFactor::kDestinationColor:
+    return destination[component];
+  case BlendFactor::kOneMinusDestinationColor:
+    return 1.0F - destination[component];
+  case BlendFactor::kDestinationAlpha:
+    return destination[3];
+  case BlendFactor::kOneMinusDestinationAlpha:
+    return 1.0F - destination[3];
+  case BlendFactor::kSourceAlphaSaturate:
+    return component == 3 ? 1.0F
+                          : std::min(source[3], 1.0F - destination[3]);
+  case BlendFactor::kConstantColor:
+    return constant[component];
+  case BlendFactor::kOneMinusConstantColor:
+    return 1.0F - constant[component];
+  case BlendFactor::kConstantAlpha:
+    return constant[3];
+  case BlendFactor::kOneMinusConstantAlpha:
+    return 1.0F - constant[3];
+  }
+  throw std::runtime_error("PBE received an unsupported blend factor");
+}
+
+float BlendEquationFloat(pvrgpu::stub::BlendEquation equation, float source,
+                         float destination, float source_factor,
+                         float destination_factor) {
+  using pvrgpu::stub::BlendEquation;
+  if (equation == BlendEquation::kMin)
+    return std::min(source, destination);
+  if (equation == BlendEquation::kMax)
+    return std::max(source, destination);
+  const float term1 = source * source_factor;
+  const float term2 = destination * destination_factor;
+  float result = 0.0F;
+  if (equation == BlendEquation::kAdd)
+    result = term1 + term2;
+  else if (equation == BlendEquation::kSubtract)
+    result = term1 - term2;
+  else if (equation == BlendEquation::kReverseSubtract)
+    result = term2 - term1;
+  else
+    throw std::runtime_error("PBE received an unsupported blend equation in calculation");
+  return std::clamp(result, 0.0F, 1.0F);
+}
+
 void ValidateBlendState(const pvrgpu::stub::BlendState &blend) {
   using pvrgpu::stub::BlendEquation;
   if (!blend.enable)
@@ -306,6 +374,65 @@ void Pbe::Run() {
           std::memcpy(framebuffer.data() + byte_offset +
                           channel * sizeof(raw),
                       &raw, sizeof(raw));
+        }
+        continue;
+      }
+      if (state.color_is_srgb) {
+        /*
+         * GLES blends an sRGB colour buffer in linear space with no toggle.
+         * The shader source is already linear; decode the stored sRGB
+         * destination to linear, blend (or pass the source through) there, and
+         * re-encode on write.  Alpha never passes through the sRGB transfer.
+         */
+        std::array<float, 4> source_linear{};
+        for (std::size_t component = 0; component < 4; ++component) {
+          source_linear[component] = std::clamp(
+              BitsFloat(output.pixel_output[target * 4 + component]), 0.0F,
+              1.0F);
+        }
+        std::array<float, 4> result_linear = source_linear;
+        if (state.raster_state.blend.enable) {
+          const BlendState &blend = state.raster_state.blend;
+          std::array<float, 4> dest_linear{};
+          for (std::size_t component = 0; component < 3; ++component) {
+            dest_linear[component] =
+                SrgbChannelToLinear(framebuffer[byte_offset + component]);
+          }
+          dest_linear[3] =
+              static_cast<float>(framebuffer[byte_offset + 3]) / 255.0F;
+          std::array<float, 4> constant_linear{};
+          for (std::size_t component = 0; component < 4; ++component) {
+            constant_linear[component] = std::clamp(
+                BitsFloat(blend.constant_color_bits[component]), 0.0F, 1.0F);
+          }
+          for (std::size_t component = 0; component < 4; ++component) {
+            const BlendFactor source_factor =
+                component == 3 ? blend.source_alpha_factor
+                               : blend.source_rgb_factor;
+            const BlendFactor destination_factor =
+                component == 3 ? blend.destination_alpha_factor
+                               : blend.destination_rgb_factor;
+            const BlendEquation equation = component == 3
+                                               ? blend.alpha_equation
+                                               : blend.rgb_equation;
+            const float sf = FactorToFloat(source_factor, source_linear,
+                                           dest_linear, constant_linear,
+                                           component);
+            const float df = FactorToFloat(destination_factor, source_linear,
+                                           dest_linear, constant_linear,
+                                           component);
+            result_linear[component] = BlendEquationFloat(
+                equation, source_linear[component], dest_linear[component], sf,
+                df);
+          }
+        }
+        for (std::size_t component = 0; component < 4; ++component) {
+          if ((state.raster_state.color_mask & (1U << component)) == 0)
+            continue;
+          framebuffer[byte_offset + component] =
+              component == 3
+                  ? FloatValueToUnorm8(result_linear[3])
+                  : LinearChannelToSrgbUnorm8(result_linear[component]);
         }
         continue;
       }

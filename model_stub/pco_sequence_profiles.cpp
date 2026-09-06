@@ -20,6 +20,8 @@ constexpr char kDriverCommandProducer[] = "pvrgpu-gallium-driver";
 constexpr char kDrawPcoTriangles[] = "draw_pco_triangles";
 constexpr char kDrawPcoSequence[] = "draw_pco_sequence";
 constexpr char kRgba8[] = "PIPE_FORMAT_R8G8B8A8_UNORM";
+constexpr char kRgba8Srgb[] = "PIPE_FORMAT_R8G8B8A8_SRGB";
+constexpr char kBgra8Srgb[] = "PIPE_FORMAT_B8G8R8A8_SRGB";
 constexpr char kR32Ui[] = "PIPE_FORMAT_R32_UINT";
 constexpr char kRg32Ui[] = "PIPE_FORMAT_R32G32_UINT";
 constexpr char kRgba32Ui[] = "PIPE_FORMAT_R32G32B32A32_UINT";
@@ -30,8 +32,8 @@ constexpr char kRgba32Ui[] = "PIPE_FORMAT_R32G32B32A32_UINT";
 // into RG32UI, a vec3 or vec4 into RGBA32UI -- and requiring RGBA8 refused
 // every one of them.
 bool IsGenericDrawFormat(const std::string &format) {
-  return format == kRgba8 || format == kR32Ui || format == kRg32Ui ||
-         format == kRgba32Ui;
+  return format == kRgba8 || format == kRgba8Srgb || format == kBgra8Srgb ||
+         format == kR32Ui || format == kRg32Ui || format == kRgba32Ui;
 }
 constexpr char kRgbx8[] = "PIPE_FORMAT_R8G8B8X8_UNORM";
 constexpr char kZ32[] = "PIPE_FORMAT_Z32_UNORM";

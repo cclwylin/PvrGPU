@@ -15,6 +15,15 @@ extern "C" {
 #define PVRGPU_DRIVER_COMMAND_SCHEMA "pvrgpu.driver-command.v1"
 #define PVRGPU_DRIVER_COMMAND_PRODUCER "pvrgpu-gallium-driver"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8 "PIPE_FORMAT_R8G8B8A8_UNORM"
+/*
+ * The sRGB-encoded eight-bit colour target.  Its bytes are laid out exactly
+ * like RGBA8, but the stored value is the sRGB transfer of a linear colour:
+ * the model encodes the shader's linear PIXOUT on write and, when blending,
+ * decodes the destination to linear, blends there, and re-encodes -- which is
+ * what GLES does for an sRGB framebuffer with no toggle.
+ */
+#define PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8_SRGB "PIPE_FORMAT_R8G8B8A8_SRGB"
+#define PVRGPU_DRIVER_COMMAND_FORMAT_BGRA8_SRGB "PIPE_FORMAT_B8G8R8A8_SRGB"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_RGBX8 "PIPE_FORMAT_R8G8B8X8_UNORM"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_BGRX8 "PIPE_FORMAT_B8G8R8X8_UNORM"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_R5G6B5 "PIPE_FORMAT_R5G6B5_UNORM"

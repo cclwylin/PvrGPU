@@ -580,6 +580,11 @@ enum class TextureFormat : std::uint8_t {
 // transfer function exactly; alpha never passes through it.
 float SrgbChannelToLinear(std::uint8_t encoded);
 
+// The inverse: one linear colour channel encoded to an sRGB UNORM8 byte, with
+// the same floor(v*255 + 0.5) store rounding the UNORM8 colour path uses.
+// Alpha never passes through it.
+std::uint8_t LinearChannelToSrgbUnorm8(float linear);
+
 enum class TextureLayout : std::uint8_t {
   kLinear = 0,
 };

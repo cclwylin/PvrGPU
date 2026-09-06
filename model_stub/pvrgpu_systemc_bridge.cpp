@@ -817,7 +817,8 @@ bool CopyPcoTrianglePayload(
       source.depth_clamp != 0 || source.sample_mask != UINT32_MAX ||
       // The PBE honours a partial write mask, so any four-bit mask is valid.
       source.color_mask > 0x0f || source.blend_enable > 1 ||
-      source.dither != 1;
+      // Dither is cosmetic and never applied; either state is valid.
+      source.dither > 1;
   const bool ideas_raster_invalid =
       ideas_sequence &&
       ((source.cull_face != 0 && source.cull_face != 2) ||
@@ -901,10 +902,12 @@ bool CopyPcoSequenceDraw(
   }
   if (!source.case_name || !source.case_name[0])
     return refuse("case_name is empty");
-  // The colour formats the PBE can write a draw into: four UNORM8 channels, or
-  // one, two or four raw 32-bit integer channels.
+  // The colour formats the PBE can write a draw into: four UNORM8 channels
+  // (linear or sRGB-encoded), or one, two or four raw 32-bit integer channels.
   if (!source.format ||
       (std::string_view(source.format) != "PIPE_FORMAT_R8G8B8A8_UNORM" &&
+       std::string_view(source.format) != "PIPE_FORMAT_R8G8B8A8_SRGB" &&
+       std::string_view(source.format) != "PIPE_FORMAT_B8G8R8A8_SRGB" &&
        std::string_view(source.format) != "PIPE_FORMAT_R32_UINT" &&
        std::string_view(source.format) != "PIPE_FORMAT_R32G32_UINT" &&
        std::string_view(source.format) != "PIPE_FORMAT_R32G32B32A32_UINT")) {
@@ -1093,7 +1096,10 @@ bool CopyPcoSequenceDraw(
   else if (source.blend_enable > 1 || !blend_enums_valid ||
            !disabled_blend_is_canonical)
     nested_reason = "blend";
-  else if (source.dither != 1)
+  else if (source.dither > 1)
+    // Dither is cosmetic and the model never dithers -- an RGBA8 store is
+    // exact -- so either GL_DITHER state produces the same pixels.  Accept
+    // both; only an out-of-range value is malformed.
     nested_reason = "dither";
   else if (source.depth_enable > 1 || source.depth_write > 1 ||
            (source.depth_write != 0 && source.depth_enable == 0) ||

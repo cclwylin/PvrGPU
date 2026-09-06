@@ -1004,6 +1004,14 @@ pvrgpu_resource_readback_format_is_supported(enum pipe_format format)
    case PIPE_FORMAT_B8G8R8A8_UNORM:
    case PIPE_FORMAT_B8G8R8X8_UNORM:
    /*
+    * The sRGB eight-bit targets store the same byte layout as their UNORM
+    * siblings -- the model has already applied the sRGB transfer -- so the
+    * readback publishes those bytes unchanged, only swapping R/B for the BGRA
+    * order.
+    */
+   case PIPE_FORMAT_R8G8B8A8_SRGB:
+   case PIPE_FORMAT_B8G8R8A8_SRGB:
+   /*
     * The 32-bit integer attachments: the model publishes the shader's PIXOUT
     * lanes verbatim, one dword per channel, which is already the stored pixel,
     * so they need no reordering at all -- only the right pixel width.
@@ -1062,7 +1070,8 @@ pvrgpu_resource_readback_store_row(enum pipe_format format,
       return;
    }
    const bool swap_red_blue = format == PIPE_FORMAT_B8G8R8A8_UNORM ||
-                              format == PIPE_FORMAT_B8G8R8X8_UNORM;
+                              format == PIPE_FORMAT_B8G8R8X8_UNORM ||
+                              format == PIPE_FORMAT_B8G8R8A8_SRGB;
    const bool opaque = format == PIPE_FORMAT_R8G8B8X8_UNORM ||
                        format == PIPE_FORMAT_B8G8R8X8_UNORM;
 

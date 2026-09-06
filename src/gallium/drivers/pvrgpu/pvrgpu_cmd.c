@@ -164,6 +164,8 @@ pvrgpu_cmd_format_supported(const char *format)
 {
    return format &&
           (strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8) == 0 ||
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8_SRGB) == 0 ||
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_BGRA8_SRGB) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBX8) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_BGRX8) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R5G6B5) == 0 ||
@@ -831,6 +833,8 @@ pvrgpu_cmd_validate_draw_pco_triangles(
     */
    const bool format_ok =
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8) == 0 ||
+      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8_SRGB) == 0 ||
+      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_BGRA8_SRGB) == 0 ||
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_R32UI) == 0 ||
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RG32UI) == 0 ||
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32UI) == 0;
@@ -1374,7 +1378,13 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       raster_reason = "color_mask";
    else if (cmd->blend_enable > 1)
       raster_reason = "blend";
-   else if (cmd->dither != 1)
+   else if (cmd->dither > 1)
+      /*
+       * Dither is cosmetic and the model never dithers: an RGBA8 store is
+       * already exact, so an enabled or disabled GL_DITHER produces the same
+       * pixels.  Accept either -- dEQP's fragment_ops.interaction randomizes
+       * it -- and only reject an out-of-range value.
+       */
       raster_reason = "dither";
    else if (!pvrgpu_depth_clear_value_is_representable(cmd->depth_clear_bits))
       raster_reason = "depth_clear_value";

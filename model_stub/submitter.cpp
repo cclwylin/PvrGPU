@@ -1592,6 +1592,13 @@ void Submitter::RunJob() {
           : command.format == "PIPE_FORMAT_R32G32_UINT"       ? 2U
           : command.format == "PIPE_FORMAT_R32G32B32A32_UINT" ? 4U
                                                               : 0U;
+      // An sRGB-encoded eight-bit colour target: same byte layout as RGBA8, but
+      // the PBE applies the sRGB transfer on write and blends in linear space.
+      state.color_is_srgb =
+          (command.format == "PIPE_FORMAT_R8G8B8A8_SRGB" ||
+           command.format == "PIPE_FORMAT_B8G8R8A8_SRGB")
+              ? 1U
+              : 0U;
       state.vertex_sampled_texture_count =
           command.vertex_sampled_texture_count;
       state.sampled_texture_count =

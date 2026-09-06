@@ -42,6 +42,15 @@ float SrgbChannelToLinear(std::uint8_t encoded) {
   return static_cast<float>(linear);
 }
 
+std::uint8_t LinearChannelToSrgbUnorm8(float linear) {
+  const double value = std::clamp(static_cast<double>(linear), 0.0, 1.0);
+  const double encoded = value <= 0.0031308
+                             ? value * 12.92
+                             : 1.055 * std::pow(value, 1.0 / 2.4) - 0.055;
+  const double scaled = std::clamp(encoded, 0.0, 1.0) * 255.0;
+  return static_cast<std::uint8_t>(std::floor(scaled + 0.5));
+}
+
 std::size_t DepthAttachmentBytesPerPixel(std::uint32_t format) {
   if (format == kDriverPcoDepthFormatZ16Unorm)
     return sizeof(std::uint16_t);

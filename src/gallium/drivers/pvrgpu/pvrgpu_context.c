@@ -788,6 +788,10 @@ pvrgpu_command_format_for_framebuffer(const struct pvrgpu_context *ctx)
       return PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8;
 
    switch (ctx->framebuffer.cbufs[0].format) {
+   case PIPE_FORMAT_R8G8B8A8_SRGB:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8_SRGB;
+   case PIPE_FORMAT_B8G8R8A8_SRGB:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_BGRA8_SRGB;
    case PIPE_FORMAT_R8G8B8X8_UNORM:
       return PVRGPU_DRIVER_COMMAND_FORMAT_RGBX8;
    case PIPE_FORMAT_B8G8R8X8_UNORM:
