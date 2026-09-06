@@ -9639,7 +9639,8 @@ pvrgpu_capture_generic_sequence_texture(
    }
    if (view->target != PIPE_TEXTURE_2D &&
        view->target != PIPE_TEXTURE_2D_ARRAY &&
-       view->target != PIPE_TEXTURE_3D) {
+       view->target != PIPE_TEXTURE_3D &&
+       view->target != PIPE_TEXTURE_CUBE) {
       *reason = "view_target";
       return false;
    }
@@ -9658,8 +9659,16 @@ pvrgpu_capture_generic_sequence_texture(
     * the texture unit filters across the two nearest slices.
     */
    const bool volume_view = view->target == PIPE_TEXTURE_3D;
+   /*
+    * A cube map stores its six faces exactly like a six-layer array -- one
+    * complete 2D image per face per level, face-minor, the count constant
+    * across levels.  The shader hands the SMP a three-component direction; the
+    * texture unit projects it to a face and the 2D coordinate within it.
+    */
+   const bool cube_view = view->target == PIPE_TEXTURE_CUBE;
    const unsigned layers = array_view    ? view->texture->array_size
                            : volume_view ? view->texture->depth0
+                           : cube_view   ? view->texture->array_size
                                          : 1U;
    if (layers == 0U || layers > 4096U) {
       *reason = "layers";
@@ -9833,7 +9842,8 @@ pvrgpu_capture_generic_sequence_texture(
       return false;
    }
    destination->normalized_coordinates = 1;
-   destination->texture_kind = volume_view ? 2U : array_view ? 1U : 0U;
+   destination->texture_kind =
+      cube_view ? 3U : volume_view ? 2U : array_view ? 1U : 0U;
    destination->layers = layers;
    destination->min_lod_u4_6 = 0;
    /*
@@ -12006,7 +12016,8 @@ pvrgpu_draw_is_lowerable_array_primitive(
        */
       if (view->texture->target != PIPE_TEXTURE_2D &&
           view->texture->target != PIPE_TEXTURE_2D_ARRAY &&
-          view->texture->target != PIPE_TEXTURE_3D) {
+          view->texture->target != PIPE_TEXTURE_3D &&
+          view->texture->target != PIPE_TEXTURE_CUBE) {
          *reason = "texture_target";
          if (detail && detail_size) {
             const char *name =

@@ -1223,12 +1223,18 @@ void TextureUnit::SampleRunForStage(
     // halves with each mip level, so it is derived per level below.
     const bool volume_texture =
         resource.dimension_type == TextureDimensionType::k3D;
+    // A cube sample also carries three coordinates -- a direction vector --
+    // but resolves them to a face and a 2D face coordinate rather than a
+    // depth slice.
+    const bool cube_texture =
+        resource.dimension_type == TextureDimensionType::kCube;
     // The SMP always carries two in-plane coordinates; the sample's
     // dimension names the texture (three for 3D, whose depth coordinate rides
     // in coordinates[2]).  A 2D array folds its layer into the address and
     // stays dimension two.
     const std::uint8_t expected_coordinate_count = 2U;
-    const std::uint8_t expected_dimension = volume_texture ? 3U : 2U;
+    const std::uint8_t expected_dimension =
+        (volume_texture || cube_texture) ? 3U : 2U;
     std::uint64_t texel_fetch_count = 0;
     std::uint64_t expected_texel_fetches = 0;
     for (std::size_t index = 0; index < requests.size(); ++index) {
@@ -1290,6 +1296,40 @@ void TextureUnit::SampleRunForStage(
         if (layer >= resource.layer_count)
           layer = resource.layer_count - 1U;
         selected_layer = static_cast<std::uint32_t>(layer);
+      }
+      // The in-plane coordinates a sample filters with.  A cube sample derives
+      // them from its direction vector: the largest-magnitude component names
+      // the face (GL order +X,-X,+Y,-Y,+Z,-Z, the face-minor layer order the
+      // capture stored), and the other two, divided by that magnitude and
+      // mapped to [0,1], give the face coordinate (lp_build_cube_lookup / the
+      // GLES cube face selection).
+      float plane_s = BitsFloat(request.coordinates[0]);
+      float plane_t = BitsFloat(request.coordinates[1]);
+      if (cube_texture) {
+        const float rx = BitsFloat(request.coordinates[0]);
+        const float ry = BitsFloat(request.coordinates[1]);
+        const float rz = BitsFloat(request.coordinates[2]);
+        const float ax = std::fabs(rx);
+        const float ay = std::fabs(ry);
+        const float az = std::fabs(rz);
+        float ma = az;
+        float sc = rz >= 0.0F ? rx : -rx;
+        float tc = -ry;
+        std::uint32_t face = rz >= 0.0F ? 4U : 5U;
+        if (ax >= ay && ax >= az) {
+          ma = ax;
+          sc = rx >= 0.0F ? -rz : rz;
+          tc = -ry;
+          face = rx >= 0.0F ? 0U : 1U;
+        } else if (ay >= az) {
+          ma = ay;
+          sc = rx;
+          tc = ry >= 0.0F ? rz : -rz;
+          face = ry >= 0.0F ? 2U : 3U;
+        }
+        plane_s = 0.5F * (sc / ma + 1.0F);
+        plane_t = 0.5F * (tc / ma + 1.0F);
+        selected_layer = face;
       }
       const bool astc_image = image.format == TextureFormat::kAstcLdr ||
                               image.format == TextureFormat::kAstcLdrSrgb;
@@ -1393,10 +1433,10 @@ void TextureUnit::SampleRunForStage(
           [&](const TextureMipLevel &mip,
               std::uint64_t first_request_id) -> std::uint32_t {
         const TextureLinearAxis x = ComputeTextureLinearRepeat(
-            BitsFloat(request.coordinates[0]), mip.width,
+            plane_s, mip.width,
             decoded_sampler.wrap_u);
         const TextureLinearAxis y = ComputeTextureLinearRepeat(
-            BitsFloat(request.coordinates[1]), mip.height,
+            plane_t, mip.height,
             decoded_sampler.wrap_v);
         const std::uint32_t depth00 = SampledDepth24FromTexel(
             read_texel(mip, x.lower, y.lower, first_request_id + 0U));
@@ -1421,10 +1461,10 @@ void TextureUnit::SampleRunForStage(
       const auto sample_nearest =
           [&](const TextureMipLevel &mip, std::uint64_t request_id) {
         const std::uint32_t x =
-            ComputeTextureNearestRepeat(BitsFloat(request.coordinates[0]),
+            ComputeTextureNearestRepeat(plane_s,
                                         mip.width, decoded_sampler.wrap_u);
         const std::uint32_t y =
-            ComputeTextureNearestRepeat(BitsFloat(request.coordinates[1]),
+            ComputeTextureNearestRepeat(plane_t,
                                         mip.height, decoded_sampler.wrap_v);
         return read_texel(mip, x, y, request_id);
       };
@@ -1433,10 +1473,10 @@ void TextureUnit::SampleRunForStage(
           [&](const TextureMipLevel &mip,
               std::uint64_t first_request_id) {
         const TextureLinearAxis x = ComputeTextureLinearRepeat(
-            BitsFloat(request.coordinates[0]), mip.width,
+            plane_s, mip.width,
             decoded_sampler.wrap_u);
         const TextureLinearAxis y = ComputeTextureLinearRepeat(
-            BitsFloat(request.coordinates[1]), mip.height,
+            plane_t, mip.height,
             decoded_sampler.wrap_v);
         const std::array<std::uint8_t, 8> texel00 =
             read_texel(mip, x.lower, y.lower, first_request_id + 0U);
@@ -1494,10 +1534,10 @@ void TextureUnit::SampleRunForStage(
       const auto sample_nearest_float =
           [&](const TextureMipLevel &mip, std::uint64_t request_id) {
         const std::uint32_t x = ComputeTextureFloatNearest(
-            BitsFloat(request.coordinates[0]), mip.width,
+            plane_s, mip.width,
             decoded_sampler.wrap_u);
         const std::uint32_t y = ComputeTextureFloatNearest(
-            BitsFloat(request.coordinates[1]), mip.height,
+            plane_t, mip.height,
             decoded_sampler.wrap_v);
         return DecodeTexelToFloat(image.format,
                                   read_texel(mip, x, y, request_id));
@@ -1506,10 +1546,10 @@ void TextureUnit::SampleRunForStage(
       const auto sample_bilinear_float =
           [&](const TextureMipLevel &mip, std::uint64_t first_request_id) {
         const TextureFloatAxis x = ComputeTextureFloatLinear(
-            BitsFloat(request.coordinates[0]), mip.width,
+            plane_s, mip.width,
             decoded_sampler.wrap_u);
         const TextureFloatAxis y = ComputeTextureFloatLinear(
-            BitsFloat(request.coordinates[1]), mip.height,
+            plane_t, mip.height,
             decoded_sampler.wrap_v);
         const std::array<float, 4> texel00 = DecodeTexelToFloat(
             image.format,
@@ -1558,8 +1598,8 @@ void TextureUnit::SampleRunForStage(
                   << std::setfill('0') << request.coordinates[0] << ",0x"
                   << std::setw(8) << request.coordinates[1] << std::dec
                   << std::setfill(' ') << " coord="
-                  << BitsFloat(request.coordinates[0]) << ','
-                  << BitsFloat(request.coordinates[1]);
+                  << plane_s << ','
+                  << plane_t;
         if (needs_lod) {
           std::cerr << " lod=" << lod.lambda << ','
                     << static_cast<unsigned>(lod.level0) << ','
@@ -1611,10 +1651,10 @@ void TextureUnit::SampleRunForStage(
         if (linear_filter || two_levels)
           throw std::runtime_error("TextureUnit cannot filter Z32_UNORM");
         const std::uint32_t x = ComputeTextureNearestRepeat(
-            BitsFloat(request.coordinates[0]), level0.width,
+            plane_s, level0.width,
             decoded_sampler.wrap_u);
         const std::uint32_t y = ComputeTextureNearestRepeat(
-            BitsFloat(request.coordinates[1]), level0.height,
+            plane_t, level0.height,
             decoded_sampler.wrap_v);
         const std::array<std::uint8_t, 8> texel =
             read_texel(level0, x, y, tap_request_base);
@@ -1638,10 +1678,10 @@ void TextureUnit::SampleRunForStage(
           if (linear_filter)
             return sample_bilinear_depth(mip, first_request_id);
           const std::uint32_t x = ComputeTextureNearestRepeat(
-              BitsFloat(request.coordinates[0]), mip.width,
+              plane_s, mip.width,
               decoded_sampler.wrap_u);
           const std::uint32_t y = ComputeTextureNearestRepeat(
-              BitsFloat(request.coordinates[1]), mip.height,
+              plane_t, mip.height,
               decoded_sampler.wrap_v);
           return SampledDepth24FromTexel(
               read_texel(mip, x, y, first_request_id));

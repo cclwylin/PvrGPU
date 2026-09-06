@@ -2227,6 +2227,8 @@ void Submitter::RunJob() {
                   ? TextureDimensionType::k2DArray
               : texture.texture_kind == 2U
                   ? TextureDimensionType::k3D
+              : texture.texture_kind == 3U
+                  ? TextureDimensionType::kCube
                   : TextureDimensionType::k2D;
           resource.format =
               texture.format == "PIPE_FORMAT_Z32_UNORM"
