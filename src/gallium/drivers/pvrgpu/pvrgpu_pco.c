@@ -3937,8 +3937,13 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
             case nir_instr_type_tex: {
                /* Only plain sampling of a bound 2D texture is lowered. */
                const nir_tex_instr *tex = nir_instr_as_tex(instr);
+               /*
+                * Plain sampling of a bound 2D or 2D-array texture is lowered;
+                * PCO compiles the array sample itself, emitting a three-
+                * coordinate SMP whose third component is the layer index.
+                */
                if (texture_count == 0 || tex->op != nir_texop_tex ||
-                   tex->is_array || tex->is_shadow ||
+                   tex->is_shadow ||
                    tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
                    tex->texture_index != tex->sampler_index ||
                    tex->texture_index >= texture_count) {

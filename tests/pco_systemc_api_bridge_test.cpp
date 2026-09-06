@@ -242,8 +242,8 @@ void VerifyDepthAttachmentFormats() {
 
 int main() {
   using namespace pvrgpu::stub;
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 16U,
-                "native sequence bridge test requires API-v16");
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 17U,
+                "native sequence bridge test requires API-v17");
   static_assert(PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS == 15U);
   static_assert(kDriverPcoMaximumTextureMipLevels == 15U);
   static_assert(kMaximumTextureMipLevels == 15U);
@@ -254,7 +254,7 @@ int main() {
       "SystemC API texture ABI does not expose all 15 mip slots");
   static_assert(
       sizeof(void *) != 8U ||
-          sizeof(pvrgpu_systemc_pco_sequence_texture) == 336U,
+          sizeof(pvrgpu_systemc_pco_sequence_texture) == 344U,
       "64-bit SystemC API-v10 sequence texture ABI size changed");
   static_assert(
       std::tuple_size<decltype(DriverPcoSampledTexture{}.mip)>::value ==

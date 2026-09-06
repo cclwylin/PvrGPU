@@ -9619,8 +9619,21 @@ pvrgpu_capture_generic_sequence_texture(
       *reason = "binding";
       return false;
    }
-   if (view->target != PIPE_TEXTURE_2D) {
+   if (view->target != PIPE_TEXTURE_2D &&
+       view->target != PIPE_TEXTURE_2D_ARRAY) {
       *reason = "view_target";
+      return false;
+   }
+   /*
+    * A 2D array stores `layers` complete 2D images per mip level, layer-minor
+    * inside each level.  The shader's third texture coordinate selects a
+    * layer; every level keeps the full layer count while its width and height
+    * halve.  Plain 2D is one layer.
+    */
+   const bool array_view = view->target == PIPE_TEXTURE_2D_ARRAY;
+   const unsigned layers = array_view ? view->texture->array_size : 1U;
+   if (layers == 0U || layers > 4096U) {
+      *reason = "layers";
       return false;
    }
 
@@ -9698,7 +9711,8 @@ pvrgpu_capture_generic_sequence_texture(
          return false;
       }
       expected_offset +=
-         (uintptr_t)util_format_get_2d_size(format, row_pitch, level_height);
+         (uintptr_t)util_format_get_2d_size(format, row_pitch, level_height) *
+         layers;
    }
    if (expected_offset == 0 || expected_offset != (uintptr_t)resource->size) {
       *reason = "image_size";
@@ -9783,6 +9797,8 @@ pvrgpu_capture_generic_sequence_texture(
       return false;
    }
    destination->normalized_coordinates = 1;
+   destination->texture_kind = array_view ? 1U : 0U;
+   destination->layers = layers;
    destination->min_lod_u4_6 = 0;
    /*
     * GL's mip filter NONE has no Rogue encoding: the sampler word carries a
@@ -11944,7 +11960,13 @@ pvrgpu_draw_is_lowerable_array_primitive(
          }
          return false;
       }
-      if (view->texture->target != PIPE_TEXTURE_2D) {
+      /*
+       * A 2D array is lowerable: PCO compiles the array sample and the model
+       * addresses the layer from the shader's third coordinate.  Other
+       * targets still fall to the shape recognisers.
+       */
+      if (view->texture->target != PIPE_TEXTURE_2D &&
+          view->texture->target != PIPE_TEXTURE_2D_ARRAY) {
          *reason = "texture_target";
          if (detail && detail_size) {
             const char *name =

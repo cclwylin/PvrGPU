@@ -112,6 +112,9 @@ struct DriverPcoSampledTexture {
   std::uint32_t normalized_coordinates = 0;
   std::uint32_t min_lod_u4_6 = 0;
   std::uint32_t max_lod_u4_6 = 0;
+  // 0 = plain 2D, 1 = 2D array.  A 2D array holds `layers` images per level.
+  std::uint32_t texture_kind = 0;
+  std::uint32_t layers = 1;
 };
 
 inline constexpr DriverPcoStageAbi kConditionalsVertexPcoAbi = {

@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 /* API-v14 states the PIXOUT lanes each colour attachment expects. */
-#define PVRGPU_SYSTEMC_API_VERSION 16u
+#define PVRGPU_SYSTEMC_API_VERSION 17u
 /*
  * Draws one sequence may describe; must match the model's own bound.  This is
  * independent of how many attachments the sequence creates, which the model's
@@ -145,6 +145,14 @@ struct pvrgpu_systemc_pco_sequence_texture {
    uint32_t normalized_coordinates;
    uint32_t min_lod_u4_6;
    uint32_t max_lod_u4_6;
+   /*
+    * The sampled image's dimensionality: 0 = plain 2D, 1 = 2D array.  A 2D
+    * array stores `layers` complete 2D images per mip level, layer-minor
+    * inside each level, and the shader's third texture coordinate selects one.
+    * Plain 2D leaves layers at one.
+    */
+   uint32_t texture_kind;
+   uint32_t layers;
 };
 
 struct pvrgpu_systemc_driver_command {

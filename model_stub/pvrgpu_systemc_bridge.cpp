@@ -1597,6 +1597,8 @@ bool CopyPcoSequenceTexture(
   texture.normalized_coordinates = source.normalized_coordinates;
   texture.min_lod_u4_6 = source.min_lod_u4_6;
   texture.max_lod_u4_6 = source.max_lod_u4_6;
+  texture.texture_kind = source.texture_kind;
+  texture.layers = source.layers == 0U ? 1U : source.layers;
   *destination = std::move(texture);
   return true;
 }

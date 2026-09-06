@@ -715,7 +715,6 @@ void TextureUnit::SampleRunForStage(
       if (candidate_resource.descriptor_set != set ||
           candidate_resource.binding != 0 ||
           !block_is_consistent ||
-          candidate_resource.reserved[0] != 0 ||
           candidate_sampler.descriptor_set != set ||
           candidate_sampler.binding != 0 ||
           candidate_sampler.reserved[0] != 0 ||
@@ -878,9 +877,12 @@ void TextureUnit::SampleRunForStage(
         throw std::runtime_error(
             "TextureUnit structured mip layout disagrees with raw image");
       }
+      // A 2D array stores layer_count images per level, so the level occupies
+      // that many single-image byte sizes.
       expected_offset +=
           static_cast<std::uint64_t>(expected_pitch) *
-          storage_blocks(expected_height, storage_block_height);
+          storage_blocks(expected_height, storage_block_height) *
+          resource.layer_count;
       if (expected_offset > std::numeric_limits<std::uint32_t>::max())
         throw std::overflow_error("TextureUnit mip allocation overflow");
       expected_width = std::max<std::uint32_t>(1U, expected_width >> 1U);
@@ -1170,6 +1172,12 @@ void TextureUnit::SampleRunForStage(
                 << static_cast<unsigned>(lod.mip_weight_u8) << '\n';
       std::cerr.precision(saved_precision);
     }
+    // A 2D array carries a third coordinate: the layer index.  Plain 2D
+    // reads two.  The layer never affects LOD or the in-plane filter -- it
+    // only selects which of the level's stacked images the taps read from.
+    const bool array_texture =
+        resource.dimension_type == TextureDimensionType::k2DArray;
+    const std::uint8_t expected_coordinate_count = array_texture ? 3U : 2U;
     std::uint64_t texel_fetch_count = 0;
     std::uint64_t expected_texel_fetches = 0;
     for (std::size_t index = 0; index < requests.size(); ++index) {
@@ -1181,9 +1189,11 @@ void TextureUnit::SampleRunForStage(
       const TextureImplicitLod &lod = implicit_lods[index];
       if (request.shader_lane_index != index || request.request_id != index ||
           request.shader_stage != shader_stage ||
-          request.coordinate_count != 2 || request.component_count != 4 ||
+          request.coordinate_count != expected_coordinate_count ||
+          request.component_count != 4 ||
           request.descriptor_set != descriptor_set || request.binding != 0 ||
-          request.dimension != 2 || request.normalized != 1 ||
+          request.dimension != expected_coordinate_count ||
+          request.normalized != 1 ||
           request.data_request != 0 ||
           (vertex_stage
                ? (request.quad_id != 0 || request.quad_lane != 0)
@@ -1207,6 +1217,18 @@ void TextureUnit::SampleRunForStage(
        * makes the cache and DRAM counters describe block traffic rather than
        * a texel read the hardware never issues.
        */
+      // lp_build_layer_coord: the array layer is the third coordinate as a
+      // signed integer (the shader applied f2i32_rtne before the sample),
+      // clamped to the levels that exist.  It is 0 for a plain 2D image.
+      std::uint32_t selected_layer = 0U;
+      if (array_texture) {
+        std::int32_t raw_layer = 0;
+        std::memcpy(&raw_layer, &request.coordinates[2], sizeof(raw_layer));
+        const std::int32_t last_layer =
+            static_cast<std::int32_t>(resource.layer_count) - 1;
+        raw_layer = std::max(0, std::min(raw_layer, last_layer));
+        selected_layer = static_cast<std::uint32_t>(raw_layer);
+      }
       const bool astc_image = image.format == TextureFormat::kAstcLdr ||
                               image.format == TextureFormat::kAstcLdrSrgb;
       const AstcBlockFootprint astc_footprint{resource.block_width,
@@ -1221,8 +1243,11 @@ void TextureUnit::SampleRunForStage(
             astc_image ? x / astc_footprint.width : x;
         const std::uint32_t fetch_y =
             astc_image ? y / astc_footprint.height : y;
+        const std::uint64_t layer_stride =
+            static_cast<std::uint64_t>(mip.row_pitch_bytes) * mip.height;
         const std::uint64_t texel_offset =
             static_cast<std::uint64_t>(mip.offset_bytes) +
+            static_cast<std::uint64_t>(selected_layer) * layer_stride +
             static_cast<std::uint64_t>(fetch_y) * mip.row_pitch_bytes +
             static_cast<std::uint64_t>(fetch_x) * fetch_bytes;
         if (texel_offset > resource.byte_size - fetch_bytes ||

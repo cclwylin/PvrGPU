@@ -2219,6 +2219,13 @@ void Submitter::RunJob() {
           resource.byte_size =
               static_cast<std::uint32_t>(texture.declared_bytes_size);
           resource.mip_count = static_cast<std::uint8_t>(texture.mip_count);
+          resource.layer_count =
+              static_cast<std::uint16_t>(texture.layers == 0U ? 1U
+                                                              : texture.layers);
+          resource.dimension_type =
+              texture.texture_kind == 1U
+                  ? TextureDimensionType::k2DArray
+                  : TextureDimensionType::k2D;
           resource.format =
               texture.format == "PIPE_FORMAT_Z32_UNORM"
                   ? TextureFormat::kZ32Unorm

@@ -571,6 +571,17 @@ enum class TextureLayout : std::uint8_t {
   kLinear = 0,
 };
 
+// A sampled image's dimensionality.  It selects how the shader's coordinates
+// past the first two are read: an array layer is a clamped integer index, a
+// 3D slice and a cube face are computed from floats (added with 3D and cube
+// support).  Plain 2D reads only s and t.
+enum class TextureDimensionType : std::uint8_t {
+  k2D = 0,
+  k2DArray = 1,
+  k3D = 2,
+  kCube = 3,
+};
+
 enum class TextureFilter : std::uint8_t {
   kNearest = 0,
   kLinear,
@@ -606,7 +617,11 @@ struct TextureResource {
   // ceil(width / block_width) blocks.
   std::uint8_t block_width = 1;
   std::uint8_t block_height = 1;
-  std::uint8_t reserved[1]{};
+  // A 2D array stores `layer_count` complete images per level, layer-minor
+  // within the level (offset += layer * row_pitch * height).  Plain 2D leaves
+  // this at one.
+  TextureDimensionType dimension_type = TextureDimensionType::k2D;
+  std::uint16_t layer_count = 1;
   TextureMipLevel mip[kMaximumTextureMipLevels]{};
 };
 
