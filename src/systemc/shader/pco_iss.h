@@ -123,6 +123,7 @@ enum class PcoOpcode : std::uint8_t {
   kIntegerMultiplyAdd32,
   kBitfieldInsert,
   kBitfieldExtractUnsigned,
+  kIntegerAdd64_32,
   kBitwiseAnd,
   kBitwiseOr,
   kBitwiseXor,
@@ -211,6 +212,8 @@ struct PcoInstruction {
   std::uint32_t binary_offset = 0;
   std::uint16_t group_index = 0;
   std::uint16_t output_index = 0;
+  // The high half's destination for a two-output op (add64_32).
+  std::uint16_t output_index1 = 0;
   std::uint16_t branch_target_index = 0;
   std::uint32_t loop_count = 0;
   // Raw binary32/integer payload for compiler-emitted immediate groups.

@@ -1498,6 +1498,64 @@ PcoInstruction DecodeTextureSampleGroup(
   return instruction;
 }
 
+/* ADD64_32: a 64-bit + 32-bit integer add producing a 64-bit result in two
+ * registers (nir_uadd64_32).  The array-index math adds the layer's 32-bit
+ * byte offset to the texture descriptor's 64-bit base address before the
+ * sample.  Sources are the base low, base high and the offset; the two
+ * destinations are the result low and high, written as a dual-destination
+ * pair. */
+PcoInstruction DecodeGenericAdd64_32Group(
+    ShaderStage, const std::vector<std::uint8_t> &binary,
+    const GroupHeader &header, std::uint16_t group_index) {
+  if (header.control || header.bitwise || header.da != 3 ||
+      header.operation_origin != 0 || !header.write0_present ||
+      !header.write1_present || header.repeat_count != 1 ||
+      header.total_bytes != 12) {
+    DecodeError(header.offset, "unsupported ADD64_32 instruction-group header");
+  }
+  const std::size_t group_end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  if (binary[cursor++] != 0xe0U)
+    DecodeError(header.offset + 3, "expected the ADD64_32 int32/64 operation");
+  const ThreeLowerSources sources =
+      DecodeThreeLowerSources(binary, group_end, cursor);
+  if (sources.input_selector != 0)
+    DecodeError(header.offset, "ADD64_32 requires embedded is0=s0");
+  if (cursor >= group_end || binary[cursor++] != 0x00U)
+    DecodeError(cursor - 1, "unsupported ADD64_32 upper-source encoding");
+  if (cursor >= group_end || binary[cursor++] != 0xc0U)
+    DecodeError(cursor - 1, "unsupported ADD64_32 ISS selection");
+  // Dual destination (ISA DstSpec True, 1, 7, 1, 6): the first byte carries a
+  // 1-bit bank in bit 7 and a 7-bit index; the second a 1-bit bank in bit 6
+  // and a 6-bit index.  Both must be temporaries.
+  if (group_end - cursor < 2)
+    DecodeError(cursor, "truncated ADD64_32 dual destination");
+  const std::uint8_t dst0_byte = binary[cursor++];
+  const std::uint8_t dst1_byte = binary[cursor++];
+  if (((dst0_byte >> 7U) & 1U) != 1U || ((dst1_byte >> 6U) & 1U) != 1U)
+    DecodeError(cursor - 2, "ADD64_32 destinations must be temporaries");
+  const std::uint16_t output0 = static_cast<std::uint16_t>(dst0_byte & 0x7fU);
+  const std::uint16_t output1 = static_cast<std::uint16_t>(dst1_byte & 0x3fU);
+  if (output0 >= kPcoTemporaryCount || output1 >= kPcoTemporaryCount)
+    DecodeError(cursor - 2, "ADD64_32 destination exceeds the temporary file");
+  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
+
+  PcoInstruction instruction;
+  instruction.opcode = PcoOpcode::kIntegerAdd64_32;
+  instruction.target = PcoWriteTarget::kTemporary;
+  instruction.source = sources.source0;   // base low
+  instruction.source1 = sources.source1;  // base high
+  instruction.source2 = sources.source2;  // 32-bit offset
+  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
+  instruction.group_index = group_index;
+  instruction.output_index = output0;
+  instruction.output_index1 = output1;
+  instruction.source_count = 3;
+  instruction.repeat_count = 1;
+  instruction.end_group = 0;
+  return instruction;
+}
+
 PcoInstruction DecodeGenericSimpleAluGroup(
     ShaderStage stage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
@@ -2925,9 +2983,13 @@ PcoInstruction DecodeFragmentGroup(const std::vector<std::uint8_t> &binary,
       return DecodeTextureSampleGroup(binary, header, group_index);
     return DecodeFragmentFitrpGroup(binary, header, group_index);
   }
-  if (header.operation_origin == 0)
+  if (header.operation_origin == 0) {
+    if (header.write1_present && binary[header.offset + 3] == 0xe0U)
+      return DecodeGenericAdd64_32Group(ShaderStage::kFragment, binary, header,
+                                        group_index);
     return DecodeGenericSimpleAluGroup(ShaderStage::kFragment, binary, header,
                                       group_index);
+  }
   if (header.operation_origin == 1) {
     const std::size_t operation_offset = header.offset + 3;
     if (operation_offset >= header.offset + header.total_bytes)
@@ -3905,6 +3967,10 @@ void ValidateFragmentProgram(
     case PcoOpcode::kBitfieldInsert:
       writes_temporary = instruction.target == PcoWriteTarget::kTemporary &&
                          instruction.source_count == 4;
+      break;
+    case PcoOpcode::kIntegerAdd64_32:
+      writes_temporary = instruction.target == PcoWriteTarget::kTemporary &&
+                         instruction.source_count == 3;
       break;
     default:
       DecodeError(instruction.binary_offset,
@@ -5922,6 +5988,7 @@ PcoFragmentExecution ExecuteFragmentPco(
     case PcoOpcode::kIntegerMultiplyAdd32: return "IMADD32";
     case PcoOpcode::kBitfieldInsert: return "BFI";
     case PcoOpcode::kBitfieldExtractUnsigned: return "UBFE";
+    case PcoOpcode::kIntegerAdd64_32: return "ADD64_32";
     case PcoOpcode::kBitwiseAnd: return "AND";
     case PcoOpcode::kBitwiseOr: return "OR";
     case PcoOpcode::kBitwiseXor: return "XOR";
@@ -6247,6 +6314,34 @@ PcoFragmentExecution ExecuteFragmentPco(
     if (instruction.opcode == PcoOpcode::kDiscard) {
       result.discarded = true;
       break;
+    }
+    if (instruction.opcode == PcoOpcode::kIntegerAdd64_32) {
+      if (instruction.output_index >= temporaries.size() ||
+          instruction.output_index1 >= temporaries.size())
+        ExecuteError("invalid ADD64_32 target in fragment shader");
+      const auto read64 = [&](const PcoRegisterRef &reference) {
+        return static_cast<std::uint64_t>(ReadSource(
+            reference, no_vertex_inputs, temporaries, temporary_written_mask,
+            0, ShaderStage::kFragment));
+      };
+      const std::uint64_t base =
+          (read64(instruction.source1) << 32U) | read64(instruction.source);
+      const std::uint64_t sum = base + read64(instruction.source2);
+      temporaries[instruction.output_index] =
+          static_cast<std::uint32_t>(sum & UINT64_C(0xffffffff));
+      temporaries[instruction.output_index1] =
+          static_cast<std::uint32_t>(sum >> 32U);
+      temporary_written_mask |=
+          (UINT64_C(1) << instruction.output_index) |
+          (UINT64_C(1) << instruction.output_index1);
+      if (trace) {
+        std::cerr << "pco-fragment-trace pc=" << pc << " off="
+                  << instruction.binary_offset << " op=ADD64_32 dst=t"
+                  << instruction.output_index << ",t"
+                  << instruction.output_index1 << '\n';
+      }
+      ++pc;
+      continue;
     }
 
     if (instruction.opcode == PcoOpcode::kFloatNegate ||
