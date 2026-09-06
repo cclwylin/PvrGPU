@@ -596,10 +596,14 @@ bool DriverPcoTextureDescriptorClassSupported(
    * while the rest of the pipeline accounted for a trilinear fetch.
    */
   const bool one_level_in_range = sampler.max_lod_u4_6 < 64U;
+  /*
+   * Crossing levels needs the mip-linear path, which is the only one that
+   * selects a level.  What it samples inside each level now follows the image
+   * filter, so GL_NEAREST_MIPMAP_LINEAR -- GL's default minification filter --
+   * belongs here too.
+   */
   const bool filters_across_levels =
-      sampler.mip_filter == TextureFilter::kLinear &&
-      sampler.min_filter == TextureFilter::kLinear &&
-      sampler.mag_filter == TextureFilter::kLinear;
+      sampler.mip_filter == TextureFilter::kLinear;
   const bool level_selection_is_exact =
       one_level_in_range || filters_across_levels;
 
@@ -1535,6 +1539,24 @@ void TextureUnit::SampleRunForStage(
             LerpSampledDepth24(depth01, depth11, x.weight), y.weight);
       };
 
+      /*
+       * One nearest tap from a chosen level.  The mip-linear path needs this
+       * to serve GL_NEAREST_MIPMAP_LINEAR -- nearest inside each level, linear
+       * between them -- which is GL's default minification filter and which
+       * this unit used to decline because its only cross-level path filtered
+       * bilinearly inside every level.
+       */
+      const auto sample_nearest =
+          [&](const TextureMipLevel &mip, std::uint64_t request_id) {
+        const std::uint32_t x =
+            NearestRepeat(BitsFloat(request.coordinates[0]), mip.width,
+                          decoded_sampler.wrap_u);
+        const std::uint32_t y =
+            NearestRepeat(BitsFloat(request.coordinates[1]), mip.height,
+                          decoded_sampler.wrap_v);
+        return read_texel(mip, x, y, request_id);
+      };
+
       const auto sample_bilinear =
           [&](const TextureMipLevel &mip,
               std::uint64_t first_request_id) {
@@ -1617,7 +1639,59 @@ void TextureUnit::SampleRunForStage(
         }
         std::cerr << '\n';
       }
-      if (!linear_filter) {
+      /*
+       * Order matters: a mip-linear sampler crosses levels whatever its
+       * image filter is.  Testing the image filter first sent every
+       * GL_NEAREST_MIPMAP_LINEAR down the single-level nearest path, which
+       * reads mip[0] and never selects a level at all.
+       */
+      if (mip_linear) {
+        if (image.format == TextureFormat::kZ32Unorm) {
+          throw std::runtime_error(
+              "TextureUnit cannot mip-filter Z32_UNORM");
+        }
+        if (request.request_id >
+            (std::numeric_limits<std::uint64_t>::max() - 7U) / 8U) {
+          throw std::overflow_error("TextureUnit trilinear request ID overflow");
+        }
+        const TextureImplicitLod &lod = implicit_lods[index];
+        const std::uint64_t first_request_id = request.request_id * 8U;
+        if (image.format == TextureFormat::kZ24UnormS8Uint) {
+          // A single-level depth image resolves both LOD taps to level 0, so
+          // the mip blend is exact whatever weight the LOD datapath produced.
+          const std::uint32_t lower = sample_bilinear_depth(
+              resource.mip[lod.level0], first_request_id + 0U);
+          const std::uint32_t upper = sample_bilinear_depth(
+              resource.mip[lod.level1], first_request_id + 4U);
+          filtered = {SampledDepth24ToFloat(LerpSampledDepth24(
+                          lower, upper, lod.mip_weight_u8)),
+                      0.0F, 0.0F, 1.0F};
+        } else {
+          /*
+           * The image filter chooses what a level's tap is; the mip filter
+           * only decides that two levels are blended.  Sampling each level
+           * bilinearly whatever the image filter said is what made
+           * GL_NEAREST_MIPMAP_LINEAR unanswerable.
+           */
+          const std::array<std::uint8_t, 4> lower =
+              linear_filter
+                  ? sample_bilinear(resource.mip[lod.level0],
+                                    first_request_id + 0U)
+                  : sample_nearest(resource.mip[lod.level0],
+                                   first_request_id + 0U);
+          const std::array<std::uint8_t, 4> upper =
+              linear_filter
+                  ? sample_bilinear(resource.mip[lod.level1],
+                                    first_request_id + 4U)
+                  : sample_nearest(resource.mip[lod.level1],
+                                   first_request_id + 1U);
+          for (std::size_t component = 0; component < 4; ++component) {
+            const std::uint8_t texel = LerpTextureUnorm8(
+                lower[component], upper[component], lod.mip_weight_u8);
+            filtered[component] = static_cast<float>(texel) / 255.0F;
+          }
+        }
+      } else if (!linear_filter) {
         const TextureMipLevel &mip = resource.mip[0];
         const std::uint32_t x =
             NearestRepeat(BitsFloat(request.coordinates[0]), mip.width,
@@ -1658,7 +1732,7 @@ void TextureUnit::SampleRunForStage(
                 static_cast<float>(texel[component]) / 255.0F;
           }
         }
-      } else if (!mip_linear) {
+      } else {
         if (image.format == TextureFormat::kZ32Unorm) {
           throw std::runtime_error(
               "TextureUnit cannot linearly filter Z32_UNORM");
@@ -1678,38 +1752,6 @@ void TextureUnit::SampleRunForStage(
           for (std::size_t component = 0; component < 4; ++component) {
             filtered[component] =
                 static_cast<float>(texel[component]) / 255.0F;
-          }
-        }
-      } else {
-        if (image.format == TextureFormat::kZ32Unorm) {
-          throw std::runtime_error(
-              "TextureUnit cannot mip-filter Z32_UNORM");
-        }
-        if (request.request_id >
-            (std::numeric_limits<std::uint64_t>::max() - 7U) / 8U) {
-          throw std::overflow_error("TextureUnit trilinear request ID overflow");
-        }
-        const TextureImplicitLod &lod = implicit_lods[index];
-        const std::uint64_t first_request_id = request.request_id * 8U;
-        if (image.format == TextureFormat::kZ24UnormS8Uint) {
-          // A single-level depth image resolves both LOD taps to level 0, so
-          // the mip blend is exact whatever weight the LOD datapath produced.
-          const std::uint32_t lower = sample_bilinear_depth(
-              resource.mip[lod.level0], first_request_id + 0U);
-          const std::uint32_t upper = sample_bilinear_depth(
-              resource.mip[lod.level1], first_request_id + 4U);
-          filtered = {SampledDepth24ToFloat(LerpSampledDepth24(
-                          lower, upper, lod.mip_weight_u8)),
-                      0.0F, 0.0F, 1.0F};
-        } else {
-          const std::array<std::uint8_t, 4> lower = sample_bilinear(
-              resource.mip[lod.level0], first_request_id + 0U);
-          const std::array<std::uint8_t, 4> upper = sample_bilinear(
-              resource.mip[lod.level1], first_request_id + 4U);
-          for (std::size_t component = 0; component < 4; ++component) {
-            const std::uint8_t texel = LerpTextureUnorm8(
-                lower[component], upper[component], lod.mip_weight_u8);
-            filtered[component] = static_cast<float>(texel) / 255.0F;
           }
         }
       }
@@ -1738,7 +1780,7 @@ void TextureUnit::SampleRunForStage(
     }
 
     const std::uint64_t fetches_per_request =
-        mip_linear ? 8U : linear_filter ? 4U : 1U;
+        mip_linear ? (linear_filter ? 8U : 2U) : linear_filter ? 4U : 1U;
     if (requests.size() >
             std::numeric_limits<std::uint64_t>::max() /
                 fetches_per_request ||
