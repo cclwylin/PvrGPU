@@ -237,6 +237,47 @@ TextureWrapMode DecodeWrapMode(std::uint64_t encoded) {
   }
 }
 
+// A seamless cube filter's bilinear tap can leave the base face by one texel;
+// this returns the face and integer coordinate the neighbouring face contributes
+// instead (a port of tcu's remapCubeEdgeCoords, in GL face order
+// +X,-X,+Y,-Y,+Z,-Z rather than tcu's -X,+X,...).  It returns false when both
+// axes are out of bounds -- the corner -- whose colour the caller averages from
+// the other three taps.
+inline bool RemapCubeEdgeCoords(int face, int s, int t, int size,
+                                int *out_face, int *out_s, int *out_t) {
+  const bool u_in = s >= 0 && s < size;
+  const bool v_in = t >= 0 && t < size;
+  if (u_in && v_in) {
+    *out_face = face;
+    *out_s = s;
+    *out_t = t;
+    return true;
+  }
+  if (!u_in && !v_in)
+    return false;  // corner: no unique neighbour
+  const int cx = std::clamp(s, -1, size);
+  const int cy = std::clamp(t, -1, size);
+  int x = 0;
+  int y = 0;
+  int z = 0;
+  switch (face) {
+  case 0: x = size - 1;     y = size - 1 - cy; z = size - 1 - cx; break;  // +X
+  case 1: x = 0;            y = size - 1 - cy; z = cx;            break;  // -X
+  case 2: x = cx;           y = size - 1;      z = cy;            break;  // +Y
+  case 3: x = cx;           y = 0;             z = size - 1 - cy; break;  // -Y
+  case 4: x = cx;           y = size - 1 - cy; z = size - 1;      break;  // +Z
+  case 5: x = size - 1 - cx; y = size - 1 - cy; z = 0;            break;  // -Z
+  default: return false;
+  }
+  if (x == -1)   { *out_face = 1; *out_s = z;              *out_t = size - 1 - y; return true; }
+  if (x == size) { *out_face = 0; *out_s = size - 1 - z;   *out_t = size - 1 - y; return true; }
+  if (y == -1)   { *out_face = 3; *out_s = x;              *out_t = size - 1 - z; return true; }
+  if (y == size) { *out_face = 2; *out_s = x;              *out_t = z;            return true; }
+  if (z == -1)   { *out_face = 5; *out_s = size - 1 - x;   *out_t = size - 1 - y; return true; }
+  if (z == size) { *out_face = 4; *out_s = x;              *out_t = size - 1 - y; return true; }
+  return false;
+}
+
 } // namespace
 
 RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
@@ -1305,6 +1346,7 @@ void TextureUnit::SampleRunForStage(
       // GLES cube face selection).
       float plane_s = BitsFloat(request.coordinates[0]);
       float plane_t = BitsFloat(request.coordinates[1]);
+      std::uint32_t cube_face = 0U;
       if (cube_texture) {
         const float rx = BitsFloat(request.coordinates[0]);
         const float ry = BitsFloat(request.coordinates[1]);
@@ -1330,6 +1372,7 @@ void TextureUnit::SampleRunForStage(
         plane_s = 0.5F * (sc / ma + 1.0F);
         plane_t = 0.5F * (tc / ma + 1.0F);
         selected_layer = face;
+        cube_face = face;
       }
       const bool astc_image = image.format == TextureFormat::kAstcLdr ||
                               image.format == TextureFormat::kAstcLdrSrgb;
@@ -1618,8 +1661,13 @@ void TextureUnit::SampleRunForStage(
        */
       const bool linear_filter = lod.image_filter == TextureFilter::kLinear;
       const bool two_levels = lod.mip_mode == TextureMipMode::kLinear;
+      // A seamless cube bilinear crosses faces and decodes each tap, so it
+      // runs on the float datapath even for 8-bit unorm; llvmpipe likewise
+      // forces the SOA path for a cube.
       const TextureFilterDatapath datapath =
-          SelectTextureFilterDatapath(image.format, decoded_sampler);
+          (cube_texture && linear_filter)
+              ? TextureFilterDatapath::kFloat32
+              : SelectTextureFilterDatapath(image.format, decoded_sampler);
       if (request.request_id >
           (std::numeric_limits<std::uint64_t>::max() - 15U) / 16U) {
         throw std::overflow_error("TextureUnit sample request ID overflow");
@@ -1740,7 +1788,69 @@ void TextureUnit::SampleRunForStage(
           filtered[component] = static_cast<float>(texel[component]) / 255.0F;
       } else {
         const auto float_plane = [&](const TextureMipLevel &mip,
-                                     std::uint64_t rid) {
+                                     std::uint64_t rid) -> std::array<float, 4> {
+          if (cube_texture && linear_filter) {
+            // Seamless cube bilinear: each of the four taps that leaves the
+            // base face reads the neighbouring face instead, and a corner tap
+            // takes the average of the other three (tcu getCubeLinearSamples).
+            const std::int32_t size = static_cast<std::int32_t>(mip.width);
+            const float u = plane_s * static_cast<float>(size);
+            const float v = plane_t * static_cast<float>(size);
+            const std::int32_t x0 =
+                static_cast<std::int32_t>(std::floor(u - 0.5F));
+            const std::int32_t y0 =
+                static_cast<std::int32_t>(std::floor(v - 0.5F));
+            const std::int32_t tap_x[4] = {x0, x0 + 1, x0, x0 + 1};
+            const std::int32_t tap_y[4] = {y0, y0, y0 + 1, y0 + 1};
+            std::array<std::array<float, 4>, 4> colors{};
+            int corner = -1;
+            for (int i = 0; i < 4; ++i) {
+              int face_i = 0;
+              int cs = 0;
+              int ct = 0;
+              if (RemapCubeEdgeCoords(static_cast<int>(cube_face), tap_x[i],
+                                      tap_y[i], size, &face_i, &cs, &ct)) {
+                selected_layer = static_cast<std::uint32_t>(face_i);
+                colors[i] = DecodeTexelToFloat(
+                    image.format,
+                    read_texel(mip, static_cast<std::uint32_t>(cs),
+                               static_cast<std::uint32_t>(ct),
+                               rid + static_cast<std::uint64_t>(i)));
+              } else {
+                // The corner tap has no unique neighbour; still read one texel
+                // (the base face, clamped) so the batch's texel traffic stays
+                // deterministic, then replace its colour with the average of
+                // the other three below.
+                corner = i;
+                selected_layer = cube_face;
+                const std::uint32_t ccs = static_cast<std::uint32_t>(
+                    std::clamp(tap_x[i], 0, size - 1));
+                const std::uint32_t cct = static_cast<std::uint32_t>(
+                    std::clamp(tap_y[i], 0, size - 1));
+                (void)read_texel(mip, ccs, cct,
+                                 rid + static_cast<std::uint64_t>(i));
+              }
+            }
+            if (corner >= 0) {
+              std::array<float, 4> average{};
+              for (int i = 0; i < 4; ++i)
+                if (i != corner)
+                  for (int c = 0; c < 4; ++c)
+                    average[c] += colors[i][c];
+              for (int c = 0; c < 4; ++c)
+                average[c] /= 3.0F;
+              colors[corner] = average;
+            }
+            const float a = (u - 0.5F) - std::floor(u - 0.5F);
+            const float b = (v - 0.5F) - std::floor(v - 0.5F);
+            std::array<float, 4> blended{};
+            for (int c = 0; c < 4; ++c)
+              blended[c] = colors[0][c] * (1.0F - a) * (1.0F - b) +
+                           colors[1][c] * a * (1.0F - b) +
+                           colors[2][c] * (1.0F - a) * b +
+                           colors[3][c] * a * b;
+            return blended;
+          }
           return linear_filter ? sample_bilinear_float(mip, rid)
                                : sample_nearest_float(mip, rid);
         };
