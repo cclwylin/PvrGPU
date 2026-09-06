@@ -1555,31 +1555,30 @@ bool CopyPcoSequenceTexture(
       }
     }
     /*
-     * Decline a compressed texture the decoder cannot read, here, before the
-     * draw is claimed.
+     * A compressed image's footprint has to be one the decoder covers, and
+     * that is knowable here, before the draw is claimed.
      *
-     * Which ASTC block types an image contains is only knowable from its
-     * bytes, and the texture unit meets them one at a time in the middle of a
-     * sample -- far too late to decline anything.  Refusing there aborts the
-     * simulation and the case reports NoResult, which tells nobody anything.
-     * This is the same rule the shader path already follows: a draw the model
-     * cannot execute has to be declined before the driver claims it.
+     * The block contents are not: the decoder answers every 128-bit LDR
+     * block, invalid encodings included -- the spec gives those the error
+     * colour, which is what the hardware returns too -- so there is nothing
+     * about the bytes left to decline.  What would still be undecodable is a
+     * footprint this decoder does not have, and refusing that in the middle
+     * of a sample would abort the simulation and report NoResult, which
+     * tells nobody anything.
      */
     if (block_width != 1U || block_height != 1U) {
       const pvrgpu::stub::AstcBlockFootprint footprint{block_width,
                                                        block_height};
       pvrgpu::stub::AstcDecodedBlock decoded;
-      for (std::size_t offset = 0; offset + 16U <= source.bytes_size;
-           offset += 16U) {
-        const char *refusal = nullptr;
-        if (!pvrgpu::stub::DecodeAstcBlock(source.bytes + offset, footprint,
-                                           /*srgb=*/false, &decoded,
-                                           &refusal)) {
-          *error = std::string("SystemC API PCO sequence ASTC block at byte ") +
-                   std::to_string(offset) + " cannot be decoded: " +
-                   (refusal != nullptr ? refusal : "unstated");
-          return false;
-        }
+      const std::uint8_t probe_block[16] = {};
+      const char *refusal = nullptr;
+      if (!pvrgpu::stub::DecodeAstcBlock(probe_block, footprint,
+                                         /*srgb=*/false, &decoded, &refusal)) {
+        *error = std::string("SystemC API PCO sequence compressed footprint ") +
+                 std::to_string(block_width) + "x" +
+                 std::to_string(block_height) + " cannot be decoded: " +
+                 (refusal != nullptr ? refusal : "unstated");
+        return false;
       }
     }
   } else if (source.producer_command_index >= consumer_command_index ||

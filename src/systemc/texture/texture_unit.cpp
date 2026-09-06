@@ -1428,10 +1428,22 @@ void TextureUnit::SampleRunForStage(
       }
       const bool astc_image = image.format == TextureFormat::kAstcLdr ||
                               image.format == TextureFormat::kAstcLdrSrgb;
+      const bool astc_srgb = image.format == TextureFormat::kAstcLdrSrgb;
       const AstcBlockFootprint astc_footprint{resource.block_width,
                                               resource.block_height};
       const std::uint32_t fetch_bytes =
           astc_image ? 16U : TextureBytesPerTexel(image.format);
+      /*
+       * The block most recently decoded, and the bytes it was decoded from.
+       * The TPU decodes a block once as it arrives from the TCU and hands
+       * the whole footprint to the filter; decoding again for each texel of
+       * the same block would model work the hardware does not do.  The fetch
+       * itself still happens per texel, so cache and DRAM counters are
+       * unchanged by this.
+       */
+      AstcDecodedBlock astc_block;
+      std::array<std::uint8_t, 16> astc_block_bytes{};
+      bool astc_block_decoded = false;
 
       const auto read_texel = [&](const TextureMipLevel &mip,
                                   std::uint32_t x, std::uint32_t y,
@@ -1500,18 +1512,24 @@ void TextureUnit::SampleRunForStage(
         ++texel_fetch_count;
         std::array<std::uint8_t, 8> texel{};
         if (astc_image) {
-          AstcDecodedBlock block;
-          const char *refusal = nullptr;
-          if (!DecodeAstcBlock(payload.data(), astc_footprint,
-                               /*srgb=*/false, &block, &refusal)) {
-            throw std::runtime_error(
-                std::string("TextureUnit cannot decode this ASTC block: ") +
-                (refusal != nullptr ? refusal : "unstated"));
+          if (!astc_block_decoded ||
+              !std::equal(payload.begin(), payload.end(),
+                          astc_block_bytes.begin())) {
+            const char *refusal = nullptr;
+            if (!DecodeAstcBlock(payload.data(), astc_footprint, astc_srgb,
+                                 &astc_block, &refusal)) {
+              throw std::runtime_error(
+                  std::string("TextureUnit cannot decode this ASTC block: ") +
+                  (refusal != nullptr ? refusal : "unstated"));
+            }
+            std::copy(payload.begin(), payload.end(),
+                      astc_block_bytes.begin());
+            astc_block_decoded = true;
           }
           const std::uint32_t inside_x = x % astc_footprint.width;
           const std::uint32_t inside_y = y % astc_footprint.height;
           const std::array<std::uint8_t, 4> &decoded =
-              block.texels[inside_y * astc_footprint.width + inside_x];
+              astc_block.texels[inside_y * astc_footprint.width + inside_x];
           std::copy(decoded.begin(), decoded.end(), texel.begin());
         } else {
           std::copy(payload.begin(), payload.end(), texel.begin());

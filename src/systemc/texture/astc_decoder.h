@@ -5,9 +5,6 @@
 //
 // 這裡只有「一個區塊 → 一組 texel」這件事。定址、mip 與 filter 仍屬
 // TextureUnit；區塊的取得也還是走 TCU，所以 cache 與 DRAM 的計數不變。
-// 包住它的 sc_module 與 TextureUnit 的接線隨壓縮紋理真的送到模型時一起
-// 加進這一組檔案 —— 在 driver 宣告 ASTC、Mesa 停止 CPU 解壓之前，沒有
-// 任何壓縮資料會走到這裡，先接線只會是無人執行的程式碼。
 #pragma once
 
 #include <array>
@@ -35,16 +32,27 @@ struct AstcDecodedBlock {
   AstcBlockFootprint footprint;
   // 最大 footprint 是 12x12 = 144 texel。
   std::array<std::array<std::uint8_t, 4>, 144> texels{};
+  // 這個區塊裡有沒有 texel 走了規格的 error colour 路徑（無效編碼，或
+  // LDR 模式下的 HDR 區塊）。解碼仍然成功 —— error colour 是規格規定的
+  // 輸出，不是失敗。
+  bool error_colour = false;
 };
 
-// 解一個 128-bit ASTC LDR 區塊。
+// 解一個 128-bit ASTC 區塊，走 LDR 解碼模式（GLES 的
+// GL_KHR_texture_compression_astc_ldr）。二維 footprint 的整個 LDR profile
+// 都在這裡：block mode、weight grid 與其 infill、ISE（trit / quint / 純
+// 位元）、partition pattern、十個 LDR colour endpoint mode、dual plane 與
+// colour component selector。
 //
-// 目前只解 void-extent 區塊：整個 footprint 是同一個顏色，區塊自己用
-// 低 9 位元標示身分，不需要權重或 partition。其他區塊型別會被具名拒絕
-// 而不是猜一個顏色出來 —— 拒絕會少一個 PASS，編一個答案則是錯的。
+// 區塊「無效」不是拒絕。規格對每一種無效編碼都規定了輸出 —— error
+// colour（洋紅）—— HDR 區塊在 LDR 模式下也是同一條路。硬體照樣會吐出
+// texel，所以這裡也照樣吐；能讓這個函式回 false 的只有「這根本不是一次
+// 合法的呼叫」：空指標，或一個不屬於這個解碼器的 footprint。
 //
-// 成功時回傳 true 並填滿 `out`；失敗時回傳 false 並把 `*out_refusal`
-// 指向一個說明「哪一種區塊、哪個欄位」的靜態字串。
+// `srgb` 選的是輸出的轉換，不是要不要做 sRGB。sRGB 區塊在內插時就用不同
+// 的端點展開（低位元組是 0x80 而不是端點自己），輸出取 16-bit 結果的高
+// 8 位元；transfer function 由 TextureUnit 在 filter 之前施加，和未壓縮的
+// sRGB 影像走同一條路。
 bool DecodeAstcBlock(const std::uint8_t block[16],
                      AstcBlockFootprint footprint,
                      bool srgb,
