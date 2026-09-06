@@ -226,6 +226,9 @@ struct PcoInstruction {
   // coordinate temporaries the instruction reads, which is why a 2D-array,
   // cube or 3D sample needs three where a 2D sample needs two.
   std::uint8_t texture_dimension = 2;
+  // SMP `.tao`: the sample takes its texture base from a shader-computed
+  // 64-bit address (array layer folded in) at coordinate_base+3/+4.
+  std::uint8_t texture_address_offset = 0;
   std::uint8_t data_request = 0;
   PcoIterationMode iteration_mode = PcoIterationMode::kPixel;
   std::uint8_t perspective = 0;
@@ -278,6 +281,9 @@ struct PcoTextureRequest {
   std::array<std::uint32_t, 2> coordinates{};
   std::array<std::uint32_t, 4> texture_state{};
   std::array<std::uint32_t, 4> sampler_state{};
+  // The `.tao` sample's shader-computed 64-bit texture base address.
+  std::uint32_t texture_address_lo = 0;
+  std::uint32_t texture_address_hi = 0;
   std::uint8_t coordinate_count = 0;
   std::uint8_t component_count = 0;
   std::uint8_t descriptor_set = 0;

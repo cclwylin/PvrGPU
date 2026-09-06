@@ -374,6 +374,8 @@ void UscCluster::Run() {
               request.dimension = issued.dimension;
               request.normalized = issued.normalized;
               request.data_request = issued.data_request;
+              request.texture_address_lo = issued.texture_address_lo;
+              request.texture_address_hi = issued.texture_address_hi;
               requests[lane_index] = request;
               continuations[lane_index] = execution.continuation;
               queued[lane_index] = 1;
@@ -857,6 +859,10 @@ void UscCluster::Run() {
           request.dimension = execution.texture_request.dimension;
           request.normalized = execution.texture_request.normalized;
           request.data_request = execution.texture_request.data_request;
+          request.texture_address_lo =
+              execution.texture_request.texture_address_lo;
+          request.texture_address_hi =
+              execution.texture_request.texture_address_hi;
           if (debug_fragment && shader_lane.x == debug_x &&
               shader_lane.y == debug_y &&
               shader_lane.helper == 0) {

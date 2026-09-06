@@ -1442,9 +1442,13 @@ bool CopyPcoSequenceTexture(
     const pvrgpu_systemc_pco_texture_mip &mip = source.mip[level];
     const std::uint64_t tight_pitch =
         blocks_for(mip.width, block_width) * block_bytes;
+    // A 2D array stores `layers` images per level, layer-minor: the level
+    // spans that many single-image byte sizes.
+    const std::uint64_t layers =
+        source.layers == 0U ? 1U : static_cast<std::uint64_t>(source.layers);
     const std::uint64_t level_bytes =
         static_cast<std::uint64_t>(mip.row_pitch) *
-        blocks_for(mip.height, block_height);
+        blocks_for(mip.height, block_height) * layers;
     const std::uint64_t level_end =
         static_cast<std::uint64_t>(mip.offset) + level_bytes;
     if (mip.width == 0 || mip.height == 0 ||

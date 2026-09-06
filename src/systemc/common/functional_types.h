@@ -894,6 +894,10 @@ struct TextureSampleRequest {
   // Three, not two: a 2D-array layer, a 3D slice and a cube direction all
   // arrive as SMP's third coordinate.  A 2D sample leaves the last one zero.
   std::uint32_t coordinates[3]{};
+  // The `.tao` sample's shader-computed 64-bit texture base address, which
+  // already includes the array layer; zero for a plain sample.
+  std::uint32_t texture_address_lo = 0;
+  std::uint32_t texture_address_hi = 0;
   std::uint32_t texture_state[4]{};
   std::uint32_t sampler_state[4]{};
   std::uint64_t request_id = 0;

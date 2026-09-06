@@ -1177,7 +1177,9 @@ void TextureUnit::SampleRunForStage(
     // only selects which of the level's stacked images the taps read from.
     const bool array_texture =
         resource.dimension_type == TextureDimensionType::k2DArray;
-    const std::uint8_t expected_coordinate_count = array_texture ? 3U : 2U;
+    // A 2D array folds the layer into the sample's texture address; it reads
+    // two coordinates like any 2D sample.
+    const std::uint8_t expected_coordinate_count = 2U;
     std::uint64_t texel_fetch_count = 0;
     std::uint64_t expected_texel_fetches = 0;
     for (std::size_t index = 0; index < requests.size(); ++index) {
@@ -1220,14 +1222,25 @@ void TextureUnit::SampleRunForStage(
       // lp_build_layer_coord: the array layer is the third coordinate as a
       // signed integer (the shader applied f2i32_rtne before the sample),
       // clamped to the levels that exist.  It is 0 for a plain 2D image.
+      // A 2D-array sample folds the layer into the texture address: the
+      // shader computed base + layer * LAYER_SIZE, and the compiler's
+      // LAYER_SIZE is the whole array allocation's byte size (its own array
+      // stride), so the layer is (address - base) / byte_size.  The texel
+      // within the layer is then addressed with the level-major per-level
+      // layer stride below.
       std::uint32_t selected_layer = 0U;
       if (array_texture) {
-        std::int32_t raw_layer = 0;
-        std::memcpy(&raw_layer, &request.coordinates[2], sizeof(raw_layer));
-        const std::int32_t last_layer =
-            static_cast<std::int32_t>(resource.layer_count) - 1;
-        raw_layer = std::max(0, std::min(raw_layer, last_layer));
-        selected_layer = static_cast<std::uint32_t>(raw_layer);
+        const std::uint64_t sample_address =
+            (static_cast<std::uint64_t>(request.texture_address_hi) << 32U) |
+            request.texture_address_lo;
+        if (sample_address < image.gpu_address || resource.byte_size == 0)
+          throw std::runtime_error(
+              "TextureUnit array sample address is out of range");
+        std::uint64_t layer =
+            (sample_address - image.gpu_address) / resource.byte_size;
+        if (layer >= resource.layer_count)
+          layer = resource.layer_count - 1U;
+        selected_layer = static_cast<std::uint32_t>(layer);
       }
       const bool astc_image = image.format == TextureFormat::kAstcLdr ||
                               image.format == TextureFormat::kAstcLdrSrgb;
