@@ -358,7 +358,10 @@ void UscCluster::Run() {
               request.shader_lane_index = static_cast<std::uint32_t>(lane_index);
               request.request_id = lane_index;
               request.shader_stage = ShaderStage::kVertex;
-              for (std::size_t component = 0; component < 2; ++component)
+              // Every coordinate the request holds: a 2D sample leaves the
+              // third zero, and a 2D-array, cube or 3D sample needs it.
+              for (std::size_t component = 0;
+                   component < std::size(request.coordinates); ++component)
                 request.coordinates[component] = issued.coordinates[component];
               for (std::size_t dword = 0; dword < 4; ++dword) {
                 request.texture_state[dword] = issued.texture_state[dword];
@@ -833,7 +836,8 @@ void UscCluster::Run() {
           // round.  Lane identity remains stable across all continuations.
           request.request_id = shader_lane_index;
           request.shader_stage = ShaderStage::kFragment;
-          for (std::size_t component = 0; component < 2; ++component) {
+          for (std::size_t component = 0;
+               component < std::size(request.coordinates); ++component) {
             request.coordinates[component] =
                 execution.texture_request.coordinates[component];
           }

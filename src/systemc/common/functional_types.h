@@ -865,7 +865,9 @@ struct TextureSampleRequest {
   // the FragmentFrontend/PDS quad identity across the USC -> TPU FIFO instead
   // of reconstructing derivatives from request ordering or a test-case name.
   std::uint32_t quad_id = 0;
-  std::uint32_t coordinates[2]{};
+  // Three, not two: a 2D-array layer, a 3D slice and a cube direction all
+  // arrive as SMP's third coordinate.  A 2D sample leaves the last one zero.
+  std::uint32_t coordinates[3]{};
   std::uint32_t texture_state[4]{};
   std::uint32_t sampler_state[4]{};
   std::uint64_t request_id = 0;

@@ -209,6 +209,10 @@ struct PcoInstruction {
   // field: one group interpolates one through four coefficient sets while its
   // encoded group repeat remains one.
   std::uint8_t component_count = 1;
+  // SMP's dmn field: 1d=0b01, 2d=0b10, 3d=0b11.  It is also the number of
+  // coordinate temporaries the instruction reads, which is why a 2D-array,
+  // cube or 3D sample needs three where a 2D sample needs two.
+  std::uint8_t texture_dimension = 2;
   std::uint8_t data_request = 0;
   PcoIterationMode iteration_mode = PcoIterationMode::kPixel;
   std::uint8_t perspective = 0;

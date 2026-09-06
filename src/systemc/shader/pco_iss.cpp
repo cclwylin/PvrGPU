@@ -1425,11 +1425,17 @@ PcoInstruction DecodeTextureSampleGroup(
   const bool exta = (backend1 & 0x10U) != 0;
   const std::uint8_t channel_encoding = (backend1 >> 2U) & 3U;
   const std::uint8_t lod_mode = backend1 & 3U;
+  /*
+   * dmn is the coordinate count as well as the dimension: 2D reads s,t and 3D
+   * reads s,t and a third component, which is the array layer for a 2D array,
+   * the slice for a 3D image and part of the direction for a cube.  Both are
+   * decoded; what the texture unit can then sample is its own question.
+   */
   if (backend_op != kBackendOpDma || !fcnorm || drc != 0 || dma_op != 4 ||
-      extb || dimension != 2 || exta || channel_encoding != 3 ||
-      lod_mode != 0) {
+      extb || (dimension != 2 && dimension != 3) || exta ||
+      channel_encoding != 3 || lod_mode != 0) {
     DecodeError(header.offset + 3,
-                "SMP must be exact 2D/FCNORM/count4/AUTO/drc0");
+                "SMP must be FCNORM/count4/AUTO/drc0 in 2D or 3D");
   }
 
   /* The three lower sources are the four-word texture state, two normalized
@@ -1445,7 +1451,7 @@ PcoInstruction DecodeTextureSampleGroup(
       static_cast<std::size_t>(sources.source0.index) + 4U >
           kPcoMaximumSharedCount ||
       sources.source1.bank != PcoRegisterBank::kTemporary ||
-      static_cast<std::size_t>(sources.source1.index) + 2U >
+      static_cast<std::size_t>(sources.source1.index) + dimension >
           kPcoTemporaryCount ||
       sources.source2.bank != PcoRegisterBank::kShared ||
       static_cast<std::size_t>(sources.source2.index) + 4U >
@@ -1459,7 +1465,7 @@ PcoInstruction DecodeTextureSampleGroup(
               kPcoTextureDescriptorDwordCount >
           kPcoMaximumSharedCount) {
     DecodeError(header.offset + 5,
-                "SMP source registers exceed the public 2D layout");
+                "SMP source registers exceed the public layout");
   }
 
   if (group_end - cursor < 3 || binary[cursor++] != 0x80U)
@@ -1476,6 +1482,7 @@ PcoInstruction DecodeTextureSampleGroup(
 
   PcoInstruction instruction;
   instruction.opcode = PcoOpcode::kTextureSample;
+  instruction.texture_dimension = dimension;
   instruction.target = PcoWriteTarget::kTemporary;
   instruction.source = sources.source1;
   instruction.source1 = sources.source0;
@@ -3290,9 +3297,14 @@ void ValidateVertexTemporaryProgram(
   for (const PcoInstruction &instruction : instructions) {
     if (instruction.opcode == PcoOpcode::kTextureSample) {
       const std::size_t coordinate_base = instruction.source.index;
+      // dmn is the coordinate count: two for 2D, three for 2D-array, cube
+      // and 3D.
+      const std::size_t coordinate_count =
+          instruction.texture_dimension != 0 ? instruction.texture_dimension
+                                             : 2U;
       const std::uint64_t coordinate_mask =
-          coordinate_base + 2U <= kPcoTemporaryCount
-              ? (UINT64_C(3) << coordinate_base)
+          coordinate_base + coordinate_count <= kPcoTemporaryCount
+              ? (((UINT64_C(1) << coordinate_count) - 1U) << coordinate_base)
               : UINT64_C(0);
       if (++texture_sample_count > kPcoMaximumTextureSampleInstructions ||
           instruction.target != PcoWriteTarget::kTemporary ||
@@ -3517,9 +3529,14 @@ void ValidateFragmentProgram(
     }
     if (instruction.opcode == PcoOpcode::kTextureSample) {
       const std::size_t coordinate_base = instruction.source.index;
+      // dmn is the coordinate count: two for 2D, three for 2D-array, cube
+      // and 3D.
+      const std::size_t coordinate_count =
+          instruction.texture_dimension != 0 ? instruction.texture_dimension
+                                             : 2U;
       const std::uint64_t coordinate_mask =
-          coordinate_base + 2U <= kPcoTemporaryCount
-              ? (UINT64_C(3) << coordinate_base)
+          coordinate_base + coordinate_count <= kPcoTemporaryCount
+              ? (((UINT64_C(1) << coordinate_count) - 1U) << coordinate_base)
               : UINT64_C(0);
       if (request_pending || instruction.target != PcoWriteTarget::kTemporary ||
           instruction.source_count != 3 || instruction.repeat_count != 1 ||
@@ -5049,9 +5066,14 @@ PcoVertexExecution ExecuteVertexPco(
 
     if (instruction.opcode == PcoOpcode::kTextureSample) {
       const std::size_t coordinate_base = instruction.source.index;
+      // dmn is the coordinate count: two for 2D, three for 2D-array, cube
+      // and 3D.
+      const std::size_t coordinate_count =
+          instruction.texture_dimension != 0 ? instruction.texture_dimension
+                                             : 2U;
       const std::uint64_t coordinate_mask =
-          coordinate_base + 2U <= kPcoTemporaryCount
-              ? (UINT64_C(3) << coordinate_base)
+          coordinate_base + coordinate_count <= kPcoTemporaryCount
+              ? (((UINT64_C(1) << coordinate_count) - 1U) << coordinate_base)
               : UINT64_C(0);
       if (drc0_pending ||
           instruction.target != PcoWriteTarget::kTemporary ||
@@ -5077,7 +5099,8 @@ PcoVertexExecution ExecuteVertexPco(
               kPcoTemporaryCount) {
         ExecuteError("invalid generic vertex SMP.2D.FCNORM instruction");
       }
-      for (std::size_t coordinate = 0; coordinate < 2; ++coordinate) {
+      for (std::size_t coordinate = 0; coordinate < coordinate_count;
+           ++coordinate) {
         result.texture_request.coordinates[coordinate] = ReadSource(
             instruction.source, effective_vertex_inputs, temporaries,
             temporary_written_mask, static_cast<std::uint8_t>(coordinate),
@@ -5089,12 +5112,14 @@ PcoVertexExecution ExecuteVertexPco(
         result.texture_request.sampler_state[word] =
             effective_shared[instruction.source2.index + word];
       }
-      result.texture_request.coordinate_count = 2;
+      result.texture_request.coordinate_count =
+          static_cast<std::uint8_t>(coordinate_count);
       result.texture_request.component_count = kPcoPixelOutputCount;
       result.texture_request.descriptor_set = static_cast<std::uint8_t>(
           instruction.source1.index / kPcoTextureDescriptorDwordCount);
       result.texture_request.binding = 0;
-      result.texture_request.dimension = 2;
+      result.texture_request.dimension =
+          static_cast<std::uint8_t>(coordinate_count);
       result.texture_request.normalized = 1;
       result.texture_request.data_request = instruction.data_request;
       result.texture_request_valid = 1;
@@ -5863,9 +5888,14 @@ PcoFragmentExecution ExecuteFragmentPco(
 
     if (instruction.opcode == PcoOpcode::kTextureSample) {
       const std::size_t coordinate_base = instruction.source.index;
+      // dmn is the coordinate count: two for 2D, three for 2D-array, cube
+      // and 3D.
+      const std::size_t coordinate_count =
+          instruction.texture_dimension != 0 ? instruction.texture_dimension
+                                             : 2U;
       const std::uint64_t coordinate_mask =
-          coordinate_base + 2U <= kPcoTemporaryCount
-              ? (UINT64_C(3) << coordinate_base)
+          coordinate_base + coordinate_count <= kPcoTemporaryCount
+              ? (((UINT64_C(1) << coordinate_count) - 1U) << coordinate_base)
               : UINT64_C(0);
       if (drc0_pending ||
           instruction.target != PcoWriteTarget::kTemporary ||
@@ -5907,7 +5937,8 @@ PcoFragmentExecution ExecuteFragmentPco(
       result.texture_request.descriptor_set = static_cast<std::uint8_t>(
           instruction.source1.index / kPcoTextureDescriptorDwordCount);
       result.texture_request.binding = 0;
-      result.texture_request.dimension = 2;
+      result.texture_request.dimension =
+          static_cast<std::uint8_t>(coordinate_count);
       result.texture_request.normalized = 1;
       result.texture_request.data_request = instruction.data_request;
       result.texture_request_valid = 1;
