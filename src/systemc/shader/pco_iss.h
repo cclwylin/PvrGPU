@@ -121,6 +121,8 @@ enum class PcoOpcode : std::uint8_t {
   kTextureSampleLod,
   kIntegerAdd,
   kIntegerMultiplyAdd32,
+  kBitfieldInsert,
+  kBitfieldExtractUnsigned,
   kBitwiseAnd,
   kBitwiseOr,
   kBitwiseXor,
@@ -204,6 +206,8 @@ struct PcoInstruction {
   PcoRegisterRef source1{};
   // source2 is present when source_count is three (e.g. FMAD a * b + c).
   PcoRegisterRef source2{};
+  // source3 is present only for the four-source bitfield insert.
+  PcoRegisterRef source3{};
   std::uint32_t binary_offset = 0;
   std::uint16_t group_index = 0;
   std::uint16_t output_index = 0;

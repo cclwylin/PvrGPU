@@ -2513,6 +2513,114 @@ PcoInstruction DecodeGenericBitwiseOrGroup(
   return instruction;
 }
 
+/* UBFE: GL bitfieldExtract on unsigned data, (value >> offset) & ((1<<bits)-1),
+ * lowered to a three-phase masked group (pco_map.py O_UBFE):
+ *   p0: msk_bbyp0s1 ft1(mask), ft2(value)  from bits, offset, value
+ *   p1: logical.or ft4 = ft2 & ft1  (the field bits in place)
+ *   p2: shift.shr dst = ft4 >> offset
+ * The lower sources are bits, offset and value; the shift's offset is repeated
+ * as an upper source.  The array-index math extracts fields of the packed
+ * texture address offset. */
+PcoInstruction DecodeGenericBitfieldExtractUnsignedGroup(
+    ShaderStage stage, const std::vector<std::uint8_t> &binary,
+    const GroupHeader &header, std::uint16_t group_index) {
+  if (stage != ShaderStage::kFragment || !header.bitwise || header.control ||
+      header.da != 6 || header.operation_origin != 7 ||
+      header.output_load_check || !header.write0_present ||
+      header.write1_present || header.repeat_count != 1 || header.end ||
+      header.total_bytes != 14) {
+    DecodeError(header.offset, "unsupported UBFE instruction-group header");
+  }
+  const std::size_t group_end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  if (group_end - cursor < 11 || binary[cursor++] != 0x01U)
+    DecodeError(header.offset + 3, "expected the phase-2 SHR operation");
+  if (binary[cursor++] != 0x68U)
+    DecodeError(header.offset + 4, "expected the phase-1 masked LOGICAL.OR");
+  if (binary[cursor++] != 0x03U)
+    DecodeError(header.offset + 5, "expected the phase-0 MSK.BBYP0S1 operation");
+  const ThreeLowerSources lower =
+      DecodeThreeLowerSources(binary, group_end, cursor);
+  if (lower.input_selector != 0)
+    DecodeError(header.offset + 6, "UBFE lower sources are not the canonical form");
+  // The shift amount is the same offset repeated as an upper source.
+  if (cursor >= group_end || binary[cursor++] != 0x80U)
+    DecodeError(cursor - 1, "unsupported UBFE upper-source selector");
+  const std::uint8_t offset_byte = binary[cursor++];
+  if ((offset_byte & 0xc0U) != 0x80U)
+    DecodeError(cursor - 1, "unsupported UBFE shift upper-source selector");
+  const DecodedDestination destination =
+      DecodeGenericDestination(binary, group_end, cursor);
+  if (destination.target != PcoWriteTarget::kTemporary)
+    DecodeError(header.offset, "UBFE destination must be temporary");
+  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
+
+  PcoInstruction instruction;
+  instruction.opcode = PcoOpcode::kBitfieldExtractUnsigned;
+  instruction.target = destination.target;
+  instruction.source = lower.source2;   // value
+  instruction.source1 = lower.source1;  // offset
+  instruction.source2 = lower.source0;  // bits
+  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
+  instruction.group_index = group_index;
+  instruction.output_index = destination.index;
+  instruction.source_count = 3;
+  instruction.repeat_count = 1;
+  instruction.end_group = 0;
+  return instruction;
+}
+
+/* BFI: GL bitfieldInsert(base, insert, offset, bits) lowered to a masked
+ * bitfield-insert group (pco_map.py O_BFI):
+ *   p0: msk_lsl ft1(mask), ft2(insert<<offset)  from bits, offset, insert
+ *   p1: logical.or dst = (ft2 & ft1) | (base & ~ft1)
+ * The hardware lower sources are, in order, bits, offset and insert (the
+ * three-source group) then base.  The array-index math uses it to pack the
+ * clamped layer's field into the sample's texture address offset. */
+PcoInstruction DecodeGenericBitfieldInsertGroup(
+    ShaderStage stage, const std::vector<std::uint8_t> &binary,
+    const GroupHeader &header, std::uint16_t group_index) {
+  if (stage != ShaderStage::kFragment || !header.bitwise || header.control ||
+      header.da != 5 || header.operation_origin != 3 ||
+      header.output_load_check || !header.write0_present ||
+      header.write1_present || header.repeat_count != 1 || header.end ||
+      header.total_bytes != 12) {
+    DecodeError(header.offset, "unsupported BFI instruction-group header");
+  }
+  const std::size_t group_end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  if (group_end - cursor < 8 || binary[cursor++] != 0x68U)
+    DecodeError(header.offset + 3, "expected the phase-1 masked LOGICAL.OR");
+  if (binary[cursor++] != 0x0fU)
+    DecodeError(header.offset + 4, "expected the phase-0 MSK.LSL operation");
+  const ThreeLowerSources lower =
+      DecodeThreeLowerSources(binary, group_end, cursor);
+  if (lower.input_selector != 0)
+    DecodeError(header.offset + 5, "BFI lower sources are not the canonical form");
+  const PcoRegisterRef base =
+      DecodeOneLowerSource(binary, group_end, cursor);
+  const DecodedDestination destination =
+      DecodeGenericDestination(binary, group_end, cursor);
+  if (destination.target != PcoWriteTarget::kTemporary)
+    DecodeError(header.offset, "BFI destination must be temporary");
+  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
+
+  PcoInstruction instruction;
+  instruction.opcode = PcoOpcode::kBitfieldInsert;
+  instruction.target = destination.target;
+  instruction.source = lower.source0;   // bits
+  instruction.source1 = lower.source1;  // offset
+  instruction.source2 = lower.source2;  // insert
+  instruction.source3 = base;           // base
+  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
+  instruction.group_index = group_index;
+  instruction.output_index = destination.index;
+  instruction.source_count = 4;
+  instruction.repeat_count = 1;
+  instruction.end_group = 0;
+  return instruction;
+}
+
 PcoInstruction DecodeGenericBitwiseXnorGroup(
     ShaderStage stage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
@@ -2781,6 +2889,10 @@ PcoInstruction DecodeFragmentGroup(const std::vector<std::uint8_t> &binary,
         return DecodeGenericBitwiseXnorGroup(ShaderStage::kFragment, binary,
                                              header, group_index);
       }
+      if (binary[operation_offset] == 0x68U) {
+        return DecodeGenericBitfieldInsertGroup(ShaderStage::kFragment, binary,
+                                                header, group_index);
+      }
       DecodeError(operation_offset,
                   "logical phase operation is outside the public subset");
     }
@@ -2795,6 +2907,11 @@ PcoInstruction DecodeFragmentGroup(const std::vector<std::uint8_t> &binary,
       }
       DecodeError(operation_offset,
                   "phase-2 bitwise operation is outside the public subset");
+    }
+    if (header.operation_origin == 7) {
+      return DecodeGenericBitfieldExtractUnsignedGroup(ShaderStage::kFragment,
+                                                       binary, header,
+                                                       group_index);
     }
     DecodeError(header.offset,
                 "bitwise operation is outside the fragment public subset");
@@ -3778,11 +3895,16 @@ void ValidateFragmentProgram(
     case PcoOpcode::kFloatMadNegateSource0:
     case PcoOpcode::kFloatMadNegateSource0Source2:
     case PcoOpcode::kIntegerMultiplyAdd32:
+    case PcoOpcode::kBitfieldExtractUnsigned:
     case PcoOpcode::kConditionalSelect:
     case PcoOpcode::kConditionalSelectNegateTrue:
     case PcoOpcode::kConditionalSelectGreaterZero:
       writes_temporary = instruction.target == PcoWriteTarget::kTemporary &&
                          instruction.source_count == 3;
+      break;
+    case PcoOpcode::kBitfieldInsert:
+      writes_temporary = instruction.target == PcoWriteTarget::kTemporary &&
+                         instruction.source_count == 4;
       break;
     default:
       DecodeError(instruction.binary_offset,
@@ -4825,6 +4947,8 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
     case PcoOpcode::kFloatMadNegateSource0:
     case PcoOpcode::kFloatMadNegateSource0Source2:
     case PcoOpcode::kIntegerMultiplyAdd32:
+    case PcoOpcode::kBitfieldInsert:
+    case PcoOpcode::kBitfieldExtractUnsigned:
     case PcoOpcode::kFloatMin:
     case PcoOpcode::kFloatMax:
     case PcoOpcode::kIntegerMaxSigned:
@@ -5487,6 +5611,8 @@ PcoVertexExecution ExecuteVertexPco(
         instruction.opcode == PcoOpcode::kFloatMultiply ||
         instruction.opcode == PcoOpcode::kFloatMad ||
         instruction.opcode == PcoOpcode::kIntegerMultiplyAdd32 ||
+        instruction.opcode == PcoOpcode::kBitfieldInsert ||
+        instruction.opcode == PcoOpcode::kBitfieldExtractUnsigned ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource2 ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource0 ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource0Source2 ||
@@ -5794,6 +5920,8 @@ PcoFragmentExecution ExecuteFragmentPco(
     case PcoOpcode::kFloatExp2: return "FEXP2";
     case PcoOpcode::kIntegerAdd: return "IADD";
     case PcoOpcode::kIntegerMultiplyAdd32: return "IMADD32";
+    case PcoOpcode::kBitfieldInsert: return "BFI";
+    case PcoOpcode::kBitfieldExtractUnsigned: return "UBFE";
     case PcoOpcode::kBitwiseAnd: return "AND";
     case PcoOpcode::kBitwiseOr: return "OR";
     case PcoOpcode::kBitwiseXor: return "XOR";
@@ -6127,6 +6255,8 @@ PcoFragmentExecution ExecuteFragmentPco(
         instruction.opcode == PcoOpcode::kFloatMultiply ||
         instruction.opcode == PcoOpcode::kFloatMad ||
         instruction.opcode == PcoOpcode::kIntegerMultiplyAdd32 ||
+        instruction.opcode == PcoOpcode::kBitfieldInsert ||
+        instruction.opcode == PcoOpcode::kBitfieldExtractUnsigned ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource2 ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource0 ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource0Source2 ||
@@ -6250,6 +6380,29 @@ PcoFragmentExecution ExecuteFragmentPco(
         const std::uint32_t src1 = read(instruction.source1);
         const std::uint32_t src2 = read(instruction.source2);
         result_val = src0 * src1 + src2;
+      } else if (instruction.opcode == PcoOpcode::kBitfieldInsert) {
+        // GL bitfieldInsert(base, insert, offset, bits): source is bits,
+        // source1 offset, source2 insert, source3 base.
+        const std::uint32_t bits = src0 & 0x1fU;
+        const std::uint32_t offset = read(instruction.source1) & 0x1fU;
+        const std::uint32_t insert = read(instruction.source2);
+        const std::uint32_t base = read(instruction.source3);
+        const std::uint32_t mask =
+            bits == 0U ? 0U
+                       : (((bits >= 32U ? UINT32_C(0xffffffff)
+                                        : ((UINT32_C(1) << bits) - 1U))
+                           << offset));
+        result_val = (base & ~mask) | ((insert << offset) & mask);
+      } else if (instruction.opcode == PcoOpcode::kBitfieldExtractUnsigned) {
+        // GL bitfieldExtract (unsigned): source value, source1 offset,
+        // source2 bits.
+        const std::uint32_t offset = read(instruction.source1) & 0x1fU;
+        const std::uint32_t bits = read(instruction.source2) & 0x1fU;
+        const std::uint32_t field_mask =
+            bits >= 32U ? UINT32_C(0xffffffff)
+            : bits == 0U ? 0U
+                         : ((UINT32_C(1) << bits) - 1U);
+        result_val = (src0 >> offset) & field_mask;
       } else if (instruction.opcode ==
                  PcoOpcode::kFloatMadNegateSource2) {
         const std::uint32_t src1 = read(instruction.source1);
