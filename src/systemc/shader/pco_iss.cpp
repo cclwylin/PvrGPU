@@ -6492,6 +6492,8 @@ PcoFragmentExecution ExecuteFragmentPco(
         instruction.opcode == PcoOpcode::kFloatToInt32Rtz ||
         instruction.opcode == PcoOpcode::kFloatPackHalfRtz ||
         instruction.opcode == PcoOpcode::kFloatUnpackHalf ||
+        instruction.opcode == PcoOpcode::kUnpackUnsignedToFloat ||
+        instruction.opcode == PcoOpcode::kUnpackSignedToFloat ||
         (instruction.opcode == PcoOpcode::kFloatAdd && instruction.target == PcoWriteTarget::kTemporary) ||
         (instruction.opcode == PcoOpcode::kMoveBypass && instruction.target == PcoWriteTarget::kTemporary) ||
         instruction.opcode == PcoOpcode::kIntegerAdd ||
