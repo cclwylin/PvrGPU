@@ -9595,6 +9595,22 @@ pvrgpu_sequence_texture_addrmode(uint32_t capsule_wrap)
    }
 }
 
+/*
+ * The format a sampled view presents to the shader.  Mesa decompresses an
+ * RGB-only compressed image (ETC1/ETC2 RGB8) to RGBA8 and gives the view an
+ * (X,Y,Z,1) swizzle so alpha reads one; that is exactly RGBX8, which the
+ * descriptor and texture unit already sample, so treat it as such rather than
+ * declining the (otherwise unexpected) alpha-one swizzle on an RGBA8 image.
+ */
+static enum pipe_format
+pvrgpu_effective_sampled_format(const struct pipe_sampler_view *view)
+{
+   if (view && view->format == PIPE_FORMAT_R8G8B8A8_UNORM &&
+       view->swizzle_a == PIPE_SWIZZLE_1)
+      return PIPE_FORMAT_R8G8B8X8_UNORM;
+   return view ? view->format : PIPE_FORMAT_NONE;
+}
+
 static bool
 pvrgpu_capture_generic_sequence_texture(
    const struct pvrgpu_context *ctx,
@@ -9638,7 +9654,7 @@ pvrgpu_capture_generic_sequence_texture(
       return false;
    }
 
-   const enum pipe_format format = view->format;
+   const enum pipe_format format = pvrgpu_effective_sampled_format(view);
    /*
     * A combined depth/stencil image sampled through a 2D view is depth-as-
     * texture: the app renders depth and reads it back.  Its texel is the same
@@ -10969,7 +10985,8 @@ pvrgpu_record_color_primitive_pco_draw(
              fragment_shared_count ||
           !pvrgpu_pco_build_terrain_texture_descriptor(
              &fragment_uniform_words[descriptor_start],
-             ctx->sampler_views[MESA_SHADER_FRAGMENT][texture]->format,
+             pvrgpu_effective_sampled_format(
+                ctx->sampler_views[MESA_SHADER_FRAGMENT][texture]),
              captured->mip[0].width,
              captured->mip[0].height,
              captured->mip_count,
