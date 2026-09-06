@@ -963,10 +963,16 @@ pvrgpu_clear(struct pipe_context *pipe,
                                              colormask,
                                              color);
    /*
-    * A whole-surface RGBA clear is the colour every later draw starts from, so
-    * the capsule can state it instead of assuming black.
+    * The colour a later draw sequence starts from is the one the application
+    * cleared the surface to.  A whole-surface RGBA clear states it outright; a
+    * scissored RGBA clear -- dEQP renders its fragment_ops.depth_stencil cells
+    * into a sub-rectangle it first clears to that colour and reads back only
+    * that rectangle -- states it for the region that matters just as well.
+    * The model reproduces one clear colour for the frame, so record the app's
+    * requested colour for either; only a partial (masked) RGBA clear leaves a
+    * colour the single sequence clear cannot reproduce.
     */
-   if (full_surface_rect && colormask == PIPE_MASK_RGBA) {
+   if (colormask == PIPE_MASK_RGBA) {
       for (unsigned channel = 0; channel < 4; ++channel) {
          const float value = color->f[channel];
          memcpy(&ctx->color_clear_bits[channel], &value,

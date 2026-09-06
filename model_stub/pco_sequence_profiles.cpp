@@ -1169,11 +1169,17 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
   for (std::size_t ordinal = 0; ordinal < options.driver_commands.size();
        ++ordinal) {
     const DriverCommand &draw = options.driver_commands[ordinal];
+    // Every draw writes the sequence's render target (framebuffer extent), but
+    // each may render into its own viewport sub-rectangle: dEQP's
+    // fragment_ops.depth_stencil grid gives every cell its own viewport.  The
+    // draw's width/height therefore only have to fit the attachment, not match
+    // the logical command's -- SystemC positions the geometry from the draw's
+    // own viewport scale/translate and clips it with the draw's scissor.
     if (draw.command != kDrawPcoTriangles || draw.test_case != logical.test_case ||
         !IsGenericDrawFormat(draw.format) || draw.frame != 1 ||
         draw.framebuffer_width != logical.framebuffer_width ||
         draw.framebuffer_height != logical.framebuffer_height ||
-        draw.width != logical.width || draw.height != logical.height ||
+        draw.width == 0 || draw.height == 0 ||
         draw.width > draw.framebuffer_width ||
         draw.height > draw.framebuffer_height) {
       return Reject(error, "generic PCO sequence draw envelope is invalid");
@@ -1237,20 +1243,17 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
     if (draw.color_attachment_source_command_index != expected_source) {
       return Reject(error, "generic PCO sequence colour attachment chain is invalid");
     }
-    // The stencil plane shares the depth attachment, so a draw that only tests
-    // stencil still needs it chained to the previous ordinal.  Reading this as
-    // "depth test or write" alone refused every stencil-only draw.
-    const bool uses_depth_attachment = draw.depth_enable != 0 ||
-                                       draw.depth_write != 0 ||
-                                       draw.stencil_enable != 0;
-    if (!uses_depth_attachment &&
-        (draw.depth_format != 0 ||
-         draw.depth_attachment_source_command_index !=
-             kDriverPcoNewAttachment)) {
-      return Reject(error, "generic PCO sequence depth attachment is invalid");
-    }
-    if (uses_depth_attachment &&
-        draw.depth_attachment_source_command_index != expected_source) {
+    // The depth/stencil attachment is bound for the whole render pass, so a
+    // draw carries it whenever the surface has one (depth_format != 0),
+    // regardless of whether this draw tests or writes depth or stencil: a
+    // colour-only draw between depth draws still forwards the plane they share,
+    // and dEQP's fragment_ops.depth_stencil.*.no_stencil_no_depth reads the
+    // depth attachment after exactly such a draw.  A surface with no
+    // depth/stencil attachment leaves every draw's depth_format zero and its
+    // source a fresh clear.
+    const std::uint32_t expected_depth_source =
+        draw.depth_format == 0 ? kDriverPcoNewAttachment : expected_source;
+    if (draw.depth_attachment_source_command_index != expected_depth_source) {
       return Reject(error, "generic PCO sequence depth attachment chain is invalid");
     }
   }

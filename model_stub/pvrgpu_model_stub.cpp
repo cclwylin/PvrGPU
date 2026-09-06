@@ -138,11 +138,15 @@ bool ConfigureDriverCommandOptions(Options *options, std::string *error) {
         (options->driver_commands.back().framebuffer_width !=
              options->driver_command.framebuffer_width ||
          options->driver_commands.back().framebuffer_height !=
-             options->driver_command.framebuffer_height ||
-         options->driver_commands.back().width !=
-             options->driver_command.width ||
-         options->driver_commands.back().height !=
-             options->driver_command.height)) {
+             options->driver_command.framebuffer_height)) {
+      /*
+       * The sequence's final target is the framebuffer every draw shares, not
+       * any single draw's viewport.  A draw -- the last one included -- may
+       * render into a sub-rectangle of that framebuffer (dEQP's
+       * fragment_ops.depth_stencil visualize passes end on a cell-sized
+       * viewport), so only the shared framebuffer extent has to match; the
+       * per-draw viewport is validated to fit the attachment elsewhere.
+       */
       *error = "driver PCO sequence final target is incompatible";
       return false;
     }

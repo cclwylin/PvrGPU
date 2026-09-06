@@ -10057,14 +10057,20 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
          ctx->array_primitive_draws[ordinal];
       /*
        * One sequence describes one render target, so every draw has to agree
-       * on the surface it writes.  A trace that retargets mid-frame is left
-       * for the caller to reject rather than silently flattened.
+       * on the surface it writes: the framebuffer extent it renders into and
+       * how many colour attachments it has.  The per-draw viewport
+       * (command.width/height) is deliberately *not* required to match: the
+       * model sizes each pass's attachments from framebuffer_width/height and
+       * positions the geometry with the draw's own viewport scale/translate,
+       * so a sequence whose draws each target a sub-rectangle of the frame --
+       * dEQP's fragment_ops.depth_stencil grid renders one cell per draw --
+       * is reproduced exactly.  A trace that retargets to a different surface
+       * mid-frame is still left for the caller to reject rather than
+       * silently flattened.
        */
       if (!recorded ||
           recorded->command.framebuffer_width != first->framebuffer_width ||
           recorded->command.framebuffer_height != first->framebuffer_height ||
-          recorded->command.width != first->width ||
-          recorded->command.height != first->height ||
           recorded->command.render_target_count !=
              first->render_target_count) {
          pvrgpu_counter_eventf("draw_array_primitive_sequence_error",
@@ -10099,16 +10105,19 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
       draws[ordinal].color_attachment_source_command_index =
          ordinal == 0 ? PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR : ordinal - 1u;
       /*
-       * The stencil plane lives in the same attachment as the depth one, so a
-       * draw that only tests stencil still needs it.  Dropping the attachment
-       * on depth_enable/depth_write alone erased the plane every stencil draw
-       * depended on: dEQP's fragment_ops.stencil.* arrived at the model with
-       * depth_format zero and the stencil test never ran.
+       * The depth/stencil attachment is bound for the whole render pass, so it
+       * persists across every draw the surface has one -- not only the draws
+       * that test or write it.  What decides whether a draw carries it is the
+       * framebuffer (the recorded depth_format is the surface's zsbuf format),
+       * never the draw's own depth/stencil enables: a colour-only draw in the
+       * middle of a pass must still forward the plane the draws around it
+       * depend on.  Keying the drop on the draw's enables instead lost the
+       * plane whenever a draw touched neither -- dEQP's
+       * fragment_ops.depth_stencil.*.no_stencil_no_depth writes colour with
+       * depth and stencil off, and the depth-visualize draws after it read a
+       * depth attachment that had been dropped.
        */
-      if (draws[ordinal].depth_enable == 0 &&
-          draws[ordinal].depth_write == 0 &&
-          draws[ordinal].stencil_enable == 0) {
-         draws[ordinal].depth_format = 0;
+      if (draws[ordinal].depth_format == 0) {
          draws[ordinal].depth_attachment_source_command_index =
             PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR;
       } else {
@@ -10128,8 +10137,15 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
    command.frame = 1;
    command.framebuffer_width = first->framebuffer_width;
    command.framebuffer_height = first->framebuffer_height;
-   command.width = first->width;
-   command.height = first->height;
+   /*
+    * The sequence as a whole covers the framebuffer, not any one draw's
+    * viewport: individual draws may each render into a sub-rectangle (their
+    * command.width/height carry those viewports).  The submitter matches the
+    * sequence command's width/height against the render size, so state them as
+    * the framebuffer extent rather than the first draw's viewport.
+    */
+   command.width = first->framebuffer_width;
+   command.height = first->framebuffer_height;
    memcpy(command.clear_color_bits,
           first->clear_color_bits,
           sizeof(command.clear_color_bits));
@@ -10200,6 +10216,22 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
    ctx->driver_draw_command_emitted = true;
    ctx->array_primitive_sequence_owns_command = true;
    pvrgpu_note_driver_draw_command_emitted();
+   /*
+    * The sequence reproduces the whole frame in the model -- the clear it
+    * starts from and every draw that followed.  A scissored or masked clear
+    * earlier in the frame flagged the colour attachment as something the model
+    * could not reproduce, to stop the readback erasing a driver-only write; now
+    * that the model owns the frame, its output is authoritative and the
+    * readback must publish it.
+    */
+   {
+      struct pvrgpu_resource *cbuf0 =
+         ctx->framebuffer.cbufs[0].texture
+            ? pvrgpu_resource(ctx->framebuffer.cbufs[0].texture)
+            : NULL;
+      if (cbuf0)
+         cbuf0->driver_writes_model_cannot_reproduce = false;
+   }
    unsigned stencil_draws = 0;
    unsigned depth_attachment_draws = 0;
    for (unsigned ordinal = 0; ordinal < command.pco_sequence_command_count;

@@ -184,12 +184,19 @@ void Isp::Run() {
       parameters =
           LoadArray<ParameterTriangle>(pool_, state.parameter_triangles);
     }
-    const bool empty_face_culled_setup =
+    // A draw can reach the ISP with no primitives: every triangle was culled,
+    // or -- in a sequence -- every triangle was clipped away by the view
+    // volume (dEQP's fragment_ops.depth_stencil depth-visualize quads at
+    // z = -1.05).  Either way the setup is legitimately empty; the ISP shades
+    // no fragment but still loads the attachment, applies the scissored
+    // depth/stencil clears the draw inherited, and writes the planes back, so
+    // the frame carries forward.  Only a parameter buffer that is empty
+    // without the primitive count agreeing is malformed.
+    const bool empty_setup =
         parameters.empty() && primitive_refs.empty() &&
-        state.raster_state.face_cull.enable &&
         state.counters.c_primitives == 0;
     if (tiles.size() != state.scheduled_tiles ||
-        (parameters.empty() && !empty_face_culled_setup))
+        (parameters.empty() && !empty_setup))
       throw std::runtime_error("ISP received invalid tile/parameter data");
 
     std::vector<FragmentCandidate> candidates;

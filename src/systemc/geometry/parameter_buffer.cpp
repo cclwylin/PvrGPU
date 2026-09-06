@@ -200,8 +200,12 @@ void ParameterBuffer::Run() {
     if (triangles.size() != state.counters.c_primitives)
       throw std::runtime_error(
           "ParameterBuffer clip-primitive count mismatch");
-    if (triangles.empty() && !state.raster_state.face_cull.enable)
-      throw std::runtime_error("ParameterBuffer received no setup triangles");
+    // A draw may legitimately contribute no primitives -- every one culled, or
+    // (in a sequence) every one clipped away by the view volume, as dEQP's
+    // fragment_ops.depth_stencil depth-visualize quads at z = -1.05 are.  The
+    // parameter buffer then holds no triangles, coefficients or parameters
+    // (the empty handles below already account for that) and the draw shades
+    // nothing, leaving the accumulated frame untouched.
 
     if (!HasPoolHandle(state.raster_vertex_outputs)) {
       throw std::runtime_error(

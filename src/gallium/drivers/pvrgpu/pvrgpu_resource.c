@@ -1124,12 +1124,26 @@ pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
       return;
    }
    /*
+    * Flush any pending draw sequence to the model before deciding whether its
+    * framebuffer describes the surface.  A sequence starts from its own clear
+    * and rasterizes every draw, so once it is emitted the model owns the whole
+    * frame -- including the region a scissored clear touched -- and clears the
+    * "driver wrote what the model cannot reproduce" flag.  Emitting only after
+    * that flag was tested (as this once did) declined the readback of every
+    * frame whose first clear was scissored, even though the sequence that
+    * followed reproduced it exactly: dEQP's fragment_ops.depth_stencil grid
+    * clears its cell rectangle before drawing into it.
+    */
+   pvrgpu_context_end_frame_at_readback(ctx);
+
+   /*
     * The model's framebuffer only describes the surface while everything that
-    * touched it went to the model.  A scissored or masked clear did not, so
-    * copying the model's output back would erase it -- which is what a run of
-    * dEQP's color_clear.scissored_* showed: two full clears reached the model,
-    * thirteen scissored ones did not, and the readback published the uniform
-    * surface the model had.  Leave the driver's own content alone instead.
+    * touched it went to the model.  A scissored or masked clear that no draw
+    * sequence subsumed did not, so copying the model's output back would erase
+    * it -- which is what a run of dEQP's color_clear.scissored_* showed: two
+    * full clears reached the model, thirteen scissored ones did not, and the
+    * readback published the uniform surface the model had.  Leave the driver's
+    * own content alone instead.
     */
    if (pvrgpu->driver_writes_model_cannot_reproduce) {
       pvrgpu_counter_eventf("framebuffer_readback_declined",
@@ -1153,8 +1167,6 @@ pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
    uint8_t *pixels = MALLOC(pixels_size);
    if (!pixels)
       return;
-
-   pvrgpu_context_end_frame_at_readback(ctx);
 
    bool written = false;
    char error[512] = { 0 };

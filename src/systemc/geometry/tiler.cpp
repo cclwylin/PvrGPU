@@ -50,8 +50,14 @@ void Tiler::Run() {
         LoadArray<RasterTriangle>(pool_, state.raster_triangles);
     if (triangles.size() != state.counters.c_primitives)
       throw std::runtime_error("Tiler clip-primitive count mismatch");
-    if (triangles.empty() && !state.raster_state.face_cull.enable)
-      throw std::runtime_error("Tiler received an empty setup stream");
+    // An empty setup stream is a valid state, not only when face culling
+    // removed every primitive: a draw whose geometry lies wholly outside the
+    // view volume is clipped away just the same.  dEQP's
+    // fragment_ops.depth_stencil renders depth-visualize quads at z = -1.05,
+    // past the near plane, and depth clipping discards them entirely -- one
+    // draw of a long sequence that legitimately contributes no fragments.  The
+    // tiler bins zero primitives for it (as the culled case already does) and
+    // the frame carries forward what the earlier draws produced.
     if (triangles.size() > std::numeric_limits<std::uint32_t>::max())
       throw std::overflow_error("Tiler parameter index exceeds uint32_t");
 

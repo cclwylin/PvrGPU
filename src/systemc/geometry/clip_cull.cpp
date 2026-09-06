@@ -835,9 +835,13 @@ void ClipCull::Run() {
       // window-Y convention.  This model retains NDC +Y upward until viewport
       // conversion, which is one axis reflection.  That reflection changes
       // winding independently of whether the application culls front or back
-      // faces, so classify every validated driver PCO CULL/CW draw as CCW.
+      // faces, so classify every validated driver PCO CW draw as CCW -- a
+      // two-sided-stencil draw with culling disabled (dEQP's
+      // fragment_ops.depth_stencil renders its back-facing test quad this way)
+      // needs the same reflection to pick the right stencil face, so this must
+      // not be gated on face culling being enabled.
       const bool driver_window_y_reflection =
-          driver_pco_triangles && state.raster_state.face_cull.enable == 1 &&
+          driver_pco_triangles &&
           state.raster_state.face_cull.front_face ==
               FrontFaceWinding::kClockwise;
       const FrontFaceWinding classification_winding =
