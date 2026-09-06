@@ -103,11 +103,15 @@ import sys; sys.path.insert(0, '${REPO_DIR}/tools')
 from deqp_groups import GROUP_SPECS, filter_exact_cases
 g = GROUP_SPECS[${IDX} - 1]
 all_cases = [l.strip() for l in open('${DISC}') if l.strip()]
-sel = list(filter_exact_cases(g, all_cases))[:${N}]
+matched = list(filter_exact_cases(g, all_cases))
+# Sample with a stride so N cases cover every subgroup (formats, sizes,
+# wrap modes, array/cube/3d ...) instead of the first N alphabetically.
+step = max(1, len(matched) // ${N}) if ${N} > 0 else 1
+sel = matched[::step][:${N}]
 if not sel:
     sys.exit(f'group ${IDX} matched none of the {len(all_cases)} discovered cases')
 open('${LIST}', 'w').write('\n'.join(sel) + '\n')
-print(f'group ${IDX}: {g.label}  ({len(all_cases)} discovered -> {len(sel)} sampled)')
+print(f'group ${IDX}: {g.label}  ({len(all_cases)} discovered, {len(matched)} in group -> {len(sel)} sampled, stride {step})')
 " || die "case selection failed"
 
 "${REPO_DIR}/script/run_deqp_dynamic.sh" \

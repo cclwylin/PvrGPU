@@ -11,6 +11,7 @@
 
 #include "common/functional_types.h"
 #include "memory/gpu_memory_system.h"
+#include "texture/texture_filter.h"
 #include "memory_pool.h"
 #include "model_types.h"
 
@@ -29,59 +30,6 @@ MemoryAccessStats MaterializeSequenceColorMipChain(
     GpuMemorySystem &memory, const DriverPcoSampledTexture &texture,
     std::uint64_t attachment_address = 0);
 
-// Decoded subset of the public Rogue STRIDE image descriptor which the
-// selected reference TPU supports.  Unsupported/reserved encodings fail in
-// DecodeRogueTextureImageDescriptor rather than falling back to parallel
-// software metadata.
-struct RogueTextureImageDescriptor {
-  std::uint64_t gpu_address = 0;
-  std::uint32_t width = 0;
-  std::uint32_t height = 0;
-  std::uint32_t row_pitch_bytes = 0;
-  std::uint8_t mip_count = 0;
-  TextureFormat format = TextureFormat::kRgba8Unorm;
-  TextureLayout layout = TextureLayout::kLinear;
-};
-
-// Decoded subset of public Rogue SAMPLER_WORD0/1.  The raw fields select
-// normalized repeat addressing, image filters, mip filtering, and U4.6 LOD
-// clamps.  Gate 18 uses mip-linear implicit LOD; no parallel case metadata is
-// allowed to override these hardware words.
-struct RogueTextureSamplerDescriptor {
-  TextureFilter min_filter = TextureFilter::kNearest;
-  TextureFilter mag_filter = TextureFilter::kNearest;
-  TextureFilter mip_filter = TextureFilter::kNearest;
-  TextureWrapMode wrap_u = TextureWrapMode::kRepeat;
-  TextureWrapMode wrap_v = TextureWrapMode::kRepeat;
-  std::uint16_t min_lod_u4_6 = 0;
-  std::uint16_t max_lod_u4_6 = 0;
-  std::uint8_t normalized_coordinates = 1;
-};
-
-struct TextureLinearAxis {
-  std::uint32_t lower = 0;
-  std::uint32_t upper = 0;
-  std::uint16_t weight = 0;
-};
-
-// Result of the selected TPU's implicit-derivative LOD datapath.  The four
-// coordinates are ordered as the architectural 2x2 quad lanes 0,1,2,3.
-struct TextureImplicitLod {
-  float lambda = 0.0F;
-  float mip_weight = 0.0F;
-  // Retain exact f32 datapath intermediates for bounded diagnostics and unit
-  // regressions; sampling still consumes only lambda/levels/TFRAC below.
-  float dsdx = 0.0F;
-  float dtdx = 0.0F;
-  float dsdy = 0.0F;
-  float dtdy = 0.0F;
-  float rho_squared = 0.0F;
-  std::uint8_t level0 = 0;
-  std::uint8_t level1 = 0;
-  std::uint8_t mip_weight_u8 = 0;
-  std::uint8_t reserved = 0;
-};
-
 // `compressed` says which enum the seven-bit texformat field is read
 // through.  Rogue overlays FORMAT and FORMAT_COMPRESSED on the same bits, so
 // the value alone cannot say whether 0 means U8 or ASTC_4x4.  The structured
@@ -92,20 +40,13 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
     const std::array<std::uint32_t, 4>& words, bool compressed = false);
 RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
     const std::array<std::uint32_t, 4>& words);
-// Strict public descriptor families accepted by driver-PCO sampling.  This is
-// deliberately narrower than the raw image/sampler decoders: both RGBA8 and
-// RGBX8 are valid colour storage, including canonical mip-linear chains, but
-// their mip count and LOD clamp must agree exactly.
+// What driver-PCO sampling can serve: a format the unit decodes, address
+// modes the wrap arithmetic implements, a LOD window that runs forwards.
+// Level selection is not a constraint -- see texture_filter.h.
 bool DriverPcoTextureDescriptorClassSupported(
     const RogueTextureImageDescriptor& image,
     const RogueTextureSamplerDescriptor& sampler,
     std::uint32_t descriptor_count);
-TextureLinearAxis ComputeTextureLinearRepeat(float coordinate,
-                                             std::uint32_t extent,
-                                             TextureWrapMode wrap = TextureWrapMode::kRepeat,
-                                             float round_threshold = 0.5F);
-std::uint8_t LerpTextureUnorm8(std::uint8_t first, std::uint8_t second,
-                               std::uint16_t weight);
 TextureImplicitLod ComputeTextureImplicitLod(
     const std::array<std::array<float, 2>, 4>& coordinates,
     const RogueTextureImageDescriptor& image,

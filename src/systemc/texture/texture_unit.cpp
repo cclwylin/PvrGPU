@@ -169,8 +169,6 @@ MemoryAccessStats MaterializeSequenceColorMipChain(
 
 namespace {
 
-inline constexpr float kLinearCoordinateRoundThreshold = 0.5F;
-
 std::uint32_t DebugFragmentCoordinate(const char *name,
                                       std::uint32_t fallback) {
   const char *value = std::getenv(name);
@@ -236,77 +234,6 @@ TextureWrapMode DecodeWrapMode(std::uint64_t encoded) {
     return TextureWrapMode::kClampToBorder;
   default:
     throw std::runtime_error("TextureUnit unsupported wrap mode encoding");
-  }
-}
-
-std::uint32_t RepeatIndex(std::int64_t integer, std::uint32_t extent) {
-  const std::int64_t modulus = extent;
-  const std::int64_t wrapped = ((integer % modulus) + modulus) % modulus;
-  return static_cast<std::uint32_t>(wrapped);
-}
-
-std::uint32_t WrapTexelIndex(std::int64_t integer, std::uint32_t extent,
-                             TextureWrapMode wrap) {
-  if (extent == 0)
-    throw std::runtime_error("TextureUnit texel extent is invalid");
-  if (wrap == TextureWrapMode::kRepeat)
-    return RepeatIndex(integer, extent);
-  if (wrap == TextureWrapMode::kClampToEdge) {
-    if (integer < 0)
-      return 0;
-    if (integer >= static_cast<std::int64_t>(extent))
-      return extent - 1U;
-    return static_cast<std::uint32_t>(integer);
-  }
-  if (wrap == TextureWrapMode::kMirroredRepeat) {
-    const std::int64_t period = static_cast<std::int64_t>(extent) * 2;
-    const std::int64_t wrapped = ((integer % period) + period) % period;
-    if (wrapped >= static_cast<std::int64_t>(extent))
-      return static_cast<std::uint32_t>(period - 1 - wrapped);
-    return static_cast<std::uint32_t>(wrapped);
-  }
-  throw std::runtime_error("TextureUnit clamp-to-border sampling is unsupported");
-}
-
-std::uint32_t NearestRepeat(float coordinate, std::uint32_t extent, TextureWrapMode wrap) {
-  if (!std::isfinite(coordinate) || extent == 0)
-    throw std::runtime_error("TextureUnit coordinate/extent is invalid");
-
-  if (wrap == TextureWrapMode::kClampToEdge) {
-    float clamped = std::clamp(coordinate, 0.0f, 1.0f);
-    const float scaled =
-        std::floor(clamped * static_cast<float>(extent));
-    std::int64_t index = static_cast<std::int64_t>(scaled);
-    if (index >= static_cast<std::int64_t>(extent)) {
-      index = extent - 1;
-    }
-    if (index < 0) {
-      index = 0;
-    }
-    return static_cast<std::uint32_t>(index);
-  } else if (wrap == TextureWrapMode::kMirroredRepeat) {
-    float floored = std::floor(coordinate);
-    float frac = coordinate - floored;
-    bool is_odd = (static_cast<std::int64_t>(floored) % 2) != 0;
-    float mapped = is_odd ? (1.0f - frac) : frac;
-    const float scaled =
-        std::floor(mapped * static_cast<float>(extent));
-    std::int64_t index = static_cast<std::int64_t>(scaled);
-    if (index >= static_cast<std::int64_t>(extent)) {
-      index = extent - 1;
-    }
-    if (index < 0) {
-      index = 0;
-    }
-    return static_cast<std::uint32_t>(index);
-  } else {
-    const float scaled =
-        std::floor(coordinate * static_cast<float>(extent));
-    if (scaled < static_cast<double>(std::numeric_limits<std::int64_t>::min()) ||
-        scaled > static_cast<double>(std::numeric_limits<std::int64_t>::max())) {
-      throw std::overflow_error("TextureUnit normalized coordinate overflow");
-    }
-    return RepeatIndex(static_cast<std::int64_t>(scaled), extent);
   }
 }
 
@@ -507,20 +434,16 @@ bool DriverPcoTextureDescriptorClassSupported(
   /*
    * What this unit can sample, stated rather than enumerated.
    *
-   * This used to be five classes, each a format/mip-count/filter combination
-   * that some workload had been observed to use.  That is not a description
-   * of the datapath: the format selects the decode and the filter selects the
-   * taps, and they do not interact, so listing their product left real gaps
-   * between the entries.  RGBA8 sampled nearest was missing because one class
-   * had RGBX8-nearest and another RGBA8-linear; a mipped image sampled
-   * nearest was missing because one class wanted a single level and the other
-   * wanted every filter linear.  Neither absence meant the unit could not do
-   * it.
-   *
-   * Four things are actually required.
+   * The format selects the decode and the sampler selects the taps, and the
+   * two do not interact, so each is checked on its own.  Level selection is
+   * not a constraint at all (texture_filter.h): every mip filter selects a
+   * level, every image filter runs on one of the two datapaths, and the LOD
+   * window may reach past the last level -- lp_build_nearest_mip_level clamps
+   * the level, and a window of 0..0.25 is how a driver says "base level only"
+   * while keeping the minification decision.  Earlier versions refused a
+   * window past the last level and a mipped image sampled nearest; neither
+   * absence meant the unit could not do it.
    */
-
-  // One: a format whose texel this unit knows how to produce.
   const bool decodable_format =
       image.format == TextureFormat::kRgba8Unorm ||
       image.format == TextureFormat::kRgbx8Unorm ||
@@ -529,85 +452,15 @@ bool DriverPcoTextureDescriptorClassSupported(
       image.format == TextureFormat::kAstcLdrSrgb ||
       image.format == TextureFormat::kZ32Unorm ||
       image.format == TextureFormat::kZ24UnormS8Uint;
-
-  const bool filters_nearest_only =
-      sampler.min_filter == TextureFilter::kNearest &&
-      sampler.mag_filter == TextureFilter::kNearest &&
-      sampler.mip_filter == TextureFilter::kNearest;
-
-  /*
-   * Two: the formats that filter only nearest, and why.
-   *
-   * Z32_UNORM is sampled through SMP.FCNORM, which the datapath restricts to
-   * nearest.  sRGB -- whether stored directly or decoded out of an ASTC block
-   * -- is converted to linear before GL's filter weights it, while the linear
-   * paths here blend stored bytes and convert afterwards.  Those are
-   * different functions, so an sRGB image asking for a linear filter is
-   * declined rather than answered with the wrong arithmetic.
-   */
-  const bool nearest_only_format =
-      image.format == TextureFormat::kZ32Unorm ||
-      image.format == TextureFormat::kRgba8Srgb ||
-      image.format == TextureFormat::kAstcLdrSrgb;
-
-  /*
-   * Three: the sampler's LOD window lies inside the image.
-   *
-   * A sampler may address fewer levels than the image has -- GL_NEAREST on a
-   * mipmapped texture reads level zero and nothing else -- so this is a
-   * containment, not an equality.  Requiring equality is what refused dEQP's
-   * texture.filtering cases, whose images carry a full mip chain while the
-   * sampler clamps the LOD to zero.
-   */
-  const std::uint32_t image_last_lod_u4_6 =
-      (image.mip_count == 0U ? 0U : (image.mip_count - 1U)) * 64U;
-  const bool lod_window_fits =
-      sampler.min_lod_u4_6 == 0 &&
-      sampler.max_lod_u4_6 <= image_last_lod_u4_6;
-
-  /*
-   * Four: what it takes to sample across levels.
-   *
-   * Only one path in this unit visits more than one level -- the mip-linear
-   * one, which picks two levels from the computed LOD and blends them, and
-   * which filters linearly inside each.  Every other path reads
-   * resource.mip[0] outright and never selects a level at all, and none of
-   * them implements GL's rule for choosing between the minification and
-   * magnification filters.
-   *
-   * Two things follow.
-   *
-   * min must equal mag, whatever the image.  GL chooses between them per
-   * fragment from lambda -- magnified fragments take the magnification
-   * filter, minified ones the minification filter -- and that choice does not
-   * depend on how many levels the image has.  A single-level image was
-   * briefly allowed to differ here on the reasoning that both mip taps land
-   * on the same level, which is true and beside the point: dEQP's
-   * nearest_linear cases magnify part of the quad, and sampling all of it
-   * with the minification filter left 1496 of 65536 pixels wrong.  Sampling
-   * with the wrong filter and reporting the result is worse than declining
-   * it, and guessing the rule was tried once and moved results away from the
-   * reference.
-   *
-   * Past one level every filter must be linear, not just the mip filter.
-   * The dispatch selects its path from `min_filter == kLinear`, so a nearest
-   * minification filter takes the level-zero path however the mip filter is
-   * set: GL_NEAREST_MIPMAP_LINEAR would read one texel from the base level
-   * while the rest of the pipeline accounted for a trilinear fetch.
-   */
-  const bool one_level_in_range = sampler.max_lod_u4_6 < 64U;
-  /*
-   * Crossing levels needs the mip-linear path, which is the only one that
-   * selects a level.  What it samples inside each level now follows the image
-   * filter, so GL_NEAREST_MIPMAP_LINEAR -- GL's default minification filter --
-   * belongs here too.
-   */
-  const bool filters_across_levels =
-      sampler.mip_filter == TextureFilter::kLinear;
-  const bool level_selection_is_exact =
-      one_level_in_range || filters_across_levels;
-
-  // Five: an address mode the wrap arithmetic implements.
+  // Z32 is one uint32 per texel with no filter datapath: nearest taps only.
+  const bool depth32_nearest_only =
+      image.format != TextureFormat::kZ32Unorm ||
+      (sampler.min_filter == TextureFilter::kNearest &&
+       sampler.mag_filter == TextureFilter::kNearest &&
+       sampler.mip_filter == TextureFilter::kNearest);
+  const bool window_runs_forwards =
+      sampler.min_lod_u4_6 <= sampler.max_lod_u4_6;
+  // An address mode the wrap arithmetic implements.
   const bool supported_wrap =
       (sampler.wrap_u == TextureWrapMode::kClampToEdge ||
        sampler.wrap_u == TextureWrapMode::kRepeat ||
@@ -616,88 +469,8 @@ bool DriverPcoTextureDescriptorClassSupported(
        sampler.wrap_v == TextureWrapMode::kRepeat ||
        sampler.wrap_v == TextureWrapMode::kMirroredRepeat);
 
-  return decodable_format && lod_window_fits && supported_wrap &&
-         level_selection_is_exact &&
-         (!nearest_only_format || filters_nearest_only);
-}
-
-TextureLinearAxis ComputeTextureLinearRepeat(float coordinate,
-                                             std::uint32_t extent,
-                                             TextureWrapMode wrap,
-                                             float round_threshold) {
-  if (!std::isfinite(coordinate) || extent == 0)
-    throw std::runtime_error("TextureUnit coordinate/extent is invalid");
-  if (!std::isfinite(round_threshold) || round_threshold < 0.0F ||
-      round_threshold > 1.0F) {
-    throw std::runtime_error("TextureUnit linear round threshold is invalid");
-  }
-  // The selected reference TPU uses the common 8-bit UNORM filter datapath:
-  // multiply the live binary32 coordinate by N*256 in binary32, round to
-  // nearest-even, then subtract the half-texel centre (128).  Power-of-two
-  // repeat is applied to the integer taps afterwards.  Keeping the multiply
-  // in binary32 is observable at half-LSB boundaries and is part of the
-  // versioned reference-uArch assumption.
-  const float scaled_extent = static_cast<float>(extent) * 256.0F;
-  const float scaled = coordinate * scaled_extent;
-  const float scaled_floor = std::floor(scaled);
-  const double scaled_floor_wide = static_cast<double>(scaled_floor);
-  if (scaled_floor_wide <
-          static_cast<double>(std::numeric_limits<std::int64_t>::min()) +
-              128.0 ||
-      scaled_floor_wide >
-          static_cast<double>(std::numeric_limits<std::int64_t>::max()) -
-              128.0) {
-    throw std::overflow_error("TextureUnit normalized coordinate overflow");
-  }
-  std::int64_t rounded = static_cast<std::int64_t>(scaled_floor);
-  const float remainder = scaled - scaled_floor;
-  if (remainder > round_threshold ||
-      (remainder == round_threshold &&
-       (round_threshold != kLinearCoordinateRoundThreshold ||
-        (rounded & INT64_C(1)) != 0))) {
-    ++rounded;
-  }
-  const std::int64_t centered = rounded - 128;
-  const std::int64_t lower_integer =
-      centered >= 0 ? centered / 256 : -((-centered + 255) / 256);
-  const std::int64_t weight = centered - lower_integer * 256;
-  if (weight < 0 || weight > 255)
-    throw std::runtime_error("TextureUnit linear weight is invalid");
-  TextureLinearAxis result;
-  result.lower = WrapTexelIndex(lower_integer, extent, wrap);
-  result.upper = WrapTexelIndex(lower_integer + 1, extent, wrap);
-  result.weight = static_cast<std::uint16_t>(weight);
-  return result;
-}
-
-std::uint8_t LerpTextureUnorm8(std::uint8_t first, std::uint8_t second,
-                               std::uint16_t weight) {
-  if (weight > 255)
-    throw std::runtime_error("TextureUnit linear weight exceeds U8 range");
-  // The common U8-normalized filter datapath rounds the signed delta
-  // contribution before adding the first endpoint:
-  //   first + RNE(weight * (second - first) / 256).
-  // This is observably different from rounding the final weighted sum when a
-  // half tie changes parity after adding first.  Use an explicit magnitude so
-  // the result does not depend on the host's signed-shift representation.
-  const std::int32_t product =
-      static_cast<std::int32_t>(weight) *
-      (static_cast<std::int32_t>(second) -
-       static_cast<std::int32_t>(first));
-  const bool negative = product < 0;
-  const std::uint32_t magnitude = static_cast<std::uint32_t>(
-      negative ? -product : product);
-  std::uint32_t quotient = magnitude >> 8U;
-  const std::uint32_t remainder = magnitude & 0xffU;
-  if (remainder > 128U || (remainder == 128U && (quotient & 1U) != 0))
-    ++quotient;
-  const std::int32_t result =
-      static_cast<std::int32_t>(first) +
-      (negative ? -static_cast<std::int32_t>(quotient)
-                : static_cast<std::int32_t>(quotient));
-  if (result < 0 || result > 255)
-    throw std::runtime_error("TextureUnit linear result exceeds UNORM8");
-  return static_cast<std::uint8_t>(result);
+  return decodable_format && window_runs_forwards && supported_wrap &&
+         depth32_nearest_only;
 }
 
 // The sampled depth of a combined depth/stencil texel.  The driver's clear and
@@ -749,19 +522,16 @@ TextureImplicitLod ComputeTextureImplicitLod(
     const std::array<std::array<float, 2>, 4> &coordinates,
     const RogueTextureImageDescriptor &image,
     const RogueTextureSamplerDescriptor &sampler) {
-  if (image.width == 0 || image.height == 0 || image.mip_count == 0 ||
-      sampler.mip_filter != TextureFilter::kLinear) {
+  if (image.width == 0 || image.height == 0 || image.mip_count == 0)
     throw std::runtime_error("TextureUnit implicit LOD state is invalid");
-  }
   for (const auto &coordinate : coordinates) {
     if (!std::isfinite(coordinate[0]) || !std::isfinite(coordinate[1]))
       throw std::runtime_error("TextureUnit implicit LOD coordinate is invalid");
   }
 
-  // Public SMP LODM=NORMAL derives one isotropic LOD for a 2x2 quad.  The
-  // selected reference uArch first computes the exact Euclidean derivative
-  // norm, then uses a hardware-style piecewise-linear log2 approximation on
-  // rho^2.  It is exact at powers of two and avoids a transcendental unit.
+  // Public SMP LODM=NORMAL derives one isotropic LOD for a 2x2 quad from the
+  // exact Euclidean derivative norm (lp_build_rho); the log2 and everything
+  // after it are in SelectTextureLod / SelectTextureLevels.
   const float dsdx =
       (coordinates[1][0] - coordinates[0][0]) * image.width;
   const float dtdx =
@@ -776,43 +546,25 @@ TextureImplicitLod ComputeTextureImplicitLod(
   if (rho_squared < 0.0F || !std::isfinite(rho_squared))
     throw std::runtime_error("TextureUnit implicit derivative rho is invalid");
 
-  const float min_lod = static_cast<float>(sampler.min_lod_u4_6) / 64.0F;
-  const float max_lod = static_cast<float>(sampler.max_lod_u4_6) / 64.0F;
-  const float last_level = static_cast<float>(image.mip_count - 1U);
-  float lambda = min_lod;
-  if (rho_squared > 0.0F) {
-    int binary_exponent = 0;
-    const float half_open_mantissa =
-        std::frexp(rho_squared, &binary_exponent); // [0.5, 1.0)
-    const float normalized_mantissa = half_open_mantissa * 2.0F;
-    const float approximate_log2_squared =
-        static_cast<float>(binary_exponent - 2) + normalized_mantissa;
-    lambda = std::clamp(approximate_log2_squared * 0.5F, min_lod,
-                        std::min(max_lod, last_level));
-  }
-  const float level0_float = std::floor(lambda);
-  const float level1_float = std::min(level0_float + 1.0F, last_level);
+  const TextureLodSelection lod =
+      SelectTextureLod(rho_squared, sampler, image.mip_count);
+  const TextureLevelSelection levels =
+      SelectTextureLevels(lod, sampler, image.mip_count);
 
   TextureImplicitLod result;
-  result.lambda = lambda;
+  result.lambda = lod.lambda;
   result.dsdx = dsdx;
   result.dtdx = dtdx;
   result.dsdy = dsdy;
   result.dtdy = dtdy;
   result.rho_squared = rho_squared;
-  result.level0 = static_cast<std::uint8_t>(level0_float);
-  result.level1 = static_cast<std::uint8_t>(level1_float);
-  if (result.level0 != result.level1) {
-    // Public Rogue exposes the filtering fraction as TFRAC_byte/256.  The
-    // Gallivm oracle converts the positive fractional LOD with fptosi after
-    // multiplying by 256: strict truncation, with no near-integer snap.
-    const float fractional = lambda - level0_float;
-    const float scaled_byte = fractional * 256.0F;
-    result.mip_weight_u8 = static_cast<std::uint8_t>(
-        std::clamp(scaled_byte, 0.0F, 255.0F));
-    result.mip_weight =
-        static_cast<float>(result.mip_weight_u8) / 256.0F;
-  }
+  result.minified = lod.minified;
+  result.image_filter = levels.image_filter;
+  result.mip_mode = levels.mip_mode;
+  result.level0 = levels.level0;
+  result.level1 = levels.level1;
+  result.mip_weight_u8 = levels.mip_weight_u8;
+  result.mip_weight = levels.mip_weight;
   return result;
 }
 
@@ -1062,14 +814,6 @@ void TextureUnit::SampleRunForStage(
         throw std::runtime_error(message.str());
       }
     }
-    if (vertex_stage &&
-        (image.mip_count != 1 ||
-         decoded_sampler.mip_filter != TextureFilter::kNearest ||
-         decoded_sampler.min_lod_u4_6 != 0 ||
-         decoded_sampler.max_lod_u4_6 != 0)) {
-      throw std::runtime_error(
-          "TextureUnit vertex sampling requires descriptor-clamped LOD0");
-    }
 
     std::uint64_t expected_offset = 0;
     std::uint32_t expected_width = image.width;
@@ -1118,22 +862,31 @@ void TextureUnit::SampleRunForStage(
       throw std::runtime_error(
           "TextureUnit allocation size disagrees with raw mip state");
 
-    const bool mip_linear_requested =
-        decoded_sampler.mip_filter == TextureFilter::kLinear;
-    const float linear_coordinate_round_threshold =
-        kLinearCoordinateRoundThreshold;
-
-    // LODM=NORMAL is a quad operation, not four unrelated scalar requests.
-    // Preserve the PDS/USC spatial identity and compute one derivative result
-    // for each architectural lane quartet, including helper lanes.
+    /*
+     * lp_build_sample_common computes a LOD only when something depends on
+     * it: a mipped image whose level has to be selected, or a minification
+     * filter that differs from the magnification one -- and then only if the
+     * sampler's window lets lambda move at all.  A window of 0..0 pins
+     * lambda to zero, which is the base level and the magnification filter
+     * whatever the derivatives say.  Otherwise every lane samples the base
+     * level with the one filter there is, and the batch need not be
+     * quad-shaped.
+     *
+     * LODM=NORMAL is a quad operation, not four unrelated scalar requests.
+     * Preserve the PDS/USC spatial identity and compute one derivative result
+     * for each architectural lane quartet, including helper lanes.  A vertex
+     * sample has no screen-space derivatives; llvmpipe samples it at LOD 0
+     * and so does this unit.
+     */
+    const bool needs_lod =
+        !vertex_stage && decoded_sampler.max_lod_u4_6 != 0 &&
+        (image.mip_count > 1U ||
+         decoded_sampler.min_filter != decoded_sampler.mag_filter);
     std::vector<TextureImplicitLod> implicit_lods(requests.size());
-    if (mip_linear_requested) {
-      if (vertex_stage)
-        throw std::runtime_error(
-            "TextureUnit vertex sampling cannot derive implicit quad LOD");
+    if (needs_lod) {
       if (requests.size() % 4U != 0U)
         throw std::runtime_error(
-            "TextureUnit mip-linear request batch is not quad aligned");
+            "TextureUnit LOD request batch is not quad aligned");
       for (std::size_t first = 0; first < requests.size(); first += 4U) {
         std::array<std::array<float, 2>, 4> coordinates{};
         const std::uint32_t quad_id = requests[first].quad_id;
@@ -1141,7 +894,7 @@ void TextureUnit::SampleRunForStage(
           const TextureSampleRequest &request = requests[first + lane];
           if (request.quad_id != quad_id || request.quad_lane != lane)
             throw std::runtime_error(
-                "TextureUnit mip-linear request lost 2x2 quad identity");
+                "TextureUnit LOD request lost 2x2 quad identity");
           coordinates[lane][0] = BitsFloat(request.coordinates[0]);
           coordinates[lane][1] = BitsFloat(request.coordinates[1]);
         }
@@ -1150,6 +903,12 @@ void TextureUnit::SampleRunForStage(
         for (std::size_t lane = 0; lane < 4U; ++lane)
           implicit_lods[first + lane] = lod;
       }
+    } else {
+      // Zero derivatives: the window's minimum LOD, the base level.
+      const std::array<std::array<float, 2>, 4> degenerate_quad{};
+      const TextureImplicitLod base_level =
+          ComputeTextureImplicitLod(degenerate_quad, image, decoded_sampler);
+      std::fill(implicit_lods.begin(), implicit_lods.end(), base_level);
     }
 
     // Bounded, default-off evidence for diagnosing captured mip residency.
@@ -1166,9 +925,9 @@ void TextureUnit::SampleRunForStage(
       float maximum_lambda = 0.0F;
       for (std::size_t index = 0; index < requests.size(); ++index) {
         const TextureImplicitLod &lod = implicit_lods[index];
-        const std::uint8_t level0 = mip_linear_requested ? lod.level0 : 0U;
-        const std::uint8_t level1 = mip_linear_requested ? lod.level1 : 0U;
-        const std::uint8_t tfrac = mip_linear_requested ? lod.mip_weight_u8 : 0U;
+        const std::uint8_t level0 = lod.level0;
+        const std::uint8_t level1 = lod.level1;
+        const std::uint8_t tfrac = lod.mip_weight_u8;
         if (level0 >= kMaximumTextureMipLevels ||
             level1 >= kMaximumTextureMipLevels) {
           throw std::runtime_error(
@@ -1176,7 +935,7 @@ void TextureUnit::SampleRunForStage(
         }
         ++level_pair_counts[level0][level1];
         ++tfrac_counts[tfrac];
-        if (mip_linear_requested) {
+        if (needs_lod) {
           if (index == 0U) {
             minimum_lambda = lod.lambda;
             maximum_lambda = lod.lambda;
@@ -1192,7 +951,7 @@ void TextureUnit::SampleRunForStage(
                 << " set=" << static_cast<unsigned>(descriptor_set)
                 << " requests=" << requests.size()
                 << " quads=" << (requests.size() / 4U)
-                << " mip_linear=" << static_cast<unsigned>(mip_linear_requested)
+                << " needs_lod=" << static_cast<unsigned>(needs_lod)
                 << " lambda_bits=0x" << std::hex << std::setw(8)
                 << std::setfill('0') << FloatBits(minimum_lambda) << ",0x"
                 << std::setw(8) << FloatBits(maximum_lambda) << std::dec
@@ -1224,18 +983,6 @@ void TextureUnit::SampleRunForStage(
       }
       std::cerr << '\n';
     }
-
-    // The minification filter drives the datapath.  GL would pick the
-    // magnification filter for a non-minifying lane, but nothing here can yet
-    // say which of the two llvmpipe used -- and guessing changes texel_fetches
-    // -- so keep taking min_filter, as every sampler that reached this point
-    // before stated the same filter for both anyway.
-    const bool linear_filter =
-        decoded_sampler.min_filter == TextureFilter::kLinear;
-    // On a single-level image both mip taps resolve to level 0 with a zero
-    // blend weight, so a mip-linear sampler is exactly the base-level filter
-    // and issuing the second tap would only inflate texel traffic.
-    const bool mip_linear = mip_linear_requested && image.mip_count > 1U;
 
     MemoryAccessStats memory_stats;
     if (!texture_preloaded_[stage_index][descriptor_set]) {
@@ -1340,7 +1087,7 @@ void TextureUnit::SampleRunForStage(
       }
     }
 
-    if (debug_target_found && descriptor_set == 1U && mip_linear) {
+    if (debug_target_found && descriptor_set == 1U && needs_lod) {
       constexpr std::size_t kAbsent =
           std::numeric_limits<std::size_t>::max();
       std::array<std::size_t, 4> quad_indices = {
@@ -1396,12 +1143,14 @@ void TextureUnit::SampleRunForStage(
       std::cerr.precision(saved_precision);
     }
     std::uint64_t texel_fetch_count = 0;
+    std::uint64_t expected_texel_fetches = 0;
     for (std::size_t index = 0; index < requests.size(); ++index) {
       const TextureSampleRequest &request = requests[index];
       const bool debug_request =
           debug_target_found &&
           debug_lanes[index].parameter_index == debug_target_parameter &&
           request.quad_id == debug_target_quad;
+      const TextureImplicitLod &lod = implicit_lods[index];
       if (request.shader_lane_index != index || request.request_id != index ||
           request.shader_stage != shader_stage ||
           request.coordinate_count != 2 || request.component_count != 4 ||
@@ -1522,10 +1271,10 @@ void TextureUnit::SampleRunForStage(
               std::uint64_t first_request_id) -> std::uint32_t {
         const TextureLinearAxis x = ComputeTextureLinearRepeat(
             BitsFloat(request.coordinates[0]), mip.width,
-            decoded_sampler.wrap_u, linear_coordinate_round_threshold);
+            decoded_sampler.wrap_u);
         const TextureLinearAxis y = ComputeTextureLinearRepeat(
             BitsFloat(request.coordinates[1]), mip.height,
-            decoded_sampler.wrap_v, linear_coordinate_round_threshold);
+            decoded_sampler.wrap_v);
         const std::uint32_t depth00 = SampledDepth24FromTexel(
             read_texel(mip, x.lower, y.lower, first_request_id + 0U));
         const std::uint32_t depth10 = SampledDepth24FromTexel(
@@ -1549,11 +1298,11 @@ void TextureUnit::SampleRunForStage(
       const auto sample_nearest =
           [&](const TextureMipLevel &mip, std::uint64_t request_id) {
         const std::uint32_t x =
-            NearestRepeat(BitsFloat(request.coordinates[0]), mip.width,
-                          decoded_sampler.wrap_u);
+            ComputeTextureNearestRepeat(BitsFloat(request.coordinates[0]),
+                                        mip.width, decoded_sampler.wrap_u);
         const std::uint32_t y =
-            NearestRepeat(BitsFloat(request.coordinates[1]), mip.height,
-                          decoded_sampler.wrap_v);
+            ComputeTextureNearestRepeat(BitsFloat(request.coordinates[1]),
+                                        mip.height, decoded_sampler.wrap_v);
         return read_texel(mip, x, y, request_id);
       };
 
@@ -1562,10 +1311,10 @@ void TextureUnit::SampleRunForStage(
               std::uint64_t first_request_id) {
         const TextureLinearAxis x = ComputeTextureLinearRepeat(
             BitsFloat(request.coordinates[0]), mip.width,
-            decoded_sampler.wrap_u, linear_coordinate_round_threshold);
+            decoded_sampler.wrap_u);
         const TextureLinearAxis y = ComputeTextureLinearRepeat(
             BitsFloat(request.coordinates[1]), mip.height,
-            decoded_sampler.wrap_v, linear_coordinate_round_threshold);
+            decoded_sampler.wrap_v);
         const std::array<std::uint8_t, 4> texel00 =
             read_texel(mip, x.lower, y.lower, first_request_id + 0U);
         const std::array<std::uint8_t, 4> texel10 =
@@ -1618,6 +1367,65 @@ void TextureUnit::SampleRunForStage(
         return result;
       };
 
+      // The float datapath's taps (lp_bld_sample_soa.c): binary32 weights,
+      // texels decoded before the lerp so sRGB is blended in linear light.
+      const auto sample_nearest_float =
+          [&](const TextureMipLevel &mip, std::uint64_t request_id) {
+        const std::uint32_t x = ComputeTextureFloatNearest(
+            BitsFloat(request.coordinates[0]), mip.width,
+            decoded_sampler.wrap_u);
+        const std::uint32_t y = ComputeTextureFloatNearest(
+            BitsFloat(request.coordinates[1]), mip.height,
+            decoded_sampler.wrap_v);
+        return DecodeTexelToFloat(image.format,
+                                  read_texel(mip, x, y, request_id));
+      };
+
+      const auto sample_bilinear_float =
+          [&](const TextureMipLevel &mip, std::uint64_t first_request_id) {
+        const TextureFloatAxis x = ComputeTextureFloatLinear(
+            BitsFloat(request.coordinates[0]), mip.width,
+            decoded_sampler.wrap_u);
+        const TextureFloatAxis y = ComputeTextureFloatLinear(
+            BitsFloat(request.coordinates[1]), mip.height,
+            decoded_sampler.wrap_v);
+        const std::array<float, 4> texel00 = DecodeTexelToFloat(
+            image.format,
+            read_texel(mip, x.lower, y.lower, first_request_id + 0U));
+        const std::array<float, 4> texel10 = DecodeTexelToFloat(
+            image.format,
+            read_texel(mip, x.upper, y.lower, first_request_id + 1U));
+        const std::array<float, 4> texel01 = DecodeTexelToFloat(
+            image.format,
+            read_texel(mip, x.lower, y.upper, first_request_id + 2U));
+        const std::array<float, 4> texel11 = DecodeTexelToFloat(
+            image.format,
+            read_texel(mip, x.upper, y.upper, first_request_id + 3U));
+        std::array<float, 4> result{};
+        for (std::size_t component = 0; component < result.size();
+             ++component) {
+          // lp_build_lerp_2d: along x first, then y.
+          const float lower = LerpTextureFloat(
+              texel00[component], texel10[component], x.weight);
+          const float upper = LerpTextureFloat(
+              texel01[component], texel11[component], x.weight);
+          result[component] = LerpTextureFloat(lower, upper, y.weight);
+        }
+        if (debug_request) {
+          std::cerr << "sequence-fragment-texture phase=bilinear-float set="
+                    << static_cast<unsigned>(descriptor_set)
+                    << " lane=" << index << " mip="
+                    << static_cast<unsigned>(mip.width) << 'x'
+                    << static_cast<unsigned>(mip.height) << " x="
+                    << x.lower << ',' << x.upper << ',' << x.weight
+                    << " y=" << y.lower << ',' << y.upper << ','
+                    << y.weight << " result=" << result[0] << ','
+                    << result[1] << ',' << result[2] << ',' << result[3]
+                    << '\n';
+        }
+        return result;
+      };
+
       std::array<float, 4> filtered{};
       if (debug_request) {
         std::cerr << "sequence-fragment-texture phase=request set="
@@ -1630,8 +1438,7 @@ void TextureUnit::SampleRunForStage(
                   << std::setfill(' ') << " coord="
                   << BitsFloat(request.coordinates[0]) << ','
                   << BitsFloat(request.coordinates[1]);
-        if (mip_linear) {
-          const TextureImplicitLod &lod = implicit_lods[index];
+        if (needs_lod) {
           std::cerr << " lod=" << lod.lambda << ','
                     << static_cast<unsigned>(lod.level0) << ','
                     << static_cast<unsigned>(lod.level1) << ','
@@ -1640,118 +1447,106 @@ void TextureUnit::SampleRunForStage(
         std::cerr << '\n';
       }
       /*
-       * Order matters: a mip-linear sampler crosses levels whatever its
-       * image filter is.  Testing the image filter first sent every
-       * GL_NEAREST_MIPMAP_LINEAR down the single-level nearest path, which
-       * reads mip[0] and never selects a level at all.
+       * lp_build_sample_general, per lane: the selection made from the
+       * quad's LOD names the image filter and the level pair, the format and
+       * the address modes name the datapath.  A mip-linear selection blends
+       * its two levels on the datapath that filtered them -- 8-bit weights on
+       * the fixed-point one, the fractional LOD on the float one.  Depth
+       * keeps its own 24-bit datapath.
        */
-      if (mip_linear) {
-        if (image.format == TextureFormat::kZ32Unorm) {
-          throw std::runtime_error(
-              "TextureUnit cannot mip-filter Z32_UNORM");
-        }
-        if (request.request_id >
-            (std::numeric_limits<std::uint64_t>::max() - 7U) / 8U) {
-          throw std::overflow_error("TextureUnit trilinear request ID overflow");
-        }
-        const TextureImplicitLod &lod = implicit_lods[index];
-        const std::uint64_t first_request_id = request.request_id * 8U;
-        if (image.format == TextureFormat::kZ24UnormS8Uint) {
-          // A single-level depth image resolves both LOD taps to level 0, so
-          // the mip blend is exact whatever weight the LOD datapath produced.
-          const std::uint32_t lower = sample_bilinear_depth(
-              resource.mip[lod.level0], first_request_id + 0U);
-          const std::uint32_t upper = sample_bilinear_depth(
-              resource.mip[lod.level1], first_request_id + 4U);
-          filtered = {SampledDepth24ToFloat(LerpSampledDepth24(
-                          lower, upper, lod.mip_weight_u8)),
-                      0.0F, 0.0F, 1.0F};
-        } else {
-          /*
-           * The image filter chooses what a level's tap is; the mip filter
-           * only decides that two levels are blended.  Sampling each level
-           * bilinearly whatever the image filter said is what made
-           * GL_NEAREST_MIPMAP_LINEAR unanswerable.
-           */
-          const std::array<std::uint8_t, 4> lower =
-              linear_filter
-                  ? sample_bilinear(resource.mip[lod.level0],
-                                    first_request_id + 0U)
-                  : sample_nearest(resource.mip[lod.level0],
-                                   first_request_id + 0U);
-          const std::array<std::uint8_t, 4> upper =
-              linear_filter
-                  ? sample_bilinear(resource.mip[lod.level1],
-                                    first_request_id + 4U)
-                  : sample_nearest(resource.mip[lod.level1],
-                                   first_request_id + 1U);
-          for (std::size_t component = 0; component < 4; ++component) {
-            const std::uint8_t texel = LerpTextureUnorm8(
-                lower[component], upper[component], lod.mip_weight_u8);
-            filtered[component] = static_cast<float>(texel) / 255.0F;
-          }
-        }
-      } else if (!linear_filter) {
-        const TextureMipLevel &mip = resource.mip[0];
-        const std::uint32_t x =
-            NearestRepeat(BitsFloat(request.coordinates[0]), mip.width,
-                          decoded_sampler.wrap_u);
-        const std::uint32_t y =
-            NearestRepeat(BitsFloat(request.coordinates[1]), mip.height,
-                          decoded_sampler.wrap_v);
+      const bool linear_filter = lod.image_filter == TextureFilter::kLinear;
+      const bool two_levels = lod.mip_mode == TextureMipMode::kLinear;
+      const TextureFilterDatapath datapath =
+          SelectTextureFilterDatapath(image.format, decoded_sampler);
+      if (request.request_id >
+          (std::numeric_limits<std::uint64_t>::max() - 7U) / 8U) {
+        throw std::overflow_error("TextureUnit sample request ID overflow");
+      }
+      // Up to eight taps per sample; memory request IDs need only be
+      // distinct within the batch.
+      const std::uint64_t tap_request_base = request.request_id * 8U;
+      const TextureMipLevel &level0 = resource.mip[lod.level0];
+      const TextureMipLevel &level1 = resource.mip[lod.level1];
+      expected_texel_fetches +=
+          (linear_filter ? 4U : 1U) * (two_levels ? 2U : 1U);
+
+      if (image.format == TextureFormat::kZ32Unorm) {
+        if (linear_filter || two_levels)
+          throw std::runtime_error("TextureUnit cannot filter Z32_UNORM");
+        const std::uint32_t x = ComputeTextureNearestRepeat(
+            BitsFloat(request.coordinates[0]), level0.width,
+            decoded_sampler.wrap_u);
+        const std::uint32_t y = ComputeTextureNearestRepeat(
+            BitsFloat(request.coordinates[1]), level0.height,
+            decoded_sampler.wrap_v);
         const std::array<std::uint8_t, 4> texel =
-            read_texel(mip, x, y, request.request_id);
-        if (image.format == TextureFormat::kZ24UnormS8Uint) {
-          const float depth =
-              SampledDepth24ToFloat(SampledDepth24FromTexel(texel));
-          filtered = {depth, 0.0F, 0.0F, 1.0F};
-        } else if (image.format == TextureFormat::kZ32Unorm) {
-          std::uint32_t encoded = 0;
-          std::memcpy(&encoded, texel.data(), sizeof(encoded));
-          const float depth = static_cast<float>(
-              static_cast<double>(encoded) /
-              static_cast<double>(std::numeric_limits<std::uint32_t>::max()));
-          filtered = {depth, depth, depth, 1.0F};
-          if (debug_request) {
-            std::cerr << "sequence-fragment-texture phase=nearest-depth set="
-                      << static_cast<unsigned>(descriptor_set) << " texel="
-                      << x << ',' << y << " encoded=0x" << std::hex
-                      << std::setw(8) << std::setfill('0') << encoded
-                      << std::dec << std::setfill(' ') << " depth=" << depth
-                      << '\n';
-          }
-        } else if (image.format == TextureFormat::kRgba8Srgb ||
-                   image.format == TextureFormat::kAstcLdrSrgb) {
-          // Colour through the sRGB transfer function, alpha left linear.
-          for (std::size_t component = 0; component < 3; ++component)
-            filtered[component] = SrgbChannelToLinear(texel[component]);
-          filtered[3] = static_cast<float>(texel[3]) / 255.0F;
-        } else {
+            read_texel(level0, x, y, tap_request_base);
+        std::uint32_t encoded = 0;
+        std::memcpy(&encoded, texel.data(), sizeof(encoded));
+        const float depth = static_cast<float>(
+            static_cast<double>(encoded) /
+            static_cast<double>(std::numeric_limits<std::uint32_t>::max()));
+        filtered = {depth, depth, depth, 1.0F};
+        if (debug_request) {
+          std::cerr << "sequence-fragment-texture phase=nearest-depth set="
+                    << static_cast<unsigned>(descriptor_set) << " texel="
+                    << x << ',' << y << " encoded=0x" << std::hex
+                    << std::setw(8) << std::setfill('0') << encoded
+                    << std::dec << std::setfill(' ') << " depth=" << depth
+                    << '\n';
+        }
+      } else if (image.format == TextureFormat::kZ24UnormS8Uint) {
+        const auto depth_level = [&](const TextureMipLevel &mip,
+                                     std::uint64_t first_request_id) {
+          if (linear_filter)
+            return sample_bilinear_depth(mip, first_request_id);
+          const std::uint32_t x = ComputeTextureNearestRepeat(
+              BitsFloat(request.coordinates[0]), mip.width,
+              decoded_sampler.wrap_u);
+          const std::uint32_t y = ComputeTextureNearestRepeat(
+              BitsFloat(request.coordinates[1]), mip.height,
+              decoded_sampler.wrap_v);
+          return SampledDepth24FromTexel(
+              read_texel(mip, x, y, first_request_id));
+        };
+        std::uint32_t depth = depth_level(level0, tap_request_base);
+        if (two_levels) {
+          depth = LerpSampledDepth24(
+              depth, depth_level(level1, tap_request_base + 4U),
+              lod.mip_weight_u8);
+        }
+        filtered = {SampledDepth24ToFloat(depth), 0.0F, 0.0F, 1.0F};
+      } else if (datapath == TextureFilterDatapath::kUnorm8) {
+        const auto unorm8_level = [&](const TextureMipLevel &mip,
+                                      std::uint64_t first_request_id) {
+          return linear_filter ? sample_bilinear(mip, first_request_id)
+                               : sample_nearest(mip, first_request_id);
+        };
+        std::array<std::uint8_t, 4> texel =
+            unorm8_level(level0, tap_request_base);
+        if (two_levels) {
+          const std::array<std::uint8_t, 4> upper =
+              unorm8_level(level1, tap_request_base + 4U);
           for (std::size_t component = 0; component < 4; ++component) {
-            filtered[component] =
-                static_cast<float>(texel[component]) / 255.0F;
+            texel[component] = LerpTextureUnorm8(
+                texel[component], upper[component], lod.mip_weight_u8);
           }
         }
+        for (std::size_t component = 0; component < 4; ++component)
+          filtered[component] = static_cast<float>(texel[component]) / 255.0F;
       } else {
-        if (image.format == TextureFormat::kZ32Unorm) {
-          throw std::runtime_error(
-              "TextureUnit cannot linearly filter Z32_UNORM");
-        }
-        if (request.request_id >
-            (std::numeric_limits<std::uint64_t>::max() - 3U) / 4U) {
-          throw std::overflow_error("TextureUnit bilinear request ID overflow");
-        }
-        const std::uint64_t first_request_id = request.request_id * 4U;
-        if (image.format == TextureFormat::kZ24UnormS8Uint) {
-          const float depth = SampledDepth24ToFloat(
-              sample_bilinear_depth(resource.mip[0], first_request_id));
-          filtered = {depth, 0.0F, 0.0F, 1.0F};
-        } else {
-          const std::array<std::uint8_t, 4> texel =
-              sample_bilinear(resource.mip[0], first_request_id);
+        const auto float_level = [&](const TextureMipLevel &mip,
+                                     std::uint64_t first_request_id) {
+          return linear_filter ? sample_bilinear_float(mip, first_request_id)
+                               : sample_nearest_float(mip, first_request_id);
+        };
+        filtered = float_level(level0, tap_request_base);
+        if (two_levels) {
+          const std::array<float, 4> upper =
+              float_level(level1, tap_request_base + 4U);
           for (std::size_t component = 0; component < 4; ++component) {
-            filtered[component] =
-                static_cast<float>(texel[component]) / 255.0F;
+            filtered[component] = LerpTextureFloat(
+                filtered[component], upper[component], lod.mip_weight);
           }
         }
       }
@@ -1779,12 +1574,7 @@ void TextureUnit::SampleRunForStage(
       responses.push_back(response);
     }
 
-    const std::uint64_t fetches_per_request =
-        mip_linear ? (linear_filter ? 8U : 2U) : linear_filter ? 4U : 1U;
-    if (requests.size() >
-            std::numeric_limits<std::uint64_t>::max() /
-                fetches_per_request ||
-        texel_fetch_count != requests.size() * fetches_per_request) {
+    if (texel_fetch_count != expected_texel_fetches) {
       throw std::runtime_error(
           "TextureUnit sample batch has invalid texel traffic");
     }

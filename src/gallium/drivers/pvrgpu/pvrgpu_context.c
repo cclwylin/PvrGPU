@@ -9764,9 +9764,18 @@ pvrgpu_capture_generic_sequence_texture(
    }
    destination->normalized_coordinates = 1;
    destination->min_lod_u4_6 = 0;
+   /*
+    * GL's mip filter NONE has no Rogue encoding: the sampler word carries a
+    * mip filter bit and an LOD window, nothing else.  Zink expresses it on
+    * Vulkan hardware by clamping the LOD to 0.25 -- small enough that the
+    * nearest level is always the base level, positive enough that a minified
+    * fragment still takes the minification filter.  Clamping to 0 instead
+    * makes every fragment look magnified and take the magnification filter,
+    * which shows whenever min and mag differ.  0.25 in U4.6 is 16.
+    */
    destination->max_lod_u4_6 =
       state->min_mip_filter == PIPE_TEX_MIPFILTER_NONE ?
-         0U : (mip_count - 1U) * 64U;
+         16U : (mip_count - 1U) * 64U;
 
    *out_bytes = bytes;
    return true;

@@ -315,22 +315,28 @@ void CheckDescriptorAndArithmetic() {
                 terrain_d3_image, terrain_d3_sampler, 5),
         "Terrain D3 real RGBX8 mip-linear descriptor class");
   /*
-   * The LOD window has to lie inside the image, not equal it.  A sampler may
+   * The LOD window is the sampler's, not the image's.  A sampler may
    * address fewer levels than the image carries -- GL_TEXTURE_MAX_LOD, or a
-   * non-mipmapping filter on a mipmapped texture -- so 512 over a ten-level
-   * image is levels 0..8 and is a request the unit can serve.  What stays
-   * fail-closed is a window reaching past the last level the image has.
+   * non-mipmapping filter on a mipmapped texture -- and it may reach past
+   * the last level: the level clamp (lp_build_nearest_mip_level) answers
+   * that, and a window of 0..0.25 is how the driver says "base level only"
+   * for GL's mip filter NONE without losing the minification decision.
    */
   RogueTextureSamplerDescriptor clamped_terrain_lod = terrain_d3_sampler;
   clamped_terrain_lod.max_lod_u4_6 = 512;
   Check(DriverPcoTextureDescriptorClassSupported(
             terrain_d3_image, clamped_terrain_lod, 5),
         "Terrain D3 accepts a LOD window inside the image");
-  RogueTextureSamplerDescriptor wrong_terrain_lod = terrain_d3_sampler;
-  wrong_terrain_lod.max_lod_u4_6 = 640;
+  RogueTextureSamplerDescriptor wide_terrain_lod = terrain_d3_sampler;
+  wide_terrain_lod.max_lod_u4_6 = 640;
+  Check(DriverPcoTextureDescriptorClassSupported(
+            terrain_d3_image, wide_terrain_lod, 5),
+        "Terrain D3 accepts a LOD window past the last level: the level clamps");
+  RogueTextureSamplerDescriptor backwards_terrain_lod = terrain_d3_sampler;
+  backwards_terrain_lod.min_lod_u4_6 = 640;
   Check(!DriverPcoTextureDescriptorClassSupported(
-            terrain_d3_image, wrong_terrain_lod, 5),
-        "Terrain D3 refuses a LOD window past the last level");
+            terrain_d3_image, backwards_terrain_lod, 5),
+        "Terrain D3 refuses a LOD window that runs backwards");
   RogueTextureImageDescriptor mipped_depth = terrain_d3_image;
   mipped_depth.format = TextureFormat::kZ32Unorm;
   Check(!DriverPcoTextureDescriptorClassSupported(
@@ -382,7 +388,8 @@ void CheckDescriptorAndArithmetic() {
 
   // One screen-pixel derivative across the 64x64 Gate 18 quad after its
   // float32 0.933 vertex scale.  The selected LODM=NORMAL datapath must expose
-  // mip levels 3/4 and architectural TFRAC=19, not a host-float mip weight.
+  // mip levels 3/4 and architectural TFRAC=19; the float datapath's weight is
+  // the unquantized fraction TFRAC was truncated from.
   const float gate18_scale = BitsFloat(trilinear.vertex_scale_bits);
   const float gate18_derivative = 1.0F / (64.0F * gate18_scale);
   constexpr float kGate18U = 0.25F;
@@ -397,7 +404,8 @@ void CheckDescriptorAndArithmetic() {
       gate18_coordinates, trilinear_image, trilinear_sampler);
   Check(gate18_lod.level0 == 3 && gate18_lod.level1 == 4 &&
             gate18_lod.mip_weight_u8 == 19 &&
-            FloatBits(gate18_lod.mip_weight) == FloatBits(19.0F / 256.0F) &&
+            gate18_lod.mip_weight >= 19.0F / 256.0F &&
+            gate18_lod.mip_weight < 20.0F / 256.0F &&
             gate18_lod.lambda >= 3.0F && gate18_lod.lambda < 4.0F,
         "Gate 18 implicit LOD levels and TFRAC");
 
@@ -420,7 +428,8 @@ void CheckDescriptorAndArithmetic() {
       gate19_coordinates, trilinear04_image, trilinear04_sampler);
   Check(gate19_lod.level0 == 3 && gate19_lod.level1 == 4 &&
             gate19_lod.mip_weight_u8 == 94 &&
-            FloatBits(gate19_lod.mip_weight) == FloatBits(94.0F / 256.0F) &&
+            gate19_lod.mip_weight >= 94.0F / 256.0F &&
+            gate19_lod.mip_weight < 95.0F / 256.0F &&
             gate19_lod.lambda >= 3.0F && gate19_lod.lambda < 4.0F,
         "Gate 19 implicit LOD levels and TFRAC");
 
@@ -445,7 +454,8 @@ void CheckDescriptorAndArithmetic() {
   Check(FloatBits(gate20_derivative) == UINT32_C(0x3cb50565) &&
             gate20_lod.level0 == 3 && gate20_lod.level1 == 4 &&
             gate20_lod.mip_weight_u8 == 128 &&
-            FloatBits(gate20_lod.mip_weight) == FloatBits(0.5F) &&
+            gate20_lod.mip_weight >= static_cast<float>(gate20_lod.mip_weight_u8) / 256.0F &&
+            gate20_lod.mip_weight < static_cast<float>(gate20_lod.mip_weight_u8 + 1U) / 256.0F &&
             FloatBits(gate20_lod.lambda) == UINT32_C(0x40600026),
         "Gate 20 implicit LOD levels, approximate lambda, and TFRAC");
   const std::array<std::array<float, 2>, 4> gate20_edge_coordinates = {{
@@ -458,8 +468,8 @@ void CheckDescriptorAndArithmetic() {
       gate20_edge_coordinates, trilinear05_image, trilinear05_sampler);
   Check(gate20_edge_lod.level0 == 0 && gate20_edge_lod.level1 == 1 &&
             gate20_edge_lod.mip_weight_u8 == 127 &&
-            FloatBits(gate20_edge_lod.mip_weight) ==
-                FloatBits(127.0F / 256.0F),
+            gate20_edge_lod.mip_weight >= static_cast<float>(gate20_edge_lod.mip_weight_u8) / 256.0F &&
+            gate20_edge_lod.mip_weight < static_cast<float>(gate20_edge_lod.mip_weight_u8 + 1U) / 256.0F,
         "Gate 20 near-boundary TFRAC uses strict positive truncation");
 
   // Two exact f16->f32 Refract composite quads formerly rounded upward by a
@@ -489,8 +499,8 @@ void CheckDescriptorAndArithmetic() {
             refract_scaled_a > 10.99F && refract_scaled_a < 11.0F &&
             refract_lod_a.level0 == 6 && refract_lod_a.level1 == 7 &&
             refract_lod_a.mip_weight_u8 == 10 &&
-            FloatBits(refract_lod_a.mip_weight) ==
-                FloatBits(10.0F / 256.0F),
+            refract_lod_a.mip_weight >= static_cast<float>(refract_lod_a.mip_weight_u8) / 256.0F &&
+            refract_lod_a.mip_weight < static_cast<float>(refract_lod_a.mip_weight_u8 + 1U) / 256.0F,
         "Refract lane 37,45 TFRAC 10.99939 truncates to 10");
 
   const std::array<std::array<float, 2>, 4> refract_coordinates_b = {{
@@ -510,8 +520,8 @@ void CheckDescriptorAndArithmetic() {
             refract_scaled_b > 230.98F && refract_scaled_b < 231.0F &&
             refract_lod_b.level0 == 1 && refract_lod_b.level1 == 2 &&
             refract_lod_b.mip_weight_u8 == 230 &&
-            FloatBits(refract_lod_b.mip_weight) ==
-                FloatBits(230.0F / 256.0F),
+            refract_lod_b.mip_weight >= static_cast<float>(refract_lod_b.mip_weight_u8) / 256.0F &&
+            refract_lod_b.mip_weight < static_cast<float>(refract_lod_b.mip_weight_u8 + 1U) / 256.0F,
         "Refract lane 38,17 TFRAC 230.98755 truncates to 230");
 
   /* Golden Gallivm target primitive/quad for the final Refract mismatch:
@@ -543,7 +553,7 @@ void CheckDescriptorAndArithmetic() {
    * A non-zero max LOD is a valid encoding; whether it can be sampled depends
    * on how many levels the image has, which is the class predicate's
    * question.  The decode no longer answers it, so this checks both halves:
-   * the window decodes, and a window past a single-level image is refused.
+   * the window decodes, and a window past a single-level image is served.
    */
   auto mutated = DescriptorDwords(linear, 8);
   mutated[0] |= UINT32_C(1) << 23U; // public maxlod[0]
@@ -556,9 +566,9 @@ void CheckDescriptorAndArithmetic() {
   one_level_image.row_pitch_bytes = 64 * 4;
   one_level_image.mip_count = 1;
   one_level_image.format = TextureFormat::kRgba8Unorm;
-  Check(!DriverPcoTextureDescriptorClassSupported(one_level_image,
-                                                 non_zero_lod, 1),
-        "a LOD window past a single-level image is refused");
+  Check(DriverPcoTextureDescriptorClassSupported(one_level_image,
+                                                non_zero_lod, 1),
+        "a LOD window past a single-level image clamps to that level");
   mutated = DescriptorDwords(linear, 8);
   mutated[1] |= UINT32_C(4) << (41U - 32U); // addrmode_v=BORDER
   ExpectFailure([&] { DecodeRogueTextureSamplerDescriptor(mutated); },
