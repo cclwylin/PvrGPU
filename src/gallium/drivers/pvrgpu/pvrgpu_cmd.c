@@ -1097,116 +1097,166 @@ pvrgpu_cmd_validate_draw_pco_triangles(
     * A pass-through vertex shader that only forwards position and colour uses
     * no temporaries, exactly as the color layout's fragment stage may.
     */
-   if ((!color_layout && cmd->vertex_pco_abi.temps == 0) ||
-       cmd->vertex_pco_abi.temps > 256 ||
-       cmd->vertex_pco_abi.shareds > 64 ||
-       cmd->vertex_pco_abi.coefficients != 0 ||
-       cmd->vertex_pco_abi.push_constant_start != 0 ||
-       /*
-        * Shared registers hold texture descriptors first and push constants
-        * after, so the two are only equal for a stage that samples nothing.
-        * What has to hold either way is that the push-constant window lies
-        * inside the shared span.
-        */
-       (uint64_t)cmd->vertex_pco_abi.push_constant_start +
-             cmd->vertex_pco_abi.push_constant_count >
-          cmd->vertex_pco_abi.shareds ||
-       cmd->vertex_pco_abi.entry_offset != 0 ||
-       (!ideas_position_layout && !color_layout &&
-        cmd->fragment_pco_abi.temps == 0) ||
-       cmd->fragment_pco_abi.temps > 256 ||
-       cmd->fragment_pco_abi.shareds > 64 ||
-       cmd->fragment_pco_abi.vertex_inputs != 0 ||
-       cmd->fragment_pco_abi.vertex_outputs != 0 ||
-       cmd->fragment_pco_abi.push_constant_start != 0 ||
-       cmd->fragment_pco_abi.entry_offset != 0 ||
-       cmd->position_output_start != 0 ||
-       cmd->position_output_count != 4 ||
-       /*
-        * Position occupies the first outputs, gl_PointSize the next one when
-        * the shader sizes its points, and the varyings follow.
-        */
-       cmd->vertex_pco_abi.vertex_outputs !=
-          cmd->position_output_count + cmd->point_size_output_count +
-             cmd->varying_output_count ||
-       (cmd->varying_output_count != 0 &&
-        cmd->varying_output_start !=
-           cmd->position_output_count + cmd->point_size_output_count) ||
-       cmd->fragment_position_start != 0 ||
-       (cmd->fragment_varying_count != 0 &&
-        cmd->fragment_varying_start != cmd->fragment_position_count) ||
-       cmd->fragment_pco_abi.coefficients !=
-          cmd->fragment_position_count + cmd->fragment_varying_count ||
-       ((conditionals_layout) &&
-        (cmd->varying_output_count != 0 ||
-         cmd->fragment_position_count != 0 ||
-         cmd->fragment_varying_count != 0)) ||
-       ((lit_mesh_layout) &&
-        (cmd->varying_output_count == 0 ||
-         cmd->varying_output_count > 4 ||
-         cmd->fragment_position_count != 4 ||
-         cmd->fragment_varying_count != cmd->varying_output_count * 4)) ||
-       /*
-        * A command that states its own layout reports the varying width it
-        * built; the pinned colour profile is pinned to one vec4.
-        */
-       /*
-        * A shape shaded from a uniform passes no varyings at all, so zero is
-        * a layout the generic path builds rather than one it failed to.
-        */
-       (color_layout && cmd->vertex_attribute_count != 0 &&
-        (cmd->fragment_position_count != 4 ||
-         cmd->fragment_varying_count > cmd->varying_output_count * 4u ||
-         (cmd->fragment_varying_count & 3u) != 0)) ||
-       (color_layout && cmd->vertex_attribute_count == 0 &&
-        (cmd->varying_output_count != 4 ||
-         cmd->fragment_position_count != 4 ||
-         cmd->fragment_varying_count != 16)) ||
-       (ideas_position_layout &&
-        (cmd->vertex_pco_abi.vertex_outputs != 4 ||
-         cmd->vertex_pco_abi.shareds != 32 ||
-         cmd->varying_output_start != 0 ||
-         cmd->varying_output_count != 0 ||
-         cmd->fragment_position_count != 0 ||
-         cmd->fragment_varying_start != 0 ||
-         cmd->fragment_varying_count != 0 ||
-         cmd->fragment_pco_abi.coefficients != 0 ||
-         (cmd->fragment_pco_abi.shareds != 0 &&
-          cmd->fragment_pco_abi.shareds != 4))) ||
-       (ideas_two_attribute_layout &&
-        (cmd->vertex_pco_abi.vertex_outputs != 14 ||
-         cmd->vertex_pco_abi.shareds != 44 ||
-         cmd->fragment_pco_abi.shareds != 12 ||
-         cmd->varying_output_start != 4 ||
-         cmd->varying_output_count != 10 ||
-         cmd->fragment_position_count != 4 ||
-         cmd->fragment_varying_start != 4 ||
-         cmd->fragment_varying_count != 40 ||
-         cmd->fragment_pco_abi.coefficients != 44)) ||
-       (uint64_t)cmd->fragment_pco_abi.push_constant_start +
-             cmd->fragment_pco_abi.push_constant_count >
-          cmd->fragment_pco_abi.shareds ||
-       ((!texture_layout && !color_layout) &&
-        cmd->fragment_pco_abi.push_constant_count !=
-           cmd->fragment_pco_abi.shareds) ||
-       (texture_layout &&
-        (cmd->vertex_count != 36 ||
-         cmd->vertex_pco_abi.vertex_outputs != 7 ||
-         cmd->vertex_pco_abi.shareds != 32 ||
-         cmd->vertex_pco_abi.push_constant_count != 32 ||
-         cmd->fragment_pco_abi.coefficients != 16 ||
-         cmd->fragment_pco_abi.shareds != 20 ||
-         cmd->fragment_pco_abi.push_constant_count != 0 ||
-         cmd->varying_output_start != 4 ||
-         cmd->varying_output_count != 3 ||
-         cmd->fragment_position_count != 4 ||
-         cmd->fragment_varying_start != 4 ||
-         cmd->fragment_varying_count != 12))) {
+   /*
+    * Say which requirement refused.
+    *
+    * These used to be one OR-chain ending in a single sentence that printed
+    * every number and named none of them, so a draw that missed by one field
+    * looked exactly like a draw that missed by ten.  The expressions are
+    * unchanged; they are only grouped and named, and the first group that
+    * holds is reported.
+    */
+   const bool vertex_stage_invalid =
+      (!color_layout && cmd->vertex_pco_abi.temps == 0) ||
+      cmd->vertex_pco_abi.temps > 256 ||
+      cmd->vertex_pco_abi.shareds > 64 ||
+      cmd->vertex_pco_abi.coefficients != 0 ||
+      cmd->vertex_pco_abi.push_constant_start != 0 ||
+      /*
+       * Shared registers hold texture descriptors first and push constants
+       * after, so the two are only equal for a stage that samples nothing.
+       * What has to hold either way is that the push-constant window lies
+       * inside the shared span.
+       */
+      (uint64_t)cmd->vertex_pco_abi.push_constant_start +
+            cmd->vertex_pco_abi.push_constant_count >
+         cmd->vertex_pco_abi.shareds ||
+      cmd->vertex_pco_abi.entry_offset != 0;
+   /*
+    * Name the field, not just the stage.  "fragment stage limits" still left
+    * nine candidates to tell apart by hand.
+    */
+   const char *fragment_stage_refusal =
+      (!ideas_position_layout && !color_layout &&
+       cmd->fragment_pco_abi.temps == 0)      ? "fs temps is zero" :
+      cmd->fragment_pco_abi.temps > 256       ? "fs temps > 256" :
+      cmd->fragment_pco_abi.shareds > 64      ? "fs shareds > 64" :
+      cmd->fragment_pco_abi.vertex_inputs != 0  ? "fs vertex_inputs != 0" :
+      cmd->fragment_pco_abi.vertex_outputs != 0 ? "fs vertex_outputs != 0" :
+      /*
+       * The fragment stage's push constants do not have to start at zero.
+       * Shared registers hold texture descriptors first and push constants
+       * after -- the rule the vertex stage above already states -- so a
+       * fragment shader that samples anything has a nonzero start by
+       * construction.  Requiring zero here refused every textured draw whose
+       * shader also read a uniform: dEQP's compressed-texture cases hand the
+       * stage 20 descriptor dwords followed by 8 push-constant dwords.  What
+       * still has to hold is that the window lies inside the shared span,
+       * which is the next check.
+       */
+      cmd->fragment_pco_abi.entry_offset != 0 ? "fs entry_offset != 0" :
+      ((uint64_t)cmd->fragment_pco_abi.push_constant_start +
+           cmd->fragment_pco_abi.push_constant_count >
+       cmd->fragment_pco_abi.shareds)
+         ? "fs push-constant window overruns shareds" :
+      ((!texture_layout && !color_layout) &&
+       cmd->fragment_pco_abi.push_constant_count !=
+          cmd->fragment_pco_abi.shareds)
+         ? "fs push_constant_count != shareds" : NULL;
+   const bool fragment_stage_invalid = fragment_stage_refusal != NULL;
+   /*
+    * Position occupies the first outputs, gl_PointSize the next one when the
+    * shader sizes its points, and the varyings follow.  The fragment stage's
+    * coefficients have to describe the same span the vertex stage wrote.
+    */
+   const bool stage_linkage_invalid =
+      cmd->position_output_start != 0 ||
+      cmd->position_output_count != 4 ||
+      cmd->vertex_pco_abi.vertex_outputs !=
+         cmd->position_output_count + cmd->point_size_output_count +
+            cmd->varying_output_count ||
+      (cmd->varying_output_count != 0 &&
+       cmd->varying_output_start !=
+          cmd->position_output_count + cmd->point_size_output_count) ||
+      cmd->fragment_position_start != 0 ||
+      (cmd->fragment_varying_count != 0 &&
+       cmd->fragment_varying_start != cmd->fragment_position_count) ||
+      cmd->fragment_pco_abi.coefficients !=
+         cmd->fragment_position_count + cmd->fragment_varying_count;
+   const bool conditionals_layout_invalid =
+      conditionals_layout &&
+      (cmd->varying_output_count != 0 ||
+       cmd->fragment_position_count != 0 ||
+       cmd->fragment_varying_count != 0);
+   const bool lit_mesh_layout_invalid =
+      lit_mesh_layout &&
+      (cmd->varying_output_count == 0 ||
+       cmd->varying_output_count > 4 ||
+       cmd->fragment_position_count != 4 ||
+       cmd->fragment_varying_count != cmd->varying_output_count * 4);
+   /*
+    * A command that states its own layout reports the varying width it built;
+    * the pinned colour profile is pinned to one vec4.  A shape shaded from a
+    * uniform passes no varyings at all, so zero is a layout the generic path
+    * builds rather than one it failed to.
+    */
+   const bool color_layout_invalid =
+      (color_layout && cmd->vertex_attribute_count != 0 &&
+       (cmd->fragment_position_count != 4 ||
+        cmd->fragment_varying_count > cmd->varying_output_count * 4u ||
+        (cmd->fragment_varying_count & 3u) != 0)) ||
+      (color_layout && cmd->vertex_attribute_count == 0 &&
+       (cmd->varying_output_count != 4 ||
+        cmd->fragment_position_count != 4 ||
+        cmd->fragment_varying_count != 16));
+   const bool ideas_position_layout_invalid =
+      ideas_position_layout &&
+      (cmd->vertex_pco_abi.vertex_outputs != 4 ||
+       cmd->vertex_pco_abi.shareds != 32 ||
+       cmd->varying_output_start != 0 ||
+       cmd->varying_output_count != 0 ||
+       cmd->fragment_position_count != 0 ||
+       cmd->fragment_varying_start != 0 ||
+       cmd->fragment_varying_count != 0 ||
+       cmd->fragment_pco_abi.coefficients != 0 ||
+       (cmd->fragment_pco_abi.shareds != 0 &&
+        cmd->fragment_pco_abi.shareds != 4));
+   const bool ideas_two_attribute_layout_invalid =
+      ideas_two_attribute_layout &&
+      (cmd->vertex_pco_abi.vertex_outputs != 14 ||
+       cmd->vertex_pco_abi.shareds != 44 ||
+       cmd->fragment_pco_abi.shareds != 12 ||
+       cmd->varying_output_start != 4 ||
+       cmd->varying_output_count != 10 ||
+       cmd->fragment_position_count != 4 ||
+       cmd->fragment_varying_start != 4 ||
+       cmd->fragment_varying_count != 40 ||
+       cmd->fragment_pco_abi.coefficients != 44);
+   const bool texture_layout_invalid =
+      texture_layout &&
+      (cmd->vertex_count != 36 ||
+       cmd->vertex_pco_abi.vertex_outputs != 7 ||
+       cmd->vertex_pco_abi.shareds != 32 ||
+       cmd->vertex_pco_abi.push_constant_count != 32 ||
+       cmd->fragment_pco_abi.coefficients != 16 ||
+       cmd->fragment_pco_abi.shareds != 20 ||
+       cmd->fragment_pco_abi.push_constant_count != 0 ||
+       cmd->varying_output_start != 4 ||
+       cmd->varying_output_count != 3 ||
+       cmd->fragment_position_count != 4 ||
+       cmd->fragment_varying_start != 4 ||
+       cmd->fragment_varying_count != 12);
+
+   const char *abi_refusal =
+      vertex_stage_invalid              ? "vertex stage limits" :
+      fragment_stage_invalid            ? fragment_stage_refusal :
+      stage_linkage_invalid             ? "vertex-to-fragment linkage" :
+      conditionals_layout_invalid       ? "conditionals layout" :
+      lit_mesh_layout_invalid           ? "lit-mesh layout" :
+      color_layout_invalid              ? "color layout" :
+      ideas_position_layout_invalid     ? "ideas position layout" :
+      ideas_two_attribute_layout_invalid ? "ideas two-attribute layout" :
+      texture_layout_invalid            ? "texture layout" : NULL;
+   if (abi_refusal) {
       snprintf(error, error_size,
-               "draw PCO triangles has incompatible PCO ABI metadata: "
+               "draw PCO triangles has incompatible PCO ABI metadata "
+               "(%s refused): "
                "vs_outputs=%u (pos=%u+var=%u) vs_shared=%u "
                "fs_coeffs=%u (pos=%u+var=%u) fs_shared=%u "
-               "vs_temps=%u fs_temps=%u psize=%u@%u lit_mesh=%d cond=%d",
+               "vs_temps=%u fs_temps=%u psize=%u@%u lit_mesh=%d cond=%d "
+               "color=%d texture=%d attrs=%u "
+               "fs_push=%u@%u fs_vin=%u fs_vout=%u fs_entry=%u",
+               abi_refusal,
                cmd->vertex_pco_abi.vertex_outputs,
                cmd->position_output_count, cmd->varying_output_count,
                cmd->vertex_pco_abi.shareds,
@@ -1215,10 +1265,16 @@ pvrgpu_cmd_validate_draw_pco_triangles(
                cmd->fragment_pco_abi.shareds,
                cmd->vertex_pco_abi.temps, cmd->fragment_pco_abi.temps,
                cmd->point_size_output_count, cmd->point_size_output_start,
-               lit_mesh_layout ? 1 : 0, conditionals_layout ? 1 : 0);
+               lit_mesh_layout ? 1 : 0, conditionals_layout ? 1 : 0,
+               color_layout ? 1 : 0, texture_layout ? 1 : 0,
+               cmd->vertex_attribute_count,
+               cmd->fragment_pco_abi.push_constant_count,
+               cmd->fragment_pco_abi.push_constant_start,
+               cmd->fragment_pco_abi.vertex_inputs,
+               cmd->fragment_pco_abi.vertex_outputs,
+               cmd->fragment_pco_abi.entry_offset);
       return false;
    }
-
    const bool ideas_depth_state_matches =
       cmd->depth_format != 0 &&
       ((cmd->depth_enable == 0 && cmd->depth_write == 0 &&

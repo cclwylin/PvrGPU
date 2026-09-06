@@ -477,8 +477,19 @@ bool DriverPcoTextureDescriptorClassSupported(
     const RogueTextureImageDescriptor &image,
     const RogueTextureSamplerDescriptor &sampler,
     std::uint32_t descriptor_count) {
-  const bool legacy_single =
-      descriptor_count == 1 && image.format == TextureFormat::kRgbx8Unorm &&
+  /*
+   * A single-level colour image sampled nearest.  Both eight-bit orderings
+   * belong here: they share one decode and differ only in whether alpha comes
+   * from the texture or is forced to one, which every other colour class below
+   * already treats as the same class.  Listing only RGBX8 refused dEQP's
+   * compressed-texture cases, whose decompressed image is RGBA8 sampled
+   * nearest -- a combination the datapath already performs, since it does
+   * RGBX8 nearest and RGBA8 linear.
+   */
+  const bool single_level_nearest_color =
+      descriptor_count == 1 &&
+      (image.format == TextureFormat::kRgba8Unorm ||
+       image.format == TextureFormat::kRgbx8Unorm) &&
       image.mip_count == 1 &&
       sampler.min_filter == TextureFilter::kNearest &&
       sampler.mag_filter == TextureFilter::kNearest &&
@@ -514,7 +525,8 @@ bool DriverPcoTextureDescriptorClassSupported(
       sampler.mag_filter == TextureFilter::kLinear &&
       sampler.mip_filter == TextureFilter::kNearest &&
       sampler.max_lod_u4_6 == 0;
-  return (legacy_single || sequence_depth || sequence_sampled_depth_stencil ||
+  return (single_level_nearest_color || sequence_depth ||
+          sequence_sampled_depth_stencil ||
           sequence_mipped_color || sequence_external) &&
          sampler.min_lod_u4_6 == 0 &&
          (sampler.wrap_u == TextureWrapMode::kClampToEdge ||
@@ -907,19 +919,47 @@ void TextureUnit::SampleRunForStage(
           static_cast<std::uint64_t>(shared[descriptor_base + 18U]) |
           (static_cast<std::uint64_t>(shared[descriptor_base + 19U])
            << 32U);
-      if (!DriverPcoTextureDescriptorClassSupported(
-              image, decoded_sampler, descriptor_count) ||
-          shared[descriptor_base + 4U] != resource.byte_size ||
-          shared[descriptor_base + 5U] != 0 ||
-          shared[descriptor_base + 6U] != 0 ||
-          shared[descriptor_base + 7U] != 0 ||
-          shared[descriptor_base + 12U] != 0 ||
-          shared[descriptor_base + 13U] != 0 ||
-          shared[descriptor_base + 14U] != 0 ||
-          shared[descriptor_base + 15U] != 0 ||
-          gather_word0 != expected_gather_word0 || gather_word1 != 0) {
-        throw std::runtime_error(
-            "TextureUnit driver PCO descriptor block mismatch");
+      // Name the word that disagreed.  Ten conditions sharing one sentence
+      // meant a descriptor that missed in one dword read exactly like one
+      // built by a stage that had never been implemented.
+      const char *descriptor_refusal =
+          !DriverPcoTextureDescriptorClassSupported(image, decoded_sampler,
+                                                    descriptor_count)
+              ? "descriptor class is unsupported"
+          : shared[descriptor_base + 4U] != resource.byte_size
+              ? "word4 is not the resource byte size"
+          : shared[descriptor_base + 5U] != 0   ? "word5 is not zero"
+          : shared[descriptor_base + 6U] != 0   ? "word6 is not zero"
+          : shared[descriptor_base + 7U] != 0   ? "word7 is not zero"
+          : shared[descriptor_base + 12U] != 0  ? "word12 is not zero"
+          : shared[descriptor_base + 13U] != 0  ? "word13 is not zero"
+          : shared[descriptor_base + 14U] != 0  ? "word14 is not zero"
+          : shared[descriptor_base + 15U] != 0  ? "word15 is not zero"
+          : gather_word0 != expected_gather_word0
+              ? "gather word0 does not match the sampler"
+          : gather_word1 != 0 ? "gather word1 is not zero"
+                              : nullptr;
+      if (descriptor_refusal != nullptr) {
+        std::ostringstream message;
+        message << "TextureUnit driver PCO descriptor block mismatch: "
+                << descriptor_refusal << " (descriptor " << descriptor_count
+                << " at shared word " << descriptor_base
+                << ", format=" << static_cast<unsigned>(image.format)
+                << " mips=" << static_cast<unsigned>(image.mip_count)
+                << " extent=" << image.width << 'x' << image.height
+                << " filters=" << static_cast<unsigned>(decoded_sampler.min_filter)
+                << '/' << static_cast<unsigned>(decoded_sampler.mag_filter)
+                << '/' << static_cast<unsigned>(decoded_sampler.mip_filter)
+                << " lod=" << decoded_sampler.min_lod_u4_6 << ".."
+                << decoded_sampler.max_lod_u4_6
+                << " wrap=" << static_cast<unsigned>(decoded_sampler.wrap_u)
+                << ',' << static_cast<unsigned>(decoded_sampler.wrap_v)
+                << ", word4=" << shared[descriptor_base + 4U]
+                << " resource_bytes=" << resource.byte_size
+                << ", gather0=0x" << std::hex << gather_word0
+                << " expected=0x" << expected_gather_word0
+                << ", gather1=0x" << gather_word1 << std::dec << ')';
+        throw std::runtime_error(message.str());
       }
     }
     if (vertex_stage &&
