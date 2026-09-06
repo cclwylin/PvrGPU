@@ -614,12 +614,19 @@ class MainWindow(QMainWindow):
         self.caselist_field = self._field("Caselist 檔案", caselist_row)
         layout.addWidget(self.caselist_field)
 
-        self.max_cases_spin = QSpinBox()
-        self.max_cases_spin.setRange(0, 100_000)
-        self.max_cases_spin.setValue(20)
-        self.max_cases_spin.setSpecialValueText("全部")
+        # Three sizes rather than a free number.  Groups run from 10 cases to
+        # over 3000, so an absolute count means something different in each of
+        # them; "一半" and "全部" are the same intent whichever group is
+        # selected, and the note below says what they come to.
+        self.max_cases_combo = QComboBox()
+        for label, portion in (("前 20 個", 20), ("一半", "half"), ("全部", "all")):
+            self.max_cases_combo.addItem(label, portion)
+        self.max_cases_combo.currentIndexChanged.connect(self._update_group_note)
+        self._compact_combo(self.max_cases_combo)
         self.max_cases_field = self._field(
-            "最多跑幾個 case", self.max_cases_spin, "0 = 跑完整個 group"
+            "要跑幾個 case",
+            self.max_cases_combo,
+            "一半採無條件進位，所以奇數組不會少跑最後一個",
         )
         layout.addWidget(self.max_cases_field)
 
@@ -983,21 +990,41 @@ class MainWindow(QMainWindow):
         self.caselist_field.setVisible(mode == MODE_CASELIST)
         self.max_cases_field.setVisible(mode in (MODE_GROUP, MODE_CASELIST))
 
+    def _resolve_case_limit(self, total: int) -> int:
+        """How many of `total` discovered cases this run should take.
+
+        A group holds anywhere from 10 to over 3000 cases, so the sizes are
+        relative.  Half rounds up: a one-case group still runs, and an odd
+        group does not quietly drop its last case.
+        """
+        combo = getattr(self, "max_cases_combo", None)
+        if combo is None or total <= 0:
+            return max(total, 0)
+        portion = combo.currentData()
+        if portion == "all":
+            return total
+        if portion == "half":
+            return (total + 1) // 2
+        return min(int(portion), total)
+
     def _update_group_note(self) -> None:
         if not GROUPS_AVAILABLE or self.group_combo.count() == 0:
             self.group_note.setText("tools/deqp_groups.py 不可用，group 模式已停用。")
             return
         spec = get_group(self.group_combo.currentData())
         if spec.available:
+            selected = self._resolve_case_limit(spec.locked_case_count)
             note = (
-                f"{spec.suite} · {spec.locked_case_count} cases（locked CTS）。"
+                f"{spec.suite} · {spec.locked_case_count} cases（locked CTS）"
+                f"，這次會跑 {selected} 個。"
                 " 會先 discovery 展開，再一個 case 一個 process 跑。"
             )
             if spec.suite in ("dEQP-GLES3", "dEQP-GLES31"):
                 note += (
-                    " 注意：bridge 在 process 結束才模擬、結果不會回寫給 glReadPixels，"
-                    "所以影像比對類的 case 目前一律回報 Fail；請看 case 目錄裡的"
-                    " systemc PNG 判斷模型輸出。"
+                    " 影像比對類的 case 取決於 readback：模型的畫面要回寫進"
+                    " glReadPixels 才可能 PASS。若結果可疑，先看 case 目錄裡"
+                    " driver-counter.txt 的 framebuffer_readback（有沒有回寫）"
+                    "與 systemc PNG（模型畫了什麼）。"
                 )
             self.group_note.setText(note)
         else:
@@ -1164,9 +1191,8 @@ class MainWindow(QMainWindow):
         self._launch_cases([case_name])
 
     def _launch_cases(self, names: list[str]) -> None:
-        limit = self.max_cases_spin.value()
-        if limit > 0 and self.mode_combo.currentText() in (MODE_GROUP, MODE_CASELIST):
-            names = names[:limit]
+        if self.mode_combo.currentText() in (MODE_GROUP, MODE_CASELIST):
+            names = names[: self._resolve_case_limit(len(names))]
         names = [name for name in names if EXACT_CASE_RE.match(name)]
         if not names:
             QMessageBox.warning(self, "PvrGPU", "沒有可執行的 exact case。")
@@ -1637,9 +1663,8 @@ class MainWindow(QMainWindow):
             add(f"preset        : {self.preset_combo.currentText()}")
         elif mode == MODE_CUSTOM:
             add(f"custom case   : {self._selected_case() or '<blank>'}")
-        if mode in (MODE_GROUP, MODE_CASELIST) and hasattr(self, "max_cases_spin"):
-            limit = self.max_cases_spin.value()
-            add(f"case limit    : {limit if limit else 'all'}")
+        if mode in (MODE_GROUP, MODE_CASELIST) and hasattr(self, "max_cases_combo"):
+            add(f"case limit    : {self.max_cases_combo.currentText()}")
         if getattr(self, "caselist_path", None):
             add(f"caselist      : {self.caselist_path}")
         add("")

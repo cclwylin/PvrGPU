@@ -461,14 +461,17 @@ RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
       descriptor.min_filter == descriptor.mag_filter;
   // A mip-linear sampler whose LOD range is empty has a single level to
   // resolve both taps to; the image class gate pairs that with mip_count == 1.
+  /*
+   * A mip-linear sampler.  The LOD range used to be a list of the values the
+   * captures happened to contain -- zero, the multiples of 64 up to 640, and
+   * 959 -- which is observation, not a limit the hardware has.  Whether a
+   * range is usable depends on how many levels the image carries, and
+   * DriverPcoTextureDescriptorClassSupported already answers that; here it is
+   * enough that the window is not inverted.
+   */
   const bool trilinear_sampler =
       descriptor.mip_filter == TextureFilter::kLinear &&
-      descriptor.min_lod_u4_6 == 0U &&
-      (descriptor.max_lod_u4_6 == 0U ||
-       ((descriptor.max_lod_u4_6 >= 64U &&
-         descriptor.max_lod_u4_6 <= 640U &&
-         descriptor.max_lod_u4_6 % 64U == 0U)) ||
-       descriptor.max_lod_u4_6 == 959U) &&
+      descriptor.min_lod_u4_6 <= descriptor.max_lod_u4_6 &&
       descriptor.min_filter == TextureFilter::kLinear &&
       descriptor.mag_filter == TextureFilter::kLinear;
   // A single-level image sampled with mip-linear: the LOD range is empty, so
@@ -513,74 +516,104 @@ bool DriverPcoTextureDescriptorClassSupported(
     const RogueTextureImageDescriptor &image,
     const RogueTextureSamplerDescriptor &sampler,
     std::uint32_t descriptor_count) {
+  (void)descriptor_count;
   /*
-   * A single-level colour image sampled nearest.  Both eight-bit orderings
-   * belong here: they share one decode and differ only in whether alpha comes
-   * from the texture or is forced to one, which every other colour class below
-   * already treats as the same class.  Listing only RGBX8 refused dEQP's
-   * compressed-texture cases, whose decompressed image is RGBA8 sampled
-   * nearest -- a combination the datapath already performs, since it does
-   * RGBX8 nearest and RGBA8 linear.
+   * What this unit can sample, stated rather than enumerated.
+   *
+   * This used to be five classes, each a format/mip-count/filter combination
+   * that some workload had been observed to use.  That is not a description
+   * of the datapath: the format selects the decode and the filter selects the
+   * taps, and they do not interact, so listing their product left real gaps
+   * between the entries.  RGBA8 sampled nearest was missing because one class
+   * had RGBX8-nearest and another RGBA8-linear; a mipped image sampled
+   * nearest was missing because one class wanted a single level and the other
+   * wanted every filter linear.  Neither absence meant the unit could not do
+   * it.
+   *
+   * Four things are actually required.
    */
-  /*
-   * sRGB belongs here and nowhere below: GL converts each encoded channel to
-   * linear before the filter weights it, and the linear paths in this unit
-   * blend stored bytes and convert afterwards.  Those are different
-   * functions, so an sRGB image asking for a linear filter is declined rather
-   * than answered with the wrong one.
-   */
-  const bool single_level_nearest_color =
-      descriptor_count == 1 &&
-      (image.format == TextureFormat::kRgba8Unorm ||
-       image.format == TextureFormat::kRgbx8Unorm ||
-       image.format == TextureFormat::kRgba8Srgb ||
-       // ASTC decodes to the same eight-bit texel, so once the block is
-       // expanded the filter sees nothing unusual.
-       image.format == TextureFormat::kAstcLdr ||
-       image.format == TextureFormat::kAstcLdrSrgb) &&
-      image.mip_count == 1 &&
+
+  // One: a format whose texel this unit knows how to produce.
+  const bool decodable_format =
+      image.format == TextureFormat::kRgba8Unorm ||
+      image.format == TextureFormat::kRgbx8Unorm ||
+      image.format == TextureFormat::kRgba8Srgb ||
+      image.format == TextureFormat::kAstcLdr ||
+      image.format == TextureFormat::kAstcLdrSrgb ||
+      image.format == TextureFormat::kZ32Unorm ||
+      image.format == TextureFormat::kZ24UnormS8Uint;
+
+  const bool filters_nearest_only =
       sampler.min_filter == TextureFilter::kNearest &&
       sampler.mag_filter == TextureFilter::kNearest &&
-      sampler.mip_filter == TextureFilter::kNearest &&
-      sampler.max_lod_u4_6 == 0;
-  const bool sequence_depth =
-      image.format == TextureFormat::kZ32Unorm && image.mip_count == 1 &&
-      sampler.min_filter == TextureFilter::kNearest &&
-      sampler.mag_filter == TextureFilter::kNearest &&
-      sampler.mip_filter == TextureFilter::kNearest &&
-      sampler.max_lod_u4_6 == 0;
-  // Depth-as-texture is a single-level image the application filters like any
-  // other: the GLBench fills sample it nearest, bilinear and trilinear.  A
-  // trilinear request on one level resolves to that level, so the LOD range
-  // stays zero whatever the mip filter says.
-  const bool sequence_sampled_depth_stencil =
-      image.format == TextureFormat::kZ24UnormS8Uint && image.mip_count == 1 &&
-      sampler.max_lod_u4_6 == 0;
-  const bool sequence_mipped_color =
-      (image.format == TextureFormat::kRgba8Unorm ||
-       image.format == TextureFormat::kRgbx8Unorm) &&
-      image.mip_count > 1 &&
-      sampler.min_filter == TextureFilter::kLinear &&
-      sampler.mag_filter == TextureFilter::kLinear &&
+      sampler.mip_filter == TextureFilter::kNearest;
+
+  /*
+   * Two: the formats that filter only nearest, and why.
+   *
+   * Z32_UNORM is sampled through SMP.FCNORM, which the datapath restricts to
+   * nearest.  sRGB -- whether stored directly or decoded out of an ASTC block
+   * -- is converted to linear before GL's filter weights it, while the linear
+   * paths here blend stored bytes and convert afterwards.  Those are
+   * different functions, so an sRGB image asking for a linear filter is
+   * declined rather than answered with the wrong arithmetic.
+   */
+  const bool nearest_only_format =
+      image.format == TextureFormat::kZ32Unorm ||
+      image.format == TextureFormat::kRgba8Srgb ||
+      image.format == TextureFormat::kAstcLdrSrgb;
+
+  /*
+   * Three: the sampler's LOD window lies inside the image.
+   *
+   * A sampler may address fewer levels than the image has -- GL_NEAREST on a
+   * mipmapped texture reads level zero and nothing else -- so this is a
+   * containment, not an equality.  Requiring equality is what refused dEQP's
+   * texture.filtering cases, whose images carry a full mip chain while the
+   * sampler clamps the LOD to zero.
+   */
+  const std::uint32_t image_last_lod_u4_6 =
+      (image.mip_count == 0U ? 0U : (image.mip_count - 1U)) * 64U;
+  const bool lod_window_fits =
+      sampler.min_lod_u4_6 == 0 &&
+      sampler.max_lod_u4_6 <= image_last_lod_u4_6;
+
+  /*
+   * Four: what it takes to sample across levels.
+   *
+   * Only one path in this unit visits more than one level -- the mip-linear
+   * one, which picks two levels from the computed LOD and blends them, and
+   * which filters linearly inside each.  Every other path reads
+   * resource.mip[0] outright and never selects a level at all, and none of
+   * them implements GL's rule for choosing between the minification and
+   * magnification filters.
+   *
+   * So while the LOD window covers a single level, any filter combination is
+   * exact: there is no level to choose and no blend to weight.  Past that,
+   * the sample is only what GL asked for when the mip filter is linear and
+   * both image filters are too.  GL_NEAREST_MIPMAP_LINEAR over six levels
+   * would otherwise be answered from the base level with the wrong taps --
+   * guessing that was tried once and moved results away from the reference,
+   * so this declines instead.
+   */
+  const bool one_level_in_range = sampler.max_lod_u4_6 < 64U;
+  const bool filters_across_levels =
       sampler.mip_filter == TextureFilter::kLinear &&
-      sampler.max_lod_u4_6 ==
-          static_cast<std::uint16_t>((image.mip_count - 1U) * 64U);
-  const bool sequence_external =
-      (image.format == TextureFormat::kRgba8Unorm ||
-       image.format == TextureFormat::kRgbx8Unorm) &&
-      image.mip_count == 1 &&
       sampler.min_filter == TextureFilter::kLinear &&
-      sampler.mag_filter == TextureFilter::kLinear &&
-      sampler.mip_filter == TextureFilter::kNearest &&
-      sampler.max_lod_u4_6 == 0;
-  return (single_level_nearest_color || sequence_depth ||
-          sequence_sampled_depth_stencil ||
-          sequence_mipped_color || sequence_external) &&
-         sampler.min_lod_u4_6 == 0 &&
-         (sampler.wrap_u == TextureWrapMode::kClampToEdge ||
-          sampler.wrap_u == TextureWrapMode::kRepeat) &&
-         (sampler.wrap_v == TextureWrapMode::kClampToEdge ||
-          sampler.wrap_v == TextureWrapMode::kRepeat);
+      sampler.mag_filter == TextureFilter::kLinear;
+  const bool level_selection_is_exact =
+      one_level_in_range || filters_across_levels;
+
+  // Five: an address mode the wrap arithmetic implements.
+  const bool supported_wrap =
+      (sampler.wrap_u == TextureWrapMode::kClampToEdge ||
+       sampler.wrap_u == TextureWrapMode::kRepeat) &&
+      (sampler.wrap_v == TextureWrapMode::kClampToEdge ||
+       sampler.wrap_v == TextureWrapMode::kRepeat);
+
+  return decodable_format && lod_window_fits && supported_wrap &&
+         level_selection_is_exact &&
+         (!nearest_only_format || filters_nearest_only);
 }
 
 TextureLinearAxis ComputeTextureLinearRepeat(float coordinate,

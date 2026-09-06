@@ -233,30 +233,56 @@ void CheckDescriptorAndArithmetic() {
               terrain_sampler.wrap_v == TextureWrapMode::kRepeat,
           "bounded sequence mip LOD and repeat sampler are accepted");
   }
-  auto non_step_lod_words = DescriptorDwords(trilinear, 8);
-  std::uint64_t non_step_word0 =
-      static_cast<std::uint64_t>(non_step_lod_words[0]) |
-      (static_cast<std::uint64_t>(non_step_lod_words[1]) << 32U);
-  non_step_word0 &= ~(UINT64_C(0x3ff) << 23U);
-  non_step_word0 |= UINT64_C(385) << 23U;
-  non_step_lod_words[0] = static_cast<std::uint32_t>(non_step_word0);
-  non_step_lod_words[1] = static_cast<std::uint32_t>(non_step_word0 >> 32U);
-  ExpectFailure(
-      [&] { DecodeRogueTextureSamplerDescriptor(non_step_lod_words); },
-      "non-64-step native mip LOD");
+  /*
+   * LOD is U4.6 fixed point, so 385 is 6.015625 -- a value GL_TEXTURE_MAX_LOD
+   * can hold and the sampler can express.  Refusing it was an artifact of the
+   * captures only ever containing whole levels, not a limit.  What the decode
+   * still has to refuse is a window that runs backwards; whether a window
+   * fits the image is the image-and-sampler class's question, checked above.
+   */
+  auto fractional_lod_words = DescriptorDwords(trilinear, 8);
+  std::uint64_t fractional_word0 =
+      static_cast<std::uint64_t>(fractional_lod_words[0]) |
+      (static_cast<std::uint64_t>(fractional_lod_words[1]) << 32U);
+  fractional_word0 &= ~(UINT64_C(0x3ff) << 23U);
+  fractional_word0 |= UINT64_C(385) << 23U;
+  fractional_lod_words[0] = static_cast<std::uint32_t>(fractional_word0);
+  fractional_lod_words[1] = static_cast<std::uint32_t>(fractional_word0 >> 32U);
+  Check(DecodeRogueTextureSamplerDescriptor(fractional_lod_words)
+                .max_lod_u4_6 == 385,
+        "a fractional mip LOD decodes");
 
-  auto excessive_lod_words = DescriptorDwords(trilinear, 8);
-  std::uint64_t excessive_lod_word0 =
-      static_cast<std::uint64_t>(excessive_lod_words[0]) |
-      (static_cast<std::uint64_t>(excessive_lod_words[1]) << 32U);
-  excessive_lod_word0 &= ~(UINT64_C(0x3ff) << 23U);
-  excessive_lod_word0 |= UINT64_C(704) << 23U;
-  excessive_lod_words[0] = static_cast<std::uint32_t>(excessive_lod_word0);
-  excessive_lod_words[1] =
-      static_cast<std::uint32_t>(excessive_lod_word0 >> 32U);
+  auto inverted_lod_words = DescriptorDwords(trilinear, 8);
+  std::uint64_t inverted_word0 =
+      static_cast<std::uint64_t>(inverted_lod_words[0]) |
+      (static_cast<std::uint64_t>(inverted_lod_words[1]) << 32U);
+  inverted_word0 &= ~(UINT64_C(0x3ff) << 23U);   // max lod -> 64
+  inverted_word0 |= UINT64_C(64) << 23U;
+  inverted_word0 &= ~(UINT64_C(0x3ff) << 13U);   // min lod -> 128
+  inverted_word0 |= UINT64_C(128) << 13U;
+  inverted_lod_words[0] = static_cast<std::uint32_t>(inverted_word0);
+  inverted_lod_words[1] = static_cast<std::uint32_t>(inverted_word0 >> 32U);
   ExpectFailure(
-      [&] { DecodeRogueTextureSamplerDescriptor(excessive_lod_words); },
-      "sequence mip LOD above the Refract 800 ceiling");
+      [&] { DecodeRogueTextureSamplerDescriptor(inverted_lod_words); },
+      "an inverted mip LOD window");
+
+  /*
+   * 704 is eleven levels.  The old ceiling here was the largest LOD the
+   * captured workloads used, which says nothing about what the field or the
+   * sampler can express -- an image with twelve levels wants exactly this.
+   * Whether the image has them is checked against the image, not here.
+   */
+  auto deep_lod_words = DescriptorDwords(trilinear, 8);
+  std::uint64_t deep_lod_word0 =
+      static_cast<std::uint64_t>(deep_lod_words[0]) |
+      (static_cast<std::uint64_t>(deep_lod_words[1]) << 32U);
+  deep_lod_word0 &= ~(UINT64_C(0x3ff) << 23U);
+  deep_lod_word0 |= UINT64_C(704) << 23U;
+  deep_lod_words[0] = static_cast<std::uint32_t>(deep_lod_word0);
+  deep_lod_words[1] = static_cast<std::uint32_t>(deep_lod_word0 >> 32U);
+  Check(DecodeRogueTextureSamplerDescriptor(deep_lod_words).max_lod_u4_6 ==
+            704,
+        "a deep mip LOD decodes");
 
   // Terrain D3's real external resources are ten-level RGBX8 chains.  Pin
   // the exact address-zero producer words, then relocate IMAGE_WORD1 exactly
@@ -288,11 +314,23 @@ void CheckDescriptorAndArithmetic() {
             DriverPcoTextureDescriptorClassSupported(
                 terrain_d3_image, terrain_d3_sampler, 5),
         "Terrain D3 real RGBX8 mip-linear descriptor class");
+  /*
+   * The LOD window has to lie inside the image, not equal it.  A sampler may
+   * address fewer levels than the image carries -- GL_TEXTURE_MAX_LOD, or a
+   * non-mipmapping filter on a mipmapped texture -- so 512 over a ten-level
+   * image is levels 0..8 and is a request the unit can serve.  What stays
+   * fail-closed is a window reaching past the last level the image has.
+   */
+  RogueTextureSamplerDescriptor clamped_terrain_lod = terrain_d3_sampler;
+  clamped_terrain_lod.max_lod_u4_6 = 512;
+  Check(DriverPcoTextureDescriptorClassSupported(
+            terrain_d3_image, clamped_terrain_lod, 5),
+        "Terrain D3 accepts a LOD window inside the image");
   RogueTextureSamplerDescriptor wrong_terrain_lod = terrain_d3_sampler;
-  wrong_terrain_lod.max_lod_u4_6 = 512;
+  wrong_terrain_lod.max_lod_u4_6 = 640;
   Check(!DriverPcoTextureDescriptorClassSupported(
             terrain_d3_image, wrong_terrain_lod, 5),
-        "Terrain D3 mip count and LOD clamp remain fail-closed");
+        "Terrain D3 refuses a LOD window past the last level");
   RogueTextureImageDescriptor mipped_depth = terrain_d3_image;
   mipped_depth.format = TextureFormat::kZ32Unorm;
   Check(!DriverPcoTextureDescriptorClassSupported(

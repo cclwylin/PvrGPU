@@ -1,5 +1,6 @@
 #include "model_runner.h"
 #include "texture/astc_decoder.h"
+#include "texture/texture_unit.h"
 #include "pco_sequence_profiles.h"
 #include "pvrgpu_systemc_api.h"
 #include "shader/pco_iss.h"
@@ -1336,18 +1337,36 @@ bool CopyPcoSequenceTexture(
   std::uint32_t block_width = 1U;
   std::uint32_t block_height = 1U;
   std::uint32_t block_bytes = 0U;
+  pvrgpu::stub::TextureFormat texture_format =
+      pvrgpu::stub::TextureFormat::kRgba8Unorm;
   if (format == "PIPE_FORMAT_R8G8B8A8_UNORM" ||
       format == "PIPE_FORMAT_R8G8B8X8_UNORM" ||
       format == "PIPE_FORMAT_R8G8B8A8_SRGB" ||
       format == "PIPE_FORMAT_Z32_UNORM" ||
       format == "PIPE_FORMAT_Z24_UNORM_S8_UINT") {
     block_bytes = 4U;
+    texture_format =
+        format == "PIPE_FORMAT_R8G8B8X8_UNORM"
+            ? pvrgpu::stub::TextureFormat::kRgbx8Unorm
+        : format == "PIPE_FORMAT_R8G8B8A8_SRGB"
+            ? pvrgpu::stub::TextureFormat::kRgba8Srgb
+        : format == "PIPE_FORMAT_Z32_UNORM"
+            ? pvrgpu::stub::TextureFormat::kZ32Unorm
+        : format == "PIPE_FORMAT_Z24_UNORM_S8_UINT"
+            ? pvrgpu::stub::TextureFormat::kZ24UnormS8Uint
+            : pvrgpu::stub::TextureFormat::kRgba8Unorm;
   } else {
     for (const TextureStorageBlock &block : kAstcBlocks) {
       if (format == block.format) {
         block_width = block.width;
         block_height = block.height;
         block_bytes = 16U;  // every ASTC block is 128 bits
+        texture_format =
+            std::string_view(block.format).size() > 5 &&
+                    std::string_view(block.format).substr(
+                        std::string_view(block.format).size() - 5) == "_SRGB"
+                ? pvrgpu::stub::TextureFormat::kAstcLdrSrgb
+                : pvrgpu::stub::TextureFormat::kAstcLdr;
         break;
       }
     }
@@ -1436,6 +1455,57 @@ bool CopyPcoSequenceTexture(
         source.bytes_size != source.declared_bytes_size) {
       *error = "SystemC API external PCO sequence texture payload is invalid";
       return false;
+    }
+    /*
+     * Decline anything the texture unit cannot sample, here, before the draw
+     * is claimed.
+     *
+     * The capability question has one answer, and it lives in
+     * DriverPcoTextureDescriptorClassSupported.  Asking it from here as well
+     * turns what would be a fatal exception in the middle of SampleRun -- a
+     * killed process and a NoResult that tells nobody anything -- into a
+     * named refusal the driver can act on.
+     */
+    {
+      pvrgpu::stub::RogueTextureImageDescriptor probe_image;
+      probe_image.width = source.mip[0].width;
+      probe_image.height = source.mip[0].height;
+      probe_image.row_pitch_bytes = source.mip[0].row_pitch;
+      probe_image.mip_count = static_cast<std::uint8_t>(source.mip_count);
+      probe_image.format = texture_format;
+      pvrgpu::stub::RogueTextureSamplerDescriptor probe_sampler;
+      probe_sampler.min_filter = static_cast<pvrgpu::stub::TextureFilter>(
+          source.min_filter);
+      probe_sampler.mag_filter = static_cast<pvrgpu::stub::TextureFilter>(
+          source.mag_filter);
+      probe_sampler.mip_filter = static_cast<pvrgpu::stub::TextureFilter>(
+          source.mip_filter);
+      probe_sampler.wrap_u = static_cast<pvrgpu::stub::TextureWrapMode>(
+          source.wrap_u == PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT
+              ? pvrgpu::stub::TextureWrapMode::kRepeat
+              : pvrgpu::stub::TextureWrapMode::kClampToEdge);
+      probe_sampler.wrap_v = static_cast<pvrgpu::stub::TextureWrapMode>(
+          source.wrap_v == PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT
+              ? pvrgpu::stub::TextureWrapMode::kRepeat
+              : pvrgpu::stub::TextureWrapMode::kClampToEdge);
+      probe_sampler.min_lod_u4_6 =
+          static_cast<std::uint16_t>(source.min_lod_u4_6);
+      probe_sampler.max_lod_u4_6 =
+          static_cast<std::uint16_t>(source.max_lod_u4_6);
+      probe_sampler.normalized_coordinates = 1;
+      if (!pvrgpu::stub::DriverPcoTextureDescriptorClassSupported(
+              probe_image, probe_sampler, 1U)) {
+        *error =
+            std::string("SystemC API PCO sequence texture cannot be sampled: "
+                        "format=") + std::string(format) +
+            " mips=" + std::to_string(source.mip_count) +
+            " filters=" + std::to_string(source.min_filter) + "/" +
+            std::to_string(source.mag_filter) + "/" +
+            std::to_string(source.mip_filter) +
+            " lod=" + std::to_string(source.min_lod_u4_6) + ".." +
+            std::to_string(source.max_lod_u4_6);
+        return false;
+      }
     }
     /*
      * Decline a compressed texture the decoder cannot read, here, before the
