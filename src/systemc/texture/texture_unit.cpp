@@ -237,6 +237,56 @@ TextureWrapMode DecodeWrapMode(std::uint64_t encoded) {
   }
 }
 
+// Projects a cube direction to the face it points at (GL order +X,-X,+Y,-Y,
+// +Z,-Z, the layer order the capture stored) and the normalized face
+// coordinate within it -- tcu selectCubeFace + projectToFace.
+struct CubeProjection {
+  std::uint32_t face;
+  float u;
+  float v;
+};
+inline CubeProjection ProjectCubeDirection(float rx, float ry, float rz) {
+  const float ax = std::fabs(rx);
+  const float ay = std::fabs(ry);
+  const float az = std::fabs(rz);
+  float ma = az;
+  float sc = rz >= 0.0F ? rx : -rx;
+  float tc = -ry;
+  std::uint32_t face = rz >= 0.0F ? 4U : 5U;
+  if (ax >= ay && ax >= az) {
+    ma = ax;
+    sc = rx >= 0.0F ? -rz : rz;
+    tc = -ry;
+    face = rx >= 0.0F ? 0U : 1U;
+  } else if (ay >= az) {
+    ma = ay;
+    sc = rx;
+    tc = ry >= 0.0F ? rz : -rz;
+    face = ry >= 0.0F ? 2U : 3U;
+  }
+  return CubeProjection{face, 0.5F * (sc / ma + 1.0F), 0.5F * (tc / ma + 1.0F)};
+}
+
+// Projects a direction onto a *given* face (tcu projectToFace), the [0,1] face
+// coordinate possibly leaving the face.  The cube LOD projects a quad's four
+// lanes onto one face so the derivative stays smooth where the quad straddles
+// a face edge and the per-lane selected face would jump.
+inline std::array<float, 2> ProjectCubeToFace(std::uint32_t face, float rx,
+                                              float ry, float rz) {
+  float sc = 0.0F;
+  float tc = 0.0F;
+  float ma = 1.0F;
+  switch (face) {
+  case 0: sc = -rz; tc = -ry; ma = rx; break;   // +X
+  case 1: sc = rz;  tc = -ry; ma = -rx; break;  // -X
+  case 2: sc = rx;  tc = rz;  ma = ry; break;   // +Y
+  case 3: sc = rx;  tc = -rz; ma = -ry; break;  // -Y
+  case 4: sc = rx;  tc = -ry; ma = rz; break;   // +Z
+  default: sc = -rx; tc = -ry; ma = -rz; break; // -Z
+  }
+  return {0.5F * (sc / ma + 1.0F), 0.5F * (tc / ma + 1.0F)};
+}
+
 // A seamless cube filter's bilinear tap can leave the base face by one texel;
 // this returns the face and integer coordinate the neighbouring face contributes
 // instead (a port of tcu's remapCubeEdgeCoords, in GL face order
@@ -1004,8 +1054,27 @@ void TextureUnit::SampleRunForStage(
           if (request.quad_id != quad_id || request.quad_lane != lane)
             throw std::runtime_error(
                 "TextureUnit LOD request lost 2x2 quad identity");
-          coordinates[lane][0] = BitsFloat(request.coordinates[0]);
-          coordinates[lane][1] = BitsFloat(request.coordinates[1]);
+          if (resource.dimension_type == TextureDimensionType::kCube) {
+            // The cube LOD comes from the derivatives of the projected face
+            // coordinate, not the raw direction.  Project every lane onto the
+            // face the first lane selects so the derivative stays smooth where
+            // the quad straddles a face edge (the per-lane face would jump and
+            // blow the LOD up to a coarse level).
+            const std::uint32_t lod_face =
+                ProjectCubeDirection(BitsFloat(requests[first].coordinates[0]),
+                                     BitsFloat(requests[first].coordinates[1]),
+                                     BitsFloat(requests[first].coordinates[2]))
+                    .face;
+            const std::array<float, 2> uv = ProjectCubeToFace(
+                lod_face, BitsFloat(request.coordinates[0]),
+                BitsFloat(request.coordinates[1]),
+                BitsFloat(request.coordinates[2]));
+            coordinates[lane][0] = uv[0];
+            coordinates[lane][1] = uv[1];
+          } else {
+            coordinates[lane][0] = BitsFloat(request.coordinates[0]);
+            coordinates[lane][1] = BitsFloat(request.coordinates[1]);
+          }
         }
         const TextureImplicitLod lod =
             ComputeTextureImplicitLod(coordinates, image, decoded_sampler);
@@ -1348,31 +1417,14 @@ void TextureUnit::SampleRunForStage(
       float plane_t = BitsFloat(request.coordinates[1]);
       std::uint32_t cube_face = 0U;
       if (cube_texture) {
-        const float rx = BitsFloat(request.coordinates[0]);
-        const float ry = BitsFloat(request.coordinates[1]);
-        const float rz = BitsFloat(request.coordinates[2]);
-        const float ax = std::fabs(rx);
-        const float ay = std::fabs(ry);
-        const float az = std::fabs(rz);
-        float ma = az;
-        float sc = rz >= 0.0F ? rx : -rx;
-        float tc = -ry;
-        std::uint32_t face = rz >= 0.0F ? 4U : 5U;
-        if (ax >= ay && ax >= az) {
-          ma = ax;
-          sc = rx >= 0.0F ? -rz : rz;
-          tc = -ry;
-          face = rx >= 0.0F ? 0U : 1U;
-        } else if (ay >= az) {
-          ma = ay;
-          sc = rx;
-          tc = ry >= 0.0F ? rz : -rz;
-          face = ry >= 0.0F ? 2U : 3U;
-        }
-        plane_s = 0.5F * (sc / ma + 1.0F);
-        plane_t = 0.5F * (tc / ma + 1.0F);
-        selected_layer = face;
-        cube_face = face;
+        const CubeProjection projection = ProjectCubeDirection(
+            BitsFloat(request.coordinates[0]),
+            BitsFloat(request.coordinates[1]),
+            BitsFloat(request.coordinates[2]));
+        plane_s = projection.u;
+        plane_t = projection.v;
+        selected_layer = projection.face;
+        cube_face = projection.face;
       }
       const bool astc_image = image.format == TextureFormat::kAstcLdr ||
                               image.format == TextureFormat::kAstcLdrSrgb;
