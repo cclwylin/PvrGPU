@@ -116,6 +116,7 @@ add_executable(pvrgpu-model-stub
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp
     src/systemc/shader/usc_slot.cpp
+    src/systemc/texture/astc_decoder.cpp
     src/systemc/texture/texture_unit.cpp
 )
 target_include_directories(pvrgpu-model-stub PRIVATE
@@ -177,6 +178,7 @@ add_library(pvrgpu-systemc-bridge SHARED
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp
     src/systemc/shader/usc_slot.cpp
+    src/systemc/texture/astc_decoder.cpp
     src/systemc/texture/texture_unit.cpp
 )
 set_target_properties(pvrgpu-systemc-bridge PROPERTIES
@@ -471,6 +473,7 @@ add_executable(texture-unit-test
     src/systemc/common/functional_types.cpp
     src/systemc/common/glbench_texture_fixture.cpp
     src/systemc/common/pipeline_state.cpp
+    src/systemc/texture/astc_decoder.cpp
     src/systemc/texture/texture_unit.cpp
 )
 target_include_directories(texture-unit-test PRIVATE
@@ -481,6 +484,19 @@ target_include_directories(texture-unit-test PRIVATE
 target_link_libraries(texture-unit-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(texture-unit-test)
 add_test(NAME texture-unit-unit COMMAND texture-unit-test)
+
+add_executable(astc-decoder-test
+    tests/astc_decoder_test.cpp
+    src/systemc/texture/astc_decoder.cpp
+)
+target_include_directories(astc-decoder-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(astc-decoder-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(astc-decoder-test)
+add_test(NAME astc-decoder-unit COMMAND astc-decoder-test)
 
 add_executable(usc-cluster-texture-continuation-test
     tests/usc_cluster_texture_continuation_test.cpp
@@ -566,6 +582,7 @@ add_executable(ordered-blend-pipeline-test
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp
     src/systemc/shader/usc_slot.cpp
+    src/systemc/texture/astc_decoder.cpp
     src/systemc/texture/texture_unit.cpp
 )
 target_include_directories(ordered-blend-pipeline-test PRIVATE
@@ -786,6 +803,7 @@ add_executable(varyings-shader-one-pipeline-test
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp
     src/systemc/shader/usc_slot.cpp
+    src/systemc/texture/astc_decoder.cpp
     src/systemc/texture/texture_unit.cpp
 )
 target_include_directories(varyings-shader-one-pipeline-test PRIVATE
@@ -832,6 +850,7 @@ add_executable(varyings-shader-two-pipeline-test
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp
     src/systemc/shader/usc_slot.cpp
+    src/systemc/texture/astc_decoder.cpp
     src/systemc/texture/texture_unit.cpp
 )
 target_include_directories(varyings-shader-two-pipeline-test PRIVATE
@@ -901,6 +920,7 @@ add_executable(varyings-shader-four-pipeline-test
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp
     src/systemc/shader/usc_slot.cpp
+    src/systemc/texture/astc_decoder.cpp
     src/systemc/texture/texture_unit.cpp
 )
 target_include_directories(varyings-shader-four-pipeline-test PRIVATE
@@ -970,6 +990,7 @@ add_executable(varyings-shader-eight-pipeline-test
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp
     src/systemc/shader/usc_slot.cpp
+    src/systemc/texture/astc_decoder.cpp
     src/systemc/texture/texture_unit.cpp
 )
 target_include_directories(varyings-shader-eight-pipeline-test PRIVATE
