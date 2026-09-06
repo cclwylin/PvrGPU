@@ -4464,7 +4464,10 @@ void TestDecodeAndExecuteIdeasLogicalAnd() {
         "Ideas LOGICAL.AND executes an exact 32-bit Boolean conjunction");
 
   auto mutation = fragment_binary;
-  mutation[27] ^= 0x01;
+  // 0x41 (AND) ^ 0x01 = 0x40 is now LOGICAL.OR, a supported op, so mutate the
+  // op selector's low bits to 0x45 -- a logical op outside {or, and, xnor} --
+  // which stays fail-closed.
+  mutation[27] ^= 0x04;
   ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, mutation); },
                 "Ideas LOGICAL.AND phase-1 opcode mutation");
   mutation = fragment_binary;

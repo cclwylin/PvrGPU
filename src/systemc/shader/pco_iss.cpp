@@ -1605,6 +1605,13 @@ PcoInstruction DecodeGenericSimpleAluGroup(
     opcode = PcoOpcode::kFloatMadNegateSource0Source2;
     source_count = 3;
     break;
+  case 0xe2:
+    // IMADD32: s0 * s1 + s2 in 32-bit integer arithmetic.  The array-index
+    // lowering multiplies the clamped layer by the per-layer stride and adds
+    // the mip base to form the texture address offset.
+    opcode = PcoOpcode::kIntegerMultiplyAdd32;
+    source_count = 3;
+    break;
   case 0x9c: {
     /*
      * UNPCK's format selector, as the compiler's own PCO_PCK_FORMAT_* values:
@@ -1768,6 +1775,11 @@ PcoInstruction DecodeGenericPackHalfGroup(
     opcode = PcoOpcode::kFloatPackHalfRtne;
   else if (rounding == 0x4eU)
     opcode = PcoOpcode::kFloatPackHalfRtz;
+  else if ((rounding & 0x1fU) == 0x07U)
+    // PCK.S32: binary32 -> signed int32.  Bit 6 selects round-toward-zero;
+    // its absence is round-to-nearest-even, which is what f2i32_rtne needs.
+    opcode = (rounding & 0x40U) ? PcoOpcode::kFloatToInt32Rtz
+                                : PcoOpcode::kFloatToInt32Rtne;
   else {
     if (std::getenv("PVRGPU_PCO_DECODE_DUMP")) {
       std::cerr << "PCO_DECODE_DUMP PCK.F16F16 rounding=0x" << std::hex
@@ -1826,11 +1838,28 @@ PcoInstruction DecodeGenericFloatMaxGroup(
   }
   const std::size_t group_end = header.offset + header.total_bytes;
   std::size_t cursor = header.offset + 3;
-  constexpr std::uint8_t kCanonicalPhases[] = {0xd0, 0x3c, 0xfa,
-                                               0x10, 0x87, 0x87};
-  for (std::uint8_t expected : kCanonicalPhases) {
+  // TST.G + MOVC: the greater of the two sources.  The MOVC phase byte's type
+  // is 0x10 for a float compare and 0xd0 for a signed-int one -- the same
+  // datapath, a different comparison, which is what distinguishes the array
+  // layer's integer clamp (max(0, ...)) from glmark's float max.
+  constexpr std::uint8_t kLeadPhases[] = {0xd0, 0x3c, 0xfa};
+  for (std::uint8_t expected : kLeadPhases) {
     if (cursor >= group_end || binary[cursor++] != expected)
       DecodeError(cursor - 1, "unsupported TST/MOVC FMAX phase sequence");
+  }
+  PcoOpcode max_opcode;
+  if (cursor >= group_end)
+    DecodeError(cursor, "truncated TST/MOVC max phase");
+  const std::uint8_t movc_type = binary[cursor++];
+  if (movc_type == 0x10U)
+    max_opcode = PcoOpcode::kFloatMax;
+  else if (movc_type == 0xd0U)
+    max_opcode = PcoOpcode::kIntegerMaxSigned;
+  else
+    DecodeError(cursor - 1, "unsupported TST/MOVC max type");
+  for (std::uint8_t expected : {0x87U, 0x87U}) {
+    if (cursor >= group_end || binary[cursor++] != expected)
+      DecodeError(cursor - 1, "unsupported TST/MOVC max source selector");
   }
   const PcoRegisterRef source0 =
       DecodeOneLowerSource(binary, group_end, cursor);
@@ -1845,7 +1874,7 @@ PcoInstruction DecodeGenericFloatMaxGroup(
   ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
 
   PcoInstruction instruction;
-  instruction.opcode = PcoOpcode::kFloatMax;
+  instruction.opcode = max_opcode;
   instruction.target = destination.target;
   instruction.source = source0;
   instruction.source1 = source1;
@@ -1873,12 +1902,24 @@ PcoInstruction DecodeGenericFloatMinGroup(
   }
   const std::size_t group_end = header.offset + header.total_bytes;
   std::size_t cursor = header.offset + 3;
-  constexpr std::uint8_t kCanonicalPhases[] = {
-      0xd0, 0x3c, 0xf0, 0x11, 0x87, 0x87,
-  };
-  for (std::uint8_t expected : kCanonicalPhases) {
+  constexpr std::uint8_t kLeadPhases[] = {0xd0, 0x3c, 0xf0};
+  for (std::uint8_t expected : kLeadPhases) {
     if (cursor >= group_end || binary[cursor++] != expected)
       DecodeError(cursor - 1, "unsupported TST/MOVC FMIN phase sequence");
+  }
+  PcoOpcode min_opcode;
+  if (cursor >= group_end)
+    DecodeError(cursor, "truncated TST/MOVC min phase");
+  const std::uint8_t movc_type = binary[cursor++];
+  if (movc_type == 0x11U)
+    min_opcode = PcoOpcode::kFloatMin;
+  else if (movc_type == 0xd1U)
+    min_opcode = PcoOpcode::kIntegerMinSigned;
+  else
+    DecodeError(cursor - 1, "unsupported TST/MOVC min type");
+  for (std::uint8_t expected : {0x87U, 0x87U}) {
+    if (cursor >= group_end || binary[cursor++] != expected)
+      DecodeError(cursor - 1, "unsupported TST/MOVC min source selector");
   }
   const PcoRegisterRef source0 =
       DecodeOneLowerSource(binary, group_end, cursor);
@@ -1893,7 +1934,7 @@ PcoInstruction DecodeGenericFloatMinGroup(
   ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
 
   PcoInstruction instruction;
-  instruction.opcode = PcoOpcode::kFloatMin;
+  instruction.opcode = min_opcode;
   instruction.target = destination.target;
   instruction.source = source0;
   instruction.source1 = source1;
@@ -2411,6 +2452,57 @@ PcoInstruction DecodeGenericBitwiseAndGroup(
   return instruction;
 }
 
+/* LOGICAL.OR: the same two-phase form as LOGICAL.AND (p0 bbyp0s1, p1 the
+ * logical op) with the op selector's low three bits 000 rather than 001.  The
+ * array-index computation ORs partial fields of the packed layer together.
+ * A masked OR (mska/mskb set, F_LOGICAL_OP bits 3 and 5) is a different, wider
+ * form handled elsewhere; this covers the plain two-source OR. */
+PcoInstruction DecodeGenericBitwiseOrGroup(
+    ShaderStage stage, const std::vector<std::uint8_t> &binary,
+    const GroupHeader &header, std::uint16_t group_index) {
+  if (stage != ShaderStage::kFragment || !header.bitwise || header.control ||
+      header.da != 5 || header.operation_origin != 3 ||
+      header.output_load_check || !header.write0_present ||
+      header.write1_present || header.repeat_count != 1 || header.end ||
+      header.total_bytes != 12) {
+    DecodeError(header.offset,
+                "unsupported LOGICAL.OR instruction-group header");
+  }
+  const std::size_t group_end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  if (group_end - cursor < 8 || binary[cursor++] != 0x40U)
+    DecodeError(header.offset + 3, "expected LOGICAL.OR phase-1 operation");
+  if (binary[cursor++] != 0x02U)
+    DecodeError(header.offset + 4, "expected BBYP0S1 phase-0 operation");
+  if (binary[cursor++] != 0x80U || binary[cursor++] != 0x40U ||
+      binary[cursor++] != 0x00U) {
+    DecodeError(header.offset + 5,
+                "LOGICAL.OR lower-source selector is not canonical");
+  }
+  const PcoRegisterRef source0 =
+      DecodeOneLowerSource(binary, group_end, cursor);
+  const PcoRegisterRef source1 =
+      DecodeOneLowerSource(binary, group_end, cursor);
+  const DecodedDestination destination =
+      DecodeGenericDestination(binary, group_end, cursor);
+  if (destination.target != PcoWriteTarget::kTemporary)
+    DecodeError(header.offset, "LOGICAL.OR destination must be temporary");
+  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
+
+  PcoInstruction instruction;
+  instruction.opcode = PcoOpcode::kBitwiseOr;
+  instruction.target = destination.target;
+  instruction.source = source0;
+  instruction.source1 = source1;
+  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
+  instruction.group_index = group_index;
+  instruction.output_index = destination.index;
+  instruction.source_count = 2;
+  instruction.repeat_count = 1;
+  instruction.end_group = 0;
+  return instruction;
+}
+
 PcoInstruction DecodeGenericBitwiseXnorGroup(
     ShaderStage stage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
@@ -2494,19 +2586,25 @@ PcoInstruction DecodeGenericBitwiseXnorGroup(
 /* SHR: the bitwise ALU running phases 0 and 2.  Phase 0 bypasses the value
  * into the shifter (BBYP0BM with both count and bitmask bypassed) and phase 2
  * shifts it right by the upper source. */
-PcoInstruction DecodeGenericShiftRightGroup(
+PcoInstruction DecodeGenericShiftGroup(
     ShaderStage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
   if (!header.bitwise || header.control || header.da != 5 ||
       header.operation_origin != 5 || header.output_load_check ||
       !header.write0_present || header.write1_present ||
       header.repeat_count != 1 || header.end || header.total_bytes != 10) {
-    DecodeError(header.offset, "unsupported SHR instruction-group header");
+    DecodeError(header.offset, "unsupported shift instruction-group header");
   }
   const std::size_t group_end = header.offset + header.total_bytes;
   std::size_t cursor = header.offset + 3;
-  if (binary[cursor++] != 0x01U)
-    DecodeError(header.offset + 3, "expected the phase-2 SHR operation");
+  // F_SHIFT2_OP: lsl=0b000, shr=0b001.  Both are the same shifter datapath
+  // (BBYP0BM feed in phase 0, the shift in phase 2); only the direction and
+  // the decoded opcode differ.  The array-index computation left-shifts.
+  const std::uint8_t shift_op = binary[cursor++];
+  if (shift_op != 0x00U && shift_op != 0x01U)
+    DecodeError(header.offset + 3, "expected a phase-2 LSL or SHR operation");
+  const PcoOpcode shift_opcode =
+      shift_op == 0x00U ? PcoOpcode::kShiftLeft : PcoOpcode::kShiftRight;
   if (binary[cursor++] != 0x02U)
     DecodeError(header.offset + 4, "expected the phase-0 BBYP0BM operation");
 
@@ -2515,17 +2613,17 @@ PcoInstruction DecodeGenericShiftRightGroup(
       DecodeTwoLowerSources(binary, group_end, cursor);
   if (lower.source0.bank != PcoRegisterBank::kSpecial ||
       lower.source0.index != kSpecialConstantZero) {
-    DecodeError(header.offset, "SHR bitmask feed is not the canonical sc0");
+    DecodeError(header.offset, "shift bitmask feed is not the canonical sc0");
   }
 
   /* Upper sources 2up_1b6i_1b5i: s3 is unused and s4 is the shift count. */
   if (group_end - cursor < 3)
-    DecodeError(cursor, "truncated SHR upper-source encoding");
+    DecodeError(cursor, "truncated shift upper-source encoding");
   if (binary[cursor++] != 0x80U)
-    DecodeError(cursor - 1, "SHR upper source s3 is not the canonical sc0");
+    DecodeError(cursor - 1, "shift upper source s3 is not the canonical sc0");
   const std::uint8_t count_byte = binary[cursor++];
   if ((count_byte & 0xc0U) != 0x80U)
-    DecodeError(cursor - 1, "unsupported SHR upper-source selector");
+    DecodeError(cursor - 1, "unsupported shift upper-source selector");
   PcoRegisterRef count;
   count.bank =
       static_cast<PcoRegisterBank>((count_byte >> 5U) & 1U);
@@ -2535,11 +2633,11 @@ PcoInstruction DecodeGenericShiftRightGroup(
   const DecodedDestination destination =
       DecodeGenericDestination(binary, group_end, cursor);
   if (destination.target != PcoWriteTarget::kTemporary)
-    DecodeError(header.offset, "SHR destination must be temporary");
+    DecodeError(header.offset, "shift destination must be temporary");
   ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
 
   PcoInstruction instruction;
-  instruction.opcode = PcoOpcode::kShiftRight;
+  instruction.opcode = shift_opcode;
   instruction.target = destination.target;
   instruction.source = lower.source1;
   instruction.source1 = count;
@@ -2661,6 +2759,10 @@ PcoInstruction DecodeFragmentGroup(const std::vector<std::uint8_t> &binary,
       const std::size_t operation_offset = header.offset + 3;
       if (operation_offset >= header.offset + header.total_bytes)
         DecodeError(operation_offset, "missing logical phase operation");
+      if (binary[operation_offset] == 0x40U) {
+        return DecodeGenericBitwiseOrGroup(ShaderStage::kFragment, binary,
+                                           header, group_index);
+      }
       if (binary[operation_offset] == 0x41U) {
         return DecodeGenericBitwiseAndGroup(ShaderStage::kFragment, binary,
                                             header, group_index);
@@ -2676,9 +2778,10 @@ PcoInstruction DecodeFragmentGroup(const std::vector<std::uint8_t> &binary,
       const std::size_t operation_offset = header.offset + 3;
       if (operation_offset >= header.offset + header.total_bytes)
         DecodeError(operation_offset, "missing phase-2 bitwise operation");
-      if (binary[operation_offset] == 0x01U) {
-        return DecodeGenericShiftRightGroup(ShaderStage::kFragment, binary,
-                                            header, group_index);
+      if (binary[operation_offset] == 0x00U ||
+          binary[operation_offset] == 0x01U) {
+        return DecodeGenericShiftGroup(ShaderStage::kFragment, binary,
+                                       header, group_index);
       }
       DecodeError(operation_offset,
                   "phase-2 bitwise operation is outside the public subset");
@@ -3404,6 +3507,8 @@ void ValidateVertexTemporaryProgram(
     case PcoOpcode::kFloatExp2:
     case PcoOpcode::kFloatPackHalfRtne:
     case PcoOpcode::kFloatPackHalfRtz:
+    case PcoOpcode::kFloatToInt32Rtne:
+    case PcoOpcode::kFloatToInt32Rtz:
     case PcoOpcode::kFloatUnpackHalf:
     case PcoOpcode::kUnpackUnsignedToFloat:
     case PcoOpcode::kUnpackSignedToFloat:
@@ -3417,6 +3522,8 @@ void ValidateVertexTemporaryProgram(
     case PcoOpcode::kFloatMultiply:
     case PcoOpcode::kFloatMin:
     case PcoOpcode::kFloatMax:
+    case PcoOpcode::kIntegerMaxSigned:
+    case PcoOpcode::kIntegerMinSigned:
     case PcoOpcode::kFloatEqual:
     case PcoOpcode::kFloatGreaterEqual:
     case PcoOpcode::kFloatLess:
@@ -3629,6 +3736,8 @@ void ValidateFragmentProgram(
     case PcoOpcode::kFloatExp2:
     case PcoOpcode::kFloatPackHalfRtne:
     case PcoOpcode::kFloatPackHalfRtz:
+    case PcoOpcode::kFloatToInt32Rtne:
+    case PcoOpcode::kFloatToInt32Rtz:
     case PcoOpcode::kFloatUnpackHalf:
     case PcoOpcode::kUnpackUnsignedToFloat:
     case PcoOpcode::kUnpackSignedToFloat:
@@ -3641,12 +3750,16 @@ void ValidateFragmentProgram(
     case PcoOpcode::kFloatMultiply:
     case PcoOpcode::kFloatMin:
     case PcoOpcode::kFloatMax:
+    case PcoOpcode::kIntegerMaxSigned:
+    case PcoOpcode::kIntegerMinSigned:
     case PcoOpcode::kFloatEqual:
     case PcoOpcode::kFloatGreaterEqual:
     case PcoOpcode::kFloatLess:
     case PcoOpcode::kBitwiseAnd:
+    case PcoOpcode::kBitwiseOr:
     case PcoOpcode::kBitwiseXnor:
     case PcoOpcode::kShiftRight:
+    case PcoOpcode::kShiftLeft:
       writes_temporary = instruction.target == PcoWriteTarget::kTemporary &&
                          instruction.source_count == 2;
       break;
@@ -3654,6 +3767,7 @@ void ValidateFragmentProgram(
     case PcoOpcode::kFloatMadNegateSource2:
     case PcoOpcode::kFloatMadNegateSource0:
     case PcoOpcode::kFloatMadNegateSource0Source2:
+    case PcoOpcode::kIntegerMultiplyAdd32:
     case PcoOpcode::kConditionalSelect:
     case PcoOpcode::kConditionalSelectNegateTrue:
     case PcoOpcode::kConditionalSelectGreaterZero:
@@ -3770,6 +3884,27 @@ std::uint32_t FloatFromSigned(std::int32_t value) {
           ? UINT32_C(0x80000000)
           : static_cast<std::uint32_t>(-value);
   return FloatFromUnsigned(magnitude) | UINT32_C(0x80000000);
+}
+
+// PCK.S32: convert a binary32 to a signed 32-bit integer.  Round to nearest
+// even (rtz=false) or toward zero (rtz=true), saturating to the int32 range;
+// a NaN converts to zero.  This is nir_f2i32_rtne, which the array-index
+// lowering applies to the layer coordinate before the sample.
+std::uint32_t FloatToInt32Bits(std::uint32_t value_bits, bool round_to_zero) {
+  float value;
+  std::memcpy(&value, &value_bits, sizeof(value));
+  if (std::isnan(value))
+    return 0U;
+  const float rounded =
+      round_to_zero ? std::trunc(value) : std::nearbyint(value);
+  std::int32_t result;
+  if (rounded >= 2147483647.0F)
+    result = std::numeric_limits<std::int32_t>::max();
+  else if (rounded <= -2147483648.0F)
+    result = std::numeric_limits<std::int32_t>::min();
+  else
+    result = static_cast<std::int32_t>(rounded);
+  return static_cast<std::uint32_t>(result);
 }
 
 std::uint64_t ShiftRightJam(std::uint64_t value, std::uint32_t distance) {
@@ -4662,6 +4797,7 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
     case PcoOpcode::kMoveImmediate:
     case PcoOpcode::kPackCoverageMask:
     case PcoOpcode::kShiftRight:
+    case PcoOpcode::kShiftLeft:
     case PcoOpcode::kTestZero:
     case PcoOpcode::kFloatFloor:
     case PcoOpcode::kFloatSubtract:
@@ -4678,8 +4814,11 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
     case PcoOpcode::kFloatMadNegateSource2:
     case PcoOpcode::kFloatMadNegateSource0:
     case PcoOpcode::kFloatMadNegateSource0Source2:
+    case PcoOpcode::kIntegerMultiplyAdd32:
     case PcoOpcode::kFloatMin:
     case PcoOpcode::kFloatMax:
+    case PcoOpcode::kIntegerMaxSigned:
+    case PcoOpcode::kIntegerMinSigned:
     case PcoOpcode::kReciprocal:
     case PcoOpcode::kReciprocalSquareRoot:
     case PcoOpcode::kFloatLog2:
@@ -4701,6 +4840,8 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
     case PcoOpcode::kUnpackHalf2x16:
     case PcoOpcode::kFloatPackHalfRtne:
     case PcoOpcode::kFloatPackHalfRtz:
+    case PcoOpcode::kFloatToInt32Rtne:
+    case PcoOpcode::kFloatToInt32Rtz:
     case PcoOpcode::kFloatUnpackHalf:
     case PcoOpcode::kUnpackUnsignedToFloat:
     case PcoOpcode::kUnpackSignedToFloat:
@@ -5335,11 +5476,14 @@ PcoVertexExecution ExecuteVertexPco(
         instruction.opcode == PcoOpcode::kFloatAddNegateSource0 ||
         instruction.opcode == PcoOpcode::kFloatMultiply ||
         instruction.opcode == PcoOpcode::kFloatMad ||
+        instruction.opcode == PcoOpcode::kIntegerMultiplyAdd32 ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource2 ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource0 ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource0Source2 ||
         instruction.opcode == PcoOpcode::kFloatMin ||
         instruction.opcode == PcoOpcode::kFloatMax ||
+        instruction.opcode == PcoOpcode::kIntegerMaxSigned ||
+        instruction.opcode == PcoOpcode::kIntegerMinSigned ||
         instruction.opcode == PcoOpcode::kFloatEqual ||
         instruction.opcode == PcoOpcode::kFloatGreaterEqual ||
         instruction.opcode == PcoOpcode::kFloatLess ||
@@ -5632,16 +5776,20 @@ PcoFragmentExecution ExecuteFragmentPco(
     case PcoOpcode::kFloatMadNegateSource0Source2: return "FMAD.NEG02";
     case PcoOpcode::kFloatMin: return "FMIN";
     case PcoOpcode::kFloatMax: return "FMAX";
+    case PcoOpcode::kIntegerMaxSigned: return "IMAX.S32";
+    case PcoOpcode::kIntegerMinSigned: return "IMIN.S32";
     case PcoOpcode::kReciprocal: return "FRCP";
     case PcoOpcode::kReciprocalSquareRoot: return "FRSQ";
     case PcoOpcode::kFloatLog2: return "FLOG2";
     case PcoOpcode::kFloatExp2: return "FEXP2";
     case PcoOpcode::kIntegerAdd: return "IADD";
+    case PcoOpcode::kIntegerMultiplyAdd32: return "IMADD32";
     case PcoOpcode::kBitwiseAnd: return "AND";
     case PcoOpcode::kBitwiseOr: return "OR";
     case PcoOpcode::kBitwiseXor: return "XOR";
     case PcoOpcode::kBitwiseXnor: return "XNOR";
     case PcoOpcode::kShiftRight: return "SHR";
+    case PcoOpcode::kShiftLeft: return "LSL";
     case PcoOpcode::kTestZero: return "TSTZ";
     case PcoOpcode::kPackCoverageMask: return "PCK.COV";
     case PcoOpcode::kFloatInterpolatePerspective: return "FITRP";
@@ -5968,11 +6116,14 @@ PcoFragmentExecution ExecuteFragmentPco(
         instruction.opcode == PcoOpcode::kFloatAddNegateSource0 ||
         instruction.opcode == PcoOpcode::kFloatMultiply ||
         instruction.opcode == PcoOpcode::kFloatMad ||
+        instruction.opcode == PcoOpcode::kIntegerMultiplyAdd32 ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource2 ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource0 ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource0Source2 ||
         instruction.opcode == PcoOpcode::kFloatMin ||
         instruction.opcode == PcoOpcode::kFloatMax ||
+        instruction.opcode == PcoOpcode::kIntegerMaxSigned ||
+        instruction.opcode == PcoOpcode::kIntegerMinSigned ||
         instruction.opcode == PcoOpcode::kFloatEqual ||
         instruction.opcode == PcoOpcode::kFloatGreaterEqual ||
         instruction.opcode == PcoOpcode::kFloatLess ||
@@ -5985,6 +6136,8 @@ PcoFragmentExecution ExecuteFragmentPco(
         instruction.opcode == PcoOpcode::kFloatExp2 ||
         instruction.opcode == PcoOpcode::kMoveImmediate ||
         instruction.opcode == PcoOpcode::kFloatPackHalfRtne ||
+        instruction.opcode == PcoOpcode::kFloatToInt32Rtne ||
+        instruction.opcode == PcoOpcode::kFloatToInt32Rtz ||
         instruction.opcode == PcoOpcode::kFloatPackHalfRtz ||
         instruction.opcode == PcoOpcode::kFloatUnpackHalf ||
         (instruction.opcode == PcoOpcode::kFloatAdd && instruction.target == PcoWriteTarget::kTemporary) ||
@@ -5992,10 +6145,12 @@ PcoFragmentExecution ExecuteFragmentPco(
         instruction.opcode == PcoOpcode::kIntegerAdd ||
         instruction.opcode == PcoOpcode::kBitwiseAnd ||
         instruction.opcode == PcoOpcode::kBitwiseOr ||
+        instruction.opcode == PcoOpcode::kBitwiseOr ||
         instruction.opcode == PcoOpcode::kBitwiseXor ||
         instruction.opcode == PcoOpcode::kBitwiseXnor ||
         instruction.opcode == PcoOpcode::kPackCoverageMask ||
         instruction.opcode == PcoOpcode::kShiftRight ||
+        instruction.opcode == PcoOpcode::kShiftLeft ||
         instruction.opcode == PcoOpcode::kTestZero ||
         instruction.opcode == PcoOpcode::kFloatSine ||
         instruction.opcode == PcoOpcode::kFloatCosine ||
@@ -6081,6 +6236,10 @@ PcoFragmentExecution ExecuteFragmentPco(
         const std::uint32_t src1 = read(instruction.source1);
         const std::uint32_t src2 = read(instruction.source2);
         result_val = FloatMadBits(src0, src1, src2);
+      } else if (instruction.opcode == PcoOpcode::kIntegerMultiplyAdd32) {
+        const std::uint32_t src1 = read(instruction.source1);
+        const std::uint32_t src2 = read(instruction.source2);
+        result_val = src0 * src1 + src2;
       } else if (instruction.opcode ==
                  PcoOpcode::kFloatMadNegateSource2) {
         const std::uint32_t src1 = read(instruction.source1);
@@ -6138,6 +6297,10 @@ PcoFragmentExecution ExecuteFragmentPco(
         result_val = FloatToHalf(src0);
       } else if (instruction.opcode == PcoOpcode::kFloatPackHalfRtz) {
         result_val = FloatToHalfRtz(src0);
+      } else if (instruction.opcode == PcoOpcode::kFloatToInt32Rtne) {
+        result_val = FloatToInt32Bits(src0, /*round_to_zero=*/false);
+      } else if (instruction.opcode == PcoOpcode::kFloatToInt32Rtz) {
+        result_val = FloatToInt32Bits(src0, /*round_to_zero=*/true);
       } else if (instruction.opcode == PcoOpcode::kFloatUnpackHalf) {
         result_val = HalfToFloat(
             static_cast<std::uint16_t>(src0 & UINT32_C(0xffff)));
@@ -6210,6 +6373,21 @@ PcoFragmentExecution ExecuteFragmentPco(
         if (src1 >= 32U)
           ExecuteError("SHR shift count exceeds the register width");
         result_val = src0 >> src1;
+      } else if (instruction.opcode == PcoOpcode::kShiftLeft) {
+        const std::uint32_t src1 = read(instruction.source1);
+        if (src1 >= 32U)
+          ExecuteError("LSL shift count exceeds the register width");
+        result_val = src0 << src1;
+      } else if (instruction.opcode == PcoOpcode::kIntegerMaxSigned) {
+        const std::int32_t a = static_cast<std::int32_t>(src0);
+        const std::int32_t b =
+            static_cast<std::int32_t>(read(instruction.source1));
+        result_val = static_cast<std::uint32_t>(a > b ? a : b);
+      } else if (instruction.opcode == PcoOpcode::kIntegerMinSigned) {
+        const std::int32_t a = static_cast<std::int32_t>(src0);
+        const std::int32_t b =
+            static_cast<std::int32_t>(read(instruction.source1));
+        result_val = static_cast<std::uint32_t>(a < b ? a : b);
       } else if (instruction.opcode == PcoOpcode::kTestZero) {
         /* TST.Z selects between the internal all-ones Boolean and a packed
          * zero, so a passing test reads back as every bit set. */

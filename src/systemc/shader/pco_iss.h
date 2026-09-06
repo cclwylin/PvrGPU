@@ -107,6 +107,8 @@ enum class PcoOpcode : std::uint8_t {
   kFloatMadNegateSource0Source2,
   kFloatMin,
   kFloatMax,
+  kIntegerMaxSigned,
+  kIntegerMinSigned,
   kReciprocal,
   kReciprocalSquareRoot,
   kFloatLog2,
@@ -118,11 +120,13 @@ enum class PcoOpcode : std::uint8_t {
   kTextureSample,
   kTextureSampleLod,
   kIntegerAdd,
+  kIntegerMultiplyAdd32,
   kBitwiseAnd,
   kBitwiseOr,
   kBitwiseXor,
   kBitwiseXnor,
   kShiftRight,
+  kShiftLeft,
   kTestZero,
   kFloatSine,
   kFloatCosine,
@@ -146,6 +150,8 @@ enum class PcoOpcode : std::uint8_t {
    * low 16-bit lane is transferred and one temporary is written. */
   kFloatPackHalfRtne,
   kFloatPackHalfRtz,
+  kFloatToInt32Rtne,
+  kFloatToInt32Rtz,
   kFloatUnpackHalf,
   /* UNPCK.U32 / UNPCK.S32: the packed source is a whole 32-bit integer, so
    * the unpack is the integer-to-float conversion GLSL spells uint(x) and
