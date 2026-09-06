@@ -87,6 +87,7 @@ static const unsigned pvrgpu_swizzle_depth_x001[4] = {
 static void
 pvrgpu_build_refract_descriptor(uint32_t descriptor[20],
                                 unsigned tex_format,
+                                bool gamma,
                                 const unsigned swizzle[4],
                                 unsigned width,
                                 unsigned height,
@@ -102,6 +103,10 @@ pvrgpu_build_refract_descriptor(uint32_t descriptor[20],
    memset(descriptor, 0, 20U * sizeof(descriptor[0]));
    const uint64_t image_word0 =
       pvrgpu_refract_descriptor_bits(4U, 0, 2) |
+      /* Rogue IMAGE_WORD0 GAMMA: the texture unit decodes sRGB, the driver
+       * only says that it should.  Two-component gamma shares bit 4 and stays
+       * off; no format lowered here has two channels. */
+      pvrgpu_refract_descriptor_bits(gamma ? 1U : 0U, 3, 3) |
       pvrgpu_refract_descriptor_bits(swizzle[3], 5, 7) |
       pvrgpu_refract_descriptor_bits(swizzle[2], 8, 10) |
       pvrgpu_refract_descriptor_bits(swizzle[1], 11, 13) |
@@ -192,6 +197,7 @@ pvrgpu_pco_build_refract_fragment_shared_for_extent(
       return false;
    pvrgpu_build_refract_descriptor(&out[0],
                                     24U,
+                                    false,
                                     pvrgpu_swizzle_depth_xxx1,
                                     width,
                                     height,
@@ -205,6 +211,7 @@ pvrgpu_pco_build_refract_fragment_shared_for_extent(
                                     0U);
    pvrgpu_build_refract_descriptor(&out[20],
                                     12U,
+                                    false,
                                     pvrgpu_swizzle_rgba,
                                     width,
                                     height,
@@ -218,6 +225,7 @@ pvrgpu_pco_build_refract_fragment_shared_for_extent(
                                     (mip_count - 1U) * 64U);
    pvrgpu_build_refract_descriptor(&out[40],
                                     12U,
+                                    false,
                                     pvrgpu_swizzle_rgba,
                                     512U,
                                     512U,
@@ -256,6 +264,7 @@ pvrgpu_pco_build_shadow_fragment_shared_for_extent(
       return false;
    pvrgpu_build_refract_descriptor(out,
                                     24U,
+                                    false,
                                     pvrgpu_swizzle_depth_xxx1,
                                     width,
                                     height,
@@ -295,9 +304,16 @@ pvrgpu_pco_build_terrain_texture_descriptor(
    unsigned max_lod_u4_6)
 {
    const bool depth_stencil = format == PIPE_FORMAT_Z24_UNORM_S8_UINT;
+   /*
+    * An sRGB view stores the same four bytes as RGBA8 and names the same
+    * Rogue format; what differs is the GAMMA bit, which tells the texture
+    * unit to decode R, G and B through the sRGB transfer function.  The
+    * driver states that here and decodes nothing.
+    */
+   const bool srgb = format == PIPE_FORMAT_R8G8B8A8_SRGB;
    if (!out ||
        (format != PIPE_FORMAT_R8G8B8A8_UNORM &&
-        format != PIPE_FORMAT_R8G8B8X8_UNORM && !depth_stencil) ||
+        format != PIPE_FORMAT_R8G8B8X8_UNORM && !srgb && !depth_stencil) ||
        width == 0 || width > 16384U || height == 0 || height > 16384U ||
        mip_count == 0 || mip_count > 15U || byte_size == 0 ||
        min_filter > 1U || mag_filter > 1U || mip_filter > 1U ||
@@ -314,6 +330,7 @@ pvrgpu_pco_build_terrain_texture_descriptor(
    pvrgpu_build_refract_descriptor(
       out,
       depth_stencil ? 22U : 12U,
+      srgb,
       depth_stencil ? pvrgpu_swizzle_depth_x001
                     : format == PIPE_FORMAT_R8G8B8X8_UNORM
                          ? pvrgpu_swizzle_rgb1

@@ -336,8 +336,16 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
   const bool z24_unorm_s8_uint =
       format == 22U && red_swizzle == 0U && green_swizzle == 5U &&
       blue_swizzle == 5U && alpha_swizzle == 4U;
+  /*
+   * Rogue IMAGE_WORD0 bit 3 is GAMMA and bit 4 is the second half of
+   * TWOCOMP_GAMMA.  Gamma on a four-channel image is sRGB, which this unit
+   * decodes; two-component gamma applies to formats it does not sample, so
+   * bit 4 still has to be zero.
+   */
+  const bool gamma = ExtractBits(word0, 3, 3) != 0U;
   if (ExtractBits(word0, 0, 2) != 4U ||
-      ExtractBits(word0, 3, 4) != 0U ||
+      ExtractBits(word0, 4, 4) != 0U ||
+      (gamma && !rgba8) ||
       ExtractBits(word0, 17, 26) != 0U ||
       (!rgba8 && !z32_unorm && !z24_unorm_s8_uint) ||
       ExtractBits(word0, 62, 63) != 0U) {
@@ -385,9 +393,11 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
                           ? TextureFormat::kZ24UnormS8Uint
                           : z32_unorm
                                 ? TextureFormat::kZ32Unorm
-                                : alpha_swizzle == 4U
-                                      ? TextureFormat::kRgbx8Unorm
-                                      : TextureFormat::kRgba8Unorm;
+                                : gamma
+                                      ? TextureFormat::kRgba8Srgb
+                                      : alpha_swizzle == 4U
+                                            ? TextureFormat::kRgbx8Unorm
+                                            : TextureFormat::kRgba8Unorm;
   if (descriptor.gpu_address == 0 ||
       descriptor.row_pitch_bytes < descriptor.width * 4U) {
     throw std::runtime_error("TextureUnit invalid raw Rogue image layout");
@@ -486,10 +496,18 @@ bool DriverPcoTextureDescriptorClassSupported(
    * nearest -- a combination the datapath already performs, since it does
    * RGBX8 nearest and RGBA8 linear.
    */
+  /*
+   * sRGB belongs here and nowhere below: GL converts each encoded channel to
+   * linear before the filter weights it, and the linear paths in this unit
+   * blend stored bytes and convert afterwards.  Those are different
+   * functions, so an sRGB image asking for a linear filter is declined rather
+   * than answered with the wrong one.
+   */
   const bool single_level_nearest_color =
       descriptor_count == 1 &&
       (image.format == TextureFormat::kRgba8Unorm ||
-       image.format == TextureFormat::kRgbx8Unorm) &&
+       image.format == TextureFormat::kRgbx8Unorm ||
+       image.format == TextureFormat::kRgba8Srgb) &&
       image.mip_count == 1 &&
       sampler.min_filter == TextureFilter::kNearest &&
       sampler.mag_filter == TextureFilter::kNearest &&
@@ -1497,6 +1515,11 @@ void TextureUnit::SampleRunForStage(
                       << std::dec << std::setfill(' ') << " depth=" << depth
                       << '\n';
           }
+        } else if (image.format == TextureFormat::kRgba8Srgb) {
+          // Colour through the sRGB transfer function, alpha left linear.
+          for (std::size_t component = 0; component < 3; ++component)
+            filtered[component] = SrgbChannelToLinear(texel[component]);
+          filtered[3] = static_cast<float>(texel[3]) / 255.0F;
         } else {
           for (std::size_t component = 0; component < 4; ++component) {
             filtered[component] =

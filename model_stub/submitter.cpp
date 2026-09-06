@@ -2228,6 +2228,10 @@ void Submitter::RunJob() {
                         ? TextureFormat::kRgba8Unorm
                         : texture.format == "PIPE_FORMAT_R8G8B8X8_UNORM"
                               ? TextureFormat::kRgbx8Unorm
+                        // Same four stored bytes as RGBA8; the texture unit
+                        // decodes R, G and B through the sRGB curve.
+                        : texture.format == "PIPE_FORMAT_R8G8B8A8_SRGB"
+                              ? TextureFormat::kRgba8Srgb
                         : throw std::runtime_error(
                               "Submitter PCO sequence texture format is "
                               "unsupported");

@@ -9615,6 +9615,12 @@ pvrgpu_capture_generic_sequence_texture(
     */
    if (format != PIPE_FORMAT_R8G8B8A8_UNORM &&
        format != PIPE_FORMAT_R8G8B8X8_UNORM &&
+       /*
+        * An sRGB view is RGBA8 storage the texture unit decodes through the
+        * sRGB transfer function; its texel is the same four bytes, so every
+        * layout check below holds unchanged.
+        */
+       format != PIPE_FORMAT_R8G8B8A8_SRGB &&
        format != PIPE_FORMAT_Z24_UNORM_S8_UINT) {
       *reason = "format";
       return false;
@@ -9662,6 +9668,7 @@ pvrgpu_capture_generic_sequence_texture(
    const unsigned expected_swizzle_a =
       (depth_stencil_view || format == PIPE_FORMAT_R8G8B8X8_UNORM) ?
          PIPE_SWIZZLE_1 : PIPE_SWIZZLE_W;
+   /* sRGB carries the identity swizzle, exactly as RGBA8 does. */
    if (view->swizzle_r != PIPE_SWIZZLE_X ||
        view->swizzle_g != expected_swizzle_g ||
        view->swizzle_b != expected_swizzle_b ||

@@ -34,6 +34,14 @@ std::int64_t QuantizeRasterSubpixel(float value) {
   return static_cast<std::int64_t>(rounded);
 }
 
+float SrgbChannelToLinear(std::uint8_t encoded) {
+  const double value = static_cast<double>(encoded) / 255.0;
+  const double linear = value <= 0.04045
+                            ? value / 12.92
+                            : std::pow((value + 0.055) / 1.055, 2.4);
+  return static_cast<float>(linear);
+}
+
 std::size_t DepthAttachmentBytesPerPixel(std::uint32_t format) {
   if (format == kDriverPcoDepthFormatZ16Unorm)
     return sizeof(std::uint16_t);

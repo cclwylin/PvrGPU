@@ -1284,9 +1284,12 @@ bool CopyPcoSequenceTexture(
   // A combined depth/stencil image sampled through a 2D view stores the same
   // four bytes per texel as a colour image; the depth occupies the low 24
   // bits and the texture unit masks the stencil byte off.
+  // An sRGB image stores the same four bytes as RGBA8; only the texture
+  // unit's decode of R, G and B differs.
   const std::uint32_t bytes_per_texel =
       format == "PIPE_FORMAT_R8G8B8A8_UNORM" ||
               format == "PIPE_FORMAT_R8G8B8X8_UNORM" ||
+              format == "PIPE_FORMAT_R8G8B8A8_SRGB" ||
               format == "PIPE_FORMAT_Z32_UNORM" ||
               format == "PIPE_FORMAT_Z24_UNORM_S8_UINT"
           ? 4U

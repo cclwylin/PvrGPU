@@ -535,7 +535,17 @@ enum class TextureFormat : std::uint8_t {
   // 2^24-1, exactly as the driver's clear path packs it.  GL swizzles it to
   // (depth, 0, 0, 1), and unlike kZ32Unorm it filters.
   kZ24UnormS8Uint,
+  // The same four stored bytes as kRgba8Unorm, with the Rogue IMAGE_WORD0
+  // gamma bit set: R, G and B are sRGB-encoded and alpha is linear.  GL
+  // converts the encoded channels to linear *before* filtering, so a filter
+  // that blends stored bytes and converts afterwards is a different function
+  // and is declined rather than approximated.
+  kRgba8Srgb,
 };
+
+// One sRGB-encoded channel, as a linear value.  This is the GL/IEC 61966-2-1
+// transfer function exactly; alpha never passes through it.
+float SrgbChannelToLinear(std::uint8_t encoded);
 
 enum class TextureLayout : std::uint8_t {
   kLinear = 0,

@@ -518,10 +518,21 @@ void CheckDescriptorAndArithmetic() {
   ExpectFailure([&] { DecodeRogueTextureSamplerDescriptor(mutated); },
                 "unsupported sampler word1");
 
+  /*
+   * IMAGE_WORD0 bit 3 is GAMMA and bit 4 is the second half of
+   * TWOCOMP_GAMMA.  Gamma on a four-channel image is sRGB, which the unit
+   * decodes, so it now describes a format rather than failing; two-component
+   * gamma still has no sampled format and must be refused.
+   */
   auto mutated_image = DescriptorDwords(linear, 0);
-  mutated_image[0] ^= UINT32_C(1) << 3U; // gamma/two-component state
+  mutated_image[0] |= UINT32_C(1) << 3U; // gamma ON
+  Check(DecodeRogueTextureImageDescriptor(mutated_image).format ==
+            TextureFormat::kRgba8Srgb,
+        "gamma image decodes as sRGB");
+  mutated_image = DescriptorDwords(linear, 0);
+  mutated_image[0] |= UINT32_C(1) << 4U; // two-component gamma
   ExpectFailure([&] { DecodeRogueTextureImageDescriptor(mutated_image); },
-                "gamma image mutation");
+                "two-component gamma image mutation");
   mutated_image = DescriptorDwords(linear, 0);
   mutated_image[3] |= UINT32_C(1) << (54U - 32U); // compression state
   ExpectFailure([&] { DecodeRogueTextureImageDescriptor(mutated_image); },
