@@ -99,11 +99,17 @@ TextureLodSelection SelectTextureLod(
   // Public SMP LODM=NORMAL derives one isotropic LOD for a 2x2 quad from
   // rho^2 = max(|d/dx|^2, |d/dy|^2) (lp_build_rho without the rho_opt
   // shortcut).  log2(rho) is half of log2(rho^2), so the log2 is taken once
-  // on the square and halved: exact at powers of two, no transcendental
-  // unit.
+  // on the square and halved.  The LOD is an exact log2 rather than
+  // llvmpipe's piecewise-linear fast_log2: GL requires the LOD accurate to a
+  // few fractional bits (dEQP checks six), and fast_log2's mid-octave error
+  // (~0.086, e.g. log2(3) as 1.5 not 1.585) shows up directly as the mip
+  // blend weight of a trilinear filter -- a low-quality result the hardware's
+  // LOD unit does not produce.  Level selection still rounds this LOD, so the
+  // mip-nearest and magnification decisions are unchanged at every boundary
+  // fast_log2 already resolved exactly (the powers of two).
   float lambda = min_lod;
   if (rho_squared > 0.0F)
-    lambda = std::clamp(TextureFastLog2(rho_squared) * 0.5F, min_lod, max_lod);
+    lambda = std::clamp(std::log2(rho_squared) * 0.5F, min_lod, max_lod);
   result.lambda = lambda;
   result.minified = lambda > 0.0F;
   const std::uint32_t last_level_u4_6 = (mip_count - 1U) * 64U;
