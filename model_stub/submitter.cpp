@@ -2232,6 +2232,22 @@ void Submitter::RunJob() {
                         // decodes R, G and B through the sRGB curve.
                         : texture.format == "PIPE_FORMAT_R8G8B8A8_SRGB"
                               ? TextureFormat::kRgba8Srgb
+                        // Packed / wide colour: the texture unit unpacks the
+                        // little-endian bit layout on its float datapath.
+                        : (texture.format == "PIPE_FORMAT_R5G6B5_UNORM" ||
+                           texture.format == "PIPE_FORMAT_B5G6R5_UNORM")
+                              ? TextureFormat::kRgb565Unorm
+                        : (texture.format == "PIPE_FORMAT_R10G10B10A2_UNORM" ||
+                           texture.format == "PIPE_FORMAT_B10G10R10A2_UNORM")
+                              ? TextureFormat::kRgb10A2Unorm
+                        : texture.format == "PIPE_FORMAT_R8G8B8A8_SNORM"
+                              ? TextureFormat::kRgba8Snorm
+                        : texture.format == "PIPE_FORMAT_R16G16B16A16_FLOAT"
+                              ? TextureFormat::kRgba16Float
+                        : texture.format == "PIPE_FORMAT_R11G11B10_FLOAT"
+                              ? TextureFormat::kR11fG11fB10f
+                        : texture.format == "PIPE_FORMAT_R9G9B9E5_FLOAT"
+                              ? TextureFormat::kRgb9e5Float
                         // ASTC arrives compressed: the texture unit decodes
                         // the blocks, which is where the hardware does it.
                         : texture.format.rfind("PIPE_FORMAT_ASTC_", 0) == 0

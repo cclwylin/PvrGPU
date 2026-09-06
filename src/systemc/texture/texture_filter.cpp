@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -413,8 +414,134 @@ float LerpTextureFloat(float first, float second, float weight) {
   return first + weight * (second - first);
 }
 
-std::array<float, 4> DecodeTexelToFloat(TextureFormat format,
-                                        const std::array<std::uint8_t, 4> &texel) {
+namespace {
+
+// The GL/IEC half-to-float, exact (util half_float.h reference).  Denormals
+// and infinities included; the texture-filter tests exercise only finite
+// LDR values but the decode is the full one.
+float HalfToFloat(std::uint16_t bits) {
+  const std::uint32_t sign = (bits & 0x8000U) << 16U;
+  std::uint32_t exponent = (bits >> 10U) & 0x1fU;
+  std::uint32_t mantissa = bits & 0x3ffU;
+  std::uint32_t result;
+  if (exponent == 0U) {
+    if (mantissa == 0U) {
+      result = sign;
+    } else {
+      // Subnormal: normalize it into a float32 normal.
+      exponent = 1U;
+      while ((mantissa & 0x400U) == 0U) {
+        mantissa <<= 1U;
+        --exponent;
+      }
+      mantissa &= 0x3ffU;
+      result = sign | ((exponent + (127U - 15U)) << 23U) | (mantissa << 13U);
+    }
+  } else if (exponent == 0x1fU) {
+    result = sign | 0x7f800000U | (mantissa << 13U);
+  } else {
+    result = sign | ((exponent + (127U - 15U)) << 23U) | (mantissa << 13U);
+  }
+  float value;
+  std::memcpy(&value, &result, sizeof(value));
+  return value;
+}
+
+// util format_r11g11b10f uf11_to_f32 / uf10_to_f32.
+float Uf11ToFloat(std::uint32_t val) {
+  const int exponent = (val & 0x07c0U) >> 6U;
+  const int mantissa = static_cast<int>(val & 0x003fU);
+  if (exponent == 0) {
+    if (mantissa == 0)
+      return 0.0F;
+    return (1.0F / static_cast<float>(1U << 20U)) * static_cast<float>(mantissa);
+  }
+  if (exponent == 31) {
+    std::uint32_t ui = 0x7f800000U | static_cast<std::uint32_t>(mantissa);
+    float value;
+    std::memcpy(&value, &ui, sizeof(value));
+    return value;
+  }
+  const int e = exponent - 15;
+  const float scale =
+      e < 0 ? 1.0F / static_cast<float>(1U << static_cast<unsigned>(-e))
+            : static_cast<float>(1U << static_cast<unsigned>(e));
+  return scale * (1.0F + static_cast<float>(mantissa) / 64.0F);
+}
+
+float Uf10ToFloat(std::uint32_t val) {
+  const int exponent = (val & 0x03e0U) >> 5U;
+  const int mantissa = static_cast<int>(val & 0x001fU);
+  if (exponent == 0) {
+    if (mantissa == 0)
+      return 0.0F;
+    return (1.0F / static_cast<float>(1U << 19U)) * static_cast<float>(mantissa);
+  }
+  if (exponent == 31) {
+    std::uint32_t ui = 0x7f800000U | static_cast<std::uint32_t>(mantissa);
+    float value;
+    std::memcpy(&value, &ui, sizeof(value));
+    return value;
+  }
+  const int e = exponent - 15;
+  const float scale =
+      e < 0 ? 1.0F / static_cast<float>(1U << static_cast<unsigned>(-e))
+            : static_cast<float>(1U << static_cast<unsigned>(e));
+  return scale * (1.0F + static_cast<float>(mantissa) / 32.0F);
+}
+
+// util format_rgb9e5 rgb9e5_to_float3.
+void Rgb9e5ToFloat3(std::uint32_t rgb, float out[3]) {
+  const int exponent =
+      static_cast<int>(rgb >> 27U) - 15 - 9; // RGB9E5_EXP_BIAS, MANTISSA_BITS
+  std::uint32_t scale_bits =
+      static_cast<std::uint32_t>(exponent + 127) << 23U;
+  float scale;
+  std::memcpy(&scale, &scale_bits, sizeof(scale));
+  out[0] = static_cast<float>(rgb & 0x1ffU) * scale;
+  out[1] = static_cast<float>((rgb >> 9U) & 0x1ffU) * scale;
+  out[2] = static_cast<float>((rgb >> 18U) & 0x1ffU) * scale;
+}
+
+std::uint32_t LoadLe32(const std::array<std::uint8_t, 8> &texel) {
+  return static_cast<std::uint32_t>(texel[0]) |
+         (static_cast<std::uint32_t>(texel[1]) << 8U) |
+         (static_cast<std::uint32_t>(texel[2]) << 16U) |
+         (static_cast<std::uint32_t>(texel[3]) << 24U);
+}
+
+std::uint16_t LoadLe16(const std::array<std::uint8_t, 8> &texel,
+                       std::size_t byte) {
+  return static_cast<std::uint16_t>(texel[byte]) |
+         static_cast<std::uint16_t>(texel[byte + 1U] << 8U);
+}
+
+} // namespace
+
+std::uint32_t TextureBytesPerTexel(TextureFormat format) {
+  switch (format) {
+  case TextureFormat::kRgb565Unorm:
+    return 2U;
+  case TextureFormat::kRgba16Float:
+    return 8U;
+  case TextureFormat::kRgba8Unorm:
+  case TextureFormat::kRgbx8Unorm:
+  case TextureFormat::kRgba8Srgb:
+  case TextureFormat::kZ32Unorm:
+  case TextureFormat::kZ24UnormS8Uint:
+  case TextureFormat::kRgb10A2Unorm:
+  case TextureFormat::kRgba8Snorm:
+  case TextureFormat::kR11fG11fB10f:
+  case TextureFormat::kRgb9e5Float:
+    return 4U;
+  default:
+    // ASTC has no per-texel width (128-bit blocks).
+    throw std::runtime_error("TextureUnit format has no per-texel byte width");
+  }
+}
+
+std::array<float, 4> DecodeTexelToFloat(
+    TextureFormat format, const std::array<std::uint8_t, 8> &texel) {
   std::array<float, 4> result{};
   switch (format) {
   case TextureFormat::kRgba8Unorm:
@@ -433,6 +560,50 @@ std::array<float, 4> DecodeTexelToFloat(TextureFormat format,
     for (std::size_t component = 0; component < 3; ++component)
       result[component] = SrgbChannelToLinear(texel[component]);
     result[3] = static_cast<float>(texel[3]) / 255.0F;
+    return result;
+  case TextureFormat::kRgba8Snorm:
+    // GL signed-normalized: c = max(s / (2^7 - 1), -1).
+    for (std::size_t component = 0; component < 4; ++component) {
+      const std::int8_t s = static_cast<std::int8_t>(texel[component]);
+      result[component] = std::max(static_cast<float>(s) / 127.0F, -1.0F);
+    }
+    return result;
+  case TextureFormat::kRgb565Unorm: {
+    const std::uint16_t v = LoadLe16(texel, 0);
+    result[0] = static_cast<float>((v >> 11U) & 0x1fU) / 31.0F;
+    result[1] = static_cast<float>((v >> 5U) & 0x3fU) / 63.0F;
+    result[2] = static_cast<float>(v & 0x1fU) / 31.0F;
+    result[3] = 1.0F;
+    return result;
+  }
+  case TextureFormat::kRgb10A2Unorm: {
+    const std::uint32_t v = LoadLe32(texel);
+    result[0] = static_cast<float>(v & 0x3ffU) / 1023.0F;
+    result[1] = static_cast<float>((v >> 10U) & 0x3ffU) / 1023.0F;
+    result[2] = static_cast<float>((v >> 20U) & 0x3ffU) / 1023.0F;
+    result[3] = static_cast<float>((v >> 30U) & 0x3U) / 3.0F;
+    return result;
+  }
+  case TextureFormat::kR11fG11fB10f: {
+    const std::uint32_t v = LoadLe32(texel);
+    result[0] = Uf11ToFloat(v & 0x7ffU);
+    result[1] = Uf11ToFloat((v >> 11U) & 0x7ffU);
+    result[2] = Uf10ToFloat((v >> 22U) & 0x3ffU);
+    result[3] = 1.0F;
+    return result;
+  }
+  case TextureFormat::kRgb9e5Float: {
+    float rgb[3];
+    Rgb9e5ToFloat3(LoadLe32(texel), rgb);
+    result[0] = rgb[0];
+    result[1] = rgb[1];
+    result[2] = rgb[2];
+    result[3] = 1.0F;
+    return result;
+  }
+  case TextureFormat::kRgba16Float:
+    for (std::size_t component = 0; component < 4; ++component)
+      result[component] = HalfToFloat(LoadLe16(texel, component * 2U));
     return result;
   default:
     throw std::runtime_error("TextureUnit cannot decode this format as colour");

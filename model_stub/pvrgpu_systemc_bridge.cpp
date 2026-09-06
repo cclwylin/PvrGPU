@@ -1355,6 +1355,29 @@ bool CopyPcoSequenceTexture(
         : format == "PIPE_FORMAT_Z24_UNORM_S8_UINT"
             ? pvrgpu::stub::TextureFormat::kZ24UnormS8Uint
             : pvrgpu::stub::TextureFormat::kRgba8Unorm;
+  } else if (format == "PIPE_FORMAT_B5G6R5_UNORM" ||
+             format == "PIPE_FORMAT_R5G6B5_UNORM") {
+    // GL RGB565 storage is one little-endian uint16 (R in the high five
+    // bits).  Mesa hands the driver B5G6R5 or R5G6B5 depending on the host;
+    // the stored bytes are identical.
+    block_bytes = 2U;
+    texture_format = pvrgpu::stub::TextureFormat::kRgb565Unorm;
+  } else if (format == "PIPE_FORMAT_R10G10B10A2_UNORM" ||
+             format == "PIPE_FORMAT_B10G10R10A2_UNORM") {
+    block_bytes = 4U;
+    texture_format = pvrgpu::stub::TextureFormat::kRgb10A2Unorm;
+  } else if (format == "PIPE_FORMAT_R8G8B8A8_SNORM") {
+    block_bytes = 4U;
+    texture_format = pvrgpu::stub::TextureFormat::kRgba8Snorm;
+  } else if (format == "PIPE_FORMAT_R16G16B16A16_FLOAT") {
+    block_bytes = 8U;
+    texture_format = pvrgpu::stub::TextureFormat::kRgba16Float;
+  } else if (format == "PIPE_FORMAT_R11G11B10_FLOAT") {
+    block_bytes = 4U;
+    texture_format = pvrgpu::stub::TextureFormat::kR11fG11fB10f;
+  } else if (format == "PIPE_FORMAT_R9G9B9E5_FLOAT") {
+    block_bytes = 4U;
+    texture_format = pvrgpu::stub::TextureFormat::kRgb9e5Float;
   } else {
     for (const TextureStorageBlock &block : kAstcBlocks) {
       if (format == block.format) {

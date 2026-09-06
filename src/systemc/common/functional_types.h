@@ -550,6 +550,17 @@ enum class TextureFormat : std::uint8_t {
   // both, because the image descriptor's gamma bit applies to the decoded
   // texel and nothing downstream could recover it otherwise.
   kAstcLdrSrgb,
+  // Uncompressed non-8-bit colour formats sampled on the binary32 datapath.
+  // Storage is the packed little-endian bit layout GL defines for each; the
+  // texture unit unpacks it to RGBA floats (texture_filter DecodeTexelToFloat)
+  // rather than storing an already-decoded texel.  Byte widths: RGB565 two,
+  // RGBA16F eight, the rest four (TextureBytesPerTexel).
+  kRgb565Unorm,        // R5G6B5, alpha implied one
+  kRgb10A2Unorm,       // R10G10B10A2, four channels
+  kRgba8Snorm,         // signed-normalized, clamped at -1
+  kRgba16Float,        // four IEEE half floats
+  kR11fG11fB10f,       // two 11-bit and one 10-bit unsigned float, alpha one
+  kRgb9e5Float,        // shared 5-bit exponent, alpha one
 };
 
 // One sRGB-encoded channel, as a linear value.  This is the GL/IEC 61966-2-1

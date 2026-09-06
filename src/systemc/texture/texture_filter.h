@@ -209,10 +209,18 @@ TextureFloatAxis ComputeTextureFloatLinear(float coordinate,
 // lp_build_lerp_simple on a float type: first + weight * (second - first).
 float LerpTextureFloat(float first, float second, float weight);
 
-// The stored texel as the float datapath sees it: unorm channels scaled to
-// [0, 1], sRGB colour channels through the transfer function with alpha left
-// linear, RGBX alpha forced to one.  Depth formats are not colour and throw.
+// Bytes one texel of this format occupies in memory.  ASTC has no per-texel
+// width (it stores 128-bit blocks) and throws; depth formats are four.
+std::uint32_t TextureBytesPerTexel(TextureFormat format);
+
+// The stored texel as the float datapath sees it, from up to eight raw
+// little-endian bytes: unorm and snorm channels scaled to [0, 1] / [-1, 1],
+// packed 565 / 10-10-10-2 fields unpacked, the two packed-float and the
+// shared-exponent formats expanded, IEEE halves widened, sRGB colour channels
+// through the transfer function with alpha left linear, RGBX and the
+// three-channel formats' alpha forced to one.  Depth formats are not colour
+// and throw.
 std::array<float, 4> DecodeTexelToFloat(TextureFormat format,
-                                        const std::array<std::uint8_t, 4> &texel);
+                                        const std::array<std::uint8_t, 8> &texel);
 
 } // namespace pvrgpu::stub

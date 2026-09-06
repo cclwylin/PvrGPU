@@ -275,6 +275,22 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
   const bool z24_unorm_s8_uint =
       format == 22U && red_swizzle == 0U && green_swizzle == 5U &&
       blue_swizzle == 5U && alpha_swizzle == 4U;
+  // Uncompressed non-RGBA8 colour formats.  Each names a Rogue FORMAT number
+  // and an identity swizzle: the three-channel formats select SRC_ONE (4) for
+  // alpha, the four-channel ones select the alpha channel (3).  The FORMAT
+  // number is what distinguishes an RGB1-swizzled RGB565 from an RGB1-swizzled
+  // RGBX8.
+  const bool identity_rgb =
+      !compressed && red_swizzle == 0U && green_swizzle == 1U &&
+      blue_swizzle == 2U;
+  const bool rgb565 = identity_rgb && format == 5U && alpha_swizzle == 4U;
+  const bool rgba8_snorm = identity_rgb && format == 13U && alpha_swizzle == 3U;
+  const bool rgb10_a2 = identity_rgb && format == 14U && alpha_swizzle == 3U;
+  const bool rgb9e5 = identity_rgb && format == 26U && alpha_swizzle == 4U;
+  const bool r11g11b10 = identity_rgb && format == 27U && alpha_swizzle == 4U;
+  const bool rgba16f = identity_rgb && format == 28U && alpha_swizzle == 3U;
+  const bool packed_colour =
+      rgb565 || rgba8_snorm || rgb10_a2 || rgb9e5 || r11g11b10 || rgba16f;
   /*
    * Rogue IMAGE_WORD0 bit 3 is GAMMA and bit 4 is the second half of
    * TWOCOMP_GAMMA.  Gamma on a four-channel image is sRGB, which this unit
@@ -286,7 +302,8 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
       ExtractBits(word0, 4, 4) != 0U ||
       (gamma && !rgba8 && !astc) ||
       ExtractBits(word0, 17, 26) != 0U ||
-      (!rgba8 && !astc && !z32_unorm && !z24_unorm_s8_uint) ||
+      (!rgba8 && !astc && !z32_unorm && !z24_unorm_s8_uint &&
+       !packed_colour) ||
       ExtractBits(word0, 62, 63) != 0U) {
     throw std::runtime_error(
         "TextureUnit unsupported raw Rogue image word0");
@@ -313,6 +330,10 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
       static_cast<std::uint32_t>(ExtractBits(word0, 48, 61) + 1U);
   const std::uint32_t encoded_stride =
       static_cast<std::uint32_t>(ExtractBits(word1, 0, 14) + 1U);
+  // The colour formats' byte width drives both the stride decode and the
+  // minimum-pitch floor.  ASTC's stride is measured in blocks, not texels.
+  const std::uint32_t bytes_per_texel =
+      astc ? 0U : rgba16f ? 8U : rgb565 ? 2U : 4U;
   /* Public STRIDE_IMAGE_WORD1 expresses stride in texels. The pinned GLBench
    * literals predate that decoder contract and encode byte stride instead.
    * Their value is at least one complete RGBA8 byte row; a new tight public
@@ -326,8 +347,8 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
      */
     descriptor.row_pitch_bytes = encoded_stride;
   } else if (encoded_stride == descriptor.width) {
-    descriptor.row_pitch_bytes = encoded_stride * 4U;
-  } else if (encoded_stride >= descriptor.width * 4U) {
+    descriptor.row_pitch_bytes = encoded_stride * bytes_per_texel;
+  } else if (encoded_stride >= descriptor.width * bytes_per_texel) {
     descriptor.row_pitch_bytes = encoded_stride;
   } else {
     throw std::runtime_error(
@@ -335,22 +356,23 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
   }
   descriptor.gpu_address = ExtractBits(word1, 16, 53) << 2U;
   descriptor.mip_count = static_cast<std::uint8_t>(raw_mip_count);
-  descriptor.format = astc
-                          ? (gamma ? TextureFormat::kAstcLdrSrgb
-                                   : TextureFormat::kAstcLdr)
-                          : z24_unorm_s8_uint
-                          ? TextureFormat::kZ24UnormS8Uint
-                          : z32_unorm
-                                ? TextureFormat::kZ32Unorm
-                                : gamma
-                                      ? TextureFormat::kRgba8Srgb
-                                      : alpha_swizzle == 4U
-                                            ? TextureFormat::kRgbx8Unorm
-                                            : TextureFormat::kRgba8Unorm;
+  descriptor.format =
+      astc ? (gamma ? TextureFormat::kAstcLdrSrgb : TextureFormat::kAstcLdr)
+      : z24_unorm_s8_uint ? TextureFormat::kZ24UnormS8Uint
+      : z32_unorm         ? TextureFormat::kZ32Unorm
+      : rgb565            ? TextureFormat::kRgb565Unorm
+      : rgba8_snorm       ? TextureFormat::kRgba8Snorm
+      : rgb10_a2          ? TextureFormat::kRgb10A2Unorm
+      : r11g11b10         ? TextureFormat::kR11fG11fB10f
+      : rgb9e5            ? TextureFormat::kRgb9e5Float
+      : rgba16f           ? TextureFormat::kRgba16Float
+      : gamma             ? TextureFormat::kRgba8Srgb
+      : alpha_swizzle == 4U ? TextureFormat::kRgbx8Unorm
+                            : TextureFormat::kRgba8Unorm;
   const std::uint32_t minimum_row_pitch =
       astc ? ((descriptor.width + astc_footprint.width - 1U) /
               astc_footprint.width) * 16U
-           : descriptor.width * 4U;
+           : descriptor.width * bytes_per_texel;
   if (descriptor.gpu_address == 0 ||
       descriptor.row_pitch_bytes < minimum_row_pitch) {
     throw std::runtime_error("TextureUnit invalid raw Rogue image layout");
@@ -451,7 +473,13 @@ bool DriverPcoTextureDescriptorClassSupported(
       image.format == TextureFormat::kAstcLdr ||
       image.format == TextureFormat::kAstcLdrSrgb ||
       image.format == TextureFormat::kZ32Unorm ||
-      image.format == TextureFormat::kZ24UnormS8Uint;
+      image.format == TextureFormat::kZ24UnormS8Uint ||
+      image.format == TextureFormat::kRgb565Unorm ||
+      image.format == TextureFormat::kRgb10A2Unorm ||
+      image.format == TextureFormat::kRgba8Snorm ||
+      image.format == TextureFormat::kRgba16Float ||
+      image.format == TextureFormat::kR11fG11fB10f ||
+      image.format == TextureFormat::kRgb9e5Float;
   // Z32 is one uint32 per texel with no filter datapath: nearest taps only.
   const bool depth32_nearest_only =
       image.format != TextureFormat::kZ32Unorm ||
@@ -478,7 +506,7 @@ bool DriverPcoTextureDescriptorClassSupported(
 // bits 24..31, so the stencil is masked off rather than normalized with it.
 constexpr std::uint32_t kSampledDepth24Maximum = 0x00ffffffU;
 
-std::uint32_t SampledDepth24FromTexel(const std::array<std::uint8_t, 4> &texel) {
+std::uint32_t SampledDepth24FromTexel(const std::array<std::uint8_t, 8> &texel) {
   std::uint32_t encoded = 0;
   std::memcpy(&encoded, texel.data(), sizeof(encoded));
   return encoded & kSampledDepth24Maximum;
@@ -831,7 +859,7 @@ void TextureUnit::SampleRunForStage(
         (image.format == TextureFormat::kAstcLdr ||
          image.format == TextureFormat::kAstcLdrSrgb)
             ? 16U
-            : 4U;
+            : TextureBytesPerTexel(image.format);
     const auto storage_blocks = [](std::uint32_t extent,
                                    std::uint32_t block) {
       return (extent + block - 1U) / block;
@@ -1183,7 +1211,8 @@ void TextureUnit::SampleRunForStage(
                               image.format == TextureFormat::kAstcLdrSrgb;
       const AstcBlockFootprint astc_footprint{resource.block_width,
                                               resource.block_height};
-      const std::uint32_t fetch_bytes = astc_image ? 16U : 4U;
+      const std::uint32_t fetch_bytes =
+          astc_image ? 16U : TextureBytesPerTexel(image.format);
 
       const auto read_texel = [&](const TextureMipLevel &mip,
                                   std::uint32_t x, std::uint32_t y,
@@ -1247,7 +1276,7 @@ void TextureUnit::SampleRunForStage(
         if (texel_fetch_count == std::numeric_limits<std::uint64_t>::max())
           throw std::overflow_error("TextureUnit texel fetch overflow");
         ++texel_fetch_count;
-        std::array<std::uint8_t, 4> texel{};
+        std::array<std::uint8_t, 8> texel{};
         if (astc_image) {
           AstcDecodedBlock block;
           const char *refusal = nullptr;
@@ -1259,11 +1288,13 @@ void TextureUnit::SampleRunForStage(
           }
           const std::uint32_t inside_x = x % astc_footprint.width;
           const std::uint32_t inside_y = y % astc_footprint.height;
-          texel = block.texels[inside_y * astc_footprint.width + inside_x];
+          const std::array<std::uint8_t, 4> &decoded =
+              block.texels[inside_y * astc_footprint.width + inside_x];
+          std::copy(decoded.begin(), decoded.end(), texel.begin());
         } else {
           std::copy(payload.begin(), payload.end(), texel.begin());
         }
-        return texel;
+        return texel;  // valid bytes: fetch_bytes; upper bytes stay zero
       };
 
       const auto sample_bilinear_depth =
@@ -1315,17 +1346,16 @@ void TextureUnit::SampleRunForStage(
         const TextureLinearAxis y = ComputeTextureLinearRepeat(
             BitsFloat(request.coordinates[1]), mip.height,
             decoded_sampler.wrap_v);
-        const std::array<std::uint8_t, 4> texel00 =
+        const std::array<std::uint8_t, 8> texel00 =
             read_texel(mip, x.lower, y.lower, first_request_id + 0U);
-        const std::array<std::uint8_t, 4> texel10 =
+        const std::array<std::uint8_t, 8> texel10 =
             read_texel(mip, x.upper, y.lower, first_request_id + 1U);
-        const std::array<std::uint8_t, 4> texel01 =
+        const std::array<std::uint8_t, 8> texel01 =
             read_texel(mip, x.lower, y.upper, first_request_id + 2U);
-        const std::array<std::uint8_t, 4> texel11 =
+        const std::array<std::uint8_t, 8> texel11 =
             read_texel(mip, x.upper, y.upper, first_request_id + 3U);
-        std::array<std::uint8_t, 4> result{};
-        for (std::size_t component = 0; component < result.size();
-             ++component) {
+        std::array<std::uint8_t, 8> result{};
+        for (std::size_t component = 0; component < 4U; ++component) {
           const std::uint8_t lower =
               LerpTextureUnorm8(texel00[component], texel10[component],
                                 x.weight);
@@ -1345,7 +1375,7 @@ void TextureUnit::SampleRunForStage(
                     << static_cast<unsigned>(x.weight) << " y=" << y.lower
                     << ',' << y.upper << ','
                     << static_cast<unsigned>(y.weight) << " texels=";
-          const std::array<std::array<std::uint8_t, 4>, 4> texels = {
+          const std::array<std::array<std::uint8_t, 8>, 4> texels = {
               texel00, texel10, texel01, texel11};
           for (const auto &texel : texels) {
             std::cerr << '[';
@@ -1479,7 +1509,7 @@ void TextureUnit::SampleRunForStage(
         const std::uint32_t y = ComputeTextureNearestRepeat(
             BitsFloat(request.coordinates[1]), level0.height,
             decoded_sampler.wrap_v);
-        const std::array<std::uint8_t, 4> texel =
+        const std::array<std::uint8_t, 8> texel =
             read_texel(level0, x, y, tap_request_base);
         std::uint32_t encoded = 0;
         std::memcpy(&encoded, texel.data(), sizeof(encoded));
@@ -1522,10 +1552,10 @@ void TextureUnit::SampleRunForStage(
           return linear_filter ? sample_bilinear(mip, first_request_id)
                                : sample_nearest(mip, first_request_id);
         };
-        std::array<std::uint8_t, 4> texel =
+        std::array<std::uint8_t, 8> texel =
             unorm8_level(level0, tap_request_base);
         if (two_levels) {
-          const std::array<std::uint8_t, 4> upper =
+          const std::array<std::uint8_t, 8> upper =
               unorm8_level(level1, tap_request_base + 4U);
           for (std::size_t component = 0; component < 4; ++component) {
             texel[component] = LerpTextureUnorm8(

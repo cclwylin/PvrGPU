@@ -22,6 +22,7 @@ using pvrgpu::stub::RogueTextureSamplerDescriptor;
 using pvrgpu::stub::SelectTextureFilterDatapath;
 using pvrgpu::stub::SelectTextureLevels;
 using pvrgpu::stub::SelectTextureLod;
+using pvrgpu::stub::TextureBytesPerTexel;
 using pvrgpu::stub::TextureFastLog2;
 using pvrgpu::stub::TextureFilter;
 using pvrgpu::stub::TextureFilterDatapath;
@@ -280,8 +281,8 @@ void CheckFloatAxes() {
         "float nearest clamp");
   Check(Near(LerpTextureFloat(0.25F, 0.75F, 0.5F), 0.5F), "float lerp");
 
-  const std::array<std::uint8_t, 4> white = {255, 255, 255, 255};
-  const std::array<std::uint8_t, 4> mid = {128, 0, 0, 128};
+  const std::array<std::uint8_t, 8> white = {255, 255, 255, 255, 0, 0, 0, 0};
+  const std::array<std::uint8_t, 8> mid = {128, 0, 0, 128, 0, 0, 0, 0};
   Check(Near(DecodeTexelToFloat(TextureFormat::kRgba8Srgb, white)[0], 1.0F),
         "sRGB 255 is linear 1");
   Check(DecodeTexelToFloat(TextureFormat::kRgba8Srgb, mid)[0] < 0.25F &&
@@ -298,6 +299,81 @@ void CheckFloatAxes() {
   Check(threw, "depth is not decoded as colour");
 }
 
+// The packed / wide colour formats, each expected value worked from the bit
+// layout GL defines -- not from any captured texel.
+void CheckPackedFormatDecode() {
+  Check(TextureBytesPerTexel(TextureFormat::kRgb565Unorm) == 2 &&
+            TextureBytesPerTexel(TextureFormat::kRgba16Float) == 8 &&
+            TextureBytesPerTexel(TextureFormat::kRgb10A2Unorm) == 4 &&
+            TextureBytesPerTexel(TextureFormat::kR11fG11fB10f) == 4,
+        "per-texel byte widths");
+
+  // RGB565: 0xF800 = red 31/31, green 0, blue 0; little-endian bytes 0x00,0xF8.
+  const std::array<std::uint8_t, 8> red565 = {0x00, 0xF8, 0, 0, 0, 0, 0, 0};
+  const std::array<float, 4> r565 =
+      DecodeTexelToFloat(TextureFormat::kRgb565Unorm, red565);
+  Check(Near(r565[0], 1.0F) && Near(r565[1], 0.0F) && Near(r565[2], 0.0F) &&
+            Near(r565[3], 1.0F),
+        "RGB565 red, alpha implied one");
+  // green 63/63: 0x07E0 -> bytes 0xE0,0x07.
+  const std::array<std::uint8_t, 8> g565 = {0xE0, 0x07, 0, 0, 0, 0, 0, 0};
+  Check(Near(DecodeTexelToFloat(TextureFormat::kRgb565Unorm, g565)[1], 1.0F),
+        "RGB565 green full scale");
+
+  // R10G10B10A2: R = 1023/1023, A = 3/3.  value = 0xC00003FF.
+  const std::array<std::uint8_t, 8> ra1010102 = {0xFF, 0x03, 0x00, 0xC0,
+                                                 0, 0, 0, 0};
+  const std::array<float, 4> ra =
+      DecodeTexelToFloat(TextureFormat::kRgb10A2Unorm, ra1010102);
+  Check(Near(ra[0], 1.0F) && Near(ra[1], 0.0F) && Near(ra[2], 0.0F) &&
+            Near(ra[3], 1.0F),
+        "R10G10B10A2 red and alpha full scale");
+
+  // RGBA8_SNORM: 127 -> +1, 129 (=-127) -> -1 (clamped), 0 -> 0.
+  const std::array<std::uint8_t, 8> snorm = {127, 129, 0, 64, 0, 0, 0, 0};
+  const std::array<float, 4> sn =
+      DecodeTexelToFloat(TextureFormat::kRgba8Snorm, snorm);
+  Check(Near(sn[0], 1.0F) && Near(sn[1], -1.0F) && Near(sn[2], 0.0F) &&
+            Near(sn[3], 64.0F / 127.0F),
+        "RGBA8_SNORM signed scale, clamped at -1");
+
+  // RGBA16F: 0x3C00 = 1.0, 0x0000 = 0, 0x4000 = 2.0.  Little-endian halves.
+  const std::array<std::uint8_t, 8> half = {0x00, 0x3C, 0x00, 0x00,
+                                            0x00, 0x40, 0x00, 0x3C};
+  const std::array<float, 4> hf =
+      DecodeTexelToFloat(TextureFormat::kRgba16Float, half);
+  Check(Near(hf[0], 1.0F) && Near(hf[1], 0.0F) && Near(hf[2], 2.0F) &&
+            Near(hf[3], 1.0F),
+        "RGBA16F half decode");
+
+  // R11F_G11F_B10F: an all-zero word is (0,0,0), alpha one.  A red exponent
+  // of 15 (bias) with zero mantissa is 1.0: bits 0x000003C0 in the low 11.
+  const std::array<std::uint8_t, 8> one11 = {0xC0, 0x03, 0x00, 0x00,
+                                             0, 0, 0, 0};
+  const std::array<float, 4> f11 =
+      DecodeTexelToFloat(TextureFormat::kR11fG11fB10f, one11);
+  Check(Near(f11[0], 1.0F) && Near(f11[1], 0.0F) && Near(f11[2], 0.0F) &&
+            Near(f11[3], 1.0F),
+        "R11F_G11F_B10F red 1.0, alpha one");
+
+  // RGB9E5: mantissa 256 with shared exponent giving scale 1/256 -> 1.0 in R.
+  // exp field 15+9 = 24 gives 2^(24-15-9)=1; mantissa 1 -> 1.0.  value:
+  // exponent<<27 | (0<<18)|(0<<9)|1, with exponent stored biased.
+  const std::uint32_t e = 15U + 9U; // biased exponent for scale 1.0 per mantissa unit? build value
+  const std::uint32_t rgb9e5_word = (e << 27) | 1U;
+  const std::array<std::uint8_t, 8> e5 = {
+      static_cast<std::uint8_t>(rgb9e5_word & 0xFF),
+      static_cast<std::uint8_t>((rgb9e5_word >> 8) & 0xFF),
+      static_cast<std::uint8_t>((rgb9e5_word >> 16) & 0xFF),
+      static_cast<std::uint8_t>((rgb9e5_word >> 24) & 0xFF),
+      0, 0, 0, 0};
+  const std::array<float, 4> f9 =
+      DecodeTexelToFloat(TextureFormat::kRgb9e5Float, e5);
+  Check(Near(f9[0], 1.0F) && Near(f9[1], 0.0F) && Near(f9[2], 0.0F) &&
+            Near(f9[3], 1.0F),
+        "RGB9E5 shared-exponent red 1.0, alpha one");
+}
+
 } // namespace
 
 int main() {
@@ -306,6 +382,7 @@ int main() {
   CheckDatapathSelection();
   CheckFixedPointAxes();
   CheckFloatAxes();
+  CheckPackedFormatDecode();
   if (failures != 0) {
     std::cerr << failures << " texture filter check(s) failed\n";
     return 1;

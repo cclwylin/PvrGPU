@@ -377,10 +377,38 @@ pvrgpu_pco_build_terrain_texture_descriptor(
    const unsigned astc_row_pitch_bytes =
       astc ? util_format_get_stride(format, width) : 0U;
    const bool srgb = format == PIPE_FORMAT_R8G8B8A8_SRGB || astc_srgb;
+   /*
+    * The uncompressed non-RGBA8 colour formats: each names a Rogue TEXSTATE
+    * FORMAT number and stores three or four channels.  A three-channel format
+    * selects SRC_ONE for alpha (the RGB1 swizzle); a four-channel one selects
+    * its own alpha channel.  The texture unit unpacks the packed bit layout;
+    * the driver only names the format.
+    */
+   unsigned packed_rogue_format = 0U;
+   bool packed_three_channel = false;
+   bool packed = true;
+   switch (format) {
+   case PIPE_FORMAT_R5G6B5_UNORM:
+   case PIPE_FORMAT_B5G6R5_UNORM:
+      packed_rogue_format = 5U;  packed_three_channel = true;  break;
+   case PIPE_FORMAT_R8G8B8A8_SNORM:
+      packed_rogue_format = 13U; break;
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+   case PIPE_FORMAT_B10G10R10A2_UNORM:
+      packed_rogue_format = 14U; break;
+   case PIPE_FORMAT_R9G9B9E5_FLOAT:
+      packed_rogue_format = 26U; packed_three_channel = true;  break;
+   case PIPE_FORMAT_R11G11B10_FLOAT:
+      packed_rogue_format = 27U; packed_three_channel = true;  break;
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+      packed_rogue_format = 28U; break;
+   default:
+      packed = false; break;
+   }
    if (!out ||
        (format != PIPE_FORMAT_R8G8B8A8_UNORM &&
         format != PIPE_FORMAT_R8G8B8X8_UNORM && !srgb && !astc &&
-        !depth_stencil) ||
+        !depth_stencil && !packed) ||
        width == 0 || width > 16384U || height == 0 || height > 16384U ||
        mip_count == 0 || mip_count > 15U || byte_size == 0 ||
        min_filter > 1U || mag_filter > 1U || mip_filter > 1U ||
@@ -390,17 +418,18 @@ pvrgpu_pco_build_terrain_texture_descriptor(
       return false;
 
    /*
-    * Rogue TEXSTATE FORMAT: U8U8U8U8 for colour, ST8U24 for a combined
-    * depth/stencil image, whose depth occupies the low 24 bits exactly as the
-    * driver's own clear path packs it.  A sampled depth image carries GL's
-    * (depth, 0, 0, 1) swizzle rather than the XXX1 the refract prepass uses.
+    * Rogue TEXSTATE FORMAT: U8U8U8U8 for RGBA8 colour, ST8U24 for a combined
+    * depth/stencil image, or the packed format's own number.  A sampled depth
+    * image carries GL's (depth, 0, 0, 1) swizzle rather than the XXX1 the
+    * refract prepass uses; a three-channel colour format carries RGB1.
     */
    pvrgpu_build_refract_descriptor(
       out,
-      astc ? astc_rogue_format : depth_stencil ? 22U : 12U,
+      astc ? astc_rogue_format
+           : depth_stencil ? 22U : packed ? packed_rogue_format : 12U,
       srgb,
       depth_stencil ? pvrgpu_swizzle_depth_x001
-                    : format == PIPE_FORMAT_R8G8B8X8_UNORM
+      : (format == PIPE_FORMAT_R8G8B8X8_UNORM || packed_three_channel)
                          ? pvrgpu_swizzle_rgb1
                          : pvrgpu_swizzle_rgba,
       width,

@@ -9638,6 +9638,25 @@ pvrgpu_capture_generic_sequence_texture(
     */
    const bool astc_view =
       util_format_description(format)->layout == UTIL_FORMAT_LAYOUT_ASTC;
+   /*
+    * The uncompressed non-RGBA8 colour formats the texture unit unpacks on its
+    * float datapath.  Storage is util_format-sized below, so only the set of
+    * accepted formats lives here; a three-channel format samples alpha as one.
+    */
+   const bool packed_colour_view =
+      format == PIPE_FORMAT_R5G6B5_UNORM ||
+      format == PIPE_FORMAT_B5G6R5_UNORM ||
+      format == PIPE_FORMAT_R8G8B8A8_SNORM ||
+      format == PIPE_FORMAT_R10G10B10A2_UNORM ||
+      format == PIPE_FORMAT_B10G10R10A2_UNORM ||
+      format == PIPE_FORMAT_R16G16B16A16_FLOAT ||
+      format == PIPE_FORMAT_R11G11B10_FLOAT ||
+      format == PIPE_FORMAT_R9G9B9E5_FLOAT;
+   const bool three_channel_view =
+      format == PIPE_FORMAT_R5G6B5_UNORM ||
+      format == PIPE_FORMAT_B5G6R5_UNORM ||
+      format == PIPE_FORMAT_R11G11B10_FLOAT ||
+      format == PIPE_FORMAT_R9G9B9E5_FLOAT;
    if (format != PIPE_FORMAT_R8G8B8A8_UNORM &&
        format != PIPE_FORMAT_R8G8B8X8_UNORM &&
        /*
@@ -9646,7 +9665,7 @@ pvrgpu_capture_generic_sequence_texture(
         * layout check below holds unchanged.
         */
        format != PIPE_FORMAT_R8G8B8A8_SRGB && !astc_view &&
-       format != PIPE_FORMAT_Z24_UNORM_S8_UINT) {
+       format != PIPE_FORMAT_Z24_UNORM_S8_UINT && !packed_colour_view) {
       *reason = "format";
       return false;
    }
@@ -9698,7 +9717,8 @@ pvrgpu_capture_generic_sequence_texture(
    const unsigned expected_swizzle_b =
       depth_stencil_view ? PIPE_SWIZZLE_0 : PIPE_SWIZZLE_Z;
    const unsigned expected_swizzle_a =
-      (depth_stencil_view || format == PIPE_FORMAT_R8G8B8X8_UNORM) ?
+      (depth_stencil_view || format == PIPE_FORMAT_R8G8B8X8_UNORM ||
+       three_channel_view) ?
          PIPE_SWIZZLE_1 : PIPE_SWIZZLE_W;
    /* sRGB carries the identity swizzle, exactly as RGBA8 does. */
    if (view->swizzle_r != PIPE_SWIZZLE_X ||
