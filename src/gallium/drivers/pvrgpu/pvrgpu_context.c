@@ -13328,35 +13328,6 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
    if (pvrgpu_depth_write_enabled(ctx))
       pvrgpu_invalidate_full_depth_clear(ctx);
 
-   if (pvrgpu_cpu_present_textured_quad(ctx, info, indirect, draws,
-                                        num_draws)) {
-      ctx->observed_draws++;
-      pvrgpu_counter_eventf("draw_present_textured_quad",
-                            "count=%u first_count=%u mode=%u index_size=%u "
-                            "vertex_elements=%u vertex_buffers=%u "
-                            "framebuffer=%ux%u total=%u",
-                            num_draws,
-                            draws && num_draws ? draws[0].count : 0,
-                            info ? info->mode : 0,
-                            info ? info->index_size : 0,
-                            ctx->vertex_elements ?
-                               ctx->vertex_elements->num_elements : 0,
-                            ctx->num_vertex_buffers,
-                            ctx->framebuffer.width,
-                            ctx->framebuffer.height,
-                            ctx->observed_draws);
-      if (pvrgpu_framebuffer_matches_rdc_output(ctx) &&
-          !ctx->driver_draw_command_emitted &&
-          !pvrgpu_driver_draw_command_has_been_emitted())
-         pvrgpu_note_unsupported_draw(ctx,
-                                      info,
-                                      indirect,
-                                      draws,
-                                      num_draws,
-                                      "cpu_present_without_model_command");
-      return;
-   }
-
    /*
     * Generic PCO lowering runs before the shape-matched paths below.
     *
@@ -13438,6 +13409,48 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
       snprintf(lowering_detail, sizeof(lowering_detail),
                "see the draw_array_primitive_record_error event immediately "
                "before this one");
+   }
+
+   /*
+    * The CPU present is a shape recogniser too, and it used to run above
+    * the generic lowering rather than below it.
+    *
+    * It claims a four-vertex triangle strip that samples a texture, which
+    * is exactly what GLBench's fill_tex present quad is -- and claiming it
+    * meant the model never saw the draw whose filter each of those cases
+    * varies.  The model rendered and counted the *other* draw instead, the
+    * one sampling the just-cleared depth buffer, whose sampler is the same
+    * in all five.  llvmpipe's golden says so plainly: one drawlist, and a
+    * texel count that tracks the per-case filter (1 tap nearest, 4
+    * bilinear, about 7 trilinear), which draw one cannot produce.
+    */
+   if (pvrgpu_cpu_present_textured_quad(ctx, info, indirect, draws,
+                                        num_draws)) {
+      ctx->observed_draws++;
+      pvrgpu_counter_eventf("draw_present_textured_quad",
+                            "count=%u first_count=%u mode=%u index_size=%u "
+                            "vertex_elements=%u vertex_buffers=%u "
+                            "framebuffer=%ux%u total=%u",
+                            num_draws,
+                            draws && num_draws ? draws[0].count : 0,
+                            info ? info->mode : 0,
+                            info ? info->index_size : 0,
+                            ctx->vertex_elements ?
+                               ctx->vertex_elements->num_elements : 0,
+                            ctx->num_vertex_buffers,
+                            ctx->framebuffer.width,
+                            ctx->framebuffer.height,
+                            ctx->observed_draws);
+      if (pvrgpu_framebuffer_matches_rdc_output(ctx) &&
+          !ctx->driver_draw_command_emitted &&
+          !pvrgpu_driver_draw_command_has_been_emitted())
+         pvrgpu_note_unsupported_draw(ctx,
+                                      info,
+                                      indirect,
+                                      draws,
+                                      num_draws,
+                                      "cpu_present_without_model_command");
+      return;
    }
 
    if (pvrgpu_draw_is_observable_textured_triangle(ctx, info, indirect, draws,

@@ -407,6 +407,9 @@ class MainWindow(QMainWindow):
         self.last_phase: str = ""
         self.current_group = None
         self.caselist_path: Path | None = None
+        # Set per run by the two Run buttons rather than by a widget, so it
+        # cannot be left on from a previous run.
+        self.stop_on_fail = False
         self.stdout_buffer = ""
         self.log_lines = 0
 
@@ -532,13 +535,23 @@ class MainWindow(QMainWindow):
 
         actions = QWidget()
         actions.setObjectName("sideActions")
-        action_layout = QHBoxLayout(actions)
+        action_layout = QVBoxLayout(actions)
         action_layout.setContentsMargins(14, 10, 10, 12)
         action_layout.setSpacing(8)
-        self.run_button = QPushButton("Run")
+
+        primary_row = QHBoxLayout()
+        primary_row.setSpacing(8)
+        # Stopping at the first failure is the default action, because that is
+        # what a debug loop wants.  The runner already implements it as the
+        # absence of --keep-going, so this button simply withholds the flag.
+        # "&&" because a single "&" would become a keyboard mnemonic.
+        self.run_button = QPushButton("Run && Stop if fail")
         self.run_button.setObjectName("primary")
         self.run_button.setMinimumHeight(36)
-        self.run_button.clicked.connect(self.start_run)
+        self.run_button.setToolTip(
+            "第一個失敗的 case 就停，後面的不跑；會覆寫 --keep-going 勾選"
+        )
+        self.run_button.clicked.connect(lambda: self.start_run(stop_on_fail=True))
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setMinimumHeight(36)
         self.cancel_button.setEnabled(False)
@@ -548,9 +561,20 @@ class MainWindow(QMainWindow):
         self.quit_button.setMinimumHeight(36)
         self.quit_button.setToolTip("關閉視窗；若還在跑會先問要不要中止")
         self.quit_button.clicked.connect(self.close)
-        action_layout.addWidget(self.run_button, 2)
-        action_layout.addWidget(self.cancel_button, 1)
-        action_layout.addWidget(self.quit_button, 1)
+        primary_row.addWidget(self.run_button, 2)
+        primary_row.addWidget(self.cancel_button, 1)
+        primary_row.addWidget(self.quit_button, 1)
+        action_layout.addLayout(primary_row)
+
+        # The whole list, failures and all.  That is a sweep, not a fix, so it
+        # is the deliberate second choice rather than the default.
+        self.run_all_button = QPushButton("Run 全部（失敗也繼續）")
+        self.run_all_button.setMinimumHeight(32)
+        self.run_all_button.setToolTip(
+            "跑完整份清單；某個 case 失敗不會中斷後面的（依 --keep-going 勾選）"
+        )
+        self.run_all_button.clicked.connect(lambda: self.start_run())
+        action_layout.addWidget(self.run_all_button)
         layout.addWidget(actions)
 
         container.setMinimumWidth(360)
@@ -621,6 +645,7 @@ class MainWindow(QMainWindow):
         self.max_cases_combo = QComboBox()
         for label, portion in (("前 20 個", 20), ("一半", "half"), ("全部", "all")):
             self.max_cases_combo.addItem(label, portion)
+        self.max_cases_combo.setCurrentIndex(self.max_cases_combo.findData("all"))
         self.max_cases_combo.currentIndexChanged.connect(self._update_group_note)
         self._compact_combo(self.max_cases_combo)
         self.max_cases_field = self._field(
@@ -774,7 +799,9 @@ class MainWindow(QMainWindow):
 
         self.keep_going_check = QCheckBox("--keep-going")
         self.keep_going_check.setChecked(True)
-        keep_note = QLabel("某個 case 失敗後仍然跑完清單")
+        keep_note = QLabel(
+            "只有「Run 全部」會用到這個勾選；預設的 Run 一律在第一個失敗停下"
+        )
         keep_note.setObjectName("note")
         keep_note.setWordWrap(True)
 
@@ -1069,7 +1096,9 @@ class MainWindow(QMainWindow):
             arguments += ["--timeout", str(self.timeout_spin.value())]
         if self.verify_link_check.isChecked():
             arguments.append("--verify-link")
-        if self.keep_going_check.isChecked():
+        # Stopping at the first failure is the absence of --keep-going, which
+        # is what the runner already implements; the button just withholds it.
+        if self.keep_going_check.isChecked() and not self.stop_on_fail:
             arguments.append("--keep-going")
         return arguments
 
@@ -1113,6 +1142,7 @@ class MainWindow(QMainWindow):
 
         self._append_log(f"$ {RUNNER_SCRIPT.name} {' '.join(arguments)}")
         self.run_button.setEnabled(False)
+        self.run_all_button.setEnabled(False)
         self.check_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         process.start()
@@ -1136,7 +1166,8 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(1)
         self._start_process(arguments, "check")
 
-    def start_run(self) -> None:
+    def start_run(self, stop_on_fail: bool = False) -> None:
+        self.stop_on_fail = stop_on_fail
         mode = self.mode_combo.currentText()
         self.run_dir = self._new_run_dir()
         self._reset_run_view()
@@ -1568,6 +1599,7 @@ class MainWindow(QMainWindow):
 
     def _finish_idle(self) -> None:
         self.run_button.setEnabled(True)
+        self.run_all_button.setEnabled(True)
         self.check_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
 
@@ -1665,6 +1697,7 @@ class MainWindow(QMainWindow):
             add(f"custom case   : {self._selected_case() or '<blank>'}")
         if mode in (MODE_GROUP, MODE_CASELIST) and hasattr(self, "max_cases_combo"):
             add(f"case limit    : {self.max_cases_combo.currentText()}")
+        add(f"on failure    : {'stop' if self.stop_on_fail else 'keep going'}")
         if getattr(self, "caselist_path", None):
             add(f"caselist      : {self.caselist_path}")
         add("")

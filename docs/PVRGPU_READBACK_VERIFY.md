@@ -77,15 +77,43 @@ itself as a second frame.  That split is in
 
 ## 3. The suite this was for
 
-```bash
-./script/run_regression.sh --suite dEQP --limit 50
-```
-
-or, for one case with the artifacts to look at:
+dEQP does not run through `run_regression.sh`.  The RDC dEQP captures are
+retired -- `RETIRED_SUITES` in `tools/run_rdc_regression.py` -- and dEQP is
+driven straight against the already-built driver and bridge instead:
 
 ```bash
-./script/run_deqp_dynamic.sh -c dEQP-GLES2.functional.prerequisite.clear_color
+# One group: a pass/fail/skip tally plus the QPA reason behind every failure
+./script/run_deqp_group_sample.sh --list              # the 24 groups
+./script/run_deqp_group_sample.sh <group-index> [n-cases]
+
+# One exact case, with the artifacts to look at
+./script/run_deqp_dynamic.sh -c dEQP-GLES3.functional.rasterization.primitives.triangles
+
+# Or the desktop front end: pick a group, then 前 20 個 / 一半 / 全部
+./script/deqp_dynamic_ui.py
 ```
+
+`gles3-rasterization-primitives` is the cheapest thing that exercises this
+change end to end: 10 cases, each of them clear -> draw -> readback -> compare,
+about three seconds for the group.  `gles3-color-clear` (19) and `gles3-fbo`
+(2077) come after it, not before.
+
+Read the artifacts before the pass count.  A case that fails because the
+readback never ran looks nothing like one that fails on rasterization, and the
+counter log tells them apart directly:
+
+```bash
+D=<run-dir>/cases/<case-name>
+grep -c '"type":"counter"' "$D"/systemc.jsonl              # one set per flush
+grep -c "framebuffer_readback " "$D"/driver-counter.txt    # times pixels came back
+grep "framebuffer_readback_skip" "$D"/driver-counter.txt   # and why they did not
+```
+
+A case that draws three times and reads back after each should show three
+counter sets and three `framebuffer_readback` events.  One counter set means
+the flush is still deferred to `atexit` and the hook never fired -- and every
+refusal leaves a `framebuffer_readback_skip` naming the gate that declined it,
+which is how the format gate in section 4 was found.
 
 The thing to check in `results.qpa` is the shape of the failure, not just the
 count.  Before, image comparisons read
