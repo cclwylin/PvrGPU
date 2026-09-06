@@ -77,6 +77,11 @@ static const unsigned pvrgpu_swizzle_rgba[4] = {
 static const unsigned pvrgpu_swizzle_rgb1[4] = {
    PVRGPU_SWIZ_CHAN0, PVRGPU_SWIZ_CHAN1, PVRGPU_SWIZ_CHAN2, PVRGPU_SWIZ_ONE,
 };
+/* B8G8R8A8: red reads source channel 2 and blue channel 0, so the sampled
+ * texel presents as RGBA out of BGRA storage. */
+static const unsigned pvrgpu_swizzle_bgra[4] = {
+   PVRGPU_SWIZ_CHAN2, PVRGPU_SWIZ_CHAN1, PVRGPU_SWIZ_CHAN0, PVRGPU_SWIZ_CHAN3,
+};
 static const unsigned pvrgpu_swizzle_depth_xxx1[4] = {
    PVRGPU_SWIZ_CHAN0, PVRGPU_SWIZ_CHAN0, PVRGPU_SWIZ_CHAN0, PVRGPU_SWIZ_ONE,
 };
@@ -425,6 +430,7 @@ pvrgpu_pco_build_terrain_texture_descriptor(
    }
    if (!out ||
        (format != PIPE_FORMAT_R8G8B8A8_UNORM &&
+        format != PIPE_FORMAT_B8G8R8A8_UNORM &&
         format != PIPE_FORMAT_R8G8B8X8_UNORM && !srgb && !astc &&
         !depth_stencil && !packed) ||
        width == 0 || width > 16384U || height == 0 || height > 16384U ||
@@ -447,6 +453,7 @@ pvrgpu_pco_build_terrain_texture_descriptor(
            : depth_stencil ? 22U : packed ? packed_rogue_format : 12U,
       srgb,
       depth_stencil ? pvrgpu_swizzle_depth_x001
+      : format == PIPE_FORMAT_B8G8R8A8_UNORM ? pvrgpu_swizzle_bgra
       : (format == PIPE_FORMAT_R8G8B8X8_UNORM || packed_three_channel)
                          ? pvrgpu_swizzle_rgb1
                          : pvrgpu_swizzle_rgba,

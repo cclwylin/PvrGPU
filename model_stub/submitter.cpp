@@ -2233,6 +2233,10 @@ void Submitter::RunJob() {
                         ? TextureFormat::kZ24UnormS8Uint
                   : texture.format == "PIPE_FORMAT_R8G8B8A8_UNORM"
                         ? TextureFormat::kRgba8Unorm
+                        // B8G8R8A8 storage; the descriptor swizzle presents it
+                        // as RGBA and the texture unit swaps red/blue at fetch.
+                        : texture.format == "PIPE_FORMAT_B8G8R8A8_UNORM"
+                              ? TextureFormat::kBgra8Unorm
                         : texture.format == "PIPE_FORMAT_R8G8B8X8_UNORM"
                               ? TextureFormat::kRgbx8Unorm
                         // Same four stored bytes as RGBA8; the texture unit

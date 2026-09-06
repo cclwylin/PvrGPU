@@ -9672,6 +9672,7 @@ pvrgpu_capture_generic_sequence_texture(
       format == PIPE_FORMAT_R11G11B10_FLOAT ||
       format == PIPE_FORMAT_R9G9B9E5_FLOAT;
    if (format != PIPE_FORMAT_R8G8B8A8_UNORM &&
+       format != PIPE_FORMAT_B8G8R8A8_UNORM &&
        format != PIPE_FORMAT_R8G8B8X8_UNORM &&
        /*
         * An sRGB view is RGBA8 storage the texture unit decodes through the

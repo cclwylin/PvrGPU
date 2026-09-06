@@ -190,6 +190,7 @@ TextureFilterDatapath SelectTextureFilterDatapath(
   // what the state tracker hands llvmpipe for it as well.
   const bool fits_8unorm = format == TextureFormat::kRgba8Unorm ||
                            format == TextureFormat::kRgbx8Unorm ||
+                           format == TextureFormat::kBgra8Unorm ||
                            format == TextureFormat::kAstcLdr;
   const auto simple_wrap = [](TextureWrapMode wrap) {
     return wrap == TextureWrapMode::kRepeat ||
@@ -526,6 +527,7 @@ std::uint32_t TextureBytesPerTexel(TextureFormat format) {
     return 8U;
   case TextureFormat::kRgba8Unorm:
   case TextureFormat::kRgbx8Unorm:
+  case TextureFormat::kBgra8Unorm:
   case TextureFormat::kRgba8Srgb:
   case TextureFormat::kZ32Unorm:
   case TextureFormat::kZ24UnormS8Uint:
@@ -545,6 +547,7 @@ std::array<float, 4> DecodeTexelToFloat(
   std::array<float, 4> result{};
   switch (format) {
   case TextureFormat::kRgba8Unorm:
+  case TextureFormat::kBgra8Unorm:  // red/blue already swapped at fetch
   case TextureFormat::kAstcLdr:
     for (std::size_t component = 0; component < 4; ++component)
       result[component] = static_cast<float>(texel[component]) / 255.0F;

@@ -266,6 +266,12 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
       !compressed && format == 12U && red_swizzle == 0U &&
       green_swizzle == 1U && blue_swizzle == 2U &&
       (alpha_swizzle == 3U || alpha_swizzle == 4U);
+  // B8G8R8A8: the same U8U8U8U8 storage as RGBA8 with the descriptor's
+  // (Z,Y,X,W) swizzle -- red reads channel 2 and blue channel 0.  The texel
+  // fetch swaps the two bytes so the datapath treats it as plain RGBA8.
+  const bool bgra8 =
+      !compressed && format == 12U && red_swizzle == 2U &&
+      green_swizzle == 1U && blue_swizzle == 0U && alpha_swizzle == 3U;
   const bool z32_unorm =
       format == 24U && red_swizzle == 0U && green_swizzle == 0U &&
       blue_swizzle == 0U && alpha_swizzle == 4U;
@@ -309,7 +315,7 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
       ExtractBits(word0, 4, 4) != 0U ||
       (gamma && !rgba8 && !astc) ||
       ExtractBits(word0, 17, 26) != 0U ||
-      (!rgba8 && !astc && !z32_unorm && !z24_unorm_s8_uint &&
+      (!rgba8 && !bgra8 && !astc && !z32_unorm && !z24_unorm_s8_uint &&
        !packed_colour) ||
       ExtractBits(word0, 62, 63) != 0U) {
     throw std::runtime_error(
@@ -383,6 +389,7 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
       : r11g11b10         ? TextureFormat::kR11fG11fB10f
       : rgb9e5            ? TextureFormat::kRgb9e5Float
       : rgba16f           ? TextureFormat::kRgba16Float
+      : bgra8             ? TextureFormat::kBgra8Unorm
       : gamma             ? TextureFormat::kRgba8Srgb
       : alpha_swizzle == 4U ? TextureFormat::kRgbx8Unorm
                             : TextureFormat::kRgba8Unorm;
@@ -486,6 +493,7 @@ bool DriverPcoTextureDescriptorClassSupported(
   const bool decodable_format =
       image.format == TextureFormat::kRgba8Unorm ||
       image.format == TextureFormat::kRgbx8Unorm ||
+      image.format == TextureFormat::kBgra8Unorm ||
       image.format == TextureFormat::kRgba8Srgb ||
       image.format == TextureFormat::kAstcLdr ||
       image.format == TextureFormat::kAstcLdrSrgb ||
@@ -1349,6 +1357,11 @@ void TextureUnit::SampleRunForStage(
         } else {
           std::copy(payload.begin(), payload.end(), texel.begin());
         }
+        // B8G8R8A8 storage arrives B,G,R,A; the descriptor's swizzle presents
+        // it as RGBA, which the unit realises by swapping red and blue here so
+        // every datapath downstream reads plain RGBA8 bytes.
+        if (image.format == TextureFormat::kBgra8Unorm)
+          std::swap(texel[0], texel[2]);
         return texel;  // valid bytes: fetch_bytes; upper bytes stay zero
       };
 

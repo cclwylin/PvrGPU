@@ -561,6 +561,11 @@ enum class TextureFormat : std::uint8_t {
   kRgba16Float,        // four IEEE half floats
   kR11fG11fB10f,       // two 11-bit and one 10-bit unsigned float, alpha one
   kRgb9e5Float,        // shared 5-bit exponent, alpha one
+  // The same four stored bytes as kRgba8Unorm in B,G,R,A order.  The Rogue
+  // image descriptor carries the (Z,Y,X,W) swizzle that presents them as RGBA;
+  // the texture unit realises it by swapping the red and blue bytes at fetch,
+  // so every datapath downstream treats the texel as plain 8-bit unorm.
+  kBgra8Unorm,
 };
 
 // One sRGB-encoded channel, as a linear value.  This is the GL/IEC 61966-2-1

@@ -1340,13 +1340,16 @@ bool CopyPcoSequenceTexture(
   pvrgpu::stub::TextureFormat texture_format =
       pvrgpu::stub::TextureFormat::kRgba8Unorm;
   if (format == "PIPE_FORMAT_R8G8B8A8_UNORM" ||
+      format == "PIPE_FORMAT_B8G8R8A8_UNORM" ||
       format == "PIPE_FORMAT_R8G8B8X8_UNORM" ||
       format == "PIPE_FORMAT_R8G8B8A8_SRGB" ||
       format == "PIPE_FORMAT_Z32_UNORM" ||
       format == "PIPE_FORMAT_Z24_UNORM_S8_UINT") {
     block_bytes = 4U;
     texture_format =
-        format == "PIPE_FORMAT_R8G8B8X8_UNORM"
+        format == "PIPE_FORMAT_B8G8R8A8_UNORM"
+            ? pvrgpu::stub::TextureFormat::kBgra8Unorm
+        : format == "PIPE_FORMAT_R8G8B8X8_UNORM"
             ? pvrgpu::stub::TextureFormat::kRgbx8Unorm
         : format == "PIPE_FORMAT_R8G8B8A8_SRGB"
             ? pvrgpu::stub::TextureFormat::kRgba8Srgb
