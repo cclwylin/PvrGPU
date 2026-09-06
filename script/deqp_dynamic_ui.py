@@ -137,6 +137,10 @@ LOG_LINE_LIMIT = 20_000
 # conversation, so it stays readable rather than complete; the run
 # directory beside it holds everything that was trimmed.
 DIAGNOSTICS_MAX_CASES = 12
+# NotSupported can legitimately hit every case in a blocked group (e.g. a
+# whole GLES3 batch on a driver without ES3), so the one-line summary table
+# gets a much bigger allowance than the expensive per-case detail dump.
+DIAGNOSTICS_MAX_SUMMARY_ROWS = 200
 DIAGNOSTICS_LOG_LINES = 200
 ARTIFACT_ROW_LIMIT = 5_000
 
@@ -407,9 +411,14 @@ class MainWindow(QMainWindow):
         self.last_phase: str = ""
         self.current_group = None
         self.caselist_path: Path | None = None
-        # Set per run by the two Run buttons rather than by a widget, so it
+        # Set per run by the Run buttons rather than by a widget, so it
         # cannot be left on from a previous run.
         self.stop_on_fail = False
+        self.skip_passed = False
+        # Accumulates across runs (NOT reset per run): every case name whose
+        # most recently observed status was Pass. "Run & Skip if passed" reruns
+        # only what is missing from here; "Clear Pass" forgets all of it.
+        self.known_pass_cases: set[str] = set()
         self.stdout_buffer = ""
         self.log_lines = 0
 
@@ -575,6 +584,30 @@ class MainWindow(QMainWindow):
         )
         self.run_all_button.clicked.connect(lambda: self.start_run())
         action_layout.addWidget(self.run_all_button)
+
+        # Repeat runs converge on the real failures fastest when they skip
+        # whatever is already known to pass instead of re-running everything.
+        self.run_skip_passed_button = QPushButton("Run Skip if passed && Stop if fail")
+        self.run_skip_passed_button.setMinimumHeight(32)
+        self.run_skip_passed_button.setToolTip(
+            "只重跑目前記錄裡還沒 pass 過的 case（跳過已知 pass 的），\n"
+            "也就是直接跑上一輪 fail／還沒跑過的地方；\n"
+            "遇到第一個失敗就停，後面的不跑（跟 Run && Stop if fail 一樣）。\n"
+            "跟 Clear Pass 搭配：按過 Clear Pass 之後這裡就會整份重跑。"
+        )
+        self.run_skip_passed_button.clicked.connect(
+            lambda: self.start_run(stop_on_fail=True, skip_passed=True)
+        )
+        action_layout.addWidget(self.run_skip_passed_button)
+
+        self.clear_pass_button = QPushButton("Clear Pass")
+        self.clear_pass_button.setMinimumHeight(28)
+        self.clear_pass_button.setToolTip(
+            "忘記目前記錄的已知 pass case：清空「Run & Skip if passed」用的\n"
+            "名單，並把目前結果表裡的 Pass 那幾行移除。"
+        )
+        self.clear_pass_button.clicked.connect(self.clear_known_pass)
+        action_layout.addWidget(self.clear_pass_button)
         layout.addWidget(actions)
 
         container.setMinimumWidth(360)
@@ -828,9 +861,10 @@ class MainWindow(QMainWindow):
 
         self.copy_diagnostics_button = QPushButton("複製診斷資訊")
         self.copy_diagnostics_button.setToolTip(
-            "把這次執行的設定、解析後的路徑、每個 case 的結果、失敗 case 的\n"
-            "命令與 log 尾巴收成一份純文字，複製到剪貼簿,\n"
-            "同時寫成 run 目錄裡的 diagnostics.txt。"
+            "把這次執行的設定、解析後的路徑，以及有問題（fail/warn/\n"
+            "NotSupported）case 的結果、命令與 log 尾巴收成一份純文字，\n"
+            "複製到剪貼簿,\n"
+            "同時寫成 run 目錄裡的 diagnostics.txt。全部通過時不附 log。"
         )
         self.copy_diagnostics_button.clicked.connect(self.copy_diagnostics)
         header_layout.addWidget(self.copy_diagnostics_button, 0, 5)
@@ -1166,8 +1200,9 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(1)
         self._start_process(arguments, "check")
 
-    def start_run(self, stop_on_fail: bool = False) -> None:
+    def start_run(self, stop_on_fail: bool = False, skip_passed: bool = False) -> None:
         self.stop_on_fail = stop_on_fail
+        self.skip_passed = skip_passed
         mode = self.mode_combo.currentText()
         self.run_dir = self._new_run_dir()
         self._reset_run_view()
@@ -1222,11 +1257,25 @@ class MainWindow(QMainWindow):
         self._launch_cases([case_name])
 
     def _launch_cases(self, names: list[str]) -> None:
+        if self.skip_passed and self.known_pass_cases:
+            before = len(names)
+            names = [name for name in names if name not in self.known_pass_cases]
+            skipped = before - len(names)
+            if skipped:
+                self._append_log(
+                    f"--- skip-if-passed: {skipped} case(s) already known "
+                    "passing, skipped ---"
+                )
         if self.mode_combo.currentText() in (MODE_GROUP, MODE_CASELIST):
             names = names[: self._resolve_case_limit(len(names))]
         names = [name for name in names if EXACT_CASE_RE.match(name)]
         if not names:
-            QMessageBox.warning(self, "PvrGPU", "沒有可執行的 exact case。")
+            message = (
+                "目前沒有已知失敗／還沒跑過的 case 可以重跑（都已標記為 pass）。"
+                if self.skip_passed
+                else "沒有可執行的 exact case。"
+            )
+            QMessageBox.warning(self, "PvrGPU", message)
             self._finish_idle()
             return
 
@@ -1252,6 +1301,19 @@ class MainWindow(QMainWindow):
             return
         self._append_log("--- cancel requested ---")
         self.process.kill()
+
+    def clear_known_pass(self) -> None:
+        """Forget every case remembered as passing: empty the \"Run & Skip
+        if passed\" memory, and drop the current Pass rows from the results
+        table so the view agrees that nothing is recorded as passing."""
+        self.known_pass_cases.clear()
+        self.state.rows = [row for row in self.state.rows if row.bucket != "pass"]
+        for position in reversed(range(self.results_table.rowCount())):
+            status_item = self.results_table.item(position, 2)
+            if status_item is not None and status_bucket(status_item.text()) == "pass":
+                self.results_table.removeRow(position)
+        self._refresh_counters()
+        self.statusBar().showMessage("已清除已知 Pass 記錄", 5000)
 
     # --------------------------------------------------------------------------
     # Process output
@@ -1340,6 +1402,12 @@ class MainWindow(QMainWindow):
             value = payload.get(key)
             if value:
                 setattr(row, key, Path(value))
+        # Track the most recently observed outcome, not just "ever passed":
+        # a regression must make a case eligible for "Skip if passed" again.
+        if row.bucket == "pass":
+            self.known_pass_cases.add(case_name)
+        else:
+            self.known_pass_cases.discard(case_name)
         self._update_result_row(row)
         self.progress.setValue(min(row.index, self.progress.maximum()))
         self._refresh_counters()
@@ -1748,28 +1816,44 @@ class MainWindow(QMainWindow):
             f"skip={buckets['skip']} warn={buckets['warn']}")
         add("")
 
-        add("[cases]")
+        # Notable = anything worth a human looking at: real failures/warnings,
+        # plus NotSupported (unlike Waiver, that often means a real capability
+        # gap, not an intentionally-accepted exclusion). A passing/skipped-only
+        # run should not need a wall of "everything is fine" rows.
+        def _is_notable(row: CaseRow) -> bool:
+            return (
+                row.bucket in ("fail", "warn")
+                or row.status.strip().casefold() == "notsupported"
+            )
+
+        notable = [row for row in self.state.rows if _is_notable(row)]
+        add(f"[problem cases]  ({len(notable)} of {len(self.state.rows)};"
+            f" first {min(len(notable), DIAGNOSTICS_MAX_SUMMARY_ROWS)} shown)")
         add(f"{'#':>3}  {'status':<13} {'exit':>4} {'duration':>9}  "
             f"{'artifacts':<24} case")
-        for row in self.state.rows:
+        if not notable:
+            add("(none -- every case passed or was an accepted waiver)")
+        for row in notable[:DIAGNOSTICS_MAX_SUMMARY_ROWS]:
             add(f"{row.index:>3}  {row.status:<13} "
                 f"{('' if row.exit_code is None else row.exit_code):>4} "
                 f"{format_duration(row.duration_ms):>9}  "
                 f"{row.artifact_summary():<24} {row.case_name}")
+        if len(notable) > DIAGNOSTICS_MAX_SUMMARY_ROWS:
+            add(f"... ({len(notable) - DIAGNOSTICS_MAX_SUMMARY_ROWS} more not shown)")
         add("")
 
-        failing = [row for row in self.state.rows if row.bucket in ("fail", "warn")]
-        add(f"[failing cases in detail]  ({len(failing)} of {len(self.state.rows)};"
-            f" first {min(len(failing), DIAGNOSTICS_MAX_CASES)} shown)")
-        if not failing:
+        add(f"[problem cases in detail]  ({len(notable)} total;"
+            f" first {min(len(notable), DIAGNOSTICS_MAX_CASES)} shown)")
+        if not notable:
             add("(none)")
-        for row in failing[:DIAGNOSTICS_MAX_CASES]:
+        for row in notable[:DIAGNOSTICS_MAX_CASES]:
             lines.extend(self._case_detail(row))
             add("")
 
-        add("[UI log tail]")
-        add(self._tail(self.log_view.toPlainText(), DIAGNOSTICS_LOG_LINES))
-        add("")
+        if notable:
+            add("[UI log tail]")
+            add(self._tail(self.log_view.toPlainText(), DIAGNOSTICS_LOG_LINES))
+            add("")
         add("=== end of diagnostics ===")
         return "\n".join(lines)
 
