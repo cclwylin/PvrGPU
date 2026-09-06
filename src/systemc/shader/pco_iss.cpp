@@ -2423,13 +2423,20 @@ PcoInstruction DecodeGenericBitwiseAndGroup(
     DecodeError(header.offset + 3, "expected LOGICAL.AND phase-1 operation");
   if (binary[cursor++] != 0x02U)
     DecodeError(header.offset + 4, "expected BBYP0S1 phase-0 operation");
-  if (binary[cursor++] != 0x80U || binary[cursor++] != 0x40U ||
-      binary[cursor++] != 0x00U) {
+  // The lower-source group carries the first operand as s2; s0/s1 are the
+  // unused sc0 the phase form bypasses.  Decoding it generically (rather than
+  // pinning the selector to a temporary) lets s2 be a shared register, which
+  // is how the array-index math reads its layer count and strides.
+  const ThreeLowerSources lower =
+      DecodeThreeLowerSources(binary, group_end, cursor);
+  if (lower.input_selector != 0 ||
+      lower.source0.bank != PcoRegisterBank::kSpecial ||
+      lower.source0.index != kSpecialConstantZero ||
+      lower.source1.bank != PcoRegisterBank::kSpecial ||
+      lower.source1.index != kSpecialConstantZero) {
     DecodeError(header.offset + 5,
-                "LOGICAL.AND lower-source selector is not canonical");
+                "LOGICAL.AND lower sources are not the canonical form");
   }
-  const PcoRegisterRef source0 =
-      DecodeOneLowerSource(binary, group_end, cursor);
   const PcoRegisterRef source1 =
       DecodeOneLowerSource(binary, group_end, cursor);
   const DecodedDestination destination =
@@ -2441,7 +2448,7 @@ PcoInstruction DecodeGenericBitwiseAndGroup(
   PcoInstruction instruction;
   instruction.opcode = PcoOpcode::kBitwiseAnd;
   instruction.target = destination.target;
-  instruction.source = source0;
+  instruction.source = lower.source2;
   instruction.source1 = source1;
   instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
   instruction.group_index = group_index;
@@ -2474,13 +2481,16 @@ PcoInstruction DecodeGenericBitwiseOrGroup(
     DecodeError(header.offset + 3, "expected LOGICAL.OR phase-1 operation");
   if (binary[cursor++] != 0x02U)
     DecodeError(header.offset + 4, "expected BBYP0S1 phase-0 operation");
-  if (binary[cursor++] != 0x80U || binary[cursor++] != 0x40U ||
-      binary[cursor++] != 0x00U) {
+  const ThreeLowerSources lower =
+      DecodeThreeLowerSources(binary, group_end, cursor);
+  if (lower.input_selector != 0 ||
+      lower.source0.bank != PcoRegisterBank::kSpecial ||
+      lower.source0.index != kSpecialConstantZero ||
+      lower.source1.bank != PcoRegisterBank::kSpecial ||
+      lower.source1.index != kSpecialConstantZero) {
     DecodeError(header.offset + 5,
-                "LOGICAL.OR lower-source selector is not canonical");
+                "LOGICAL.OR lower sources are not the canonical form");
   }
-  const PcoRegisterRef source0 =
-      DecodeOneLowerSource(binary, group_end, cursor);
   const PcoRegisterRef source1 =
       DecodeOneLowerSource(binary, group_end, cursor);
   const DecodedDestination destination =
@@ -2492,7 +2502,7 @@ PcoInstruction DecodeGenericBitwiseOrGroup(
   PcoInstruction instruction;
   instruction.opcode = PcoOpcode::kBitwiseOr;
   instruction.target = destination.target;
-  instruction.source = source0;
+  instruction.source = lower.source2;
   instruction.source1 = source1;
   instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
   instruction.group_index = group_index;
