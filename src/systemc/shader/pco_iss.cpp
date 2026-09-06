@@ -583,15 +583,93 @@ bool IsFragmentCoordinateSpecialRegister(std::uint16_t index) {
          index == kSpecialFragmentYPixel || index == kSpecialFragmentYSample;
 }
 
+// The public PCO special-constant file, exactly as the compiler's
+// pco_const_imms.c defines it: indices 0..31 hold the small integers 0..31
+// (the raw word is the integer), and the named indices below hold fixed
+// IEEE-754 bit patterns.  Returning the compiler's own table -- rather than a
+// hand-picked subset -- lets any constant a dEQP-generated shader folds appear
+// as an ALU source with the exact value the reference used.
+bool SpecialConstantBits(std::uint16_t index, std::uint32_t *bits) {
+  std::uint32_t value = 0;
+  if (index <= 31) {
+    value = index;
+  } else {
+    switch (index) {
+    case 64: value = 0x3f800000U; break;  /* 1 */
+    case 65: value = 0x40000000U; break;  /* 2 */
+    case 66: value = 0x40800000U; break;  /* 4 */
+    case 67: value = 0x41000000U; break;  /* 8 */
+    case 68: value = 0x41800000U; break;  /* 16 */
+    case 69: value = 0x42000000U; break;  /* 32 */
+    case 70: value = 0x42800000U; break;  /* 64 */
+    case 71: value = 0x43000000U; break;  /* 128 */
+    case 72: value = 0x43800000U; break;  /* 256 */
+    case 73: value = 0x44000000U; break;  /* 512 */
+    case 74: value = 0x44800000U; break;  /* 1024 */
+    case 75: value = 0x3f000000U; break;  /* 1/2 */
+    case 76: value = 0x3e800000U; break;  /* 1/4 */
+    case 77: value = 0x3e000000U; break;  /* 1/8 */
+    case 78: value = 0x3d800000U; break;  /* 1/16 */
+    case 79: value = 0x3d000000U; break;  /* 1/32 */
+    case 80: value = 0x3c800000U; break;  /* 1/64 */
+    case 81: value = 0x3c000000U; break;  /* 1/128 */
+    case 82: value = 0x3b800000U; break;  /* 1/256 */
+    case 83: value = 0x3b000000U; break;  /* 1/512 */
+    case 84: value = 0x3a800000U; break;
+    case 85: value = 0x3a000000U; break;
+    case 86: value = 0x39800000U; break;
+    case 87: value = 0x39000000U; break;
+    case 88: value = 0x38800000U; break;
+    case 89: value = 0x402df854U; break;  /* e */
+    case 90: value = 0x3ebc5ab2U; break;
+    case 91: value = 0x3fb504f3U; break;  /* sqrt(2) */
+    case 92: value = 0x3f3504f3U; break;  /* 1/sqrt(2) */
+    case 93: value = 0x3f490fdbU; break;  /* pi/4 */
+    case 94: value = 0x3fc90fdbU; break;  /* pi/2 */
+    case 95: value = 0x40490fdbU; break;  /* pi */
+    case 128: value = 0x3ea2f983U; break; /* 1/pi */
+    case 129: value = 0x3f22f983U; break; /* 2/pi */
+    case 130: value = 0x3fa2f983U; break;
+    case 131: value = 0x40c90fdbU; break;
+    case 132: value = 0x41490fdbU; break;
+    case 133: value = 0x41c90fdbU; break;
+    case 134: value = 0x37800000U; break;
+    case 135: value = 0x38000000U; break;
+    case 136: value = 0x3b4d2e1cU; break;
+    case 137: value = 0x414eb852U; break;
+    case 138: value = 0x3ed55555U; break;
+    case 139: value = 0x3f870a3dU; break;
+    case 140: value = 0x3d6147aeU; break;
+    case 141: value = 0x80000000U; break; /* -0 */
+    case 142: value = 0x7f800000U; break; /* +inf */
+    case 143: value = 0xffffffffU; break; /* all-ones boolean */
+    case 144: value = 0x7fff7fffU; break;
+    case 145: value = 0x3e9a209bU; break;
+    case 146: value = 0x3f317218U; break; /* ln(2) */
+    case 147: value = 0x0000007fU; break; /* 127 */
+    case 148: value = 0x7f7fffffU; break; /* FLT_MAX */
+    case 149: value = 0x4b000000U; break;
+    case 150: value = 0x4b800000U; break;
+    case 151: value = 0x3f860a92U; break;
+    case 152: value = 0x3eaaaaabU; break; /* 1/3 */
+    case 153: value = 0x3e2aaaabU; break; /* 1/6 */
+    case 154: value = 0x40549a78U; break;
+    case 155: value = 0x3fb8aa3bU; break; /* log2(e) */
+    case 156: value = 0x3d25aee6U; break;
+    case 157: value = 0x3d9e8391U; break;
+    case 158: value = 0x3f72a76fU; break;
+    case 159: value = 0x4019999aU; break;
+    default: return false;
+    }
+  }
+  if (bits)
+    *bits = value;
+  return true;
+}
+
 bool IsSupportedSpecialConstant(std::uint16_t index) {
-  return index <= 31 || index == kSpecialConstantOne ||
-         index == kSpecialConstantTwo || index == kSpecialConstantFour ||
-         index == kSpecialConstantEight || index == kSpecialConstantHalf ||
-         index == kSpecialConstantQuarter ||
-         index == kSpecialConstantEighth ||
-         index == kSpecialConstantOneOver256 ||
-         index == kSpecialConstantOneThird ||
-         index == kSpecialConstantOneSixth;
+  std::uint32_t bits = 0;
+  return SpecialConstantBits(index, &bits);
 }
 
 struct GroupHeader {
@@ -1762,9 +1840,10 @@ PcoInstruction DecodeGenericSimpleAluGroup(
   }
   if (destination.target == PcoWriteTarget::kPixelOutput &&
       source0.bank == PcoRegisterBank::kSpecial &&
-      source0.index != kSpecialConstantZero &&
-      source0.index != kSpecialConstantOne &&
-      source0.index != kSpecialConstantHalf) {
+      !IsSupportedSpecialConstant(source0.index)) {
+    // A constant colour output can be any special constant the file holds:
+    // the PBE clamps the written value into the attachment's range, so a
+    // constant above one or below zero is as valid a source as 0, 1 or 1/2.
     DecodeError(header.offset,
                 "PIXOUT special source is outside the public color gate");
   }
@@ -4026,34 +4105,14 @@ std::uint32_t ReadSource(const PcoRegisterRef &source,
   const std::size_t index =
       static_cast<std::size_t>(source.index) + repeat_index;
   switch (source.bank) {
-  case PcoRegisterBank::kSpecial:
+  case PcoRegisterBank::kSpecial: {
     if (repeat_index != 0)
       ExecuteError("special constants cannot be register-range repeated");
-    if (source.index <= 31)
-      return source.index;
-    if (source.index == kSpecialConstantZero)
-      return UINT32_C(0x00000000);
-    if (source.index == kSpecialConstantOne)
-      return UINT32_C(0x3f800000);
-    if (source.index == kSpecialConstantTwo)
-      return UINT32_C(0x40000000);
-    if (source.index == kSpecialConstantFour)
-      return UINT32_C(0x40800000);
-    if (source.index == kSpecialConstantEight)
-      return UINT32_C(0x41000000);
-    if (source.index == kSpecialConstantHalf)
-      return UINT32_C(0x3f000000);
-    if (source.index == kSpecialConstantQuarter)
-      return UINT32_C(0x3e800000);
-    if (source.index == kSpecialConstantEighth)
-      return UINT32_C(0x3e000000);
-    if (source.index == kSpecialConstantOneOver256)
-      return UINT32_C(0x3b800000);
-    if (source.index == kSpecialConstantOneThird)
-      return UINT32_C(0x3eaaaaab);
-    if (source.index == kSpecialConstantOneSixth)
-      return UINT32_C(0x3e2aaaab);
-    ExecuteError("unsupported special-constant register");
+    std::uint32_t bits = 0;
+    if (!SpecialConstantBits(source.index, &bits))
+      ExecuteError("unsupported special-constant register");
+    return bits;
+  }
   case PcoRegisterBank::kVertexInput:
     if (stage != ShaderStage::kVertex)
       ExecuteError("fragment instruction read a vertex-input register");
@@ -6743,9 +6802,7 @@ PcoFragmentExecution ExecuteFragmentPco(
       ExecuteError("non-MBYP/pixout operation reached the fragment executor");
     }
     if (instruction.source.bank == PcoRegisterBank::kSpecial) {
-      if (instruction.source.index != kSpecialConstantZero &&
-          instruction.source.index != kSpecialConstantOne &&
-          instruction.source.index != kSpecialConstantHalf) {
+      if (!IsSupportedSpecialConstant(instruction.source.index)) {
         ExecuteError("fragment MBYP special source is outside the gate");
       }
     } else if (instruction.source.bank == PcoRegisterBank::kTemporary) {
