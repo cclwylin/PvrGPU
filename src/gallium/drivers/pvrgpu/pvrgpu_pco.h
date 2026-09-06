@@ -142,11 +142,22 @@ bool pvrgpu_pco_compile_conditionals(struct pvrgpu_pco_compiler *compiler,
 /* Combined image/sampler descriptors one generically lowered draw can bind. */
 #define PVRGPU_PCO_MAX_TEXTURES 8u
 
-/* Reports the component width the vertex shader declares for each generic
- * attribute, so the driver can pack them at the width the program reads. */
+/*
+ * Reports, for each bound vertex element, the component width the vertex
+ * shader declares for the attribute it feeds and the generic location that
+ * attribute occupies.  The driver packs each attribute at the width the
+ * program reads, and the PCO vertex-input data has to be keyed by location
+ * because a shader that reads a sparse set of locations still gets one dense
+ * vertex element per location it reads.
+ *
+ * `reason` names the condition that rejected the layout so a declined draw
+ * says which one it was rather than reporting a bare boolean.
+ */
 bool pvrgpu_pco_vertex_attribute_components(const struct nir_shader *vertex_nir,
                                             unsigned attribute_count,
-                                            unsigned *components);
+                                            unsigned *components,
+                                            unsigned *locations,
+                                            const char **reason);
 
 bool pvrgpu_pco_compile_color_triangle(
    struct pvrgpu_pco_compiler *compiler,

@@ -10501,13 +10501,22 @@ pvrgpu_record_color_primitive_pco_draw(
     */
    const unsigned attribute_count = ctx->vertex_elements->num_elements;
    unsigned attribute_components[PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES] = {0};
+   unsigned attribute_locations[PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES] = {0};
+   const char *attribute_reason = NULL;
    if (!pvrgpu_pco_vertex_attribute_components(ctx->vs->nir,
                                                attribute_count,
-                                               attribute_components)) {
+                                               attribute_components,
+                                               attribute_locations,
+                                               &attribute_reason)) {
       pvrgpu_counter_eventf("draw_array_primitive_record_error",
                             "stage=attributes reason=shader_layout "
-                            "attributes=%u",
-                            attribute_count);
+                            "detail=%s attributes=%u inputs=0x%llx",
+                            attribute_reason ? attribute_reason : "unstated",
+                            attribute_count,
+                            ctx->vs->nir != NULL
+                               ? (unsigned long long)
+                                    ctx->vs->nir->info.inputs_read
+                               : 0ull);
       free(index_data);
       return false;
    }
@@ -10739,20 +10748,46 @@ pvrgpu_record_color_primitive_pco_draw(
     * at submission, when the sequence is already committed.
     */
    char decode_error[512] = { 0 };
-   if (!pvrgpu_pco_binary_is_executable(PVRGPU_SYSTEMC_PCO_SHADER_STAGE_VERTEX,
-                                        binary.vertex.data,
-                                        binary.vertex.size,
-                                        decode_error,
-                                        sizeof(decode_error)) ||
-       !pvrgpu_pco_binary_is_executable(
-          PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT,
-          binary.fragment.data,
-          binary.fragment.size,
-          decode_error,
-          sizeof(decode_error))) {
+   const char *decode_stage = "vertex";
+   const struct pvrgpu_pco_owned_binary *undecodable = &binary.vertex;
+   bool decodable =
+      pvrgpu_pco_binary_is_executable(PVRGPU_SYSTEMC_PCO_SHADER_STAGE_VERTEX,
+                                      binary.vertex.data,
+                                      binary.vertex.size,
+                                      decode_error,
+                                      sizeof(decode_error));
+   if (decodable) {
+      decode_stage = "fragment";
+      undecodable = &binary.fragment;
+      decodable = pvrgpu_pco_binary_is_executable(
+         PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT,
+         binary.fragment.data,
+         binary.fragment.size,
+         decode_error,
+         sizeof(decode_error));
+   }
+   if (!decodable) {
+      /*
+       * The offending binary itself, not just the message: an unsupported
+       * encoding is only actionable once the bytes around the reported offset
+       * are visible, and recompiling the case to recover them is a detour.
+       */
+      char hex[2u * 256u + 8u];
+      const size_t dumped =
+         MIN2(undecodable->size, (sizeof(hex) - 1u) / 2u);
+      for (size_t byte = 0; byte < dumped; ++byte) {
+         static const char digits[] = "0123456789abcdef";
+         hex[2u * byte] = digits[undecodable->data[byte] >> 4];
+         hex[2u * byte + 1u] = digits[undecodable->data[byte] & 0xfu];
+      }
+      hex[2u * dumped] = '\0';
       pvrgpu_counter_eventf("draw_array_primitive_record_error",
-                            "stage=decode reason=%s",
-                            decode_error[0] ? decode_error : "unknown");
+                            "stage=decode shader=%s reason=%s size=%zu "
+                            "pco=%s",
+                            decode_stage,
+                            decode_error[0] ? decode_error : "unknown",
+                            undecodable->size,
+                            hex);
       pvrgpu_pco_graphics_binary_finish(&binary);
       free(interleaved);
       free(index_data);

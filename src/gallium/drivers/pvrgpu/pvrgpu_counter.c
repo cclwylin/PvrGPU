@@ -44,7 +44,12 @@ pvrgpu_counter_eventf(const char *event, const char *format, ...)
    if (!pvrgpu_counter_output_path())
       return;
 
-   char details[512];
+   /*
+    * Large enough for a decode failure to carry the offending PCO binary as
+    * hex alongside its message; a truncated dump is the one thing that makes
+    * such an event useless.
+    */
+   char details[2048];
    va_list args;
    va_start(args, format);
    vsnprintf(details, sizeof(details), format ? format : "", args);

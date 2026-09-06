@@ -1674,6 +1674,7 @@ PcoInstruction DecodeGenericSimpleAluGroup(
   PcoOpcode opcode = PcoOpcode::kInternal;
   std::uint8_t source_count = 0;
   std::uint8_t source0_floor = 0;
+  std::uint8_t source0_integer_negate = 0;
   std::uint8_t source0_absolute = 0;
   std::uint8_t source1_absolute = 0;
   std::uint8_t saturate = 0;
@@ -1771,6 +1772,26 @@ PcoInstruction DecodeGenericSimpleAluGroup(
     opcode = PcoOpcode::kIntegerMultiplyAdd32;
     source_count = 3;
     break;
+  case 0xfa: {
+    /*
+     * The same IMADD32 with `s_i3264` set and the extended modifier byte.
+     * Signedness selects how the multiply overflows, which cannot change the
+     * low 32 bits this model keeps, so it needs no separate opcode; the
+     * modifier byte's `s0neg` does change the result and is carried on the
+     * instruction.  Every other modifier stays fail-closed by number.
+     */
+    if (cursor >= group_end)
+      DecodeError(cursor, "missing IMADD32 source-modifier byte");
+    const std::uint8_t modifiers = binary[cursor++];
+    if (modifiers != 0x10U) {
+      DecodeError(cursor - 1, "unsupported IMADD32 source modifiers [" +
+                                  std::to_string(modifiers) + "]");
+    }
+    source0_integer_negate = 1;
+    opcode = PcoOpcode::kIntegerMultiplyAdd32;
+    source_count = 3;
+    break;
+  }
   case 0x9c: {
     /*
      * UNPCK's format selector, as the compiler's own PCO_PCK_FORMAT_* values:
@@ -1859,6 +1880,7 @@ PcoInstruction DecodeGenericSimpleAluGroup(
   instruction.group_index = group_index;
   instruction.output_index = destination.index;
   instruction.source0_floor = source0_floor;
+  instruction.source0_integer_negate = source0_integer_negate;
   instruction.source0_absolute = source0_absolute;
   instruction.source1_absolute = source1_absolute;
   instruction.saturate = saturate;
@@ -1987,422 +2009,367 @@ PcoInstruction DecodeGenericPackHalfGroup(
   return instruction;
 }
 
-PcoInstruction DecodeGenericFloatMaxGroup(
-    ShaderStage, const std::vector<std::uint8_t> &binary,
-    const GroupHeader &header, std::uint16_t group_index) {
+/*
+ * PCO's F_TST_OP and F_TST_TYPE, spelled as pco_isa.py encodes them.  A BCMP
+ * group carries both in its TST phase, so one decoder covers every comparison
+ * the compiler can emit rather than one decoder -- and one opcode -- per
+ * operation.
+ */
+enum : std::uint8_t {
+  kTstOpZero = 0x0,
+  kTstOpGreaterZero = 0x1,
+  kTstOpGreaterEqualZero = 0x2,
+  kTstOpCarry = 0x3,
+  kTstOpEqual = 0x4,
+  kTstOpGreater = 0x5,
+  kTstOpGreaterEqual = 0x6,
+  kTstOpNotEqual = 0x7,
+  kTstOpLess = 0x8,
+  kTstOpLessEqual = 0x9,
+};
+
+enum : std::uint8_t {
+  kTstTypeF32 = 0x0,
+  kTstTypeU16 = 0x1,
+  kTstTypeS16 = 0x2,
+  kTstTypeU8 = 0x3,
+  kTstTypeS8 = 0x4,
+  kTstTypeU32 = 0x5,
+  kTstTypeS32 = 0x6,
+};
+
+struct DecodedTestPhase {
+  std::uint8_t op = kTstOpEqual;
+  std::uint8_t type = kTstTypeF32;
+  std::uint8_t bytes = 1;
+};
+
+/*
+ * TST phase byte 0 is `main_op:3 | ext0 | tst_op[2:0] | pwen`.  Without ext0
+ * the phase is one byte and compares as f32; with it a second byte carries
+ * `tst_type:3 | p2end | elem:2 | rsvd1 | tst_op[3]`, which is how the integer
+ * comparisons are spelled and also how TST.F32.L reaches operation 8, whose
+ * fourth bit does not fit in the three-bit field.
+ */
+DecodedTestPhase DecodeTestPhase(const std::vector<std::uint8_t> &binary,
+                                 std::size_t group_end, std::size_t offset,
+                                 bool expect_phase2_end = false) {
+  if (offset >= group_end)
+    DecodeError(offset, "missing BCMP TST phase");
+  const std::uint8_t byte0 = binary[offset];
+  if ((byte0 >> 5U) != 0x7U)
+    DecodeError(offset, "unsupported BCMP TST phase main operation");
+  if ((byte0 & 0x01U) != 0)
+    DecodeError(offset, "unsupported BCMP TST partial-write enable");
+  DecodedTestPhase phase;
+  phase.op = static_cast<std::uint8_t>((byte0 >> 1U) & 0x07U);
+  if ((byte0 & 0x10U) == 0)
+    return phase;
+  if (offset + 1U >= group_end)
+    DecodeError(offset, "truncated extended BCMP TST phase");
+  const std::uint8_t byte1 = binary[offset + 1U];
+  /*
+   * `elem` and `rsvd1` always have to be clear: the TST covers the whole
+   * register.  `p2end` says whether the TST is the last phase-2 operation,
+   * which is set in the TST/MOVC select form and clear in the BCMP form whose
+   * PCK still follows.
+   */
+  const std::uint8_t expected_phase2_end = expect_phase2_end ? 0x10U : 0x00U;
+  if ((byte1 & 0x1eU) != expected_phase2_end)
+    DecodeError(offset + 1U, "unsupported extended TST phase modifiers");
+  phase.bytes = 2;
+  phase.type = static_cast<std::uint8_t>((byte1 >> 5U) & 0x07U);
+  phase.op = static_cast<std::uint8_t>(phase.op | ((byte1 & 0x01U) << 3U));
+  return phase;
+}
+
+const char *TestOperationName(std::uint8_t op) {
+  switch (op) {
+  case kTstOpZero: return "Z";
+  case kTstOpGreaterZero: return "GZ";
+  case kTstOpGreaterEqualZero: return "GEZ";
+  case kTstOpCarry: return "C";
+  case kTstOpEqual: return "E";
+  case kTstOpGreater: return "G";
+  case kTstOpGreaterEqual: return "GE";
+  case kTstOpNotEqual: return "NE";
+  case kTstOpLess: return "L";
+  case kTstOpLessEqual: return "LE";
+  default: return "?";
+  }
+}
+
+const char *TestTypeName(std::uint8_t type) {
+  switch (type) {
+  case kTstTypeF32: return "F32";
+  case kTstTypeU16: return "U16";
+  case kTstTypeS16: return "S16";
+  case kTstTypeU8: return "U8";
+  case kTstTypeS8: return "S8";
+  case kTstTypeU32: return "U32";
+  case kTstTypeS32: return "S32";
+  default: return "?";
+  }
+}
+
+/*
+ * The three float comparisons that the model executed before the TST phase
+ * was decoded generically keep their own opcodes, so every switch that
+ * classifies them -- and the histogram bins they feed -- stays as it was.
+ */
+PcoOpcode BooleanCompareOpcode(const DecodedTestPhase &test,
+                               bool result_float_one) {
+  if (test.type == kTstTypeF32) {
+    switch (test.op) {
+    case kTstOpEqual:
+    case kTstOpLess:
+      /* These two materialize canonical Boolean bits only.  Mesa's PCK.ONE
+       * form makes binary32 1.0/0.0 instead, which only kFloatGreaterEqual
+       * ever learned to do, so it goes to the generic comparison. */
+      if (result_float_one)
+        break;
+      return test.op == kTstOpEqual ? PcoOpcode::kFloatEqual
+                                    : PcoOpcode::kFloatLess;
+    case kTstOpGreaterEqual:
+      return PcoOpcode::kFloatGreaterEqual;
+    default:
+      break;
+    }
+  }
+  return PcoOpcode::kBooleanCompare;
+}
+
+/*
+ * Public Mesa materializes a GLSL Boolean from a comparison as a five-phase
+ * group: P0/P1 move the ordered operands, P2 supplies the false value, TST
+ * forms the predicate, and MOVC selects the true or false value.
+ *
+ * The two forms differ only in what they materialize.  The canonical Boolean
+ * form selects internal sc143 (all bits one) or zero; Mesa's PCK.ONE form
+ * selects binary32 1.0 or 0.0 from sc0.  Everything else about the group --
+ * operand order, ISS selection, destination -- is shared, so both are decoded
+ * here and told apart by `result_float_one`.
+ */
+PcoInstruction DecodeGenericBooleanCompareGroup(
+    const std::vector<std::uint8_t> &binary, const GroupHeader &header,
+    std::uint16_t group_index, bool result_float_one) {
+  const char *form = result_float_one ? "BCMP.ONE" : "BCMP";
+  if (header.control || header.bitwise || header.operation_origin != 5 ||
+      header.output_load_check || !header.write0_present ||
+      header.write1_present || header.repeat_count != 1 || header.end) {
+    DecodeError(header.offset,
+                std::string("unsupported ") + form +
+                    " instruction-group header");
+  }
+  const std::size_t group_end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  const std::uint8_t lead[] = {
+      static_cast<std::uint8_t>(result_float_one ? 0xd2U : 0xd3U),
+      0x3c,
+  };
+  for (std::uint8_t expected : lead) {
+    if (cursor >= group_end || binary[cursor++] != expected) {
+      DecodeError(cursor - 1,
+                  std::string("unsupported ") + form + " P2/TST lead-in");
+    }
+  }
+
+  const DecodedTestPhase test = DecodeTestPhase(binary, group_end, cursor);
+  cursor += test.bytes;
+  /*
+   * `da` counts the group's operation bytes, so the extended TST phase moves
+   * it by exactly the byte it adds.  Checking it against the phase that was
+   * decoded keeps the header and the body agreeing on the group's shape.
+   */
+  if (header.da != 8U + (test.bytes - 1U)) {
+    DecodeError(header.offset,
+                std::string("unsupported ") + form + " group length for TST." +
+                    TestTypeName(test.type) + "." +
+                    TestOperationName(test.op));
+  }
+
+  const std::uint8_t tail[] = {
+      0x9c,
+      static_cast<std::uint8_t>(result_float_one ? 0x1fU : 0x1eU),
+      0x87,
+      0x87,
+  };
+  for (std::uint8_t expected : tail) {
+    if (cursor >= group_end || binary[cursor++] != expected) {
+      DecodeError(cursor - 1,
+                  std::string("unsupported ") + form + " MOVC phase sequence");
+    }
+  }
+
+  const TwoLowerSources lower =
+      DecodeTwoLowerSources(binary, group_end, cursor, true, true);
+  const unsigned expected_true_source = result_float_one ? 0u : 143u;
+  if (lower.source1.bank != PcoRegisterBank::kSpecial ||
+      lower.source1.index != expected_true_source) {
+    DecodeError(header.offset,
+                std::string(form) + " requires canonical internal sc" +
+                    std::to_string(expected_true_source) + " true source");
+  }
+  const PcoRegisterRef compare_source1 =
+      DecodeOneLowerSource(binary, group_end, cursor);
+  const std::uint8_t expected_iss = result_float_one ? 0x30U : 0x20U;
+  if (cursor >= group_end || binary[cursor++] != expected_iss)
+    DecodeError(cursor - 1, std::string("unsupported ") + form + " ISS selection");
+  const DecodedDestination destination =
+      DecodeGenericDestination(binary, group_end, cursor);
+  if (destination.target != PcoWriteTarget::kTemporary)
+    DecodeError(header.offset, std::string(form) + " destination must be temporary");
+  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
+
+  PcoInstruction instruction;
+  instruction.opcode = BooleanCompareOpcode(test, result_float_one);
+  instruction.target = destination.target;
+  instruction.source = lower.source0;
+  instruction.source1 = compare_source1;
+  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
+  instruction.group_index = group_index;
+  instruction.output_index = destination.index;
+  instruction.comparison_result_float_one = result_float_one ? 1 : 0;
+  instruction.comparison_test_op = test.op;
+  instruction.comparison_test_type = test.type;
+  instruction.source_count = 2;
+  instruction.repeat_count = 1;
+  instruction.end_group = 0;
+  return instruction;
+}
+
+/*
+ * TST + MOVC without the PCK phase: the group tests, then selects, instead of
+ * materializing a Boolean.  Which operands MOVC picks between follows from the
+ * test itself.
+ *
+ * A binary test (E/G/GE/NE/L/LE) compares the two values the MOVC selects
+ * between, which is what min and max are: TST.G picks the greater of the pair,
+ * TST.L the lesser.  A unary test (Z/GZ/GEZ/C) has only one operand, so the
+ * group carries a separate condition and two values to choose from -- the
+ * conditional select.  The two shapes encode their sources differently, and
+ * confirm which was decoded through the ISS selection byte that follows them.
+ */
+PcoInstruction DecodeGenericTestSelectGroup(
+    const std::vector<std::uint8_t> &binary, const GroupHeader &header,
+    std::uint16_t group_index) {
   if (header.control || header.bitwise || header.da != 7 ||
       header.operation_origin != 5 || header.output_load_check ||
       !header.write0_present || header.write1_present ||
       header.repeat_count != 1) {
-    DecodeError(header.offset, "unsupported FMAX instruction-group header");
+    DecodeError(header.offset,
+                "unsupported TST/MOVC instruction-group header");
   }
   const std::size_t group_end = header.offset + header.total_bytes;
   std::size_t cursor = header.offset + 3;
-  // TST.G + MOVC: the greater of the two sources.  The MOVC phase byte's type
-  // is 0x10 for a float compare and 0xd0 for a signed-int one -- the same
-  // datapath, a different comparison, which is what distinguishes the array
-  // layer's integer clamp (max(0, ...)) from glmark's float max.
-  constexpr std::uint8_t kLeadPhases[] = {0xd0, 0x3c, 0xfa};
-  for (std::uint8_t expected : kLeadPhases) {
+  for (std::uint8_t expected : {0xd0U, 0x3cU}) {
     if (cursor >= group_end || binary[cursor++] != expected)
-      DecodeError(cursor - 1, "unsupported TST/MOVC FMAX phase sequence");
+      DecodeError(cursor - 1, "unsupported TST/MOVC lead-in");
   }
-  PcoOpcode max_opcode;
+  /*
+   * This form always uses the extended TST phase: it needs the operand type,
+   * and its `p2end` is set because the TST is the last phase-2 operation --
+   * the MOVC that follows reads the predicate rather than continuing it.
+   */
+  const DecodedTestPhase test =
+      DecodeTestPhase(binary, group_end, cursor, /*expect_phase2_end=*/true);
+  if (test.bytes != 2)
+    DecodeError(cursor, "TST/MOVC requires the extended TST phase");
+  cursor += test.bytes;
+  if (cursor >= group_end || binary[cursor++] != 0x87U)
+    DecodeError(cursor - 1, "unsupported TST/MOVC MBYP phase");
+  /*
+   * The second MBYP carries the value MOVC moves when the test passes, and
+   * may negate it on the way -- which is how `cond ? -a : b` is spelled.
+   */
+  bool negate_true_source = false;
   if (cursor >= group_end)
-    DecodeError(cursor, "truncated TST/MOVC max phase");
-  const std::uint8_t movc_type = binary[cursor++];
-  if (movc_type == 0x10U)
-    max_opcode = PcoOpcode::kFloatMax;
-  else if (movc_type == 0xd0U)
-    max_opcode = PcoOpcode::kIntegerMaxSigned;
-  else
-    DecodeError(cursor - 1, "unsupported TST/MOVC max type");
-  for (std::uint8_t expected : {0x87U, 0x87U}) {
-    if (cursor >= group_end || binary[cursor++] != expected)
-      DecodeError(cursor - 1, "unsupported TST/MOVC max source selector");
+    DecodeError(cursor, "missing TST/MOVC true-value MBYP phase");
+  if (binary[cursor] == 0x87U) {
+    ++cursor;
+  } else if (binary[cursor] == 0x97U) {
+    ++cursor;
+    if (cursor >= group_end || binary[cursor++] != 0x02U)
+      DecodeError(cursor - 1, "unsupported TST/MOVC true-source modifier");
+    negate_true_source = true;
+  } else {
+    DecodeError(cursor, "unsupported TST/MOVC MBYP phase");
   }
-  const PcoRegisterRef source0 =
-      DecodeOneLowerSource(binary, group_end, cursor);
-  const PcoRegisterRef source1 =
-      DecodeOneLowerSource(binary, group_end, cursor);
-  if (cursor >= group_end || binary[cursor++] != 0x10U)
-    DecodeError(cursor - 1, "unsupported FMAX ISS selection");
+
+  PcoInstruction instruction;
+  instruction.comparison_test_op = test.op;
+  instruction.comparison_test_type = test.type;
+  instruction.source1_negate = negate_true_source ? 1U : 0U;
+  if (test.op > kTstOpCarry) {
+    /* Binary test: MOVC selects between the two compared operands. */
+    const PcoRegisterRef source0 =
+        DecodeOneLowerSource(binary, group_end, cursor);
+    const PcoRegisterRef source1 =
+        DecodeOneLowerSource(binary, group_end, cursor);
+    if (cursor >= group_end || binary[cursor++] != 0x10U)
+      DecodeError(cursor - 1, "unsupported TST/MOVC pair ISS selection");
+    if (negate_true_source) {
+      DecodeError(header.offset,
+                  "TST/MOVC pair select cannot negate a compared operand");
+    }
+    if (test.op == kTstOpGreater && test.type == kTstTypeF32)
+      instruction.opcode = PcoOpcode::kFloatMax;
+    else if (test.op == kTstOpGreater && test.type == kTstTypeS32)
+      instruction.opcode = PcoOpcode::kIntegerMaxSigned;
+    else if (test.op == kTstOpLess && test.type == kTstTypeF32)
+      instruction.opcode = PcoOpcode::kFloatMin;
+    else if (test.op == kTstOpLess && test.type == kTstTypeS32)
+      instruction.opcode = PcoOpcode::kIntegerMinSigned;
+    else
+      DecodeError(header.offset,
+                  std::string("unsupported TST.") + TestTypeName(test.type) +
+                      "." + TestOperationName(test.op) + " MOVC pair select");
+    instruction.source = source0;
+    instruction.source1 = source1;
+    instruction.source_count = 2;
+  } else {
+    /*
+     * Unary test: P0 supplies the true value, is0/s1 the condition, and P1
+     * the false value.  The long lower-source encoding is mandatory because
+     * it carries the exact is0=s1 selector.
+     */
+    const TwoLowerSources lower =
+        DecodeTwoLowerSources(binary, group_end, cursor, true, false);
+    const PcoRegisterRef false_source =
+        DecodeOneLowerSource(binary, group_end, cursor);
+    if (cursor >= group_end || binary[cursor++] != 0x11U)
+      DecodeError(cursor - 1, "unsupported TST/MOVC select ISS selection");
+    /*
+     * The two forms the model executed before the TST phase was decoded
+     * generically keep their own opcodes, so their histogram bins and the
+     * switches that name them are unchanged.
+     */
+    if (negate_true_source)
+      instruction.opcode = PcoOpcode::kTestConditionalSelect;
+    else if (test.op == kTstOpGreaterZero && test.type == kTstTypeF32)
+      instruction.opcode = PcoOpcode::kConditionalSelectGreaterZero;
+    else if (test.op == kTstOpGreaterZero && test.type == kTstTypeU32)
+      instruction.opcode = PcoOpcode::kConditionalSelect;
+    else
+      instruction.opcode = PcoOpcode::kTestConditionalSelect;
+    instruction.source = lower.source1;
+    instruction.source1 = lower.source0;
+    instruction.source2 = false_source;
+    instruction.source_count = 3;
+  }
+
   const DecodedDestination destination =
       DecodeGenericDestination(binary, group_end, cursor);
   if (destination.target != PcoWriteTarget::kTemporary)
-    DecodeError(header.offset, "FMAX destination must be temporary");
+    DecodeError(header.offset, "TST/MOVC destination must be temporary");
   ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
 
-  PcoInstruction instruction;
-  instruction.opcode = max_opcode;
   instruction.target = destination.target;
-  instruction.source = source0;
-  instruction.source1 = source1;
   instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
   instruction.group_index = group_index;
   instruction.output_index = destination.index;
-  instruction.source_count = 2;
   instruction.repeat_count = 1;
   instruction.end_group = header.end ? 1U : 0U;
-  return instruction;
-}
-
-PcoInstruction DecodeGenericFloatMinGroup(
-    ShaderStage, const std::vector<std::uint8_t> &binary,
-    const GroupHeader &header, std::uint16_t group_index) {
-  /* Public FMIN lowers to an ordered TST.L and MOVC: P0 carries source0,
-   * P1 carries source1, true selects P0, and false selects P1.  The false
-   * source routing is observable for unordered inputs and equal signed zero,
-   * so retain this exact phase form rather than treating it as host min(). */
-  if (header.control || header.bitwise || header.da != 7 ||
-      header.operation_origin != 5 || header.output_load_check ||
-      !header.write0_present || header.write1_present ||
-      header.repeat_count != 1 || header.end) {
-    DecodeError(header.offset, "unsupported FMIN instruction-group header");
-  }
-  const std::size_t group_end = header.offset + header.total_bytes;
-  std::size_t cursor = header.offset + 3;
-  constexpr std::uint8_t kLeadPhases[] = {0xd0, 0x3c, 0xf0};
-  for (std::uint8_t expected : kLeadPhases) {
-    if (cursor >= group_end || binary[cursor++] != expected)
-      DecodeError(cursor - 1, "unsupported TST/MOVC FMIN phase sequence");
-  }
-  PcoOpcode min_opcode;
-  if (cursor >= group_end)
-    DecodeError(cursor, "truncated TST/MOVC min phase");
-  const std::uint8_t movc_type = binary[cursor++];
-  if (movc_type == 0x11U)
-    min_opcode = PcoOpcode::kFloatMin;
-  else if (movc_type == 0xd1U)
-    min_opcode = PcoOpcode::kIntegerMinSigned;
-  else
-    DecodeError(cursor - 1, "unsupported TST/MOVC min type");
-  for (std::uint8_t expected : {0x87U, 0x87U}) {
-    if (cursor >= group_end || binary[cursor++] != expected)
-      DecodeError(cursor - 1, "unsupported TST/MOVC min source selector");
-  }
-  const PcoRegisterRef source0 =
-      DecodeOneLowerSource(binary, group_end, cursor);
-  const PcoRegisterRef source1 =
-      DecodeOneLowerSource(binary, group_end, cursor);
-  if (cursor >= group_end || binary[cursor++] != 0x10U)
-    DecodeError(cursor - 1, "unsupported FMIN ISS selection");
-  const DecodedDestination destination =
-      DecodeGenericDestination(binary, group_end, cursor);
-  if (destination.target != PcoWriteTarget::kTemporary)
-    DecodeError(header.offset, "FMIN destination must be temporary");
-  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
-
-  PcoInstruction instruction;
-  instruction.opcode = min_opcode;
-  instruction.target = destination.target;
-  instruction.source = source0;
-  instruction.source1 = source1;
-  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
-  instruction.group_index = group_index;
-  instruction.output_index = destination.index;
-  instruction.source_count = 2;
-  instruction.repeat_count = 1;
-  instruction.end_group = 0;
-  return instruction;
-}
-
-PcoInstruction DecodeGenericConditionalSelectGreaterZeroGroup(
-    ShaderStage, const std::vector<std::uint8_t> &binary,
-    const GroupHeader &header, std::uint16_t group_index) {
-  if (header.control || header.bitwise || header.da != 7 ||
-      header.operation_origin != 5 || header.output_load_check ||
-      !header.write0_present || header.write1_present ||
-      header.repeat_count != 1 || header.end) {
-    DecodeError(header.offset,
-                "unsupported CSEL.F32.GZ instruction-group header");
-  }
-  const std::size_t group_end = header.offset + header.total_bytes;
-  std::size_t cursor = header.offset + 3;
-  /* MOVC(ft0, eall) then TST.GZ; the fourth byte carries the test type and
-   * the phase-2 end flag.  Mesa emits the float form for FSIGN-style selects
-   * and the unsigned form for the Boolean select that picks a fragment's pixel
-   * or sample coordinate, so both decode -- to different semantics. */
-  constexpr std::uint8_t kCanonicalPhases[] = {0xd0, 0x3c, 0xf2};
-  for (std::uint8_t expected : kCanonicalPhases) {
-    if (cursor >= group_end || binary[cursor++] != expected) {
-      DecodeError(cursor - 1, "unsupported CSEL.GZ TST/MOVC phase sequence");
-    }
-  }
-  if (cursor >= group_end)
-    DecodeError(cursor, "missing CSEL.GZ test-type byte");
-  const std::uint8_t test_type = binary[cursor++];
-  if (test_type != 0x10U && test_type != 0xb0U)
-    DecodeError(cursor - 1, "unsupported CSEL.GZ test type");
-  for (unsigned phase = 0; phase < 2; ++phase) {
-    if (cursor >= group_end || binary[cursor++] != 0x87U)
-      DecodeError(cursor - 1, "unsupported CSEL.GZ MBYP phase");
-  }
-
-  /* P0 supplies the true value, is0/s1 supplies the floating-point
-   * condition, and P1 supplies the false value.  The long lower-source
-   * encoding is mandatory because it carries the exact is0=s1 selector. */
-  const TwoLowerSources lower =
-      DecodeTwoLowerSources(binary, group_end, cursor, true, false);
-  const PcoRegisterRef false_source =
-      DecodeOneLowerSource(binary, group_end, cursor);
-  if (cursor >= group_end || binary[cursor++] != 0x11U) {
-    DecodeError(cursor - 1,
-                "unsupported CSEL.F32.GZ ISS selection");
-  }
-  const DecodedDestination destination =
-      DecodeGenericDestination(binary, group_end, cursor);
-  if (destination.target != PcoWriteTarget::kTemporary) {
-    DecodeError(header.offset,
-                "CSEL.F32.GZ destination must be temporary");
-  }
-  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
-
-  PcoInstruction instruction;
-  /* An unsigned "> 0" test on a Boolean is exactly "is non-zero", which is the
-   * generic conditional select; only the float form needs the sign-aware
-   * comparison. */
-  instruction.opcode = test_type == 0xb0U
-                           ? PcoOpcode::kConditionalSelect
-                           : PcoOpcode::kConditionalSelectGreaterZero;
-  instruction.target = destination.target;
-  instruction.source = lower.source1;
-  instruction.source1 = lower.source0;
-  instruction.source2 = false_source;
-  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
-  instruction.group_index = group_index;
-  instruction.output_index = destination.index;
-  instruction.source_count = 3;
-  instruction.repeat_count = 1;
-  instruction.end_group = 0;
-  return instruction;
-}
-
-PcoInstruction DecodeGenericFloatEqualGroup(
-    ShaderStage, const std::vector<std::uint8_t> &binary,
-    const GroupHeader &header, std::uint16_t group_index) {
-  if (header.control || header.bitwise || header.da != 8 ||
-      header.operation_origin != 5 || header.output_load_check ||
-      !header.write0_present || header.write1_present ||
-      header.repeat_count != 1 || header.end) {
-    DecodeError(header.offset,
-                "unsupported BCMP.F32.E instruction-group header");
-  }
-  const std::size_t group_end = header.offset + header.total_bytes;
-  std::size_t cursor = header.offset + 3;
-  constexpr std::uint8_t kCanonicalPhases[] = {
-      0xd3, 0x3c, 0xe8, 0x9c, 0x1e, 0x87, 0x87,
-  };
-  for (std::uint8_t expected : kCanonicalPhases) {
-    if (cursor >= group_end || binary[cursor++] != expected) {
-      DecodeError(cursor - 1,
-                  "unsupported BCMP.F32.E TST/PCK/MOVC phase sequence");
-    }
-  }
-
-  const TwoLowerSources lower =
-      DecodeTwoLowerSources(binary, group_end, cursor, true, true);
-  if (lower.source1.bank != PcoRegisterBank::kSpecial ||
-      lower.source1.index != 143) {
-    DecodeError(header.offset,
-                "BCMP.F32.E requires canonical internal sc143 true source");
-  }
-  const PcoRegisterRef compare_source1 =
-      DecodeOneLowerSource(binary, group_end, cursor);
-  if (cursor >= group_end || binary[cursor++] != 0x20U)
-    DecodeError(cursor - 1, "unsupported BCMP.F32.E ISS selection");
-  const DecodedDestination destination =
-      DecodeGenericDestination(binary, group_end, cursor);
-  if (destination.target != PcoWriteTarget::kTemporary)
-    DecodeError(header.offset, "BCMP.F32.E destination must be temporary");
-  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
-
-  PcoInstruction instruction;
-  instruction.opcode = PcoOpcode::kFloatEqual;
-  instruction.target = destination.target;
-  instruction.source = lower.source0;
-  instruction.source1 = compare_source1;
-  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
-  instruction.group_index = group_index;
-  instruction.output_index = destination.index;
-  instruction.source_count = 2;
-  instruction.repeat_count = 1;
-  instruction.end_group = 0;
-  return instruction;
-}
-
-PcoInstruction DecodeGenericFloatLessGroup(
-    ShaderStage, const std::vector<std::uint8_t> &binary,
-    const GroupHeader &header, std::uint16_t group_index) {
-  /* Public Mesa BCMP.F32.L is a five-phase group.  P0/P1 move the ordered
-   * compare operands, P2 creates zero solely for MOVC's false value, TST.L
-   * produces the predicate, and MOVC selects canonical sc143 or zero. */
-  if (header.control || header.bitwise || header.da != 9 ||
-      header.operation_origin != 5 || header.output_load_check ||
-      !header.write0_present || header.write1_present ||
-      header.repeat_count != 1 || header.end) {
-    DecodeError(header.offset,
-                "unsupported BCMP.F32.L instruction-group header");
-  }
-  const std::size_t group_end = header.offset + header.total_bytes;
-  std::size_t cursor = header.offset + 3;
-  constexpr std::uint8_t kCanonicalPhases[] = {
-      0xd3, 0x3c, 0xf0, 0x01, 0x9c, 0x1e, 0x87, 0x87,
-  };
-  for (std::uint8_t expected : kCanonicalPhases) {
-    if (cursor >= group_end || binary[cursor++] != expected) {
-      DecodeError(cursor - 1,
-                  "unsupported BCMP.F32.L TST/PCK/MOVC phase sequence");
-    }
-  }
-
-  const TwoLowerSources lower =
-      DecodeTwoLowerSources(binary, group_end, cursor, true, true);
-  if (lower.source1.bank != PcoRegisterBank::kSpecial ||
-      lower.source1.index != 143) {
-    DecodeError(header.offset,
-                "BCMP.F32.L requires canonical internal sc143 true source");
-  }
-  const PcoRegisterRef compare_source1 =
-      DecodeOneLowerSource(binary, group_end, cursor);
-  if (cursor >= group_end || binary[cursor++] != 0x20U)
-    DecodeError(cursor - 1, "unsupported BCMP.F32.L ISS selection");
-  const DecodedDestination destination =
-      DecodeGenericDestination(binary, group_end, cursor);
-  if (destination.target != PcoWriteTarget::kTemporary)
-    DecodeError(header.offset, "BCMP.F32.L destination must be temporary");
-  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
-
-  PcoInstruction instruction;
-  instruction.opcode = PcoOpcode::kFloatLess;
-  instruction.target = destination.target;
-  instruction.source = lower.source0;
-  instruction.source1 = compare_source1;
-  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
-  instruction.group_index = group_index;
-  instruction.output_index = destination.index;
-  instruction.source_count = 2;
-  instruction.repeat_count = 1;
-  instruction.end_group = 0;
-  return instruction;
-}
-
-PcoInstruction DecodeGenericFloatGreaterEqualGroup(
-    ShaderStage, const std::vector<std::uint8_t> &binary,
-    const GroupHeader &header, std::uint16_t group_index) {
-  /* Public Mesa BCMP.F32.GE uses the same canonical Boolean materialization
-   * as BCMP.F32.E: P0/P1 move the ordered compare operands, P2 supplies the
-   * zero false value, TST.GE forms the predicate, and MOVC selects sc143 or
-   * zero.  Accept only the exact public five-phase shape. */
-  if (header.control || header.bitwise || header.da != 8 ||
-      header.operation_origin != 5 || header.output_load_check ||
-      !header.write0_present || header.write1_present ||
-      header.repeat_count != 1 || header.end) {
-    DecodeError(header.offset,
-                "unsupported BCMP.F32.GE instruction-group header");
-  }
-  const std::size_t group_end = header.offset + header.total_bytes;
-  std::size_t cursor = header.offset + 3;
-  constexpr std::uint8_t kCanonicalPhases[] = {
-      0xd3, 0x3c, 0xec, 0x9c, 0x1e, 0x87, 0x87,
-  };
-  for (std::uint8_t expected : kCanonicalPhases) {
-    if (cursor >= group_end || binary[cursor++] != expected) {
-      DecodeError(cursor - 1,
-                  "unsupported BCMP.F32.GE TST/PCK/MOVC phase sequence");
-    }
-  }
-
-  const TwoLowerSources lower =
-      DecodeTwoLowerSources(binary, group_end, cursor, true, true);
-  if (lower.source1.bank != PcoRegisterBank::kSpecial ||
-      lower.source1.index != 143) {
-    DecodeError(
-        header.offset,
-        "BCMP.F32.GE requires canonical internal sc143 true source");
-  }
-  const PcoRegisterRef compare_source1 =
-      DecodeOneLowerSource(binary, group_end, cursor);
-  if (cursor >= group_end || binary[cursor++] != 0x20U)
-    DecodeError(cursor - 1, "unsupported BCMP.F32.GE ISS selection");
-  const DecodedDestination destination =
-      DecodeGenericDestination(binary, group_end, cursor);
-  if (destination.target != PcoWriteTarget::kTemporary)
-    DecodeError(header.offset, "BCMP.F32.GE destination must be temporary");
-  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
-
-  PcoInstruction instruction;
-  instruction.opcode = PcoOpcode::kFloatGreaterEqual;
-  instruction.target = destination.target;
-  instruction.source = lower.source0;
-  instruction.source1 = compare_source1;
-  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
-  instruction.group_index = group_index;
-  instruction.output_index = destination.index;
-  instruction.source_count = 2;
-  instruction.repeat_count = 1;
-  instruction.end_group = 0;
-  return instruction;
-}
-
-PcoInstruction DecodeGenericFloatGreaterEqualOneZeroGroup(
-    ShaderStage, const std::vector<std::uint8_t> &binary,
-    const GroupHeader &header, std::uint16_t group_index) {
-  /* Terrain's public Mesa FS also uses a distinct BCMP.F32.GE form whose P2
-   * PCK.ONE and MOVC materialize binary32 1.0/0.0 instead of sc143 Boolean
-   * bits.  Keep this encoding separate from the canonical Boolean form. */
-  if (header.control || header.bitwise || header.da != 8 ||
-      header.operation_origin != 5 || header.output_load_check ||
-      !header.write0_present || header.write1_present ||
-      header.repeat_count != 1 || header.end) {
-    DecodeError(
-        header.offset,
-        "unsupported BCMP.F32.GE.ONE instruction-group header");
-  }
-  const std::size_t group_end = header.offset + header.total_bytes;
-  std::size_t cursor = header.offset + 3;
-  constexpr std::uint8_t kCanonicalPhases[] = {
-      0xd2, 0x3c, 0xec, 0x9c, 0x1f, 0x87, 0x87,
-  };
-  for (std::uint8_t expected : kCanonicalPhases) {
-    if (cursor >= group_end || binary[cursor++] != expected) {
-      DecodeError(
-          cursor - 1,
-          "unsupported BCMP.F32.GE.ONE TST/PCK/MOVC phase sequence");
-    }
-  }
-
-  const TwoLowerSources lower =
-      DecodeTwoLowerSources(binary, group_end, cursor, true, true);
-  if (lower.source1.bank != PcoRegisterBank::kSpecial ||
-      lower.source1.index != 0) {
-    DecodeError(header.offset,
-                "BCMP.F32.GE.ONE requires canonical internal sc0 source");
-  }
-  const PcoRegisterRef compare_source1 =
-      DecodeOneLowerSource(binary, group_end, cursor);
-  if (cursor >= group_end || binary[cursor++] != 0x30U)
-    DecodeError(cursor - 1, "unsupported BCMP.F32.GE.ONE ISS selection");
-  const DecodedDestination destination =
-      DecodeGenericDestination(binary, group_end, cursor);
-  if (destination.target != PcoWriteTarget::kTemporary) {
-    DecodeError(header.offset,
-                "BCMP.F32.GE.ONE destination must be temporary");
-  }
-  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
-
-  PcoInstruction instruction;
-  instruction.opcode = PcoOpcode::kFloatGreaterEqual;
-  instruction.target = destination.target;
-  instruction.source = lower.source0;
-  instruction.source1 = compare_source1;
-  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
-  instruction.group_index = group_index;
-  instruction.output_index = destination.index;
-  instruction.comparison_result_float_one = 1;
-  instruction.source_count = 2;
-  instruction.repeat_count = 1;
-  instruction.end_group = 0;
   return instruction;
 }
 
@@ -2473,45 +2440,21 @@ PcoInstruction DecodeGenericPhase2Group(
     DecodeError(operation_offset, "missing phase-2 ALU operation");
   switch (binary[operation_offset]) {
   case 0xd0:
-    if (operation_offset + 2 >= header.offset + header.total_bytes) {
-      DecodeError(operation_offset,
-                  "truncated FMAX/CSEL.F32.GZ phase-2 operation");
-    }
-    if (binary[operation_offset + 2] == 0xfaU)
-      return DecodeGenericFloatMaxGroup(stage, binary, header, group_index);
-    if (binary[operation_offset + 2] == 0xf0U)
-      return DecodeGenericFloatMinGroup(stage, binary, header, group_index);
-    if (binary[operation_offset + 2] == 0xf2U) {
-      return DecodeGenericConditionalSelectGreaterZeroGroup(
-          stage, binary, header, group_index);
-    }
-    DecodeError(operation_offset + 2,
-                "unsupported FMAX/CSEL.F32.GZ TST operation");
+    return DecodeGenericTestSelectGroup(binary, header, group_index);
   case 0xd1:
     return DecodeGenericConditionalSelectGroup(stage, binary, header,
                                                 group_index);
+  /*
+   * Both BCMP forms carry the comparison in their TST phase, so the phase
+   * decodes it rather than the dispatch enumerating one byte value per
+   * operation and operand type.
+   */
   case 0xd2:
-    if (operation_offset + 2 >= header.offset + header.total_bytes)
-      DecodeError(operation_offset, "truncated BCMP.F32.GE.ONE operation");
-    if (binary[operation_offset + 2] == 0xecU) {
-      return DecodeGenericFloatGreaterEqualOneZeroGroup(
-          stage, binary, header, group_index);
-    }
-    DecodeError(operation_offset + 2,
-                "unsupported BCMP.F32.GE.ONE TST operation");
+    return DecodeGenericBooleanCompareGroup(binary, header, group_index,
+                                            /*result_float_one=*/true);
   case 0xd3:
-    if (operation_offset + 2 >= header.offset + header.total_bytes)
-      DecodeError(operation_offset, "truncated BCMP.F32 operation");
-    if (binary[operation_offset + 2] == 0xe8U)
-      return DecodeGenericFloatEqualGroup(stage, binary, header, group_index);
-    if (binary[operation_offset + 2] == 0xecU) {
-      return DecodeGenericFloatGreaterEqualGroup(stage, binary, header,
-                                                 group_index);
-    }
-    if (binary[operation_offset + 2] == 0xf0U)
-      return DecodeGenericFloatLessGroup(stage, binary, header, group_index);
-    DecodeError(operation_offset + 2,
-                "unsupported BCMP.F32 TST operation");
+    return DecodeGenericBooleanCompareGroup(binary, header, group_index,
+                                            /*result_float_one=*/false);
   default:
     DecodeError(operation_offset,
                 "phase-2 ALU operation is outside the public subset");
@@ -2560,7 +2503,7 @@ PcoInstruction DecodeGenericImmediateGroup(
 }
 
 PcoInstruction DecodeGenericBitwiseAndGroup(
-    ShaderStage stage, const std::vector<std::uint8_t> &binary,
+    ShaderStage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
   /* Ideas lighting emits this public two-phase form for Boolean conjunction:
    *   p0: bbyp0s1 ft2, ft3, s2
@@ -2568,11 +2511,10 @@ PcoInstruction DecodeGenericBitwiseAndGroup(
    * The three leading lower-source bytes encode unused s0/s1 plus the s2
    * selector.  Keep every phase and selector exact while allowing the actual
    * register indices carried by the final lower and upper source bytes. */
-  if (stage != ShaderStage::kFragment || !header.bitwise || header.control ||
-      header.da != 5 || header.operation_origin != 3 ||
-      header.output_load_check || !header.write0_present ||
-      header.write1_present || header.repeat_count != 1 || header.end ||
-      header.total_bytes != 12) {
+  if (!header.bitwise || header.control || header.da != 5 ||
+      header.operation_origin != 3 || header.output_load_check ||
+      !header.write0_present || header.write1_present ||
+      header.repeat_count != 1 || header.end || header.total_bytes != 12) {
     DecodeError(header.offset,
                 "unsupported LOGICAL.AND instruction-group header");
   }
@@ -2826,10 +2768,6 @@ PcoInstruction DecodeGenericBitwiseXnorGroup(
       DecodeGenericDestination(binary, group_end, cursor);
   if (destination.target != PcoWriteTarget::kTemporary)
     DecodeError(header.offset, "LOGICAL.XNOR destination must be temporary");
-  if (destination.index != source0.index) {
-    DecodeError(header.offset,
-                "LOGICAL.XNOR captured form must update its source in place");
-  }
   ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
 
   PcoInstruction instruction;
@@ -3392,9 +3330,33 @@ PcoInstruction DecodeVertexGroup(const std::vector<std::uint8_t> &binary,
                                  std::uint16_t group_index) {
   if (header.control)
     return DecodeWdfGroup(binary, header, group_index);
-  if (header.bitwise)
-    return DecodeGenericImmediateGroup(ShaderStage::kVertex, binary, header,
-                                       group_index);
+  if (header.bitwise) {
+    if (header.operation_origin == 1) {
+      return DecodeGenericImmediateGroup(ShaderStage::kVertex, binary, header,
+                                         group_index);
+    }
+    /*
+     * LOGICAL.AND is the same group in either stage; the vertex dispatch
+     * simply stopped at the immediate form, so a vertex shader computing a
+     * Boolean conjunction -- which dEQP's random shaders do -- was reported
+     * as an unsupported immediate header.  The remaining logical operations
+     * stay closed here until the vertex execution and report cover them too.
+     */
+    if (header.operation_origin == 3) {
+      const std::size_t operation_offset = header.offset + 3;
+      if (operation_offset >= header.offset + header.total_bytes)
+        DecodeError(operation_offset, "missing logical phase operation");
+      if (binary[operation_offset] == 0x41U) {
+        return DecodeGenericBitwiseAndGroup(ShaderStage::kVertex, binary,
+                                            header, group_index);
+      }
+      DecodeError(operation_offset,
+                  "logical phase operation is outside the vertex public "
+                  "subset");
+    }
+    DecodeError(header.offset,
+                "bitwise operation is outside the vertex public subset");
+  }
   if (header.operation_origin == 0)
     return DecodeGenericSimpleAluGroup(ShaderStage::kVertex, binary, header,
                                       group_index);
@@ -3480,7 +3442,8 @@ bool HasCanonicalGenericComparisonResult(
     const PcoInstruction &instruction) {
   return instruction.comparison_result_float_one == 0 ||
          (instruction.comparison_result_float_one == 1 &&
-          instruction.opcode == PcoOpcode::kFloatGreaterEqual);
+          (instruction.opcode == PcoOpcode::kFloatGreaterEqual ||
+           instruction.opcode == PcoOpcode::kBooleanCompare));
 }
 
 bool HasCanonicalGenericSaturate(const PcoInstruction &instruction) {
@@ -3508,14 +3471,20 @@ bool HasCanonicalGenericAbsoluteModifiers(
   return true;
 }
 
+/*
+ * XNOR against canonical sc0 is `~s0`, and the group names its own
+ * destination.  The one capture this decoder was written from happened to
+ * negate a temporary in place, which is not a property of the encoding: a
+ * shader that writes the complement somewhere else -- dEQP's random shaders
+ * do -- is the same instruction.
+ */
 bool HasCanonicalLogicalXnorShape(const PcoInstruction &instruction) {
   return instruction.opcode != PcoOpcode::kBitwiseXnor ||
          (instruction.target == PcoWriteTarget::kTemporary &&
           instruction.source_count == 2 &&
           instruction.source.bank == PcoRegisterBank::kTemporary &&
           instruction.source1.bank == PcoRegisterBank::kSpecial &&
-          instruction.source1.index == 0 &&
-          instruction.output_index == instruction.source.index);
+          instruction.source1.index == 0);
 }
 
 bool HasCanonicalGenericNonFitrpFields(
@@ -3820,6 +3789,8 @@ void ValidateVertexTemporaryProgram(
     case PcoOpcode::kFloatEqual:
     case PcoOpcode::kFloatGreaterEqual:
     case PcoOpcode::kFloatLess:
+    case PcoOpcode::kBooleanCompare:
+    case PcoOpcode::kBitwiseAnd:
       if (instruction.target != PcoWriteTarget::kTemporary ||
           instruction.source_count != 2 || instruction.repeat_count != 1)
         DecodeError(instruction.binary_offset,
@@ -3832,6 +3803,8 @@ void ValidateVertexTemporaryProgram(
     case PcoOpcode::kConditionalSelect:
     case PcoOpcode::kConditionalSelectNegateTrue:
     case PcoOpcode::kConditionalSelectGreaterZero:
+    case PcoOpcode::kTestConditionalSelect:
+    case PcoOpcode::kIntegerMultiplyAdd32:
       if (instruction.target != PcoWriteTarget::kTemporary ||
           instruction.source_count != 3 || instruction.repeat_count != 1)
         DecodeError(instruction.binary_offset,
@@ -4050,6 +4023,7 @@ void ValidateFragmentProgram(
     case PcoOpcode::kFloatEqual:
     case PcoOpcode::kFloatGreaterEqual:
     case PcoOpcode::kFloatLess:
+    case PcoOpcode::kBooleanCompare:
     case PcoOpcode::kBitwiseAnd:
     case PcoOpcode::kBitwiseOr:
     case PcoOpcode::kBitwiseXnor:
@@ -4068,6 +4042,7 @@ void ValidateFragmentProgram(
     case PcoOpcode::kConditionalSelect:
     case PcoOpcode::kConditionalSelectNegateTrue:
     case PcoOpcode::kConditionalSelectGreaterZero:
+    case PcoOpcode::kTestConditionalSelect:
       writes_temporary = instruction.target == PcoWriteTarget::kTemporary &&
                          instruction.source_count == 3;
       break;
@@ -4567,6 +4542,109 @@ std::uint32_t FloatLessBits(std::uint32_t left_bits,
 bool FloatGreaterZero(std::uint32_t value_bits) {
   const Binary32Operand operand = DecodeFaddOperand(value_bits);
   return !operand.sign && !operand.zero;
+}
+
+/*
+ * A BCMP whose TST phase is not one of the three float forms that have their
+ * own opcode.  The operation and the type it compares as travel on the
+ * instruction, so this is the whole of the ISA's comparison matrix in one
+ * place: the ordered float ops reuse the float helpers so NaN handling stays
+ * identical, and the integer ops compare the register bits at their declared
+ * signedness.
+ *
+ * The result is the same canonical Boolean the float forms produce -- all
+ * bits one, or binary32 1.0 for Mesa's PCK.ONE form.
+ */
+bool EvaluateTestPredicate(std::uint8_t op, std::uint8_t type,
+                           std::uint32_t left_bits,
+                           std::uint32_t right_bits) {
+  switch (type) {
+  case kTstTypeF32:
+    switch (op) {
+    case kTstOpEqual:
+      return FloatEqualBits(left_bits, right_bits) != 0;
+    case kTstOpNotEqual:
+      /* Ordered inequality: NaN on either side makes equality false, and the
+       * public compiler spells `a != b` as TST.F32.NE rather than a negated
+       * equality, so the unordered case follows TST.F32.E's rule. */
+      return FloatEqualBits(left_bits, right_bits) == 0;
+    case kTstOpGreaterEqual:
+      return FloatGreaterEqualBits(left_bits, right_bits) != 0;
+    case kTstOpLess:
+      return FloatLessBits(left_bits, right_bits) != 0;
+    case kTstOpGreater:
+      return FloatLessBits(right_bits, left_bits) != 0;
+    case kTstOpLessEqual:
+      return FloatGreaterEqualBits(right_bits, left_bits) != 0;
+    case kTstOpZero:
+      return FloatEqualBits(left_bits, UINT32_C(0)) != 0;
+    case kTstOpGreaterZero:
+      return FloatGreaterZero(left_bits);
+    case kTstOpGreaterEqualZero:
+      return FloatGreaterEqualBits(left_bits, UINT32_C(0)) != 0;
+    default:
+      ExecuteError(std::string("unsupported TST.F32 operation ") +
+                   TestOperationName(op));
+    }
+    break;
+  case kTstTypeS32:
+  case kTstTypeU32: {
+    const bool is_signed = type == kTstTypeS32;
+    const auto as_signed = [](std::uint32_t bits) {
+      std::int32_t value = 0;
+      std::memcpy(&value, &bits, sizeof(value));
+      return value;
+    };
+    const std::int32_t left = as_signed(left_bits);
+    const std::int32_t right = as_signed(right_bits);
+    switch (op) {
+    case kTstOpEqual:
+      return left_bits == right_bits;
+    case kTstOpNotEqual:
+      return left_bits != right_bits;
+    case kTstOpZero:
+      return left_bits == 0;
+    case kTstOpGreater:
+      return is_signed ? left > right : left_bits > right_bits;
+    case kTstOpGreaterEqual:
+      return is_signed ? left >= right : left_bits >= right_bits;
+    case kTstOpLess:
+      return is_signed ? left < right : left_bits < right_bits;
+    case kTstOpLessEqual:
+      return is_signed ? left <= right : left_bits <= right_bits;
+    case kTstOpGreaterZero:
+      /* Unsigned "> 0" is exactly "is non-zero", which is how the compiler
+       * spells a Boolean condition. */
+      return is_signed ? left > 0 : left_bits != 0;
+    case kTstOpGreaterEqualZero:
+      return is_signed ? left >= 0 : true;
+    default:
+      ExecuteError(std::string("unsupported TST integer operation ") +
+                   TestOperationName(op));
+    }
+    break;
+  }
+  default:
+    ExecuteError(std::string("unsupported TST operand type ") +
+                 TestTypeName(type));
+  }
+  return false;
+}
+
+/*
+ * A BCMP whose TST phase is not one of the three float forms that have their
+ * own opcode.  The result is the same canonical Boolean those produce -- all
+ * bits one, or binary32 1.0 for Mesa's PCK.ONE form.
+ */
+std::uint32_t BooleanCompareBits(std::uint8_t op, std::uint8_t type,
+                                 std::uint32_t left_bits,
+                                 std::uint32_t right_bits,
+                                 std::uint8_t float_one_result) {
+  const bool predicate =
+      EvaluateTestPredicate(op, type, left_bits, right_bits);
+  if (float_one_result != 0)
+    return predicate ? UINT32_C(0x3f800000) : UINT32_C(0);
+  return predicate ? UINT32_MAX : UINT32_C(0);
 }
 
 
@@ -5091,9 +5169,11 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
     case PcoOpcode::kFloatGreaterEqual:
     case PcoOpcode::kFloatEqual:
     case PcoOpcode::kFloatLess:
+    case PcoOpcode::kBooleanCompare:
     case PcoOpcode::kConditionalSelect:
     case PcoOpcode::kConditionalSelectNegateTrue:
     case PcoOpcode::kConditionalSelectGreaterZero:
+    case PcoOpcode::kTestConditionalSelect:
     case PcoOpcode::kFloatAdd:
     case PcoOpcode::kFloatAddNegateSource0:
     case PcoOpcode::kFloatMultiply:
@@ -5705,6 +5785,13 @@ PcoVertexExecution ExecuteVertexPco(
         value = FloatLessBits(read(instruction.source),
                               read(instruction.source1));
         break;
+      case PcoOpcode::kBooleanCompare:
+        value = BooleanCompareBits(instruction.comparison_test_op,
+                                   instruction.comparison_test_type,
+                                   read(instruction.source),
+                                   read(instruction.source1),
+                                   instruction.comparison_result_float_one);
+        break;
       case PcoOpcode::kConditionalSelect:
         value = read(instruction.source) != 0 ? read(instruction.source1)
                                                : read(instruction.source2);
@@ -5712,6 +5799,16 @@ PcoVertexExecution ExecuteVertexPco(
       case PcoOpcode::kConditionalSelectNegateTrue:
         value = read(instruction.source) != 0
                     ? (read(instruction.source1) ^ UINT32_C(0x80000000))
+                    : read(instruction.source2);
+        break;
+      case PcoOpcode::kTestConditionalSelect:
+        value = EvaluateTestPredicate(instruction.comparison_test_op,
+                                      instruction.comparison_test_type,
+                                      read(instruction.source), UINT32_C(0))
+                    ? (read(instruction.source1) ^
+                       (instruction.source1_negate != 0
+                            ? UINT32_C(0x80000000)
+                            : UINT32_C(0)))
                     : read(instruction.source2);
         break;
       case PcoOpcode::kConditionalSelectGreaterZero:
@@ -5754,6 +5851,35 @@ PcoVertexExecution ExecuteVertexPco(
         value = FloatFromSigned(
             static_cast<std::int32_t>(read(instruction.source)));
         break;
+      /*
+       * The other direction, for the same reason: a vertex shader that casts
+       * a float to int -- which dEQP's random shaders do as readily in the
+       * vertex stage as in the fragment one -- reaches the same PCK the
+       * fragment path has always executed.
+       */
+      case PcoOpcode::kFloatToInt32Rtne:
+        value = FloatToInt32Bits(read(instruction.source),
+                                 /*round_to_zero=*/false);
+        break;
+      case PcoOpcode::kFloatToInt32Rtz:
+        value = FloatToInt32Bits(read(instruction.source),
+                                 /*round_to_zero=*/true);
+        break;
+      case PcoOpcode::kBitwiseAnd:
+        value = read(instruction.source) & read(instruction.source1);
+        break;
+      /*
+       * Integer multiply-add, which the vertex stage reaches for the same
+       * reason the fragment stage does: a shader doing integer arithmetic.
+       */
+      case PcoOpcode::kIntegerMultiplyAdd32: {
+        const std::uint32_t factor0 = read(instruction.source);
+        value = (instruction.source0_integer_negate != 0 ? ~factor0 + 1U
+                                                         : factor0) *
+                    read(instruction.source1) +
+                read(instruction.source2);
+        break;
+      }
       default:
         ExecuteError("unknown generic vertex ALU operation: opcode=" +
                      std::to_string(
@@ -5782,9 +5908,11 @@ PcoVertexExecution ExecuteVertexPco(
         instruction.opcode == PcoOpcode::kFloatEqual ||
         instruction.opcode == PcoOpcode::kFloatGreaterEqual ||
         instruction.opcode == PcoOpcode::kFloatLess ||
+        instruction.opcode == PcoOpcode::kBooleanCompare ||
         instruction.opcode == PcoOpcode::kConditionalSelect ||
         instruction.opcode == PcoOpcode::kConditionalSelectNegateTrue ||
         instruction.opcode == PcoOpcode::kConditionalSelectGreaterZero ||
+        instruction.opcode == PcoOpcode::kTestConditionalSelect ||
         instruction.opcode == PcoOpcode::kReciprocal ||
         instruction.opcode == PcoOpcode::kReciprocalSquareRoot ||
         instruction.opcode == PcoOpcode::kFloatLog2 ||
@@ -6059,9 +6187,11 @@ PcoFragmentExecution ExecuteFragmentPco(
     case PcoOpcode::kFloatGreaterEqual: return "FGE";
     case PcoOpcode::kFloatEqual: return "FEQ";
     case PcoOpcode::kFloatLess: return "FLT";
+    case PcoOpcode::kBooleanCompare: return "BCMP";
     case PcoOpcode::kConditionalSelect: return "CSEL";
     case PcoOpcode::kConditionalSelectNegateTrue: return "CSEL.NEG";
     case PcoOpcode::kConditionalSelectGreaterZero: return "CSEL.GZ";
+    case PcoOpcode::kTestConditionalSelect: return "CSEL.TST";
     case PcoOpcode::kFloatAdd: return "FADD";
     case PcoOpcode::kFloatAddNegateSource0: return "FADD.NEG0";
     case PcoOpcode::kFloatMultiply: return "FMUL";
@@ -6479,9 +6609,11 @@ PcoFragmentExecution ExecuteFragmentPco(
         instruction.opcode == PcoOpcode::kFloatEqual ||
         instruction.opcode == PcoOpcode::kFloatGreaterEqual ||
         instruction.opcode == PcoOpcode::kFloatLess ||
+        instruction.opcode == PcoOpcode::kBooleanCompare ||
         instruction.opcode == PcoOpcode::kConditionalSelect ||
         instruction.opcode == PcoOpcode::kConditionalSelectNegateTrue ||
         instruction.opcode == PcoOpcode::kConditionalSelectGreaterZero ||
+        instruction.opcode == PcoOpcode::kTestConditionalSelect ||
         instruction.opcode == PcoOpcode::kReciprocal ||
         instruction.opcode == PcoOpcode::kReciprocalSquareRoot ||
         instruction.opcode == PcoOpcode::kFloatLog2 ||
@@ -6593,7 +6725,9 @@ PcoFragmentExecution ExecuteFragmentPco(
       } else if (instruction.opcode == PcoOpcode::kIntegerMultiplyAdd32) {
         const std::uint32_t src1 = read(instruction.source1);
         const std::uint32_t src2 = read(instruction.source2);
-        result_val = src0 * src1 + src2;
+        const std::uint32_t factor =
+            instruction.source0_integer_negate != 0 ? ~src0 + 1U : src0;
+        result_val = factor * src1 + src2;
       } else if (instruction.opcode == PcoOpcode::kBitfieldInsert) {
         // GL bitfieldInsert(base, insert, offset, bits): source is bits,
         // source1 offset, source2 insert, source3 base.
@@ -6650,6 +6784,11 @@ PcoFragmentExecution ExecuteFragmentPco(
       } else if (instruction.opcode == PcoOpcode::kFloatLess) {
         const std::uint32_t src1 = read(instruction.source1);
         result_val = FloatLessBits(src0, src1);
+      } else if (instruction.opcode == PcoOpcode::kBooleanCompare) {
+        const std::uint32_t src1 = read(instruction.source1);
+        result_val = BooleanCompareBits(
+            instruction.comparison_test_op, instruction.comparison_test_type,
+            src0, src1, instruction.comparison_result_float_one);
       } else if (instruction.opcode == PcoOpcode::kConditionalSelect) {
         result_val = src0 != 0 ? read(instruction.source1)
                                : read(instruction.source2);
@@ -6657,6 +6796,15 @@ PcoFragmentExecution ExecuteFragmentPco(
                  PcoOpcode::kConditionalSelectNegateTrue) {
         result_val = src0 != 0
                          ? (read(instruction.source1) ^ UINT32_C(0x80000000))
+                         : read(instruction.source2);
+      } else if (instruction.opcode == PcoOpcode::kTestConditionalSelect) {
+        result_val = EvaluateTestPredicate(instruction.comparison_test_op,
+                                           instruction.comparison_test_type,
+                                           src0, UINT32_C(0))
+                         ? (read(instruction.source1) ^
+                            (instruction.source1_negate != 0
+                                 ? UINT32_C(0x80000000)
+                                 : UINT32_C(0)))
                          : read(instruction.source2);
       } else if (instruction.opcode ==
                  PcoOpcode::kConditionalSelectGreaterZero) {

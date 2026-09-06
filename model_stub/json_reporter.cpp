@@ -127,6 +127,9 @@ struct VertexPcoEvidence {
   std::uint64_t fge = 0;
   std::uint64_t feq = 0;
   std::uint64_t flt = 0;
+  // BCMP with any other TST operation/operand type: one bin for the whole of
+  // the ISA's comparison matrix, matching the single kBooleanCompare opcode.
+  std::uint64_t bcmp = 0;
   std::uint64_t bitwise_and = 0;
   std::uint64_t csel = 0;
   std::uint64_t fmad = 0;
@@ -141,6 +144,11 @@ struct VertexPcoEvidence {
   // UNPCK.U32 / UNPCK.S32: integer-to-float, which a shader reaches for the
   // moment it uses gl_InstanceID or gl_VertexID as a number.
   std::uint64_t unpck_int = 0;
+  // PCK.U32/S32: the other direction, which a vertex shader casting a float
+  // to int reaches just as the fragment stage does.
+  std::uint64_t f2i = 0;
+  // IMADD32, likewise reached by any vertex shader doing integer arithmetic.
+  std::uint64_t imadd32 = 0;
   std::uint64_t smp = 0;
   std::uint64_t wdf = 0;
   std::uint64_t uvsw_write = 0;
@@ -169,6 +177,8 @@ struct FragmentPcoEvidence {
   std::uint64_t fge = 0;
   std::uint64_t feq = 0;
   std::uint64_t flt = 0;
+  // As above: every BCMP the three float opcodes do not already name.
+  std::uint64_t bcmp = 0;
   std::uint64_t bitwise_and = 0;
   std::uint64_t bitwise_xnor = 0;
   std::uint64_t csel = 0;
@@ -273,12 +283,16 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kFloatLess:
       ++evidence.flt;
       break;
+    case PcoOpcode::kBooleanCompare:
+      ++evidence.bcmp;
+      break;
     case PcoOpcode::kBitwiseAnd:
       ++evidence.bitwise_and;
       break;
     case PcoOpcode::kConditionalSelect:
     case PcoOpcode::kConditionalSelectNegateTrue:
     case PcoOpcode::kConditionalSelectGreaterZero:
+    case PcoOpcode::kTestConditionalSelect:
       ++evidence.csel;
       break;
     case PcoOpcode::kFloatMad:
@@ -316,6 +330,13 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kUnpackSignedToFloat:
       ++evidence.unpck_int;
       break;
+    case PcoOpcode::kFloatToInt32Rtne:
+    case PcoOpcode::kFloatToInt32Rtz:
+      ++evidence.f2i;
+      break;
+    case PcoOpcode::kIntegerMultiplyAdd32:
+      ++evidence.imadd32;
+      break;
     case PcoOpcode::kUvsWrite:
       ++evidence.uvsw_write;
       break;
@@ -341,10 +362,11 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
       evidence.uvsw_write_emit_endtask + evidence.uvsw_emit_endtask +
       evidence.internal + evidence.fneg + evidence.fabs + evidence.movi + evidence.ffloor +
       evidence.fsub + evidence.fge + evidence.feq + evidence.flt +
+      evidence.bcmp +
       evidence.bitwise_and + evidence.csel + evidence.fmad + evidence.fmin + evidence.fmax +
       evidence.frcp + evidence.frsq + evidence.flog2 + evidence.fexp2 +
       evidence.pck_f16 + evidence.unpck_f16 + evidence.unpck_int +
-      evidence.smp + evidence.wdf;
+      evidence.f2i + evidence.imadd32 + evidence.smp + evidence.wdf;
   if (opcode_total != instructions.size()) {
     throw std::runtime_error(
         "JsonReporter vertex PCO opcode histogram mismatch");
@@ -430,6 +452,9 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kFloatLess:
       ++evidence.flt;
       break;
+    case PcoOpcode::kBooleanCompare:
+      ++evidence.bcmp;
+      break;
     case PcoOpcode::kBitwiseAnd:
       ++evidence.bitwise_and;
       break;
@@ -439,6 +464,7 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kConditionalSelect:
     case PcoOpcode::kConditionalSelectNegateTrue:
     case PcoOpcode::kConditionalSelectGreaterZero:
+    case PcoOpcode::kTestConditionalSelect:
       ++evidence.csel;
       break;
     case PcoOpcode::kFloatMad:
@@ -526,6 +552,7 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
           evidence.movi + evidence.pck_cov + evidence.shr +
           evidence.tstz + evidence.ffloor +
           evidence.fsub + evidence.fge + evidence.feq + evidence.flt +
+      evidence.bcmp +
           evidence.bitwise_and + evidence.bitwise_xnor + evidence.csel +
           evidence.fmad +
           evidence.fmin + evidence.fmax + evidence.frcp + evidence.frsq +
@@ -577,6 +604,7 @@ void AppendVertexPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_VERTEX_EVIDENCE(fge);
   PVRGPU_ADD_VERTEX_EVIDENCE(feq);
   PVRGPU_ADD_VERTEX_EVIDENCE(flt);
+  PVRGPU_ADD_VERTEX_EVIDENCE(bcmp);
   PVRGPU_ADD_VERTEX_EVIDENCE(bitwise_and);
   PVRGPU_ADD_VERTEX_EVIDENCE(csel);
   PVRGPU_ADD_VERTEX_EVIDENCE(fmad);
@@ -588,6 +616,11 @@ void AppendVertexPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_VERTEX_EVIDENCE(fexp2);
   PVRGPU_ADD_VERTEX_EVIDENCE(pck_f16);
   PVRGPU_ADD_VERTEX_EVIDENCE(unpck_f16);
+  /* Counted since the vertex stage learned these, but never carried into the
+   * report, so the JSON always said zero for a shader that used them. */
+  PVRGPU_ADD_VERTEX_EVIDENCE(unpck_int);
+  PVRGPU_ADD_VERTEX_EVIDENCE(f2i);
+  PVRGPU_ADD_VERTEX_EVIDENCE(imadd32);
   PVRGPU_ADD_VERTEX_EVIDENCE(smp);
   PVRGPU_ADD_VERTEX_EVIDENCE(wdf);
   PVRGPU_ADD_VERTEX_EVIDENCE(uvsw_write);
@@ -629,6 +662,7 @@ void AppendFragmentPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_FRAGMENT_EVIDENCE(fge);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(feq);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(flt);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(bcmp);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(bitwise_and);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(bitwise_xnor);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(csel);
@@ -1535,6 +1569,10 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"unpck_f16\":" << vertex_pco.unpck_f16;
   if (vertex_pco.unpck_int != 0)
     std::cout << ",\"unpck_int\":" << vertex_pco.unpck_int;
+  if (vertex_pco.f2i != 0)
+    std::cout << ",\"f2i\":" << vertex_pco.f2i;
+  if (vertex_pco.imadd32 != 0)
+    std::cout << ",\"imadd32\":" << vertex_pco.imadd32;
   if (vertex_pco.smp != 0)
     std::cout << ",\"smp\":" << vertex_pco.smp;
   if (vertex_pco.wdf != 0)
@@ -1555,6 +1593,8 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"feq\":" << vertex_pco.feq;
   if (vertex_pco.flt != 0)
     std::cout << ",\"flt\":" << vertex_pco.flt;
+  if (vertex_pco.bcmp != 0)
+    std::cout << ",\"bcmp\":" << vertex_pco.bcmp;
   if (vertex_pco.bitwise_and != 0)
     std::cout << ",\"bitwise_and\":" << vertex_pco.bitwise_and;
   if (vertex_pco.csel != 0)
@@ -1612,6 +1652,8 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"feq\":" << fragment_pco.feq;
   if (fragment_pco.flt != 0)
     std::cout << ",\"flt\":" << fragment_pco.flt;
+  if (fragment_pco.bcmp != 0)
+    std::cout << ",\"bcmp\":" << fragment_pco.bcmp;
   if (fragment_pco.bitwise_and != 0)
     std::cout << ",\"bitwise_and\":" << fragment_pco.bitwise_and;
   if (fragment_pco.bitwise_xnor != 0)

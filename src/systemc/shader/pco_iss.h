@@ -96,8 +96,15 @@ enum class PcoOpcode : std::uint8_t {
   kFloatGreaterEqual,
   kFloatEqual,
   kFloatLess,
+  // BCMP with any other PCO TST operation/type pair: the operation and the
+  // operand type it compares as travel on the instruction rather than in the
+  // opcode, so a new comparison the compiler emits costs no new opcode.
+  kBooleanCompare,
   kConditionalSelect,
   kConditionalSelectNegateTrue,
+  // TST + MOVC with any other unary test operation/operand type: like
+  // kBooleanCompare, the test travels on the instruction.
+  kTestConditionalSelect,
   kFloatAdd,
   kFloatAddNegateSource0,
   kFloatMultiply,
@@ -246,6 +253,18 @@ struct PcoInstruction {
   // Mesa's PCK.ONE form instead materializes binary32 1.0 or 0.0; retain the
   // distinction without inventing a second comparison opcode/histogram bin.
   std::uint8_t comparison_result_float_one = 0;
+  // PCO F_TST_OP / F_TST_TYPE as the TST phase encodes them, for
+  // kBooleanCompare.  The three float forms that predate this keep their own
+  // opcodes, so these stay at the f32-equal encoding for every other opcode.
+  std::uint8_t comparison_test_op = 0;
+  std::uint8_t comparison_test_type = 0;
+  // IMADD32's `s0neg` modifier: a two's-complement negate of the first
+  // factor, which is how `-a * b + c` is spelled in the integer datapath.
+  std::uint8_t source0_integer_negate = 0;
+  // MOVC's true-value phase is an MBYP that may negate what it moves, which
+  // is how the compiler spells `cond ? -a : b`.  Orthogonal to the test, so a
+  // negated select needs no opcode of its own.
+  std::uint8_t source1_negate = 0;
   std::uint8_t source_count = 1;
   std::uint8_t repeat_count = 1;
   std::uint8_t end_group = 0;

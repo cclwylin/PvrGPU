@@ -3843,7 +3843,7 @@ static bool pvrgpu_color_primitive_allowed_intrinsic(nir_intrinsic_op op)
 static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                                                 mesa_shader_stage expected_stage,
                                                 unsigned render_target_count,
-                                                unsigned attribute_count,
+                                                uint64_t vertex_input_mask,
                                                 uint64_t varying_mask,
                                                 bool writes_point_size,
                                                 unsigned texture_count,
@@ -3856,9 +3856,11 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                              "color primitive shader stage mismatch");
    }
 
-   uint64_t vertex_inputs = 0;
-   for (unsigned attribute = 0; attribute < attribute_count; ++attribute)
-      vertex_inputs |= BITFIELD64_BIT(VERT_ATTRIB_GENERIC0 + attribute);
+   /*
+    * `vertex_input_mask` is the set of generic locations the draw's vertex
+    * elements feed, which is not GENERIC0..GENERIC(n-1) once the shader reads
+    * a sparse set of them.
+    */
    /*
     * Varyings occupy whichever slots the shaders agreed on, not VAR0 upwards:
     * the placement into registers is this profile's choice, so a shader that
@@ -3866,7 +3868,7 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
     */
    const uint64_t varying_slots = varying_mask;
    const uint64_t expected_inputs =
-      expected_stage == MESA_SHADER_VERTEX ? vertex_inputs : varying_slots;
+      expected_stage == MESA_SHADER_VERTEX ? vertex_input_mask : varying_slots;
    const uint64_t expected_outputs =
       expected_stage == MESA_SHADER_VERTEX
          ? (BITFIELD64_BIT(VARYING_SLOT_POS) | varying_slots |
@@ -4146,28 +4148,59 @@ static bool pvrgpu_strip_dead_point_size(nir_shader *nir)
 }
 
 /*
- * Components the vertex shader declares for each generic attribute.  The model
- * matches a program's VTXIN read mask against the attribute bindings exactly,
- * so the driver has to supply each attribute at the width its shader declares
- * rather than a uniform four.  Returns false when an attribute the draw binds
- * is absent from the shader or is not a plain float vector.
+ * Components the vertex shader declares for each generic attribute, and the
+ * location each bound vertex element feeds.  The model matches a program's
+ * VTXIN read mask against the attribute bindings exactly, so the driver has
+ * to supply each attribute at the width its shader declares rather than a
+ * uniform four.
+ *
+ * Vertex element N is *not* generic location N.  The state tracker allocates
+ * one element per bit of `inputs_read`, in ascending location order
+ * (st_atom_array.cpp counts the read bits below each attribute), so a shader
+ * whose live inputs are locations 0 and 3 -- which is what dEQP's random
+ * fragment-op shaders produce once the linker drops the inputs they declare
+ * but never read -- binds two elements that feed locations 0 and 3.  Assuming
+ * the two were locations 0 and 1 rejected every such draw as an unsupported
+ * layout; reporting the real locations lets the caller key PCO's vertex-input
+ * data by location while the packed stream stays dense.
  */
 bool pvrgpu_pco_vertex_attribute_components(const struct nir_shader *vertex_nir,
                                             unsigned attribute_count,
-                                            unsigned *components)
+                                            unsigned *components,
+                                            unsigned *locations,
+                                            const char **reason)
 {
-   if (!vertex_nir || !components || attribute_count == 0 ||
-       attribute_count > PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES)
+   if (reason)
+      *reason = "none";
+   const char *ignored = NULL;
+   if (!reason)
+      reason = &ignored;
+   if (!vertex_nir || !components || !locations || attribute_count == 0 ||
+       attribute_count > PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES) {
+      *reason = "attribute_count";
       return false;
-   for (unsigned attribute = 0; attribute < attribute_count; ++attribute)
+   }
+   for (unsigned attribute = 0; attribute < attribute_count; ++attribute) {
       components[attribute] = 0;
+      locations[attribute] = 0;
+   }
 
+   /*
+    * Widths the shader declares, indexed by generic location.  A location the
+    * shader declares but the linker left unread simply owns no binding, so it
+    * is recorded here and then ignored by the walk over `inputs_read` below.
+    */
+   unsigned declared[PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES] = {0};
    nir_foreach_variable_with_modes (var, vertex_nir, nir_var_shader_in) {
-      if (var->data.location < VERT_ATTRIB_GENERIC0)
+      if (var->data.location < VERT_ATTRIB_GENERIC0) {
+         *reason = "non_generic_input";
          return false;
-      const unsigned index = var->data.location - VERT_ATTRIB_GENERIC0;
-      if (index >= attribute_count)
+      }
+      const unsigned location = var->data.location - VERT_ATTRIB_GENERIC0;
+      if (location >= PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES) {
+         *reason = "location_range";
          return false;
+      }
       /*
        * A matrix attribute occupies one location per column, each holding as
        * many components as the matrix has rows -- which is how the
@@ -4179,27 +4212,50 @@ bool pvrgpu_pco_vertex_attribute_components(const struct nir_shader *vertex_nir,
          const unsigned columns = glsl_get_matrix_columns(var->type);
          const unsigned rows = glsl_get_vector_elements(var->type);
          if (columns == 0 || rows == 0 || rows > 4 ||
-             index + columns > attribute_count)
+             location + columns > PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES) {
+            *reason = "matrix_shape";
             return false;
+         }
          for (unsigned column = 0; column < columns; ++column)
-            components[index + column] = rows;
+            declared[location + column] = rows;
          continue;
       }
       const unsigned count = glsl_get_components(var->type);
-      if (count == 0 || count > 4 || !glsl_type_is_vector_or_scalar(var->type))
+      if (count == 0 || count > 4 ||
+          !glsl_type_is_vector_or_scalar(var->type)) {
+         *reason = "input_type";
          return false;
-      components[index] = count;
+      }
+      declared[location] = count;
    }
 
-   /*
-    * An application may bind an attribute its shader never reads.  Give the
-    * unread binding a single placeholder component so the packed layout keeps
-    * one entry per bound attribute; the shader ignores it, and the draw stays
-    * lowerable instead of being dropped for a binding nothing consumes.
-    */
-   for (unsigned attribute = 0; attribute < attribute_count; ++attribute) {
-      if (components[attribute] == 0)
-         components[attribute] = 1;
+   const uint64_t inputs_read = vertex_nir->info.inputs_read;
+   if ((inputs_read & BITFIELD64_MASK(VERT_ATTRIB_GENERIC0)) != 0) {
+      *reason = "builtin_input";
+      return false;
+   }
+   unsigned slot = 0;
+   for (unsigned location = 0; location < PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES;
+        ++location) {
+      if ((inputs_read &
+           BITFIELD64_BIT(VERT_ATTRIB_GENERIC0 + location)) == 0)
+         continue;
+      if (slot >= attribute_count) {
+         *reason = "more_inputs_than_bindings";
+         return false;
+      }
+      /*
+       * A read location whose variable the linker already removed keeps a
+       * single placeholder component, so the packed layout still has one
+       * entry per binding and the draw stays lowerable.
+       */
+      components[slot] = declared[location] != 0 ? declared[location] : 1;
+      locations[slot] = location;
+      ++slot;
+   }
+   if (slot != attribute_count) {
+      *reason = "fewer_inputs_than_bindings";
+      return false;
    }
    return true;
 }
@@ -4392,13 +4448,43 @@ bool pvrgpu_pco_compile_color_triangle(
                              (unsigned long long)vs->info.outputs_written,
                              (unsigned long long)fs->info.inputs_read);
    }
+   /*
+    * The generic location each bound vertex element feeds: PCO's vertex-input
+    * data is keyed by location while the VTXIN file it allocates is dense, so
+    * the shader cannot be validated or lowered without the mapping.  The
+    * widths come back too; the draw itself packs by them, this only needs
+    * where each one lands.
+    */
+   unsigned attribute_components[PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES] = {0};
+   unsigned attribute_locations[PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES] = {0};
+   const char *attribute_reason = NULL;
+   if (!pvrgpu_pco_vertex_attribute_components(vs,
+                                               attribute_count,
+                                               attribute_components,
+                                               attribute_locations,
+                                               &attribute_reason)) {
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error,
+                             error_size,
+                             "color primitive attribute layout is "
+                             "unsupported (%s): inputs=0x%llx bindings=%u",
+                             attribute_reason ? attribute_reason : "unstated",
+                             (unsigned long long)vs->info.inputs_read,
+                             attribute_count);
+   }
+   uint64_t vertex_input_mask = 0;
+   for (unsigned attribute = 0; attribute < attribute_count; ++attribute) {
+      vertex_input_mask |=
+         BITFIELD64_BIT(VERT_ATTRIB_GENERIC0 + attribute_locations[attribute]);
+   }
+
    const bool probe_writes_point_size =
       topology_uses_point_size &&
       (vs->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_PSIZ)) != 0;
    if (!pvrgpu_validate_color_primitive_nir(vs,
                                             MESA_SHADER_VERTEX,
                                             render_target_count,
-                                            attribute_count,
+                                            vertex_input_mask,
                                             probe_varying_mask,
                                             probe_writes_point_size,
                                             expected_stage_textures_vs,
@@ -4407,7 +4493,7 @@ bool pvrgpu_pco_compile_color_triangle(
        !pvrgpu_validate_color_primitive_nir(fs,
                                             MESA_SHADER_FRAGMENT,
                                             render_target_count,
-                                            attribute_count,
+                                            0,
                                             fs->info.inputs_read,
                                             false,
                                             texture_count,
@@ -4462,9 +4548,15 @@ bool pvrgpu_pco_compile_color_triangle(
                                 "format",
                                 attribute);
       }
-      vertex_data.vs.attrib_formats[VERT_ATTRIB_GENERIC0 + attribute] =
+      /*
+       * Keyed by the location the shader reads, sourced from the dense VTXIN
+       * slot the packed vertex stream writes: the two only coincide while the
+       * shader's live inputs happen to start at GENERIC0 and be contiguous.
+       */
+      const unsigned location = attribute_locations[attribute];
+      vertex_data.vs.attrib_formats[VERT_ATTRIB_GENERIC0 + location] =
          attribute_formats[attribute];
-      vertex_data.vs.attribs[VERT_ATTRIB_GENERIC0 + attribute] =
+      vertex_data.vs.attribs[VERT_ATTRIB_GENERIC0 + location] =
          (pco_range){
             .start = attribute * 4,
             .count = 4,
