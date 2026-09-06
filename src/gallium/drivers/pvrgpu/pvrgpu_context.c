@@ -6609,6 +6609,23 @@ pvrgpu_systemc_blend_factor_from_pipe(unsigned source,
       *destination =
          PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_DESTINATION_ALPHA;
       return true;
+   case PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE:
+      *destination = PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_SOURCE_ALPHA_SATURATE;
+      return true;
+   case PIPE_BLENDFACTOR_CONST_COLOR:
+      *destination = PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_CONSTANT_COLOR;
+      return true;
+   case PIPE_BLENDFACTOR_INV_CONST_COLOR:
+      *destination =
+         PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+      return true;
+   case PIPE_BLENDFACTOR_CONST_ALPHA:
+      *destination = PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_CONSTANT_ALPHA;
+      return true;
+   case PIPE_BLENDFACTOR_INV_CONST_ALPHA:
+      *destination =
+         PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+      return true;
    default:
       return false;
    }
@@ -11144,6 +11161,16 @@ pvrgpu_record_color_primitive_pco_draw(
                                blending ? rt->alpha_dst_factor : 0);
          pvrgpu_array_primitive_draw_destroy(&recorded);
          return false;
+      }
+      /*
+       * The blend constant (glBlendColor) is read only when a CONSTANT_* factor
+       * selects it, but it costs nothing to state and lets the model reproduce
+       * dEQP's blend.*_constant_* cases exactly.
+       */
+      for (unsigned channel = 0; channel < 4; ++channel) {
+         const float value = ctx->blend_color.color[channel];
+         memcpy(&recorded->command.blend_constant_color_bits[channel], &value,
+                sizeof(recorded->command.blend_constant_color_bits[channel]));
       }
    }
    ctx->array_primitive_draws[ctx->array_primitive_draw_count++] = recorded;

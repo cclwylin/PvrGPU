@@ -331,6 +331,9 @@ struct DriverCommand {
   std::uint32_t blend_destination_rgb_factor = 0;
   std::uint32_t blend_source_alpha_factor = 1;
   std::uint32_t blend_destination_alpha_factor = 0;
+  // glBlendColor as IEEE-754 float bit patterns R,G,B,A; read only when a
+  // CONSTANT_* blend factor selects it.
+  std::uint32_t blend_constant_color_bits[4] = {0, 0, 0, 0};
   std::uint32_t dither = 0;
   std::uint32_t depth_enable = 0;
   std::uint32_t depth_write = 0;

@@ -86,6 +86,11 @@ enum pvrgpu_systemc_pco_blend_factor {
    PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_DESTINATION_COLOR = 7,
    PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_DESTINATION_ALPHA = 8,
    PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_DESTINATION_ALPHA = 9,
+   PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_SOURCE_ALPHA_SATURATE = 10,
+   PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_CONSTANT_COLOR = 11,
+   PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR = 12,
+   PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_CONSTANT_ALPHA = 13,
+   PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA = 14,
 };
 
 enum pvrgpu_systemc_pco_texture_filter {
@@ -354,6 +359,11 @@ struct pvrgpu_systemc_driver_command {
    uint32_t blend_destination_rgb_factor;
    uint32_t blend_source_alpha_factor;
    uint32_t blend_destination_alpha_factor;
+   /*
+    * GLES blend constant colour (glBlendColor), as four IEEE-754 float bit
+    * patterns R,G,B,A.  Only read when a CONSTANT_* blend factor selects it.
+    */
+   uint32_t blend_constant_color_bits[4];
 
    /*
     * API-v8 native PCO sequence.  The outer logical command carries captured

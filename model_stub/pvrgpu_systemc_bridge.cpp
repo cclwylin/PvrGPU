@@ -378,6 +378,8 @@ void CopyPcoPayloadFields(
   destination->blend_source_alpha_factor = source.blend_source_alpha_factor;
   destination->blend_destination_alpha_factor =
       source.blend_destination_alpha_factor;
+  std::copy_n(source.blend_constant_color_bits, 4,
+              destination->blend_constant_color_bits);
   destination->dither = source.dither;
   destination->depth_enable = source.depth_enable;
   destination->depth_write = source.depth_write;
@@ -1007,13 +1009,13 @@ bool CopyPcoSequenceDraw(
       source.blend_alpha_equation <=
           PVRGPU_SYSTEMC_PCO_BLEND_EQUATION_MAX &&
       source.blend_source_rgb_factor <=
-          PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_DESTINATION_ALPHA &&
+          PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA &&
       source.blend_destination_rgb_factor <=
-          PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_DESTINATION_ALPHA &&
+          PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA &&
       source.blend_source_alpha_factor <=
-          PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_DESTINATION_ALPHA &&
+          PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA &&
       source.blend_destination_alpha_factor <=
-          PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_DESTINATION_ALPHA;
+          PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
   const bool disabled_blend_is_canonical =
       source.blend_enable != 0 ||
       (source.blend_rgb_equation ==

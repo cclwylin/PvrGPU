@@ -1728,6 +1728,10 @@ void Submitter::RunJob() {
           static_cast<BlendFactor>(command.blend_source_alpha_factor);
       state.raster_state.blend.destination_alpha_factor =
           static_cast<BlendFactor>(command.blend_destination_alpha_factor);
+      for (std::size_t channel = 0; channel < 4; ++channel) {
+        state.raster_state.blend.constant_color_bits[channel] =
+            command.blend_constant_color_bits[channel];
+      }
       state.raster_state.face_cull.enable = command.cull_face == 0 ? 0U : 1U;
       state.raster_state.face_cull.mode =
           command.cull_face == 1

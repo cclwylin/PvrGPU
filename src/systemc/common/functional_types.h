@@ -366,6 +366,11 @@ enum class BlendFactor : std::uint8_t {
   kOneMinusDestinationColor,
   kDestinationAlpha,
   kOneMinusDestinationAlpha,
+  kSourceAlphaSaturate,
+  kConstantColor,
+  kOneMinusConstantColor,
+  kConstantAlpha,
+  kOneMinusConstantAlpha,
 };
 
 // GLES blend state is explicit for both RGB and alpha.  GLBench Fill.Solid
@@ -379,6 +384,9 @@ struct BlendState {
   BlendFactor destination_alpha_factor = BlendFactor::kZero;
   std::uint8_t enable = 0;
   std::uint8_t reserved = 0;
+  // GLES blend constant colour (glBlendColor) as IEEE-754 float bit patterns
+  // R,G,B,A.  Read only when a kConstant* factor selects it.
+  std::uint32_t constant_color_bits[4] = {0, 0, 0, 0};
 };
 
 // GLES face-cull state is independent from triangle setup.  When enabled,

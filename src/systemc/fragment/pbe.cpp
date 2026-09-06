@@ -47,6 +47,7 @@ std::uint8_t FloatBitsToUnorm8(std::uint32_t raw_bits) {
 std::uint8_t FactorToUnorm8(pvrgpu::stub::BlendFactor factor,
                             const std::array<std::uint8_t, 4> &source,
                             const std::array<std::uint8_t, 4> &destination,
+                            const std::array<std::uint8_t, 4> &constant,
                             std::size_t component) {
   using pvrgpu::stub::BlendFactor;
   switch (factor) {
@@ -70,6 +71,22 @@ std::uint8_t FactorToUnorm8(pvrgpu::stub::BlendFactor factor,
     return destination[3];
   case BlendFactor::kOneMinusDestinationAlpha:
     return static_cast<std::uint8_t>(255U - destination[3]);
+  case BlendFactor::kSourceAlphaSaturate:
+    // GLES: f = min(As, 1 - Ad) for the colour components, exactly 1 for the
+    // alpha component.
+    return component == 3
+               ? static_cast<std::uint8_t>(255U)
+               : std::min<std::uint8_t>(
+                     source[3],
+                     static_cast<std::uint8_t>(255U - destination[3]));
+  case BlendFactor::kConstantColor:
+    return constant[component];
+  case BlendFactor::kOneMinusConstantColor:
+    return static_cast<std::uint8_t>(255U - constant[component]);
+  case BlendFactor::kConstantAlpha:
+    return constant[3];
+  case BlendFactor::kOneMinusConstantAlpha:
+    return static_cast<std::uint8_t>(255U - constant[3]);
   }
   throw std::runtime_error("PBE received an unsupported blend factor");
 }
@@ -129,8 +146,9 @@ void ValidateBlendState(const pvrgpu::stub::BlendState &blend) {
   };
   const std::array<std::uint8_t, 4> dummy_source{};
   const std::array<std::uint8_t, 4> dummy_dest{};
+  const std::array<std::uint8_t, 4> dummy_constant{};
   for (const pvrgpu::stub::BlendFactor factor : factors)
-    (void)FactorToUnorm8(factor, dummy_source, dummy_dest, 0);
+    (void)FactorToUnorm8(factor, dummy_source, dummy_dest, dummy_constant, 0);
 }
 
 } // namespace
@@ -303,6 +321,11 @@ void Pbe::Run() {
         for (std::size_t component = 0; component < 4; ++component) {
           destination_color[component] = framebuffer[byte_offset + component];
         }
+        std::array<std::uint8_t, 4> constant_color{};
+        for (std::size_t component = 0; component < 4; ++component) {
+          constant_color[component] =
+              FloatBitsToUnorm8(blend.constant_color_bits[component]);
+        }
         for (std::size_t component = 0; component < 4; ++component) {
           const BlendFactor source_factor =
               component == 3 ? blend.source_alpha_factor
@@ -313,8 +336,8 @@ void Pbe::Run() {
           const BlendEquation equation =
               component == 3 ? blend.alpha_equation
                              : blend.rgb_equation;
-          const std::uint8_t sf = FactorToUnorm8(source_factor, source, destination_color, component);
-          const std::uint8_t df = FactorToUnorm8(destination_factor, source, destination_color, component);
+          const std::uint8_t sf = FactorToUnorm8(source_factor, source, destination_color, constant_color, component);
+          const std::uint8_t df = FactorToUnorm8(destination_factor, source, destination_color, constant_color, component);
 
           const std::uint8_t blended_val = BlendEquationUnorm8(
               equation, source[component], destination_color[component], sf, df);
