@@ -539,10 +539,26 @@ void CheckDescriptorAndArithmetic() {
             refract_target_lod.mip_weight_u8 == 90,
         "Refract target primitive quad derives golden rho/lambda/TFRAC90");
 
+  /*
+   * A non-zero max LOD is a valid encoding; whether it can be sampled depends
+   * on how many levels the image has, which is the class predicate's
+   * question.  The decode no longer answers it, so this checks both halves:
+   * the window decodes, and a window past a single-level image is refused.
+   */
   auto mutated = DescriptorDwords(linear, 8);
   mutated[0] |= UINT32_C(1) << 23U; // public maxlod[0]
-  ExpectFailure([&] { DecodeRogueTextureSamplerDescriptor(mutated); },
-                "non-zero max LOD");
+  const RogueTextureSamplerDescriptor non_zero_lod =
+      DecodeRogueTextureSamplerDescriptor(mutated);
+  Check(non_zero_lod.max_lod_u4_6 == 1, "a non-zero max LOD decodes");
+  RogueTextureImageDescriptor one_level_image;
+  one_level_image.width = 64;
+  one_level_image.height = 64;
+  one_level_image.row_pitch_bytes = 64 * 4;
+  one_level_image.mip_count = 1;
+  one_level_image.format = TextureFormat::kRgba8Unorm;
+  Check(!DriverPcoTextureDescriptorClassSupported(one_level_image,
+                                                 non_zero_lod, 1),
+        "a LOD window past a single-level image is refused");
   mutated = DescriptorDwords(linear, 8);
   mutated[1] |= UINT32_C(4) << (41U - 32U); // addrmode_v=BORDER
   ExpectFailure([&] { DecodeRogueTextureSamplerDescriptor(mutated); },

@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 /* API-v14 states the PIXOUT lanes each colour attachment expects. */
-#define PVRGPU_SYSTEMC_API_VERSION 15u
+#define PVRGPU_SYSTEMC_API_VERSION 16u
 /*
  * Draws one sequence may describe; must match the model's own bound.  This is
  * independent of how many attachments the sequence creates, which the model's
@@ -101,6 +101,13 @@ enum pvrgpu_systemc_pco_texture_mip_filter {
 enum pvrgpu_systemc_pco_texture_wrap {
    PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_EDGE = 0,
    PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT = 1,
+   /*
+    * The texture unit has always implemented mirrored repeat -- both its
+    * nearest and its linear address paths fold the coordinate over a period
+    * of twice the extent -- but the capsule had no way to ask for it, so
+    * every GL_MIRRORED_REPEAT sampler was declined at the driver.
+    */
+   PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT = 2,
 };
 
 struct pvrgpu_systemc_pco_texture_mip {

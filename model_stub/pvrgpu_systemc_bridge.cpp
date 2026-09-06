@@ -1405,9 +1405,9 @@ bool CopyPcoSequenceTexture(
     return reject("mag filter");
   if (source.mip_filter > PVRGPU_SYSTEMC_PCO_TEXTURE_MIP_FILTER_LINEAR)
     return reject("mip filter");
-  if (source.wrap_u > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT)
+  if (source.wrap_u > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT)
     return reject("wrap u");
-  if (source.wrap_v > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT)
+  if (source.wrap_v > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT)
     return reject("wrap v");
   if (source.normalized_coordinates != 1)
     return reject("normalized coordinates");
@@ -1480,14 +1480,18 @@ bool CopyPcoSequenceTexture(
           source.mag_filter);
       probe_sampler.mip_filter = static_cast<pvrgpu::stub::TextureFilter>(
           source.mip_filter);
-      probe_sampler.wrap_u = static_cast<pvrgpu::stub::TextureWrapMode>(
-          source.wrap_u == PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT
-              ? pvrgpu::stub::TextureWrapMode::kRepeat
-              : pvrgpu::stub::TextureWrapMode::kClampToEdge);
-      probe_sampler.wrap_v = static_cast<pvrgpu::stub::TextureWrapMode>(
-          source.wrap_v == PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT
-              ? pvrgpu::stub::TextureWrapMode::kRepeat
-              : pvrgpu::stub::TextureWrapMode::kClampToEdge);
+      const auto probe_wrap = [](std::uint32_t capsule_wrap) {
+        switch (capsule_wrap) {
+        case PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT:
+          return pvrgpu::stub::TextureWrapMode::kRepeat;
+        case PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT:
+          return pvrgpu::stub::TextureWrapMode::kMirroredRepeat;
+        default:
+          return pvrgpu::stub::TextureWrapMode::kClampToEdge;
+        }
+      };
+      probe_sampler.wrap_u = probe_wrap(source.wrap_u);
+      probe_sampler.wrap_v = probe_wrap(source.wrap_v);
       probe_sampler.min_lod_u4_6 =
           static_cast<std::uint16_t>(source.min_lod_u4_6);
       probe_sampler.max_lod_u4_6 =

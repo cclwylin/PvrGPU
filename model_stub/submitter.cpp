@@ -2323,12 +2323,14 @@ void Submitter::RunJob() {
           sampler.mip_filter = texture.mip_filter == 0
                                    ? TextureFilter::kNearest
                                    : TextureFilter::kLinear;
-          sampler.wrap_u = texture.wrap_u == 0
-                               ? TextureWrapMode::kClampToEdge
-                               : TextureWrapMode::kRepeat;
-          sampler.wrap_v = texture.wrap_v == 0
-                               ? TextureWrapMode::kClampToEdge
-                               : TextureWrapMode::kRepeat;
+          // Capsule address modes: 0 clamp to edge, 1 repeat, 2 mirrored.
+          const auto capsule_wrap = [](std::uint32_t value) {
+            return value == 1U   ? TextureWrapMode::kRepeat
+                   : value == 2U ? TextureWrapMode::kMirroredRepeat
+                                 : TextureWrapMode::kClampToEdge;
+          };
+          sampler.wrap_u = capsule_wrap(texture.wrap_u);
+          sampler.wrap_v = capsule_wrap(texture.wrap_v);
           sampler.min_lod_u4_6 =
               static_cast<std::uint16_t>(texture.min_lod_u4_6);
           sampler.max_lod_u4_6 =

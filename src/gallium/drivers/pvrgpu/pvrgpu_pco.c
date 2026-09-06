@@ -384,8 +384,9 @@ pvrgpu_pco_build_terrain_texture_descriptor(
        width == 0 || width > 16384U || height == 0 || height > 16384U ||
        mip_count == 0 || mip_count > 15U || byte_size == 0 ||
        min_filter > 1U || mag_filter > 1U || mip_filter > 1U ||
-       (wrap_u != 0U && wrap_u != 2U) ||
-       (wrap_v != 0U && wrap_v != 2U) || max_lod_u4_6 > 1023U)
+       /* Rogue ADDRMODE: 0 repeat, 1 mirrored repeat, 2 clamp to edge. */
+       (wrap_u != 0U && wrap_u != 1U && wrap_u != 2U) ||
+       (wrap_v != 0U && wrap_v != 1U && wrap_v != 2U) || max_lod_u4_6 > 1023U)
       return false;
 
    /*

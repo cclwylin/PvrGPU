@@ -451,40 +451,27 @@ RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
   descriptor.wrap_u = DecodeWrapMode(ExtractBits(word0, 33, 35));
   descriptor.wrap_v = DecodeWrapMode(ExtractBits(word0, 41, 43));
 
-  // dadjust=4095 is zero bias.  The selected path implements repeat U/V/W,
-  // no anisotropy/luma-key/border/compare/YUV state, and either an exact LOD0
-  // non-mip sampler (Gates 16/17) or the public full-range mip-linear sampler
-  // used by Gate 18.  Reject every other public or reserved encoding.
-  const bool lod0_sampler =
-      descriptor.mip_filter == TextureFilter::kNearest &&
-      descriptor.min_lod_u4_6 == 0U && descriptor.max_lod_u4_6 == 0U &&
-      descriptor.min_filter == descriptor.mag_filter;
-  // A mip-linear sampler whose LOD range is empty has a single level to
-  // resolve both taps to; the image class gate pairs that with mip_count == 1.
   /*
-   * A mip-linear sampler.  The LOD range used to be a list of the values the
-   * captures happened to contain -- zero, the multiples of 64 up to 640, and
-   * 959 -- which is observation, not a limit the hardware has.  Whether a
-   * range is usable depends on how many levels the image carries, and
-   * DriverPcoTextureDescriptorClassSupported already answers that; here it is
-   * enough that the window is not inverted.
+   * dadjust=4095 is zero bias.  What is checked here is that the encoding is
+   * one this decoder understands -- the reserved fields, the address modes,
+   * normalized coordinates, and a LOD window that runs forwards.
+   *
+   * Which filter combinations can actually be sampled is a question about the
+   * image as well as the sampler, and DriverPcoTextureDescriptorClassSupported
+   * answers it.  This used to enumerate three sampler shapes here as well,
+   * which disagreed with that predicate as soon as either moved: a sampler the
+   * capability check admitted could still be refused by the decode, and the
+   * refusal arrived as a fatal exception mid-sample.
    */
-  const bool trilinear_sampler =
-      descriptor.mip_filter == TextureFilter::kLinear &&
-      descriptor.min_lod_u4_6 <= descriptor.max_lod_u4_6 &&
-      descriptor.min_filter == TextureFilter::kLinear &&
-      descriptor.mag_filter == TextureFilter::kLinear;
-  // A single-level image sampled with mip-linear: the LOD range is empty, so
-  // both taps resolve to level 0 and GL's magnification rule decides between
-  // the two image filters.  This is the only class that admits min != mag.
-  const bool single_level_sampler =
-      descriptor.mip_filter == TextureFilter::kLinear &&
-      descriptor.min_lod_u4_6 == 0U && descriptor.max_lod_u4_6 == 0U;
+  const bool lod_window_runs_forwards =
+      descriptor.min_lod_u4_6 <= descriptor.max_lod_u4_6;
   const bool supported_wrap_u =
       descriptor.wrap_u == TextureWrapMode::kRepeat ||
+      descriptor.wrap_u == TextureWrapMode::kMirroredRepeat ||
       descriptor.wrap_u == TextureWrapMode::kClampToEdge;
   const bool supported_wrap_v =
       descriptor.wrap_v == TextureWrapMode::kRepeat ||
+      descriptor.wrap_v == TextureWrapMode::kMirroredRepeat ||
       descriptor.wrap_v == TextureWrapMode::kClampToEdge;
   if (ExtractBits(word0, 0, 12) != 4095U ||
       !supported_wrap_u || !supported_wrap_v ||
@@ -494,7 +481,7 @@ RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
       ExtractBits(word0, 50, 55) != 0U ||
       ExtractBits(word0, 56, 58) != 0U ||
       ExtractBits(word0, 59, 63) != 0U || word1 != 0U ||
-      (!lod0_sampler && !trilinear_sampler && !single_level_sampler)) {
+      !lod_window_runs_forwards) {
     std::ostringstream detail;
     detail << "TextureUnit unsupported raw Rogue sampler descriptor"
            << " (word0=0x" << std::hex << word0 << " word1=0x" << word1
@@ -588,13 +575,25 @@ bool DriverPcoTextureDescriptorClassSupported(
    * them implements GL's rule for choosing between the minification and
    * magnification filters.
    *
-   * So while the LOD window covers a single level, any filter combination is
-   * exact: there is no level to choose and no blend to weight.  Past that,
-   * the sample is only what GL asked for when the mip filter is linear and
-   * both image filters are too.  GL_NEAREST_MIPMAP_LINEAR over six levels
-   * would otherwise be answered from the base level with the wrong taps --
-   * guessing that was tried once and moved results away from the reference,
-   * so this declines instead.
+   * Two things follow.
+   *
+   * min must equal mag, whatever the image.  GL chooses between them per
+   * fragment from lambda -- magnified fragments take the magnification
+   * filter, minified ones the minification filter -- and that choice does not
+   * depend on how many levels the image has.  A single-level image was
+   * briefly allowed to differ here on the reasoning that both mip taps land
+   * on the same level, which is true and beside the point: dEQP's
+   * nearest_linear cases magnify part of the quad, and sampling all of it
+   * with the minification filter left 1496 of 65536 pixels wrong.  Sampling
+   * with the wrong filter and reporting the result is worse than declining
+   * it, and guessing the rule was tried once and moved results away from the
+   * reference.
+   *
+   * Past one level every filter must be linear, not just the mip filter.
+   * The dispatch selects its path from `min_filter == kLinear`, so a nearest
+   * minification filter takes the level-zero path however the mip filter is
+   * set: GL_NEAREST_MIPMAP_LINEAR would read one texel from the base level
+   * while the rest of the pipeline accounted for a trilinear fetch.
    */
   const bool one_level_in_range = sampler.max_lod_u4_6 < 64U;
   const bool filters_across_levels =
@@ -607,9 +606,11 @@ bool DriverPcoTextureDescriptorClassSupported(
   // Five: an address mode the wrap arithmetic implements.
   const bool supported_wrap =
       (sampler.wrap_u == TextureWrapMode::kClampToEdge ||
-       sampler.wrap_u == TextureWrapMode::kRepeat) &&
+       sampler.wrap_u == TextureWrapMode::kRepeat ||
+       sampler.wrap_u == TextureWrapMode::kMirroredRepeat) &&
       (sampler.wrap_v == TextureWrapMode::kClampToEdge ||
-       sampler.wrap_v == TextureWrapMode::kRepeat);
+       sampler.wrap_v == TextureWrapMode::kRepeat ||
+       sampler.wrap_v == TextureWrapMode::kMirroredRepeat);
 
   return decodable_format && lod_window_fits && supported_wrap &&
          level_selection_is_exact &&

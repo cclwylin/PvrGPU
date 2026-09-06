@@ -9563,18 +9563,35 @@ pvrgpu_sequence_texture_wrap(unsigned gallium_wrap)
       return PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT;
    case PIPE_TEX_WRAP_CLAMP_TO_EDGE:
       return PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_EDGE;
+   case PIPE_TEX_WRAP_MIRROR_REPEAT:
+      return PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT;
    default:
       /* Out of range for the capsule enum, so the caller fails closed. */
       return PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT + 1U;
    }
 }
 
-/* Back to the Rogue ADDRMODE domain the image descriptor encodes. */
+/*
+ * Back to the Rogue ADDRMODE domain the image descriptor encodes.
+ *
+ * These are Rogue's own numbers, spelled out.  It used to return the Gallium
+ * PIPE_TEX_WRAP_* constants and worked only by coincidence: Gallium's REPEAT
+ * and CLAMP_TO_EDGE happen to be 0 and 2, which are also Rogue's.  Its
+ * MIRROR_REPEAT is 4, which Rogue reads as clamp-to-border, so the first
+ * address mode that did not coincide would have been sampled as something
+ * else entirely.
+ */
 static unsigned
 pvrgpu_sequence_texture_addrmode(uint32_t capsule_wrap)
 {
-   return capsule_wrap == PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT ?
-             PIPE_TEX_WRAP_REPEAT : PIPE_TEX_WRAP_CLAMP_TO_EDGE;
+   switch (capsule_wrap) {
+   case PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT:
+      return 0U;
+   case PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT:
+      return 1U;
+   default:
+      return 2U;
+   }
 }
 
 static bool
@@ -9739,8 +9756,8 @@ pvrgpu_capture_generic_sequence_texture(
          PVRGPU_SYSTEMC_PCO_TEXTURE_MIP_FILTER_NONE;
    destination->wrap_u = pvrgpu_sequence_texture_wrap(state->wrap_s);
    destination->wrap_v = pvrgpu_sequence_texture_wrap(state->wrap_t);
-   if (destination->wrap_u > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT ||
-       destination->wrap_v > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT) {
+   if (destination->wrap_u > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT ||
+       destination->wrap_v > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT) {
       *reason = "wrap_mode";
       free(bytes);
       return false;
