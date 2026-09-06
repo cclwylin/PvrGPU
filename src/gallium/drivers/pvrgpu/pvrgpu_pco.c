@@ -84,6 +84,54 @@ static const unsigned pvrgpu_swizzle_depth_x001[4] = {
    PVRGPU_SWIZ_CHAN0, PVRGPU_SWIZ_ZERO, PVRGPU_SWIZ_ZERO, PVRGPU_SWIZ_ONE,
 };
 
+/*
+ * Rogue TEXSTATE FORMAT_COMPRESSED, the ASTC half.
+ *
+ * The texformat field is one seven-bit number read through either the FORMAT
+ * or the FORMAT_COMPRESSED enum, so an ASTC image writes its footprint's
+ * value here and the model is told separately which enum applies -- it
+ * cross-checks the raw word against the structured format it was given, as
+ * it already does for every other image.  The order is texstate.xml's, and
+ * the sRGB form of a footprint is the same value with GAMMA set.
+ */
+static const struct {
+   enum pipe_format unorm;
+   enum pipe_format srgb;
+   unsigned rogue_format;
+} pvrgpu_astc_rogue_formats[] = {
+   { PIPE_FORMAT_ASTC_4x4, PIPE_FORMAT_ASTC_4x4_SRGB, 0u },
+   { PIPE_FORMAT_ASTC_5x4, PIPE_FORMAT_ASTC_5x4_SRGB, 1u },
+   { PIPE_FORMAT_ASTC_5x5, PIPE_FORMAT_ASTC_5x5_SRGB, 2u },
+   { PIPE_FORMAT_ASTC_6x5, PIPE_FORMAT_ASTC_6x5_SRGB, 3u },
+   { PIPE_FORMAT_ASTC_6x6, PIPE_FORMAT_ASTC_6x6_SRGB, 4u },
+   { PIPE_FORMAT_ASTC_8x5, PIPE_FORMAT_ASTC_8x5_SRGB, 5u },
+   { PIPE_FORMAT_ASTC_8x6, PIPE_FORMAT_ASTC_8x6_SRGB, 6u },
+   { PIPE_FORMAT_ASTC_8x8, PIPE_FORMAT_ASTC_8x8_SRGB, 7u },
+   { PIPE_FORMAT_ASTC_10x5, PIPE_FORMAT_ASTC_10x5_SRGB, 8u },
+   { PIPE_FORMAT_ASTC_10x6, PIPE_FORMAT_ASTC_10x6_SRGB, 9u },
+   { PIPE_FORMAT_ASTC_10x8, PIPE_FORMAT_ASTC_10x8_SRGB, 10u },
+   { PIPE_FORMAT_ASTC_10x10, PIPE_FORMAT_ASTC_10x10_SRGB, 11u },
+   { PIPE_FORMAT_ASTC_12x10, PIPE_FORMAT_ASTC_12x10_SRGB, 12u },
+   { PIPE_FORMAT_ASTC_12x12, PIPE_FORMAT_ASTC_12x12_SRGB, 13u },
+};
+
+static bool
+pvrgpu_astc_rogue_format(enum pipe_format format,
+                         unsigned *out_rogue_format,
+                         bool *out_srgb)
+{
+   for (unsigned index = 0;
+        index < ARRAY_SIZE(pvrgpu_astc_rogue_formats); ++index) {
+      if (format == pvrgpu_astc_rogue_formats[index].unorm ||
+          format == pvrgpu_astc_rogue_formats[index].srgb) {
+         *out_rogue_format = pvrgpu_astc_rogue_formats[index].rogue_format;
+         *out_srgb = format == pvrgpu_astc_rogue_formats[index].srgb;
+         return true;
+      }
+   }
+   return false;
+}
+
 static void
 pvrgpu_build_refract_descriptor(uint32_t descriptor[20],
                                 unsigned tex_format,
@@ -93,6 +141,7 @@ pvrgpu_build_refract_descriptor(uint32_t descriptor[20],
                                 unsigned height,
                                 unsigned mip_count,
                                 uint32_t byte_size,
+                                unsigned row_pitch_bytes,
                                 unsigned min_filter,
                                 unsigned mag_filter,
                                 unsigned mip_filter,
@@ -117,9 +166,15 @@ pvrgpu_build_refract_descriptor(uint32_t descriptor[20],
    pvrgpu_refract_descriptor_store_u64(descriptor, 0, image_word0);
 
    /* IMAGE_WORD1 address bits 16..53 intentionally remain zero until the
-    * bridge has deep-copied and allocated each structured resource. */
+    * bridge has deep-copied and allocated each structured resource.
+    *
+    * The stride field carries texels for an image that stores one texel per
+    * position and bytes for a compressed one, because a block row is not a
+    * whole number of texels: ASTC 5x4 over 256 texels is 52 blocks, which is
+    * 832 bytes and no texel count at all. */
    const uint64_t image_word1 =
-      pvrgpu_refract_descriptor_bits(width - 1U, 0, 14) |
+      pvrgpu_refract_descriptor_bits(
+         (row_pitch_bytes != 0U ? row_pitch_bytes : width) - 1U, 0, 14) |
       pvrgpu_refract_descriptor_bits(mip_count > 1U, 15, 15) |
       pvrgpu_refract_descriptor_bits(mip_count, 60, 63);
    pvrgpu_refract_descriptor_store_u64(descriptor, 2, image_word1);
@@ -206,6 +261,7 @@ pvrgpu_pco_build_refract_fragment_shared_for_extent(
                                     0U,
                                     0U,
                                     0U,
+                                    0U,
                                     2U,
                                     2U,
                                     0U);
@@ -217,6 +273,7 @@ pvrgpu_pco_build_refract_fragment_shared_for_extent(
                                     height,
                                     mip_count,
                                     color_bytes,
+                                    0U,
                                     1U,
                                     1U,
                                     1U,
@@ -231,6 +288,7 @@ pvrgpu_pco_build_refract_fragment_shared_for_extent(
                                     512U,
                                     1U,
                                     1048576U,
+                                    0U,
                                     1U,
                                     1U,
                                     0U,
@@ -273,6 +331,7 @@ pvrgpu_pco_build_shadow_fragment_shared_for_extent(
                                     0U,
                                     0U,
                                     0U,
+                                    0U,
                                     2U,
                                     2U,
                                     0U);
@@ -310,10 +369,18 @@ pvrgpu_pco_build_terrain_texture_descriptor(
     * unit to decode R, G and B through the sRGB transfer function.  The
     * driver states that here and decodes nothing.
     */
-   const bool srgb = format == PIPE_FORMAT_R8G8B8A8_SRGB;
+   unsigned astc_rogue_format = 0;
+   bool astc_srgb = false;
+   const bool astc =
+      pvrgpu_astc_rogue_format(format, &astc_rogue_format, &astc_srgb);
+   /* One row of blocks: ceil(width / block width) of them, 16 bytes each. */
+   const unsigned astc_row_pitch_bytes =
+      astc ? util_format_get_stride(format, width) : 0U;
+   const bool srgb = format == PIPE_FORMAT_R8G8B8A8_SRGB || astc_srgb;
    if (!out ||
        (format != PIPE_FORMAT_R8G8B8A8_UNORM &&
-        format != PIPE_FORMAT_R8G8B8X8_UNORM && !srgb && !depth_stencil) ||
+        format != PIPE_FORMAT_R8G8B8X8_UNORM && !srgb && !astc &&
+        !depth_stencil) ||
        width == 0 || width > 16384U || height == 0 || height > 16384U ||
        mip_count == 0 || mip_count > 15U || byte_size == 0 ||
        min_filter > 1U || mag_filter > 1U || mip_filter > 1U ||
@@ -329,7 +396,7 @@ pvrgpu_pco_build_terrain_texture_descriptor(
     */
    pvrgpu_build_refract_descriptor(
       out,
-      depth_stencil ? 22U : 12U,
+      astc ? astc_rogue_format : depth_stencil ? 22U : 12U,
       srgb,
       depth_stencil ? pvrgpu_swizzle_depth_x001
                     : format == PIPE_FORMAT_R8G8B8X8_UNORM
@@ -339,6 +406,7 @@ pvrgpu_pco_build_terrain_texture_descriptor(
       height,
       mip_count,
       byte_size,
+      astc ? astc_row_pitch_bytes : 0U,
       min_filter,
       mag_filter,
       mip_filter,

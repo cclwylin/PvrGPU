@@ -1,4 +1,5 @@
 #include "model_runner.h"
+#include "texture/astc_decoder.h"
 #include "pco_sequence_profiles.h"
 #include "pvrgpu_systemc_api.h"
 #include "shader/pco_iss.h"
@@ -1284,16 +1285,76 @@ bool CopyPcoSequenceTexture(
   // A combined depth/stencil image sampled through a 2D view stores the same
   // four bytes per texel as a colour image; the depth occupies the low 24
   // bits and the texture unit masks the stencil byte off.
-  // An sRGB image stores the same four bytes as RGBA8; only the texture
-  // unit's decode of R, G and B differs.
-  const std::uint32_t bytes_per_texel =
-      format == "PIPE_FORMAT_R8G8B8A8_UNORM" ||
-              format == "PIPE_FORMAT_R8G8B8X8_UNORM" ||
-              format == "PIPE_FORMAT_R8G8B8A8_SRGB" ||
-              format == "PIPE_FORMAT_Z32_UNORM" ||
-              format == "PIPE_FORMAT_Z24_UNORM_S8_UINT"
-          ? 4U
-          : 0U;
+  /*
+   * A texture's storage unit, not its texel.
+   *
+   * An uncompressed image stores one four-byte texel per position, so its
+   * block is 1x1.  ASTC stores one sixteen-byte block per footprint, so a row
+   * is ceil(width / block width) blocks and a level is ceil(height / block
+   * height) of those rows.  Expressing both as a block removes the "four
+   * bytes per texel" the layout check below used to assume -- which is the
+   * only reason a compressed image could not be described here.
+   *
+   * An sRGB image stores exactly what its non-sRGB form does; only the
+   * texture unit's decode of R, G and B differs.
+   */
+  struct TextureStorageBlock {
+    const char *format;
+    std::uint32_t width;
+    std::uint32_t height;
+  };
+  static constexpr TextureStorageBlock kAstcBlocks[] = {
+      {"PIPE_FORMAT_ASTC_4x4", 4, 4},
+      {"PIPE_FORMAT_ASTC_4x4_SRGB", 4, 4},
+      {"PIPE_FORMAT_ASTC_5x4", 5, 4},
+      {"PIPE_FORMAT_ASTC_5x4_SRGB", 5, 4},
+      {"PIPE_FORMAT_ASTC_5x5", 5, 5},
+      {"PIPE_FORMAT_ASTC_5x5_SRGB", 5, 5},
+      {"PIPE_FORMAT_ASTC_6x5", 6, 5},
+      {"PIPE_FORMAT_ASTC_6x5_SRGB", 6, 5},
+      {"PIPE_FORMAT_ASTC_6x6", 6, 6},
+      {"PIPE_FORMAT_ASTC_6x6_SRGB", 6, 6},
+      {"PIPE_FORMAT_ASTC_8x5", 8, 5},
+      {"PIPE_FORMAT_ASTC_8x5_SRGB", 8, 5},
+      {"PIPE_FORMAT_ASTC_8x6", 8, 6},
+      {"PIPE_FORMAT_ASTC_8x6_SRGB", 8, 6},
+      {"PIPE_FORMAT_ASTC_8x8", 8, 8},
+      {"PIPE_FORMAT_ASTC_8x8_SRGB", 8, 8},
+      {"PIPE_FORMAT_ASTC_10x5", 10, 5},
+      {"PIPE_FORMAT_ASTC_10x5_SRGB", 10, 5},
+      {"PIPE_FORMAT_ASTC_10x6", 10, 6},
+      {"PIPE_FORMAT_ASTC_10x6_SRGB", 10, 6},
+      {"PIPE_FORMAT_ASTC_10x8", 10, 8},
+      {"PIPE_FORMAT_ASTC_10x8_SRGB", 10, 8},
+      {"PIPE_FORMAT_ASTC_10x10", 10, 10},
+      {"PIPE_FORMAT_ASTC_10x10_SRGB", 10, 10},
+      {"PIPE_FORMAT_ASTC_12x10", 12, 10},
+      {"PIPE_FORMAT_ASTC_12x10_SRGB", 12, 10},
+      {"PIPE_FORMAT_ASTC_12x12", 12, 12},
+      {"PIPE_FORMAT_ASTC_12x12_SRGB", 12, 12},
+  };
+  std::uint32_t block_width = 1U;
+  std::uint32_t block_height = 1U;
+  std::uint32_t block_bytes = 0U;
+  if (format == "PIPE_FORMAT_R8G8B8A8_UNORM" ||
+      format == "PIPE_FORMAT_R8G8B8X8_UNORM" ||
+      format == "PIPE_FORMAT_R8G8B8A8_SRGB" ||
+      format == "PIPE_FORMAT_Z32_UNORM" ||
+      format == "PIPE_FORMAT_Z24_UNORM_S8_UINT") {
+    block_bytes = 4U;
+  } else {
+    for (const TextureStorageBlock &block : kAstcBlocks) {
+      if (format == block.format) {
+        block_width = block.width;
+        block_height = block.height;
+        block_bytes = 16U;  // every ASTC block is 128 bits
+        break;
+      }
+    }
+  }
+  const auto blocks_for = [](std::uint32_t extent, std::uint32_t block) {
+    return static_cast<std::uint64_t>((extent + block - 1U) / block);
+  };
   // Each field names itself: a bundled predicate here only reports that some
   // unspecified part of the metadata was rejected.
   const auto reject = [&](const char *field) {
@@ -1310,7 +1371,7 @@ bool CopyPcoSequenceTexture(
     return reject("descriptor set");
   if (source.binding != 0)
     return reject("binding");
-  if (bytes_per_texel == 0)
+  if (block_bytes == 0)
     return reject("format");
   if (source.declared_bytes_size == 0 ||
       source.declared_bytes_size >
@@ -1338,9 +1399,10 @@ bool CopyPcoSequenceTexture(
   for (std::size_t level = 0; level < source.mip_count; ++level) {
     const pvrgpu_systemc_pco_texture_mip &mip = source.mip[level];
     const std::uint64_t tight_pitch =
-        static_cast<std::uint64_t>(mip.width) * bytes_per_texel;
+        blocks_for(mip.width, block_width) * block_bytes;
     const std::uint64_t level_bytes =
-        static_cast<std::uint64_t>(mip.row_pitch) * mip.height;
+        static_cast<std::uint64_t>(mip.row_pitch) *
+        blocks_for(mip.height, block_height);
     const std::uint64_t level_end =
         static_cast<std::uint64_t>(mip.offset) + level_bytes;
     if (mip.width == 0 || mip.height == 0 ||
@@ -1374,6 +1436,34 @@ bool CopyPcoSequenceTexture(
         source.bytes_size != source.declared_bytes_size) {
       *error = "SystemC API external PCO sequence texture payload is invalid";
       return false;
+    }
+    /*
+     * Decline a compressed texture the decoder cannot read, here, before the
+     * draw is claimed.
+     *
+     * Which ASTC block types an image contains is only knowable from its
+     * bytes, and the texture unit meets them one at a time in the middle of a
+     * sample -- far too late to decline anything.  Refusing there aborts the
+     * simulation and the case reports NoResult, which tells nobody anything.
+     * This is the same rule the shader path already follows: a draw the model
+     * cannot execute has to be declined before the driver claims it.
+     */
+    if (block_width != 1U || block_height != 1U) {
+      const pvrgpu::stub::AstcBlockFootprint footprint{block_width,
+                                                       block_height};
+      pvrgpu::stub::AstcDecodedBlock decoded;
+      for (std::size_t offset = 0; offset + 16U <= source.bytes_size;
+           offset += 16U) {
+        const char *refusal = nullptr;
+        if (!pvrgpu::stub::DecodeAstcBlock(source.bytes + offset, footprint,
+                                           /*srgb=*/false, &decoded,
+                                           &refusal)) {
+          *error = std::string("SystemC API PCO sequence ASTC block at byte ") +
+                   std::to_string(offset) + " cannot be decoded: " +
+                   (refusal != nullptr ? refusal : "unstated");
+          return false;
+        }
+      }
     }
   } else if (source.producer_command_index >= consumer_command_index ||
              source.bytes || source.bytes_size != 0) {

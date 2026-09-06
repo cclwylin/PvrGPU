@@ -9613,6 +9613,14 @@ pvrgpu_capture_generic_sequence_texture(
     * texture: the app renders depth and reads it back.  Its texel is the same
     * four bytes as a colour texel, so the layout checks below hold unchanged.
     */
+   /*
+    * An ASTC view hands the model the compressed blocks themselves: the
+    * texture unit decodes them, which is where the hardware does it.  Its
+    * storage is blocks rather than texels, so the layout arithmetic below
+    * goes through util_format rather than assuming four bytes per texel.
+    */
+   const bool astc_view =
+      util_format_description(format)->layout == UTIL_FORMAT_LAYOUT_ASTC;
    if (format != PIPE_FORMAT_R8G8B8A8_UNORM &&
        format != PIPE_FORMAT_R8G8B8X8_UNORM &&
        /*
@@ -9620,7 +9628,7 @@ pvrgpu_capture_generic_sequence_texture(
         * sRGB transfer function; its texel is the same four bytes, so every
         * layout check below holds unchanged.
         */
-       format != PIPE_FORMAT_R8G8B8A8_SRGB &&
+       format != PIPE_FORMAT_R8G8B8A8_SRGB && !astc_view &&
        format != PIPE_FORMAT_Z24_UNORM_S8_UINT) {
       *reason = "format";
       return false;
@@ -9636,18 +9644,25 @@ pvrgpu_capture_generic_sequence_texture(
       return false;
    }
 
-   /* The model reads a tightly packed mip chain from one allocation. */
+   /*
+    * The model reads a tightly packed mip chain from one allocation.  The row
+    * pitch and the bytes a level occupies come from util_format, which is one
+    * row of blocks for a compressed format and one row of texels otherwise --
+    * the same arithmetic the resource was allocated with, rather than a
+    * second copy of it that assumed four bytes per texel.
+    */
    uintptr_t expected_offset = 0;
    for (unsigned level = 0; level < mip_count; ++level) {
       const unsigned level_width = MAX2(width >> level, 1U);
       const unsigned level_height = MAX2(height >> level, 1U);
-      const unsigned row_pitch = level_width * 4U;
+      const unsigned row_pitch = util_format_get_stride(format, level_width);
       if (resource->level_offsets[level] != expected_offset ||
           resource->level_strides[level] != row_pitch) {
          *reason = "mip_layout";
          return false;
       }
-      expected_offset += (uintptr_t)row_pitch * level_height;
+      expected_offset +=
+         (uintptr_t)util_format_get_2d_size(format, row_pitch, level_height);
    }
    if (expected_offset == 0 || expected_offset != (uintptr_t)resource->size) {
       *reason = "image_size";

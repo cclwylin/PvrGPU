@@ -2232,9 +2232,73 @@ void Submitter::RunJob() {
                         // decodes R, G and B through the sRGB curve.
                         : texture.format == "PIPE_FORMAT_R8G8B8A8_SRGB"
                               ? TextureFormat::kRgba8Srgb
+                        // ASTC arrives compressed: the texture unit decodes
+                        // the blocks, which is where the hardware does it.
+                        : texture.format.rfind("PIPE_FORMAT_ASTC_", 0) == 0
+                              ? (texture.format.size() > 5 &&
+                                 texture.format.compare(
+                                     texture.format.size() - 5, 5,
+                                     "_SRGB") == 0
+                                     ? TextureFormat::kAstcLdrSrgb
+                                     : TextureFormat::kAstcLdr)
                         : throw std::runtime_error(
                               "Submitter PCO sequence texture format is "
-                              "unsupported");
+                              "unsupported: " + texture.format);
+          if (resource.format == TextureFormat::kAstcLdr ||
+              resource.format == TextureFormat::kAstcLdrSrgb) {
+            // The footprint the format names, from the same fourteen Rogue
+            // TEXSTATE declares.  An ASTC name outside them is not a
+            // footprint this model has, and saying so beats guessing 4x4.
+            struct AstcFootprintName {
+              const char *format;
+              std::uint8_t width;
+              std::uint8_t height;
+            };
+            static constexpr AstcFootprintName kFootprints[] = {
+              {"PIPE_FORMAT_ASTC_4x4", 4, 4},
+              {"PIPE_FORMAT_ASTC_4x4_SRGB", 4, 4},
+              {"PIPE_FORMAT_ASTC_5x4", 5, 4},
+              {"PIPE_FORMAT_ASTC_5x4_SRGB", 5, 4},
+              {"PIPE_FORMAT_ASTC_5x5", 5, 5},
+              {"PIPE_FORMAT_ASTC_5x5_SRGB", 5, 5},
+              {"PIPE_FORMAT_ASTC_6x5", 6, 5},
+              {"PIPE_FORMAT_ASTC_6x5_SRGB", 6, 5},
+              {"PIPE_FORMAT_ASTC_6x6", 6, 6},
+              {"PIPE_FORMAT_ASTC_6x6_SRGB", 6, 6},
+              {"PIPE_FORMAT_ASTC_8x5", 8, 5},
+              {"PIPE_FORMAT_ASTC_8x5_SRGB", 8, 5},
+              {"PIPE_FORMAT_ASTC_8x6", 8, 6},
+              {"PIPE_FORMAT_ASTC_8x6_SRGB", 8, 6},
+              {"PIPE_FORMAT_ASTC_8x8", 8, 8},
+              {"PIPE_FORMAT_ASTC_8x8_SRGB", 8, 8},
+              {"PIPE_FORMAT_ASTC_10x5", 10, 5},
+              {"PIPE_FORMAT_ASTC_10x5_SRGB", 10, 5},
+              {"PIPE_FORMAT_ASTC_10x6", 10, 6},
+              {"PIPE_FORMAT_ASTC_10x6_SRGB", 10, 6},
+              {"PIPE_FORMAT_ASTC_10x8", 10, 8},
+              {"PIPE_FORMAT_ASTC_10x8_SRGB", 10, 8},
+              {"PIPE_FORMAT_ASTC_10x10", 10, 10},
+              {"PIPE_FORMAT_ASTC_10x10_SRGB", 10, 10},
+              {"PIPE_FORMAT_ASTC_12x10", 12, 10},
+              {"PIPE_FORMAT_ASTC_12x10_SRGB", 12, 10},
+              {"PIPE_FORMAT_ASTC_12x12", 12, 12},
+              {"PIPE_FORMAT_ASTC_12x12_SRGB", 12, 12},
+            };
+            bool found = false;
+            for (const AstcFootprintName &entry : kFootprints) {
+              if (texture.format == entry.format) {
+                resource.block_width = entry.width;
+                resource.block_height = entry.height;
+                found = true;
+                break;
+              }
+            }
+            if (!found) {
+              throw std::runtime_error(
+                  "Submitter PCO sequence ASTC footprint is unsupported: " +
+                  texture.format);
+            }
+          }
           resource.layout = TextureLayout::kLinear;
           resource.descriptor_set =
               static_cast<std::uint8_t>(texture.descriptor_set);

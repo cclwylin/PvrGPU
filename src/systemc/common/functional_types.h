@@ -541,6 +541,15 @@ enum class TextureFormat : std::uint8_t {
   // that blends stored bytes and converts afterwards is a different function
   // and is declined rather than approximated.
   kRgba8Srgb,
+  // ASTC LDR.  The footprint is not part of the format: it lives in the
+  // resource's storage block, because one decoder handles all fourteen.
+  kAstcLdr,
+  // ASTC LDR whose decoded R, G and B are sRGB-encoded.  The block decode and
+  // the transfer function are separate steps -- the decoder returns stored
+  // channels and the texture unit converts them -- but the format has to name
+  // both, because the image descriptor's gamma bit applies to the decoded
+  // texel and nothing downstream could recover it otherwise.
+  kAstcLdrSrgb,
 };
 
 // One sRGB-encoded channel, as a linear value.  This is the GL/IEC 61966-2-1
@@ -581,7 +590,12 @@ struct TextureResource {
   TextureLayout layout = TextureLayout::kLinear;
   std::uint8_t descriptor_set = 0;
   std::uint8_t binding = 0;
-  std::uint8_t reserved[3]{};
+  // The storage block.  1x1 for an image that stores one texel per position;
+  // an ASTC image stores one 128-bit block per footprint, so a row holds
+  // ceil(width / block_width) blocks.
+  std::uint8_t block_width = 1;
+  std::uint8_t block_height = 1;
+  std::uint8_t reserved[1]{};
   TextureMipLevel mip[kMaximumTextureMipLevels]{};
 };
 

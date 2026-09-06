@@ -422,6 +422,49 @@ pvrgpu_is_sampler_only_format(enum pipe_format format)
    /* ARB_stencil_texturing (ES 3.1) */
    case PIPE_FORMAT_X24S8_UINT:
    case PIPE_FORMAT_S8X24_UINT:
+   /*
+    * KHR_texture_compression_astc_ldr, the two-dimensional LDR footprints.
+    *
+    * Advertising these is what stops Mesa decompressing ASTC on the CPU:
+    * st_context queries PIPE_FORMAT_ASTC_4x4_SRGB once, and the answer sets
+    * st->has_astc_2d_ldr, which is what st_astc_format_fallback() consults
+    * before allocating a decompressed shadow image.  Saying yes hands the
+    * compressed blocks to this driver, and the model's texture unit decodes
+    * them -- which is where the hardware does it.
+    *
+    * The list is exactly the fourteen footprints Rogue TEXSTATE names in
+    * FORMAT_COMPRESSED, in both orderings.  The HDR (_FLOAT) forms are
+    * deliberately absent: the decoder declines HDR blocks, and advertising a
+    * format whose blocks it will refuse would promise work nobody does.
+    */
+   case PIPE_FORMAT_ASTC_4x4:
+   case PIPE_FORMAT_ASTC_4x4_SRGB:
+   case PIPE_FORMAT_ASTC_5x4:
+   case PIPE_FORMAT_ASTC_5x4_SRGB:
+   case PIPE_FORMAT_ASTC_5x5:
+   case PIPE_FORMAT_ASTC_5x5_SRGB:
+   case PIPE_FORMAT_ASTC_6x5:
+   case PIPE_FORMAT_ASTC_6x5_SRGB:
+   case PIPE_FORMAT_ASTC_6x6:
+   case PIPE_FORMAT_ASTC_6x6_SRGB:
+   case PIPE_FORMAT_ASTC_8x5:
+   case PIPE_FORMAT_ASTC_8x5_SRGB:
+   case PIPE_FORMAT_ASTC_8x6:
+   case PIPE_FORMAT_ASTC_8x6_SRGB:
+   case PIPE_FORMAT_ASTC_8x8:
+   case PIPE_FORMAT_ASTC_8x8_SRGB:
+   case PIPE_FORMAT_ASTC_10x5:
+   case PIPE_FORMAT_ASTC_10x5_SRGB:
+   case PIPE_FORMAT_ASTC_10x6:
+   case PIPE_FORMAT_ASTC_10x6_SRGB:
+   case PIPE_FORMAT_ASTC_10x8:
+   case PIPE_FORMAT_ASTC_10x8_SRGB:
+   case PIPE_FORMAT_ASTC_10x10:
+   case PIPE_FORMAT_ASTC_10x10_SRGB:
+   case PIPE_FORMAT_ASTC_12x10:
+   case PIPE_FORMAT_ASTC_12x10_SRGB:
+   case PIPE_FORMAT_ASTC_12x12:
+   case PIPE_FORMAT_ASTC_12x12_SRGB:
       return true;
    default:
       return false;

@@ -9,6 +9,8 @@
 // event-driven wait 表示。
 #include "texture/texture_unit.h"
 
+#include "texture/astc_decoder.h"
+
 #include "common/functional_types.h"
 #include "common/pipeline_state.h"
 
@@ -311,7 +313,7 @@ std::uint32_t NearestRepeat(float coordinate, std::uint32_t extent, TextureWrapM
 } // namespace
 
 RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
-    const std::array<std::uint32_t, 4> &words) {
+    const std::array<std::uint32_t, 4> &words, bool compressed) {
   const std::uint64_t word0 = ReadU64(words, 0);
   const std::uint64_t word1 = ReadU64(words, 2);
 
@@ -323,9 +325,19 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
   const std::uint64_t green_swizzle = ExtractBits(word0, 11, 13);
   const std::uint64_t red_swizzle = ExtractBits(word0, 14, 16);
   const std::uint64_t format = ExtractBits(word0, 27, 33);
+  /*
+   * Read through FORMAT_COMPRESSED when the command said the image is
+   * compressed.  ASTC occupies values 0..13 there, one per footprint, and the
+   * footprint itself travels with the resource rather than the descriptor.
+   */
+  const AstcBlockFootprint astc_footprint =
+      compressed ? AstcFootprintForRogueFormat(
+                       static_cast<std::uint32_t>(format))
+                 : AstcBlockFootprint{};
+  const bool astc = compressed && astc_footprint.valid();
   const bool rgba8 =
-      format == 12U && red_swizzle == 0U && green_swizzle == 1U &&
-      blue_swizzle == 2U &&
+      !compressed && format == 12U && red_swizzle == 0U &&
+      green_swizzle == 1U && blue_swizzle == 2U &&
       (alpha_swizzle == 3U || alpha_swizzle == 4U);
   const bool z32_unorm =
       format == 24U && red_swizzle == 0U && green_swizzle == 0U &&
@@ -345,9 +357,9 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
   const bool gamma = ExtractBits(word0, 3, 3) != 0U;
   if (ExtractBits(word0, 0, 2) != 4U ||
       ExtractBits(word0, 4, 4) != 0U ||
-      (gamma && !rgba8) ||
+      (gamma && !rgba8 && !astc) ||
       ExtractBits(word0, 17, 26) != 0U ||
-      (!rgba8 && !z32_unorm && !z24_unorm_s8_uint) ||
+      (!rgba8 && !astc && !z32_unorm && !z24_unorm_s8_uint) ||
       ExtractBits(word0, 62, 63) != 0U) {
     throw std::runtime_error(
         "TextureUnit unsupported raw Rogue image word0");
@@ -379,7 +391,14 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
    * Their value is at least one complete RGBA8 byte row; a new tight public
    * descriptor is exactly one width in texels, so the two accepted encodings
    * remain unambiguous without weakening arbitrary mip-count validation. */
-  if (encoded_stride == descriptor.width) {
+  if (astc) {
+    /*
+     * A compressed image's stride is bytes, because a row of blocks is not a
+     * whole number of texels: ASTC 5x4 over 256 texels is 52 blocks, which is
+     * 832 bytes and no texel count at all.
+     */
+    descriptor.row_pitch_bytes = encoded_stride;
+  } else if (encoded_stride == descriptor.width) {
     descriptor.row_pitch_bytes = encoded_stride * 4U;
   } else if (encoded_stride >= descriptor.width * 4U) {
     descriptor.row_pitch_bytes = encoded_stride;
@@ -389,7 +408,10 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
   }
   descriptor.gpu_address = ExtractBits(word1, 16, 53) << 2U;
   descriptor.mip_count = static_cast<std::uint8_t>(raw_mip_count);
-  descriptor.format = z24_unorm_s8_uint
+  descriptor.format = astc
+                          ? (gamma ? TextureFormat::kAstcLdrSrgb
+                                   : TextureFormat::kAstcLdr)
+                          : z24_unorm_s8_uint
                           ? TextureFormat::kZ24UnormS8Uint
                           : z32_unorm
                                 ? TextureFormat::kZ32Unorm
@@ -398,8 +420,12 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
                                       : alpha_swizzle == 4U
                                             ? TextureFormat::kRgbx8Unorm
                                             : TextureFormat::kRgba8Unorm;
+  const std::uint32_t minimum_row_pitch =
+      astc ? ((descriptor.width + astc_footprint.width - 1U) /
+              astc_footprint.width) * 16U
+           : descriptor.width * 4U;
   if (descriptor.gpu_address == 0 ||
-      descriptor.row_pitch_bytes < descriptor.width * 4U) {
+      descriptor.row_pitch_bytes < minimum_row_pitch) {
     throw std::runtime_error("TextureUnit invalid raw Rogue image layout");
   }
   return descriptor;
@@ -507,7 +533,11 @@ bool DriverPcoTextureDescriptorClassSupported(
       descriptor_count == 1 &&
       (image.format == TextureFormat::kRgba8Unorm ||
        image.format == TextureFormat::kRgbx8Unorm ||
-       image.format == TextureFormat::kRgba8Srgb) &&
+       image.format == TextureFormat::kRgba8Srgb ||
+       // ASTC decodes to the same eight-bit texel, so once the block is
+       // expanded the filter sees nothing unusual.
+       image.format == TextureFormat::kAstcLdr ||
+       image.format == TextureFormat::kAstcLdrSrgb) &&
       image.mip_count == 1 &&
       sampler.min_filter == TextureFilter::kNearest &&
       sampler.mag_filter == TextureFilter::kNearest &&
@@ -851,11 +881,23 @@ void TextureUnit::SampleRunForStage(
     for (std::size_t set = 0; set < descriptor_count; ++set) {
       const TextureResource &candidate_resource = resources[set];
       const SamplerState &candidate_sampler = samplers[set];
+      /*
+       * The storage block is 1x1 for every format that stores one texel per
+       * position, and the footprint for a compressed one.  A zero here would
+       * make every later ceil(extent / block) divide by zero, so it is
+       * checked with the rest of the metadata rather than at the divide.
+       */
+      const bool block_is_consistent =
+          candidate_resource.block_width != 0 &&
+          candidate_resource.block_height != 0 &&
+          ((candidate_resource.format == TextureFormat::kAstcLdr ||
+            candidate_resource.format == TextureFormat::kAstcLdrSrgb) ||
+           (candidate_resource.block_width == 1 &&
+            candidate_resource.block_height == 1));
       if (candidate_resource.descriptor_set != set ||
           candidate_resource.binding != 0 ||
+          !block_is_consistent ||
           candidate_resource.reserved[0] != 0 ||
-          candidate_resource.reserved[1] != 0 ||
-          candidate_resource.reserved[2] != 0 ||
           candidate_sampler.descriptor_set != set ||
           candidate_sampler.binding != 0 ||
           candidate_sampler.reserved[0] != 0 ||
@@ -895,7 +937,9 @@ void TextureUnit::SampleRunForStage(
     std::copy_n(shared.begin() + descriptor_base + 8U, sampler_words.size(),
                 sampler_words.begin());
     const RogueTextureImageDescriptor image =
-        DecodeRogueTextureImageDescriptor(image_words);
+        DecodeRogueTextureImageDescriptor(
+            image_words, resource.format == TextureFormat::kAstcLdr ||
+                             resource.format == TextureFormat::kAstcLdrSrgb);
     const RogueTextureSamplerDescriptor decoded_sampler =
         DecodeRogueTextureSamplerDescriptor(sampler_words);
 
@@ -992,9 +1036,30 @@ void TextureUnit::SampleRunForStage(
     std::uint64_t expected_offset = 0;
     std::uint32_t expected_width = image.width;
     std::uint32_t expected_height = image.height;
+    /*
+     * A level occupies whole storage blocks: ceil(extent / block) of them in
+     * each direction.  For every format that stores one texel per position
+     * the block is 1x1 and this is the texel arithmetic it replaces.
+     */
+    const std::uint32_t storage_block_width =
+        resource.block_width != 0 ? resource.block_width : 1U;
+    const std::uint32_t storage_block_height =
+        resource.block_height != 0 ? resource.block_height : 1U;
+    const std::uint32_t storage_block_bytes =
+        (image.format == TextureFormat::kAstcLdr ||
+         image.format == TextureFormat::kAstcLdrSrgb)
+            ? 16U
+            : 4U;
+    const auto storage_blocks = [](std::uint32_t extent,
+                                   std::uint32_t block) {
+      return (extent + block - 1U) / block;
+    };
     for (std::uint32_t level = 0; level < image.mip_count; ++level) {
+      const std::uint32_t tight_pitch =
+          storage_blocks(expected_width, storage_block_width) *
+          storage_block_bytes;
       const std::uint32_t expected_pitch =
-          level == 0 ? image.row_pitch_bytes : expected_width * 4U;
+          level == 0 ? image.row_pitch_bytes : tight_pitch;
       const TextureMipLevel &structured_mip = resource.mip[level];
       if (structured_mip.width != expected_width ||
           structured_mip.height != expected_height ||
@@ -1004,7 +1069,8 @@ void TextureUnit::SampleRunForStage(
             "TextureUnit structured mip layout disagrees with raw image");
       }
       expected_offset +=
-          static_cast<std::uint64_t>(expected_pitch) * expected_height;
+          static_cast<std::uint64_t>(expected_pitch) *
+          storage_blocks(expected_height, storage_block_height);
       if (expected_offset > std::numeric_limits<std::uint32_t>::max())
         throw std::overflow_error("TextureUnit mip allocation overflow");
       expected_width = std::max<std::uint32_t>(1U, expected_width >> 1U);
@@ -1319,14 +1385,31 @@ void TextureUnit::SampleRunForStage(
           throw std::runtime_error("TextureUnit SMP descriptor state mismatch");
         }
       }
+      /*
+       * An ASTC image stores one 128-bit block per footprint, so a texel is
+       * fetched by fetching the block that contains it and decoding.  The
+       * fetch goes through the same TCU path as any other, which is what
+       * makes the cache and DRAM counters describe block traffic rather than
+       * a texel read the hardware never issues.
+       */
+      const bool astc_image = image.format == TextureFormat::kAstcLdr ||
+                              image.format == TextureFormat::kAstcLdrSrgb;
+      const AstcBlockFootprint astc_footprint{resource.block_width,
+                                              resource.block_height};
+      const std::uint32_t fetch_bytes = astc_image ? 16U : 4U;
+
       const auto read_texel = [&](const TextureMipLevel &mip,
                                   std::uint32_t x, std::uint32_t y,
                                   std::uint64_t memory_request_id) {
+        const std::uint32_t fetch_x =
+            astc_image ? x / astc_footprint.width : x;
+        const std::uint32_t fetch_y =
+            astc_image ? y / astc_footprint.height : y;
         const std::uint64_t texel_offset =
             static_cast<std::uint64_t>(mip.offset_bytes) +
-            static_cast<std::uint64_t>(y) * mip.row_pitch_bytes +
-            static_cast<std::uint64_t>(x) * 4U;
-        if (texel_offset > resource.byte_size - 4U ||
+            static_cast<std::uint64_t>(fetch_y) * mip.row_pitch_bytes +
+            static_cast<std::uint64_t>(fetch_x) * fetch_bytes;
+        if (texel_offset > resource.byte_size - fetch_bytes ||
             texel_offset > std::numeric_limits<std::uint64_t>::max() -
                                resource.gpu_address) {
           throw std::runtime_error(
@@ -1336,14 +1419,14 @@ void TextureUnit::SampleRunForStage(
         std::vector<std::uint8_t> payload;
         if (memory_) {
           MemoryReadResult read = memory_->Read(
-              texel_address, 4, MemoryClient::kTextureCache);
+              texel_address, fetch_bytes, MemoryClient::kTextureCache);
           payload = std::move(read.data);
           memory_stats += read.stats;
         } else {
           MemoryTxn memory_request;
           memory_request.pipeline = txn;
           memory_request.address = texel_address;
-          memory_request.bytes = 4;
+          memory_request.bytes = fetch_bytes;
           memory_request.request_id = memory_request_id;
           memory_request.operation = MemoryOperation::kRead;
           memory_request.client = MemoryClient::kTextureCache;
@@ -1360,7 +1443,7 @@ void TextureUnit::SampleRunForStage(
                   memory_request.pipeline.state.generation ||
               memory_response.request_id != memory_request.request_id ||
               memory_response.address != memory_request.address ||
-              memory_response.bytes != 4 ||
+              memory_response.bytes != fetch_bytes ||
               memory_response.client != MemoryClient::kTextureCache ||
               memory_response.operation != MemoryOperation::kRead ||
               memory_response.payload_format !=
@@ -1372,13 +1455,27 @@ void TextureUnit::SampleRunForStage(
               LoadArray<std::uint8_t>(pool_, memory_response.payload);
           pool_.Release(memory_response.payload);
         }
-        if (payload.size() != 4)
+        if (payload.size() != fetch_bytes)
           throw std::runtime_error("TextureUnit TCU texel size mismatch");
         if (texel_fetch_count == std::numeric_limits<std::uint64_t>::max())
           throw std::overflow_error("TextureUnit texel fetch overflow");
         ++texel_fetch_count;
         std::array<std::uint8_t, 4> texel{};
-        std::copy(payload.begin(), payload.end(), texel.begin());
+        if (astc_image) {
+          AstcDecodedBlock block;
+          const char *refusal = nullptr;
+          if (!DecodeAstcBlock(payload.data(), astc_footprint,
+                               /*srgb=*/false, &block, &refusal)) {
+            throw std::runtime_error(
+                std::string("TextureUnit cannot decode this ASTC block: ") +
+                (refusal != nullptr ? refusal : "unstated"));
+          }
+          const std::uint32_t inside_x = x % astc_footprint.width;
+          const std::uint32_t inside_y = y % astc_footprint.height;
+          texel = block.texels[inside_y * astc_footprint.width + inside_x];
+        } else {
+          std::copy(payload.begin(), payload.end(), texel.begin());
+        }
         return texel;
       };
 
@@ -1515,7 +1612,8 @@ void TextureUnit::SampleRunForStage(
                       << std::dec << std::setfill(' ') << " depth=" << depth
                       << '\n';
           }
-        } else if (image.format == TextureFormat::kRgba8Srgb) {
+        } else if (image.format == TextureFormat::kRgba8Srgb ||
+                   image.format == TextureFormat::kAstcLdrSrgb) {
           // Colour through the sRGB transfer function, alpha left linear.
           for (std::size_t component = 0; component < 3; ++component)
             filtered[component] = SrgbChannelToLinear(texel[component]);

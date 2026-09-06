@@ -82,8 +82,14 @@ struct TextureImplicitLod {
   std::uint8_t reserved = 0;
 };
 
+// `compressed` says which enum the seven-bit texformat field is read
+// through.  Rogue overlays FORMAT and FORMAT_COMPRESSED on the same bits, so
+// the value alone cannot say whether 0 means U8 or ASTC_4x4.  The structured
+// resource the command carried supplies that, and the two are cross-checked
+// afterwards exactly as every other descriptor field is -- the model is told
+// which enum applies, not what the answer is.
 RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
-    const std::array<std::uint32_t, 4>& words);
+    const std::array<std::uint32_t, 4>& words, bool compressed = false);
 RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
     const std::array<std::uint32_t, 4>& words);
 // Strict public descriptor families accepted by driver-PCO sampling.  This is
