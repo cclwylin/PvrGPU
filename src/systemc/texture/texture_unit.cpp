@@ -298,7 +298,14 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
    * bit 4 still has to be zero.
    */
   const bool gamma = ExtractBits(word0, 3, 3) != 0U;
-  if (ExtractBits(word0, 0, 2) != 4U ||
+  // Rogue TEXTYPE: a plain linear image is STRIDE (4) and carries its row
+  // pitch in STRIDE_IMAGE_WORD1; a 2D-array image is 2D (1) and carries the
+  // array depth in IMAGE_WORD1's depth field instead, because a sampled array
+  // needs the layer count the shader clamps to and a strided word has no room
+  // for it beside the pitch.
+  const std::uint64_t textype = ExtractBits(word0, 0, 2);
+  const bool array_image = textype == 1U;
+  if ((textype != 4U && textype != 1U) ||
       ExtractBits(word0, 4, 4) != 0U ||
       (gamma && !rgba8 && !astc) ||
       ExtractBits(word0, 17, 26) != 0U ||
@@ -314,9 +321,17 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
   // mipmaps-present bit; the GLBench fixtures retain their complete ten-level
   // allocation. Other valid counts remain available for future command
   // lowering without weakening the structured-layout cross-check below.
-  const std::uint64_t raw_mip_count = ExtractBits(word1, 60, 63);
+  // IMAGE_WORD1 (array, non-stride) keeps num_mip_levels in [0:3] and the
+  // array depth in [4:14]; STRIDE_IMAGE_WORD1 keeps num_mip_levels in [60:63]
+  // and the texel stride in [0:14].  baselevel [60:63] and the compression
+  // controls stay zero in the array form.
+  const std::uint64_t raw_mip_count =
+      array_image ? ExtractBits(word1, 0, 3) : ExtractBits(word1, 60, 63);
   const bool mipmaps_present = ExtractBits(word1, 15, 15) != 0U;
-  if (ExtractBits(word1, 54, 59) != 0U || raw_mip_count == 0U ||
+  const bool word1_reserved_set =
+      array_image ? (ExtractBits(word1, 54, 63) != 0U)
+                  : (ExtractBits(word1, 54, 59) != 0U);
+  if (word1_reserved_set || raw_mip_count == 0U ||
       raw_mip_count > kMaximumTextureMipLevels ||
       mipmaps_present != (raw_mip_count > 1U)) {
     throw std::runtime_error(
@@ -329,7 +344,9 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
   descriptor.height =
       static_cast<std::uint32_t>(ExtractBits(word0, 48, 61) + 1U);
   const std::uint32_t encoded_stride =
-      static_cast<std::uint32_t>(ExtractBits(word1, 0, 14) + 1U);
+      array_image
+          ? descriptor.width
+          : static_cast<std::uint32_t>(ExtractBits(word1, 0, 14) + 1U);
   // The colour formats' byte width drives both the stride decode and the
   // minimum-pitch floor.  ASTC's stride is measured in blocks, not texels.
   const std::uint32_t bytes_per_texel =

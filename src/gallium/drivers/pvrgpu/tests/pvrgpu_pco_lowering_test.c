@@ -3023,7 +3023,8 @@ static void test_terrain_texture_descriptors(void)
           1,
           2,
           2,
-          384) ||
+          384,
+          1U) ||
        !pvrgpu_pco_build_terrain_texture_descriptor(
           rgbx,
           PIPE_FORMAT_R8G8B8X8_UNORM,
@@ -3036,7 +3037,8 @@ static void test_terrain_texture_descriptors(void)
           1,
           0,
           0,
-          576)) {
+          576,
+          1U)) {
       fail("terrain descriptor builder rejected valid layouts");
    }
    const uint64_t rgba_image = read_u64(rgba, 0);
@@ -3064,7 +3066,8 @@ static void test_terrain_texture_descriptors(void)
           1,
           0,
           0,
-          576)) {
+          576,
+          1U)) {
       fail("terrain descriptor builder accepted unsupported format");
    }
 }
@@ -3085,7 +3088,8 @@ static void test_terrain_texture_descriptor_for_800_extent(void)
           1U,
           2U,
           2U,
-          576U) ||
+          576U,
+          1U) ||
        fnv1a64(descriptor, sizeof(descriptor)) !=
           UINT64_C(0x33d7c2aad6bb3b8a)) {
       fail("terrain 800x600 descriptor fingerprint changed");
@@ -3103,7 +3107,8 @@ static void test_terrain_texture_descriptor_for_800_extent(void)
           1U,
           2U,
           2U,
-          575U) ||
+          575U,
+          1U) ||
        fnv1a64(near_mutation, sizeof(near_mutation)) ==
           UINT64_C(0x33d7c2aad6bb3b8a)) {
       fail("terrain 800x600 fingerprint accepted near mutation");

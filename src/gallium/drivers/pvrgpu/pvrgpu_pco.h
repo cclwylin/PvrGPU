@@ -281,7 +281,8 @@ bool pvrgpu_pco_build_terrain_texture_descriptor(
    unsigned mip_filter,
    unsigned wrap_u,
    unsigned wrap_v,
-   unsigned max_lod_u4_6);
+   unsigned max_lod_u4_6,
+   unsigned layers);
 
 /* Compile one of the four shader pairs used by the 180-draw GLMark2 ideas
  * capture.  The simple profiles consume one float4 attribute and 32 VS

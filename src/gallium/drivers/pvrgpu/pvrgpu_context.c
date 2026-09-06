@@ -8264,7 +8264,8 @@ pvrgpu_terrain_pco_capture_texture(
           mip_linear ? 1U : 0U,
           expected_wrap,
           expected_wrap,
-          texture->max_lod_u4_6)) {
+          texture->max_lod_u4_6,
+          1U)) {
       *failure_reason = "texture_descriptor";
       return false;
    }
@@ -10977,7 +10978,8 @@ pvrgpu_record_color_primitive_pco_draw(
              captured->mip_filter,
              pvrgpu_sequence_texture_addrmode(captured->wrap_u),
              pvrgpu_sequence_texture_addrmode(captured->wrap_v),
-             captured->max_lod_u4_6)) {
+             captured->max_lod_u4_6,
+             captured->layers)) {
          pvrgpu_counter_eventf("draw_array_primitive_record_error",
                                "stage=textures reason=descriptor slot=%u "
                                "start=%u shared=%u",

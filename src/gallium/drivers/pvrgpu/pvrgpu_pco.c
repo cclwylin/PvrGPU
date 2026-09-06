@@ -147,11 +147,20 @@ pvrgpu_build_refract_descriptor(uint32_t descriptor[20],
                                 unsigned mip_filter,
                                 unsigned wrap_u,
                                 unsigned wrap_v,
-                                unsigned max_lod_u4_6)
+                                unsigned max_lod_u4_6,
+                                unsigned layers)
 {
    memset(descriptor, 0, 20U * sizeof(descriptor[0]));
+   /*
+    * A sampled 2D-array image is Rogue TEXTYPE 2D and carries its layer count
+    * in IMAGE_WORD1's depth field, which is what pco's usclib_tex_state_array_max
+    * clamps the layer index to; a plain image is STRIDE and carries a row
+    * pitch there instead.  The two share the word, so an array cannot be a
+    * strided image.
+    */
+   const bool is_array = layers > 1U;
    const uint64_t image_word0 =
-      pvrgpu_refract_descriptor_bits(4U, 0, 2) |
+      pvrgpu_refract_descriptor_bits(is_array ? 1U : 4U, 0, 2) |
       /* Rogue IMAGE_WORD0 GAMMA: the texture unit decodes sRGB, the driver
        * only says that it should.  Two-component gamma shares bit 4 and stays
        * off; no format lowered here has two channels. */
@@ -173,10 +182,14 @@ pvrgpu_build_refract_descriptor(uint32_t descriptor[20],
     * whole number of texels: ASTC 5x4 over 256 texels is 52 blocks, which is
     * 832 bytes and no texel count at all. */
    const uint64_t image_word1 =
-      pvrgpu_refract_descriptor_bits(
-         (row_pitch_bytes != 0U ? row_pitch_bytes : width) - 1U, 0, 14) |
-      pvrgpu_refract_descriptor_bits(mip_count > 1U, 15, 15) |
-      pvrgpu_refract_descriptor_bits(mip_count, 60, 63);
+      is_array
+         ? (pvrgpu_refract_descriptor_bits(mip_count, 0, 3) |
+            pvrgpu_refract_descriptor_bits(layers - 1U, 4, 14) |
+            pvrgpu_refract_descriptor_bits(mip_count > 1U, 15, 15))
+         : (pvrgpu_refract_descriptor_bits(
+               (row_pitch_bytes != 0U ? row_pitch_bytes : width) - 1U, 0, 14) |
+            pvrgpu_refract_descriptor_bits(mip_count > 1U, 15, 15) |
+            pvrgpu_refract_descriptor_bits(mip_count, 60, 63));
    pvrgpu_refract_descriptor_store_u64(descriptor, 2, image_word1);
    descriptor[4] = byte_size;
 
@@ -264,7 +277,8 @@ pvrgpu_pco_build_refract_fragment_shared_for_extent(
                                     0U,
                                     2U,
                                     2U,
-                                    0U);
+                                    0U,
+                                    1U);
    pvrgpu_build_refract_descriptor(&out[20],
                                     12U,
                                     false,
@@ -279,7 +293,8 @@ pvrgpu_pco_build_refract_fragment_shared_for_extent(
                                     1U,
                                     2U,
                                     2U,
-                                    (mip_count - 1U) * 64U);
+                                    (mip_count - 1U) * 64U,
+                                    1U);
    pvrgpu_build_refract_descriptor(&out[40],
                                     12U,
                                     false,
@@ -294,7 +309,8 @@ pvrgpu_pco_build_refract_fragment_shared_for_extent(
                                     0U,
                                     2U,
                                     2U,
-                                    0U);
+                                    0U,
+                                    1U);
    return true;
 }
 
@@ -334,7 +350,8 @@ pvrgpu_pco_build_shadow_fragment_shared_for_extent(
                                     0U,
                                     2U,
                                     2U,
-                                    0U);
+                                    0U,
+                                    1U);
    return true;
 }
 
@@ -360,7 +377,8 @@ pvrgpu_pco_build_terrain_texture_descriptor(
    unsigned mip_filter,
    unsigned wrap_u,
    unsigned wrap_v,
-   unsigned max_lod_u4_6)
+   unsigned max_lod_u4_6,
+   unsigned layers)
 {
    const bool depth_stencil = format == PIPE_FORMAT_Z24_UNORM_S8_UINT;
    /*
@@ -442,7 +460,8 @@ pvrgpu_pco_build_terrain_texture_descriptor(
       mip_filter,
       wrap_u,
       wrap_v,
-      max_lod_u4_6);
+      max_lod_u4_6,
+      layers);
    return true;
 }
 

@@ -184,6 +184,20 @@ struct FragmentPcoEvidence {
   // UNPCK.U32 / UNPCK.S32: integer-to-float, which a shader reaches for the
   // moment it uses gl_InstanceID or gl_VertexID as a number.
   std::uint64_t unpck_int = 0;
+  // Integer and bitwise ALU operations a fragment shader reaches for when it
+  // folds a 2D-array layer into a texture address (the compiler's .tao idiom:
+  // f2i32 the layer coordinate, multiply by the layer size and add the base).
+  std::uint64_t iadd = 0;
+  std::uint64_t imadd32 = 0;
+  std::uint64_t bfi = 0;
+  std::uint64_t ubfe = 0;
+  std::uint64_t add64_32 = 0;
+  std::uint64_t bitwise_or = 0;
+  std::uint64_t bitwise_xor = 0;
+  std::uint64_t shl = 0;
+  std::uint64_t imax_s32 = 0;
+  std::uint64_t imin_s32 = 0;
+  std::uint64_t f2i = 0;
 };
 
 VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
@@ -465,6 +479,40 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kTextureSample:
       ++evidence.smp;
       break;
+    case PcoOpcode::kIntegerAdd:
+      ++evidence.iadd;
+      break;
+    case PcoOpcode::kIntegerMultiplyAdd32:
+      ++evidence.imadd32;
+      break;
+    case PcoOpcode::kBitfieldInsert:
+      ++evidence.bfi;
+      break;
+    case PcoOpcode::kBitfieldExtractUnsigned:
+      ++evidence.ubfe;
+      break;
+    case PcoOpcode::kIntegerAdd64_32:
+      ++evidence.add64_32;
+      break;
+    case PcoOpcode::kBitwiseOr:
+      ++evidence.bitwise_or;
+      break;
+    case PcoOpcode::kBitwiseXor:
+      ++evidence.bitwise_xor;
+      break;
+    case PcoOpcode::kShiftLeft:
+      ++evidence.shl;
+      break;
+    case PcoOpcode::kIntegerMaxSigned:
+      ++evidence.imax_s32;
+      break;
+    case PcoOpcode::kIntegerMinSigned:
+      ++evidence.imin_s32;
+      break;
+    case PcoOpcode::kFloatToInt32Rtne:
+    case PcoOpcode::kFloatToInt32Rtz:
+      ++evidence.f2i;
+      break;
     default:
       throw std::runtime_error(
           "JsonReporter fragment PCO opcode histogram received a vertex-only "
@@ -482,7 +530,11 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
           evidence.fmad +
           evidence.fmin + evidence.fmax + evidence.frcp + evidence.frsq +
           evidence.flog2 + evidence.fexp2 +
-          evidence.pck_f16 + evidence.unpck_f16 + evidence.unpck_int !=
+          evidence.pck_f16 + evidence.unpck_f16 + evidence.unpck_int +
+          evidence.iadd + evidence.imadd32 + evidence.bfi + evidence.ubfe +
+          evidence.add64_32 + evidence.bitwise_or + evidence.bitwise_xor +
+          evidence.shl + evidence.imax_s32 + evidence.imin_s32 +
+          evidence.f2i !=
       instructions.size()) {
     throw std::runtime_error(
         "JsonReporter fragment PCO opcode histogram mismatch");
@@ -589,6 +641,18 @@ void AppendFragmentPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_FRAGMENT_EVIDENCE(fexp2);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(pck_f16);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(unpck_f16);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(unpck_int);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(iadd);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(imadd32);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(bfi);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(ubfe);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(add64_32);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(bitwise_or);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(bitwise_xor);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(shl);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(imax_s32);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(imin_s32);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(f2i);
 #undef PVRGPU_ADD_FRAGMENT_EVIDENCE
 }
 
@@ -1552,6 +1616,28 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"bitwise_and\":" << fragment_pco.bitwise_and;
   if (fragment_pco.bitwise_xnor != 0)
     std::cout << ",\"bitwise_xnor\":" << fragment_pco.bitwise_xnor;
+  if (fragment_pco.bitwise_or != 0)
+    std::cout << ",\"bitwise_or\":" << fragment_pco.bitwise_or;
+  if (fragment_pco.bitwise_xor != 0)
+    std::cout << ",\"bitwise_xor\":" << fragment_pco.bitwise_xor;
+  if (fragment_pco.shl != 0)
+    std::cout << ",\"shl\":" << fragment_pco.shl;
+  if (fragment_pco.iadd != 0)
+    std::cout << ",\"iadd\":" << fragment_pco.iadd;
+  if (fragment_pco.imadd32 != 0)
+    std::cout << ",\"imadd32\":" << fragment_pco.imadd32;
+  if (fragment_pco.bfi != 0)
+    std::cout << ",\"bfi\":" << fragment_pco.bfi;
+  if (fragment_pco.ubfe != 0)
+    std::cout << ",\"ubfe\":" << fragment_pco.ubfe;
+  if (fragment_pco.add64_32 != 0)
+    std::cout << ",\"add64_32\":" << fragment_pco.add64_32;
+  if (fragment_pco.imax_s32 != 0)
+    std::cout << ",\"imax_s32\":" << fragment_pco.imax_s32;
+  if (fragment_pco.imin_s32 != 0)
+    std::cout << ",\"imin_s32\":" << fragment_pco.imin_s32;
+  if (fragment_pco.f2i != 0)
+    std::cout << ",\"f2i\":" << fragment_pco.f2i;
   if (fragment_pco.csel != 0)
     std::cout << ",\"csel\":" << fragment_pco.csel;
   if (fragment_pco.pck_f16 != 0)
