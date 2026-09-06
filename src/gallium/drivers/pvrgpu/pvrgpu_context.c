@@ -8265,7 +8265,8 @@ pvrgpu_terrain_pco_capture_texture(
           expected_wrap,
           expected_wrap,
           texture->max_lod_u4_6,
-          1U)) {
+          1U,
+          expected_wrap)) {
       *failure_reason = "texture_descriptor";
       return false;
    }
@@ -9821,8 +9822,12 @@ pvrgpu_capture_generic_sequence_texture(
          PVRGPU_SYSTEMC_PCO_TEXTURE_MIP_FILTER_NONE;
    destination->wrap_u = pvrgpu_sequence_texture_wrap(state->wrap_s);
    destination->wrap_v = pvrgpu_sequence_texture_wrap(state->wrap_t);
+   // The depth-axis wrap only bites on a 3D image; a 2D or array sample never
+   // reads a third coordinate, so its r wrap rides along unused.
+   destination->wrap_w = pvrgpu_sequence_texture_wrap(state->wrap_r);
    if (destination->wrap_u > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT ||
-       destination->wrap_v > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT) {
+       destination->wrap_v > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT ||
+       destination->wrap_w > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT) {
       *reason = "wrap_mode";
       free(bytes);
       return false;
@@ -11010,7 +11015,8 @@ pvrgpu_record_color_primitive_pco_draw(
              pvrgpu_sequence_texture_addrmode(captured->wrap_u),
              pvrgpu_sequence_texture_addrmode(captured->wrap_v),
              captured->max_lod_u4_6,
-             captured->layers)) {
+             captured->layers,
+             pvrgpu_sequence_texture_addrmode(captured->wrap_w))) {
          pvrgpu_counter_eventf("draw_array_primitive_record_error",
                                "stage=textures reason=descriptor slot=%u "
                                "start=%u shared=%u",

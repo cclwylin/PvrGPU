@@ -202,8 +202,11 @@ TextureFilterDatapath SelectTextureFilterDatapath(
     return wrap == TextureWrapMode::kRepeat ||
            wrap == TextureWrapMode::kClampToEdge;
   };
+  // A 3D sample's depth axis follows the same rule: a mirrored r wrap forces
+  // the float path just as a mirrored s or t would (lp_is_simple_wrap_mode).
+  // wrap_w is repeat for a 2D image, so this never moves a 2D sample.
   return fits_8unorm && simple_wrap(sampler.wrap_u) &&
-                 simple_wrap(sampler.wrap_v)
+                 simple_wrap(sampler.wrap_v) && simple_wrap(sampler.wrap_w)
              ? TextureFilterDatapath::kUnorm8
              : TextureFilterDatapath::kFloat32;
 }

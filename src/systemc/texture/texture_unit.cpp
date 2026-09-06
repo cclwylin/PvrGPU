@@ -423,6 +423,9 @@ RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
 
   descriptor.wrap_u = DecodeWrapMode(ExtractBits(word0, 33, 35));
   descriptor.wrap_v = DecodeWrapMode(ExtractBits(word0, 41, 43));
+  // Rogue SAMPLER_WORD0 addrmode_w: the depth-axis wrap a 3D sample applies to
+  // its third coordinate.  A 2D or array sample never reads it.
+  descriptor.wrap_w = DecodeWrapMode(ExtractBits(word0, 56, 58));
 
   /*
    * dadjust=4095 is zero bias.  What is checked here is that the encoding is
@@ -446,13 +449,18 @@ RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
       descriptor.wrap_v == TextureWrapMode::kRepeat ||
       descriptor.wrap_v == TextureWrapMode::kMirroredRepeat ||
       descriptor.wrap_v == TextureWrapMode::kClampToEdge;
+  // addrmode_w carries the depth-axis wrap; a 2D or array sample leaves it
+  // repeat and never reads it, a 3D sample applies it to the r coordinate.
+  const bool supported_wrap_w =
+      descriptor.wrap_w == TextureWrapMode::kRepeat ||
+      descriptor.wrap_w == TextureWrapMode::kMirroredRepeat ||
+      descriptor.wrap_w == TextureWrapMode::kClampToEdge;
   if (ExtractBits(word0, 0, 12) != 4095U ||
-      !supported_wrap_u || !supported_wrap_v ||
+      !supported_wrap_u || !supported_wrap_v || !supported_wrap_w ||
       ExtractBits(word0, 44, 46) != 0U ||
       ExtractBits(word0, 47, 48) != 0U ||
       descriptor.normalized_coordinates != 1U ||
       ExtractBits(word0, 50, 55) != 0U ||
-      ExtractBits(word0, 56, 58) != 0U ||
       ExtractBits(word0, 59, 63) != 0U || word1 != 0U ||
       !lod_window_runs_forwards) {
     std::ostringstream detail;
@@ -1588,12 +1596,10 @@ void TextureUnit::SampleRunForStage(
       expected_texel_fetches +=
           (linear_filter ? 4U : 1U) * (two_levels ? 2U : 1U) *
           (volume_linear ? 2U : 1U);
-      // The third coordinate and the wrap on the depth axis.  The formats and
-      // sizes subgroups wrap every axis alike, so the r axis reuses wrap_u
-      // until a distinct depth wrap is plumbed for the wrap combinations.
+      // The third coordinate and its own depth-axis wrap (addrmode_w).
       const float volume_r =
           volume_texture ? BitsFloat(request.coordinates[2]) : 0.0F;
-      const TextureWrapMode wrap_r = decoded_sampler.wrap_u;
+      const TextureWrapMode wrap_r = decoded_sampler.wrap_w;
       const std::uint32_t base_depth =
           resource.layer_count == 0U ? 1U : resource.layer_count;
       const auto level_depth = [&](std::uint8_t level_index) -> std::uint32_t {

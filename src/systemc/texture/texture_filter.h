@@ -46,6 +46,7 @@ struct RogueTextureSamplerDescriptor {
   TextureFilter mip_filter = TextureFilter::kNearest;
   TextureWrapMode wrap_u = TextureWrapMode::kRepeat;
   TextureWrapMode wrap_v = TextureWrapMode::kRepeat;
+  TextureWrapMode wrap_w = TextureWrapMode::kRepeat;
   std::uint16_t min_lod_u4_6 = 0;
   std::uint16_t max_lod_u4_6 = 0;
   std::uint8_t normalized_coordinates = 1;

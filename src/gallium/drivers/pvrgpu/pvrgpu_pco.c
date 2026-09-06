@@ -153,7 +153,8 @@ pvrgpu_build_refract_descriptor(uint32_t descriptor[20],
                                 unsigned wrap_u,
                                 unsigned wrap_v,
                                 unsigned max_lod_u4_6,
-                                unsigned layers)
+                                unsigned layers,
+                                unsigned wrap_w)
 {
    memset(descriptor, 0, 20U * sizeof(descriptor[0]));
    /*
@@ -208,7 +209,10 @@ pvrgpu_build_refract_descriptor(uint32_t descriptor[20],
       pvrgpu_refract_descriptor_bits(mag_filter, 36, 37) |
       pvrgpu_refract_descriptor_bits(min_filter, 38, 39) |
       pvrgpu_refract_descriptor_bits(mip_filter, 40, 40) |
-      pvrgpu_refract_descriptor_bits(wrap_v, 41, 43);
+      pvrgpu_refract_descriptor_bits(wrap_v, 41, 43) |
+      /* Rogue SAMPLER_WORD0 addrmode_w -- the depth-axis wrap a 3D sample
+       * applies to its third coordinate. */
+      pvrgpu_refract_descriptor_bits(wrap_w, 56, 58);
    pvrgpu_refract_descriptor_store_u64(descriptor, 8, sampler_word0);
    const uint64_t gather_word0 =
       sampler_word0 | pvrgpu_refract_descriptor_bits(1U, 36, 37) |
@@ -283,7 +287,8 @@ pvrgpu_pco_build_refract_fragment_shared_for_extent(
                                     2U,
                                     2U,
                                     0U,
-                                    1U);
+                                    1U,
+                                    0U);
    pvrgpu_build_refract_descriptor(&out[20],
                                     12U,
                                     false,
@@ -299,7 +304,8 @@ pvrgpu_pco_build_refract_fragment_shared_for_extent(
                                     2U,
                                     2U,
                                     (mip_count - 1U) * 64U,
-                                    1U);
+                                    1U,
+                                    0U);
    pvrgpu_build_refract_descriptor(&out[40],
                                     12U,
                                     false,
@@ -315,7 +321,8 @@ pvrgpu_pco_build_refract_fragment_shared_for_extent(
                                     2U,
                                     2U,
                                     0U,
-                                    1U);
+                                    1U,
+                                    0U);
    return true;
 }
 
@@ -356,7 +363,8 @@ pvrgpu_pco_build_shadow_fragment_shared_for_extent(
                                     2U,
                                     2U,
                                     0U,
-                                    1U);
+                                    1U,
+                                    0U);
    return true;
 }
 
@@ -383,7 +391,8 @@ pvrgpu_pco_build_terrain_texture_descriptor(
    unsigned wrap_u,
    unsigned wrap_v,
    unsigned max_lod_u4_6,
-   unsigned layers)
+   unsigned layers,
+   unsigned wrap_w)
 {
    const bool depth_stencil = format == PIPE_FORMAT_Z24_UNORM_S8_UINT;
    /*
@@ -468,7 +477,8 @@ pvrgpu_pco_build_terrain_texture_descriptor(
       wrap_u,
       wrap_v,
       max_lod_u4_6,
-      layers);
+      layers,
+      wrap_w);
    return true;
 }
 

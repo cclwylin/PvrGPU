@@ -142,6 +142,7 @@ struct pvrgpu_systemc_pco_sequence_texture {
    uint32_t mip_filter;
    uint32_t wrap_u;
    uint32_t wrap_v;
+   uint32_t wrap_w;
    uint32_t normalized_coordinates;
    uint32_t min_lod_u4_6;
    uint32_t max_lod_u4_6;
