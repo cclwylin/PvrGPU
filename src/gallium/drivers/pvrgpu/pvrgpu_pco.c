@@ -3970,7 +3970,8 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                 */
                if (texture_count == 0 || tex->op != nir_texop_tex ||
                    tex->is_shadow ||
-                   tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+                   (tex->sampler_dim != GLSL_SAMPLER_DIM_2D &&
+                    tex->sampler_dim != GLSL_SAMPLER_DIM_3D) ||
                    tex->texture_index != tex->sampler_index ||
                    tex->texture_index >= texture_count) {
                   const char *op_name = pvrgpu_nir_texop_name(tex->op);

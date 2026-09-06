@@ -278,7 +278,8 @@ struct PcoDecodedProgram {
  * read by the decoded USC instruction, not a precomputed texel or case name.
  */
 struct PcoTextureRequest {
-  std::array<std::uint32_t, 2> coordinates{};
+  // Three normalized coordinates: s, t and (for a 3D image) the depth r.
+  std::array<std::uint32_t, 3> coordinates{};
   std::array<std::uint32_t, 4> texture_state{};
   std::array<std::uint32_t, 4> sampler_state{};
   // The `.tao` sample's shader-computed 64-bit texture base address.

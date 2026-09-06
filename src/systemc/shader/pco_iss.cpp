@@ -6312,7 +6312,17 @@ PcoFragmentExecution ExecuteFragmentPco(
               kPcoTemporaryCount) {
         ExecuteError("invalid generic SMP.2D.FCNORM instruction");
       }
-      for (std::size_t coordinate = 0; coordinate < 2; ++coordinate) {
+      // Two in-plane coordinates for every sample; a 3D sample reads a third
+      // (the depth coordinate r) from the next source register.  An array
+      // sample stays two-coordinate -- its layer rides in the folded address
+      // read below, not as a third coordinate.
+      const std::size_t coordinates_to_read =
+          (!instruction.texture_address_offset &&
+           instruction.texture_dimension >= 3U)
+              ? 3U
+              : 2U;
+      for (std::size_t coordinate = 0; coordinate < coordinates_to_read;
+           ++coordinate) {
         result.texture_request.coordinates[coordinate] = ReadSource(
             instruction.source, no_vertex_inputs, temporaries,
             temporary_written_mask, static_cast<std::uint8_t>(coordinate),

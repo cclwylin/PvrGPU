@@ -9637,7 +9637,8 @@ pvrgpu_capture_generic_sequence_texture(
       return false;
    }
    if (view->target != PIPE_TEXTURE_2D &&
-       view->target != PIPE_TEXTURE_2D_ARRAY) {
+       view->target != PIPE_TEXTURE_2D_ARRAY &&
+       view->target != PIPE_TEXTURE_3D) {
       *reason = "view_target";
       return false;
    }
@@ -9648,7 +9649,17 @@ pvrgpu_capture_generic_sequence_texture(
     * halve.  Plain 2D is one layer.
     */
    const bool array_view = view->target == PIPE_TEXTURE_2D_ARRAY;
-   const unsigned layers = array_view ? view->texture->array_size : 1U;
+   /*
+    * A 3D image stores `depth` complete 2D slices per mip level, slice-minor
+    * like an array's layers -- but unlike an array the slice count halves with
+    * every level.  The shader passes the third texture coordinate straight
+    * through (it is not folded into an address the way an array layer is), and
+    * the texture unit filters across the two nearest slices.
+    */
+   const bool volume_view = view->target == PIPE_TEXTURE_3D;
+   const unsigned layers = array_view    ? view->texture->array_size
+                           : volume_view ? view->texture->depth0
+                                         : 1U;
    if (layers == 0U || layers > 4096U) {
       *reason = "layers";
       return false;
@@ -9728,9 +9739,11 @@ pvrgpu_capture_generic_sequence_texture(
          *reason = "mip_layout";
          return false;
       }
+      const unsigned level_slices =
+         volume_view ? MAX2(layers >> level, 1U) : layers;
       expected_offset +=
          (uintptr_t)util_format_get_2d_size(format, row_pitch, level_height) *
-         layers;
+         level_slices;
    }
    if (expected_offset == 0 || expected_offset != (uintptr_t)resource->size) {
       *reason = "image_size";
@@ -9815,7 +9828,7 @@ pvrgpu_capture_generic_sequence_texture(
       return false;
    }
    destination->normalized_coordinates = 1;
-   destination->texture_kind = array_view ? 1U : 0U;
+   destination->texture_kind = volume_view ? 2U : array_view ? 1U : 0U;
    destination->layers = layers;
    destination->min_lod_u4_6 = 0;
    /*
@@ -11986,7 +11999,8 @@ pvrgpu_draw_is_lowerable_array_primitive(
        * targets still fall to the shape recognisers.
        */
       if (view->texture->target != PIPE_TEXTURE_2D &&
-          view->texture->target != PIPE_TEXTURE_2D_ARRAY) {
+          view->texture->target != PIPE_TEXTURE_2D_ARRAY &&
+          view->texture->target != PIPE_TEXTURE_3D) {
          *reason = "texture_target";
          if (detail && detail_size) {
             const char *name =

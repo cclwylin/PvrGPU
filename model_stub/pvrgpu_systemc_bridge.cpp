@@ -1446,12 +1446,17 @@ bool CopyPcoSequenceTexture(
     const std::uint64_t tight_pitch =
         blocks_for(mip.width, block_width) * block_bytes;
     // A 2D array stores `layers` images per level, layer-minor: the level
-    // spans that many single-image byte sizes.
-    const std::uint64_t layers =
+    // spans that many single-image byte sizes.  A 3D image (kind 2) stores
+    // `depth` slices the same way, but its slice count halves with each level.
+    const std::uint64_t base_slices =
         source.layers == 0U ? 1U : static_cast<std::uint64_t>(source.layers);
+    const std::uint64_t level_slices =
+        source.texture_kind == 2U
+            ? ((base_slices >> level) == 0U ? 1U : (base_slices >> level))
+            : base_slices;
     const std::uint64_t level_bytes =
         static_cast<std::uint64_t>(mip.row_pitch) *
-        blocks_for(mip.height, block_height) * layers;
+        blocks_for(mip.height, block_height) * level_slices;
     const std::uint64_t level_end =
         static_cast<std::uint64_t>(mip.offset) + level_bytes;
     if (mip.width == 0 || mip.height == 0 ||

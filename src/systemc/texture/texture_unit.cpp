@@ -902,12 +902,17 @@ void TextureUnit::SampleRunForStage(
         throw std::runtime_error(
             "TextureUnit structured mip layout disagrees with raw image");
       }
-      // A 2D array stores layer_count images per level, so the level occupies
-      // that many single-image byte sizes.
+      // A 2D array stores layer_count images per level; a 3D image stores
+      // `depth` slices whose count halves with each level.  Both are
+      // slice-minor inside the level.
+      const std::uint32_t level_slices =
+          resource.dimension_type == TextureDimensionType::k3D
+              ? std::max<std::uint32_t>(1U, resource.layer_count >> level)
+              : resource.layer_count;
       expected_offset +=
           static_cast<std::uint64_t>(expected_pitch) *
           storage_blocks(expected_height, storage_block_height) *
-          resource.layer_count;
+          level_slices;
       if (expected_offset > std::numeric_limits<std::uint32_t>::max())
         throw std::overflow_error("TextureUnit mip allocation overflow");
       expected_width = std::max<std::uint32_t>(1U, expected_width >> 1U);
@@ -1202,9 +1207,20 @@ void TextureUnit::SampleRunForStage(
     // only selects which of the level's stacked images the taps read from.
     const bool array_texture =
         resource.dimension_type == TextureDimensionType::k2DArray;
-    // A 2D array folds the layer into the sample's texture address; it reads
-    // two coordinates like any 2D sample.
+    // A 3D image reads three coordinates: the third selects the depth slice
+    // (or the two slices a linear filter blends).  Unlike an array layer it is
+    // not folded into the address -- the shader passes it straight through and
+    // the texture unit resolves the slice, whose stride is the same
+    // slice-minor per-level image size the array path uses.  The slice count
+    // halves with each mip level, so it is derived per level below.
+    const bool volume_texture =
+        resource.dimension_type == TextureDimensionType::k3D;
+    // The SMP always carries two in-plane coordinates; the sample's
+    // dimension names the texture (three for 3D, whose depth coordinate rides
+    // in coordinates[2]).  A 2D array folds its layer into the address and
+    // stays dimension two.
     const std::uint8_t expected_coordinate_count = 2U;
+    const std::uint8_t expected_dimension = volume_texture ? 3U : 2U;
     std::uint64_t texel_fetch_count = 0;
     std::uint64_t expected_texel_fetches = 0;
     for (std::size_t index = 0; index < requests.size(); ++index) {
@@ -1219,7 +1235,7 @@ void TextureUnit::SampleRunForStage(
           request.coordinate_count != expected_coordinate_count ||
           request.component_count != 4 ||
           request.descriptor_set != descriptor_set || request.binding != 0 ||
-          request.dimension != expected_coordinate_count ||
+          request.dimension != expected_dimension ||
           request.normalized != 1 ||
           request.data_request != 0 ||
           (vertex_stage
@@ -1557,16 +1573,33 @@ void TextureUnit::SampleRunForStage(
       const TextureFilterDatapath datapath =
           SelectTextureFilterDatapath(image.format, decoded_sampler);
       if (request.request_id >
-          (std::numeric_limits<std::uint64_t>::max() - 7U) / 8U) {
+          (std::numeric_limits<std::uint64_t>::max() - 15U) / 16U) {
         throw std::overflow_error("TextureUnit sample request ID overflow");
       }
-      // Up to eight taps per sample; memory request IDs need only be
-      // distinct within the batch.
-      const std::uint64_t tap_request_base = request.request_id * 8U;
+      // Up to sixteen taps per sample -- a 3D trilinear filter reads two mip
+      // levels, two depth slices each and a 2x2 footprint per slice; memory
+      // request IDs need only be distinct within the batch.
+      const std::uint64_t tap_request_base = request.request_id * 16U;
       const TextureMipLevel &level0 = resource.mip[lod.level0];
       const TextureMipLevel &level1 = resource.mip[lod.level1];
+      // A linearly filtered 3D image blends the two nearest depth slices, so
+      // it doubles the taps a 2D image of the same filter would read.
+      const bool volume_linear = volume_texture && linear_filter;
       expected_texel_fetches +=
-          (linear_filter ? 4U : 1U) * (two_levels ? 2U : 1U);
+          (linear_filter ? 4U : 1U) * (two_levels ? 2U : 1U) *
+          (volume_linear ? 2U : 1U);
+      // The third coordinate and the wrap on the depth axis.  The formats and
+      // sizes subgroups wrap every axis alike, so the r axis reuses wrap_u
+      // until a distinct depth wrap is plumbed for the wrap combinations.
+      const float volume_r =
+          volume_texture ? BitsFloat(request.coordinates[2]) : 0.0F;
+      const TextureWrapMode wrap_r = decoded_sampler.wrap_u;
+      const std::uint32_t base_depth =
+          resource.layer_count == 0U ? 1U : resource.layer_count;
+      const auto level_depth = [&](std::uint8_t level_index) -> std::uint32_t {
+        const std::uint32_t d = base_depth >> level_index;
+        return d == 0U ? 1U : d;
+      };
 
       if (image.format == TextureFormat::kZ32Unorm) {
         if (linear_filter || two_levels)
@@ -1615,16 +1648,43 @@ void TextureUnit::SampleRunForStage(
         }
         filtered = {SampledDepth24ToFloat(depth), 0.0F, 0.0F, 1.0F};
       } else if (datapath == TextureFilterDatapath::kUnorm8) {
+        const auto unorm8_plane = [&](const TextureMipLevel &mip,
+                                      std::uint64_t rid) {
+          return linear_filter ? sample_bilinear(mip, rid)
+                               : sample_nearest(mip, rid);
+        };
+        // One mip level, filtered in the plane and then across depth: a
+        // nearest depth filter takes the one slice the r axis rounds to, a
+        // linear one lerps the two nearest slices with the axis weight.
         const auto unorm8_level = [&](const TextureMipLevel &mip,
-                                      std::uint64_t first_request_id) {
-          return linear_filter ? sample_bilinear(mip, first_request_id)
-                               : sample_nearest(mip, first_request_id);
+                                      std::uint8_t level_index,
+                                      std::uint64_t rid)
+            -> std::array<std::uint8_t, 8> {
+          if (!volume_texture)
+            return unorm8_plane(mip, rid);
+          const std::uint32_t d = level_depth(level_index);
+          if (linear_filter) {
+            const TextureLinearAxis z =
+                ComputeTextureLinearRepeat(volume_r, d, wrap_r);
+            selected_layer = z.lower;
+            const std::array<std::uint8_t, 8> lo = unorm8_plane(mip, rid);
+            selected_layer = z.upper;
+            const std::array<std::uint8_t, 8> hi = unorm8_plane(mip, rid + 4U);
+            std::array<std::uint8_t, 8> blended{};
+            for (std::size_t component = 0; component < 4U; ++component)
+              blended[component] =
+                  LerpTextureUnorm8(lo[component], hi[component], z.weight);
+            return blended;
+          }
+          selected_layer = ComputeTextureNearestRepeat(volume_r, d, wrap_r);
+          return unorm8_plane(mip, rid);
         };
         std::array<std::uint8_t, 8> texel =
-            unorm8_level(level0, tap_request_base);
+            unorm8_level(level0, lod.level0, tap_request_base);
         if (two_levels) {
           const std::array<std::uint8_t, 8> upper =
-              unorm8_level(level1, tap_request_base + 4U);
+              unorm8_level(level1, lod.level1,
+                           tap_request_base + (volume_texture ? 8U : 4U));
           for (std::size_t component = 0; component < 4; ++component) {
             texel[component] = LerpTextureUnorm8(
                 texel[component], upper[component], lod.mip_weight_u8);
@@ -1633,15 +1693,39 @@ void TextureUnit::SampleRunForStage(
         for (std::size_t component = 0; component < 4; ++component)
           filtered[component] = static_cast<float>(texel[component]) / 255.0F;
       } else {
-        const auto float_level = [&](const TextureMipLevel &mip,
-                                     std::uint64_t first_request_id) {
-          return linear_filter ? sample_bilinear_float(mip, first_request_id)
-                               : sample_nearest_float(mip, first_request_id);
+        const auto float_plane = [&](const TextureMipLevel &mip,
+                                     std::uint64_t rid) {
+          return linear_filter ? sample_bilinear_float(mip, rid)
+                               : sample_nearest_float(mip, rid);
         };
-        filtered = float_level(level0, tap_request_base);
+        const auto float_level = [&](const TextureMipLevel &mip,
+                                     std::uint8_t level_index,
+                                     std::uint64_t rid)
+            -> std::array<float, 4> {
+          if (!volume_texture)
+            return float_plane(mip, rid);
+          const std::uint32_t d = level_depth(level_index);
+          if (linear_filter) {
+            const TextureFloatAxis z =
+                ComputeTextureFloatLinear(volume_r, d, wrap_r);
+            selected_layer = z.lower;
+            const std::array<float, 4> lo = float_plane(mip, rid);
+            selected_layer = z.upper;
+            const std::array<float, 4> hi = float_plane(mip, rid + 4U);
+            std::array<float, 4> blended{};
+            for (std::size_t component = 0; component < 4U; ++component)
+              blended[component] =
+                  LerpTextureFloat(lo[component], hi[component], z.weight);
+            return blended;
+          }
+          selected_layer = ComputeTextureFloatNearest(volume_r, d, wrap_r);
+          return float_plane(mip, rid);
+        };
+        filtered = float_level(level0, lod.level0, tap_request_base);
         if (two_levels) {
           const std::array<float, 4> upper =
-              float_level(level1, tap_request_base + 4U);
+              float_level(level1, lod.level1,
+                          tap_request_base + (volume_texture ? 8U : 4U));
           for (std::size_t component = 0; component < 4; ++component) {
             filtered[component] = LerpTextureFloat(
                 filtered[component], upper[component], lod.mip_weight);
