@@ -81,11 +81,25 @@ void PbeWriteBack::Run() {
     if (render_target_count > kMaxRenderTargets)
       throw std::runtime_error("PbeWriteBack render target count is invalid");
     for (std::uint32_t target = 1; target < render_target_count; ++target) {
-      if (!HasPoolHandle(state.extra_pbe_framebuffer[target - 1]) ||
-          state.extra_framebuffer_gpu_address[target - 1] == 0 ||
-          state.extra_framebuffer_bytes[target - 1] != expected_bytes) {
+      /* Each condition names itself: a bundled sentence here leaves the
+       * caller guessing between an attachment the PBE never published, one
+       * with no address, and one whose byte count disagrees. */
+      if (!HasPoolHandle(state.extra_pbe_framebuffer[target - 1])) {
         throw std::runtime_error(
-            "PbeWriteBack extra colour attachment state is invalid");
+            "PbeWriteBack colour attachment " + std::to_string(target) +
+            " was never published by the PBE");
+      }
+      if (state.extra_framebuffer_gpu_address[target - 1] == 0) {
+        throw std::runtime_error(
+            "PbeWriteBack colour attachment " + std::to_string(target) +
+            " has no GPU address");
+      }
+      if (state.extra_framebuffer_bytes[target - 1] != expected_bytes) {
+        throw std::runtime_error(
+            "PbeWriteBack colour attachment " + std::to_string(target) +
+            " is " +
+            std::to_string(state.extra_framebuffer_bytes[target - 1]) +
+            " bytes, expected " + std::to_string(expected_bytes));
       }
     }
     // Every attachment is a separate DRAM transaction of the same size.

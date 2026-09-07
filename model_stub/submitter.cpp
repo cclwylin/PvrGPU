@@ -1484,9 +1484,15 @@ void Submitter::RunJob() {
           static_cast<std::uint64_t>(submission) * kMaxRenderTargets + target;
       state.extra_framebuffer_gpu_address[target - 1] =
           kDriverPcoMrtColorAddressBase + slot * kDriverPcoSequenceAttachmentStride;
+      /* Every attachment of a pass stores the same pixel, and its width
+       * comes from the command's format.  Reading state.color_attachment_raw_
+       * dwords here took it before this submission had set it, so an integer
+       * attachment was sized as four bytes a pixel. */
       state.extra_framebuffer_bytes[target - 1] =
           static_cast<std::uint64_t>(state.width) * state.height *
-          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
+          ColorAttachmentBytesPerPixel(
+              static_cast<std::uint8_t>(ColorAttachmentRawDwords(
+                  command.format)));
     }
     if (driver_pco_sequence_command) {
       state.framebuffer_gpu_address = sequence_color_addresses[submission];
@@ -1603,7 +1609,11 @@ void Submitter::RunJob() {
           command.fragment_varying_start;
       state.fragment_varying_count =
           command.fragment_varying_count;
-      state.fragment_output_mask = command.fragment_output_mask[0];
+      for (std::size_t target = 0;
+           target < state.fragment_output_mask.size(); ++target) {
+        state.fragment_output_mask[target] =
+            command.fragment_output_mask[target];
+      }
       /*
        * How many raw 32-bit channels the colour attachment stores, from the
        * format the driver stated.  dEQP's shader executor renders a scalar

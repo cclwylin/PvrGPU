@@ -37,6 +37,26 @@ static_assert(kFillTexNearestSharedDwordCount ==
 // transactions carry only the generation-checked handle plus ordering fields.
 // Raw PCO code, semantic instructions, primitive lists and per-fragment USC
 // output remain separate handles so no large object crosses a module FIFO.
+/*
+ * The pixel-output lanes a fragment program must write, given what each
+ * render target declared.  Every target takes its own run of four outputs --
+ * the first at pixout0, the second at pixout4 -- so a shader writing two vec3
+ * attachments is expected to write 0x77, not 0x07.  Four lanes is the default
+ * only when nothing was declared at all; requiring PIXOUT0..3 outright
+ * rejected every shader whose output is narrower than a vec4.
+ */
+inline std::uint32_t ExpectedPixelOutputMask(
+    const std::array<std::uint32_t, 8> &declared_by_target) {
+  std::uint32_t expected = 0;
+  for (std::size_t target = 0;
+       target < declared_by_target.size() &&
+       (target + 1) * 4 <= kPcoPixelOutputCount;
+       ++target) {
+    expected |= declared_by_target[target] << (4U * target);
+  }
+  return expected != 0 ? expected : 0x0fU;
+}
+
 struct PipelineState {
   std::uint32_t width = 0;
   std::uint32_t height = 0;
@@ -137,9 +157,12 @@ struct PipelineState {
   std::uint32_t varying_output_count = 0;
   std::uint32_t fragment_varying_start = 0;
   std::uint32_t fragment_varying_count = 0;
-  // PIXOUT lanes the colour attachment expects.  Zero means the pipeline has
-  // not been told, and the four-lane default applies.
-  std::uint32_t fragment_output_mask = 0;
+  // PIXOUT lanes each colour attachment expects, one entry per render
+  // target.  Zero means the pipeline has not been told about that target, and
+  // for target zero the four-lane default applies.  A fragment shader writing
+  // two attachments uses two runs of the pixel-output file -- pixout0..3 for
+  // the first and pixout4..7 for the second -- so the masks stay separate.
+  std::array<std::uint32_t, 8> fragment_output_mask{};
   // How many raw 32-bit channels the colour attachment stores per pixel -- the
   // shader's PIXOUT lanes verbatim -- rather than four UNORM8 channels.  Zero
   // means it is not an integer attachment and the UNORM8 packing applies.

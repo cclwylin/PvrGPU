@@ -2049,10 +2049,11 @@ void TextureUnit::Run() {
       throw std::runtime_error("TextureUnit memory mode mismatch");
     if (!IsRasterFunctionalCase(state.functional_case))
       throw std::runtime_error("texture unit received an unsupported case");
-    // The lanes the attachment expects, which is four only when it has four
-    // channels.
+    // Every lane the attachments expect, across each target's own run of the
+    // pixel-output file.  This is the same quantity the decoder checks the
+    // shader summary against, so both read it from one place.
     const std::uint32_t expected_pixel_output_mask =
-        state.fragment_output_mask != 0 ? state.fragment_output_mask : 0x0fU;
+        ExpectedPixelOutputMask(state.fragment_output_mask);
     if (!HasPoolHandle(state.fragment_outputs) ||
         state.fragment_program_summary.pixel_output_mask !=
             expected_pixel_output_mask) {

@@ -10,6 +10,7 @@
  */
 #include "shader/pco_iss.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -693,8 +694,8 @@ void TestDecodeAndExecuteAttributeFetch() {
       ExecuteFragment(fragment.summary, fragment.instructions);
   Check(fragment_result.written_mask == 0x0f,
         "attribute-fetch gray FS writes RGBA");
-  for (std::uint32_t component : fragment_result.pixel_outputs) {
-    Check(component == UINT32_C(0x3f000000),
+  for (std::size_t index = 0; index < 4; ++index) {
+    Check(fragment_result.pixel_outputs[index] == UINT32_C(0x3f000000),
           "attribute-fetch gray FS writes exact IEEE-754 0.5");
   }
 }
@@ -1407,8 +1408,8 @@ void TestDecodeAndExecuteScalarSource0Floor() {
   const auto execution = ExecuteFragment(decoded.summary, decoded.instructions);
   Check(execution.written_mask == 0x0f,
         "scalar-floor fragment writes the complete color");
-  for (const std::uint32_t component : execution.pixel_outputs) {
-    Check(component == FloatBits(-2.0F),
+  for (std::size_t index = 0; index < 4; ++index) {
+    Check(execution.pixel_outputs[index] == FloatBits(-2.0F),
           "fragment FADD applies floor(source0) before adding sc0");
   }
 
@@ -1438,9 +1439,10 @@ void TestDecodeAndExecuteScalarSource0Floor() {
         "FADD decodes source-0 negate and source-1 absolute together");
   /* sc0 is zero here, so the executed value shows the negate: the same r5 of
    * -1.25 that floored to -2.0 above negates to +1.25. */
-  for (const std::uint32_t component :
-       ExecuteFragment(negated.summary, negated.instructions).pixel_outputs) {
-    Check(component == FloatBits(1.25F),
+  const auto negated_result =
+      ExecuteFragment(negated.summary, negated.instructions);
+  for (std::size_t index = 0; index < 4; ++index) {
+    Check(negated_result.pixel_outputs[index] == FloatBits(1.25F),
           "negated FADD source-0 reaches the add without its floor");
   }
 
@@ -3025,7 +3027,8 @@ void TestDecodeAndExecuteFillTexNearest() {
             completed.continuation.valid == 0 &&
             completed.executed_instruction_count == 5 &&
             completed.written_mask == 0x0f &&
-            completed.pixel_outputs == texture_response,
+            std::equal(texture_response.begin(), texture_response.end(),
+                       completed.pixel_outputs.begin()),
         "fill_tex_nearest FS resumes at WDF and exports the live response");
   Check(suspended.executed_instruction_count +
                 completed.executed_instruction_count ==
@@ -3039,7 +3042,8 @@ void TestDecodeAndExecuteFillTexNearest() {
   const auto changed = ResumeFragment(
       fragment.summary, fragment.instructions, suspended.continuation,
       changed_response);
-  Check(changed.pixel_outputs == changed_response,
+  Check(std::equal(changed_response.begin(), changed_response.end(),
+                   changed.pixel_outputs.begin()),
         "fill_tex_nearest output is supplied by the texture response");
 }
 
@@ -5620,7 +5624,8 @@ void TestExecuteThreeTextureContinuations() {
   }
   Check(execution.suspended == 0 && execution.texture_request_valid == 0 &&
             execution.written_mask == 0x0f &&
-            execution.pixel_outputs == responses[2] &&
+            std::equal(responses[2].begin(), responses[2].end(),
+                       execution.pixel_outputs.begin()) &&
             executed_groups == instructions.size(),
         "three SMP continuations resume without replay or state loss");
 

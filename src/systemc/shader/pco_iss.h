@@ -25,7 +25,15 @@ namespace pvrgpu::stub {
  * file below, it is an explicit ABI bound rather than a Rogue hardware limit. */
 inline constexpr std::size_t kPcoVertexInputCount = 64;
 inline constexpr std::size_t kPcoVertexOutputCount = 64;
-inline constexpr std::size_t kPcoPixelOutputCount = 4;
+/* A sampler's response is four components, one per channel. */
+inline constexpr std::size_t kPcoTextureResponseCount = 4;
+/*
+ * The pixel-output registers.  PCO's special file holds them in two runs --
+ * pixout0..3 at 32 and pixout4..7 at 164 -- and a fragment shader writing
+ * more than one attachment reaches the second: dEQP's modf returns its
+ * fractional and integral parts into two targets.
+ */
+inline constexpr std::size_t kPcoPixelOutputCount = 8;
 /* Public PCO programs may declare and address TEMP0..63.  Keep the execution
  * file and its written-register bitmap at the same explicit 64-register ABI
  * bound so valid high TEMP declarations do not fail before decode. */
@@ -389,7 +397,7 @@ struct PcoVertexExecution {
  */
 struct PcoVertexExecutionContext {
   std::array<std::uint32_t, kPcoMaximumSharedCount> shared_registers{};
-  std::array<std::uint32_t, kPcoPixelOutputCount> texture_response{};
+  std::array<std::uint32_t, kPcoTextureResponseCount> texture_response{};
   PcoVertexContinuation continuation{};
   std::uint8_t shared_count = 0;
   std::uint8_t texture_response_valid = 0;
@@ -439,7 +447,7 @@ struct PcoFragmentExecutionContext {
   std::uint32_t sample_x = 0;
   std::uint32_t sample_y = 0;
   std::array<std::uint32_t, kPcoMaximumSharedCount> shared_registers{};
-  std::array<std::uint32_t, kPcoPixelOutputCount> texture_response{};
+  std::array<std::uint32_t, kPcoTextureResponseCount> texture_response{};
   PcoFragmentContinuation continuation{};
   std::uint8_t coefficient_count = 0;
   std::uint8_t shared_count = 0;
@@ -499,7 +507,7 @@ PcoVertexExecution ResumeVertexPco(
     const PcoProgramSummary &summary,
     const std::vector<PcoInstruction> &instructions,
     const PcoVertexContinuation &continuation,
-    const std::array<std::uint32_t, kPcoPixelOutputCount> &texture_response);
+    const std::array<std::uint32_t, kPcoTextureResponseCount> &texture_response);
 
 PcoFragmentExecution
 ExecuteFragmentPco(const PcoProgramSummary &summary,
@@ -512,7 +520,7 @@ PcoFragmentExecution ResumeFragmentPco(
     const PcoProgramSummary &summary,
     const std::vector<PcoInstruction> &instructions,
     const PcoFragmentContinuation &continuation,
-    const std::array<std::uint32_t, kPcoPixelOutputCount> &texture_response);
+    const std::array<std::uint32_t, kPcoTextureResponseCount> &texture_response);
 
 /* Short ISS-facing names used by the decoder/USC pipeline. */
 inline PcoDecodedProgram Decode(ShaderStage stage,
@@ -539,7 +547,7 @@ inline PcoVertexExecution ResumeVertex(
     const PcoProgramSummary &summary,
     const std::vector<PcoInstruction> &instructions,
     const PcoVertexContinuation &continuation,
-    const std::array<std::uint32_t, kPcoPixelOutputCount> &texture_response) {
+    const std::array<std::uint32_t, kPcoTextureResponseCount> &texture_response) {
   return ResumeVertexPco(summary, instructions, continuation,
                          texture_response);
 }
@@ -561,7 +569,7 @@ inline PcoFragmentExecution ResumeFragment(
     const PcoProgramSummary &summary,
     const std::vector<PcoInstruction> &instructions,
     const PcoFragmentContinuation &continuation,
-    const std::array<std::uint32_t, kPcoPixelOutputCount> &texture_response) {
+    const std::array<std::uint32_t, kPcoTextureResponseCount> &texture_response) {
   return ResumeFragmentPco(summary, instructions, continuation,
                            texture_response);
 }

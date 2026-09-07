@@ -230,12 +230,15 @@ void PcoDecoder::Run() {
       state.stage = PipelineStage::kVertexDecoded;
     } else {
       /*
-       * The lanes the attachment expects, which is four only when it has four
-       * channels.  Requiring PIXOUT0..3 outright rejected every shader whose
-       * output is narrower than a vec4.
+       * The lanes the attachments expect.  Each render target takes its own
+       * run of four pixel outputs -- the first at pixout0, the second at
+       * pixout4 -- so a shader writing two vec3 attachments declares 0x77,
+       * not 0x07.  Four is the default only when nothing has been declared,
+       * and only for the first target: requiring PIXOUT0..3 outright rejected
+       * every shader whose output is narrower than a vec4.
        */
       const std::uint32_t expected_pixel_output_mask =
-          state.fragment_output_mask != 0 ? state.fragment_output_mask : 0x0fU;
+          ExpectedPixelOutputMask(state.fragment_output_mask);
       if (decoded.summary.pixel_output_mask != expected_pixel_output_mask) {
         throw std::runtime_error(
             "fragment PCO pixel output mask does not match the attachment: "

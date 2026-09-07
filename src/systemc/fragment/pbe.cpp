@@ -333,10 +333,14 @@ void Pbe::Run() {
                                  identity_reason);
       }
       // Every lane the attachment expects, which is four only when it has
-      // four channels.
-      const std::uint32_t expected_pixel_output_mask =
-          state.fragment_output_mask != 0 ? state.fragment_output_mask : 0x0fU;
+      // four channels, and which each target declares for itself.
       for (std::uint32_t target = 0; target < render_target_count; ++target) {
+        const std::uint32_t declared =
+            target < state.fragment_output_mask.size()
+                ? state.fragment_output_mask[target]
+                : 0U;
+        const std::uint32_t expected_pixel_output_mask =
+            declared != 0 ? declared : 0x0fU;
         if (output.written_mask[target] != expected_pixel_output_mask) {
           throw std::runtime_error(
               "PBE fragment did not write every expected PIXOUT lane of "

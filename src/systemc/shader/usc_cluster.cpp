@@ -185,6 +185,35 @@ UscCluster::UscCluster(sc_core::sc_module_name name, MemoryPool &pool,
   SC_THREAD(Run);
 }
 
+/*
+ * Spread a fragment program's pixel outputs over the attachments it wrote.
+ * The pixel-output file is render-target major -- pixout0..3 are the first
+ * attachment's channels and pixout4..7 the second's -- and FragmentOutput
+ * stores them the same way, so this is a copy plus the per-target slice of
+ * the written mask.  A shader returning two results, as dEQP's modf does,
+ * writes two attachments in one pass.
+ */
+void StoreFragmentPixelOutputs(FragmentOutput &fragment_output,
+                               const std::array<std::uint32_t,
+                                                kPcoPixelOutputCount> &outputs,
+                               std::uint8_t written_mask,
+                               std::uint32_t render_target_count) {
+  const std::uint32_t targets =
+      std::min<std::uint32_t>(render_target_count == 0 ? 1U
+                                                       : render_target_count,
+                              static_cast<std::uint32_t>(
+                                  kPcoPixelOutputCount / 4));
+  for (std::uint32_t target = 0; target < targets; ++target) {
+    for (std::size_t component = 0; component < 4; ++component) {
+      fragment_output.pixel_output[target * 4 + component] =
+          outputs[target * 4 + component];
+    }
+    fragment_output.written_mask[target] =
+        static_cast<std::uint8_t>((written_mask >> (4U * target)) & 0x0fU);
+  }
+  fragment_output.render_target_count = static_cast<std::uint8_t>(targets);
+}
+
 void UscCluster::Run() {
   while (true) {
     const PipelineTxn txn = input.read();
@@ -487,7 +516,7 @@ void UscCluster::Run() {
               throw std::runtime_error(
                   "texture vertex USC response ordering is invalid");
             }
-            std::array<std::uint32_t, kPcoPixelOutputCount> texture_response{};
+            std::array<std::uint32_t, kPcoTextureResponseCount> texture_response{};
             std::copy(std::begin(response.rgba), std::end(response.rgba),
                       texture_response.begin());
             const PcoVertexExecution execution = ResumeVertexPco(
@@ -637,12 +666,9 @@ void UscCluster::Run() {
         fragment_output.parameter_index = invocation.parameter_index;
         fragment_output.submit_ordinal = invocation.submit_ordinal;
         fragment_output.depth = invocation.depth;
-        for (std::size_t component = 0; component < 4; ++component) {
-          fragment_output.pixel_output[component] =
-              execution.pixel_outputs[component];
-        }
-        fragment_output.written_mask[0] = execution.written_mask;
-        fragment_output.render_target_count = 1;
+        StoreFragmentPixelOutputs(fragment_output, execution.pixel_outputs,
+                                  execution.written_mask,
+                                  state.render_target_count);
         outputs[invocation_index] = fragment_output;
         output_written[invocation_index] = 1;
       };
@@ -781,12 +807,9 @@ void UscCluster::Run() {
           fragment_output.parameter_index = invocation.parameter_index;
           fragment_output.submit_ordinal = invocation.submit_ordinal;
           fragment_output.depth = invocation.depth;
-          for (std::size_t component = 0; component < 4; ++component) {
-            fragment_output.pixel_output[component] =
-                execution.pixel_outputs[component];
-          }
-          fragment_output.written_mask[0] = execution.written_mask;
-        fragment_output.render_target_count = 1;
+          StoreFragmentPixelOutputs(fragment_output, execution.pixel_outputs,
+                                    execution.written_mask,
+                                    state.render_target_count);
           outputs[invocation_index] = fragment_output;
           output_written[invocation_index] = 1;
         };

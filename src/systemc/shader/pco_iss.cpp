@@ -551,6 +551,28 @@ inline constexpr std::uint8_t kUvsOpWrite = 0b000;
 inline constexpr std::uint8_t kUvsOpEmitEndTask = 0b101;
 inline constexpr std::uint8_t kUvsOpWriteEmitEndTask = 0b110;
 inline constexpr std::uint16_t kPixelOutput0SpecialIndex = 32;
+/*
+ * PCO's special file holds the pixel outputs in two runs: pixout0..3 at 32
+ * and pixout4..7 at 164.  pco_map's register lowering makes the same split,
+ * adding PCO_SR_PIXOUT0 below four and PCO_SR_PIXOUT4 - 4 at or above it.
+ */
+inline constexpr std::uint16_t kPixelOutput4SpecialIndex = 164;
+inline constexpr std::size_t kPixelOutputFirstRunCount = 4;
+
+/* The pixel output a special-file index names, or -1 if it names none. */
+inline int PixelOutputFromSpecialIndex(std::uint16_t index) {
+  if (index >= kPixelOutput0SpecialIndex &&
+      index < kPixelOutput0SpecialIndex + kPixelOutputFirstRunCount) {
+    return static_cast<int>(index - kPixelOutput0SpecialIndex);
+  }
+  if (index >= kPixelOutput4SpecialIndex &&
+      index < kPixelOutput4SpecialIndex + kPcoPixelOutputCount -
+                  kPixelOutputFirstRunCount) {
+    return static_cast<int>(index - kPixelOutput4SpecialIndex +
+                            kPixelOutputFirstRunCount);
+  }
+  return -1;
+}
 inline constexpr std::uint16_t kSpecialConstantZero = 0;
 inline constexpr std::uint16_t kSpecialConstantOne = 64;
 inline constexpr std::uint16_t kSpecialConstantTwo = 65;
@@ -1050,11 +1072,17 @@ std::uint16_t DecodePixelOutput(const std::vector<std::uint8_t> &binary,
     DecodeError(cursor - 1, "extended destinations are outside this subset");
   const std::uint8_t bank = (byte >> 6U) & 1U;
   const std::uint8_t special_index = byte & 0x3fU;
-  if (bank != 0 || special_index < kPixelOutput0SpecialIndex ||
-      special_index >= kPixelOutput0SpecialIndex + kPcoPixelOutputCount) {
-    DecodeError(cursor - 1, "destination is not pixout0..pixout3");
+  /* The one-byte form has a six-bit index, so only the first run of pixel
+   * outputs fits in it; pixout4 and above need the extended encoding. */
+  const int pixel_output =
+      bank != 0 ? -1 : PixelOutputFromSpecialIndex(special_index);
+  if (pixel_output < 0) {
+    DecodeError(cursor - 1,
+                "destination is not pixout0..pixout3 (bank " +
+                    std::to_string(bank) + " index " +
+                    std::to_string(special_index) + ")");
   }
-  return static_cast<std::uint16_t>(special_index - kPixelOutput0SpecialIndex);
+  return static_cast<std::uint16_t>(pixel_output);
 }
 
 struct DecodedDestination {
@@ -1098,10 +1126,12 @@ DecodedDestination DecodeGenericDestination(
                       std::to_string(kPcoTemporaryCount));
     return {PcoWriteTarget::kTemporary, index};
   }
-  if (index >= kPixelOutput0SpecialIndex &&
-      index < kPixelOutput0SpecialIndex + kPcoPixelOutputCount) {
-    return {PcoWriteTarget::kPixelOutput,
-            static_cast<std::uint16_t>(index - kPixelOutput0SpecialIndex)};
+  if (bank == static_cast<std::uint8_t>(PcoRegisterBank::kSpecial)) {
+    const int pixel_output = PixelOutputFromSpecialIndex(index);
+    if (pixel_output >= 0) {
+      return {PcoWriteTarget::kPixelOutput,
+              static_cast<std::uint16_t>(pixel_output)};
+    }
   }
   std::string window;
   const std::size_t window_begin =
@@ -3936,7 +3966,7 @@ void ValidateVertexTemporaryProgram(
       if (++texture_sample_count > kPcoMaximumTextureSampleInstructions ||
           instruction.target != PcoWriteTarget::kTemporary ||
           instruction.source_count != 3 || instruction.repeat_count != 1 ||
-          instruction.component_count != kPcoPixelOutputCount ||
+          instruction.component_count != kPcoTextureResponseCount ||
           instruction.data_request != 0 ||
           instruction.iteration_mode != PcoIterationMode::kPixel ||
           instruction.perspective != 0 || instruction.saturate != 0 ||
@@ -3954,7 +3984,7 @@ void ValidateVertexTemporaryProgram(
           instruction.source2.bank != PcoRegisterBank::kShared ||
           instruction.source2.index != instruction.source1.index + 8U ||
           static_cast<std::size_t>(instruction.output_index) +
-                  kPcoPixelOutputCount >
+                  kPcoTextureResponseCount >
               kPcoTemporaryCount) {
         DecodeError(instruction.binary_offset,
                     "invalid generic vertex 2D texture request");
@@ -4691,17 +4721,18 @@ std::uint32_t FloatAddBits(std::uint32_t left_bits,
       return UINT32_C(0x00000000);
     while ((result_significand & (UINT64_C(1) << 26U)) == 0) {
       if (exponent == 1) {
-        ExecuteError(
-            "FADD subnormal-result policy is not in the public ISA gate");
+        /* The difference has cancelled down past the smallest normal, so the
+         * result is subnormal.  That is an ordinary binary32 sum, and the
+         * host computes it under the same rounding this path implements. */
+        return native_add(left_bits, right_bits);
       }
       result_significand <<= 1U;
       --exponent;
     }
   }
 
-  if (exponent == 0) {
-    ExecuteError("FADD subnormal-result policy is not in the public ISA gate");
-  }
+  if (exponent == 0)
+    return native_add(left_bits, right_bits);
   if (exponent >= UINT32_C(0xff)) {
     return (result_sign ? UINT32_C(0xff800000)
                         : UINT32_C(0x7f800000));
@@ -4725,9 +4756,10 @@ std::uint32_t FloatAddBits(std::uint32_t left_bits,
                           : UINT32_C(0x7f800000));
     }
   }
-  if (rounded_significand < UINT32_C(0x00800000)) {
-    ExecuteError("FADD subnormal-result policy is not in the public ISA gate");
-  }
+  /* Rounding can leave the significand below the implicit one, which is the
+   * same subnormal result reached from the other direction. */
+  if (rounded_significand < UINT32_C(0x00800000))
+    return native_add(left_bits, right_bits);
 
   return (result_sign ? UINT32_C(0x80000000) : UINT32_C(0)) |
          (exponent << 23U) |
@@ -5429,7 +5461,7 @@ void ValidateExecutionEnvelope(const PcoProgramSummary &summary,
     if (instruction.repeat_count == 0 || instruction.repeat_count > 4)
       ExecuteError("invalid decoded group repeat count");
     if (instruction.component_count == 0 ||
-        instruction.component_count > kPcoPixelOutputCount)
+        instruction.component_count > kPcoTextureResponseCount)
       ExecuteError("invalid decoded component count");
     if (instruction.source_count > 4)
       ExecuteError("invalid decoded source count");
@@ -5567,7 +5599,7 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
     if (instruction.repeat_count == 0 || instruction.repeat_count > 4)
       ExecuteError("instruction counter received an invalid repeat count");
     if (instruction.component_count == 0 ||
-        instruction.component_count > kPcoPixelOutputCount) {
+        instruction.component_count > kPcoTextureResponseCount) {
       ExecuteError("instruction counter received an invalid component count");
     }
     /* FITRP vec4 is one issued PCO instruction. component_count describes
@@ -5842,7 +5874,7 @@ PcoVertexExecution ExecuteVertexPco(
   if (vertex_input_mask != summary.vertex_input_mask)
     ExecuteError("vertex inputs do not match the decoded summary");
 
-  std::array<std::uint32_t, kPcoPixelOutputCount> pending{};
+  std::array<std::uint32_t, kPcoTextureResponseCount> pending{};
   bool drc0_pending = false;
   std::uint16_t pending_output_index = 0;
   std::uint8_t pending_component_count = 0;
@@ -5875,7 +5907,7 @@ PcoVertexExecution ExecuteVertexPco(
     if (continuation.pending_output_index != sample.output_index ||
         continuation.pending_component_count != sample.component_count ||
         continuation.data_request != sample.data_request ||
-        continuation.pending_component_count != kPcoPixelOutputCount ||
+        continuation.pending_component_count != kPcoTextureResponseCount ||
         static_cast<std::size_t>(continuation.pending_output_index) +
                 continuation.pending_component_count >
             kPcoTemporaryCount ||
@@ -6020,7 +6052,7 @@ PcoVertexExecution ExecuteVertexPco(
       if (drc0_pending ||
           instruction.target != PcoWriteTarget::kTemporary ||
           instruction.source_count != 3 || instruction.repeat_count != 1 ||
-          instruction.component_count != kPcoPixelOutputCount ||
+          instruction.component_count != kPcoTextureResponseCount ||
           instruction.data_request != 0 ||
           instruction.source.bank != PcoRegisterBank::kTemporary ||
           coordinate_mask == 0 ||
@@ -6037,7 +6069,7 @@ PcoVertexExecution ExecuteVertexPco(
           static_cast<std::size_t>(instruction.source2.index) + 4U >
               effective_shared_count ||
           static_cast<std::size_t>(instruction.output_index) +
-                  kPcoPixelOutputCount >
+                  kPcoTextureResponseCount >
               kPcoTemporaryCount) {
         ExecuteError("invalid generic vertex SMP.2D.FCNORM instruction");
       }
@@ -6056,7 +6088,7 @@ PcoVertexExecution ExecuteVertexPco(
       }
       result.texture_request.coordinate_count =
           static_cast<std::uint8_t>(coordinate_count);
-      result.texture_request.component_count = kPcoPixelOutputCount;
+      result.texture_request.component_count = kPcoTextureResponseCount;
       result.texture_request.descriptor_set = static_cast<std::uint8_t>(
           instruction.source1.index / kPcoTextureDescriptorDwordCount);
       result.texture_request.binding = 0;
@@ -6100,7 +6132,7 @@ PcoVertexExecution ExecuteVertexPco(
           instruction.source_count != 0 || instruction.repeat_count != 1 ||
           instruction.component_count != 1 || instruction.data_request != 0 ||
           instruction.output_index != 0 || !drc0_pending ||
-          pending_component_count != kPcoPixelOutputCount ||
+          pending_component_count != kPcoTextureResponseCount ||
           static_cast<std::size_t>(pending_output_index) +
                   pending_component_count >
               kPcoTemporaryCount) {
@@ -6653,7 +6685,7 @@ PcoVertexExecution ResumeVertexPco(
     const PcoProgramSummary &summary,
     const std::vector<PcoInstruction> &instructions,
     const PcoVertexContinuation &continuation,
-    const std::array<std::uint32_t, kPcoPixelOutputCount> &texture_response) {
+    const std::array<std::uint32_t, kPcoTextureResponseCount> &texture_response) {
   PcoVertexExecutionContext context;
   context.texture_response = texture_response;
   context.continuation = continuation;
@@ -6809,7 +6841,7 @@ PcoFragmentExecution ExecuteFragmentPco(
   const std::vector<std::uint32_t> no_vertex_inputs;
   std::array<std::uint32_t, kPcoTemporaryCount> temporaries{};
   std::uint64_t temporary_written_mask = 0;
-  std::array<std::uint32_t, kPcoPixelOutputCount> pending{};
+  std::array<std::uint32_t, kPcoTextureResponseCount> pending{};
   bool drc0_pending = false;
   std::uint16_t pending_output_index = 0;
   std::uint8_t pending_component_count = 0;
@@ -6836,7 +6868,7 @@ PcoFragmentExecution ExecuteFragmentPco(
     if (continuation.pending_output_index != sample.output_index ||
         continuation.pending_component_count != sample.component_count ||
         continuation.data_request != sample.data_request ||
-        continuation.pending_component_count != kPcoPixelOutputCount ||
+        continuation.pending_component_count != kPcoTextureResponseCount ||
         static_cast<std::size_t>(continuation.pending_output_index) +
                 continuation.pending_component_count >
             kPcoTemporaryCount) {
@@ -6951,7 +6983,7 @@ PcoFragmentExecution ExecuteFragmentPco(
           instruction.target != PcoWriteTarget::kTemporary ||
           instruction.source_count != 2 || instruction.repeat_count != 1 ||
           instruction.component_count < 1 ||
-          instruction.component_count > kPcoPixelOutputCount ||
+          instruction.component_count > kPcoTextureResponseCount ||
           static_cast<std::size_t>(instruction.output_index) +
                   instruction.component_count >
               kPcoTemporaryCount ||
@@ -7044,7 +7076,7 @@ PcoFragmentExecution ExecuteFragmentPco(
       if (drc0_pending ||
           instruction.target != PcoWriteTarget::kTemporary ||
           instruction.source_count != 3 || instruction.repeat_count != 1 ||
-          instruction.component_count != kPcoPixelOutputCount ||
+          instruction.component_count != kPcoTextureResponseCount ||
           instruction.data_request != 0 ||
           instruction.source.bank != PcoRegisterBank::kTemporary ||
           coordinate_mask == 0 ||
@@ -7592,7 +7624,7 @@ PcoFragmentExecution ResumeFragmentPco(
     const PcoProgramSummary &summary,
     const std::vector<PcoInstruction> &instructions,
     const PcoFragmentContinuation &continuation,
-    const std::array<std::uint32_t, kPcoPixelOutputCount> &texture_response) {
+    const std::array<std::uint32_t, kPcoTextureResponseCount> &texture_response) {
   PcoFragmentExecutionContext context;
   context.texture_response = texture_response;
   context.continuation = continuation;
