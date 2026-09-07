@@ -1708,44 +1708,47 @@ PcoInstruction DecodeGenericSimpleAluGroup(
   std::uint8_t source1_absolute = 0;
   std::uint8_t saturate = 0;
   const std::uint8_t main = binary[cursor++];
+  /*
+   * PCO's I_MAIN byte is a three-bit operation selector over five
+   * independent modifier bits, not a flat opcode:
+   *
+   *   7:5  main_op -- 000 fadd, 001 fadd.lp, 010 fmul, 011 fmul.lp,
+   *                   100 sngl, 101 int8_16, 110 fmad/movc, 111 int32_64/tst
+   *     4  saturate       3  source0 negate   2  source0 absolute
+   *     1  source1 absolute                   0  source0 floor
+   *
+   * The fadd and fmul families are decoded from those fields rather than
+   * from a list of the combinations a capture happened to contain, so a
+   * shader that pairs two modifiers this model has only seen apart -- for
+   * instance `-s0 + |s1|`, which the lowered fround_even emits -- decodes
+   * as the instruction it is.  The modifiers apply innermost-first as
+   * floor, then absolute, then negate: pco_ref_abs clears a reference's
+   * negate because absolute subsumes it in that order, and pco_print emits
+   * them .flr .abs .neg.
+   */
+  constexpr std::uint8_t kMainOpFloatAdd = 0x00;
+  constexpr std::uint8_t kMainOpFloatMultiply = 0x02;
+  const std::uint8_t main_op = static_cast<std::uint8_t>(main >> 5U);
+  if (main_op == kMainOpFloatAdd || main_op == kMainOpFloatMultiply) {
+    saturate = (main & 0x10U) != 0 ? 1U : 0U;
+    const bool negate_source0 = (main & 0x08U) != 0;
+    source0_absolute = (main & 0x04U) != 0 ? 1U : 0U;
+    source1_absolute = (main & 0x02U) != 0 ? 1U : 0U;
+    source0_floor = (main & 0x01U) != 0 ? 1U : 0U;
+    source_count = 2;
+    if (main_op == kMainOpFloatAdd) {
+      opcode = negate_source0 ? PcoOpcode::kFloatAddNegateSource0
+                              : PcoOpcode::kFloatAdd;
+    } else if (negate_source0) {
+      /* FMUL carries its own source-0 negate bit, but this model has no
+       * opcode for the negated product yet.  Name the combination rather
+       * than reporting the whole byte as an unknown operation. */
+      DecodeError(cursor - 1, "unsupported FMUL source0 negate modifier");
+    } else {
+      opcode = PcoOpcode::kFloatMultiply;
+    }
+  } else {
   switch (main) {
-  case 0x00:
-    opcode = PcoOpcode::kFloatAdd;
-    source_count = 2;
-    break;
-  case 0x01:
-    opcode = PcoOpcode::kFloatAdd;
-    source_count = 2;
-    source0_floor = 1;
-    break;
-  case 0x04:
-    opcode = PcoOpcode::kFloatAdd;
-    source_count = 2;
-    source0_absolute = 1;
-    break;
-  case 0x08:
-    opcode = PcoOpcode::kFloatAddNegateSource0;
-    source_count = 2;
-    break;
-  case 0x10:
-    opcode = PcoOpcode::kFloatAdd;
-    source_count = 2;
-    saturate = 1;
-    break;
-  case 0x40:
-    opcode = PcoOpcode::kFloatMultiply;
-    source_count = 2;
-    break;
-  case 0x41:
-    opcode = PcoOpcode::kFloatMultiply;
-    source_count = 2;
-    source0_floor = 1;
-    break;
-  case 0x42:
-    opcode = PcoOpcode::kFloatMultiply;
-    source_count = 2;
-    source1_absolute = 1;
-    break;
   case 0x80:
     opcode = PcoOpcode::kReciprocal;
     source_count = 1;
@@ -1864,6 +1867,7 @@ PcoInstruction DecodeGenericSimpleAluGroup(
     DecodeError(cursor - 1,
                 "unsupported public scalar ALU operation [" +
                     std::to_string(main) + "]");
+  }
   }
 
   PcoRegisterRef source0{};
@@ -3538,12 +3542,21 @@ bool HasDefaultNonFitrpFields(const PcoInstruction &instruction) {
          instruction.comparison_result_float_one == 0;
 }
 
+/* The fadd and fmul families carry saturate, source-0 floor/absolute/negate
+ * and source-1 absolute as five independent bits of one encoding byte, so
+ * these predicates ask which family the opcode belongs to rather than which
+ * lone modifier it has been observed with. */
+bool IsFloatAddOrMultiplyFamily(const PcoInstruction &instruction) {
+  return instruction.opcode == PcoOpcode::kFloatAdd ||
+         instruction.opcode == PcoOpcode::kFloatAddNegateSource0 ||
+         instruction.opcode == PcoOpcode::kFloatMultiply;
+}
+
 bool HasCanonicalGenericSource0Modifier(
     const PcoInstruction &instruction) {
   return instruction.source0_floor == 0 ||
          (instruction.source0_floor == 1 &&
-          (instruction.opcode == PcoOpcode::kFloatAdd ||
-           instruction.opcode == PcoOpcode::kFloatMultiply));
+          IsFloatAddOrMultiplyFamily(instruction));
 }
 
 bool HasCanonicalGenericComparisonResult(
@@ -3557,26 +3570,19 @@ bool HasCanonicalGenericComparisonResult(
 bool HasCanonicalGenericSaturate(const PcoInstruction &instruction) {
   return instruction.saturate == 0 ||
          (instruction.saturate == 1 &&
-          instruction.opcode == PcoOpcode::kFloatAdd);
+          IsFloatAddOrMultiplyFamily(instruction));
 }
 
 bool HasCanonicalGenericAbsoluteModifiers(
     const PcoInstruction &instruction) {
-  if (instruction.source0_absolute > 1 ||
-      instruction.source1_absolute > 1 ||
-      (instruction.source0_absolute != 0 &&
-       instruction.source1_absolute != 0)) {
+  if (instruction.source0_absolute > 1 || instruction.source1_absolute > 1)
     return false;
-  }
-  if (instruction.source0_absolute != 0) {
-    return instruction.opcode == PcoOpcode::kFloatAdd &&
-           instruction.source0_floor == 0 && instruction.saturate == 0;
-  }
-  if (instruction.source1_absolute != 0) {
-    return instruction.opcode == PcoOpcode::kFloatMultiply &&
-           instruction.source0_floor == 0 && instruction.saturate == 0;
-  }
-  return true;
+  if (instruction.source0_absolute == 0 && instruction.source1_absolute == 0)
+    return true;
+  /* Both operands may be made absolute at once, and either may accompany a
+   * floor or a saturate: they are separate bits of the same byte and the
+   * datapath applies them to separate points. */
+  return IsFloatAddOrMultiplyFamily(instruction);
 }
 
 /*
@@ -6016,11 +6022,19 @@ PcoVertexExecution ExecuteVertexPco(
           value = FloatSaturateBits(value);
         break;
       case PcoOpcode::kFloatAddNegateSource0:
-        value = FloatAddBits(read(instruction.source) ^ UINT32_C(0x80000000),
-                             read(instruction.source1));
+        /* Negate is the outermost source-0 modifier, applied after floor and
+         * absolute, and the same byte can carry source-1 absolute and the
+         * saturate.  Read both operands through the shared modifier helpers
+         * so this differs from FADD only by that one bit. */
+        value = FloatAddBits(read_source0() ^ UINT32_C(0x80000000),
+                             read_source1());
+        if (instruction.saturate != 0)
+          value = FloatSaturateBits(value);
         break;
       case PcoOpcode::kFloatMultiply:
         value = FloatMultiplyBits(read_source0(), read_source1());
+        if (instruction.saturate != 0)
+          value = FloatSaturateBits(value);
         break;
       case PcoOpcode::kFloatMad:
         value = FloatMadBits(read(instruction.source),
@@ -7020,13 +7034,20 @@ PcoFragmentExecution ExecuteFragmentPco(
           result_val = FloatSaturateBits(result_val);
       } else if (instruction.opcode ==
                  PcoOpcode::kFloatAddNegateSource0) {
-        const std::uint32_t src1 = read(instruction.source1);
+        std::uint32_t src1 = read(instruction.source1);
+        if (instruction.source1_absolute != 0)
+          src1 &= UINT32_C(0x7fffffff);
         result_val = FloatAddBits(src0 ^ UINT32_C(0x80000000), src1);
+        if (instruction.saturate != 0)
+          result_val = FloatSaturateBits(result_val);
       } else if (instruction.opcode == PcoOpcode::kFloatMultiply) {
         std::uint32_t src1 = read(instruction.source1);
         if (instruction.source1_absolute != 0)
           src1 &= UINT32_C(0x7fffffff);
         result_val = FloatMultiplyBits(src0, src1);
+        /* FMUL carries the saturate bit in the same position FADD does. */
+        if (instruction.saturate != 0)
+          result_val = FloatSaturateBits(result_val);
       } else if (instruction.opcode == PcoOpcode::kFloatMad) {
         const std::uint32_t src1 = read(instruction.source1);
         const std::uint32_t src2 = read(instruction.source2);

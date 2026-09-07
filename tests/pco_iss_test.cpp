@@ -1412,11 +1412,37 @@ void TestDecodeAndExecuteScalarSource0Floor() {
           "fragment FADD applies floor(source0) before adding sc0");
   }
 
-  auto unsupported_modifier = binary;
-  unsupported_modifier[15] = 0x03;
-  ExpectFailure(
-      [&] { (void)Decode(ShaderStage::kFragment, unsupported_modifier); },
-      "unverified scalar source-modifier combination");
+  /* The five modifier bits of the I_MAIN byte are independent, so a pairing
+   * this model had not been shown before is still the instruction the
+   * encoding names.  0x03 is the same FADD with source-0 floor joined by
+   * source-1 absolute, and 0x0a swaps the floor for a source-0 negate --
+   * the `-s0 + |s1|` that the lowered fround_even emits. */
+  auto floor_and_absolute = binary;
+  floor_and_absolute[15] = 0x03;
+  const auto both = Decode(ShaderStage::kFragment, floor_and_absolute);
+  Check(both.instructions[1].opcode == PcoOpcode::kFloatAdd &&
+            both.instructions[1].source0_floor == 1 &&
+            both.instructions[1].source1_absolute == 1 &&
+            both.instructions[1].source0_absolute == 0 &&
+            both.instructions[1].saturate == 0,
+        "FADD decodes source-0 floor and source-1 absolute together");
+
+  auto negate_and_absolute = binary;
+  negate_and_absolute[15] = 0x0a;
+  const auto negated = Decode(ShaderStage::kFragment, negate_and_absolute);
+  Check(negated.instructions[1].opcode ==
+                PcoOpcode::kFloatAddNegateSource0 &&
+            negated.instructions[1].source1_absolute == 1 &&
+            negated.instructions[1].source0_floor == 0 &&
+            negated.instructions[1].source0_absolute == 0,
+        "FADD decodes source-0 negate and source-1 absolute together");
+  /* sc0 is zero here, so the executed value shows the negate: the same r5 of
+   * -1.25 that floored to -2.0 above negates to +1.25. */
+  for (const std::uint32_t component :
+       ExecuteFragment(negated.summary, negated.instructions).pixel_outputs) {
+    Check(component == FloatBits(1.25F),
+          "negated FADD source-0 reaches the add without its floor");
+  }
 
   auto tampered = decoded;
   tampered.instructions[1].source0_floor = 2;
@@ -1502,14 +1528,30 @@ void TestTwoAttributeFetchFailsClosed() {
       },
       "two-attribute VS decoded as fragment stage");
 
-  for (std::uint8_t main_mutation : {std::uint8_t{0x02},
-                                     std::uint8_t{0x20},
-                                     std::uint8_t{0x43},
-                                     std::uint8_t{0x80}}) {
+  /* 0x20 selects the low-precision FADD and 0x80 the single-source family,
+   * neither of which this model implements; both stay refused. */
+  for (std::uint8_t main_mutation : {std::uint8_t{0x20}, std::uint8_t{0x80}}) {
     auto binary = AttributeFetchTwoAttributeVertexPcoBinary();
     binary[3] = main_mutation;
     ExpectFailure([&] { (void)Decode(ShaderStage::kVertex, binary); },
-                  "modified/later FADD main encoding");
+                  "unimplemented FADD main-op family");
+  }
+
+  /* 0x02 and 0x43 are the same two families with modifier bits set, which
+   * the encoding defines independently of one another. */
+  const std::pair<std::uint8_t, PcoOpcode> modifier_mutations[] = {
+      {0x02, PcoOpcode::kFloatAdd},
+      {0x43, PcoOpcode::kFloatMultiply},
+  };
+  for (const auto &mutation : modifier_mutations) {
+    auto binary = AttributeFetchTwoAttributeVertexPcoBinary();
+    binary[3] = mutation.first;
+    const auto decoded = Decode(ShaderStage::kVertex, binary);
+    Check(decoded.instructions[0].opcode == mutation.second &&
+              decoded.instructions[0].source1_absolute == 1 &&
+              decoded.instructions[0].source0_floor ==
+                  ((mutation.first & 0x01U) != 0 ? 1 : 0),
+          "modifier bits decode independently of the main-op family");
   }
 
   auto saturate_fadd = AttributeFetchTwoAttributeVertexPcoBinary();
@@ -4269,9 +4311,21 @@ void TestDecodeAndExecuteTerrainFloatAddSaturate() {
                     .pixel_outputs[0] == FloatBits(2.0F),
         "scalar main 0x00 remains the distinct unsaturated FADD encoding");
 
+  /* 0x11 is this same saturating FADD with the source-0 floor bit also set.
+   * Saturate and floor occupy different bits of the encoding byte and apply
+   * at different points, so the pair decodes rather than being refused. */
+  auto saturate_and_floor = fragment_binary;
+  saturate_and_floor[15] = 0x11;
+  const auto both_modifiers =
+      Decode(ShaderStage::kFragment, saturate_and_floor);
+  Check(both_modifiers.instructions[1].opcode == PcoOpcode::kFloatAdd &&
+            both_modifiers.instructions[1].saturate == 1 &&
+            both_modifiers.instructions[1].source0_floor == 1,
+        "FADD carries saturate and source-0 floor at once");
+
   for (const std::pair<std::size_t, std::uint8_t> mutation : {
            std::pair<std::size_t, std::uint8_t>{14, 0x80},
-           {15, 0x11}, {16, 0xff}, {18, 0x01}, {19, 0x01},
+           {16, 0xff}, {18, 0x01}, {19, 0x01},
            {20, 0x20}, {21, 0xfe}}) {
     auto malformed = fragment_binary;
     malformed[mutation.first] = mutation.second;
@@ -4286,13 +4340,30 @@ void TestDecodeAndExecuteTerrainFloatAddSaturate() {
         (void)ExecuteFragment(decoded.summary, malformed_instructions);
       },
       "Terrain FADD.SAT rejects a reserved saturate flag");
-  malformed_instructions = decoded.instructions;
-  malformed_instructions[1].opcode = PcoOpcode::kFloatMultiply;
-  ExpectFailure(
-      [&] {
-        (void)ExecuteFragment(decoded.summary, malformed_instructions);
-      },
-      "Terrain saturate flag is rejected on non-FADD operations");
+  /* Saturate is an op modifier of both FADD and FMUL -- pco_ops declares
+   * OM_SAT on each -- so the same flag on a multiply clamps the product
+   * rather than being refused. */
+  auto plain_multiply = decoded.instructions;
+  plain_multiply[1].opcode = PcoOpcode::kFloatMultiply;
+  plain_multiply[1].saturate = 0;
+  const std::uint32_t product =
+      ExecuteFragment(decoded.summary, plain_multiply).pixel_outputs[0];
+
+  auto saturating_multiply = plain_multiply;
+  saturating_multiply[1].saturate = 1;
+  const std::uint32_t clamped_product =
+      ExecuteFragment(decoded.summary, saturating_multiply).pixel_outputs[0];
+
+  float product_value = 0.0F;
+  std::memcpy(&product_value, &product, sizeof(product_value));
+  const float expected_value =
+      std::isnan(product_value) || product_value <= 0.0F
+          ? 0.0F
+          : (product_value > 1.0F ? 1.0F : product_value);
+  std::uint32_t expected = 0;
+  std::memcpy(&expected, &expected_value, sizeof(expected));
+  Check(clamped_product == expected,
+        "the saturate flag clamps an FMUL product as it does an FADD sum");
 
   auto post_add = decoded.instructions;
   post_add[0].immediate = FloatBits(-2.0F);
@@ -4400,16 +4471,45 @@ void TestDecodeAndExecuteTerrainAbsoluteBinarySources() {
                             74),
         "Terrain binary ABS reads sc74 when its constant is changed");
 
+  /* 0x43 changes the family to FMUL and sets two of its modifier bits, all
+   * of which the encoding defines; it decodes as that instruction. */
+  auto multiply_with_modifiers = fragment_binary;
+  multiply_with_modifiers[15] = 0x43;
+  const auto as_multiply =
+      Decode(ShaderStage::kFragment, multiply_with_modifiers);
+  Check(as_multiply.instructions[1].opcode == PcoOpcode::kFloatMultiply &&
+            as_multiply.instructions[1].source0_floor == 1 &&
+            as_multiply.instructions[1].source1_absolute == 1,
+        "byte 15 selects the FMUL family and its modifier bits");
+
+  /* Byte 37 is the second group's operation byte; 0x05 sets source-0
+   * absolute and source-0 floor together, which the datapath applies in
+   * that order as floor(|s0|). */
+  auto absolute_and_floor = fragment_binary;
+  absolute_and_floor[37] = 0x05;
+  const auto stacked = Decode(ShaderStage::kFragment, absolute_and_floor);
+  bool found_stacked_modifiers = false;
+  for (const auto &instruction : stacked.instructions) {
+    if (instruction.opcode == PcoOpcode::kFloatAdd &&
+        instruction.source0_absolute == 1 && instruction.source0_floor == 1) {
+      found_stacked_modifiers = true;
+    }
+  }
+  Check(found_stacked_modifiers,
+        "FADD decodes source-0 absolute and source-0 floor together");
+
   for (const std::pair<std::size_t, std::uint8_t> mutation : {
            std::pair<std::size_t, std::uint8_t>{14, 0x80},
-           {15, 0x43}, {17, 0x64}, {18, 0x24},
+           {17, 0x64}, {18, 0x24},
            {19, 0x01}, {20, 0x01}, {21, 0x84},
-           {36, 0x80}, {37, 0x05}, {38, 0x03}, {39, 0x24},
+           {36, 0x80}, {38, 0x03}, {39, 0x24},
            {40, 0x01}, {41, 0x01}, {42, 0x83}, {43, 0xfe}}) {
     auto malformed = fragment_binary;
     malformed[mutation.first] = mutation.second;
     ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, malformed); },
-                  "Terrain binary ABS near-neighbor/reserved mutation");
+                  "Terrain binary ABS near-neighbor/reserved mutation at byte " +
+                      std::to_string(mutation.first) + " = " +
+                      std::to_string(mutation.second));
   }
   ExpectFailure(
       [&] { (void)Decode(ShaderStage::kVertex, fragment_binary); },
@@ -4427,36 +4527,68 @@ void TestDecodeAndExecuteTerrainAbsoluteBinarySources() {
   expect_decoded_failure(
       1, [](PcoInstruction &instruction) { instruction.source1_absolute = 2; },
       "Terrain FMUL rejects a reserved source1-absolute flag");
-  expect_decoded_failure(
-      1, [](PcoInstruction &instruction) { instruction.source0_absolute = 1; },
-      "Terrain FMUL rejects simultaneous source0/source1 ABS");
-  expect_decoded_failure(
+  /* The two absolute bits sit at different positions of the operation byte
+   * and apply to different operands, so a multiply may make both of its
+   * sources absolute.  Setting the source-0 bit on this instruction, whose
+   * source 1 is already absolute, gives |s0| * |s1| -- a product that cannot
+   * be negative. */
+  auto both_absolute = decoded.instructions;
+  both_absolute[1].source0_absolute = 1;
+  const std::uint32_t both_absolute_product =
+      ExecuteFragment(decoded.summary, both_absolute).pixel_outputs[0];
+  const std::uint32_t signed_product =
+      ExecuteFragment(decoded.summary, decoded.instructions).pixel_outputs[0];
+  Check((both_absolute_product & UINT32_C(0x80000000)) == 0 &&
+            (both_absolute_product & UINT32_C(0x7fffffff)) ==
+                (signed_product & UINT32_C(0x7fffffff)),
+        "FMUL makes both of its sources absolute at once");
+  /* Saturate, the two absolute bits and the source-0 floor are separate
+   * fields of one operation byte, and pco_ops declares the same source and
+   * op modifiers on FADD and on FMUL.  Adding any one of them to either
+   * instruction is therefore an instruction the encoding can express, and
+   * each executes rather than being refused. */
+  const auto expect_decoded_success = [&](std::size_t instruction_index,
+                                          auto mutate,
+                                          const std::string &description) {
+    auto modified = decoded.instructions;
+    mutate(modified[instruction_index]);
+    bool executed = true;
+    try {
+      (void)ExecuteFragment(decoded.summary, modified);
+    } catch (const std::exception &) {
+      executed = false;
+    }
+    Check(executed, description);
+  };
+  expect_decoded_success(
       1, [](PcoInstruction &instruction) { instruction.source0_floor = 1; },
-      "Terrain FMUL source1 ABS rejects a combined floor modifier");
-  expect_decoded_failure(
+      "FMUL takes a source-0 floor alongside its source-1 absolute");
+  expect_decoded_success(
       1, [](PcoInstruction &instruction) { instruction.saturate = 1; },
-      "Terrain FMUL source1 ABS rejects a combined saturate modifier");
-  expect_decoded_failure(
+      "FMUL takes a saturate alongside its source-1 absolute");
+  expect_decoded_success(
       1, [](PcoInstruction &instruction) { instruction.opcode = PcoOpcode::kFloatAdd; },
-      "Terrain source1 ABS is rejected on FADD");
-  expect_decoded_failure(
-      3, [](PcoInstruction &instruction) { instruction.source0_absolute = 2; },
-      "Terrain FADD rejects a reserved source0-absolute flag");
-  expect_decoded_failure(
+      "the source-1 absolute bit is defined on FADD as well as FMUL");
+  expect_decoded_success(
       3, [](PcoInstruction &instruction) { instruction.source1_absolute = 1; },
-      "Terrain FADD rejects simultaneous source0/source1 ABS");
-  expect_decoded_failure(
+      "FADD makes both of its sources absolute at once");
+  expect_decoded_success(
       3, [](PcoInstruction &instruction) { instruction.source0_floor = 1; },
-      "Terrain FADD source0 ABS rejects a combined floor modifier");
-  expect_decoded_failure(
+      "FADD takes a source-0 floor alongside its source-0 absolute");
+  expect_decoded_success(
       3, [](PcoInstruction &instruction) { instruction.saturate = 1; },
-      "Terrain FADD source0 ABS rejects a combined saturate modifier");
-  expect_decoded_failure(
+      "FADD takes a saturate alongside its source-0 absolute");
+  expect_decoded_success(
       3,
       [](PcoInstruction &instruction) {
         instruction.opcode = PcoOpcode::kFloatMultiply;
       },
-      "Terrain source0 ABS is rejected on FMUL");
+      "the source-0 absolute bit is defined on FMUL as well as FADD");
+
+  /* A value of two is not a one-bit flag, and stays refused. */
+  expect_decoded_failure(
+      3, [](PcoInstruction &instruction) { instruction.source0_absolute = 2; },
+      "FADD rejects a reserved source0-absolute flag");
 }
 
 void TestDecodeAndExecuteTerrainOneOver256SpecialConstant() {
@@ -4768,9 +4900,20 @@ void TestDecodeAndExecuteIdeasNegatedFloatSources() {
   Check(normal_pixel.pixel_outputs[0] == FloatBits(5.5F),
         "clearing the valid FADD negate modifier changes real arithmetic");
 
+  /* 0x09 keeps the source-0 negate and adds the source-0 floor.  They are
+   * different bits of the operation byte and apply in the order floor then
+   * negate, so the pair decodes as -floor(s0) + s1. */
+  auto negate_and_floor = fragment_binary;
+  negate_and_floor[87] = 0x09;
+  const auto negated_floor = Decode(ShaderStage::kFragment, negate_and_floor);
+  Check(negated_floor.instructions[7].opcode ==
+                PcoOpcode::kFloatAddNegateSource0 &&
+            negated_floor.instructions[7].source0_floor == 1,
+        "FADD decodes source-0 negate and source-0 floor together");
+
   for (const std::pair<std::size_t, std::uint8_t> mutation : {
-           std::pair<std::size_t, std::uint8_t>{87, 0x09},
-           {97, 0xc3}, {109, 0xcb}, {121, 0xc9}}) {
+           std::pair<std::size_t, std::uint8_t>{97, 0xc3},
+           {109, 0xcb}, {121, 0xc9}}) {
     auto malformed = fragment_binary;
     malformed[mutation.first] = mutation.second;
     ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, malformed); },
