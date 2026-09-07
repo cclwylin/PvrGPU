@@ -78,6 +78,25 @@ void ExpectFailure(Function &&function, const std::string &description) {
   throw std::runtime_error("expected failure: " + description);
 }
 
+/*
+ * Whether any instruction of a decoded program reads the given special
+ * constant.  The decoder reads the whole of pco_const_imms.c, so a mutation
+ * that selects a neighbouring constant produces a different program rather
+ * than an invalid one, and what these tests check is that the index arrives
+ * unchanged.
+ */
+template <typename Decoded>
+bool ReadsSpecialConstant(const Decoded &decoded, std::uint16_t index) {
+  for (const PcoInstruction &instruction : decoded.instructions) {
+    for (const auto &source :
+         {instruction.source, instruction.source1, instruction.source2}) {
+      if (source.bank == PcoRegisterBank::kSpecial && source.index == index)
+        return true;
+    }
+  }
+  return false;
+}
+
 std::uint32_t FloatBits(float value) {
   std::uint32_t bits = 0;
   static_assert(sizeof(bits) == sizeof(value));
@@ -1205,29 +1224,36 @@ void TestDecodeFailsClosed() {
   ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, bad_destination); },
                 "unsupported pixout4 destination");
 
-  auto bad_constant = FillSolidFragmentPcoBinary();
-  bad_constant[5] = 0x02; // sc128 rather than the supported public sc64.
-  ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, bad_constant); },
-                "unsupported special constant");
-
-  auto nearby_half_constant = FillSolidRedHalfAlphaFragmentPcoBinary();
-  nearby_half_constant[36] = 0x8a; // sc74 is not part of the exact subset.
-  ExpectFailure(
-      [&] { (void)Decode(ShaderStage::kFragment, nearby_half_constant); },
-      "nearby but unsupported special constant must fail closed");
-
-  auto bad_orange_constant = TriangleSetupOrangeFragmentPcoBinary();
-  bad_orange_constant[14] = 0x8a; // sc74 is not part of the exact subset.
-  ExpectFailure(
-      [&] { (void)Decode(ShaderStage::kFragment, bad_orange_constant); },
-      "triangle_setup orange nearby special constant must fail closed");
-
-  auto bad_cyan_constant = TriangleSetupCyanFragmentPcoBinary();
-  bad_cyan_constant[12] = 0x8a; // sc74 is not part of the exact subset.
-  ExpectFailure(
-      [&] { (void)Decode(ShaderStage::kFragment, bad_cyan_constant); },
-      "triangle_setup_half_culled cyan nearby special constant must fail "
-      "closed");
+  /*
+   * Selecting a neighbouring special constant used to be a refusal, from when
+   * the decoder admitted a hand-picked subset of them.  It reads the whole of
+   * pco_const_imms.c now, so these decode; what has to hold is that the index
+   * reaches the instruction unchanged instead of folding onto the constant
+   * the capture happened to use.
+   */
+  const auto reads_special_constant = [](ShaderStage stage,
+                                         std::vector<std::uint8_t> binary,
+                                         std::size_t byte, std::uint8_t value,
+                                         std::uint16_t index) {
+    binary[byte] = value;
+    return ReadsSpecialConstant(Decode(stage, binary), index);
+  };
+  Check(reads_special_constant(ShaderStage::kFragment,
+                               FillSolidFragmentPcoBinary(), 5, 0x02, 128),
+        "the neighbouring constant of sc64 decodes as sc128");
+  Check(reads_special_constant(ShaderStage::kFragment,
+                               FillSolidRedHalfAlphaFragmentPcoBinary(), 36,
+                               0x8a, 74),
+        "the neighbouring constant of sc75 decodes as sc74");
+  Check(reads_special_constant(ShaderStage::kFragment,
+                               TriangleSetupOrangeFragmentPcoBinary(), 14,
+                               0x8a, 74),
+        "triangle_setup orange reads its neighbouring constant as sc74");
+  Check(reads_special_constant(ShaderStage::kFragment,
+                               TriangleSetupCyanFragmentPcoBinary(), 12, 0x8a,
+                               74),
+        "triangle_setup_half_culled cyan reads its neighbouring constant as "
+        "sc74");
 
   auto bad_iss = FillSolidVertexPcoBinary();
   bad_iss[9] = 0x31;
@@ -1442,16 +1468,29 @@ void TestDecodeAndExecuteSpecialConstant153() {
             execution.pixel_outputs[3] == UINT32_C(0x3f955555),
         "sc153 executes as exact bits 0x3e2aaaab for FMUL and FADD");
 
-  auto unsupported_source0 = binary;
-  unsupported_source0[16] = 0x9a;
-  ExpectFailure(
-      [&] { (void)Decode(ShaderStage::kFragment, unsupported_source0); },
-      "neighboring special constant sc154 in source0");
-  auto unsupported_source1 = binary;
-  unsupported_source1[41] = 0xda;
-  ExpectFailure(
-      [&] { (void)Decode(ShaderStage::kFragment, unsupported_source1); },
-      "neighboring special constant sc154 in source1");
+  /*
+   * sc154 is an ordinary entry of the same constant file.  These two
+   * mutations used to be expected refusals, from when the decoder admitted a
+   * hand-picked subset of the special constants; it now reads all of
+   * pco_const_imms.c, so selecting the neighbour decodes and what has to hold
+   * is that it is read as itself rather than folded onto sc153.
+   */
+  auto neighbour_source0 = binary;
+  neighbour_source0[16] = 0x9a;
+  const auto decoded_source0 =
+      Decode(ShaderStage::kFragment, neighbour_source0);
+  Check(decoded_source0.instructions[1].source.bank ==
+                PcoRegisterBank::kSpecial &&
+            decoded_source0.instructions[1].source.index == 154,
+        "the neighbouring special constant decodes as sc154 in source0");
+  auto neighbour_source1 = binary;
+  neighbour_source1[41] = 0xda;
+  const auto decoded_source1 =
+      Decode(ShaderStage::kFragment, neighbour_source1);
+  Check(decoded_source1.instructions[3].source1.bank ==
+                PcoRegisterBank::kSpecial &&
+            decoded_source1.instructions[3].source1.index == 154,
+        "the neighbouring special constant decodes as sc154 in source1");
 }
 
 void TestTwoAttributeFetchFailsClosed() {
@@ -1567,11 +1606,14 @@ void TestTwoAttributeFetchFailsClosed() {
             66,
         "generic ALU accepts the public negative-one special constant");
 
+  /* Every entry of the constant file decodes in either stage; the fragment
+   * gate used to admit a subset, which is what made this a refusal. */
   auto fragment_sc65 = AttributeFetchGrayFragmentPcoBinary();
   fragment_sc65[4] = 0x81;
-  ExpectFailure(
-      [&] { (void)Decode(ShaderStage::kFragment, fragment_sc65); },
-      "sc65 remains outside the exact fragment-shader gate");
+  Check(Decode(ShaderStage::kFragment, fragment_sc65)
+                .instructions[0]
+                .source.index == 65,
+        "the fragment stage reads sc65 as itself");
 
   auto truncated = AttributeFetchTwoAttributeVertexPcoBinary();
   truncated.pop_back();
@@ -1640,11 +1682,14 @@ void TestFourAttributeFetchFailsClosed() {
   expect_byte_failure(24, 0xc2,
                       "TEMP+VI FADD reads temp2 before it is written");
 
+  /* Every entry of the constant file decodes in either stage; the fragment
+   * gate used to admit a subset, which is what made this a refusal. */
   auto fragment_sc66 = AttributeFetchGrayFragmentPcoBinary();
   fragment_sc66[4] = 0x82;
-  ExpectFailure(
-      [&] { (void)Decode(ShaderStage::kFragment, fragment_sc66); },
-      "sc66 remains outside the exact fragment-shader gate");
+  Check(Decode(ShaderStage::kFragment, fragment_sc66)
+                .instructions[0]
+                .source.index == 66,
+        "the fragment stage reads sc66 as itself");
 
   auto truncated = AttributeFetchFourAttributeVertexPcoBinary();
   truncated.pop_back();
@@ -1700,14 +1745,21 @@ void TestEightAttributeFetchFailsClosed() {
   }
   Check(found_floor_later,
         "eight-attribute later FADD decodes source0-floor");
-  expect_byte_failure(152, 0x84,
-                      "eight-attribute sc67 changed to unknown sc68");
+  /* sc68 is another entry of the same file, so changing the constant is a
+   * different program rather than an invalid one. */
+  auto eight_sc68 = AttributeFetchEightAttributeVertexPcoBinary();
+  eight_sc68[152] = 0x84;
+  Check(ReadsSpecialConstant(Decode(ShaderStage::kVertex, eight_sc68), 68),
+        "eight-attribute sc67 changed to sc68 decodes as sc68");
 
+  /* Every entry of the constant file decodes in either stage; the fragment
+   * gate used to admit a subset, which is what made this a refusal. */
   auto fragment_sc67 = AttributeFetchGrayFragmentPcoBinary();
   fragment_sc67[4] = 0x83;
-  ExpectFailure(
-      [&] { (void)Decode(ShaderStage::kFragment, fragment_sc67); },
-      "sc67 remains outside the exact fragment-shader gate");
+  Check(Decode(ShaderStage::kFragment, fragment_sc67)
+                .instructions[0]
+                .source.index == 67,
+        "the fragment stage reads sc67 as itself");
 
   auto truncated = AttributeFetchEightAttributeVertexPcoBinary();
   truncated.pop_back();
@@ -2057,11 +2109,13 @@ void TestVaryingsTwoFailsClosed() {
             floor_fmul.instructions[5].source0_floor == 1,
         "public FMUL shares the scalar source0-floor modifier contract");
 
-  auto bad_fmul_constant = VaryingsTwoVertexPcoBinary();
-  bad_fmul_constant[53] = 0xca;
-  ExpectFailure(
-      [&] { (void)Decode(ShaderStage::kVertex, bad_fmul_constant); },
-      "varyings_shader_2 FMUL sc75 changed");
+  /* Changing the constant selects a different one, not an invalid program. */
+  auto other_fmul_constant = VaryingsTwoVertexPcoBinary();
+  other_fmul_constant[53] = 0xca;
+  Check(ReadsSpecialConstant(Decode(ShaderStage::kVertex,
+                                    other_fmul_constant),
+                            74),
+        "varyings_shader_2 FMUL reads sc74 when its constant is changed");
 
   auto bad_uvsw_temp4 = VaryingsTwoVertexPcoBinary();
   bad_uvsw_temp4[91] = 0xc5;
@@ -3320,9 +3374,12 @@ void TestExecuteFailsClosed() {
       [&] { (void)ExecuteFragment(decoded.summary, decoded.instructions); },
       "tampered serialized program summary");
 
+  /* sc74 is an ordinary constant now, so substituting it is not detectable.
+   * An index past the end of the constant file still is, and that is what the
+   * execution-side gate is there for. */
   decoded =
       Decode(ShaderStage::kFragment, FillSolidRedHalfAlphaFragmentPcoBinary());
-  decoded.instructions[3].source.index = 74;
+  decoded.instructions[3].source.index = 4095;
   ExpectFailure(
       [&] { (void)ExecuteFragment(decoded.summary, decoded.instructions); },
       "tampered decoded special constant must fail closed at execution");
@@ -3903,10 +3960,22 @@ void TestDecodeAndExecuteTerrainLogicalXnor() {
             pixel.pixel_outputs[3] == UINT32_C(0x0f0f5aa5),
         "Terrain LOGICAL.XNOR executes exact 32-bit ~(r14 xor sc0)");
 
+  /*
+   * Byte 22 is the destination, which is not part of the group's shape: XNOR
+   * against sc0 is `~s0` wherever it writes, so changing it is a different
+   * program rather than a malformed one.
+   */
+  auto other_xnor_destination = fragment_binary;
+  other_xnor_destination[22] = 0x4f;
+  Check(Decode(ShaderStage::kFragment, other_xnor_destination)
+                .instructions[1]
+                .opcode == PcoOpcode::kBitwiseXnor,
+        "Terrain LOGICAL.XNOR decodes with another destination");
+
   for (const std::pair<std::size_t, std::uint8_t> mutation : {
            std::pair<std::size_t, std::uint8_t>{14, 0x00},
            {15, 0x47}, {16, 0x03}, {17, 0x81}, {18, 0x41},
-           {19, 0x01}, {20, 0x00}, {21, 0x01}, {22, 0x4f}, {23, 0xfe}}) {
+           {19, 0x01}, {20, 0x00}, {21, 0x01}, {23, 0xfe}}) {
     auto malformed = fragment_binary;
     malformed[mutation.first] = mutation.second;
     ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, malformed); },
@@ -4322,9 +4391,17 @@ void TestDecodeAndExecuteTerrainAbsoluteBinarySources() {
                     .pixel_outputs[0] == FloatBits(-2.0F),
         "main 0x00 remains the distinct unmodified FADD encoding");
 
+  /* Byte 16 selects the constant, and every entry of the file decodes. */
+  auto other_abs_constant = fragment_binary;
+  other_abs_constant[16] = 0x8a;
+  Check(ReadsSpecialConstant(Decode(ShaderStage::kFragment,
+                                    other_abs_constant),
+                            74),
+        "Terrain binary ABS reads sc74 when its constant is changed");
+
   for (const std::pair<std::size_t, std::uint8_t> mutation : {
            std::pair<std::size_t, std::uint8_t>{14, 0x80},
-           {15, 0x43}, {16, 0x8a}, {17, 0x64}, {18, 0x24},
+           {15, 0x43}, {17, 0x64}, {18, 0x24},
            {19, 0x01}, {20, 0x01}, {21, 0x84},
            {36, 0x80}, {37, 0x05}, {38, 0x03}, {39, 0x24},
            {40, 0x01}, {41, 0x01}, {42, 0x83}, {43, 0xfe}}) {
@@ -4416,11 +4493,13 @@ void TestDecodeAndExecuteTerrainOneOver256SpecialConstant() {
   Check(executed.pixel_outputs[0] == UINT32_C(0x3c000000),
         "Terrain SC82 is exact binary32 1/256 before FMUL source1 ABS");
 
-  auto unmodeled_neighbor = fragment_binary;
-  unmodeled_neighbor[16] = 0x93;
-  ExpectFailure(
-      [&] { (void)Decode(ShaderStage::kFragment, unmodeled_neighbor); },
-      "Terrain D5 adjacent but unmodeled SC83 remains fail-closed");
+  /* SC83 is the next entry of the same file, and decodes as itself. */
+  auto adjacent_neighbor = fragment_binary;
+  adjacent_neighbor[16] = 0x93;
+  Check(ReadsSpecialConstant(Decode(ShaderStage::kFragment,
+                                    adjacent_neighbor),
+                            83),
+        "Terrain D5 reads its adjacent constant as sc83");
 }
 
 void TestDecodeAndExecuteIdeasLogicalAnd() {
