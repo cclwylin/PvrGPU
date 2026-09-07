@@ -1702,6 +1702,10 @@ PcoInstruction DecodeGenericSimpleAluGroup(
   std::uint8_t source_count = 0;
   std::uint8_t source0_floor = 0;
   std::uint8_t source0_integer_negate = 0;
+  std::uint8_t source0_integer_absolute = 0;
+  std::uint8_t source1_integer_negate = 0;
+  std::uint8_t source1_integer_absolute = 0;
+  std::uint8_t source2_integer_absolute = 0;
   std::uint8_t unpack_format = 0;
   std::uint8_t unpack_scale = 0;
   std::uint8_t source0_absolute = 0;
@@ -1815,11 +1819,23 @@ PcoInstruction DecodeGenericSimpleAluGroup(
     if (cursor >= group_end)
       DecodeError(cursor, "missing IMADD32 source-modifier byte");
     const std::uint8_t modifiers = binary[cursor++];
-    if (modifiers != 0x10U) {
-      DecodeError(cursor - 1, "unsupported IMADD32 source modifiers [" +
-                                  std::to_string(modifiers) + "]");
+    /*
+     * I_MAIN's int32_64 extension byte, by field: bit 6 is a carry-in, bit 5
+     * an s1 negate, bit 4 an s0 negate, bit 2 an s0 absolute, bit 1 an s1
+     * absolute and bit 0 an s2 absolute.  Reading the bits rather than
+     * matching the one value the captures held is what lets GL's integer
+     * abs() -- an s0 absolute against a multiply by one -- decode.
+     */
+    if ((modifiers & 0x48U) != 0) {
+      DecodeError(cursor - 1,
+                  "unsupported IMADD32 carry-in or reserved modifier [" +
+                      std::to_string(modifiers) + "]");
     }
-    source0_integer_negate = 1;
+    source0_integer_negate = (modifiers & 0x10U) != 0 ? 1U : 0U;
+    source1_integer_negate = (modifiers & 0x20U) != 0 ? 1U : 0U;
+    source0_integer_absolute = (modifiers & 0x04U) != 0 ? 1U : 0U;
+    source1_integer_absolute = (modifiers & 0x02U) != 0 ? 1U : 0U;
+    source2_integer_absolute = (modifiers & 0x01U) != 0 ? 1U : 0U;
     opcode = PcoOpcode::kIntegerMultiplyAdd32;
     source_count = 3;
     break;
@@ -1931,6 +1947,10 @@ PcoInstruction DecodeGenericSimpleAluGroup(
   instruction.output_index = destination.index;
   instruction.source0_floor = source0_floor;
   instruction.source0_integer_negate = source0_integer_negate;
+  instruction.source0_integer_absolute = source0_integer_absolute;
+  instruction.source1_integer_negate = source1_integer_negate;
+  instruction.source1_integer_absolute = source1_integer_absolute;
+  instruction.source2_integer_absolute = source2_integer_absolute;
   instruction.unpack_format = unpack_format;
   instruction.unpack_scale = unpack_scale;
   /*
@@ -4714,6 +4734,22 @@ std::uint32_t FloatAddBits(std::uint32_t left_bits,
          (rounded_significand & UINT32_C(0x007fffff));
 }
 
+/*
+ * An IMADD32 operand under its absolute and negate modifiers, applied in that
+ * order as the float sources apply theirs.  Both are two's-complement and are
+ * computed on the unsigned pattern, so the most negative integer -- whose
+ * mathematical absolute is not representable -- returns itself rather than
+ * overflowing a signed negation.
+ */
+std::uint32_t IntegerSourceModifier(std::uint32_t bits, bool absolute,
+                                    bool negate) {
+  if (absolute && (bits & UINT32_C(0x80000000)) != 0)
+    bits = ~bits + 1U;
+  if (negate)
+    bits = ~bits + 1U;
+  return bits;
+}
+
 std::uint32_t FloatSaturateBits(std::uint32_t value_bits) {
   constexpr std::uint32_t kSign = UINT32_C(0x80000000);
   constexpr std::uint32_t kExponent = UINT32_C(0x7f800000);
@@ -6338,11 +6374,18 @@ PcoVertexExecution ExecuteVertexPco(
         break;
       }
       case PcoOpcode::kIntegerMultiplyAdd32: {
-        const std::uint32_t factor0 = read(instruction.source);
-        value = (instruction.source0_integer_negate != 0 ? ~factor0 + 1U
-                                                         : factor0) *
-                    read(instruction.source1) +
-                read(instruction.source2);
+        const std::uint32_t factor0 = IntegerSourceModifier(
+            read(instruction.source),
+            instruction.source0_integer_absolute != 0,
+            instruction.source0_integer_negate != 0);
+        const std::uint32_t factor1 = IntegerSourceModifier(
+            read(instruction.source1),
+            instruction.source1_integer_absolute != 0,
+            instruction.source1_integer_negate != 0);
+        const std::uint32_t addend = IntegerSourceModifier(
+            read(instruction.source2),
+            instruction.source2_integer_absolute != 0, false);
+        value = factor0 * factor1 + addend;
         break;
       }
       /* The masked bitfield insert, whose inserted value is shifted into
@@ -7251,11 +7294,17 @@ PcoFragmentExecution ExecuteFragmentPco(
         const std::uint32_t src2 = read(instruction.source2);
         result_val = FloatMadBits(src0, src1, src2);
       } else if (instruction.opcode == PcoOpcode::kIntegerMultiplyAdd32) {
-        const std::uint32_t src1 = read(instruction.source1);
-        const std::uint32_t src2 = read(instruction.source2);
-        const std::uint32_t factor =
-            instruction.source0_integer_negate != 0 ? ~src0 + 1U : src0;
-        result_val = factor * src1 + src2;
+        const std::uint32_t factor0 = IntegerSourceModifier(
+            src0, instruction.source0_integer_absolute != 0,
+            instruction.source0_integer_negate != 0);
+        const std::uint32_t factor1 = IntegerSourceModifier(
+            read(instruction.source1),
+            instruction.source1_integer_absolute != 0,
+            instruction.source1_integer_negate != 0);
+        const std::uint32_t addend = IntegerSourceModifier(
+            read(instruction.source2),
+            instruction.source2_integer_absolute != 0, false);
+        result_val = factor0 * factor1 + addend;
       } else if (instruction.opcode == PcoOpcode::kBitfieldInsert) {
         // GL bitfieldInsert(base, insert, offset, bits): source is bits,
         // source1 offset, source2 insert, source3 base.

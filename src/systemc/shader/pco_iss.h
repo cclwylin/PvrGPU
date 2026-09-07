@@ -268,9 +268,15 @@ struct PcoInstruction {
   // opcodes, so these stay at the f32-equal encoding for every other opcode.
   std::uint8_t comparison_test_op = 0;
   std::uint8_t comparison_test_type = 0;
-  // IMADD32's `s0neg` modifier: a two's-complement negate of the first
-  // factor, which is how `-a * b + c` is spelled in the integer datapath.
+  /* IMADD32's source modifiers, one bit each in the extended byte: a
+   * two's-complement absolute and then a negate, applied in that order to
+   * each operand.  `-a * b + c` is an s0 negate, and GL's integer abs() is
+   * an s0 absolute against a multiply by one. */
   std::uint8_t source0_integer_negate = 0;
+  std::uint8_t source0_integer_absolute = 0;
+  std::uint8_t source1_integer_negate = 0;
+  std::uint8_t source1_integer_absolute = 0;
+  std::uint8_t source2_integer_absolute = 0;
   // MOVC's true-value phase is an MBYP that may negate what it moves, which
   // is how the compiler spells `cond ? -a : b`.  Orthogonal to the test, so a
   // negated select needs no opcode of its own.
