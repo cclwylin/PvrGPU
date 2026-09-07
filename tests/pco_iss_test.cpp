@@ -10,6 +10,8 @@
  */
 #include "shader/pco_iss.h"
 #include "pco_depth_feedback_fixture.h"
+#include "pco_uniform_buffer_fixtures.h"
+#include "pco_temp256_fixtures.h"
 
 #include <algorithm>
 #include <cmath>
@@ -54,6 +56,7 @@ using pvrgpu::stub::PcoVertexExecutionContext;
 using pvrgpu::stub::PcoIterationMode;
 using pvrgpu::stub::PcoProgramSummary;
 using pvrgpu::stub::PcoRegisterBank;
+using pvrgpu::stub::PcoTemporaryMask;
 using pvrgpu::stub::PcoWriteTarget;
 using pvrgpu::stub::ShaderStage;
 using pvrgpu::stub::TriangleSetupCyanFragmentPcoBinary;
@@ -3348,7 +3351,7 @@ void TestDecodeAndExecuteFillTexNearest() {
   }
   Check(suspended.continuation.resume_instruction_index == 17 &&
             suspended.continuation.temporary_written_mask ==
-                UINT32_C(0xffff0000) &&
+                PcoTemporaryMask{{UINT32_C(0xffff0000)}} &&
             suspended.continuation.program_binary_size == 184 &&
             suspended.continuation.program_instruction_count == 22 &&
             suspended.continuation.pending_output_index == 0 &&
@@ -3490,7 +3493,7 @@ void TestFillTexNearestFailsClosed() {
       },
       "fragment continuation resume-PC mutation");
   continuation = suspended.continuation;
-  continuation.temporary_written_mask ^= UINT32_C(1);
+  continuation.temporary_written_mask.words[0] ^= UINT32_C(1);
   ExpectFailure(
       [&] {
         (void)ResumeFragment(fragment.summary, fragment.instructions,
@@ -3647,7 +3650,7 @@ c4 a0 00 00 48 ff 35 82 00 40 c5 a0 00 00 40 ff
             suspended.texture_request.coordinates[1] == FloatBits(0.75F) &&
             suspended.texture_request.texture_state[0] == UINT32_C(0x100) &&
             suspended.texture_request.sampler_state[0] == UINT32_C(0x108) &&
-            suspended.continuation.temporary_written_mask == UINT32_C(0x1f) &&
+            suspended.continuation.temporary_written_mask == PcoTemporaryMask{{UINT32_C(0x1f)}} &&
             suspended.continuation.resume_instruction_index == 5 &&
             suspended.continuation.pending_output_index == 3 &&
             suspended.continuation.pending_component_count == 4,
@@ -3683,7 +3686,7 @@ c4 a0 00 00 48 ff 35 82 00 40 c5 a0 00 00 40 ff
         "FITRP preserves llvmpipe reciprocal-then-multiply rounding");
 
   auto tampered_continuation = suspended.continuation;
-  tampered_continuation.temporary_written_mask |= UINT32_C(1) << 5U;
+  tampered_continuation.temporary_written_mask.set(5);
   ExpectFailure(
       [&] {
         (void)ResumeFragment(
@@ -6151,6 +6154,16 @@ void TestSharedRegisterFileBoundary() {
                               fragment_context);
       },
       "terrain fragment validation rejects SH164 beyond its transport gate");
+  fragment_instructions[0].source.index = 255;
+  fragment_context.shared_count = 256;
+  fragment_context.shared_registers[255] = UINT32_C(0x7fa54321);
+  Check(ExecuteFragment(fragment_summary, fragment_instructions, fragment_context)
+                .pixel_outputs[0] == UINT32_C(0x7fa54321),
+        "full SH0..255 transport retains count256 without uint8 wraparound");
+  fragment_context.shared_count = 255;
+  ExpectFailure([&] {
+    ExecuteFragment(fragment_summary, fragment_instructions, fragment_context);
+  }, "SH255 is absent in a 255-DWORD transport");
 }
 
 void TestBitfieldInsertFourSourceValidation() {
@@ -6304,7 +6317,7 @@ void TestExecuteVertexTextureContinuations() {
             execution.continuation.vertex_inputs[0] == inputs[0] &&
             execution.continuation.shared_count == context.shared_count &&
             execution.continuation.shared_registers[39] == UINT32_C(0x3027) &&
-            execution.continuation.temporary_written_mask == UINT64_C(0x3) &&
+            execution.continuation.temporary_written_mask == PcoTemporaryMask{{UINT64_C(0x3)}} &&
             execution.continuation.output_written_mask == 0 &&
             execution.continuation.emitted == 0 &&
             execution.continuation.ended_task == 0,
@@ -6320,7 +6333,7 @@ void TestExecuteVertexTextureContinuations() {
             execution.texture_request.coordinates[1] == first_response[1] &&
             execution.texture_request.texture_state[0] == UINT32_C(0x3000) &&
             execution.texture_request.sampler_state[0] == UINT32_C(0x3008) &&
-            execution.continuation.temporary_written_mask == UINT64_C(0xf),
+            execution.continuation.temporary_written_mask == PcoTemporaryMask{{UINT64_C(0xf)}},
         "vertex continuation consumes WDF response then reaches the next SMP");
 
   const auto second_continuation = execution.continuation;
@@ -6360,7 +6373,7 @@ void TestExecuteVertexTextureContinuations() {
       "vertex resume rejects inputs that differ from its saved lane");
 
   auto bad_continuation = second_continuation;
-  bad_continuation.temporary_written_mask |= UINT64_C(1) << 12U;
+  bad_continuation.temporary_written_mask.set(12);
   ExpectFailure(
       [&] {
         (void)ResumeVertex(vertex.summary, vertex.instructions,
@@ -6483,11 +6496,11 @@ void TestFragmentRepeatedTemporaryMove() {
             backward.pixel_outputs[1] == FloatBits(0.75F),
         "overlapping backward MBYP retains the two distinct source values");
   auto bad = instructions;
-  bad[3].source.index = 63;
+  bad[3].source.index = 255;
   ExpectFailure([&] { (void)ExecuteFragment(decoded.summary, bad, context); },
                 "repeated fragment MBYP rejects source range overflow");
   bad = instructions;
-  bad[3].output_index = 63;
+  bad[3].output_index = 255;
   ExpectFailure([&] { (void)ExecuteFragment(decoded.summary, bad, context); },
                 "repeated fragment MBYP rejects destination range overflow");
   bad = instructions;
@@ -6526,7 +6539,7 @@ void TestFragmentRepeatedTemporaryMove() {
   Check(suspended.suspended == 1 &&
             suspended.texture_request.coordinates[0] == FloatBits(0.25F) &&
             suspended.texture_request.coordinates[1] == FloatBits(0.5F) &&
-            suspended.continuation.temporary_written_mask == UINT64_C(0x37),
+            suspended.continuation.temporary_written_mask == PcoTemporaryMask{{UINT64_C(0x37)}},
         "repeated fragment MBYP supplies both coordinates and saved TEMP bits");
   context.continuation = suspended.continuation;
   context.texture_response_valid = 1;
@@ -6809,6 +6822,392 @@ void TestDepthFeedback() {
   ExpectFailure([&] { Decode(ShaderStage::kVertex, binary); }, "DEPTHF stage gate");
 }
 
+void TestUniformBufferLoads() {
+  using namespace pvrgpu::stub;
+  struct Memory {
+    std::uint64_t address;
+    unsigned count;
+    unsigned reads = 0;
+    std::array<std::uint32_t, kPcoMaximumBufferLoadDwords> words{
+        0xffffffffU, 0x01000001U, 0x80000000U, 0x7fa12345U,
+        0x00000001U, 0x12345678U, 0xff800000U, 0x00800001U,
+        0x00000000U, 0xabcdef01U, 0x7fc98765U, 0x87654321U,
+        0x000000ffU, 0x7f800000U, 0x807fffffU, 0xcafebabeU};
+  };
+  const auto read = +[](void *opaque, std::uint64_t address,
+                        std::uint32_t count, std::uint32_t *destination) {
+    auto &memory = *static_cast<Memory *>(opaque);
+    Check(address == memory.address && count == memory.count,
+          "LD callback receives computed 64-bit address and exact burst size");
+    std::copy_n(memory.words.begin(), count, destination);
+    ++memory.reads;
+  };
+  const auto binary_for_count = [](bool vertex, unsigned count) {
+    auto binary = test::UniformBufferFixture(vertex, std::min(count, 4U));
+    // Enumerate the native I_LD_IMMBL burstlen field on the genuine Mesa
+    // fixture: operation1[4:2] is low3 and operation2[0] is high1. Mesa's
+    // F_UINT4_POS_WRAP maps 16 to zero, not to an empty transaction.
+    binary[52] = static_cast<std::uint8_t>((count & 7U) << 2U);
+    binary[53] = static_cast<std::uint8_t>((count >> 3U) & 1U);
+    return binary;
+  };
+  for (const bool vertex : {false, true}) {
+    for (unsigned count = 1; count <= kPcoMaximumBufferLoadDwords; ++count) {
+      const auto binary = binary_for_count(vertex, count);
+      const ShaderStage stage = vertex ? ShaderStage::kVertex : ShaderStage::kFragment;
+      const auto program = Decode(stage, binary);
+      Check(program.instructions[2].opcode == PcoOpcode::kIntegerAdd64_32 &&
+                program.instructions[2].address_offset_signed == 1 &&
+                program.instructions[4].opcode == PcoOpcode::kBufferLoad &&
+                program.instructions[4].component_count == count,
+            "Mesa UBO ADD64_32.S and native LD decode");
+      Check(CountPcoInstructions({program.instructions[4]}, true).memory == 1,
+            "a 1..16 DWORD LD counts as one memory instruction");
+      for (const std::int32_t offset : {12, -8}) {
+        // Positive offset carries into the high word; negative offset must
+        // sign extend instead of accidentally adding 4 GiB.
+        const std::uint64_t base = UINT64_C(0x1fffffff8);
+        Memory memory{base + static_cast<std::uint64_t>(offset) + 4U, count};
+        PcoVertexExecutionContext vs;
+        PcoFragmentExecutionContext fs;
+        vs.shared_count = fs.shared_count = 5;
+        vs.shared_registers[0] = fs.shared_registers[0] = static_cast<std::uint32_t>(base);
+        vs.shared_registers[1] = fs.shared_registers[1] = static_cast<std::uint32_t>(base >> 32U);
+        vs.shared_registers[2] = fs.shared_registers[2] = 65536;
+        vs.shared_registers[3] = fs.shared_registers[3] = 4;
+        vs.shared_registers[4] = fs.shared_registers[4] = static_cast<std::uint32_t>(offset);
+        vs.memory_read = fs.memory_read = read;
+        vs.memory_user_data = fs.memory_user_data = &memory;
+        // The fixture exports at most four registers. Move that observation
+        // window over the decoded TEMP response, checking all DWORDs without
+        // adding any load, conversion, or shader-result shortcut to the ISS.
+        for (unsigned window = 0; window < count; window += 4) {
+          const unsigned base = count > 4 ? std::min(window, count - 4) : 0;
+          auto instructions = program.instructions;
+          for (auto &instruction : instructions) {
+            if ((instruction.target == PcoWriteTarget::kVertexOutput ||
+                 instruction.target == PcoWriteTarget::kPixelOutput) &&
+                instruction.source.bank == PcoRegisterBank::kTemporary)
+              instruction.source.index += base;
+          }
+          memory.reads = 0;
+          if (vertex) {
+            const auto output = ExecuteVertex(program.summary, instructions, {}, vs);
+            for (unsigned channel = 0; channel < std::min(count, 4U); ++channel)
+              Check(output.outputs[channel] == memory.words[base + channel],
+                    "vertex LD preserves every raw DWORD in a 1..16 burst");
+          } else {
+            const auto output = ExecuteFragment(program.summary, instructions, fs);
+            for (unsigned channel = 0; channel < 4; ++channel)
+              Check(output.pixel_outputs[channel] ==
+                        (channel < count ? memory.words[base + channel] : 0),
+                    "fragment LD preserves every raw DWORD in a 1..16 burst");
+          }
+          Check(memory.reads == 1, "one native LD performs one modeled read");
+        }
+        vs.memory_read = fs.memory_read = nullptr;
+        ExpectFailure([&] {
+          if (vertex) ExecuteVertex(program.summary, program.instructions, {}, vs);
+          else ExecuteFragment(program.summary, program.instructions, fs);
+        }, "LD refuses absent modeled memory callback");
+        vs.memory_read = fs.memory_read = read;
+        vs.shared_registers[4] = fs.shared_registers[4] = 1;
+        ExpectFailure([&] {
+          if (vertex) ExecuteVertex(program.summary, program.instructions, {}, vs);
+          else ExecuteFragment(program.summary, program.instructions, fs);
+        }, "LD rejects unaligned computed address");
+      }
+      for (unsigned mutation = 0; mutation < 4; ++mutation) {
+        auto invalid = binary;
+        if (mutation == 0) invalid[51] |= 8U; // DRC1.
+        if (mutation == 1) invalid[53] |= 2U; // Reserved operation bit.
+        if (mutation == 2) invalid[55] = 0x3f; // Non-TEMP response.
+        if (mutation == 3) invalid[60] = 0; // Missing matching WDF.
+        ExpectFailure([&] { Decode(stage, invalid); }, "malformed native LD fails closed");
+      }
+      {
+        auto invalid = binary;
+        const unsigned output = kPcoTemporaryCount + 1U - count;
+        invalid[48] += 1; // Extended upper source adds two bytes to the group.
+        invalid[55] = static_cast<std::uint8_t>(0xc0U | (output & 63U));
+        invalid.insert(invalid.begin() + 56,
+                       {static_cast<std::uint8_t>((output >> 6U) & 3U),
+                        static_cast<std::uint8_t>((output >> 8U) & 7U)});
+        ExpectFailure([&] { Decode(stage, invalid); },
+                      "native LD response cannot extend past TEMP255");
+      }
+      auto invalid = program.instructions;
+      invalid[4].component_count = 17;
+      ExpectFailure([&] { CountPcoInstructions(invalid, true); },
+                    "decoded LD rejects more than sixteen DWORDs");
+      if (count == 16) {
+        auto instructions = program.instructions;
+        instructions[4].output_index = 240;
+        for (auto &instruction : instructions) {
+          if (instruction.target == PcoWriteTarget::kVertexOutput ||
+              instruction.target == PcoWriteTarget::kPixelOutput)
+            instruction.source.index += 252;
+        }
+        Memory memory{UINT64_C(0x100002000), count};
+        PcoVertexExecutionContext vs;
+        PcoFragmentExecutionContext fs;
+        vs.shared_count = fs.shared_count = 5;
+        vs.shared_registers[0] = fs.shared_registers[0] = 0x2000;
+        vs.shared_registers[1] = fs.shared_registers[1] = 1;
+        vs.shared_registers[2] = fs.shared_registers[2] = 65536;
+        vs.memory_read = fs.memory_read = read;
+        vs.memory_user_data = fs.memory_user_data = &memory;
+        if (vertex) {
+          const auto output = ExecuteVertex(program.summary, instructions, {}, vs);
+          Check(output.outputs[0] == memory.words[12] &&
+                    output.outputs[3] == memory.words[15],
+                "sixteen-DWORD vertex LD can end exactly at TEMP255");
+        } else {
+          const auto output = ExecuteFragment(program.summary, instructions, fs);
+          Check(output.pixel_outputs[0] == memory.words[12] &&
+                    output.pixel_outputs[3] == memory.words[15],
+                "sixteen-DWORD fragment LD can end exactly at TEMP255");
+        }
+        instructions[4].output_index = 241;
+        ExpectFailure([&] {
+          if (vertex) ExecuteVertex(program.summary, instructions, {}, vs);
+          else ExecuteFragment(program.summary, instructions, fs);
+        }, "decoded sixteen-DWORD LD must not overflow the TEMP file");
+        Check(memory.reads == 1, "invalid LD response range never reaches memory");
+      }
+    }
+  }
+
+  // Concatenate only genuine compiler groups: UBO LD/WDF, the Terrain
+  // set1 SMP/WDF, another UBO LD/WDF, then the UBO fixture's output tail.
+  // The second load must execute after resumption, without repeating the first.
+  const auto sample = BytesFromHex(
+      "57 a0 00 f4 4c 94 60 80 1c 88 80 a0 00 ff 02 80 6a ff");
+  for (const bool vertex : {false, true}) {
+    for (const unsigned count : {4U, 16U}) {
+    const auto original = binary_for_count(vertex, count);
+    std::vector<std::uint8_t> binary(original.begin(), original.begin() + 62);
+    binary.insert(binary.end(), sample.begin(), sample.end());
+    binary.insert(binary.end(), original.begin(), original.end());
+    auto program = Decode(vertex ? ShaderStage::kVertex : ShaderStage::kFragment,
+                          binary);
+    auto wide_sample = program.instructions;
+    wide_sample[6].component_count = 16;
+    ExpectFailure([&] { CountPcoInstructions(wide_sample, true); },
+                  "supporting LD16 must not permit a sixteen-component SMP");
+    for (auto &instruction : program.instructions) {
+      if (instruction.target == PcoWriteTarget::kVertexOutput ||
+          instruction.target == PcoWriteTarget::kPixelOutput)
+        instruction.source.index += count - 4U;
+    }
+    Memory memory{UINT64_C(0x100002000), count};
+    PcoVertexExecutionContext vs;
+    PcoFragmentExecutionContext fs;
+    vs.shared_count = fs.shared_count = 40;
+    vs.shared_registers[0] = fs.shared_registers[0] = 0x2000;
+    vs.shared_registers[1] = fs.shared_registers[1] = 1;
+    vs.shared_registers[2] = fs.shared_registers[2] = 65536;
+    vs.memory_read = fs.memory_read = read;
+    vs.memory_user_data = fs.memory_user_data = &memory;
+    const std::array<std::uint32_t, 4> response{0xdeadbeef, 3, 5, 7};
+    if (vertex) {
+      const auto first = ExecuteVertex(program.summary, program.instructions, {}, vs);
+      Check(first.suspended == 1 && memory.reads == 1 &&
+                first.texture_request.component_count == 4 &&
+                first.continuation.pending_component_count == 4,
+            "vertex native LD executes before texture suspension");
+      ExpectFailure([&] {
+        ResumeVertexPco(program.summary, program.instructions, first.continuation, response);
+      }, "vertex continuation cannot retain a host memory callback");
+      const auto second = ResumeVertexPco(program.summary, program.instructions,
+                                          first.continuation, response, read, &memory);
+      Check(second.suspended == 0 && second.outputs[0] == memory.words[count - 4] &&
+                second.outputs[3] == memory.words[count - 1] && memory.reads == 2 &&
+                first.executed_instruction_count + second.executed_instruction_count ==
+                    program.instructions.size(),
+            "vertex resume executes the next LD once with fresh memory context");
+    } else {
+      const auto first = ExecuteFragment(program.summary, program.instructions, fs);
+      Check(first.suspended == 1 && memory.reads == 1 &&
+                first.texture_request.component_count == 4 &&
+                first.continuation.pending_component_count == 4,
+            "fragment native LD executes before texture suspension");
+      fs.continuation = first.continuation;
+      fs.texture_response = response;
+      fs.texture_response_valid = 1;
+      fs.memory_read = nullptr;
+      ExpectFailure([&] { ExecuteFragment(program.summary, program.instructions, fs); },
+                    "fragment continuation cannot retain a host memory callback");
+      fs.memory_read = read;
+      const auto second = ExecuteFragment(program.summary, program.instructions, fs);
+      Check(second.suspended == 0 && second.pixel_outputs[0] == memory.words[count - 4] &&
+                second.pixel_outputs[3] == memory.words[count - 1] && memory.reads == 2 &&
+                first.executed_instruction_count + second.executed_instruction_count ==
+                    program.instructions.size(),
+            "fragment resume executes the next LD once with fresh memory context");
+    }
+    }
+  }
+}
+
+void TestTemporaryFile256() {
+  using namespace pvrgpu::stub;
+  PcoTemporaryMask mask;
+  for (unsigned index = 0; index < 256; ++index) {
+    Check(!mask.test(index), "TEMP mask starts unwritten in every word");
+    mask.set(index);
+    Check(mask.test(index) && mask.contains_range(0, index + 1),
+          "TEMP mask tracks all 256 independent registers");
+  }
+  Check(mask.contains_range(60, 136) && !mask.contains_range(255, 2) &&
+            !mask.contains_range(SIZE_MAX, 2) &&
+            !mask.contains_range(1, SIZE_MAX) && !mask.test(256),
+        "TEMP mask ranges cross words without accepting wraparound");
+  ExpectFailure([&] { mask.set(256); }, "TEMP mask rejects index 256");
+
+  struct Memory {
+    unsigned count;
+    unsigned reads = 0;
+    std::array<std::uint32_t, 16> words{};
+  };
+  const auto read = +[](void *opaque, std::uint64_t address,
+                        std::uint32_t count, std::uint32_t *destination) {
+    auto &memory = *static_cast<Memory *>(opaque);
+    Check(address == UINT64_C(0x100002000) && count == memory.count,
+          "high-TEMP native LD reads the computed address and exact width");
+    std::copy_n(memory.words.begin(), count, destination);
+    ++memory.reads;
+  };
+  for (const bool vertex : {false, true}) {
+    for (const auto [base, count] : {
+             std::pair<unsigned, unsigned>{63, 2}, {64, 1}, {127, 2}, {128, 1},
+             {191, 2}, {192, 1}, {240, 16}, {252, 4}, {255, 1}}) {
+      const auto binary = test::TemporaryFileUniformBufferFixture(vertex, base, count);
+      const auto stage = vertex ? ShaderStage::kVertex : ShaderStage::kFragment;
+      const auto program = Decode(stage, binary);
+      Check(program.instructions[4].output_index == base &&
+                program.instructions[4].component_count == count &&
+                program.instructions[6].source.index == base + count - 1,
+            "Mesa extended upper LD and lower export operands decode exactly");
+      Memory memory{count};
+      for (unsigned channel = 0; channel < count; ++channel)
+        memory.words[channel] = 0x7fa12345U ^ (0x01010101U * channel);
+      PcoVertexExecutionContext vs;
+      PcoFragmentExecutionContext fs;
+      vs.shared_count = fs.shared_count = 40;
+      vs.shared_registers[0] = fs.shared_registers[0] = 0x2000;
+      vs.shared_registers[1] = fs.shared_registers[1] = 1;
+      vs.shared_registers[2] = fs.shared_registers[2] = 65536;
+      vs.memory_read = fs.memory_read = read;
+      vs.memory_user_data = fs.memory_user_data = &memory;
+      if (vertex) {
+        const auto output = ExecuteVertex(program.summary, program.instructions, {}, vs);
+        for (unsigned channel = 0; channel < 4; ++channel)
+          Check(output.outputs[channel] == memory.words[count - 1],
+                "native vertex export reads every high TEMP boundary");
+      } else {
+        const auto output = ExecuteFragment(program.summary, program.instructions, fs);
+        for (unsigned channel = 0; channel < 4; ++channel)
+          Check(output.pixel_outputs[channel] == memory.words[count - 1],
+                "native fragment export reads every high TEMP boundary");
+      }
+      Check(memory.reads == 1, "high-TEMP packet issues one modeled read");
+
+      // The low TEMP SMP response must preserve the distinct high TEMP words
+      // and their four-word ownership mask across both stage continuations.
+      const auto sample = BytesFromHex(
+          "57 a0 00 f4 4c 94 60 80 1c 88 80 a0 00 ff 02 80 6a ff");
+      auto mixed = binary;
+      mixed.insert(mixed.begin() + 64, sample.begin(), sample.end());
+      const auto suspended_program = Decode(stage, mixed);
+      const std::array<std::uint32_t, 4> response{1, 2, 3, 4};
+      if (vertex) {
+        const auto first = ExecuteVertex(suspended_program.summary,
+                                         suspended_program.instructions, {}, vs);
+        Check(first.suspended &&
+                  first.continuation.temporary_written_mask.contains_range(base, count),
+              "vertex continuation retains high TEMP ownership");
+        const auto second = ResumeVertex(suspended_program.summary,
+                                          suspended_program.instructions,
+                                          first.continuation, response);
+        Check(second.outputs[3] == memory.words[count - 1],
+              "vertex high TEMP contents survive SMP response writeback");
+        auto invalid = first.continuation;
+        invalid.temporary_written_mask.words[(base + count - 1) / 64] ^=
+            UINT64_C(1) << ((base + count - 1) % 64);
+        ExpectFailure([&] { ResumeVertex(suspended_program.summary,
+            suspended_program.instructions, invalid, response); },
+            "vertex continuation rejects high-word TEMP ownership corruption");
+      } else {
+        const auto first = ExecuteFragment(suspended_program.summary,
+                                           suspended_program.instructions, fs);
+        Check(first.suspended &&
+                  first.continuation.temporary_written_mask.contains_range(base, count),
+              "fragment continuation retains high TEMP ownership");
+        const auto second = ResumeFragment(suspended_program.summary,
+                                            suspended_program.instructions,
+                                            first.continuation, response);
+        Check(second.pixel_outputs[3] == memory.words[count - 1],
+              "fragment high TEMP contents survive SMP response writeback");
+        auto invalid = first.continuation;
+        invalid.temporary_written_mask.words[(base + count - 1) / 64] ^=
+            UINT64_C(1) << ((base + count - 1) % 64);
+        ExpectFailure([&] { ResumeFragment(suspended_program.summary,
+            suspended_program.instructions, invalid, response); },
+            "fragment continuation rejects high-word TEMP ownership corruption");
+      }
+    }
+    for (const unsigned address : {63U, 64U, 127U, 128U, 191U, 192U, 240U, 254U}) {
+      for (const bool long_form : {false, true}) {
+        const auto binary = test::TemporaryAddressUniformBufferFixture(
+            vertex, address, long_form);
+        const auto stage = vertex ? ShaderStage::kVertex : ShaderStage::kFragment;
+        const auto program = Decode(stage, binary);
+        Check(program.instructions[3].output_index == address &&
+                  program.instructions[3].output_index1 == address + 1 &&
+                  program.instructions[4].source.index == address,
+              "native extended ADD64_32 pair feeds the exact high TEMP LD address");
+        Memory memory{1};
+        memory.words[0] = 0x7fa12345;
+        PcoVertexExecutionContext vs;
+        PcoFragmentExecutionContext fs;
+        vs.shared_count = fs.shared_count = 5;
+        vs.shared_registers[0] = fs.shared_registers[0] = 0x2000;
+        vs.shared_registers[1] = fs.shared_registers[1] = 1;
+        vs.shared_registers[2] = fs.shared_registers[2] = 65536;
+        vs.memory_read = fs.memory_read = read;
+        vs.memory_user_data = fs.memory_user_data = &memory;
+        if (vertex) {
+          const auto output = ExecuteVertex(program.summary, program.instructions, {}, vs);
+          Check(output.outputs[3] == memory.words[0],
+                "vertex ADD64_32 high pair preserves address and raw memory payload");
+        } else {
+          const auto output = ExecuteFragment(program.summary, program.instructions, fs);
+          Check(output.pixel_outputs[3] == memory.words[0],
+                "fragment ADD64_32 high pair preserves address and raw memory payload");
+        }
+        Check(memory.reads == 1, "extended ADD64_32 result reaches memory exactly once");
+        auto invalid = binary;
+        invalid[47] |= 0x02; // Add an upper bank bit to destination0.
+        ExpectFailure([&] { Decode(stage, invalid); },
+                      "ADD64_32 rejects non-TEMP extended destination banks");
+        if (long_form) {
+          invalid = binary;
+          invalid[48] = 0x40;
+          ExpectFailure([&] { Decode(stage, invalid); },
+                        "ADD64_32 rejects reserved long-destination bits");
+          invalid[48] = 0x01;
+          ExpectFailure([&] { Decode(stage, invalid); },
+                        "ADD64_32 rejects extended destinations beyond TEMP255");
+        }
+      }
+    }
+    const auto invalid = test::TemporaryFileUniformBufferFixture(vertex, 256, 1);
+    ExpectFailure([&] { Decode(vertex ? ShaderStage::kVertex : ShaderStage::kFragment,
+                               invalid); }, "native extended LD rejects TEMP256");
+  }
+}
+
 int main() {
   try {
     TestEmbeddedBinaries();
@@ -6826,6 +7225,8 @@ int main() {
     TestIntegerFloatAddRoundingAndClasses();
     TestDecodeAndExecuteFragment();
     TestDepthFeedback();
+    TestUniformBufferLoads();
+    TestTemporaryFile256();
     TestDecodeAndExecuteHalfAlphaFragments();
     TestDecodeAndExecuteTriangleSetupOrange();
     TestDecodeAndExecuteTriangleSetupHalfCulledCyan();

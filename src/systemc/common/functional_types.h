@@ -494,6 +494,15 @@ struct VertexBufferResource {
   std::uint32_t reserved = 0;
 };
 
+// Exact immutable bound range for one stage-local UBO. DRAM's page-presence
+// check is deliberately insufficient: loads must also fit this byte range.
+struct UniformBufferResource {
+  std::uint64_t gpu_address = 0;
+  std::uint64_t bytes = 0;
+  std::uint32_t block_index = 0;
+  std::uint32_t descriptor_shared_start = 0;
+};
+
 // Hardware-facing vertex input route. source_components are fetched from the
 // VBO; destination_components also materialize the GLES defaults (0,0,0,1)
 // into consecutive PCO VTXIN registers. Defaults are not memory traffic.
@@ -1050,6 +1059,7 @@ static_assert(std::is_trivially_copyable_v<FaceCullState>);
 static_assert(std::is_trivially_copyable_v<RasterState>);
 static_assert(std::is_trivially_copyable_v<InputVertex>);
 static_assert(std::is_trivially_copyable_v<VertexBufferResource>);
+static_assert(std::is_trivially_copyable_v<UniformBufferResource>);
 static_assert(std::is_trivially_copyable_v<VertexAttributeBinding>);
 static_assert(std::is_trivially_copyable_v<VertexLane>);
 static_assert(std::is_trivially_copyable_v<VertexLaneRef>);

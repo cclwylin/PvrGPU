@@ -95,6 +95,8 @@ struct PipelineState {
   // source index.
   PoolHandle expanded_source_vertices;
   PoolHandle vertex_shared_registers;
+  PoolHandle vertex_uniform_buffer_resources;
+  PoolHandle fragment_uniform_buffer_resources;
   PoolHandle shader_varying_bindings;
   PoolHandle vertex_texture_resources;
   PoolHandle vertex_sampler_states;

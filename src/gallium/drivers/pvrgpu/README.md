@@ -59,6 +59,12 @@ Current status:
   shader-depth tests through SystemC. Typed CPU clears/blits preserve native
   resource storage and materialize pending model output first. API v20 carries
   initial color/depth/stencil payloads and exact sample-count readback.
+- API v21 snapshots each draw's bound VS/FS uniform-buffer ranges independently
+  from CB0 push constants. Native Mesa PCO descriptor lowering and LD/WDF
+  execute against stage-local GPU-memory ranges; rebinding or updating a
+  buffer cannot alter an earlier draw. The transport supports up to 15 blocks
+  per stage, 64 KiB per bound range and 256 TEMP registers. Missing or invalid
+  payloads fail closed; text summaries alone cannot replay UBO draws.
 - The historical Phase 0–6 observations below remain available alongside that
   generic path; their counter-only limits do not describe all current draws.
 - Phase 0/1/2/3/4/5/6 bring-up driver.
@@ -83,7 +89,7 @@ Current status:
 - Mesa's upload manager is initialized for state-tracker internal uploads, and resource release hooks are wired so teardown is clean.
 - narrow draw lowering/rasterization exists for the supported command profiles; all other draw shapes still record `unsupported_draw`.
 - Shader/texture forms beyond the implemented generic ISA and sampler contract,
-  UBO layout correctness, EGL image import/export, compute, and asynchronous
+  EGL image import/export, compute, and asynchronous
   synchronization remain unsupported or separately unvalidated. Incomplete
   RDC replay's intermediate ordered stencil-clear capsule still does not
   express a partial write mask; the live path instead LOADs its already-masked

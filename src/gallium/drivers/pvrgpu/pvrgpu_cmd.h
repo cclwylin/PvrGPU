@@ -131,6 +131,8 @@ struct pvrgpu_draw_pco_stage_abi {
    uint32_t push_constant_start;
    uint32_t push_constant_count;
    uint32_t entry_offset;
+   uint32_t uniform_buffer_descriptor_start;
+   uint32_t uniform_buffer_descriptor_count;
 };
 
 struct pvrgpu_draw_pco_triangles_command {
@@ -209,6 +211,8 @@ struct pvrgpu_draw_pco_triangles_command {
    size_t vertex_shared_count;
    const uint32_t *fragment_shared;
    size_t fragment_shared_count;
+   const struct pvrgpu_systemc_pco_uniform_buffer *uniform_buffers;
+   uint32_t uniform_buffer_count;
 
    uint32_t sampled_texture_count;
    const uint8_t *sampled_texture_bytes;

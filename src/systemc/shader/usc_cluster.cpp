@@ -11,6 +11,7 @@
 #include "common/functional_types.h"
 #include "common/pipeline_state.h"
 #include "shader/pco_iss.h"
+#include "shader/usc_uniform_buffer_memory.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -31,12 +32,24 @@ bool DriverPcoTextureSharedLayoutSupported(
       descriptor_set_count > kPcoMaximumTextureDescriptorSets) {
     return false;
   }
-  const std::uint64_t descriptor_shared_dwords =
+  std::uint64_t descriptor_shared_dwords =
       static_cast<std::uint64_t>(descriptor_set_count) *
       kPcoTextureDescriptorDwordCount;
+  if (abi.uniform_buffer_descriptor_count > kMaximumUniformBuffersPerStage ||
+      (abi.uniform_buffer_descriptor_count == 0 &&
+       abi.uniform_buffer_descriptor_start != 0) ||
+      (abi.uniform_buffer_descriptor_count != 0 &&
+       abi.uniform_buffer_descriptor_start != descriptor_shared_dwords))
+    return false;
+  descriptor_shared_dwords +=
+      static_cast<std::uint64_t>(abi.uniform_buffer_descriptor_count) *
+      kUniformBufferDescriptorDwordCount;
+  if (abi.shareds > kPcoMaximumFragmentSharedCount)
+    return false;
   if (abi.push_constant_count == 0) {
     return abi.shareds == descriptor_shared_dwords &&
-           (abi.push_constant_start == 0 ||
+           ((abi.uniform_buffer_descriptor_count == 0 &&
+             abi.push_constant_start == 0) ||
             abi.push_constant_start == descriptor_shared_dwords);
   }
   const std::uint64_t push_end =
@@ -181,8 +194,8 @@ void RecordInstructionExecutions(
 } // namespace
 
 UscCluster::UscCluster(sc_core::sc_module_name name, MemoryPool &pool,
-                       ShaderStage stage)
-    : sc_module(name), pool_(pool), stage_(stage) {
+                       ShaderStage stage, GpuMemorySystem *memory)
+    : sc_module(name), pool_(pool), stage_(stage), memory_(memory) {
   SC_THREAD(Run);
 }
 
@@ -221,6 +234,15 @@ void UscCluster::Run() {
     if (!IsRasterFunctionalCase(state.functional_case))
       throw std::runtime_error("USC cluster received an unsupported case");
 
+    const PoolHandle uniform_resources = stage_ == ShaderStage::kVertex
+        ? state.vertex_uniform_buffer_resources
+        : state.fragment_uniform_buffer_resources;
+    UscUniformBufferMemory uniform_memory(
+        memory_, state.memory_mode,
+        HasPoolHandle(uniform_resources)
+            ? LoadArray<UniformBufferResource>(pool_, uniform_resources)
+            : std::vector<UniformBufferResource>{});
+
     const std::uint64_t groups = stage_ == ShaderStage::kVertex
                                      ? state.vertex_groups
                                      : state.fragment_groups;
@@ -243,6 +265,8 @@ void UscCluster::Run() {
       if (lanes.size() != state.counters.vs_invocations)
         throw std::runtime_error("vertex USC lane count mismatch");
       PcoVertexExecutionContext vertex_context;
+      vertex_context.memory_read = UscUniformBufferMemory::Read;
+      vertex_context.memory_user_data = &uniform_memory;
       const bool vertex_texture_case =
           UsesTextureSampling(state, ShaderStage::kVertex);
       const bool driver_pco =
@@ -269,7 +293,7 @@ void UscCluster::Run() {
         if (shared.size() != expected_shared_count) {
           throw std::runtime_error("vertex USC shared-register count mismatch");
         }
-        vertex_context.shared_count = static_cast<std::uint8_t>(shared.size());
+        vertex_context.shared_count = static_cast<std::uint16_t>(shared.size());
         for (std::size_t index = 0; index < shared.size(); ++index)
           vertex_context.shared_registers[index] = shared[index].value;
       } else if (HasPoolHandle(state.vertex_shared_registers)) {
@@ -522,7 +546,7 @@ void UscCluster::Run() {
                       texture_response.begin());
             const PcoVertexExecution execution = ResumeVertexPco(
                 state.vertex_program_summary, instructions, saved,
-                texture_response);
+                texture_response, UscUniformBufferMemory::Read, &uniform_memory);
             queue_suspension(lane_index, execution, next_requests,
                              next_continuations, next_queued);
           }
@@ -907,14 +931,16 @@ void UscCluster::Run() {
                       << execution.continuation.resume_instruction_index
                       << " pending="
                       << execution.continuation.pending_output_index
-                      << " temp_mask=0x" << std::hex
-                      << execution.continuation.temporary_written_mask
-                      << std::dec << " temps=";
+                      << " temp_mask=0x" << std::hex << std::setfill('0');
+            for (auto word = execution.continuation.temporary_written_mask.words.rbegin();
+                 word != execution.continuation.temporary_written_mask.words.rend();
+                 ++word)
+              std::cerr << std::setw(16) << *word;
+            std::cerr << std::dec << std::setfill(' ') << " temps=";
             for (std::size_t temporary = 0;
                  temporary < execution.continuation.temporaries.size();
                  ++temporary) {
-              if ((execution.continuation.temporary_written_mask &
-                   (UINT64_C(1) << temporary)) == 0)
+              if (!execution.continuation.temporary_written_mask.test(temporary))
                 continue;
               std::cerr << temporary << ":0x" << std::hex << std::setw(8)
                         << std::setfill('0')
@@ -954,9 +980,11 @@ void UscCluster::Run() {
                 "texture fragment USC received an invalid quad mask");
           }
           PcoFragmentExecutionContext context;
+          context.memory_read = UscUniformBufferMemory::Read;
+          context.memory_user_data = &uniform_memory;
           context.coefficient_count = static_cast<std::uint8_t>(
               task.coefficient_dword_count);
-          context.shared_count = static_cast<std::uint8_t>(
+          context.shared_count = static_cast<std::uint16_t>(
               shared_registers.size());
           for (std::size_t dword = 0;
                dword < task.coefficient_dword_count; ++dword) {
@@ -1222,11 +1250,13 @@ void UscCluster::Run() {
         for (std::size_t index = 0; index < invocations.size(); ++index) {
           const FragmentInvocation &invocation = invocations[index];
           PcoFragmentExecutionContext context;
+          context.memory_read = UscUniformBufferMemory::Read;
+          context.memory_user_data = &uniform_memory;
           context.sample_x =
               FloatBits(static_cast<float>(invocation.x) + 0.5F);
           context.sample_y =
               FloatBits(static_cast<float>(invocation.y) + 0.5F);
-          context.shared_count = static_cast<std::uint8_t>(
+          context.shared_count = static_cast<std::uint16_t>(
               shared_registers.size());
           for (std::size_t shared = 0; shared < shared_registers.size();
                ++shared) {
@@ -1297,6 +1327,8 @@ void UscCluster::Run() {
                 "varying fragment USC received an invalid quad lane mask");
           }
           PcoFragmentExecutionContext context;
+          context.memory_read = UscUniformBufferMemory::Read;
+          context.memory_user_data = &uniform_memory;
           if (task.coefficient_dword_count > context.coefficients.size() ||
               task.coefficient_dword_count >
                   std::numeric_limits<std::uint8_t>::max()) {
@@ -1306,7 +1338,7 @@ void UscCluster::Run() {
           context.coefficient_count = static_cast<std::uint8_t>(
               task.coefficient_dword_count);
           context.shared_count =
-              static_cast<std::uint8_t>(shared_registers.size());
+              static_cast<std::uint16_t>(shared_registers.size());
           for (std::size_t dword = 0;
                dword < task.coefficient_dword_count; ++dword) {
             context.coefficients[dword] =
@@ -1368,12 +1400,16 @@ void UscCluster::Run() {
       state.stage = PipelineStage::kFragmentShaded;
     }
 
-    const std::uint64_t cycles =
+    std::uint64_t cycles =
         groups == 0
             ? 0
             : kReferenceUarch.usc_cluster_base_cycles +
                   CeilDivide(groups,
                              kReferenceUarch.usc_groups_per_cluster_batch);
+    // Texture suspension can reload PipelineState; apply the independent LD
+    // accounting once to the latest state, after all shader lanes complete.
+    ApplyMemoryAccessStats(state.counters, uniform_memory.stats());
+    AddInstructionCounter(cycles, MemoryAccessDelayCycles(uniform_memory.stats()));
     state.counters.usc_groups += groups;
     state.counters.usc_cluster_cycles += cycles;
     if (stage_ == ShaderStage::kVertex)

@@ -759,7 +759,8 @@ private:
   VertexFetch vertex_fetch{"vertex_fetch", pool, &memory};
   PcoDecoder vertex_decoder{"vertex_pco_decoder", pool, ShaderStage::kVertex};
   UscSlot vertex_slot{"vertex_usc_slot", pool, ShaderStage::kVertex};
-  UscCluster vertex_cluster{"vertex_usc_cluster", pool, ShaderStage::kVertex};
+  UscCluster vertex_cluster{"vertex_usc_cluster", pool, ShaderStage::kVertex,
+                            &memory};
   ClipCull clip_cull{"clip_cull", pool};
   Tiler tiler{"tiler", pool};
   ParameterBuffer parameter_buffer{"parameter_buffer", pool, &memory};
@@ -772,7 +773,7 @@ private:
                               ShaderStage::kFragment};
   UscSlot fragment_slot{"fragment_usc_slot", pool, ShaderStage::kFragment};
   UscCluster fragment_cluster{"fragment_usc_cluster", pool,
-                              ShaderStage::kFragment};
+                              ShaderStage::kFragment, &memory};
   TextureUnit texture_unit{"texture_unit", pool, &memory};
   Pbe pbe{"pbe", pool};
   PbeWriteBack pbe_write_back{"pbe_write_back", pool, &memory};

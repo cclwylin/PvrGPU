@@ -373,6 +373,17 @@ target_include_directories(pco-sequence-profiles-test PRIVATE
 pvrgpu_target_warnings(pco-sequence-profiles-test)
 add_test(NAME pco-sequence-profiles-unit COMMAND pco-sequence-profiles-test)
 
+add_executable(pco-test-select-mbyp-test
+    tests/pco_test_select_mbyp_test.cpp
+    src/systemc/shader/pco_iss.cpp
+)
+target_include_directories(pco-test-select-mbyp-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(pco-test-select-mbyp-test)
+add_test(NAME pco-test-select-mbyp-unit COMMAND pco-test-select-mbyp-test)
+
 add_executable(driver-command-test
     tests/driver_command_test.cpp
     model_stub/driver_command.cpp
@@ -449,6 +460,10 @@ target_link_libraries(pco-initial-color-load-test PRIVATE
 )
 pvrgpu_target_warnings(pco-initial-color-load-test)
 add_test(NAME pco-initial-color-load-unit COMMAND pco-initial-color-load-test)
+add_test(NAME pco-uniform-buffer-bypass-unit
+    COMMAND pco-initial-color-load-test ubo-bypass)
+add_test(NAME pco-uniform-buffer-cache-unit
+    COMMAND pco-initial-color-load-test ubo-cache)
 
 add_executable(pco-initial-depth-load-test tests/pco_initial_depth_load_test.cpp)
 target_include_directories(pco-initial-depth-load-test PRIVATE
@@ -560,6 +575,26 @@ target_include_directories(texture-filter-test PRIVATE
 target_link_libraries(texture-filter-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(texture-filter-test)
 add_test(NAME texture-filter-unit COMMAND texture-filter-test)
+
+add_executable(usc-uniform-buffer-memory-test
+    tests/usc_uniform_buffer_memory_test.cpp
+)
+target_include_directories(usc-uniform-buffer-memory-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(usc-uniform-buffer-memory-test)
+add_test(NAME usc-uniform-buffer-memory-unit COMMAND usc-uniform-buffer-memory-test)
+
+add_executable(uniform-buffer-contract-test
+    tests/uniform_buffer_contract_test.cpp
+)
+target_include_directories(uniform-buffer-contract-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(uniform-buffer-contract-test)
+add_test(NAME uniform-buffer-contract-unit COMMAND uniform-buffer-contract-test)
 
 add_executable(usc-cluster-texture-continuation-test
     tests/usc_cluster_texture_continuation_test.cpp

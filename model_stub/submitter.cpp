@@ -12,6 +12,7 @@
 // 大型 vertex/index/pipeline payload 留在 MemoryPool，output FIFO 只傳
 // PipelineTxn handle 與 frame/sequence metadata。
 #include "submitter.h"
+#include "uniform_buffers.h"
 
 #include "common/functional_types.h"
 #include "common/glbench_triangle_fixture.h"
@@ -76,6 +77,25 @@ inline constexpr std::uint64_t kBuiltinIndexBufferGpuAddress =
     kBuiltinVertexBufferGpuAddress + kDriverSequenceAddressRegionBytes;
 inline constexpr std::uint64_t kBuiltinTexcoordBufferGpuAddress =
     kBuiltinIndexBufferGpuAddress + kDriverSequenceAddressRegionBytes;
+// UBO addresses are full 64-bit descriptor addresses. Reserve the region after
+// all three large vertex/index/UV regions, not inside texture/attachment space.
+inline constexpr std::uint64_t kUniformBufferGpuAddressBase =
+    kBuiltinTexcoordBufferGpuAddress + kDriverSequenceAddressRegionBytes;
+
+std::uint64_t SequenceUniformBufferAddress(
+    std::size_t submission, DriverPcoShaderStage stage, std::uint32_t block) {
+  const auto stage_index = static_cast<unsigned>(stage);
+  if (submission >= kDriverSequenceAddressSlots || stage_index > 1 ||
+      block >= kMaximumUniformBuffersPerStage)
+    throw std::runtime_error("Submitter uniform buffer address slot is invalid");
+  const std::uint64_t slot =
+      (static_cast<std::uint64_t>(submission) * 2U + stage_index) *
+          kMaximumUniformBuffersPerStage + block;
+  if (slot > (std::numeric_limits<std::uint64_t>::max() -
+              kUniformBufferGpuAddressBase) / kMaximumUniformBufferBytes)
+    throw std::overflow_error("Submitter uniform buffer address wraps");
+  return kUniformBufferGpuAddressBase + slot * kMaximumUniformBufferBytes;
+}
 
 // The address a submission's vertex or index buffer owns.  Sequences longer
 // than the region holds are refused by name rather than wrapped onto a
@@ -2196,6 +2216,39 @@ void Submitter::RunJob() {
     } else if (driver_pco_triangles) {
       std::vector<std::uint32_t> vertex_shared_words = command.vertex_shared;
       std::vector<std::uint32_t> fragment_shared = command.fragment_shared;
+      std::string uniform_error;
+      if (!ValidateDriverUniformBuffers(command, &uniform_error))
+        throw std::runtime_error(uniform_error);
+      if (!command.uniform_buffers.empty()) {
+        if (!driver_pco_sequence_command || !memory_)
+          throw std::runtime_error("Submitter uniform buffers require sequence GPU memory");
+        std::vector<UniformBufferResource> vertex_uniform_buffers;
+        std::vector<UniformBufferResource> fragment_uniform_buffers;
+        for (const auto &buffer : command.uniform_buffers) {
+          const bool vertex_stage = buffer.stage == DriverPcoShaderStage::kVertex;
+          const auto &abi = vertex_stage ? command.vertex_pco_abi
+                                         : command.fragment_pco_abi;
+          auto &shared = vertex_stage ? vertex_shared_words : fragment_shared;
+          UniformBufferResource resource;
+          resource.gpu_address = SequenceUniformBufferAddress(
+              submission, buffer.stage, buffer.block_index);
+          resource.bytes = buffer.bytes.size();
+          resource.block_index = buffer.block_index;
+          resource.descriptor_shared_start = abi.uniform_buffer_descriptor_start +
+              buffer.block_index * kUniformBufferDescriptorDwordCount;
+          HostWriteArray(*memory_, resource.gpu_address, buffer.bytes);
+          const std::size_t word = resource.descriptor_shared_start;
+          shared[word] = static_cast<std::uint32_t>(resource.gpu_address);
+          shared[word + 1] = static_cast<std::uint32_t>(resource.gpu_address >> 32U);
+          // Size and zero dynamic offset were validated against the snapshot.
+          (vertex_stage ? vertex_uniform_buffers : fragment_uniform_buffers)
+              .push_back(resource);
+        }
+        if (!vertex_uniform_buffers.empty())
+          state.vertex_uniform_buffer_resources = StoreNewArray(pool_, vertex_uniform_buffers);
+        if (!fragment_uniform_buffers.empty())
+          state.fragment_uniform_buffer_resources = StoreNewArray(pool_, fragment_uniform_buffers);
+      }
       if (!command.sampled_textures.empty()) {
         if (!driver_pco_sequence_command || !memory_ ||
             command.sampled_textures.size() !=

@@ -57,17 +57,41 @@ bytes from Mesa commit `da14d65e4499e66468094be52bff9ea0915a695e`:
 - `src/systemc/shader/pco_iss.h`
 - `tools/pco-fixtures/generate_fill_solid_fs.c`
 - `tools/pco-fixtures/generate_attribute_fetch_shader.c`
+- `tools/pco-fixtures/generate_varying_shader.c`
+- `tools/pco-fixtures/generate_fill_tex_nearest.c`
+- `tools/pco-fixtures/generate_conditionals.c`
+- `tools/pco-fixtures/generate_ubo_shader.c`
+- `tools/pco-fixtures/generate_temp256_operands.c`
+- `tests/pco_uniform_buffer_fixtures.h`
+- `tests/pco_temp256_fixtures.h`
 
-The two files under `tools/pco-fixtures/` are development-time generators that
-build NIR and call Mesa's public PCO backend. The SystemC runtime does not call
-Mesa's compiler; it embeds and strictly decodes the resulting immutable raw
-USC binaries. The locked core fixture provenance is:
+The NIR shader generators under `tools/pco-fixtures/` are development-time
+tools that call Mesa's public PCO backend. The SystemC runtime does not call
+Mesa's compiler: its built-in fixture paths embed immutable raw USC binaries,
+and its driver-command path strictly decodes supplied compiled binaries.
+`tools/pco-fixtures/generate_temp256_operands.c` separately
+calls the generated public `pco_isa.py` source/destination encoders to record
+high-register operand bytes in `tests/pco_temp256_fixtures.h`. That test header
+assembles ISA-level LD/WDF/export and extended ADD64_32 register-boundary
+programs using those bytes and the existing UBO compiler prefix; it does not
+claim the assembled variants are unmodified GLSL compiler output. The
+TEMP256 generator, operand tables, and assembled variants are test-only,
+never runtime answer maps.
+The locked core fixture provenance is:
 
 | Fixture | Generator/origin | Bytes | SHA-256 |
 |---|---|---:|---|
 | Fill.Solid passthrough VS | Mesa `VS_PASSTHROUGH_COMMON` precompiled data | 32 | `81aeeb897687ca7e9e5997c90378a4e094d15b9c47df24ee2d0092d47d78a3b3` |
 | Fill.Solid red FS | `tools/pco-fixtures/generate_fill_solid_fs.c` | 48 | `731542be4e64da704e3576248a6d234f8ea56e999e1a9ab447a182e7a03eb3dd` |
 | Red FS + SH0 depth feedback | `tools/pco-fixtures/generate_fill_solid_fs.c` (`red depth-feedback`) | 80 | `163561de2918bd44913dac20eb45c759eb69960004326a96b645b924132715bf` |
+| UBO raw DWORD VS, burst 1 | `tools/pco-fixtures/generate_ubo_shader.c` (`vertex 1`) | 80 | `ac88ef87c909311920f74e812451d576bdd3d5f4af9690f35dc4f5fa089b0f92` |
+| UBO raw DWORD VS, burst 2 | `tools/pco-fixtures/generate_ubo_shader.c` (`vertex 2`) | 88 | `165d39faea0beb79e406f61a336dba33dcad368356d95ad766175a15848ef86c` |
+| UBO raw DWORD VS, burst 3 | `tools/pco-fixtures/generate_ubo_shader.c` (`vertex 3`) | 104 | `1a23ee188479ed3b8ee5410d90324f38bf04c07bbc86d9d76edc63566640fa1b` |
+| UBO raw DWORD VS, burst 4 | `tools/pco-fixtures/generate_ubo_shader.c` (`vertex 4`) | 112 | `7d257e488cd9b1cfdbd68414c18a1edcad75d86051fcf4196057a0efd9564905` |
+| UBO raw DWORD FS, burst 1 | `tools/pco-fixtures/generate_ubo_shader.c` (`fragment 1`) | 96 | `38df63312521290dd7fb6617a59907d7babd9b218811029055441b2b32a0e283` |
+| UBO raw DWORD FS, burst 2 | `tools/pco-fixtures/generate_ubo_shader.c` (`fragment 2`) | 96 | `65ab6614e945f2dcb75b11057462c20faf4dafe2d6d2a37b90d0e0e6eb2ca0c3` |
+| UBO raw DWORD FS, burst 3 | `tools/pco-fixtures/generate_ubo_shader.c` (`fragment 3`) | 96 | `2d12ab78c8297412f65c4aca61853cca79d09ca5dfe232b9c726bde87823e567` |
+| UBO raw DWORD FS, burst 4 | `tools/pco-fixtures/generate_ubo_shader.c` (`fragment 4`) | 96 | `8b6963924cc6fda6e18955dd9b3e36fe20eb0a7f3b45bc45d994a816bb81d90b` |
 | Attribute fetch case-1 VS | `tools/pco-fixtures/generate_attribute_fetch_shader.c` | 56 | `01fb08add3c710fb9062ed0033fecc15e5cfbce56a38a49ed17db4e43f2bf026` |
 | Attribute fetch case-2 VS | `tools/pco-fixtures/generate_attribute_fetch_shader.c` | 56 | `a275bcd7b146f7243e995528c197a04ee24e17f11d313313c7a5bea78030b88f` |
 | Attribute fetch case-4 VS | `tools/pco-fixtures/generate_attribute_fetch_shader.c` | 96 | `81b4bf2b412eb2ba35adcd1076d965918336ffb0ffb860e66547695ef4a6ae28` |

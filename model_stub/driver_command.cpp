@@ -421,6 +421,11 @@ bool ReadFields(const std::string &path,
       return false;
     }
     const std::string value = line.substr(separator + 1);
+    if (key == "uniform_buffer_replay") {
+      *error = "uniform buffer snapshots require the in-process API; "
+               "standalone driver-command text replay is unsupported";
+      return false;
+    }
     if (key == "initial_color_attachment_replay") {
       *error = "initial attachments and multisampling require API-v20 sequence submission; "
                "standalone driver-command text replay is unsupported";

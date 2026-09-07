@@ -8,7 +8,44 @@ bring-up seam: small enough to debug quickly, strict enough to prevent fake
 passes, and close enough to Gallium state that the driver can grow phase by
 phase.
 
-## Current FBO continuity and MSAA extension (SystemC API v20)
+## Uniform-buffer snapshots (SystemC API v21)
+
+The native stage ABI's `temps` field is a register count, not an 8-bit index:
+it may reserve up to 256 TEMP registers (indices 0 through 255) independently
+for VS and FS. A count of 257 is rejected at the driver, bridge and model
+boundaries. This is an explicit model transport/execution bound, not a claim
+about the larger register-index encoding space of the hardware ISA. Temporary
+ownership masks retain all 256 bits across texture continuations.
+
+Every physical nested PCO draw may carry `uniform_buffers` and
+`uniform_buffer_count`. Each entry states a VS/FS `stage`, zero-based
+`block_index`, `bytes` and `bytes_size`. The driver snapshots only the bound
+Gallium constant-buffer range at index `block_index + 1`; CB0 remains the
+ordinary uniform/push-constant source. Both the deferred driver draw and the
+bridge own deep copies, so rebinding or updating a buffer cannot modify an
+earlier draw. There are at most 15 blocks per stage and 64 KiB per bound range.
+
+The stage ABI exposes `uniform_buffer_descriptor_start` (DWORD index) and
+`uniform_buffer_descriptor_count` (slot extent). Each native descriptor is
+four DWORDs: 64-bit base address, byte size, and dynamic byte offset. Texture
+descriptors retain their existing 20-DWORD prefix; UBO descriptors follow,
+then CB0 push constants. When CB0 is empty, its start still equals the
+descriptor-prefix end. The compiler maps UBO block N to set 0/binding N+1;
+texture unit N remains set N/binding 0. Unbound holes contain four zeros.
+Captured descriptors contain `[0, 0, bytes_size, 0]`, because the payload is
+already sliced to the binding range. Submitter assigns a disjoint address to
+each draw/stage/block, imports its bytes into DRAM and relocates the address.
+
+UBO loads use native PCO address arithmetic and LD/WDF execution, not host
+GLSL evaluation. The USC memory client may read only a declared byte range of
+the executing stage; page presence alone is not a bounds check. Duplicate
+stage/block entries, oversized or missing payloads, descriptor/push overlap,
+noncanonical input addresses and out-of-range loads fail closed. API v21 is
+required on both sides; zero UBO fields preserve previous non-UBO behavior.
+Text summaries carrying `uniform_buffer_replay=api-v21-only` are deliberately
+not replayable, since they omit these immutable byte payloads.
+
+## FBO continuity and MSAA extension (introduced in SystemC API v20)
 
 The in-process API supports a nested PCO draw's initial color attachment via
 `initial_color_attachment_bytes` and `initial_color_attachment_bytes_size`.

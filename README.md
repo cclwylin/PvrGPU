@@ -108,10 +108,18 @@ Detail per component: [PvrGPU.md §3.5](PvrGPU.md), the
   color/depth/stencil LOAD/readback, per-sample MSAA, and shader-depth late tests.
   The driver also implements typed clear and scaled/format-converting blits,
   including color and depth/stencil resolves. See the
-  [API v20 contract](docs/PVRGPU_DRIVER_COMMAND.md).
+  [native API contract](docs/PVRGPU_DRIVER_COMMAND.md).
+- API v21 adds immutable, per-draw VS/FS uniform-buffer snapshots. Mesa's
+  native PCO lowering supplies descriptors and address arithmetic; USC executes
+  LD/WDF against the declared GPU-memory ranges, including 1–16 DWORD bursts
+  and 256 TEMP registers. UBO data is not evaluated as GLSL on the host.
+- Full live GLES3 group validation: `functional.ubo` is 2357 Pass with no
+  failures; `functional.fbo` is 2061 Pass, 15 NotSupported and 1 QualityWarning,
+  with no failures (2077 cases, including 70/70 MSAA Pass). The 16 FBO
+  exceptions are not Passes. This is group coverage, not full GLES3 conformance.
 - The numbered Phase 0–6 entries below describe the original narrow bring-up
-  paths, not the full extent of the newer generic PCO path. UBO layout and
-  broader synchronization support remain separate validation work.
+  paths, not the full extent of the newer generic PCO path. Broader
+  synchronization support remains separate work.
 - GLBench/RDC counter infrastructure exists for fixed captured workloads.
 - dEQP capture cataloging is ready through Phase 0 to Phase 6.
 - `pvrgpu-deqp` now runs EGL/GLES2/GLES3/GLES31 dEQP cases directly through
@@ -252,8 +260,8 @@ This is the first real driver/model seam. The strictly matched glmark2
 tight RGBA8 texture sidecar, then runs SystemC depth, interpolation, nearest
 sampling, and readback. Phase 2/3/5/6 still have counter-oriented or narrowly
 modeled portions. The newer generic PCO path adds typed texture sampling,
-model-rendered FBO pixels, depth/blend/stencil, MSAA and driver blits/resolves.
-Arbitrary shaders beyond its decoded ISA, UBO/model layout correctness and real
+model-rendered FBO pixels, depth/blend/stencil, MSAA, driver blits/resolves and
+native VS/FS UBO loads. Arbitrary shaders beyond its decoded ISA and real
 fences/sync remain separate work. Live dEQP is an executable integration gate
 for the supported slice.
 

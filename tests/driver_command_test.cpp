@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 
 namespace {
@@ -295,6 +296,38 @@ int main() {
           "legacy PCO parser lost its pinned viewport contract"))
     return failed;
   std::filesystem::remove(pco_large_viewport);
+
+  // A generic ABI reservation is not inferred from a particular shader's
+  // instruction count. Both stage counts preserve the full 256-register
+  // model boundary, including the former 64/65 transition.
+  const std::filesystem::path pco_temp_boundary = TempFile("pco-temp-boundary.txt");
+  const auto temp_text = [&](unsigned vertex_temps, unsigned fragment_temps) {
+    std::string text = pco_large_text;
+    if (!ReplaceOnce(&text, "vertex_pco_abi=10,4,4,0,16,0,16,0",
+                     "vertex_pco_abi=" + std::to_string(vertex_temps) + ",4,4,0,16,0,16,0") ||
+        !ReplaceOnce(&text, "fragment_pco_abi=4,0,0,0,4,0,4,0",
+                     "fragment_pco_abi=" + std::to_string(fragment_temps) + ",0,0,0,4,0,4,0"))
+      throw std::runtime_error("TEMP boundary fixture did not contain its ABI fields");
+    return text;
+  };
+  for (const unsigned count : {64U, 65U, 255U, 256U}) {
+    WriteText(pco_temp_boundary, temp_text(count, count));
+    error.clear();
+    if (int failed = Expect(LoadDriverCommand(pco_temp_boundary.string(), &command, &error) &&
+            command.vertex_pco_abi.temps == count && command.fragment_pco_abi.temps == count,
+            "generic text TEMP reservation rejected/truncated: " + std::to_string(count) + " " + error))
+      return failed;
+  }
+  for (const bool vertex_stage : {false, true}) {
+    WriteText(pco_temp_boundary, temp_text(vertex_stage ? 257U : 256U,
+                                          vertex_stage ? 256U : 257U));
+    error.clear();
+    if (int failed = Expect(!LoadDriverCommand(pco_temp_boundary.string(), &command, &error) &&
+            error.find("model bounds") != std::string::npos,
+            "257-register TEMP reservation was not rejected independently per stage"))
+      return failed;
+  }
+  std::filesystem::remove(pco_temp_boundary);
 
   const std::filesystem::path pco_indexed = TempFile("pco-indexed.txt");
   std::string pco_indexed_text = pco_text;
@@ -679,6 +712,16 @@ int main() {
                  "unsupported command error did not name the cause"))
     return failed;
 
+  const std::filesystem::path ubo_summary = TempFile("ubo-summary.txt");
+  WriteText(ubo_summary, "uniform_buffer_replay=api-v21-only\n");
+  error.clear();
+  if (int failed = Expect(
+          !LoadDriverCommand(ubo_summary.string(), &command, &error) &&
+              error.find("uniform buffer snapshots require the in-process API") !=
+                  std::string::npos,
+          "UBO summary without immutable payload was accepted for text replay"))
+    return failed;
+  std::filesystem::remove(ubo_summary);
   std::filesystem::remove(good);
   std::filesystem::remove(draw);
   std::filesystem::remove(quad);

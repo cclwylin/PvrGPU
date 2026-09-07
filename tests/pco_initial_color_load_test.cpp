@@ -3,6 +3,7 @@
 // bridge, deferred payload ownership, Submitter DRAM transfer and PBE together.
 #include "pvrgpu_systemc_api.h"
 #include "shader/pco_iss.h"
+#include "pco_uniform_buffer_fixtures.h"
 
 #include <algorithm>
 #include <array>
@@ -166,8 +167,13 @@ struct Submission {
 void VerifyInitialLoad(const std::filesystem::path &root,
                        const char *name, const char *format,
                        unsigned channels, bool normalized,
-                       bool clipped = false, bool implicit_single_target = false) {
+                       bool clipped = false, bool implicit_single_target = false,
+                       unsigned reserved_temps = 0) {
   Fixture fixture(format, channels, normalized, clipped);
+  if (reserved_temps != 0) {
+    fixture.draw.vertex_pco_abi.temps = reserved_temps;
+    fixture.draw.fragment_pco_abi.temps = reserved_temps;
+  }
   if (implicit_single_target)
     fixture.draw.render_target_count = 0;
   const std::vector<std::uint8_t> expected = fixture.initial;
@@ -334,26 +340,170 @@ void VerifyRejectedPayloads(const std::filesystem::path &root) {
   }
 }
 
+void VerifyUniformBufferRejections(const std::filesystem::path &root) {
+  const auto reject = [&](auto mutate, const char *name) {
+    Fixture fixture("PIPE_FORMAT_R32G32B32A32_FLOAT", 4, false);
+    std::array<std::uint8_t, 16> bytes{};
+    std::array<std::uint32_t, 4> shared = {0, 0, 16, 0};
+    std::array<pvrgpu_systemc_pco_uniform_buffer, 2> buffers = {{
+        {PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT, 0, bytes.data(), bytes.size()},
+        {PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT, 0, bytes.data(), bytes.size()},
+    }};
+    fixture.draw.fragment_shared = shared.data();
+    fixture.draw.fragment_shared_count = shared.size();
+    fixture.draw.fragment_pco_abi.shareds = shared.size();
+    fixture.draw.fragment_pco_abi.uniform_buffer_descriptor_count = 1;
+    fixture.draw.fragment_pco_abi.push_constant_start = 4;
+    fixture.draw.uniform_buffers = buffers.data();
+    fixture.draw.uniform_buffer_count = 1;
+    mutate(fixture.draw, buffers, shared);
+    Submission submission(root / name, &fixture.sequence);
+    std::array<char, 512> error{};
+    if (pvrgpu_systemc_submit_driver_command(&submission.info,
+            error.data(), error.size()) == 0 ||
+        std::string(error.data()).find("uniform buffer") == std::string::npos)
+      Fail(std::string(name) + " did not reject the invalid UBO: " + error.data());
+  };
+  reject([](auto &d, auto &, auto &) { d.uniform_buffers = nullptr; }, "ubo-list-null");
+  reject([](auto &d, auto &, auto &) { d.uniform_buffer_count = 0; }, "ubo-list-count");
+  reject([](auto &d, auto &, auto &) { d.uniform_buffer_count = 2; }, "ubo-duplicate");
+  reject([](auto &, auto &b, auto &) { b[0].stage = 2; }, "ubo-stage");
+  reject([](auto &, auto &b, auto &) { b[0].block_index = 1; }, "ubo-block");
+  reject([](auto &, auto &b, auto &) { b[0].bytes = nullptr; }, "ubo-bytes-null");
+  reject([](auto &, auto &b, auto &) { b[0].bytes_size = 0; }, "ubo-bytes-zero");
+  reject([](auto &, auto &b, auto &) { b[0].bytes_size = 65537; }, "ubo-bytes-large");
+  reject([](auto &, auto &, auto &s) { s[2] = 12; }, "ubo-size-mismatch");
+  reject([](auto &, auto &, auto &s) { s[0] = 128; }, "ubo-prepatched-address");
+  reject([](auto &, auto &, auto &s) { s[3] = 4; }, "ubo-dynamic-offset");
+  reject([](auto &d, auto &, auto &) { d.fragment_pco_abi.push_constant_start = 0; },
+         "ubo-push-overlap");
+}
+
+void VerifyDeferredUniformBuffers(const std::filesystem::path &root,
+                                  const char *memory_mode) {
+  Fixture fixture("PIPE_FORMAT_R32G32B32A32_FLOAT", 4, false);
+  // This fragment shader has no varying inputs; use a position-only VS so
+  // the fixed-function linkage does not declare an unused varying route.
+  fixture.vertex_pco = pvrgpu::stub::AttributeFetchVertexPcoBinary();
+  fixture.draw.vertex_pco = fixture.vertex_pco.data();
+  fixture.draw.vertex_pco_size = fixture.vertex_pco.size();
+  fixture.draw.vertex_pco_abi.vertex_outputs = 4;
+  fixture.draw.varying_output_count = 0;
+  auto fragment_pco = pvrgpu::stub::test::UniformBufferFixture(false, 4);
+  std::array<pvrgpu_systemc_driver_command, 2> draws = {fixture.draw, fixture.draw};
+  const std::array<std::array<float, 4>, 2> expected = {{
+      {-0.75F, 2.5F, 17.25F, 1.0F}, {0.375F, -3.25F, 50.0F, 0.5F},
+  }};
+  std::array<std::array<std::uint8_t, 32>, 2> bytes{};
+  std::array<std::array<std::uint32_t, 5>, 2> shared = {{
+      {0, 0, 32, 0, 16}, {0, 0, 32, 0, 16},
+  }};
+  std::array<pvrgpu_systemc_pco_uniform_buffer, 2> buffers{};
+  for (unsigned index = 0; index < 2; ++index) {
+    // A runtime byte offset reaches the last legal vec4 of the bound range.
+    std::memcpy(bytes[index].data() + 16, expected[index].data(), 16);
+    buffers[index] = {PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT, 0,
+                      bytes[index].data(), bytes[index].size()};
+    auto &draw = draws[index];
+    draw.fragment_pco = fragment_pco.data();
+    draw.fragment_pco_size = fragment_pco.size();
+    draw.fragment_pco_abi.temps = 4;
+    draw.fragment_pco_abi.coefficients = 4;
+    draw.fragment_pco_abi.shareds = 5;
+    draw.fragment_pco_abi.push_constant_start = 4;
+    draw.fragment_pco_abi.push_constant_count = 1;
+    draw.fragment_pco_abi.uniform_buffer_descriptor_count = 1;
+    draw.fragment_shared = shared[index].data();
+    draw.fragment_shared_count = shared[index].size();
+    draw.fragment_varying_count = 0;
+    draw.uniform_buffers = &buffers[index];
+    draw.uniform_buffer_count = 1;
+    draw.scissor = 1;
+    draw.scissor_x = index * 2;
+    draw.scissor_width = 2;
+    draw.scissor_height = kHeight;
+    if (index != 0) {
+      draw.color_attachment_source_command_index = 0;
+      draw.initial_color_attachment_bytes = nullptr;
+      draw.initial_color_attachment_bytes_size = 0;
+    }
+  }
+  fixture.sequence.pco_sequence_commands = draws.data();
+  fixture.sequence.pco_sequence_command_count = 2;
+  fixture.sequence.draw_count = 2;
+  fixture.sequence.ia_vertices = 6;
+  fixture.sequence.ia_primitives = 2;
+  fixture.sequence.clip_invocations = 2;
+  Submission submission(root / (std::string("ubo-deferred-") + memory_mode),
+                        &fixture.sequence);
+  submission.info.memory_mode = memory_mode;
+  std::array<char, 512> error{};
+  if (pvrgpu_systemc_submit_driver_command(&submission.info,
+          error.data(), error.size()) != 0)
+    Fail(std::string("UBO submit: ") + error.data());
+  // Neither draw may borrow the caller's descriptor, push data or UBO bytes.
+  for (unsigned index = 0; index < 2; ++index) {
+    bytes[index].fill(0xcc);
+    shared[index].fill(0xffffffff);
+    buffers[index].bytes = nullptr;
+  }
+  std::vector<std::uint8_t> pixels(kWidth * kHeight * 16);
+  pvrgpu_systemc_readback_info readback{};
+  readback.version = PVRGPU_SYSTEMC_API_VERSION;
+  readback.width = kWidth;
+  readback.height = kHeight;
+  readback.bytes_per_pixel = 16;
+  readback.pixels = pixels.data();
+  readback.pixels_size = pixels.size();
+  if (pvrgpu_systemc_flush_readback(&readback, error.data(), error.size()) != 0 ||
+      readback.pixels_written != 1)
+    Fail(std::string("UBO readback: ") + error.data());
+  for (unsigned index = 0; index < 2; ++index) {
+    if (std::memcmp(pixels.data() + index * 2U * 16U,
+                    expected[index].data(), 16) != 0)
+      Fail("UBO per-draw snapshot/LD returned another binding's bytes");
+  }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char **argv) {
   const auto nonce =
       std::chrono::high_resolution_clock::now().time_since_epoch().count();
   const std::filesystem::path root =
       std::filesystem::temp_directory_path() /
       ("pvrgpu-pco-initial-color-load-test-" + std::to_string(nonce));
-  VerifyRejectedPayloads(root);
-  VerifyInitialLoad(root, "rgba8", "PIPE_FORMAT_R8G8B8A8_UNORM", 4, true);
-  VerifyInitialLoad(root, "r32ui", "PIPE_FORMAT_R32_UINT", 1, false);
-  VerifyInitialLoad(root, "rg32ui", "PIPE_FORMAT_R32G32_UINT", 2, false);
-  VerifyInitialLoad(root, "rgba32ui", "PIPE_FORMAT_R32G32B32A32_UINT", 4, false);
-  VerifyInitialLoad(root, "rgba32f", "PIPE_FORMAT_R32G32B32A32_FLOAT", 4, false);
-  VerifyInitialLoad(root, "fully-clipped", "PIPE_FORMAT_R8G8B8A8_UNORM",
-                    4, true, true);
-  VerifyInitialLoad(root, "implicit-single-target", "PIPE_FORMAT_R32G32_UINT",
-                    2, false, false, true);
-  VerifyOversizedViewport(root, false);
-  VerifyOversizedViewport(root, true);
+  // The shared runtime's memory mode is fixed at SystemC elaboration. Each
+  // additional mode therefore gets its own test process, not a mode switch.
+  if (argc == 2 && std::string(argv[1]) == "ubo-bypass") {
+    VerifyDeferredUniformBuffers(root, "bypass");
+  } else if (argc == 2 && std::string(argv[1]) == "ubo-cache") {
+    VerifyDeferredUniformBuffers(root, "cache");
+  } else if (argc == 1) {
+    VerifyRejectedPayloads(root);
+    VerifyUniformBufferRejections(root);
+    VerifyInitialLoad(root, "rgba8", "PIPE_FORMAT_R8G8B8A8_UNORM", 4, true);
+    VerifyInitialLoad(root, "r32ui", "PIPE_FORMAT_R32_UINT", 1, false);
+    VerifyInitialLoad(root, "rg32ui", "PIPE_FORMAT_R32G32_UINT", 2, false);
+    VerifyInitialLoad(root, "rgba32ui", "PIPE_FORMAT_R32G32B32A32_UINT", 4, false);
+    VerifyInitialLoad(root, "rgba32f", "PIPE_FORMAT_R32G32B32A32_FLOAT", 4, false);
+    // Real shader execution with a larger resource reservation: the public
+    // ABI and Submitter must retain 65/256 rather than narrowing to uint8_t.
+    // Actual accesses to high TEMP indices are covered by the ISS tests.
+    VerifyInitialLoad(root, "temp65-abi", "PIPE_FORMAT_R32G32B32A32_FLOAT",
+                      4, false, false, false, 65);
+    VerifyInitialLoad(root, "temp256-abi", "PIPE_FORMAT_R32G32B32A32_FLOAT",
+                      4, false, false, false, 256);
+    VerifyInitialLoad(root, "fully-clipped", "PIPE_FORMAT_R8G8B8A8_UNORM",
+                      4, true, true);
+    VerifyInitialLoad(root, "implicit-single-target", "PIPE_FORMAT_R32G32_UINT",
+                      2, false, false, true);
+    VerifyOversizedViewport(root, false);
+    VerifyOversizedViewport(root, true);
+    VerifyDeferredUniformBuffers(root, "direct");
+  } else {
+    Fail("unknown test mode");
+  }
   std::error_code error;
   std::filesystem::remove_all(root, error);
   std::puts("pco-initial-color-load-test: PASS");

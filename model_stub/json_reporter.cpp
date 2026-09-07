@@ -171,6 +171,8 @@ struct VertexPcoEvidence {
   std::uint64_t imadd32 = 0;
   // UBFE/IBFE: unpacking a narrow integer attribute, one per component.
   std::uint64_t ubfe = 0;
+  std::uint64_t add64_32 = 0;
+  std::uint64_t ld = 0;
   std::uint64_t smp = 0;
   std::uint64_t wdf = 0;
   std::uint64_t uvsw_write = 0;
@@ -183,6 +185,7 @@ struct FragmentPcoEvidence {
   std::uint64_t binary_bytes = 0;
   std::uint64_t fitrp = 0;
   std::uint64_t depthf = 0;
+  std::uint64_t ld = 0;
   std::uint64_t wdf = 0;
   std::uint64_t fadd = 0;
   std::uint64_t mbyp = 0;
@@ -389,6 +392,12 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kBitfieldInsert:
       ++evidence.bfi;
       break;
+    case PcoOpcode::kIntegerAdd64_32:
+      ++evidence.add64_32;
+      break;
+    case PcoOpcode::kBufferLoad:
+      ++evidence.ld;
+      break;
     case PcoOpcode::kUvsWrite:
       ++evidence.uvsw_write;
       break;
@@ -420,7 +429,7 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
       evidence.frcp + evidence.frsq + evidence.flog2 + evidence.fexp2 +
       evidence.pck_f16 + evidence.unpck_f16 + evidence.unpck_int +
       evidence.f2i + evidence.imadd32 + evidence.ubfe + evidence.smp +
-      evidence.wdf;
+      evidence.wdf + evidence.add64_32 + evidence.ld;
   if (opcode_total != instructions.size()) {
     throw std::runtime_error(
         "JsonReporter vertex PCO opcode histogram mismatch");
@@ -472,6 +481,9 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
       break;
     case PcoOpcode::kDepthFeedback:
       ++evidence.depthf;
+      break;
+    case PcoOpcode::kBufferLoad:
+      ++evidence.ld;
       break;
     case PcoOpcode::kWaitDataFence:
       ++evidence.wdf;
@@ -610,7 +622,7 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
           std::to_string(static_cast<unsigned>(instruction.opcode)));
     }
   }
-  if (evidence.fitrp + evidence.depthf + evidence.wdf + evidence.fadd + evidence.fmul +
+  if (evidence.fitrp + evidence.depthf + evidence.ld + evidence.wdf + evidence.fadd + evidence.fmul +
           evidence.mbyp + evidence.smp + evidence.internal + evidence.fneg +
           evidence.fabs +
           evidence.movi + evidence.pck_cov + evidence.shr +
@@ -692,6 +704,8 @@ void AppendVertexPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_VERTEX_EVIDENCE(f2i);
   PVRGPU_ADD_VERTEX_EVIDENCE(imadd32);
   PVRGPU_ADD_VERTEX_EVIDENCE(ubfe);
+  PVRGPU_ADD_VERTEX_EVIDENCE(add64_32);
+  PVRGPU_ADD_VERTEX_EVIDENCE(ld);
   PVRGPU_ADD_VERTEX_EVIDENCE(smp);
   PVRGPU_ADD_VERTEX_EVIDENCE(wdf);
   PVRGPU_ADD_VERTEX_EVIDENCE(uvsw_write);
@@ -717,6 +731,7 @@ void AppendFragmentPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_FRAGMENT_EVIDENCE(binary_bytes);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(fitrp);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(depthf);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(ld);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(wdf);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(fadd);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(mbyp);
@@ -1691,6 +1706,10 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"smp\":" << vertex_pco.smp;
   if (vertex_pco.wdf != 0)
     std::cout << ",\"wdf\":" << vertex_pco.wdf;
+  if (vertex_pco.add64_32 != 0)
+    std::cout << ",\"add64_32\":" << vertex_pco.add64_32;
+  if (vertex_pco.ld != 0)
+    std::cout << ",\"ld\":" << vertex_pco.ld;
   if (vertex_pco.movi != 0)
     std::cout << ",\"movi\":" << vertex_pco.movi;
   if (vertex_pco.fneg != 0)
@@ -1800,6 +1819,8 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"ubfe\":" << fragment_pco.ubfe;
   if (fragment_pco.add64_32 != 0)
     std::cout << ",\"add64_32\":" << fragment_pco.add64_32;
+  if (fragment_pco.ld != 0)
+    std::cout << ",\"ld\":" << fragment_pco.ld;
   if (fragment_pco.imax_s32 != 0)
     std::cout << ",\"imax_s32\":" << fragment_pco.imax_s32;
   if (fragment_pco.imin_s32 != 0)

@@ -1,4 +1,5 @@
 #include "pco_sequence_profiles.h"
+#include "uniform_buffers.h"
 
 #include "model_types.h"
 #include "common/functional_types.h"
@@ -1300,6 +1301,14 @@ bool DriverPcoSequenceSupported(const Options &options, std::string *error) {
   if (error)
     error->clear();
   const DriverCommand &logical = options.driver_command;
+  if (!logical.uniform_buffers.empty() ||
+      logical.vertex_pco_abi.uniform_buffer_descriptor_count ||
+      logical.fragment_pco_abi.uniform_buffer_descriptor_count)
+    return Reject(error, "logical PCO sequence cannot carry uniform buffer payloads");
+  for (const auto &draw : options.driver_commands) {
+    if (!ValidateDriverUniformBuffers(draw, error))
+      return false;
+  }
   if (logical.command != kDrawPcoSequence) {
     return Reject(error, "command is not a native PCO sequence");
   }

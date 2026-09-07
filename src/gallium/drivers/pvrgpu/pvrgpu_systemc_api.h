@@ -10,7 +10,9 @@ extern "C" {
 #endif
 
 /* API-v19 can initialize a new sequence color attachment from host storage. */
-#define PVRGPU_SYSTEMC_API_VERSION 20u
+#define PVRGPU_SYSTEMC_API_VERSION 21u
+#define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE 15u
+#define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES (64u * 1024u)
 /*
  * Draws one sequence may describe; must match the model's own bound.  This is
  * independent of how many attachments the sequence creates, which the model's
@@ -54,6 +56,9 @@ struct pvrgpu_systemc_pco_stage_abi {
    uint32_t push_constant_start;
    uint32_t push_constant_count;
    uint32_t entry_offset;
+   /* API-v21: four DWORDs per UBO, after textures and before CB0 push data. */
+   uint32_t uniform_buffer_descriptor_start;
+   uint32_t uniform_buffer_descriptor_count;
 };
 
 enum pvrgpu_systemc_pco_texture_source {
@@ -65,6 +70,16 @@ enum pvrgpu_systemc_pco_texture_source {
 enum pvrgpu_systemc_pco_shader_stage {
    PVRGPU_SYSTEMC_PCO_SHADER_STAGE_VERTEX = 0,
    PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT = 1,
+};
+
+/* Immutable snapshot of the bound range, not the whole Gallium buffer.
+ * block_index is stage-local NIR UBO index (Gallium constant buffer index - 1).
+ * Descriptor words are [0, 0, bytes_size, 0] before model relocation. */
+struct pvrgpu_systemc_pco_uniform_buffer {
+   uint32_t stage;
+   uint32_t block_index;
+   const uint8_t *bytes;
+   size_t bytes_size;
 };
 
 enum pvrgpu_systemc_pco_blend_equation {
@@ -396,6 +411,9 @@ struct pvrgpu_systemc_driver_command {
    /* Optional complete native depth/stencil LOAD, using depth_format. */
    const uint8_t *initial_depth_attachment_bytes;
    size_t initial_depth_attachment_bytes_size;
+   /* API-v21 per-physical-draw payloads; all bytes are copied before return. */
+   const struct pvrgpu_systemc_pco_uniform_buffer *uniform_buffers;
+   uint32_t uniform_buffer_count;
 };
 
 struct pvrgpu_systemc_submit_info {

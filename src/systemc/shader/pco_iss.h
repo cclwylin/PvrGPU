@@ -15,6 +15,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <type_traits>
 #include <vector>
 
@@ -27,6 +28,9 @@ inline constexpr std::size_t kPcoVertexInputCount = 64;
 inline constexpr std::size_t kPcoVertexOutputCount = 64;
 /* A sampler's response is four components, one per channel. */
 inline constexpr std::size_t kPcoTextureResponseCount = 4;
+/* Mesa I_LD_IMMBL uses a four-bit positive wrapped burst length: 1..15
+ * encode themselves and zero encodes 16 DWORDs. This is not the SMP width. */
+inline constexpr std::size_t kPcoMaximumBufferLoadDwords = 16;
 /*
  * The driver's four-render-target ABI provides four dwords per attachment.
  * Mesa pco_map lowers PIXOUT indices below four to special 32 + index and
@@ -35,10 +39,42 @@ inline constexpr std::size_t kPcoTextureResponseCount = 4;
  * a claim about the number of physical pixel-output registers on Rogue.
  */
 inline constexpr std::size_t kPcoPixelOutputCount = 16;
-/* Public PCO programs may declare and address TEMP0..63.  Keep the execution
- * file and its written-register bitmap at the same explicit 64-register ABI
- * bound so valid high TEMP declarations do not fail before decode. */
-inline constexpr std::size_t kPcoTemporaryCount = 64;
+/* The driver command ABI transports up to 256 temporary registers. This is
+ * an explicit model bound, not the larger index limit of the public ISA. */
+inline constexpr std::size_t kPcoTemporaryCount = 256;
+
+/* Lane/continuation ownership covers the full TEMP file, without shifting a
+ * 64-bit integer by a register index >=64. Keep this payload trivially
+ * copyable for the MemoryPool; it never owns memory or a host callback. */
+struct PcoTemporaryMask {
+  std::array<std::uint64_t, kPcoTemporaryCount / 64> words{};
+
+  bool test(std::size_t index) const {
+    return index < kPcoTemporaryCount &&
+           (words[index / 64] & (UINT64_C(1) << (index % 64))) != 0;
+  }
+  void set(std::size_t index) {
+    if (index >= kPcoTemporaryCount)
+      throw std::out_of_range("PCO TEMP mask index exceeds the modeled file");
+    words[index / 64] |= UINT64_C(1) << (index % 64);
+  }
+  bool contains_range(std::size_t first, std::size_t count) const {
+    if (first > kPcoTemporaryCount || count > kPcoTemporaryCount - first)
+      return false;
+    for (std::size_t index = first; index < first + count; ++index) {
+      if (!test(index))
+        return false;
+    }
+    return true;
+  }
+  bool operator==(const PcoTemporaryMask &other) const {
+    return words == other.words;
+  }
+  bool operator!=(const PcoTemporaryMask &other) const {
+    return !(*this == other);
+  }
+};
+static_assert(std::is_trivially_copyable_v<PcoTemporaryMask>);
 /* A combined image/sampler descriptor occupies one 20-dword public PDS/USC
  * shared-register slot.  Descriptor count, sequential SMP count, and the
  * transported shared-register span are independent bounds.  The captured
@@ -286,6 +322,8 @@ struct PcoInstruction {
   std::uint16_t output_index = 0;
   // The high half's destination for a two-output op (add64_32).
   std::uint16_t output_index1 = 0;
+  // ADD64_32 sign-extends its 32-bit offset when the ISA S bit is set.
+  std::uint8_t address_offset_signed = 0;
   std::uint16_t branch_target_index = 0;
   std::uint32_t loop_count = 0;
   // Raw binary32/integer payload for compiler-emitted immediate groups.
@@ -437,7 +475,7 @@ struct PcoVertexContinuation {
   std::array<std::uint32_t, kPcoMaximumVertexSharedCount> shared_registers{};
   std::array<std::uint32_t, kPcoTemporaryCount> temporaries{};
   std::array<std::uint32_t, kPcoVertexOutputCount> outputs{};
-  std::uint64_t temporary_written_mask = 0;
+  PcoTemporaryMask temporary_written_mask{};
   std::uint64_t output_written_mask = 0;
   std::uint32_t program_binary_size = 0;
   std::uint32_t program_instruction_count = 0;
@@ -446,7 +484,7 @@ struct PcoVertexContinuation {
   std::uint8_t pending_component_count = 0;
   std::uint8_t data_request = 0;
   std::uint8_t vertex_input_count = 0;
-  std::uint8_t shared_count = 0;
+  std::uint16_t shared_count = 0;
   std::uint8_t emitted = 0;
   std::uint8_t ended_task = 0;
   std::uint8_t valid = 0;
@@ -464,6 +502,13 @@ struct PcoVertexExecution {
   std::uint8_t suspended = 0;
 };
 
+/* Stack-only bridge to the modeled memory system. No host pointers are saved
+ * in a shader continuation or a MemoryPool payload. The caller validates the
+ * complete address range and may throw on an invalid request. */
+using PcoMemoryReadCallback = void (*)(void *user_data, std::uint64_t address,
+                                      std::uint32_t dword_count,
+                                      std::uint32_t *destination);
+
 /* Lane-local shared-register input supplied by the PDS/USC ABI. The explicit
  * shared_count keeps every access outside the producer-declared transport
  * span fail-closed.  texture_response is accepted only with a valid saved
@@ -473,8 +518,10 @@ struct PcoVertexExecutionContext {
   std::array<std::uint32_t, kPcoMaximumSharedCount> shared_registers{};
   std::array<std::uint32_t, kPcoTextureResponseCount> texture_response{};
   PcoVertexContinuation continuation{};
-  std::uint8_t shared_count = 0;
+  std::uint16_t shared_count = 0;
   std::uint8_t texture_response_valid = 0;
+  PcoMemoryReadCallback memory_read = nullptr;
+  void *memory_user_data = nullptr;
 };
 
 /* Lane-local USC state captured at the public SMP suspension point.  The
@@ -484,7 +531,7 @@ struct PcoVertexExecutionContext {
  */
 struct PcoFragmentContinuation {
   std::array<std::uint32_t, kPcoTemporaryCount> temporaries{};
-  std::uint64_t temporary_written_mask = 0;
+  PcoTemporaryMask temporary_written_mask{};
   std::uint32_t program_binary_size = 0;
   std::uint32_t program_instruction_count = 0;
   std::uint16_t resume_instruction_index = 0;
@@ -528,8 +575,10 @@ struct PcoFragmentExecutionContext {
   std::array<std::uint32_t, kPcoTextureResponseCount> texture_response{};
   PcoFragmentContinuation continuation{};
   std::uint8_t coefficient_count = 0;
-  std::uint8_t shared_count = 0;
+  std::uint16_t shared_count = 0;
   std::uint8_t texture_response_valid = 0;
+  PcoMemoryReadCallback memory_read = nullptr;
+  void *memory_user_data = nullptr;
 };
 
 /* Immutable raw PCO binaries generated by the identified public Mesa backend.
@@ -585,7 +634,9 @@ PcoVertexExecution ResumeVertexPco(
     const PcoProgramSummary &summary,
     const std::vector<PcoInstruction> &instructions,
     const PcoVertexContinuation &continuation,
-    const std::array<std::uint32_t, kPcoTextureResponseCount> &texture_response);
+    const std::array<std::uint32_t, kPcoTextureResponseCount> &texture_response,
+    PcoMemoryReadCallback memory_read = nullptr,
+    void *memory_user_data = nullptr);
 
 PcoFragmentExecution
 ExecuteFragmentPco(const PcoProgramSummary &summary,
@@ -625,9 +676,10 @@ inline PcoVertexExecution ResumeVertex(
     const PcoProgramSummary &summary,
     const std::vector<PcoInstruction> &instructions,
     const PcoVertexContinuation &continuation,
-    const std::array<std::uint32_t, kPcoTextureResponseCount> &texture_response) {
+    const std::array<std::uint32_t, kPcoTextureResponseCount> &texture_response,
+    PcoMemoryReadCallback memory_read = nullptr, void *memory_user_data = nullptr) {
   return ResumeVertexPco(summary, instructions, continuation,
-                         texture_response);
+                         texture_response, memory_read, memory_user_data);
 }
 
 inline PcoFragmentExecution

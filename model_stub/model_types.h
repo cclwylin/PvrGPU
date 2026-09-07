@@ -33,6 +33,8 @@ struct DriverPcoStageAbi {
   std::uint32_t push_constant_start = 0;
   std::uint32_t push_constant_count = 0;
   std::uint32_t entry_offset = 0;
+  std::uint32_t uniform_buffer_descriptor_start = 0;
+  std::uint32_t uniform_buffer_descriptor_count = 0;
 };
 
 // Planes a DriverAttachmentClear touches.
@@ -77,6 +79,16 @@ enum class DriverPcoTextureSource : std::uint8_t {
 enum class DriverPcoShaderStage : std::uint8_t {
   kVertex = 0,
   kFragment = 1,
+};
+
+inline constexpr std::size_t kMaximumUniformBuffersPerStage = 15;
+inline constexpr std::size_t kMaximumUniformBufferBytes = 64U * 1024U;
+inline constexpr std::size_t kUniformBufferDescriptorDwordCount = 4;
+
+struct DriverPcoUniformBuffer {
+  DriverPcoShaderStage stage = DriverPcoShaderStage::kVertex;
+  std::uint32_t block_index = 0;
+  std::vector<std::uint8_t> bytes;
 };
 
 struct DriverPcoTextureMipLayout {
@@ -218,7 +230,9 @@ constexpr bool DriverPcoStageAbiMatches(const DriverPcoStageAbi &actual,
          actual.shareds == expected.shareds &&
          actual.push_constant_start == expected.push_constant_start &&
          actual.push_constant_count == expected.push_constant_count &&
-         actual.entry_offset == expected.entry_offset;
+         actual.entry_offset == expected.entry_offset &&
+         actual.uniform_buffer_descriptor_start == expected.uniform_buffer_descriptor_start &&
+         actual.uniform_buffer_descriptor_count == expected.uniform_buffer_descriptor_count;
 }
 
 struct DriverCommand {
@@ -249,6 +263,7 @@ struct DriverCommand {
   std::vector<std::uint8_t> fragment_pco;
   std::vector<std::uint32_t> vertex_shared;
   std::vector<std::uint32_t> fragment_shared;
+  std::vector<DriverPcoUniformBuffer> uniform_buffers;
   std::uint32_t sampled_texture_count = 0;
   std::vector<std::uint8_t> sampled_texture_bytes;
   std::uint64_t declared_sampled_texture_bytes_size = 0;
@@ -504,6 +519,7 @@ enum class MemoryClient : std::uint8_t {
   kParameterRead = 8,
   kFramebufferReadback = 9,
   kTextureMipmap = 10,
+  kUniformBuffer = 11,
 };
 
 enum class MemoryPayloadFormat : std::uint8_t {

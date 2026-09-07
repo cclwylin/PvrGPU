@@ -7,14 +7,18 @@
 #include "common/pipeline_state.h"
 #include "shader/pco_iss.h"
 #include "shader/usc_cluster.h"
+#include "memory/gpu_memory_system.h"
+#include "pco_uniform_buffer_fixtures.h"
 
 #include <systemc>
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -506,6 +510,232 @@ void CheckCompletedCase(MemoryPool &pool, const CasePayload &payload,
         "MemoryPool allocations are balanced");
 }
 
+constexpr std::uint64_t kUniformAddress = UINT64_C(0x12345678000);
+constexpr std::uint64_t kTextureReadAddress = kUniformAddress + 4096;
+constexpr std::array<std::uint32_t, 4> kFirstUniformWords = {
+    0x3e800000, 0x3f400000, 0x80000000, 0x7fa12345};
+constexpr std::array<std::uint32_t, 4> kSecondUniformWords = {
+    0xdeadbeef, 0x01000001, 0x40000000, 0x3f800000};
+
+CasePayload MakeUniformTextureCase(MemoryPool &pool,
+                                    pvrgpu::stub::GpuMemorySystem &memory,
+                                    ShaderStage stage) {
+  using namespace pvrgpu::stub;
+  const bool vertex = stage == ShaderStage::kVertex;
+  auto payload = vertex ? MakeVertexCase(pool, 81) : MakeCase(pool, 1, 82, 2);
+  auto state = LoadPipelineState(pool, payload.state);
+  state.memory_mode = memory.mode();
+  const auto original = test::UniformBufferFixture(vertex, 4);
+  // Genuine Mesa groups: LD/WDF, Terrain set1 SMP/WDF, LD/WDF + output.
+  const std::array<std::uint8_t, 18> sample = {
+      0x57, 0xa0, 0x00, 0xf4, 0x4c, 0x94, 0x60, 0x80, 0x1c,
+      0x88, 0x80, 0xa0, 0x00, 0xff, 0x02, 0x80, 0x6a, 0xff};
+  std::vector<std::uint8_t> binary(original.begin(), original.begin() + 62);
+  binary.insert(binary.end(), sample.begin(), sample.end());
+  binary.insert(binary.end(), original.begin(), original.end());
+  auto program = Decode(stage, binary);
+  Check(program.instructions[6].opcode == PcoOpcode::kTextureSample &&
+            program.instructions[7].opcode == PcoOpcode::kWaitDataFence,
+        "UBO/texture fixture group boundary");
+  // Relocate the decoded UBO shared operands behind two texture descriptors.
+  // Give the second LD its own runtime push offset (SH45 instead of SH44),
+  // so returning/repeating the first read cannot accidentally pass.
+  for (std::size_t index = 0; index < program.instructions.size(); ++index) {
+    auto &instruction = program.instructions[index];
+    if (instruction.opcode == PcoOpcode::kTextureSample)
+      continue;
+    for (auto *source : {&instruction.source, &instruction.source1,
+                         &instruction.source2, &instruction.source3}) {
+      if (source->bank == PcoRegisterBank::kShared) {
+        source->index += 40;
+        if (index >= 8 && source->index == 44)
+          source->index = 45;
+      }
+    }
+  }
+  memory.HostWrite(kUniformAddress, kFirstUniformWords.data(), 16);
+  memory.HostWrite(kUniformAddress + 16, kSecondUniformWords.data(), 16);
+  const auto texture_words = ResponseForRound(0);
+  memory.HostWrite(kTextureReadAddress, texture_words.data(), 16);
+  std::vector<std::uint32_t> shared(46, 0);
+  shared[40] = static_cast<std::uint32_t>(kUniformAddress);
+  shared[41] = static_cast<std::uint32_t>(kUniformAddress >> 32U);
+  shared[42] = 32;
+  shared[45] = 16;
+  auto &abi = vertex ? state.vertex_pco_abi : state.fragment_pco_abi;
+  abi.temps = 8;
+  abi.shareds = shared.size();
+  abi.uniform_buffer_descriptor_start = 40;
+  abi.uniform_buffer_descriptor_count = 1;
+  abi.push_constant_start = 44;
+  abi.push_constant_count = 2;
+  auto &instructions = vertex ? state.vertex_instructions : state.fragment_instructions;
+  pool.Release(instructions);
+  instructions = StoreNewArray(pool, program.instructions);
+  auto &registers = vertex ? state.vertex_shared_registers : state.fragment_shared_registers;
+  pool.Release(registers);
+  if (vertex) {
+    std::vector<ShaderSharedRegister> words(shared.size());
+    for (std::size_t index = 0; index < shared.size(); ++index)
+      words[index].value = shared[index];
+    registers = StoreNewArray(pool, words);
+    state.vertex_program_summary = program.summary;
+  } else {
+    registers = StoreNewArray(pool, shared);
+    state.fragment_program_summary = program.summary;
+  }
+  const auto resources = StoreNewArray(pool,
+      std::vector<UniformBufferResource>{{kUniformAddress, 32, 0, 40}});
+  (vertex ? state.vertex_uniform_buffer_resources
+          : state.fragment_uniform_buffer_resources) = resources;
+  auto drawlists = LoadArray<DrawListStats>(pool, state.drawlist_stats);
+  auto &stats = vertex ? drawlists[0].vertex : drawlists[0].fragment;
+  stats = {};
+  const auto counts = CountPcoInstructions(program.instructions, false);
+  stats.program_groups = program.summary.group_count;
+  stats.program_instructions = program.summary.instruction_count;
+  stats.program_alu_instructions = counts.alu;
+  stats.program_tex_instructions = counts.texture;
+  stats.program_memory_instructions = counts.memory;
+  stats.program_recorded = 1;
+  StoreArray(pool, state.drawlist_stats, drawlists);
+  StorePipelineState(pool, payload.state, state);
+  return payload;
+}
+
+class UniformTextureResponder final : public sc_core::sc_module {
+public:
+  sc_core::sc_fifo_in<PipelineTxn> input{"input"};
+  sc_core::sc_fifo_out<PipelineTxn> output{"output"};
+  UniformTextureResponder(sc_core::sc_module_name name, MemoryPool &pool,
+                          pvrgpu::stub::GpuMemorySystem &memory, ShaderStage stage)
+      : sc_module(name), pool_(pool), memory_(memory), stage_(stage) {
+    SC_THREAD(Run);
+  }
+  unsigned requests_seen = 0;
+private:
+  void Run() {
+    using namespace pvrgpu::stub;
+    const auto txn = input.read();
+    auto state = LoadPipelineState(pool_, txn.state);
+    const bool vertex = stage_ == ShaderStage::kVertex;
+    Check(state.stage == (vertex ? PipelineStage::kVertexTexturePending
+                                 : PipelineStage::kFragmentTexturePending),
+          "UBO sequence reaches the real texture FIFO");
+    const auto requests = LoadArray<TextureSampleRequest>(pool_, state.texture_sample_requests);
+    Check(requests.size() == 1 && requests[0].shader_stage == stage_ &&
+              requests[0].descriptor_set == 1 && requests[0].request_id == 0,
+          "UBO sequence has one stage-local texture request");
+    ++requests_seen;
+    const auto check_saved = [&](const auto &saved) {
+      Check(saved.size() == 1 && saved[0].valid == 1 &&
+                std::equal(kFirstUniformWords.begin(), kFirstUniformWords.end(),
+                           saved[0].temporaries.begin()),
+            "first LD's four exact words survive into the FIFO continuation");
+    };
+    if (vertex)
+      check_saved(LoadArray<PcoVertexContinuation>(pool_, state.vertex_continuations));
+    else
+      check_saved(LoadArray<PcoFragmentContinuation>(pool_, state.fragment_continuations));
+    // Give USC a real suspended interval, then add genuine texture-read stats
+    // to the carried state. The final result must retain these plus both LDs.
+    wait(sc_core::sc_time(7, sc_core::SC_NS));
+    const auto read = memory_.Read(kTextureReadAddress, 16, MemoryClient::kTextureCache);
+    ApplyMemoryAccessStats(state.counters, read.stats);
+    TextureSampleResponse response;
+    response.shader_stage = stage_;
+    response.shader_lane_index = requests[0].shader_lane_index;
+    response.request_id = requests[0].request_id;
+    std::memcpy(response.rgba, read.data.data(), 16);
+    state.texture_sample_responses = StoreNewArray(pool_,
+        std::vector<TextureSampleResponse>{response});
+    state.stage = vertex ? PipelineStage::kVertexTextureSamplesReady
+                         : PipelineStage::kTextureSamplesReady;
+    StorePipelineState(pool_, txn.state, state);
+    output.write(txn);
+  }
+  MemoryPool &pool_;
+  pvrgpu::stub::GpuMemorySystem &memory_;
+  ShaderStage stage_;
+};
+
+class UniformTextureHarness final : public sc_core::sc_module {
+public:
+  UniformTextureHarness(sc_core::sc_module_name name, ShaderStage stage,
+                        pvrgpu::stub::MemoryMode mode)
+      : sc_module(name), memory_(mode), stage_(stage),
+        payload_(MakeUniformTextureCase(pool_, memory_, stage)),
+        cluster_("cluster", pool_, stage, &memory_),
+        responder_("responder", pool_, memory_, stage) {
+    cluster_.input(input_);
+    cluster_.output(output_);
+    cluster_.texture_request_output(requests_);
+    cluster_.texture_response_input(responses_);
+    responder_.input(requests_);
+    responder_.output(responses_);
+    input_.write(payload_.txn);
+  }
+  void Verify() {
+    using namespace pvrgpu::stub;
+    PipelineTxn completed;
+    Check(output_.nb_read(completed) && completed.sequence == payload_.txn.sequence &&
+              responder_.requests_seen == 1 && !output_.nb_read(completed),
+          "LD/SMP/LD completes exactly once");
+    const auto state = LoadPipelineState(pool_, payload_.state);
+    const bool vertex = stage_ == ShaderStage::kVertex;
+    Check(state.stage == (vertex ? PipelineStage::kVertexShaded
+                                 : PipelineStage::kFragmentShaded), "UBO completion stage");
+    if (vertex) {
+      const auto lanes = LoadArray<VertexLane>(pool_, state.vertex_lanes);
+      Check(lanes.size() == 1 && lanes[0].emitted == 1 && lanes[0].ended == 1 &&
+                std::equal(kSecondUniformWords.begin(), kSecondUniformWords.end(),
+                           std::begin(lanes[0].vertex_output)),
+            "vertex second LD reads its distinct offset after texture resume");
+    } else {
+      const auto pixels = LoadArray<FragmentOutput>(pool_, state.fragment_outputs);
+      Check(pixels.size() == 1 && pixels[0].written_mask[0] == 15 &&
+                std::equal(kSecondUniformWords.begin(), kSecondUniformWords.end(),
+                           std::begin(pixels[0].pixel_output)),
+            "fragment second LD reads its distinct offset after texture resume");
+    }
+    const auto &c = state.counters;
+    if (memory_.mode() == MemoryMode::kDirect) {
+      Check(c.memory_direct_read_bytes == 48 && c.dram_read_transactions == 0 &&
+                c.slc_read_accesses == 0, "direct mode counts two LDs plus one texture read");
+    } else if (memory_.mode() == MemoryMode::kBypass) {
+      Check(c.memory_direct_read_bytes == 0 && c.dram_read_transactions == 3 &&
+                c.dram_read_bytes == 48 && c.slc_read_accesses == 0,
+            "bypass mode preserves all three reads through state reload");
+    } else {
+      Check(c.slc_read_accesses == 3 && c.slc_misses == 2 && c.slc_hits == 1 &&
+                c.dram_read_transactions == 2 && c.dram_read_bytes == 256,
+            "cache mode retains UBO cold/warm reads and the texture cold read");
+    }
+    Check((vertex ? c.vs_tex_instructions : c.fs_tex_instructions) == 1,
+          "texture suspension does not repeat the SMP instruction");
+    Check(!HasPoolHandle(state.vertex_continuations) &&
+              !HasPoolHandle(state.fragment_continuations) &&
+              !HasPoolHandle(state.texture_sample_requests) &&
+              !HasPoolHandle(state.texture_sample_responses),
+          "UBO texture continuation payloads retire");
+    ReleaseFunctionalPayloads(pool_, state);
+    pool_.Release(payload_.state);
+    Check(pool_.bytes_in_flight() == 0 && pool_.allocations() == pool_.releases(),
+          "UBO range and continuation handles are released exactly once");
+  }
+private:
+  MemoryPool pool_;
+  pvrgpu::stub::GpuMemorySystem memory_;
+  ShaderStage stage_;
+  CasePayload payload_;
+  sc_core::sc_fifo<PipelineTxn> input_{"input", 1};
+  sc_core::sc_fifo<PipelineTxn> requests_{"requests", 1};
+  sc_core::sc_fifo<PipelineTxn> responses_{"responses", 1};
+  sc_core::sc_fifo<PipelineTxn> output_{"output", 1};
+  UscCluster cluster_;
+  UniformTextureResponder responder_;
+};
+
 int RunExpectedFailure(bool too_many_requests) {
   MemoryPool pool;
   const std::size_t sample_count =
@@ -577,6 +807,41 @@ int sc_main(int argc, char **argv) {
     Check(DriverPcoTextureSharedLayoutSupported(terrain_d4_fragment_abi, 1),
           "legacy descriptor-only empty push range remains accepted");
 
+    DriverPcoStageAbi mixed_abi;
+    mixed_abi.shareds = 32;
+    mixed_abi.uniform_buffer_descriptor_start = 20;
+    mixed_abi.uniform_buffer_descriptor_count = 2;
+    mixed_abi.push_constant_start = 28;
+    mixed_abi.push_constant_count = 4;
+    Check(DriverPcoTextureSharedLayoutSupported(mixed_abi, 1),
+          "texture plus UBO prefix precedes push constants");
+    mixed_abi.push_constant_count = 0;
+    mixed_abi.shareds = 28;
+    Check(DriverPcoTextureSharedLayoutSupported(mixed_abi, 1),
+          "UBO empty push suffix uses canonical prefix end");
+    mixed_abi.push_constant_start = 0;
+    Check(!DriverPcoTextureSharedLayoutSupported(mixed_abi, 1),
+          "UBO layouts reject noncanonical legacy empty push start");
+    mixed_abi.push_constant_start = 28;
+    mixed_abi.push_constant_count = 4;
+    mixed_abi.shareds = 32;
+    mixed_abi.uniform_buffer_descriptor_start = 19;
+    Check(!DriverPcoTextureSharedLayoutSupported(mixed_abi, 1),
+          "UBO descriptor cannot overlap texture descriptor");
+    mixed_abi.uniform_buffer_descriptor_start = 20;
+    mixed_abi.push_constant_start = 20;
+    Check(!DriverPcoTextureSharedLayoutSupported(mixed_abi, 1),
+          "push constants cannot overlap UBO descriptors");
+    mixed_abi.push_constant_start = 28;
+    mixed_abi.push_constant_count = 228;
+    mixed_abi.shareds = 256;
+    Check(DriverPcoTextureSharedLayoutSupported(mixed_abi, 1),
+          "256 DWORD shared-register endpoint remains representable");
+    mixed_abi.push_constant_count = 229;
+    mixed_abi.shareds = 257;
+    Check(!DriverPcoTextureSharedLayoutSupported(mixed_abi, 1),
+          "shared-register file overflow is rejected");
+
     MemoryPool one_pool;
     MemoryPool three_pool;
     MemoryPool five_pool;
@@ -587,6 +852,14 @@ int sc_main(int argc, char **argv) {
     const CasePayload five = MakeCase(five_pool, 5, 3, 5, 64);
     const CasePayload nine = MakeCase(nine_pool, 9, 4, 1);
     const CasePayload vertex = MakeVertexCase(vertex_pool, 5);
+    std::vector<std::unique_ptr<UniformTextureHarness>> uniform_cases;
+    for (auto mode : {pvrgpu::stub::MemoryMode::kDirect,
+                      pvrgpu::stub::MemoryMode::kBypass,
+                      pvrgpu::stub::MemoryMode::kCache}) {
+      for (auto stage : {ShaderStage::kVertex, ShaderStage::kFragment})
+        uniform_cases.emplace_back(new UniformTextureHarness(
+            sc_core::sc_gen_unique_name("uniform_texture"), stage, mode));
+    }
 
     sc_core::sc_fifo<PipelineTxn> one_input("one_input", 1);
     sc_core::sc_fifo<PipelineTxn> one_requests("one_requests", 1);
@@ -682,6 +955,8 @@ int sc_main(int argc, char **argv) {
     CheckCompletedCase(five_pool, five, five_responder, 5);
     CheckCompletedCase(nine_pool, nine, nine_responder, 9);
     CheckCompletedVertexCase(vertex_pool, vertex);
+    for (const auto &test : uniform_cases)
+      test->Verify();
 
     std::cout << "usc_cluster_texture_continuation_test: PASS\n";
     return 0;

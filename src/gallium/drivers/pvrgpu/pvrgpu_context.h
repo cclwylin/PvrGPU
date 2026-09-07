@@ -28,7 +28,7 @@
 #define PVRGPU_MAX_RENDER_TARGETS 4u
 
 /* Shared-register words one lowered draw carries per stage. */
-#define PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS 64u
+#define PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS 256u
 
 struct pvrgpu_array_primitive_draw;
 struct pvrgpu_deqp_primitive_sequence_profile;

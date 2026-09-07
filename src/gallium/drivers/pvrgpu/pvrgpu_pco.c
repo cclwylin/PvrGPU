@@ -3553,6 +3553,8 @@ static bool pvrgpu_copy_pco_stage(pco_shader *shader,
    out->abi.push_constant_start = data->common.push_consts.range.start;
    out->abi.push_constant_count = data->common.push_consts.range.count;
    out->abi.entry_offset = data->common.entry_offset;
+   out->abi.uniform_buffer_descriptor_start = 0;
+   out->abi.uniform_buffer_descriptor_count = 0;
    return true;
 }
 
@@ -3967,6 +3969,8 @@ static const char *pvrgpu_glsl_sampler_dim_name(enum glsl_sampler_dim dim)
 static bool pvrgpu_color_primitive_allowed_intrinsic(nir_intrinsic_op op)
 {
    switch (op) {
+   case nir_intrinsic_load_ubo:
+   case nir_intrinsic_get_ubo_size:
    case nir_intrinsic_load_uniform:
    case nir_intrinsic_load_deref:
    case nir_intrinsic_store_deref:
@@ -4068,14 +4072,14 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
    }
 
    /*
-    * Default-block uniforms become push constants, so they are allowed.
-    * Anything reached through a descriptor is not.
+    * Default-block uniforms become push constants. Uniform blocks use
+    * bounded read-only descriptors; other buffer/image classes remain gated.
     */
    const char *stage_name =
       expected_stage == MESA_SHADER_VERTEX ? "VS" : "FS";
-   if (nir->info.num_ubos != 0) {
+   if (nir->info.num_ubos > 15) {
       return pvrgpu_pco_fail(error, error_size,
-                             "color primitive %s reads %u uniform buffer(s)",
+                             "color primitive %s exceeds 15 uniform buffers (%u)",
                              stage_name, nir->info.num_ubos);
    }
    if (nir->info.num_ssbos != 0) {
@@ -4576,6 +4580,63 @@ pvrgpu_restore_depth_feedback_no_discard(nir_builder *b,
    return true;
 }
 
+/* Gallium's stage-local UBO index is not PCO's Vulkan descriptor reference.
+ * Keep block bytes in modeled memory and translate only the binding metadata.
+ * Set 0/binding 0 remains the texture unit; UBO i uses binding i+1. */
+static bool
+pvrgpu_lower_generic_uniform_buffers(nir_shader *nir, pco_data *data,
+                                     unsigned start, void *mem,
+                                     char *error, size_t error_size)
+{
+   const unsigned count = nir->info.num_ubos;
+   if (!count)
+      return true;
+   if (count > 15)
+      return pvrgpu_pco_fail(error, error_size, "UBO block count exceeds ABI");
+   pco_descriptor_set_data *set = &data->common.desc_sets[0];
+   pco_binding_data *bindings = rzalloc_array(mem, pco_binding_data, count + 1);
+   if (!bindings)
+      return pvrgpu_pco_fail(error, error_size, "allocating UBO descriptor ABI");
+   if (set->binding_count)
+      bindings[0] = set->bindings[0];
+   set->bindings = bindings;
+   set->binding_count = count + 1;
+   set->used = true;
+   set->range = (pco_range){.start = 0, .count = start + count * 4};
+   for (unsigned i = 0; i < count; ++i) {
+      bindings[i + 1].used = true;
+      bindings[i + 1].range = (pco_range){
+         .start = start + i * 4, .count = 4, .stride = 4,
+      };
+   }
+   data->common.shareds = start + count * 4;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_ubo &&
+                intr->intrinsic != nir_intrinsic_get_ubo_size)
+               continue;
+            if (!nir_src_is_const(intr->src[0]) ||
+                intr->src[0].ssa->num_components != 1 ||
+                nir_src_as_uint(intr->src[0]) >= count ||
+                intr->def.bit_size != 32 || intr->def.num_components > 4)
+               return pvrgpu_pco_fail(error, error_size,
+                                      "UBO requires a bounded static block and 32-bit load");
+            const unsigned block = nir_src_as_uint(intr->src[0]);
+            b.cursor = nir_before_instr(instr);
+            nir_src_rewrite(&intr->src[0],
+                            nir_imm_ivec2(&b, (block + 1) << 16, 0));
+         }
+      }
+      nir_progress(true, impl, nir_metadata_control_flow);
+   }
+   return true;
+}
+
 bool pvrgpu_pco_compile_color_triangle(
    struct pvrgpu_pco_compiler *compiler,
    const struct nir_shader *vertex_nir,
@@ -4921,6 +4982,19 @@ bool pvrgpu_pco_compile_color_triangle(
       descriptor_dwords = texture_count * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
       fragment_data.common.shareds = descriptor_dwords;
    }
+   const unsigned vertex_ubo_count = vs->info.num_ubos;
+   const unsigned fragment_ubo_count = fs->info.num_ubos;
+   const unsigned vertex_descriptor_dwords = vertex_ubo_count * 4;
+   const unsigned fragment_ubo_start = descriptor_dwords;
+   if (!pvrgpu_lower_generic_uniform_buffers(vs, &vertex_data, 0,
+                                              compile_mem_ctx, error, error_size) ||
+       !pvrgpu_lower_generic_uniform_buffers(fs, &fragment_data,
+                                              descriptor_dwords,
+                                              compile_mem_ctx, error, error_size)) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+   descriptor_dwords += fragment_ubo_count * 4;
    fragment_data.fs.z_replicate = ~0U;
    fragment_data.fs.rasterization_samples = 1;
    /*
@@ -5008,7 +5082,8 @@ bool pvrgpu_pco_compile_color_triangle(
    pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=nir_done");
 
    if ((vertex_uniform_loads != 0 &&
-        !pvrgpu_allocate_generic_push_constants(&vertex_data,
+        !pvrgpu_allocate_generic_push_constants_after(&vertex_data,
+                                                vertex_descriptor_dwords,
                                                 vertex_uniform_dwords,
                                                 "VS",
                                                 error,
@@ -5024,9 +5099,22 @@ bool pvrgpu_pco_compile_color_triangle(
       return false;
    }
 
+   /* A missing CB0 is an empty suffix after all descriptors, not a window
+    * at SH0. Keep its canonical origin so the transport's non-overlap check
+    * still distinguishes a valid empty range from a malformed ABI. */
+   if (vertex_ubo_count && vertex_data.common.push_consts.range.count == 0)
+      vertex_data.common.push_consts.range.start = vertex_descriptor_dwords;
+   if (fragment_ubo_count && fragment_data.common.push_consts.range.count == 0)
+      fragment_data.common.push_consts.range.start = descriptor_dwords;
+
    if (depth_feedback)
       nir_shader_intrinsics_pass(fs, pvrgpu_restore_depth_feedback_no_discard,
                                   nir_metadata_control_flow, NULL);
+   if (vertex_data.common.shareds > 96 || fragment_data.common.shareds > 256) {
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error, error_size,
+                             "descriptor and push constant span exceeds USC ABI");
+   }
    pco_shader *vertex =
       pco_trans_nir(compiler->pco, vs, &vertex_data, compile_mem_ctx);
    pco_shader *fragment =
@@ -5051,6 +5139,11 @@ bool pvrgpu_pco_compile_color_triangle(
    }
 
    /* Position, then gl_PointSize when the shader writes it, then varyings. */
+   out->vertex.abi.uniform_buffer_descriptor_start = 0;
+   out->vertex.abi.uniform_buffer_descriptor_count = vertex_ubo_count;
+   out->fragment.abi.uniform_buffer_descriptor_start = fragment_ubo_count
+                                                        ? fragment_ubo_start : 0;
+   out->fragment.abi.uniform_buffer_descriptor_count = fragment_ubo_count;
    out->position_output_start = 0;
    out->position_output_count = 4;
    out->fragment_position_start = 0;

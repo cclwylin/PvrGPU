@@ -42,6 +42,9 @@ struct pvrgpu_pco_stage_abi {
    uint32_t push_constant_start;
    uint32_t push_constant_count;
    uint32_t entry_offset;
+   /* Four DWORDs per block: base low/high, byte size, dynamic byte offset. */
+   uint32_t uniform_buffer_descriptor_start;
+   uint32_t uniform_buffer_descriptor_count;
 };
 
 struct pvrgpu_pco_owned_binary {

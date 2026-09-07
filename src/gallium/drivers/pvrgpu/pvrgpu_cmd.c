@@ -585,6 +585,8 @@ pvrgpu_systemc_copy_pco_stage_abi(
    destination->push_constant_start = source->push_constant_start;
    destination->push_constant_count = source->push_constant_count;
    destination->entry_offset = source->entry_offset;
+   destination->uniform_buffer_descriptor_start = source->uniform_buffer_descriptor_start;
+   destination->uniform_buffer_descriptor_count = source->uniform_buffer_descriptor_count;
 }
 
 static bool
@@ -816,6 +818,72 @@ pvrgpu_cmd_validate_draw_textured_triangles(
                                                    cmd,
                                                    error,
                                                    error_size);
+}
+
+/* Validate the exact, unrelocated UBO inputs before crossing the API boundary.
+ * A missing block is a legal descriptor hole, never an implicit zero buffer. */
+static bool
+pvrgpu_cmd_validate_uniform_buffers(
+   const struct pvrgpu_systemc_driver_command *cmd,
+   char *error, size_t error_size)
+{
+   if (cmd->uniform_buffer_count >
+          2 * PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
+       (cmd->uniform_buffer_count && !cmd->uniform_buffers))
+      goto invalid;
+   for (uint32_t stage = 0; stage < 2; ++stage) {
+      const struct pvrgpu_systemc_pco_stage_abi *abi = stage == 0
+         ? &cmd->vertex_pco_abi : &cmd->fragment_pco_abi;
+      const uint32_t *shared = stage == 0
+         ? cmd->vertex_shared : cmd->fragment_shared;
+      const size_t shared_count = stage == 0
+         ? cmd->vertex_shared_count : cmd->fragment_shared_count;
+      const uint32_t blocks = abi->uniform_buffer_descriptor_count;
+      const uint64_t end = (uint64_t)abi->uniform_buffer_descriptor_start +
+                           4u * blocks;
+      if (blocks > PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
+          shared_count != abi->shareds || shared_count > (stage == 0 ? 96 : 256) ||
+          (shared_count && !shared) || end > shared_count ||
+          (abi->uniform_buffer_descriptor_start & 3u) ||
+          (!blocks && abi->uniform_buffer_descriptor_start) ||
+          (blocks && abi->push_constant_count &&
+           end > abi->push_constant_start))
+         goto invalid;
+      for (uint32_t block = 0; block < blocks; ++block) {
+         const uint32_t *descriptor = shared +
+            abi->uniform_buffer_descriptor_start + 4u * block;
+         uint32_t size = 0;
+         bool found = false;
+         for (uint32_t i = 0; i < cmd->uniform_buffer_count; ++i) {
+            const struct pvrgpu_systemc_pco_uniform_buffer *entry =
+               &cmd->uniform_buffers[i];
+            if (entry->stage != stage || entry->block_index != block)
+               continue;
+            if (found || !entry->bytes || !entry->bytes_size ||
+                entry->bytes_size > PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES)
+               goto invalid;
+            found = true;
+            size = (uint32_t)entry->bytes_size;
+         }
+         if (descriptor[0] || descriptor[1] || descriptor[2] != size ||
+             descriptor[3])
+            goto invalid;
+      }
+   }
+   for (uint32_t i = 0; i < cmd->uniform_buffer_count; ++i) {
+      const struct pvrgpu_systemc_pco_uniform_buffer *entry =
+         &cmd->uniform_buffers[i];
+      if (entry->stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT ||
+          entry->block_index >= (entry->stage == 0
+             ? cmd->vertex_pco_abi.uniform_buffer_descriptor_count
+             : cmd->fragment_pco_abi.uniform_buffer_descriptor_count))
+         goto invalid;
+   }
+   return true;
+invalid:
+   pvrgpu_cmd_error(error, error_size,
+                   "invalid PCO uniform-buffer snapshot or descriptor window");
+   return false;
 }
 
 static bool
@@ -1152,9 +1220,8 @@ pvrgpu_cmd_validate_draw_pco_triangles(
    const bool vertex_stage_invalid =
       (!color_layout && cmd->vertex_pco_abi.temps == 0) ||
       cmd->vertex_pco_abi.temps > 256 ||
-      cmd->vertex_pco_abi.shareds > 64 ||
+      cmd->vertex_pco_abi.shareds > 96 ||
       cmd->vertex_pco_abi.coefficients != 0 ||
-      cmd->vertex_pco_abi.push_constant_start != 0 ||
       /*
        * Shared registers hold texture descriptors first and push constants
        * after, so the two are only equal for a stage that samples nothing.
@@ -1173,7 +1240,7 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       (!ideas_position_layout && !color_layout &&
        cmd->fragment_pco_abi.temps == 0)      ? "fs temps is zero" :
       cmd->fragment_pco_abi.temps > 256       ? "fs temps > 256" :
-      cmd->fragment_pco_abi.shareds > 64      ? "fs shareds > 64" :
+      cmd->fragment_pco_abi.shareds > 256     ? "fs shareds > 256" :
       cmd->fragment_pco_abi.vertex_inputs != 0  ? "fs vertex_inputs != 0" :
       cmd->fragment_pco_abi.vertex_outputs != 0 ? "fs vertex_outputs != 0" :
       /*
@@ -1197,6 +1264,10 @@ pvrgpu_cmd_validate_draw_pco_triangles(
           cmd->fragment_pco_abi.shareds)
          ? "fs push_constant_count != shareds" : NULL;
    const bool fragment_stage_invalid = fragment_stage_refusal != NULL;
+   struct pvrgpu_systemc_driver_command uniform_api;
+   pvrgpu_pco_triangles_command_to_systemc(cmd, &uniform_api);
+   if (!pvrgpu_cmd_validate_uniform_buffers(&uniform_api, error, error_size))
+      return false;
    /*
     * Position occupies the first outputs, gl_PointSize the next one when the
     * shader sizes its points, and the varyings follow.  The fragment stage's
@@ -1827,6 +1898,8 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->vertex_shared_count = cmd->vertex_shared_count;
    out->fragment_shared = cmd->fragment_shared;
    out->fragment_shared_count = cmd->fragment_shared_count;
+   out->uniform_buffers = cmd->uniform_buffers;
+   out->uniform_buffer_count = cmd->uniform_buffer_count;
    out->sampled_texture_count = cmd->sampled_texture_count;
    out->sampled_texture_bytes = cmd->sampled_texture_bytes;
    out->sampled_texture_bytes_size = cmd->sampled_texture_bytes_size;
@@ -1925,6 +1998,7 @@ pvrgpu_write_draw_pco_triangles_command(
 
    int written = fprintf(
       file,
+      "%s"
       "schema=%s\n"
       "producer=%s\n"
       "command=draw_pco_triangles\n"
@@ -1967,6 +2041,9 @@ pvrgpu_write_draw_pco_triangles_command(
       "vertex_pco_size=%zu\n"
       "fragment_pco_size=%zu\n"
       "vertex_shared_count=%zu\n",
+      (cmd->vertex_pco_abi.uniform_buffer_descriptor_count ||
+       cmd->fragment_pco_abi.uniform_buffer_descriptor_count)
+         ? "uniform_buffer_replay=api-v21-only\n" : "",
       PVRGPU_DRIVER_COMMAND_SCHEMA,
       PVRGPU_DRIVER_COMMAND_PRODUCER,
       cmd->case_name,
@@ -2175,6 +2252,7 @@ pvrgpu_write_draw_pco_sequence_command(
    }
 
    bool has_initial_color_attachment = false;
+   bool has_uniform_buffers = false;
    for (uint32_t ordinal = 0;
         ordinal < cmd->pco_sequence_command_count;
         ++ordinal) {
@@ -2192,6 +2270,11 @@ pvrgpu_write_draw_pco_sequence_command(
                           "invalid nested API-v6 PCO sequence draw");
          return false;
       }
+      if (!pvrgpu_cmd_validate_uniform_buffers(nested, error, error_size))
+         return false;
+      has_uniform_buffers = has_uniform_buffers ||
+         nested->vertex_pco_abi.uniform_buffer_descriptor_count ||
+         nested->fragment_pco_abi.uniform_buffer_descriptor_count;
       has_initial_color_attachment = has_initial_color_attachment ||
          nested->initial_color_attachment_bytes ||
          nested->initial_color_attachment_bytes_size != 0 ||
@@ -2210,6 +2293,7 @@ pvrgpu_write_draw_pco_sequence_command(
    }
    const int written = fprintf(
       file,
+      "%s"
       "%s"
       "schema=%s\n"
       "producer=%s\n"
@@ -2237,6 +2321,7 @@ pvrgpu_write_draw_pco_sequence_command(
        * Make replay reject explicitly before it can lose imported pixels. */
       has_initial_color_attachment
          ? "initial_color_attachment_replay=api-v20-only\n" : "",
+      has_uniform_buffers ? "uniform_buffer_replay=api-v21-only\n" : "",
       cmd->schema && cmd->schema[0] ? cmd->schema :
                                       PVRGPU_DRIVER_COMMAND_SCHEMA,
       cmd->producer && cmd->producer[0] ? cmd->producer :

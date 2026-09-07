@@ -4,10 +4,20 @@
 #include "../model_stub/model_types.h"
 
 #include <png.h>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +37,92 @@ std::filesystem::path g_test_root;
 [[noreturn]] void Fail(const std::string &message) {
   std::fprintf(stderr, "pco-systemc-api-bridge-test: %s\n", message.c_str());
   std::_Exit(EXIT_FAILURE);
+}
+
+void VerifyGuardedPreviousVersionCommand(
+    const pvrgpu_systemc_submit_info &original_info) {
+  // API-v21 added two DWORDs to each embedded stage ABI and appended the
+  // uniform-buffer list. Reconstruct the API-v20 byte extent, not a zeroed
+  // current-size command whose readable tail would hide the invalid access.
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 21U,
+                "update the frozen API-v20 guard-page fixture on ABI changes");
+  constexpr std::size_t kApi20CommandBytes =
+      offsetof(pvrgpu_systemc_driver_command, uniform_buffers) -
+      2U * 2U * sizeof(std::uint32_t);
+  static_assert(offsetof(pvrgpu_systemc_driver_command, version) == 0);
+  static_assert(kApi20CommandBytes %
+                    alignof(pvrgpu_systemc_driver_command) == 0);
+#if defined(_WIN32)
+  SYSTEM_INFO system_info{};
+  GetSystemInfo(&system_info);
+  const long page_size_result = static_cast<long>(system_info.dwPageSize);
+#else
+  const long page_size_result = sysconf(_SC_PAGESIZE);
+#endif
+  if (page_size_result <= 0 ||
+      static_cast<std::size_t>(page_size_result) < kApi20CommandBytes)
+    Fail("cannot determine guard-page size for the previous API command");
+  const std::size_t page_size = static_cast<std::size_t>(page_size_result);
+#if defined(_WIN32)
+  void *mapping = VirtualAlloc(nullptr, 2U * page_size,
+                              MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+  DWORD previous_protection = 0;
+  if (!mapping ||
+      !VirtualProtect(mapping, page_size, PAGE_READWRITE, &previous_protection))
+#else
+  void *mapping = mmap(nullptr, 2U * page_size, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (mapping == MAP_FAILED ||
+      mprotect(mapping, page_size, PROT_READ | PROT_WRITE) != 0)
+#endif
+    Fail("cannot allocate previous-version command guard pages");
+  auto *previous_bytes = static_cast<std::uint8_t *>(mapping) + page_size -
+                         kApi20CommandBytes;
+  std::memset(previous_bytes, 0, kApi20CommandBytes);
+  constexpr std::uint32_t kPreviousVersion = 20U;
+  std::memcpy(previous_bytes, &kPreviousVersion, sizeof(kPreviousVersion));
+#if defined(_WIN32)
+  if (!VirtualProtect(mapping, page_size, PAGE_READONLY, &previous_protection))
+#else
+  if (mprotect(mapping, page_size, PROT_READ) != 0)
+#endif
+    Fail("cannot protect previous-version command storage");
+  const auto *previous_command =
+      reinterpret_cast<const pvrgpu_systemc_driver_command *>(previous_bytes);
+
+  pvrgpu_systemc_submit_info info = original_info;
+  std::array<char, 256> error{};
+  info.command = previous_command;
+  if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) !=
+          2 ||
+      std::string(error.data()).find("command version") == std::string::npos)
+    Fail("guarded old-size top-level command was not rejected by version");
+
+  // A valid current-version envelope must independently reject the first
+  // nested command before reading its inaccessible v21 uniform-buffer tail.
+  pvrgpu_systemc_driver_command sequence{};
+  sequence.version = PVRGPU_SYSTEMC_API_VERSION;
+  sequence.command = "draw_pco_sequence";
+  sequence.case_name = "bridge.sequence.previous-version";
+  sequence.format = "PIPE_FORMAT_R8G8B8A8_UNORM";
+  sequence.framebuffer_width = sequence.width = 80;
+  sequence.framebuffer_height = sequence.height = 60;
+  sequence.pco_sequence_command_count = 1;
+  sequence.pco_sequence_commands = previous_command;
+  info.command = &sequence;
+  error.fill(0);
+  if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) !=
+          2 ||
+      std::string(error.data()).find(
+          "nested PCO sequence draw header is invalid: version=20 expected=21") ==
+          std::string::npos)
+    Fail("guarded old-size nested command was not rejected by version");
+#if defined(_WIN32)
+  if (!VirtualFree(mapping, 0, MEM_RELEASE))
+#else
+  if (munmap(mapping, 2U * page_size) != 0)
+#endif
+    Fail("cannot release previous-version command guard pages");
 }
 
 std::string ReadText(const std::filesystem::path &path) {
@@ -242,8 +338,8 @@ void VerifyDepthAttachmentFormats() {
 
 int main() {
   using namespace pvrgpu::stub;
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 20U,
-                "native sequence bridge test requires API-v20");
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 21U,
+                "native sequence bridge test requires API-v21");
   static_assert(PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS == 15U);
   static_assert(kDriverPcoMaximumTextureMipLevels == 15U);
   static_assert(kMaximumTextureMipLevels == 15U);
@@ -422,6 +518,7 @@ int main() {
   }
   command.version = PVRGPU_SYSTEMC_API_VERSION;
   error.fill(0);
+  VerifyGuardedPreviousVersionCommand(info);
 
   set_pco_resolution(640, 480);
   if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) ==
@@ -598,9 +695,27 @@ int main() {
     expect_sequence_rejected(draws, "unsupported: blend",
                              "noncanonical disabled blend state");
   }
+  // Deliberately invalid blend state proves a legal reservation passes the
+  // nested ABI gate without pretending the fixture uses every reserved TEMP.
+  for (const std::uint32_t temps : {64U, 65U, 255U, 256U}) {
+    std::array<pvrgpu_systemc_driver_command, 2> draws = {
+        make_sequence_draw(), make_sequence_draw()};
+    draws[0].vertex_pco_abi.temps = temps;
+    draws[0].fragment_pco_abi.temps = temps;
+    draws[0].blend_source_rgb_factor = PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ZERO;
+    expect_sequence_rejected(draws, "unsupported: blend",
+                             "bounded nested TEMP reservation");
+  }
+  for (const bool vertex_stage : {false, true}) {
+    std::array<pvrgpu_systemc_driver_command, 2> draws = {
+        make_sequence_draw(), make_sequence_draw()};
+    (vertex_stage ? draws[0].vertex_pco_abi : draws[0].fragment_pco_abi).temps =
+        kPcoTemporaryCount + 1U;
+    expect_sequence_rejected(draws, "ABI/payload is invalid",
+                             "257-register nested TEMP reservation");
+  }
   // Matrix operands and other wide VS-to-FS interfaces use more than sixteen
-  // scalar varyings.  Deliberately invalid blend state proves legal wide
-  // interfaces pass the ABI gate without submitting a fake shader payload.
+  // scalar varyings. The same independent blend failure isolates that bound.
   for (const std::uint32_t components : {18U, 32U, 60U}) {
     std::array<pvrgpu_systemc_driver_command, 2> draws = {
         make_sequence_draw(), make_sequence_draw()};
@@ -686,7 +801,7 @@ int main() {
   // than a value hard-coded for today's Ideas lighting shader (TEMP36).
   // Use a non-root Ideas command so the subsequent conditionals submit can
   // replace it under the ordinary deferred last-command-wins contract.
-  static_assert(kPcoTemporaryCount == 64,
+  static_assert(kPcoTemporaryCount == 256,
                 "bridge boundary test tracks the modeled TEMP bank");
   std::vector<std::uint8_t> ideas_vertices(12U * 16U, 0);
   std::vector<std::uint32_t> ideas_vertex_shared(32U, 0);
@@ -742,7 +857,7 @@ int main() {
   error.fill(0);
   if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) !=
       0) {
-    Fail("TEMP64 Ideas API submit was rejected: " +
+    Fail("256-register TEMP reservation was rejected: " +
          std::string(error.data()));
   }
   command.vertex_pco_abi.temps = kPcoTemporaryCount + 1U;
@@ -751,7 +866,7 @@ int main() {
           0 ||
       std::string(error.data()).find("vertex ABI exceeds model bounds") ==
           std::string::npos) {
-    Fail("TEMP65 vertex ABI was not rejected at the bridge boundary");
+    Fail("257-register vertex TEMP ABI was not rejected at the bridge boundary");
   }
   command.vertex_pco_abi.temps = kPcoTemporaryCount;
   command.fragment_pco_abi.temps = kPcoTemporaryCount + 1U;
@@ -760,7 +875,7 @@ int main() {
           0 ||
       std::string(error.data()).find("fragment ABI exceeds model bounds") ==
           std::string::npos) {
-    Fail("TEMP65 fragment ABI was not rejected at the bridge boundary");
+    Fail("257-register fragment TEMP ABI was not rejected at the bridge boundary");
   }
   command = conditionals_command;
 

@@ -7,6 +7,7 @@
 #include "pvrgpu_resource.h"
 #include "pvrgpu_state.h"
 #include "pvrgpu_systemc_api.h"
+#include "pvrgpu_uniform_buffer.h"
 
 #include "pipe/p_defines.h"
 #include "nir/nir.h"
@@ -6346,6 +6347,8 @@ pvrgpu_copy_pco_stage_abi_to_command(
    destination->push_constant_start = source->push_constant_start;
    destination->push_constant_count = source->push_constant_count;
    destination->entry_offset = source->entry_offset;
+   destination->uniform_buffer_descriptor_start = source->uniform_buffer_descriptor_start;
+   destination->uniform_buffer_descriptor_count = source->uniform_buffer_descriptor_count;
 }
 
 static uint64_t
@@ -6560,6 +6563,8 @@ pvrgpu_copy_pco_stage_abi_to_systemc(
    destination->push_constant_start = source->push_constant_start;
    destination->push_constant_count = source->push_constant_count;
    destination->entry_offset = source->entry_offset;
+   destination->uniform_buffer_descriptor_start = source->uniform_buffer_descriptor_start;
+   destination->uniform_buffer_descriptor_count = source->uniform_buffer_descriptor_count;
 }
 
 static bool
@@ -9995,6 +10000,9 @@ struct pvrgpu_array_primitive_draw {
     */
    uint32_t vertex_shared_words[PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS];
    uint32_t fragment_shared_words[PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS];
+   struct pvrgpu_systemc_pco_uniform_buffer
+      uniform_buffers[2 * PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE];
+   unsigned uniform_buffer_count;
    /*
     * Images the draw samples.  The sequence carries them in one flat array
     * that each nested draw consumes a slice of, so the record owns its own
@@ -10019,6 +10027,8 @@ pvrgpu_array_primitive_draw_destroy(struct pvrgpu_array_primitive_draw **slot)
    free(draw->attachment_clears);
    free(draw->initial_color_attachment_bytes);
    free(draw->initial_depth_attachment_bytes);
+   pvrgpu_finish_uniform_buffer_snapshots(draw->uniform_buffers,
+                                         &draw->uniform_buffer_count);
    for (unsigned texture = 0; texture < PVRGPU_PCO_MAX_TEXTURES; ++texture)
       free(draw->texture_bytes[texture]);
    FREE(draw);
@@ -10634,6 +10644,27 @@ pvrgpu_copy_stage_uniform_words(const struct pvrgpu_context *ctx,
       words[abi->push_constant_start + word] = value;
    }
    return true;
+}
+
+static bool
+pvrgpu_capture_stage_uniform_buffers(
+   const struct pvrgpu_context *ctx, mesa_shader_stage stage,
+   unsigned active_blocks, const struct pvrgpu_pco_stage_abi *abi,
+   struct pvrgpu_array_primitive_draw *recorded, uint32_t *shared)
+{
+   if ((stage != MESA_SHADER_VERTEX && stage != MESA_SHADER_FRAGMENT) ||
+       active_blocks > PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
+       active_blocks != abi->uniform_buffer_descriptor_count ||
+       (uint64_t)abi->uniform_buffer_descriptor_start + 4u * active_blocks >
+          abi->shareds || abi->shareds > PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS)
+      return false;
+   return pvrgpu_snapshot_stage_uniform_buffers(
+      ctx->constant_buffers[stage],
+      stage == MESA_SHADER_VERTEX ? PVRGPU_SYSTEMC_PCO_SHADER_STAGE_VERTEX
+                                 : PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT,
+      active_blocks, abi->uniform_buffer_descriptor_start, shared, abi->shareds,
+      recorded->uniform_buffers, &recorded->uniform_buffer_count,
+      ARRAY_SIZE(recorded->uniform_buffers));
 }
 
 /*
@@ -11380,6 +11411,21 @@ pvrgpu_record_color_primitive_pco_draw(
    /* The nested draw points at payloads this record owns until submission. */
    recorded->vertex_data = interleaved;
    recorded->index_data = index_data;
+   recorded->binary = binary;
+   if (!pvrgpu_capture_stage_uniform_buffers(
+          ctx, MESA_SHADER_VERTEX, ctx->vs->nir->info.num_ubos,
+          &binary.vertex.abi, recorded, vertex_uniform_words) ||
+       !pvrgpu_capture_stage_uniform_buffers(
+          ctx, MESA_SHADER_FRAGMENT, ctx->fs->nir->info.num_ubos,
+          &binary.fragment.abi, recorded, fragment_uniform_words)) {
+      pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                            "stage=uniform_buffers reason=bound_range_or_descriptor");
+      pvrgpu_array_primitive_draw_destroy(&recorded);
+      return false;
+   }
+   command.uniform_buffers = recorded->uniform_buffer_count
+      ? recorded->uniform_buffers : NULL;
+   command.uniform_buffer_count = recorded->uniform_buffer_count;
    for (unsigned texture = 0;
         texture < fragment_texture_count; ++texture) {
       const char *texture_reason = NULL;
@@ -11445,7 +11491,6 @@ pvrgpu_record_color_primitive_pco_draw(
       ++recorded->texture_count;
    }
    command.sampled_texture_count = recorded->texture_count;
-   recorded->binary = binary;
    /*
     * Re-point the command at storage the record owns before the pointer copy
     * below; vertex_uniform_words / fragment_uniform_words are locals of this

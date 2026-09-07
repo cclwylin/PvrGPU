@@ -14,10 +14,13 @@
 
 namespace pvrgpu::stub {
 
+class GpuMemorySystem;
+
 // Validates the public shared-register layout used by a stage's combined
 // image/sampler descriptor prefix and optional push-constant suffix.  Mesa
-// may represent an empty suffix either as the legacy {start=0,count=0} pair or
-// as the canonical empty range at the end of the descriptor prefix.
+// without UBOs may represent an empty suffix either as the legacy
+// {start=0,count=0} pair or the canonical range at the prefix end. API-v21
+// UBO layouts always use the canonical prefix end, even for an empty suffix.
 bool DriverPcoTextureSharedLayoutSupported(
     const DriverPcoStageAbi &abi, std::uint32_t descriptor_set_count);
 
@@ -32,13 +35,15 @@ public:
                    sc_core::SC_ZERO_OR_MORE_BOUND>
       texture_response_input{"texture_response_input"};
 
-  UscCluster(sc_core::sc_module_name name, MemoryPool &pool, ShaderStage stage);
+  UscCluster(sc_core::sc_module_name name, MemoryPool &pool, ShaderStage stage,
+             GpuMemorySystem *memory = nullptr);
 
 private:
   void Run();
 
   MemoryPool &pool_;
   ShaderStage stage_;
+  GpuMemorySystem *memory_;
 };
 
 } // namespace pvrgpu::stub

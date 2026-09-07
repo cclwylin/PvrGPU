@@ -1,4 +1,5 @@
 #include "model_runner.h"
+#include "uniform_buffers.h"
 #include "texture/astc_decoder.h"
 #include "texture/texture_unit.h"
 #include "pco_sequence_profiles.h"
@@ -101,7 +102,9 @@ bool PcoStageAbiMatches(const Abi &actual,
          actual.shareds == expected.shareds &&
          actual.push_constant_start == expected.push_constant_start &&
          actual.push_constant_count == expected.push_constant_count &&
-         actual.entry_offset == expected.entry_offset;
+         actual.entry_offset == expected.entry_offset &&
+         actual.uniform_buffer_descriptor_start == expected.uniform_buffer_descriptor_start &&
+         actual.uniform_buffer_descriptor_count == expected.uniform_buffer_descriptor_count;
 }
 
 template <typename Abi>
@@ -119,6 +122,10 @@ bool PcoStageAbiIsBounded(const Abi &abi, bool allow_zero_temps = false,
          abi.shareds <= maximum_shared &&
          abi.push_constant_start <= abi.shareds &&
          abi.push_constant_count <= abi.shareds - abi.push_constant_start &&
+         abi.uniform_buffer_descriptor_count <= pvrgpu::stub::kMaximumUniformBuffersPerStage &&
+         abi.uniform_buffer_descriptor_start <= abi.shareds &&
+         abi.uniform_buffer_descriptor_count * 4U <=
+             abi.shareds - abi.uniform_buffer_descriptor_start &&
          abi.entry_offset == 0;
 }
 
@@ -129,6 +136,9 @@ std::string PcoStageAbiText(const Abi &abi) {
        << ',' << abi.coefficients << ',' << abi.shareds << ','
        << abi.push_constant_start << ',' << abi.push_constant_count << ','
        << abi.entry_offset;
+  if (abi.uniform_buffer_descriptor_start || abi.uniform_buffer_descriptor_count)
+    text << ',' << abi.uniform_buffer_descriptor_start
+         << ',' << abi.uniform_buffer_descriptor_count;
   return text.str();
 }
 
@@ -354,6 +364,8 @@ void CopyPcoPayloadFields(
       source.vertex_pco_abi.push_constant_start,
       source.vertex_pco_abi.push_constant_count,
       source.vertex_pco_abi.entry_offset,
+      source.vertex_pco_abi.uniform_buffer_descriptor_start,
+      source.vertex_pco_abi.uniform_buffer_descriptor_count,
   };
   destination->fragment_pco_abi = {
       source.fragment_pco_abi.temps,
@@ -364,6 +376,8 @@ void CopyPcoPayloadFields(
       source.fragment_pco_abi.push_constant_start,
       source.fragment_pco_abi.push_constant_count,
       source.fragment_pco_abi.entry_offset,
+      source.fragment_pco_abi.uniform_buffer_descriptor_start,
+      source.fragment_pco_abi.uniform_buffer_descriptor_count,
   };
   destination->position_output_start = source.position_output_start;
   destination->position_output_count = source.position_output_count;
@@ -1012,9 +1026,17 @@ bool CopyPcoSequenceDraw(
     *error = "SystemC API nested PCO sequence draw header is invalid: " + what;
     return false;
   };
+  // The outer envelope does not establish the version or byte size of a
+  // nested draw. Read only its version before touching any versioned field.
   if (source.version != PVRGPU_SYSTEMC_API_VERSION) {
     return refuse("version=" + std::to_string(source.version) +
                   " expected=" + std::to_string(PVRGPU_SYSTEMC_API_VERSION));
+  }
+  if (source.uniform_buffer_count >
+          2U * PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
+      ((source.uniform_buffer_count != 0) != (source.uniform_buffers != nullptr))) {
+    *error = "SystemC API uniform buffer payload list is invalid";
+    return false;
   }
   if (!source.command ||
       std::string_view(source.command) != "draw_pco_triangles") {
@@ -1320,6 +1342,21 @@ bool CopyPcoSequenceDraw(
                               source.clear_color_bits[2],
                               source.clear_color_bits[3]};
   CopyPcoPayloadFields(source, &command);
+  for (std::uint32_t index = 0; index < source.uniform_buffer_count; ++index) {
+    const auto &buffer = source.uniform_buffers[index];
+    if (buffer.stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT ||
+        buffer.block_index >= PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
+        !buffer.bytes || buffer.bytes_size == 0 ||
+        buffer.bytes_size > PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES) {
+      *error = "SystemC API uniform buffer stage/index/bytes is invalid";
+      return false;
+    }
+    pvrgpu::stub::DriverPcoUniformBuffer owned;
+    owned.stage = static_cast<pvrgpu::stub::DriverPcoShaderStage>(buffer.stage);
+    owned.block_index = buffer.block_index;
+    owned.bytes.assign(buffer.bytes, buffer.bytes + buffer.bytes_size);
+    command.uniform_buffers.push_back(std::move(owned));
+  }
   command.draw_count = source.draw_count;
   command.index_count = source.index_count;
   command.unique_vertices = source.unique_vertices;
@@ -1346,8 +1383,17 @@ bool CopyCommand(const pvrgpu_systemc_driver_command &source,
                  std::string *error) {
   if (!destination || !error)
     return false;
+  // Keep the helper safe independently of the public entry-point check.
   if (source.version != PVRGPU_SYSTEMC_API_VERSION) {
     *error = "unsupported SystemC API command version";
+    return false;
+  }
+  if (source.uniform_buffer_count || source.uniform_buffers ||
+      source.vertex_pco_abi.uniform_buffer_descriptor_start ||
+      source.vertex_pco_abi.uniform_buffer_descriptor_count ||
+      source.fragment_pco_abi.uniform_buffer_descriptor_start ||
+      source.fragment_pco_abi.uniform_buffer_descriptor_count) {
+    *error = "SystemC API uniform buffers require a nested PCO draw";
     return false;
   }
   if (!source.command || !source.command[0]) {
@@ -1455,6 +1501,12 @@ std::uint64_t CommandOwnedPayloadBytes(
       throw std::overflow_error("SystemC API sequence payload size overflow");
     }
     byte_vectors += texture.bytes.size();
+  }
+  for (const auto &buffer : command.uniform_buffers) {
+    if (buffer.bytes.size() >
+        std::numeric_limits<std::uint64_t>::max() - byte_vectors)
+      throw std::overflow_error("SystemC API uniform buffer payload size overflow");
+    byte_vectors += buffer.bytes.size();
   }
   const std::uint64_t dword_count =
       static_cast<std::uint64_t>(command.vertex_shared.size()) +
@@ -1994,6 +2046,8 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
         }
       }
     }
+    if (!pvrgpu::stub::ValidateDriverUniformBuffers(command, error))
+      return false;
     texture_offset += texture_count;
     try {
       const std::uint64_t command_bytes = CommandOwnedPayloadBytes(command);
