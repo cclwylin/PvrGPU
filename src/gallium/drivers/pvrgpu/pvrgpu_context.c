@@ -9454,39 +9454,15 @@ pvrgpu_array_assembled_vertex_count(unsigned mode, unsigned count)
 }
 
 /*
- * The value GL substitutes for a component the source format does not carry.
- * The default vertex attribute is (0, 0, 0, 1), and the one in the fourth
- * component has to be spelled in the input's own type: 1.0f for a float
- * input, the integer 1 for an `int` or `uint` one.
- */
-static uint32_t
-pvrgpu_default_attribute_word(enum pipe_format format, unsigned component)
-{
-   if (component != 3)
-      return 0;
-   if (util_format_is_pure_integer(format))
-      return 1;
-   const float one = 1.0f;
-   uint32_t bits = 0;
-   memcpy(&bits, &one, sizeof(bits));
-   return bits;
-}
-
-/*
- * Read one vertex attribute into the register words the shader reads.
+ * Copy one vertex attribute into the register words it occupies.
  *
- * A VTXIN register is 32 bits of whatever the attribute's type is, so this
- * writes raw words rather than floats: a float input lands as its binary32
- * bits, an `int` or `uint` input as the integer itself.  GLES feeds a float
- * input from any of the normalized, scaled and float source formats, so the
- * unpack is delegated to the format description rather than enumerated here --
- * restricting the driver to a handful of float formats is what made
- * vertex_arrays.input_types unlowerable -- and `unpack_rgba` already yields
- * R32G32B32A32_UINT/SINT for a pure integer source, which is exactly the word
- * the shader wants.
- *
- * Components the shader does not declare are not read.  They cannot influence
- * the result, and the packed buffer carries only what the shader consumes.
+ * The stream carries the attribute exactly as the array holds it: a four-byte
+ * RGBA8 attribute is one 32-bit word, not four.  PCO's vertex-input lowering
+ * unpacks it from the format the draw states, and the model executes that
+ * unpack -- which is the point.  Decoding here instead would hand the model an
+ * answer it exists to compute, and would quadruple a narrow attribute's
+ * stream so that every fetch bandwidth it reported was of a buffer no
+ * application would submit.
  */
 static bool
 pvrgpu_read_vertex_attribute(const struct pvrgpu_context *ctx,
@@ -9558,8 +9534,13 @@ pvrgpu_read_vertex_attribute(const struct pvrgpu_context *ctx,
        * submit as unlowerable.
        */
       if (offset + blocksize > (uint64_t)resource->size) {
-         for (unsigned component = 0; component < wanted; ++component)
-            out[component] = pvrgpu_default_attribute_word(format, component);
+         /*
+          * GLES leaves a fetch past the array undefined but requires the draw
+          * to complete.  Zero the words; the unpack then yields the format's
+          * own zero, which is the default attribute for every channel the
+          * source carries.
+          */
+         memset(out, 0, (size_t)wanted * sizeof(*out));
          return true;
       }
    }
@@ -9569,27 +9550,17 @@ pvrgpu_read_vertex_attribute(const struct pvrgpu_context *ctx,
    }
 
    /*
-    * One 4 x 32-bit destination for both cases: `unpack_rgba` writes floats
-    * for a float-ish source and 32-bit integers for a pure integer one, and
-    * either way the words are what the register holds.
+    * The attribute's own bytes, not a decoded value: the shader's unpack is
+    * PCO's, and running it on the CPU here would hand the model an answer it
+    * exists to compute -- and would inflate the vertex stream fourfold, so
+    * every fetch bandwidth the model reports would be of a buffer no
+    * application would submit.  A four-byte attribute occupies one register
+    * word; anything the source does not carry is left for the unpack to
+    * substitute.
     */
-   uint32_t rgba[4];
-   unpack->unpack_rgba(rgba, base + offset, 1);
-   const bool integer_source = util_format_is_pure_integer(format);
-
-   for (unsigned component = 0; component < wanted; ++component) {
-      out[component] = component < components
-                          ? rgba[component]
-                          : pvrgpu_default_attribute_word(format, component);
-      if (!integer_source) {
-         float value = 0.0f;
-         memcpy(&value, &out[component], sizeof(value));
-         if (!isfinite(value)) {
-            *reason = "non_finite";
-            return false;
-         }
-      }
-   }
+   (void)unpack;
+   (void)components;
+   memcpy(out, base + offset, blocksize);
    return true;
 }
 
@@ -10585,13 +10556,36 @@ pvrgpu_record_color_primitive_pco_draw(
    }
    const unsigned instance_count =
       info->instance_count != 0 ? info->instance_count : 1u;
-   /* One 32-bit register word per component the shader declares. */
+   /*
+    * Register words per attribute: what the *source format* occupies, not what
+    * the shader declares.  PCO reads the attribute's words and unpacks them
+    * from that format, so an RGBA8 attribute is one word however many
+    * components the input has.
+    */
+   unsigned attribute_words[PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES] = {0};
+   for (unsigned attribute = 0; attribute < packed_attribute_count;
+        ++attribute) {
+      const unsigned blocksize =
+         util_format_get_blocksize(attribute_formats[attribute]);
+      attribute_words[attribute] =
+         DIV_ROUND_UP(blocksize, (unsigned)sizeof(uint32_t));
+      if (attribute_words[attribute] == 0 || attribute_words[attribute] > 4) {
+         pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                               "stage=attributes reason=source_blocksize "
+                               "attribute=%u format=%s blocksize=%u",
+                               attribute,
+                               util_format_name(attribute_formats[attribute]),
+                               blocksize);
+         free(index_data);
+         return false;
+      }
+   }
    unsigned packed_words = 0;
    unsigned attribute_offsets[PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES] = {0};
    for (unsigned attribute = 0; attribute < packed_attribute_count;
         ++attribute) {
       attribute_offsets[attribute] = packed_words;
-      packed_words += attribute_components[attribute];
+      packed_words += attribute_words[attribute];
    }
    /*
     * The layout the draw packs to, in one line: which generic location each
@@ -10602,11 +10596,12 @@ pvrgpu_record_color_primitive_pco_draw(
     */
    for (unsigned attribute = 0; attribute < attribute_count; ++attribute) {
       pvrgpu_counter_eventf("draw_array_primitive_attribute",
-                            "slot=%u location=%u components=%u offset=%u "
-                            "format=%s divisor=%u",
+                            "slot=%u location=%u declared=%u words=%u "
+                            "offset=%u format=%s divisor=%u",
                             attribute,
                             attribute_locations[attribute],
                             attribute_components[attribute],
+                            attribute_words[attribute],
                             attribute_offsets[attribute],
                             util_format_name(attribute_formats[attribute]),
                             ctx->vertex_elements->elements[attribute]
@@ -10681,8 +10676,13 @@ pvrgpu_record_color_primitive_pco_draw(
       return false;
    }
 
-   uint32_t *interleaved = malloc((size_t)packed_vertex_count *
-                                  packed_words * sizeof(uint32_t));
+   /*
+    * Zeroed: a source format whose block is not a whole number of words --
+    * three bytes, say -- leaves the rest of its last word untouched, and an
+    * undefined byte must not reach the model as if it were vertex data.
+    */
+   uint32_t *interleaved = calloc((size_t)packed_vertex_count * packed_words,
+                                  sizeof(uint32_t));
    if (!interleaved) {
       free(index_data);
       return false;
@@ -10711,7 +10711,7 @@ pvrgpu_record_color_primitive_pco_draw(
                    ctx,
                    element,
                    source_index,
-                   attribute_components[attribute],
+                   attribute_words[attribute],
                    &interleaved[packed_base + attribute_offsets[attribute]],
                    &attribute_reason)) {
                pvrgpu_counter_eventf(
@@ -10886,7 +10886,7 @@ pvrgpu_record_color_primitive_pco_draw(
    for (unsigned attribute = 0; attribute < packed_attribute_count;
         ++attribute) {
       command.vertex_attribute_components[attribute] =
-         attribute_components[attribute];
+         attribute_words[attribute];
       /*
        * An `int` or `uint` input keeps its bits, so the words the stream
        * carries for it are integers -- as are gl_InstanceID's, whose reserved

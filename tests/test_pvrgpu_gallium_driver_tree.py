@@ -774,10 +774,13 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             "pvrgpu_write_draw_pco_triangles_command", validator_start
         )
         validator = command[validator_start:validator_end]
-        self.assertIn(
-            "cmd->vertex_stride == 24 && cmd->vertex_pco_abi.vertex_inputs == 8",
-            validator,
-        )
+        # The lit-mesh layout is recognised from the command's own stride and
+        # VTXIN count.  Asserted as two conjuncts: the recognition has since
+        # gained a further qualifier -- a command that states its own attribute
+        # layout is not a pinned capture profile -- and rewrapping the line is
+        # not a change in what is checked.
+        self.assertIn("cmd->vertex_stride == 24", validator)
+        self.assertIn("cmd->vertex_pco_abi.vertex_inputs == 8", validator)
         self.assertIn(
             "cmd->raw_vertex_data_size != (size_t)expected_vertex_bytes",
             validator,

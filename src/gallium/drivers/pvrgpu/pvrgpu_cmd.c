@@ -880,7 +880,18 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       (uint64_t)cmd->first_vertex + cmd->vertex_count;
    const uint64_t expected_vertex_bytes =
       end_vertex * (uint64_t)cmd->vertex_stride;
+   /*
+    * The pinned capture profiles are recognised by the stride and VTXIN count
+    * their capture happened to have.  A command that states its own attribute
+    * layout is not one of them however its stride lands -- and once the stream
+    * carries attributes at their source width rather than four words each, a
+    * generic draw of one three-component attribute is exactly the twelve-byte
+    * stride the conditionals capture claims.  `color_layout` below already
+    * makes this distinction; every profile needs it.
+    */
+   const bool states_own_attributes = cmd->vertex_attribute_count != 0;
    const bool conditionals_layout =
+      !states_own_attributes &&
       cmd->vertex_stride == 12 && cmd->vertex_pco_abi.vertex_inputs == 4;
    /*
     * Untextured position/colour layout.  A shader reading vec2 position packs
@@ -896,26 +907,28 @@ pvrgpu_cmd_validate_draw_pco_triangles(
    const bool ideas_case_name =
       strcmp(cmd->case_name, "ideas.ideas.capture.1") == 0;
    const bool color_layout =
-      (cmd->vertex_stride == 24 && cmd->vertex_pco_abi.vertex_inputs == 8 &&
+      (!states_own_attributes && cmd->vertex_stride == 24 &&
+       cmd->vertex_pco_abi.vertex_inputs == 8 &&
        cmd->vertex_pco_abi.shareds == 0) ||
-      (!ideas_case_name && cmd->vertex_stride == 32 &&
-       cmd->vertex_pco_abi.vertex_inputs == 8) ||
+      (!states_own_attributes && !ideas_case_name &&
+       cmd->vertex_stride == 32 && cmd->vertex_pco_abi.vertex_inputs == 8) ||
       /* A command that states its attribute widths describes itself. */
-      (cmd->vertex_attribute_count != 0 &&
+      (states_own_attributes &&
        cmd->vertex_pco_abi.vertex_inputs ==
           cmd->vertex_attribute_count * 4u);
    const bool lit_mesh_layout =
-      cmd->vertex_stride == 24 && cmd->vertex_pco_abi.vertex_inputs == 8 &&
-      !color_layout;
+      !states_own_attributes && cmd->vertex_stride == 24 &&
+      cmd->vertex_pco_abi.vertex_inputs == 8 && !color_layout;
    const bool texture_layout =
-      cmd->vertex_stride == 32 && cmd->vertex_pco_abi.vertex_inputs == 12;
+      !states_own_attributes && cmd->vertex_stride == 32 &&
+      cmd->vertex_pco_abi.vertex_inputs == 12;
    const bool ideas_case =
       strcmp(cmd->case_name, "ideas.ideas.capture.1") == 0;
    const bool ideas_position_layout =
-      ideas_case && cmd->vertex_stride == 16 &&
+      ideas_case && !states_own_attributes && cmd->vertex_stride == 16 &&
       cmd->vertex_pco_abi.vertex_inputs == 4;
    const bool ideas_two_attribute_layout =
-      ideas_case && cmd->vertex_stride == 32 &&
+      ideas_case && !states_own_attributes && cmd->vertex_stride == 32 &&
       cmd->vertex_pco_abi.vertex_inputs == 8;
    const bool ideas_layout =
       ideas_position_layout || ideas_two_attribute_layout;

@@ -1657,12 +1657,39 @@ PcoInstruction DecodeGenericAdd64_32Group(
   return instruction;
 }
 
+/* PCO's F_PCK_FORMAT, for the packed vector formats an attribute arrives in. */
+enum : std::uint8_t {
+  kPckFormatU8888 = 0x00,
+  kPckFormatS8888 = 0x01,
+  kPckFormatU1616 = 0x03,
+  kPckFormatS1616 = 0x04,
+  kPckFormatU1010102 = 0x08,
+  kPckFormatS1010102 = 0x09,
+};
+
+/*
+ * Operations whose group repeat selects a sub-field of one packed word rather
+ * than stepping to the next register: UNPCK reads a single source and yields
+ * one component per repeat, which is how a two-component half attribute is
+ * unpacked from the one word it occupies.
+ */
+bool PcoOpcodeRepeatsOverLanes(PcoOpcode opcode) {
+  return opcode == PcoOpcode::kFloatUnpackHalf ||
+         opcode == PcoOpcode::kUnpackVector;
+}
+
 PcoInstruction DecodeGenericSimpleAluGroup(
     ShaderStage stage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
+  /*
+   * A group repeat runs the operation over consecutive registers, which is how
+   * the compiler applies one scalar instruction to a vector -- the F16F16
+   * unpack of a two-component half attribute is one group repeated twice.  The
+   * ranges it steps through are bounded where the sources are decoded below.
+   */
   if (header.control || header.bitwise || header.da != 3 ||
       header.operation_origin != 0 || !header.write0_present ||
-      header.write1_present || header.repeat_count != 1) {
+      header.write1_present || header.repeat_count == 0) {
     DecodeError(header.offset, "unsupported scalar ALU instruction-group header");
   }
 
@@ -1675,6 +1702,8 @@ PcoInstruction DecodeGenericSimpleAluGroup(
   std::uint8_t source_count = 0;
   std::uint8_t source0_floor = 0;
   std::uint8_t source0_integer_negate = 0;
+  std::uint8_t unpack_format = 0;
+  std::uint8_t unpack_scale = 0;
   std::uint8_t source0_absolute = 0;
   std::uint8_t source1_absolute = 0;
   std::uint8_t saturate = 0;
@@ -1802,15 +1831,32 @@ PcoInstruction DecodeGenericSimpleAluGroup(
     if (cursor >= group_end)
       DecodeError(cursor, "truncated scalar PCK/UNPCK format");
     const std::uint8_t pck_format = binary[cursor++];
-    if (pck_format == 0x06U)
+    /*
+     * The byte is `rtz | scale | format[4:0]`.  `scale` normalizes the field
+     * -- an 8-bit unsigned lane to [0,1] rather than to 0..255 -- which is
+     * exactly GL's normalized versus scaled vertex attribute.
+     */
+    if ((pck_format & 0x40U) != 0)
+      DecodeError(cursor - 1, "unsupported round-to-zero PCK/UNPCK modifier");
+    const std::uint8_t format = pck_format & 0x1fU;
+    const bool scale = (pck_format & 0x20U) != 0;
+    if (format == 0x06U && !scale) {
       opcode = PcoOpcode::kUnpackUnsignedToFloat;
-    else if (pck_format == 0x07U)
+    } else if (format == 0x07U && !scale) {
       opcode = PcoOpcode::kUnpackSignedToFloat;
-    else if (pck_format == 0x0eU)
+    } else if (format == 0x0eU && !scale) {
       opcode = PcoOpcode::kFloatUnpackHalf;
-    else
+    } else if (format == kPckFormatU8888 || format == kPckFormatS8888 ||
+               format == kPckFormatU1616 || format == kPckFormatS1616 ||
+               format == kPckFormatU1010102 ||
+               format == kPckFormatS1010102) {
+      opcode = PcoOpcode::kUnpackVector;
+      unpack_format = format;
+      unpack_scale = scale ? 1U : 0U;
+    } else {
       DecodeError(cursor - 1, "unsupported scalar PCK/UNPCK format [" +
                                   std::to_string(pck_format) + "]");
+    }
     source_count = 1;
     break;
   }
@@ -1881,11 +1927,47 @@ PcoInstruction DecodeGenericSimpleAluGroup(
   instruction.output_index = destination.index;
   instruction.source0_floor = source0_floor;
   instruction.source0_integer_negate = source0_integer_negate;
+  instruction.unpack_format = unpack_format;
+  instruction.unpack_scale = unpack_scale;
+  /*
+   * Every register-file source and the destination step with the repeat, so
+   * each range has to lie inside its file.
+   */
+  const bool repeats_over_lanes = PcoOpcodeRepeatsOverLanes(opcode);
+  const auto stepped_range_fits = [&](const PcoRegisterRef &source) {
+    if (repeats_over_lanes)
+      return true;
+    const std::size_t last =
+        static_cast<std::size_t>(source.index) + header.repeat_count;
+    if (source.bank == PcoRegisterBank::kTemporary)
+      return last <= kPcoTemporaryCount;
+    if (source.bank == PcoRegisterBank::kVertexInput)
+      return last <= kPcoVertexInputCount;
+    return header.repeat_count == 1;
+  };
+  if (header.repeat_count != 1) {
+    for (unsigned index = 0; index < source_count; ++index) {
+      const PcoRegisterRef &source =
+          index == 0 ? source0 : (index == 1 ? source1 : source2);
+      if (!stepped_range_fits(source)) {
+        DecodeError(header.offset,
+                    "repeated scalar ALU source range exceeds its register "
+                    "file");
+      }
+    }
+    if (destination.target != PcoWriteTarget::kTemporary ||
+        static_cast<std::size_t>(destination.index) + header.repeat_count >
+            kPcoTemporaryCount) {
+      DecodeError(header.offset,
+                  "repeated scalar ALU destination range exceeds the "
+                  "temporary file");
+    }
+  }
   instruction.source0_absolute = source0_absolute;
   instruction.source1_absolute = source1_absolute;
   instruction.saturate = saturate;
   instruction.source_count = source_count;
-  instruction.repeat_count = 1;
+  instruction.repeat_count = header.repeat_count;
   instruction.end_group = header.end ? 1U : 0U;
   return instruction;
 }
@@ -2626,17 +2708,32 @@ PcoInstruction DecodeGenericBitwiseOrGroup(
 PcoInstruction DecodeGenericBitfieldExtractUnsignedGroup(
     ShaderStage stage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
-  if (stage != ShaderStage::kFragment || !header.bitwise || header.control ||
+  (void)stage;
+  if (!header.bitwise || header.control ||
       header.da != 6 || header.operation_origin != 7 ||
       header.output_load_check || !header.write0_present ||
       header.write1_present || header.repeat_count != 1 || header.end ||
       header.total_bytes != 14) {
-    DecodeError(header.offset, "unsupported UBFE instruction-group header");
+    DecodeError(header.offset, "unsupported BFE instruction-group header");
   }
   const std::size_t group_end = header.offset + header.total_bytes;
   std::size_t cursor = header.offset + 3;
-  if (group_end - cursor < 11 || binary[cursor++] != 0x01U)
-    DecodeError(header.offset + 3, "expected the phase-2 SHR operation");
+  if (group_end - cursor < 11)
+    DecodeError(header.offset + 3, "truncated BFE instruction group");
+  /*
+   * Phase 2 shifts the masked field down.  A logical shift leaves the field
+   * zero-extended and an arithmetic one keeps its sign -- the only difference
+   * between GL's unsigned and signed bitfieldExtract, and between a narrow
+   * `uint` and `int` vertex attribute.
+   */
+  bool signed_field = false;
+  const std::uint8_t shift_op = binary[cursor++];
+  if (shift_op == 0x01U)
+    signed_field = false;
+  else if (shift_op == 0x06U)
+    signed_field = true;
+  else
+    DecodeError(header.offset + 3, "unsupported BFE phase-2 shift operation");
   if (binary[cursor++] != 0x68U)
     DecodeError(header.offset + 4, "expected the phase-1 masked LOGICAL.OR");
   if (binary[cursor++] != 0x03U)
@@ -2644,21 +2741,22 @@ PcoInstruction DecodeGenericBitfieldExtractUnsignedGroup(
   const ThreeLowerSources lower =
       DecodeThreeLowerSources(binary, group_end, cursor);
   if (lower.input_selector != 0)
-    DecodeError(header.offset + 6, "UBFE lower sources are not the canonical form");
+    DecodeError(header.offset + 6, "BFE lower sources are not the canonical form");
   // The shift amount is the same offset repeated as an upper source.
   if (cursor >= group_end || binary[cursor++] != 0x80U)
-    DecodeError(cursor - 1, "unsupported UBFE upper-source selector");
+    DecodeError(cursor - 1, "unsupported BFE upper-source selector");
   const std::uint8_t offset_byte = binary[cursor++];
   if ((offset_byte & 0xc0U) != 0x80U)
-    DecodeError(cursor - 1, "unsupported UBFE shift upper-source selector");
+    DecodeError(cursor - 1, "unsupported BFE shift upper-source selector");
   const DecodedDestination destination =
       DecodeGenericDestination(binary, group_end, cursor);
   if (destination.target != PcoWriteTarget::kTemporary)
-    DecodeError(header.offset, "UBFE destination must be temporary");
+    DecodeError(header.offset, "BFE destination must be temporary");
   ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
 
   PcoInstruction instruction;
-  instruction.opcode = PcoOpcode::kBitfieldExtractUnsigned;
+  instruction.opcode = signed_field ? PcoOpcode::kBitfieldExtractSigned
+                                    : PcoOpcode::kBitfieldExtractUnsigned;
   instruction.target = destination.target;
   instruction.source = lower.source2;   // value
   instruction.source1 = lower.source1;  // offset
@@ -3354,6 +3452,16 @@ PcoInstruction DecodeVertexGroup(const std::vector<std::uint8_t> &binary,
                   "logical phase operation is outside the vertex public "
                   "subset");
     }
+    /*
+     * Bitfield extract: the vertex stage reaches it for the same reason the
+     * fragment stage does -- unpacking a narrow integer, which for a vertex
+     * shader is every `int` or `uint` attribute the array holds packed.
+     */
+    if (header.operation_origin == 7) {
+      return DecodeGenericBitfieldExtractUnsignedGroup(ShaderStage::kVertex,
+                                                       binary, header,
+                                                       group_index);
+    }
     DecodeError(header.offset,
                 "bitwise operation is outside the vertex public subset");
   }
@@ -3640,10 +3748,18 @@ void ValidateVertexTemporaryProgram(
     }
     if (instruction.target == PcoWriteTarget::kTemporary) {
       uses_temporary_program = true;
-      if (instruction.output_index >= kPcoTemporaryCount)
+      /* A repeated group writes the whole range it steps through. */
+      if (static_cast<std::size_t>(instruction.output_index) +
+              instruction.repeat_count >
+          kPcoTemporaryCount) {
         DecodeError(instruction.binary_offset,
                     "temporary destination exceeds the USC file");
-      written_mask |= UINT64_C(1) << instruction.output_index;
+      }
+      for (std::uint8_t repeat = 0; repeat < instruction.repeat_count;
+           ++repeat) {
+        written_mask |= UINT64_C(1)
+                        << (instruction.output_index + repeat);
+      }
     }
     if (instruction.opcode == PcoOpcode::kUvsEmitEndTask)
       uses_temporary_program = true;
@@ -3774,8 +3890,9 @@ void ValidateVertexTemporaryProgram(
     case PcoOpcode::kFloatUnpackHalf:
     case PcoOpcode::kUnpackUnsignedToFloat:
     case PcoOpcode::kUnpackSignedToFloat:
+    case PcoOpcode::kUnpackVector:
       if (instruction.target != PcoWriteTarget::kTemporary ||
-          instruction.source_count != 1 || instruction.repeat_count != 1)
+          instruction.source_count != 1)
         DecodeError(instruction.binary_offset,
                     "invalid generic vertex unary ALU operation");
       break;
@@ -3792,7 +3909,7 @@ void ValidateVertexTemporaryProgram(
     case PcoOpcode::kBooleanCompare:
     case PcoOpcode::kBitwiseAnd:
       if (instruction.target != PcoWriteTarget::kTemporary ||
-          instruction.source_count != 2 || instruction.repeat_count != 1)
+          instruction.source_count != 2)
         DecodeError(instruction.binary_offset,
                     "invalid generic vertex binary ALU operation");
       break;
@@ -3805,8 +3922,10 @@ void ValidateVertexTemporaryProgram(
     case PcoOpcode::kConditionalSelectGreaterZero:
     case PcoOpcode::kTestConditionalSelect:
     case PcoOpcode::kIntegerMultiplyAdd32:
+    case PcoOpcode::kBitfieldExtractUnsigned:
+    case PcoOpcode::kBitfieldExtractSigned:
       if (instruction.target != PcoWriteTarget::kTemporary ||
-          instruction.source_count != 3 || instruction.repeat_count != 1)
+          instruction.source_count != 3)
         DecodeError(instruction.binary_offset,
                     "invalid generic vertex ternary ALU operation");
       break;
@@ -4038,6 +4157,7 @@ void ValidateFragmentProgram(
     case PcoOpcode::kFloatMadNegateSource0Source2:
     case PcoOpcode::kIntegerMultiplyAdd32:
     case PcoOpcode::kBitfieldExtractUnsigned:
+    case PcoOpcode::kBitfieldExtractSigned:
     case PcoOpcode::kIntegerAdd64_32:
     case PcoOpcode::kConditionalSelect:
     case PcoOpcode::kConditionalSelectNegateTrue:
@@ -4537,6 +4657,88 @@ std::uint32_t FloatLessBits(std::uint32_t left_bits,
   std::memcpy(&left, &left_bits, sizeof(left));
   std::memcpy(&right, &right_bits, sizeof(right));
   return left < right ? UINT32_MAX : UINT32_C(0);
+}
+
+/*
+ * GL's signed bitfieldExtract: the field is shifted down and sign-extended
+ * from its own top bit.  A zero-width field is zero, as the spec says.
+ */
+std::uint32_t SignedBitfieldExtract(std::uint32_t value, std::uint32_t offset,
+                                    std::uint32_t bits) {
+  if (bits == 0U)
+    return 0U;
+  if (offset + bits >= 32U)
+    return static_cast<std::uint32_t>(static_cast<std::int32_t>(value) >>
+                                      offset);
+  const std::uint32_t shifted = value << (32U - offset - bits);
+  return static_cast<std::uint32_t>(static_cast<std::int32_t>(shifted) >>
+                                    (32U - bits));
+}
+
+/*
+ * One component of a packed vector format, as binary32.
+ *
+ * The lane's width and offset come from the format; `scale` is GL's
+ * normalized conversion -- an unsigned field over its maximum, a signed one
+ * over its positive maximum and clamped at -1, which is the two's-complement
+ * asymmetry the spec resolves that way.  Without it the field's integer value
+ * is converted as it stands, which is GL's scaled conversion.
+ */
+std::uint32_t UnpackVectorLaneBits(std::uint8_t format, bool scale,
+                                   std::uint32_t word, std::uint8_t lane) {
+  std::uint8_t offset = 0;
+  std::uint8_t bits = 0;
+  bool is_signed = false;
+  switch (format) {
+  case kPckFormatU8888:
+  case kPckFormatS8888:
+    if (lane >= 4)
+      ExecuteError("UNPCK 8888 lane is out of range");
+    offset = static_cast<std::uint8_t>(8U * lane);
+    bits = 8;
+    is_signed = format == kPckFormatS8888;
+    break;
+  case kPckFormatU1616:
+  case kPckFormatS1616:
+    if (lane >= 2)
+      ExecuteError("UNPCK 1616 lane is out of range");
+    offset = static_cast<std::uint8_t>(16U * lane);
+    bits = 16;
+    is_signed = format == kPckFormatS1616;
+    break;
+  case kPckFormatU1010102:
+  case kPckFormatS1010102:
+    if (lane >= 4)
+      ExecuteError("UNPCK 1010102 lane is out of range");
+    /* 2_10_10_10_REV: x, y and z are ten bits, w the top two. */
+    offset = static_cast<std::uint8_t>(lane == 3 ? 30U : 10U * lane);
+    bits = lane == 3 ? 2 : 10;
+    is_signed = format == kPckFormatS1010102;
+    break;
+  default:
+    ExecuteError("UNPCK format is outside the supported set");
+  }
+
+  float value = 0.0F;
+  if (is_signed) {
+    const std::int32_t field = static_cast<std::int32_t>(
+        SignedBitfieldExtract(word, offset, bits));
+    value = static_cast<float>(field);
+    if (scale) {
+      const float positive_maximum =
+          static_cast<float>((INT32_C(1) << (bits - 1)) - 1);
+      value = std::max(value / positive_maximum, -1.0F);
+    }
+  } else {
+    const std::uint32_t field =
+        (word >> offset) & ((UINT32_C(1) << bits) - 1U);
+    value = static_cast<float>(field);
+    if (scale)
+      value /= static_cast<float>((UINT32_C(1) << bits) - 1U);
+  }
+  std::uint32_t bits_out = 0;
+  std::memcpy(&bits_out, &value, sizeof(bits_out));
+  return bits_out;
 }
 
 bool FloatGreaterZero(std::uint32_t value_bits) {
@@ -5184,6 +5386,7 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
     case PcoOpcode::kIntegerMultiplyAdd32:
     case PcoOpcode::kBitfieldInsert:
     case PcoOpcode::kBitfieldExtractUnsigned:
+    case PcoOpcode::kBitfieldExtractSigned:
     case PcoOpcode::kIntegerAdd64_32:
     case PcoOpcode::kFloatMin:
     case PcoOpcode::kFloatMax:
@@ -5215,6 +5418,7 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
     case PcoOpcode::kFloatUnpackHalf:
     case PcoOpcode::kUnpackUnsignedToFloat:
     case PcoOpcode::kUnpackSignedToFloat:
+    case PcoOpcode::kUnpackVector:
     case PcoOpcode::kFloatInterpolatePerspective:
       counts.alu += amount;
       break;
@@ -5286,8 +5490,12 @@ PcoDecodedProgram DecodePcoProgram(ShaderStage stage,
       const auto include_vertex_source = [&](const PcoRegisterRef &source) {
         if (source.bank != PcoRegisterBank::kVertexInput)
           return;
-        for (std::uint8_t repeat = 0; repeat < instruction.repeat_count;
-             ++repeat) {
+        /* A lane repeat reads one register however many times it repeats. */
+        const std::uint8_t span =
+            PcoOpcodeRepeatsOverLanes(instruction.opcode)
+                ? 1U
+                : instruction.repeat_count;
+        for (std::uint8_t repeat = 0; repeat < span; ++repeat) {
           if (source.index + repeat >= kPcoVertexInputCount)
             DecodeError(offset, "vertex-input mask exceeds the USC file");
           decoded.summary.vertex_input_mask |= static_cast<std::uint32_t>(
@@ -5394,11 +5602,13 @@ PcoVertexExecution ExecuteVertexPco(
     const auto include_vertex_source = [&](const PcoRegisterRef &source) {
       if (source.bank != PcoRegisterBank::kVertexInput)
         return;
-      if (source.index + instruction.repeat_count > kPcoVertexInputCount) {
+      /* As above: a lane repeat names one register, not a range. */
+      const std::uint8_t span = PcoOpcodeRepeatsOverLanes(instruction.opcode)
+                                    ? 1U
+                                    : instruction.repeat_count;
+      if (source.index + span > kPcoVertexInputCount)
         ExecuteError("vertex-input range exceeds the modeled USC file");
-      }
-      for (std::uint8_t repeat = 0; repeat < instruction.repeat_count;
-           ++repeat) {
+      for (std::uint8_t repeat = 0; repeat < span; ++repeat) {
         vertex_input_mask |= static_cast<std::uint32_t>(
             UINT32_C(1) << (source.index + repeat));
       }
@@ -5691,16 +5901,38 @@ PcoVertexExecution ExecuteVertexPco(
 
 
     if (instruction.target == PcoWriteTarget::kTemporary) {
-      if (instruction.output_index >= temporaries.size() ||
-          instruction.repeat_count != 1)
+      if (instruction.repeat_count == 0 ||
+          static_cast<std::size_t>(instruction.output_index) +
+                  instruction.repeat_count >
+              temporaries.size()) {
         ExecuteError("generic vertex ALU destination is out of range");
-      const auto read = [&](const PcoRegisterRef &source) {
-        if (source.bank == PcoRegisterBank::kShared) {
-          if (source.index >= effective_shared_count)
-            ExecuteError("generic vertex shared source is absent");
-          return effective_shared[source.index];
+      }
+      /*
+       * A group repeat runs the same operation over consecutive registers --
+       * the compiler's way of applying one instruction to a vector's
+       * components -- so every register-file source and the destination step
+       * with it.  A shared or special source names one register and does not.
+       */
+      std::uint8_t repeat = 0;
+      const bool repeats_over_lanes =
+          PcoOpcodeRepeatsOverLanes(instruction.opcode);
+      const auto stepped = [&](const PcoRegisterRef &source) {
+        PcoRegisterRef ref = source;
+        if (!repeats_over_lanes && repeat != 0 &&
+            (ref.bank == PcoRegisterBank::kTemporary ||
+             ref.bank == PcoRegisterBank::kVertexInput)) {
+          ref.index = static_cast<std::uint16_t>(ref.index + repeat);
         }
-        return ReadSource(source, effective_vertex_inputs, temporaries,
+        return ref;
+      };
+      const auto read = [&](const PcoRegisterRef &source) {
+        const PcoRegisterRef ref = stepped(source);
+        if (ref.bank == PcoRegisterBank::kShared) {
+          if (ref.index >= effective_shared_count)
+            ExecuteError("generic vertex shared source is absent");
+          return effective_shared[ref.index];
+        }
+        return ReadSource(ref, effective_vertex_inputs, temporaries,
                           temporary_written_mask, 0,
                           ShaderStage::kVertex);
       };
@@ -5718,6 +5950,7 @@ PcoVertexExecution ExecuteVertexPco(
           bits &= UINT32_C(0x7fffffff);
         return bits;
       };
+      for (; repeat < instruction.repeat_count; ++repeat) {
       std::uint32_t value = 0;
       switch (instruction.opcode) {
       case PcoOpcode::kMoveImmediate:
@@ -5834,9 +6067,16 @@ PcoVertexExecution ExecuteVertexPco(
       case PcoOpcode::kFloatPackHalfRtz:
         value = FloatToHalfRtz(read(instruction.source));
         break;
+      case PcoOpcode::kUnpackVector:
+        value = UnpackVectorLaneBits(instruction.unpack_format,
+                                     instruction.unpack_scale != 0,
+                                     read(instruction.source), repeat);
+        break;
       case PcoOpcode::kFloatUnpackHalf:
+        /* Two halves share one word; the repeat names which. */
         value = HalfToFloat(static_cast<std::uint16_t>(
-            read(instruction.source) & UINT32_C(0xffff)));
+            (read(instruction.source) >> (16U * (repeat & 1U))) &
+            UINT32_C(0xffff)));
         break;
       /*
        * Integer-to-float conversion, which a vertex shader reaches for the
@@ -5872,6 +6112,23 @@ PcoVertexExecution ExecuteVertexPco(
        * Integer multiply-add, which the vertex stage reaches for the same
        * reason the fragment stage does: a shader doing integer arithmetic.
        */
+      /* Unpacking a narrow integer attribute, one component per extract. */
+      case PcoOpcode::kBitfieldExtractUnsigned:
+      case PcoOpcode::kBitfieldExtractSigned: {
+        const std::uint32_t offset = read(instruction.source1) & 0x1fU;
+        const std::uint32_t bits = read(instruction.source2) & 0x1fU;
+        const std::uint32_t field = read(instruction.source);
+        if (instruction.opcode == PcoOpcode::kBitfieldExtractSigned) {
+          value = SignedBitfieldExtract(field, offset, bits);
+        } else {
+          const std::uint32_t field_mask =
+              bits >= 32U  ? UINT32_C(0xffffffff)
+              : bits == 0U ? 0U
+                           : ((UINT32_C(1) << bits) - 1U);
+          value = (field >> offset) & field_mask;
+        }
+        break;
+      }
       case PcoOpcode::kIntegerMultiplyAdd32: {
         const std::uint32_t factor0 = read(instruction.source);
         value = (instruction.source0_integer_negate != 0 ? ~factor0 + 1U
@@ -5885,8 +6142,11 @@ PcoVertexExecution ExecuteVertexPco(
                      std::to_string(
                          static_cast<std::uint32_t>(instruction.opcode)));
       }
-      temporaries[instruction.output_index] = value;
-      temporary_written_mask |= UINT64_C(1) << instruction.output_index;
+      const std::size_t destination =
+          static_cast<std::size_t>(instruction.output_index) + repeat;
+      temporaries[destination] = value;
+      temporary_written_mask |= UINT64_C(1) << destination;
+      }
       continue;
     }
 
@@ -5898,6 +6158,7 @@ PcoVertexExecution ExecuteVertexPco(
         instruction.opcode == PcoOpcode::kIntegerMultiplyAdd32 ||
         instruction.opcode == PcoOpcode::kBitfieldInsert ||
         instruction.opcode == PcoOpcode::kBitfieldExtractUnsigned ||
+        instruction.opcode == PcoOpcode::kBitfieldExtractSigned ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource2 ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource0 ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource0Source2 ||
@@ -6187,6 +6448,7 @@ PcoFragmentExecution ExecuteFragmentPco(
     case PcoOpcode::kFloatGreaterEqual: return "FGE";
     case PcoOpcode::kFloatEqual: return "FEQ";
     case PcoOpcode::kFloatLess: return "FLT";
+    case PcoOpcode::kUnpackVector: return "UNPCK.VEC";
     case PcoOpcode::kBooleanCompare: return "BCMP";
     case PcoOpcode::kConditionalSelect: return "CSEL";
     case PcoOpcode::kConditionalSelectNegateTrue: return "CSEL.NEG";
@@ -6211,6 +6473,7 @@ PcoFragmentExecution ExecuteFragmentPco(
     case PcoOpcode::kIntegerMultiplyAdd32: return "IMADD32";
     case PcoOpcode::kBitfieldInsert: return "BFI";
     case PcoOpcode::kBitfieldExtractUnsigned: return "UBFE";
+    case PcoOpcode::kBitfieldExtractSigned: return "IBFE";
     case PcoOpcode::kIntegerAdd64_32: return "ADD64_32";
     case PcoOpcode::kBitwiseAnd: return "AND";
     case PcoOpcode::kBitwiseOr: return "OR";
@@ -6599,6 +6862,7 @@ PcoFragmentExecution ExecuteFragmentPco(
         instruction.opcode == PcoOpcode::kIntegerMultiplyAdd32 ||
         instruction.opcode == PcoOpcode::kBitfieldInsert ||
         instruction.opcode == PcoOpcode::kBitfieldExtractUnsigned ||
+        instruction.opcode == PcoOpcode::kBitfieldExtractSigned ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource2 ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource0 ||
         instruction.opcode == PcoOpcode::kFloatMadNegateSource0Source2 ||
@@ -6751,6 +7015,10 @@ PcoFragmentExecution ExecuteFragmentPco(
             : bits == 0U ? 0U
                          : ((UINT32_C(1) << bits) - 1U);
         result_val = (src0 >> offset) & field_mask;
+      } else if (instruction.opcode == PcoOpcode::kBitfieldExtractSigned) {
+        const std::uint32_t offset = read(instruction.source1) & 0x1fU;
+        const std::uint32_t bits = read(instruction.source2) & 0x1fU;
+        result_val = SignedBitfieldExtract(src0, offset, bits);
       } else if (instruction.opcode ==
                  PcoOpcode::kFloatMadNegateSource2) {
         const std::uint32_t src1 = read(instruction.source1);

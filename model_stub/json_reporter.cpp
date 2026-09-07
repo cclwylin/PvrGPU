@@ -149,6 +149,8 @@ struct VertexPcoEvidence {
   std::uint64_t f2i = 0;
   // IMADD32, likewise reached by any vertex shader doing integer arithmetic.
   std::uint64_t imadd32 = 0;
+  // UBFE/IBFE: unpacking a narrow integer attribute, one per component.
+  std::uint64_t ubfe = 0;
   std::uint64_t smp = 0;
   std::uint64_t wdf = 0;
   std::uint64_t uvsw_write = 0;
@@ -328,6 +330,7 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
       break;
     case PcoOpcode::kUnpackUnsignedToFloat:
     case PcoOpcode::kUnpackSignedToFloat:
+    case PcoOpcode::kUnpackVector:
       ++evidence.unpck_int;
       break;
     case PcoOpcode::kFloatToInt32Rtne:
@@ -336,6 +339,10 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
       break;
     case PcoOpcode::kIntegerMultiplyAdd32:
       ++evidence.imadd32;
+      break;
+    case PcoOpcode::kBitfieldExtractUnsigned:
+    case PcoOpcode::kBitfieldExtractSigned:
+      ++evidence.ubfe;
       break;
     case PcoOpcode::kUvsWrite:
       ++evidence.uvsw_write;
@@ -366,7 +373,8 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
       evidence.bitwise_and + evidence.csel + evidence.fmad + evidence.fmin + evidence.fmax +
       evidence.frcp + evidence.frsq + evidence.flog2 + evidence.fexp2 +
       evidence.pck_f16 + evidence.unpck_f16 + evidence.unpck_int +
-      evidence.f2i + evidence.imadd32 + evidence.smp + evidence.wdf;
+      evidence.f2i + evidence.imadd32 + evidence.ubfe + evidence.smp +
+      evidence.wdf;
   if (opcode_total != instructions.size()) {
     throw std::runtime_error(
         "JsonReporter vertex PCO opcode histogram mismatch");
@@ -515,6 +523,7 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
       ++evidence.bfi;
       break;
     case PcoOpcode::kBitfieldExtractUnsigned:
+    case PcoOpcode::kBitfieldExtractSigned:
       ++evidence.ubfe;
       break;
     case PcoOpcode::kIntegerAdd64_32:
@@ -621,6 +630,7 @@ void AppendVertexPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_VERTEX_EVIDENCE(unpck_int);
   PVRGPU_ADD_VERTEX_EVIDENCE(f2i);
   PVRGPU_ADD_VERTEX_EVIDENCE(imadd32);
+  PVRGPU_ADD_VERTEX_EVIDENCE(ubfe);
   PVRGPU_ADD_VERTEX_EVIDENCE(smp);
   PVRGPU_ADD_VERTEX_EVIDENCE(wdf);
   PVRGPU_ADD_VERTEX_EVIDENCE(uvsw_write);
@@ -1573,6 +1583,8 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"f2i\":" << vertex_pco.f2i;
   if (vertex_pco.imadd32 != 0)
     std::cout << ",\"imadd32\":" << vertex_pco.imadd32;
+  if (vertex_pco.ubfe != 0)
+    std::cout << ",\"ubfe\":" << vertex_pco.ubfe;
   if (vertex_pco.smp != 0)
     std::cout << ",\"smp\":" << vertex_pco.smp;
   if (vertex_pco.wdf != 0)

@@ -133,14 +133,16 @@ std::string PcoStageAbiText(const Abi &abi) {
 }
 
 /*
- * Words of one packed vertex that hold an integer rather than a float, taken
- * from the attribute layout the command states.  A float check on an integer
- * word is meaningless -- the `int` attribute -50 is the bit pattern of a NaN
- * -- so those words are exempt from the finiteness check below.  A command
- * that states no attribute layout (the pinned capture profiles) yields an
- * empty mask and is checked exactly as before.
+ * Words of one packed vertex the float finiteness check below cannot judge.
+ *
+ * A command that states its own attribute layout carries each attribute as
+ * the bytes the array holds, and the shader's own unpack decides what they
+ * mean: an `int` attribute of -50, a pair of halves, a 2_10_10_10 -- read as
+ * binary32 any of them can be a NaN, an infinity or a denormal.  So every
+ * word such a command describes is opaque, and only the pinned capture
+ * profiles, which really do carry floats, are checked.
  */
-std::uint64_t IntegerVertexWordMask(
+std::uint64_t OpaqueVertexWordMask(
     const pvrgpu_systemc_driver_command &source) {
   std::uint64_t mask = 0;
   std::uint32_t word = 0;
@@ -155,8 +157,7 @@ std::uint64_t IntegerVertexWordMask(
     for (std::uint32_t component = 0; component < components; ++component) {
       if (word >= 64U)
         return mask;
-      if (source.vertex_attribute_integer[attribute] != 0)
-        mask |= UINT64_C(1) << word;
+      mask |= UINT64_C(1) << word;
       ++word;
     }
   }
@@ -167,7 +168,7 @@ bool RawFloatVerticesAreFinite(const std::uint8_t *data,
                                std::uint64_t vertex_count,
                                std::uint32_t stride,
                                std::uint32_t component_count,
-                               std::uint64_t integer_word_mask = 0) {
+                               std::uint64_t opaque_word_mask = 0) {
   if (!data || component_count == 0 ||
       component_count * sizeof(float) > stride) {
     return false;
@@ -177,7 +178,7 @@ bool RawFloatVerticesAreFinite(const std::uint8_t *data,
     for (std::uint32_t component = 0; component < component_count;
          ++component) {
       if (component < 64U &&
-          (integer_word_mask & (UINT64_C(1) << component)) != 0) {
+          (opaque_word_mask & (UINT64_C(1) << component)) != 0) {
         continue;
       }
       std::uint32_t bits = 0;
@@ -625,7 +626,7 @@ bool CopyPcoTrianglePayload(
                                            : ((lit_mesh_layout || color_layout)
                                                   ? 6U
                                                   : 3U),
-                                 IntegerVertexWordMask(source))) {
+                                 OpaqueVertexWordMask(source))) {
     *error = "invalid SystemC API PCO triangle VBO/topology payload";
     return false;
   }
@@ -975,8 +976,15 @@ bool CopyPcoSequenceDraw(
         source.height > source.framebuffer_height) {
       return "viewport does not fit the framebuffer";
     }
-    if (source.vertex_stride < 2U * sizeof(float))
-      return "vertex stride is below one 2D position";
+    /*
+     * One register word is the smallest a vertex can be: an attribute occupies
+     * the words its source format does, and a packed one -- four bytes of
+     * RGBA8, or a 2_10_10_10 -- is a single word that the shader's own unpack
+     * expands.  Requiring two floats assumed every attribute arrived already
+     * unpacked to one word per component.
+     */
+    if (source.vertex_stride < sizeof(std::uint32_t))
+      return "vertex stride is below one register word";
     if (source.vertex_stride > 256)
       return "vertex stride is beyond the model's limit";
     if (source.vertex_stride % sizeof(std::uint32_t) != 0)
@@ -1014,7 +1022,7 @@ bool CopyPcoSequenceDraw(
                                    source.vertex_stride,
                                    source.vertex_stride /
                                        sizeof(std::uint32_t),
-                                   IntegerVertexWordMask(source))) {
+                                   OpaqueVertexWordMask(source))) {
       return "a float vertex component is not finite";
     }
     return nullptr;

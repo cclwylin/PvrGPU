@@ -1980,18 +1980,20 @@ void Submitter::RunJob() {
             binding.stride_bytes = command.vertex_stride;
             binding.destination_register =
                 static_cast<std::uint16_t>(attribute * 4U);
-            // An integer attribute reaches the shader as raw 32-bit bits;
-            // reading them as a float and writing them back is only exact by
-            // accident, so the capsule states which it is.
-            const bool integer =
-                command.vertex_attribute_integer[attribute] != 0;
-            binding.component_type = integer ? VertexComponentType::kUint32
-                                             : VertexComponentType::kFloat32;
+            /*
+             * The stream carries the attribute's own bytes and the shader's
+             * own unpack decodes them, so every word here is opaque: fetch
+             * copies it verbatim.  Reading it as a float and writing the bits
+             * back would be exact only by accident -- a packed pair of bytes
+             * is a denormal, and four that happen to set the exponent are a
+             * NaN, neither of which survives a round trip through `float`.
+             */
+            binding.component_type = VertexComponentType::kUint32;
             binding.source_components =
                 static_cast<std::uint8_t>(components);
             binding.destination_components = 4;
             binding.normalized = 0;
-            binding.integer = integer ? 1U : 0U;
+            binding.integer = 1U;
             binding.instance_divisor = 0;
             bindings.push_back(binding);
             offset_bytes += components * sizeof(float);

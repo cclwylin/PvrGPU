@@ -130,6 +130,11 @@ enum class PcoOpcode : std::uint8_t {
   kIntegerMultiplyAdd32,
   kBitfieldInsert,
   kBitfieldExtractUnsigned,
+  // The same three-phase group with an arithmetic shift in phase 2, which is
+  // what GL's signed bitfieldExtract lowers to: the extracted field keeps its
+  // sign.  A narrow signed vertex attribute read as an int reaches the shader
+  // through one of these per component.
+  kBitfieldExtractSigned,
   kIntegerAdd64_32,
   kBitwiseAnd,
   kBitwiseOr,
@@ -168,6 +173,11 @@ enum class PcoOpcode : std::uint8_t {
    * int(x).  Named for the format the encoding selects. */
   kUnpackUnsignedToFloat,
   kUnpackSignedToFloat,
+  /* UNPCK of a packed vector format -- 8888, 1616 or 1010102, signed or not,
+   * with or without the normalizing scale.  One source word yields one
+   * component per group repeat, which is how a packed vertex attribute
+   * reaches the shader. */
+  kUnpackVector,
   /* Mesa fcsel_gt lowered as TST.F32.GZ + MOVC.  Keep this distinct from
    * Boolean BCSEL: the condition is an ordered float comparison with +0. */
   kConditionalSelectGreaterZero,
@@ -265,6 +275,11 @@ struct PcoInstruction {
   // is how the compiler spells `cond ? -a : b`.  Orthogonal to the test, so a
   // negated select needs no opcode of its own.
   std::uint8_t source1_negate = 0;
+  /* PCO's F_PCK_FORMAT for kUnpackVector, and its `scale` bit: scaling
+   * normalizes the field to [0,1] or [-1,1] instead of yielding its integer
+   * value as a float. */
+  std::uint8_t unpack_format = 0;
+  std::uint8_t unpack_scale = 0;
   std::uint8_t source_count = 1;
   std::uint8_t repeat_count = 1;
   std::uint8_t end_group = 0;

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -117,8 +118,15 @@ void PcoDecoder::Run() {
            (state.vertex_pco_abi.vertex_inputs != 0 &&
             state.vertex_pco_abi.vertex_inputs !=
                 declared_vertex_input_count))) {
-        throw std::runtime_error(
-            "driver PCO vertex-input mask does not match attribute bindings");
+        std::ostringstream message;
+        message << "driver PCO vertex-input mask does not match attribute "
+                   "bindings: program reads 0x" << std::hex
+                << decoded.summary.vertex_input_mask << ", bindings supply 0x"
+                << driver_readable_vertex_inputs << " of 0x"
+                << available_vertex_inputs << std::dec
+                << ", declared vtxins " << state.vertex_pco_abi.vertex_inputs
+                << " versus " << declared_vertex_input_count;
+        throw std::runtime_error(message.str());
       }
     }
 
