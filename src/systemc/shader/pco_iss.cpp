@@ -2862,6 +2862,13 @@ PcoInstruction DecodeGenericPhase2Group(
   if (operation_offset >= header.offset + header.total_bytes)
     DecodeError(operation_offset, "missing phase-2 ALU operation");
   switch (binary[operation_offset]) {
+  /*
+   * A MOVC that moves phase 0's result.  min, max and the CSEL forms are
+   * decoded here; group_map shows the sign functions to be the same
+   * phase-composed shape with a different test, but routing them by the
+   * test operation alone also caught the CSEL and trunc groups that share
+   * it, so they stay with the form that already serves them.
+   */
   case 0xd0:
     return DecodeGenericTestSelectGroup(binary, header, group_index);
   case 0xd1:
