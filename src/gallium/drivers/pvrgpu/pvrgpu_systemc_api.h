@@ -9,8 +9,8 @@
 extern "C" {
 #endif
 
-/* API-v14 states the PIXOUT lanes each colour attachment expects. */
-#define PVRGPU_SYSTEMC_API_VERSION 17u
+/* API-v18 lets a readback name which colour attachment it wants. */
+#define PVRGPU_SYSTEMC_API_VERSION 18u
 /*
  * Draws one sequence may describe; must match the model's own bound.  This is
  * independent of how many attachments the sequence creates, which the model's
@@ -412,6 +412,14 @@ struct pvrgpu_systemc_readback_info {
     * the one it rendered rather than reinterpreting the bytes.
     */
    uint32_t bytes_per_pixel;
+   /*
+    * Which colour attachment to read.  A fragment shader returning more than
+    * one result writes one attachment per result, and the caller reads each
+    * in turn; the flush runs once and the attachments it produced stay
+    * readable until the next submission replaces them, so asking for a second
+    * attachment does not need a second flush and does not lose the first.
+    */
+   uint32_t attachment;
    uint8_t *pixels;
    size_t pixels_size;
    uint32_t pixels_written;

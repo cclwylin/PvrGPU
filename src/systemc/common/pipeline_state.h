@@ -142,6 +142,10 @@ struct PipelineState {
   PoolHandle pbe_framebuffer;
   PoolHandle slc_writeback_lines;
   PoolHandle dram_framebuffer;
+  // Attachments 1..render_target_count-1 as read back from DRAM, alongside
+  // dram_framebuffer's attachment zero.  A shader returning more than one
+  // result writes them all, and the driver reads back each in turn.
+  PoolHandle extra_dram_framebuffer[kMaxRenderTargets - 1]{};
   PcoProgramSummary vertex_program_summary;
   PcoProgramSummary fragment_program_summary;
   // Producer-declared PCO resource ABI and exact VS-to-FS linkage. Keeping

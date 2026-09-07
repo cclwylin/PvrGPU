@@ -49,6 +49,10 @@ struct ModelJob {
   // packs UNORM8 channels: an integer attachment stores a dword per channel,
   // so the pixel width travels with the pixels.
   std::vector<std::uint8_t> framebuffer;
+  // Colour attachments past the first, in target order and each the same
+  // size as the first.  A shader returning more than one result writes one
+  // per target, and the driver reads back whichever it maps.
+  std::vector<std::vector<std::uint8_t>> extra_framebuffers;
   std::uint32_t framebuffer_width = 0;
   std::uint32_t framebuffer_height = 0;
   std::uint32_t framebuffer_bytes_per_pixel = 4;
@@ -61,6 +65,7 @@ struct ModelJob {
     failed = false;
     error.clear();
     framebuffer.clear();
+    extra_framebuffers.clear();
     framebuffer_width = 0;
     framebuffer_height = 0;
     framebuffer_bytes_per_pixel = 4;
@@ -77,13 +82,20 @@ struct ModelJob {
 
   void PublishFramebuffer(const std::vector<std::uint8_t> &pixels,
                           std::uint32_t width, std::uint32_t height,
-                          std::uint32_t bytes_per_pixel) {
+                          std::uint32_t bytes_per_pixel,
+                          std::vector<std::vector<std::uint8_t>> extra = {}) {
+    const std::uint64_t expected =
+        static_cast<std::uint64_t>(width) * height * bytes_per_pixel;
     if (bytes_per_pixel == 0 ||
-        static_cast<std::uint64_t>(pixels.size()) !=
-            static_cast<std::uint64_t>(width) * height * bytes_per_pixel) {
+        static_cast<std::uint64_t>(pixels.size()) != expected) {
       return;
     }
+    for (const std::vector<std::uint8_t> &attachment : extra) {
+      if (static_cast<std::uint64_t>(attachment.size()) != expected)
+        return;
+    }
     framebuffer = pixels;
+    extra_framebuffers = std::move(extra);
     framebuffer_width = width;
     framebuffer_height = height;
     framebuffer_bytes_per_pixel = bytes_per_pixel;

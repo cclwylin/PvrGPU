@@ -19,6 +19,9 @@ bool ConfigureDriverCommandOptions(Options *options, std::string *error);
  */
 struct ModelFramebuffer {
   std::vector<std::uint8_t> pixels;
+  // Colour attachments past the first, in target order.  Each is the same
+  // width, height and pixel width as `pixels`.
+  std::vector<std::vector<std::uint8_t>> extra;
   std::uint32_t width = 0;
   std::uint32_t height = 0;
   // Four while the attachment packs UNORM8 channels; an integer attachment

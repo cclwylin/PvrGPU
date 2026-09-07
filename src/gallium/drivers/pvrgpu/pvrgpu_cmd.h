@@ -361,6 +361,7 @@ bool
 pvrgpu_systemc_flush_readback_pixels(uint32_t width,
                                      uint32_t height,
                                      uint32_t bytes_per_pixel,
+                                     uint32_t attachment,
                                      uint8_t *pixels,
                                      size_t pixels_size,
                                      bool *out_written,

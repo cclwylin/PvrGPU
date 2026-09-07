@@ -778,7 +778,13 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
       state.pbe_framebuffer,
       state.slc_writeback_lines,
       state.dram_framebuffer,
+      /* The colour attachments past the first, read back alongside it. */
+      state.extra_dram_framebuffer[0],
+      state.extra_dram_framebuffer[1],
+      state.extra_dram_framebuffer[2],
   };
+  static_assert(kMaxRenderTargets == 4,
+                "every extra colour attachment must be listed for release");
   for (const PoolHandle handle : handles)
     release_unique(handle);
 }

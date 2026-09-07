@@ -150,6 +150,24 @@ void PbeWriteBack::Run() {
         throw std::runtime_error("PbeWriteBack readback framebuffer mismatch");
 
       const PoolHandle readback_handle = StoreNewArray(pool_, readback.data);
+      /* Every attachment is read back, not only the one the frame is
+       * published from: a shader returning more than one result writes each
+       * to its own target and the driver reads back each in turn. */
+      PoolHandle extra_readback_handles[kMaxRenderTargets - 1]{};
+      std::uint64_t extra_readback_bytes = 0;
+      for (std::uint32_t target = 1; target < render_target_count; ++target) {
+        MemoryReadResult extra = memory_->Readback(
+            state.extra_framebuffer_gpu_address[target - 1], source.size(),
+            MemoryClient::kFramebufferReadback);
+        memory_stats += extra.stats;
+        if (extra.data.size() != source.size()) {
+          throw std::runtime_error(
+              "PbeWriteBack readback of colour attachment " +
+              std::to_string(target) + " is the wrong size");
+        }
+        extra_readback_handles[target - 1] = StoreNewArray(pool_, extra.data);
+        extra_readback_bytes += expected_bytes;
+      }
       if (SameHandle(readback_handle, state.pbe_framebuffer)) {
         pool_.Release(readback_handle);
         throw std::logic_error("PbeWriteBack reused a live source handle");
@@ -168,9 +186,14 @@ void PbeWriteBack::Run() {
       state.pbe_framebuffer = {};
       state.slc_writeback_lines = {};
       state.dram_framebuffer = readback_handle;
+      for (std::uint32_t target = 1; target < render_target_count; ++target) {
+        state.extra_dram_framebuffer[target - 1] =
+            extra_readback_handles[target - 1];
+      }
       state.framebuffer_from_dram = 1;
       ApplyMemoryAccessStats(state.counters, memory_stats);
-      state.counters.framebuffer_dram_readback_bytes = expected_bytes;
+      state.counters.framebuffer_dram_readback_bytes =
+          expected_bytes + extra_readback_bytes;
       const std::uint64_t memory_cycles =
           MemoryAccessDelayCycles(memory_stats);
       state.counters.renderer_cycles = CheckedAdd(
@@ -195,6 +218,10 @@ void PbeWriteBack::Run() {
         StorePipelineState(pool_, txn.state, state);
       } catch (...) {
         pool_.Release(readback_handle);
+        for (PoolHandle &extra : extra_readback_handles) {
+          if (HasPoolHandle(extra))
+            pool_.Release(extra);
+        }
         release_sources();
         throw;
       }

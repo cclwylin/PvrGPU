@@ -252,7 +252,14 @@ int main() {
 
   info.command = &clear;
 
-  // A readback with nothing new submitted must not re-run the last command.
+  /*
+   * A readback with nothing new submitted hands back what the last one
+   * produced rather than running it again.  A pass writing several colour
+   * attachments is read one attachment at a time and the first of those reads
+   * is what runs it, so the later ones have to find the same result waiting.
+   * That the submission is not re-run is what the JSONL record count below
+   * establishes: three flushes, three record sets.
+   */
   std::array<std::uint8_t, kWidth * kHeight * 4> repeat{};
   repeat.fill(UINT8_C(0x17));
   pvrgpu_systemc_readback_info again{};
@@ -265,8 +272,38 @@ int main() {
   error.fill(0);
   if (pvrgpu_systemc_flush_readback(&again, error.data(), error.size()) != 0)
     Fail(std::string("repeat flush failed: ") + error.data());
-  if (again.pixels_written != 0)
-    Fail("repeat flush re-ran an already executed submission");
+  if (again.pixels_written != 1)
+    Fail("repeat readback did not hand back the executed submission's pixels");
+  if (repeat != drawn)
+    Fail("repeat readback published something other than the last result");
+
+  /* An attachment the pass never wrote publishes nothing rather than the
+   * first one's pixels. */
+  std::array<std::uint8_t, kWidth * kHeight * 4> absent{};
+  absent.fill(UINT8_C(0x17));
+  pvrgpu_systemc_readback_info second_target{};
+  second_target.version = PVRGPU_SYSTEMC_API_VERSION;
+  second_target.width = kWidth;
+  second_target.height = kHeight;
+  second_target.bytes_per_pixel = 4;
+  second_target.attachment = 1;
+  second_target.pixels = absent.data();
+  second_target.pixels_size = absent.size();
+  error.fill(0);
+  if (pvrgpu_systemc_flush_readback(&second_target, error.data(),
+                                    error.size()) != 0) {
+    Fail(std::string("second-attachment readback failed: ") + error.data());
+  }
+  if (second_target.pixels_written != 0)
+    Fail("a colour attachment the pass never wrote published pixels");
+  if (absent != std::array<std::uint8_t, kWidth * kHeight * 4>{
+                   [] {
+                     std::array<std::uint8_t, kWidth * kHeight * 4> filled{};
+                     filled.fill(UINT8_C(0x17));
+                     return filled;
+                   }()}) {
+    Fail("an unwritten attachment's readback touched the destination");
+  }
 
   // Each flush reports for itself, so the stream carries one complete record
   // set per flush rather than a single set held back until exit.

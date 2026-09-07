@@ -456,6 +456,7 @@ bool
 pvrgpu_systemc_flush_readback_pixels(uint32_t width,
                                      uint32_t height,
                                      uint32_t bytes_per_pixel,
+                                     uint32_t attachment,
                                      uint8_t *pixels,
                                      size_t pixels_size,
                                      bool *out_written,
@@ -498,6 +499,7 @@ pvrgpu_systemc_flush_readback_pixels(uint32_t width,
    readback.version = PVRGPU_SYSTEMC_API_VERSION;
    readback.width = width;
    readback.height = height;
+   readback.attachment = attachment;
    readback.bytes_per_pixel = bytes_per_pixel;
    readback.pixels = pixels;
    readback.pixels_size = pixels_size;
@@ -518,8 +520,8 @@ pvrgpu_systemc_flush_readback_pixels(uint32_t width,
    if (out_written)
       *out_written = readback.pixels_written != 0;
    pvrgpu_counter_eventf("systemc_readback_flush",
-                         "width=%u height=%u pixels=%u",
-                         width, height, readback.pixels_written);
+                         "width=%u height=%u attachment=%u pixels=%u",
+                         width, height, attachment, readback.pixels_written);
    return true;
 }
 

@@ -1173,11 +1173,13 @@ void ValidateMemoryPath(const Options &options, const PipelineState &state,
   }
   if (counters.pixel_data_master_cycles == 0)
     throw std::runtime_error("JsonReporter pixel data master spent no cycles");
-  if (counters.framebuffer_dram_readback_bytes != expected_bytes) {
+  if (counters.framebuffer_dram_readback_bytes !=
+      expected_bytes * render_target_count) {
     throw std::runtime_error(
         "JsonReporter framebuffer read back " +
         std::to_string(counters.framebuffer_dram_readback_bytes) +
-        " bytes, expected " + std::to_string(expected_bytes));
+        " bytes, expected " +
+        std::to_string(expected_bytes * render_target_count));
   }
   if (counters.dram_cycles !=
       counters.dram_read_transactions + counters.dram_write_transactions) {
@@ -1974,6 +1976,10 @@ void JsonReporter::RunJob() {
     VertexPcoEvidence vertex_pco;
     FragmentPcoEvidence fragment_pco;
     std::vector<std::uint8_t> final_framebuffer;
+    /* Colour attachments past the first, from the same submission the frame
+     * is published from.  A shader returning more than one result writes one
+     * per target and the driver reads back each in turn. */
+    std::vector<std::vector<std::uint8_t>> final_extra_framebuffers;
     std::uint32_t final_bytes_per_pixel = 4;
     std::uint32_t final_width = 0;
     std::uint32_t final_height = 0;
@@ -2103,9 +2109,11 @@ void JsonReporter::RunJob() {
         const std::uint64_t expected_framebuffer_bytes =
             static_cast<std::uint64_t>(state.width) * state.height *
             ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
+        const std::uint64_t submission_render_target_count =
+            state.render_target_count == 0 ? 1U : state.render_target_count;
         if (state.framebuffer_bytes != expected_framebuffer_bytes ||
             state.counters.framebuffer_dram_readback_bytes !=
-                expected_framebuffer_bytes ||
+                expected_framebuffer_bytes * submission_render_target_count ||
             framebuffer.size() != expected_framebuffer_bytes) {
           throw std::runtime_error(
               "JsonReporter PCO sequence DRAM byte count mismatch");
@@ -2130,6 +2138,17 @@ void JsonReporter::RunJob() {
           aggregate_drawlists.push_back(drawlist);
         }
         final_framebuffer = framebuffer;
+        final_extra_framebuffers.clear();
+        for (std::uint64_t target = 1; target < submission_render_target_count;
+             ++target) {
+          if (!HasPoolHandle(state.extra_dram_framebuffer[target - 1])) {
+            throw std::runtime_error(
+                "JsonReporter PCO sequence colour attachment " +
+                std::to_string(target) + " was not read back from DRAM");
+          }
+          final_extra_framebuffers.push_back(LoadArray<std::uint8_t>(
+              pool_, state.extra_dram_framebuffer[target - 1]));
+        }
         final_bytes_per_pixel = static_cast<std::uint32_t>(
             ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords));
         final_width = state.width;
@@ -2190,9 +2209,11 @@ void JsonReporter::RunJob() {
       // `glReadPixels` on this colour attachment has to see.  Publish it
       // before the artifact so a run with no output directory still answers
       // the driver.
-      if (job_)
+      if (job_) {
         job_->PublishFramebuffer(final_framebuffer, final_width, final_height,
-                                 final_bytes_per_pixel);
+                                 final_bytes_per_pixel,
+                                 std::move(final_extra_framebuffers));
+      }
       std::filesystem::path artifact_path;
       // An integer attachment's pixel is not an RGBA8 colour, so there is no
       // PNG to write for one.  The readback above still carries its real
@@ -2273,12 +2294,27 @@ void JsonReporter::RunJob() {
       const std::uint64_t expected_framebuffer_bytes =
           static_cast<std::uint64_t>(state.width) * state.height *
           ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
+      const std::uint64_t sequence_render_target_count =
+          state.render_target_count == 0 ? 1U : state.render_target_count;
       if (state.framebuffer_bytes != expected_framebuffer_bytes ||
           state.counters.framebuffer_dram_readback_bytes !=
-              expected_framebuffer_bytes ||
+              expected_framebuffer_bytes * sequence_render_target_count ||
           framebuffer.size() != expected_framebuffer_bytes) {
         throw std::runtime_error(
             "JsonReporter DRAM framebuffer byte count mismatch");
+      }
+      /* Attachments past the first, in target order, so a driver reading back
+       * a second colour surface sees what the shader wrote to it. */
+      std::vector<std::vector<std::uint8_t>> extra_framebuffers;
+      for (std::uint64_t target = 1; target < sequence_render_target_count;
+           ++target) {
+        if (!HasPoolHandle(state.extra_dram_framebuffer[target - 1])) {
+          throw std::runtime_error(
+              "JsonReporter colour attachment " + std::to_string(target) +
+              " was not read back from DRAM");
+        }
+        extra_framebuffers.push_back(LoadArray<std::uint8_t>(
+            pool_, state.extra_dram_framebuffer[target - 1]));
       }
       ValidateMemoryPath(options_, state, expected_framebuffer_bytes);
       if (!HasPoolHandle(state.drawlist_stats))
@@ -2295,9 +2331,11 @@ void JsonReporter::RunJob() {
       // command sidecar the artifact may be overlaid with below.
       const std::uint32_t frame_bytes_per_pixel = static_cast<std::uint32_t>(
           ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords));
-      if (job_)
+      if (job_) {
         job_->PublishFramebuffer(framebuffer, state.width, state.height,
-                                 frame_bytes_per_pixel);
+                                 frame_bytes_per_pixel,
+                                 std::move(extra_framebuffers));
+      }
       std::filesystem::path artifact_path;
       // As above: an integer attachment has no RGBA8 rendering, so it gets no
       // PNG.  The pixels the driver reads back are unaffected.

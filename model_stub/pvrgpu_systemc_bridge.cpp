@@ -2059,10 +2059,21 @@ void DeriveSequenceInputAssembly(pvrgpu::stub::Options *options) {
       any_indexed ? 0U : static_cast<std::uint32_t>(vertices);
 }
 
+/*
+ * What the last flush left behind.  A pass writing several colour
+ * attachments is read back one attachment at a time, and the flush that
+ * produced them is consumed by the first of those reads, so the attachments
+ * are held here until the next submission runs and replaces them.
+ */
+pvrgpu::stub::ModelFramebuffer g_last_framebuffer;
+
 int FlushPendingSubmitLocked(pvrgpu::stub::ModelFramebuffer *framebuffer,
                              std::string *error) {
-  if (!g_pending_submit.valid || g_pending_submit.executed)
+  if (!g_pending_submit.valid || g_pending_submit.executed) {
+    if (framebuffer && g_last_framebuffer.valid())
+      *framebuffer = g_last_framebuffer;
     return 0;
+  }
   g_pending_submit.executed = true;
   if (IsIdeasPcoSequenceRoot(g_pending_submit.options.driver_command) &&
       g_pending_submit.options.driver_commands.size() !=
@@ -2072,8 +2083,16 @@ int FlushPendingSubmitLocked(pvrgpu::stub::ModelFramebuffer *framebuffer,
     return 2;
   }
   DeriveSequenceInputAssembly(&g_pending_submit.options);
-  return RunModelToFiles(g_pending_submit.options, g_pending_submit.jsonl_path,
-                         g_pending_submit.stderr_path, framebuffer, error);
+  pvrgpu::stub::ModelFramebuffer produced;
+  const int status =
+      RunModelToFiles(g_pending_submit.options, g_pending_submit.jsonl_path,
+                      g_pending_submit.stderr_path, &produced, error);
+  if (status == 0) {
+    g_last_framebuffer = std::move(produced);
+    if (framebuffer)
+      *framebuffer = g_last_framebuffer;
+  }
+  return status;
 }
 
 /*
@@ -2280,6 +2299,10 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
     g_atexit_registered = true;
   }
 
+  /* The attachments held from the previous flush describe work that this
+   * submission replaces, so they stop being readable now rather than when
+   * the new flush happens to run. */
+  g_last_framebuffer = {};
   g_pending_submit = std::move(pending);
   return 0;
 }
@@ -2311,12 +2334,16 @@ extern "C" int pvrgpu_systemc_flush_readback(
     return 2;
   }
 
-  // Nothing submitted, or the last submission already ran: there is no work to
-  // do and no pixels to claim, which is a success -- the caller keeps whatever
-  // it already has.
-  if (!g_pending_submit.valid || g_pending_submit.executed)
-    return 0;
-
+  /*
+   * A submission that has already run still has attachments to hand out: a
+   * pass writing several colour targets is read back one target at a time,
+   * and the first of those reads is what runs it.  The flush below returns
+   * what that run produced, so this asks it rather than returning early --
+   * doing that here published attachment zero and nothing else, because the
+   * second read never reached the flush at all.  With nothing submitted and
+   * nothing cached it still succeeds and claims no pixels, leaving the caller
+   * whatever it already has.
+   */
   pvrgpu::stub::ModelFramebuffer framebuffer;
   std::string message;
   const int result = FlushPendingSubmitLocked(&framebuffer, &message);
@@ -2337,7 +2364,21 @@ extern "C" int pvrgpu_systemc_flush_readback(
       framebuffer.bytes_per_pixel != readback->bytes_per_pixel)
     return 0;
 
-  std::memcpy(readback->pixels, framebuffer.pixels.data(),
+  /*
+   * Attachment zero is the frame's own surface; the rest are the additional
+   * colour targets the same pass wrote, in target order.  An attachment the
+   * pass did not write publishes nothing rather than the first one's pixels.
+   */
+  const std::vector<std::uint8_t> *source = nullptr;
+  if (readback->attachment == 0) {
+    source = &framebuffer.pixels;
+  } else if (readback->attachment - 1 < framebuffer.extra.size()) {
+    source = &framebuffer.extra[readback->attachment - 1];
+  }
+  if (!source || source->size() != static_cast<std::size_t>(required))
+    return 0;
+
+  std::memcpy(readback->pixels, source->data(),
               static_cast<std::size_t>(required));
   readback->pixels_written = 1;
   return 0;

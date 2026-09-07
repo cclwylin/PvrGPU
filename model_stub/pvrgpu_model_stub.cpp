@@ -891,6 +891,7 @@ int ModelSession::Run(const Options &options, ModelFramebuffer *framebuffer,
   }
   if (framebuffer) {
     framebuffer->pixels = job.framebuffer;
+    framebuffer->extra = job.extra_framebuffers;
     framebuffer->width = job.framebuffer_width;
     framebuffer->height = job.framebuffer_height;
     framebuffer->bytes_per_pixel = job.framebuffer_bytes_per_pixel;

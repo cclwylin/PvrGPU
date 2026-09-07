@@ -970,19 +970,28 @@ pvrgpu_transfer_box_in_bounds(const struct pipe_resource *resource,
 }
 
 /*
- * True when this is the surface the model has been drawing into.
+ * Which colour attachment of the current framebuffer this resource is, or -1
+ * when it is not one of them.
  *
  * A readback of anything else -- a texture the application uploaded, a
  * staging buffer -- has nothing to do with the model's framebuffer and must
- * not be overwritten with it.
+ * not be overwritten with it.  A fragment shader returning more than one
+ * result writes one attachment per result -- dEQP's modf returns its
+ * fractional and integral parts -- and each is mapped for read separately, so
+ * matching only attachment zero left every further one reading its own
+ * untouched backing store.
  */
-static bool
-pvrgpu_resource_is_current_color_attachment(
-   const struct pvrgpu_context *ctx,
-   const struct pipe_resource *resource)
+static int
+pvrgpu_resource_color_attachment_index(const struct pvrgpu_context *ctx,
+                                       const struct pipe_resource *resource)
 {
-   return ctx && resource && ctx->framebuffer.nr_cbufs != 0 &&
-          ctx->framebuffer.cbufs[0].texture == resource;
+   if (!ctx || !resource)
+      return -1;
+   for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target) {
+      if (ctx->framebuffer.cbufs[target].texture == resource)
+         return (int)target;
+   }
+   return -1;
 }
 
 /*
@@ -1126,8 +1135,27 @@ pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
    if (!(usage & PIPE_MAP_READ) || level != 0 || !ctx || !resource ||
        !pvrgpu || !pvrgpu->data || resource->target == PIPE_BUFFER)
       return;
-   if (!pvrgpu_resource_is_current_color_attachment(ctx, resource))
+   const int attachment =
+      pvrgpu_resource_color_attachment_index(ctx, resource);
+   if (attachment < 0) {
+      /*
+       * Say which surface was asked for and what the framebuffer held, so a
+       * readback that silently returned the caller's own contents can be told
+       * from one that was never a colour attachment at all.
+       */
+      pvrgpu_counter_eventf("framebuffer_readback_declined",
+                            "reason=not_a_current_color_attachment res=%p "
+                            "nr_cbufs=%u cbuf0=%p cbuf1=%p",
+                            (void *)resource,
+                            ctx ? ctx->framebuffer.nr_cbufs : 0u,
+                            (ctx && ctx->framebuffer.nr_cbufs > 0)
+                               ? (void *)ctx->framebuffer.cbufs[0].texture
+                               : NULL,
+                            (ctx && ctx->framebuffer.nr_cbufs > 1)
+                               ? (void *)ctx->framebuffer.cbufs[1].texture
+                               : NULL);
       return;
+   }
    if (!pvrgpu_resource_readback_format_is_supported(resource->format)) {
       /*
        * Say so.  Returning quietly here left a case reading its own zeroed
@@ -1190,7 +1218,8 @@ pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
    char error[512] = { 0 };
    const bool flushed =
       pvrgpu_systemc_flush_readback_pixels(width, height, bytes_per_pixel,
-                                           pixels, pixels_size, &written,
+                                           (uint32_t)attachment, pixels,
+                                           pixels_size, &written,
                                            error, sizeof(error));
    if (!flushed || !written) {
       if (!flushed) {
