@@ -948,7 +948,10 @@ bool CopyPcoSequenceDraw(
        std::string_view(source.format) != "PIPE_FORMAT_B8G8R8A8_SRGB" &&
        std::string_view(source.format) != "PIPE_FORMAT_R32_UINT" &&
        std::string_view(source.format) != "PIPE_FORMAT_R32G32_UINT" &&
-       std::string_view(source.format) != "PIPE_FORMAT_R32G32B32A32_UINT")) {
+       std::string_view(source.format) != "PIPE_FORMAT_R32G32B32A32_UINT" &&
+       std::string_view(source.format) != "PIPE_FORMAT_R32_SINT" &&
+       std::string_view(source.format) != "PIPE_FORMAT_R32G32_SINT" &&
+       std::string_view(source.format) != "PIPE_FORMAT_R32G32B32A32_SINT")) {
     return refuse(std::string("format=") +
                   (source.format ? source.format : "<none>"));
   }

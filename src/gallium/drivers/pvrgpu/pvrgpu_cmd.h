@@ -37,10 +37,18 @@ extern "C" {
  * R32_UINT, a vec2 to RG32UI, and a vec3 or vec4 to RGBA32UI, GLES having no
  * three-channel integer target.  A pixel is therefore 4, 8 or 16 bytes wide
  * and nothing downstream may assume four.
+ *
+ * A signed result -- an int, an ivec, or a bvec, which dEQP reads back as
+ * integers -- goes to the matching SINT format.  The stored pixel is the same
+ * raw dword per channel; only the value's interpretation on the host differs,
+ * so every width and path below treats the two alike.
  */
 #define PVRGPU_DRIVER_COMMAND_FORMAT_R32UI "PIPE_FORMAT_R32_UINT"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_RG32UI "PIPE_FORMAT_R32G32_UINT"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32UI "PIPE_FORMAT_R32G32B32A32_UINT"
+#define PVRGPU_DRIVER_COMMAND_FORMAT_R32I "PIPE_FORMAT_R32_SINT"
+#define PVRGPU_DRIVER_COMMAND_FORMAT_RG32I "PIPE_FORMAT_R32G32_SINT"
+#define PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32I "PIPE_FORMAT_R32G32B32A32_SINT"
 
 struct pvrgpu_clear_color_command {
    const char *case_name;

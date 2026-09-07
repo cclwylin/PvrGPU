@@ -25,15 +25,20 @@ constexpr char kBgra8Srgb[] = "PIPE_FORMAT_B8G8R8A8_SRGB";
 constexpr char kR32Ui[] = "PIPE_FORMAT_R32_UINT";
 constexpr char kRg32Ui[] = "PIPE_FORMAT_R32G32_UINT";
 constexpr char kRgba32Ui[] = "PIPE_FORMAT_R32G32B32A32_UINT";
+constexpr char kR32I[] = "PIPE_FORMAT_R32_SINT";
+constexpr char kRg32I[] = "PIPE_FORMAT_R32G32_SINT";
+constexpr char kRgba32I[] = "PIPE_FORMAT_R32G32B32A32_SINT";
 
 // The colour formats the PBE can write a generic draw into: four UNORM8
 // channels, or one, two or four raw 32-bit integer channels.  dEQP's shader
 // tests render into the integer ones -- a scalar result into R32_UINT, a vec2
 // into RG32UI, a vec3 or vec4 into RGBA32UI -- and requiring RGBA8 refused
-// every one of them.
+// every one of them.  A signed result takes the matching SINT format, whose
+// stored pixel is the same raw dword per channel.
 bool IsGenericDrawFormat(const std::string &format) {
   return format == kRgba8 || format == kRgba8Srgb || format == kBgra8Srgb ||
-         format == kR32Ui || format == kRg32Ui || format == kRgba32Ui;
+         format == kR32Ui || format == kRg32Ui || format == kRgba32Ui ||
+         format == kR32I || format == kRg32I || format == kRgba32I;
 }
 constexpr char kRgbx8[] = "PIPE_FORMAT_R8G8B8X8_UNORM";
 constexpr char kZ32[] = "PIPE_FORMAT_Z32_UNORM";

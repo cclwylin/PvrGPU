@@ -1014,11 +1014,15 @@ pvrgpu_resource_readback_format_is_supported(enum pipe_format format)
    /*
     * The 32-bit integer attachments: the model publishes the shader's PIXOUT
     * lanes verbatim, one dword per channel, which is already the stored pixel,
-    * so they need no reordering at all -- only the right pixel width.
+    * so they need no reordering at all -- only the right pixel width.  A
+    * signed result is stored identically; only its reading differs.
     */
    case PIPE_FORMAT_R32_UINT:
    case PIPE_FORMAT_R32G32_UINT:
    case PIPE_FORMAT_R32G32B32A32_UINT:
+   case PIPE_FORMAT_R32_SINT:
+   case PIPE_FORMAT_R32G32_SINT:
+   case PIPE_FORMAT_R32G32B32A32_SINT:
       return true;
    default:
       return false;
@@ -1038,8 +1042,10 @@ pvrgpu_resource_readback_bytes_per_pixel(enum pipe_format format)
 {
    switch (format) {
    case PIPE_FORMAT_R32G32_UINT:
+   case PIPE_FORMAT_R32G32_SINT:
       return 8u;
    case PIPE_FORMAT_R32G32B32A32_UINT:
+   case PIPE_FORMAT_R32G32B32A32_SINT:
       return 16u;
    default:
       return 4u;
@@ -1063,7 +1069,10 @@ pvrgpu_resource_readback_store_row(enum pipe_format format,
 {
    if (format == PIPE_FORMAT_R32_UINT ||
        format == PIPE_FORMAT_R32G32_UINT ||
-       format == PIPE_FORMAT_R32G32B32A32_UINT) {
+       format == PIPE_FORMAT_R32G32B32A32_UINT ||
+       format == PIPE_FORMAT_R32_SINT ||
+       format == PIPE_FORMAT_R32G32_SINT ||
+       format == PIPE_FORMAT_R32G32B32A32_SINT) {
       /* An integer pixel is already stored as the model published it. */
       memcpy(destination, source_row,
              (size_t)width * pvrgpu_resource_readback_bytes_per_pixel(format));

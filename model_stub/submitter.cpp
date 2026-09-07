@@ -167,6 +167,36 @@ FrontFaceWinding FrontFaceFromDriverCommand(std::uint32_t front_ccw,
                    : FrontFaceWinding::kCounterClockwise;
 }
 
+/*
+ * How many raw 32-bit channels a colour attachment stores, or zero when it is
+ * not one of the integer formats.  dEQP's shader executor renders a scalar
+ * result into a one-channel target, a vec2 into two channels and a vec3 or
+ * vec4 into four -- GLES has no three-channel integer format -- and the
+ * result's signedness picks UINT or SINT.  The stored pixel is the same raw
+ * dword either way; only the host's reading of it differs.  This is also what
+ * widens the framebuffer past four bytes a pixel.
+ */
+std::uint32_t ColorAttachmentRawDwords(const std::string &format) {
+  if (format == "PIPE_FORMAT_R32_UINT" || format == "PIPE_FORMAT_R32_SINT")
+    return 1U;
+  if (format == "PIPE_FORMAT_R32G32_UINT" ||
+      format == "PIPE_FORMAT_R32G32_SINT") {
+    return 2U;
+  }
+  if (format == "PIPE_FORMAT_R32G32B32A32_UINT" ||
+      format == "PIPE_FORMAT_R32G32B32A32_SINT") {
+    return 4U;
+  }
+  return 0U;
+}
+
+/* The colour formats a generic PCO draw may target: eight-bit UNORM, or one,
+ * two or four raw 32-bit integer channels of either signedness. */
+bool DriverPcoColorAttachmentFormatSupported(const std::string &format) {
+  return format == "PIPE_FORMAT_R8G8B8A8_UNORM" ||
+         ColorAttachmentRawDwords(format) != 0U;
+}
+
 bool PcoSingleDrawResolutionSupported(const DriverCommand &command) {
   // The rasterizer is resolution independent; the single-draw path only needs
   // a full-surface render target within the model's addressable extent.
@@ -293,10 +323,7 @@ bool DriverIdeasPcoSequenceCommandSupported(const DriverCommand &command) {
        command.vertex_count == 12U);
   if (!layout || !topology ||
       !PcoSingleDrawResolutionSupported(command) ||
-      (command.format != "PIPE_FORMAT_R8G8B8A8_UNORM" &&
-       command.format != "PIPE_FORMAT_R32_UINT" &&
-       command.format != "PIPE_FORMAT_R32G32_UINT" &&
-       command.format != "PIPE_FORMAT_R32G32B32A32_UINT") ||
+      !DriverPcoColorAttachmentFormatSupported(command.format) ||
       command.clear_color_bits != kOpaqueBlack || command.first_vertex != 0 ||
       command.instance_count != 1 || command.indexed > 1 ||
       command.vertex_pco.empty() || command.fragment_pco.empty() ||
@@ -429,10 +456,7 @@ bool DriverPcoTrianglesCommandSupported(const DriverCommand &command) {
           kDriverPcoPositionNormalTexcoordVertexStride &&
       command.vertex_pco_abi.vertex_inputs == 12;
   if (!PcoSingleDrawResolutionSupported(command) ||
-      (command.format != "PIPE_FORMAT_R8G8B8A8_UNORM" &&
-       command.format != "PIPE_FORMAT_R32_UINT" &&
-       command.format != "PIPE_FORMAT_R32G32_UINT" &&
-       command.format != "PIPE_FORMAT_R32G32B32A32_UINT") ||
+      !DriverPcoColorAttachmentFormatSupported(command.format) ||
       command.clear_color_bits != kOpaqueBlack ||
       (!conditionals_layout && !lit_mesh_layout && !texture_layout &&
        !color_layout) ||
@@ -1588,10 +1612,7 @@ void Submitter::RunJob() {
        * also what widens the framebuffer past four bytes a pixel.
        */
       state.color_attachment_raw_dwords =
-          command.format == "PIPE_FORMAT_R32_UINT"            ? 1U
-          : command.format == "PIPE_FORMAT_R32G32_UINT"       ? 2U
-          : command.format == "PIPE_FORMAT_R32G32B32A32_UINT" ? 4U
-                                                              : 0U;
+          ColorAttachmentRawDwords(command.format);
       // An sRGB-encoded eight-bit colour target: same byte layout as RGBA8, but
       // the PBE applies the sRGB transfer on write and blends in linear space.
       state.color_is_srgb =

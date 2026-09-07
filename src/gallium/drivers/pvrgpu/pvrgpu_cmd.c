@@ -174,7 +174,10 @@ pvrgpu_cmd_format_supported(const char *format)
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_B10G10R10A2) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R32UI) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RG32UI) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32UI) == 0);
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32UI) == 0 ||
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R32I) == 0 ||
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RG32I) == 0 ||
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32I) == 0);
 }
 
 /*
@@ -837,7 +840,10 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_BGRA8_SRGB) == 0 ||
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_R32UI) == 0 ||
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RG32UI) == 0 ||
-      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32UI) == 0;
+      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32UI) == 0 ||
+      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_R32I) == 0 ||
+      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RG32I) == 0 ||
+      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32I) == 0;
    if (!resolution_ok || !format_ok) {
       /*
        * Say which half of the requirement failed and with what.  A
