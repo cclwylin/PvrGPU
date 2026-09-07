@@ -402,22 +402,20 @@ void ParameterBuffer::Run() {
                   triangle.first_vertex_output_dword +
                   vertex * triangle.vertex_output_stride_dwords +
                   binding.vertex_output_base + component;
+              /* A varying is a shader result, and GLSL lets a shader compute
+               * a NaN or an infinity and write one out.  This stage only fits
+               * a plane through the three values it is given, so a non-finite
+               * varying is carried into the coefficients and reaches the
+               * fragment shader as the non-finite value it is, exactly as the
+               * finite ones are interpolated. */
               const float varying =
                   BitsFloat(raster_vertex_outputs[output_index]);
-              if (!std::isfinite(varying)) {
-                throw std::runtime_error(
-                    "ParameterBuffer received a non-finite varying");
-              }
               if (binding.interpolation == InterpolationMode::kFlat) {
                 numerator[vertex] = varying;
               } else if (binding.interpolation == InterpolationMode::kNoPerspective) {
                 numerator[vertex] = varying;
               } else {
                 numerator[vertex] = varying * reciprocal_w[vertex];
-              }
-              if (!std::isfinite(numerator[vertex])) {
-                throw std::runtime_error(
-                    "ParameterBuffer varying/W product is non-finite");
               }
             }
             if (binding.interpolation == InterpolationMode::kFlat) {

@@ -79,10 +79,17 @@ ClipVertex ReadClipVertex(const VertexLane &vertex,
     throw std::runtime_error(
         "ClipCull received a vertex without UVSW emit/end-task");
   }
-  for (std::size_t component = 0; component < output_count; ++component) {
+  /* Only the clip position drives the clipping arithmetic.  The registers
+   * above it -- gl_PointSize and then the varyings -- are shader results the
+   * clipper merely carries and interpolates, and GLSL places no finiteness
+   * requirement on them: a shader may legitimately compute a NaN or an
+   * infinity and write it to a varying.  Checking those here rejected valid
+   * shader output, so the check is scoped to the four components whose value
+   * this stage actually reasons about. */
+  for (std::size_t component = 0; component < 4; ++component) {
     if (!std::isfinite(result.output[component])) {
       throw std::runtime_error(
-          "ClipCull received a non-finite clip vertex: component " +
+          "ClipCull received a non-finite clip position: component " +
           std::to_string(component) + " of " + std::to_string(output_count) +
           " bits=" + std::to_string(vertex.vertex_output[component]));
     }

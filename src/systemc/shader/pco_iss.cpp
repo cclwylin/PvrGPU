@@ -4307,17 +4307,20 @@ struct Binary32Operand {
   std::uint32_t significand = 0;
 };
 
-Binary32Operand DecodeFaddOperand(std::uint32_t bits) {
+Binary32Operand DecodeFaddOperand(std::uint32_t bits,
+                                  const char *caller = "FADD") {
   Binary32Operand operand;
   operand.sign = (bits & UINT32_C(0x80000000)) != 0;
   operand.exponent = (bits >> 23U) & UINT32_C(0xff);
   const std::uint32_t fraction = bits & UINT32_C(0x007fffff);
 
   if (operand.exponent == UINT32_C(0xff))
-    ExecuteError("FADD NaN/Inf policy is not in the public ISA gate");
+    ExecuteError(std::string(caller) +
+                 " NaN/Inf policy is not in the public ISA gate");
   if (operand.exponent == 0) {
     if (fraction != 0)
-      ExecuteError("FADD subnormal-input policy is not in the public ISA gate");
+      ExecuteError(std::string(caller) +
+                   " subnormal-input policy is not in the public ISA gate");
     operand.zero = true;
     return operand;
   }
@@ -4593,7 +4596,10 @@ std::uint32_t FloatSaturateBits(std::uint32_t value_bits) {
 }
 
 std::uint32_t FloatFloorBits(std::uint32_t value_bits) {
-  (void)DecodeFaddOperand(value_bits);
+  /* std::floor is IEEE-754 roundToIntegralTowardNegative, which is defined
+   * over every class: a NaN or an infinity is returned unchanged and a
+   * subnormal floors to a zero of its own sign or to -1.  Nothing here needs
+   * the arithmetic decode, so the operand is not passed through it. */
   float value = 0.0F;
   std::memcpy(&value, &value_bits, sizeof(value));
   const float floored = std::floor(value);
@@ -4632,8 +4638,10 @@ std::uint32_t FloatGreaterEqualResultBits(std::uint32_t left_bits,
 
 std::uint32_t FloatEqualBits(std::uint32_t left_bits,
                              std::uint32_t right_bits) {
-  (void)DecodeFaddOperand(left_bits);
-  (void)DecodeFaddOperand(right_bits);
+  /* TST.F32.EQ is ordered, so either NaN makes the predicate false -- which
+   * is what host binary32 == yields -- and the two zeroes compare equal.
+   * Keep the operands' bit patterns rather than sending them through the
+   * arithmetic-only FADD gate, as FloatGreaterEqualBits and FloatLessBits do. */
   float left = 0.0F;
   float right = 0.0F;
   std::memcpy(&left, &left_bits, sizeof(left));
@@ -4742,8 +4750,13 @@ std::uint32_t UnpackVectorLaneBits(std::uint8_t format, bool scale,
 }
 
 bool FloatGreaterZero(std::uint32_t value_bits) {
-  const Binary32Operand operand = DecodeFaddOperand(value_bits);
-  return !operand.sign && !operand.zero;
+  /* CSEL.GZ selects on an ordered "greater than zero".  Classifying by sign
+   * and zero alone answered true for a NaN, whose ordered comparison against
+   * any value is false, and it could not see an operand the arithmetic gate
+   * refused.  Host binary32 > gives the ordered answer for every class. */
+  float value = 0.0F;
+  std::memcpy(&value, &value_bits, sizeof(value));
+  return value > 0.0F;
 }
 
 /*
@@ -4898,8 +4911,11 @@ std::uint32_t ReciprocalBits(std::uint32_t val_bits) {
       return kCanonicalQuietNan;
     return val_bits & UINT32_C(0x80000000);
   }
-  const Binary32Operand operand = DecodeFaddOperand(val_bits);
-  if (operand.zero) {
+  /* Zero and sign are read from the encoding rather than from the arithmetic
+   * decode, so a subnormal operand -- whose reciprocal is an ordinary large
+   * finite number or an infinity -- reaches the division below instead of
+   * being refused by a gate that only describes FADD's normalised path. */
+  if ((val_bits & UINT32_C(0x7fffffff)) == 0) {
     /* Public PCO FRCP follows IEEE binary32 division for signed zero:
      * 1/+0 -> +infinity and 1/-0 -> -infinity.  Handle this class explicitly
      * so the otherwise strict NaN/Inf gate cannot confuse a legitimate RCP
@@ -4911,7 +4927,9 @@ std::uint32_t ReciprocalBits(std::uint32_t val_bits) {
   const float result_val = 1.0f / val;
   std::uint32_t result_bits = 0;
   std::memcpy(&result_bits, &result_val, sizeof(result_bits));
-  (void)DecodeFaddOperand(result_bits);
+  /* The reciprocal of a large finite operand is a subnormal and that of a
+   * tiny one is an infinity.  Both are the IEEE binary32 result, so the
+   * result is returned as computed rather than re-decoded. */
   return result_bits;
 }
 
@@ -4930,14 +4948,15 @@ std::uint32_t ReciprocalSquareRootBits(std::uint32_t val_bits) {
     }
     return UINT32_C(0);
   }
-  const Binary32Operand operand = DecodeFaddOperand(val_bits);
-  if (operand.zero) {
+  /* As in FRCP, classify from the encoding so a subnormal radicand reaches
+   * the square root rather than the normalised-operand gate. */
+  if ((val_bits & UINT32_C(0x7fffffff)) == 0) {
     /* PCO FRSQ follows the binary32 1/sqrt operation for signed zero.
      * sqrt preserves the zero sign, so the reciprocal is the correspondingly
      * signed infinity. */
     return (val_bits & UINT32_C(0x80000000)) | UINT32_C(0x7f800000);
   }
-  if (operand.sign) {
+  if ((val_bits & UINT32_C(0x80000000)) != 0) {
     /* A finite negative radicand has no real result.  Mesa's fsqrt lowering
      * relies on the canonical quiet NaN being carried until a later fcsel
      * discards the total-internal-reflection path. */
@@ -4948,7 +4967,8 @@ std::uint32_t ReciprocalSquareRootBits(std::uint32_t val_bits) {
   const float result_val = 1.0f / std::sqrt(val);
   std::uint32_t result_bits = 0;
   std::memcpy(&result_bits, &result_val, sizeof(result_bits));
-  (void)DecodeFaddOperand(result_bits);
+  /* As with FRCP, an operand near either end of the finite range drives this
+   * to a subnormal or an infinity, and both are the binary32 result. */
   return result_bits;
 }
 
@@ -5085,8 +5105,8 @@ std::uint32_t FloatMultiplyBits(std::uint32_t left_bits,
     return result_bits;
   }
 
-  const Binary32Operand left = DecodeFaddOperand(left_bits);
-  const Binary32Operand right = DecodeFaddOperand(right_bits);
+  const Binary32Operand left = DecodeFaddOperand(left_bits, "FMUL");
+  const Binary32Operand right = DecodeFaddOperand(right_bits, "FMUL");
   const bool sign = left.sign != right.sign;
   if (left.zero || right.zero)
     return sign ? UINT32_C(0x80000000) : UINT32_C(0x00000000);
@@ -5124,10 +5144,35 @@ std::uint32_t FloatMultiplyBits(std::uint32_t left_bits,
 
 std::uint32_t FloatDivideBits(std::uint32_t numerator_bits,
                               std::uint32_t denominator_bits) {
-  const Binary32Operand numerator = DecodeFaddOperand(numerator_bits);
-  const Binary32Operand denominator = DecodeFaddOperand(denominator_bits);
-  if (denominator.zero)
+  const auto native_divide = [](std::uint32_t left, std::uint32_t right) {
+    float left_value = 0.0F;
+    float right_value = 0.0F;
+    std::memcpy(&left_value, &left, sizeof(left_value));
+    std::memcpy(&right_value, &right, sizeof(right_value));
+    const float quotient = left_value / right_value;
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &quotient, sizeof(bits));
+    return bits;
+  };
+  const auto class_exponent = [](std::uint32_t bits) {
+    return (bits >> 23U) & UINT32_C(0xff);
+  };
+  if ((denominator_bits & UINT32_C(0x7fffffff)) == 0)
     ExecuteError("FITRP perspective divide by zero");
+  /* The normalised long division below is defined only over normal operands.
+   * A NaN, an infinity or a subnormal on either side -- the reciprocal that
+   * feeds this divide is itself allowed to be subnormal or infinite -- is
+   * the same binary32/RNE function on the host, which is the compiler target.
+   * FADD and FMUL hand their equivalent classes to the host for this reason. */
+  if (class_exponent(numerator_bits) == 0 ||
+      class_exponent(denominator_bits) == 0 ||
+      class_exponent(numerator_bits) == UINT32_C(0xff) ||
+      class_exponent(denominator_bits) == UINT32_C(0xff)) {
+    return native_divide(numerator_bits, denominator_bits);
+  }
+  const Binary32Operand numerator = DecodeFaddOperand(numerator_bits, "FDIV");
+  const Binary32Operand denominator =
+      DecodeFaddOperand(denominator_bits, "FDIV");
   const bool sign = numerator.sign != denominator.sign;
   if (numerator.zero)
     return sign ? UINT32_C(0x80000000) : UINT32_C(0x00000000);
@@ -5153,10 +5198,10 @@ std::uint32_t FloatDivideBits(std::uint32_t numerator_bits,
     significand >>= 1U;
     ++exponent;
   }
-  if (exponent <= 0)
-    ExecuteError("FDIV subnormal-result policy is outside this ISA gate");
-  if (exponent >= 255)
-    ExecuteError("FDIV overflow policy is outside this ISA gate");
+  /* A wide exponent difference underflows to a subnormal or overflows to an
+   * infinity.  Both are ordinary binary32 results of this same division. */
+  if (exponent <= 0 || exponent >= 255)
+    return native_divide(numerator_bits, denominator_bits);
   if (significand < UINT64_C(0x00800000) ||
       significand >= UINT64_C(0x01000000)) {
     ExecuteError("FDIV normalization failed");

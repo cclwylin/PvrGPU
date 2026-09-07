@@ -10,6 +10,7 @@
  */
 #include "shader/pco_iss.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <exception>
@@ -4634,17 +4635,26 @@ void TestDecodeAndExecuteIdeasReciprocalZero() {
                 .pixel_outputs[0] == UINT32_C(0x7fc00000),
         "PCO FRCP canonicalizes and propagates a quiet NaN");
 
-  const std::pair<std::uint32_t, const char *> malformed_cases[] = {
-      {UINT32_C(0x00000001), "subnormal input"},
-      {UINT32_C(0x7f7fffff), "subnormal result"},
+  /* A subnormal operand and an operand large enough to drive the reciprocal
+   * back down into the subnormal range are both ordinary binary32 divisions.
+   * The expectation is the host's own quotient rather than a written-down
+   * constant, so this states that FRCP is 1/x at binary32 and not that it
+   * reproduces one recorded pair of numbers. */
+  const std::pair<std::uint32_t, const char *> extreme_cases[] = {
+      {UINT32_C(0x00000001), "a subnormal operand"},
+      {UINT32_C(0x7f7fffff), "an operand whose reciprocal is subnormal"},
   };
-  for (const auto &malformed : malformed_cases) {
+  for (const auto &extreme : extreme_cases) {
     const auto decoded = Decode(ShaderStage::kFragment,
-                                make_binary(malformed.first));
-    ExpectFailure(
-        [&] { (void)ExecuteFragment(decoded.summary, decoded.instructions); },
-        "Ideas FRCP retains fail-closed " + std::string(malformed.second) +
-            " policy");
+                                make_binary(extreme.first));
+    float operand = 0.0F;
+    std::memcpy(&operand, &extreme.first, sizeof(operand));
+    const float quotient = 1.0F / operand;
+    std::uint32_t expected = 0;
+    std::memcpy(&expected, &quotient, sizeof(expected));
+    Check(ExecuteFragment(decoded.summary, decoded.instructions)
+                  .pixel_outputs[0] == expected,
+          "Ideas FRCP divides binary32 for " + std::string(extreme.second));
   }
 
   const auto make_frsq_binary = [&](std::uint32_t input) {
@@ -4692,12 +4702,21 @@ void TestDecodeAndExecuteIdeasReciprocalZero() {
           "PCO FRSQ canonicalizes negative infinity and NaN");
   }
 
-  for (const auto malformed : {UINT32_C(0x00000001)}) {
+  /* As with FRCP, a subnormal radicand has a perfectly ordinary reciprocal
+   * square root; compare against the host's own to state the operation
+   * rather than a recorded value. */
+  for (const auto subnormal : {UINT32_C(0x00000001)}) {
     const auto decoded =
-        Decode(ShaderStage::kFragment, make_frsq_binary(malformed));
-    ExpectFailure(
-        [&] { (void)ExecuteFragment(decoded.summary, decoded.instructions); },
-        "PCO FRSQ keeps subnormal inputs outside the public gate");
+        Decode(ShaderStage::kFragment, make_frsq_binary(subnormal));
+    float operand = 0.0F;
+    std::memcpy(&operand, &subnormal, sizeof(operand));
+    const float root = 1.0F / std::sqrt(operand);
+    std::uint32_t expected = 0;
+    std::memcpy(&expected, &root, sizeof(expected));
+    Check(ExecuteFragment(decoded.summary, decoded.instructions)
+                  .pixel_outputs[0] == expected,
+          "PCO FRSQ takes the binary32 reciprocal square root of a "
+          "subnormal radicand");
   }
 }
 
@@ -4852,12 +4871,22 @@ void TestDecodeAndExecuteConditionalSelectGreaterZero() {
           "Refract CSEL.GZ negative and signed-zero conditions select false");
   }
 
+  /* CSEL.GZ is an ordered "greater than zero".  A NaN condition compares
+   * false against every value and so selects the false source, while a
+   * positive infinity is greater than zero and selects the true one.  The
+   * Refract lowering depends on the NaN half: a negative radicand reaches
+   * this select as a NaN and must take the total-internal-reflection path. */
   const auto nan_binary = make_binary(UINT32_C(0x7fc00000));
   const auto nan_decoded = Decode(ShaderStage::kFragment, nan_binary);
-  ExpectFailure(
-      [&] { (void)ExecuteFragment(nan_decoded.summary,
-                                  nan_decoded.instructions); },
-      "Refract CSEL.GZ non-finite comparison policy remains fail closed");
+  Check(ExecuteFragment(nan_decoded.summary, nan_decoded.instructions)
+                .pixel_outputs[0] == FloatBits(7.0F),
+        "Refract CSEL.GZ NaN condition compares false and selects false");
+
+  const auto infinity_binary = make_binary(UINT32_C(0x7f800000));
+  const auto infinity_decoded = Decode(ShaderStage::kFragment, infinity_binary);
+  Check(ExecuteFragment(infinity_decoded.summary, infinity_decoded.instructions)
+                .pixel_outputs[0] == FloatBits(0.0F),
+        "Refract CSEL.GZ positive infinity is greater than zero");
 
   constexpr std::size_t group = 24;
   for (const std::pair<std::size_t, std::uint8_t> mutation : {
