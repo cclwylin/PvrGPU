@@ -11,6 +11,15 @@
 struct nir_shader;
 struct pvrgpu_pco_compiler;
 
+/* Lower float builtins whose NIR semantics are wider than native PCO's
+ * instruction sequence before public PCO instruction selection. */
+bool pvrgpu_lower_float_builtins_nir(struct nir_shader *nir);
+
+/* Run the common PCO preprocessing pipeline with the compiler-owned NIR
+ * options, including the builtin lowerings above. */
+void pvrgpu_pco_preprocess_nir(struct pvrgpu_pco_compiler *compiler,
+                               struct nir_shader *nir);
+
 #define PVRGPU_PCO_PUBLIC_TARGET "gx6250"
 #define PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS 20U
 #define PVRGPU_PCO_REFRACT_TEXTURE_COUNT 3U

@@ -11,6 +11,8 @@
 namespace {
 
 using pvrgpu::stub::ClassifyVertexPcoTextureEvidenceOpcode;
+using pvrgpu::stub::ClassifyPcoShiftEvidenceOpcode;
+using pvrgpu::stub::PcoShiftEvidenceClass;
 using pvrgpu::stub::PcoOpcode;
 using pvrgpu::stub::VertexPcoTextureEvidenceClass;
 
@@ -39,6 +41,15 @@ int sc_main(int, char **) {
               PcoOpcode::kFloatInterpolatePerspective) ==
               VertexPcoTextureEvidenceClass::kUnsupported,
           "fragment interpolation was accepted as vertex evidence");
+    Check(ClassifyPcoShiftEvidenceOpcode(PcoOpcode::kShiftRight) ==
+              PcoShiftEvidenceClass::kShiftRight,
+          "SHR reporter evidence was rejected");
+    Check(ClassifyPcoShiftEvidenceOpcode(PcoOpcode::kShiftLeft) ==
+              PcoShiftEvidenceClass::kShiftLeft,
+          "LSL reporter evidence was rejected");
+    Check(ClassifyPcoShiftEvidenceOpcode(PcoOpcode::kBitwiseOr) ==
+              PcoShiftEvidenceClass::kUnsupported,
+          "non-shift opcode was accepted as shift reporter evidence");
     std::cout << "json_reporter_opcode_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

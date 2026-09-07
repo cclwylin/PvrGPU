@@ -125,10 +125,11 @@ inline constexpr std::uint32_t kDriverPcoPositionVertexStride = 12;
 inline constexpr std::uint32_t kDriverPcoPositionNormalVertexStride = 24;
 inline constexpr std::uint32_t kDriverPcoPositionNormalTexcoordVertexStride =
     32;
-// Smooth-varying components one command may link.  Each needs four
-// coefficient registers, so this and the ISS coefficient file are sized
-// together: sixteen was the eight-varying capture's figure, not a limit.
-inline constexpr std::uint32_t kDriverPcoMaximumVaryingComponents = 16;
+// Smooth-varying components one command may link.  The modeled 64-dword
+// VTXOUT file reserves four dwords for position.  gl_PointSize, when present,
+// consumes another dword and the per-draw stage ABI enforces that total.
+// Each varying also needs four fragment coefficient registers.
+inline constexpr std::uint32_t kDriverPcoMaximumVaryingComponents = 60;
 inline constexpr std::size_t kDriverPcoIdeasSequenceCommands = 180;
 inline constexpr std::size_t kDriverPcoIdeasDepthEnabledFirstCommand = 162;
 inline constexpr std::size_t kDriverPcoIdeasDepthEnabledEndCommand = 168;

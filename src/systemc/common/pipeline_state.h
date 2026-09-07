@@ -14,6 +14,12 @@ namespace pvrgpu::stub {
 
 static_assert(kPcoVertexOutputRegisterCount == kPcoVertexOutputCount,
               "common and PCO VTXOUT payload sizes must stay aligned");
+static_assert(kPcoPixelOutputCount == 4 * kMaxRenderTargets,
+              "PCO PIXOUT and PBE render-target payload sizes must stay aligned");
+static_assert(kDriverPcoMaximumVaryingComponents + 4 == kPcoVertexOutputCount &&
+                  (kDriverPcoMaximumVaryingComponents + 1) * 4 <=
+                      kPcoMaximumVaryingCoefficientCount,
+              "varying linkage must fit both VTXOUT and fragment coefficients");
 static_assert(kVaryingsShaderOneCoefficientDwordCount ==
                   kPcoVaryingOneCoefficientCount,
               "PDS and PCO varying coefficient banks must stay aligned");

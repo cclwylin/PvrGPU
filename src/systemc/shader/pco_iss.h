@@ -28,12 +28,13 @@ inline constexpr std::size_t kPcoVertexOutputCount = 64;
 /* A sampler's response is four components, one per channel. */
 inline constexpr std::size_t kPcoTextureResponseCount = 4;
 /*
- * The pixel-output registers.  PCO's special file holds them in two runs --
- * pixout0..3 at 32 and pixout4..7 at 164 -- and a fragment shader writing
- * more than one attachment reaches the second: dEQP's modf returns its
- * fractional and integral parts into two targets.
+ * The driver's four-render-target ABI provides four dwords per attachment.
+ * Mesa pco_map lowers PIXOUT indices below four to special 32 + index and
+ * all later indices to special 164 + index - 4.  The public ISA names only
+ * PIXOUT0..7; extending that lowering to PIXOUT15 is a model ABI bound, not
+ * a claim about the number of physical pixel-output registers on Rogue.
  */
-inline constexpr std::size_t kPcoPixelOutputCount = 8;
+inline constexpr std::size_t kPcoPixelOutputCount = 16;
 /* Public PCO programs may declare and address TEMP0..63.  Keep the execution
  * file and its written-register bitmap at the same explicit 64-register ABI
  * bound so valid high TEMP declarations do not fail before decode. */
@@ -168,11 +169,14 @@ enum class PcoOpcode : std::uint8_t {
   kUvsWrite,
   kUvsWriteEmitEndTask,
   kUvsEmitEndTask,
-  /* Scalar PCO pck.f16f16/unpck.f16f16 operations.  These are distinct from
-   * the GLSL packHalf2x16/unpackHalf2x16 vector operations above: only the
-   * low 16-bit lane is transferred and one temporary is written. */
+  /* Scalar PCO PCK/UNPCK conversion operations.  The F16F16 forms are
+   * distinct from the GLSL packHalf2x16/unpackHalf2x16 vector operations
+   * above: only the low 16-bit lane is transferred and one temporary is
+   * written.  U32/S32 forms convert the whole word. */
   kFloatPackHalfRtne,
   kFloatPackHalfRtz,
+  kFloatToUint32Rtne,
+  kFloatToUint32Rtz,
   kFloatToInt32Rtne,
   kFloatToInt32Rtz,
   kFloatUnpackHalf,
@@ -196,6 +200,8 @@ enum class PcoWriteTarget : std::uint8_t {
   kPixelOutput,
   kVertexOutput,
   kTemporary,
+  // PCO register allocation reuses dead vertex-input registers for ALU values.
+  kVertexInput,
 };
 
 enum class PcoIterationMode : std::uint8_t {
@@ -307,6 +313,9 @@ struct PcoInstruction {
   // independently of each other and of the opcode.
   std::uint8_t source0_absolute = 0;
   std::uint8_t source1_absolute = 0;
+  // I_FMAD_EXT adds source-2 floor/absolute before its compact negate bit.
+  std::uint8_t source2_floor = 0;
+  std::uint8_t source2_absolute = 0;
   // BCMP normally materializes canonical Boolean bits (all ones or zero).
   // Mesa's PCK.ONE form instead materializes binary32 1.0 or 0.0; retain the
   // distinction without inventing a second comparison opcode/histogram bin.
@@ -325,9 +334,11 @@ struct PcoInstruction {
   std::uint8_t source1_integer_negate = 0;
   std::uint8_t source1_integer_absolute = 0;
   std::uint8_t source2_integer_absolute = 0;
-  // MOVC's true-value phase is an MBYP that may negate what it moves, which
-  // is how the compiler spells `cond ? -a : b`.  Orthogonal to the test, so a
-  // negated select needs no opcode of its own.
+  /* BCMP moves both comparison operands through phase-0/phase-1 MBYPs, and
+   * each MBYP may negate its source after taking its absolute value.  The
+   * same source-1 flag is also used by TST/MOVC's true-value MBYP, which is
+   * how the compiler spells `cond ? -a : b`. */
+  std::uint8_t source0_negate = 0;
   std::uint8_t source1_negate = 0;
   /* Which way the MOVC that follows a TST reads the predicate.  In the
    * TST/MOVC select form a passing test takes the value phase 0 supplies;
@@ -374,9 +385,9 @@ struct PcoProgramSummary {
   std::uint32_t instruction_count = 0;
   // Vertex-input registers read by the decoded program. The decoder checks
   // this mask against the input-assembler attribute-to-register contract.
-  std::uint32_t vertex_input_mask = 0;
+  std::uint64_t vertex_input_mask = 0;
   std::uint64_t vertex_output_mask = 0;
-  std::uint8_t pixel_output_mask = 0;
+  std::uint16_t pixel_output_mask = 0;
   std::uint8_t early_hsr_safe = 0;
   std::uint8_t ends_task = 0;
 };
@@ -481,7 +492,7 @@ struct PcoFragmentExecution {
   PcoTextureRequest texture_request{};
   PcoFragmentContinuation continuation{};
   std::uint32_t executed_instruction_count = 0;
-  std::uint8_t written_mask = 0;
+  std::uint16_t written_mask = 0;
   std::uint8_t texture_request_valid = 0;
   std::uint8_t suspended = 0;
   bool discarded = false;

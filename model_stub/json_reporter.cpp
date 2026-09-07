@@ -42,6 +42,17 @@ ClassifyVertexPcoTextureEvidenceOpcode(PcoOpcode opcode) {
   }
 }
 
+PcoShiftEvidenceClass ClassifyPcoShiftEvidenceOpcode(PcoOpcode opcode) {
+  switch (opcode) {
+  case PcoOpcode::kShiftRight:
+    return PcoShiftEvidenceClass::kShiftRight;
+  case PcoOpcode::kShiftLeft:
+    return PcoShiftEvidenceClass::kShiftLeft;
+  default:
+    return PcoShiftEvidenceClass::kUnsupported;
+  }
+}
+
 namespace {
 
 std::filesystem::path FramePath(const Options &options, std::uint32_t frame) {
@@ -137,6 +148,8 @@ struct VertexPcoEvidence {
   std::uint64_t bitwise_or = 0;
   std::uint64_t bitwise_xor = 0;
   std::uint64_t bitwise_xnor = 0;
+  std::uint64_t shr = 0;
+  std::uint64_t shl = 0;
   std::uint64_t bfi = 0;
   std::uint64_t csel = 0;
   std::uint64_t fmad = 0;
@@ -254,6 +267,16 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
       ++evidence.wdf;
       continue;
     }
+    const PcoShiftEvidenceClass shift_class =
+        ClassifyPcoShiftEvidenceOpcode(instruction.opcode);
+    if (shift_class == PcoShiftEvidenceClass::kShiftRight) {
+      ++evidence.shr;
+      continue;
+    }
+    if (shift_class == PcoShiftEvidenceClass::kShiftLeft) {
+      ++evidence.shl;
+      continue;
+    }
     switch (instruction.opcode) {
     case PcoOpcode::kInternal:
       ++evidence.internal;
@@ -340,6 +363,8 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kUnpackVector:
       ++evidence.unpck_int;
       break;
+    case PcoOpcode::kFloatToUint32Rtne:
+    case PcoOpcode::kFloatToUint32Rtz:
     case PcoOpcode::kFloatToInt32Rtne:
     case PcoOpcode::kFloatToInt32Rtz:
       ++evidence.f2i;
@@ -373,7 +398,6 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
       ++evidence.uvsw_emit_endtask;
       break;
     case PcoOpcode::kPackCoverageMask:
-    case PcoOpcode::kShiftRight:
     case PcoOpcode::kTestZero:
     case PcoOpcode::kFloatInterpolatePerspective:
     default:
@@ -390,7 +414,7 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
       evidence.fsub + evidence.fge + evidence.feq + evidence.flt +
       evidence.bcmp +
       evidence.bitwise_and + evidence.bitwise_or + evidence.bitwise_xor +
-      evidence.bitwise_xnor + evidence.bfi +
+      evidence.bitwise_xnor + evidence.shr + evidence.shl + evidence.bfi +
       evidence.csel + evidence.fmad + evidence.fmin + evidence.fmax +
       evidence.frcp + evidence.frsq + evidence.flog2 + evidence.fexp2 +
       evidence.pck_f16 + evidence.unpck_f16 + evidence.unpck_int +
@@ -428,6 +452,16 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
     evidence.binary_fnv1a64 *= UINT64_C(1099511628211);
   }
   for (const PcoInstruction &instruction : instructions) {
+    const PcoShiftEvidenceClass shift_class =
+        ClassifyPcoShiftEvidenceOpcode(instruction.opcode);
+    if (shift_class == PcoShiftEvidenceClass::kShiftRight) {
+      ++evidence.shr;
+      continue;
+    }
+    if (shift_class == PcoShiftEvidenceClass::kShiftLeft) {
+      ++evidence.shl;
+      continue;
+    }
     switch (instruction.opcode) {
     case PcoOpcode::kInternal:
       ++evidence.internal;
@@ -459,9 +493,6 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
       break;
     case PcoOpcode::kPackCoverageMask:
       ++evidence.pck_cov;
-      break;
-    case PcoOpcode::kShiftRight:
-      ++evidence.shr;
       break;
     case PcoOpcode::kTestZero:
       ++evidence.tstz;
@@ -556,15 +587,14 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kBitwiseXor:
       ++evidence.bitwise_xor;
       break;
-    case PcoOpcode::kShiftLeft:
-      ++evidence.shl;
-      break;
     case PcoOpcode::kIntegerMaxSigned:
       ++evidence.imax_s32;
       break;
     case PcoOpcode::kIntegerMinSigned:
       ++evidence.imin_s32;
       break;
+    case PcoOpcode::kFloatToUint32Rtne:
+    case PcoOpcode::kFloatToUint32Rtz:
     case PcoOpcode::kFloatToInt32Rtne:
     case PcoOpcode::kFloatToInt32Rtz:
       ++evidence.f2i;
@@ -639,6 +669,8 @@ void AppendVertexPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_VERTEX_EVIDENCE(bitwise_or);
   PVRGPU_ADD_VERTEX_EVIDENCE(bitwise_xor);
   PVRGPU_ADD_VERTEX_EVIDENCE(bitwise_xnor);
+  PVRGPU_ADD_VERTEX_EVIDENCE(shr);
+  PVRGPU_ADD_VERTEX_EVIDENCE(shl);
   PVRGPU_ADD_VERTEX_EVIDENCE(bfi);
   PVRGPU_ADD_VERTEX_EVIDENCE(csel);
   PVRGPU_ADD_VERTEX_EVIDENCE(fmad);
@@ -1670,6 +1702,10 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"bitwise_xor\":" << vertex_pco.bitwise_xor;
   if (vertex_pco.bitwise_xnor != 0)
     std::cout << ",\"bitwise_xnor\":" << vertex_pco.bitwise_xnor;
+  if (vertex_pco.shr != 0)
+    std::cout << ",\"shr\":" << vertex_pco.shr;
+  if (vertex_pco.shl != 0)
+    std::cout << ",\"shl\":" << vertex_pco.shl;
   if (vertex_pco.bfi != 0)
     std::cout << ",\"bfi\":" << vertex_pco.bfi;
   if (vertex_pco.csel != 0)

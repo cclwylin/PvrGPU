@@ -16,6 +16,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1208,6 +1209,59 @@ void TestDecodeAndExecuteTriangleSetupHalfCulledCyan() {
         "triangle_setup_half_culled cyan A = exact IEEE-754 1.0");
 }
 
+void TestFourTargetPixelOutputBoundary() {
+  /* Encode public single-source MBYP groups with the extended special
+   * destination form.  Each lane reads sc64 (1.0) or sc75 (0.5), so routing
+   * across both the physical split and every attachment boundary is visible.
+   * Each 16-byte group includes its independently encoded word/alignment
+   * padding; none of these bytes selects a known shader fixture. */
+  std::vector<std::uint8_t> binary;
+  for (std::uint16_t output = 0; output < 16; ++output) {
+    const std::uint16_t special = output < 4 ? 32 + output : 160 + output;
+    const std::vector<std::uint8_t> group = {
+        0x38, 0x8a, static_cast<std::uint8_t>(output == 15 ? 0x80 : 0),
+        0x87, static_cast<std::uint8_t>(output % 2 == 0 ? 0x80 : 0x8b),
+        0x01, 0x00, 0x00, 0x00,
+        static_cast<std::uint8_t>(0x80U | (special & 0x3fU)),
+        static_cast<std::uint8_t>(special >> 6U),
+        0xff, 0xf2, 0xff, 0xff, 0xff};
+    binary.insert(binary.end(), group.begin(), group.end());
+  }
+  const auto decoded = Decode(ShaderStage::kFragment, binary);
+  Check(decoded.summary.pixel_output_mask == UINT16_C(0xffff) &&
+            decoded.instructions.size() == 16,
+        "all four render targets retain their complete PIXOUT mask");
+  const auto execution = ExecuteFragment(decoded.summary, decoded.instructions);
+  Check(execution.written_mask == UINT16_C(0xffff),
+        "execution does not truncate third/fourth attachment written bits");
+  for (std::size_t output = 0; output < 16; ++output) {
+    Check(decoded.instructions[output].target == PcoWriteTarget::kPixelOutput &&
+              decoded.instructions[output].output_index == output &&
+              execution.pixel_outputs[output] ==
+                  FloatBits(output % 2 == 0 ? 1.0F : 0.5F),
+          "extended PIXOUT preserves destination identity and raw source bits");
+  }
+
+  auto outside_abi = binary;
+  outside_abi[15 * 16 + 9] = 0xb0; // special 176 would denote PIXOUT16.
+  ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, outside_abi); },
+                "PIXOUT beyond four render targets fails closed");
+  auto reserved_destination = binary;
+  reserved_destination[10] |= 0x80;
+  ExpectFailure(
+      [&] { (void)Decode(ShaderStage::kFragment, reserved_destination); },
+      "extended PIXOUT reserved destination bit fails closed");
+  auto wrong_bank = binary;
+  wrong_bank[10] |= 0x04; // Bank 2 is not a pixel output.
+  ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, wrong_bank); },
+                "PIXOUT output-load-check cannot designate another bank");
+  auto bad_summary = decoded.summary;
+  bad_summary.pixel_output_mask &= UINT16_C(0x7fff);
+  ExpectFailure(
+      [&] { (void)ExecuteFragment(bad_summary, decoded.instructions); },
+      "missing highest PIXOUT summary bit is rejected");
+}
+
 void TestDecodeFailsClosed() {
   ExpectFailure(
       [] { (void)Decode(ShaderStage::kFragment, FillSolidVertexPcoBinary()); },
@@ -1453,6 +1507,291 @@ void TestDecodeAndExecuteScalarSource0Floor() {
         (void)ExecuteFragment(tampered.summary, tampered.instructions);
       },
       "non-Boolean decoded source0-floor modifier");
+}
+
+void TestDecodeAndExecuteExtendedFloatModifiers() {
+  const auto finish = [](std::vector<std::uint8_t> bytes, ShaderStage stage) {
+    const auto tail = BytesFromHex(stage == ShaderStage::kVertex ? R"hex(
+55 a0 00 08 00 c0 00 00 00 30
+44 a0 80 05 00 00 00 ff
+)hex" : R"hex(
+34 8a 00 87 40 00 00 20
+34 8a 00 87 40 00 00 21
+34 8a 00 87 40 00 00 22
+34 8a 80 87 40 00 00 23
+)hex");
+    bytes.insert(bytes.end(), tail.begin(), tail.end());
+    return bytes;
+  };
+  const auto execute = [](const auto &decoded, ShaderStage stage) {
+    return stage == ShaderStage::kVertex
+        ? ExecuteVertex(decoded.summary, decoded.instructions, {}).outputs[0]
+        : ExecuteFragment(decoded.summary, decoded.instructions).pixel_outputs[0];
+  };
+  for (ShaderStage stage : {ShaderStage::kVertex, ShaderStage::kFragment}) {
+    for (unsigned op = 0; op < 4; ++op) {
+      for (unsigned modifier = 0; modifier < 4; ++modifier) {
+        for (std::uint32_t input_bits : {
+                 FloatBits(-4.0F), UINT32_C(0), UINT32_C(0x80000000),
+                 UINT32_C(0x7f800000), UINT32_C(0xff800000),
+                 UINT32_C(0x7fc12345), UINT32_C(0xffc54321),
+                 UINT32_C(1), UINT32_C(0x80000001)}) {
+          auto binary = BytesFromHex(R"hex(
+86 92 40 13 00 00 80 c0 00 00 40 ff
+35 82 00 90 00 40 00 00 40 ff
+)hex");
+          for (unsigned byte = 0; byte < 4; ++byte)
+            binary[4 + byte] =
+                static_cast<std::uint8_t>(input_bits >> (8U * byte));
+          binary[15] = static_cast<std::uint8_t>(0x90U | op);
+          binary[16] = static_cast<std::uint8_t>(modifier);
+          const auto decoded = Decode(stage, finish(binary, stage));
+          Check(decoded.instructions[1].source0_absolute == (modifier & 1U) &&
+                    decoded.instructions[1].source0_negate == (modifier >> 1U),
+                "scalar unary extended ABS/NEG decode independently");
+          std::uint32_t modified_bits = input_bits;
+          if (modifier & 1U)
+            modified_bits &= UINT32_C(0x7fffffff);
+          if (modifier & 2U)
+            modified_bits ^= UINT32_C(0x80000000);
+          float input = 0.0F;
+          std::memcpy(&input, &modified_bits, sizeof(input));
+          const float expected = op == 0 ? 1.0F / input
+              : op == 1 ? 1.0F / std::sqrt(input)
+              : op == 2 ? std::log2(input) : std::exp2(input);
+          const auto actual = execute(decoded, stage);
+          Check(std::isnan(expected)
+                    ? (actual & UINT32_C(0x7fffffff)) > UINT32_C(0x7f800000)
+                    : actual == FloatBits(expected),
+                "VS/FS unary ABS/NEG preserve signed zero, infinity, NaN "
+                "and subnormals");
+          if (input_bits == FloatBits(-4.0F)) {
+            binary[16] |= 0x04U;
+            ExpectFailure([&] { (void)Decode(stage, finish(binary, stage)); },
+                          "scalar unary extension reserved bits are rejected");
+          }
+        }
+      }
+    }
+    for (unsigned modifier = 0; modifier < 32; ++modifier) {
+      auto binary = BytesFromHex(R"hex(
+86 92 40 13 00 00 88 c0 00 00 40 ff
+86 92 40 13 00 00 40 c0 00 00 41 ff
+35 82 00 40 c0 a1 00 00 40 ff
+)hex");
+      binary[27] = static_cast<std::uint8_t>(0x40U | modifier);
+      const auto decoded = Decode(stage, finish(binary, stage));
+      float source0 = (modifier & 1U) ? -5.0F : -4.25F;
+      if (modifier & 4U)
+        source0 = std::abs(source0);
+      if (modifier & 8U)
+        source0 = -source0;
+      const float source1 = (modifier & 2U) ? 3.0F : -3.0F;
+      float expected = source0 * source1;
+      if (modifier & 16U)
+        expected = std::max(0.0F, std::min(1.0F, expected));
+      Check(execute(decoded, stage) == FloatBits(expected),
+            "VS/FS FMUL independently executes floor/ABS/NEG/SAT fields");
+    }
+    for (unsigned modifier = 0; modifier < 16; ++modifier) {
+      auto binary = BytesFromHex(R"hex(
+86 92 40 13 00 00 80 c0 00 00 40 ff
+86 92 40 13 00 00 40 40 00 00 41 ff
+86 92 40 13 00 00 00 3f 00 00 42 ff
+36 82 00 c0 c0 61 00 42 00 00 40 ff
+)hex");
+      binary[39] = static_cast<std::uint8_t>(0xc0U | modifier);
+      const auto decoded = Decode(stage, finish(binary, stage));
+      float source0 = (modifier & 4U) ? 4.0F : -4.0F;
+      if (modifier & 8U)
+        source0 = -source0;
+      const float source2 = (modifier & 2U) ? -0.5F : 0.5F;
+      float expected = std::fma(source0, 3.0F, source2);
+      if (modifier & 1U)
+        expected = std::max(0.0F, std::min(1.0F, expected));
+      Check(execute(decoded, stage) == FloatBits(expected),
+            "VS/FS scalar FMAD independently executes all compact modifiers");
+    }
+    for (unsigned compact = 0; compact < 16; ++compact) {
+      for (unsigned extension = 0; extension < 16; ++extension) {
+        auto binary = BytesFromHex(R"hex(
+86 92 40 13 00 00 80 c0 00 00 40 ff
+86 92 40 13 00 00 40 c0 00 00 41 ff
+86 92 40 13 00 00 00 bf 00 00 42 ff
+36 82 00 d0 00 c0 61 00 42 00 00 40
+)hex");
+        binary[39] = static_cast<std::uint8_t>(0xd0U | compact);
+        binary[40] = static_cast<std::uint8_t>(extension);
+        const auto decoded = Decode(stage, finish(binary, stage));
+        float source0 = (compact & 4U) ? 4.0F : -4.0F;
+        if (compact & 8U)
+          source0 = -source0;
+        float source1 = (extension & 8U) ? 3.0F : -3.0F;
+        if (extension & 4U)
+          source1 = -source1;
+        float source2 = (extension & 2U) ? -1.0F : -0.5F;
+        if (extension & 1U)
+          source2 = std::abs(source2);
+        if (compact & 2U)
+          source2 = -source2;
+        float expected = std::fma(source0, source1, source2);
+        if (compact & 1U)
+          expected = std::max(0.0F, std::min(1.0F, expected));
+        Check(execute(decoded, stage) == FloatBits(expected),
+              "VS/FS FMAD extended modifiers preserve operand ordering");
+        if (compact == 0 && extension == 0) {
+          for (std::uint8_t invalid : {UINT8_C(0x10), UINT8_C(0x20)}) {
+            binary[40] = invalid;
+            ExpectFailure([&] { (void)Decode(stage, finish(binary, stage)); },
+                          "FMAD unsupported precision/reserved bits reject");
+          }
+        }
+      }
+    }
+  }
+}
+
+void TestDecodeAndExecuteScalarPackUint32() {
+  /*
+   * Minimal public-ISA envelope for one scalar PCK.  The second operation
+   * byte is assembled from I_PCK's fields: rtz=1, scale=0 and
+   * pck_format=U32 (0x06), hence 0x46.  Keeping only MOVI, PCK and four
+   * exports makes this a field/operation test rather than a captured-shader
+   * fingerprint.
+   */
+  const auto rtz_binary = BytesFromHex(R"hex(
+86 92 40 13 00 00 e0 3f 00 00 41 ff
+57 92 00 9c 46 80 40 a0 41 10 00 2c 41 ff
+34 8a 00 87 41 00 00 20
+34 8a 00 87 41 00 00 21
+34 8a 00 87 41 00 00 22
+34 8a 80 87 41 00 00 23
+)hex");
+  const auto rtz = Decode(ShaderStage::kFragment, rtz_binary);
+  Check(rtz.summary.group_count == 6 &&
+            rtz.summary.pixel_output_mask == 0x0f &&
+            rtz.instructions[1].opcode == PcoOpcode::kFloatToUint32Rtz &&
+            rtz.instructions[1].source.bank == PcoRegisterBank::kTemporary &&
+            rtz.instructions[1].source.index == 1 &&
+            rtz.instructions[1].output_index == 1,
+        "PCK decodes U32 format and roundzero as independent fields");
+  const auto truncated = ExecuteFragment(rtz.summary, rtz.instructions);
+  for (std::size_t component = 0; component < 4; ++component) {
+    Check(truncated.pixel_outputs[component] == 1U,
+          "PCK.U32.roundzero truncates positive binary32");
+  }
+
+  auto rtne_binary = rtz_binary;
+  rtne_binary[16] = 0x06U; // same U32 format with rtz clear
+  const auto rtne = Decode(ShaderStage::kFragment, rtne_binary);
+  Check(rtne.instructions[1].opcode == PcoOpcode::kFloatToUint32Rtne,
+        "clearing only I_PCK.rtz selects U32 round-to-nearest-even");
+  const auto nearest = ExecuteFragment(rtne.summary, rtne.instructions);
+  for (std::size_t component = 0; component < 4; ++component) {
+    Check(nearest.pixel_outputs[component] == 2U,
+          "PCK.U32 round-to-nearest-even rounds 1.75 to two");
+  }
+
+  auto negative_binary = rtz_binary;
+  negative_binary[7] = 0xbfU; // -1.75, still PCK.U32.roundzero
+  const auto negative = Decode(ShaderStage::kFragment, negative_binary);
+  const auto saturated_low =
+      ExecuteFragment(negative.summary, negative.instructions);
+  for (std::size_t component = 0; component < 4; ++component) {
+    Check(saturated_low.pixel_outputs[component] == 0U,
+          "PCK.U32 saturates a negative conversion to zero");
+  }
+
+  auto infinity_binary = rtz_binary;
+  infinity_binary[6] = 0x80U;
+  infinity_binary[7] = 0x7fU; // +infinity
+  const auto infinity = Decode(ShaderStage::kFragment, infinity_binary);
+  const auto saturated_high =
+      ExecuteFragment(infinity.summary, infinity.instructions);
+  for (std::size_t component = 0; component < 4; ++component) {
+    Check(saturated_high.pixel_outputs[component] ==
+              std::numeric_limits<std::uint32_t>::max(),
+          "PCK.U32 saturates positive overflow to UINT32_MAX");
+  }
+
+  auto scaled_binary = rtz_binary;
+  scaled_binary[16] |= 0x20U;
+  ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, scaled_binary); },
+                "unimplemented I_PCK.scale remains fail-closed by field");
+}
+
+void TestDecodeAndExecuteLogicalExtendedSource() {
+  /*
+   * LOGICAL.AND/OR have a fixed pair of phase operations, but their register
+   * fields are variable length.  sc142 needs the three-byte I_SRC form, so the
+   * otherwise ordinary logical group occupies fourteen bytes rather than the
+   * twelve-byte TEMP+TEMP form.  These small envelopes exercise both shader
+   * stages without depending on a whole captured program.
+   */
+  const auto fragment_binary = BytesFromHex(R"hex(
+57 b2 40 41 02 80 40 00 c6 8e 02 00 40 ff
+34 8a 00 87 40 00 00 20
+34 8a 00 87 40 00 00 21
+34 8a 00 87 40 00 00 22
+34 8a 80 87 40 00 00 23
+)hex");
+  const auto fragment = Decode(ShaderStage::kFragment, fragment_binary);
+  Check(fragment.summary.group_count == 5 &&
+            fragment.instructions[0].opcode == PcoOpcode::kBitwiseAnd &&
+            fragment.instructions[0].source.bank ==
+                PcoRegisterBank::kCoefficient &&
+            fragment.instructions[0].source.index == 6 &&
+            fragment.instructions[0].source1.bank ==
+                PcoRegisterBank::kSpecial &&
+            fragment.instructions[0].source1.index == 142 &&
+            fragment.instructions[0].output_index == 0,
+        "extended logical source decodes independently of group byte length");
+  PcoFragmentExecutionContext fragment_context;
+  fragment_context.coefficient_count = 7;
+  fragment_context.coefficients[6] = UINT32_C(0xffc12345);
+  const auto fragment_result =
+      ExecuteFragment(fragment.summary, fragment.instructions, fragment_context);
+  for (std::size_t component = 0; component < 4; ++component) {
+    Check(fragment_result.pixel_outputs[component] == UINT32_C(0x7f800000),
+          "extended-source LOGICAL.AND executes exact register bits");
+  }
+
+  auto or_binary = fragment_binary;
+  or_binary[3] = 0x40U;
+  const auto logical_or = Decode(ShaderStage::kFragment, or_binary);
+  Check(logical_or.instructions[0].opcode == PcoOpcode::kBitwiseOr,
+        "extended-source logical phase selects OR by its ISA field");
+  fragment_context.coefficients[6] = UINT32_C(0x00412345);
+  const auto or_result = ExecuteFragment(logical_or.summary,
+                                         logical_or.instructions,
+                                         fragment_context);
+  Check(or_result.pixel_outputs[0] == UINT32_C(0x7fc12345),
+        "extended-source LOGICAL.OR executes exact register bits");
+
+  const auto vertex_binary = BytesFromHex(R"hex(
+57 b2 40 41 02 80 40 00 84 8e 02 00 40 ff
+55 a0 00 08 00 c0 00 00 00 30
+44 a0 80 05 00 00 00 ff
+)hex");
+  const auto vertex = Decode(ShaderStage::kVertex, vertex_binary);
+  Check(vertex.summary.group_count == 3 &&
+            vertex.summary.vertex_input_mask == (UINT32_C(1) << 4U) &&
+            vertex.summary.vertex_output_mask == 1 &&
+            vertex.instructions[0].opcode == PcoOpcode::kBitwiseAnd &&
+            vertex.instructions[0].source.bank ==
+                PcoRegisterBank::kVertexInput &&
+            vertex.instructions[0].source.index == 4 &&
+            vertex.instructions[0].source1.bank == PcoRegisterBank::kSpecial &&
+            vertex.instructions[0].source1.index == 142,
+        "vertex logical group accepts an extended special-constant operand");
+  const std::vector<std::uint32_t> vertex_inputs = {
+      0, 0, 0, 0, UINT32_C(0xffc12345)};
+  const auto vertex_result =
+      ExecuteVertex(vertex.summary, vertex.instructions, vertex_inputs);
+  Check(vertex_result.written_mask == 1 &&
+            vertex_result.outputs[0] == UINT32_C(0x7f800000) &&
+            vertex_result.emitted == 1 && vertex_result.ended_task == 1,
+        "vertex extended-source LOGICAL.AND reaches the UVSW result");
 }
 
 void TestDecodeAndExecuteSpecialConstant153() {
@@ -3908,6 +4247,96 @@ void TestDecodeAndExecuteTerrainFloatGreaterEqual() {
       "Terrain BCMP.F32.GE rejects a noncanonical decoded modifier");
 }
 
+void TestDecodeAndExecuteBooleanCompareSourceModifiers() {
+  /* The first group is copied from
+   * common.isinf.vec3_highp_fragment.  pco_map(O_BCMP) lowers |cf6| == +inf
+   * as phase-0 MBYP.abs (97 01), a plain phase-1 MBYP, TST.F32.E and the
+   * canonical sc143/zero MOVC.  The final MBYP only exports the Boolean so
+   * the exact compiler group can be executed in isolation. */
+  const auto make_binary = [] {
+    return BytesFromHex(R"hex(
+8a d2 00 d3 3c e8 9c 1e 87 97 01 c6 cf 90 11 8e 02 00 20 40
+34 8a 80 87 40 00 00 20
+)hex");
+  };
+
+  const auto fragment_binary = make_binary();
+  Check(fragment_binary.size() == 28,
+        "isinf BCMP modifier fixture preserves exact group size");
+  const auto decoded = Decode(ShaderStage::kFragment, fragment_binary);
+  Check(decoded.summary.group_count == 2 &&
+            decoded.instructions[0].opcode == PcoOpcode::kFloatEqual &&
+            decoded.instructions[0].source.bank ==
+                PcoRegisterBank::kCoefficient &&
+            decoded.instructions[0].source.index == 6 &&
+            decoded.instructions[0].source1.bank ==
+                PcoRegisterBank::kSpecial &&
+            decoded.instructions[0].source1.index == 142 &&
+            decoded.instructions[0].source0_absolute == 1 &&
+            decoded.instructions[0].source1_absolute == 0 &&
+            decoded.instructions[0].source0_negate == 0 &&
+            decoded.instructions[0].source1_negate == 0 &&
+            decoded.instructions[0].output_index == 0,
+        "BCMP phase-0 MBYP.abs decorates the first logical operand");
+
+  PcoFragmentExecutionContext context;
+  context.coefficient_count = 7;
+  context.coefficients[6] = UINT32_C(0xff800000); // -inf
+  const auto negative_infinity =
+      ExecuteFragment(decoded.summary, decoded.instructions, context);
+  Check(negative_infinity.pixel_outputs[0] == UINT32_C(0xffffffff),
+        "isinf compares abs(-inf) equal to +inf");
+  context.coefficients[6] = FloatBits(-3.0F);
+  Check(ExecuteFragment(decoded.summary, decoded.instructions, context)
+                .pixel_outputs[0] == 0,
+        "isinf leaves a finite absolute value unequal to infinity");
+  context.coefficients[6] = UINT32_C(0xffc00001);
+  Check(ExecuteFragment(decoded.summary, decoded.instructions, context)
+                .pixel_outputs[0] == 0,
+        "isinf keeps an absolute NaN unordered");
+
+  /* Operations are encoded phase 1 first.  Moving the extended NEG form to
+   * that slot and making phase 0 plain proves each modifier reaches the
+   * operand its phase names rather than whichever one happened to be seen in
+   * the isinf capture. */
+  auto phase1_negated_binary = make_binary();
+  phase1_negated_binary[8] = 0x97;
+  phase1_negated_binary[9] = 0x02;
+  phase1_negated_binary[10] = 0x87;
+  const auto phase1_negated =
+      Decode(ShaderStage::kFragment, phase1_negated_binary);
+  Check(phase1_negated.instructions[0].source0_absolute == 0 &&
+            phase1_negated.instructions[0].source0_negate == 0 &&
+            phase1_negated.instructions[0].source1_absolute == 0 &&
+            phase1_negated.instructions[0].source1_negate == 1,
+        "BCMP phase-1 MBYP.neg decorates the second logical operand");
+  context.coefficients[6] = UINT32_C(0xff800000);
+  Check(ExecuteFragment(phase1_negated.summary,
+                        phase1_negated.instructions, context)
+                .pixel_outputs[0] == UINT32_C(0xffffffff),
+        "BCMP executes the phase-1 negate against +inf");
+
+  auto absolute_then_negated = make_binary();
+  absolute_then_negated[10] = 0x03;
+  const auto stacked =
+      Decode(ShaderStage::kFragment, absolute_then_negated);
+  Check(stacked.instructions[0].source0_absolute == 1 &&
+            stacked.instructions[0].source0_negate == 1,
+        "BCMP MBYP accepts independent ABS and NEG modifier bits");
+  Check(ExecuteFragment(stacked.summary, stacked.instructions, context)
+                .pixel_outputs[0] == 0,
+        "BCMP applies ABS before NEG to the compared operand");
+
+  auto malformed = make_binary();
+  malformed[10] = 0x04;
+  ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, malformed); },
+                "BCMP MBYP reserved source modifier bit");
+  malformed = make_binary();
+  malformed[9] = 0x00;
+  ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, malformed); },
+                "BCMP phase operation outside MBYP");
+}
+
 void TestDecodeAndExecuteTerrainFloatGreaterEqualOneZero() {
   /* Exact Terrain D1 FS group at offset 0xee.  Unlike the sc143 Boolean form
    * above, PCK.ONE plus MOVC materializes binary32 1.0 or 0.0. */
@@ -4048,9 +4477,51 @@ void TestDecodeAndExecuteTerrainLogicalXnor() {
     ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, malformed); },
                   "Terrain LOGICAL.XNOR near-neighbor mutation");
   }
+  /* O_LOGICAL has no shader-stage field.  Put the same canonical XNOR phase
+   * in a vertex envelope and export its temporary so both the stage dispatch
+   * and the vertex executor are observable. */
+  const auto vertex_binary = BytesFromHex(R"hex(
+86 92 40 13 5a a5 f0 f0 00 00 4e ff
+86 92 40 13 00 00 00 00 00 00 4f ff
+86 92 40 13 00 00 00 00 00 00 50 ff
+86 92 40 13 00 00 00 00 00 00 51 ff
+56 b2 40 46 02 80 40 00 4e 00 4e ff
+55 a0 06 08 00 ce 00 00 00 30
+44 a0 80 05 00 00 00 ff
+)hex");
+  const auto vertex = Decode(ShaderStage::kVertex, vertex_binary);
+  Check(vertex.summary.group_count == 7 &&
+            vertex.summary.vertex_input_mask == 0 &&
+            vertex.summary.vertex_output_mask == UINT64_C(0x0f) &&
+            vertex.summary.ends_task == 1 &&
+            vertex.instructions[4].opcode == PcoOpcode::kBitwiseXnor &&
+            vertex.instructions[4].source.bank ==
+                PcoRegisterBank::kTemporary &&
+            vertex.instructions[4].source.index == 14 &&
+            vertex.instructions[4].source1.bank == PcoRegisterBank::kSpecial &&
+            vertex.instructions[4].source1.index == 0 &&
+            vertex.instructions[4].output_index == 14,
+        "LOGICAL.XNOR has the same decoded ISA semantics in the vertex stage");
+  const auto vertex_result =
+      ExecuteVertex(vertex.summary, vertex.instructions, {});
+  Check(vertex_result.written_mask == UINT64_C(0x0f) &&
+            vertex_result.outputs[0] == UINT32_C(0x0f0f5aa5) &&
+            vertex_result.outputs[1] == 0 && vertex_result.outputs[2] == 0 &&
+            vertex_result.outputs[3] == 0 &&
+            vertex_result.emitted == 1 && vertex_result.ended_task == 1,
+        "vertex LOGICAL.XNOR executes exact 32-bit ~(r14 xor sc0)");
+
+  auto malformed_vertex = vertex_binary;
+  malformed_vertex[51] = 0x45;
+  ExpectFailure([&] { (void)Decode(ShaderStage::kVertex, malformed_vertex); },
+                "vertex LOGICAL.XNOR rejects an unsupported logical opcode");
+  auto malformed_vertex_instructions = vertex.instructions;
+  malformed_vertex_instructions[4].source1.index = 1;
   ExpectFailure(
-      [&] { (void)Decode(ShaderStage::kVertex, fragment_binary); },
-      "Terrain LOGICAL.XNOR is rejected from the vertex stage");
+      [&] {
+        (void)ExecuteVertex(vertex.summary, malformed_vertex_instructions, {});
+      },
+      "vertex LOGICAL.XNOR rejects a noncanonical decoded source");
 
   auto malformed_instructions = decoded.instructions;
   malformed_instructions[1].source1.index = 1;
@@ -4958,10 +5429,12 @@ void TestDecodeAndExecuteIdeasNegatedFloatSources() {
   for (const std::pair<std::size_t, std::uint8_t> mutation : {
            std::pair<std::size_t, std::uint8_t>{97, 0xc3},
            {109, 0xcb}, {121, 0xc9}}) {
-    auto malformed = fragment_binary;
-    malformed[mutation.first] = mutation.second;
-    ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, malformed); },
-                  "Ideas float source-negation modifier reserved bit");
+    auto saturated = fragment_binary;
+    saturated[mutation.first] = mutation.second;
+    const auto sat = Decode(ShaderStage::kFragment, saturated);
+    const std::size_t index = 8 + (mutation.first - 97) / 12;
+    Check(sat.instructions[index].saturate == 1,
+          "FMAD bit zero encodes saturation alongside source negation");
   }
 }
 
@@ -5350,6 +5823,157 @@ c5 42 08 40 00 00 40 ff 36 82 00 c0 c6 42 08 41
       "lit shading FS coefficient span is truncated");
 }
 
+std::uint32_t ExecuteShiftBoundary(ShaderStage stage, PcoOpcode opcode,
+                                   std::uint32_t count) {
+  std::vector<PcoInstruction> instructions;
+  instructions.resize(stage == ShaderStage::kVertex ? 4U : 7U);
+  for (std::size_t index = 0; index < instructions.size(); ++index) {
+    instructions[index].binary_offset =
+        static_cast<std::uint32_t>(index * 8U);
+    instructions[index].group_index = static_cast<std::uint16_t>(index);
+  }
+
+  instructions[0].opcode = PcoOpcode::kMoveImmediate;
+  instructions[0].target = PcoWriteTarget::kTemporary;
+  instructions[0].source_count = 0;
+  instructions[0].output_index = 0;
+  instructions[0].immediate = UINT32_C(0x80000001);
+
+  instructions[1].opcode = PcoOpcode::kMoveImmediate;
+  instructions[1].target = PcoWriteTarget::kTemporary;
+  instructions[1].source_count = 0;
+  instructions[1].output_index = 1;
+  instructions[1].immediate = count;
+
+  instructions[2].opcode = opcode;
+  instructions[2].target = PcoWriteTarget::kTemporary;
+  instructions[2].source = {PcoRegisterBank::kTemporary, 0};
+  instructions[2].source1 = {PcoRegisterBank::kTemporary, 1};
+  instructions[2].source_count = 2;
+  instructions[2].output_index = 2;
+
+  PcoProgramSummary summary;
+  summary.stage = stage;
+  summary.binary_size = static_cast<std::uint32_t>(instructions.size() * 8U);
+  summary.group_count = static_cast<std::uint32_t>(instructions.size());
+  summary.instruction_count = summary.group_count;
+
+  if (stage == ShaderStage::kVertex) {
+    PcoInstruction &write = instructions[3];
+    write.opcode = PcoOpcode::kUvsWriteEmitEndTask;
+    write.target = PcoWriteTarget::kVertexOutput;
+    write.source = {PcoRegisterBank::kTemporary, 2};
+    write.output_index = 0;
+    write.end_group = 1;
+    summary.vertex_output_mask = 1;
+    summary.ends_task = 1;
+    return ExecuteVertex(summary, instructions, {}).outputs[0];
+  }
+
+  for (std::size_t component = 0; component < 4; ++component) {
+    PcoInstruction &write = instructions[3U + component];
+    write.opcode = PcoOpcode::kMoveBypass;
+    write.target = PcoWriteTarget::kPixelOutput;
+    write.source = {PcoRegisterBank::kTemporary, 2};
+    write.output_index = static_cast<std::uint16_t>(component);
+  }
+  instructions.back().end_group = 1;
+  summary.pixel_output_mask = 0x0f;
+  summary.early_hsr_safe = 1;
+  return ExecuteFragment(summary, instructions).pixel_outputs[0];
+}
+
+void TestShiftCountUsesLowFiveBits() {
+  struct Boundary {
+    std::uint32_t count;
+    std::uint32_t left;
+    std::uint32_t right;
+  };
+  constexpr Boundary boundaries[] = {
+      {31U, UINT32_C(0x80000000), UINT32_C(0x00000001)},
+      {32U, UINT32_C(0x80000001), UINT32_C(0x80000001)},
+      {33U, UINT32_C(0x00000002), UINT32_C(0x40000000)},
+  };
+
+  for (const ShaderStage stage :
+       {ShaderStage::kVertex, ShaderStage::kFragment}) {
+    const std::string stage_name =
+        stage == ShaderStage::kVertex ? "vertex" : "fragment";
+    for (const Boundary &boundary : boundaries) {
+      Check(ExecuteShiftBoundary(stage, PcoOpcode::kShiftLeft,
+                                 boundary.count) == boundary.left,
+            stage_name + " LSL uses the low five count bits at " +
+                std::to_string(boundary.count));
+      Check(ExecuteShiftBoundary(stage, PcoOpcode::kShiftRight,
+                                 boundary.count) == boundary.right,
+            stage_name + " SHR uses the low five count bits at " +
+                std::to_string(boundary.count));
+    }
+  }
+}
+
+void TestVertexInputRegisterReuse() {
+  // Compact field-level program: MBYP vi0 -> vi2, FRCP vi2 -> vi1,
+  // then the ordinary passthrough UVSW exports vi0..vi2. The destination
+  // bank is the ISA's VTXIN (2), which pco_ra.c may allocate to SSA results.
+  auto binary = BytesFromHex(R"hex(
+36 82 00 87 80 04 00 00 00 82 04 ff
+36 82 00 80 82 04 00 00 00 81 04 ff
+)hex");
+  const auto &exports = FillSolidVertexPcoBinary();
+  binary.insert(binary.end(), exports.begin(), exports.end());
+  const auto decoded = Decode(ShaderStage::kVertex, binary);
+  Check(decoded.instructions[0].target == PcoWriteTarget::kVertexInput &&
+            decoded.instructions[0].output_index == 2 &&
+            decoded.instructions[1].target == PcoWriteTarget::kVertexInput &&
+            decoded.instructions[1].output_index == 1,
+        "scalar ALU destinations preserve the writable VTXIN bank");
+  Check(decoded.summary.vertex_input_mask == UINT64_C(1),
+        "VTXIN reads after a shader write do not require another attribute");
+  for (const float value : {2.0F, -4.0F, 0.5F}) {
+    const std::vector<std::uint32_t> inputs = {
+        FloatBits(value), FloatBits(11.0F), FloatBits(7.0F)};
+    const auto result = ExecuteVertex(decoded.summary, decoded.instructions,
+                                      inputs);
+    Check(result.outputs[0] == FloatBits(value) &&
+              result.outputs[1] == FloatBits(1.0F / value) &&
+              result.outputs[2] == FloatBits(value),
+          "later ALU reads and UVSW see rewritten VTXIN values");
+    Check(inputs[1] == FloatBits(11.0F) && inputs[2] == FloatBits(7.0F),
+          "register reuse is local to the executing vertex");
+  }
+  auto malformed = binary;
+  malformed[10] |= 0x80U;
+  ExpectFailure([&] { (void)Decode(ShaderStage::kVertex, malformed); },
+                "VTXIN destination reserved bit remains rejected");
+  malformed = binary;
+  malformed[9] = 0x80U;
+  malformed[10] = 0x05U; // bank 2, register 64.
+  ExpectFailure([&] { (void)Decode(ShaderStage::kVertex, malformed); },
+                "VTXIN write cannot exceed the modeled file");
+  ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, binary); },
+                "fragment stage cannot write VTXIN");
+  auto high_source = binary;
+  high_source[4] = 0xbfU; // First MBYP reads vi63 instead of vi0.
+  const auto high_decoded = Decode(ShaderStage::kVertex, high_source);
+  Check(high_decoded.summary.vertex_input_mask ==
+            (UINT64_C(1) << 63U | UINT64_C(1)),
+        "live VTXIN63 keeps its distinct 64-bit input-mask bit");
+  std::vector<std::uint32_t> high_inputs(64, FloatBits(0.5F));
+  high_inputs[63] = FloatBits(8.0F);
+  const auto high_result = ExecuteVertex(high_decoded.summary,
+                                         high_decoded.instructions, high_inputs);
+  Check(high_result.outputs[1] == FloatBits(0.125F) &&
+            high_result.outputs[2] == FloatBits(8.0F),
+        "high VTXIN source is preserved through register reuse and export");
+  auto missing_span = decoded;
+  missing_span.instructions[0].output_index = 3;
+  ExpectFailure([&] {
+    (void)ExecuteVertex(missing_span.summary, missing_span.instructions,
+                        {FloatBits(2.0F), FloatBits(11.0F), FloatBits(7.0F)});
+  }, "VTXIN write outside the supplied register span is rejected");
+}
+
 void TestSharedRegisterFileBoundary() {
   // These are workload transport gates rather than hardware limits, so the
   // property worth pinning is that the file holds what the bounds promise:
@@ -5475,6 +6099,100 @@ void TestSharedRegisterFileBoundary() {
                               fragment_context);
       },
       "terrain fragment validation rejects SH164 beyond its transport gate");
+}
+
+void TestBitfieldInsertFourSourceValidation() {
+  /* Public MSK.LSL / LOGICAL.OR with bits=sc8, offset=sc4, insert=vi0,
+   * base=vi1 and destination r0.  Neither input is read anywhere else. */
+  auto binary = BytesFromHex(
+      "57 b2 40 68 0f 88 44 00 80 81 04 00 40 ff "
+      "34 82 00 87 00 00 00 41");
+  const auto attribute_binary = AttributeFetchVertexPcoBinary();
+  const auto attribute = Decode(ShaderStage::kVertex, attribute_binary);
+  const std::size_t tail = attribute.instructions[2].binary_offset - 3U;
+  binary.insert(binary.end(), attribute_binary.begin() + tail,
+                attribute_binary.end());
+  const auto vertex = Decode(ShaderStage::kVertex, binary);
+  Check(vertex.instructions.front().opcode == PcoOpcode::kBitfieldInsert &&
+            vertex.instructions.front().source_count == 4 &&
+            vertex.summary.vertex_input_mask == UINT64_C(0x3),
+        "BFI insert and base operands both contribute VTXIN live-in bits");
+  const std::vector<std::uint32_t> inputs = {UINT32_C(0xab), UINT32_C(0xffff0000)};
+  const auto result = ExecuteVertex(vertex.summary, vertex.instructions, inputs);
+  Check(result.outputs[0] == UINT32_C(0xffff0ab0),
+        "four-source BFI retains base bits and inserts the selected bit field");
+
+  for (bool base_operand : {false, true}) {
+    auto missing_live_in = vertex.summary;
+    missing_live_in.vertex_input_mask &=
+        ~(UINT64_C(1) << (base_operand ? 1U : 0U));
+    ExpectFailure(
+        [&] { (void)ExecuteVertex(missing_live_in, vertex.instructions, inputs); },
+        "BFI summary cannot omit either insert or base live-in input");
+    for (const PcoRegisterBank bank : {PcoRegisterBank::kTemporary,
+                                       PcoRegisterBank::kVertexInput}) {
+      auto invalid = vertex.instructions;
+      auto &source = base_operand ? invalid.front().source3
+                                 : invalid.front().source2;
+      source = {bank, static_cast<std::uint16_t>(
+                          bank == PcoRegisterBank::kTemporary ? 63 : 64)};
+      ExpectFailure(
+          [&] { (void)ExecuteVertex(vertex.summary, invalid, inputs); },
+          "BFI extra operand rejects unwritten TEMP and out-of-range VTXIN");
+    }
+  }
+  auto unused_vertex_source = vertex.instructions;
+  unused_vertex_source[1].source3 = {PcoRegisterBank::kVertexInput, 0};
+  ExpectFailure(
+      [&] { (void)ExecuteVertex(vertex.summary, unused_vertex_source, inputs); },
+      "non-BFI vertex instruction rejects a noncanonical fourth source");
+
+  std::vector<PcoInstruction> fragment(5);
+  fragment.front() = vertex.instructions.front();
+  fragment.front().source2 = {PcoRegisterBank::kShared, 0};
+  fragment.front().source3 = {PcoRegisterBank::kShared, 1};
+  for (std::size_t index = 0; index < fragment.size(); ++index) {
+    fragment[index].binary_offset = static_cast<std::uint32_t>(3U + 8U * index);
+    fragment[index].group_index = static_cast<std::uint16_t>(index);
+    if (index == 0)
+      continue;
+    fragment[index].opcode = PcoOpcode::kMoveBypass;
+    fragment[index].target = PcoWriteTarget::kPixelOutput;
+    fragment[index].source = {PcoRegisterBank::kTemporary, 0};
+    fragment[index].output_index = static_cast<std::uint16_t>(index - 1U);
+  }
+  fragment.back().end_group = 1;
+  PcoProgramSummary summary;
+  summary.stage = ShaderStage::kFragment;
+  summary.binary_size = 40;
+  summary.group_count = summary.instruction_count = 5;
+  summary.pixel_output_mask = 0x0f;
+  summary.early_hsr_safe = 1;
+  PcoFragmentExecutionContext context;
+  context.shared_count = 2;
+  context.shared_registers[0] = inputs[0];
+  context.shared_registers[1] = inputs[1];
+  Check(ExecuteFragment(summary, fragment, context).pixel_outputs[0] ==
+            UINT32_C(0xffff0ab0),
+        "fragment BFI validates and reads both extra shared operands");
+  for (bool base_operand : {false, true}) {
+    for (const PcoRegisterBank bank : {PcoRegisterBank::kTemporary,
+                                       PcoRegisterBank::kShared}) {
+      auto invalid = fragment;
+      auto &source = base_operand ? invalid.front().source3
+                                 : invalid.front().source2;
+      source = {bank, static_cast<std::uint16_t>(
+                          bank == PcoRegisterBank::kTemporary ? 63 : 256)};
+      ExpectFailure(
+          [&] { (void)ExecuteFragment(summary, invalid, context); },
+          "fragment BFI extra operand rejects unwritten TEMP and invalid shared range");
+    }
+  }
+  auto unused_fragment_source = fragment;
+  unused_fragment_source[1].source3 = {PcoRegisterBank::kShared, 0};
+  ExpectFailure(
+      [&] { (void)ExecuteFragment(summary, unused_fragment_source, context); },
+      "non-BFI fragment instruction rejects a noncanonical fourth source");
 }
 
 void TestExecuteVertexTextureContinuations() {
@@ -5614,6 +6332,67 @@ void TestExecuteVertexTextureContinuations() {
   ExpectFailure(
       [&] { (void)Decode(ShaderStage::kVertex, ten_sample_binary); },
       "the tenth sequential vertex SMP exceeds the bounded continuation gate");
+
+  /* PCO register allocation may reuse a dead VTXIN for an ALU result.
+   * Prefix FADD vi0,vi1 -> vi0 (extended destination bank 2), then let the
+   * existing program fetch that changed coordinate and suspend twice. */
+  auto overwritten_binary = BytesFromHex(
+      "36 82 00 00 80 c1 18 00 00 80 04 ff");
+  overwritten_binary.insert(overwritten_binary.end(), vertex_binary.begin(),
+                            vertex_binary.end());
+  const auto overwritten_vertex =
+      Decode(ShaderStage::kVertex, overwritten_binary);
+  Check(overwritten_vertex.instructions.front().opcode == PcoOpcode::kFloatAdd &&
+            overwritten_vertex.instructions.front().target ==
+                PcoWriteTarget::kVertexInput &&
+            overwritten_vertex.instructions.front().output_index == 0,
+        "texture prefix decodes a writable VTXIN ALU destination");
+  const auto overwritten_first = ExecuteVertex(
+      overwritten_vertex.summary, overwritten_vertex.instructions, inputs,
+      context);
+  Check(overwritten_first.suspended == 1 &&
+            overwritten_first.texture_request.coordinates[0] == FloatBits(1.0F) &&
+            overwritten_first.continuation.vertex_inputs[0] == FloatBits(1.0F) &&
+            overwritten_first.continuation.vertex_inputs[1] == inputs[1],
+        "vertex texture continuation saves current overwritten VTXIN state");
+
+  PcoVertexExecutionContext overwritten_resume;
+  overwritten_resume.continuation = overwritten_first.continuation;
+  overwritten_resume.texture_response = first_response;
+  overwritten_resume.texture_response_valid = 1;
+  const auto overwritten_second = ExecuteVertex(
+      overwritten_vertex.summary, overwritten_vertex.instructions, inputs,
+      overwritten_resume);
+  Check(overwritten_second.suspended == 1 &&
+            overwritten_second.continuation.vertex_inputs[0] == FloatBits(1.0F) &&
+            overwritten_second.texture_request.coordinates[0] == first_response[0],
+        "original caller inputs resume without replacing shader-written VTXIN");
+  const auto overwritten_done = ResumeVertex(
+      overwritten_vertex.summary, overwritten_vertex.instructions,
+      overwritten_second.continuation, second_response);
+  Check(overwritten_done.suspended == 0 && overwritten_done.ended_task == 1 &&
+            overwritten_done.outputs[0] == second_response[0] &&
+            overwritten_done.outputs[1] == second_response[1],
+        "writable VTXIN survives both texture continuations through final export");
+
+  auto changed_unwritten_input = inputs;
+  changed_unwritten_input[1] = FloatBits(0.5F);
+  ExpectFailure(
+      [&] {
+        (void)ExecuteVertex(overwritten_vertex.summary,
+                            overwritten_vertex.instructions,
+                            changed_unwritten_input, overwritten_resume);
+      },
+      "resumed caller cannot alter a VTXIN the shader has not overwritten");
+  auto changed_unwritten_saved = overwritten_resume;
+  changed_unwritten_saved.continuation.vertex_inputs[1] = FloatBits(0.5F);
+  ExpectFailure(
+      [&] {
+        (void)ExecuteVertex(overwritten_vertex.summary,
+                            overwritten_vertex.instructions, inputs,
+                            changed_unwritten_saved);
+      },
+      "saved unmodified VTXIN must still agree with the original caller lane");
 }
 
 void TestExecuteThreeTextureContinuations() {
@@ -5867,6 +6646,9 @@ int main() {
     TestDecodeAndExecuteAttributeFetch();
     TestDecodeAndExecuteTwoAttributeFetch();
     TestDecodeAndExecuteScalarSource0Floor();
+    TestDecodeAndExecuteExtendedFloatModifiers();
+    TestDecodeAndExecuteScalarPackUint32();
+    TestDecodeAndExecuteLogicalExtendedSource();
     TestDecodeAndExecuteSpecialConstant153();
     TestDecodeAndExecuteFourAttributeFetch();
     TestDecodeAndExecuteEightAttributeFetch();
@@ -5875,6 +6657,7 @@ int main() {
     TestDecodeAndExecuteHalfAlphaFragments();
     TestDecodeAndExecuteTriangleSetupOrange();
     TestDecodeAndExecuteTriangleSetupHalfCulledCyan();
+    TestFourTargetPixelOutputBoundary();
     TestDecodeFailsClosed();
     TestAttributeFetchFailsClosed();
     TestTwoAttributeFetchFailsClosed();
@@ -5896,6 +6679,7 @@ int main() {
     TestDecodeAndExecuteIdeasLightingSelect();
     TestDecodeAndExecuteShadowFloatLess();
     TestDecodeAndExecuteTerrainFloatGreaterEqual();
+    TestDecodeAndExecuteBooleanCompareSourceModifiers();
     TestDecodeAndExecuteTerrainFloatGreaterEqualOneZero();
     TestDecodeAndExecuteTerrainLogicalXnor();
     TestDecodeAndExecuteTerrainFloatMin();
@@ -5910,7 +6694,10 @@ int main() {
     TestDecodeAndExecuteIdeasNegatedBcsel();
     TestDecodeAndExecuteConditionalSelectGreaterZero();
     TestDecodeAndExecuteLitShading();
+    TestShiftCountUsesLowFiveBits();
+    TestVertexInputRegisterReuse();
     TestSharedRegisterFileBoundary();
+    TestBitfieldInsertFourSourceValidation();
     TestExecuteVertexTextureContinuations();
     TestExecuteThreeTextureContinuations();
     TestLoweredPowSpecialValues();

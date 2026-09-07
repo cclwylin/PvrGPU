@@ -196,13 +196,12 @@ UscCluster::UscCluster(sc_core::sc_module_name name, MemoryPool &pool,
 void StoreFragmentPixelOutputs(FragmentOutput &fragment_output,
                                const std::array<std::uint32_t,
                                                 kPcoPixelOutputCount> &outputs,
-                               std::uint8_t written_mask,
+                               std::uint16_t written_mask,
                                std::uint32_t render_target_count) {
   const std::uint32_t targets =
-      std::min<std::uint32_t>(render_target_count == 0 ? 1U
-                                                       : render_target_count,
-                              static_cast<std::uint32_t>(
-                                  kPcoPixelOutputCount / 4));
+      render_target_count == 0 ? 1U : render_target_count;
+  if (targets > kMaxRenderTargets || targets * 4 > outputs.size())
+    throw std::runtime_error("fragment output render-target count exceeds ABI");
   for (std::uint32_t target = 0; target < targets; ++target) {
     for (std::size_t component = 0; component < 4; ++component) {
       fragment_output.pixel_output[target * 4 + component] =

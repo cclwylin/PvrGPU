@@ -28,6 +28,14 @@ enum class VertexPcoTextureEvidenceClass : std::uint8_t {
 VertexPcoTextureEvidenceClass
 ClassifyVertexPcoTextureEvidenceOpcode(PcoOpcode opcode);
 
+enum class PcoShiftEvidenceClass : std::uint8_t {
+  kUnsupported = 0,
+  kShiftRight,
+  kShiftLeft,
+};
+
+PcoShiftEvidenceClass ClassifyPcoShiftEvidenceOpcode(PcoOpcode opcode);
+
 class JsonReporter final : public sc_core::sc_module {
 public:
   sc_core::sc_fifo_in<PipelineTxn> input{"input"};

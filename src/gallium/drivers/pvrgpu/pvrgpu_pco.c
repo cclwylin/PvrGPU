@@ -39,7 +39,156 @@ struct pvrgpu_pco_compiler {
    struct pvr_device_info dev_info;
    struct pvr_device_runtime_info runtime_info;
    pco_ctx *pco;
+   /* Owned for the compiler's whole lifetime: shaders retain this pointer
+    * through preprocess, linking, lowering and instruction selection. */
+   nir_shader_compiler_options nir_options;
 };
+
+/*
+ * The sin/cos arithmetic below is adapted from Mesa's
+ * src/gallium/auxiliary/gallivm/lp_bld_arit.c:lp_build_sin_or_cos.
+ *
+ * Copyright 2009-2010 VMware, Inc.
+ * All Rights Reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sub license, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the
+ * next paragraph) shall be included in all copies or substantial portions
+ * of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+ * IN NO EVENT SHALL VMWARE AND/OR ITS SUPPLIERS BE LIABLE FOR
+ * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+/*
+ * The model does not implement USC's FRED/FSINC intermediate representation.
+ * Lower ordinary NIR sin/cos to arithmetic before PCO selects those operations.
+ * This is the same Cephes reduction and pair of polynomials used by llvmpipe's
+ * gallivm/lp_bld_arit.c:lp_build_sin_or_cos. Each generated arithmetic operation
+ * is compiled to PCO and executed by the model, including both polynomials,
+ * quadrant/sign selection, the [-1,1] clamp, and nonfinite-to-NaN handling.
+ */
+static bool
+pvrgpu_lower_float_builtin_instr(nir_builder *b,
+                                  nir_alu_instr *alu,
+                                  void *data)
+{
+   (void)data;
+   if (alu->def.bit_size != 32)
+      return false;
+
+   if (alu->op == nir_op_fsign) {
+      /*
+       * PCO's native O_FSIGN tests the source's raw bits with
+       * TST.GEZERO.S32.  That intentionally distinguishes the sign bit, so
+       * changing the ISS comparison to floating point would corrupt the ISA
+       * semantics for signed zero and other users of the same test phase.
+       * It also means the native sequence returns -1.0 for -0.0, whereas NIR
+       * fsign (and GLSL sign) treats both zeroes as zero.
+       *
+       * Use NIR's standard lower_fsign identity before PCO instruction
+       * selection.  Ordered comparisons make both zeroes and NaNs produce
+       * zero, positive values produce one, and negative values minus one:
+       *
+       *   b2f(0.0 < x) - b2f(x < 0.0)
+       */
+      b->cursor = nir_before_instr(&alu->instr);
+      nir_def *value = nir_ssa_for_alu_src(b, alu, 0);
+      nir_def *zero = nir_imm_float(b, 0.0f);
+      nir_def *positive = nir_b2f32(b, nir_flt(b, zero, value));
+      nir_def *negative = nir_b2f32(b, nir_flt(b, value, zero));
+      nir_def_replace(&alu->def, nir_fsub(b, positive, negative));
+      return true;
+   }
+
+   if (alu->op != nir_op_fsin && alu->op != nir_op_fcos)
+      return false;
+
+   const bool cosine = alu->op == nir_op_fcos;
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *a = nir_ssa_for_alu_src(b, alu, 0);
+   nir_def *x_abs = nir_fabs(b, a);
+   nir_def *scaled = nir_fmul_imm(b, x_abs, 1.27323954473516);
+   nir_def *j_add = nir_iadd_imm(b, nir_f2i32(b, scaled), 1);
+   nir_def *j = nir_iand_imm(b, j_add, ~1u);
+   nir_def *y = nir_i2f32(b, j);
+   nir_def *quadrant = cosine ? nir_iadd_imm(b, j, -2) : j;
+   nir_def *sin_poly = nir_ieq_imm(b, nir_iand_imm(b, quadrant, 2), 0);
+   nir_def *flip_sign;
+   if (cosine) {
+      flip_sign = nir_ieq_imm(b, nir_iand_imm(b, quadrant, 4), 0);
+   } else {
+      nir_def *input_negative = nir_ine_imm(
+         b, nir_iand_imm(b, a, 0x80000000u), 0);
+      nir_def *quadrant_negative = nir_ine_imm(
+         b, nir_iand_imm(b, j_add, 4), 0);
+      flip_sign = nir_ine(b, input_negative, quadrant_negative);
+   }
+
+   nir_def *x = nir_ffma(b, y, nir_imm_float(b, -0.78515625), x_abs);
+   x = nir_ffma(b, y, nir_imm_float(b, -2.4187564849853515625e-4), x);
+   x = nir_ffma(b, y, nir_imm_float(b, -3.77489497744594108e-8), x);
+   nir_def *z = nir_fmul(b, x, x);
+   nir_def *c = nir_ffma(b, z, nir_imm_float(b, 2.443315711809948e-5),
+                          nir_imm_float(b, -1.388731625493765e-3));
+   c = nir_ffma(b, c, z, nir_imm_float(b, 4.166664568298827e-2));
+   c = nir_fmul(b, nir_fmul(b, c, z), z);
+   c = nir_fadd_imm(b, nir_fsub(b, c, nir_fmul_imm(b, z, 0.5)), 1.0);
+   nir_def *s = nir_ffma(b, z, nir_imm_float(b, -1.9515295891e-4),
+                          nir_imm_float(b, 8.3321608736e-3));
+   s = nir_ffma(b, s, z, nir_imm_float(b, -1.6666654611e-1));
+   s = nir_ffma(b, nir_fmul(b, s, z), x, x);
+   nir_def *result = nir_bcsel(b, sin_poly, s, c);
+   result = nir_bcsel(b, flip_sign, nir_fneg(b, result), result);
+   result = nir_fmin(b, nir_fmax(b, result, nir_imm_float(b, -1.0)),
+                        nir_imm_float(b, 1.0));
+   nir_def *finite = nir_ine_imm(
+      b, nir_iand_imm(b, a, 0x7f800000u), 0x7f800000u);
+   result = nir_bcsel(b, finite, result, nir_imm_int(b, 0x7fc00000u));
+   nir_def_replace(&alu->def, result);
+   return true;
+}
+
+bool
+pvrgpu_lower_float_builtins_nir(nir_shader *nir)
+{
+   return nir_shader_alu_pass(nir, pvrgpu_lower_float_builtin_instr,
+                              nir_metadata_control_flow, NULL);
+}
+
+void
+pvrgpu_pco_preprocess_nir(struct pvrgpu_pco_compiler *compiler,
+                          nir_shader *nir)
+{
+   /* Profile-specific option copies (split FMA in bump/refract/terrain) must
+    * remain intact.  A caller-created shader can still arrive with frontend
+    * options that do not request lower_fsign, so give only that shader a full
+    * copy with the one required bit changed.  The compiler ralloc context
+    * outlives every preprocessing/link/lowering pass that retains the pointer. */
+   if (!nir->options || !nir->options->lower_fsign) {
+      nir_shader_compiler_options *options =
+         ralloc(compiler->mem_ctx, nir_shader_compiler_options);
+      if (!options)
+         abort();
+      *options = nir->options ? *nir->options : compiler->nir_options;
+      options->lower_fsign = true;
+      nir->options = options;
+   }
+   pvrgpu_lower_float_builtins_nir(nir);
+   pco_preprocess_nir(compiler->pco, nir);
+}
 
 static uint64_t
 pvrgpu_refract_descriptor_bits(uint64_t value,
@@ -3420,6 +3569,12 @@ struct pvrgpu_pco_compiler *pvrgpu_pco_compiler_create(char *error,
       return NULL;
    }
 
+   compiler->nir_options = *pco_nir_options();
+   /* Keep the ordered-comparison form produced above through every PCO NIR
+    * optimization pass.  Without this option nir_opt_algebraic is allowed to
+    * fold it back to the native FSIGN that distinguishes -0 by its sign bit. */
+   compiler->nir_options.lower_fsign = true;
+
    if (!pvr_device_info_init_public_name(&compiler->dev_info,
                                          PVRGPU_PCO_PUBLIC_TARGET)) {
       pvrgpu_pco_fail(error,
@@ -3517,8 +3672,8 @@ bool pvrgpu_pco_compile_conditionals(struct pvrgpu_pco_compiler *compiler,
     */
    vs->info.internal = true;
    fs->info.internal = true;
-   vs->options = pco_nir_options();
-   fs->options = pco_nir_options();
+   vs->options = &compiler->nir_options;
+   fs->options = &compiler->nir_options;
 
    nir_lower_fragcolor(fs, 1);
    nir_foreach_variable_with_modes (var, fs, nir_var_shader_in) {
@@ -3565,8 +3720,8 @@ bool pvrgpu_pco_compile_conditionals(struct pvrgpu_pco_compiler *compiler,
                                         &fragment_data,
                                         vertex_format);
 
-   pco_preprocess_nir(compiler->pco, vs);
-   pco_preprocess_nir(compiler->pco, fs);
+   pvrgpu_pco_preprocess_nir(compiler, vs);
+   pvrgpu_pco_preprocess_nir(compiler, fs);
    pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
    pco_rev_link_nir(compiler->pco, vs, fs);
 
@@ -3963,6 +4118,13 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
             case nir_instr_type_alu:
             case nir_instr_type_load_const:
             case nir_instr_type_deref:
+            /*
+             * Structured NIR control flow joins values with phi nodes.  PCO
+             * keeps those through preprocessing/lowering and converts them
+             * out of SSA in pco_postprocess_nir(), so a phi is not an
+             * unsupported instruction in this pipeline.
+             */
+            case nir_instr_type_phi:
             /*
              * An undefined SSA value is ordinary NIR -- it stands for a value
              * the language leaves unspecified, such as an uninitialised
@@ -4417,8 +4579,8 @@ bool pvrgpu_pco_compile_color_triangle(
 
    vs->info.internal = true;
    fs->info.internal = true;
-   vs->options = pco_nir_options();
-   fs->options = pco_nir_options();
+   vs->options = &compiler->nir_options;
+   fs->options = &compiler->nir_options;
 
    if (!topology_uses_point_size)
       pvrgpu_strip_dead_point_size(vs);
@@ -4769,9 +4931,9 @@ bool pvrgpu_pco_compile_color_triangle(
     * segmentation fault with nothing to say which shader or which pass.
     */
    pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=preprocess_vs");
-   pco_preprocess_nir(compiler->pco, vs);
+   pvrgpu_pco_preprocess_nir(compiler, vs);
    pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=preprocess_fs");
-   pco_preprocess_nir(compiler->pco, fs);
+   pvrgpu_pco_preprocess_nir(compiler, fs);
    pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=link");
    pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
    pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=rev_link");
@@ -7692,11 +7854,11 @@ bool pvrgpu_pco_compile_lit_mesh(
 
    vs->info.internal = true;
    fs->info.internal = true;
-   vs->options = pco_nir_options();
-   fs->options = pco_nir_options();
+   vs->options = &compiler->nir_options;
+   fs->options = &compiler->nir_options;
    nir_shader_compiler_options bump_fragment_options;
    if (profile == PVRGPU_PCO_LIT_MESH_BUMP) {
-      bump_fragment_options = *pco_nir_options();
+      bump_fragment_options = compiler->nir_options;
       bump_fragment_options.float_mul_add32 &=
          ~nir_float_muladd_support_fuse;
       bump_fragment_options.float_mul_add32 |=
@@ -7746,8 +7908,8 @@ bool pvrgpu_pco_compile_lit_mesh(
                                     &fragment_data,
                                     desc->varying_components);
 
-   pco_preprocess_nir(compiler->pco, vs);
-   pco_preprocess_nir(compiler->pco, fs);
+   pvrgpu_pco_preprocess_nir(compiler, vs);
+   pvrgpu_pco_preprocess_nir(compiler, fs);
    pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
    pco_rev_link_nir(compiler->pco, vs, fs);
    pco_lower_nir(compiler->pco, vs, &vertex_data);
@@ -7886,8 +8048,8 @@ bool pvrgpu_pco_compile_texture(
 
    vs->info.internal = true;
    fs->info.internal = true;
-   vs->options = pco_nir_options();
-   fs->options = pco_nir_options();
+   vs->options = &compiler->nir_options;
+   fs->options = &compiler->nir_options;
    nir_lower_fragcolor(fs, 1);
 
    if (!pvrgpu_validate_lit_mesh_varying_store(vs,
@@ -7926,8 +8088,8 @@ bool pvrgpu_pco_compile_texture(
       return false;
    }
 
-   pco_preprocess_nir(compiler->pco, vs);
-   pco_preprocess_nir(compiler->pco, fs);
+   pvrgpu_pco_preprocess_nir(compiler, vs);
+   pvrgpu_pco_preprocess_nir(compiler, fs);
    pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
    pco_rev_link_nir(compiler->pco, vs, fs);
    pco_lower_nir(compiler->pco, vs, &vertex_data);
@@ -8088,14 +8250,14 @@ bool pvrgpu_pco_compile_refract(
 
    vs->info.internal = true;
    fs->info.internal = true;
-   vs->options = pco_nir_options();
-   fs->options = pco_nir_options();
+   vs->options = &compiler->nir_options;
+   fs->options = &compiler->nir_options;
    nir_shader_compiler_options vertex_options;
    nir_shader_compiler_options fragment_options;
    /* Gallivm preserves both Refract vertex shaders' matrix and normal chains
     * as distinct multiply and add operations.  Keep that boundary local to
     * these strict profiles instead of changing global PCO policy. */
-   vertex_options = *pco_nir_options();
+   vertex_options = compiler->nir_options;
    vertex_options.float_mul_add32 &= ~nir_float_muladd_support_fuse;
    vertex_options.float_mul_add32 |=
       nir_float_muladd_support_prefers_split;
@@ -8103,7 +8265,7 @@ bool pvrgpu_pco_compile_refract(
    if (profile == PVRGPU_PCO_REFRACT_COMPOSITE) {
       /* The GLES source spells every product and sum separately.  Retain
        * those IEEE operation boundaries through generic NIR optimization. */
-      fragment_options = *pco_nir_options();
+      fragment_options = compiler->nir_options;
       fragment_options.float_mul_add32 &= ~nir_float_muladd_support_fuse;
       fragment_options.float_mul_add32 |=
          nir_float_muladd_support_prefers_split;
@@ -8146,8 +8308,8 @@ bool pvrgpu_pco_compile_refract(
       return false;
    }
 
-   pco_preprocess_nir(compiler->pco, vs);
-   pco_preprocess_nir(compiler->pco, fs);
+   pvrgpu_pco_preprocess_nir(compiler, vs);
+   pvrgpu_pco_preprocess_nir(compiler, fs);
    pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
    pco_rev_link_nir(compiler->pco, vs, fs);
    pco_lower_nir(compiler->pco, vs, &vertex_data);
@@ -8318,8 +8480,8 @@ bool pvrgpu_pco_compile_shadow(
 
    vs->info.internal = true;
    fs->info.internal = true;
-   vs->options = pco_nir_options();
-   fs->options = pco_nir_options();
+   vs->options = &compiler->nir_options;
+   fs->options = &compiler->nir_options;
    nir_lower_fragcolor(fs, 1);
    if (!pvrgpu_validate_lit_mesh_fragment_output(fs,
                                                  desc->name,
@@ -8357,8 +8519,8 @@ bool pvrgpu_pco_compile_shadow(
       return false;
    }
 
-   pco_preprocess_nir(compiler->pco, vs);
-   pco_preprocess_nir(compiler->pco, fs);
+   pvrgpu_pco_preprocess_nir(compiler, vs);
+   pvrgpu_pco_preprocess_nir(compiler, fs);
    pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
    pco_rev_link_nir(compiler->pco, vs, fs);
    pco_lower_nir(compiler->pco, vs, &vertex_data);
@@ -11547,7 +11709,7 @@ bool pvrgpu_pco_compile_terrain(
                              desc->name);
    }
 
-   nir_shader_compiler_options terrain_options = *pco_nir_options();
+   nir_shader_compiler_options terrain_options = compiler->nir_options;
    terrain_options.float_mul_add32 &= ~nir_float_muladd_support_fuse;
    terrain_options.float_mul_add32 |=
       nir_float_muladd_support_prefers_split;
@@ -11643,8 +11805,8 @@ bool pvrgpu_pco_compile_terrain(
       ralloc_free(compile_mem_ctx);
       return false;
    }
-   pco_preprocess_nir(compiler->pco, vs);
-   pco_preprocess_nir(compiler->pco, fs);
+   pvrgpu_pco_preprocess_nir(compiler, vs);
+   pvrgpu_pco_preprocess_nir(compiler, fs);
    pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
    pco_rev_link_nir(compiler->pco, vs, fs);
    pco_lower_nir(compiler->pco, vs, &vertex_data);
@@ -12159,8 +12321,8 @@ bool pvrgpu_pco_compile_ideas(
    }
    vs->info.internal = true;
    fs->info.internal = true;
-   vs->options = pco_nir_options();
-   fs->options = pco_nir_options();
+   vs->options = &compiler->nir_options;
+   fs->options = &compiler->nir_options;
    nir_lower_fragcolor(fs, 1);
 
    const unsigned vs_loads =
@@ -12198,8 +12360,8 @@ bool pvrgpu_pco_compile_ideas(
    pco_data vertex_data = { 0 };
    pco_data fragment_data = { 0 };
    pvrgpu_init_ideas_shader_data(profile, &vertex_data, &fragment_data);
-   pco_preprocess_nir(compiler->pco, vs);
-   pco_preprocess_nir(compiler->pco, fs);
+   pvrgpu_pco_preprocess_nir(compiler, vs);
+   pvrgpu_pco_preprocess_nir(compiler, fs);
    pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
    pco_rev_link_nir(compiler->pco, vs, fs);
    pco_lower_nir(compiler->pco, vs, &vertex_data);

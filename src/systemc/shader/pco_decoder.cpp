@@ -67,8 +67,8 @@ void PcoDecoder::Run() {
       const std::vector<VertexAttributeBinding> bindings =
           LoadArray<VertexAttributeBinding>(pool_,
                                             state.vertex_attribute_bindings);
-      std::uint32_t available_vertex_inputs = 0;
-      std::uint32_t driver_readable_vertex_inputs = 0;
+      std::uint64_t available_vertex_inputs = 0;
+      std::uint64_t driver_readable_vertex_inputs = 0;
       std::uint32_t declared_vertex_input_count = 0;
       for (const VertexAttributeBinding &binding : bindings) {
         const std::size_t first = binding.destination_register;
@@ -79,8 +79,7 @@ void PcoDecoder::Run() {
               "vertex attribute binding has an invalid VTXIN range");
         }
         for (std::size_t component = 0; component < count; ++component) {
-          available_vertex_inputs |= static_cast<std::uint32_t>(
-              UINT32_C(1) << (first + component));
+          available_vertex_inputs |= UINT64_C(1) << (first + component);
         }
         if (driver_pco_triangles) {
           if (binding.source_components == 0 ||
@@ -90,8 +89,7 @@ void PcoDecoder::Run() {
           }
           for (std::size_t component = 0;
                component < binding.source_components; ++component) {
-            driver_readable_vertex_inputs |= static_cast<std::uint32_t>(
-                UINT32_C(1) << (first + component));
+            driver_readable_vertex_inputs |= UINT64_C(1) << (first + component);
           }
           declared_vertex_input_count = std::max(
               declared_vertex_input_count,

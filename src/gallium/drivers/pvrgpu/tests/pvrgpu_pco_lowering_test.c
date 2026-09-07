@@ -2925,6 +2925,52 @@ static unsigned count_alu(const nir_shader *nir, nir_op op)
    return count;
 }
 
+static void
+test_float_sign_lowering(struct pvrgpu_pco_compiler *compiler)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX,
+                                                  pco_nir_options(),
+                                                  "float_sign_lowering");
+   nir_variable *output = nir_variable_create(b.shader,
+                                              nir_var_shader_out,
+                                              glsl_vec4_type(),
+                                              "result");
+   output->data.location = VARYING_SLOT_POS;
+   /* A live, vector source proves this is an operation lowering rather than
+    * constant folding one recorded signed-zero value. */
+   nir_def *source = nir_load_uniform(&b,
+                                      4,
+                                      32,
+                                      nir_imm_int(&b, 0),
+                                      .base = 0,
+                                      .range = 4,
+                                      .dest_type = nir_type_float32);
+   nir_store_var(&b, output, nir_fsign(&b, source), 0xf);
+   nir_jump(&b, nir_jump_return);
+   if (count_alu(b.shader, nir_op_fsign) != 1)
+      fail("float-sign test did not start with one vector fsign");
+
+   if (!pvrgpu_lower_float_builtins_nir(b.shader) ||
+       count_alu(b.shader, nir_op_fsign) != 0 ||
+       count_alu(b.shader, nir_op_flt) != 2 ||
+       count_alu(b.shader, nir_op_b2f32) != 2 ||
+       count_alu(b.shader, nir_op_fsub) != 1) {
+      fail("float sign was not lowered to the standard ordered-compare form");
+   }
+   /* The pass is stable: generated comparisons and conversions are not
+    * mistaken for another builtin on a second preprocessing visit. */
+   if (pvrgpu_lower_float_builtins_nir(b.shader))
+      fail("float builtin lowering was not idempotent");
+
+   /* Public PCO preprocessing runs algebraic optimization repeatedly.  Its
+    * compiler-owned lower_fsign option must keep that optimizer from folding
+    * the ordered form back into the native signed-bit FSIGN sequence. */
+   pvrgpu_pco_preprocess_nir(compiler, b.shader);
+   if (count_alu(b.shader, nir_op_fsign) != 0)
+      fail("PCO preprocessing reconstructed native float sign");
+   ralloc_free(b.shader);
+}
+
 static uint64_t fnv1a64(const void *data, size_t size)
 {
    const uint8_t *bytes = data;
@@ -4082,6 +4128,7 @@ int main(void)
       pvrgpu_pco_compiler_create(error, sizeof(error));
    if (!compiler)
       fail(error[0] ? error : "failed to create compiler");
+   test_float_sign_lowering(compiler);
 
    struct pvrgpu_pco_graphics_binary binary;
    if (!pvrgpu_pco_compile_conditionals(compiler,

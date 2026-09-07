@@ -294,7 +294,12 @@ int sc_main(int, char **) {
     input.write({subtract_test.state, 5, 5});
     input.write({colormask_test.state, 6, 6});
     input.write({max_test.state, 7, 7});
-    const TestStateHandles mrt = MakeMrtState(pool, 9, 3);
+    const TestStateHandles mrt = MakeMrtState(pool, 9, 4);
+    Check(pvrgpu::stub::ExpectedPixelOutputMask({0xf, 0xf, 0xf, 0xf}) ==
+              0xffff &&
+              pvrgpu::stub::ExpectedPixelOutputMask({0x3, 0x3, 0x3, 0x3}) ==
+                  0x3333,
+          "four-target full and narrow output masks preserve upper lanes");
 
     input.write({loaded_additive.state, 8, 8});
     input.write({mrt.state, 9, 9});
@@ -333,7 +338,7 @@ int sc_main(int, char **) {
     // Each attachment keeps the colour its own PIXOUT lane produced.
     {
       const PipelineState resolved = LoadPipelineState(pool, mrt.state);
-      Check(resolved.render_target_count == 3,
+      Check(resolved.render_target_count == 4,
             "MRT render target count survived the PBE");
       const auto attachment0 =
           LoadArray<std::uint8_t>(pool, resolved.pbe_framebuffer);
@@ -341,8 +346,10 @@ int sc_main(int, char **) {
           LoadArray<std::uint8_t>(pool, resolved.extra_pbe_framebuffer[0]);
       const auto attachment2 =
           LoadArray<std::uint8_t>(pool, resolved.extra_pbe_framebuffer[1]);
+      const auto attachment3 =
+          LoadArray<std::uint8_t>(pool, resolved.extra_pbe_framebuffer[2]);
       Check(attachment0.size() == 4 && attachment1.size() == 4 &&
-                attachment2.size() == 4,
+                attachment2.size() == 4 && attachment3.size() == 4,
             "every MRT attachment was resolved");
       Check(attachment0[0] == 64 && attachment0[3] == 64,
             "MRT attachment 0 colour");
@@ -350,11 +357,14 @@ int sc_main(int, char **) {
             "MRT attachment 1 colour");
       Check(attachment2[0] == 191 && attachment2[3] == 191,
             "MRT attachment 2 colour");
-      Check(resolved.counters.pbe_pixels_written == 3,
+      Check(attachment3[0] == 255 && attachment3[3] == 255,
+            "MRT attachment 3 colour");
+      Check(resolved.counters.pbe_pixels_written == 4,
             "MRT pixel writes counted per attachment");
       pool.Release(resolved.pbe_framebuffer);
       pool.Release(resolved.extra_pbe_framebuffer[0]);
       pool.Release(resolved.extra_pbe_framebuffer[1]);
+      pool.Release(resolved.extra_pbe_framebuffer[2]);
       pool.Release(mrt.invocations);
       pool.Release(mrt.outputs);
       pool.Release(mrt.state);

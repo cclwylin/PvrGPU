@@ -598,6 +598,31 @@ int main() {
     expect_sequence_rejected(draws, "unsupported: blend",
                              "noncanonical disabled blend state");
   }
+  // Matrix operands and other wide VS-to-FS interfaces use more than sixteen
+  // scalar varyings.  Deliberately invalid blend state proves legal wide
+  // interfaces pass the ABI gate without submitting a fake shader payload.
+  for (const std::uint32_t components : {18U, 32U, 60U}) {
+    std::array<pvrgpu_systemc_driver_command, 2> draws = {
+        make_sequence_draw(), make_sequence_draw()};
+    draws[0].vertex_pco_abi.vertex_outputs = 4U + components;
+    draws[0].varying_output_count = components;
+    draws[0].fragment_varying_count = 4U * components;
+    draws[0].fragment_pco_abi.coefficients = 4U + 4U * components;
+    draws[0].blend_source_rgb_factor =
+        PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ZERO;
+    expect_sequence_rejected(draws, "unsupported: blend",
+                             "bounded wide varying interface");
+  }
+  {
+    std::array<pvrgpu_systemc_driver_command, 2> draws = {
+        make_sequence_draw(), make_sequence_draw()};
+    draws[0].vertex_pco_abi.vertex_outputs = 65;
+    draws[0].varying_output_count = 61;
+    draws[0].fragment_varying_count = 244;
+    draws[0].fragment_pco_abi.coefficients = 248;
+    expect_sequence_rejected(draws, "ABI/payload is invalid",
+                             "varyings beyond the VTXOUT file");
+  }
 
   std::vector<std::uint8_t> texture_vertices(36U * 32U, 0);
   std::vector<std::uint8_t> texture_bytes(512U * 512U * 4U, UINT8_C(0x5a));
