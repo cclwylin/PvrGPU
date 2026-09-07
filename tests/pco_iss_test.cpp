@@ -4121,15 +4121,35 @@ void TestDecodeAndExecuteTerrainFloatMin() {
                 UINT32_C(0x00000000),
         "Terrain ordered FMIN equal signed zeros select the right source");
 
+  /* Byte 27 is the MOVC's operation byte, whose low bits name the internal
+   * result it moves.  Changing ft0 to ft1 is a different select, not a
+   * malformed group: it decodes as the same comparison taking the other
+   * phase's result. */
+  auto other_result = fragment_binary;
+  other_result[27] = 0xd1;
+  const auto moves_phase1 = Decode(ShaderStage::kFragment, other_result);
+  bool takes_phase1 = false;
+  for (const auto &instruction : moves_phase1.instructions) {
+    if (instruction.phase_composed != 0 &&
+        instruction.select_true_result ==
+            pvrgpu::stub::PcoInternalResult::kPhase1) {
+      takes_phase1 = true;
+    }
+  }
+  Check(takes_phase1,
+        "the MOVC's movw0 names which phase result a passing test takes");
+
   for (const std::pair<std::size_t, std::uint8_t> mutation : {
            std::pair<std::size_t, std::uint8_t>{26, 0x80},
-           {27, 0xd1}, {28, 0x3d}, {29, 0xf1}, {30, 0x10},
+           {28, 0x3d}, {29, 0xf1}, {30, 0x10},
            {31, 0x86}, {32, 0x86}, {33, 0x80}, {34, 0x80},
            {35, 0x11}, {36, 0x20}, {37, 0xfe}}) {
     auto malformed = fragment_binary;
     malformed[mutation.first] = mutation.second;
     ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, malformed); },
-                  "Terrain FMIN near-neighbor encoding mutation");
+                  "Terrain FMIN mutation at byte " +
+                      std::to_string(mutation.first) + " = " +
+                      std::to_string(mutation.second));
   }
 
   auto malformed_instructions = decoded.instructions;
@@ -5103,9 +5123,25 @@ void TestDecodeAndExecuteConditionalSelectGreaterZero() {
                  decoded.instructions[2].phase1.source.index),
         "a cleared source byte names different registers");
 
+  /* The ISS byte's is1 says whether the test reads the source the group
+   * feeds through or phase 0's own result -- min and max use the latter --
+   * so clearing it selects a different operand rather than malforming the
+   * group. */
+  auto tests_phase0 = positive;
+  tests_phase0[group + 14] = 0x10;
+  const auto reads_phase0 = Decode(ShaderStage::kFragment, tests_phase0);
+  bool tests_a_phase = false;
+  for (const auto &instruction : reads_phase0.instructions) {
+    if (instruction.phase_composed != 0 &&
+        instruction.test_source0_result ==
+            pvrgpu::stub::PcoInternalResult::kPhase0) {
+      tests_a_phase = true;
+    }
+  }
+  Check(tests_a_phase, "the ISS is1 selector names the test's first operand");
+
   for (const std::pair<std::size_t, std::uint8_t> mutation : {
            std::pair<std::size_t, std::uint8_t>{group + 5, 0xf3},
-           {group + 14, 0x10},
            {group + 9, 0xbf},
            {group + 12, 0x11},
            {group + 13, 0x91},

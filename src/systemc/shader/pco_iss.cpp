@@ -2627,10 +2627,36 @@ PcoPhaseOperation DecodePhaseOperation(const std::vector<std::uint8_t> &binary,
     phase.source_count = 3;
     return phase;
   }
+  if (main_op == 0x07U) {
+    /*
+     * The 32/64-bit integer family.  I_MAIN gives it bit 3 for signedness,
+     * bit 2 for a source-2 negate and bits 1:0 for the operation, of which
+     * this models the 64-bit multiply-add: the integer sign is built from
+     * one, multiplying its input by one so that the low word is the value
+     * and the high word its sign extension.
+     */
+    if ((main & 0x03U) != 0x03U) {
+      DecodeError(operation_offset,
+                  "instruction-group integer phase is not a 64-bit "
+                  "multiply-add [" +
+                      std::to_string(main) + "]");
+    }
+    if ((main & 0x10U) != 0)
+      DecodeError(operation_offset, "phase IMADD64 modifier byte is not "
+                                    "modelled");
+    if ((main & 0x04U) != 0)
+      DecodeError(operation_offset, "phase IMADD64 source-2 negate is not "
+                                    "modelled");
+    phase.opcode = PcoOpcode::kIntegerMultiplyAdd32;
+    phase.integer_signed = (main & 0x08U) != 0 ? 1U : 0U;
+    phase.produces_feed_through = 1U;
+    phase.source_count = 3;
+    return phase;
+  }
   if (main_op != 0x00U && main_op != 0x02U) {
     DecodeError(operation_offset,
                 "instruction-group phase operation is outside the move, "
-                "fadd/fmul and fmad families [" +
+                "fadd/fmul, fmad and integer families [" +
                     std::to_string(main) + "] in the group at byte " +
                     std::to_string(group_offset));
   }
@@ -2806,11 +2832,9 @@ PcoInstruction DecodeGenericConditionalSelectGroup(
   if (cursor >= group_end)
     DecodeError(cursor, "missing instruction-group ISS selection");
   const std::uint8_t iss = binary[cursor++];
-  if ((iss & 0x01U) == 0) {
-    DecodeError(cursor - 1,
-                "instruction-group test reads ft0 rather than its source [" +
-                    std::to_string(iss) + "]");
-  }
+  const PcoInternalResult test_source0_result =
+      (iss & 0x01U) != 0 ? PcoInternalResult::kFeedThrough
+                         : PcoInternalResult::kPhase0;
   if ((iss & 0xccU) != 0) {
     DecodeError(cursor - 1,
                 "unsupported instruction-group is3/is5 selection [" +
@@ -2844,6 +2868,7 @@ PcoInstruction DecodeGenericConditionalSelectGroup(
   instruction.phase1.source2 = upper_sources[2];
   instruction.select_true_result = select_true_result;
   instruction.select_false_result = select_false_result;
+  instruction.test_source0_result = test_source0_result;
   instruction.test_source1_result = test_source1_result;
   instruction.target = destination.target;
   /*
@@ -5072,10 +5097,16 @@ std::uint32_t FloatSaturateBits(std::uint32_t value_bits);
 std::uint32_t FloatMadBits(std::uint32_t left_bits, std::uint32_t right_bits,
                            std::uint32_t addend_bits);
 
-std::uint32_t EvaluatePhaseOperation(const PcoPhaseOperation &phase,
-                                     std::uint32_t source0_bits,
-                                     std::uint32_t source1_bits,
-                                     std::uint32_t source2_bits = 0) {
+struct PhaseResult {
+  std::uint32_t value = 0;
+  /* The high word of a 64-bit product, which the group feeds through. */
+  std::uint32_t feed_through = 0;
+};
+
+PhaseResult EvaluatePhaseOperation(const PcoPhaseOperation &phase,
+                                   std::uint32_t source0_bits,
+                                   std::uint32_t source1_bits,
+                                   std::uint32_t source2_bits = 0) {
   std::uint32_t source0 = source0_bits;
   if (phase.source0_floor != 0)
     source0 = FloatFloorBits(source0);
@@ -5089,12 +5120,39 @@ std::uint32_t EvaluatePhaseOperation(const PcoPhaseOperation &phase,
     source2 = FloatFloorBits(source2);
   if (phase.source2_absolute != 0)
     source2 &= UINT32_C(0x7fffffff);
+  PhaseResult outcome;
   std::uint32_t result = 0;
   switch (phase.opcode) {
   case PcoOpcode::kMoveBypass:
-    return source0;
+    outcome.value = source0;
+    return outcome;
   case PcoOpcode::kFloatNegate:
-    return source0 ^ UINT32_C(0x80000000);
+    outcome.value = source0 ^ UINT32_C(0x80000000);
+    return outcome;
+  case PcoOpcode::kIntegerMultiplyAdd32: {
+    /* The 64-bit multiply-add: the low word is the phase's own result and
+     * the high word feeds through.  Signedness only reaches the high word,
+     * which is what makes this a sign extension of the product. */
+    if (phase.integer_signed != 0) {
+      std::int32_t left = 0;
+      std::int32_t right = 0;
+      std::int32_t addend = 0;
+      std::memcpy(&left, &source0, sizeof(left));
+      std::memcpy(&right, &source1, sizeof(right));
+      std::memcpy(&addend, &source2, sizeof(addend));
+      const std::int64_t wide =
+          static_cast<std::int64_t>(left) * right + addend;
+      const std::uint64_t bits = static_cast<std::uint64_t>(wide);
+      outcome.value = static_cast<std::uint32_t>(bits);
+      outcome.feed_through = static_cast<std::uint32_t>(bits >> 32U);
+    } else {
+      const std::uint64_t wide =
+          static_cast<std::uint64_t>(source0) * source1 + source2;
+      outcome.value = static_cast<std::uint32_t>(wide);
+      outcome.feed_through = static_cast<std::uint32_t>(wide >> 32U);
+    }
+    return outcome;
+  }
   case PcoOpcode::kFloatAdd:
     result = FloatAddBits(source0, source1);
     break;
@@ -5123,7 +5181,8 @@ std::uint32_t EvaluatePhaseOperation(const PcoPhaseOperation &phase,
   }
   if (phase.saturate != 0)
     result = FloatSaturateBits(result);
-  return result;
+  outcome.value = result;
+  return outcome;
 }
 
 /*
@@ -5144,28 +5203,38 @@ std::uint32_t ExecutePhaseComposedSelect(const PcoInstruction &instruction,
         phase.source_count > 1 ? read_source(phase.source1) : UINT32_C(0),
         phase.source_count > 2 ? read_source(phase.source2) : UINT32_C(0));
   };
-  const std::uint32_t phase0 = evaluate(instruction.phase0);
-  const std::uint32_t phase1 = evaluate(instruction.phase1);
+  const PhaseResult phase0 = evaluate(instruction.phase0);
+  const PhaseResult phase1 = evaluate(instruction.phase1);
+  /* What the group feeds through: a 64-bit product's high word when a phase
+   * computed one, and otherwise the source the group reads directly. */
+  const std::uint32_t feed_through =
+      instruction.phase0.produces_feed_through != 0   ? phase0.feed_through
+      : instruction.phase1.produces_feed_through != 0 ? phase1.feed_through
+                                                      : test_source0;
   const auto internal_result = [&](PcoInternalResult which) {
     switch (which) {
     case PcoInternalResult::kPhase0:
-      return phase0;
+      return phase0.value;
     case PcoInternalResult::kPhase1:
-      return phase1;
+      return phase1.value;
     case PcoInternalResult::kFeedThrough:
-      return test_source0;
+      return feed_through;
     default:
       ExecuteError("instruction-group phase 2 names an unmodelled internal "
                    "result");
     }
   };
+  const std::uint32_t test_left =
+      instruction.test_source0_result == PcoInternalResult::kFeedThrough
+          ? test_source0
+          : internal_result(instruction.test_source0_result);
   const std::uint32_t test_source1 =
       instruction.test_source1_result == PcoInternalResult::kFeedThrough
           ? UINT32_C(0)
           : internal_result(instruction.test_source1_result);
   const bool passed = EvaluateTestPredicate(
       instruction.comparison_test_op, instruction.comparison_test_type,
-      test_source0, test_source1);
+      test_left, test_source1);
   /* The MOVC moves what its movw0 names when the test passes and internal
    * source 4 when it does not, which is the operation stated directly rather
    * than the inversion the source-shaped select needs to express it. */

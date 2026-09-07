@@ -243,6 +243,15 @@ struct PcoPhaseOperation {
   std::uint8_t source2_absolute = 0;
   std::uint8_t source2_floor = 0;
   std::uint8_t saturate = 0;
+  /*
+   * A 64-bit multiply-add produces two results: its low word into the phase's
+   * own internal register and its high word into the feed-through one.  That
+   * is how the integer sign is built -- the low word is the value tested and
+   * the high word is its sign extension, which is the answer for everything
+   * that is not positive.
+   */
+  std::uint8_t produces_feed_through = 0;
+  std::uint8_t integer_signed = 0;
 };
 
 /* Which internal result a phase-2 MOVC moves when its test passes. */
@@ -339,6 +348,7 @@ struct PcoInstruction {
   PcoPhaseOperation phase1{};
   PcoInternalResult select_true_result = PcoInternalResult::kPhase1;
   PcoInternalResult select_false_result = PcoInternalResult::kPhase0;
+  PcoInternalResult test_source0_result = PcoInternalResult::kFeedThrough;
   PcoInternalResult test_source1_result = PcoInternalResult::kPhase1;
   /* PCO's F_PCK_FORMAT for kUnpackVector, and its `scale` bit: scaling
    * normalizes the field to [0,1] or [-1,1] instead of yielding its integer
