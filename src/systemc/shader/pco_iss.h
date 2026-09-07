@@ -275,6 +275,11 @@ struct PcoInstruction {
   // is how the compiler spells `cond ? -a : b`.  Orthogonal to the test, so a
   // negated select needs no opcode of its own.
   std::uint8_t source1_negate = 0;
+  /* Which way the MOVC that follows a TST reads the predicate.  In the
+   * TST/MOVC select form a passing test takes the value phase 0 supplies;
+   * in the BCSEL group it takes internal source 4 instead, so a passing test
+   * there selects the operand the other form calls the false one. */
+  std::uint8_t conditional_select_inverted = 0;
   /* PCO's F_PCK_FORMAT for kUnpackVector, and its `scale` bit: scaling
    * normalizes the field to [0,1] or [-1,1] instead of yielding its integer
    * value as a float. */

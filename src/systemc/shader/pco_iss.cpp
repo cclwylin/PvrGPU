@@ -2362,8 +2362,13 @@ PcoInstruction DecodeGenericTestSelectGroup(
   if (test.bytes != 2)
     DecodeError(cursor, "TST/MOVC requires the extended TST phase");
   cursor += test.bytes;
-  if (cursor >= group_end || binary[cursor++] != 0x87U)
-    DecodeError(cursor - 1, "unsupported TST/MOVC MBYP phase");
+  if (cursor >= group_end)
+    DecodeError(cursor, "missing TST/MOVC condition MBYP phase");
+  if (binary[cursor] != 0x87U) {
+    DecodeError(cursor, "unsupported TST/MOVC condition MBYP phase [" +
+                            std::to_string(binary[cursor]) + "]");
+  }
+  ++cursor;
   /*
    * The second MBYP carries the value MOVC moves when the test passes, and
    * may negate it on the way -- which is how `cond ? -a : b` is spelled.
@@ -2379,7 +2384,8 @@ PcoInstruction DecodeGenericTestSelectGroup(
       DecodeError(cursor - 1, "unsupported TST/MOVC true-source modifier");
     negate_true_source = true;
   } else {
-    DecodeError(cursor, "unsupported TST/MOVC MBYP phase");
+    DecodeError(cursor, "unsupported TST/MOVC true-value MBYP phase [" +
+                            std::to_string(binary[cursor]) + "]");
   }
 
   PcoInstruction instruction;
@@ -2470,14 +2476,39 @@ PcoInstruction DecodeGenericConditionalSelectGroup(
   }
   const std::size_t group_end = header.offset + header.total_bytes;
   std::size_t cursor = header.offset + 3;
-  constexpr std::uint8_t kCanonicalPhases[] = {
-      0xd1, 0x3c, 0xf0, 0xb0, 0x87,
-  };
-  for (std::uint8_t expected : kCanonicalPhases) {
-    if (cursor >= group_end || binary[cursor++] != expected)
-      DecodeError(cursor - 1, "unsupported BCSEL TST/MOVC phase sequence");
+  /* The MOVC phase, which reads the test result and selects between the
+   * value phase 0 supplies and internal source 4. */
+  constexpr std::uint8_t kMovcPhase[] = {0xd1, 0x3c};
+  for (std::uint8_t expected : kMovcPhase) {
+    if (cursor >= group_end)
+      DecodeError(cursor, "BCSEL MOVC phase is truncated");
+    if (binary[cursor] != expected) {
+      DecodeError(cursor, "BCSEL MOVC phase byte " +
+                              std::to_string(cursor - (header.offset + 3)) +
+                              " is " + std::to_string(binary[cursor]) +
+                              ", expected " + std::to_string(expected));
+    }
+    ++cursor;
   }
-  PcoOpcode opcode = PcoOpcode::kConditionalSelect;
+  /* The TST phase carries the operation and operand type, exactly as it does
+   * in the TST/MOVC select form.  Matching the two bytes against one recorded
+   * pair admitted only the unsigned zero test, so a select on any other
+   * comparison -- ceil tests equality and sign tests greater-than-zero --
+   * was reported as an unknown phase sequence. */
+  const DecodedTestPhase test =
+      DecodeTestPhase(binary, group_end, cursor, /*expect_phase2_end=*/true);
+  if (test.bytes != 2)
+    DecodeError(cursor, "BCSEL requires the extended TST phase");
+  cursor += test.bytes;
+  if (cursor >= group_end)
+    DecodeError(cursor, "missing BCSEL condition MBYP phase");
+  if (binary[cursor] != 0x87U) {
+    DecodeError(cursor, "unsupported BCSEL condition MBYP phase [" +
+                            std::to_string(binary[cursor]) + "]");
+  }
+  ++cursor;
+  const PcoOpcode opcode = PcoOpcode::kTestConditionalSelect;
+  bool negate_true_source = false;
   if (cursor >= group_end)
     DecodeError(cursor, "missing BCSEL P0 MBYP operation");
   if (binary[cursor] == 0x87U) {
@@ -2486,9 +2517,12 @@ PcoInstruction DecodeGenericConditionalSelectGroup(
     ++cursor;
     if (cursor >= group_end || binary[cursor++] != 0x02U)
       DecodeError(cursor - 1, "unsupported BCSEL true-source negate modifier");
-    opcode = PcoOpcode::kConditionalSelectNegateTrue;
+    /* The negate is a source modifier of the value phase 0 moves, which the
+     * test-driven select carries alongside any comparison. */
+    negate_true_source = true;
   } else {
-    DecodeError(cursor, "unsupported BCSEL P0 MBYP operation");
+    DecodeError(cursor, "unsupported BCSEL P0 MBYP operation [" +
+                            std::to_string(binary[cursor]) + "]");
   }
 
   const TwoLowerSources lower =
@@ -2505,6 +2539,10 @@ PcoInstruction DecodeGenericConditionalSelectGroup(
 
   PcoInstruction instruction;
   instruction.opcode = opcode;
+  instruction.comparison_test_op = test.op;
+  instruction.comparison_test_type = test.type;
+  instruction.source1_negate = negate_true_source ? 1U : 0U;
+  instruction.conditional_select_inverted = 1U;
   instruction.target = destination.target;
   instruction.source = lower.source1;
   instruction.source1 = lower.source0;
@@ -6188,9 +6226,11 @@ PcoVertexExecution ExecuteVertexPco(
                     : read(instruction.source2);
         break;
       case PcoOpcode::kTestConditionalSelect:
-        value = EvaluateTestPredicate(instruction.comparison_test_op,
-                                      instruction.comparison_test_type,
-                                      read(instruction.source), UINT32_C(0))
+        value = (EvaluateTestPredicate(instruction.comparison_test_op,
+                                       instruction.comparison_test_type,
+                                       read(instruction.source),
+                                       UINT32_C(0)) !=
+                 (instruction.conditional_select_inverted != 0))
                     ? (read(instruction.source1) ^
                        (instruction.source1_negate != 0
                             ? UINT32_C(0x80000000)
@@ -7293,9 +7333,11 @@ PcoFragmentExecution ExecuteFragmentPco(
                          ? (read(instruction.source1) ^ UINT32_C(0x80000000))
                          : read(instruction.source2);
       } else if (instruction.opcode == PcoOpcode::kTestConditionalSelect) {
-        result_val = EvaluateTestPredicate(instruction.comparison_test_op,
-                                           instruction.comparison_test_type,
-                                           src0, UINT32_C(0))
+        const bool passed =
+            EvaluateTestPredicate(instruction.comparison_test_op,
+                                  instruction.comparison_test_type, src0,
+                                  UINT32_C(0));
+        result_val = (passed != (instruction.conditional_select_inverted != 0))
                          ? (read(instruction.source1) ^
                             (instruction.source1_negate != 0
                                  ? UINT32_C(0x80000000)

@@ -3641,9 +3641,17 @@ void TestDecodeAndExecuteIdeasLightingSelect() {
             decoded.instructions[7].source1.index == 0 &&
             decoded.instructions[7].output_index == 15,
         "Ideas BCMP.F32.E compares TEMP7 with positive zero");
+  /* The BCSEL group's TST phase is decoded from its own fields now, so this
+   * select carries the comparison it encodes -- the unsigned zero test -- and
+   * the inverted MOVC polarity that makes a passing test take internal
+   * source 4.  The two together are the Boolean condition this fixture had
+   * when the phase bytes were matched as a fixed pair. */
   for (std::size_t index = 8; index <= 10; ++index) {
     Check(decoded.instructions[index].opcode ==
-                  PcoOpcode::kConditionalSelect &&
+                  PcoOpcode::kTestConditionalSelect &&
+              decoded.instructions[index].comparison_test_op == 0x0 &&
+              decoded.instructions[index].comparison_test_type == 0x5 &&
+              decoded.instructions[index].conditional_select_inverted == 1 &&
               decoded.instructions[index].source.bank ==
                   PcoRegisterBank::kTemporary &&
               decoded.instructions[index].source.index == 15 &&
@@ -4935,9 +4943,16 @@ void TestDecodeAndExecuteIdeasNegatedBcsel() {
 34 8a 80 87 00 00 00 23
 )hex");
   const auto decoded = Decode(ShaderStage::kFragment, fragment_binary);
+  /* The negate is a source modifier of the value phase 0 moves, carried
+   * alongside the comparison the TST phase encodes rather than selecting a
+   * separate opcode. */
   Check(decoded.summary.group_count == 8 &&
             decoded.instructions[3].opcode ==
-                PcoOpcode::kConditionalSelectNegateTrue &&
+                PcoOpcode::kTestConditionalSelect &&
+            decoded.instructions[3].source1_negate == 1 &&
+            decoded.instructions[3].conditional_select_inverted == 1 &&
+            decoded.instructions[3].comparison_test_op == 0x0 &&
+            decoded.instructions[3].comparison_test_type == 0x5 &&
             decoded.instructions[3].source.index == 25 &&
             decoded.instructions[3].source1.index == 0 &&
             decoded.instructions[3].source2.index == 13 &&
