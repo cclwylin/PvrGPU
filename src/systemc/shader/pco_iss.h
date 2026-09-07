@@ -222,6 +222,37 @@ struct PcoInstructionCounts {
  * A canonical, serializable instruction produced from a real PCO group.
  * repeat_count applies the PCO group repeat to both source and output index.
  */
+/*
+ * One phase of an instruction group that computes a value into an internal
+ * result register.  PCO's select-shaped groups -- bcsel, fceil, fsign, isign
+ * -- all have the same layout: phase 0 and phase 1 each run a main-ALU
+ * operation into ft0 and ft1, phase 2 tests and then MOVCs between them.
+ * Modelling one group as one ALU instruction could describe only the case
+ * where both phases are plain moves, which is bcsel; ceil adds one to a
+ * floor in phase 0 and takes the floor itself in phase 1.
+ */
+struct PcoPhaseOperation {
+  PcoOpcode opcode = PcoOpcode::kMoveBypass;
+  PcoRegisterRef source{};
+  PcoRegisterRef source1{};
+  PcoRegisterRef source2{};
+  std::uint8_t source_count = 1;
+  std::uint8_t source0_floor = 0;
+  std::uint8_t source0_absolute = 0;
+  std::uint8_t source1_absolute = 0;
+  std::uint8_t source2_absolute = 0;
+  std::uint8_t source2_floor = 0;
+  std::uint8_t saturate = 0;
+};
+
+/* Which internal result a phase-2 MOVC moves when its test passes. */
+enum class PcoInternalResult : std::uint8_t {
+  kPhase0 = 0,
+  kPhase1 = 1,
+  kPhase2 = 2,
+  kFeedThrough = 3,
+};
+
 struct PcoInstruction {
   PcoOpcode opcode = PcoOpcode::kMoveBypass;
   PcoWriteTarget target = PcoWriteTarget::kNone;
@@ -294,6 +325,21 @@ struct PcoInstruction {
    * in the BCSEL group it takes internal source 4 instead, so a passing test
    * there selects the operand the other form calls the false one. */
   std::uint8_t conditional_select_inverted = 0;
+  /*
+   * The two computing phases of a select-shaped group, and how phase 2 reads
+   * them.  `phase_composed` says the group has them at all: without it the
+   * select's operands are plain register sources, which is what a bcsel is.
+   * `select_true_result` is the MOVC's movw0 -- the internal result it moves
+   * when the test passes -- and `select_false_result` is its is4 selector.
+   * `test_source1_result` is the ISS is2 selector, which is what a binary
+   * test compares the fed-through operand against.
+   */
+  std::uint8_t phase_composed = 0;
+  PcoPhaseOperation phase0{};
+  PcoPhaseOperation phase1{};
+  PcoInternalResult select_true_result = PcoInternalResult::kPhase1;
+  PcoInternalResult select_false_result = PcoInternalResult::kPhase0;
+  PcoInternalResult test_source1_result = PcoInternalResult::kPhase1;
   /* PCO's F_PCK_FORMAT for kUnpackVector, and its `scale` bit: scaling
    * normalizes the field to [0,1] or [-1,1] instead of yielding its integer
    * value as a float. */

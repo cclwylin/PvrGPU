@@ -884,7 +884,8 @@ void ValidateGenericSource(PcoRegisterRef source, std::size_t offset) {
 TwoLowerSources DecodeTwoLowerSources(
     const std::vector<std::uint8_t> &binary, std::size_t group_end,
     std::size_t &cursor, bool expect_is0_source1 = false,
-    bool allow_internal_true_source1 = false) {
+    bool allow_internal_true_source1 = false,
+    bool *is0_selects_source1 = nullptr) {
   const std::size_t source_offset = cursor;
   if (group_end - cursor < 2)
     DecodeError(cursor, "truncated two-source lower encoding");
@@ -912,14 +913,28 @@ TwoLowerSources DecodeTwoLowerSources(
     DecodeError(source_offset + 1, "FADD lower source has sel=0");
   if (ext1 && (byte2 & 0x60U) != 0)
     DecodeError(source_offset + 2, "FADD lower-source mux is unsupported");
-  const std::uint8_t expected_long_control =
-      expect_is0_source1 ? UINT8_C(0x10) : UINT8_C(0);
-  if (ext2 && (byte3 & 0x14U) != expected_long_control)
-    DecodeError(source_offset + 3,
-                "long two-source reserved/mux bits are not canonical");
-  if (expect_is0_source1 && !ext2)
-    DecodeError(source_offset,
-                "two-source is0=s1 selector requires the long encoding");
+  /*
+   * The short two-source forms carry no is0 mux at all -- I_SRC gives them
+   * no mux field -- so is0 is source 0 there and the selector only exists in
+   * the long form.  A caller that wants to know which it is passes an output
+   * rather than an expectation.
+   */
+  if (is0_selects_source1 != nullptr) {
+    if (ext2 && (byte3 & 0x04U) != 0) {
+      DecodeError(source_offset + 3,
+                  "long two-source reserved bits are not canonical");
+    }
+    *is0_selects_source1 = ext2 && (byte3 & 0x10U) != 0;
+  } else {
+    const std::uint8_t expected_long_control =
+        expect_is0_source1 ? UINT8_C(0x10) : UINT8_C(0);
+    if (ext2 && (byte3 & 0x14U) != expected_long_control)
+      DecodeError(source_offset + 3,
+                  "long two-source reserved/mux bits are not canonical");
+    if (expect_is0_source1 && !ext2)
+      DecodeError(source_offset,
+                  "two-source is0=s1 selector requires the long encoding");
+  }
 
   const std::uint8_t bank0 = static_cast<std::uint8_t>(
       ((byte0 >> 6U) & 1U) | (((byte2 >> 4U) & 1U) << 1U) |
@@ -2515,6 +2530,128 @@ PcoInstruction DecodeGenericTestSelectGroup(
   return instruction;
 }
 
+/*
+ * The main-ALU operation a phase byte names, for the select-shaped groups
+ * whose phases 0 and 1 each compute one.  This is the same I_MAIN encoding
+ * the scalar ALU groups carry -- three bits of operation over five modifier
+ * bits -- restricted to the forms a phase can hold: a move, with or without
+ * its source modifier byte, and the fadd/fmul families.
+ */
+/*
+ * How many sources a source block holds, from the encoding rather than from
+ * what the reader expects.  I_SRC's forms are distinguished by three bits:
+ * ext0 clear is the single-byte one-source form, sel set is a two-source
+ * form, and sel clear with ext1 set is a three-source one.
+ */
+std::size_t SourceBlockCount(const std::vector<std::uint8_t> &binary,
+                             std::size_t group_end, std::size_t cursor) {
+  if (cursor >= group_end)
+    DecodeError(cursor, "missing instruction-group source block");
+  if ((binary[cursor] & 0x80U) == 0)
+    return 1;
+  if (cursor + 1 >= group_end)
+    DecodeError(cursor, "truncated instruction-group source block");
+  const std::uint8_t byte1 = binary[cursor + 1];
+  if ((byte1 & 0x80U) != 0)
+    return 2;
+  return (byte1 & 0x40U) != 0 ? 3 : 1;
+}
+
+PcoPhaseOperation DecodePhaseOperation(const std::vector<std::uint8_t> &binary,
+                                       std::size_t group_end,
+                                       std::size_t &cursor,
+                                       std::size_t group_offset) {
+  if (cursor >= group_end)
+    DecodeError(cursor, "missing instruction-group phase operation");
+  const std::size_t operation_offset = cursor;
+  const std::uint8_t main = binary[cursor++];
+  PcoPhaseOperation phase;
+  if (main == 0x87U) {
+    phase.opcode = PcoOpcode::kMoveBypass;
+    phase.source_count = 1;
+    return phase;
+  }
+  if (main == 0x97U) {
+    /* MBYP with the single-source modifier byte: bit 1 negates and bit 0
+     * takes the absolute, as I_MAIN's s0neg_sngl and s0abs_sngl. */
+    if (cursor >= group_end)
+      DecodeError(cursor, "missing phase MBYP source-modifier byte");
+    const std::uint8_t modifier = binary[cursor++];
+    if ((modifier & ~UINT8_C(0x03)) != 0) {
+      DecodeError(cursor - 1,
+                  "unsupported phase MBYP source modifier [" +
+                      std::to_string(modifier) + "]");
+    }
+    phase.opcode = (modifier & 0x02U) != 0 ? PcoOpcode::kFloatNegate
+                                           : PcoOpcode::kMoveBypass;
+    phase.source0_absolute = (modifier & 0x01U) != 0 ? 1U : 0U;
+    phase.source_count = 1;
+    return phase;
+  }
+  const std::uint8_t main_op = static_cast<std::uint8_t>(main >> 5U);
+  if (main_op == 0x06U) {
+    /*
+     * FMAD, whose modifiers occupy their own positions: bit 3 negates
+     * source 0, bit 2 takes its absolute, bit 1 negates source 2 and bit 0
+     * saturates, with an extension byte carrying source 1's and source 2's
+     * when bit 4 asks for one.  The negate combinations have opcodes of
+     * their own, which the histogram and the executors already know.
+     */
+    const bool source0_negate = (main & 0x08U) != 0;
+    const bool source2_negate = (main & 0x02U) != 0;
+    phase.source0_absolute = (main & 0x04U) != 0 ? 1U : 0U;
+    phase.saturate = (main & 0x01U) != 0 ? 1U : 0U;
+    if ((main & 0x10U) != 0) {
+      if (cursor >= group_end)
+        DecodeError(cursor, "missing phase FMAD modifier byte");
+      const std::uint8_t extension = binary[cursor++];
+      if ((extension & ~UINT8_C(0x1f)) != 0) {
+        DecodeError(cursor - 1,
+                    "unsupported phase FMAD modifier byte [" +
+                        std::to_string(extension) + "]");
+      }
+      if ((extension & 0x10U) != 0)
+        DecodeError(cursor - 1, "phase FMAD low-precision is not modelled");
+      if ((extension & 0x04U) != 0)
+        DecodeError(cursor - 1, "phase FMAD source-1 negate is not modelled");
+      phase.source1_absolute = (extension & 0x08U) != 0 ? 1U : 0U;
+      phase.source2_floor = (extension & 0x02U) != 0 ? 1U : 0U;
+      phase.source2_absolute = (extension & 0x01U) != 0 ? 1U : 0U;
+    }
+    phase.opcode =
+        source0_negate
+            ? (source2_negate ? PcoOpcode::kFloatMadNegateSource0Source2
+                              : PcoOpcode::kFloatMadNegateSource0)
+            : (source2_negate ? PcoOpcode::kFloatMadNegateSource2
+                              : PcoOpcode::kFloatMad);
+    phase.source_count = 3;
+    return phase;
+  }
+  if (main_op != 0x00U && main_op != 0x02U) {
+    DecodeError(operation_offset,
+                "instruction-group phase operation is outside the move, "
+                "fadd/fmul and fmad families [" +
+                    std::to_string(main) + "] in the group at byte " +
+                    std::to_string(group_offset));
+  }
+  phase.saturate = (main & 0x10U) != 0 ? 1U : 0U;
+  phase.source0_absolute = (main & 0x04U) != 0 ? 1U : 0U;
+  phase.source1_absolute = (main & 0x02U) != 0 ? 1U : 0U;
+  phase.source0_floor = (main & 0x01U) != 0 ? 1U : 0U;
+  const bool negate_source0 = (main & 0x08U) != 0;
+  if (main_op == 0x00U) {
+    phase.opcode = negate_source0 ? PcoOpcode::kFloatAddNegateSource0
+                                  : PcoOpcode::kFloatAdd;
+  } else if (negate_source0) {
+    DecodeError(operation_offset,
+                "unsupported phase FMUL source0 negate modifier");
+  } else {
+    phase.opcode = PcoOpcode::kFloatMultiply;
+  }
+  phase.source_count = 2;
+  return phase;
+}
+
 PcoInstruction DecodeGenericConditionalSelectGroup(
     ShaderStage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
@@ -2526,20 +2663,37 @@ PcoInstruction DecodeGenericConditionalSelectGroup(
   }
   const std::size_t group_end = header.offset + header.total_bytes;
   std::size_t cursor = header.offset + 3;
-  /* The MOVC phase, which reads the test result and selects between the
-   * value phase 0 supplies and internal source 4. */
-  constexpr std::uint8_t kMovcPhase[] = {0xd1, 0x3c};
-  for (std::uint8_t expected : kMovcPhase) {
-    if (cursor >= group_end)
-      DecodeError(cursor, "BCSEL MOVC phase is truncated");
-    if (binary[cursor] != expected) {
-      DecodeError(cursor, "BCSEL MOVC phase byte " +
-                              std::to_string(cursor - (header.offset + 3)) +
-                              " is " + std::to_string(binary[cursor]) +
-                              ", expected " + std::to_string(expected));
-    }
-    ++cursor;
+  /*
+   * The MOVC phase reads the test result and moves one of the internal
+   * results, or internal source 4 when the test fails.  I_MAIN's movc fields
+   * are movw1 at bits 3:2 and movw0 at 1:0 of the operation byte, then
+   * maskw0 at bits 5:2 of its extension.  Which result it moves varies
+   * across the family -- fsign moves phase 0's, the rest phase 1's -- so it
+   * is read rather than matched.
+   */
+  if (cursor >= group_end)
+    DecodeError(cursor, "instruction-group MOVC phase is truncated");
+  const std::uint8_t movc_operation = binary[cursor];
+  if ((movc_operation >> 5U) != 0x06U) {
+    DecodeError(cursor, "instruction-group phase 2 is not a MOVC [" +
+                            std::to_string(movc_operation) + "]");
   }
+  if ((movc_operation & 0x10U) == 0)
+    DecodeError(cursor, "MOVC phase has no extension byte");
+  if (((movc_operation >> 2U) & 0x03U) != 0)
+    DecodeError(cursor, "MOVC phase writes a second destination");
+  const PcoInternalResult select_true_result =
+      static_cast<PcoInternalResult>(movc_operation & 0x03U);
+  ++cursor;
+  if (cursor >= group_end)
+    DecodeError(cursor, "instruction-group MOVC phase is truncated");
+  const std::uint8_t movc_extension = binary[cursor];
+  if ((movc_extension & 0x3fU) != 0x3cU) {
+    DecodeError(cursor,
+                "MOVC phase does not write all four components once [" +
+                    std::to_string(movc_extension) + "]");
+  }
+  ++cursor;
   /* The TST phase carries the operation and operand type, exactly as it does
    * in the TST/MOVC select form.  Matching the two bytes against one recorded
    * pair admitted only the unsigned zero test, so a select on any other
@@ -2550,37 +2704,115 @@ PcoInstruction DecodeGenericConditionalSelectGroup(
   if (test.bytes != 2)
     DecodeError(cursor, "BCSEL requires the extended TST phase");
   cursor += test.bytes;
-  if (cursor >= group_end)
-    DecodeError(cursor, "missing BCSEL condition MBYP phase");
-  if (binary[cursor] != 0x87U) {
-    DecodeError(cursor, "unsupported BCSEL condition MBYP phase [" +
-                            std::to_string(binary[cursor]) + "]");
+  /*
+   * Phases 0 and 1 each compute an internal result.  A bcsel moves a value
+   * into each; fceil adds one to a floor in phase 0 and takes the floor
+   * itself in phase 1; fsign multiplies by a saturating infinity.  Reading
+   * both as main-ALU operations is what admits the whole family.
+   */
+  const PcoPhaseOperation phase0 =
+      DecodePhaseOperation(binary, group_end, cursor, header.offset);
+  const PcoPhaseOperation phase1 =
+      DecodePhaseOperation(binary, group_end, cursor, header.offset);
+
+  /*
+   * Sources are packed as a lower block holding s0..s2 and an upper block
+   * holding s3..s5, each in the same encoding.  Phase 0 reads from the lower
+   * block, phase 1 from the upper, and a test with a register operand of its
+   * own takes the lower block's second slot -- which is the bcsel shape,
+   * where phase 0 moves one value and the test reads another.
+   */
+  const std::size_t lower_count =
+      SourceBlockCount(binary, group_end, cursor);
+  if (lower_count < phase0.source_count) {
+    DecodeError(header.offset,
+                "instruction-group lower block holds " +
+                    std::to_string(lower_count) + " sources, phase 0 needs " +
+                    std::to_string(phase0.source_count));
   }
-  ++cursor;
-  const PcoOpcode opcode = PcoOpcode::kTestConditionalSelect;
-  bool negate_true_source = false;
-  if (cursor >= group_end)
-    DecodeError(cursor, "missing BCSEL P0 MBYP operation");
-  if (binary[cursor] == 0x87U) {
-    ++cursor;
-  } else if (binary[cursor] == 0x97U) {
-    ++cursor;
-    if (cursor >= group_end || binary[cursor++] != 0x02U)
-      DecodeError(cursor - 1, "unsupported BCSEL true-source negate modifier");
-    /* The negate is a source modifier of the value phase 0 moves, which the
-     * test-driven select carries alongside any comparison. */
-    negate_true_source = true;
+  /* Which of the block's slots the test feeds through, which the long
+   * two-source form states with its is0 mux and the shorter ones leave at
+   * source 0. */
+  bool test_reads_lower_source1 = false;
+  PcoRegisterRef lower_sources[3]{};
+  if (lower_count == 1) {
+    lower_sources[0] = DecodeOneLowerSource(binary, group_end, cursor);
+  } else if (lower_count == 2) {
+    const TwoLowerSources lower =
+        DecodeTwoLowerSources(binary, group_end, cursor, false, false,
+                              &test_reads_lower_source1);
+    lower_sources[0] = lower.source0;
+    lower_sources[1] = lower.source1;
+  } else if (lower_count == 3) {
+    const ThreeLowerSources lower =
+        DecodeThreeLowerSources(binary, group_end, cursor);
+    lower_sources[0] = lower.source0;
+    lower_sources[1] = lower.source1;
+    lower_sources[2] = lower.source2;
   } else {
-    DecodeError(cursor, "unsupported BCSEL P0 MBYP operation [" +
-                            std::to_string(binary[cursor]) + "]");
+    DecodeError(header.offset,
+                "instruction-group phase 0 needs " +
+                    std::to_string(lower_count) + " lower sources");
   }
 
-  const TwoLowerSources lower =
-      DecodeTwoLowerSources(binary, group_end, cursor, true, false);
-  const PcoRegisterRef false_source =
-      DecodeOneLowerSource(binary, group_end, cursor);
-  if (cursor >= group_end || binary[cursor++] != 0x01U)
-    DecodeError(cursor - 1, "unsupported BCSEL ISS selection");
+  const std::size_t upper_count =
+      SourceBlockCount(binary, group_end, cursor);
+  if (upper_count != phase1.source_count) {
+    /* Print the group so a shape this decoder does not yet cover can be read
+     * against the ISA rather than guessed at from an offset. */
+    std::string bytes;
+    for (std::size_t at = header.offset; at < group_end; ++at) {
+      static const char kHex[] = "0123456789abcdef";
+      bytes += kHex[(binary[at] >> 4U) & 0xfU];
+      bytes += kHex[binary[at] & 0xfU];
+      bytes += ' ';
+    }
+    DecodeError(header.offset,
+                "instruction-group upper block holds " +
+                    std::to_string(upper_count) + " sources, phase 1 needs " +
+                    std::to_string(phase1.source_count) + " (group: " +
+                    bytes + ")");
+  }
+  PcoRegisterRef upper_sources[3]{};
+  if (phase1.source_count == 1) {
+    upper_sources[0] = DecodeOneLowerSource(binary, group_end, cursor);
+  } else if (phase1.source_count == 2) {
+    const TwoLowerSources upper =
+        DecodeTwoLowerSources(binary, group_end, cursor, false, false);
+    upper_sources[0] = upper.source0;
+    upper_sources[1] = upper.source1;
+  } else {
+    const ThreeLowerSources upper =
+        DecodeThreeLowerSources(binary, group_end, cursor);
+    upper_sources[0] = upper.source0;
+    upper_sources[1] = upper.source1;
+    upper_sources[2] = upper.source2;
+  }
+
+  /*
+   * I__ISS, by field: bits 7:6 is5, 5:4 is4, 3:2 is3, bit 1 is2, bit 0 is1.
+   * is1 selects the test's first operand -- ft0, or the fed-through source --
+   * is2 its second, and is4 the value the MOVC takes when the test fails.
+   */
+  if (cursor >= group_end)
+    DecodeError(cursor, "missing instruction-group ISS selection");
+  const std::uint8_t iss = binary[cursor++];
+  if ((iss & 0x01U) == 0) {
+    DecodeError(cursor - 1,
+                "instruction-group test reads ft0 rather than its source [" +
+                    std::to_string(iss) + "]");
+  }
+  if ((iss & 0xccU) != 0) {
+    DecodeError(cursor - 1,
+                "unsupported instruction-group is3/is5 selection [" +
+                    std::to_string(iss) + "]");
+  }
+  const PcoInternalResult test_source1_result =
+      (iss & 0x02U) != 0 ? PcoInternalResult::kFeedThrough
+                         : PcoInternalResult::kPhase1;
+  const PcoInternalResult select_false_result =
+      static_cast<PcoInternalResult>((iss >> 4U) & 0x03U);
+
   const DecodedDestination destination =
       DecodeGenericDestination(binary, group_end, cursor);
   if (destination.target != PcoWriteTarget::kTemporary)
@@ -2588,15 +2820,32 @@ PcoInstruction DecodeGenericConditionalSelectGroup(
   ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
 
   PcoInstruction instruction;
-  instruction.opcode = opcode;
+  instruction.opcode = PcoOpcode::kTestConditionalSelect;
   instruction.comparison_test_op = test.op;
   instruction.comparison_test_type = test.type;
-  instruction.source1_negate = negate_true_source ? 1U : 0U;
   instruction.conditional_select_inverted = 1U;
+  instruction.phase_composed = 1U;
+  instruction.phase0 = phase0;
+  instruction.phase1 = phase1;
+  instruction.phase0.source = lower_sources[0];
+  instruction.phase0.source1 = lower_sources[1];
+  instruction.phase0.source2 = lower_sources[2];
+  instruction.phase1.source = upper_sources[0];
+  instruction.phase1.source1 = upper_sources[1];
+  instruction.phase1.source2 = upper_sources[2];
+  instruction.select_true_result = select_true_result;
+  instruction.select_false_result = select_false_result;
+  instruction.test_source1_result = test_source1_result;
   instruction.target = destination.target;
-  instruction.source = lower.source1;
-  instruction.source1 = lower.source0;
-  instruction.source2 = false_source;
+  /*
+   * The test's fed-through operand: the lower block's second slot when the
+   * test has a register operand of its own, and phase 0's first source
+   * otherwise -- fceil compares the value phase 0 floored against the floor.
+   */
+  instruction.source =
+      test_reads_lower_source1 ? lower_sources[1] : lower_sources[0];
+  instruction.source1 = lower_sources[0];
+  instruction.source2 = upper_sources[0];
   instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
   instruction.group_index = group_index;
   instruction.output_index = destination.index;
@@ -4782,6 +5031,123 @@ std::uint32_t IntegerSourceModifier(std::uint32_t bits, bool absolute,
   return bits;
 }
 
+std::uint32_t FloatAddBits(std::uint32_t left_bits, std::uint32_t right_bits);
+std::uint32_t FloatMultiplyBits(std::uint32_t left_bits,
+                                std::uint32_t right_bits);
+bool EvaluateTestPredicate(std::uint8_t op, std::uint8_t type,
+                           std::uint32_t left_bits, std::uint32_t right_bits);
+std::uint32_t FloatFloorBits(std::uint32_t value_bits);
+std::uint32_t FloatSaturateBits(std::uint32_t value_bits);
+
+/*
+ * One phase's main-ALU operation, over operands the caller has already read.
+ * The source modifiers apply innermost-first as floor, absolute, then
+ * negate, which is the order the whole ISA applies them in.
+ */
+std::uint32_t FloatMadBits(std::uint32_t left_bits, std::uint32_t right_bits,
+                           std::uint32_t addend_bits);
+
+std::uint32_t EvaluatePhaseOperation(const PcoPhaseOperation &phase,
+                                     std::uint32_t source0_bits,
+                                     std::uint32_t source1_bits,
+                                     std::uint32_t source2_bits = 0) {
+  std::uint32_t source0 = source0_bits;
+  if (phase.source0_floor != 0)
+    source0 = FloatFloorBits(source0);
+  if (phase.source0_absolute != 0)
+    source0 &= UINT32_C(0x7fffffff);
+  std::uint32_t source1 = source1_bits;
+  if (phase.source1_absolute != 0)
+    source1 &= UINT32_C(0x7fffffff);
+  std::uint32_t source2 = source2_bits;
+  if (phase.source2_floor != 0)
+    source2 = FloatFloorBits(source2);
+  if (phase.source2_absolute != 0)
+    source2 &= UINT32_C(0x7fffffff);
+  std::uint32_t result = 0;
+  switch (phase.opcode) {
+  case PcoOpcode::kMoveBypass:
+    return source0;
+  case PcoOpcode::kFloatNegate:
+    return source0 ^ UINT32_C(0x80000000);
+  case PcoOpcode::kFloatAdd:
+    result = FloatAddBits(source0, source1);
+    break;
+  case PcoOpcode::kFloatAddNegateSource0:
+    result = FloatAddBits(source0 ^ UINT32_C(0x80000000), source1);
+    break;
+  case PcoOpcode::kFloatMultiply:
+    result = FloatMultiplyBits(source0, source1);
+    break;
+  case PcoOpcode::kFloatMad:
+    result = FloatMadBits(source0, source1, source2);
+    break;
+  case PcoOpcode::kFloatMadNegateSource0:
+    result = FloatMadBits(source0 ^ UINT32_C(0x80000000), source1, source2);
+    break;
+  case PcoOpcode::kFloatMadNegateSource2:
+    result = FloatMadBits(source0, source1, source2 ^ UINT32_C(0x80000000));
+    break;
+  case PcoOpcode::kFloatMadNegateSource0Source2:
+    result = FloatMadBits(source0 ^ UINT32_C(0x80000000), source1,
+                          source2 ^ UINT32_C(0x80000000));
+    break;
+  default:
+    ExecuteError("unsupported instruction-group phase operation: opcode=" +
+                 std::to_string(static_cast<std::uint32_t>(phase.opcode)));
+  }
+  if (phase.saturate != 0)
+    result = FloatSaturateBits(result);
+  return result;
+}
+
+/*
+ * A select-shaped instruction group.  Phases 0 and 1 compute their results,
+ * the test compares the fed-through operand against whichever internal
+ * result its is2 selector names, and the MOVC moves one of them.  The test
+ * reads inverted here for the same reason it does in the plain select: a
+ * passing test takes internal source 4, which is the operand the other form
+ * calls the false one.
+ */
+template <typename ReadSourceFn>
+std::uint32_t ExecutePhaseComposedSelect(const PcoInstruction &instruction,
+                                         std::uint32_t test_source0,
+                                         ReadSourceFn read_source) {
+  const auto evaluate = [&](const PcoPhaseOperation &phase) {
+    return EvaluatePhaseOperation(
+        phase, read_source(phase.source),
+        phase.source_count > 1 ? read_source(phase.source1) : UINT32_C(0),
+        phase.source_count > 2 ? read_source(phase.source2) : UINT32_C(0));
+  };
+  const std::uint32_t phase0 = evaluate(instruction.phase0);
+  const std::uint32_t phase1 = evaluate(instruction.phase1);
+  const auto internal_result = [&](PcoInternalResult which) {
+    switch (which) {
+    case PcoInternalResult::kPhase0:
+      return phase0;
+    case PcoInternalResult::kPhase1:
+      return phase1;
+    case PcoInternalResult::kFeedThrough:
+      return test_source0;
+    default:
+      ExecuteError("instruction-group phase 2 names an unmodelled internal "
+                   "result");
+    }
+  };
+  const std::uint32_t test_source1 =
+      instruction.test_source1_result == PcoInternalResult::kFeedThrough
+          ? UINT32_C(0)
+          : internal_result(instruction.test_source1_result);
+  const bool passed = EvaluateTestPredicate(
+      instruction.comparison_test_op, instruction.comparison_test_type,
+      test_source0, test_source1);
+  /* The MOVC moves what its movw0 names when the test passes and internal
+   * source 4 when it does not, which is the operation stated directly rather
+   * than the inversion the source-shaped select needs to express it. */
+  return passed ? internal_result(instruction.select_true_result)
+                : internal_result(instruction.select_false_result);
+}
+
 std::uint32_t FloatSaturateBits(std::uint32_t value_bits) {
   constexpr std::uint32_t kSign = UINT32_C(0x80000000);
   constexpr std::uint32_t kExponent = UINT32_C(0x7f800000);
@@ -6294,6 +6660,12 @@ PcoVertexExecution ExecuteVertexPco(
                     : read(instruction.source2);
         break;
       case PcoOpcode::kTestConditionalSelect:
+        if (instruction.phase_composed != 0) {
+          value = ExecutePhaseComposedSelect(
+              instruction, read(instruction.source),
+              [&](const PcoRegisterRef &source) { return read(source); });
+          break;
+        }
         value = (EvaluateTestPredicate(instruction.comparison_test_op,
                                        instruction.comparison_test_type,
                                        read(instruction.source),
@@ -7414,6 +7786,11 @@ PcoFragmentExecution ExecuteFragmentPco(
                          ? (read(instruction.source1) ^ UINT32_C(0x80000000))
                          : read(instruction.source2);
       } else if (instruction.opcode == PcoOpcode::kTestConditionalSelect) {
+        if (instruction.phase_composed != 0) {
+          result_val = ExecutePhaseComposedSelect(
+              instruction, src0,
+              [&](const PcoRegisterRef &source) { return read(source); });
+        } else {
         const bool passed =
             EvaluateTestPredicate(instruction.comparison_test_op,
                                   instruction.comparison_test_type, src0,
@@ -7424,6 +7801,7 @@ PcoFragmentExecution ExecuteFragmentPco(
                                  ? UINT32_C(0x80000000)
                                  : UINT32_C(0)))
                          : read(instruction.source2);
+        }
       } else if (instruction.opcode ==
                  PcoOpcode::kConditionalSelectGreaterZero) {
         result_val = FloatGreaterZero(src0) ? read(instruction.source1)

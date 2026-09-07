@@ -3645,17 +3645,21 @@ void TestDecodeAndExecuteIdeasLightingSelect() {
             decoded.instructions[7].source1.index == 0 &&
             decoded.instructions[7].output_index == 15,
         "Ideas BCMP.F32.E compares TEMP7 with positive zero");
-  /* The BCSEL group's TST phase is decoded from its own fields now, so this
-   * select carries the comparison it encodes -- the unsigned zero test -- and
-   * the inverted MOVC polarity that makes a passing test take internal
-   * source 4.  The two together are the Boolean condition this fixture had
-   * when the phase bytes were matched as a fixed pair. */
+  /* The group is read as the phases it holds: the TST phase carries the
+   * comparison -- the unsigned zero test -- phases 0 and 1 each move a value,
+   * and the MOVC takes phase 1's when the test passes.  That is the Boolean
+   * condition this fixture had when the phase bytes were matched as a fixed
+   * pair. */
   for (std::size_t index = 8; index <= 10; ++index) {
     Check(decoded.instructions[index].opcode ==
                   PcoOpcode::kTestConditionalSelect &&
+              decoded.instructions[index].phase_composed == 1 &&
               decoded.instructions[index].comparison_test_op == 0x0 &&
               decoded.instructions[index].comparison_test_type == 0x5 &&
-              decoded.instructions[index].conditional_select_inverted == 1 &&
+              decoded.instructions[index].select_true_result ==
+                  pvrgpu::stub::PcoInternalResult::kPhase1 &&
+              decoded.instructions[index].select_false_result ==
+                  pvrgpu::stub::PcoInternalResult::kPhase0 &&
               decoded.instructions[index].source.bank ==
                   PcoRegisterBank::kTemporary &&
               decoded.instructions[index].source.index == 15 &&
@@ -3710,10 +3714,18 @@ void TestDecodeAndExecuteIdeasLightingSelect() {
   mutation[95] ^= 0x01;
   ExpectFailure([&] { (void)Decode(ShaderStage::kVertex, mutation); },
                 "Ideas BCMP internal true source mutation");
+  /* Byte 114 holds the long two-source form's is0 mux, which says which of
+   * the block's slots the test feeds through.  Clearing it is a different
+   * instruction rather than a malformed one: the test then reads the slot
+   * phase 0 moves instead of the one beside it. */
   mutation = vertex_binary;
   mutation[114] = 0x00;
-  ExpectFailure([&] { (void)Decode(ShaderStage::kVertex, mutation); },
-                "Ideas BCSEL is0=s1 selector mutation");
+  const auto other_selector = Decode(ShaderStage::kVertex, mutation);
+  Check(other_selector.instructions[8].source.index ==
+                other_selector.instructions[8].phase0.source.index &&
+            decoded.instructions[8].source.index !=
+                decoded.instructions[8].phase0.source.index,
+        "the is0 mux chooses which slot the test feeds through");
   mutation = vertex_binary;
   mutation[154] = 0x00;
   ExpectFailure([&] { (void)Decode(ShaderStage::kVertex, mutation); },
@@ -4947,25 +4959,35 @@ void TestDecodeAndExecuteIdeasNegatedBcsel() {
 34 8a 80 87 00 00 00 23
 )hex");
   const auto decoded = Decode(ShaderStage::kFragment, fragment_binary);
-  /* The negate is a source modifier of the value phase 0 moves, carried
-   * alongside the comparison the TST phase encodes rather than selecting a
-   * separate opcode. */
+  /* The negate is a source modifier of the value phase 1 moves, carried on
+   * that phase rather than selecting a separate opcode: phase 0 moves the
+   * value the MOVC takes when the test fails, phase 1 the one it takes when
+   * the test passes. */
   Check(decoded.summary.group_count == 8 &&
             decoded.instructions[3].opcode ==
                 PcoOpcode::kTestConditionalSelect &&
-            decoded.instructions[3].source1_negate == 1 &&
-            decoded.instructions[3].conditional_select_inverted == 1 &&
+            decoded.instructions[3].phase_composed == 1 &&
+            decoded.instructions[3].phase1.opcode ==
+                PcoOpcode::kFloatNegate &&
             decoded.instructions[3].comparison_test_op == 0x0 &&
             decoded.instructions[3].comparison_test_type == 0x5 &&
             decoded.instructions[3].source.index == 25 &&
-            decoded.instructions[3].source1.index == 0 &&
-            decoded.instructions[3].source2.index == 13 &&
+            decoded.instructions[3].phase0.source.index == 0 &&
+            decoded.instructions[3].phase1.source.index == 13 &&
             decoded.instructions[3].output_index == 13,
         "Ideas negated BCSEL preserves condition/true/false/destination ABI");
+  /*
+   * The negate belongs to phase 1, whose operand is the upper block's slot --
+   * group_map(O_BCSEL) gives phase 1 SRC(2) and s3 -- not to the value phase
+   * 0 moves.  This fixture's test reads a nonzero condition, so the MOVC
+   * takes phase 0's value, which is the 2.0 the first MOVI wrote and carries
+   * no sign change.  Reading the negate as phase 0's produced -2.0 here and
+   * put ceil's added one on the wrong side of its select.
+   */
   const auto true_pixel =
       ExecuteFragment(decoded.summary, decoded.instructions);
-  Check(true_pixel.pixel_outputs[0] == FloatBits(-2.0F),
-        "Ideas negated BCSEL toggles the true source sign bit");
+  Check(true_pixel.pixel_outputs[0] == FloatBits(2.0F),
+        "a failing test takes the value phase 0 moves, unnegated");
 
   auto false_binary = fragment_binary;
   false_binary[16] = 0;
@@ -4975,13 +4997,22 @@ void TestDecodeAndExecuteIdeasNegatedBcsel() {
   const auto false_decoded = Decode(ShaderStage::kFragment, false_binary);
   const auto false_pixel = ExecuteFragment(
       false_decoded.summary, false_decoded.instructions);
-  Check(false_pixel.pixel_outputs[0] == FloatBits(7.0F),
-        "Ideas negated BCSEL leaves the false source unchanged");
+  /* Zeroing the condition makes the test pass, so the MOVC takes phase 1 --
+   * the phase whose operation byte carries the negate -- and the 7.0 the
+   * third MOVI wrote comes back negated. */
+  Check(false_pixel.pixel_outputs[0] == FloatBits(-7.0F),
+        "a passing test takes the value phase 1 moves, negated");
 
+  /* The two modifier bits are independent: setting both makes the phase
+   * move the negated absolute of its source, which is an instruction the
+   * encoding expresses rather than a malformed one. */
   auto mutation = fragment_binary;
   mutation[45] = 0x03;
-  ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, mutation); },
-                "Ideas BCSEL true-source negate modifier mutation");
+  const auto negated_absolute = Decode(ShaderStage::kFragment, mutation);
+  Check(negated_absolute.instructions[3].phase1.opcode ==
+                PcoOpcode::kFloatNegate &&
+            negated_absolute.instructions[3].phase1.source0_absolute == 1,
+        "a phase move takes the negate and absolute modifiers together");
   mutation = fragment_binary;
   mutation[44] = 0x96;
   ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, mutation); },
