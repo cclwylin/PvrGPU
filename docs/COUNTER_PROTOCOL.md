@@ -288,11 +288,15 @@ LOD, filtering, helper-lane execution, and sampling can make these quantities
 differ. Non-textured cases report zero for all three; a texture case reports
 the work actually executed rather than deriving it from logical
 `ps_invocations`. One executed `SMP` creates one logical `texture_requests`
-event. Nearest filtering expands that request to one real texel fetch and one
-TCU access, whereas bilinear filtering expands the same request to four real
-texel fetches and four TCU accesses. The DrawList texture count therefore
-remains shader-level work; `texel_fetches` and TCU access counters are
-filter-tap-level work.
+event. A valid nearest request performs one real texel fetch, whereas
+bilinear filtering performs four. A multisample `SMP` selects one stored
+sample, without filtering or resolving; an out-of-bounds decoded coordinate
+or sample index performs no memory read. Helper-lane requests may also be
+suppressed. The DrawList texture count therefore remains shader-level work;
+`texel_fetches` counts actual fetches. TCU access counters describe the legacy
+TCU FIFO path, not every texture access: the unified-memory path records its
+actual SLC/DRAM traffic, or direct-memory accesses in direct mode. They must
+not be inferred from `texel_fetches` in those modes.
 
 ### Vertex-input counter meanings
 

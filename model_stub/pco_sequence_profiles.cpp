@@ -459,6 +459,8 @@ bool DrawFixedFunctionStateMatches(const DriverCommand &command,
       command.bottom_edge_rule != 0 || command.clip_halfz != 0 ||
       command.depth_clip_near != 1 || command.depth_clip_far != 1 ||
       command.depth_clamp != 0 || command.sample_mask != UINT32_MAX ||
+      command.alpha_to_coverage != 0 || command.alpha_to_one != 0 ||
+      command.alpha_to_coverage_dither > 1 ||
       command.color_mask != spec.color_mask ||
       command.blend_enable != spec.blend_enable ||
       command.blend_rgb_equation != kBlendAdd ||

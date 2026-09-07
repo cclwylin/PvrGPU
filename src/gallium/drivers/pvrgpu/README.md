@@ -59,7 +59,17 @@ Current status:
   shader-depth tests through SystemC. Typed CPU clears/blits preserve native
   resource storage and materialize pending model output first. API v20 carries
   initial color/depth/stencil payloads and exact sample-count readback.
-- API v21 snapshots each draw's bound VS/FS uniform-buffer ranges independently
+- Graphics API v22 additionally snapshots alpha-to-coverage, ordered coverage
+  dithering and alpha-to-one per draw. Coverage is computed by the model from
+  the native fragment shader's DATA0 alpha before late per-sample depth/stencil
+  and color stores. The independent Compute API remains version 2.
+- Graphics API v23 adds sampled-image sample counts. Real PCO `SMP` selects
+  individual 2D/MS-array samples through the texture unit; integer, float and
+  depth transport preserves each sample without resolving. Native descriptor
+  queries, actual sample positions and depth-only attachment readback use the
+  same driver state. Sampled storage supports 1/2/4/8; render-only storage
+  retains 16. Restricted MS-array sampler views fail closed.
+- API v21 introduced snapshots of each draw's bound VS/FS uniform-buffer ranges independently
   from CB0 push constants. Native Mesa PCO descriptor lowering and LD/WDF
   execute against stage-local GPU-memory ranges; rebinding or updating a
   buffer cannot alter an earlier draw. The transport supports up to 15 blocks
@@ -88,8 +98,28 @@ Current status:
 - Phase 6 GLES2 uniform uploads are retained as Gallium constant-buffer state and one uniform-driven triangle is observable through `draw_uniform_triangles` counters.
 - Mesa's upload manager is initialized for state-tracker internal uploads, and resource release hooks are wired so teardown is clean.
 - narrow draw lowering/rasterization exists for the supported command profiles; all other draw shapes still record `unsupported_draw`.
+- Compute has a separate native PCO compiler and synchronous SystemC dispatch
+  API (compute version 2, graphics version 23). The current slice covers static
+  local sizes, direct grids, CB0/UBO/SSBO (up to vec16), scalar integer atomic32,
+  loops and system
+  values. A unique backing-BO snapshot preserves aliased binding views;
+  successful model DRAM readback updates only writable driver ranges. Native
+  shader work runs in `ComputeShader`, not the graphics USC modules. DMA
+  ADD/SUB/XCHG, signed/unsigned MIN/MAX and AND/OR/XOR execute through the CDM;
+  compare-swap executes PCO's native MUTEX/SR51/LD/ST sequence. Only DMA AMOs
+  increment the atomic instruction counter. Memory-only fences and execution
+  barriers within one 32-lane task are supported by the serial, lockstep path.
+  Shared/image memory, multi-task workgroup barriers, float/64-bit atomics and
+  indirect/variable dispatch remain explicitly rejected. OOB views fail closed;
+  this does not implement llvmpipe's robust zero/no-op behavior.
+  CAS normalizes the cloned NIR's coherent access bit. Residual sparse SSBO
+  store masks are rejected instead of overwriting unselected components.
+  The focused SSBO atomic (48) and atomic-counter (298) CTS cases are all Pass,
+  matching llvmpipe: 341 native dispatch cases plus five compile-negative tests.
+  Basic compute is 24/41 raw QPA Pass in full direct/bypass/cache runs, but only 22
+  have completed native dispatches; two zero-result cases remain unsupported.
 - Shader/texture forms beyond the implemented generic ISA and sampler contract,
-  EGL image import/export, compute, and asynchronous
+  EGL image import/export and asynchronous
   synchronization remain unsupported or separately unvalidated. Incomplete
   RDC replay's intermediate ordered stencil-clear capsule still does not
   express a partial write mask; the live path instead LOADs its already-masked

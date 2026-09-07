@@ -1,0 +1,32 @@
+Subject: [PATCH] pco: do not read a base level from STRIDE image state
+
+Applies to Mesa 26.2.1, commit
+da14d65e4499e66468094be52bff9ea0915a695e (third_party/mesa-pco.lock).
+
+IMAGE_WORD1 bits 60:63 encode baselevel, but STRIDE_IMAGE_WORD1 uses
+the same bits for num_mip_levels and has no baselevel field. Reading every
+descriptor as IMAGE_WORD1 made a one-level STRIDE texture report width
+and height shifted right by one, including native multisample size queries.
+
+Use the native IMAGE_WORD0.textype to distinguish these layouts. Explicit
+query LOD still applies to STRIDE textures; non-STRIDE baselevel behavior
+is unchanged. Preserve the real STRIDE descriptor and its mip count.
+
+Apply the same patch to both PvrGPU and llvmpipe Mesa source trees for A/B.
+The original Imagination Technologies copyright and MIT notice are retained.
+This changes native compiler lowering, not CTS, the ISS, or runtime answers.
+
+diff --git a/src/imagination/pco/usclib/tex.cl b/src/imagination/pco/usclib/tex.cl
+--- a/src/imagination/pco/usclib/tex.cl
++++ b/src/imagination/pco/usclib/tex.cl
+@@ -71,7 +71,9 @@ usclib_tex_state_size(uint4 tex_state, uint num_comps, enum glsl_sampler_dim dim, bool is_array, bool is_image, uint lod)
+    ROGUE_TEXSTATE_IMAGE_WORD0_unpack(texstate_image_word0, &texstate_image_struct0);
+    ROGUE_TEXSTATE_IMAGE_WORD1_unpack(texstate_image_word1, &texstate_image_struct1);
+ 
+-   lod += texstate_image_struct1.baselevel;
++   /* STRIDE_IMAGE_WORD1 has num_mip_levels here, not baselevel. */
++   if (texstate_image_struct0.textype != ROGUE_TEXSTATE_TEXTYPE_STRIDE)
++      lod += texstate_image_struct1.baselevel;
+ 
+    uint3 size_comps = (uint3)(texstate_image_struct0.width + 1,
+                               texstate_image_struct0.height + 1,

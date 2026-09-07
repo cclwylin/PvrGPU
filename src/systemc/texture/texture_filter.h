@@ -32,6 +32,7 @@ struct RogueTextureImageDescriptor {
   std::uint32_t height = 0;
   std::uint32_t row_pitch_bytes = 0;
   std::uint8_t mip_count = 0;
+  std::uint8_t sample_count = 1;
   TextureFormat format = TextureFormat::kRgba8Unorm;
   TextureLayout layout = TextureLayout::kLinear;
 };

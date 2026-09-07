@@ -8,6 +8,9 @@
 
 namespace pvrgpu::stub {
 
+struct ModelComputeDispatch;
+struct ModelComputeStats;
+
 bool ConfigureDriverCommandOptions(Options *options, std::string *error);
 
 /*
@@ -50,6 +53,11 @@ struct ModelFramebuffer {
  */
 int RunConfiguredModel(Options options,
                        ModelFramebuffer *framebuffer = nullptr);
+
+// Compute uses the same elaborated memory/session, with its own CDM and
+// ComputeShader modules. Writable raw resources are published on success.
+int RunConfiguredCompute(ModelComputeDispatch *dispatch,
+                          ModelComputeStats *stats, std::string *error);
 
 /*
  * End the simulation.  `sc_stop()` is one-way: after it no further flush will

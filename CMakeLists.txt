@@ -69,7 +69,15 @@ pvrgpu_target_warnings(pvrgpu-memory-core)
 # The archive is pulled only into executables that reference its symbols.
 link_libraries(pvrgpu-memory-core)
 
+set(PVRGPU_RESERVED_SHADER_STAGE_SOURCES
+    src/systemc/shader/geometry_shader.cpp
+    src/systemc/shader/tessellation_control_shader.cpp
+    src/systemc/geometry/tessellator.cpp
+    src/systemc/shader/tessellation_evaluation_shader.cpp
+)
+
 add_executable(pvrgpu-model-stub
+    ${PVRGPU_RESERVED_SHADER_STAGE_SOURCES}
     model_stub/driver_command.cpp
     model_stub/json_reporter.cpp
     model_stub/memory_pool.cpp
@@ -113,6 +121,8 @@ add_executable(pvrgpu-model-stub
     src/systemc/pds/pds_engine.cpp
     src/systemc/pds/vertex_pds_engine.cpp
     src/systemc/shader/pco_decoder.cpp
+    src/systemc/shader/compute_shader.cpp
+    src/systemc/shader/compute_iss.cpp
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp
     src/systemc/shader/usc_slot.cpp
@@ -132,6 +142,7 @@ target_link_libraries(pvrgpu-model-stub PRIVATE
 pvrgpu_target_warnings(pvrgpu-model-stub)
 
 add_library(pvrgpu-systemc-bridge SHARED
+    ${PVRGPU_RESERVED_SHADER_STAGE_SOURCES}
     model_stub/driver_command.cpp
     model_stub/json_reporter.cpp
     model_stub/memory_pool.cpp
@@ -176,6 +187,8 @@ add_library(pvrgpu-systemc-bridge SHARED
     src/systemc/pds/pds_engine.cpp
     src/systemc/pds/vertex_pds_engine.cpp
     src/systemc/shader/pco_decoder.cpp
+    src/systemc/shader/compute_shader.cpp
+    src/systemc/shader/compute_iss.cpp
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp
     src/systemc/shader/usc_slot.cpp
@@ -361,6 +374,17 @@ target_include_directories(pco-iss-test PRIVATE
 pvrgpu_target_warnings(pco-iss-test)
 add_test(NAME pco-iss-unit COMMAND pco-iss-test)
 
+add_executable(pco-multisample-texture-test
+    tests/pco_multisample_texture_test.cpp
+    src/systemc/shader/pco_iss.cpp
+)
+target_include_directories(pco-multisample-texture-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(pco-multisample-texture-test)
+add_test(NAME pco-multisample-texture-unit COMMAND pco-multisample-texture-test)
+
 add_executable(pco-sequence-profiles-test
     tests/pco_sequence_profiles_test.cpp
     model_stub/pco_sequence_profiles.cpp
@@ -418,6 +442,19 @@ target_link_libraries(systemc-readback-flush-test PRIVATE
 )
 pvrgpu_target_warnings(systemc-readback-flush-test)
 add_test(NAME systemc-readback-flush-unit COMMAND systemc-readback-flush-test)
+add_test(NAME systemc-compute-first-interleave-unit
+    COMMAND systemc-readback-flush-test compute-first)
+
+add_executable(shader-stage-placeholders-test
+    tests/shader_stage_placeholders_test.cpp
+    ${PVRGPU_RESERVED_SHADER_STAGE_SOURCES}
+)
+target_include_directories(shader-stage-placeholders-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(shader-stage-placeholders-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(shader-stage-placeholders-test)
+add_test(NAME shader-stage-placeholders-unit COMMAND shader-stage-placeholders-test)
 
 add_executable(pco-systemc-api-bridge-test
     tests/pco_systemc_api_bridge_test.cpp
@@ -433,6 +470,77 @@ target_link_libraries(pco-systemc-api-bridge-test PRIVATE
 )
 pvrgpu_target_warnings(pco-systemc-api-bridge-test)
 add_test(NAME pco-systemc-api-bridge-unit COMMAND pco-systemc-api-bridge-test)
+
+add_executable(compute-systemc-api-test tests/compute_systemc_api_test.cpp)
+target_include_directories(compute-systemc-api-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu"
+)
+target_link_libraries(compute-systemc-api-test PRIVATE pvrgpu-systemc-bridge)
+pvrgpu_target_warnings(compute-systemc-api-test)
+foreach(compute_memory_mode RANGE 0 2)
+    add_test(NAME compute-systemc-api-mode-${compute_memory_mode}
+        COMMAND compute-systemc-api-test ${compute_memory_mode})
+endforeach()
+
+add_executable(pco-compute-decode-test
+    tests/pco_compute_decode_test.cpp
+    src/systemc/shader/pco_iss.cpp
+)
+target_include_directories(pco-compute-decode-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(pco-compute-decode-test)
+add_test(NAME pco-compute-decode-unit COMMAND pco-compute-decode-test)
+
+add_executable(pco-compute-alu-test
+    tests/pco_compute_alu_test.cpp
+    src/systemc/shader/pco_iss.cpp
+)
+target_include_directories(pco-compute-alu-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(pco-compute-alu-test)
+add_test(NAME pco-compute-alu-unit COMMAND pco-compute-alu-test)
+
+add_executable(pco-compute-add64-test
+    tests/pco_compute_add64_test.cpp
+    src/systemc/shader/pco_iss.cpp
+    src/systemc/shader/compute_iss.cpp
+)
+target_include_directories(pco-compute-add64-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(pco-compute-add64-test PRIVATE pvrgpu-memory-core)
+pvrgpu_target_warnings(pco-compute-add64-test)
+add_test(NAME pco-compute-add64-unit COMMAND pco-compute-add64-test)
+
+add_executable(compute-shader-fifo-test
+    tests/compute_shader_fifo_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/data_master/compute_data_master.cpp
+    src/systemc/shader/compute_shader.cpp
+    src/systemc/shader/compute_iss.cpp
+    src/systemc/shader/pco_iss.cpp
+)
+target_include_directories(compute-shader-fifo-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(compute-shader-fifo-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(compute-shader-fifo-test)
+foreach(compute_memory_mode RANGE 0 2)
+    add_test(NAME compute-shader-fifo-mode-${compute_memory_mode}
+        COMMAND compute-shader-fifo-test ${compute_memory_mode})
+endforeach()
 
 add_executable(pco-sequence-integer-load-test
     tests/pco_sequence_integer_load_test.cpp
@@ -548,6 +656,25 @@ target_link_libraries(texture-unit-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(texture-unit-test)
 add_test(NAME texture-unit-unit COMMAND texture-unit-test)
 
+add_executable(texture-multisample-test
+    tests/texture_multisample_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/texture/astc_decoder.cpp
+    src/systemc/texture/texture_filter.cpp
+    src/systemc/texture/texture_unit.cpp
+)
+target_include_directories(texture-multisample-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(texture-multisample-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(texture-multisample-test)
+add_test(NAME texture-multisample-unit COMMAND texture-multisample-test)
+
 add_executable(astc-decoder-test
     tests/astc_decoder_test.cpp
     src/systemc/texture/astc_decoder.cpp
@@ -604,6 +731,8 @@ add_executable(usc-cluster-texture-continuation-test
     src/systemc/common/pipeline_state.cpp
     src/systemc/shader/pco_iss.cpp
     src/systemc/shader/usc_cluster.cpp
+    src/systemc/pds/pds_engine.cpp
+    src/systemc/shader/usc_slot.cpp
 )
 target_include_directories(usc-cluster-texture-continuation-test PRIVATE
     "${CMAKE_SOURCE_DIR}/model_stub"

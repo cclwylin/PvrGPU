@@ -53,6 +53,50 @@ struct pvrgpu_pco_owned_binary {
    struct pvrgpu_pco_stage_abi abi;
 };
 
+/* Compute has its own transport contract; it is never a graphics stage.
+ * LOCAL_INVOCATION_INDEX uses VTXIN. WORKGROUP_ID and NUM_WORKGROUPS use
+ * COEFF, as in Mesa's public PDS compute ABI. All other IDs are shader ALU.
+ * Shared registers contain UBO descriptors, SSBO descriptors, then CB0.
+ * Descriptor words are baseLo/baseHi/byteSize/dynamicByteOffset. */
+struct pvrgpu_pco_compute_abi {
+   struct pvrgpu_pco_stage_abi stage;
+   uint32_t local_size[3];
+   uint32_t local_invocation_index_start;
+   uint32_t local_invocation_index_count;
+   uint32_t workgroup_id_start;
+   uint32_t workgroup_id_count;
+   uint32_t num_workgroups_start;
+   uint32_t num_workgroups_count;
+   uint32_t storage_buffer_descriptor_start;
+   uint32_t storage_buffer_descriptor_count;
+   uint32_t uniform_buffer_used_mask;
+   uint32_t storage_buffer_used_mask;
+   uint32_t storage_buffer_read_mask;
+   uint32_t storage_buffer_write_mask;
+   uint32_t shared_memory_bytes;
+   uint32_t scratch_bytes;
+};
+
+struct pvrgpu_pco_compute_binary {
+   uint8_t *data;
+   size_t size;
+   struct pvrgpu_pco_compute_abi abi;
+};
+
+/* Input NIR is cloned. A successful caller owns data until finish(). The
+ * initial native subset accepts static workgroups, IDs, CB0 and 32-bit
+ * UBO/SSBO accesses with static bindings and runtime byte offsets. Unsupported
+ * image, shared, atomic and barrier operations fail before PCO lowering. */
+bool pvrgpu_pco_compile_compute(
+   struct pvrgpu_pco_compiler *compiler,
+   const struct nir_shader *compute_nir,
+   unsigned uniform_dwords,
+   struct pvrgpu_pco_compute_binary *out,
+   char *error,
+   size_t error_size);
+
+void pvrgpu_pco_compute_binary_finish(struct pvrgpu_pco_compute_binary *binary);
+
 struct pvrgpu_pco_graphics_binary {
    struct pvrgpu_pco_owned_binary vertex;
    struct pvrgpu_pco_owned_binary fragment;
@@ -307,6 +351,11 @@ bool pvrgpu_pco_build_terrain_texture_descriptor(
    unsigned max_lod_u4_6,
    unsigned layers,
    unsigned wrap_w);
+
+/* Rogue IMAGE_WORD0 SMPCNT is log2(samples), exactly two bits. The image
+ * extent and stride remain logical texels; storage is pixel-interleaved. */
+bool pvrgpu_pco_set_texture_sample_count(
+   uint32_t out[PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS], unsigned sample_count);
 
 /* Compile one of the four shader pairs used by the 180-draw GLMark2 ideas
  * capture.  The simple profiles consume one float4 attribute and 32 VS

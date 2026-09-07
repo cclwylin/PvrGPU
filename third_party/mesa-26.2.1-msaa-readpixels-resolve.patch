@@ -1,0 +1,105 @@
+Subject: [PATCH] mesa: resolve multisampled renderbuffers before CPU reads
+
+Applies to Mesa 26.2.1, commit
+da14d65e4499e66468094be52bff9ea0915a695e (third_party/mesa-pco.lock).
+
+st_ReadPixels can reach _mesa_readpixels because the driver does not prefer
+blit-based transfers, the client format already matches the renderbuffer,
+GL_DEPTH_STENCIL is requested, or software pixel conversion is needed.
+All these paths use _mesa_map_renderbuffer. Directly texture-mapping a
+multisampled resource there reads one sample, not the resolved framebuffer.
+The same failure is observable with both llvmpipe and PvrGPU through the
+surfaceless default framebuffer; changing a performance preference does
+not fix the other fallback paths.
+
+For a read-only mapping of actual multisampled storage, blit the requested
+level/layer/rectangle into a private single-sample staging resource before
+mapping it. Keep the existing software format conversion, pixel-store/PBO
+packing and inverted row-stride behavior. Derive the blit mask with
+util_format_get_mask, which returns PIPE_MASK_RGBA/Z/S/ZS as appropriate.
+Use the linear format view already used by st_ReadPixels and readpix.c for
+sRGB encoded readback; this is not a claim that all GLES sRGB resolve
+requirements have independently been verified.
+
+Single-sample and writable mappings retain their original behavior. Do not
+change Gallium's texture_map contract or either driver's sample limits.
+On allocation/map failure return NULL, allowing the existing caller to
+report GL_OUT_OF_MEMORY instead of silently reading sample zero. A successful
+pipe transfer owns the mapped resource reference until texture_unmap, so
+no gl_renderbuffer ABI or persistent staging/cache fields are required.
+
+diff --git a/src/mesa/main/renderbuffer.c b/src/mesa/main/renderbuffer.c
+--- a/src/mesa/main/renderbuffer.c
++++ b/src/mesa/main/renderbuffer.c
+@@ -33,6 +33,7 @@
+ #include "glformats.h"
+ #include "mtypes.h"
+ #include "renderbuffer.h"
++#include "util/format/u_format.h"
+ #include "util/u_memory.h"
+ #include "util/u_inlines.h"
+ 
+@@ -485,11 +486,60 @@ _mesa_map_renderbuffer(struct gl_context *ctx,
+       y2 = y;
+ 
+    _mesa_update_renderbuffer_surface(ctx, rb);
++   struct pipe_resource *texture = rb->texture;
++   struct pipe_resource *staging = NULL;
++   unsigned level = rb->surface.level;
++   unsigned layer = rb->surface.first_layer;
++
++   if (texture->nr_samples > 1 &&
++       (mode & GL_MAP_READ_BIT) && !(mode & GL_MAP_WRITE_BIT)) {
++      struct pipe_resource templ = {0};
++      struct pipe_blit_info blit = {0};
++
++      /* The slow ReadPixels paths still require a real resolve. Preserve the
++       * existing encoded sRGB readback semantics by using a linear view. */
++      templ.target = texture->target;
++      templ.format = util_format_linear(rb->Format);
++      templ.width0 = w;
++      templ.height0 = h;
++      templ.depth0 = 1;
++      templ.array_size = 1;
++      templ.usage = PIPE_USAGE_STAGING;
++      templ.bind = util_format_is_depth_or_stencil(templ.format) ?
++         PIPE_BIND_DEPTH_STENCIL : PIPE_BIND_RENDER_TARGET;
++      staging = pipe->screen->resource_create(pipe->screen, &templ);
++      if (!staging) {
++         *mapOut = NULL;
++         *rowStrideOut = 0;
++         return;
++      }
++
++      blit.src.resource = texture;
++      blit.src.level = level;
++      blit.src.format = templ.format;
++      blit.src.box.x = x;
++      blit.src.box.y = y2;
++      blit.src.box.z = layer;
++      blit.src.box.width = blit.dst.box.width = w;
++      blit.src.box.height = blit.dst.box.height = h;
++      blit.src.box.depth = blit.dst.box.depth = 1;
++      blit.dst.resource = staging;
++      blit.dst.format = templ.format;
++      blit.mask = util_format_get_mask(templ.format);
++      blit.filter = PIPE_TEX_FILTER_NEAREST;
++      pipe->blit(pipe, &blit);
++
++      texture = staging;
++      level = layer = 0;
++      x = y2 = 0;
++   }
++
+    map = pipe_texture_map(pipe,
+-                           rb->texture,
+-                           rb->surface.level,
+-                           rb->surface.first_layer,
++                           texture, level, layer,
+                            transfer_flags, x, y2, w, h, &rb->transfer);
++   /* A successful transfer holds its own reference until unmap. On failure
++    * this drops the staging resource immediately, without leaking it. */
++   pipe_resource_reference(&staging, NULL);
+    if (map) {
+       if (invert) {
+          *rowStrideOut = -(int) rb->transfer->stride;

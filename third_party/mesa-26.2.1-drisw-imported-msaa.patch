@@ -1,0 +1,122 @@
+Subject: [PATCH] drisw: allocate private attachments for imported images
+
+Applies to Mesa 26.2.1, commit
+da14d65e4499e66468094be52bff9ea0915a695e (third_party/mesa-pco.lock).
+
+The surfaceless EGL swrast loader supplies an image-loader extension as
+well as the swrast loader. Its pbuffer image is intentionally single
+sampled. drisw_allocate_textures imported this image but skipped its
+non-import allocation loop, which was the only place allocating private
+MSAA and depth/stencil resources. dri_st_framebuffer_validate then selected
+the empty msaa_textures array for a multisampled visual while returning the
+single-sample image as the resolve target. Both llvmpipe and PvrGPU therefore
+received an empty default framebuffer despite GL_SAMPLES reporting four.
+
+Follow the private-attachment lifecycle in this same Mesa revision's
+dri2_allocate_textures: keep imported display images single sampled,
+allocate only requested private color/depth/stencil attachments, and seed
+new MSAA color resources once from the corresponding imported image.
+Compatible private resources survive validation and image replacement;
+their rendered samples must not be overwritten on every getBuffers call.
+Allocation failure leaves the attachment absent and never invokes a blit
+with a NULL resource. The imported image dimensions must be known before
+resize invalidation, including before the first private allocation.
+
+This changes the common swrast frontend, not either rendering backend,
+sample capabilities, test selection, or image-comparison policy. It does
+not alter the existing non-image-loader path. The upstream copyright and
+license notices in drisw.c and dri2.c remain applicable and unchanged.
+
+diff --git a/src/gallium/frontends/dri/drisw.c b/src/gallium/frontends/dri/drisw.c
+--- a/src/gallium/frontends/dri/drisw.c
++++ b/src/gallium/frontends/dri/drisw.c
+@@ -409,6 +409,25 @@ drisw_allocate_textures(struct dri_context *stctx,
+          imported_buffers = false;
+    }
+ 
++   /* Image loaders can supply a new size without updating drawable geometry.
++    * Use it before invalidating private attachments or recording old_w/h. */
++   if (imported_buffers && image) {
++      struct pipe_resource *texture = NULL;
++
++      if (images.image_mask & __DRI_IMAGE_BUFFER_FRONT)
++         texture = images.front->texture;
++      if (images.image_mask & __DRI_IMAGE_BUFFER_BACK)
++         texture = images.back->texture;
++      if (images.image_mask & __DRI_IMAGE_BUFFER_SHARED)
++         texture = images.back->texture;
++
++      /* Front and back images, when both supplied, have the same size. */
++      if (texture) {
++         drawable->w = texture->width0;
++         drawable->h = texture->height0;
++      }
++   }
++
+    width  = drawable->w;
+    height = drawable->h;
+ 
+@@ -473,6 +492,63 @@ drisw_allocate_textures(struct dri_context *stctx,
+        */
+       templ.width0 = drawable->w;
+       templ.height0 = drawable->h;
++
++      /* Imported images are the single-sample presentation/resolve targets.
++       * Allocate the requested private attachments independently, as dri2
++       * does, without replacing compatible retained MSAA sample storage. */
++      for (i = 0; i < count; i++) {
++         enum st_attachment_type statt = statts[i];
++         struct pipe_resource *texture = drawable->textures[statt];
++         struct pipe_resource **buf;
++         bool initialize_color = false;
++
++         if (statt == ST_ATTACHMENT_DEPTH_STENCIL) {
++            enum pipe_format format;
++            unsigned bind;
++
++            dri_drawable_get_format(drawable, statt, &format, &bind);
++            if (format == PIPE_FORMAT_NONE)
++               continue;
++
++            templ.format = format;
++            templ.bind = bind & ~PIPE_BIND_SHARED;
++            buf = drawable->stvis.samples > 1 ?
++               &drawable->msaa_textures[statt] : &drawable->textures[statt];
++         } else if (drawable->stvis.samples > 1) {
++            buf = &drawable->msaa_textures[statt];
++            if (!texture) {
++               pipe_resource_reference(buf, NULL);
++               continue;
++            }
++
++            templ.format = texture->format;
++            templ.bind = texture->bind &
++               (PIPE_BIND_RENDER_TARGET | PIPE_BIND_BLENDABLE |
++                PIPE_BIND_SAMPLER_VIEW);
++            initialize_color = true;
++         } else {
++            continue;
++         }
++
++         templ.nr_samples = drawable->stvis.samples > 1 ?
++            drawable->stvis.samples : 0;
++         templ.nr_storage_samples = templ.nr_samples;
++
++         if (*buf && ((*buf)->width0 != templ.width0 ||
++                      (*buf)->height0 != templ.height0 ||
++                      (*buf)->format != templ.format ||
++                      (*buf)->nr_samples != templ.nr_samples ||
++                      (*buf)->nr_storage_samples != templ.nr_storage_samples))
++            pipe_resource_reference(buf, NULL);
++
++         if (*buf)
++            continue;
++
++         *buf = screen->base.screen->resource_create(screen->base.screen,
++                                                       &templ);
++         if (*buf && initialize_color)
++            dri_pipe_blit(stctx->st->pipe, *buf, texture);
++      }
+    } else {
+       for (i = 0; i < count; i++) {
+          enum pipe_format format;

@@ -28,7 +28,10 @@ test_resource_2d(enum pipe_format format, unsigned width, unsigned height,
    resource.base.array_size = 1;
    resource.base.nr_samples = samples;
    resource.base.nr_storage_samples = samples;
-   resource.base.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
+   resource.base.bind = PIPE_BIND_RENDER_TARGET;
+   /* 16 samples 僅供 render/resolve，不能宣告不可編碼的 sampler view。 */
+   if (samples <= 8)
+      resource.base.bind |= PIPE_BIND_SAMPLER_VIEW;
    CHECK(pvrgpu_init_resource_storage(&resource));
    return resource;
 }
@@ -158,6 +161,169 @@ test_sample_copy_and_mask(void)
    CHECK(!pvrgpu_can_blit_as_texture_region(&info));
    FREE(src.data);
    FREE(dst.data);
+}
+
+static double
+test_srgb_decode(uint8_t value)
+{
+   const double encoded = (double)value / 255.0;
+   return encoded <= 0.04045 ? encoded / 12.92 :
+                              pow((encoded + 0.055) / 1.055, 2.4);
+}
+
+static void
+test_srgb_resolve(void)
+{
+   /* RGB must be unpacked to linear light before the MSAA average, and only
+    * encoded after it. Alpha remains linear in both source and destination.
+    * Midtone inputs also distinguish decode-before-average from byte math. */
+   const uint8_t pairs[2][2][4] = {
+      {{0, 255, 0, 0}, {255, 0, 255, 255}},
+      {{0, 64, 128, 0}, {128, 255, 255, 255}},
+   };
+   const uint8_t expected_encoded[2][4] = {
+      {188, 188, 188, 128}, {92, 192, 205, 128},
+   };
+   for (unsigned samples = 2; samples <= 16; samples *= 2) {
+      struct pvrgpu_resource src =
+         test_resource(PIPE_FORMAT_R8G8B8A8_SRGB, 1, samples);
+      struct pvrgpu_resource linear =
+         test_resource(PIPE_FORMAT_R32G32B32A32_FLOAT, 1, 1);
+      struct pvrgpu_resource encoded =
+         test_resource(PIPE_FORMAT_R8G8B8A8_SRGB, 1, 1);
+      for (unsigned pair = 0; pair < ARRAY_SIZE(pairs); ++pair) {
+         for (unsigned sample = 0; sample < samples; ++sample)
+            memcpy(src.data + sample * 4, pairs[pair][sample % 2], 4);
+
+         struct pipe_blit_info info = test_blit(&src, &linear);
+         CHECK(pvrgpu_can_blit_as_texture_region(&info));
+         CHECK(pvrgpu_blit_texture_region_unchecked(&info));
+         for (unsigned channel = 0; channel < 3; ++channel) {
+            const double expected =
+               (test_srgb_decode(pairs[pair][0][channel]) +
+                test_srgb_decode(pairs[pair][1][channel])) * 0.5;
+            CHECK(fabs((double)((float *)linear.data)[channel] - expected) <
+                  0.000001);
+         }
+         CHECK(((float *)linear.data)[3] == 0.5f);
+
+         info = test_blit(&src, &encoded);
+         CHECK(pvrgpu_can_blit_as_texture_region(&info));
+         CHECK(pvrgpu_blit_texture_region_unchecked(&info));
+         CHECK(memcmp(encoded.data, expected_encoded[pair], 4) == 0);
+
+         info.sample0_only = true;
+         CHECK(pvrgpu_can_blit_as_texture_region(&info));
+         CHECK(pvrgpu_blit_texture_region_unchecked(&info));
+         CHECK(memcmp(encoded.data, pairs[pair][0], 4) == 0);
+      }
+      FREE(src.data);
+      FREE(linear.data);
+      FREE(encoded.data);
+   }
+}
+
+static void
+test_bilinear_resolve(void)
+{
+   /* Mesa's util_make_fs_msaa_resolve_bilinear averages every sample at each
+    * of four texels before interpolation. Distinct, signed per-sample offsets
+    * make sample-zero copying observably different from the true result. */
+   for (unsigned samples = 2; samples <= 16; samples *= 2) {
+      struct pvrgpu_resource src =
+         test_resource_2d(PIPE_FORMAT_R32_FLOAT, 2, 2, samples);
+      struct pvrgpu_resource dst =
+         test_resource_2d(PIPE_FORMAT_R32_FLOAT, 3, 3, 1);
+      for (unsigned y = 0; y < 2; ++y)
+         for (unsigned x = 0; x < 2; ++x)
+            for (unsigned sample = 0; sample < samples; ++sample)
+               ((float *)src.data)[(y * 2 + x) * samples + sample] =
+                  -8.0f + 16.0f * x + 32.0f * y +
+                  (float)sample - (float)(samples - 1) * 0.5f;
+      for (unsigned flip = 0; flip < 2; ++flip) {
+         struct pipe_blit_info info = test_blit(&src, &dst);
+         info.src.box.x = info.src.box.y = flip ? 2 : 0;
+         info.src.box.width = info.src.box.height = flip ? -2 : 2;
+         info.dst.box.height = 3;
+         info.filter = PIPE_TEX_FILTER_LINEAR;
+         CHECK(pvrgpu_can_blit_as_texture_region(&info));
+         CHECK(pvrgpu_blit_texture_region_unchecked(&info));
+         for (unsigned y = 0; y < 3; ++y) {
+            for (unsigned x = 0; x < 3; ++x) {
+               const float tx = (float)(flip ? 2 - x : x) * 0.5f;
+               const float ty = (float)(flip ? 2 - y : y) * 0.5f;
+               const float expected = -8.0f + 16.0f * tx + 32.0f * ty;
+               CHECK(fabsf(((float *)dst.data)[y * 3 + x] - expected) <
+                     0.00001f);
+            }
+         }
+      }
+      FREE(src.data);
+      FREE(dst.data);
+   }
+}
+
+static void
+test_signed_integer_resolve_and_mask(void)
+{
+   const int32_t original[2][4] = {
+      {INT32_MIN, INT32_MAX, -16777217, 16777217},
+      {-1, -123456789, 123456789, 0},
+   };
+   const int32_t preserved[4] = {INT32_MAX - 1, INT32_MIN + 1, -42, 42};
+   for (unsigned samples = 2; samples <= 16; samples *= 2) {
+      struct pvrgpu_resource src =
+         test_resource(PIPE_FORMAT_R32G32B32A32_SINT, 2, samples);
+      struct pvrgpu_resource dst =
+         test_resource(PIPE_FORMAT_R32G32B32A32_SINT, 2, 1);
+      struct pvrgpu_resource copied =
+         test_resource(PIPE_FORMAT_R32G32B32A32_SINT, 2, samples);
+      for (unsigned pixel = 0; pixel < 2; ++pixel) {
+         for (unsigned sample = 0; sample < samples; ++sample) {
+            int32_t *value = (int32_t *)src.data +
+                             (pixel * samples + sample) * 4;
+            for (unsigned channel = 0; channel < 4; ++channel)
+               value[channel] = sample == 0 ? original[pixel][channel] :
+                  -(int32_t)(100 * pixel + 10 * sample + channel);
+            memcpy((int32_t *)copied.data + (pixel * samples + sample) * 4,
+                   preserved, sizeof(preserved));
+         }
+      }
+      struct pipe_blit_info info = test_blit(&src, &dst);
+      CHECK(pvrgpu_can_blit_as_texture_region(&info));
+      CHECK(pvrgpu_blit_texture_region_unchecked(&info));
+      CHECK(memcmp(dst.data, original, sizeof(original)) == 0);
+
+      for (unsigned pixel = 0; pixel < 2; ++pixel)
+         memcpy((int32_t *)dst.data + pixel * 4, preserved, sizeof(preserved));
+      info.mask = PIPE_MASK_R | PIPE_MASK_B;
+      CHECK(pvrgpu_can_blit_as_texture_region(&info));
+      CHECK(pvrgpu_blit_texture_region_unchecked(&info));
+      for (unsigned pixel = 0; pixel < 2; ++pixel)
+         for (unsigned channel = 0; channel < 4; ++channel)
+            CHECK(((int32_t *)dst.data)[pixel * 4 + channel] ==
+                  (channel % 2 == 0 ? original[pixel][channel] :
+                                     preserved[channel]));
+
+      info = test_blit(&src, &copied);
+      info.mask = PIPE_MASK_R | PIPE_MASK_B;
+      info.dst_sample = samples; /* Gallium uses one-based selected samples. */
+      CHECK(pvrgpu_can_blit_as_texture_region(&info));
+      CHECK(pvrgpu_blit_texture_region_unchecked(&info));
+      for (unsigned pixel = 0; pixel < 2; ++pixel)
+         for (unsigned sample = 0; sample < samples; ++sample)
+            for (unsigned channel = 0; channel < 4; ++channel) {
+               const size_t index = (pixel * samples + sample) * 4 + channel;
+               CHECK(((int32_t *)copied.data)[index] ==
+                     (sample == samples - 1 && channel % 2 == 0 ?
+                        ((int32_t *)src.data)[index] : preserved[channel]));
+            }
+      info.filter = PIPE_TEX_FILTER_LINEAR;
+      CHECK(!pvrgpu_can_blit_as_texture_region(&info));
+      FREE(src.data);
+      FREE(dst.data);
+      FREE(copied.data);
+   }
 }
 
 static void
@@ -336,17 +502,274 @@ test_clipped_color_transform(void)
    FREE(dst.data);
 }
 
+static void
+test_msaa_sample0_map(void)
+{
+   const enum pipe_format formats[] = {PIPE_FORMAT_R8_UNORM,
+      PIPE_FORMAT_B8G8R8A8_UNORM, PIPE_FORMAT_R32_UINT,
+      PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_Z24_UNORM_S8_UINT,
+      PIPE_FORMAT_Z32_FLOAT_S8X24_UINT};
+   const unsigned usages[] = {PIPE_MAP_READ, PIPE_MAP_WRITE,
+      PIPE_MAP_READ | PIPE_MAP_WRITE, PIPE_MAP_WRITE | PIPE_MAP_DISCARD_RANGE,
+      PIPE_MAP_WRITE | PIPE_MAP_DISCARD_WHOLE_RESOURCE,
+      PIPE_MAP_WRITE | PIPE_MAP_FLUSH_EXPLICIT,
+      PIPE_MAP_WRITE | PIPE_MAP_DISCARD_RANGE | PIPE_MAP_FLUSH_EXPLICIT};
+   for (unsigned f = 0; f < ARRAY_SIZE(formats); ++f)
+      for (unsigned samples = 2; samples <= 16; samples *= 2) {
+         struct pvrgpu_resource resource = {0};
+         resource.base.target = PIPE_TEXTURE_2D_ARRAY;
+         resource.base.format = formats[f];
+         resource.base.width0 = 16;
+         resource.base.height0 = 8;
+         resource.base.depth0 = 1;
+         resource.base.array_size = 3;
+         resource.base.last_level = 2;
+         resource.base.nr_samples = resource.base.nr_storage_samples = samples;
+         CHECK(pvrgpu_init_resource_storage(&resource));
+         uint8_t *expected = malloc(resource.size);
+         CHECK(expected != NULL);
+         const unsigned bpp = util_format_get_blocksize(formats[f]);
+         for (unsigned u = 0; u < ARRAY_SIZE(usages); ++u) {
+            for (size_t i = 0; i < resource.size; ++i)
+               resource.data[i] = (uint8_t)((i * 37U) ^ (i >> 8));
+            memcpy(expected, resource.data, resource.size);
+            struct pvrgpu_transfer transfer = {0};
+            transfer.base.resource = &resource.base;
+            transfer.base.level = 1;
+            transfer.base.box = (struct pipe_box){.x = 3, .y = 1, .z = 1,
+               .width = 4, .height = 2, .depth = 2};
+            transfer.base.usage = usages[u];
+            uint8_t *mapped = pvrgpu_map_msaa_sample0(&transfer);
+            CHECK(mapped != NULL && mapped != resource.data);
+            if (!mapped)
+               exit(1);
+            CHECK(transfer.base.stride == 4U * bpp &&
+                  transfer.base.layer_stride == 8U * bpp &&
+                  transfer.sample0_staging_size == 16U * bpp);
+            for (unsigned z = 0; z < 2; ++z)
+               for (unsigned y = 0; y < 2; ++y)
+                  for (unsigned x = 0; x < 4; ++x) {
+                     const size_t physical = resource.level_offsets[1] +
+                        (z + 1U) * resource.level_layer_strides[1] +
+                        (y + 1U) * resource.level_strides[1] +
+                        (x + 3U) * bpp * samples;
+                     const size_t packed = z * transfer.base.layer_stride +
+                        y * transfer.base.stride + x * bpp;
+                     CHECK(memcmp(mapped + packed, resource.data + physical, bpp) == 0);
+                  }
+            const size_t physical = resource.level_offsets[1] +
+               2U * resource.level_layer_strides[1] +
+               2U * resource.level_strides[1] + 5U * bpp * samples;
+            const size_t packed = transfer.base.layer_stride + transfer.base.stride + 2U * bpp;
+            memset(mapped + packed, 0x61, bpp);
+            if (usages[u] & PIPE_MAP_WRITE)
+               memset(expected + physical, 0x61, bpp);
+            if (usages[u] & PIPE_MAP_FLUSH_EXPLICIT) {
+               // Regions are relative to the map, not the resource origin.
+               const struct pipe_box region = {.x = 2, .y = 1, .z = 1,
+                  .width = 1, .height = 1, .depth = 1};
+               pvrgpu_transfer_flush_region(NULL, &transfer.base, &region);
+               CHECK(memcmp(resource.data, expected, resource.size) == 0);
+               // Unflushed changes, including edits after an explicit flush,
+               // must not be silently committed when the map is released.
+               memset(mapped, 0xcc, transfer.sample0_staging_size);
+               const struct pipe_box bad[] = {
+                  {.x = -1, .width = 1, .height = 1, .depth = 1},
+                  {.width = 5, .height = 1, .depth = 1},
+                  {.y = 2, .width = 1, .height = 1, .depth = 1},
+                  {.z = 2, .width = 1, .height = 1, .depth = 1},
+                  {.width = 1, .height = 0, .depth = 1},
+                  {.x = INT_MAX, .width = INT_MAX, .height = 1, .depth = 1}};
+               for (unsigned i = 0; i < ARRAY_SIZE(bad); ++i)
+                  CHECK(!pvrgpu_copy_msaa_sample0(&transfer, &bad[i], true));
+            }
+            pvrgpu_unmap_msaa_sample0(&transfer);
+            CHECK(!transfer.sample0_staging && transfer.sample0_staging_size == 0);
+            CHECK(memcmp(resource.data, expected, resource.size) == 0);
+            // Double cleanup is harmless; map lifetimes own their staging.
+            pvrgpu_unmap_msaa_sample0(&transfer);
+         }
+         for (unsigned flag = PIPE_MAP_DIRECTLY; flag <= PIPE_MAP_COHERENT; flag <<= 1) {
+            if (flag != PIPE_MAP_DIRECTLY && flag != PIPE_MAP_PERSISTENT &&
+                flag != PIPE_MAP_COHERENT)
+               continue;
+            struct pvrgpu_transfer transfer = {0};
+            transfer.base.resource = &resource.base;
+            transfer.base.box = (struct pipe_box){.width = 1, .height = 1, .depth = 1};
+            transfer.base.usage = PIPE_MAP_WRITE | flag;
+            CHECK(!pvrgpu_map_msaa_sample0(&transfer) && !transfer.sample0_staging);
+         }
+         struct pvrgpu_transfer transfer = {0};
+         transfer.base.resource = &resource.base;
+         transfer.base.level = 1;
+         transfer.base.box = (struct pipe_box){.x = 3, .y = 1, .z = 1,
+            .width = 4, .height = 2, .depth = 2};
+         transfer.base.usage = PIPE_MAP_READ;
+         const uintptr_t old_offset = resource.level_offsets[1];
+         resource.level_offsets[1] = SIZE_MAX;
+         CHECK(!pvrgpu_map_msaa_sample0(&transfer) && !transfer.sample0_staging);
+         resource.level_offsets[1] = old_offset;
+         const uintptr_t old_layer_stride = resource.level_layer_strides[1];
+         resource.level_layer_strides[1] = SIZE_MAX;
+         CHECK(!pvrgpu_map_msaa_sample0(&transfer) && !transfer.sample0_staging);
+         resource.level_layer_strides[1] = old_layer_stride;
+         const unsigned old_stride = resource.level_strides[1];
+         resource.level_strides[1] = 1;
+         CHECK(!pvrgpu_map_msaa_sample0(&transfer) && !transfer.sample0_staging);
+         resource.level_strides[1] = old_stride;
+         for (unsigned level = 0; level < 3; ++level) {
+            const struct pipe_box box = {.x = 1,
+               .y = level == 2 ? 0 : 1, .z = 1,
+               .width = 3, .height = 2, .depth = 2};
+            const unsigned source_stride = box.width * bpp + 5U;
+            const size_t source_layer_stride = source_stride * box.height + 7U;
+            const size_t source_size = source_layer_stride * box.depth;
+            uint8_t *source = malloc(source_size);
+            CHECK(source != NULL);
+            for (unsigned mode = 0; mode < 3; ++mode) {
+               for (size_t i = 0; i < resource.size; ++i)
+                  resource.data[i] = (uint8_t)((i * 41U) ^ (i >> 9));
+               for (size_t i = 0; i < source_size; ++i)
+                  source[i] = (uint8_t)(0xa7U ^ (i * 59U));
+               memcpy(expected, resource.data, resource.size);
+               const unsigned flags = mode == 0 ? 0 : mode == 1 ?
+                  PIPE_MAP_DISCARD_RANGE : PIPE_MAP_FLUSH_EXPLICIT;
+               for (unsigned z = 0; z < (unsigned)box.depth; ++z)
+                  for (unsigned y = 0; y < (unsigned)box.height; ++y)
+                     for (unsigned x = 0; x < (unsigned)box.width; ++x) {
+                        const size_t physical = resource.level_offsets[level] +
+                           (box.z + z) * resource.level_layer_strides[level] +
+                           (box.y + y) * resource.level_strides[level] +
+                           (box.x + x) * bpp * samples;
+                        memcpy(expected + physical,
+                           source + z * source_layer_stride + y * source_stride + x * bpp,
+                           bpp);
+                     }
+               CHECK(pvrgpu_texture_subdata_msaa_sample0(&resource.base, level,
+                  flags, &box, source, source_stride, source_layer_stride));
+               CHECK(memcmp(resource.data, expected, resource.size) == 0);
+            }
+            // Rejected source row/layer layouts and arithmetic overflow must
+            // leave all storage intact, not partially copy the first row.
+            CHECK(!pvrgpu_texture_subdata_msaa_sample0(&resource.base, level,
+               0, &box, source, box.width * bpp - 1U, source_layer_stride));
+            CHECK(!pvrgpu_texture_subdata_msaa_sample0(&resource.base, level,
+               0, &box, source, source_stride, source_stride));
+            CHECK(!pvrgpu_texture_subdata_msaa_sample0(&resource.base, level,
+               0, &box, source, source_stride, UINTPTR_MAX));
+            CHECK(!pvrgpu_texture_subdata_msaa_sample0(&resource.base, level,
+               PIPE_MAP_READ, &box, source, source_stride, source_layer_stride));
+            CHECK(!pvrgpu_texture_subdata_msaa_sample0(&resource.base, level,
+               PIPE_MAP_DIRECTLY, &box, source, source_stride, source_layer_stride));
+            CHECK(memcmp(resource.data, expected, resource.size) == 0);
+            free(source);
+         }
+         // Single row/layer ignores the unused zero strides. Source aliases
+         // destination storage, requiring snapshot-before-scatter semantics.
+         const struct pipe_box alias_box = {.x = 1, .y = 1, .z = 1,
+            .width = 3, .height = 1, .depth = 1};
+         const size_t alias_offset = resource.level_offsets[1] +
+            resource.level_layer_strides[1] + resource.level_strides[1] + bpp * samples;
+         uint8_t snapshot[3 * 16];
+         CHECK(3U * bpp <= sizeof(snapshot));
+         memcpy(snapshot, resource.data + alias_offset, 3U * bpp);
+         memcpy(expected, resource.data, resource.size);
+         for (unsigned x = 0; x < 3; ++x)
+            memcpy(expected + alias_offset + x * bpp * samples,
+                   snapshot + x * bpp, bpp);
+         CHECK(pvrgpu_texture_subdata_msaa_sample0(&resource.base, 1, 0,
+            &alias_box, resource.data + alias_offset, 0, 0));
+         CHECK(memcmp(resource.data, expected, resource.size) == 0);
+         free(expected);
+         FREE(resource.data);
+      }
+}
+
+static void
+test_sample_count_capabilities(void)
+{
+   struct pipe_resource resource = {0};
+   resource.target = PIPE_TEXTURE_2D;
+   resource.format = PIPE_FORMAT_R8G8B8A8_UNORM;
+   resource.width0 = resource.height0 = 4;
+   resource.depth0 = resource.array_size = 1;
+   for (unsigned count = 0; count <= 17; ++count) {
+      const bool storage_supported = count == 0 || count == 1 || count == 2 ||
+                                     count == 4 || count == 8 || count == 16;
+      resource.nr_samples = resource.nr_storage_samples = count;
+      CHECK(pvrgpu_is_supported_resource_sample_count(count) == storage_supported);
+      resource.bind = PIPE_BIND_RENDER_TARGET;
+      CHECK(pvrgpu_can_create_texture_target(&resource) == storage_supported);
+      resource.bind |= PIPE_BIND_SAMPLER_VIEW;
+      CHECK(pvrgpu_can_create_texture_target(&resource) ==
+            (storage_supported && count <= 8));
+      resource.bind = PIPE_BIND_SHADER_IMAGE;
+      CHECK(pvrgpu_can_create_texture_target(&resource) ==
+            (storage_supported && count <= 8));
+      resource.target = PIPE_TEXTURE_2D_ARRAY;
+      resource.array_size = 3;
+      CHECK(pvrgpu_can_create_texture_target(&resource) ==
+            (storage_supported && count <= 8));
+      resource.target = PIPE_TEXTURE_2D;
+      resource.array_size = 1;
+   }
+   /* 兩個獨立欄位皆須有界，不能只檢查 API 的 requested samples。 */
+   resource.bind = PIPE_BIND_SAMPLER_VIEW;
+   resource.nr_samples = 4;
+   resource.nr_storage_samples = 16;
+   CHECK(!pvrgpu_can_create_texture_target(&resource));
+   resource.nr_samples = 16;
+   resource.nr_storage_samples = 4;
+   CHECK(!pvrgpu_can_create_texture_target(&resource));
+   resource.nr_samples = 3;
+   CHECK(!pvrgpu_can_create_texture_target(&resource));
+
+   /* Proxy 是 requested count 容量詢問，actual create 不可存入 3/5 samples。 */
+   for (unsigned requested = 1; requested <= 8; ++requested) {
+      struct pipe_resource probe;
+      resource.bind = 0;
+      resource.nr_samples = resource.nr_storage_samples = requested;
+      CHECK(pvrgpu_normalize_proxy_texture_samples(&resource, &probe));
+      unsigned physical = requested <= 2 ? requested : requested <= 4 ? 4 : 8;
+      CHECK(probe.nr_samples == physical && probe.nr_storage_samples == physical);
+      CHECK(probe.bind == PIPE_BIND_SAMPLER_VIEW);
+      CHECK(pvrgpu_can_create_texture_target(&probe));
+      CHECK(resource.nr_samples == requested && resource.nr_storage_samples == requested);
+      CHECK(pvrgpu_can_create_texture_target(&resource) == (requested == physical));
+   }
+   for (unsigned requested = 9; requested <= 17; ++requested) {
+      struct pipe_resource probe;
+      resource.bind = 0;
+      resource.nr_samples = resource.nr_storage_samples = requested;
+      CHECK(!pvrgpu_normalize_proxy_texture_samples(&resource, &probe));
+   }
+   struct pipe_resource probe;
+   resource.bind = PIPE_BIND_RENDER_TARGET;
+   resource.nr_samples = resource.nr_storage_samples = 16;
+   CHECK(pvrgpu_normalize_proxy_texture_samples(&resource, &probe));
+   CHECK(probe.nr_samples == 16 && probe.bind == PIPE_BIND_RENDER_TARGET);
+   CHECK(pvrgpu_can_create_texture_target(&probe));
+   resource.nr_samples = resource.nr_storage_samples = 3;
+   CHECK(pvrgpu_normalize_proxy_texture_samples(&resource, &probe));
+   CHECK(!pvrgpu_can_create_texture_target(&probe));
+}
+
 int main(void)
 {
+   test_sample_count_capabilities();
    test_float_resolve();
    test_integer_resolve();
    test_unorm_resolve();
    test_sample_copy_and_mask();
+   test_srgb_resolve();
+   test_bilinear_resolve();
+   test_signed_integer_resolve_and_mask();
    test_depth_stencil_aspects();
    test_depth_float_scale_flip();
    test_depth_stencil_samples();
    test_depth_alias_snapshot();
    test_clipped_color_transform();
+   test_msaa_sample0_map();
    if (!failures)
       puts("MSAA Mesa format blit tests passed");
    return failures ? 1 : 0;

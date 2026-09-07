@@ -651,7 +651,9 @@ void ClipCull::Run() {
                                           state.shader_varying_bindings);
       const std::uint32_t varying_count =
           VaryingVectorCount(state);
-      if (varying_count == 0 || bindings.size() != varying_count) {
+      if ((varying_count == 0 &&
+           VaryingCoefficientDwordCount(state) != kCoefficientSetDwordCount) ||
+          bindings.size() != varying_count) {
         throw std::runtime_error(
             "ClipCull varying linkage count is invalid");
       }

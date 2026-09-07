@@ -31,6 +31,7 @@
 #define PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS 256u
 
 struct pvrgpu_array_primitive_draw;
+struct pvrgpu_compute_state;
 struct pvrgpu_deqp_primitive_sequence_profile;
 struct pvrgpu_pco_compiler;
 struct pvrgpu_pco_graphics_binary;
@@ -65,6 +66,12 @@ struct pvrgpu_context {
    struct pipe_constant_buffer constant_buffers[MESA_SHADER_MESH_STAGES]
                                                 [PIPE_MAX_CONSTANT_BUFFERS];
    unsigned num_constant_buffers[MESA_SHADER_MESH_STAGES];
+   struct pipe_shader_buffer shader_buffers[MESA_SHADER_MESH_STAGES]
+                                          [PIPE_MAX_SHADER_BUFFERS];
+   uint32_t shader_buffer_writable_mask[MESA_SHADER_MESH_STAGES];
+   struct pipe_image_view shader_images[MESA_SHADER_MESH_STAGES]
+                                      [PIPE_MAX_SHADER_IMAGES];
+   struct pvrgpu_compute_state *cs;
    struct pvrgpu_shader_state *vs;
    struct pvrgpu_shader_state *fs;
    struct pvrgpu_shader_state *gs;

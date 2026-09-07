@@ -1,0 +1,35 @@
+Subject: [PATCH] mesa: keep render-only multisample renderbuffers allocatable
+
+Applies to Mesa 26.2.1, commit
+da14d65e4499e66468094be52bff9ea0915a695e (third_party/mesa-pco.lock).
+
+renderbuffer_alloc_storage chooses a renderable format/sample count, then
+unconditionally adds PIPE_BIND_SAMPLER_VIEW. This fails on drivers whose
+render-only sample count exceeds their texture sampling limit, e.g. a
+16-sample renderbuffer with an 8-sample texture sampler limit.
+
+Query the exact target, format, samples, storage samples and proposed
+combined binding before adding that optional internal sampling capability.
+Keep the required render/display/depth binding unchanged. Renderbuffer
+limits and actual storage counts are not reduced or rounded differently.
+
+Apply identically to both PvrGPU and llvmpipe Mesa source trees. This is
+independent of the existing read-only MSAA ReadPixels resolve patch.
+
+diff --git a/src/mesa/main/renderbuffer.c b/src/mesa/main/renderbuffer.c
+--- a/src/mesa/main/renderbuffer.c
++++ b/src/mesa/main/renderbuffer.c
+@@ -273,7 +273,12 @@ renderbuffer_alloc_storage(struct gl_context * ctx,
+                     PIPE_BIND_RENDER_TARGET);
+    }
+ 
+-   templ.bind |= PIPE_BIND_SAMPLER_VIEW;
++   /* Sampling a renderbuffer is an optional internal optimization. Its
++    * supported render sample count can exceed the texture sampling limit. */
++   if (screen->is_format_supported(screen, templ.format, templ.target,
++                                   templ.nr_samples, templ.nr_storage_samples,
++                                   templ.bind | PIPE_BIND_SAMPLER_VIEW))
++      templ.bind |= PIPE_BIND_SAMPLER_VIEW;
+ 
+    rb->texture = screen->resource_create(screen, &templ);
+ 

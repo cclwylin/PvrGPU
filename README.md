@@ -28,7 +28,18 @@ So behaviour comes from one place only:
   fixed-function state -- into `pvrgpu.driver-command.v1`; and
 - the **PvrGPU model** executes that command through VertexFetch, the USC ISS,
   ClipCull, the tiler, ISP, PBE and the memory hierarchy, and reports what those
-  stages actually did.
+  stages actually did. Compute submissions instead use their own
+  `ComputeDataMaster` and `ComputeShader` SystemC modules, with native task
+  state and bounded memory request/completion FIFOs.
+
+Geometry and tessellation reserve separate `GeometryShader`,
+`TessellationControlShader`, `Tessellator` (fixed function) and
+`TessellationEvaluationShader` SystemC modules. Each has its own `.h/.cpp`
+and top-level instance. These are structural placeholders only: no ports,
+processes, execution, timing or additional advertised shader capabilities.
+They are not aliases for VS/FS/CS, and `DomainDataMaster` does not replace the
+tessellation shader stages. Future connections must use bounded POD/PoolHandle
+FIFOs under the same module and memory-ownership rules as compute.
 
 ### Forbidden
 
@@ -103,12 +114,38 @@ Detail per component: [PvrGPU.md §3.5](PvrGPU.md), the
 
 ## Current Status
 
+- Graphics API v23 adds native multisample texture fetch transport: real
+  SMP.NNCOORDS.SNO selects one of 1/2/4/8 pixel-interleaved samples, including
+  integer/float/depth views and single-level 2D arrays. Size/sample queries
+  read native descriptors. Compute API remains independently versioned at 2.
+  See the [sampled-image contract](docs/PVRGPU_DRIVER_COMMAND.md).
+- Live GLES31 `functional.texture.multisample` is 87 Pass, 70 NotSupported,
+  and 0 Fail on both backends (157 cases). Requests above the native 8-sample
+  texture limit are not counted as passes; render-only 16x support remains.
+  Independent 4x/8x per-sample tests across direct/bypass/cache and descriptor-only
+  size queries match llvmpipe exactly for 207,744 DWORDs, without tolerance.
+  The three additional pinned Mesa fixes documented in the contract are
+  applied equally to both source trees. This is bounded group/probe coverage,
+  not full GLES conformance.
 - The native generic PCO path now executes FBO shaders through the SystemC
   pipeline with typed integer/float texture and color transport, persistent
   color/depth/stencil LOAD/readback, per-sample MSAA, and shader-depth late tests.
   The driver also implements typed clear and scaled/format-converting blits,
   including color and depth/stencil resolves. See the
   [native API contract](docs/PVRGPU_DRIVER_COMMAND.md).
+- Graphics API v22 carries per-draw alpha-to-coverage, its ordered 2x2
+  dithering control, and alpha-to-one. The model follows llvmpipe's alpha
+  thresholds before per-sample late depth/stencil tests and blending; alpha
+  rejection cannot write depth/stencil or erase a covered background fragment.
+  A real EGL/GLES probe of 108 fixed 4x/8x alpha-coverage and depth/stencil
+  scenarios matches llvmpipe exactly: 6,912 pixels / 27,648 RGBA bytes, with
+  native PCO execution and zero pool leaks. The two pinned Mesa frontend
+  patches documented in the API contract are applied to both backends;
+  this bounded comparison is not full MSAA/GLES conformance.
+- Live `functional.multisample` validation is 64/64 Pass on both patched
+  PvrGPU and llvmpipe runtimes, including all 16 default-framebuffer cases
+  with a real 4x MSAA pbuffer. Fixed 4x/8x FBO groups pass on both; the max
+  group uses each driver's actual limit (PvrGPU 16x, llvmpipe 8x).
 - API v21 adds immutable, per-draw VS/FS uniform-buffer snapshots. Mesa's
   native PCO lowering supplies descriptors and address arithmetic; USC executes
   LD/WDF against the declared GPU-memory ranges, including 1–16 DWORD bursts
@@ -323,12 +360,40 @@ instead of silently running unrelated tests.
 The driver advertises OpenGL ES 3.1 by default, so every group in the catalog
 can start. `PVRGPU_DISABLE_ES3=1` restores the earlier ES2-only surface, in
 which only the three EGL groups start and the GLES3/GLES31 groups show their
-blocked reason again. Two caveats remain for ES3: compute is advertised through
-no-op stubs (compute cases fail rather than crash), and because the SystemC
-bridge defers simulation to process exit, the model's framebuffer is never
-written back for `glReadPixels`, so image-comparison cases report Fail even
-when the model's own PNG matches dEQP's reference pixel for pixel. Judge those
-from the per-case `systemc/*.png` until readback is wired.
+blocked reason again. Graphics readback executes the pending SystemC work and
+returns its actual attachment bytes to `glReadPixels`; a model PNG alone is
+not a passing dEQP result. Compute bring-up uses a separate synchronous API
+(`pvrgpu_systemc_compute_api.h`, independently versioned from graphics API 23).
+Its current slice implements direct static-size dispatch, native UBO/SSBO
+loads/stores (including vec8/vec16), scalar integer SSBO atomics, loops and
+primitive system-value registers. The atomic path follows llvmpipe's
+return-old, signed/unsigned min/max and uint32-wrapping semantics: native DMA
+ADD/SUB/XCHG/MIN/MAX/AND/OR/XOR execute through the CDM memory FIFO; compare-swap
+executes PCO's real MUTEX/SR51/per-instance LD/ST sequence. Compute API 2 counts
+DMA atomic instructions separately; emulated CAS counts its actual LD/ST,
+not a synthetic atomic opcode. Graphics API is now 23. The current serial
+task scheduler supports single-task execution barriers (up to 32 lanes) and
+memory-only fences; multi-task workgroup rendezvous, shared memory and images
+(including their atomics),
+64-bit/float atomics, variable local sizes and indirect dispatch remain
+explicitly fail-closed. Out-of-range views are rejected, not treated as
+llvmpipe-style robust zero loads/no-op stores.
+CAS access qualifiers are normalized on an owned NIR clone before PCO's
+coherent usclib lowering. Sparse SSBO vector-store masks that remain after
+preprocessing are rejected until their component runs can be lowered safely;
+they are never treated as full unmasked writes.
+The focused atomic CTS suite is 346/346 Pass: all 48 SSBO atomic cases and
+298 atomic-counter cases match llvmpipe's statuses. This includes 341 completed
+native dispatch cases and five expected compile-failure cases. The independent
+atomic probe additionally validates return-old serialization, partial tasks,
+aliasing, extrema and guard words in direct/bypass/cache modes; it does not
+claim shared/image atomic support or scheduler-dependent bytewise equality.
+The 41-case Basic compute baseline was 3 Pass / 38 Fail with no actual compute
+execution. The native buffer/atomic slice improves this to 24 Pass / 17 Fail
+in complete direct/bypass/cache runs: 22 passes have completed native dispatches, while
+`ssbo_local_barrier_single_invocation` and `shared_var_single_invocation`
+still pass their QPA checks despite unsupported dispatch and are not evidence
+of implemented compute support. This is not an all-pass Basic group.
 
 Run an exact case on the fly; the executable configures the surfaceless PvrGPU
 runtime and artifact paths itself:

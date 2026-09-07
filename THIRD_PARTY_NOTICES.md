@@ -38,6 +38,47 @@ geometry and loop/order semantics for differential testing.
 
 ## Mesa / PowerVR PCO encoding
 
+Compute SSBO atomic semantics follow `emit_atomic_mem` and
+`lp_translate_atomic_op` in Mesa's
+`src/gallium/auxiliary/gallivm/lp_bld_nir_soa.c` at commit
+`da14d65e4499e66468094be52bff9ea0915a695e`: active-lane integer RMW,
+signed/unsigned min/max, uint32 wrapping and return-old values. PvrGPU
+implements these through its own serialized SystemC memory service, not
+llvmpipe's LLVM JIT. This does not claim llvmpipe's out-of-bounds robustness:
+PvrGPU rejects accesses outside an authorized binding view. The reference
+file's notice is:
+
+> Copyright 2019 Red Hat.
+> All Rights Reserved.
+>
+> Permission is hereby granted, free of charge, to any person obtaining a
+> copy of this software and associated documentation files (the "Software"),
+> to deal in the Software without restriction, including without limitation
+> the rights to use, copy, modify, merge, publish, distribute, sublicense,
+> and/or sell copies of the Software, and to permit persons to whom the
+> Software is furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included
+> in all copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+> OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+> FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+> THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+> LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+> OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+> SOFTWARE.
+
+Native compare-and-swap uses the same pinned PCO compiler's
+`pco_nir_sync.c` and `usclib/sync.cl` lowering (Copyright 2025 Imagination
+Technologies Ltd., MIT): MUTEX LOCK/RELEASE plus per-instance coherent LD/ST
+selected by SR51 INST_NUM. The model executes those actual instructions;
+it does not replace the sequence with a host CAS. Generated native compute
+fixtures in `tests/pco_compute_fixtures.h` come from
+`tests/pvrgpu_compute_compiler_test.c` and have individual hashes in
+`third_party/mesa-pco.lock`. Test-only SUB encoding and ADD64 destination
+boundary mutations are explicitly distinguished from compiler output.
+
 `src/systemc/common/msaa.h` adapts the standard 1x/2x/4x/8x/16x
 sample-position tables from Mesa's
 `src/gallium/auxiliary/util/u_sample_positions.c`, copyright 2023 Alyssa
@@ -46,6 +87,97 @@ also match llvmpipe's `lp_rast.c`. The driver resolve implementation follows
 llvmpipe's use of `util_blitter`: normalized/floating-point samples are
 averaged in linear color space and integer resolves select sample zero.
 No llvmpipe shader or rasterizer implementation is linked into the model.
+
+Multisample texture fetch follows `lp_build_sample_ms_offset` and
+`lp_build_fetch_texel` in the same pinned Mesa's
+`src/gallium/auxiliary/gallivm/lp_bld_sample_soa.c` (Copyright 2009 VMware,
+Inc.; MIT notice below): select the requested sample, check bounds, and do
+not filter or resolve. PvrGPU implements its own pixel-interleaved address
+arithmetic instead of llvmpipe's sample-major storage. Native NNCOORDS/SNO,
+the three-bit lookup sample field, SMPCNT and array-address lowering are
+verified against Mesa `pco_nir_tex.c`, `pco_isa.py`, `rogue_hw_defs.h` and
+`texstate.xml` at commit `da14d65e4499e66468094be52bff9ea0915a695e`.
+`tools/pco-fixtures/generate_multisample_texture.c` emits the native test
+binaries; these fixtures are test inputs, never runtime shader substitutes.
+The 21 entries in `tests/pco_multisample_texture_fixtures.h` preserve that
+compiler output byte-for-byte; their individual sizes and SHA-256 hashes
+are recorded in `third_party/mesa-pco.lock`. They cover FS/VS multisample
+fetch, descriptor-only NIR size/sample-count queries, and native fragment
+position reads, plus ordinary 2D size with explicit LOD, using the PvrGPU
+internal graphics export profile. The
+NIR sample-count query fixtures establish compiler/ISA behavior, not the
+availability of a `textureSamples` GLSL builtin in OpenGL ES.
+
+`third_party/mesa-26.2.1-pco-stride-texture-size.patch` corrects that pinned
+PCO `usclib/tex.cl` helper: STRIDE image-word bits 60:63 contain mip count,
+not the normal IMAGE layout's base level. Only non-STRIDE queries add a
+base level to the requested LOD. The patch preserves the upstream 2025
+Imagination Technologies MIT notice and is applied equally to both Mesa
+source trees. Fixture hashes include the patch identity; the original 20
+unpatched hashes remain recorded separately for provenance, not as runtime
+shader alternatives.
+
+The MSAA alpha-to-coverage helpers in `src/systemc/common/msaa.h` and
+per-sample late depth/stencil ordering adapt
+`lp_build_alpha_to_coverage_dither`, `lp_build_sample_alpha_to_coverage` and
+the alpha-to-one ordering in Mesa's
+`src/gallium/drivers/llvmpipe/lp_state_fs.c` at commit
+`da14d65e4499e66468094be52bff9ea0915a695e` (Mesa 26.2.1).
+The functional C++ implementation uses the same thresholds and ordered 2x2
+dither matrix, not LLVM code generation or llvmpipe host execution.
+The original notice for this adaptation is:
+
+> Copyright 2009 VMware, Inc.
+> Copyright 2007 VMware, Inc.
+> All Rights Reserved.
+>
+> Permission is hereby granted, free of charge, to any person obtaining a
+> copy of this software and associated documentation files (the
+> "Software"), to deal in the Software without restriction, including
+> without limitation the rights to use, copy, modify, merge, publish,
+> distribute, sub license, and/or sell copies of the Software, and to
+> permit persons to whom the Software is furnished to do so, subject to
+> the following conditions:
+>
+> The above copyright notice and this permission notice (including the
+> next paragraph) shall be included in all copies or substantial portions
+> of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+> OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+> MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+> IN NO EVENT SHALL VMWARE AND/OR ITS SUPPLIERS BE LIABLE FOR
+> ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+> TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+> SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+`src/gallium/drivers/pvrgpu/pvrgpu_msaa.h` adapts the sequential F32
+resolve arithmetic in `util_make_fs_msaa_resolve` from Mesa's
+`src/gallium/auxiliary/util/u_simple_shaders.c` at the same commit.
+Its copyright (2008 VMware, Inc.; 2009 Marek Olšák) and full permission and
+disclaimer are preserved in that header. Tests separately cover sRGB
+decode/linear-average/encode, resolve-before-bilinear filtering and integer
+sample selection. Mesa format utilities remain part of the external Mesa
+build rather than being copied into the model.
+
+The patches `third_party/mesa-26.2.1-drisw-imported-msaa.patch` and
+`third_party/mesa-26.2.1-msaa-readpixels-resolve.patch` target that same Mesa
+revision's DRI software frontend and renderbuffer readback, respectively.
+They preserve upstream file notices and must be applied equally to the local
+PvrGPU and llvmpipe Mesa builds for default-framebuffer MSAA comparisons.
+`third_party/mesa-26.2.1-ms-texture-sample-query.patch` targets the same pinned
+revision's `src/mesa/state_tracker/st_format.c`. It adds sampler support to
+multisample texture sample-count queries, preserves renderbuffer queries,
+and retains the upstream file notice. Apply it equally to both backends for
+multisample-texture comparisons; it does not change shader execution or CTS.
+`third_party/mesa-26.2.1-renderbuffer-optional-sampler.patch` preserves the
+same revision's `src/mesa/main/renderbuffer.c` notice and requests optional
+sampler binding only where supported, retaining render-only sample counts.
+`third_party/mesa-26.2.1-pco-stride-texture-size.patch` corrects PCO usclib's
+interpretation of STRIDE image descriptors: their high WORD1 field is a mip
+count, not a base level. The native compiler still emits and executes the
+descriptor-query instructions. Both patches are applied to both Mesa trees;
+the fixture lock records compiler-patch provenance and regenerated hashes.
 
 The current runtime points to an external Mesa 26.2.1 build with local
 llvmpipe telemetry patches. Most Mesa source and binaries are not redistributed
@@ -59,10 +191,12 @@ bytes from Mesa commit `da14d65e4499e66468094be52bff9ea0915a695e`:
 - `tools/pco-fixtures/generate_attribute_fetch_shader.c`
 - `tools/pco-fixtures/generate_varying_shader.c`
 - `tools/pco-fixtures/generate_fill_tex_nearest.c`
+- `tools/pco-fixtures/generate_multisample_texture.c`
 - `tools/pco-fixtures/generate_conditionals.c`
 - `tools/pco-fixtures/generate_ubo_shader.c`
 - `tools/pco-fixtures/generate_temp256_operands.c`
 - `tests/pco_uniform_buffer_fixtures.h`
+- `tests/pco_multisample_texture_fixtures.h`
 - `tests/pco_temp256_fixtures.h`
 
 The NIR shader generators under `tools/pco-fixtures/` are development-time

@@ -1,0 +1,73 @@
+Subject: [PATCH] mesa: query sampleable counts for multisample textures
+
+Applies to Mesa 26.2.1, commit
+da14d65e4499e66468094be52bff9ea0915a695e (third_party/mesa-pco.lock).
+
+st_QuerySamplesForFormat discarded the GL target and queried only render
+bindings. A driver with 16-sample renderbuffers and 8-sample textures then
+advertised unsupported texture sample counts, although st_texture_storage
+correctly checked PIPE_BIND_SAMPLER_VIEW during actual allocation.
+
+Only GL_TEXTURE_2D_MULTISAMPLE and GL_TEXTURE_2D_MULTISAMPLE_ARRAY add the
+sampler binding; the array query uses PIPE_TEXTURE_2D_ARRAY. Renderbuffer
+and internal target=0 behavior is unchanged. Texture queries must not
+reinsert unsupported counts via the minimum-limit or single-sample fallback.
+
+This patch does not change requested-to-physical sample count selection.
+In this pinned Mesa, st_texture_storage promotes requested 1 to 2 when
+MaxSamples > 1, then chooses the next supported physical count. Thus a
+requested count is not evidence of the actual storage sample count.
+
+Apply the same patch to both PvrGPU and llvmpipe Mesa source trees for A/B.
+It does not modify either driver's hardware limits or CTS case behavior.
+
+diff --git a/src/mesa/state_tracker/st_format.c b/src/mesa/state_tracker/st_format.c
+index 7e50e49..d78eab9 100644
+--- a/src/mesa/state_tracker/st_format.c
++++ b/src/mesa/state_tracker/st_format.c
+@@ -1496,12 +1496,21 @@ st_QuerySamplesForFormat(struct gl_context *ctx, GLenum target,
+    unsigned i, bind, num_sample_counts = 0;
+    unsigned min_max_samples;
+ 
+-   (void) target;
++   const bool multisample_texture =
++      target == GL_TEXTURE_2D_MULTISAMPLE ||
++      target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY;
++   const enum pipe_texture_target pipe_target =
++      target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY ?
++         PIPE_TEXTURE_2D_ARRAY : PIPE_TEXTURE_2D;
+ 
+    if (_mesa_is_depth_or_stencil_format(internalFormat))
+       bind = PIPE_BIND_DEPTH_STENCIL;
+    else
+       bind = PIPE_BIND_RENDER_TARGET;
++   /* Texture sample counts must be both renderable and sampleable.
++    * Renderbuffers and the internal target=0 query retain their contract. */
++   if (multisample_texture)
++      bind |= PIPE_BIND_SAMPLER_VIEW;
+ 
+    if (_mesa_is_enum_format_integer(internalFormat))
+       min_max_samples = ctx->Const.MaxIntegerSamples;
+@@ -1520,15 +1529,19 @@ st_QuerySamplesForFormat(struct gl_context *ctx, GLenum target,
+    /* Set sample counts in descending order. */
+    for (i = MAX_SAMPLES; i > 1; i--) {
+       format = st_choose_format(st, internalFormat, GL_NONE, GL_NONE,
+-                                PIPE_TEXTURE_2D, i, i, bind,
++                                pipe_target, i, i, bind,
+                                 false, false);
+ 
+-      if (format != PIPE_FORMAT_NONE || i == min_max_samples) {
++      if (format != PIPE_FORMAT_NONE ||
++          (!multisample_texture && i == min_max_samples)) {
+          samples[num_sample_counts++] = i;
+       }
+    }
+ 
+-   if (!num_sample_counts) {
++   if (!num_sample_counts &&
++       (!multisample_texture ||
++        st_choose_format(st, internalFormat, GL_NONE, GL_NONE, pipe_target,
++                         1, 1, bind, false, false) != PIPE_FORMAT_NONE)) {
+       samples[num_sample_counts++] = 1;
+    }
+ 

@@ -223,7 +223,9 @@ void ParameterBuffer::Run() {
           pool_, state.shader_varying_bindings);
       const std::uint32_t varying_count =
           VaryingVectorCount(state);
-      if (varying_count == 0 || varying_bindings.size() != varying_count) {
+      if ((varying_count == 0 &&
+           VaryingCoefficientDwordCount(state) != kCoefficientSetDwordCount) ||
+          varying_bindings.size() != varying_count) {
         throw std::runtime_error(
             "ParameterBuffer varying linkage count is invalid");
       }

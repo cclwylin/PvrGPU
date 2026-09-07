@@ -404,7 +404,8 @@ void Pbe::Run() {
     }
     std::vector<std::uint32_t> written_map(stored_samples, 0);
     std::vector<std::uint64_t> last_submit_ordinal(stored_samples, 0);
-    const bool late_depth_stencil = state.raster_state.shader_writes_depth != 0;
+    const bool late_depth_stencil =
+        RasterRequiresLateDepthStencil(state.raster_state);
     std::vector<std::uint32_t> late_depth;
     std::vector<std::uint8_t> late_stencil;
     std::uint64_t late_tested_samples = 0;
@@ -422,7 +423,7 @@ void Pbe::Run() {
     }
     for (std::size_t index = 0; index < outputs.size(); ++index) {
       const FragmentInvocation &invocation = invocations[index];
-      const FragmentOutput &output = outputs[index];
+      FragmentOutput output = outputs[index];
       // Name the property that broke: fragment identity and PIXOUT lane
       // coverage are different failures with different causes.
       const char *identity_reason = nullptr;
@@ -462,19 +463,37 @@ void Pbe::Run() {
         throw std::runtime_error("PBE fragment coordinate is out of bounds");
       const std::size_t pixel_index =
           static_cast<std::size_t>(output.y) * state.width + output.x;
-      const std::uint32_t coverage = invocation.sample_mask;
+      std::uint32_t coverage = invocation.sample_mask;
       if (coverage == 0 || (coverage & ~RasterSampleMask(sample_count)) != 0)
         throw std::runtime_error("PBE fragment sample coverage is invalid");
-      if (late_depth_stencil &&
-          (output.depth_written != 1 || invocation.front_facing > 1))
+      if ((state.raster_state.shader_writes_depth && output.depth_written != 1) ||
+          (late_depth_stencil && invocation.front_facing > 1))
         throw std::runtime_error("PBE shader depth output or facing is invalid");
+      // Coverage is derived only from a declared/written DATA0 alpha, before
+      // alpha-to-one and before any depth/stencil mutation. An absent alpha
+      // output is not an implicit zero (llvmpipe skips A2C in that case).
+      if (state.raster_state.alpha_to_coverage &&
+          (state.fragment_output_mask[0] & output.written_mask[0] & 8U) != 0) {
+        coverage &= RasterAlphaCoverageMask(
+            sample_count, BitsFloat(output.pixel_output[3]), output.x, output.y,
+            state.raster_state.alpha_to_coverage_dither != 0,
+            state.raster_state.multisample_enable != 0);
+      }
+      if (state.raster_state.alpha_to_one) {
+        for (std::uint32_t target = 0; target < render_target_count; ++target)
+          if ((state.fragment_output_mask[target] & output.written_mask[target] &
+               8U) != 0)
+            output.pixel_output[target * 4 + 3] = UINT32_C(0x3f800000);
+      }
       for (std::uint32_t sample = 0; sample < sample_count; ++sample) {
       if ((coverage & (1U << sample)) == 0)
         continue;
       const std::size_t stored_index = pixel_index * sample_count + sample;
       if (late_depth_stencil) {
         ++late_tested_samples;
-        if (!TestLateDepthStencil(state, invocation, output.depth, stored_index,
+        const float incoming_depth = state.raster_state.shader_writes_depth
+            ? output.depth : invocation.sample_depth[sample];
+        if (!TestLateDepthStencil(state, invocation, incoming_depth, stored_index,
                                   late_depth, late_stencil))
           continue;
       }

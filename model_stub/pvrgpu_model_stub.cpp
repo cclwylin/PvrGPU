@@ -13,6 +13,7 @@
 #include "common/reference_uarch.h"
 #include "common/shader_stage.h"
 #include "compression/image_compression.h"
+#include "compute_types.h"
 #include "data_master/compute_data_master.h"
 #include "data_master/domain_data_master.h"
 #include "data_master/pixel_data_master.h"
@@ -26,6 +27,7 @@
 #include "fragment/tile_scheduler.h"
 #include "geometry/clip_cull.h"
 #include "geometry/parameter_buffer.h"
+#include "geometry/tessellator.h"
 #include "geometry/tiler.h"
 #include "geometry/vdm.h"
 #include "geometry/vertex_fetch.h"
@@ -44,6 +46,10 @@
 #include "pds/pds_engine.h"
 #include "pds/vertex_pds_engine.h"
 #include "shader/pco_decoder.h"
+#include "shader/compute_shader.h"
+#include "shader/geometry_shader.h"
+#include "shader/tessellation_control_shader.h"
+#include "shader/tessellation_evaluation_shader.h"
 #include "shader/usc_cluster.h"
 #include "shader/usc_slot.h"
 #include "submitter.h"
@@ -51,7 +57,9 @@
 
 #include <systemc>
 
+#include <algorithm>
 #include <iostream>
+#include <cstring>
 #include <memory>
 #include <string>
 
@@ -646,6 +654,9 @@ public:
   int Run(const Options &options, ModelFramebuffer *framebuffer,
           std::string *error);
 
+  int RunCompute(ModelComputeDispatch *dispatch, ModelComputeStats *stats,
+                  std::string *error);
+
   // True once a flush has failed.  A failure can leave a process part-way
   // through a submission it will never finish, and there is no way to tell a
   // SystemC process to start over, so the session refuses further work rather
@@ -672,11 +683,38 @@ private:
   XpuInterface xpu_interface{"xpu_interface"};
   ControlRegisterBus control_register_bus{"control_register_bus"};
   FirmwareScheduler firmware_scheduler{"firmware_scheduler"};
-  ComputeDataMaster compute_data_master{"compute_data_master"};
   DomainDataMaster domain_data_master{"domain_data_master"};
   PixelDataMaster pixel_data_master{"pixel_data_master"};
   TwoDDataMaster two_d_data_master{"two_d_data_master"};
   ImageCompression image_compression{"image_compression"};
+
+  // Separate future shader/fixed-function boundaries, not USC aliases.
+  // They elaborate before sc_start but have no executable ingress or process.
+  // DomainDataMaster is a data-master reservation, not a TCS/TES executor.
+  GeometryShader geometry_shader{"geometry_shader"};
+  TessellationControlShader tessellation_control_shader{
+      "tessellation_control_shader"};
+  Tessellator tessellator{"tessellator"};
+  TessellationEvaluationShader tessellation_evaluation_shader{
+      "tessellation_evaluation_shader"};
+
+  // Compute has an independent event-driven execution and completion path.
+  // All modules exist before the first sc_start, even in graphics-only runs.
+  sc_core::sc_fifo<ComputeDispatchTxn> compute_submit{"compute_submit",
+                                                     ModelFifoDepth()};
+  sc_core::sc_fifo<ComputeDispatchTxn> compute_complete{"compute_complete",
+                                                       ModelFifoDepth()};
+  sc_core::sc_fifo<ComputeWorkgroupTxn> compute_workgroups{"compute_workgroups",
+                                                         ModelFifoDepth()};
+  sc_core::sc_fifo<ComputeWorkgroupTxn> compute_workgroups_done{
+      "compute_workgroups_done", ModelFifoDepth()};
+  sc_core::sc_fifo<ComputeMemoryTxn> compute_memory_requests{
+      "compute_memory_requests", ModelFifoDepth()};
+  sc_core::sc_fifo<ComputeMemoryTxn> compute_memory_responses{
+      "compute_memory_responses", ModelFifoDepth()};
+  ComputeDataMaster compute_data_master{"compute_data_master", pool, memory};
+  ComputeShader compute_shader{"compute_shader", pool};
+  std::uint64_t compute_sequence_ = 0;
 
   // MMU/fabric modules remain structural placeholders. MCU, TCU and USC-L2
   // bind idle traffic because active clients now use the shared GpuMemorySystem
@@ -784,6 +822,16 @@ private:
 ModelSession::ModelSession(MemoryMode memory_mode, bool cache_bypass)
     : memory_mode_(memory_mode), cache_bypass_(cache_bypass),
       memory(memory_mode) {
+  compute_data_master.input(compute_submit);
+  compute_data_master.completion(compute_complete);
+  compute_data_master.workgroup_output(compute_workgroups);
+  compute_data_master.workgroup_completion(compute_workgroups_done);
+  compute_data_master.memory_input(compute_memory_requests);
+  compute_data_master.memory_output(compute_memory_responses);
+  compute_shader.input(compute_workgroups);
+  compute_shader.output(compute_workgroups_done);
+  compute_shader.memory_request_output(compute_memory_requests);
+  compute_shader.memory_response_input(compute_memory_responses);
   mixed_cache.input(idle_mcu_input);
   mixed_cache.output(idle_mcu_output);
   texture_cache.input(idle_tcu_input);
@@ -903,6 +951,164 @@ int ModelSession::Run(const Options &options, ModelFramebuffer *framebuffer,
   return 0;
 }
 
+int ModelSession::RunCompute(ModelComputeDispatch *dispatch,
+                             ModelComputeStats *stats, std::string *error) {
+  const auto fail = [error](const std::string &message) {
+    if (error)
+      *error = message;
+    return 2;
+  };
+  if (!dispatch || !stats)
+    return fail("missing compute dispatch or result");
+  *stats = {};
+  if (stopped_ || poisoned_)
+    return fail("SystemC session cannot accept compute work");
+  if (job.running)
+    return fail("compute cannot overlap an unfinished graphics flush");
+
+  // Reserve a high 64-bit region beyond every graphics sequence allocation.
+  // Slots are reused only after completion; HostWrite invalidates stale SLC
+  // lines before initializing a new dispatch. Binding aliases share a slot.
+  constexpr std::uint64_t kComputeAddressBase = UINT64_C(0x1000000000000);
+  constexpr std::uint64_t kComputeResourceStride = UINT64_C(0x40000000);
+  const auto address = [](std::size_t index) {
+    return kComputeAddressBase + index * kComputeResourceStride;
+  };
+  const auto allocations_before = pool.allocations();
+  const auto releases_before = pool.releases();
+  std::vector<PoolHandle> owned;
+  owned.reserve(4);
+  bool submitted = false;
+  bool completed = false;
+  const auto release = [&]() {
+    for (auto it = owned.rbegin(); it != owned.rend(); ++it)
+      pool.Release(*it);
+    owned.clear();
+  };
+  const auto store_bytes = [&](const void *bytes, std::size_t size) {
+    const auto handle = pool.Allocate(size);
+    owned.push_back(handle);
+    if (size != 0)
+      std::memcpy(pool.Write(handle).data(), bytes, size);
+    return handle;
+  };
+  try {
+    if (!started_) {
+      sc_core::sc_start(sc_core::SC_ZERO_TIME);
+      started_ = true;
+    }
+    for (std::size_t index = 0; index < dispatch->resources.size(); ++index) {
+      const auto &bytes = dispatch->resources[index].bytes;
+      if (bytes.size() > kComputeResourceStride || index >= 64U)
+        return fail("compute resource exceeds its reserved GPU address slot");
+      if (!bytes.empty())
+        memory.HostWrite(address(index), bytes.data(), bytes.size());
+    }
+    std::vector<std::uint32_t> shared(dispatch->abi.stage.shareds, 0U);
+    const auto push_start = dispatch->abi.stage.push_constant_start;
+    if (push_start > shared.size() ||
+        dispatch->push_words.size() > shared.size() - push_start)
+      return fail("compute push payload exceeds the shared-register file");
+    std::copy(dispatch->push_words.begin(), dispatch->push_words.end(),
+               shared.begin() + push_start);
+    std::vector<ComputeBufferRange> ranges;
+    for (const auto &binding : dispatch->bindings) {
+      if (binding.resource_index >= dispatch->resources.size())
+        return fail("compute binding references an absent backing resource");
+      const auto bytes = dispatch->resources[binding.resource_index].bytes.size();
+      if (binding.offset > bytes || binding.bytes_size > bytes - binding.offset)
+        return fail("compute binding exceeds its backing resource");
+      const auto base = address(binding.resource_index) + binding.offset;
+      const auto descriptor = (binding.kind == 0U
+          ? dispatch->abi.stage.uniform_buffer_descriptor_start
+          : dispatch->abi.storage_buffer_descriptor_start) + 4U * binding.slot;
+      if (descriptor > shared.size() || 4U > shared.size() - descriptor)
+        return fail("compute descriptor exceeds the shared-register file");
+      shared[descriptor] = static_cast<std::uint32_t>(base);
+      shared[descriptor + 1U] = static_cast<std::uint32_t>(base >> 32U);
+      shared[descriptor + 2U] = static_cast<std::uint32_t>(binding.bytes_size);
+      shared[descriptor + 3U] = 0U;
+      ranges.push_back({base, binding.bytes_size, binding.access,
+                         binding.slot, binding.kind});
+    }
+    ComputeDispatchState state;
+    state.abi = dispatch->abi;
+    state.grid = dispatch->grid;
+    state.sequence = ++compute_sequence_;
+    state.code = store_bytes(dispatch->binary.data(), dispatch->binary.size());
+    state.shared_registers = store_bytes(shared.data(),
+                                          shared.size() * sizeof(shared[0]));
+    state.buffer_ranges = store_bytes(ranges.data(),
+                                       ranges.size() * sizeof(ranges[0]));
+    const auto state_handle = store_bytes(&state, sizeof(state));
+    const ComputeDispatchTxn request{state_handle, state.sequence};
+    if (!compute_submit.nb_write(request))
+      throw std::runtime_error("compute submission FIFO is unexpectedly full");
+    submitted = true;
+    ComputeDispatchTxn response;
+    while (!(completed = compute_complete.nb_read(response)) &&
+           sc_core::sc_pending_activity())
+      sc_core::sc_start(sc_core::sc_time_to_pending_activity());
+    if (!completed || response.sequence != request.sequence ||
+        response.state.slot != state_handle.slot ||
+        response.state.generation != state_handle.generation) {
+      poisoned_ = true;
+      throw std::runtime_error("SystemC compute went idle or returned stale completion");
+    }
+    const auto &state_bytes = pool.Read(state_handle);
+    if (state_bytes.size() != sizeof(state))
+      throw std::runtime_error("compute completion state has an invalid size");
+    std::memcpy(&state, state_bytes.data(), sizeof(state));
+    *stats = state.stats;
+    if (state.failed != 0) {
+      const std::string diagnostic(state.error.data(),
+          std::find(state.error.begin(), state.error.end(), '\0') -
+              state.error.begin());
+      release();
+      stats->pool_allocations = pool.allocations() - allocations_before;
+      stats->pool_releases = pool.releases() - releases_before;
+      if (pool.bytes_in_flight() != 0 ||
+          stats->pool_allocations != stats->pool_releases)
+        poisoned_ = true;
+      return fail(diagnostic.empty() ? "native compute shader execution failed"
+                                     : diagnostic);
+    }
+    if (state.counters.vs_invocations != 0 || state.counters.ps_invocations != 0)
+      throw std::runtime_error("compute incorrectly invoked a graphics shader stage");
+    for (std::size_t index = 0; index < dispatch->resources.size(); ++index) {
+      auto &resource = dispatch->resources[index];
+      if (!resource.writable || resource.bytes.empty())
+        continue;
+      auto readback = memory.Readback(address(index), resource.bytes.size(),
+                                       MemoryClient::kComputeReadback);
+      resource.bytes = std::move(readback.data);
+      stats->readback_bytes += resource.bytes.size();
+      stats->dram_read_bytes += readback.stats.dram_read_bytes;
+      stats->dram_write_bytes += readback.stats.dram_write_bytes;
+      stats->direct_read_bytes += readback.stats.direct_read_bytes;
+      stats->direct_write_bytes += readback.stats.direct_write_bytes;
+    }
+    release();
+    stats->pool_allocations = pool.allocations() - allocations_before;
+    stats->pool_releases = pool.releases() - releases_before;
+    if (pool.bytes_in_flight() != 0 ||
+        stats->pool_allocations != stats->pool_releases) {
+      poisoned_ = true;
+      return fail("SystemC compute leaked MemoryPool payloads");
+    }
+    return 0;
+  } catch (const std::exception &failure) {
+    if (submitted && !completed)
+      poisoned_ = true;
+    release();
+    if (pool.bytes_in_flight() != 0 ||
+        pool.allocations() - allocations_before !=
+            pool.releases() - releases_before)
+      poisoned_ = true;
+    return fail(failure.what());
+  }
+}
+
 void ModelSession::Shutdown() {
   if (stopped_ || !started_)
     return;
@@ -942,6 +1148,25 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options,
   if (result != 0 && !error.empty())
     std::cerr << error << '\n';
   return result;
+}
+
+int pvrgpu::stub::RunConfiguredCompute(
+    ModelComputeDispatch *dispatch, ModelComputeStats *stats,
+    std::string *error) {
+  if (!dispatch || !stats) {
+    if (error)
+      *error = "missing compute dispatch or result";
+    return 2;
+  }
+  if (!g_session) {
+    g_session = std::make_unique<ModelSession>(
+        dispatch->memory_mode, dispatch->memory_mode == MemoryMode::kBypass);
+  } else if (g_session->memory_mode() != dispatch->memory_mode) {
+    if (error)
+      *error = "SystemC model memory mode cannot change after elaboration";
+    return 2;
+  }
+  return g_session->RunCompute(dispatch, stats, error);
 }
 
 void pvrgpu::stub::ShutdownConfiguredModel() {

@@ -112,18 +112,20 @@ bool SameTextureSampleRequest(const TextureSampleRequest &left,
                     std::end(left.sampler_state),
                     std::begin(right.sampler_state)) &&
          left.request_id == right.request_id &&
+         left.texture_address_lo == right.texture_address_lo &&
+         left.texture_address_hi == right.texture_address_hi &&
          left.coordinate_count == right.coordinate_count &&
          left.component_count == right.component_count &&
          left.descriptor_set == right.descriptor_set &&
          left.binding == right.binding && left.dimension == right.dimension &&
          left.normalized == right.normalized &&
          left.fcnorm == right.fcnorm &&
+         left.sample_index == right.sample_index &&
+         left.sample_index_present == right.sample_index_present &&
          left.data_request == right.data_request &&
          left.quad_lane == right.quad_lane &&
          left.shader_stage == right.shader_stage && left.reserved[0] == 0 &&
-         left.reserved[1] == 0 && left.reserved[2] == 0 &&
-         right.reserved[0] == 0 && right.reserved[1] == 0 &&
-         right.reserved[2] == 0;
+         right.reserved[0] == 0;
 }
 
 bool SameVertexContinuation(const PcoVertexContinuation &left,
@@ -196,6 +198,8 @@ void RecordInstructionExecutions(
 UscCluster::UscCluster(sc_core::sc_module_name name, MemoryPool &pool,
                        ShaderStage stage, GpuMemorySystem *memory)
     : sc_module(name), pool_(pool), stage_(stage), memory_(memory) {
+  if (stage != ShaderStage::kVertex && stage != ShaderStage::kFragment)
+    throw std::invalid_argument("graphics UscCluster cannot execute compute");
   SC_THREAD(Run);
 }
 
@@ -412,7 +416,7 @@ void UscCluster::Run() {
               request.request_id = lane_index;
               request.shader_stage = ShaderStage::kVertex;
               // Every coordinate the request holds: a 2D sample leaves the
-              // third zero, and a 2D-array, cube or 3D sample needs it.
+              // third zero; cube/3D use it, arrays use the TAO address.
               for (std::size_t component = 0;
                    component < std::size(request.coordinates); ++component)
                 request.coordinates[component] = issued.coordinates[component];
@@ -427,6 +431,8 @@ void UscCluster::Run() {
               request.dimension = issued.dimension;
               request.normalized = issued.normalized;
               request.fcnorm = issued.fcnorm;
+              request.sample_index = issued.sample_index;
+              request.sample_index_present = issued.sample_index_present;
               request.data_request = issued.data_request;
               request.texture_address_lo = issued.texture_address_lo;
               request.texture_address_hi = issued.texture_address_hi;
@@ -645,6 +651,17 @@ void UscCluster::Run() {
               "fragment USC invocation task is invalid or duplicated");
         }
         const FragmentInvocation &invocation = invocations[invocation_index];
+        PcoFragmentExecutionContext raster_context;
+        if (IsDriverPcoTrianglesCase(state.functional_case)) {
+          if (context)
+            raster_context = *context;
+          raster_context.sample_x = FloatBits(static_cast<float>(invocation.x));
+          raster_context.sample_y = FloatBits(static_cast<float>(invocation.y));
+          // Driver commands require half_pixel_center=1. Keep the integer
+          // llvmpipe interpolation origin and the physical SR origin apart.
+          raster_context.special_coordinate_offset = FloatBits(0.5F);
+          context = &raster_context;
+        }
         const PcoFragmentExecution execution =
             context ? ExecuteFragmentPco(state.fragment_program_summary,
                                          instructions, *context)
@@ -765,7 +782,7 @@ void UscCluster::Run() {
             expected_coefficient_dwords == 0 ||
             expected_coefficient_dwords >
                 kPcoMaximumVaryingCoefficientCount ||
-            sample_instruction_count == 0 ||
+            (!driver_pco_texture && sample_instruction_count == 0) ||
             sample_instruction_count >
                 kPcoMaximumTextureSampleInstructions ||
             (driver_pco_texture &&
@@ -913,6 +930,9 @@ void UscCluster::Run() {
           request.dimension = execution.texture_request.dimension;
           request.normalized = execution.texture_request.normalized;
           request.fcnorm = execution.texture_request.fcnorm;
+          request.sample_index = execution.texture_request.sample_index;
+          request.sample_index_present =
+              execution.texture_request.sample_index_present;
           request.data_request = execution.texture_request.data_request;
           request.texture_address_lo =
               execution.texture_request.texture_address_lo;
@@ -955,11 +975,15 @@ void UscCluster::Run() {
           ++lane_request_count[shader_lane_index];
         };
 
-        std::vector<TextureSampleRequest> pending_requests(
-            shader_lanes.size());
+        // Descriptor-only queries are ordinary native ALU. The bound image
+        // still supplies SHARED words and position inputs, but only an actual
+        // decoded SMP may allocate/send a texture continuation round.
+        const std::size_t pending_lane_count =
+            sample_instruction_count == 0 ? 0 : shader_lanes.size();
+        std::vector<TextureSampleRequest> pending_requests(pending_lane_count);
         std::vector<PcoFragmentContinuation> pending_continuations(
-            shader_lanes.size());
-        std::vector<std::uint8_t> pending_queued(shader_lanes.size(), 0);
+            pending_lane_count);
+        std::vector<std::uint8_t> pending_queued(pending_lane_count, 0);
         for (const UscFragmentTask &task : tasks) {
           if (task.fragment_quad_index >= quads.size() ||
               task.coefficient_dword_count !=
@@ -982,6 +1006,9 @@ void UscCluster::Run() {
           PcoFragmentExecutionContext context;
           context.memory_read = UscUniformBufferMemory::Read;
           context.memory_user_data = &uniform_memory;
+          if (driver_pco_texture || state.functional_case ==
+                                        FunctionalCase::kDriverTexturedTriangles)
+            context.special_coordinate_offset = FloatBits(0.5F);
           context.coefficient_count = static_cast<std::uint8_t>(
               task.coefficient_dword_count);
           context.shared_count = static_cast<std::uint16_t>(
@@ -1044,8 +1071,11 @@ void UscCluster::Run() {
             }
             const PcoFragmentExecution execution = ExecuteFragmentPco(
                 state.fragment_program_summary, instructions, context);
-            queue_suspension(shader_lane_index, execution, pending_requests,
-                             pending_continuations, pending_queued);
+            if (sample_instruction_count == 0)
+              commit_output(shader_lane_index, execution);
+            else
+              queue_suspension(shader_lane_index, execution, pending_requests,
+                               pending_continuations, pending_queued);
           }
         }
         if (std::any_of(lane_context_initialized.begin(),
@@ -1068,8 +1098,7 @@ void UscCluster::Run() {
                 request.shader_stage != ShaderStage::kFragment ||
                 request.shader_lane_index != lane_index ||
                 request.request_id != lane_index ||
-                request.reserved[0] != 0 || request.reserved[1] != 0 ||
-                request.reserved[2] != 0 ||
+                request.reserved[0] != 0 ||
                 request.descriptor_set != descriptor_set ||
                 request.data_request !=
                     pending_continuations[lane_index].data_request ||

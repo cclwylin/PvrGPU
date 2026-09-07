@@ -37,6 +37,7 @@ MemoryAccessStats MaterializeSequenceColorMipChain(
       texture.producer_command_index >=
           kDriverPcoMaximumNestedSequenceCommands ||
       texture.format != "PIPE_FORMAT_R8G8B8A8_UNORM" ||
+      texture.sample_count > 1U ||
       texture.mip_count == 0 ||
       texture.mip_count > kDriverPcoMaximumTextureMipLevels ||
       texture.declared_bytes_size == 0 ||
@@ -415,8 +416,7 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
       (gamma && !rgba8 && !astc) ||
       ExtractBits(word0, 17, 26) != 0U ||
       (!rgba8 && !bgra8 && !astc && !z32_unorm && !z24_unorm_s8_uint &&
-       !packed_colour && !integer_colour) ||
-      ExtractBits(word0, 62, 63) != 0U) {
+       !packed_colour && !integer_colour)) {
     throw std::runtime_error(
         "TextureUnit unsupported raw Rogue image word0");
   }
@@ -444,6 +444,10 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
   }
 
   RogueTextureImageDescriptor descriptor;
+  descriptor.sample_count = static_cast<std::uint8_t>(
+      1U << ExtractBits(word0, 62, 63));
+  if (descriptor.sample_count > 1U && (astc || raw_mip_count != 1U))
+    throw std::runtime_error("TextureUnit multisample image must be uncompressed and single-level");
   descriptor.width =
       static_cast<std::uint32_t>(ExtractBits(word0, 34, 47) + 1U);
   descriptor.height =
@@ -470,8 +474,10 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
      */
     descriptor.row_pitch_bytes = encoded_stride;
   } else if (encoded_stride == descriptor.width) {
-    descriptor.row_pitch_bytes = encoded_stride * bytes_per_texel;
-  } else if (encoded_stride >= descriptor.width * bytes_per_texel) {
+    descriptor.row_pitch_bytes =
+        encoded_stride * bytes_per_texel * descriptor.sample_count;
+  } else if (descriptor.sample_count == 1U &&
+             encoded_stride >= descriptor.width * bytes_per_texel) {
     descriptor.row_pitch_bytes = encoded_stride;
   } else {
     throw std::runtime_error(
@@ -499,12 +505,71 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
   const std::uint32_t minimum_row_pitch =
       astc ? ((descriptor.width + astc_footprint.width - 1U) /
               astc_footprint.width) * 16U
-           : descriptor.width * bytes_per_texel;
+           : descriptor.width * bytes_per_texel * descriptor.sample_count;
   if (descriptor.gpu_address == 0 ||
       descriptor.row_pitch_bytes < minimum_row_pitch) {
     throw std::runtime_error("TextureUnit invalid raw Rogue image layout");
   }
   return descriptor;
+}
+
+bool ComputeTextureMultisampleTexelOffset(
+    const TextureResource &resource, const TextureSampleRequest &request,
+    std::uint32_t layer, std::uint64_t *offset) {
+  if (offset == nullptr || request.sample_index_present != 1U ||
+      request.normalized != 0U || resource.mip_count != 1U ||
+      (resource.sample_count != 1U && resource.sample_count != 2U &&
+       resource.sample_count != 4U && resource.sample_count != 8U) ||
+      (resource.dimension_type != TextureDimensionType::k2D &&
+       resource.dimension_type != TextureDimensionType::k2DArray) ||
+      resource.layer_count == 0 || resource.block_width != 1U ||
+      resource.block_height != 1U ||
+      resource.format == TextureFormat::kAstcLdr ||
+      resource.format == TextureFormat::kAstcLdrSrgb) {
+    throw std::runtime_error("TextureUnit invalid multisample texelFetch metadata");
+  }
+  *offset = 0;
+  const TextureMipLevel &mip = resource.mip[0];
+  const std::uint64_t bytes_per_texel = TextureBytesPerTexel(resource.format);
+  if (mip.width == 0 || mip.height == 0 ||
+      mip.row_pitch_bytes < mip.width * bytes_per_texel * resource.sample_count ||
+      resource.byte_size < bytes_per_texel ||
+      mip.offset_bytes > resource.byte_size ||
+      static_cast<std::uint64_t>(mip.row_pitch_bytes) * mip.height >
+          (resource.byte_size - mip.offset_bytes) / resource.layer_count) {
+    throw std::runtime_error("TextureUnit invalid multisample texelFetch storage");
+  }
+  // PCO has already converted integer texel coordinates to float for SMP.
+  // No normalized wrap, nearest/linear filter, LOD, or resolve participates.
+  const float x = BitsFloat(request.coordinates[0]);
+  const float y = BitsFloat(request.coordinates[1]);
+  if (!std::isfinite(x) || !std::isfinite(y) || x < 0.0F || y < 0.0F ||
+      x >= static_cast<float>(mip.width) || y >= static_cast<float>(mip.height) ||
+      std::floor(x) != x || std::floor(y) != y ||
+      layer >= resource.layer_count || request.sample_index >= resource.sample_count)
+    return false;
+  const std::uint64_t address_offset =
+      mip.offset_bytes + static_cast<std::uint64_t>(layer) * mip.row_pitch_bytes * mip.height +
+      static_cast<std::uint64_t>(y) * mip.row_pitch_bytes +
+      (static_cast<std::uint64_t>(x) * resource.sample_count + request.sample_index) * bytes_per_texel;
+  if (address_offset > resource.byte_size - bytes_per_texel ||
+      address_offset > std::numeric_limits<std::uint64_t>::max() - resource.gpu_address)
+    throw std::runtime_error("TextureUnit multisample texel address is out of range");
+  *offset = address_offset;
+  return true;
+}
+
+void ValidateTextureSingleLevelDimensions(
+    const std::array<std::uint32_t, 4> &words,
+    const TextureResource &resource) {
+  if (resource.mip_count != 1U)
+    return;
+  const std::uint64_t textype = ExtractBits(ReadU64(words, 0), 0, 2);
+  if ((resource.dimension_type == TextureDimensionType::k2D &&
+       (textype != 4U || resource.layer_count != 1U)) ||
+      (resource.dimension_type == TextureDimensionType::k2DArray &&
+       (textype != 1U || ExtractBits(ReadU64(words, 2), 4, 14) + 1U != resource.layer_count)))
+    throw std::runtime_error("TextureUnit raw image TEXTYPE/depth disagrees with layer metadata");
 }
 
 RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
@@ -914,6 +979,7 @@ void TextureUnit::SampleRunForStage(
     if (!resource_storage_valid || resource.byte_size == 0 ||
         resource.gpu_address != image.gpu_address ||
         resource.mip_count != image.mip_count ||
+        resource.sample_count != image.sample_count ||
         resource.format != image.format || resource.layout != image.layout ||
         sampler.min_filter != decoded_sampler.min_filter ||
         sampler.mag_filter != decoded_sampler.mag_filter ||
@@ -929,6 +995,7 @@ void TextureUnit::SampleRunForStage(
           "TextureUnit structured state disagrees with raw descriptor");
     }
     if (driver_pco) {
+      ValidateTextureSingleLevelDimensions(image_words, resource);
       const std::uint64_t sampler_word0 = ReadU64(sampler_words, 0);
       const std::uint64_t expected_gather_word0 =
           sampler_word0 | (UINT64_C(1) << 36U) | (UINT64_C(1) << 38U);
@@ -947,8 +1014,13 @@ void TextureUnit::SampleRunForStage(
           !DriverPcoTextureDescriptorClassSupported(image, decoded_sampler,
                                                     descriptor_count)
               ? "descriptor class is unsupported"
-          : shared[descriptor_base + 4U] != resource.byte_size
-              ? "word4 is not the resource byte size"
+          : shared[descriptor_base + 4U] !=
+                (resource.dimension_type == TextureDimensionType::k2DArray &&
+                         resource.mip_count == 1U
+                     ? static_cast<std::uint64_t>(resource.mip[0].row_pitch_bytes) *
+                           resource.mip[0].height
+                     : resource.byte_size)
+              ? "word4 is not the image layer size"
           : shared[descriptor_base + 5U] != 0   ? "word5 is not zero"
           : shared[descriptor_base + 6U] != 0   ? "word6 is not zero"
           : shared[descriptor_base + 7U] != 0   ? "word7 is not zero"
@@ -1008,7 +1080,7 @@ void TextureUnit::SampleRunForStage(
     for (std::uint32_t level = 0; level < image.mip_count; ++level) {
       const std::uint32_t tight_pitch =
           storage_blocks(expected_width, storage_block_width) *
-          storage_block_bytes;
+          storage_block_bytes * image.sample_count;
       const std::uint32_t expected_pitch =
           level == 0 ? image.row_pitch_bytes : tight_pitch;
       const TextureMipLevel &structured_mip = resource.mip[level];
@@ -1055,8 +1127,19 @@ void TextureUnit::SampleRunForStage(
      * sample has no screen-space derivatives; llvmpipe samples it at LOD 0
      * and so does this unit.
      */
+    const bool multisample_fetch = requests.front().sample_index_present != 0;
+    for (const TextureSampleRequest &request : requests) {
+      if (request.sample_index_present != (multisample_fetch ? 1U : 0U) ||
+          (multisample_fetch &&
+           (image.mip_count != 1U || resource.block_width != 1U ||
+            resource.block_height != 1U ||
+            (resource.dimension_type != TextureDimensionType::k2D &&
+             resource.dimension_type != TextureDimensionType::k2DArray))) ||
+          (!multisample_fetch && (image.sample_count != 1U || request.sample_index != 0U)))
+        throw std::runtime_error("TextureUnit invalid multisample request class");
+    }
     const bool needs_lod =
-        !vertex_stage && decoded_sampler.max_lod_u4_6 != 0 &&
+        !multisample_fetch && !vertex_stage && decoded_sampler.max_lod_u4_6 != 0 &&
         (image.mip_count > 1U ||
          decoded_sampler.min_filter != decoded_sampler.mag_filter);
     std::vector<TextureImplicitLod> implicit_lods(requests.size());
@@ -1099,7 +1182,7 @@ void TextureUnit::SampleRunForStage(
         for (std::size_t lane = 0; lane < 4U; ++lane)
           implicit_lods[first + lane] = lod;
       }
-    } else {
+    } else if (!multisample_fetch) {
       // Zero derivatives: the window's minimum LOD, the base level.
       const std::array<std::array<float, 2>, 4> degenerate_quad{};
       const TextureImplicitLod base_level =
@@ -1380,14 +1463,13 @@ void TextureUnit::SampleRunForStage(
           request.component_count != 4 ||
           request.descriptor_set != descriptor_set || request.binding != 0 ||
           request.dimension != expected_dimension ||
-          request.normalized != 1 ||
+          request.normalized != (multisample_fetch ? 0U : 1U) ||
           request.fcnorm != (integer_texture ? 0U : 1U) ||
           request.data_request != 0 ||
           (vertex_stage
                ? (request.quad_id != 0 || request.quad_lane != 0)
                : request.quad_lane > 3U) ||
-          request.reserved[0] != 0 || request.reserved[1] != 0 ||
-          request.reserved[2] != 0) {
+          request.reserved[0] != 0) {
         throw std::runtime_error("TextureUnit SMP request ABI mismatch");
       }
       for (std::size_t dword = 0; dword < 4; ++dword) {
@@ -1408,12 +1490,11 @@ void TextureUnit::SampleRunForStage(
       // lp_build_layer_coord: the array layer is the third coordinate as a
       // signed integer (the shader applied f2i32_rtne before the sample),
       // clamped to the levels that exist.  It is 0 for a plain 2D image.
-      // A 2D-array sample folds the layer into the texture address: the
-      // shader computed base + layer * LAYER_SIZE, and the compiler's
-      // LAYER_SIZE is the whole array allocation's byte size (its own array
-      // stride), so the layer is (address - base) / byte_size.  The texel
-      // within the layer is then addressed with the level-major per-level
-      // layer stride below.
+      // A 2D-array sample folds the layer into the texture address through
+      // native base + layer * PCO_IMAGE_META_LAYER_SIZE. For a one-level
+      // image this is the real layer stride, including all actual samples.
+      // Existing multi-level arrays retain their legacy whole-allocation
+      // meta convention and level-major storage until that path is revised.
       std::uint32_t selected_layer = 0U;
       if (array_texture) {
         const std::uint64_t sample_address =
@@ -1422,9 +1503,20 @@ void TextureUnit::SampleRunForStage(
         if (sample_address < image.gpu_address || resource.byte_size == 0)
           throw std::runtime_error(
               "TextureUnit array sample address is out of range");
+        const std::uint64_t address_layer_stride = resource.mip_count == 1U
+            ? static_cast<std::uint64_t>(resource.mip[0].row_pitch_bytes) *
+                  resource.mip[0].height
+            : resource.byte_size;
+        if (address_layer_stride == 0)
+          throw std::runtime_error("TextureUnit array layer stride is empty");
         std::uint64_t layer =
-            (sample_address - image.gpu_address) / resource.byte_size;
-        if (layer >= resource.layer_count)
+            (sample_address - image.gpu_address) / address_layer_stride;
+        if (multisample_fetch &&
+            (sample_address - image.gpu_address) % address_layer_stride != 0U)
+          throw std::runtime_error("TextureUnit multisample array address is not layer-aligned");
+        if (multisample_fetch && layer >= resource.layer_count)
+          layer = resource.layer_count;
+        else if (layer >= resource.layer_count)
           layer = resource.layer_count - 1U;
         selected_layer = static_cast<std::uint32_t>(layer);
       }
@@ -1454,6 +1546,10 @@ void TextureUnit::SampleRunForStage(
                                               resource.block_height};
       const std::uint32_t fetch_bytes =
           astc_image ? 16U : TextureBytesPerTexel(image.format);
+      std::uint64_t multisample_offset = 0;
+      const bool multisample_in_bounds = !multisample_fetch ||
+          ComputeTextureMultisampleTexelOffset(resource, request, selected_layer,
+                                               &multisample_offset);
       /*
        * The block most recently decoded, and the bytes it was decoded from.
        * The TPU decodes a block once as it arrives from the TCU and hands
@@ -1475,7 +1571,7 @@ void TextureUnit::SampleRunForStage(
             astc_image ? y / astc_footprint.height : y;
         const std::uint64_t layer_stride =
             static_cast<std::uint64_t>(mip.row_pitch_bytes) * mip.height;
-        const std::uint64_t texel_offset =
+        const std::uint64_t texel_offset = multisample_fetch ? multisample_offset :
             static_cast<std::uint64_t>(mip.offset_bytes) +
             static_cast<std::uint64_t>(selected_layer) * layer_stride +
             static_cast<std::uint64_t>(fetch_y) * mip.row_pitch_bytes +
@@ -1575,6 +1671,47 @@ void TextureUnit::SampleRunForStage(
         std::copy_n(bytes.begin(), texel.size(), texel.begin());
         return texel;
       };
+
+      if (multisample_fetch) {
+        TextureSampleResponse response;
+        response.shader_lane_index = request.shader_lane_index;
+        response.request_id = request.request_id;
+        response.shader_stage = shader_stage;
+        if (multisample_in_bounds) {
+          const auto texel = read_texel_bytes(resource.mip[0], 0, 0,
+              request.request_id * kTextureSampleTapRequestStride);
+          ++expected_texel_fetches;
+          if (integer_texture) {
+            const auto value = DecodeTexelToInteger(image.format, texel);
+            std::copy(value.begin(), value.end(), response.rgba);
+          } else {
+            std::array<float, 4> value{};
+            if (image.format == TextureFormat::kZ32Unorm) {
+              std::uint32_t encoded = 0;
+              std::memcpy(&encoded, texel.data(), sizeof(encoded));
+              const float depth = static_cast<float>(static_cast<double>(encoded) /
+                  static_cast<double>(std::numeric_limits<std::uint32_t>::max()));
+              value = {depth, depth, depth, 1.0F};
+            } else if (image.format == TextureFormat::kZ24UnormS8Uint) {
+              std::array<std::uint8_t, 8> depth_bytes{};
+              std::copy_n(texel.begin(), depth_bytes.size(), depth_bytes.begin());
+              value = {SampledDepth24ToFloat(SampledDepth24FromTexel(depth_bytes)),
+                       0.0F, 0.0F, 1.0F};
+            } else {
+              value = DecodeTexelToFloat(image.format, texel);
+            }
+            if (image.format == TextureFormat::kRgbx8Unorm)
+              value[3] = 1.0F;
+            for (std::size_t component = 0; component < value.size(); ++component)
+              response.rgba[component] = FloatBits(value[component]);
+          }
+        }
+        // As in llvmpipe's out-of-bounds selection, invalid shader texels
+        // produce zero. We issue no physical read for these lanes, including
+        // helper lanes beyond an odd framebuffer extent, and count no fetch.
+        responses.push_back(response);
+        continue;
+      }
 
       const auto sample_bilinear_depth =
           [&](const TextureMipLevel &mip,

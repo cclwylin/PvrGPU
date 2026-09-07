@@ -48,7 +48,8 @@ void PbeWriteBack::Run() {
       throw std::runtime_error("PbeWriteBack memory mode mismatch");
     if (!HasPoolHandle(state.pbe_framebuffer))
       throw std::runtime_error("PbeWriteBack received no PBE framebuffer");
-    if (state.raster_state.shader_writes_depth && state.capture_depth_attachment)
+    if (RasterRequiresLateDepthStencil(state.raster_state) &&
+        state.capture_depth_attachment)
       MaterializeDepthAttachment(pool_, memory_, &state);
 
     // A pixel is four bytes only while the attachment packs UNORM8 channels.

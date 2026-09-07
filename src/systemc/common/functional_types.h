@@ -272,8 +272,8 @@ struct StencilFaceState {
  *
  * The rest of the map, for whoever adds the next region: the GLBench texture at
  * 0x40000000, the sequence colour/depth/external attachments at 0x50000000,
- * 0x60000000 and 0x70000000 (model_types.h), and the driver's per-submission
- * vertex, index and texture-coordinate regions from 0x1'0000'0000 upwards
+ * 0x60000000 and 0x80'0000'0000 (model_types.h), and the driver's per-submission
+ * vertex, index and texture-coordinate regions from 0x100'0000'0000 upwards
  * (submitter.cpp).  Anything new belongs above these.
  */
 inline constexpr std::uint64_t kParameterRegionBytes =
@@ -455,6 +455,9 @@ struct RasterState {
   // Disabling multisample rasterization uses center coverage/depth while
   // retaining independent storage and tests for every selected sample.
   std::uint8_t multisample_enable = 1;
+  std::uint8_t alpha_to_coverage = 0;
+  std::uint8_t alpha_to_coverage_dither = 0;
+  std::uint8_t alpha_to_one = 0;
   std::uint8_t shader_may_discard = 0;
   std::uint8_t shader_writes_depth = 0;
   std::uint8_t shader_writes_sample_mask = 0;
@@ -466,6 +469,12 @@ struct RasterState {
   // GL top edge into the bottom one.  Only the horizontal-edge tie moves.
   std::uint8_t bottom_edge_rule = 0;
 };
+
+inline bool RasterRequiresLateDepthStencil(const RasterState &state) {
+  // Alpha-to-coverage can remove samples after shading. Neither opaque HSR
+  // nor depth/stencil writes may consume the unfiltered geometry coverage.
+  return state.shader_writes_depth != 0 || state.alpha_to_coverage != 0;
+}
 
 struct InputVertex {
   float x = 0.0f;
@@ -666,6 +675,9 @@ struct TextureResource {
   // this at one.
   TextureDimensionType dimension_type = TextureDimensionType::k2D;
   std::uint16_t layer_count = 1;
+  // MS images keep actual samples pixel-interleaved: (x * sample_count +
+  // sample) * bytes_per_texel. No resolved/duplicated single-sample plane.
+  std::uint8_t sample_count = 1;
   TextureMipLevel mip[kMaximumTextureMipLevels]{};
 };
 
@@ -866,6 +878,9 @@ struct FragmentCandidate {
   std::uint32_t sample_mask = 0;
   FragmentVisibility visibility = FragmentVisibility::kRejected;
   std::uint8_t reserved[2]{};
+  // Raster Z at each covered sample, retained for fixed-function late tests
+  // when alpha-to-coverage runs without a shader depth output.
+  float sample_depth[16]{};
 };
 
 struct FragmentInvocation {
@@ -882,6 +897,7 @@ struct FragmentInvocation {
   std::uint8_t reserved[1]{};
   float depth = 0.0f;
   float barycentric[3]{};
+  float sample_depth[16]{};
 };
 
 // A shader lane may be a covered invocation or a helper lane. Helpers execute
@@ -959,7 +975,12 @@ struct TextureSampleRequest {
   std::uint8_t data_request = 0;
   std::uint8_t quad_lane = 0;
   ShaderStage shader_stage = ShaderStage::kFragment;
-  std::uint8_t reserved[3]{};
+  // Native SMP.SNO's lookup DWORD carries the sample index in bits 18:16.
+  // Present remains set for sampler2DMS with one stored sample; NNCOORDS
+  // independently overrides coordinate normalization for this instruction.
+  std::uint8_t sample_index = 0;
+  std::uint8_t sample_index_present = 0;
+  std::uint8_t reserved[1]{};
 };
 
 struct TextureSampleResponse {

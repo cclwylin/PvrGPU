@@ -155,7 +155,8 @@ void Isp::Run() {
     // If the fragment shader may discard, we cannot perform opaque early HSR because
     // a front-most fragment might be discarded later, revealing fragments behind it.
     // Likewise, if early HSR is not safe, we disable early culling.
-    const bool late_depth_stencil = state.raster_state.shader_writes_depth != 0;
+    const bool late_depth_stencil =
+        RasterRequiresLateDepthStencil(state.raster_state);
     if (state.raster_state.shader_may_discard || late_depth_stencil ||
         !state.fragment_early_hsr_safe) {
       opaque_early_hsr = false;
@@ -163,10 +164,13 @@ void Isp::Run() {
     // If the shader writes custom depth, early depth writes are not allowed because
     // the final depth value is determined during shader execution.
     const bool early_depth_write = state.raster_state.depth.write_enable &&
-                                   !state.raster_state.shader_writes_depth;
+                                   !late_depth_stencil;
     const std::uint32_t sample_count = state.raster_state.sample_count;
-    if (state.raster_state.multisample_enable > 1)
-      throw std::runtime_error("ISP multisample rasterization flag is invalid");
+    if (state.raster_state.multisample_enable > 1 ||
+        state.raster_state.alpha_to_coverage > 1 ||
+        state.raster_state.alpha_to_coverage_dither > 1 ||
+        state.raster_state.alpha_to_one > 1)
+      throw std::runtime_error("ISP multisample/alpha control flag is invalid");
     const bool multisample_rasterization =
         sample_count > 1 && state.raster_state.multisample_enable != 0;
     const std::uint32_t enabled_samples =
@@ -466,6 +470,8 @@ void Isp::Run() {
             candidate.depth = InterpolateDepth(
                 triangle, edge_values, x, y, llvmpipe_driver_depth,
                 candidate.barycentric);
+            std::copy(sample_depth.begin(), sample_depth.end(),
+                      candidate.sample_depth);
             const std::size_t coverage_index =
                 static_cast<std::size_t>(y) * state.width + x;
             if (covered[coverage_index] == 0) {
@@ -481,8 +487,9 @@ void Isp::Run() {
               const std::size_t pixel_index =
                   coverage_index * sample_count + sample;
               if (late_depth_stencil) {
-                // gl_FragDepth is unknown until USC executes. Preserve all
-                // coverage and API order without changing either attachment.
+                // Shader depth or final alpha coverage is not known until
+                // USC/PBE. Preserve geometry coverage, raster sample depths
+                // and API order without changing either attachment.
                 candidates[candidate_index].sample_mask |= sample_bit;
                 candidates[candidate_index].visibility = FragmentVisibility::kVisible;
                 continue;

@@ -258,6 +258,95 @@ pvrgpu_safe_text(const char *text)
    return text ? text : "";
 }
 
+bool
+pvrgpu_submit_compute_command(
+   const struct pvrgpu_systemc_compute_dispatch *dispatch,
+   struct pvrgpu_systemc_compute_stats *stats,
+   char *error, size_t error_size)
+{
+   if (!dispatch || !stats) {
+      pvrgpu_cmd_error(error, error_size, "compute dispatch/stats missing");
+      return false;
+   }
+   memset(stats, 0, sizeof(*stats));
+   const char *library_path = pvrgpu_nonempty_env("PVRGPU_SYSTEMC_API_LIB");
+   if (!library_path) {
+      pvrgpu_cmd_error(error, error_size,
+                       "compute requires PVRGPU_SYSTEMC_API_LIB");
+      return false;
+   }
+   struct pvrgpu_systemc_compute_dispatch submitted = *dispatch;
+   const char *mode = pvrgpu_nonempty_env("PVRGPU_MODEL_MEMORY_MODE");
+   if (!mode || strcmp(mode, "direct") == 0)
+      submitted.memory_mode = 0;
+   else if (strcmp(mode, "bypass") == 0)
+      submitted.memory_mode = 1;
+   else if (strcmp(mode, "cache") == 0)
+      submitted.memory_mode = 2;
+   else {
+      pvrgpu_cmd_error(error, error_size, "invalid compute memory_mode");
+      return false;
+   }
+
+   static void *handle;
+   static char *loaded_path;
+   static pvrgpu_systemc_submit_compute_fn submit;
+   if (!handle || !loaded_path || strcmp(loaded_path, library_path) != 0) {
+      dlerror();
+      handle = dlopen(library_path, RTLD_NOW | RTLD_GLOBAL);
+      if (!handle) {
+         pvrgpu_cmd_error(error, error_size, dlerror());
+         return false;
+      }
+      dlerror();
+      submit = (pvrgpu_systemc_submit_compute_fn)
+         dlsym(handle, "pvrgpu_systemc_submit_compute");
+      const char *detail = dlerror();
+      if (detail || !submit) {
+         pvrgpu_cmd_error(error, error_size,
+                          detail ? detail : "compute submit symbol missing");
+         return false;
+      }
+      free(loaded_path);
+      loaded_path = strdup(library_path);
+   }
+   pvrgpu_counter_eventf(
+      "compute_api_submit",
+      "api=%u binary_bytes=%zu grid=%ux%ux%u block=%ux%ux%u "
+      "resources=%zu bindings=%zu push_words=%zu memory_mode=%u",
+      submitted.version, submitted.binary_size,
+      submitted.grid[0], submitted.grid[1], submitted.grid[2],
+      submitted.block[0], submitted.block[1], submitted.block[2],
+      submitted.resource_count, submitted.binding_count,
+      submitted.push_word_count, submitted.memory_mode);
+   if (error && error_size)
+      error[0] = '\0';
+   const int result = submit(&submitted, stats, error, error_size);
+   if (result != 0) {
+      if (error && error_size && !error[0])
+         snprintf(error, error_size, "compute API returned %d", result);
+      return false;
+   }
+   pvrgpu_counter_eventf(
+      "compute_api_done",
+      "workgroups=%" PRIu64 " invocations=%" PRIu64
+      " alu_instructions=%" PRIu64 " memory_instructions=%" PRIu64
+      " atomic_instructions=%" PRIu64
+      " load_instructions=%" PRIu64 " store_instructions=%" PRIu64
+      " dram_read_bytes=%" PRIu64 " dram_write_bytes=%" PRIu64
+      " direct_read_bytes=%" PRIu64 " direct_write_bytes=%" PRIu64
+      " readback_bytes=%" PRIu64 " pool_allocations=%" PRIu64
+      " pool_releases=%" PRIu64,
+      stats->workgroups, stats->invocations, stats->alu_instructions,
+      stats->memory_instructions, stats->atomic_instructions,
+      stats->load_instructions,
+      stats->store_instructions, stats->dram_read_bytes,
+      stats->dram_write_bytes, stats->direct_read_bytes,
+      stats->direct_write_bytes, stats->readback_bytes,
+      stats->pool_allocations, stats->pool_releases);
+   return true;
+}
+
 static void
 pvrgpu_systemc_submit_info_init(
    struct pvrgpu_systemc_submit_info *info,
@@ -1489,6 +1578,13 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       raster_reason = "depth_clamp";
    else if (!color_layout && cmd->sample_mask != UINT32_MAX)
       raster_reason = "sample_mask";
+   else if (cmd->alpha_to_coverage > 1 ||
+            (!color_layout && cmd->alpha_to_coverage))
+      raster_reason = "alpha_to_coverage";
+   else if (cmd->alpha_to_coverage_dither > 1)
+      raster_reason = "alpha_to_coverage_dither";
+   else if (cmd->alpha_to_one > 1 || (!color_layout && cmd->alpha_to_one))
+      raster_reason = "alpha_to_one";
    else if (cmd->color_mask > 0xf)
       raster_reason = "color_mask";
    else if (cmd->blend_enable > 1)
@@ -1951,6 +2047,9 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->depth_clip_far = cmd->depth_clip_far;
    out->depth_clamp = cmd->depth_clamp;
    out->sample_mask = cmd->sample_mask;
+   out->alpha_to_coverage = cmd->alpha_to_coverage;
+   out->alpha_to_coverage_dither = cmd->alpha_to_coverage_dither;
+   out->alpha_to_one = cmd->alpha_to_one;
    out->color_mask = cmd->color_mask;
    out->blend_enable = cmd->blend_enable;
    out->dither = cmd->dither;
@@ -2142,6 +2241,9 @@ pvrgpu_write_draw_pco_triangles_command(
       "primitive_width=%u,%u\n"
       "point_size_output=%u,%u\n"
       "sample_mask=%u\n"
+      "alpha_to_coverage=%u\n"
+      "alpha_to_coverage_dither=%u\n"
+      "alpha_to_one=%u\n"
       "color_state=%u,%u,%u\n"
       "depth_state=%u,%u,%u,%u,%u\n",
       cmd->vertex_pco_abi.temps,
@@ -2196,6 +2298,9 @@ pvrgpu_write_draw_pco_triangles_command(
       cmd->point_size_output_start,
       cmd->point_size_output_count,
       cmd->sample_mask,
+      cmd->alpha_to_coverage,
+      cmd->alpha_to_coverage_dither,
+      cmd->alpha_to_one,
       cmd->color_mask,
       cmd->blend_enable,
       cmd->dither,

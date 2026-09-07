@@ -7,10 +7,18 @@
 #include <stdint.h>
 
 #include "pvrgpu_systemc_api.h"
+#include "pvrgpu_systemc_compute_api.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Synchronous, independent compute entry point. The model alone mutates the
+ * dispatch snapshots; no graphics command or framebuffer supplies results. */
+bool pvrgpu_submit_compute_command(
+   const struct pvrgpu_systemc_compute_dispatch *dispatch,
+   struct pvrgpu_systemc_compute_stats *stats,
+   char *error, size_t error_size);
 
 #define PVRGPU_DRIVER_COMMAND_SCHEMA "pvrgpu.driver-command.v1"
 #define PVRGPU_DRIVER_COMMAND_PRODUCER "pvrgpu-gallium-driver"
@@ -260,6 +268,9 @@ struct pvrgpu_draw_pco_triangles_command {
    uint32_t depth_clip_far;
    uint32_t depth_clamp;
    uint32_t sample_mask;
+   uint32_t alpha_to_coverage;
+   uint32_t alpha_to_coverage_dither;
+   uint32_t alpha_to_one;
    uint32_t color_mask;
    uint32_t blend_enable;
    uint32_t dither;

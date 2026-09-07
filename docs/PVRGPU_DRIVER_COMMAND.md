@@ -8,7 +8,130 @@ bring-up seam: small enough to debug quickly, strict enough to prevent fake
 passes, and close enough to Gallium state that the driver can grow phase by
 phase.
 
-## Uniform-buffer snapshots (SystemC API v21)
+## Multisample sampled images (SystemC API v23)
+
+The sampled-texture payload appends `sample_count` (zero is the canonical
+single-sample default). Graphics API 23 rejects older top-level and nested
+commands before reading the expanded texture array; the separate Compute API
+remains version 2. Supported sampled storage counts are 1, 2, 4, and 8, matching
+the two-bit Rogue IMAGE_WORD0 SMPCNT field. Render-only storage can still use
+16 samples, but cannot be bound through the sampled-image ABI.
+
+Pinned Mesa PCO lowers `txf_ms` to real SMP with NNCOORDS and SNO. The sample
+number is the lookup DWORD's bits 18:16. An array uses PCO's native layer clamp,
+multiply and 64-bit texture-address override; it is not a third normalized
+coordinate. `textureSize` and `textureSamples` execute PCO's descriptor-reading
+instructions. No synthetic fetch/query opcode or host shader evaluation is used.
+The real GLES probe covers descriptor-only `textureSize`. This pinned Mesa
+does not expose `textureSamples` as a GLES 3.10 built-in; its native lowering
+and execution are separately tested using compiler-generated NIR fixtures,
+not claimed as live GLES support.
+
+External MS resources have one mip level, 2D or 2D-array shape, and actual
+pixel-interleaved samples: `layer * row_pitch * height + y * row_pitch +
+(x * sample_count + sample) * bytes_per_texel`. This implements llvmpipe's
+selected-sample fetch semantics using PvrGPU's existing physical layout, not
+llvmpipe's sample-major layout. NNCOORDS/SNO bypass normalized addressing,
+filtering, LOD, and resolve. Decoded coordinates/sample indices outside the
+declared image return zero without a memory read; malformed metadata is
+rejected. The native lookup has already narrowed the sample field to three
+bits. This policy does not promise a particular result for an original
+undefined GLSL index before that native masking, or define GLES out-of-range
+behavior.
+
+The driver snapshots every sample and layer. Narrow integer channels retain
+exact signed/unsigned DWORDs; supported float formats and Z32_FLOAT retain
+their values in canonical RGBA32_FLOAT transport. This is format conversion,
+never averaging or copying expected shader results. Raw SMPCNT, array depth,
+logical dimensions, allocation bounds and structured metadata are cross-checked.
+For a one-mip array, IMAGE_META_LAYER_SIZE contains one physical layer's stride,
+including every sample, even when the array has just one layer.
+Only full-array MS sampler views are transported in this slice; restricted
+layer views are explicitly rejected instead of sampling the wrong base layer.
+
+Sample-position queries use Mesa's standard table with the actual storage
+sample count, matching the model. Texture sample-count queries include sampler
+support (maximum 8); render-only support remains separately queryable up to 16.
+Proxy capacity checks round a requested count upward to supported storage,
+while resource creation still validates the actual count strictly. In this
+pinned Mesa, a GLES request of 1 can allocate 2 samples on PvrGPU; tests must
+inspect the actual count rather than assume it equals the request.
+
+The pinned external Mesa trees require the same three additional fixes:
+`mesa-26.2.1-ms-texture-sample-query.patch`,
+`mesa-26.2.1-renderbuffer-optional-sampler.patch`, and
+`mesa-26.2.1-pco-stride-texture-size.patch` in `third_party/`. The first two
+separate sampleable textures from render-only resources. The third fixes
+native PCO size queries: STRIDE WORD1 bits 60:63 hold a mip count, not the
+normal IMAGE descriptor's base level. It preserves the hardware descriptor
+and compiler-generated ALU rather than compensating on the host. Apply these
+on top of the earlier imported-MSAA/readpixels-resolve patches to both local
+backends. Regenerate native test fixtures with
+`bash script/run_mesa_pco_multisample_unit.sh`; the fixture lock records both
+the pre-fix hashes and the patched compiler's outputs.
+
+These paths are validated separately from the earlier 64 Basic MSAA cases;
+the exact GLES31 `functional.texture.multisample.*` group contains 157 cases.
+QPA Pass with refused draws is not evidence of native completion. Multilevel
+array layout, sample-frequency shading, image atomics and shared-memory compute
+are outside this sampled-image change.
+
+## Multisample alpha operations (introduced in SystemC API v22)
+
+Each physical draw snapshots three boolean fields: `alpha_to_coverage`,
+`alpha_to_coverage_dither`, and `alpha_to_one`. The driver and bridge validate
+them and copy them into the draw's `RasterState`; they are not context-global
+values read after a deferred draw. The graphics API version is now 23 and
+both top-level and nested old-version commands are rejected before accessing
+their new tail. The independent Compute API remains version 2.
+
+The model adapts Mesa 26.2.1 llvmpipe's pixel-frequency alpha-to-coverage
+algorithm: sample s survives when the original DATA0 alpha is greater than
+s/N. Optional ordered dithering first subtracts the 2x2 matrix
+`[1/8, 5/8; 7/8, 3/8] / N`, indexed by framebuffer x/y parity. This mask is
+intersected with geometric coverage and the application sample mask. Without
+a declared DATA0 alpha output, no synthetic alpha participates in this step.
+
+Alpha-to-coverage draws retain all overlapping candidates in API order.
+Rasterized per-sample depth is carried to PBE, which applies alpha coverage
+before depth/stencil updates. A shader-written depth replaces raster depth;
+otherwise each sample keeps its own interpolated depth. Only then does
+alpha-to-one replace declared color-output alpha, followed by blending and
+stores. Attachment writeback still uses the model's memory path.
+
+The driver resolve follows util_blitter's sequential F32 sum starting at +0,
+then multiplication by 1/N. Normalized and floating-point color samples are
+unpacked before averaging; sRGB RGB is averaged in linear space while alpha
+remains linear. Integer, depth and stencil resolves select an actual sample.
+See `THIRD_PARTY_NOTICES.md` for source and license provenance. These functional
+algorithms are not claims about proprietary PowerVR hardware sample patterns
+or timing, and do not make unimplemented sample-frequency shading available.
+
+Gallium texture maps are not resolves: the model's interleaved attachment
+readback remains unchanged, while the driver exposes sample zero as packed
+pixels through a private staging map, matching llvmpipe's map contract. Writes
+scatter only sample zero; explicit flushes commit only their mapped subregion.
+Texture subdata uploads use the same packed sample-zero contract, respecting
+the source row/layer strides and preserving all other samples. Attachment
+clears remain all-sample operations.
+Direct/persistent/coherent mappings cannot use this staging path and are refused.
+
+Two pinned Mesa integration patches are required for surfaceless default MSAA
+framebuffers (apply to the same source revision on both differential backends):
+
+- `third_party/mesa-26.2.1-drisw-imported-msaa.patch` creates/reuses the missing
+  private MSAA and depth/stencil attachments beside an imported single-sample
+  presentation image, including resize and allocation-failure handling.
+- `third_party/mesa-26.2.1-msaa-readpixels-resolve.patch` makes read-only MSAA
+  renderbuffer mappings resolve into single-sample staging before existing
+  CPU format/pack conversion. Software ReadPixels must not treat sample zero
+  as a resolved image merely because a driver does not prefer blit transfers.
+
+Neither patch changes renderer selection, sample capabilities, or CTS pass
+criteria. Their original unpatched test results must remain distinguishable
+from tests of the patched runtimes.
+
+## Uniform-buffer snapshots (introduced in SystemC API v21)
 
 The native stage ABI's `temps` field is a register count, not an 8-bit index:
 it may reserve up to 256 TEMP registers (indices 0 through 255) independently
@@ -40,8 +163,9 @@ UBO loads use native PCO address arithmetic and LD/WDF execution, not host
 GLSL evaluation. The USC memory client may read only a declared byte range of
 the executing stage; page presence alone is not a bounds check. Duplicate
 stage/block entries, oversized or missing payloads, descriptor/push overlap,
-noncanonical input addresses and out-of-range loads fail closed. API v21 is
-required on both sides; zero UBO fields preserve previous non-UBO behavior.
+noncanonical input addresses and out-of-range loads fail closed. The current
+graphics API version is required on both sides; zero UBO fields preserve
+previous non-UBO behavior.
 Text summaries carrying `uniform_buffer_replay=api-v21-only` are deliberately
 not replayable, since they omit these immutable byte payloads.
 

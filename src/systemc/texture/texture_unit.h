@@ -48,6 +48,20 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
     const std::array<std::uint32_t, 4>& words, bool compressed = false);
 RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
     const std::array<std::uint32_t, 4>& words);
+// Native NNCOORDS/SNO texelFetch addressing. Returns false for shader
+// coordinates, layer or sample outside the image; those requests return zero
+// without a memory read. Malformed resource/request metadata fails closed.
+// llvmpipe lp_build_sample_ms_offset adds a sample-major stride; our existing
+// render-target storage instead places the sample inside each pixel.
+bool ComputeTextureMultisampleTexelOffset(
+    const TextureResource &resource, const TextureSampleRequest &request,
+    std::uint32_t layer, std::uint64_t *offset);
+// Cross-check the raw one-level array depth/TEXTYPE used by native TAO and
+// textureSize against the resource extent; structured metadata cannot replace
+// or widen a shader-visible descriptor field.
+void ValidateTextureSingleLevelDimensions(
+    const std::array<std::uint32_t, 4> &words,
+    const TextureResource &resource);
 // What driver-PCO sampling can serve: a format the unit decodes, address
 // modes the wrap arithmetic implements, a LOD window that runs forwards.
 // Level selection is not a constraint -- see texture_filter.h.

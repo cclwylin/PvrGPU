@@ -298,6 +298,8 @@ pvrgpu_depth_surface_rect_supported(const struct pipe_surface *surface,
    const struct util_format_pack_description *pack =
       util_format_pack_description(surface->format);
    if (!desc || !pack || desc->colorspace != UTIL_FORMAT_COLORSPACE_ZS ||
+       desc->block.width != 1 || desc->block.height != 1 ||
+       desc->block.depth != 1 ||
        (!pack->pack_z_float && !pack->pack_s_8uint))
       return false;
 
@@ -311,14 +313,31 @@ pvrgpu_depth_surface_rect_supported(const struct pipe_surface *surface,
       pvrgpu_surface_level_height(surface->texture, surface->level);
    const unsigned layer_count =
       pvrgpu_surface_level_layer_count(surface->texture, surface->level);
-   return surface->texture->target == PIPE_TEXTURE_2D &&
-          level_width != 0 && level_height != 0 && layer_count == 1 &&
-          surface->first_layer == 0 && surface->last_layer == 0 &&
-          dstx <= level_width && dsty <= level_height &&
-          width <= level_width - dstx &&
-          height <= level_height - dsty &&
-          resource->level_strides[surface->level] != 0 &&
-          resource->level_layer_strides[surface->level] != 0;
+   if (surface->texture->target == PIPE_BUFFER ||
+       level_width == 0 || level_height == 0 || layer_count == 0 ||
+       surface->first_layer > surface->last_layer ||
+       surface->last_layer >= layer_count ||
+       dstx > level_width || dsty > level_height ||
+       width > level_width - dstx || height > level_height - dsty)
+      return false;
+
+   /* A surface can select a single array layer/cube face or a layer range.
+    * Validate its native sample-interleaved storage before forming pointers;
+    * in particular, a valid layer index must also fit the backing allocation. */
+   const unsigned level = surface->level;
+   const unsigned block_size = util_format_get_blocksize(surface->format);
+   const unsigned samples = MAX2(1, surface->texture->nr_storage_samples ?
+                                   surface->texture->nr_storage_samples :
+                                   surface->texture->nr_samples);
+   const size_t row_stride = resource->level_strides[level];
+   const size_t layer_stride = resource->level_layer_strides[level];
+   const size_t level_offset = resource->level_offsets[level];
+   if (!block_size || samples > SIZE_MAX / block_size ||
+       !row_stride || !layer_stride || level_offset > resource->size)
+      return false;
+   return level_width <= row_stride / ((size_t)samples * block_size) &&
+          level_height <= layer_stride / row_stride &&
+          surface->last_layer < (resource->size - level_offset) / layer_stride;
 }
 
 /* Mesa's depth/stencil packers preserve the other aspect of combined
@@ -344,18 +363,22 @@ pvrgpu_fill_surface_rect_with_clear_stencil(struct pipe_surface *surface,
    const unsigned samples = MAX2(1, surface->texture->nr_storage_samples ?
                                    surface->texture->nr_storage_samples :
                                    surface->texture->nr_samples);
-   uint8_t *base = resource->data + resource->level_offsets[level];
-   for (unsigned y = 0; y < height; ++y) {
-      uint8_t *row = base +
-                     (uintptr_t)(dsty + y) * resource->level_strides[level] +
-                     (uintptr_t)dstx * samples * block_size;
-      for (unsigned x = 0; x < width * samples; ++x) {
-         uint8_t *pixel = row + (uintptr_t)x * block_size;
-         uint8_t old_stencil = 0;
-         util_format_unpack_s_8uint(surface->format, &old_stencil, pixel, 1);
-         const uint8_t value = (old_stencil & ~stencil_mask) |
-                               (stencil & stencil_mask);
-         util_format_pack_s_8uint(surface->format, pixel, &value, 1);
+   for (unsigned layer = surface->first_layer; layer <= surface->last_layer;
+        ++layer) {
+      uint8_t *base = resource->data + resource->level_offsets[level] +
+                     (uintptr_t)layer * resource->level_layer_strides[level];
+      for (unsigned y = 0; y < height; ++y) {
+         uint8_t *row = base +
+                        (uintptr_t)(dsty + y) * resource->level_strides[level] +
+                        (uintptr_t)dstx * samples * block_size;
+         for (unsigned x = 0; x < width * samples; ++x) {
+            uint8_t *pixel = row + (uintptr_t)x * block_size;
+            uint8_t old_stencil = 0;
+            util_format_unpack_s_8uint(surface->format, &old_stencil, pixel, 1);
+            const uint8_t value = (old_stencil & ~stencil_mask) |
+                                  (stencil & stencil_mask);
+            util_format_pack_s_8uint(surface->format, pixel, &value, 1);
+         }
       }
    }
    return true;
@@ -383,14 +406,18 @@ pvrgpu_fill_surface_rect_with_clear_depth(struct pipe_surface *surface,
    const unsigned samples = MAX2(1, surface->texture->nr_storage_samples ?
                                    surface->texture->nr_storage_samples :
                                    surface->texture->nr_samples);
-   uint8_t *base = resource->data + resource->level_offsets[level];
-   for (unsigned y = 0; y < height; ++y) {
-      uint8_t *row = base +
-                     (uintptr_t)(dsty + y) * resource->level_strides[level] +
-                     (uintptr_t)dstx * samples * block_size;
-      for (unsigned x = 0; x < width * samples; ++x)
-         util_format_pack_z_float(surface->format,
-                                  row + (uintptr_t)x * block_size, &value, 1);
+   for (unsigned layer = surface->first_layer; layer <= surface->last_layer;
+        ++layer) {
+      uint8_t *base = resource->data + resource->level_offsets[level] +
+                     (uintptr_t)layer * resource->level_layer_strides[level];
+      for (unsigned y = 0; y < height; ++y) {
+         uint8_t *row = base +
+                        (uintptr_t)(dsty + y) * resource->level_strides[level] +
+                        (uintptr_t)dstx * samples * block_size;
+         for (unsigned x = 0; x < width * samples; ++x)
+            util_format_pack_z_float(surface->format,
+                                     row + (uintptr_t)x * block_size, &value, 1);
+      }
    }
    return true;
 }

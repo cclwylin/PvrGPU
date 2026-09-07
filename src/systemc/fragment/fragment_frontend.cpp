@@ -121,7 +121,7 @@ void FragmentFrontend::Run() {
           static_cast<std::size_t>(candidate.y) * state.width + candidate.x;
       if (pixel_seen[pixel_index] != 0) {
         if (!state.raster_state.blend.enable &&
-            !state.raster_state.shader_writes_depth &&
+            !RasterRequiresLateDepthStencil(state.raster_state) &&
             (pixel_seen[pixel_index] & candidate.sample_mask) != 0) {
           throw std::runtime_error(
               "FragmentFrontend received multiple opaque HSR owners");
@@ -153,6 +153,13 @@ void FragmentFrontend::Run() {
       invocation.sample_mask = candidate.sample_mask;
       invocation.front_facing = parameter.front_facing;
       invocation.depth = candidate.depth;
+      for (std::uint32_t sample = 0; sample < state.raster_state.sample_count;
+           ++sample) {
+        if ((candidate.sample_mask & (1U << sample)) != 0 &&
+            !std::isfinite(candidate.sample_depth[sample]))
+          throw std::runtime_error("FragmentFrontend sample depth is invalid");
+        invocation.sample_depth[sample] = candidate.sample_depth[sample];
+      }
       for (std::size_t component = 0; component < 3; ++component)
         invocation.barycentric[component] = candidate.barycentric[component];
       const std::uint32_t invocation_index =
@@ -194,7 +201,7 @@ void FragmentFrontend::Run() {
       throw std::runtime_error(
           "FragmentFrontend visible invocation count mismatch");
     }
-    if (!state.raster_state.shader_writes_depth)
+    if (!RasterRequiresLateDepthStencil(state.raster_state))
       MaterializeDepthAttachment(pool_, memory_, &state);
     std::vector<FragmentShaderLane> shader_lanes;
     if (UsesTextureSampling(state)) {

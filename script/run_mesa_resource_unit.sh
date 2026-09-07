@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build focused resource/clear tests with an existing Mesa build's actual
 # compiler configuration. Generated executables stay outside the source tree.
-# Usage: bash script/run_mesa_resource_unit.sh [all|blit|clear|ubo]
+# Usage: bash script/run_mesa_resource_unit.sh [all|blit|clear|ubo|compute]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,11 +24,12 @@ abort 'Mesa test build/output must be outside the source tree' if
   [build, output].any? { |path| path == repo || path.start_with?(repo + '/') }
 database = JSON.parse(File.read(File.join(build, 'compile_commands.json')))
 selected = ARGV.fetch(0)
-abort 'usage: run_mesa_resource_unit.sh [all|blit|clear|ubo]' unless
-  %w[all blit clear ubo].include?(selected)
+abort 'usage: run_mesa_resource_unit.sh [all|blit|clear|ubo|compute]' unless
+  %w[all blit clear ubo compute].include?(selected)
 tests = { 'blit' => ['pvrgpu_resource.c', 'pvrgpu_msaa_blit_test.c'],
           'clear' => ['pvrgpu_clear.c', 'pvrgpu_clear_storage_test.c'],
-          'ubo' => ['pvrgpu_context.c', 'pvrgpu_uniform_buffer_snapshot_test.c'] }
+          'ubo' => ['pvrgpu_context.c', 'pvrgpu_uniform_buffer_snapshot_test.c'],
+          'compute' => ['pvrgpu_context.c', 'pvrgpu_compute_snapshot_test.c'] }
 tests.each do |name, (driver, source)|
   next unless selected == 'all' || selected == name
   entry = database.find { |item| File.basename(item.fetch('file')) == driver }

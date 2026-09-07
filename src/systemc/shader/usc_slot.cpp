@@ -21,6 +21,8 @@ namespace pvrgpu::stub {
 UscSlot::UscSlot(sc_core::sc_module_name name, MemoryPool &pool,
                  ShaderStage stage)
     : sc_module(name), pool_(pool), stage_(stage) {
+  if (stage != ShaderStage::kVertex && stage != ShaderStage::kFragment)
+    throw std::invalid_argument("graphics UscSlot cannot execute compute");
   SC_THREAD(Run);
 }
 

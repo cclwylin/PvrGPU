@@ -54,6 +54,7 @@ const std::set<std::string> &KnownFields() {
       "viewport_translate_bits", "raster_state", "scissor_rect",
       "primitive_width", "point_size_output", "sample_mask",
       "color_state", "depth_state",
+      "alpha_to_coverage", "alpha_to_coverage_dither", "alpha_to_one",
       "sampled_texture_count", "sampled_texture_bytes_size",
       "sampled_texture_width", "sampled_texture_height",
       "sampled_texture_row_pitch", "sampled_texture_format",
@@ -345,9 +346,13 @@ bool RequireExactFields(const std::map<std::string, std::string> &fields,
         (entry.first == "raw_index_data_size" ||
          entry.first == "index_size" || entry.first == "index_count" ||
          entry.first == "first_index" || entry.first == "base_vertex");
+    const bool optional_pco_alpha =
+        command == kDrawPcoTrianglesCommand &&
+        (entry.first == "alpha_to_coverage" ||
+         entry.first == "alpha_to_coverage_dither" || entry.first == "alpha_to_one");
     if (!required.count(entry.first) && !optional_pco_counter &&
         !optional_pco_texture && !optional_pco_linkage &&
-        !optional_pco_index && !optional_pco_render_targets) {
+        !optional_pco_index && !optional_pco_render_targets && !optional_pco_alpha) {
       *error = "field is not valid for " + command +
                " driver command: " + entry.first;
       return false;
@@ -762,6 +767,15 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
       return false;
     }
     parsed.rasterizer_discard = raster_state[5];
+    if (!ParseOptionalU32(fields, "alpha_to_coverage", &parsed.alpha_to_coverage) ||
+        !ParseOptionalU32(fields, "alpha_to_coverage_dither",
+                          &parsed.alpha_to_coverage_dither) ||
+        !ParseOptionalU32(fields, "alpha_to_one", &parsed.alpha_to_one) ||
+        parsed.alpha_to_coverage > 1 || parsed.alpha_to_coverage_dither > 1 ||
+        parsed.alpha_to_one > 1) {
+      *error = "driver command alpha-to-sample state must contain booleans";
+      return false;
+    }
     parsed.multisample = raster_state[6];
     parsed.half_pixel_center = raster_state[7];
     parsed.bottom_edge_rule = raster_state[8];
@@ -864,6 +878,7 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         parsed.bottom_edge_rule != 0 || parsed.clip_halfz != 0 ||
         parsed.depth_clip_near != 1 || parsed.depth_clip_far != 1 ||
         parsed.depth_clamp != 0 || parsed.sample_mask != UINT32_MAX ||
+        parsed.alpha_to_coverage != 0 || parsed.alpha_to_one != 0 ||
         parsed.color_mask > 0x0f || parsed.blend_enable > 1 ||
         parsed.dither != 1 || parsed.depth_enable > 1 ||
         parsed.depth_write > 1 || parsed.depth_func > 7 ||

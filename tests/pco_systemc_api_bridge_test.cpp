@@ -41,16 +41,19 @@ std::filesystem::path g_test_root;
 
 void VerifyGuardedPreviousVersionCommand(
     const pvrgpu_systemc_submit_info &original_info) {
-  // API-v21 added two DWORDs to each embedded stage ABI and appended the
-  // uniform-buffer list. Reconstruct the API-v20 byte extent, not a zeroed
+  // API-v22 added alpha-to-sample state after the uniform-buffer list.
+  // Reconstruct the aligned API-v21 byte extent, not a zeroed
   // current-size command whose readable tail would hide the invalid access.
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 21U,
-                "update the frozen API-v20 guard-page fixture on ABI changes");
-  constexpr std::size_t kApi20CommandBytes =
-      offsetof(pvrgpu_systemc_driver_command, uniform_buffers) -
-      2U * 2U * sizeof(std::uint32_t);
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 23U,
+                "update the frozen API-v21 guard-page fixture on ABI changes");
+  constexpr std::size_t kApi21Tail =
+      offsetof(pvrgpu_systemc_driver_command, uniform_buffer_count) +
+      sizeof(std::uint32_t);
+  constexpr std::size_t kApi21CommandBytes =
+      (kApi21Tail + alignof(pvrgpu_systemc_driver_command) - 1U) &
+      ~(alignof(pvrgpu_systemc_driver_command) - 1U);
   static_assert(offsetof(pvrgpu_systemc_driver_command, version) == 0);
-  static_assert(kApi20CommandBytes %
+  static_assert(kApi21CommandBytes %
                     alignof(pvrgpu_systemc_driver_command) == 0);
 #if defined(_WIN32)
   SYSTEM_INFO system_info{};
@@ -60,7 +63,7 @@ void VerifyGuardedPreviousVersionCommand(
   const long page_size_result = sysconf(_SC_PAGESIZE);
 #endif
   if (page_size_result <= 0 ||
-      static_cast<std::size_t>(page_size_result) < kApi20CommandBytes)
+      static_cast<std::size_t>(page_size_result) < kApi21CommandBytes)
     Fail("cannot determine guard-page size for the previous API command");
   const std::size_t page_size = static_cast<std::size_t>(page_size_result);
 #if defined(_WIN32)
@@ -77,9 +80,9 @@ void VerifyGuardedPreviousVersionCommand(
 #endif
     Fail("cannot allocate previous-version command guard pages");
   auto *previous_bytes = static_cast<std::uint8_t *>(mapping) + page_size -
-                         kApi20CommandBytes;
-  std::memset(previous_bytes, 0, kApi20CommandBytes);
-  constexpr std::uint32_t kPreviousVersion = 20U;
+                         kApi21CommandBytes;
+  std::memset(previous_bytes, 0, kApi21CommandBytes);
+  constexpr std::uint32_t kPreviousVersion = 21U;
   std::memcpy(previous_bytes, &kPreviousVersion, sizeof(kPreviousVersion));
 #if defined(_WIN32)
   if (!VirtualProtect(mapping, page_size, PAGE_READONLY, &previous_protection))
@@ -99,7 +102,7 @@ void VerifyGuardedPreviousVersionCommand(
     Fail("guarded old-size top-level command was not rejected by version");
 
   // A valid current-version envelope must independently reject the first
-  // nested command before reading its inaccessible v21 uniform-buffer tail.
+  // nested command before reading its inaccessible v22 alpha-to-sample tail.
   pvrgpu_systemc_driver_command sequence{};
   sequence.version = PVRGPU_SYSTEMC_API_VERSION;
   sequence.command = "draw_pco_sequence";
@@ -114,7 +117,7 @@ void VerifyGuardedPreviousVersionCommand(
   if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) !=
           2 ||
       std::string(error.data()).find(
-          "nested PCO sequence draw header is invalid: version=20 expected=21") ==
+          "nested PCO sequence draw header is invalid: version=21 expected=23") ==
           std::string::npos)
     Fail("guarded old-size nested command was not rejected by version");
 #if defined(_WIN32)
@@ -334,12 +337,65 @@ void VerifyDepthAttachmentFormats() {
       std::array<std::uint32_t, 3>{0U, 0x12345678U, UINT32_MAX});
 }
 
+void VerifySequenceExternalTextureAllocation() {
+  using namespace pvrgpu::stub;
+  static_assert(kDriverPcoMaximumSequenceTextures == PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_TEXTURES);
+  DriverPcoExternalTextureAllocation allocation;
+  std::uint64_t address = 0;
+  std::uint64_t previous_end = kDriverPcoSequenceExternalAddressBase;
+  // 真 MS array 的 payload 可大於 attachment slot；依大小保留、不可跨區。
+  for (const std::uint64_t size : {UINT64_C(32) * 1024U * 1024U,
+                                   UINT64_C(3), UINT64_C(64) * 1024U * 1024U,
+                                   UINT64_C(5)}) {
+    if (!AllocateSequenceExternalTextureAddress(size, &allocation, &address) ||
+        address < previous_end || (address & 63U) != 0 ||
+        address + size > kDriverPcoSequenceExternalAddressEnd ||
+        address + size > (UINT64_C(1) << 40U))
+      Fail("external texture allocation overlaps or exceeds native address range");
+    previous_end = address + size;
+  }
+  const auto reject_without_mutation = [&](std::uint64_t size) {
+    const auto before = allocation;
+    constexpr std::uint64_t sentinel = UINT64_C(0xdeadbeef);
+    address = sentinel;
+    if (AllocateSequenceExternalTextureAddress(size, &allocation, &address) ||
+        address != sentinel || allocation.next_offset != before.next_offset ||
+        allocation.payload_bytes != before.payload_bytes ||
+        allocation.texture_count != before.texture_count)
+      Fail("failed external allocation modified its caller state");
+  };
+  reject_without_mutation(0);
+  reject_without_mutation(UINT64_MAX);
+  allocation = {};
+  reject_without_mutation(kDriverPcoMaximumSequencePayloadBytes + 1U);
+  if (!AllocateSequenceExternalTextureAddress(kDriverPcoMaximumSequencePayloadBytes,
+                                               &allocation, &address))
+    Fail("maximum external texture payload does not fit its dedicated region");
+  reject_without_mutation(1);
+  allocation = {};
+  for (std::size_t index = 0; index < kDriverPcoMaximumSequenceTextures; ++index) {
+    if (!AllocateSequenceExternalTextureAddress(1, &allocation, &address) ||
+        address != kDriverPcoSequenceExternalAddressBase + index * 64U)
+      Fail("external texture alignment or slot-count reservation is invalid");
+  }
+  reject_without_mutation(1);
+  allocation = {};
+  allocation.next_offset = UINT64_MAX;
+  reject_without_mutation(1);
+  allocation = {};
+  allocation.payload_bytes = UINT64_MAX;
+  reject_without_mutation(1);
+  if (AllocateSequenceExternalTextureAddress(1, nullptr, &address) ||
+      AllocateSequenceExternalTextureAddress(1, &allocation, nullptr))
+    Fail("null external allocation state was accepted");
+}
+
 } // namespace
 
 int main() {
   using namespace pvrgpu::stub;
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 21U,
-                "native sequence bridge test requires API-v21");
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 23U,
+                "native sequence bridge test requires API-v23");
   static_assert(PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS == 15U);
   static_assert(kDriverPcoMaximumTextureMipLevels == 15U);
   static_assert(kMaximumTextureMipLevels == 15U);
@@ -350,8 +406,8 @@ int main() {
       "SystemC API texture ABI does not expose all 15 mip slots");
   static_assert(
       sizeof(void *) != 8U ||
-          sizeof(pvrgpu_systemc_pco_sequence_texture) == 344U,
-      "64-bit SystemC API-v10 sequence texture ABI size changed");
+          sizeof(pvrgpu_systemc_pco_sequence_texture) == 352U,
+      "64-bit SystemC API-v23 sequence texture ABI size changed");
   static_assert(
       std::tuple_size<decltype(DriverPcoSampledTexture{}.mip)>::value ==
           kDriverPcoMaximumTextureMipLevels,
@@ -363,6 +419,7 @@ int main() {
   VerifyIdeasTopologyExpansion();
   VerifyGenericFloat2StripExpansion();
   VerifyDepthAttachmentFormats();
+  VerifySequenceExternalTextureAllocation();
   const auto nonce = std::chrono::high_resolution_clock::now()
                          .time_since_epoch()
                          .count();
@@ -514,7 +571,7 @@ int main() {
   if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) ==
           0 ||
       std::string(error.data()).find("command version") == std::string::npos) {
-    Fail("previous-version command was not rejected before the API-v10 tail");
+    Fail("previous-version command was not rejected before the API-v22 tail");
   }
   command.version = PVRGPU_SYSTEMC_API_VERSION;
   error.fill(0);
@@ -630,7 +687,9 @@ int main() {
   };
   const auto expect_sequence_rejected =
       [&](std::array<pvrgpu_systemc_driver_command, 2> draws,
-          const char *expected_error, const char *description) {
+          const char *expected_error, const char *description,
+          const pvrgpu_systemc_pco_sequence_texture *textures = nullptr,
+          std::uint32_t texture_count = 0) {
         pvrgpu_systemc_driver_command sequence{};
         sequence.version = PVRGPU_SYSTEMC_API_VERSION;
         sequence.schema = "pvrgpu.driver-command.v1";
@@ -644,6 +703,8 @@ int main() {
         sequence.height = 60;
         sequence.pco_sequence_command_count = draws.size();
         sequence.pco_sequence_commands = draws.data();
+        sequence.pco_sequence_texture_count = texture_count;
+        sequence.pco_sequence_textures = textures;
         info.command = &sequence;
         error.fill(0);
         if (pvrgpu_systemc_submit_driver_command(&info, error.data(),
@@ -656,6 +717,14 @@ int main() {
         info.command = &command;
       };
 
+  for (const auto field : {&pvrgpu_systemc_driver_command::alpha_to_coverage,
+                            &pvrgpu_systemc_driver_command::alpha_to_coverage_dither,
+                            &pvrgpu_systemc_driver_command::alpha_to_one}) {
+    std::array<pvrgpu_systemc_driver_command, 2> draws = {
+        make_sequence_draw(), make_sequence_draw()};
+    draws[0].*field = 2;
+    expect_sequence_rejected(draws, "alpha_to_", "non-boolean alpha-to-sample state");
+  }
   {
     std::array<pvrgpu_systemc_driver_command, 2> draws = {
         make_sequence_draw(), make_sequence_draw()};
@@ -737,6 +806,115 @@ int main() {
     draws[0].fragment_pco_abi.coefficients = 248;
     expect_sequence_rejected(draws, "ABI/payload is invalid",
                              "varyings beyond the VTXOUT file");
+  }
+
+  // 僅驗證公開 transport 的尺寸／descriptor 邊界，不宣稱執行 MS shader。
+  // 第一筆資料通過時，必須抵達第二筆刻意無效的 blend；絕不排入假 draw。
+  {
+    std::array<std::uint8_t, 2U * 2U * 4U * 8U * 2U> sample_bytes{};
+    std::array<std::uint32_t, kPcoTextureDescriptorDwordCount> sample_shared{};
+    const auto make_sample_texture = [&](std::uint32_t samples,
+                                          std::uint32_t layers) {
+      const std::uint32_t storage_samples = samples ? samples : 1U;
+      pvrgpu_systemc_pco_sequence_texture texture{};
+      texture.source = PVRGPU_SYSTEMC_PCO_TEXTURE_EXTERNAL_PAYLOAD;
+      texture.stage = PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT;
+      texture.format = "PIPE_FORMAT_R8G8B8A8_UNORM";
+      texture.bytes = sample_bytes.data();
+      texture.mip_count = 1;
+      texture.mip[0].width = 2;
+      texture.mip[0].height = 2;
+      texture.mip[0].row_pitch = 2U * 4U * storage_samples;
+      texture.bytes_size = texture.mip[0].row_pitch * 2U * layers;
+      texture.declared_bytes_size = texture.bytes_size;
+      texture.normalized_coordinates = 1;
+      texture.texture_kind = layers > 1U ? 1U : 0U;
+      texture.layers = layers;
+      texture.sample_count = samples;
+      return texture;
+    };
+    const auto check_sample_texture =
+        [&](const pvrgpu_systemc_pco_sequence_texture &texture,
+            std::uint32_t descriptor_samples, const char *expected,
+            const char *description) {
+          std::array<pvrgpu_systemc_driver_command, 2> draws = {
+              make_sequence_draw(), make_sequence_draw()};
+          sample_shared.fill(0);
+          const std::uint32_t sample_log2 = descriptor_samples == 8U ? 3U :
+              descriptor_samples == 4U ? 2U : descriptor_samples == 2U ? 1U : 0U;
+          sample_shared[1] = sample_log2 << 30U;
+          draws[0].sampled_texture_count = 1;
+          draws[0].fragment_shared = sample_shared.data();
+          draws[0].fragment_shared_count = sample_shared.size();
+          draws[0].fragment_pco_abi.shareds = sample_shared.size();
+          draws[0].fragment_pco_abi.push_constant_start = sample_shared.size();
+          draws[0].fragment_pco_abi.push_constant_count = 0;
+          draws[1].blend_source_rgb_factor = PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ZERO;
+          expect_sequence_rejected(draws, expected, description, &texture, 1);
+        };
+    for (const std::uint32_t samples : {0U, 1U, 2U, 4U, 8U}) {
+      for (const std::uint32_t layers : {1U, 2U}) {
+        check_sample_texture(make_sample_texture(samples, layers),
+                             samples ? samples : 1U, "unsupported: blend",
+                             "legal sampled texture transport");
+      }
+    }
+    for (const std::uint32_t samples : {3U, 16U, UINT32_MAX}) {
+      auto texture = make_sample_texture(4, 1);
+      texture.sample_count = samples;
+      check_sample_texture(texture, 4, "sample count is invalid",
+                           "unencodable SMPCNT");
+    }
+    for (const std::uint32_t kind : {2U, 3U}) {
+      auto texture = make_sample_texture(4, 1);
+      texture.texture_kind = kind;
+      check_sample_texture(texture, 4, "multisample external 2D single-mip",
+                           "multisample 3D/cube payload");
+    }
+    for (const std::uint32_t source : {
+             PVRGPU_SYSTEMC_PCO_TEXTURE_PREVIOUS_COLOR_ATTACHMENT,
+             PVRGPU_SYSTEMC_PCO_TEXTURE_PREVIOUS_DEPTH_ATTACHMENT}) {
+      auto texture = make_sample_texture(4, 1);
+      texture.source = source;
+      check_sample_texture(texture, 4, "multisample external 2D single-mip",
+                           "non-external multisample payload");
+    }
+    auto texture = make_sample_texture(4, 1);
+    check_sample_texture(texture, 2, "descriptor/sample count mismatch",
+                         "raw descriptor versus transport mismatch");
+    texture.mip_count = 2;
+    check_sample_texture(texture, 4, "multisample external 2D single-mip",
+                         "multisample mip chain");
+    texture = make_sample_texture(4, 1);
+    texture.format = "PIPE_FORMAT_ASTC_4x4";
+    check_sample_texture(texture, 4, "multisample external 2D single-mip",
+                         "compressed multisample payload");
+    texture = make_sample_texture(4, 1);
+    texture.mip[0].row_pitch /= 4;
+    check_sample_texture(texture, 4, "mip layout is invalid",
+                         "row pitch without sample interleaving");
+    texture = make_sample_texture(4, 1);
+    --texture.declared_bytes_size;
+    --texture.bytes_size;
+    check_sample_texture(texture, 4, "mip byte extent is invalid",
+                         "truncated multisample byte extent");
+    texture = make_sample_texture(4, 1);
+    texture.mip[0].width = UINT32_MAX;
+    check_sample_texture(texture, 4, "mip layout is invalid",
+                         "overflowing multisample row pitch");
+    texture = make_sample_texture(4, 1);
+    texture.mip[0].height = UINT32_MAX;
+    check_sample_texture(texture, 4, "mip byte extent is invalid",
+                         "overflowing multisample image extent");
+    texture = make_sample_texture(4, 1);
+    texture.texture_kind = 1;
+    texture.layers = UINT32_MAX;
+    check_sample_texture(texture, 4, "dimension/layer count is invalid",
+                         "overflowing multisample layer count");
+    texture = make_sample_texture(4, 1);
+    texture.mip[0].offset = 4;
+    check_sample_texture(texture, 4, "mip layout is invalid",
+                         "noncanonical multisample payload offset");
   }
 
   std::vector<std::uint8_t> texture_vertices(36U * 32U, 0);

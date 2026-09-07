@@ -426,8 +426,12 @@ bool UsesShaderVaryings(FunctionalCase functional_case) {
 bool UsesShaderVaryings(const PipelineState &state) {
   if (!IsDriverPcoTrianglesCase(state.functional_case))
     return UsesShaderVaryings(state.functional_case);
+  // A texture shader can address texels from gl_FragCoord or constants with
+  // no user varying. Its declared position coefficient set still traverses
+  // ParameterBuffer/PDS; an empty linkage is not an absent position plane.
   return state.varying_output_count != 0 ||
-         state.fragment_varying_count != 0;
+         state.fragment_varying_count != 0 ||
+         UsesTextureSampling(state, ShaderStage::kFragment);
 }
 
 std::uint32_t VaryingVectorCount(FunctionalCase functional_case) {

@@ -127,6 +127,8 @@ struct DriverPcoSampledTexture {
   // 0 = plain 2D, 1 = 2D array.  A 2D array holds `layers` images per level.
   std::uint32_t texture_kind = 0;
   std::uint32_t layers = 1;
+  // 每個 pixel 內依 sample 順序交錯；舊單 sample payload 保持原樣。
+  std::uint32_t sample_count = 1;
 };
 
 inline constexpr DriverPcoStageAbi kConditionalsVertexPcoAbi = {
@@ -184,7 +186,46 @@ inline constexpr std::uint64_t kDriverPcoSequenceColorAddressBase =
 inline constexpr std::uint64_t kDriverPcoSequenceDepthAddressBase =
     UINT64_C(0x60000000);
 inline constexpr std::uint64_t kDriverPcoSequenceExternalAddressBase =
-    UINT64_C(0x70000000);
+    UINT64_C(0x8000000000);
+// 外部 texture 使用獨立 512 GiB 區，仍可放入 Rogue 的 40-bit 地址。
+// 依實際 payload 大小配置，不再以 attachment stride 猜測 array/MS 大小。
+inline constexpr std::uint64_t kDriverPcoSequenceExternalAlignment = 64U;
+inline constexpr std::uint64_t kDriverPcoSequenceExternalRegionBytes =
+    kDriverPcoMaximumSequencePayloadBytes +
+    kDriverPcoMaximumSequenceTextures * kDriverPcoSequenceExternalAlignment;
+inline constexpr std::uint64_t kDriverPcoSequenceExternalAddressEnd =
+    kDriverPcoSequenceExternalAddressBase + kDriverPcoSequenceExternalRegionBytes;
+static_assert(kDriverPcoSequenceExternalAddressEnd <= (UINT64_C(1) << 40U),
+              "external textures exceed the native 40-bit descriptor address");
+
+struct DriverPcoExternalTextureAllocation {
+  std::uint64_t next_offset = 0;
+  std::uint64_t payload_bytes = 0;
+  std::size_t texture_count = 0;
+};
+
+// 失敗時不修改 allocator 或輸出地址；padding 與 payload 分開計量。
+inline bool AllocateSequenceExternalTextureAddress(
+    std::uint64_t byte_size, DriverPcoExternalTextureAllocation *allocation,
+    std::uint64_t *address) {
+  if (!allocation || !address || byte_size == 0 ||
+      allocation->texture_count >= kDriverPcoMaximumSequenceTextures ||
+      allocation->payload_bytes > kDriverPcoMaximumSequencePayloadBytes ||
+      byte_size > kDriverPcoMaximumSequencePayloadBytes - allocation->payload_bytes ||
+      allocation->next_offset > kDriverPcoSequenceExternalRegionBytes)
+    return false;
+  const std::uint64_t aligned_offset =
+      (allocation->next_offset + kDriverPcoSequenceExternalAlignment - 1U) &
+      ~(kDriverPcoSequenceExternalAlignment - 1U);
+  if (aligned_offset > kDriverPcoSequenceExternalRegionBytes ||
+      byte_size > kDriverPcoSequenceExternalRegionBytes - aligned_offset)
+    return false;
+  *address = kDriverPcoSequenceExternalAddressBase + aligned_offset;
+  allocation->next_offset = aligned_offset + byte_size;
+  allocation->payload_bytes += byte_size;
+  ++allocation->texture_count;
+  return true;
+}
 // Slots available to attachments before a region runs into the next one.  A
 // sequence may be longer than this: only an ordinal that starts a new
 // attachment consumes a slot, and the rest alias an earlier one by design.
@@ -192,16 +233,14 @@ inline constexpr std::size_t kDriverPcoSequenceAttachmentSlots =
     static_cast<std::size_t>((kDriverPcoSequenceDepthAddressBase -
                               kDriverPcoSequenceColorAddressBase) /
                              kDriverPcoSequenceAttachmentStride);
-static_assert(kDriverPcoSequenceExternalAddressBase -
-                      kDriverPcoSequenceDepthAddressBase >=
-                  kDriverPcoSequenceDepthAddressBase -
-                      kDriverPcoSequenceColorAddressBase,
-              "sequence depth region is smaller than the colour region");
 // Colour attachments past the first of a multiple-render-target draw. Each
 // (command, attachment) pair owns one attachment-stride slot so no two
 // attachments of a sequence overlap in DRAM.
 inline constexpr std::uint64_t kDriverPcoMrtColorAddressBase =
     UINT64_C(0x80000000);
+static_assert(kDriverPcoMrtColorAddressBase - kDriverPcoSequenceDepthAddressBase >=
+                  kDriverPcoSequenceDepthAddressBase - kDriverPcoSequenceColorAddressBase,
+              "sequence depth region is smaller than the colour region");
 inline constexpr std::uint64_t kDriverPcoRefractVertexFnv1a64 =
     UINT64_C(0x83920b2733098afa);
 inline constexpr std::uint64_t kDriverPcoRefractPrepassSharedFnv1a64 =
@@ -341,6 +380,9 @@ struct DriverCommand {
   std::uint32_t depth_clip_far = 0;
   std::uint32_t depth_clamp = 0;
   std::uint32_t sample_mask = 0;
+  std::uint32_t alpha_to_coverage = 0;
+  std::uint32_t alpha_to_coverage_dither = 0;
+  std::uint32_t alpha_to_one = 0;
   std::uint32_t color_mask = 0;
   std::uint32_t blend_enable = 0;
   std::uint32_t blend_rgb_equation = 0;
@@ -520,6 +562,8 @@ enum class MemoryClient : std::uint8_t {
   kFramebufferReadback = 9,
   kTextureMipmap = 10,
   kUniformBuffer = 11,
+  kComputeShader = 12,
+  kComputeReadback = 13,
 };
 
 enum class MemoryPayloadFormat : std::uint8_t {

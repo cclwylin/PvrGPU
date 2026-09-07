@@ -709,6 +709,7 @@ struct GroupHeader {
   bool write0_present = false;
   bool write1_present = false;
   bool end = false;
+  std::uint8_t exec_cnd = 0;
 };
 
 [[noreturn]] void DecodeError(std::size_t offset, const std::string &reason) {
@@ -728,7 +729,7 @@ std::uint32_t CheckedU32(std::size_t value, const char *description) {
 }
 
 GroupHeader DecodeHeader(const std::vector<std::uint8_t> &binary,
-                         std::size_t offset) {
+                         std::size_t offset, bool compute = false) {
   if (binary.size() - offset < 3)
     DecodeError(offset, "truncated extended instruction-group header");
 
@@ -745,9 +746,11 @@ GroupHeader DecodeHeader(const std::vector<std::uint8_t> &binary,
     DecodeError(offset + 2, "unsupported ALU group type");
   if (!control && (byte2 & 0x18U) != 0)
     DecodeError(offset + 2, "reserved/atomic group bits are not supported");
-  if ((byte1 & 0x01U) != 0 || (byte2 & 0x01U) != 0)
+  if (!compute && ((byte1 & 0x01U) != 0 || (byte2 & 0x01U) != 0))
     DecodeError(offset + 1, "conditional execution is outside this subset");
-  if (control && ((byte1 & 0x7eU) != 0 || (byte2 & 0x60U) != 0x60U))
+  if (control && ((!compute && (byte1 & 0x7eU) != 0) ||
+                  (compute && (byte1 & 0x78U) != 0) ||
+                  (byte2 & 0x60U) != 0x60U))
     DecodeError(offset, "unsupported control instruction-group header");
 
   std::size_t encoded_words = byte0 & 0x0fU;
@@ -767,10 +770,11 @@ GroupHeader DecodeHeader(const std::vector<std::uint8_t> &binary,
   header.write0_present = (byte1 & 0x02U) != 0;
   header.control = control;
   header.bitwise = bitwise;
+  header.exec_cnd = static_cast<std::uint8_t>((byte1 & 1U) | ((byte2 & 1U) << 1U));
   if (control) {
     header.control_misc = (byte2 >> 7U) & 1U;
     header.control_op = (byte2 >> 1U) & 0x0fU;
-    header.end = false;
+    header.end = compute && header.control_op == 7 && header.control_misc;
     header.repeat_count = 1;
   } else {
     header.end = (byte2 & 0x80U) != 0;
@@ -895,7 +899,8 @@ TwoLowerSources DecodeTwoLowerSources(
     const std::vector<std::uint8_t> &binary, std::size_t group_end,
     std::size_t &cursor, bool expect_is0_source1 = false,
     bool allow_internal_true_source1 = false,
-    bool *is0_selects_source1 = nullptr) {
+    bool *is0_selects_source1 = nullptr,
+    bool allow_compute_instance_source1 = false) {
   const std::size_t source_offset = cursor;
   if (group_end - cursor < 2)
     DecodeError(cursor, "truncated two-source lower encoding");
@@ -998,7 +1003,12 @@ TwoLowerSources DecodeTwoLowerSources(
                     " index=" + std::to_string(index) + "]");
   };
   validate_source(source0_bank, index0, source_offset);
-  if (allow_internal_true_source1 &&
+  if (allow_compute_instance_source1 &&
+      source1_bank == PcoRegisterBank::kSpecial &&
+      index1 == kPcoSpecialInstanceNumber) {
+    // Only compute MOVS1 opts into this dynamic system register. Graphics
+    // and the public constant helper retain their existing fail-closed gate.
+  } else if (allow_internal_true_source1 &&
       source1_bank == PcoRegisterBank::kSpecial &&
       index1 == kSpecialInternalTrue) {
     /* sc143 is the public all-bits-one Boolean feed used internally by BCMP.
@@ -1601,14 +1611,11 @@ PcoInstruction DecodeTextureSampleGroup(
    * the slice for a 3D image and part of the direction for a cube.  Both are
    * decoded; what the texture unit can then sample is its own question.
    */
-  const bool address_offset = exta;
   if (backend_op != kBackendOpDma || drc != 0 || dma_op != 4 ||
       extb || (dimension != 2 && dimension != 3) ||
-      channel_encoding != 3 ||
-      (!address_offset && lod_mode != 0) ||
-      (address_offset && lod_mode != 1)) {
+      channel_encoding != 3) {
     DecodeError(header.offset + 3,
-                "SMP must be count4/drc0, AUTO 2D/3D or BIAS+TAO");
+                "SMP must be count4/drc0 and supported 2D/3D encoding");
   }
   /*
    * The .tao/.bias/.pplod extension byte follows the backend words.  A 2D
@@ -1617,18 +1624,32 @@ PcoInstruction DecodeTextureSampleGroup(
    * texture address (`.tao`), which travels as addr_lo/addr_hi after the two
    * coordinates and the LOD bias.  The sample is otherwise a 2D one.
    */
-  std::uint8_t coordinate_span = dimension;
-  if (address_offset) {
+  bool address_offset = false;
+  bool non_normalized_coords = false;
+  bool sample_index_present = false;
+  if (exta) {
     if (cursor >= group_end)
       DecodeError(cursor, "truncated SMP extension byte");
     const std::uint8_t extension = binary[cursor++];
     const bool pplod = (extension & 0x80U) != 0;
-    const bool tao = (extension & 0x01U) != 0;
-    if (!pplod || !tao)
-      DecodeError(cursor - 1, "unsupported SMP extension: expected pplod+tao");
-    // s, t, one LOD bias, then the two address words.
-    coordinate_span = static_cast<std::uint8_t>(dimension + 3U);
+    address_offset = (extension & 0x01U) != 0;
+    non_normalized_coords = (extension & 0x08U) != 0;
+    sample_index_present = (extension & 0x04U) != 0;
+    // Public I_SMP byte 2: no projection, sample-buffer mode or spatial
+    // offset in this subset. In particular, never ignore NNCOORDS/SNO on
+    // an otherwise familiar TAO group: that would lose the selected sample.
+    if ((extension & 0x72U) != 0 || pplod != address_offset ||
+        non_normalized_coords != sample_index_present ||
+        (!address_offset && !sample_index_present) ||
+        (sample_index_present && dimension != 2))
+      DecodeError(cursor - 1, "unsupported SMP extension flags");
   }
+  if (lod_mode != (address_offset ? 1U : 0U))
+    DecodeError(header.offset + 4, "SMP LOD mode disagrees with TAO payload");
+  // Coordinates, optional bias/address pair, then optional lookup DWORD.
+  const std::uint8_t coordinate_span = static_cast<std::uint8_t>(
+      dimension + (address_offset ? 3U : 0U) +
+      (sample_index_present ? 1U : 0U));
 
   /* The three lower sources are the four-word texture state, two normalized
    * coordinates, and four-word sampler state.  Mesa register allocation is
@@ -1677,6 +1698,8 @@ PcoInstruction DecodeTextureSampleGroup(
   instruction.texture_dimension = dimension;
   instruction.texture_address_offset = address_offset ? 1U : 0U;
   instruction.texture_fcnorm = fcnorm ? 1U : 0U;
+  instruction.texture_non_normalized_coords = non_normalized_coords ? 1U : 0U;
+  instruction.texture_sample_index_present = sample_index_present ? 1U : 0U;
   instruction.target = PcoWriteTarget::kTemporary;
   instruction.source = sources.source1;
   instruction.source1 = sources.source0;
@@ -1699,7 +1722,7 @@ PcoInstruction DecodeTextureSampleGroup(
  * destinations are the result low and high, written as a dual-destination
  * pair. */
 PcoInstruction DecodeGenericAdd64_32Group(
-    ShaderStage, const std::vector<std::uint8_t> &binary,
+    ShaderStage stage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
   if (header.control || header.bitwise || header.da != 3 ||
       header.operation_origin != 0 || !header.write0_present ||
@@ -1750,15 +1773,32 @@ PcoInstruction DecodeGenericAdd64_32Group(
       output1 |= ((high >> 3U) & 7U) << 8U;
     }
   }
-  if (bank0 != 1U || bank1 != 1U)
-    DecodeError(cursor - 2, "ADD64_32 destinations must be temporaries");
-  if (output0 >= kPcoTemporaryCount || output1 >= kPcoTemporaryCount)
-    DecodeError(cursor - 2, "ADD64_32 destination exceeds the temporary file");
+  // Mesa F_REGBANK uses TEMP=1 and VTXIN=2. Compute register allocation can
+  // reuse dead inputs independently for either result (e.g. r21,vi0 and
+  // vi0,vi1); the two encoded destinations need not share a register file.
+  // Graphics execution still implements only the original TEMP/TEMP pair.
+  const auto destination = [&](unsigned bank, std::uint16_t index) {
+    if (bank == static_cast<unsigned>(PcoRegisterBank::kTemporary)) {
+      if (index >= kPcoTemporaryCount)
+        DecodeError(cursor - 2, "ADD64_32 destination exceeds the temporary file");
+      return PcoWriteTarget::kTemporary;
+    }
+    if (stage == ShaderStage::kCompute &&
+        bank == static_cast<unsigned>(PcoRegisterBank::kVertexInput)) {
+      if (index >= kPcoVertexInputCount)
+        DecodeError(cursor - 2, "ADD64_32 destination exceeds the vertex-input file");
+      return PcoWriteTarget::kVertexInput;
+    }
+    DecodeError(cursor - 2, "unsupported ADD64_32 destination bank");
+  };
+  const auto target0 = destination(bank0, output0);
+  const auto target1 = destination(bank1, output1);
   ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
 
   PcoInstruction instruction;
   instruction.opcode = PcoOpcode::kIntegerAdd64_32;
-  instruction.target = PcoWriteTarget::kTemporary;
+  instruction.target = target0;
+  instruction.output_target1 = target1;
   instruction.source = sources.source0;   // base low
   instruction.source1 = sources.source1;  // base high
   instruction.source2 = sources.source2;  // 32-bit offset
@@ -1778,7 +1818,8 @@ PcoInstruction DecodeGenericAdd64_32Group(
  * Both address words are captured before WDF can overwrite that range. */
 PcoInstruction DecodeBufferLoadGroup(const std::vector<std::uint8_t> &binary,
                                      const GroupHeader &header,
-                                     std::uint16_t group_index) {
+                                     std::uint16_t group_index,
+                                     bool allow_bypass = false) {
   if (header.control || header.bitwise || header.operation_origin != 2 ||
       header.write0_present || header.write1_present ||
       header.repeat_count != 1 || header.end)
@@ -1793,7 +1834,8 @@ PcoInstruction DecodeBufferLoadGroup(const std::vector<std::uint8_t> &binary,
   if (count == 0)
     count = 16;
   // srcseladd=s0, normal cached loads, reserved bits zero.
-  if ((operation1 & 0xe3U) != 0 || (operation2 & 0xfeU) != 0 ||
+  if ((operation1 & (allow_bypass ? 0xe2U : 0xe3U)) != 0 ||
+      (operation2 & 0xfeU) != 0 ||
       count > kPcoMaximumBufferLoadDwords)
     DecodeError(cursor - 2, "LD requires normal-cache s0 address and 1..16 DWORDs");
   const PcoRegisterRef address = DecodeOneLowerSource(binary, group_end, cursor);
@@ -1819,6 +1861,7 @@ PcoInstruction DecodeBufferLoadGroup(const std::vector<std::uint8_t> &binary,
   instruction.source_count = 2;
   instruction.output_index = destination.index;
   instruction.component_count = static_cast<std::uint8_t>(count);
+  instruction.memory_cache_mode = operation1 & 3U;
   instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
   instruction.group_index = group_index;
   return instruction;
@@ -2127,14 +2170,14 @@ PcoInstruction DecodeGenericSimpleAluGroup(
     DecodeError(header.offset,
                 "output-load-check does not match the ALU destination");
   }
-  if (stage == ShaderStage::kVertex &&
+  if ((stage == ShaderStage::kVertex || stage == ShaderStage::kCompute) &&
       destination.target != PcoWriteTarget::kTemporary &&
       destination.target != PcoWriteTarget::kVertexInput) {
-    DecodeError(header.offset, "vertex scalar ALU cannot write PIXOUT");
+    DecodeError(header.offset, "vertex/compute scalar ALU cannot write PIXOUT");
   }
-  if (stage != ShaderStage::kVertex &&
+  if (stage != ShaderStage::kVertex && stage != ShaderStage::kCompute &&
       destination.target == PcoWriteTarget::kVertexInput)
-    DecodeError(header.offset, "only a vertex ALU may write VTXIN");
+    DecodeError(header.offset, "only a vertex/compute ALU may write VTXIN");
   if (destination.target == PcoWriteTarget::kPixelOutput &&
       opcode != PcoOpcode::kMoveBypass) {
     DecodeError(header.offset, "only MBYP may write a modeled PIXOUT");
@@ -2405,13 +2448,14 @@ struct DecodedTestPhase {
  */
 DecodedTestPhase DecodeTestPhase(const std::vector<std::uint8_t> &binary,
                                  std::size_t group_end, std::size_t offset,
-                                 bool expect_phase2_end = false) {
+                                 bool expect_phase2_end = false,
+                                 bool allow_predicate = false) {
   if (offset >= group_end)
     DecodeError(offset, "missing BCMP TST phase");
   const std::uint8_t byte0 = binary[offset];
   if ((byte0 >> 5U) != 0x7U)
     DecodeError(offset, "unsupported BCMP TST phase main operation");
-  if ((byte0 & 0x01U) != 0)
+  if ((byte0 & 0x01U) != 0 && !allow_predicate)
     DecodeError(offset, "unsupported BCMP TST partial-write enable");
   DecodedTestPhase phase;
   phase.op = static_cast<std::uint8_t>((byte0 >> 1U) & 0x07U);
@@ -3197,7 +3241,7 @@ PcoInstruction DecodeGenericPhase2Group(
 }
 
 PcoInstruction DecodeGenericImmediateGroup(
-    ShaderStage, const std::vector<std::uint8_t> &binary,
+    ShaderStage stage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
   if (!header.bitwise || header.control || header.da != 8 ||
       header.operation_origin != 1 || header.output_load_check ||
@@ -3220,8 +3264,10 @@ PcoInstruction DecodeGenericImmediateGroup(
     DecodeError(cursor - 1, "bitwise immediate has non-zero unused sources");
   const DecodedDestination destination =
       DecodeGenericDestination(binary, group_end, cursor);
-  if (destination.target != PcoWriteTarget::kTemporary)
-    DecodeError(header.offset, "bitwise immediate destination must be TEMP");
+  if (destination.target != PcoWriteTarget::kTemporary &&
+      (stage != ShaderStage::kCompute ||
+       destination.target != PcoWriteTarget::kVertexInput))
+    DecodeError(header.offset, "unsupported bitwise immediate destination bank");
   ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
 
   PcoInstruction instruction;
@@ -3304,7 +3350,8 @@ PcoInstruction DecodeGenericBitwiseAndGroup(
 PcoInstruction DecodeGenericBitwiseOrGroup(
     ShaderStage stage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
-  if ((stage != ShaderStage::kFragment && stage != ShaderStage::kVertex) ||
+  if ((stage != ShaderStage::kFragment && stage != ShaderStage::kVertex &&
+       stage != ShaderStage::kCompute) ||
       !header.bitwise || header.control || header.da != 5 ||
       header.operation_origin != 3 ||
       header.output_load_check || !header.write0_present ||
@@ -3437,7 +3484,8 @@ PcoInstruction DecodeGenericBitfieldInsertGroup(
    * specific to a stage, and both executors compute it.  Each field is
    * checked on its own so a refusal names the one that did not match
    * instead of reporting the header as a whole. */
-  if (stage != ShaderStage::kFragment && stage != ShaderStage::kVertex)
+  if (stage != ShaderStage::kFragment && stage != ShaderStage::kVertex &&
+      stage != ShaderStage::kCompute)
     DecodeError(header.offset, "BFI reached an unsupported shader stage");
   if (!header.bitwise || header.control)
     DecodeError(header.offset, "BFI group is not a bitwise phase");
@@ -3553,7 +3601,8 @@ PcoInstruction DecodeGenericBitwiseXnorGroup(
    * Its observed s3 is canonical sc0, making the visible operation ~s2.
    * Retain a distinct opcode so the ISS and histogram do not mislabel XNOR
    * as AND/XOR, and accept no other logical phase operation. */
-  if ((stage != ShaderStage::kFragment && stage != ShaderStage::kVertex) ||
+  if ((stage != ShaderStage::kFragment && stage != ShaderStage::kVertex &&
+       stage != ShaderStage::kCompute) ||
       !header.bitwise || header.control || header.da != 5 ||
       header.operation_origin != 3 ||
       header.output_load_check || !header.write0_present ||
@@ -3630,7 +3679,7 @@ PcoInstruction DecodeGenericShiftGroup(
   if (!header.bitwise || header.control || header.da != 5 ||
       header.operation_origin != 5 || header.output_load_check ||
       !header.write0_present || header.write1_present ||
-      header.repeat_count != 1 || header.end || header.total_bytes != 10) {
+      header.repeat_count != 1 || header.end || header.total_bytes < 10) {
     DecodeError(header.offset, "unsupported shift instruction-group header");
   }
   const std::size_t group_end = header.offset + header.total_bytes;
@@ -3742,7 +3791,7 @@ PcoInstruction DecodeGenericTestZeroGroup(
 /* MOVS1: phase 2 alone, moving a register that only the s1 port can name --
  * the fragment-coordinate special registers among them -- into a temporary. */
 PcoInstruction DecodeGenericMoveSpecialSourceGroup(
-    ShaderStage, const std::vector<std::uint8_t> &binary,
+    ShaderStage stage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
   if (header.bitwise || header.control || header.da != 5 ||
       header.operation_origin != 1 || header.output_load_check ||
@@ -3756,7 +3805,8 @@ PcoInstruction DecodeGenericMoveSpecialSourceGroup(
   if (binary[cursor++] != 0xd3U || binary[cursor++] != 0x3fU)
     DecodeError(header.offset + 3, "expected the phase-2 MOVS1 operation");
   const TwoLowerSources lower =
-      DecodeTwoLowerSources(binary, group_end, cursor, true, false);
+      DecodeTwoLowerSources(binary, group_end, cursor, true, false, nullptr,
+                            stage == ShaderStage::kCompute);
   if (lower.source0.bank != PcoRegisterBank::kSpecial ||
       lower.source0.index != kSpecialConstantZero) {
     DecodeError(header.offset, "MOVS1 unused s0 feed is not the canonical sc0");
@@ -4243,6 +4293,329 @@ PcoInstruction DecodeVertexGroup(const std::vector<std::uint8_t> &binary,
               "instruction origin is outside the vertex PCO subset");
 }
 
+PcoInstruction DecodeComputeControl(const std::vector<std::uint8_t> &binary,
+                                    const GroupHeader &header,
+                                    std::uint16_t group_index) {
+  const std::size_t end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  PcoInstruction out;
+  out.source_count = 0;
+  out.binary_offset = CheckedU32(header.offset, "compute group offset");
+  out.group_index = group_index;
+  out.exec_cnd = header.exec_cnd;
+  out.end_group = header.end;
+  if (header.control_op == kControlOpWdf)
+    return DecodeWdfGroup(binary, header, group_index);
+  if (header.control_op == 6) {
+    if (header.da || header.write0_present || header.write1_present ||
+        header.control_misc || header.exec_cnd || end - cursor != 1)
+      DecodeError(header.offset, "compute MUTEX requires canonical task-control header");
+    const auto control = binary[cursor++];
+    out.control_operation = control >> 6U;
+    out.immediate = control & 15U;
+    if ((control & 0x30U) != 0 ||
+        (out.control_operation != 0 && out.control_operation != 3))
+      DecodeError(header.offset, "compute MUTEX supports LOCK/RELEASE, not sleep/wakeup or reserved bits");
+    out.opcode = PcoOpcode::kMutex;
+  } else if (header.control_op == 7) {
+    if (header.da || header.write0_present || header.write1_present ||
+        cursor >= end || binary[cursor++] != 0)
+      DecodeError(header.offset, "compute NOP has nonzero operands/reserved bits");
+    out.opcode = PcoOpcode::kNop;
+  } else if (header.control_op == 0) {
+    if (header.da || header.write0_present || header.write1_present ||
+        header.control_misc || end - cursor < 5)
+      DecodeError(header.offset, "unsupported compute branch header");
+    const std::uint8_t control = binary[cursor++];
+    if ((control & ~UINT8_C(0x0c)) != 0 || (control & 0x0c) == 0x0c)
+      DecodeError(cursor - 1, "compute branch link/absolute/reserved fields are unsupported");
+    std::uint32_t relative = 0;
+    for (unsigned i = 0; i < 4; ++i)
+      relative |= static_cast<std::uint32_t>(binary[cursor++]) << (8 * i);
+    if (relative & 1U)
+      DecodeError(cursor - 4, "compute branch target is not word aligned");
+    out.opcode = PcoOpcode::kBranch;
+    out.branch_condition = (control >> 2) & 3U;
+    // Resolve signed byte offset to a group index only after all groups exist.
+    out.immediate = relative;
+  } else if (header.control_op == 3) {
+    if (header.da != 4 || !header.write0_present || header.write1_present ||
+        header.control_misc || cursor >= end)
+      DecodeError(header.offset, "unsupported compute conditional-mask header");
+    const std::uint8_t control = binary[cursor++];
+    out.control_operation = control & 7U;
+    out.control_condition = (control >> 3) & 3U;
+    out.immediate = (control >> 5) & 3U;
+    if ((control & 0x80U) || out.control_operation > 4 ||
+        (out.control_operation == 2 ? out.immediate != 0 : out.immediate == 0) ||
+        (out.control_operation == 4 && out.control_condition != 0))
+      DecodeError(cursor - 1, "compute CND requires ST/EF/SM/LT/END with canonical adjust");
+    if (out.control_operation == 2) {
+      // PCO O_CNDSM selects independent s0 and s2; its adjust field is zero.
+      // Do not substitute a fixed immediate for the native set-mask operand.
+      const auto lower = DecodeThreeLowerSources(binary, end, cursor);
+      if (lower.source1.bank != PcoRegisterBank::kSpecial ||
+          lower.source1.index != 0 || lower.input_selector != 0)
+        DecodeError(cursor, "compute CNDSM unused s1/IS0 must be canonical");
+      out.source = lower.source0;
+      out.source1 = lower.source2;
+      out.source_count = 2;
+    } else {
+      out.source = DecodeOneLowerSource(binary, end, cursor);
+      out.source_count = 1;
+    }
+    const auto upper = DecodeOneLowerSource(binary, end, cursor);
+    if (upper.bank != PcoRegisterBank::kSpecial || upper.index != 0)
+      DecodeError(cursor, "compute CND upper source must be unused");
+    const auto dest = DecodeGenericDestination(binary, end, cursor);
+    if (dest.target != PcoWriteTarget::kTemporary)
+      DecodeError(cursor, "compute CND counter must use TEMP");
+    out.opcode = PcoOpcode::kConditionalMask;
+    out.writes_predicate = out.control_operation == 3;
+    out.target = dest.target;
+    out.output_index = dest.index;
+  } else {
+    DecodeError(header.offset, "compute control opcode is not implemented");
+  }
+  ValidateAlignmentPadding(binary, header.offset, cursor, end);
+  return out;
+}
+
+PcoInstruction DecodeComputeStore(const std::vector<std::uint8_t> &binary,
+                                  const GroupHeader &header,
+                                  std::uint16_t group_index) {
+  const std::size_t end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  if (header.da != 6 || header.write0_present || header.write1_present ||
+      header.repeat_count != 1 || header.end || end - cursor < 3 ||
+      binary[cursor++] != 0xf2)
+    DecodeError(header.offset, "compute ST32 requires immediate burst and DRC0");
+  const std::uint8_t op1 = binary[cursor++], op2 = binary[cursor++];
+  unsigned count = ((op1 >> 2) & 7U) | ((op2 & 1U) << 3);
+  if (!count) count = 16;
+  // I_ST_IMMBL: address s3, data s0, 32-bit, non-tiled, reserved bit clear.
+  if ((op1 >> 5) != 3 || (op1 & 3) == 3 || (op2 & 0xfe) != 0x08)
+    DecodeError(cursor - 2, "compute ST32 requires non-tiled s3 address/s0 data");
+  const auto data = DecodeOneLowerSource(binary, end, cursor);
+  const auto addr = DecodeOneLowerSource(binary, end, cursor);
+  if (data.bank != PcoRegisterBank::kTemporary ||
+      addr.bank != PcoRegisterBank::kTemporary ||
+      static_cast<std::size_t>(data.index) + count > kPcoTemporaryCount ||
+      static_cast<std::size_t>(addr.index) + 2 > kPcoTemporaryCount ||
+      cursor >= end || binary[cursor++] != 0)
+    DecodeError(cursor, "compute ST32 requires bounded TEMP data/address and null ISS");
+  ValidateAlignmentPadding(binary, header.offset, cursor, end);
+  PcoInstruction out;
+  out.opcode = PcoOpcode::kBufferStore;
+  out.source = addr;
+  out.source1 = {addr.bank, static_cast<std::uint16_t>(addr.index + 1)};
+  out.source2 = data;
+  out.source_count = 3;
+  out.component_count = static_cast<std::uint8_t>(count);
+  out.memory_cache_mode = op1 & 3U;
+  out.binary_offset = CheckedU32(header.offset + 3, "compute ST offset");
+  out.group_index = group_index;
+  return out;
+}
+
+PcoInstruction DecodeComputeAtomic32(const std::vector<std::uint8_t> &binary,
+                                       const GroupHeader &header,
+                                       std::uint16_t group_index) {
+  const std::size_t end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  // Mesa I_ATOMIC maps addr+data to s0, old-value destination to s3. Unlike
+  // an ALU group, this does not have a W0 destination or the header ATOM bit.
+  if (header.da != 6 || header.write0_present || header.write1_present ||
+      header.repeat_count != 1 || header.end || end - cursor < 3 ||
+      binary[cursor++] != 0xe5)
+    DecodeError(header.offset, "compute atomic requires DMA32/DRC0 and no ALU destination");
+  const auto operation = binary[cursor++];
+  if ((operation & 0x0fU) != 0 || binary[cursor++] != 3)
+    DecodeError(header.offset, "compute atomic requires s0 address-data/s3 destination and clear reserved bits");
+  // Public pco_isa.py F_ATOMIC_OP; nibble 3 is reserved, not CAS. Mesa
+  // lowers buffer compare-exchange through usclib/MUTEX instead of I_ATOMIC.
+  PcoOpcode opcode;
+  switch (operation >> 4U) {
+  case 0: opcode = PcoOpcode::kAtomicAdd32; break;
+  case 1: opcode = PcoOpcode::kAtomicSub32; break;
+  case 2: opcode = PcoOpcode::kAtomicExchange32; break;
+  case 4: opcode = PcoOpcode::kAtomicUnsignedMin32; break;
+  case 5: opcode = PcoOpcode::kAtomicSignedMin32; break;
+  case 6: opcode = PcoOpcode::kAtomicUnsignedMax32; break;
+  case 7: opcode = PcoOpcode::kAtomicSignedMax32; break;
+  case 8: opcode = PcoOpcode::kAtomicAnd32; break;
+  case 9: opcode = PcoOpcode::kAtomicOr32; break;
+  case 10: opcode = PcoOpcode::kAtomicXor32; break;
+  default: DecodeError(header.offset, "compute atomic operation is reserved");
+  }
+  const auto address_data = DecodeOneLowerSource(binary, end, cursor);
+  const auto destination = DecodeOneLowerSource(binary, end, cursor);
+  if (address_data.bank != PcoRegisterBank::kTemporary ||
+      destination.bank != PcoRegisterBank::kTemporary ||
+      static_cast<std::size_t>(address_data.index) + 3 > kPcoTemporaryCount ||
+      destination.index >= kPcoTemporaryCount ||
+      cursor >= end || binary[cursor++] != 0)
+    DecodeError(cursor, "compute atomic requires bounded TEMP operands and unused ISS");
+  ValidateAlignmentPadding(binary, header.offset, cursor, end);
+  PcoInstruction out;
+  out.opcode = opcode;
+  out.source = address_data;
+  out.source1 = {address_data.bank, static_cast<std::uint16_t>(address_data.index + 1)};
+  out.source2 = {address_data.bank, static_cast<std::uint16_t>(address_data.index + 2)};
+  out.source_count = 3;
+  out.target = PcoWriteTarget::kTemporary;
+  out.output_index = destination.index;
+  out.component_count = 1;
+  out.data_request = 0;
+  out.binary_offset = CheckedU32(header.offset + 3, "compute atomic offset");
+  out.group_index = group_index;
+  return out;
+}
+
+PcoInstruction DecodeComputeIdf(const std::vector<std::uint8_t> &binary,
+                                const GroupHeader &header,
+                                std::uint16_t group_index) {
+  const std::size_t end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  if (header.da != 5 || header.write0_present || header.write1_present ||
+      header.repeat_count != 1 || header.end || end - cursor < 2 ||
+      binary[cursor++] != 0xe0 || binary[cursor++] != 0)
+    DecodeError(header.offset, "compute IDF requires DRC0/s0 address");
+  const auto addr = DecodeOneLowerSource(binary, end, cursor);
+  if (addr.bank != PcoRegisterBank::kTemporary ||
+      static_cast<std::size_t>(addr.index) + 2 > kPcoTemporaryCount ||
+      end - cursor < 2 || binary[cursor++] != 0 || binary[cursor++] != 0)
+    DecodeError(cursor, "compute IDF requires bounded TEMP pair and unused upper/ISS");
+  ValidateAlignmentPadding(binary, header.offset, cursor, end);
+  PcoInstruction out;
+  out.opcode = PcoOpcode::kInstructionDataFence;
+  out.source = addr;
+  out.source1 = {addr.bank, static_cast<std::uint16_t>(addr.index + 1)};
+  out.source_count = 2;
+  out.binary_offset = CheckedU32(header.offset + 3, "compute IDF offset");
+  out.group_index = group_index;
+  return out;
+}
+
+PcoInstruction DecodeComputePredicate(const std::vector<std::uint8_t> &binary,
+                                      const GroupHeader &header,
+                                      std::uint16_t group_index) {
+  const std::size_t end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  if (header.write0_present || header.write1_present || header.repeat_count != 1 ||
+      header.end || end - cursor < 2 || binary[cursor++] != 0xd3 ||
+      binary[cursor++] != 0x3c)
+    DecodeError(header.offset, "unsupported compute predicate-only TST group");
+  const auto test = DecodeTestPhase(binary, end, cursor, false, true);
+  if (!(binary[cursor] & 1U) || test.op > 2 || test.type > kTstTypeS32 ||
+      header.da != 8U + test.bytes - 1U)
+    DecodeError(cursor, "compute predicate TST must write P0 and be unary");
+  cursor += test.bytes;
+  if (end - cursor < 2 || binary[cursor++] != 0x9c || binary[cursor++] != 0x1e)
+    DecodeError(cursor, "compute predicate TST requires PCK.ZERO");
+  const auto phase = DecodePhaseOperation(binary, end, cursor, header.offset);
+  if (phase.opcode != PcoOpcode::kMoveBypass || phase.source0_absolute)
+    DecodeError(cursor, "compute predicate TST input must be unmodified MBYP");
+  const auto lower = DecodeTwoLowerSources(binary, end, cursor, true, true);
+  const auto upper = DecodeOneLowerSource(binary, end, cursor);
+  if (lower.source1.bank != PcoRegisterBank::kSpecial || lower.source1.index != 143 ||
+      upper.bank != PcoRegisterBank::kSpecial || upper.index != 0 ||
+      cursor >= end || binary[cursor++] != 0x20)
+    DecodeError(cursor, "compute predicate TST selectors are not canonical");
+  ValidateAlignmentPadding(binary, header.offset, cursor, end);
+  PcoInstruction out;
+  out.opcode = PcoOpcode::kBooleanCompare;
+  out.source = lower.source0;
+  out.source_count = 1;
+  out.comparison_test_op = test.op;
+  out.comparison_test_type = test.type;
+  out.writes_predicate = 1;
+  out.binary_offset = CheckedU32(header.offset + 3, "compute predicate offset");
+  out.group_index = group_index;
+  return out;
+}
+
+PcoInstruction DecodeComputeMultiplyHigh(const std::vector<std::uint8_t> &binary,
+                                         const GroupHeader &header,
+                                         std::uint16_t group_index) {
+  const std::size_t end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  if (header.da != 3 || header.write0_present || !header.write1_present ||
+      header.repeat_count != 1 || cursor >= end || binary[cursor++] != 0xe3)
+    DecodeError(header.offset, "compute IMADD64 high requires unsigned/no-modifier single-high destination");
+  const auto lower = DecodeThreeLowerSources(binary, end, cursor);
+  const auto high = DecodeOneLowerSource(binary, end, cursor);
+  if (lower.input_selector != 1 || cursor >= end || binary[cursor++] != 0xc0)
+    DecodeError(cursor, "compute IMADD64 requires is0=s3/ft0/fte selectors");
+  const auto dest = DecodeGenericDestination(binary, end, cursor);
+  if (dest.target != PcoWriteTarget::kTemporary)
+    DecodeError(cursor, "compute IMADD64 high destination must be TEMP");
+  ValidateAlignmentPadding(binary, header.offset, cursor, end);
+  PcoInstruction out;
+  out.opcode = PcoOpcode::kIntegerMultiplyAdd64High;
+  out.source = lower.source0;
+  out.source1 = lower.source1;
+  out.source2 = lower.source2;
+  out.source3 = high;
+  out.source_count = 4;
+  out.target = dest.target;
+  out.output_index = dest.index;
+  out.binary_offset = CheckedU32(header.offset + 3, "compute IMADD64 offset");
+  out.group_index = group_index;
+  out.end_group = header.end;
+  return out;
+}
+
+PcoInstruction DecodeComputeGroup(const std::vector<std::uint8_t> &binary,
+                                  const GroupHeader &header,
+                                  std::uint16_t group_index) {
+  constexpr auto stage = ShaderStage::kCompute;
+  if (header.control) return DecodeComputeControl(binary, header, group_index);
+  const auto op = binary[header.offset + 3];
+  if (header.bitwise) {
+    if (header.operation_origin == 1)
+      return DecodeGenericImmediateGroup(stage, binary, header, group_index);
+    if (header.operation_origin == 3) {
+      switch (op) {
+      case 0x40: return DecodeGenericBitwiseOrGroup(stage, binary, header, group_index);
+      case 0x41: return DecodeGenericBitwiseAndGroup(stage, binary, header, group_index);
+      case 0x46: return DecodeGenericBitwiseXnorGroup(stage, binary, header, group_index);
+      case 0x68: return DecodeGenericBitfieldInsertGroup(stage, binary, header, group_index);
+      }
+    }
+    if (header.operation_origin == 5 && (op == 0 || op == 1))
+      return DecodeGenericShiftGroup(stage, binary, header, group_index);
+    if (header.operation_origin == 7)
+      return DecodeGenericBitfieldExtractUnsignedGroup(stage, binary, header, group_index);
+    DecodeError(header.offset, "compute bitwise group is not implemented");
+  }
+  if (header.operation_origin == 2) {
+    if (op == 0xf1) return DecodeBufferLoadGroup(binary, header, group_index, true);
+    if (op == 0xf2) return DecodeComputeStore(binary, header, group_index);
+    if (op == 0xe0) return DecodeComputeIdf(binary, header, group_index);
+    if (op == 0xe5) return DecodeComputeAtomic32(binary, header, group_index);
+    DecodeError(header.offset, "compute backend operation is not implemented");
+  }
+  if (header.operation_origin == 0) {
+    if (header.write1_present && (op & ~0x08U) == 0xe0)
+      return DecodeGenericAdd64_32Group(stage, binary, header, group_index);
+    if (header.write1_present && op == 0xe3)
+      return DecodeComputeMultiplyHigh(binary, header, group_index);
+    return DecodeGenericSimpleAluGroup(stage, binary, header, group_index);
+  }
+  if (header.operation_origin == 4 && !header.write0_present)
+    return DecodeComputePredicate(binary, header, group_index);
+  if (header.operation_origin == 4)
+    return DecodeGenericTestZeroGroup(stage, binary, header, group_index);
+  if (header.operation_origin == 5)
+    return DecodeGenericPhase2Group(stage, binary, header, group_index);
+  if (header.operation_origin == 1 && op == 0xd3)
+    return DecodeGenericMoveSpecialSourceGroup(stage, binary, header, group_index);
+  if (header.operation_origin == 1)
+    return DecodeGenericPackGroup(stage, binary, header, group_index);
+  DecodeError(header.offset, "compute ALU group is not implemented");
+}
+
 bool IsRegister(const PcoRegisterRef &reference, PcoRegisterBank bank,
                 std::uint16_t index) {
   return reference.bank == bank && reference.index == index;
@@ -4266,6 +4639,8 @@ bool SameConditionalsInstruction(const PcoInstruction &left,
          left.texture_dimension == right.texture_dimension &&
          left.texture_address_offset == right.texture_address_offset &&
          left.texture_fcnorm == right.texture_fcnorm &&
+         left.texture_non_normalized_coords == right.texture_non_normalized_coords &&
+         left.texture_sample_index_present == right.texture_sample_index_present &&
          left.data_request == right.data_request &&
          left.iteration_mode == right.iteration_mode &&
          left.perspective == right.perspective &&
@@ -4446,6 +4821,59 @@ bool HasCanonicalUnusedSources(const PcoInstruction &instruction) {
 
 bool HasDefaultControlFields(const PcoInstruction &instruction) {
   return instruction.branch_target_index == 0 && instruction.loop_count == 0;
+}
+
+bool HasCanonicalTextureFields(const PcoInstruction &instruction) {
+  return (instruction.texture_dimension == 2 ||
+          instruction.texture_dimension == 3) &&
+         instruction.texture_address_offset <= 1 &&
+         instruction.texture_fcnorm <= 1 &&
+         instruction.texture_non_normalized_coords <= 1 &&
+         instruction.texture_sample_index_present <= 1 &&
+         instruction.texture_non_normalized_coords ==
+             instruction.texture_sample_index_present &&
+         (!instruction.texture_sample_index_present ||
+          instruction.texture_dimension == 2);
+}
+
+std::size_t TextureDataDwordCount(const PcoInstruction &instruction) {
+  return static_cast<std::size_t>(instruction.texture_dimension) +
+         (instruction.texture_address_offset ? 3U : 0U) +
+         (instruction.texture_sample_index_present ? 1U : 0U);
+}
+
+// The caller has validated the complete TEMP span and its written mask. Keep
+// the coordinate array separate from the variable SMP data stream: TAO and
+// SNO add data words, not extra coordinates (including on the vertex path).
+void SetTextureRequestData(
+    const PcoInstruction &instruction,
+    const std::array<std::uint32_t, kPcoTemporaryCount> &temporaries,
+    PcoTextureRequest &request) {
+  const std::size_t base = instruction.source.index;
+  const std::size_t dimensions = instruction.texture_dimension;
+  for (std::size_t component = 0; component < dimensions; ++component)
+    request.coordinates[component] = temporaries[base + component];
+  std::size_t tail = base + dimensions;
+  if (instruction.texture_address_offset) {
+    // pco_emit_nir_smp injects a zero bias before the address pair. A nonzero
+    // BIAS needs its own LOD datapath; never silently discard it here.
+    if ((temporaries[tail++] & UINT32_C(0x7fffffff)) != 0)
+      ExecuteError("SMP TAO requires the supported zero LOD bias");
+    request.texture_address_lo = temporaries[tail++];
+    request.texture_address_hi = temporaries[tail++];
+  }
+  request.sample_index_present = instruction.texture_sample_index_present;
+  if (instruction.texture_sample_index_present) {
+    const std::uint32_t lookup = temporaries[tail];
+    // rogue_hw_defs.h ROGUE_SMP_LOOKUP_MS_NUM_START=16, BITS=3. Spatial
+    // offsets and reserved lookup bits are not supported by this opcode form.
+    if ((lookup & ~UINT32_C(0x00070000)) != 0)
+      ExecuteError("SMP SNO lookup carries unsupported or reserved bits");
+    request.sample_index = static_cast<std::uint8_t>((lookup >> 16U) & 7U);
+  }
+  request.coordinate_count = 2;
+  request.dimension = instruction.texture_dimension;
+  request.normalized = instruction.texture_non_normalized_coords ? 0U : 1U;
 }
 
 bool MatchesMove(const PcoInstruction &instruction, PcoRegisterBank source_bank,
@@ -4640,18 +5068,12 @@ void ValidateVertexTemporaryProgram(
     }
     if (instruction.opcode == PcoOpcode::kTextureSample) {
       const std::size_t coordinate_base = instruction.source.index;
-      // dmn is the coordinate count: two for 2D, three for 2D-array, cube
-      // and 3D.
-      const std::size_t coordinate_count =
-          instruction.texture_address_offset
-              ? static_cast<std::size_t>(instruction.texture_dimension) + 3U
-          : instruction.texture_dimension != 0 ? instruction.texture_dimension
-                                                : 2U;
+      const std::size_t coordinate_count = TextureDataDwordCount(instruction);
       const bool coordinate_range_valid = coordinate_count != 0 &&
           coordinate_base <= kPcoTemporaryCount &&
           coordinate_count <= kPcoTemporaryCount - coordinate_base;
       if (++texture_sample_count > kPcoMaximumTextureSampleInstructions ||
-          instruction.texture_fcnorm > 1U ||
+          !HasCanonicalTextureFields(instruction) ||
           instruction.target != PcoWriteTarget::kTemporary ||
           instruction.source_count != 3 || instruction.repeat_count != 1 ||
           instruction.component_count != kPcoTextureResponseCount ||
@@ -4907,18 +5329,12 @@ void ValidateFragmentProgram(
     }
     if (instruction.opcode == PcoOpcode::kTextureSample) {
       const std::size_t coordinate_base = instruction.source.index;
-      // dmn is the coordinate count: two for 2D, three for 2D-array, cube
-      // and 3D.
-      const std::size_t coordinate_count =
-          instruction.texture_address_offset
-              ? static_cast<std::size_t>(instruction.texture_dimension) + 3U
-          : instruction.texture_dimension != 0 ? instruction.texture_dimension
-                                                : 2U;
+      const std::size_t coordinate_count = TextureDataDwordCount(instruction);
       const bool coordinate_range_valid = coordinate_count != 0 &&
           coordinate_base <= kPcoTemporaryCount &&
           coordinate_count <= kPcoTemporaryCount - coordinate_base;
       if (request_pending || instruction.target != PcoWriteTarget::kTemporary ||
-          instruction.texture_fcnorm > 1U ||
+          !HasCanonicalTextureFields(instruction) ||
           instruction.source_count != 3 || instruction.repeat_count != 1 ||
           instruction.component_count != 4 || instruction.data_request != 0 ||
           instruction.iteration_mode != PcoIterationMode::kPixel ||
@@ -6396,6 +6812,11 @@ void ValidateExecutionEnvelope(const PcoProgramSummary &summary,
       ExecuteError("invalid decoded component count");
     if (instruction.source_count > 4)
       ExecuteError("invalid decoded source count");
+    if (instruction.exec_cnd || instruction.writes_predicate ||
+        instruction.control_operation || instruction.control_condition ||
+        instruction.branch_condition || instruction.memory_cache_mode ||
+        instruction.output_target1 != PcoWriteTarget::kTemporary)
+      ExecuteError("compute-only execution fields reached a graphics executor");
     if (instruction.address_offset_signed > 1 ||
         (instruction.address_offset_signed != 0 &&
          instruction.opcode != PcoOpcode::kIntegerAdd64_32))
@@ -6536,7 +6957,8 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
     if (instruction.repeat_count == 0 || instruction.repeat_count > 4)
       ExecuteError("instruction counter received an invalid repeat count");
     const std::size_t maximum_components =
-        instruction.opcode == PcoOpcode::kBufferLoad
+        (instruction.opcode == PcoOpcode::kBufferLoad ||
+         instruction.opcode == PcoOpcode::kBufferStore)
             ? kPcoMaximumBufferLoadDwords : kPcoTextureResponseCount;
     if (instruction.component_count == 0 ||
         instruction.component_count > maximum_components) {
@@ -6592,6 +7014,7 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
     case PcoOpcode::kLoopBegin:
     case PcoOpcode::kLoopEnd:
     case PcoOpcode::kIntegerAdd:
+    case PcoOpcode::kIntegerMultiplyAdd64High:
     case PcoOpcode::kBitwiseAnd:
     case PcoOpcode::kBitwiseOr:
     case PcoOpcode::kBitwiseXor:
@@ -6621,6 +7044,10 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
       counts.texture += amount;
       break;
     case PcoOpcode::kWaitDataFence:
+    case PcoOpcode::kNop:
+    case PcoOpcode::kConditionalMask:
+    case PcoOpcode::kInstructionDataFence:
+    case PcoOpcode::kMutex:
       /* Control/synchronization is intentionally not mislabeled ALU/TEX/MEM. */
       break;
     case PcoOpcode::kUvsWrite:
@@ -6630,6 +7057,16 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
     case PcoOpcode::kBufferStore:
     case PcoOpcode::kDiscard:
     case PcoOpcode::kAtomicAdd:
+    case PcoOpcode::kAtomicAdd32:
+    case PcoOpcode::kAtomicSub32:
+    case PcoOpcode::kAtomicExchange32:
+    case PcoOpcode::kAtomicUnsignedMin32:
+    case PcoOpcode::kAtomicSignedMin32:
+    case PcoOpcode::kAtomicUnsignedMax32:
+    case PcoOpcode::kAtomicSignedMax32:
+    case PcoOpcode::kAtomicAnd32:
+    case PcoOpcode::kAtomicOr32:
+    case PcoOpcode::kAtomicXor32:
     case PcoOpcode::kAtomicCompSwap:
     case PcoOpcode::kDepthFeedback:
       counts.memory += amount;
@@ -6641,8 +7078,202 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
   return counts;
 }
 
+bool PcoSpecialConstantBits(std::uint16_t index, std::uint32_t *bits) {
+  return SpecialConstantBits(index, bits);
+}
+
+namespace {
+std::uint32_t ComputeAluSource(const PcoInstruction &i, std::uint32_t value,
+                               unsigned source, bool negate = true) {
+  if ((source == 0 && i.source0_floor) || (source == 2 && i.source2_floor))
+    value = FloatFloorBits(value);
+  if ((source == 0 && i.source0_absolute) || (source == 1 && i.source1_absolute) ||
+      (source == 2 && i.source2_absolute)) value &= UINT32_C(0x7fffffff);
+  if (negate && ((source == 0 && i.source0_negate) || (source == 1 && i.source1_negate)))
+    value ^= UINT32_C(0x80000000);
+  return value;
+}
+struct ComputePhaseResults {
+  PhaseResult phase0, phase1;
+  std::uint32_t feed = 0;
+  std::uint32_t Get(PcoInternalResult which) const {
+    switch (which) {
+    case PcoInternalResult::kPhase0: return phase0.value;
+    case PcoInternalResult::kPhase1: return phase1.value;
+    case PcoInternalResult::kFeedThrough: return feed;
+    default: ExecuteError("compute phase result is unsupported");
+    }
+  }
+};
+ComputePhaseResults ComputePhases(const PcoInstruction &i, std::uint32_t test,
+    const std::array<std::uint32_t, 3> &p0, const std::array<std::uint32_t, 3> &p1) {
+  ComputePhaseResults out;
+  out.phase0 = EvaluatePhaseOperation(i.phase0, p0[0], p0[1], p0[2]);
+  out.phase1 = EvaluatePhaseOperation(i.phase1, p1[0], p1[1], p1[2]);
+  out.feed = i.phase0.produces_feed_through ? out.phase0.feed_through :
+             i.phase1.produces_feed_through ? out.phase1.feed_through : test;
+  return out;
+}
+} // namespace
+
+bool EvaluatePcoPredicate(const PcoInstruction &i,
+    const std::array<std::uint32_t, 4> &s,
+    const std::array<std::uint32_t, 3> &p0,
+    const std::array<std::uint32_t, 3> &p1) {
+  if (i.phase_composed) {
+    const auto p = ComputePhases(i, s[0], p0, p1);
+    const auto left = i.test_source0_result == PcoInternalResult::kFeedThrough
+                          ? s[0] : p.Get(i.test_source0_result);
+    const auto right = i.test_source1_result == PcoInternalResult::kFeedThrough
+                           ? 0U : p.Get(i.test_source1_result);
+    return EvaluateTestPredicate(i.comparison_test_op, i.comparison_test_type, left, right);
+  }
+  const auto left = ComputeAluSource(i, s[0], 0);
+  const auto right = ComputeAluSource(i, s[1], 1);
+  if (i.opcode == PcoOpcode::kTestZero) return s[0] == 0;
+  return EvaluateTestPredicate(i.comparison_test_op, i.comparison_test_type,
+                                left, i.source_count < 2 ? 0 : right);
+}
+
+std::uint32_t EvaluatePcoAluInstruction(const PcoInstruction &i,
+    const std::array<std::uint32_t, 4> &s, std::uint8_t repeat,
+    const std::array<std::uint32_t, 3> &p0,
+    const std::array<std::uint32_t, 3> &p1) {
+  const auto a = ComputeAluSource(i, s[0], 0);
+  const auto b = ComputeAluSource(i, s[1], 1);
+  const auto c = ComputeAluSource(i, s[2], 2);
+  std::uint32_t value = 0;
+  switch (i.opcode) {
+  case PcoOpcode::kMoveImmediate: return i.immediate;
+  case PcoOpcode::kMoveBypass: return a;
+  case PcoOpcode::kFloatNegate: return a ^ UINT32_C(0x80000000);
+  case PcoOpcode::kFloatAbs: return a & UINT32_C(0x7fffffff);
+  case PcoOpcode::kIntegerAdd: return s[0] + s[1];
+  case PcoOpcode::kIntegerMultiplyAdd32:
+    return IntegerSourceModifier(s[0], i.source0_integer_absolute, i.source0_integer_negate) *
+           IntegerSourceModifier(s[1], i.source1_integer_absolute, i.source1_integer_negate) +
+           IntegerSourceModifier(s[2], i.source2_integer_absolute, false);
+  case PcoOpcode::kIntegerMultiplyAdd64High:
+    return static_cast<std::uint32_t>((static_cast<std::uint64_t>(s[0]) * s[1] +
+        s[2] + (static_cast<std::uint64_t>(s[3]) << 32)) >> 32);
+  case PcoOpcode::kBitwiseAnd: return s[0] & s[1];
+  case PcoOpcode::kBitwiseOr: return s[0] | s[1];
+  case PcoOpcode::kBitwiseXor: return s[0] ^ s[1];
+  case PcoOpcode::kBitwiseXnor: return ~(s[0] ^ s[1]);
+  case PcoOpcode::kShiftLeft: return s[0] << (s[1] & 31);
+  case PcoOpcode::kShiftRight: return s[0] >> (s[1] & 31);
+  case PcoOpcode::kBitfieldExtractUnsigned:
+    return (s[0] >> (s[1] & 31)) & ((UINT32_C(1) << (s[2] & 31)) - 1);
+  case PcoOpcode::kBitfieldExtractSigned:
+    return SignedBitfieldExtract(s[0], s[1] & 31, s[2] & 31);
+  case PcoOpcode::kBitfieldInsert: {
+    const auto bits = s[0] & 31U, offset = s[1] & 31U;
+    const auto mask = ((UINT32_C(1) << bits) - 1) << offset;
+    const auto insert = i.bitfield_insert_shifts ? s[2] << offset : s[2];
+    return (s[3] & ~mask) | (insert & mask);
+  }
+  case PcoOpcode::kBooleanCompare:
+  case PcoOpcode::kFloatEqual:
+  case PcoOpcode::kFloatLess:
+  case PcoOpcode::kFloatGreaterEqual:
+    return EvaluatePcoPredicate(i, s, p0, p1)
+        ? (i.comparison_result_float_one ? UINT32_C(0x3f800000) : UINT32_MAX) : 0;
+  case PcoOpcode::kTestZero: return s[0] == 0 ? UINT32_MAX : 0;
+  case PcoOpcode::kConditionalSelect: return s[0] ? s[1] : s[2];
+  case PcoOpcode::kConditionalSelectNegateTrue:
+    return s[0] ? s[1] ^ UINT32_C(0x80000000) : s[2];
+  case PcoOpcode::kConditionalSelectGreaterZero:
+    return FloatGreaterZero(s[0]) ? s[1] : s[2];
+  case PcoOpcode::kTestConditionalSelect:
+    if (i.phase_composed) {
+      const auto p = ComputePhases(i, s[0], p0, p1);
+      return p.Get(EvaluatePcoPredicate(i, s, p0, p1)
+                       ? i.select_true_result : i.select_false_result);
+    }
+    return (EvaluateTestPredicate(i.comparison_test_op, i.comparison_test_type, s[0], 0) !=
+             (i.conditional_select_inverted != 0)) ? b : s[2];
+  case PcoOpcode::kFloatFloor: return FloatFloorBits(a);
+  case PcoOpcode::kFloatAdd: value = FloatAddBits(a, b); break;
+  case PcoOpcode::kFloatAddNegateSource0: value = FloatAddBits(a ^ UINT32_C(0x80000000), b); break;
+  case PcoOpcode::kFloatMultiply: value = FloatMultiplyBits(a, b); break;
+  case PcoOpcode::kFloatMad: value = FloatMadBits(a, b, c); break;
+  case PcoOpcode::kFloatMadNegateSource0:
+    value = FloatMadBits(a ^ UINT32_C(0x80000000), b, c); break;
+  case PcoOpcode::kFloatMadNegateSource2:
+    value = FloatMadBits(a, b, c ^ UINT32_C(0x80000000)); break;
+  case PcoOpcode::kFloatMadNegateSource0Source2:
+    value = FloatMadBits(a ^ UINT32_C(0x80000000), b, c ^ UINT32_C(0x80000000)); break;
+  case PcoOpcode::kFloatMin: return FloatMinBits(s[0], s[1]);
+  case PcoOpcode::kFloatMax: return FloatMaxBits(s[0], s[1]);
+  case PcoOpcode::kReciprocal: return ReciprocalBits(a);
+  case PcoOpcode::kReciprocalSquareRoot: return ReciprocalSquareRootBits(a);
+  case PcoOpcode::kFloatLog2: return FloatLog2Bits(a);
+  case PcoOpcode::kFloatExp2: return FloatExp2Bits(a);
+  case PcoOpcode::kUnpackUnsignedToFloat: return FloatFromUnsigned(s[0]);
+  case PcoOpcode::kUnpackSignedToFloat: return FloatFromSigned(static_cast<std::int32_t>(s[0]));
+  case PcoOpcode::kFloatToUint32Rtne: return FloatToUint32Bits(s[0], false);
+  case PcoOpcode::kFloatToUint32Rtz: return FloatToUint32Bits(s[0], true);
+  case PcoOpcode::kFloatToInt32Rtne: return FloatToInt32Bits(s[0], false);
+  case PcoOpcode::kFloatToInt32Rtz: return FloatToInt32Bits(s[0], true);
+  case PcoOpcode::kFloatPackHalfRtne: return FloatToHalf(s[0]);
+  case PcoOpcode::kFloatPackHalfRtz: return FloatToHalfRtz(s[0]);
+  case PcoOpcode::kFloatUnpackHalf:
+    return HalfToFloat(static_cast<std::uint16_t>(s[0] >> (16U * (repeat & 1U))));
+  case PcoOpcode::kUnpackVector: return UnpackVectorLaneBits(i.unpack_format, i.unpack_scale, s[0], repeat);
+  default: ExecuteError("pure compute ALU opcode is not implemented: " +
+                         std::to_string(static_cast<unsigned>(i.opcode)));
+  }
+  return i.saturate ? FloatSaturateBits(value) : value;
+}
+
+PcoDecodedProgram DecodeComputePcoProgram(const std::vector<std::uint8_t> &binary) {
+  if (binary.empty()) DecodeError(0, "empty compute binary");
+  PcoDecodedProgram out;
+  out.summary.stage = ShaderStage::kCompute;
+  out.summary.binary_size = CheckedU32(binary.size(), "compute binary size");
+  std::vector<std::size_t> group_offsets;
+  for (std::size_t offset = 0; offset < binary.size();) {
+    if (out.summary.ends_task) DecodeError(offset, "bytes follow compute END");
+    if (out.instructions.size() > UINT16_MAX) DecodeError(offset, "too many compute groups");
+    const auto header = DecodeHeader(binary, offset, true);
+    auto instruction = DecodeComputeGroup(binary, header,
+                            static_cast<std::uint16_t>(out.instructions.size()));
+    instruction.exec_cnd = header.exec_cnd;
+    instruction.end_group = header.end;
+    if (instruction.target != PcoWriteTarget::kNone &&
+        instruction.target != PcoWriteTarget::kTemporary &&
+        instruction.target != PcoWriteTarget::kVertexInput)
+      DecodeError(offset, "compute group writes a graphics-only register target");
+    group_offsets.push_back(offset);
+    out.instructions.push_back(instruction);
+    if (header.end) out.summary.ends_task = 1;
+    offset += header.total_bytes;
+  }
+  if (!out.summary.ends_task) DecodeError(binary.size(), "compute has no native END");
+  for (std::size_t index = 0; index < out.instructions.size(); ++index) {
+    auto &instruction = out.instructions[index];
+    if (instruction.opcode != PcoOpcode::kBranch) continue;
+    std::int32_t relative;
+    std::memcpy(&relative, &instruction.immediate, sizeof(relative));
+    const auto target = static_cast<std::int64_t>(group_offsets[index]) + relative;
+    if (target < 0 || static_cast<std::uint64_t>(target) >= binary.size())
+      DecodeError(group_offsets[index], "compute branch leaves binary");
+    const auto found = std::lower_bound(group_offsets.begin(), group_offsets.end(),
+                                         static_cast<std::size_t>(target));
+    if (found == group_offsets.end() || *found != static_cast<std::size_t>(target))
+      DecodeError(group_offsets[index], "compute branch does not name a group boundary");
+    instruction.branch_target_index = static_cast<std::uint16_t>(found - group_offsets.begin());
+  }
+  out.summary.group_count = CheckedU32(out.instructions.size(), "compute group count");
+  out.summary.instruction_count = out.summary.group_count;
+  return out;
+}
+
 PcoDecodedProgram DecodePcoProgram(ShaderStage stage,
                                    const std::vector<std::uint8_t> &binary) {
+  if (stage == ShaderStage::kCompute) return DecodeComputePcoProgram(binary);
+  if (stage != ShaderStage::kVertex && stage != ShaderStage::kFragment)
+    DecodeError(0, "invalid shader stage");
   if (binary.empty())
     DecodeError(0, "empty shader binary");
   if (binary.size() > std::numeric_limits<std::uint32_t>::max())
@@ -7024,17 +7655,12 @@ PcoVertexExecution ExecuteVertexPco(
 
     if (instruction.opcode == PcoOpcode::kTextureSample) {
       const std::size_t coordinate_base = instruction.source.index;
-      // dmn is the coordinate count: two for 2D, three for 2D-array, cube
-      // and 3D.
-      const std::size_t coordinate_count =
-          instruction.texture_address_offset
-              ? static_cast<std::size_t>(instruction.texture_dimension) + 3U
-          : instruction.texture_dimension != 0 ? instruction.texture_dimension
-                                                : 2U;
+      const std::size_t coordinate_count = TextureDataDwordCount(instruction);
       const bool coordinate_range_valid = coordinate_count != 0 &&
           coordinate_base <= kPcoTemporaryCount &&
           coordinate_count <= kPcoTemporaryCount - coordinate_base;
       if (drc0_pending ||
+          !HasCanonicalTextureFields(instruction) ||
           instruction.target != PcoWriteTarget::kTemporary ||
           instruction.source_count != 3 || instruction.repeat_count != 1 ||
           instruction.component_count != kPcoTextureResponseCount ||
@@ -7058,29 +7684,17 @@ PcoVertexExecution ExecuteVertexPco(
               kPcoTemporaryCount) {
         ExecuteError("invalid generic vertex SMP.2D.FCNORM instruction");
       }
-      for (std::size_t coordinate = 0; coordinate < coordinate_count;
-           ++coordinate) {
-        result.texture_request.coordinates[coordinate] = ReadSource(
-            instruction.source, effective_vertex_inputs, temporaries,
-            temporary_written_mask, static_cast<std::uint8_t>(coordinate),
-            ShaderStage::kVertex);
-      }
+      SetTextureRequestData(instruction, temporaries, result.texture_request);
       for (std::size_t word = 0; word < 4; ++word) {
         result.texture_request.texture_state[word] =
             effective_shared[instruction.source1.index + word];
         result.texture_request.sampler_state[word] =
             effective_shared[instruction.source2.index + word];
       }
-      result.texture_request.coordinate_count =
-          static_cast<std::uint8_t>(coordinate_count);
       result.texture_request.component_count = kPcoTextureResponseCount;
       result.texture_request.descriptor_set = static_cast<std::uint8_t>(
           instruction.source1.index / kPcoTextureDescriptorDwordCount);
       result.texture_request.binding = 0;
-      result.texture_request.dimension = static_cast<std::uint8_t>(
-          instruction.texture_address_offset ? instruction.texture_dimension
-                                             : coordinate_count);
-      result.texture_request.normalized = 1;
       result.texture_request.fcnorm = instruction.texture_fcnorm;
       result.texture_request.data_request = instruction.data_request;
       result.texture_request_valid = 1;
@@ -8171,19 +8785,14 @@ PcoFragmentExecution ExecuteFragmentPco(
 
     if (instruction.opcode == PcoOpcode::kTextureSample) {
       const std::size_t coordinate_base = instruction.source.index;
-      // dmn is the coordinate count: two for 2D, three for 2D-array, cube
-      // and 3D.
-      const std::size_t coordinate_count =
-          instruction.texture_address_offset
-              ? static_cast<std::size_t>(instruction.texture_dimension) + 3U
-          : instruction.texture_dimension != 0 ? instruction.texture_dimension
-                                                : 2U;
+      const std::size_t coordinate_count = TextureDataDwordCount(instruction);
       const bool coordinate_range_valid = coordinate_count != 0 &&
           coordinate_base <= kPcoTemporaryCount &&
           coordinate_count <= kPcoTemporaryCount - coordinate_base;
       if (drc0_pending ||
           instruction.target != PcoWriteTarget::kTemporary ||
           instruction.source_count != 3 || instruction.repeat_count != 1 ||
+          !HasCanonicalTextureFields(instruction) ||
           instruction.component_count != kPcoTextureResponseCount ||
           instruction.data_request != 0 ||
           instruction.source.bank != PcoRegisterBank::kTemporary ||
@@ -8204,45 +8813,17 @@ PcoFragmentExecution ExecuteFragmentPco(
               kPcoTemporaryCount) {
         ExecuteError("invalid generic SMP.2D.FCNORM instruction");
       }
-      // Two in-plane coordinates for every sample; a 3D sample reads a third
-      // (the depth coordinate r) from the next source register.  An array
-      // sample stays two-coordinate -- its layer rides in the folded address
-      // read below, not as a third coordinate.
-      const std::size_t coordinates_to_read =
-          (!instruction.texture_address_offset &&
-           instruction.texture_dimension >= 3U)
-              ? 3U
-              : 2U;
-      for (std::size_t coordinate = 0; coordinate < coordinates_to_read;
-           ++coordinate) {
-        result.texture_request.coordinates[coordinate] = ReadSource(
-            instruction.source, no_vertex_inputs, temporaries,
-            temporary_written_mask, static_cast<std::uint8_t>(coordinate),
-            ShaderStage::kFragment);
-      }
-      if (instruction.texture_address_offset) {
-        result.texture_request.texture_address_lo = ReadSource(
-            instruction.source, no_vertex_inputs, temporaries,
-            temporary_written_mask, 3U, ShaderStage::kFragment);
-        result.texture_request.texture_address_hi = ReadSource(
-            instruction.source, no_vertex_inputs, temporaries,
-            temporary_written_mask, 4U, ShaderStage::kFragment);
-      }
+      SetTextureRequestData(instruction, temporaries, result.texture_request);
       for (std::size_t word = 0; word < 4; ++word) {
         result.texture_request.texture_state[word] =
             context.shared_registers[instruction.source1.index + word];
         result.texture_request.sampler_state[word] =
             context.shared_registers[instruction.source2.index + word];
       }
-      result.texture_request.coordinate_count = 2;
       result.texture_request.component_count = 4;
       result.texture_request.descriptor_set = static_cast<std::uint8_t>(
           instruction.source1.index / kPcoTextureDescriptorDwordCount);
       result.texture_request.binding = 0;
-      result.texture_request.dimension = static_cast<std::uint8_t>(
-          instruction.texture_address_offset ? instruction.texture_dimension
-                                             : coordinate_count);
-      result.texture_request.normalized = 1;
       result.texture_request.fcnorm = instruction.texture_fcnorm;
       result.texture_request.data_request = instruction.data_request;
       result.texture_request_valid = 1;
@@ -8298,9 +8879,11 @@ PcoFragmentExecution ExecuteFragmentPco(
         result.depth = context.coefficients[source.index];
       } else if (source.bank == PcoRegisterBank::kSpecial &&
                  IsFragmentCoordinateSpecialRegister(source.index)) {
-        result.depth = (source.index == kSpecialFragmentXPixel ||
-                        source.index == kSpecialFragmentXSample)
-                           ? context.sample_x : context.sample_y;
+        result.depth = FloatAddBits(
+            (source.index == kSpecialFragmentXPixel ||
+             source.index == kSpecialFragmentXSample)
+                ? context.sample_x : context.sample_y,
+            context.special_coordinate_offset);
       } else {
         result.depth = ReadSource(source, no_vertex_inputs, temporaries,
                                   temporary_written_mask, 0, ShaderStage::kFragment);
@@ -8460,12 +9043,14 @@ PcoFragmentExecution ExecuteFragmentPco(
             IsFragmentCoordinateSpecialRegister(source.index)) {
           if (repeat != 0)
             ExecuteError("fragment coordinate registers cannot be repeated");
-          /* The model rasterises one sample per pixel, so the pixel-centre and
-           * sample coordinates are the same value. */
-          return (source.index == kSpecialFragmentXPixel ||
-                  source.index == kSpecialFragmentXSample)
-                     ? context.sample_x
-                     : context.sample_y;
+          // Pixel-frequency shading uses the physical pixel center for both
+          // native coordinate selectors. Coefficient evaluation can have a
+          // different origin and must not inherit this offset.
+          return FloatAddBits(
+              (source.index == kSpecialFragmentXPixel ||
+               source.index == kSpecialFragmentXSample)
+                  ? context.sample_x : context.sample_y,
+              context.special_coordinate_offset);
         }
         return ReadSource(source, no_vertex_inputs, temporaries,
                           temporary_written_mask, repeat,

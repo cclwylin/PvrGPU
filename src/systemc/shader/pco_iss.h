@@ -42,6 +42,9 @@ inline constexpr std::size_t kPcoPixelOutputCount = 16;
 /* The driver command ABI transports up to 256 temporary registers. This is
  * an explicit model bound, not the larger index limit of the public ISA. */
 inline constexpr std::size_t kPcoTemporaryCount = 256;
+// Public PCO_SR_INST_NUM. This is a runtime compute system register, never a
+// constant-table entry; its value is the physical instance within a 32-lane task.
+inline constexpr std::uint16_t kPcoSpecialInstanceNumber = 51;
 
 /* Lane/continuation ownership covers the full TEMP file, without shifting a
  * 64-bit integer by a register index >=64. Keep this payload trivially
@@ -230,7 +233,45 @@ enum class PcoOpcode : std::uint8_t {
    * Boolean BCSEL: the condition is an ordered float comparison with +0. */
   kConditionalSelectGreaterZero,
   kDepthFeedback,
+  // Compute control/memory groups retain their native state transitions.
+  kNop,
+  kConditionalMask,
+  kInstructionDataFence,
+  kIntegerMultiplyAdd64High,
+  // Native DMA atomic add: source/source1 is the address pair, source2 is
+  // the DWORD addend. The destination receives the old DWORD after WDF.
+  kAtomicAdd32,
+  // The remaining native I_ATOMIC operations have the same address/data
+  // triplet and old-value destination. DMA has no compare-exchange encoding.
+  kAtomicSub32,
+  kAtomicExchange32,
+  kAtomicUnsignedMin32,
+  kAtomicSignedMin32,
+  kAtomicUnsignedMax32,
+  kAtomicSignedMax32,
+  kAtomicAnd32,
+  kAtomicOr32,
+  kAtomicXor32,
+  kMutex,
 };
+
+inline bool IsPcoAtomic32(PcoOpcode opcode) {
+  switch (opcode) {
+  case PcoOpcode::kAtomicAdd32:
+  case PcoOpcode::kAtomicSub32:
+  case PcoOpcode::kAtomicExchange32:
+  case PcoOpcode::kAtomicUnsignedMin32:
+  case PcoOpcode::kAtomicSignedMin32:
+  case PcoOpcode::kAtomicUnsignedMax32:
+  case PcoOpcode::kAtomicSignedMax32:
+  case PcoOpcode::kAtomicAnd32:
+  case PcoOpcode::kAtomicOr32:
+  case PcoOpcode::kAtomicXor32:
+    return true;
+  default:
+    return false;
+  }
+}
 
 enum class PcoWriteTarget : std::uint8_t {
   kNone,
@@ -322,6 +363,8 @@ struct PcoInstruction {
   std::uint16_t output_index = 0;
   // The high half's destination for a two-output op (add64_32).
   std::uint16_t output_index1 = 0;
+  // Dual destinations encode independent banks. Keep the graphics TEMP default.
+  PcoWriteTarget output_target1 = PcoWriteTarget::kTemporary;
   // ADD64_32 sign-extends its 32-bit offset when the ISA S bit is set.
   std::uint8_t address_offset_signed = 0;
   std::uint16_t branch_target_index = 0;
@@ -333,8 +376,8 @@ struct PcoInstruction {
   // encoded group repeat remains one.
   std::uint8_t component_count = 1;
   // SMP's dmn field: 1d=0b01, 2d=0b10, 3d=0b11.  It is also the number of
-  // coordinate temporaries the instruction reads, which is why a 2D-array,
-  // cube or 3D sample needs three where a 2D sample needs two.
+  // coordinate temporaries: cube/3D use three, while a 2D-array uses two
+  // and carries its shader-computed layer address in the TAO payload.
   std::uint8_t texture_dimension = 2;
   // SMP `.tao`: the sample takes its texture base from a shader-computed
   // 64-bit address (array layer folded in) at coordinate_base+3/+4.
@@ -343,6 +386,10 @@ struct PcoInstruction {
   // Mesa leaves it clear for integer samplers; it does not control whether
   // the texture coordinates are normalized.
   std::uint8_t texture_fcnorm = 1;
+  // Public SMP NNCOORDS keeps floating-point coordinates in texel space.
+  // SNO appends a lookup DWORD; bits 18:16 name one sample, never a resolve.
+  std::uint8_t texture_non_normalized_coords = 0;
+  std::uint8_t texture_sample_index_present = 0;
   std::uint8_t data_request = 0;
   PcoIterationMode iteration_mode = PcoIterationMode::kPixel;
   std::uint8_t perspective = 0;
@@ -418,6 +465,17 @@ struct PcoInstruction {
   std::uint8_t source_count = 1;
   std::uint8_t repeat_count = 1;
   std::uint8_t end_group = 0;
+  // Public F_CC: PE; PE&&P0; ignore PE; PE&&!P0.
+  std::uint8_t exec_cnd = 0;
+  std::uint8_t writes_predicate = 0;
+  // Public F_CNDINST and F_PCND. Immediate holds adjust except CNDSM (op2),
+  // whose source1 carries native s2. CNDLT (op3) also writes P0.
+  std::uint8_t control_operation = 0;
+  std::uint8_t control_condition = 0;
+  // Public F_BPRED: execution condition, all instances, any instance.
+  std::uint8_t branch_condition = 0;
+  // Native LD: normal=0/bypass=1; ST: through=0/back=1/lazy=2.
+  std::uint8_t memory_cache_mode = 0;
 };
 
 /* Stored directly in PipelineState; no owning container appears here. */
@@ -444,11 +502,11 @@ struct PcoDecodedProgram {
 };
 
 /* One decoded public SMP request emitted by either shader-stage ISS. The
- * normalized coordinates and hardware texture/sampler state are the values
+ * coordinate bits and hardware texture/sampler state are the values
  * read by the decoded USC instruction, not a precomputed texel or case name.
  */
 struct PcoTextureRequest {
-  // Three normalized coordinates: s, t and (for a 3D image) the depth r.
+  // Float coordinates: normalized normally, or texel-space with NNCOORDS.
   std::array<std::uint32_t, 3> coordinates{};
   std::array<std::uint32_t, 4> texture_state{};
   std::array<std::uint32_t, 4> sampler_state{};
@@ -462,6 +520,8 @@ struct PcoTextureRequest {
   std::uint8_t dimension = 0;
   std::uint8_t normalized = 0;
   std::uint8_t fcnorm = 1;
+  std::uint8_t sample_index = 0;
+  std::uint8_t sample_index_present = 0;
   std::uint8_t data_request = 0;
 };
 
@@ -562,7 +622,10 @@ struct PcoFragmentExecution {
  * A/B/C/PAD sets: position-W, then RGBA for each linked smooth varying.
  * varyings_shader_1 uses 20 dwords, varyings_shader_2 uses 36 and
  * varyings_shader_4 uses 68 and varyings_shader_8 uses 132. sample_x and
- * sample_y are raw binary32 framebuffer sample-center coordinates.
+ * sample_y are raw binary32 coefficient-evaluation coordinates. The driver
+ * uses integer pixels with llvmpipe's already center-biased plane constants;
+ * special_coordinate_offset independently restores the physical coordinate
+ * used by native X_P/Y_P/X_S/Y_S without shifting FITR/FITRP evaluations.
  * coefficient_count is explicit so a truncated MemoryPool span fails closed
  * instead of reading zero fill.
  */
@@ -571,6 +634,7 @@ struct PcoFragmentExecutionContext {
       coefficients{};
   std::uint32_t sample_x = 0;
   std::uint32_t sample_y = 0;
+  std::uint32_t special_coordinate_offset = 0;
   std::array<std::uint32_t, kPcoMaximumSharedCount> shared_registers{};
   std::array<std::uint32_t, kPcoTextureResponseCount> texture_response{};
   PcoFragmentContinuation continuation{};
@@ -618,6 +682,23 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
  * subset, including malformed register ranges and non-canonical phase forms. */
 PcoDecodedProgram DecodePcoProgram(ShaderStage stage,
                                    const std::vector<std::uint8_t> &binary);
+
+/* Separate compute decoder and pure per-group ALU semantics. These never
+ * construct a graphics context or call a VS/FS executor. Phase operands are
+ * separately supplied because a composed group can read more than 4 regs. */
+PcoDecodedProgram DecodeComputePcoProgram(const std::vector<std::uint8_t> &binary);
+bool PcoSpecialConstantBits(std::uint16_t index, std::uint32_t *bits);
+std::uint32_t EvaluatePcoAluInstruction(
+    const PcoInstruction &instruction,
+    const std::array<std::uint32_t, 4> &sources,
+    std::uint8_t repeat_component = 0,
+    const std::array<std::uint32_t, 3> &phase0_sources = {},
+    const std::array<std::uint32_t, 3> &phase1_sources = {});
+bool EvaluatePcoPredicate(
+    const PcoInstruction &instruction,
+    const std::array<std::uint32_t, 4> &sources,
+    const std::array<std::uint32_t, 3> &phase0_sources = {},
+    const std::array<std::uint32_t, 3> &phase1_sources = {});
 
 /* Execute raw 32-bit USC register values without host floating-point changes.
  */

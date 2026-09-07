@@ -9,8 +9,8 @@
 extern "C" {
 #endif
 
-/* API-v19 can initialize a new sequence color attachment from host storage. */
-#define PVRGPU_SYSTEMC_API_VERSION 21u
+/* API-v22 transports per-draw multisample alpha operations. */
+#define PVRGPU_SYSTEMC_API_VERSION 23u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE 15u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES (64u * 1024u)
 /*
@@ -174,6 +174,9 @@ struct pvrgpu_systemc_pco_sequence_texture {
     */
    uint32_t texture_kind;
    uint32_t layers;
+   /* 0 等同 1；支援 1/2/4/8。MS 資料採 pixel-interleaved samples，
+    * 僅外部 payload、2D/2D-array、單一 mip；row_pitch 包含全部 samples。 */
+   uint32_t sample_count;
 };
 
 struct pvrgpu_systemc_driver_command {
@@ -414,6 +417,11 @@ struct pvrgpu_systemc_driver_command {
    /* API-v21 per-physical-draw payloads; all bytes are copied before return. */
    const struct pvrgpu_systemc_pco_uniform_buffer *uniform_buffers;
    uint32_t uniform_buffer_count;
+   /* API-v22: boolean Gallium blend state, snapshotted independently per draw.
+    * Coverage uses original DATA0 alpha before alpha-to-one and blending. */
+   uint32_t alpha_to_coverage;
+   uint32_t alpha_to_coverage_dither;
+   uint32_t alpha_to_one;
 };
 
 struct pvrgpu_systemc_submit_info {

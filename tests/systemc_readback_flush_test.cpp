@@ -15,6 +15,8 @@
 // second command's result that comes back, not the first one's.
 
 #include "pvrgpu_systemc_api.h"
+#include "pvrgpu_systemc_compute_api.h"
+#include "pco_compute_fixtures.h"
 
 #include <array>
 #include <chrono>
@@ -59,6 +61,56 @@ std::size_t CountOccurrences(const std::string &haystack,
 constexpr std::uint32_t kFloatOne = UINT32_C(0x3f800000);
 constexpr std::uint32_t kWidth = 2;
 constexpr std::uint32_t kHeight = 2;
+
+// Real native SSBO LD/WDF/ST, interleaved with graphics in the same elaborated
+// session. Compute must not consume the last framebuffer or reset its owner.
+void SubmitComputeCopy(std::uint32_t seed) {
+  std::array<std::uint32_t, 30> input{}, output{};
+  for (std::size_t i = 0; i < input.size(); ++i)
+    input[i] = seed + static_cast<std::uint32_t>(i * 17U);
+  output.fill(UINT32_C(0xdeadbeef));
+  std::array<pvrgpu_systemc_compute_resource, 2> resources{{
+      {reinterpret_cast<std::uint8_t *>(input.data()), sizeof(input)},
+      {reinterpret_cast<std::uint8_t *>(output.data()), sizeof(output)},
+  }};
+  std::array<pvrgpu_systemc_compute_binding, 2> bindings{{
+      {PVRGPU_SYSTEMC_COMPUTE_STORAGE_BUFFER, 0, 0,
+       PVRGPU_SYSTEMC_COMPUTE_ACCESS_READ, 0, sizeof(input)},
+      {PVRGPU_SYSTEMC_COMPUTE_STORAGE_BUFFER, 1, 1,
+       PVRGPU_SYSTEMC_COMPUTE_ACCESS_WRITE, 0, sizeof(output)},
+  }};
+  pvrgpu_systemc_compute_dispatch dispatch{};
+  dispatch.version = PVRGPU_SYSTEMC_COMPUTE_API_VERSION;
+  const auto &binary = pvrgpu::stub::ComputePcoFixture(1);
+  dispatch.binary = binary.data();
+  dispatch.binary_size = binary.size();
+  dispatch.grid[0] = dispatch.grid[1] = dispatch.grid[2] = 1;
+  const std::uint32_t local[] = {3, 2, 5};
+  for (unsigned i = 0; i < 3; ++i)
+    dispatch.block[i] = dispatch.abi.local_size[i] = local[i];
+  dispatch.abi.stage.temps = 6;
+  dispatch.abi.stage.vertex_inputs = 1;
+  dispatch.abi.stage.shareds = dispatch.abi.stage.push_constant_start = 8;
+  dispatch.abi.local_invocation_index_count = 1;
+  dispatch.abi.storage_buffer_descriptor_count = 2;
+  dispatch.abi.storage_buffer_used_mask = 3;
+  dispatch.abi.storage_buffer_read_mask = 1;
+  dispatch.abi.storage_buffer_write_mask = 2;
+  dispatch.resources = resources.data();
+  dispatch.resource_count = resources.size();
+  dispatch.bindings = bindings.data();
+  dispatch.binding_count = bindings.size();
+  pvrgpu_systemc_compute_stats stats{};
+  std::array<char, 512> error{};
+  if (pvrgpu_systemc_submit_compute(&dispatch, &stats, error.data(),
+                                    error.size()) != 0)
+    Fail(std::string("interleaved native compute failed: ") + error.data());
+  if (input != output || stats.workgroups != 1 || stats.invocations != 30 ||
+      stats.load_instructions != 30 || stats.store_instructions != 30 ||
+      stats.readback_bytes != sizeof(output) || stats.pool_allocations == 0 ||
+      stats.pool_allocations != stats.pool_releases)
+    Fail("interleaved native compute result/accounting mismatch");
+}
 
 // Submits one opaque clear of the given colour and returns the pixels the
 // model left in DRAM for it.
@@ -114,7 +166,7 @@ void RequireOpaqueColor(
 
 }  // namespace
 
-int main() {
+int main(int argc, char **argv) {
   const auto nonce =
       std::chrono::high_resolution_clock::now().time_since_epoch().count();
   g_test_root = std::filesystem::temp_directory_path() /
@@ -124,6 +176,10 @@ int main() {
   const std::string jsonl_text = (g_test_root / "model.jsonl").string();
   const std::string stderr_text = (g_test_root / "model.stderr.log").string();
   const std::string outdir_text = (g_test_root / "out").string();
+
+  // Run both elaboration orders in separate CTest processes.
+  if (argc == 2 && std::string(argv[1]) == "compute-first")
+    SubmitComputeCopy(100);
 
   pvrgpu_systemc_driver_command clear{};
   clear.version = PVRGPU_SYSTEMC_API_VERSION;
@@ -168,6 +224,7 @@ int main() {
                                          "systemc-readback-flush-test-red",
                                          kFloatOne, 0, 0);
   RequireOpaqueColor(first, 255, 0, 0, "first readback");
+  SubmitComputeCopy(200);
 
   // The second submission is what the old arrangement could not do at all: the
   // model has already run once, and a second elaboration is refused.  It only
@@ -216,6 +273,9 @@ int main() {
       0) {
     Fail(std::string("triangle submit failed: ") + error.data());
   }
+  // This dispatch must flush the queued triangle before using the shared
+  // memory service, and later graphics readback must still return that draw.
+  SubmitComputeCopy(300);
   std::array<std::uint8_t, kWidth * kHeight * 4> drawn{};
   pvrgpu_systemc_readback_info drawn_readback{};
   drawn_readback.version = PVRGPU_SYSTEMC_API_VERSION;
@@ -249,6 +309,7 @@ int main() {
     Fail("a draw on a later flush produced no rasterized pixels");
   if (!any_clear)
     Fail("a draw on a later flush covered the whole surface");
+  SubmitComputeCopy(400);
 
   info.command = &clear;
 

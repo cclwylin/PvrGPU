@@ -3121,6 +3121,99 @@ static void test_terrain_texture_descriptors(void)
    }
 }
 
+static void test_multisample_texture_descriptors(void)
+{
+   uint32_t descriptor[PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS];
+   if (!pvrgpu_pco_build_terrain_texture_descriptor(descriptor,
+          PIPE_FORMAT_R32G32B32A32_FLOAT, 13, 19, 1, 13 * 19 * 16 * 8,
+          0, 0, 0, 2, 2, 0, 1, 2))
+      fail("multisample descriptor base layout rejected");
+   const uint32_t before = descriptor[1] & UINT32_C(0x3fffffff);
+   for (unsigned exponent = 0; exponent < 4; ++exponent) {
+      if (!pvrgpu_pco_set_texture_sample_count(descriptor, 1u << exponent) ||
+          (descriptor[1] >> 30) != exponent ||
+          (descriptor[1] & UINT32_C(0x3fffffff)) != before)
+         fail("multisample SMPCNT encoding differs from native texstate");
+   }
+   const uint64_t fingerprint = fnv1a64(descriptor, sizeof(descriptor));
+   const unsigned invalid[] = {0, 3, 5, 10, 16, 64};
+   for (unsigned i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+      if (pvrgpu_pco_set_texture_sample_count(descriptor, invalid[i]) ||
+          fnv1a64(descriptor, sizeof(descriptor)) != fingerprint)
+         fail("invalid sample count changed the native descriptor");
+   }
+}
+
+static void test_multisample_texture_lowering(struct pvrgpu_pco_compiler *compiler)
+{
+   nir_builder vb = nir_builder_init_simple_shader(MESA_SHADER_VERTEX,
+      pco_nir_options(), "multisample_position_vs");
+   nir_variable *vin = nir_variable_create(vb.shader, nir_var_shader_in,
+      glsl_vec4_type(), "position");
+   vin->data.location = VERT_ATTRIB_GENERIC0;
+   nir_variable *vout = nir_variable_create(vb.shader, nir_var_shader_out,
+      glsl_vec4_type(), "gl_Position");
+   vout->data.location = VARYING_SLOT_POS;
+   nir_store_var(&vb, vout, nir_load_var(&vb, vin), 15);
+   nir_shader_gather_info(vb.shader, nir_shader_get_entrypoint(vb.shader));
+   const nir_texop operations[] = {nir_texop_txf_ms, nir_texop_txs,
+                                   nir_texop_texture_samples};
+   for (unsigned array = 0; array < 2; ++array) {
+      for (unsigned op = 0; op < 3; ++op) {
+         nir_builder fb = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+            pco_nir_options(), "multisample_fragcoord_fs");
+         nir_variable *out = nir_variable_create(fb.shader, nir_var_shader_out,
+            glsl_vec4_type(), "color");
+         out->data.location = FRAG_RESULT_DATA0;
+         nir_tex_instr *tex = nir_tex_instr_create(fb.shader, op == 0 ? 2 : 0);
+         tex->op = operations[op];
+         tex->sampler_dim = GLSL_SAMPLER_DIM_MS;
+         tex->is_array = array != 0;
+         tex->dest_type = op == 0 ? nir_type_float32 : nir_type_int32;
+         tex->texture_index = tex->sampler_index = 0;
+         unsigned components = op == 0 ? 4 : op == 1 ? 2 + array : 1;
+         if (op == 0) {
+            nir_variable *coord = nir_variable_create(fb.shader, nir_var_shader_in,
+               glsl_vec4_type(), "gl_FragCoord");
+            coord->data.location = VARYING_SLOT_POS;
+            coord->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
+            nir_def *xy = nir_f2i32(&fb, nir_ffloor(&fb,
+               nir_trim_vector(&fb, nir_load_var(&fb, coord), 2)));
+            nir_def *coords = array ? nir_vec3(&fb, nir_channel(&fb, xy, 0),
+               nir_channel(&fb, xy, 1), nir_imm_int(&fb, 1)) : xy;
+            tex->coord_components = 2 + array;
+            tex->src[0].src_type = nir_tex_src_coord;
+            tex->src[0].src = nir_src_for_ssa(coords);
+            tex->src[1].src_type = nir_tex_src_ms_index;
+            tex->src[1].src = nir_src_for_ssa(nir_imm_int(&fb, 1));
+         }
+         nir_def_init(&tex->instr, &tex->def, components, 32);
+         nir_builder_instr_insert(&fb, &tex->instr);
+         nir_def *value = &tex->def;
+         if (op != 0)
+            value = nir_i2f32(&fb, value);
+         nir_def *rgba = nir_vec4(&fb, nir_channel(&fb, value, 0),
+            components > 1 ? nir_channel(&fb, value, 1) : nir_imm_float(&fb, 0),
+            components > 2 ? nir_channel(&fb, value, 2) : nir_imm_float(&fb, 0),
+            components > 3 ? nir_channel(&fb, value, 3) : nir_imm_float(&fb, 1));
+         nir_store_var(&fb, out, rgba, 15);
+         nir_shader_gather_info(fb.shader, nir_shader_get_entrypoint(fb.shader));
+         fb.shader->info.num_textures = 1;
+         struct pvrgpu_pco_graphics_binary binary;
+         char error[512] = {0};
+         const enum pipe_format attribute = PIPE_FORMAT_R32G32B32A32_FLOAT;
+         if (!pvrgpu_pco_compile_color_triangle(compiler, vb.shader, fb.shader,
+               &attribute, false, 1, 0, 0, 1, 1, &binary, error, sizeof(error)))
+            fail(error);
+         if (!binary.fragment.size || binary.fragment_position_count != 4)
+            fail("multisample fragment lost native code or position ABI");
+         pvrgpu_pco_graphics_binary_finish(&binary);
+         ralloc_free(fb.shader);
+      }
+   }
+   ralloc_free(vb.shader);
+}
+
 static void test_terrain_texture_descriptor_for_800_extent(void)
 {
    uint32_t descriptor[PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS];
@@ -4110,6 +4203,7 @@ int main(void)
    test_refract_fragment_descriptors();
    test_refract_fragment_descriptors_for_extent();
    test_terrain_texture_descriptors();
+   test_multisample_texture_descriptors();
    test_terrain_texture_descriptor_for_800_extent();
    test_shadow_fragment_descriptor();
    test_shadow_fragment_descriptor_for_extent();
@@ -4129,6 +4223,7 @@ int main(void)
    if (!compiler)
       fail(error[0] ? error : "failed to create compiler");
    test_float_sign_lowering(compiler);
+   test_multisample_texture_lowering(compiler);
 
    struct pvrgpu_pco_graphics_binary binary;
    if (!pvrgpu_pco_compile_conditionals(compiler,

@@ -25,6 +25,8 @@
 struct pvrgpu_transfer {
    struct pipe_transfer base;
    void *displaytarget_map;
+   uint8_t *sample0_staging;
+   size_t sample0_staging_size;
 };
 
 static uint64_t
@@ -228,19 +230,8 @@ pvrgpu_is_supported_resource_sample_count(unsigned sample_count)
    case 0:
    case 1:
    case 2:
-   case 3:
    case 4:
-   case 5:
-   case 6:
-   case 7:
    case 8:
-   case 9:
-   case 10:
-   case 11:
-   case 12:
-   case 13:
-   case 14:
-   case 15:
    case 16:
       return true;
    default:
@@ -264,6 +255,9 @@ pvrgpu_can_create_texture_target(const struct pipe_resource *template)
        !pvrgpu_is_supported_resource_sample_count(template->nr_samples) ||
        !pvrgpu_is_supported_resource_sample_count(
           template->nr_storage_samples))
+      return false;
+   if ((template->bind & (PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHADER_IMAGE)) &&
+       (template->nr_samples > 8 || template->nr_storage_samples > 8))
       return false;
 
    switch (template->target) {
@@ -320,12 +314,15 @@ pvrgpu_resource_create_refusal(const struct pipe_resource *template)
    if (!pvrgpu_is_supported_resource_sample_count(template->nr_samples) ||
        !pvrgpu_is_supported_resource_sample_count(template->nr_storage_samples))
       return "sample_count";
+   if ((template->bind & (PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHADER_IMAGE)) &&
+       (template->nr_samples > 8 || template->nr_storage_samples > 8))
+      return "sampled_sample_count";
    return "target";
 }
 
 static bool
-pvrgpu_can_create_resource(struct pipe_screen *screen,
-                           const struct pipe_resource *template)
+pvrgpu_validate_resource_creation(struct pipe_screen *screen,
+                                  const struct pipe_resource *template)
 {
    (void)screen;
    const char *refusal = pvrgpu_resource_create_refusal(template);
@@ -346,6 +343,45 @@ pvrgpu_can_create_resource(struct pipe_screen *screen,
                          template ? util_format_name(template->format) : "none",
                          template ? template->bind : 0);
    return false;
+}
+
+/* Mesa st_TestProxyTexImage 傳入尚未 round 的 API requested samples 與
+ * bind=0；後續 st_texture_storage 才挑選下一個可取樣的實際 sample count。
+ * 只調整容量詢問的 local copy，真正 resource_create 仍驗原始嚴格格式。 */
+static bool
+pvrgpu_normalize_proxy_texture_samples(const struct pipe_resource *requested,
+                                       struct pipe_resource *probe)
+{
+   if (!requested || !probe)
+      return false;
+   *probe = *requested;
+   if (requested->bind != 0 ||
+       (requested->target != PIPE_TEXTURE_2D &&
+        requested->target != PIPE_TEXTURE_2D_ARRAY) ||
+       (requested->nr_samples == 0 && requested->nr_storage_samples == 0))
+      return true;
+   if (requested->nr_samples > 8 || requested->nr_storage_samples > 8)
+      return false;
+   unsigned samples = requested->nr_samples;
+   unsigned storage_samples = requested->nr_storage_samples;
+   while (!pvrgpu_is_supported_resource_sample_count(samples))
+      ++samples;
+   while (!pvrgpu_is_supported_resource_sample_count(storage_samples))
+      ++storage_samples;
+   probe->nr_samples = samples;
+   probe->nr_storage_samples = storage_samples;
+   probe->bind = PIPE_BIND_SAMPLER_VIEW;
+   return true;
+}
+
+static bool
+pvrgpu_can_create_resource(struct pipe_screen *screen,
+                           const struct pipe_resource *requested)
+{
+   struct pipe_resource probe;
+   if (!pvrgpu_normalize_proxy_texture_samples(requested, &probe))
+      return false;
+   return pvrgpu_validate_resource_creation(screen, &probe);
 }
 
 static unsigned
@@ -714,7 +750,7 @@ pvrgpu_resource_create_common(struct pipe_screen *screen,
                               const struct pipe_resource *template,
                               const void *map_front_private)
 {
-   if (!pvrgpu_can_create_resource(screen, template))
+   if (!pvrgpu_validate_resource_creation(screen, template))
       return NULL;
 
    struct pvrgpu_resource *resource = CALLOC_STRUCT(pvrgpu_resource);
@@ -778,7 +814,7 @@ pvrgpu_resource_from_handle(struct pipe_screen *screen,
                             unsigned usage)
 {
    (void)usage;
-   if (!pvrgpu_can_create_resource(screen, template))
+   if (!pvrgpu_validate_resource_creation(screen, template))
       return NULL;
 
    struct pvrgpu_screen *pscreen = pvrgpu_screen(screen);
@@ -997,6 +1033,10 @@ pvrgpu_resource_color_attachment_index(const struct pvrgpu_context *ctx,
    return -1;
 }
 
+/* Color targets occupy bits 0..3. A depth-only pass still owns pending
+ * work: carry its plane independently until real model execution/readback. */
+#define PVRGPU_DEPTH_READBACK_PENDING (1u << 31)
+
 void
 pvrgpu_note_current_color_readback_pending(struct pvrgpu_context *ctx)
 {
@@ -1008,6 +1048,8 @@ pvrgpu_note_current_color_readback_pending(struct pvrgpu_context *ctx)
       if (ctx->framebuffer.cbufs[target].texture)
          ctx->color_readback_pending_mask |= 1u << target;
    }
+   if (ctx->framebuffer.zsbuf.texture)
+      ctx->color_readback_pending_mask |= PVRGPU_DEPTH_READBACK_PENDING;
 }
 
 /*
@@ -1430,9 +1472,6 @@ pvrgpu_flush_current_color_attachments(struct pipe_context *pipe)
       pvrgpu_context_end_frame_at_readback(ctx);
    if (ctx->color_readback_pending_mask == 0)
       return;
-   const bool read_depth = ctx->color_readback_generation ==
-                           pvrgpu_systemc_submission_generation();
-
    unsigned written = 0;
    for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target) {
       const struct pipe_surface *surface = &ctx->framebuffer.cbufs[target];
@@ -1440,6 +1479,12 @@ pvrgpu_flush_current_color_attachments(struct pipe_context *pipe)
           pvrgpu_resource_read_back_color_surface(pipe, surface, target))
          ++written;
    }
+   /* A failed color execution clears the entire pending mask. Do not read
+    * stale cached depth from an earlier successful sequence after that. */
+   const bool read_depth =
+      (ctx->color_readback_pending_mask & PVRGPU_DEPTH_READBACK_PENDING) &&
+      ctx->color_readback_generation == pvrgpu_systemc_submission_generation();
+   ctx->color_readback_pending_mask &= ~PVRGPU_DEPTH_READBACK_PENDING;
    if (read_depth)
       pvrgpu_resource_read_back_depth_surface(pipe);
    pvrgpu_counter_eventf("framebuffer_boundary_flush",
@@ -1494,6 +1539,222 @@ pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
    pvrgpu_flush_current_color_attachments(pipe);
 }
 
+/* Gallium texture_map exposes one tightly addressed pixel per format block,
+ * not the driver's interleaved sample storage. llvmpipe's default map selects
+ * sample zero (lp_texture.c:llvmpipe_transfer_map_ms/transfer_map). Preserve that
+ * contract with a private packed staging view; an MSAA resolve is a separate
+ * blit operation and must never be hidden inside this map. */
+static bool
+pvrgpu_copy_msaa_sample0(struct pvrgpu_transfer *transfer,
+                         const struct pipe_box *region, bool write)
+{
+   if (!transfer || !transfer->sample0_staging || !region)
+      return false;
+   const struct pipe_transfer *map = &transfer->base;
+   struct pvrgpu_resource *resource = pvrgpu_resource(map->resource);
+   if (!resource || !resource->data || resource->base.target == PIPE_BUFFER ||
+       !pvrgpu_transfer_box_in_bounds(&resource->base, map->level, &map->box) ||
+       region->x < 0 || region->y < 0 || region->z < 0 ||
+       region->width <= 0 || region->height <= 0 || region->depth <= 0 ||
+       (uint64_t)region->x + region->width > (unsigned)map->box.width ||
+       (uint64_t)region->y + region->height > (unsigned)map->box.height ||
+       (uint64_t)region->z + region->depth > (unsigned)map->box.depth)
+      return false;
+   const unsigned bpp = util_format_get_blocksize(resource->base.format);
+   const unsigned samples = pvrgpu_resource_storage_sample_count(&resource->base);
+   if (!bpp || samples <= 1 ||
+       util_format_get_blockwidth(resource->base.format) != 1 ||
+       util_format_get_blockheight(resource->base.format) != 1)
+      return false;
+   const size_t pixel_stride = (size_t)bpp * samples;
+   const size_t row_stride = resource->level_strides[map->level];
+   const size_t layer_stride = resource->level_layer_strides[map->level];
+   const unsigned level_width = pvrgpu_resource_level_width(&resource->base, map->level);
+   const unsigned level_height = pvrgpu_resource_level_height(&resource->base, map->level);
+   /* Validate both physical row/layer strides and the last byte before any
+    * copy. Bounds expressed as division/subtraction also reject corrupt
+    * metadata without overflowing size_t, including mip/layer offsets. */
+   if (pixel_stride > row_stride || level_width > row_stride / pixel_stride ||
+       !row_stride || level_height > layer_stride / row_stride ||
+       !map->stride || (unsigned)map->box.width > map->stride / bpp ||
+       (unsigned)map->box.height > map->layer_stride / map->stride ||
+       !map->layer_stride ||
+       (unsigned)map->box.depth > transfer->sample0_staging_size / map->layer_stride)
+      return false;
+   const size_t last_x = (unsigned)map->box.x + (unsigned)region->x + region->width - 1U;
+   const size_t last_y = (unsigned)map->box.y + (unsigned)region->y + region->height - 1U;
+   const size_t last_z = (unsigned)map->box.z + (unsigned)region->z + region->depth - 1U;
+   size_t end = resource->level_offsets[map->level];
+   if (end > resource->size || !layer_stride ||
+       last_z > (resource->size - end) / layer_stride)
+      return false;
+   end += last_z * layer_stride;
+   if (last_y > (resource->size - end) / row_stride)
+      return false;
+   end += last_y * row_stride;
+   if (last_x > (resource->size - end) / pixel_stride)
+      return false;
+   end += last_x * pixel_stride;
+   if (bpp > resource->size - end)
+      return false;
+
+   for (unsigned z = 0; z < (unsigned)region->depth; ++z)
+      for (unsigned y = 0; y < (unsigned)region->height; ++y) {
+         const size_t relative_z = (unsigned)region->z + z;
+         const size_t relative_y = (unsigned)region->y + y;
+         uint8_t *packed = transfer->sample0_staging +
+            relative_z * map->layer_stride + relative_y * map->stride +
+            (size_t)region->x * bpp;
+         uint8_t *interleaved = resource->data + resource->level_offsets[map->level] +
+            ((size_t)map->box.z + relative_z) * layer_stride +
+            ((size_t)map->box.y + relative_y) * row_stride +
+            ((size_t)map->box.x + region->x) * pixel_stride;
+         for (unsigned x = 0; x < (unsigned)region->width; ++x) {
+            if (write)
+               memcpy(interleaved + (size_t)x * pixel_stride,
+                      packed + (size_t)x * bpp, bpp);
+            else
+               memcpy(packed + (size_t)x * bpp,
+                      interleaved + (size_t)x * pixel_stride, bpp);
+         }
+      }
+   return true;
+}
+
+static void *
+pvrgpu_map_msaa_sample0(struct pvrgpu_transfer *transfer)
+{
+   if (!transfer || !transfer->base.resource || transfer->sample0_staging)
+      return NULL;
+   struct pipe_transfer *map = &transfer->base;
+   const struct pvrgpu_resource *resource = pvrgpu_resource(map->resource);
+   if ((map->usage & (PIPE_MAP_DIRECTLY | PIPE_MAP_PERSISTENT | PIPE_MAP_COHERENT)) ||
+       !(map->usage & (PIPE_MAP_READ | PIPE_MAP_WRITE)) ||
+       !pvrgpu_transfer_box_in_bounds(map->resource, map->level, &map->box) ||
+       pvrgpu_resource_storage_sample_count(map->resource) <= 1 ||
+       util_format_get_blockwidth(map->resource->format) != 1 ||
+       util_format_get_blockheight(map->resource->format) != 1 ||
+       map->box.width <= 0 || map->box.height <= 0 || map->box.depth <= 0)
+      return NULL;
+   const unsigned bpp = util_format_get_blocksize(map->resource->format);
+   if (!bpp || (unsigned)map->box.width > UINT_MAX / bpp)
+      return NULL;
+   const unsigned row_stride = (unsigned)map->box.width * bpp;
+   if ((unsigned)map->box.height > SIZE_MAX / row_stride)
+      return NULL;
+   const size_t layer_stride = (size_t)row_stride * map->box.height;
+   if ((unsigned)map->box.depth > SIZE_MAX / layer_stride)
+      return NULL;
+   const size_t bytes = layer_stride * map->box.depth;
+   if (bytes > resource->size)
+      return NULL;
+   map->stride = row_stride;
+   map->layer_stride = layer_stride;
+   transfer->sample0_staging = malloc(bytes);
+   if (!transfer->sample0_staging)
+      return NULL;
+   transfer->sample0_staging_size = bytes;
+   const struct pipe_box whole = {.width = map->box.width,
+      .height = map->box.height, .depth = map->box.depth};
+   /* Gather even a write-only map so bytes the caller does not modify stay
+    * intact. DISCARD permits losing them but does not require it; preserving
+    * them also gives deterministic contents without exposing allocator data. */
+   if (!pvrgpu_copy_msaa_sample0(transfer, &whole, false)) {
+      FREE(transfer->sample0_staging);
+      transfer->sample0_staging = NULL;
+      transfer->sample0_staging_size = 0;
+   }
+   return transfer->sample0_staging;
+}
+
+static void
+pvrgpu_unmap_msaa_sample0(struct pvrgpu_transfer *transfer)
+{
+   if (!transfer || !transfer->sample0_staging)
+      return;
+   const struct pipe_transfer *map = &transfer->base;
+   if ((map->usage & PIPE_MAP_WRITE) && !(map->usage & PIPE_MAP_FLUSH_EXPLICIT)) {
+      const struct pipe_box whole = {.width = map->box.width,
+         .height = map->box.height, .depth = map->box.depth};
+      (void)pvrgpu_copy_msaa_sample0(transfer, &whole, true);
+   }
+   FREE(transfer->sample0_staging);
+   transfer->sample0_staging = NULL;
+   transfer->sample0_staging_size = 0;
+}
+
+static bool
+pvrgpu_texture_subdata_msaa_sample0(struct pipe_resource *resource,
+                                    unsigned level, unsigned usage,
+                                    const struct pipe_box *box, const void *data,
+                                    unsigned stride, uintptr_t layer_stride)
+{
+   if (!resource || !data || !box || (usage & PIPE_MAP_READ) ||
+       !pvrgpu_transfer_box_in_bounds(resource, level, box) ||
+       box->width <= 0 || box->height <= 0 || box->depth <= 0)
+      return false;
+   const unsigned bpp = util_format_get_blocksize(resource->format);
+   if (!bpp || (unsigned)box->width > SIZE_MAX / bpp)
+      return false;
+   const size_t row_bytes = (size_t)box->width * bpp;
+   // A one-row/layer upload need not declare an unused stride. Otherwise the
+   // source's packed rows/layers must not overlap or wrap pointer arithmetic.
+   if ((box->height > 1 && stride < row_bytes) ||
+       (stride && (unsigned)(box->height - 1) > (SIZE_MAX - row_bytes) / stride))
+      return false;
+   const size_t layer_bytes = (size_t)(box->height - 1) * stride + row_bytes;
+   if ((box->depth > 1 && layer_stride < layer_bytes) ||
+       (layer_stride && (unsigned)(box->depth - 1) >
+                           (SIZE_MAX - layer_bytes) / layer_stride))
+      return false;
+   const size_t source_bytes = (size_t)(box->depth - 1) * layer_stride + layer_bytes;
+   if ((uintptr_t)data > UINTPTR_MAX - (source_bytes - 1U))
+      return false;
+
+   struct pvrgpu_transfer transfer = {0};
+   transfer.base.resource = resource;
+   transfer.base.level = level;
+   transfer.base.box = *box;
+   // Subdata is a complete upload, equivalent to explicitly flushing its
+   // whole mapped region. Use explicit mode so failure cleanup cannot commit.
+   transfer.base.usage = usage | PIPE_MAP_WRITE | PIPE_MAP_DISCARD_RANGE |
+                          PIPE_MAP_FLUSH_EXPLICIT;
+   uint8_t *mapped = pvrgpu_map_msaa_sample0(&transfer);
+   if (!mapped)
+      return false;
+   for (unsigned z = 0; z < (unsigned)box->depth; ++z)
+      for (unsigned y = 0; y < (unsigned)box->height; ++y)
+         memcpy(mapped + (size_t)z * transfer.base.layer_stride +
+                    (size_t)y * transfer.base.stride,
+                (const uint8_t *)data + (size_t)z * layer_stride + (size_t)y * stride,
+                row_bytes);
+   // The private snapshot also makes aliased source data safe: no destination
+   // sample is mutated until every source row has been copied.
+   const struct pipe_box whole = {.width = box->width,
+      .height = box->height, .depth = box->depth};
+   const bool copied = pvrgpu_copy_msaa_sample0(&transfer, &whole, true);
+   pvrgpu_unmap_msaa_sample0(&transfer);
+   return copied;
+}
+
+static void
+pvrgpu_transfer_flush_region(struct pipe_context *pipe,
+                             struct pipe_transfer *transfer,
+                             const struct pipe_box *box)
+{
+   if (!transfer)
+      return;
+   struct pvrgpu_transfer *mapped = (struct pvrgpu_transfer *)transfer;
+   if (mapped->sample0_staging) {
+      if (transfer->usage & PIPE_MAP_WRITE)
+         (void)pvrgpu_copy_msaa_sample0(mapped, box, true);
+      return;
+   }
+   /* Non-staging maps are directly backed: retain the previous
+    * u_default_transfer_flush_region no-op behavior. */
+   (void)pipe;
+}
+
 static void *
 pvrgpu_transfer_map(struct pipe_context *pipe,
                     struct pipe_resource *resource,
@@ -1506,6 +1767,13 @@ pvrgpu_transfer_map(struct pipe_context *pipe,
    if (!out_transfer || !pvrgpu || !pvrgpu->data ||
        !pvrgpu_transfer_box_in_bounds(resource, level, box))
       return NULL;
+   *out_transfer = NULL;
+   const bool msaa = resource->target != PIPE_BUFFER &&
+                     pvrgpu_resource_storage_sample_count(resource) > 1;
+   if (msaa && (usage & (PIPE_MAP_DIRECTLY | PIPE_MAP_PERSISTENT | PIPE_MAP_COHERENT))) {
+      pvrgpu_counter_eventf("texture_map_declined", "reason=msaa-staging-map-flags usage=0x%x", usage);
+      return NULL;
+   }
 
    /*
     * Ahead of every path below, including the displaytarget one -- that path
@@ -1513,6 +1781,8 @@ pvrgpu_transfer_map(struct pipe_context *pipe,
     * pixels have to be here before it runs.
     */
    pvrgpu_resource_read_back_color_attachment(pipe, resource, level, usage);
+   if (msaa && (usage & PIPE_MAP_WRITE) && !(usage & PIPE_MAP_UNSYNCHRONIZED))
+      pvrgpu_flush_current_color_attachments(pipe);
 
    struct pvrgpu_transfer *pvrgpu_transfer =
       CALLOC_STRUCT(pvrgpu_transfer);
@@ -1526,6 +1796,24 @@ pvrgpu_transfer_map(struct pipe_context *pipe,
    transfer->box = *box;
    transfer->stride = pvrgpu->level_strides[level];
    transfer->layer_stride = pvrgpu->level_layer_strides[level];
+
+   if (msaa) {
+      void *mapped = pvrgpu_map_msaa_sample0(pvrgpu_transfer);
+      if (!mapped) {
+         pipe_resource_reference(&transfer->resource, NULL);
+         FREE(pvrgpu_transfer);
+         return NULL;
+      }
+      *out_transfer = transfer;
+      if (usage & PIPE_MAP_WRITE)
+         pvrgpu_invalidate_full_depth_clear_for_resource(pvrgpu_context(pipe), resource);
+      pvrgpu_counter_eventf("texture_map", "res=%p level=%u usage=0x%x x=%d y=%d z=%d "
+         "width=%d height=%d depth=%d stride=%u layer_stride=%zu format=%s sample=0 staging=1",
+         (void *)resource, level, usage, box->x, box->y, box->z,
+         box->width, box->height, box->depth, transfer->stride,
+         (size_t)transfer->layer_stride, util_format_name(resource->format));
+      return mapped;
+   }
 
    pvrgpu_counter_eventf(resource->target == PIPE_BUFFER ?
                          "buffer_map" : "texture_map",
@@ -1617,6 +1905,7 @@ pvrgpu_transfer_unmap(struct pipe_context *pipe,
          (struct pvrgpu_transfer *)transfer;
       struct pvrgpu_resource *pvrgpu =
          pvrgpu_resource(transfer->resource);
+      pvrgpu_unmap_msaa_sample0(pvrgpu_transfer);
       if (pvrgpu_transfer->displaytarget_map &&
           pvrgpu && pvrgpu->displaytarget) {
          if (transfer->usage & PIPE_MAP_WRITE) {
@@ -1700,11 +1989,26 @@ pvrgpu_texture_subdata(struct pipe_context *pipe,
                        unsigned stride,
                        uintptr_t layer_stride)
 {
-   (void)usage;
    struct pvrgpu_resource *pvrgpu = pvrgpu_resource(resource);
    if (!pvrgpu || !data ||
        !pvrgpu_transfer_box_in_bounds(resource, level, box))
       return;
+   if (resource->target != PIPE_BUFFER &&
+       pvrgpu_resource_storage_sample_count(resource) > 1) {
+      if (!(usage & PIPE_MAP_UNSYNCHRONIZED))
+         pvrgpu_flush_current_color_attachments(pipe);
+      const bool copied = pvrgpu_texture_subdata_msaa_sample0(
+         resource, level, usage, box, data, stride, layer_stride);
+      if (copied)
+         pvrgpu_invalidate_full_depth_clear_for_resource(pvrgpu_context(pipe), resource);
+      pvrgpu_counter_eventf(copied ? "texture_subdata" : "texture_subdata_declined",
+         "res=%p level=%u x=%d y=%d z=%d width=%d height=%d depth=%d "
+         "stride=%u layer_stride=%zu format=%s sample=0 staging=1",
+         (void *)resource, level, box->x, box->y, box->z,
+         box->width, box->height, box->depth, stride, (size_t)layer_stride,
+         util_format_name(resource->format));
+      return;
+   }
    pvrgpu_invalidate_full_depth_clear_for_resource(pvrgpu_context(pipe),
                                                     resource);
 
@@ -3647,7 +3951,7 @@ pvrgpu_init_context_resource_functions(struct pipe_context *context)
    context->buffer_unmap = pvrgpu_transfer_unmap;
    context->texture_map = pvrgpu_transfer_map;
    context->texture_unmap = pvrgpu_transfer_unmap;
-   context->transfer_flush_region = u_default_transfer_flush_region;
+   context->transfer_flush_region = pvrgpu_transfer_flush_region;
    context->buffer_subdata = pvrgpu_buffer_subdata;
    context->texture_subdata = pvrgpu_texture_subdata;
    context->clear_buffer = pvrgpu_clear_buffer;

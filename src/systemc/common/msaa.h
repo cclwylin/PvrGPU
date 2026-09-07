@@ -6,6 +6,8 @@
  * src/gallium/auxiliary/util/u_sample_positions.c. The 4x and 8x positions
  * also match llvmpipe's lp_rast.c tables. Values below are exact sixteenths
  * of a pixel, so coverage never rounds a floating-point sample position.
+ * Alpha-to-coverage follows llvmpipe; see THIRD_PARTY_NOTICES for its full
+ * VMware license and the exact upstream functions used as references.
  */
 #ifndef PVRGPU_SYSTEMC_COMMON_MSAA_H
 #define PVRGPU_SYSTEMC_COMMON_MSAA_H
@@ -24,6 +26,33 @@ inline std::uint32_t RasterSampleMask(std::uint32_t count) {
   if (!IsSupportedRasterSampleCount(count))
     throw std::runtime_error("unsupported raster sample_count");
   return (1U << count) - 1U;
+}
+
+// Mesa llvmpipe lp_state_fs.c's lp_build_alpha_to_coverage_dither and
+// lp_build_sample_alpha_to_coverage: intersect sample s iff alpha > s/N,
+// optionally after the exact 2x2 ordered-dither offset. No UNORM conversion
+// or integer rounding is involved; equality and NaN fail the ordered test.
+inline std::uint32_t RasterAlphaCoverageMask(std::uint32_t count, float alpha,
+                                            std::uint32_t x, std::uint32_t y,
+                                            bool dither,
+                                            bool multisample = true) {
+  const std::uint32_t all_samples = RasterSampleMask(count);
+  const std::uint32_t coverage_samples = multisample ? count : 1;
+  if (dither) {
+    constexpr float thresholds[] = {0.125F, 0.625F, 0.875F, 0.375F};
+    alpha -= thresholds[(x & 1U) | ((y & 1U) << 1U)] /
+             static_cast<float>(coverage_samples);
+  }
+  // llvmpipe's non-MSAA path is lp_bld_blend.c's single alpha test. It is
+  // distinct from a one-sample framebuffer with multisample enabled.
+  if (!multisample)
+    return alpha > (dither ? 0.0F : 0.5F) ? all_samples : 0;
+  std::uint32_t result = 0;
+  const float step = 1.0F / static_cast<float>(coverage_samples);
+  for (std::uint32_t sample = 0; sample < coverage_samples; ++sample)
+    if (alpha > step * static_cast<float>(sample))
+      result |= 1U << sample;
+  return result;
 }
 
 inline std::array<std::uint8_t, 2>

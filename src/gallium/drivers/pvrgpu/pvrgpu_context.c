@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "pvrgpu_context.h"
+#include "pvrgpu_compute_snapshot.h"
 #include "pvrgpu_cmd.h"
 #include "pvrgpu_counter.h"
 #include "pvrgpu_pco.h"
@@ -17,6 +18,7 @@
 #include "util/u_inlines.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
+#include "util/u_sample_positions.h"
 #include "util/u_upload_mgr.h"
 
 #include <ctype.h>
@@ -9714,11 +9716,27 @@ pvrgpu_capture_generic_sequence_texture(
     * texture unit projects it to a face and the 2D coordinate within it.
     */
    const bool cube_view = view->target == PIPE_TEXTURE_CUBE;
+   const unsigned sample_count = MAX2(1U, view->texture->nr_samples);
+   const bool multisample_view = view->texture->nr_samples != 0;
+   if (sample_count > 8U || (sample_count & (sample_count - 1U)) != 0 ||
+       (multisample_view && (volume_view || cube_view ||
+                            view->texture->last_level != 0))) {
+      *reason = "sample_layout";
+      return false;
+   }
    const unsigned layers = array_view    ? view->texture->array_size
                            : volume_view ? view->texture->depth0
                            : cube_view   ? 6U
                                          : 1U;
-   if (layers == 0U || layers > 4096U) {
+   /* The MS snapshot currently transports a whole image.  Do not silently
+    * interpret a restricted array view relative to the backing image. */
+   if (multisample_view && array_view &&
+       (view->u.tex.first_layer != 0 ||
+        view->u.tex.last_layer + 1U != layers)) {
+      *reason = "sample_layer_view";
+      return false;
+   }
+   if (layers == 0U || layers > 4096U || (array_view && layers > 2048U)) {
       *reason = "layers";
       return false;
    }
@@ -9759,14 +9777,15 @@ pvrgpu_capture_generic_sequence_texture(
       format == PIPE_FORMAT_R11G11B10_FLOAT ||
       format == PIPE_FORMAT_R9G9B9E5_FLOAT;
    const struct util_format_description *format_desc = util_format_description(format);
-   const bool canonical_float_view = !integer_view &&
+   const bool float_depth_view = format == PIPE_FORMAT_Z32_FLOAT;
+   const bool canonical_float_view = float_depth_view || (!integer_view &&
       (!packed_colour_view || util_format_is_float(format)) &&
       format_desc->colorspace != UTIL_FORMAT_COLORSPACE_ZS &&
       format_desc->block.width == 1 && format_desc->block.height == 1 &&
       format != PIPE_FORMAT_R8G8B8A8_UNORM &&
       format != PIPE_FORMAT_B8G8R8A8_UNORM &&
       format != PIPE_FORMAT_R8G8B8X8_UNORM &&
-      format != PIPE_FORMAT_R8G8B8A8_SRGB;
+      format != PIPE_FORMAT_R8G8B8A8_SRGB);
    const bool canonical_view = integer_view || canonical_float_view;
    const enum pipe_format storage_format = integer_view ?
       (util_format_is_pure_uint(format) ? PIPE_FORMAT_R32G32B32A32_UINT :
@@ -9808,7 +9827,7 @@ pvrgpu_capture_generic_sequence_texture(
    for (unsigned level = 0; level < mip_count; ++level) {
       const unsigned level_width = MAX2(width >> level, 1U);
       const unsigned level_height = MAX2(height >> level, 1U);
-      const unsigned row_pitch = util_format_get_stride(format, level_width);
+      const unsigned row_pitch = util_format_get_stride(format, level_width) * sample_count;
       if (resource->level_offsets[level] != expected_offset ||
           resource->level_strides[level] != row_pitch) {
          *reason = "mip_layout";
@@ -9850,8 +9869,8 @@ pvrgpu_capture_generic_sequence_texture(
    }
 
    const struct pipe_sampler_state *state = &sampler->state;
-   if (state->compare_mode != PIPE_TEX_COMPARE_NONE ||
-       state->unnormalized_coords || state->max_anisotropy > 1) {
+   if (!multisample_view && (state->compare_mode != PIPE_TEX_COMPARE_NONE ||
+       state->unnormalized_coords || state->max_anisotropy > 1)) {
       *reason = "sampler_state";
       return false;
    }
@@ -9862,7 +9881,8 @@ pvrgpu_capture_generic_sequence_texture(
       const unsigned level_height = MAX2(height >> level, 1U);
       const unsigned slices = volume_view ? MAX2(layers >> level, 1U) : layers;
       storage_size += (uintptr_t)util_format_get_2d_size(storage_format,
-         util_format_get_stride(storage_format, level_width), level_height) * slices;
+         util_format_get_stride(storage_format, level_width) * sample_count,
+         level_height) * slices;
    }
    if (storage_size > UINT32_MAX) {
       *reason = "storage_size";
@@ -9893,10 +9913,21 @@ pvrgpu_capture_generic_sequence_texture(
                const uint8_t *row = resource->data + resource->level_offsets[level] +
                   (uintptr_t)layer * resource->level_layer_strides[level] +
                   (uintptr_t)y * resource->level_strides[level];
-               for (unsigned x = 0; x < level_width; ++x) {
+               /* Preserve each physical sample, in pixel-interleaved order.
+                * Format transport never resolves or evaluates texelFetch. */
+               for (unsigned x = 0; x < level_width * sample_count; ++x) {
                   uint32_t rgba[4] = {0, 0, 0, 1};
                   uint32_t result[4];
-                  util_format_unpack_rgba(format, rgba, row + (uintptr_t)x * native_bpp, 1);
+                  if (float_depth_view) {
+                     float depth;
+                     util_format_unpack_z_float(format, &depth,
+                        row + (uintptr_t)x * native_bpp, 1);
+                     memcpy(&rgba[0], &depth, sizeof(depth));
+                     rgba[3] = UINT32_C(0x3f800000);
+                  } else {
+                     util_format_unpack_rgba(format, rgba,
+                        row + (uintptr_t)x * native_bpp, 1);
+                  }
                   for (unsigned channel = 0; channel < 4; ++channel)
                      result[channel] = swizzle[channel] < 4 ? rgba[swizzle[channel]] :
                         swizzle[channel] == PIPE_SWIZZLE_1 ?
@@ -9925,7 +9956,7 @@ pvrgpu_capture_generic_sequence_texture(
       destination->mip[level].width = MAX2(width >> level, 1U);
       destination->mip[level].height = MAX2(height >> level, 1U);
       destination->mip[level].row_pitch = util_format_get_stride(
-         storage_format, destination->mip[level].width);
+         storage_format, destination->mip[level].width) * sample_count;
       destination->mip[level].offset = (uint32_t)mip_offset;
       mip_offset += (uintptr_t)util_format_get_2d_size(storage_format,
          destination->mip[level].row_pitch, destination->mip[level].height) *
@@ -9960,6 +9991,7 @@ pvrgpu_capture_generic_sequence_texture(
    destination->texture_kind =
       cube_view ? 3U : volume_view ? 2U : array_view ? 1U : 0U;
    destination->layers = layers;
+   destination->sample_count = sample_count;
    destination->min_lod_u4_6 = 0;
    /*
     * GL's mip filter NONE has no Rogue encoding: the sampler word carries a
@@ -9973,6 +10005,17 @@ pvrgpu_capture_generic_sequence_texture(
    destination->max_lod_u4_6 =
       state->min_mip_filter == PIPE_TEX_MIPFILTER_NONE ?
          16U : (mip_count - 1U) * 64U;
+
+   /* MS fetch has no sampler object state. NNCOORDS/SNO in the shader
+    * select integer texels and one sample; neutral sampler words are merely
+    * redundant transport and never convert the image to a resolved one. */
+   if (multisample_view) {
+      destination->min_filter = destination->mag_filter = 0;
+      destination->mip_filter = PVRGPU_SYSTEMC_PCO_TEXTURE_MIP_FILTER_NONE;
+      destination->wrap_u = destination->wrap_v = destination->wrap_w =
+         PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_EDGE;
+      destination->min_lod_u4_6 = destination->max_lod_u4_6 = 0;
+   }
 
    *out_bytes = bytes;
    return true;
@@ -11063,7 +11106,7 @@ pvrgpu_record_color_primitive_pco_draw(
                                              ctx->rasterizer &&
                                              ctx->rasterizer->state
                                                 .point_size_per_vertex,
-                                          ctx->framebuffer.nr_cbufs,
+                                          MAX2(1U, ctx->framebuffer.nr_cbufs),
                                           vertex_uniform_dwords,
                                           fragment_uniform_dwords,
                                           attribute_count,
@@ -11196,7 +11239,10 @@ pvrgpu_record_color_primitive_pco_draw(
    command.instance_count = 1;
    command.primitive_mode = (uint32_t)info->mode;
    command.indexed = info->index_size != 0 ? 1u : 0u;
-   command.render_target_count = ctx->framebuffer.nr_cbufs;
+   /* The model retains one inactive color slot for a depth-only pass,
+    * matching the existing depth prepass transport. No GL color resource is
+    * fabricated or written: color_mask=0 and only Z/S is read back. */
+   command.render_target_count = MAX2(1U, ctx->framebuffer.nr_cbufs);
    command.raw_index_data = index_data;
    command.raw_index_data_size = index_data_size;
    command.index_size = command_index_size;
@@ -11328,6 +11374,10 @@ pvrgpu_record_color_primitive_pco_draw(
    command.rasterizer_discard =
       ctx->rasterizer ? ctx->rasterizer->state.rasterizer_discard : 0;
    command.multisample = ctx->rasterizer ? ctx->rasterizer->state.multisample : 0;
+   command.alpha_to_coverage = ctx->blend ? ctx->blend->state.alpha_to_coverage : 0;
+   command.alpha_to_coverage_dither =
+      ctx->blend ? ctx->blend->state.alpha_to_coverage_dither : 0;
+   command.alpha_to_one = ctx->blend ? ctx->blend->state.alpha_to_one : 0;
    command.half_pixel_center =
       ctx->rasterizer ? ctx->rasterizer->state.half_pixel_center : 1;
    command.bottom_edge_rule =
@@ -11340,9 +11390,9 @@ pvrgpu_record_color_primitive_pco_draw(
    command.depth_clamp =
       ctx->rasterizer ? ctx->rasterizer->state.depth_clamp : 0;
    command.sample_mask = ctx->sample_mask;
-   command.color_mask = pvrgpu_rt_colormask(ctx, 0);
+   command.color_mask = ctx->framebuffer.nr_cbufs ? pvrgpu_rt_colormask(ctx, 0) : 0;
    command.blend_enable =
-      ctx->blend ? ctx->blend->state.rt[0].blend_enable : 0;
+      ctx->framebuffer.nr_cbufs && ctx->blend ? ctx->blend->state.rt[0].blend_enable : 0;
    command.dither = ctx->blend ? ctx->blend->state.dither : 1;
    command.depth_enable = ctx->dsa ? ctx->dsa->state.depth_enabled : 0;
    command.depth_write = ctx->dsa ? ctx->dsa->state.depth_writemask : 0;
@@ -11478,7 +11528,9 @@ pvrgpu_record_color_primitive_pco_draw(
              pvrgpu_sequence_texture_addrmode(captured->wrap_v),
              captured->max_lod_u4_6,
              captured->layers,
-             pvrgpu_sequence_texture_addrmode(captured->wrap_w))) {
+             pvrgpu_sequence_texture_addrmode(captured->wrap_w)) ||
+          !pvrgpu_pco_set_texture_sample_count(
+             &fragment_uniform_words[descriptor_start], captured->sample_count)) {
          pvrgpu_counter_eventf("draw_array_primitive_record_error",
                                "stage=textures reason=descriptor slot=%u "
                                "start=%u shared=%u",
@@ -11487,6 +11539,17 @@ pvrgpu_record_color_primitive_pco_draw(
                                fragment_shared_count);
          pvrgpu_array_primitive_draw_destroy(&recorded);
          return false;
+      }
+      if (captured->texture_kind == 1U && captured->mip_count == 1U) {
+         /* PCO's software array lowering multiplies the selected layer by
+          * IMAGE_META_LAYER_SIZE, not the whole allocation size. Preserve
+          * TEXTYPE 2D even for an array with just one layer: textureSize's
+          * array extent comes from WORD1.depth, not the STRIDE field. */
+         uint32_t *descriptor = &fragment_uniform_words[descriptor_start];
+         descriptor[0] = (descriptor[0] & ~UINT32_C(7)) | 1U;
+         descriptor[2] = 1U | ((captured->layers - 1U) << 4U);
+         descriptor[3] = 0;
+         descriptor[4] = captured->mip[0].row_pitch * captured->mip[0].height;
       }
       ++recorded->texture_count;
    }
@@ -11555,7 +11618,7 @@ pvrgpu_record_color_primitive_pco_draw(
        */
       const struct pipe_rt_blend_state *rt =
          ctx->blend ? &ctx->blend->state.rt[0] : NULL;
-      const bool blending = rt && rt->blend_enable;
+      const bool blending = ctx->framebuffer.nr_cbufs && rt && rt->blend_enable;
       if (!pvrgpu_init_systemc_blend_state(
              &recorded->command,
              blending,
@@ -12539,8 +12602,8 @@ pvrgpu_draw_is_lowerable_array_primitive(
     * One to four colour attachments, every one present and sharing the
     * format the capsule states for the pass.
     */
-   if (ctx->framebuffer.nr_cbufs == 0) {
-      *reason = "no_colour_attachment";
+   if (ctx->framebuffer.nr_cbufs == 0 && !ctx->framebuffer.zsbuf.texture) {
+      *reason = "no_attachment";
       return false;
    }
    if (ctx->framebuffer.nr_cbufs > PVRGPU_MAX_RENDER_TARGETS) {
@@ -12678,6 +12741,10 @@ pvrgpu_destroy(struct pipe_context *pipe)
       for (unsigned i = 0; i < PIPE_MAX_CONSTANT_BUFFERS; ++i) {
          util_copy_constant_buffer(&ctx->constant_buffers[stage][i], NULL);
       }
+      for (unsigned i = 0; i < PIPE_MAX_SHADER_BUFFERS; ++i)
+         util_copy_shader_buffer(&ctx->shader_buffers[stage][i], NULL);
+      for (unsigned i = 0; i < PIPE_MAX_SHADER_IMAGES; ++i)
+         util_copy_image_view(&ctx->shader_images[stage][i], NULL);
    }
    if (ctx->base.stream_uploader)
       u_upload_destroy(ctx->base.stream_uploader);
@@ -14350,18 +14417,12 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
                                 "unsupported_state");
 }
 
-/*
- * Compute entry points.
- *
- * The screen advertises ES 3.1, which makes Mesa expose compute shaders,
- * shader storage buffers and shader images.  The model has no compute
- * pipeline yet, so these record what was asked for and decline the dispatch.
- * They exist so an ES 3.1 context and its compute cases reach a reported
- * failure instead of dereferencing a NULL pipe_context hook, which would take
- * the whole dEQP process down and hide every other result in the same run.
- */
+/* Compute commands have independent native PCO and synchronous model state.
+ * Buffer snapshots transport raw bytes, never evaluated shader results. */
 struct pvrgpu_compute_state {
-   unsigned static_shared_mem;
+   struct nir_shader *nir;
+   struct pvrgpu_pco_compute_binary binary;
+   unsigned uniform_dwords;
 };
 
 static void *
@@ -14369,45 +14430,221 @@ pvrgpu_create_compute_state(struct pipe_context *pipe,
                             const struct pipe_compute_state *state)
 {
    (void)pipe;
+   if (!state || state->ir_type != PIPE_SHADER_IR_NIR || !state->prog) {
+      pvrgpu_counter_event("compute_state_error", "reason=compute_ir_type");
+      return NULL;
+   }
    struct pvrgpu_compute_state *compute =
       CALLOC_STRUCT(pvrgpu_compute_state);
    if (!compute)
       return NULL;
-   compute->static_shared_mem = state ? state->static_shared_mem : 0;
+   /* Gallium transfers NIR ownership, as for this driver's graphics states. */
+   compute->nir = (struct nir_shader *)state->prog;
+   compute->uniform_dwords = UINT_MAX;
    pvrgpu_counter_eventf("compute_state_create",
-                         "static_shared_mem=%u",
-                         compute->static_shared_mem);
+                         "shader=%p shared_memory_bytes=%u ubos=%u ssbos=%u",
+                         (void *)compute, compute->nir->info.shared_size,
+                         compute->nir->info.num_ubos,
+                         compute->nir->info.num_ssbos);
    return compute;
 }
 
 static void
 pvrgpu_bind_compute_state(struct pipe_context *pipe, void *state)
 {
-   (void)pipe;
+   pvrgpu_context(pipe)->cs = state;
    pvrgpu_counter_eventf("compute_state_bind", "bound=%u", state ? 1 : 0);
 }
 
 static void
 pvrgpu_delete_compute_state(struct pipe_context *pipe, void *state)
 {
-   (void)pipe;
-   FREE(state);
+   struct pvrgpu_compute_state *compute = state;
+   if (!compute)
+      return;
+   if (pvrgpu_context(pipe)->cs == compute)
+      pvrgpu_context(pipe)->cs = NULL;
+   pvrgpu_pco_compute_binary_finish(&compute->binary);
+   ralloc_free(compute->nir);
+   FREE(compute);
+}
+
+static void
+pvrgpu_copy_compute_abi(struct pvrgpu_systemc_compute_abi *out,
+                        const struct pvrgpu_pco_compute_abi *in)
+{
+#define COPY_STAGE(field) out->stage.field = in->stage.field
+   COPY_STAGE(temps);
+   COPY_STAGE(vertex_inputs);
+   COPY_STAGE(vertex_outputs);
+   COPY_STAGE(coefficients);
+   COPY_STAGE(shareds);
+   COPY_STAGE(push_constant_start);
+   COPY_STAGE(push_constant_count);
+   COPY_STAGE(entry_offset);
+   COPY_STAGE(uniform_buffer_descriptor_start);
+   COPY_STAGE(uniform_buffer_descriptor_count);
+#undef COPY_STAGE
+   memcpy(out->local_size, in->local_size, sizeof(out->local_size));
+#define COPY(field) out->field = in->field
+   COPY(local_invocation_index_start);
+   COPY(local_invocation_index_count);
+   COPY(workgroup_id_start);
+   COPY(workgroup_id_count);
+   COPY(num_workgroups_start);
+   COPY(num_workgroups_count);
+   COPY(storage_buffer_descriptor_start);
+   COPY(storage_buffer_descriptor_count);
+   COPY(uniform_buffer_used_mask);
+   COPY(storage_buffer_used_mask);
+   COPY(storage_buffer_read_mask);
+   COPY(storage_buffer_write_mask);
+   COPY(shared_memory_bytes);
+   COPY(scratch_bytes);
+#undef COPY
 }
 
 static void
 pvrgpu_launch_grid(struct pipe_context *pipe,
                    const struct pipe_grid_info *info)
 {
-   (void)pipe;
-   pvrgpu_counter_eventf("compute_launch_unsupported",
-                         "grid=%ux%ux%u block=%ux%ux%u indirect=%u",
-                         info ? info->grid[0] : 0,
-                         info ? info->grid[1] : 0,
-                         info ? info->grid[2] : 0,
-                         info ? info->block[0] : 0,
-                         info ? info->block[1] : 0,
-                         info ? info->block[2] : 0,
-                         info && info->indirect ? 1 : 0);
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   struct pvrgpu_compute_state *compute = ctx->cs;
+   struct pvrgpu_compute_snapshot snapshot = {0};
+   const char *reason = "compute_state_unbound";
+   char error[512] = {0};
+   if (!compute || !compute->nir || !info)
+      goto fail;
+   reason = "compute_grid_shape";
+   if (info->indirect || info->indirect_draw_count || info->num_globals ||
+       info->variable_shared_mem)
+      goto fail;
+   for (unsigned axis = 0; axis < 3; ++axis) {
+      if (info->grid_base[axis] ||
+          (info->last_block[axis] &&
+           info->last_block[axis] != info->block[axis]))
+         goto fail;
+   }
+   reason = "compute_graphics_flush_incomplete";
+   if (pvrgpu_context_has_incomplete_replay(ctx))
+      goto fail;
+   /* Graphics and compute can alias resources. Materialize preceding graphics
+    * before taking any input bytes. The independent compute API does not
+    * replace the graphics framebuffer or its readback generation. */
+   pvrgpu_flush_current_color_attachments(pipe);
+
+   const unsigned uniform_dwords =
+      pvrgpu_stage_uniform_dwords(ctx, MESA_SHADER_COMPUTE);
+   if (!compute->binary.data || compute->uniform_dwords != uniform_dwords) {
+      pvrgpu_pco_compute_binary_finish(&compute->binary);
+      reason = "compute_compile";
+      if (!ctx->pco_compiler)
+         ctx->pco_compiler = pvrgpu_pco_compiler_create(error, sizeof(error));
+      if (!ctx->pco_compiler ||
+          !pvrgpu_pco_compile_compute(ctx->pco_compiler, compute->nir,
+             uniform_dwords, &compute->binary, error, sizeof(error)))
+         goto fail;
+      compute->uniform_dwords = uniform_dwords;
+      pvrgpu_counter_eventf(
+         "compute_pco_binary",
+         "bytes=%zu fnv1a64=0x%016llx temps=%u shareds=%u coefficients=%u "
+         "ubo_used=0x%x ssbo_used=0x%x ssbo_read=0x%x ssbo_write=0x%x",
+         compute->binary.size,
+         (unsigned long long)pvrgpu_pco_binary_fnv1a64(
+            compute->binary.data, compute->binary.size),
+         compute->binary.abi.stage.temps, compute->binary.abi.stage.shareds,
+         compute->binary.abi.stage.coefficients,
+         compute->binary.abi.uniform_buffer_used_mask,
+         compute->binary.abi.storage_buffer_used_mask,
+         compute->binary.abi.storage_buffer_read_mask,
+         compute->binary.abi.storage_buffer_write_mask);
+   }
+   const struct pvrgpu_pco_compute_abi *abi = &compute->binary.abi;
+   reason = "compute_descriptor_extent";
+   if (abi->stage.uniform_buffer_descriptor_count >
+          PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
+       abi->storage_buffer_descriptor_count > PIPE_MAX_SHADER_BUFFERS ||
+       abi->stage.shareds > PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS ||
+       (uint64_t)abi->stage.push_constant_start +
+          abi->stage.push_constant_count > abi->stage.shareds)
+      goto fail;
+   for (unsigned block = 0;
+        block < abi->stage.uniform_buffer_descriptor_count; ++block) {
+      if (!(abi->uniform_buffer_used_mask & (UINT32_C(1) << block)))
+         continue;
+      const struct pipe_constant_buffer *binding =
+         &ctx->constant_buffers[MESA_SHADER_COMPUTE][block + 1];
+      if (!pvrgpu_compute_snapshot_add(&snapshot,
+             PVRGPU_SYSTEMC_COMPUTE_UNIFORM_BUFFER, block,
+             PVRGPU_SYSTEMC_COMPUTE_ACCESS_READ,
+             binding->buffer, binding->user_buffer,
+             binding->buffer_offset, binding->buffer_size, &reason))
+         goto fail;
+   }
+   for (unsigned slot = 0; slot < abi->storage_buffer_descriptor_count; ++slot) {
+      const uint32_t bit = UINT32_C(1) << slot;
+      if (!(abi->storage_buffer_used_mask & bit))
+         continue;
+      const struct pipe_shader_buffer *binding =
+         &ctx->shader_buffers[MESA_SHADER_COMPUTE][slot];
+      uint32_t access = 0;
+      if (abi->storage_buffer_read_mask & bit)
+         access |= PVRGPU_SYSTEMC_COMPUTE_ACCESS_READ;
+      if (abi->storage_buffer_write_mask & bit) {
+         reason = "compute_storage_buffer_write_access";
+         if (!(ctx->shader_buffer_writable_mask[MESA_SHADER_COMPUTE] & bit))
+            goto fail;
+         access |= PVRGPU_SYSTEMC_COMPUTE_ACCESS_WRITE;
+      }
+      if (!pvrgpu_compute_snapshot_add(&snapshot,
+             PVRGPU_SYSTEMC_COMPUTE_STORAGE_BUFFER, slot, access,
+             binding->buffer, NULL,
+             binding->buffer_offset, binding->buffer_size, &reason))
+         goto fail;
+   }
+   uint32_t shared[PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS] = {0};
+   reason = "compute_push_constants";
+   if (!pvrgpu_copy_stage_uniform_words(ctx, MESA_SHADER_COMPUTE,
+                                        &abi->stage, shared))
+      goto fail;
+   struct pvrgpu_systemc_compute_dispatch dispatch = {0};
+   dispatch.version = PVRGPU_SYSTEMC_COMPUTE_API_VERSION;
+   pvrgpu_copy_compute_abi(&dispatch.abi, abi);
+   dispatch.binary = compute->binary.data;
+   dispatch.binary_size = compute->binary.size;
+   memcpy(dispatch.grid, info->grid, sizeof(dispatch.grid));
+   memcpy(dispatch.block, info->block, sizeof(dispatch.block));
+   dispatch.push_words = shared + abi->stage.push_constant_start;
+   dispatch.push_word_count = abi->stage.push_constant_count;
+   dispatch.resources = snapshot.resources;
+   dispatch.resource_count = snapshot.resource_count;
+   dispatch.bindings = snapshot.bindings;
+   dispatch.binding_count = snapshot.binding_count;
+   for (size_t i = 0; i < snapshot.binding_count; ++i) {
+      const struct pvrgpu_systemc_compute_binding *binding =
+         &snapshot.bindings[i];
+      pvrgpu_counter_eventf(
+         "compute_buffer_snapshot",
+         "kind=%u slot=%u resource_index=%u resource_bytes=%zu "
+         "offset=%llu bytes=%llu access=0x%x",
+         binding->kind, binding->slot, binding->resource_index,
+         snapshot.resources[binding->resource_index].bytes_size,
+         (unsigned long long)binding->offset,
+         (unsigned long long)binding->bytes_size, binding->access);
+   }
+   struct pvrgpu_systemc_compute_stats stats;
+   reason = "compute_model_submit";
+   if (!pvrgpu_submit_compute_command(&dispatch, &stats, error, sizeof(error)))
+      goto fail;
+   pvrgpu_compute_snapshot_writeback(&snapshot);
+   pvrgpu_compute_snapshot_finish(&snapshot);
+   return;
+
+fail:
+   pvrgpu_counter_eventf("compute_launch_unsupported", "reason=%s detail=%s",
+                         reason ? reason : "compute_snapshot",
+                         error[0] ? error : "none");
+   pvrgpu_compute_snapshot_finish(&snapshot);
 }
 
 static void
@@ -14418,9 +14655,23 @@ pvrgpu_set_shader_buffers(struct pipe_context *pipe,
                           const struct pipe_shader_buffer *buffers,
                           unsigned writable_bitmask)
 {
-   (void)pipe;
-   (void)buffers;
-   pvrgpu_counter_eventf("shader_buffers_unsupported",
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   if ((unsigned)shader >= MESA_SHADER_MESH_STAGES ||
+       start_slot > PIPE_MAX_SHADER_BUFFERS ||
+       count > PIPE_MAX_SHADER_BUFFERS - start_slot) {
+      pvrgpu_counter_event("shader_buffers_unsupported", "reason=binding_range");
+      return;
+   }
+   for (unsigned i = 0; i < count; ++i) {
+      const uint32_t bit = UINT32_C(1) << (start_slot + i);
+      util_copy_shader_buffer(&ctx->shader_buffers[shader][start_slot + i],
+                               buffers ? &buffers[i] : NULL);
+      ctx->shader_buffer_writable_mask[shader] &= ~bit;
+      if (buffers && buffers[i].buffer &&
+          (writable_bitmask & (UINT32_C(1) << i)))
+         ctx->shader_buffer_writable_mask[shader] |= bit;
+   }
+   pvrgpu_counter_eventf("set_shader_buffers",
                          "stage=%u start=%u count=%u writable=0x%x",
                          (unsigned)shader, start_slot, count,
                          writable_bitmask);
@@ -14434,9 +14685,18 @@ pvrgpu_set_shader_images(struct pipe_context *pipe,
                          unsigned unbind_num_trailing_slots,
                          const struct pipe_image_view *images)
 {
-   (void)pipe;
-   (void)images;
-   pvrgpu_counter_eventf("shader_images_unsupported",
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   if ((unsigned)shader >= MESA_SHADER_MESH_STAGES ||
+       start_slot > PIPE_MAX_SHADER_IMAGES ||
+       count > PIPE_MAX_SHADER_IMAGES - start_slot ||
+       unbind_num_trailing_slots > PIPE_MAX_SHADER_IMAGES - start_slot - count) {
+      pvrgpu_counter_event("shader_images_unsupported", "reason=binding_range");
+      return;
+   }
+   for (unsigned i = 0; i < count + unbind_num_trailing_slots; ++i)
+      util_copy_image_view(&ctx->shader_images[shader][start_slot + i],
+                            images && i < count ? &images[i] : NULL);
+   pvrgpu_counter_eventf("set_shader_images",
                          "stage=%u start=%u count=%u unbind=%u",
                          (unsigned)shader, start_slot, count,
                          unbind_num_trailing_slots);
@@ -14445,8 +14705,10 @@ pvrgpu_set_shader_images(struct pipe_context *pipe,
 static void
 pvrgpu_memory_barrier(struct pipe_context *pipe, unsigned flags)
 {
-   (void)pipe;
-   pvrgpu_counter_eventf("memory_barrier", "flags=0x%x", flags);
+   /* Compute returns only after model writes have been materialized. Pending
+    * graphics still needs its normal completion boundary before consumers. */
+   pvrgpu_flush_current_color_attachments(pipe);
+   pvrgpu_counter_eventf("memory_barrier", "flags=0x%x synchronous=1", flags);
 }
 
 struct pipe_context *
@@ -14477,6 +14739,9 @@ pvrgpu_create_context(struct pipe_screen *screen, void *priv,
    ctx->base.clear_render_target = pvrgpu_clear_render_target;
    ctx->base.clear_depth_stencil = pvrgpu_clear_depth_stencil;
    ctx->base.set_framebuffer_state = pvrgpu_set_framebuffer_state;
+   /* The rasterizer uses these exact standard sixteenth-pixel locations.
+    * Without this callback Mesa reports the center for every MS sample. */
+   ctx->base.get_sample_position = u_default_get_sample_position;
    ctx->base.flush = pvrgpu_flush;
    ctx->base.draw_vbo = pvrgpu_draw_vbo;
    ctx->base.create_compute_state = pvrgpu_create_compute_state;

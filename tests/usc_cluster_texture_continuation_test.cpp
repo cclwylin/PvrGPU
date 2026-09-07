@@ -9,6 +9,9 @@
 #include "shader/usc_cluster.h"
 #include "memory/gpu_memory_system.h"
 #include "pco_uniform_buffer_fixtures.h"
+#include "pco_multisample_texture_fixtures.h"
+#include "pds/pds_engine.h"
+#include "shader/usc_slot.h"
 
 #include <systemc>
 
@@ -253,7 +256,7 @@ CasePayload MakeCase(MemoryPool &pool, std::size_t sample_count,
   state.position_output_start = 0;
   state.position_output_count = 4;
   state.varying_output_start = 4;
-  state.varying_output_count = 1;
+  state.varying_output_count = coefficient_dword_count > 4 ? 1 : 0;
   state.fragment_position_start = 0;
   state.fragment_position_count = 4;
   state.fragment_varying_start = 4;
@@ -282,10 +285,12 @@ public:
   TextureResponder(sc_core::sc_module_name name, MemoryPool &pool,
                    std::size_t expected_rounds,
                    std::size_t descriptor_count,
-                   bool corrupt_response_order = false)
+                   bool corrupt_response_order = false,
+                   bool native_multisample = false)
       : sc_module(name), pool_(pool), expected_rounds_(expected_rounds),
         descriptor_count_(descriptor_count),
-        corrupt_response_order_(corrupt_response_order) {
+        corrupt_response_order_(corrupt_response_order),
+        native_multisample_(native_multisample) {
     SC_THREAD(Run);
   }
 
@@ -311,6 +316,13 @@ private:
                 requests[0].descriptor_set == round % descriptor_count_,
             "one ordered request per texture round");
       descriptor_sets_.push_back(requests[0].descriptor_set);
+      if (native_multisample_) {
+        Check(requests[0].sample_index_present == 1 &&
+                  requests[0].sample_index == 3 && requests[0].normalized == 0 &&
+                  requests[0].coordinates[0] == UINT32_C(0x40800000) &&
+                  requests[0].coordinates[1] == UINT32_C(0x40e00000),
+              "native MS request preserves integer texels and selected sample");
+      }
 
       TextureSampleResponse response;
       response.shader_lane_index = requests[0].shader_lane_index;
@@ -334,6 +346,7 @@ private:
   std::size_t expected_rounds_ = 0;
   std::size_t descriptor_count_ = 0;
   bool corrupt_response_order_ = false;
+  bool native_multisample_ = false;
   std::vector<std::uint8_t> descriptor_sets_;
 };
 
@@ -736,6 +749,136 @@ private:
   UniformTextureResponder responder_;
 };
 
+// Genuine PCO with no VS-to-FS user varying. PDS must transport the actual
+// position-W plane even though its shader-varying linkage vector is empty.
+class NativeMultisampleHarness final : public sc_core::sc_module {
+public:
+  NativeMultisampleHarness(sc_core::sc_module_name name, bool array,
+                          bool query = false)
+      : sc_module(name), array_(array), query_(query), pds_("pds", pool_),
+        slot_("slot", pool_, ShaderStage::kFragment),
+        cluster_("cluster", pool_, ShaderStage::kFragment),
+        responder_("responder", pool_, query ? 0 : 1, 1, false, !query) {
+    payload_ = MakeCase(pool_, 1, array ? 202 : 201, 1, query ? 0 : 4, true, 4);
+    auto state = LoadPipelineState(pool_, payload_.state);
+    const auto program = Decode(ShaderStage::kFragment,
+        pvrgpu::stub::test::MultisampleTextureFixture(query ? (array ? 19 : 18) :
+                                                            (array ? 3 : 0)));
+    pool_.Release(state.fragment_instructions);
+    state.fragment_instructions = StoreNewArray(pool_, program.instructions);
+    state.fragment_program_summary = program.summary;
+    auto stats = LoadArray<DrawListStats>(pool_, state.drawlist_stats);
+    const auto counts = CountPcoInstructions(program.instructions, false);
+    stats[0].fragment.program_groups = program.summary.group_count;
+    stats[0].fragment.program_instructions = program.summary.instruction_count;
+    stats[0].fragment.program_alu_instructions = counts.alu;
+    stats[0].fragment.program_tex_instructions = counts.texture;
+    stats[0].fragment.program_memory_instructions = counts.memory;
+    pvrgpu::stub::StoreArray(pool_, state.drawlist_stats, stats);
+    std::vector<std::uint32_t> shared(query ? 20 : 24, 0);
+    const std::uint64_t image0 = (UINT64_C(2) << 62) |
+        (UINT64_C(18) << 48) | (UINT64_C(12) << 34) | (array ? 1U : 4U);
+    const std::uint64_t image1 = ((UINT64_C(0x1234000040) >> 2) << 16) |
+        (array ? (UINT64_C(4) << 4) | 1U : (UINT64_C(1) << 60) | 12U);
+    shared[0] = static_cast<std::uint32_t>(image0);
+    shared[1] = static_cast<std::uint32_t>(image0 >> 32);
+    shared[2] = static_cast<std::uint32_t>(image1);
+    shared[3] = static_cast<std::uint32_t>(image1 >> 32);
+    shared[4] = 13 * 19 * 16 * 4;
+    if (!query) {
+      shared[20] = 4; shared[21] = 7; shared[22] = 2; shared[23] = 3;
+    }
+    pvrgpu::stub::StoreArray(pool_, state.fragment_shared_registers, shared);
+    Check(pvrgpu::stub::UsesShaderVaryings(state) &&
+              pvrgpu::stub::VaryingVectorCount(state) == 0 &&
+              pvrgpu::stub::VaryingCoefficientDwordCount(state) == 4 &&
+              pvrgpu::stub::ActiveVertexOutputDwordCount(state) == 4,
+          "zero varying native texture retains exact position-only ABI");
+    pool_.Release(state.usc_fragment_tasks);
+    pool_.Release(state.usc_coefficient_banks);
+    state.usc_fragment_tasks = {};
+    state.usc_coefficient_banks = {};
+    state.stage = PipelineStage::kFragmentsReady;
+    state.shader_varying_bindings = StoreNewArray(pool_,
+        std::vector<pvrgpu::stub::ShaderVaryingBinding>{});
+    auto invocations = LoadArray<FragmentInvocation>(pool_, state.fragment_invocations);
+    auto lanes = LoadArray<FragmentShaderLane>(pool_, state.fragment_shader_lanes);
+    auto quads = LoadArray<FragmentQuad>(pool_, state.fragment_quads);
+    invocations[0].parameter_index = lanes[0].parameter_index = quads[0].parameter_index = 0;
+    pvrgpu::stub::StoreArray(pool_, state.fragment_invocations, invocations);
+    pvrgpu::stub::StoreArray(pool_, state.fragment_shader_lanes, lanes);
+    pvrgpu::stub::StoreArray(pool_, state.fragment_quads, quads);
+    pvrgpu::stub::ParameterTriangle parameter;
+    parameter.rasterizable = 1;
+    parameter.front_facing = 1;
+    parameter.key.submit_ordinal = payload_.txn.sequence;
+    parameter.coefficient_set_count = 1;
+    parameter.depth_plane_valid = 1;
+    parameter.depth_plane[2] = UINT32_C(0x3f000000);
+    state.parameter_triangles = StoreNewArray(pool_,
+        std::vector<pvrgpu::stub::ParameterTriangle>{parameter});
+    pvrgpu::stub::ParameterCoefficientSet plane;
+    plane.a = UINT32_C(0x3e000000);
+    plane.b = UINT32_C(0x3e800000);
+    plane.c = UINT32_C(0x3f800000);
+    state.parameter_coefficients = StoreNewArray(pool_,
+        std::vector<pvrgpu::stub::ParameterCoefficientSet>{plane});
+    state.counters.parameter_coefficient_sets = 1;
+    state.counters.parameter_write_bytes = sizeof(plane);
+    StorePipelineState(pool_, payload_.state, state);
+    pds_.input(input_); pds_.output(pds_output_);
+    slot_.input(pds_output_); slot_.output(issued_);
+    cluster_.input(issued_); cluster_.output(output_);
+    cluster_.texture_request_output(requests_);
+    cluster_.texture_response_input(responses_);
+    responder_.input(requests_); responder_.output(responses_);
+    input_.write(payload_.txn);
+  }
+  void Verify() {
+    PipelineTxn completed;
+    Check(output_.nb_read(completed), "native position-only PDS/USC FIFO completion");
+    const auto state = LoadPipelineState(pool_, payload_.state);
+    const auto bank = LoadArray<std::uint32_t>(pool_, state.usc_coefficient_banks);
+    Check(bank == std::vector<std::uint32_t>{UINT32_C(0x3e000000),
+               UINT32_C(0x3e800000), UINT32_C(0x3f800000), 0} &&
+              state.counters.pds_coefficient_tasks == 1 &&
+              state.counters.usc_coefficient_load_bytes == 16,
+          "PDS transports actual A/B/C/PAD rather than a fabricated varying");
+    if (!query_) {
+      CheckCompletedCase(pool_, payload_, responder_, 1);
+    } else {
+      const auto outputs = LoadArray<FragmentOutput>(pool_, state.fragment_outputs);
+      Check(outputs.size() == 1 && outputs[0].pixel_output[0] == 13 &&
+                outputs[0].pixel_output[1] == 19 &&
+                outputs[0].pixel_output[2] == (array_ ? 5U : 1U) &&
+                outputs[0].pixel_output[3] == 4 &&
+                state.counters.fs_tex_instructions == 0 &&
+                responder_.descriptor_sets().empty() &&
+                !HasPoolHandle(state.texture_sample_requests) &&
+                !HasPoolHandle(state.texture_sample_responses) &&
+                !HasPoolHandle(state.fragment_continuations) &&
+                requests_.num_available() == 0 && responses_.num_available() == 0,
+            "native descriptor-only query executes ALU without a texture FIFO request");
+      ReleaseFunctionalPayloads(pool_, state);
+      pool_.Release(payload_.state);
+      Check(pool_.bytes_in_flight() == 0 && pool_.allocations() == pool_.releases(),
+            "query-only payload ownership balances without fabricated continuations");
+    }
+  }
+private:
+  MemoryPool pool_;
+  CasePayload payload_;
+  bool array_;
+  bool query_;
+  sc_core::sc_fifo<PipelineTxn> input_{"input", 1}, pds_output_{"pds_output", 1},
+      issued_{"issued", 1}, requests_{"requests", 1}, responses_{"responses", 1},
+      output_{"output", 1};
+  pvrgpu::stub::PdsEngine pds_;
+  pvrgpu::stub::UscSlot slot_;
+  UscCluster cluster_;
+  TextureResponder responder_;
+};
+
 int RunExpectedFailure(bool too_many_requests) {
   MemoryPool pool;
   const std::size_t sample_count =
@@ -853,6 +996,10 @@ int sc_main(int argc, char **argv) {
     const CasePayload nine = MakeCase(nine_pool, 9, 4, 1);
     const CasePayload vertex = MakeVertexCase(vertex_pool, 5);
     std::vector<std::unique_ptr<UniformTextureHarness>> uniform_cases;
+    NativeMultisampleHarness native_ms("native_ms", false);
+    NativeMultisampleHarness native_ms_array("native_ms_array", true);
+    NativeMultisampleHarness native_ms_query("native_ms_query", false, true);
+    NativeMultisampleHarness native_ms_array_query("native_ms_array_query", true, true);
     for (auto mode : {pvrgpu::stub::MemoryMode::kDirect,
                       pvrgpu::stub::MemoryMode::kBypass,
                       pvrgpu::stub::MemoryMode::kCache}) {
@@ -957,6 +1104,10 @@ int sc_main(int argc, char **argv) {
     CheckCompletedVertexCase(vertex_pool, vertex);
     for (const auto &test : uniform_cases)
       test->Verify();
+    native_ms.Verify();
+    native_ms_array.Verify();
+    native_ms_query.Verify();
+    native_ms_array_query.Verify();
 
     std::cout << "usc_cluster_texture_continuation_test: PASS\n";
     return 0;

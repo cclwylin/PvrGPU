@@ -72,7 +72,7 @@ inline constexpr std::uint64_t kDriverSequenceAddressRegionBytes =
     kDriverSequenceVertexAddressStride *
     static_cast<std::uint64_t>(kDriverSequenceAddressSlots);
 inline constexpr std::uint64_t kBuiltinVertexBufferGpuAddress =
-    UINT64_C(0x100000000);
+    UINT64_C(0x10000000000);
 inline constexpr std::uint64_t kBuiltinIndexBufferGpuAddress =
     kBuiltinVertexBufferGpuAddress + kDriverSequenceAddressRegionBytes;
 inline constexpr std::uint64_t kBuiltinTexcoordBufferGpuAddress =
@@ -81,6 +81,18 @@ inline constexpr std::uint64_t kBuiltinTexcoordBufferGpuAddress =
 // all three large vertex/index/UV regions, not inside texture/attachment space.
 inline constexpr std::uint64_t kUniformBufferGpuAddressBase =
     kBuiltinTexcoordBufferGpuAddress + kDriverSequenceAddressRegionBytes;
+// 以全部合法 slots 驗證區域，而非只以本輪實際 draw 數推測不會相撞。
+static_assert(kDriverPcoMrtColorAddressBase +
+                  kDriverSequenceAddressSlots * kMaxRenderTargets *
+                      kDriverPcoSequenceAttachmentStride <=
+                  kDriverPcoSequenceExternalAddressBase,
+              "MRT attachments overlap external textures");
+static_assert(kDriverPcoSequenceExternalAddressEnd <= kBuiltinVertexBufferGpuAddress,
+              "external textures overlap vertex buffers");
+static_assert(kUniformBufferGpuAddressBase +
+                  kDriverSequenceAddressSlots * 2U * kMaximumUniformBuffersPerStage *
+                      kMaximumUniformBufferBytes <= kParameterTrianglesGpuAddress,
+              "driver buffers overlap parameter memory");
 
 std::uint64_t SequenceUniformBufferAddress(
     std::size_t submission, DriverPcoShaderStage stage, std::uint32_t block) {
@@ -133,26 +145,20 @@ std::size_t TakeSequenceAttachmentSlot(std::size_t *next, const char *region) {
 
 std::uint64_t SequenceExternalTextureAddress(
     std::size_t submission, DriverPcoShaderStage stage,
-    std::uint32_t descriptor_set) {
+    std::uint32_t descriptor_set, std::uint64_t byte_size,
+    DriverPcoExternalTextureAllocation *allocation) {
   if (submission >= kDriverPcoMaximumNestedSequenceCommands ||
+      (stage != DriverPcoShaderStage::kVertex &&
+       stage != DriverPcoShaderStage::kFragment) ||
       descriptor_set >= kPcoMaximumTextureDescriptorSets) {
     throw std::runtime_error(
         "Submitter sequence external texture slot is out of bounds");
   }
-  const std::uint64_t stage_index =
-      stage == DriverPcoShaderStage::kVertex ? 0U : 1U;
-  const std::uint64_t slot =
-      (static_cast<std::uint64_t>(submission) * 2U + stage_index) *
-          kPcoMaximumTextureDescriptorSets +
-      descriptor_set;
-  if (slot > (std::numeric_limits<std::uint64_t>::max() -
-              kDriverPcoSequenceExternalAddressBase) /
-                 kDriverPcoSequenceAttachmentStride) {
-    throw std::overflow_error(
-        "Submitter sequence external texture address overflow");
-  }
-  return kDriverPcoSequenceExternalAddressBase +
-         slot * kDriverPcoSequenceAttachmentStride;
+  std::uint64_t address = 0;
+  if (!AllocateSequenceExternalTextureAddress(byte_size, allocation, &address))
+    throw std::runtime_error(
+        "Submitter sequence external texture allocation exceeds its region/payload limit");
+  return address;
 }
 
 float FloatFromBits(std::uint32_t bits) {
@@ -1437,6 +1443,7 @@ void Submitter::RunJob() {
                                            : options_.driver_commands.size();
   std::vector<std::uint64_t> sequence_color_addresses(submission_count, 0);
   std::vector<std::uint64_t> sequence_depth_addresses(submission_count, 0);
+  DriverPcoExternalTextureAllocation sequence_external_allocation;
   if (driver_pco_sequence_command &&
       !ResolveSequenceAttachmentAddresses(options_.driver_commands,
                                           &sequence_color_addresses,
@@ -1458,6 +1465,22 @@ void Submitter::RunJob() {
             "Submitter PCO sequence requires unified GPU memory");
       for (const DriverPcoSampledTexture &texture :
            command.sampled_textures) {
+        const std::uint32_t samples = texture.sample_count ? texture.sample_count : 1U;
+        const auto &shared = texture.stage == DriverPcoShaderStage::kVertex
+                                 ? command.vertex_shared : command.fragment_shared;
+        const std::size_t descriptor_end =
+            (static_cast<std::size_t>(texture.descriptor_set) + 1U) *
+                kPcoTextureDescriptorDwordCount;
+        if ((texture.stage != DriverPcoShaderStage::kVertex &&
+             texture.stage != DriverPcoShaderStage::kFragment) ||
+            (samples != 1U && samples != 2U && samples != 4U && samples != 8U) ||
+            descriptor_end > shared.size() ||
+            (1U << (shared[descriptor_end - kPcoTextureDescriptorDwordCount + 1U] >> 30U)) != samples ||
+            (samples > 1U &&
+             (texture.source != DriverPcoTextureSource::kExternalPayload ||
+              texture.texture_kind > 1U || texture.mip_count != 1U))) {
+          throw std::runtime_error("Submitter PCO texture sample count/descriptor layout mismatch");
+        }
         if (texture.source ==
             DriverPcoTextureSource::kPreviousColorAttachment) {
           const std::uint64_t address = sequence_color_addresses.at(
@@ -1495,6 +1518,9 @@ void Submitter::RunJob() {
         command.sample_mask : UINT32_MAX;
     state.raster_state.multisample_enable = driver_pco_triangles_command ?
         (command.multisample ? 1 : 0) : 1;
+    state.raster_state.alpha_to_coverage = command.alpha_to_coverage;
+    state.raster_state.alpha_to_coverage_dither = command.alpha_to_coverage_dither;
+    state.raster_state.alpha_to_one = command.alpha_to_one;
     state.memory_mode = options_.memory_mode;
     state.cache_bypass = options_.cache_bypass ? 1U : 0U;
     /*
@@ -2141,7 +2167,8 @@ void Submitter::RunJob() {
     }
     state.vertex_attribute_bindings = StoreNewArray(pool_, bindings);
     if (shader_varyings) {
-      if (varying_count == 0)
+      if (varying_count == 0 &&
+          VaryingCoefficientDwordCount(state) != kCoefficientSetDwordCount)
         throw std::runtime_error("Submitter varying count is invalid");
       std::vector<ShaderVaryingBinding> linkages;
       linkages.reserve(varying_count);
@@ -2284,8 +2311,8 @@ void Submitter::RunJob() {
           if (texture.declared_bytes_size == 0 ||
               texture.declared_bytes_size >
                   std::numeric_limits<std::uint32_t>::max() ||
-              texture.declared_bytes_size >
-                  kDriverPcoSequenceAttachmentStride ||
+              (texture.source != DriverPcoTextureSource::kExternalPayload &&
+               texture.declared_bytes_size > kDriverPcoSequenceAttachmentStride) ||
               texture.mip_count == 0 ||
               texture.mip_count > kMaximumTextureMipLevels ||
               texture.descriptor_set >= resources.size() ||
@@ -2297,7 +2324,8 @@ void Submitter::RunJob() {
           switch (texture.source) {
           case DriverPcoTextureSource::kExternalPayload:
             gpu_address = SequenceExternalTextureAddress(
-                submission, texture.stage, texture.descriptor_set);
+                submission, texture.stage, texture.descriptor_set,
+                texture.declared_bytes_size, &sequence_external_allocation);
             if (texture.bytes.size() != texture.declared_bytes_size) {
               throw std::runtime_error(
                   "Submitter external PCO texture bytes are invalid");
@@ -2338,6 +2366,8 @@ void Submitter::RunJob() {
           resource.byte_size =
               static_cast<std::uint32_t>(texture.declared_bytes_size);
           resource.mip_count = static_cast<std::uint8_t>(texture.mip_count);
+          resource.sample_count = static_cast<std::uint8_t>(
+              texture.sample_count ? texture.sample_count : 1U);
           resource.layer_count =
               static_cast<std::uint16_t>(texture.layers == 0U ? 1U
                                                               : texture.layers);
@@ -2466,6 +2496,23 @@ void Submitter::RunJob() {
                 texture.mip[level].row_pitch_bytes,
                 texture.mip[level].offset_bytes,
             };
+          }
+          if (resource.sample_count > 1U) {
+            if (resource.block_width != 1U || resource.block_height != 1U ||
+                resource.format == TextureFormat::kAstcLdr ||
+                resource.format == TextureFormat::kAstcLdrSrgb ||
+                texture.layers > UINT16_MAX || !resource.layer_count ||
+                !resource.mip[0].width || !resource.mip[0].height ||
+                resource.mip[0].offset_bytes != 0 ||
+                resource.mip[0].row_pitch_bytes <
+                    static_cast<std::uint64_t>(resource.mip[0].width) *
+                        TextureBytesPerTexel(resource.format) * resource.sample_count ||
+                resource.mip[0].row_pitch_bytes >
+                    resource.byte_size / resource.mip[0].height / resource.layer_count ||
+                static_cast<std::uint64_t>(resource.mip[0].row_pitch_bytes) *
+                    resource.mip[0].height * resource.layer_count != resource.byte_size) {
+              throw std::runtime_error("Submitter PCO multisample texture byte layout is invalid");
+            }
           }
           resources[texture.descriptor_set] = resource;
 

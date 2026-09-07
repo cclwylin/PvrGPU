@@ -1,9 +1,11 @@
 #include "model_runner.h"
+#include "compute_types.h"
 #include "uniform_buffers.h"
 #include "texture/astc_decoder.h"
 #include "texture/texture_unit.h"
 #include "pco_sequence_profiles.h"
 #include "pvrgpu_systemc_api.h"
+#include "pvrgpu_systemc_compute_api.h"
 #include "shader/pco_iss.h"
 
 #include <algorithm>
@@ -90,6 +92,182 @@ void CopyError(char *error, std::size_t error_size, const std::string &message) 
   for (std::size_t i = 0; i < count; ++i)
     error[i] = message[i];
   error[count] = '\0';
+}
+
+std::uint32_t ComputeLowMask(std::uint32_t count) {
+  return count == 32U ? UINT32_MAX : (UINT32_C(1) << count) - 1U;
+}
+
+/* Validate the complete envelope before cloning any borrowed resource. The
+ * stage ABI is compiler metadata, never a shader identity or a canned answer.
+ * Read/write aliases retain one backing allocation and independent views. */
+bool PrepareComputeDispatch(
+    const pvrgpu_systemc_compute_dispatch &source,
+    pvrgpu::stub::ModelComputeDispatch *out, std::string *error) {
+  const auto fail = [error](const char *message) {
+    *error = message;
+    return false;
+  };
+  const auto &abi = source.abi;
+  const auto &stage = abi.stage;
+  if (!source.binary || source.binary_size == 0 ||
+      source.binary_size > PVRGPU_SYSTEMC_COMPUTE_MAX_BINARY_BYTES ||
+      stage.entry_offset != 0 || source.memory_mode > 2U)
+    return fail("invalid compute binary, entry point, or memory mode");
+  if (stage.temps > pvrgpu::stub::kPcoTemporaryCount ||
+      stage.vertex_inputs > pvrgpu::stub::kPcoVertexInputCount ||
+      stage.vertex_outputs != 0 ||
+      stage.coefficients > 256U ||
+      stage.shareds > pvrgpu::stub::kPcoMaximumSharedCount ||
+      stage.uniform_buffer_descriptor_count > 15U ||
+      abi.storage_buffer_descriptor_count > 32U ||
+      abi.shared_memory_bytes != 0 || abi.scratch_bytes != 0)
+    return fail("compute ABI exceeds supported native execution bounds");
+  const std::uint32_t prefix = 4U *
+      (stage.uniform_buffer_descriptor_count +
+       abi.storage_buffer_descriptor_count);
+  if (stage.uniform_buffer_descriptor_start != 0 ||
+      abi.storage_buffer_descriptor_start !=
+          4U * stage.uniform_buffer_descriptor_count ||
+      stage.push_constant_start != prefix || prefix > stage.shareds ||
+      stage.push_constant_count > stage.shareds - prefix ||
+      source.push_word_count != stage.push_constant_count ||
+      (source.push_word_count != 0 && !source.push_words))
+    return fail("invalid compute descriptor/push-register layout");
+  const auto fits = [](std::uint32_t start, std::uint32_t count,
+                       std::uint32_t size, std::uint32_t max_count) {
+    return count <= max_count && (count == 0 ||
+           (start <= size && count <= size - start));
+  };
+  if (!fits(abi.local_invocation_index_start,
+            abi.local_invocation_index_count, stage.vertex_inputs, 1U) ||
+      !fits(abi.workgroup_id_start, abi.workgroup_id_count,
+            stage.coefficients, 3U) ||
+      !fits(abi.num_workgroups_start, abi.num_workgroups_count,
+            stage.coefficients, 3U))
+    return fail("invalid compute system-value register ranges");
+  if (abi.workgroup_id_count != 0 && abi.num_workgroups_count != 0 &&
+      abi.workgroup_id_start <
+          abi.num_workgroups_start + abi.num_workgroups_count &&
+      abi.num_workgroups_start <
+          abi.workgroup_id_start + abi.workgroup_id_count)
+    return fail("overlapping compute system-value coefficient ranges");
+  if ((abi.uniform_buffer_used_mask &
+       ~ComputeLowMask(stage.uniform_buffer_descriptor_count)) != 0 ||
+      (abi.storage_buffer_used_mask &
+       ~ComputeLowMask(abi.storage_buffer_descriptor_count)) != 0 ||
+      ((abi.storage_buffer_read_mask | abi.storage_buffer_write_mask) &
+       ~abi.storage_buffer_used_mask) != 0)
+    return fail("invalid compute resource-use masks");
+  std::uint64_t lanes = 1;
+  for (unsigned axis = 0; axis < 3; ++axis) {
+    if (source.grid[axis] > 65535U || source.block[axis] == 0 ||
+        source.block[axis] > (axis == 2 ? 64U : 1024U) ||
+        source.block[axis] != abi.local_size[axis])
+      return fail("compute grid/block does not match the compiled local size");
+    lanes *= source.block[axis];
+  }
+  if (lanes > 1024U)
+    return fail("compute workgroup exceeds 1024 invocations");
+  if (source.resource_count > PVRGPU_SYSTEMC_COMPUTE_MAX_RESOURCES ||
+      source.binding_count > PVRGPU_SYSTEMC_COMPUTE_MAX_BINDINGS ||
+      (source.resource_count != 0 && !source.resources) ||
+      (source.binding_count != 0 && !source.bindings))
+    return fail("invalid compute resource or binding array");
+  std::uint64_t total_bytes = 0;
+  for (std::size_t index = 0; index < source.resource_count; ++index) {
+    const auto &resource = source.resources[index];
+    if (resource.bytes_size > PVRGPU_SYSTEMC_COMPUTE_MAX_RESOURCE_BYTES ||
+        (resource.bytes_size != 0 && !resource.bytes))
+      return fail("invalid compute backing resource");
+    total_bytes += resource.bytes_size;
+  }
+  if (total_bytes > PVRGPU_SYSTEMC_COMPUTE_MAX_RESOURCE_BYTES)
+    return fail("compute snapshot exceeds the 1 GiB global-memory bound");
+  std::uint32_t present_ubos = 0, present_ssbos = 0;
+  for (std::size_t index = 0; index < source.binding_count; ++index) {
+    const auto &binding = source.bindings[index];
+    if (binding.kind > PVRGPU_SYSTEMC_COMPUTE_STORAGE_BUFFER ||
+        binding.resource_index >= source.resource_count ||
+        (binding.access & ~3U) != 0)
+      return fail("invalid compute buffer binding");
+    const bool uniform = binding.kind == PVRGPU_SYSTEMC_COMPUTE_UNIFORM_BUFFER;
+    const auto count = uniform ? stage.uniform_buffer_descriptor_count
+                              : abi.storage_buffer_descriptor_count;
+    if (binding.slot >= count)
+      return fail("compute buffer slot exceeds its descriptor range");
+    const std::uint32_t bit = UINT32_C(1) << binding.slot;
+    auto &present = uniform ? present_ubos : present_ssbos;
+    if ((present & bit) != 0)
+      return fail("duplicate compute binding slot");
+    present |= bit;
+    const auto &resource = source.resources[binding.resource_index];
+    if (binding.offset > resource.bytes_size ||
+        binding.bytes_size > resource.bytes_size - binding.offset ||
+        binding.bytes_size > UINT32_MAX ||
+        (uniform && binding.bytes_size >
+             PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES))
+      return fail("compute binding range exceeds its backing resource");
+    const auto required = uniform
+        ? ((abi.uniform_buffer_used_mask & bit) != 0 ? 1U : 0U)
+        : (((abi.storage_buffer_read_mask & bit) != 0 ? 1U : 0U) |
+           ((abi.storage_buffer_write_mask & bit) != 0 ? 2U : 0U));
+    if ((binding.access & required) != required ||
+        (uniform && (binding.access & 2U) != 0))
+      return fail("compute binding permissions do not cover shader accesses");
+  }
+  if ((abi.uniform_buffer_used_mask & ~present_ubos) != 0 ||
+      (abi.storage_buffer_used_mask & ~present_ssbos) != 0)
+    return fail("compute shader uses an unbound buffer");
+
+  pvrgpu::stub::ModelComputeDispatch prepared;
+  auto &target = prepared.abi;
+  target.stage = {stage.temps, stage.vertex_inputs, stage.vertex_outputs,
+                  stage.coefficients, stage.shareds, stage.push_constant_start,
+                  stage.push_constant_count, stage.entry_offset,
+                  stage.uniform_buffer_descriptor_start,
+                  stage.uniform_buffer_descriptor_count};
+  for (unsigned axis = 0; axis < 3; ++axis) {
+    target.local_size[axis] = abi.local_size[axis];
+    prepared.grid[axis] = source.grid[axis];
+    prepared.block[axis] = source.block[axis];
+  }
+  target.local_invocation_index_start = abi.local_invocation_index_start;
+  target.local_invocation_index_count = abi.local_invocation_index_count;
+  target.workgroup_id_start = abi.workgroup_id_start;
+  target.workgroup_id_count = abi.workgroup_id_count;
+  target.num_workgroups_start = abi.num_workgroups_start;
+  target.num_workgroups_count = abi.num_workgroups_count;
+  target.storage_buffer_descriptor_start = abi.storage_buffer_descriptor_start;
+  target.storage_buffer_descriptor_count = abi.storage_buffer_descriptor_count;
+  target.uniform_buffer_used_mask = abi.uniform_buffer_used_mask;
+  target.storage_buffer_used_mask = abi.storage_buffer_used_mask;
+  target.storage_buffer_read_mask = abi.storage_buffer_read_mask;
+  target.storage_buffer_write_mask = abi.storage_buffer_write_mask;
+  target.shared_memory_bytes = abi.shared_memory_bytes;
+  target.scratch_bytes = abi.scratch_bytes;
+  prepared.memory_mode = static_cast<pvrgpu::stub::MemoryMode>(source.memory_mode);
+  prepared.binary.assign(source.binary, source.binary + source.binary_size);
+  if (source.push_word_count != 0)
+    prepared.push_words.assign(source.push_words,
+                               source.push_words + source.push_word_count);
+  prepared.resources.resize(source.resource_count);
+  for (std::size_t index = 0; index < source.resource_count; ++index) {
+    const auto &resource = source.resources[index];
+    if (resource.bytes_size != 0)
+      prepared.resources[index].bytes.assign(resource.bytes,
+                                              resource.bytes + resource.bytes_size);
+  }
+  for (std::size_t index = 0; index < source.binding_count; ++index) {
+    const auto &binding = source.bindings[index];
+    prepared.bindings.push_back({binding.kind, binding.slot,
+                                binding.resource_index, binding.access,
+                                binding.offset, binding.bytes_size});
+    if ((binding.access & 2U) != 0)
+      prepared.resources[binding.resource_index].writable = true;
+  }
+  *out = std::move(prepared);
+  return true;
 }
 
 template <typename Abi>
@@ -419,6 +597,9 @@ void CopyPcoPayloadFields(
   destination->depth_clip_far = source.depth_clip_far;
   destination->depth_clamp = source.depth_clamp;
   destination->sample_mask = source.sample_mask;
+  destination->alpha_to_coverage = source.alpha_to_coverage;
+  destination->alpha_to_coverage_dither = source.alpha_to_coverage_dither;
+  destination->alpha_to_one = source.alpha_to_one;
   destination->color_mask = source.color_mask;
   destination->blend_enable = source.blend_enable;
   destination->blend_rgb_equation = source.blend_rgb_equation;
@@ -950,6 +1131,8 @@ bool CopyPcoTrianglePayload(
       source.bottom_edge_rule > 1 || source.clip_halfz != 0 ||
       source.depth_clip_near != 1 || source.depth_clip_far != 1 ||
       source.depth_clamp != 0 || source.sample_mask != UINT32_MAX ||
+      source.alpha_to_coverage != 0 || source.alpha_to_one != 0 ||
+      source.alpha_to_coverage_dither > 1 ||
       // The PBE honours a partial write mask, so any four-bit mask is valid.
       source.color_mask > 0x0f || source.blend_enable > 1 ||
       // Dither is cosmetic and never applied; either state is valid.
@@ -1271,6 +1454,12 @@ bool CopyPcoSequenceDraw(
     nested_reason = "rasterizer_discard";
   else if (source.multisample > 1)
     nested_reason = "multisample";
+  else if (source.alpha_to_coverage > 1)
+    nested_reason = "alpha_to_coverage";
+  else if (source.alpha_to_coverage_dither > 1)
+    nested_reason = "alpha_to_coverage_dither";
+  else if (source.alpha_to_one > 1)
+    nested_reason = "alpha_to_one";
   else if (source.half_pixel_center != 1)
     nested_reason = "half_pixel_center";
   else if (source.bottom_edge_rule > 1)
@@ -1651,7 +1840,7 @@ bool CopyPcoSequenceTexture(
     }
   }
   const auto blocks_for = [](std::uint32_t extent, std::uint32_t block) {
-    return static_cast<std::uint64_t>((extent + block - 1U) / block);
+    return (static_cast<std::uint64_t>(extent) + block - 1U) / block;
   };
   // Each field names itself: a bundled predicate here only reports that some
   // unspecified part of the metadata was rejected.
@@ -1678,6 +1867,17 @@ bool CopyPcoSequenceTexture(
   if (source.mip_count == 0 ||
       source.mip_count > PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS)
     return reject("mip count");
+  const std::uint32_t samples = source.sample_count ? source.sample_count : 1U;
+  if (samples != 1U && samples != 2U && samples != 4U && samples != 8U)
+    return reject("sample count");
+  if (source.texture_kind > 3U || source.layers > UINT16_MAX ||
+      (source.texture_kind == 0U && source.layers > 1U))
+    return reject("dimension/layer count");
+  if (samples > 1U &&
+      (source.source != PVRGPU_SYSTEMC_PCO_TEXTURE_EXTERNAL_PAYLOAD ||
+       source.texture_kind > 1U || source.mip_count != 1U ||
+       block_width != 1U || block_height != 1U))
+    return reject("multisample external 2D single-mip layout");
   if (source.min_filter > PVRGPU_SYSTEMC_PCO_TEXTURE_FILTER_LINEAR)
     return reject("min filter");
   if (source.mag_filter > PVRGPU_SYSTEMC_PCO_TEXTURE_FILTER_LINEAR)
@@ -1697,7 +1897,7 @@ bool CopyPcoSequenceTexture(
   for (std::size_t level = 0; level < source.mip_count; ++level) {
     const pvrgpu_systemc_pco_texture_mip &mip = source.mip[level];
     const std::uint64_t tight_pitch =
-        blocks_for(mip.width, block_width) * block_bytes;
+        blocks_for(mip.width, block_width) * block_bytes * samples;
     // A 2D array stores `layers` images per level, layer-minor: the level
     // spans that many single-image byte sizes.  A 3D image (kind 2) stores
     // `depth` slices the same way, but its slice count halves with each level.
@@ -1707,9 +1907,12 @@ bool CopyPcoSequenceTexture(
         source.texture_kind == 2U
             ? ((base_slices >> level) == 0U ? 1U : (base_slices >> level))
             : base_slices;
+    const std::uint64_t rows = blocks_for(mip.height, block_height);
+    if (rows && level_slices &&
+        mip.row_pitch > source.declared_bytes_size / rows / level_slices)
+      return reject("mip byte extent");
     const std::uint64_t level_bytes =
-        static_cast<std::uint64_t>(mip.row_pitch) *
-        blocks_for(mip.height, block_height) * level_slices;
+        static_cast<std::uint64_t>(mip.row_pitch) * rows * level_slices;
     const std::uint64_t level_end =
         static_cast<std::uint64_t>(mip.offset) + level_bytes;
     if (mip.width == 0 || mip.height == 0 ||
@@ -1760,6 +1963,7 @@ bool CopyPcoSequenceTexture(
       probe_image.height = source.mip[0].height;
       probe_image.row_pitch_bytes = source.mip[0].row_pitch;
       probe_image.mip_count = static_cast<std::uint8_t>(source.mip_count);
+      probe_image.sample_count = static_cast<std::uint8_t>(samples);
       probe_image.format = texture_format;
       pvrgpu::stub::RogueTextureSamplerDescriptor probe_sampler;
       probe_sampler.min_filter = static_cast<pvrgpu::stub::TextureFilter>(
@@ -1863,6 +2067,7 @@ bool CopyPcoSequenceTexture(
   texture.max_lod_u4_6 = source.max_lod_u4_6;
   texture.texture_kind = source.texture_kind;
   texture.layers = source.layers == 0U ? 1U : source.layers;
+  texture.sample_count = samples;
   *destination = std::move(texture);
   return true;
 }
@@ -2000,6 +2205,16 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
                 return left.descriptor_set < right.descriptor_set;
               });
     for (const auto &texture : command.sampled_textures) {
+      const auto &shared = texture.stage == pvrgpu::stub::DriverPcoShaderStage::kVertex
+                               ? command.vertex_shared : command.fragment_shared;
+      // Rogue TEXSTATE_IMAGE_WORD0[63:62] 保存 log2(samples)，與結構化
+      // payload 必須一致，不能由 host metadata 蓋過 shader descriptor。
+      const std::size_t image_word1 = texture.descriptor_set * descriptor_dwords + 1U;
+      const std::uint32_t descriptor_samples = 1U << (shared.at(image_word1) >> 30U);
+      if (descriptor_samples != texture.sample_count) {
+        *error = "SystemC API PCO sequence texture descriptor/sample count mismatch";
+        return false;
+      }
       if (texture.source ==
           pvrgpu::stub::DriverPcoTextureSource::kExternalPayload) {
         continue;
@@ -2285,6 +2500,72 @@ void FlushPendingSubmitAtExit() {
 }
 
 }  // namespace
+
+extern "C" int pvrgpu_systemc_submit_compute(
+    const pvrgpu_systemc_compute_dispatch *dispatch,
+    pvrgpu_systemc_compute_stats *stats, char *error, std::size_t error_size) {
+  std::lock_guard<std::mutex> lock(g_bridge_mutex);
+  CopyError(error, error_size, "");
+  // An old or truncated envelope is permitted to expose only its version.
+  if (!dispatch || dispatch->version != PVRGPU_SYSTEMC_COMPUTE_API_VERSION) {
+    CopyError(error, error_size, "unsupported SystemC compute API version");
+    return 2;
+  }
+  // Stats layout is versioned with the envelope; do not overwrite an older
+  // caller's smaller output structure on a version mismatch.
+  if (stats)
+    *stats = {};
+  try {
+    pvrgpu::stub::ModelComputeDispatch prepared;
+    std::string diagnostic;
+    if (!PrepareComputeDispatch(*dispatch, &prepared, &diagnostic)) {
+      CopyError(error, error_size, diagnostic);
+      return 2;
+    }
+    // A pending draw must finish before compute begins on the shared memory
+    // service. The driver materializes attachment resources before snapshotting.
+    const int pending = FlushPendingSubmitLocked(nullptr, &diagnostic);
+    if (pending != 0) {
+      CopyError(error, error_size, diagnostic);
+      return pending;
+    }
+    if (!g_atexit_registered) {
+      if (std::atexit(FlushPendingSubmitAtExit) != 0) {
+        CopyError(error, error_size, "cannot register compute session teardown");
+        return 2;
+      }
+      g_atexit_registered = true;
+    }
+    pvrgpu::stub::ModelComputeStats result;
+    const int status = pvrgpu::stub::RunConfiguredCompute(
+        &prepared, &result, &diagnostic);
+    if (status != 0) {
+      CopyError(error, error_size, diagnostic);
+      return status;
+    }
+    for (std::size_t index = 0; index < prepared.resources.size(); ++index) {
+      const auto &resource = prepared.resources[index];
+      if (resource.writable && !resource.bytes.empty())
+        std::memcpy(dispatch->resources[index].bytes,
+                     resource.bytes.data(), resource.bytes.size());
+    }
+    if (stats) {
+      *stats = {result.workgroups, result.invocations, result.alu_instructions,
+                result.memory_instructions, result.atomic_instructions,
+                result.load_instructions,
+                result.store_instructions, result.dram_read_bytes,
+                result.dram_write_bytes, result.direct_read_bytes,
+                result.direct_write_bytes, result.readback_bytes,
+                result.pool_allocations, result.pool_releases};
+    }
+    return 0;
+  } catch (const std::exception &failure) {
+    CopyError(error, error_size, failure.what());
+  } catch (...) {
+    CopyError(error, error_size, "unhandled SystemC compute failure");
+  }
+  return 2;
+}
 
 extern "C" int pvrgpu_systemc_can_execute_pco_binary(std::uint32_t stage,
                                                     const std::uint8_t *binary,

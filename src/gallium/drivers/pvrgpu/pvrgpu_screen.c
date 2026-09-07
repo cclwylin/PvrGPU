@@ -293,19 +293,8 @@ pvrgpu_is_supported_sample_count(unsigned sample_count)
    case 0:
    case 1:
    case 2:
-   case 3:
    case 4:
-   case 5:
-   case 6:
-   case 7:
    case 8:
-   case 9:
-   case 10:
-   case 11:
-   case 12:
-   case 13:
-   case 14:
-   case 15:
    case 16:
       return true;
    default:
@@ -621,6 +610,10 @@ pvrgpu_is_format_supported(struct pipe_screen *screen,
 
    if (!pvrgpu_is_supported_sample_count(sample_count) ||
        !pvrgpu_is_supported_sample_count(storage_sample_count))
+      goto out;
+   /* 真 TEXSTATE SMPCNT 只有 1/2/4/8；render-only PBE 仍可用 16。 */
+   if ((bind & (PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHADER_IMAGE)) &&
+       (sample_count > 8 || storage_sample_count > 8))
       goto out;
 
    if (target == PIPE_BUFFER) {

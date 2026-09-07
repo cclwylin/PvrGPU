@@ -121,6 +121,128 @@ test_depth_stencil(void)
 }
 
 static void
+test_depth_layers(enum pipe_format format, unsigned samples,
+                  enum pipe_texture_target target, unsigned layers,
+                  unsigned level)
+{
+   const unsigned block_size = util_format_get_blocksize(format);
+   const bool has_stencil =
+      util_format_pack_description(format)->pack_s_8uint != NULL;
+   struct pvrgpu_resource resource = test_resource(format, samples);
+   free(resource.data);
+   resource.base.target = target;
+   resource.base.width0 = 3u << level;
+   resource.base.height0 = 2u << level;
+   resource.base.array_size = layers;
+   resource.level_count = level + 1;
+   /* Keep a prefix, row padding, layer padding and a suffix as guards. */
+   resource.level_offsets[level] = 16;
+   resource.level_strides[level] = 3 * samples * block_size + 16;
+   resource.level_layer_strides[level] =
+      resource.level_strides[level] * 2 + 16;
+   resource.size = 32 + layers * resource.level_layer_strides[level];
+   resource.data = malloc(resource.size);
+   uint8_t *expected = malloc(resource.size);
+   CHECK(resource.data && expected);
+   if (!resource.data || !expected) {
+      free(resource.data);
+      free(expected);
+      return;
+   }
+   memset(resource.data, 0xa5, resource.size);
+   struct pipe_surface surface = test_surface(&resource);
+   surface.level = level;
+   const float initial_depth = 0.25f;
+   const uint8_t initial_stencil = 0xab;
+   for (unsigned layer = 0; layer < layers; ++layer) {
+      for (unsigned y = 0; y < 2; ++y) {
+         for (unsigned x = 0; x < 3 * samples; ++x) {
+            uint8_t *pixel = resource.data + 16 +
+               layer * resource.level_layer_strides[level] +
+               y * resource.level_strides[level] + x * block_size;
+            util_format_pack_z_float(format, pixel, &initial_depth, 1);
+            if (has_stencil)
+               util_format_pack_s_8uint(format, pixel, &initial_stencil, 1);
+         }
+      }
+   }
+   memcpy(expected, resource.data, resource.size);
+
+   /* Match ordinary FBO attachment switches: a full clear of each single
+    * layer must initialize every sample, including pixels never rasterized. */
+   const float full_depth = 0.9375f;
+   for (unsigned layer = 0; layer < layers; ++layer) {
+      surface.first_layer = surface.last_layer = layer;
+      CHECK(pvrgpu_fill_surface_rect_with_clear_depth(
+         &surface, 0, 0, 3, 2, full_depth));
+      for (unsigned y = 0; y < 2; ++y)
+         for (unsigned x = 0; x < 3 * samples; ++x)
+            util_format_pack_z_float(format,
+               expected + 16 + layer * resource.level_layer_strides[level] +
+               y * resource.level_strides[level] + x * block_size,
+               &full_depth, 1);
+      CHECK(memcmp(resource.data, expected, resource.size) == 0);
+   }
+
+   /* A scissored layer range preserves layer 0, all borders, all padding,
+    * and the other aspect of packed depth/stencil formats. */
+   surface.first_layer = 1;
+   surface.last_layer = layers - 1;
+   CHECK(pvrgpu_fill_surface_rect_with_clear_depth(&surface, 1, 1, 1, 1, 0.5));
+   if (has_stencil) {
+      CHECK(pvrgpu_fill_surface_rect_with_clear_stencil(
+         &surface, 1, 1, 1, 1, 0x31, 0x0f));
+      CHECK(pvrgpu_fill_surface_rect_with_clear_stencil(
+         &surface, 0, 0, 3, 2, 0, 0));
+   }
+   const float partial_depth = 0.5f;
+   const uint8_t partial_stencil = 0xa1;
+   for (unsigned layer = 1; layer < layers; ++layer)
+      for (unsigned sample = 0; sample < samples; ++sample) {
+         uint8_t *pixel = expected + 16 +
+            layer * resource.level_layer_strides[level] +
+            resource.level_strides[level] + (samples + sample) * block_size;
+         util_format_pack_z_float(format, pixel, &partial_depth, 1);
+         if (has_stencil)
+            util_format_pack_s_8uint(format, pixel, &partial_stencil, 1);
+      }
+   CHECK(memcmp(resource.data, expected, resource.size) == 0);
+
+   /* Malformed metadata must fail before the first store, including when
+    * the logical layer exists but the allocation cannot hold that layer. */
+   const struct pvrgpu_resource saved = resource;
+   const struct pipe_surface saved_surface = surface;
+   for (unsigned invalid = 0; invalid < 8; ++invalid) {
+      resource = saved;
+      surface = saved_surface;
+      switch (invalid) {
+      case 0: surface.first_layer = 2; surface.last_layer = 1; break;
+      case 1: surface.last_layer = layers; break;
+      case 2: resource.level_strides[level] = 3 * samples * block_size - 1; break;
+      case 3: resource.level_layer_strides[level] =
+                 resource.level_strides[level] * 2 - 1; break;
+      case 4: resource.size = resource.level_offsets[level] +
+                 layers * resource.level_layer_strides[level] - 1; break;
+      case 5: resource.level_offsets[level] = SIZE_MAX; break;
+      case 6: surface.level = level + 1; break;
+      case 7: resource.level_layer_strides[level] = SIZE_MAX; break;
+      }
+      CHECK(!pvrgpu_fill_surface_rect_with_clear_depth(
+         &surface, 0, 0, 3, 2, 0.0));
+      CHECK(!pvrgpu_fill_surface_rect_with_clear_stencil(
+         &surface, 0, 0, 3, 2, 0, 0xff));
+      CHECK(memcmp(saved.data, expected, saved.size) == 0);
+   }
+   resource = saved;
+   surface = saved_surface;
+   CHECK(!pvrgpu_fill_surface_rect_with_clear_depth(
+      &surface, 2, 1, 2, 1, 0.0));
+   CHECK(memcmp(resource.data, expected, resource.size) == 0);
+   free(resource.data);
+   free(expected);
+}
+
+static void
 test_uniform_includes_last_sample(void)
 {
    struct pvrgpu_resource resource = test_resource(PIPE_FORMAT_R8G8B8A8_UNORM, 4);
@@ -207,6 +329,17 @@ int main(void)
    test_integer_color(PIPE_FORMAT_R32G32B32A32_SINT);
    test_float_color();
    test_depth_stencil();
+   const enum pipe_format depth_formats[] = {
+      PIPE_FORMAT_Z32_FLOAT, PIPE_FORMAT_Z24_UNORM_S8_UINT,
+      PIPE_FORMAT_Z32_FLOAT_S8X24_UINT
+   };
+   for (unsigned format = 0; format < 3; ++format) {
+      for (unsigned samples = 1; samples <= 16; samples *= 2)
+         test_depth_layers(depth_formats[format], samples,
+                           PIPE_TEXTURE_2D_ARRAY, 3, 0);
+      test_depth_layers(depth_formats[format], 1, PIPE_TEXTURE_2D_ARRAY, 3, 1);
+      test_depth_layers(depth_formats[format], 1, PIPE_TEXTURE_CUBE, 6, 1);
+   }
    test_uniform_includes_last_sample();
    test_pending_clear_lifecycle();
    if (!failures)

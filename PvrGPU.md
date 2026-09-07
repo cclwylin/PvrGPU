@@ -115,7 +115,7 @@ Golden matrix 固定 GLBench commit `e99bc684272bffd68b06c998e272531c9c84330f`�
 
 Qt/QProcess offscreen smoke 亦為 5/5 PASS：llvmpipe、PvrGPU Fill.Solid cache off、PvrGPU Fill.Solid cache on、Depth Never off、Depth Not Equal off；96×96 Fill.Solid off/on PNG 為 0 differing pixels、max channel delta 0，且 UI counter table可顯示 PixelDM/SLC/DRAM新增欄位。
 
-目前 33 個 module class 中，16 個位於 active Fill.Solid pipeline、3 個是已實作但尚未有 active workload traffic 的 cache controller、12 個仍是空 structural placeholder，另有 2 個 harness；不能把 idle cache controller或空 placeholder算成 benchmark feature coverage。
+該次 Fill.Solid baseline 的 33 個 module class 中，16 個位於 active Fill.Solid pipeline、3 個是已實作但尚未有 active workload traffic 的 cache controller、12 個仍是空 structural placeholder，另有 2 個 harness；不能把 idle cache controller或空 placeholder算成 benchmark feature coverage。後續擴充的即時 class 數以 `tests/check_systemc_module_layout.py` 為準。
 
 ```bash
 cmake --build build --target llvmpipe pvrgpu
@@ -383,9 +383,17 @@ flowchart TB
     CRB -.-> FW[FirmwareScheduler\nEMPTY / abstract only]
     FW -.-> VDM[Vdm + VertexFetch\nACTIVE subset]
     FW -.-> PDM[PixelDataMaster\nACTIVE framebuffer store]
-    FW -.-> CDM[ComputeDataMaster\nEMPTY]
+    FW -.-> CDM[ComputeDataMaster\nCOMPUTE subset]
+    CDM -.-> CS[ComputeShader\nindependent native task execution]
     FW -.-> DODM[DomainDataMaster\nEMPTY]
     FW -.-> DM2D[TwoDDataMaster\nEMPTY]
+
+    subgraph RESERVED[獨立邏輯階段預留 / 尚無執行連線]
+        GS[GeometryShader\nEMPTY]
+        TCS[TessellationControlShader\nEMPTY]
+        TESS[Tessellator / fixed function\nEMPTY]
+        TES[TessellationEvaluationShader\nEMPTY]
+    end
 
     VDM -.-> PDS[PdsEngine\nEMPTY]
     PDS -.-> USC[PCO decoder + USC slot/cluster\nACTIVE subset]
@@ -430,7 +438,12 @@ flowchart TB
 | Firmware Processor | `FirmwareScheduler` | `EMPTY-PLACEHOLDER` | 未來只做抽象 job/DM scheduler；不宣稱執行 RISC-V firmware ISA |
 | Vertex Data Master | `Vdm`、`VertexFetch` | `ACTIVE-FUNCTIONAL` subset | 只接受內建 GLBench fixture，不是完整 command/data-master implementation |
 | Pixel Data Master | `PixelDataMaster` | `ACTIVE-FUNCTIONAL` subset | 驗證 PBE RGBA store、指定 framebuffer GPU address，經 `MemoryTxn` FIFO 送往 SLC |
-| Compute Data Master | `ComputeDataMaster` | `EMPTY-PLACEHOLDER` | 現行 graphics slice 沒有 compute dispatch |
+| Compute Data Master | `ComputeDataMaster` | `COMPUTE-SLICE` | 獨立 dispatch/workgroup process 與 LD/ST/整數 atomic32 memory-service process，後者經真實共享 `GpuMemorySystem` 存取；DMA RMW 是單一不可交錯的請求。CAS 執行真實 PCO MUTEX/SR51/逐 instance LD/ST，mutex owner 為 dispatch + task PoolHandle，錯誤時清理 |
+| Compute Shader | `ComputeShader` + non-module `compute_iss` | `COMPUTE-SLICE` | 自有 `.h/.cpp`、`SC_THREAD`、task/lane/mask 狀態；不得呼叫 VS/FS executor 代替 CS。FIFO 只傳小型 POD/PoolHandle，task 逐 native instruction group 鎖步執行 |
+| Geometry Shader 邏輯階段 | `GeometryShader` | `EMPTY-PLACEHOLDER` | 獨立 `.h/.cpp` 與頂層實例；尚無 GS 執行或輸出 primitive 行為，不是 VS/FS/CS 的別名 |
+| Tessellation Control Shader 邏輯階段 | `TessellationControlShader` | `EMPTY-PLACEHOLDER` | 獨立 TCS module；尚無 shader 執行、patch/task 或同步協定 |
+| 固定功能 Tessellation 邏輯階段 | `Tessellator` | `EMPTY-PLACEHOLDER` | 與 TCS/TES 分離，屬固定功能而非 shader；尚無細分與 primitive 產生行為 |
+| Tessellation Evaluation Shader 邏輯階段 | `TessellationEvaluationShader` | `EMPTY-PLACEHOLDER` | 獨立 TES module；尚無 shader 執行，既有 `DomainDataMaster` 不可代替 TCS/TES |
 | Domain Data Master | `DomainDataMaster` | `EMPTY-PLACEHOLDER` | 名稱來自 DXTP attachment；domain protocol/semantics 尚未公開驗證 |
 | 2D Data Master | `TwoDDataMaster` | `EMPTY-PLACEHOLDER` | 尚無 blit/2D render-packet ingest |
 | Programmable Data Sequencer | `PdsEngine` | `EMPTY-PLACEHOLDER` | 沒有 PDS decode/execute/task generation；USC `PcoDecoder` 不能代替 PDS |
@@ -463,7 +476,28 @@ flowchart TB
 
 `CacheArray` 保存實際 line bytes，不只計算 hit/miss；full-line store miss 可直接 write-allocate，dirty victim/flush callback 會深拷貝成 `DramLineWrite` MemoryPool records。Forced flush 只清 dirty、不 invalidate resident line，因此跨 frame 可觀察 cold miss→warm hit。尚未實作 MSHR、prefetch/coherence、bank conflict、fabric contention 或 read-response；相關 counter 仍不可宣稱完成。
 
-目前 layout checker 為 **PASS（33 個 SystemC module class）**：16 個 active GPU functional class、3 個 implemented-idle cache class、2 個 harness class、12 個空 placeholder class。VS/FS 各自實例化 `PcoDecoder`、`UscSlot`、`UscCluster`，top-level 共有 21 個 executable-chain instance、3 個 implemented-idle cache instance 與 12 個 placeholder instance。所有具體 module 仍遵守一個 class 對一組唯一同 stem `.h/.cpp`。
+上述 Fill.Solid/cache baseline 的 layout checker 為 **PASS（33 個 SystemC module class）**：16 個 active GPU functional class、3 個 implemented-idle cache class、2 個 harness class、12 個空 placeholder class。當時 VS/FS 各自實例化 `PcoDecoder`、`UscSlot`、`UscCluster`，top-level 共有 21 個 executable-chain instance、3 個 implemented-idle cache instance 與 12 個 placeholder instance。後續 Compute 與其他階段擴充的即時總數以 `tests/check_systemc_module_layout.py` 為準；所有具體 module 仍遵守一個 class 對一組唯一同 stem `.h/.cpp`。
+
+GS / TCS / Tessellator / TES 是額外預留的四個獨立邏輯 module，不代表已證實硬體中有四組專用執行核心。每個都有自己的 `.h/.cpp`，並納入 model executable、SystemC bridge 與 `ModelSession` 的初始 elaboration；目前完全沒有 ports、process、timing 或工作接收入口，不插入既有 graphics / compute 執行鏈，也不開啟 driver capability 或 public API。未來實作時才加入真正的原生執行與 bounded POD/PoolHandle FIFO，不允許以空 process、forwarding 或 VS/FS/CS 執行器冒充支援。
+
+Compute atomic32 的功能語義參照同一 pinned Mesa 的 llvmpipe
+`lp_bld_nir_soa.c`，但不呼叫其 LLVM/JIT：有效 lane 的整數 RMW 回傳舊值，
+有號／無號 min/max 分開比較，add/sub 以 uint32 wrap。PCO 的 compare-swap
+不是 DMA atomic nibble，而是原生 MUTEX LOCK/RELEASE、SR51 `INST_NUM` 與
+逐 instance coherent LD/ST；比較失敗也依實際 usclib 指令寫回舊值。
+`atomic_instructions` 只計真正 DMA AMO，CAS 計入實際 LD/ST。Mutex owner
+經 ≤64-byte POD FIFO 傳遞 task PoolHandle，拒絕重鎖／非 owner 解鎖，
+鎖內失敗或帶鎖 END 均清理後回報錯誤，不回填 host 答案。
+
+目前 workgroup 與 task 逐一執行，因此只有單一 resident task；這不是多
+resident task 的等待／公平排程實作。鎖步執行可支援 ≤32-lane task 的
+execution barrier 與 memory-only fence；跨 task workgroup barrier、
+shared memory、images（含其 atomic）、64-bit／float atomic 仍 fail-closed。
+越出合法 binding view 的存取也會拒絕，尚未模擬 llvmpipe 的 robust
+zero-load／no-op-store 行為，不宣稱完整 GLES conformance。
+CAS 的 coherent access bit 會在 owned NIR clone 上規範化，避免依賴
+application qualifier 或 assertion 是否啟用。Preprocess 後仍為部分
+component mask 的 SSBO store 目前明確拒絕，不會當成完整 burst 誤寫。
 
 ### 5.3 目前真正的 executable FIFO / MemoryPool chain
 
