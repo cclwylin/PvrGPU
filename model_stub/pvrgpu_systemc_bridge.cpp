@@ -132,10 +132,42 @@ std::string PcoStageAbiText(const Abi &abi) {
   return text.str();
 }
 
+/*
+ * Words of one packed vertex that hold an integer rather than a float, taken
+ * from the attribute layout the command states.  A float check on an integer
+ * word is meaningless -- the `int` attribute -50 is the bit pattern of a NaN
+ * -- so those words are exempt from the finiteness check below.  A command
+ * that states no attribute layout (the pinned capture profiles) yields an
+ * empty mask and is checked exactly as before.
+ */
+std::uint64_t IntegerVertexWordMask(
+    const pvrgpu_systemc_driver_command &source) {
+  std::uint64_t mask = 0;
+  std::uint32_t word = 0;
+  const std::uint32_t attribute_count = std::min<std::uint32_t>(
+      source.vertex_attribute_count,
+      static_cast<std::uint32_t>(
+          sizeof(source.vertex_attribute_components) /
+          sizeof(source.vertex_attribute_components[0])));
+  for (std::uint32_t attribute = 0; attribute < attribute_count; ++attribute) {
+    const std::uint32_t components =
+        source.vertex_attribute_components[attribute];
+    for (std::uint32_t component = 0; component < components; ++component) {
+      if (word >= 64U)
+        return mask;
+      if (source.vertex_attribute_integer[attribute] != 0)
+        mask |= UINT64_C(1) << word;
+      ++word;
+    }
+  }
+  return mask;
+}
+
 bool RawFloatVerticesAreFinite(const std::uint8_t *data,
                                std::uint64_t vertex_count,
                                std::uint32_t stride,
-                               std::uint32_t component_count) {
+                               std::uint32_t component_count,
+                               std::uint64_t integer_word_mask = 0) {
   if (!data || component_count == 0 ||
       component_count * sizeof(float) > stride) {
     return false;
@@ -144,6 +176,10 @@ bool RawFloatVerticesAreFinite(const std::uint8_t *data,
     const std::size_t offset = static_cast<std::size_t>(vertex * stride);
     for (std::uint32_t component = 0; component < component_count;
          ++component) {
+      if (component < 64U &&
+          (integer_word_mask & (UINT64_C(1) << component)) != 0) {
+        continue;
+      }
       std::uint32_t bits = 0;
       std::memcpy(&bits, data + offset + component * sizeof(bits),
                   sizeof(bits));
@@ -588,7 +624,8 @@ bool CopyPcoTrianglePayload(
                                            ? 8U
                                            : ((lit_mesh_layout || color_layout)
                                                   ? 6U
-                                                  : 3U))) {
+                                                  : 3U),
+                                 IntegerVertexWordMask(source))) {
     *error = "invalid SystemC API PCO triangle VBO/topology payload";
     return false;
   }
@@ -922,32 +959,70 @@ bool CopyPcoSequenceDraw(
   const bool strip_or_fan =
       source.primitive_mode == 5 || source.primitive_mode == 6;
   const bool line_or_point = source.primitive_mode <= 3;
-  if (source.framebuffer_width == 0 || source.framebuffer_height == 0 ||
-      source.width == 0 || source.height == 0 ||
-      source.width > source.framebuffer_width ||
-      source.height > source.framebuffer_height ||
-      source.framebuffer_width > 4096 || source.framebuffer_height > 4096 ||
-      source.vertex_stride < 2U * sizeof(float) ||
-      source.vertex_stride > 256 || source.vertex_stride % sizeof(float) != 0 ||
-      source.vertex_count == 0 || source.first_vertex != 0 ||
-      source.instance_count != 1 ||
-      (!triangles && !strip_or_fan && !line_or_point) ||
-      // An indexed draw assembles primitives from its indices.
-      !DriverPcoArrayTopologyIsExpandable(source.primitive_mode,
-                                          source.indexed != 0
-                                              ? source.index_count
-                                              : source.vertex_count) ||
-      !DriverPcoIndexPayloadIsValid(source) ||
-      !DriverPcoRenderTargetCountIsValid(source.render_target_count) || end_vertex == 0 ||
-      end_vertex > std::numeric_limits<std::uint32_t>::max() ||
-      end_vertex > std::numeric_limits<std::uint64_t>::max() /
-                       source.vertex_stride ||
-      source.raw_vertex_data_size != end_vertex * source.vertex_stride ||
-      !source.raw_vertex_data ||
-      !RawFloatVerticesAreFinite(source.raw_vertex_data, end_vertex,
-                                 source.vertex_stride,
-                                 source.vertex_stride / sizeof(float))) {
-    *error = "SystemC API nested PCO sequence VBO/topology is invalid";
+  /*
+   * One named check per condition.  As a single bundled boolean this said only
+   * that something about the vertex buffer or the topology was wrong, and each
+   * refusal then cost a round of guessing; the field is what makes it one run.
+   */
+  const auto vbo_refusal = [&]() -> const char * {
+    if (source.framebuffer_width == 0 || source.framebuffer_height == 0)
+      return "framebuffer extent is zero";
+    if (source.framebuffer_width > 4096 || source.framebuffer_height > 4096)
+      return "framebuffer extent is beyond the model's limit";
+    if (source.width == 0 || source.height == 0)
+      return "viewport extent is zero";
+    if (source.width > source.framebuffer_width ||
+        source.height > source.framebuffer_height) {
+      return "viewport does not fit the framebuffer";
+    }
+    if (source.vertex_stride < 2U * sizeof(float))
+      return "vertex stride is below one 2D position";
+    if (source.vertex_stride > 256)
+      return "vertex stride is beyond the model's limit";
+    if (source.vertex_stride % sizeof(std::uint32_t) != 0)
+      return "vertex stride is not a whole number of register words";
+    if (source.vertex_count == 0)
+      return "vertex count is zero";
+    if (source.first_vertex != 0)
+      return "first vertex is not zero";
+    if (source.instance_count != 1)
+      return "instance count is not one";
+    if (!triangles && !strip_or_fan && !line_or_point)
+      return "primitive mode is outside the supported topologies";
+    // An indexed draw assembles primitives from its indices.
+    if (!DriverPcoArrayTopologyIsExpandable(source.primitive_mode,
+                                            source.indexed != 0
+                                                ? source.index_count
+                                                : source.vertex_count)) {
+      return "topology cannot be expanded from the element count";
+    }
+    if (!DriverPcoIndexPayloadIsValid(source))
+      return "index payload is invalid";
+    if (!DriverPcoRenderTargetCountIsValid(source.render_target_count))
+      return "render target count is invalid";
+    if (end_vertex == 0 ||
+        end_vertex > std::numeric_limits<std::uint32_t>::max() ||
+        end_vertex > std::numeric_limits<std::uint64_t>::max() /
+                         source.vertex_stride) {
+      return "vertex range overflows";
+    }
+    if (!source.raw_vertex_data)
+      return "vertex data is absent";
+    if (source.raw_vertex_data_size != end_vertex * source.vertex_stride)
+      return "vertex data size does not match the range and stride";
+    if (!RawFloatVerticesAreFinite(source.raw_vertex_data, end_vertex,
+                                   source.vertex_stride,
+                                   source.vertex_stride /
+                                       sizeof(std::uint32_t),
+                                   IntegerVertexWordMask(source))) {
+      return "a float vertex component is not finite";
+    }
+    return nullptr;
+  }();
+  if (vbo_refusal) {
+    *error = std::string("SystemC API nested PCO sequence VBO/topology is "
+                         "invalid: ") +
+             vbo_refusal;
     return false;
   }
   if (!source.vertex_pco || !source.fragment_pco ||

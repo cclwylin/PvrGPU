@@ -9454,13 +9454,36 @@ pvrgpu_array_assembled_vertex_count(unsigned mode, unsigned count)
 }
 
 /*
- * Read one vertex attribute as the float vector the shader declares.
+ * The value GL substitutes for a component the source format does not carry.
+ * The default vertex attribute is (0, 0, 0, 1), and the one in the fourth
+ * component has to be spelled in the input's own type: 1.0f for a float
+ * input, the integer 1 for an `int` or `uint` one.
+ */
+static uint32_t
+pvrgpu_default_attribute_word(enum pipe_format format, unsigned component)
+{
+   if (component != 3)
+      return 0;
+   if (util_format_is_pure_integer(format))
+      return 1;
+   const float one = 1.0f;
+   uint32_t bits = 0;
+   memcpy(&bits, &one, sizeof(bits));
+   return bits;
+}
+
+/*
+ * Read one vertex attribute into the register words the shader reads.
  *
- * GLES feeds float inputs from any of the normalized, scaled and float source
- * formats, so the unpack is delegated to the format description rather than
- * enumerated here: restricting the driver to a handful of float formats is
- * what made vertex_arrays.input_types unlowerable.  Pure integer sources need
- * an integer input path and stay fail-closed.
+ * A VTXIN register is 32 bits of whatever the attribute's type is, so this
+ * writes raw words rather than floats: a float input lands as its binary32
+ * bits, an `int` or `uint` input as the integer itself.  GLES feeds a float
+ * input from any of the normalized, scaled and float source formats, so the
+ * unpack is delegated to the format description rather than enumerated here --
+ * restricting the driver to a handful of float formats is what made
+ * vertex_arrays.input_types unlowerable -- and `unpack_rgba` already yields
+ * R32G32B32A32_UINT/SINT for a pure integer source, which is exactly the word
+ * the shader wants.
  *
  * Components the shader does not declare are not read.  They cannot influence
  * the result, and the packed buffer carries only what the shader consumes.
@@ -9470,7 +9493,7 @@ pvrgpu_read_vertex_attribute(const struct pvrgpu_context *ctx,
                              const struct pipe_vertex_element *element,
                              unsigned vertex,
                              unsigned wanted,
-                             float *out,
+                             uint32_t *out,
                              const char **reason)
 {
    const char *ignored = NULL;
@@ -9494,11 +9517,6 @@ pvrgpu_read_vertex_attribute(const struct pvrgpu_context *ctx,
       *reason = "source_layout";
       return false;
    }
-   if (util_format_is_pure_integer(format)) {
-      *reason = "pure_integer_source";
-      return false;
-   }
-
    const struct util_format_unpack_description *unpack =
       util_format_unpack_description(format);
    if (!unpack || !unpack->unpack_rgba) {
@@ -9541,7 +9559,7 @@ pvrgpu_read_vertex_attribute(const struct pvrgpu_context *ctx,
        */
       if (offset + blocksize > (uint64_t)resource->size) {
          for (unsigned component = 0; component < wanted; ++component)
-            out[component] = component == 3 ? 1.0f : 0.0f;
+            out[component] = pvrgpu_default_attribute_word(format, component);
          return true;
       }
    }
@@ -9550,15 +9568,26 @@ pvrgpu_read_vertex_attribute(const struct pvrgpu_context *ctx,
       return false;
    }
 
-   float rgba[4];
+   /*
+    * One 4 x 32-bit destination for both cases: `unpack_rgba` writes floats
+    * for a float-ish source and 32-bit integers for a pure integer one, and
+    * either way the words are what the register holds.
+    */
+   uint32_t rgba[4];
    unpack->unpack_rgba(rgba, base + offset, 1);
+   const bool integer_source = util_format_is_pure_integer(format);
 
    for (unsigned component = 0; component < wanted; ++component) {
-      out[component] = component < components ? rgba[component]
-                                              : (component == 3 ? 1.0f : 0.0f);
-      if (!isfinite(out[component])) {
-         *reason = "non_finite";
-         return false;
+      out[component] = component < components
+                          ? rgba[component]
+                          : pvrgpu_default_attribute_word(format, component);
+      if (!integer_source) {
+         float value = 0.0f;
+         memcpy(&value, &out[component], sizeof(value));
+         if (!isfinite(value)) {
+            *reason = "non_finite";
+            return false;
+         }
       }
    }
    return true;
@@ -9886,7 +9915,8 @@ pvrgpu_capture_generic_sequence_texture(
 
 struct pvrgpu_array_primitive_draw {
    struct pvrgpu_systemc_driver_command command;
-   float *vertex_data;
+   /* Packed register words, not floats: an integer input keeps its bits. */
+   uint32_t *vertex_data;
    uint8_t *index_data;
    /*
     * Scissored depth/stencil clears this draw inherits.  The record owns them
@@ -10555,12 +10585,32 @@ pvrgpu_record_color_primitive_pco_draw(
    }
    const unsigned instance_count =
       info->instance_count != 0 ? info->instance_count : 1u;
-   unsigned packed_floats = 0;
+   /* One 32-bit register word per component the shader declares. */
+   unsigned packed_words = 0;
    unsigned attribute_offsets[PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES] = {0};
    for (unsigned attribute = 0; attribute < packed_attribute_count;
         ++attribute) {
-      attribute_offsets[attribute] = packed_floats;
-      packed_floats += attribute_components[attribute];
+      attribute_offsets[attribute] = packed_words;
+      packed_words += attribute_components[attribute];
+   }
+   /*
+    * The layout the draw packs to, in one line: which generic location each
+    * binding feeds, how wide the shader declares it, and the source format it
+    * is read from.  A mismatch between those three is what every attribute
+    * refusal turns out to be, and reading it off the record beats inferring
+    * it from the one binding that happened to fail.
+    */
+   for (unsigned attribute = 0; attribute < attribute_count; ++attribute) {
+      pvrgpu_counter_eventf("draw_array_primitive_attribute",
+                            "slot=%u location=%u components=%u offset=%u "
+                            "format=%s divisor=%u",
+                            attribute,
+                            attribute_locations[attribute],
+                            attribute_components[attribute],
+                            attribute_offsets[attribute],
+                            util_format_name(attribute_formats[attribute]),
+                            ctx->vertex_elements->elements[attribute]
+                               .instance_divisor);
    }
    if (instance_count == 0 || vertex_count > UINT_MAX / instance_count) {
       pvrgpu_counter_eventf("draw_array_primitive_record_error",
@@ -10620,19 +10670,19 @@ pvrgpu_record_color_primitive_pco_draw(
       index_data_size = (size_t)expanded_count * sizeof(uint32_t);
       command_index_size = 4;
    }
-   if (packed_floats == 0 ||
-       packed_vertex_count > UINT_MAX / (packed_floats * sizeof(float))) {
+   if (packed_words == 0 ||
+       packed_vertex_count > UINT_MAX / (packed_words * sizeof(uint32_t))) {
       pvrgpu_counter_eventf("draw_array_primitive_record_error",
-                            "stage=pack reason=vertex_extent floats=%u "
+                            "stage=pack reason=vertex_extent words=%u "
                             "vertices=%u",
-                            packed_floats,
+                            packed_words,
                             vertex_count);
       free(index_data);
       return false;
    }
 
-   float *interleaved =
-      malloc((size_t)packed_vertex_count * packed_floats * sizeof(float));
+   uint32_t *interleaved = malloc((size_t)packed_vertex_count *
+                                  packed_words * sizeof(uint32_t));
    if (!interleaved) {
       free(index_data);
       return false;
@@ -10642,7 +10692,7 @@ pvrgpu_record_color_primitive_pco_draw(
          const unsigned v_idx =
             info->index_size != 0 ? v + vertex_bias : draw->start + v;
          const size_t packed_base =
-            ((size_t)instance * vertex_count + v) * packed_floats;
+            ((size_t)instance * vertex_count + v) * packed_words;
          for (unsigned attribute = 0; attribute < attribute_count;
               ++attribute) {
             const struct pipe_vertex_element *element =
@@ -10686,11 +10736,8 @@ pvrgpu_record_color_primitive_pco_draw(
              * register, so the integer is stored verbatim rather than
              * converted to float and back.
              */
-            const uint32_t id = instance;
-            memcpy(&interleaved[packed_base +
-                                attribute_offsets[attribute_count]],
-                   &id,
-                   sizeof(id));
+            interleaved[packed_base + attribute_offsets[attribute_count]] =
+               instance;
          }
       }
    }
@@ -10833,16 +10880,20 @@ pvrgpu_record_color_primitive_pco_draw(
           sizeof(command.clear_color_bits));
    command.raw_vertex_data = (const uint8_t *)interleaved;
    command.raw_vertex_data_size =
-      (size_t)packed_vertex_count * packed_floats * sizeof(float);
-   command.vertex_stride = packed_floats * sizeof(float);
+      (size_t)packed_vertex_count * packed_words * sizeof(uint32_t);
+   command.vertex_stride = packed_words * sizeof(uint32_t);
    command.vertex_attribute_count = packed_attribute_count;
    for (unsigned attribute = 0; attribute < packed_attribute_count;
         ++attribute) {
       command.vertex_attribute_components[attribute] =
          attribute_components[attribute];
-      /* Only the reserved gl_InstanceID slot carries integers so far. */
+      /*
+       * An `int` or `uint` input keeps its bits, so the words the stream
+       * carries for it are integers -- as are gl_InstanceID's, whose reserved
+       * slot states R32_UINT for exactly this reason.
+       */
       command.vertex_attribute_integer[attribute] =
-         (reads_instance_id && attribute == attribute_count) ? 1u : 0u;
+         util_format_is_pure_integer(attribute_formats[attribute]) ? 1u : 0u;
    }
    /*
     * The instances were expanded above, so the capsule describes one flat
