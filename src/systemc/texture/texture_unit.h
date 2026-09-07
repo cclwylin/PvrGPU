@@ -22,6 +22,14 @@
 
 namespace pvrgpu::stub {
 
+// Memory request IDs a sample's texel fetches are numbered from: the sample's
+// own request ID times this, plus the tap index within the sample.  Sixteen is
+// the most taps one sample reads -- a 3D trilinear filter takes two mip
+// levels, two depth slices each and a 2x2 footprint per slice -- and the IDs
+// only have to be distinct within a batch, so the stride is fixed rather than
+// packed to the taps a particular sample happens to issue.
+inline constexpr std::uint64_t kTextureSampleTapRequestStride = 16;
+
 // Validates a declared tightly packed RGBA8 texture view of an actual earlier
 // sequence color attachment in unified GPU memory. A one-level view aliases
 // the producer bytes without rewriting them; a multi-level view derives and

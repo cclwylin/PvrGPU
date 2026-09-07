@@ -1739,13 +1739,13 @@ void TextureUnit::SampleRunForStage(
               ? TextureFilterDatapath::kFloat32
               : SelectTextureFilterDatapath(image.format, decoded_sampler);
       if (request.request_id >
-          (std::numeric_limits<std::uint64_t>::max() - 15U) / 16U) {
+          (std::numeric_limits<std::uint64_t>::max() -
+           (kTextureSampleTapRequestStride - 1U)) /
+              kTextureSampleTapRequestStride) {
         throw std::overflow_error("TextureUnit sample request ID overflow");
       }
-      // Up to sixteen taps per sample -- a 3D trilinear filter reads two mip
-      // levels, two depth slices each and a 2x2 footprint per slice; memory
-      // request IDs need only be distinct within the batch.
-      const std::uint64_t tap_request_base = request.request_id * 16U;
+      const std::uint64_t tap_request_base =
+          request.request_id * kTextureSampleTapRequestStride;
       const TextureMipLevel &level0 = resource.mip[lod.level0];
       const TextureMipLevel &level1 = resource.mip[lod.level1];
       // A linearly filtered 3D image blends the two nearest depth slices, so

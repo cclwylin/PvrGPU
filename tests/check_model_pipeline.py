@@ -3803,8 +3803,11 @@ def verify_fill_tex_trilinear_linear_01(
     assert Path(artifact_field).resolve() == artifact.resolve()
     png_width, png_height, pixels = decode_rgba8_png(artifact)
     assert (png_width, png_height) == (64, 64)
+    # Trilinear output moves with the mip blend weight, which is the
+    # fractional LOD.  This is the exact-log2 LOD's image; the piecewise-linear
+    # one produced 156199bd..., differing by at most 6/255 in R and G.
     assert hashlib.sha256(pixels).hexdigest() == (
-        "156199bdeca6c5d5f20d69e09a9b145c6f65fbc215e7f04d87f4ba0eb7cf8a15"
+        "9fd73deaeb0fbf005f0178ed611ecd274d5467e85c6f5cfc6ca1cc9d189e8150"
     )
     assert [path.name for path in output_dir.rglob("*.png")] == [artifact.name]
     assert not [
@@ -3838,9 +3841,13 @@ def verify_fill_tex_trilinear_linear_04_or_05(
             "fragment_frontend_cycles": 25,
             "texture_cycles": 4992,
             "tcu_hits": 19648,
+            # As in _01, the trilinear output moves with the fractional LOD.
+            # The piecewise-linear LOD produced dd2cdfb3..., differing by at
+            # most 8/255 in R and G.  _05 below is unchanged: its LOD lands
+            # where both log2 forms agree.
             "decoded_rgba_sha256": (
-                "dd2cdfb3e08f66cadf3a509f5156fc2db"
-                "0f77d2721a95ee8f48a221f0ddf3795"
+                "c03348a18c9f1ebe2a22f73a539c0aa6"
+                "76061dd8a44ec53cb939e1892fe96de8"
             ),
         },
         "fill_tex_trilinear_linear_05": {

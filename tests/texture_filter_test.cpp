@@ -152,13 +152,15 @@ void CheckLevelSelection() {
   const RogueTextureSamplerDescriptor trilinear =
       Sampler(TextureFilter::kLinear, TextureFilter::kLinear,
               TextureFilter::kLinear, 9 * 64);
-  // rho^2 = 2^3 * 1.5 = 12: fast log2 = 3.5, lambda 1.75.
+  // rho^2 = 12: log2 12 = 3.5849625, lambda 1.7924813.  The fraction is
+  // 202.875/256, so TFRAC also shows that the quantization truncates -- a
+  // rounding datapath would report 203.
   const TextureLevelSelection blend = SelectTextureLevels(
       SelectTextureLod(12.0F, trilinear, 10), trilinear, 10);
   Check(blend.mip_mode == TextureMipMode::kLinear && blend.level0 == 1 &&
-            blend.level1 == 2 && blend.mip_weight_u8 == 192 &&
-            Near(blend.mip_weight, 0.75F) && TextureLevelTaps(blend) == 8,
-        "mip linear: floor(lambda) and the next level, fraction 0.75 = 192/256");
+            blend.level1 == 2 && blend.mip_weight_u8 == 202 &&
+            Near(blend.mip_weight, 0.7924813F) && TextureLevelTaps(blend) == 8,
+        "mip linear: floor(lambda) and the next level, fraction 202/256");
   const TextureLevelSelection blend_mag = SelectTextureLevels(
       SelectTextureLod(0.5F, trilinear, 10), trilinear, 10);
   Check(blend_mag.level0 == 0 && blend_mag.level1 == 1 &&
