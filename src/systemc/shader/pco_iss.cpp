@@ -3996,10 +3996,22 @@ void ValidateVertexTemporaryProgram(
     case PcoOpcode::kFloatLess:
     case PcoOpcode::kBooleanCompare:
     case PcoOpcode::kBitwiseAnd:
+    /* The rest of the logical phase, which the vertex dispatch and executor
+     * now cover alongside the conjunction. */
+    case PcoOpcode::kBitwiseOr:
+    case PcoOpcode::kBitwiseXor:
+    case PcoOpcode::kBitwiseXnor:
       if (instruction.target != PcoWriteTarget::kTemporary ||
           instruction.source_count != 2)
         DecodeError(instruction.binary_offset,
                     "invalid generic vertex binary ALU operation");
+      break;
+    /* The masked insert takes bits, offset, insert and base. */
+    case PcoOpcode::kBitfieldInsert:
+      if (instruction.target != PcoWriteTarget::kTemporary ||
+          instruction.source_count != 4)
+        DecodeError(instruction.binary_offset,
+                    "invalid generic vertex bitfield insert");
       break;
     case PcoOpcode::kFloatMad:
     case PcoOpcode::kFloatMadNegateSource2:
@@ -6291,6 +6303,25 @@ PcoVertexExecution ExecuteVertexPco(
                                                          : factor0) *
                     read(instruction.source1) +
                 read(instruction.source2);
+        break;
+      }
+      /* The masked bitfield insert, whose inserted value is shifted into
+       * place only when phase 0 asks for it -- fcopysign uses the same
+       * group with a full-width mask at offset zero and no shift. */
+      case PcoOpcode::kBitfieldInsert: {
+        const std::uint32_t bits = read(instruction.source) & 0x1fU;
+        const std::uint32_t offset = read(instruction.source1) & 0x1fU;
+        const std::uint32_t insert = read(instruction.source2);
+        const std::uint32_t base = read(instruction.source3);
+        const std::uint32_t mask =
+            bits == 0U ? 0U
+                       : (((bits >= 32U ? UINT32_C(0xffffffff)
+                                        : ((UINT32_C(1) << bits) - 1U))
+                           << offset));
+        const std::uint32_t placed =
+            instruction.bitfield_insert_shifts != 0 ? (insert << offset)
+                                                    : insert;
+        value = (base & ~mask) | (placed & mask);
         break;
       }
       default:

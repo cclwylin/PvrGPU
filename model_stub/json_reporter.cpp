@@ -130,7 +130,14 @@ struct VertexPcoEvidence {
   // BCMP with any other TST operation/operand type: one bin for the whole of
   // the ISA's comparison matrix, matching the single kBooleanCompare opcode.
   std::uint64_t bcmp = 0;
+  /* The logical phase, which the vertex stage decodes and executes in full:
+   * fcopysign alone masks with an AND and reinstates the sign with an OR,
+   * and it ends PCO's lowered fround_even. */
   std::uint64_t bitwise_and = 0;
+  std::uint64_t bitwise_or = 0;
+  std::uint64_t bitwise_xor = 0;
+  std::uint64_t bitwise_xnor = 0;
+  std::uint64_t bfi = 0;
   std::uint64_t csel = 0;
   std::uint64_t fmad = 0;
   std::uint64_t fmin = 0;
@@ -344,6 +351,18 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kBitfieldExtractSigned:
       ++evidence.ubfe;
       break;
+    case PcoOpcode::kBitwiseOr:
+      ++evidence.bitwise_or;
+      break;
+    case PcoOpcode::kBitwiseXor:
+      ++evidence.bitwise_xor;
+      break;
+    case PcoOpcode::kBitwiseXnor:
+      ++evidence.bitwise_xnor;
+      break;
+    case PcoOpcode::kBitfieldInsert:
+      ++evidence.bfi;
+      break;
     case PcoOpcode::kUvsWrite:
       ++evidence.uvsw_write;
       break;
@@ -370,7 +389,9 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
       evidence.internal + evidence.fneg + evidence.fabs + evidence.movi + evidence.ffloor +
       evidence.fsub + evidence.fge + evidence.feq + evidence.flt +
       evidence.bcmp +
-      evidence.bitwise_and + evidence.csel + evidence.fmad + evidence.fmin + evidence.fmax +
+      evidence.bitwise_and + evidence.bitwise_or + evidence.bitwise_xor +
+      evidence.bitwise_xnor + evidence.bfi +
+      evidence.csel + evidence.fmad + evidence.fmin + evidence.fmax +
       evidence.frcp + evidence.frsq + evidence.flog2 + evidence.fexp2 +
       evidence.pck_f16 + evidence.unpck_f16 + evidence.unpck_int +
       evidence.f2i + evidence.imadd32 + evidence.ubfe + evidence.smp +
@@ -615,6 +636,10 @@ void AppendVertexPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_VERTEX_EVIDENCE(flt);
   PVRGPU_ADD_VERTEX_EVIDENCE(bcmp);
   PVRGPU_ADD_VERTEX_EVIDENCE(bitwise_and);
+  PVRGPU_ADD_VERTEX_EVIDENCE(bitwise_or);
+  PVRGPU_ADD_VERTEX_EVIDENCE(bitwise_xor);
+  PVRGPU_ADD_VERTEX_EVIDENCE(bitwise_xnor);
+  PVRGPU_ADD_VERTEX_EVIDENCE(bfi);
   PVRGPU_ADD_VERTEX_EVIDENCE(csel);
   PVRGPU_ADD_VERTEX_EVIDENCE(fmad);
   PVRGPU_ADD_VERTEX_EVIDENCE(fmin);
@@ -1609,6 +1634,14 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"bcmp\":" << vertex_pco.bcmp;
   if (vertex_pco.bitwise_and != 0)
     std::cout << ",\"bitwise_and\":" << vertex_pco.bitwise_and;
+  if (vertex_pco.bitwise_or != 0)
+    std::cout << ",\"bitwise_or\":" << vertex_pco.bitwise_or;
+  if (vertex_pco.bitwise_xor != 0)
+    std::cout << ",\"bitwise_xor\":" << vertex_pco.bitwise_xor;
+  if (vertex_pco.bitwise_xnor != 0)
+    std::cout << ",\"bitwise_xnor\":" << vertex_pco.bitwise_xnor;
+  if (vertex_pco.bfi != 0)
+    std::cout << ",\"bfi\":" << vertex_pco.bfi;
   if (vertex_pco.csel != 0)
     std::cout << ",\"csel\":" << vertex_pco.csel;
   if (vertex_pco.internal != 0)
