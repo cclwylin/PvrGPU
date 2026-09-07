@@ -2784,19 +2784,88 @@ PcoInstruction DecodeGenericBitfieldExtractUnsignedGroup(
 PcoInstruction DecodeGenericBitfieldInsertGroup(
     ShaderStage stage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
-  if (stage != ShaderStage::kFragment || !header.bitwise || header.control ||
-      header.da != 5 || header.operation_origin != 3 ||
-      header.output_load_check || !header.write0_present ||
-      header.write1_present || header.repeat_count != 1 || header.end ||
-      header.total_bytes != 12) {
-    DecodeError(header.offset, "unsupported BFI instruction-group header");
+  /* The masked insert is one group with one encoding; nothing in it is
+   * specific to a stage, and both executors compute it.  Each field is
+   * checked on its own so a refusal names the one that did not match
+   * instead of reporting the header as a whole. */
+  if (stage != ShaderStage::kFragment && stage != ShaderStage::kVertex)
+    DecodeError(header.offset, "BFI reached an unsupported shader stage");
+  if (!header.bitwise || header.control)
+    DecodeError(header.offset, "BFI group is not a bitwise phase");
+  if (header.da != 5)
+    DecodeError(header.offset,
+                "BFI destination-alias is " + std::to_string(header.da) +
+                    ", expected 5");
+  if (header.operation_origin != 3)
+    DecodeError(header.offset,
+                "BFI operation origin is " +
+                    std::to_string(header.operation_origin) + ", expected 3");
+  if (header.output_load_check)
+    DecodeError(header.offset, "BFI group carries an output-load check");
+  if (!header.write0_present || header.write1_present)
+    DecodeError(header.offset,
+                "BFI group does not write exactly one destination (w0=" +
+                    std::to_string(header.write0_present ? 1 : 0) + " w1=" +
+                    std::to_string(header.write1_present ? 1 : 0) + ")");
+  if (header.repeat_count != 1)
+    DecodeError(header.offset,
+                "BFI repeat count is " +
+                    std::to_string(header.repeat_count) + ", expected 1");
+  if (header.end)
+    DecodeError(header.offset, "BFI group ends the program");
+  /* The group's length follows its operands: a source or destination that
+   * needs a wider encoding makes the group longer, and a vertex shader's
+   * BFI is fourteen bytes where the fragment captures were twelve.  The
+   * length is therefore only bounded below here, and the fields decoded
+   * below together with ValidateAlignmentPadding -- which requires the
+   * 0xf0|n marker and 0xff filler -- account for every byte to the end. */
+  if (header.total_bytes < 12) {
+    DecodeError(header.offset,
+                "BFI group is " + std::to_string(header.total_bytes) +
+                    " bytes, too short for its operands");
   }
   const std::size_t group_end = header.offset + header.total_bytes;
   std::size_t cursor = header.offset + 3;
-  if (group_end - cursor < 8 || binary[cursor++] != 0x68U)
-    DecodeError(header.offset + 3, "expected the phase-1 masked LOGICAL.OR");
-  if (binary[cursor++] != 0x0fU)
-    DecodeError(header.offset + 4, "expected the phase-0 MSK.LSL operation");
+  if (group_end - cursor < 8)
+    DecodeError(header.offset + 3, "BFI group is too short for its phases");
+  if (binary[cursor] != 0x68U) {
+    DecodeError(header.offset + 3,
+                "expected the phase-1 masked LOGICAL.OR, found [" +
+                    std::to_string(binary[cursor]) + "]");
+  }
+  ++cursor;
+  /* PCO's I_BITWISE phase-0 byte, by field: bit 0 is bitmask_src_op, bits
+   * 3:2 are shift1_op (00 byp, 11 lsl), bit 4 is bitmask_imm, bit 6 is
+   * count_src, and count_op is bit 1 over bit 5.  Reading the fields rather
+   * than matching one byte lets the same group carry MSK.LSL, which
+   * bitfieldInsert uses, and plain MSK, which fcopysign uses. */
+  const std::uint8_t phase0 = binary[cursor];
+  const std::uint8_t phase0_shift1_op = (phase0 >> 2U) & 0x03U;
+  const std::uint8_t phase0_count_op =
+      static_cast<std::uint8_t>((((phase0 >> 1U) & 0x01U) << 1U) |
+                                ((phase0 >> 5U) & 0x01U));
+  if ((phase0 & 0x01U) == 0) {
+    DecodeError(header.offset + 4,
+                "phase-0 bitmask operation is bypass, expected MSK [" +
+                    std::to_string(phase0) + "]");
+  }
+  if (phase0_count_op != 0x02U) {
+    DecodeError(header.offset + 4,
+                "phase-0 count operation is " +
+                    std::to_string(phase0_count_op) + ", expected bypass");
+  }
+  if ((phase0 & 0x50U) != 0) {
+    DecodeError(header.offset + 4,
+                "phase-0 uses an immediate bitmask or an ft2 count source [" +
+                    std::to_string(phase0) + "]");
+  }
+  if (phase0_shift1_op != 0x00U && phase0_shift1_op != 0x03U) {
+    DecodeError(header.offset + 4,
+                "phase-0 shift1 operation is " +
+                    std::to_string(phase0_shift1_op) +
+                    ", expected bypass or LSL");
+  }
+  ++cursor;
   const ThreeLowerSources lower =
       DecodeThreeLowerSources(binary, group_end, cursor);
   if (lower.input_selector != 0)
@@ -2816,6 +2885,7 @@ PcoInstruction DecodeGenericBitfieldInsertGroup(
   instruction.source1 = lower.source1;  // offset
   instruction.source2 = lower.source2;  // insert
   instruction.source3 = base;           // base
+  instruction.bitfield_insert_shifts = phase0_shift1_op == 0x03U ? 1U : 0U;
   instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
   instruction.group_index = group_index;
   instruction.output_index = destination.index;
@@ -3438,23 +3508,35 @@ PcoInstruction DecodeVertexGroup(const std::vector<std::uint8_t> &binary,
                                          group_index);
     }
     /*
-     * LOGICAL.AND is the same group in either stage; the vertex dispatch
-     * simply stopped at the immediate form, so a vertex shader computing a
-     * Boolean conjunction -- which dEQP's random shaders do -- was reported
-     * as an unsupported immediate header.  The remaining logical operations
-     * stay closed here until the vertex execution and report cover them too.
+     * The logical phase is the same group in either stage, and its
+     * operations are now executed and reported in both, so the vertex
+     * dispatch covers the same four the fragment dispatch does rather than
+     * stopping at the conjunction.  fcopysign alone needs two of them.
      */
     if (header.operation_origin == 3) {
       const std::size_t operation_offset = header.offset + 3;
       if (operation_offset >= header.offset + header.total_bytes)
         DecodeError(operation_offset, "missing logical phase operation");
+      if (binary[operation_offset] == 0x40U) {
+        return DecodeGenericBitwiseOrGroup(ShaderStage::kVertex, binary,
+                                           header, group_index);
+      }
       if (binary[operation_offset] == 0x41U) {
         return DecodeGenericBitwiseAndGroup(ShaderStage::kVertex, binary,
                                             header, group_index);
       }
+      if (binary[operation_offset] == 0x46U) {
+        return DecodeGenericBitwiseXnorGroup(ShaderStage::kVertex, binary,
+                                             header, group_index);
+      }
+      if (binary[operation_offset] == 0x68U) {
+        return DecodeGenericBitfieldInsertGroup(ShaderStage::kVertex, binary,
+                                                header, group_index);
+      }
       DecodeError(operation_offset,
                   "logical phase operation is outside the vertex public "
-                  "subset");
+                  "subset [" +
+                      std::to_string(binary[operation_offset]) + "]");
     }
     /*
      * Bitfield extract: the vertex stage reaches it for the same reason the
@@ -6168,6 +6250,21 @@ PcoVertexExecution ExecuteVertexPco(
         value = read(instruction.source) & read(instruction.source1);
         break;
       /*
+       * The rest of the logical phase.  A vertex shader reaches these for
+       * the same reasons a fragment shader does -- and specifically through
+       * fcopysign, which masks the magnitude with an AND and reinstates the
+       * sign with an OR, and which the lowered fround_even ends on.
+       */
+      case PcoOpcode::kBitwiseOr:
+        value = read(instruction.source) | read(instruction.source1);
+        break;
+      case PcoOpcode::kBitwiseXor:
+        value = read(instruction.source) ^ read(instruction.source1);
+        break;
+      case PcoOpcode::kBitwiseXnor:
+        value = ~(read(instruction.source) ^ read(instruction.source1));
+        break;
+      /*
        * Integer multiply-add, which the vertex stage reaches for the same
        * reason the fragment stage does: a shader doing integer arithmetic.
        */
@@ -6278,6 +6375,36 @@ PcoVertexExecution ExecuteVertexPco(
         result_val = FloatLog2Bits(src0);
       } else if (instruction.opcode == PcoOpcode::kFloatExp2) {
         result_val = FloatExp2Bits(src0);
+      } else if (instruction.opcode == PcoOpcode::kBitfieldInsert) {
+        /* GL bitfieldInsert(base, insert, offset, bits), with the hardware
+         * source order bits, offset, insert, base -- the same operation the
+         * fragment stage computes.  A vertex shader reaches it through
+         * fcopysign, which the lowered fround_even ends on. */
+        const auto read_at = [&](const PcoRegisterRef &source) {
+          return ReadSource(source, effective_vertex_inputs, temporaries,
+                            temporary_written_mask, 0, ShaderStage::kVertex);
+        };
+        const std::uint32_t bits = src0 & 0x1fU;
+        const std::uint32_t offset = read_at(instruction.source1) & 0x1fU;
+        const std::uint32_t insert = read_at(instruction.source2);
+        const std::uint32_t base = read_at(instruction.source3);
+        const std::uint32_t mask =
+            bits == 0U ? 0U
+                       : (((bits >= 32U ? UINT32_C(0xffffffff)
+                                        : ((UINT32_C(1) << bits) - 1U))
+                           << offset));
+        const std::uint32_t placed =
+            instruction.bitfield_insert_shifts != 0 ? (insert << offset)
+                                                    : insert;
+        result_val = (base & ~mask) | (placed & mask);
+      } else {
+        /* The condition above admits more opcodes than this chain computes.
+         * Without this arm the unhandled ones silently wrote a zero, which
+         * is indistinguishable from a shader that really produced one. */
+        ExecuteError("vertex ALU opcode is admitted but not computed: "
+                     "opcode=" +
+                     std::to_string(
+                         static_cast<std::uint32_t>(instruction.opcode)));
       }
       temporaries[instruction.output_index] = result_val;
       temporary_written_mask |= bit;
@@ -7070,7 +7197,10 @@ PcoFragmentExecution ExecuteFragmentPco(
                        : (((bits >= 32U ? UINT32_C(0xffffffff)
                                         : ((UINT32_C(1) << bits) - 1U))
                            << offset));
-        result_val = (base & ~mask) | ((insert << offset) & mask);
+        const std::uint32_t placed =
+            instruction.bitfield_insert_shifts != 0 ? (insert << offset)
+                                                    : insert;
+        result_val = (base & ~mask) | (placed & mask);
       } else if (instruction.opcode == PcoOpcode::kBitfieldExtractUnsigned) {
         // GL bitfieldExtract (unsigned): source value, source1 offset,
         // source2 bits.

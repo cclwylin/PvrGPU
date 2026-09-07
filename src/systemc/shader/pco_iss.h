@@ -254,9 +254,9 @@ struct PcoInstruction {
   // orthogonal to the base opcode so FADD and FMUL share the same exact
   // decode/validation/execution contract.
   std::uint8_t source0_floor = 0;
-  // The only public binary-source ABS modifiers currently admitted are
-  // FADD s0.abs and FMUL s1.abs.  Keep them explicit and orthogonal so other
-  // source/opcode combinations remain fail-closed.
+  // Source ABS is one bit per operand in the I_MAIN encoding byte, and
+  // pco_ops declares both on FADD and on FMUL, so they are carried
+  // independently of each other and of the opcode.
   std::uint8_t source0_absolute = 0;
   std::uint8_t source1_absolute = 0;
   // BCMP normally materializes canonical Boolean bits (all ones or zero).
@@ -280,6 +280,12 @@ struct PcoInstruction {
    * value as a float. */
   std::uint8_t unpack_format = 0;
   std::uint8_t unpack_scale = 0;
+  /* The bitwise phase-0 shift1 operation for kBitfieldInsert.  MSK.LSL
+   * shifts the inserted value into place, which is what GL's bitfieldInsert
+   * needs; MSK alone leaves it where it is, which is how fcopysign is built
+   * -- a full-width mask at offset zero selecting magnitude from one operand
+   * and sign from the other. */
+  std::uint8_t bitfield_insert_shifts = 1;
   std::uint8_t source_count = 1;
   std::uint8_t repeat_count = 1;
   std::uint8_t end_group = 0;
