@@ -177,6 +177,13 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    caps->clear_scissored = true;
    caps->clear_masked = true;
    caps->fs_coord_pixel_center_half_integer = true;
+   /*
+    * The depth/stencil buffer's width has nothing to do with the colour
+    * attachment's.  Leaving this at the Gallium default makes the EGL config
+    * generator pair 16-bit colour only with 16-bit depth, which is why a
+    * 565 surface could not be asked for with a 24/8 depth-stencil.
+    */
+   caps->mixed_color_depth_bits = true;
    caps->max_texture_2d_size = 4096;
    caps->max_texture_3d_levels = 9;
    caps->max_texture_array_layers = 256;
