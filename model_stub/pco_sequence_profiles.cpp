@@ -237,6 +237,7 @@ bool RootPayloadIsEmpty(const DriverCommand &command) {
          command.sampled_texture_count == 0 &&
          command.vertex_sampled_texture_count == 0 &&
          command.fragment_sampled_texture_count == 0 &&
+         command.initial_color_attachment_bytes.empty() &&
          command.sampled_texture_bytes.empty() &&
          command.declared_sampled_texture_bytes_size == 0 &&
          command.declared_raw_vertex_data_size == 0 &&
@@ -1242,13 +1243,27 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
     if (!topology_expandable) {
       return Reject(error, "generic PCO sequence draw topology is invalid");
     }
-    // The first draw starts from a clear; later draws continue from the
-    // surface an earlier ordinal produced, never from a forward reference.
+    // The first draw starts from a clear or an imported full attachment;
+    // later draws continue from the surface the previous ordinal produced.
     const std::uint32_t expected_source =
         ordinal == 0 ? kDriverPcoNewAttachment
                      : static_cast<std::uint32_t>(ordinal - 1);
     if (draw.color_attachment_source_command_index != expected_source) {
       return Reject(error, "generic PCO sequence colour attachment chain is invalid");
+    }
+    if (!draw.initial_color_attachment_bytes.empty()) {
+      const std::uint64_t bytes_per_pixel =
+          draw.format == kRgba32Ui || draw.format == kRgba32I
+              ? 16U
+              : draw.format == kRg32Ui || draw.format == kRg32I ? 8U : 4U;
+      const std::uint64_t expected_bytes =
+          static_cast<std::uint64_t>(draw.framebuffer_width) *
+          draw.framebuffer_height * bytes_per_pixel;
+      if (ordinal != 0 || draw.render_target_count > 1 ||
+          draw.initial_color_attachment_bytes.size() != expected_bytes ||
+          expected_bytes > kDriverPcoSequenceAttachmentStride) {
+        return Reject(error, "generic PCO initial colour attachment is invalid");
+      }
     }
     // The depth/stencil attachment is bound for the whole render pass, so a
     // draw carries it whenever the surface has one (depth_format != 0),

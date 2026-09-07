@@ -316,6 +316,15 @@ void FragmentFrontend::Run() {
             candidate.x >= state.width || candidate.y >= state.height)
           throw std::runtime_error(
               "FragmentFrontend texture stamp candidate is invalid");
+        /*
+         * ISP-rejected candidates do not launch a fragment shader.  Helper
+         * lanes accompany a half-stamp only when that primitive has at least
+         * one visible lane; seeding the stamp set from rejected candidates
+         * alone created quads with no invocations when an early depth or
+         * stencil test rejected the complete draw.
+         */
+        if (candidate.visibility != FragmentVisibility::kVisible)
+          continue;
         const std::uint32_t half_stamp_id =
             (candidate.y / 2U) * half_stamps_x + candidate.x / 4U;
         touched_half_stamps.emplace(

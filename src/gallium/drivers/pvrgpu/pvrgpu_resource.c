@@ -983,92 +983,124 @@ pvrgpu_transfer_box_in_bounds(const struct pipe_resource *resource,
  */
 static int
 pvrgpu_resource_color_attachment_index(const struct pvrgpu_context *ctx,
-                                       const struct pipe_resource *resource)
+                                       const struct pipe_resource *resource,
+                                       unsigned level)
 {
    if (!ctx || !resource)
       return -1;
    for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target) {
-      if (ctx->framebuffer.cbufs[target].texture == resource)
+      if (ctx->framebuffer.cbufs[target].texture == resource &&
+          ctx->framebuffer.cbufs[target].level == level)
          return (int)target;
    }
    return -1;
 }
 
-/*
- * The colour surfaces the model's output can be stored into.
- *
- * For a UNORM8 surface the model publishes R,G,B,A byte order, and a surface
- * that names the same four 8-bit channels in another order holds the same
- * bytes rearranged, so it is served by reordering them on the way in.  For an
- * integer surface it publishes the stored pixel itself.  Anything else -- a
- * packed 5:6:5, a float channel -- would need a conversion nobody has
- * specified, and is left to the path that already serves it.
- */
-static bool
-pvrgpu_resource_readback_format_is_supported(enum pipe_format format)
+void
+pvrgpu_note_current_color_readback_pending(struct pvrgpu_context *ctx)
 {
-   switch (format) {
-   case PIPE_FORMAT_R8G8B8A8_UNORM:
-   case PIPE_FORMAT_R8G8B8X8_UNORM:
-   case PIPE_FORMAT_B8G8R8A8_UNORM:
-   case PIPE_FORMAT_B8G8R8X8_UNORM:
-   /*
-    * The sRGB eight-bit targets store the same byte layout as their UNORM
-    * siblings -- the model has already applied the sRGB transfer -- so the
-    * readback publishes those bytes unchanged, only swapping R/B for the BGRA
-    * order.
-    */
-   case PIPE_FORMAT_R8G8B8A8_SRGB:
-   case PIPE_FORMAT_B8G8R8A8_SRGB:
-   /*
-    * The 32-bit integer attachments: the model publishes the shader's PIXOUT
-    * lanes verbatim, one dword per channel, which is already the stored pixel,
-    * so they need no reordering at all -- only the right pixel width.  A
-    * signed result is stored identically; only its reading differs.
-    */
-   case PIPE_FORMAT_R32_UINT:
-   case PIPE_FORMAT_R32G32_UINT:
-   case PIPE_FORMAT_R32G32B32A32_UINT:
-   case PIPE_FORMAT_R32_SINT:
-   case PIPE_FORMAT_R32G32_SINT:
-   case PIPE_FORMAT_R32G32B32A32_SINT:
-      return true;
-   default:
-      return false;
+   if (!ctx)
+      return;
+   ctx->color_readback_generation = pvrgpu_systemc_submission_generation();
+   ctx->color_readback_pending_mask = 0;
+   for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target) {
+      if (ctx->framebuffer.cbufs[target].texture)
+         ctx->color_readback_pending_mask |= 1u << target;
    }
 }
 
 /*
- * The stored width of one of those pixels.
+ * Whether the model has already applied the linear-to-sRGB transfer.
  *
- * The model's framebuffer is as wide as the attachment it rendered, so this is
- * what sizes the staging buffer, what the flush must be told, and what a row
- * copies.  Deriving it in each of those places separately is how a buffer ends
- * up read at a width nobody wrote it at.
+ * Keep this in step with pvrgpu_command_format_for_framebuffer(): the two
+ * formats below retain an sRGB command format, while all other surfaces use
+ * the model's linear RGBA8 transport for now.
+ */
+static bool
+pvrgpu_resource_readback_transport_is_srgb(enum pipe_format format)
+{
+   return format == PIPE_FORMAT_R8G8B8A8_SRGB ||
+          format == PIPE_FORMAT_B8G8R8A8_SRGB;
+}
+
+/*
+ * Raw dwords per integer pixel in the model transport.  Narrow native
+ * channels are still one dword each; GLES has no three-channel integer render
+ * target, and any such view uses the four-dword transport too.
+ */
+static unsigned
+pvrgpu_resource_readback_raw_channels(enum pipe_format format)
+{
+   if (!util_format_is_pure_integer(format))
+      return 0;
+
+   const unsigned components = util_format_get_nr_components(format);
+   if (components <= 1)
+      return 1;
+   if (components == 2)
+      return 2;
+   return 4;
+}
+
+static enum pipe_format
+pvrgpu_resource_readback_pack_format(enum pipe_format format)
+{
+   /*
+    * The model has already encoded these two sRGB transports.  Their linear
+    * equivalents have the same byte layout and pack without encoding again.
+    */
+   return pvrgpu_resource_readback_transport_is_srgb(format)
+             ? util_format_linear(format)
+             : format;
+}
+
+/* The colour surfaces Mesa's generated packers can store model output into. */
+static bool
+pvrgpu_resource_readback_format_is_supported(enum pipe_format format)
+{
+   if (!pvrgpu_is_supported_color_format(format))
+      return false;
+
+   const struct util_format_description *description =
+      util_format_description(format);
+   if (!description || description->block.width != 1 ||
+       description->block.height != 1 || description->block.depth != 1)
+      return false;
+
+   const enum pipe_format pack_format =
+      pvrgpu_resource_readback_pack_format(format);
+   const struct util_format_pack_description *pack =
+      util_format_pack_description(pack_format);
+   if (!pack)
+      return false;
+
+   if (util_format_is_pure_uint(format))
+      return pack->pack_rgba_uint != NULL;
+   if (util_format_is_pure_sint(format))
+      return pack->pack_rgba_sint != NULL;
+   return pack->pack_rgba_8unorm != NULL;
+}
+
+/*
+ * The transport width of one of those pixels.
+ *
+ * This is what sizes the staging buffer and what the flush must be told.  It
+ * deliberately differs from the native block size for narrow integer
+ * surfaces, because the model publishes one dword per logical channel.
  */
 static unsigned
 pvrgpu_resource_readback_bytes_per_pixel(enum pipe_format format)
 {
-   switch (format) {
-   case PIPE_FORMAT_R32G32_UINT:
-   case PIPE_FORMAT_R32G32_SINT:
-      return 8u;
-   case PIPE_FORMAT_R32G32B32A32_UINT:
-   case PIPE_FORMAT_R32G32B32A32_SINT:
-      return 16u;
-   default:
-      return 4u;
-   }
+   const unsigned raw_channels =
+      pvrgpu_resource_readback_raw_channels(format);
+   return raw_channels ? raw_channels * sizeof(uint32_t) : 4u;
 }
 
 /*
  * Store one row of the model's output in the surface's byte order.
  *
- * For a UNORM8 surface the layout matches pvrgpu_store_clear_color_pixel()
- * channel for channel, including an X8 format's ignored alpha lane reading
- * back as one.  A pixel a draw covered and a pixel only the clear touched
- * therefore agree, which they would not if the draw's alpha were carried
- * through verbatim.
+ * Mesa's generated packers narrow integer dwords and reconstruct normalized,
+ * float and packed native layouts from the model's logical transport.
  */
 static void
 pvrgpu_resource_readback_store_row(enum pipe_format format,
@@ -1076,37 +1108,57 @@ pvrgpu_resource_readback_store_row(enum pipe_format format,
                                    const uint8_t *source_row,
                                    unsigned width)
 {
-   if (format == PIPE_FORMAT_R32_UINT ||
-       format == PIPE_FORMAT_R32G32_UINT ||
-       format == PIPE_FORMAT_R32G32B32A32_UINT ||
-       format == PIPE_FORMAT_R32_SINT ||
-       format == PIPE_FORMAT_R32G32_SINT ||
-       format == PIPE_FORMAT_R32G32B32A32_SINT) {
-      /* An integer pixel is already stored as the model published it. */
-      memcpy(destination, source_row,
-             (size_t)width * pvrgpu_resource_readback_bytes_per_pixel(format));
+   const enum pipe_format pack_format =
+      pvrgpu_resource_readback_pack_format(format);
+   const struct util_format_pack_description *pack =
+      util_format_pack_description(pack_format);
+   const unsigned raw_channels =
+      pvrgpu_resource_readback_raw_channels(format);
+
+   if (raw_channels == 0) {
+      /*
+       * The model publishes logical RGBA8.  Mesa's generated packer performs
+       * the native channel selection, swizzle and conversion for normalized,
+       * float and packed targets.  This transport is currently quantized to
+       * eight bits even when the native surface is wider.
+       */
+      pack->pack_rgba_8unorm(destination,
+                             util_format_get_stride(pack_format, width),
+                             source_row,
+                             width * 4u,
+                             width,
+                             1);
       return;
    }
-   const bool swap_red_blue = format == PIPE_FORMAT_B8G8R8A8_UNORM ||
-                              format == PIPE_FORMAT_B8G8R8X8_UNORM ||
-                              format == PIPE_FORMAT_B8G8R8A8_SRGB;
-   const bool opaque = format == PIPE_FORMAT_R8G8B8X8_UNORM ||
-                       format == PIPE_FORMAT_B8G8R8X8_UNORM;
 
-   if (!swap_red_blue && !opaque) {
-      memcpy(destination, source_row, (size_t)width * 4u);
-      return;
-   }
-
+   const unsigned source_bytes_per_pixel =
+      raw_channels * sizeof(uint32_t);
+   const unsigned destination_bytes_per_pixel =
+      util_format_get_blocksize(format);
    for (unsigned x = 0; x < width; ++x) {
-      const uint8_t *source = source_row + (size_t)x * 4u;
-      uint8_t *pixel = destination + (size_t)x * 4u;
-      const uint8_t r = source[0];
-      const uint8_t b = source[2];
-      pixel[0] = swap_red_blue ? b : r;
-      pixel[1] = source[1];
-      pixel[2] = swap_red_blue ? r : b;
-      pixel[3] = opaque ? 255u : source[3];
+      const uint8_t *source =
+         source_row + (size_t)x * source_bytes_per_pixel;
+      uint8_t *pixel =
+         destination + (size_t)x * destination_bytes_per_pixel;
+      if (util_format_is_pure_uint(format)) {
+         uint32_t rgba[4] = { 0, 0, 0, 1 };
+         memcpy(rgba, source, source_bytes_per_pixel);
+         pack->pack_rgba_uint(pixel,
+                              destination_bytes_per_pixel,
+                              rgba,
+                              sizeof(rgba),
+                              1,
+                              1);
+      } else {
+         int32_t rgba[4] = { 0, 0, 0, 1 };
+         memcpy(rgba, source, source_bytes_per_pixel);
+         pack->pack_rgba_sint(pixel,
+                              destination_bytes_per_pixel,
+                              rgba,
+                              sizeof(rgba),
+                              1,
+                              1);
+      }
    }
 }
 
@@ -1121,42 +1173,72 @@ pvrgpu_resource_readback_store_row(enum pipe_format format,
  * submitted, the model runs them, and its DRAM readback lands here.
  *
  * Everything here is fail-closed.  A surface the model did not render, a
- * format its RGBA8 output cannot be reordered into, or a flush that produced
- * nothing all leave `pvrgpu->data` exactly as it was.
+ * format Mesa cannot pack, or a flush that produced nothing all leave
+ * `pvrgpu->data` exactly as it was.
  */
-static void
-pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
-                                           struct pipe_resource *resource,
-                                           unsigned level,
-                                           unsigned usage)
+static bool
+pvrgpu_resource_read_back_color_surface(struct pipe_context *pipe,
+                                        const struct pipe_surface *surface,
+                                        unsigned attachment)
 {
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   struct pipe_resource *resource = surface ? surface->texture : NULL;
    struct pvrgpu_resource *pvrgpu = pvrgpu_resource(resource);
-   if (!(usage & PIPE_MAP_READ) || level != 0 || !ctx || !resource ||
-       !pvrgpu || !pvrgpu->data || resource->target == PIPE_BUFFER)
-      return;
-   const int attachment =
-      pvrgpu_resource_color_attachment_index(ctx, resource);
-   if (attachment < 0) {
-      /*
-       * Say which surface was asked for and what the framebuffer held, so a
-       * readback that silently returned the caller's own contents can be told
-       * from one that was never a colour attachment at all.
-       */
+   if (!ctx || !surface || !resource || !pvrgpu || !pvrgpu->data ||
+       resource->target == PIPE_BUFFER ||
+       !pvrgpu_resource_level_valid(pvrgpu, surface->level))
+      return false;
+
+   /* A cached bridge image belongs to a submission, not merely an extent.
+    * Consume ownership even on a failed read, so an error cannot later expose
+    * an older cached image as this attachment's result. */
+   const unsigned target_bit = 1u << attachment;
+   if (!(ctx->color_readback_pending_mask & target_bit))
+      return false;
+   ctx->color_readback_pending_mask &= ~target_bit;
+   if (ctx->color_readback_generation !=
+       pvrgpu_systemc_submission_generation())
+      return false;
+
+   const struct util_format_description *view_desc =
+      util_format_description(surface->format);
+   const struct util_format_description *resource_desc =
+      util_format_description(resource->format);
+   if (!view_desc || !resource_desc ||
+       view_desc->block.bits != resource_desc->block.bits ||
+       view_desc->block.width != resource_desc->block.width ||
+       view_desc->block.height != resource_desc->block.height ||
+       view_desc->block.depth != resource_desc->block.depth) {
       pvrgpu_counter_eventf("framebuffer_readback_declined",
-                            "reason=not_a_current_color_attachment res=%p "
-                            "nr_cbufs=%u cbuf0=%p cbuf1=%p",
-                            (void *)resource,
-                            ctx ? ctx->framebuffer.nr_cbufs : 0u,
-                            (ctx && ctx->framebuffer.nr_cbufs > 0)
-                               ? (void *)ctx->framebuffer.cbufs[0].texture
-                               : NULL,
-                            (ctx && ctx->framebuffer.nr_cbufs > 1)
-                               ? (void *)ctx->framebuffer.cbufs[1].texture
-                               : NULL);
-      return;
+                            "reason=view_storage_layout res=%p target=%u "
+                            "view_format=%s resource_format=%s",
+                            (void *)resource, attachment,
+                            util_format_name(surface->format),
+                            util_format_name(resource->format));
+      return false;
    }
-   if (!pvrgpu_resource_readback_format_is_supported(resource->format)) {
+
+   /*
+    * One model attachment is a 2D image.  A single selected array or 3D layer
+    * maps to that image exactly; a layered framebuffer would require one
+    * model result per layer and is therefore left untouched.
+    */
+   const unsigned level_layers =
+      pvrgpu_resource_level_layer_count(resource, surface->level);
+   if (surface->first_layer != surface->last_layer ||
+       surface->first_layer >= level_layers) {
+      pvrgpu_counter_eventf("framebuffer_readback_declined",
+                            "reason=layered_surface res=%p target=%u "
+                            "level=%u layers=%u-%u level_layers=%u",
+                            (void *)resource,
+                            attachment,
+                            surface->level,
+                            surface->first_layer,
+                            surface->last_layer,
+                            level_layers);
+      return false;
+   }
+   if (!pvrgpu_resource_readback_format_is_supported(surface->format)) {
       /*
        * Say so.  Returning quietly here left a case reading its own zeroed
        * backing store with nothing in the log to say the model's output had
@@ -1164,23 +1246,12 @@ pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
        * result came back as zero.
        */
       pvrgpu_counter_eventf("framebuffer_readback_declined",
-                            "reason=format res=%p format=%s",
+                            "reason=format res=%p target=%u format=%s",
                             (void *)resource,
-                            util_format_name(resource->format));
-      return;
+                            attachment,
+                            util_format_name(surface->format));
+      return false;
    }
-   /*
-    * Flush any pending draw sequence to the model before deciding whether its
-    * framebuffer describes the surface.  A sequence starts from its own clear
-    * and rasterizes every draw, so once it is emitted the model owns the whole
-    * frame -- including the region a scissored clear touched -- and clears the
-    * "driver wrote what the model cannot reproduce" flag.  Emitting only after
-    * that flag was tested (as this once did) declined the readback of every
-    * frame whose first clear was scissored, even though the sequence that
-    * followed reproduced it exactly: dEQP's fragment_ops.depth_stencil grid
-    * clears its cell rectangle before drawing into it.
-    */
-   pvrgpu_context_end_frame_at_readback(ctx);
 
    /*
     * The model's framebuffer only describes the surface while everything that
@@ -1194,25 +1265,41 @@ pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
    if (pvrgpu->driver_writes_model_cannot_reproduce) {
       pvrgpu_counter_eventf("framebuffer_readback_declined",
                             "reason=driver_writes_model_cannot_reproduce "
-                            "res=%p width=%u height=%u",
+                            "res=%p target=%u width=%u height=%u",
                             (void *)resource,
-                            pvrgpu_resource_level_width(resource, level),
-                            pvrgpu_resource_level_height(resource, level));
-      return;
+                            attachment,
+                            ctx->framebuffer.width,
+                            ctx->framebuffer.height);
+      return false;
    }
 
-   const unsigned width = pvrgpu_resource_level_width(resource, level);
-   const unsigned height = pvrgpu_resource_level_height(resource, level);
-   if (width == 0 || height == 0)
-      return;
+   const unsigned width = ctx->framebuffer.width;
+   const unsigned height = ctx->framebuffer.height;
+   if (width == 0 || height == 0 ||
+       width > pvrgpu_resource_level_width(resource, surface->level) ||
+       height > pvrgpu_resource_level_height(resource, surface->level)) {
+      pvrgpu_counter_eventf("framebuffer_readback_declined",
+                            "reason=extent res=%p target=%u fb=%ux%u "
+                            "level=%u level_size=%ux%u",
+                            (void *)resource,
+                            attachment,
+                            width,
+                            height,
+                            surface->level,
+                            pvrgpu_resource_level_width(resource,
+                                                        surface->level),
+                            pvrgpu_resource_level_height(resource,
+                                                         surface->level));
+      return false;
+   }
 
    const unsigned bytes_per_pixel =
-      pvrgpu_resource_readback_bytes_per_pixel(resource->format);
+      pvrgpu_resource_readback_bytes_per_pixel(surface->format);
    const size_t pixels_size =
       (size_t)width * (size_t)height * (size_t)bytes_per_pixel;
    uint8_t *pixels = MALLOC(pixels_size);
    if (!pixels)
-      return;
+      return false;
 
    bool written = false;
    char error[512] = { 0 };
@@ -1223,22 +1310,28 @@ pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
                                            error, sizeof(error));
    if (!flushed || !written) {
       if (!flushed) {
+         /* The bridge may still retain an older successful framebuffer after
+          * this execution failed.  No remaining target can read that cache. */
+         ctx->color_readback_pending_mask = 0;
          debug_printf("pvrgpu: %s\n",
                       error[0] ? error : "readback flush failed");
       }
       FREE(pixels);
-      return;
+      return false;
    }
 
    /*
     * The model's framebuffer is tightly packed; the resource's level may be
     * padded, so store a row at a time rather than the whole block.
     */
-   uint8_t *destination = pvrgpu->data + pvrgpu->level_offsets[level];
-   const unsigned stride = pvrgpu->level_strides[level];
+   uint8_t *destination =
+      pvrgpu->data + pvrgpu->level_offsets[surface->level] +
+      (uintptr_t)surface->first_layer *
+         pvrgpu->level_layer_strides[surface->level];
+   const unsigned stride = pvrgpu->level_strides[surface->level];
    for (unsigned row = 0; row < height; ++row) {
       pvrgpu_resource_readback_store_row(
-         resource->format,
+         surface->format,
          destination + (size_t)row * stride,
          pixels + (size_t)row * (size_t)width * (size_t)bytes_per_pixel,
          width);
@@ -1246,11 +1339,93 @@ pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
    FREE(pixels);
 
    pvrgpu_counter_eventf("framebuffer_readback",
-                         "res=%p width=%u height=%u format=%s",
+                         "res=%p target=%u width=%u height=%u format=%s "
+                         "level=%u layer=%u",
                          (void *)resource,
+                         attachment,
                          width,
                          height,
-                         util_format_name(resource->format));
+                         util_format_name(surface->format),
+                         surface->level,
+                         surface->first_layer);
+   return true;
+}
+
+/*
+ * Submit once, then read every target from the bridge's cached framebuffer.
+ * Calling the ordinary transfer-map path for each target would recursively
+ * close the same frame and reset its command gates more than once.
+ */
+void
+pvrgpu_flush_current_color_attachments(struct pipe_context *pipe)
+{
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   if (!ctx || pvrgpu_context_has_incomplete_replay(ctx))
+      return;
+
+   const unsigned recorded = ctx->array_primitive_draw_count;
+   if (recorded != 0) {
+      /* A failed new sequence cannot claim a previous submission's cache.
+       * An already submitted RDC sequence keeps its existing ownership. */
+      if (!ctx->array_primitive_sequence_owns_command)
+         ctx->color_readback_pending_mask = 0;
+   }
+   if (recorded != 0 || ctx->color_readback_pending_mask != 0)
+      pvrgpu_context_end_frame_at_readback(ctx);
+   if (ctx->color_readback_pending_mask == 0)
+      return;
+
+   unsigned written = 0;
+   for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target) {
+      const struct pipe_surface *surface = &ctx->framebuffer.cbufs[target];
+      if (surface->texture &&
+          pvrgpu_resource_read_back_color_surface(pipe, surface, target))
+         ++written;
+   }
+   pvrgpu_counter_eventf("framebuffer_boundary_flush",
+                         "draws=%u targets=%u written=%u",
+                         recorded,
+                         ctx->framebuffer.nr_cbufs,
+                         written);
+}
+
+static void
+pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
+                                           struct pipe_resource *resource,
+                                           unsigned level,
+                                           unsigned usage)
+{
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   if (!(usage & PIPE_MAP_READ) || !ctx || !resource)
+      return;
+
+   const int attachment =
+      pvrgpu_resource_color_attachment_index(ctx, resource, level);
+   if (attachment < 0) {
+      /*
+       * Say which surface was asked for and what the framebuffer held, so a
+       * readback that silently returned the caller's own contents can be told
+       * from one that was never a colour attachment at all.
+       */
+      pvrgpu_counter_eventf("framebuffer_readback_declined",
+                            "reason=not_a_current_color_attachment res=%p "
+                            "level=%u nr_cbufs=%u cbuf0=%p cbuf1=%p",
+                            (void *)resource,
+                            level,
+                            ctx->framebuffer.nr_cbufs,
+                            ctx->framebuffer.nr_cbufs > 0
+                               ? (void *)ctx->framebuffer.cbufs[0].texture
+                               : NULL,
+                            ctx->framebuffer.nr_cbufs > 1
+                               ? (void *)ctx->framebuffer.cbufs[1].texture
+                               : NULL);
+      return;
+   }
+
+   /* Multiple attachments can be different layers of this same resource.
+    * Materialize every target before returning the requested box's backing;
+    * selecting only the first resource/level match loses the other layers. */
+   pvrgpu_flush_current_color_attachments(pipe);
 }
 
 static void *
@@ -1941,6 +2116,7 @@ pvrgpu_resource_copy_region(struct pipe_context *pipe,
       return;
    }
 
+   pvrgpu_flush_current_color_attachments(pipe);
    pvrgpu_invalidate_full_depth_clear_for_resource(pvrgpu_context(pipe),
                                                     dst);
    pvrgpu_copy_texture_region_unchecked(dst,
@@ -1951,6 +2127,7 @@ pvrgpu_resource_copy_region(struct pipe_context *pipe,
                                         src,
                                         src_level,
                                         src_box);
+   pvrgpu_resource(dst)->driver_writes_model_cannot_reproduce = true;
    uint8_t src_first[4] = {0, 0, 0, 0};
    uint8_t src_center[4] = {0, 0, 0, 0};
    uint8_t dst_first[4] = {0, 0, 0, 0};
@@ -2088,7 +2265,7 @@ pvrgpu_can_blit_as_2d_copy(const struct pipe_blit_info *info)
       return false;
    if (info->dst_sample || info->sample0_only || info->scissor_enable ||
        info->swizzle_enable || info->render_condition_enable ||
-       info->alpha_blend)
+       info->alpha_blend || info->num_window_rectangles)
       return false;
    return pvrgpu_can_copy_texture_region(info->dst.resource,
                                          info->dst.level,
@@ -2098,6 +2275,204 @@ pvrgpu_can_blit_as_2d_copy(const struct pipe_blit_info *info)
                                          info->src.resource,
                                          info->src.level,
                                          &info->src.box);
+}
+
+static bool
+pvrgpu_blit_source_box_in_bounds(const struct pipe_resource *resource,
+                                 unsigned level,
+                                 const struct pipe_box *box)
+{
+   if (!resource || !box || resource->target == PIPE_BUFFER ||
+       box->width == 0 || box->height == 0 || box->depth <= 0 ||
+       box->z < 0)
+      return false;
+
+   const struct pvrgpu_resource *pvrgpu =
+      pvrgpu_resource((struct pipe_resource *)resource);
+   if (!pvrgpu_resource_level_valid(pvrgpu, level))
+      return false;
+
+   const int64_t x0 = box->x;
+   const int64_t y0 = box->y;
+   const int64_t x1 = x0 + (int64_t)box->width;
+   const int64_t y1 = y0 + (int64_t)box->height;
+   const int64_t min_x = x0 < x1 ? x0 : x1;
+   const int64_t min_y = y0 < y1 ? y0 : y1;
+   const int64_t max_x = x0 > x1 ? x0 : x1;
+   const int64_t max_y = y0 > y1 ? y0 : y1;
+
+   return pvrgpu_can_create_texture_target(resource) &&
+          min_x >= 0 && min_y >= 0 &&
+          (uint64_t)max_x <= pvrgpu_resource_level_width(resource, level) &&
+          (uint64_t)max_y <= pvrgpu_resource_level_height(resource, level) &&
+          (uint64_t)box->z + (uint64_t)box->depth <=
+             pvrgpu_resource_level_layer_count(resource, level);
+}
+
+enum pvrgpu_blit_value_type {
+   PVRGPU_BLIT_VALUE_FLOAT,
+   PVRGPU_BLIT_VALUE_UINT,
+   PVRGPU_BLIT_VALUE_SINT,
+};
+
+static bool
+pvrgpu_blit_format_is_color(enum pipe_format format)
+{
+   if (format <= PIPE_FORMAT_NONE || format >= PIPE_FORMAT_COUNT)
+      return false;
+
+   const struct util_format_description *desc =
+      util_format_description(format);
+   if (!desc || desc->block.width != 1 || desc->block.height != 1 ||
+       desc->block.depth != 1 || desc->block.bits == 0 ||
+       desc->block.bits % 8 != 0)
+      return false;
+
+   return desc->colorspace == UTIL_FORMAT_COLORSPACE_RGB ||
+          desc->colorspace == UTIL_FORMAT_COLORSPACE_SRGB;
+}
+
+static bool
+pvrgpu_blit_view_matches_resource(const struct pipe_resource *resource,
+                                  enum pipe_format view_format)
+{
+   if (!resource || !pvrgpu_blit_format_is_color(view_format) ||
+       resource->format <= PIPE_FORMAT_NONE ||
+       resource->format >= PIPE_FORMAT_COUNT)
+      return false;
+
+   const struct util_format_description *view_desc =
+      util_format_description(view_format);
+   const struct util_format_description *resource_desc =
+      util_format_description(resource->format);
+
+   return resource_desc &&
+          view_desc->block.width == resource_desc->block.width &&
+          view_desc->block.height == resource_desc->block.height &&
+          view_desc->block.depth == resource_desc->block.depth &&
+          view_desc->block.bits == resource_desc->block.bits;
+}
+
+static bool
+pvrgpu_blit_get_value_type(enum pipe_format src_format,
+                           enum pipe_format dst_format,
+                           enum pvrgpu_blit_value_type *value_type)
+{
+   if (!value_type || !pvrgpu_blit_format_is_color(src_format) ||
+       !pvrgpu_blit_format_is_color(dst_format))
+      return false;
+
+   const bool src_uint = util_format_is_pure_uint(src_format);
+   const bool dst_uint = util_format_is_pure_uint(dst_format);
+   const bool src_sint = util_format_is_pure_sint(src_format);
+   const bool dst_sint = util_format_is_pure_sint(dst_format);
+   const bool src_integer = util_format_is_pure_integer(src_format);
+   const bool dst_integer = util_format_is_pure_integer(dst_format);
+
+   if (src_uint && dst_uint) {
+      *value_type = PVRGPU_BLIT_VALUE_UINT;
+      return true;
+   }
+   if (src_sint && dst_sint) {
+      *value_type = PVRGPU_BLIT_VALUE_SINT;
+      return true;
+   }
+   if (src_integer || dst_integer)
+      return false;
+
+   *value_type = PVRGPU_BLIT_VALUE_FLOAT;
+   return true;
+}
+
+static bool
+pvrgpu_blit_format_access_is_supported(
+   enum pipe_format src_format,
+   enum pipe_format dst_format,
+   enum pvrgpu_blit_value_type value_type)
+{
+   const struct util_format_unpack_description *unpack =
+      util_format_unpack_description(src_format);
+   const struct util_format_pack_description *pack =
+      util_format_pack_description(dst_format);
+   if (!unpack || (!unpack->unpack_rgba && !unpack->unpack_rgba_rect) ||
+       !pack)
+      return false;
+
+   switch (value_type) {
+   case PVRGPU_BLIT_VALUE_UINT:
+      return pack->pack_rgba_uint != NULL;
+   case PVRGPU_BLIT_VALUE_SINT:
+      return pack->pack_rgba_sint != NULL;
+   case PVRGPU_BLIT_VALUE_FLOAT:
+      return pack->pack_rgba_float != NULL;
+   default:
+      return false;
+   }
+}
+
+static bool
+pvrgpu_blit_swizzle_is_valid(const struct pipe_blit_info *info)
+{
+   if (!info->swizzle_enable)
+      return true;
+
+   for (unsigned channel = 0; channel < 4; ++channel) {
+      if (info->swizzle[channel] > PIPE_SWIZZLE_1)
+         return false;
+   }
+   return true;
+}
+
+struct pvrgpu_blit_source_window {
+   unsigned x;
+   unsigned y;
+   unsigned width;
+   unsigned height;
+};
+
+static bool
+pvrgpu_blit_get_source_window(const struct pipe_blit_info *info,
+                              struct pvrgpu_blit_source_window *window)
+{
+   if (!info || !window ||
+       !pvrgpu_blit_source_box_in_bounds(info->src.resource,
+                                         info->src.level,
+                                         &info->src.box))
+      return false;
+
+   const int64_t x0 = info->src.box.x;
+   const int64_t y0 = info->src.box.y;
+   const int64_t x1 = x0 + (int64_t)info->src.box.width;
+   const int64_t y1 = y0 + (int64_t)info->src.box.height;
+   uint64_t min_x = (uint64_t)(x0 < x1 ? x0 : x1);
+   uint64_t min_y = (uint64_t)(y0 < y1 ? y0 : y1);
+   uint64_t max_x = (uint64_t)(x0 > x1 ? x0 : x1);
+   uint64_t max_y = (uint64_t)(y0 > y1 ? y0 : y1);
+
+   if (info->filter == PIPE_TEX_FILTER_LINEAR) {
+      const uint64_t level_width = pvrgpu_resource_level_width(
+         info->src.resource, info->src.level);
+      const uint64_t level_height = pvrgpu_resource_level_height(
+         info->src.resource, info->src.level);
+      if (min_x > 0)
+         --min_x;
+      if (min_y > 0)
+         --min_y;
+      if (max_x < level_width)
+         ++max_x;
+      if (max_y < level_height)
+         ++max_y;
+   }
+
+   if (max_x <= min_x || max_y <= min_y ||
+       max_x - min_x > UINT_MAX || max_y - min_y > UINT_MAX)
+      return false;
+
+   window->x = (unsigned)min_x;
+   window->y = (unsigned)min_y;
+   window->width = (unsigned)(max_x - min_x);
+   window->height = (unsigned)(max_y - min_y);
+   return true;
 }
 
 static bool
@@ -2115,83 +2490,152 @@ pvrgpu_can_blit_as_texture_region(const struct pipe_blit_info *info)
    if (info->dst.box.width <= 0 || info->dst.box.height <= 0 ||
        info->dst.box.depth <= 0)
       return false;
-   if (info->src.box.width <= 0 || info->src.box.height <= 0 ||
-       info->src.box.depth <= 0)
-      return false;
-   if (info->dst.box.depth != info->src.box.depth)
-      return false;
-   if (info->dst.box.x < 0 || info->dst.box.y < 0 ||
-       info->dst.box.z < 0 ||
-       info->src.box.x < 0 || info->src.box.y < 0 ||
-       info->src.box.z < 0)
+   if (info->src.box.width == 0 || info->src.box.height == 0 ||
+       info->src.box.depth <= 0 ||
+       info->dst.box.depth != info->src.box.depth)
       return false;
    if (info->filter != PIPE_TEX_FILTER_NEAREST &&
        info->filter != PIPE_TEX_FILTER_LINEAR)
       return false;
    if (info->dst_sample || info->sample0_only || info->scissor_enable ||
-       info->swizzle_enable || info->render_condition_enable ||
-       info->alpha_blend)
+       info->render_condition_enable || info->alpha_blend ||
+       info->num_window_rectangles ||
+       !pvrgpu_blit_swizzle_is_valid(info))
       return false;
-   if (!pvrgpu_transfer_box_in_bounds(info->src.resource,
-                                      info->src.level,
-                                      &info->src.box))
+   if (info->dst.resource->nr_samples > 1 ||
+       info->src.resource->nr_samples > 1 ||
+       info->dst.resource->nr_storage_samples > 1 ||
+       info->src.resource->nr_storage_samples > 1 ||
+       pvrgpu_resource_storage_sample_count(info->dst.resource) != 1 ||
+       pvrgpu_resource_storage_sample_count(info->src.resource) != 1)
       return false;
    if (!pvrgpu_transfer_box_in_bounds(info->dst.resource,
                                       info->dst.level,
-                                      &info->dst.box))
+                                      &info->dst.box) ||
+       !pvrgpu_blit_source_box_in_bounds(info->src.resource,
+                                         info->src.level,
+                                         &info->src.box))
       return false;
-   if (!pvrgpu_resource(info->dst.resource)->data ||
-       !pvrgpu_resource(info->src.resource)->data)
+   if (!pvrgpu_blit_view_matches_resource(info->src.resource,
+                                          info->src.format) ||
+       !pvrgpu_blit_view_matches_resource(info->dst.resource,
+                                          info->dst.format))
       return false;
-   if (util_format_get_blocksize(info->dst.format) == 0 ||
-       util_format_get_blocksize(info->src.format) == 0)
+
+   enum pvrgpu_blit_value_type value_type;
+   if (!pvrgpu_blit_get_value_type(info->src.format,
+                                   info->dst.format,
+                                   &value_type) ||
+       (value_type != PVRGPU_BLIT_VALUE_FLOAT &&
+        info->filter != PIPE_TEX_FILTER_NEAREST) ||
+       !pvrgpu_blit_format_access_is_supported(info->src.format,
+                                                info->dst.format,
+                                                value_type))
       return false;
+
+   struct pvrgpu_resource *pvrgpu_dst =
+      pvrgpu_resource(info->dst.resource);
+   struct pvrgpu_resource *pvrgpu_src =
+      pvrgpu_resource(info->src.resource);
+   if (!pvrgpu_dst->data || !pvrgpu_src->data ||
+       pvrgpu_dst->level_strides[info->dst.level] == 0 ||
+       pvrgpu_src->level_strides[info->src.level] == 0 ||
+       pvrgpu_dst->level_layer_strides[info->dst.level] == 0 ||
+       pvrgpu_src->level_layer_strides[info->src.level] == 0)
+      return false;
+
+   struct pvrgpu_blit_source_window window;
+   if (!pvrgpu_blit_get_source_window(info, &window) ||
+       window.width > UINT_MAX / sizeof(union pipe_color_union) ||
+       (unsigned)info->dst.box.width >
+          UINT_MAX / sizeof(union pipe_color_union))
+      return false;
+
+   if (window.height > SIZE_MAX / window.width)
+      return false;
+   const size_t window_pixels = (size_t)window.width * window.height;
+   if ((size_t)info->src.box.depth > SIZE_MAX / window_pixels ||
+       window_pixels * (size_t)info->src.box.depth >
+          SIZE_MAX / sizeof(union pipe_color_union))
+      return false;
+
    return true;
 }
 
-static uint8_t
-pvrgpu_average_ubyte4(uint8_t a, uint8_t b, uint8_t c, uint8_t d)
+struct pvrgpu_blit_axis_sample {
+   unsigned first;
+   unsigned second;
+   float weight;
+};
+
+static int64_t
+pvrgpu_floor_div_s64(int64_t numerator, int64_t denominator)
 {
-   return (uint8_t)(((unsigned)a + (unsigned)b +
-                    (unsigned)c + (unsigned)d + 2u) / 4u);
+   const int64_t quotient = numerator / denominator;
+   const int64_t remainder = numerator % denominator;
+   return quotient - (remainder < 0 ? 1 : 0);
 }
 
-static void
-pvrgpu_downsample_2x_rgba8_row(const uint8_t *row0,
-                               const uint8_t *row1,
-                               uint8_t *dst,
-                               unsigned dst_width)
+static unsigned
+pvrgpu_clamp_blit_texel(int64_t coordinate, unsigned extent)
 {
-   for (unsigned x = 0; x < dst_width; ++x) {
-      const unsigned src_x = x * 2u;
-      const uint8_t *p00 = row0 + (uintptr_t)src_x * 4u;
-      const uint8_t *p01 = row0 + (uintptr_t)(src_x + 1u) * 4u;
-      const uint8_t *p10 = row1 + (uintptr_t)src_x * 4u;
-      const uint8_t *p11 = row1 + (uintptr_t)(src_x + 1u) * 4u;
-      uint8_t *out = dst + (uintptr_t)x * 4u;
-      for (unsigned channel = 0; channel < 4; ++channel) {
-         out[channel] = pvrgpu_average_ubyte4(p00[channel],
-                                              p01[channel],
-                                              p10[channel],
-                                              p11[channel]);
-      }
-   }
+   if (coordinate < 0)
+      return 0;
+   if ((uint64_t)coordinate >= extent)
+      return extent - 1;
+   return (unsigned)coordinate;
 }
 
-static void
-pvrgpu_scale_nearest_rgba8_row(const uint8_t *src,
-                               uint8_t *dst,
-                               unsigned src_width,
-                               unsigned dst_width)
+static struct pvrgpu_blit_axis_sample
+pvrgpu_get_blit_axis_sample(int src_origin,
+                            int src_extent,
+                            unsigned dst_index,
+                            unsigned dst_extent,
+                            unsigned resource_extent,
+                            bool linear)
 {
-   for (unsigned x = 0; x < dst_width; ++x) {
-      const unsigned src_x =
-         (unsigned)(((uint64_t)x * (uint64_t)src_width) /
-                    (uint64_t)dst_width);
-      memcpy(dst + (uintptr_t)x * 4u,
-             src + (uintptr_t)src_x * 4u,
-             4u);
+   const int64_t denominator = (int64_t)dst_extent * 2;
+   int64_t numerator =
+      (int64_t)src_extent * ((int64_t)dst_index * 2 + 1);
+   if (linear)
+      numerator -= dst_extent;
+
+   const int64_t offset =
+      pvrgpu_floor_div_s64(numerator, denominator);
+   const int64_t first = (int64_t)src_origin + offset;
+   struct pvrgpu_blit_axis_sample sample = {
+      .first = pvrgpu_clamp_blit_texel(first, resource_extent),
+      .second = pvrgpu_clamp_blit_texel(first + (linear ? 1 : 0),
+                                        resource_extent),
+      .weight = 0.0f,
+   };
+
+   if (linear) {
+      const int64_t remainder = numerator - offset * denominator;
+      sample.weight = (float)((double)remainder / (double)denominator);
    }
+   return sample;
+}
+
+static union pipe_color_union
+pvrgpu_blit_lerp(const union pipe_color_union *top_left,
+                 const union pipe_color_union *top_right,
+                 const union pipe_color_union *bottom_left,
+                 const union pipe_color_union *bottom_right,
+                 float x_weight,
+                 float y_weight)
+{
+   union pipe_color_union result;
+   for (unsigned channel = 0; channel < 4; ++channel) {
+      const float top = top_left->f[channel] +
+                        (top_right->f[channel] - top_left->f[channel]) *
+                           x_weight;
+      const float bottom = bottom_left->f[channel] +
+                           (bottom_right->f[channel] -
+                            bottom_left->f[channel]) * x_weight;
+      result.f[channel] = top + (bottom - top) * y_weight;
+   }
+   return result;
 }
 
 static bool
@@ -2201,100 +2645,134 @@ pvrgpu_blit_texture_region_unchecked(const struct pipe_blit_info *info)
       pvrgpu_resource(info->dst.resource);
    struct pvrgpu_resource *pvrgpu_src =
       pvrgpu_resource(info->src.resource);
-   const unsigned src_width = (unsigned)info->src.box.width;
-   const unsigned src_height = (unsigned)info->src.box.height;
    const unsigned dst_width = (unsigned)info->dst.box.width;
    const unsigned dst_height = (unsigned)info->dst.box.height;
-   const unsigned src_row_stride = src_width * 4u;
-   const unsigned dst_row_stride = dst_width * 4u;
-   uint8_t *src_row0 = MALLOC(src_row_stride);
-   uint8_t *src_row1 = MALLOC(src_row_stride);
-   uint8_t *dst_row = MALLOC(dst_row_stride);
-   if (!src_row0 || !src_row1 || !dst_row) {
-      FREE(src_row0);
-      FREE(src_row1);
-      FREE(dst_row);
+   const unsigned depth = (unsigned)info->dst.box.depth;
+   const bool linear = info->filter == PIPE_TEX_FILTER_LINEAR;
+   const unsigned src_level_width =
+      pvrgpu_resource_level_width(info->src.resource, info->src.level);
+   const unsigned src_level_height =
+      pvrgpu_resource_level_height(info->src.resource, info->src.level);
+   enum pvrgpu_blit_value_type value_type;
+   struct pvrgpu_blit_source_window window;
+   if (!pvrgpu_blit_get_value_type(info->src.format,
+                                   info->dst.format,
+                                   &value_type) ||
+       !pvrgpu_blit_get_source_window(info, &window))
+      return false;
+
+   const size_t window_pixels = (size_t)window.width * window.height;
+   const size_t source_pixel_count = window_pixels * depth;
+   const unsigned source_row_stride =
+      window.width * sizeof(union pipe_color_union);
+   const unsigned destination_row_stride =
+      dst_width * sizeof(union pipe_color_union);
+   union pipe_color_union *source_pixels =
+      MALLOC(source_pixel_count * sizeof(*source_pixels));
+   union pipe_color_union *destination_row =
+      MALLOC((size_t)destination_row_stride);
+   if (!source_pixels || !destination_row) {
+      FREE(source_pixels);
+      FREE(destination_row);
       return false;
    }
 
-   const bool exact_half_downsample =
-      info->filter == PIPE_TEX_FILTER_LINEAR &&
-      src_width == dst_width * 2u &&
-      src_height == dst_height * 2u;
-
-   for (int layer = 0; layer < info->dst.box.depth; ++layer) {
-      const unsigned dst_layer = (unsigned)info->dst.box.z + (unsigned)layer;
-      const unsigned src_layer = (unsigned)info->src.box.z + (unsigned)layer;
-      uint8_t *dst_layer_data =
-         pvrgpu_dst->data + pvrgpu_dst->level_offsets[info->dst.level] +
-         (uintptr_t)dst_layer *
-            pvrgpu_dst->level_layer_strides[info->dst.level];
+   /* Snapshot all source layers before writing so a legal cross-layer alias
+    * cannot feed already-written destination pixels back into the blit. */
+   for (unsigned layer = 0; layer < depth; ++layer) {
       const uint8_t *src_layer_data =
          pvrgpu_src->data + pvrgpu_src->level_offsets[info->src.level] +
-         (uintptr_t)src_layer *
+         (uintptr_t)((unsigned)info->src.box.z + layer) *
             pvrgpu_src->level_layer_strides[info->src.level];
+      util_format_read_4(info->src.format,
+                         source_pixels + (size_t)layer * window_pixels,
+                         source_row_stride,
+                         src_layer_data,
+                         pvrgpu_src->level_strides[info->src.level],
+                         window.x,
+                         window.y,
+                         window.width,
+                         window.height);
+   }
+
+   for (unsigned layer = 0; layer < depth; ++layer) {
+      uint8_t *dst_layer_data =
+         pvrgpu_dst->data + pvrgpu_dst->level_offsets[info->dst.level] +
+         (uintptr_t)((unsigned)info->dst.box.z + layer) *
+            pvrgpu_dst->level_layer_strides[info->dst.level];
+      const union pipe_color_union *source_layer =
+         source_pixels + (size_t)layer * window_pixels;
 
       for (unsigned dst_y = 0; dst_y < dst_height; ++dst_y) {
-         if (exact_half_downsample) {
-            const unsigned src_y0 = (unsigned)info->src.box.y + dst_y * 2u;
-            const unsigned src_y1 = src_y0 + 1u;
-            util_format_read_4ub(info->src.format,
-                                 src_row0,
-                                 src_row_stride,
-                                 src_layer_data,
-                                 pvrgpu_src->level_strides[info->src.level],
-                                 info->src.box.x,
-                                 src_y0,
-                                 src_width,
-                                 1);
-            util_format_read_4ub(info->src.format,
-                                 src_row1,
-                                 src_row_stride,
-                                 src_layer_data,
-                                 pvrgpu_src->level_strides[info->src.level],
-                                 info->src.box.x,
-                                 src_y1,
-                                 src_width,
-                                 1);
-            pvrgpu_downsample_2x_rgba8_row(src_row0,
-                                           src_row1,
-                                           dst_row,
-                                           dst_width);
-         } else {
-            const unsigned src_y =
-               (unsigned)info->src.box.y +
-               (unsigned)(((uint64_t)dst_y * (uint64_t)src_height) /
-                          (uint64_t)dst_height);
-            util_format_read_4ub(info->src.format,
-                                 src_row0,
-                                 src_row_stride,
-                                 src_layer_data,
-                                 pvrgpu_src->level_strides[info->src.level],
-                                 info->src.box.x,
-                                 src_y,
-                                 src_width,
-                                 1);
-            pvrgpu_scale_nearest_rgba8_row(src_row0,
-                                           dst_row,
-                                           src_width,
-                                           dst_width);
+         const struct pvrgpu_blit_axis_sample y_sample =
+            pvrgpu_get_blit_axis_sample(info->src.box.y,
+                                        info->src.box.height,
+                                        dst_y,
+                                        dst_height,
+                                        src_level_height,
+                                        linear);
+         const size_t first_row =
+            (size_t)(y_sample.first - window.y) * window.width;
+         const size_t second_row =
+            (size_t)(y_sample.second - window.y) * window.width;
+
+         for (unsigned dst_x = 0; dst_x < dst_width; ++dst_x) {
+            const struct pvrgpu_blit_axis_sample x_sample =
+               pvrgpu_get_blit_axis_sample(info->src.box.x,
+                                           info->src.box.width,
+                                           dst_x,
+                                           dst_width,
+                                           src_level_width,
+                                           linear);
+            const unsigned first_x = x_sample.first - window.x;
+            const unsigned second_x = x_sample.second - window.x;
+            const union pipe_color_union *top_left =
+               source_layer + first_row + first_x;
+            union pipe_color_union result;
+
+            if (linear) {
+               const union pipe_color_union *top_right =
+                  source_layer + first_row + second_x;
+               const union pipe_color_union *bottom_left =
+                  source_layer + second_row + first_x;
+               const union pipe_color_union *bottom_right =
+                  source_layer + second_row + second_x;
+               result = pvrgpu_blit_lerp(top_left,
+                                         top_right,
+                                         bottom_left,
+                                         bottom_right,
+                                         x_sample.weight,
+                                         y_sample.weight);
+            } else {
+               result = *top_left;
+            }
+
+            if (info->swizzle_enable) {
+               union pipe_color_union swizzled;
+               util_format_apply_color_swizzle(
+                  &swizzled,
+                  &result,
+                  info->swizzle,
+                  value_type != PVRGPU_BLIT_VALUE_FLOAT);
+               result = swizzled;
+            }
+            destination_row[dst_x] = result;
          }
 
-         util_format_write_4ub(info->dst.format,
-                               dst_row,
-                               dst_row_stride,
-                               dst_layer_data,
-                               pvrgpu_dst->level_strides[info->dst.level],
-                               info->dst.box.x,
-                               (unsigned)info->dst.box.y + dst_y,
-                               dst_width,
-                               1);
+         util_format_write_4(info->dst.format,
+                             destination_row,
+                             destination_row_stride,
+                             dst_layer_data,
+                             pvrgpu_dst->level_strides[info->dst.level],
+                             (unsigned)info->dst.box.x,
+                             (unsigned)info->dst.box.y + dst_y,
+                             dst_width,
+                             1);
       }
    }
 
-   FREE(src_row0);
-   FREE(src_row1);
-   FREE(dst_row);
+   FREE(source_pixels);
+   FREE(destination_row);
    return true;
 }
 
@@ -2599,7 +3077,19 @@ static void
 pvrgpu_blit(struct pipe_context *pipe,
             const struct pipe_blit_info *info)
 {
-   if (pvrgpu_can_blit_as_2d_copy(info)) {
+   const bool copy_2d = pvrgpu_can_blit_as_2d_copy(info);
+   const bool texture_blit =
+      !copy_2d && pvrgpu_can_blit_as_texture_region(info);
+
+   /*
+    * The CPU paths below consume resource backing directly.  If the source is
+    * the framebuffer a generic sequence just drew, its newest pixels still
+    * live in the model until this materializes every current colour target.
+    */
+   if (copy_2d || texture_blit)
+      pvrgpu_flush_current_color_attachments(pipe);
+
+   if (copy_2d) {
       pvrgpu_copy_texture_region_unchecked(info->dst.resource,
                                            info->dst.level,
                                            info->dst.box.x,
@@ -2608,7 +3098,7 @@ pvrgpu_blit(struct pipe_context *pipe,
                                            info->src.resource,
                                            info->src.level,
                                            &info->src.box);
-   } else if (pvrgpu_can_blit_as_texture_region(info)) {
+   } else if (texture_blit) {
       if (!pvrgpu_blit_texture_region_unchecked(info)) {
          pvrgpu_emit_unsupported_blit(pipe,
                                       "texture-blit-allocation-failed",
@@ -2621,6 +3111,14 @@ pvrgpu_blit(struct pipe_context *pipe,
                                    info);
       return;
    }
+
+   /*
+    * This copy ran only in driver memory.  A later map must not replace it
+    * with the bridge's cached pre-blit framebuffer merely because the resource
+    * is still bound as a colour target.
+    */
+   pvrgpu_resource(info->dst.resource)
+      ->driver_writes_model_cannot_reproduce = true;
    pvrgpu_invalidate_full_depth_clear_for_resource(
       pvrgpu_context(pipe), info->dst.resource);
 

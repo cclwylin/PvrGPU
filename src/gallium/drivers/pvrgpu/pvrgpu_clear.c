@@ -836,6 +836,10 @@ pvrgpu_clear(struct pipe_context *pipe,
       pvrgpu_invalidate_full_depth_clear(ctx);
       return;
    }
+   /* Preserve submitted draw output before a CPU clear changes its backing.
+    * Pending generic draws retain their ordered depth/stencil clear stream. */
+   if (clear_color && !pvrgpu_context_has_recorded_geometry(ctx))
+      pvrgpu_flush_current_color_attachments(pipe);
    const bool depth_backing_written =
       !clear_depth ||
       pvrgpu_fill_surface_rect_with_clear_depth(&ctx->framebuffer.zsbuf,
@@ -1071,6 +1075,8 @@ pvrgpu_clear_render_target(struct pipe_context *pipe,
       debug_printf("pvrgpu: unsupported clear_render_target; fail closed\n");
       return;
    }
+   if (!pvrgpu_context_has_recorded_geometry(ctx))
+      pvrgpu_flush_current_color_attachments(pipe);
    pvrgpu_fill_surface_rect_with_clear_color(dst,
                                              dstx,
                                              dsty,
@@ -1078,6 +1084,7 @@ pvrgpu_clear_render_target(struct pipe_context *pipe,
                                              height,
                                              PIPE_MASK_RGBA,
                                              color);
+   pvrgpu_resource(dst->texture)->driver_writes_model_cannot_reproduce = true;
    pvrgpu_counter_eventf("clear_render_target",
                          "res=%p x=%u y=%u width=%u height=%u format=%s "
                          "level=%u layers=%u-%u rgba=%u,%u,%u,%u "

@@ -374,6 +374,10 @@ pvrgpu_driver_draw_command_has_been_emitted(void);
 void
 pvrgpu_note_driver_draw_command_emitted(void);
 
+/* Changes on every attempted bridge submission, including clears and errors. */
+uint64_t
+pvrgpu_systemc_submission_generation(void);
+
 /*
  * Reopen the once-per-frame draw-command gate.  A readback has run the model,
  * so the frame it described is finished and the draws that follow are the next

@@ -8,6 +8,8 @@
 #include <stdint.h>
 
 struct sw_displaytarget;
+struct pipe_context;
+struct pvrgpu_context;
 
 struct pvrgpu_resource {
    struct pipe_resource base;
@@ -45,5 +47,18 @@ pvrgpu_init_resource_functions(struct pipe_screen *screen);
 
 void
 pvrgpu_init_context_resource_functions(struct pipe_context *context);
+
+/*
+ * Materialize a pending generic draw sequence into the backing stores of the
+ * framebuffer's currently bound colour surfaces.  Framebuffer changes and
+ * CPU-side blits use this before they can make the current model framebuffer
+ * refer to a different surface.
+ */
+void
+pvrgpu_flush_current_color_attachments(struct pipe_context *context);
+
+/* Call only after a draw command for the bound framebuffer was submitted. */
+void
+pvrgpu_note_current_color_readback_pending(struct pvrgpu_context *context);
 
 #endif /* PVRGPU_RESOURCE_H */

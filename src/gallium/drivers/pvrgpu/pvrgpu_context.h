@@ -49,6 +49,10 @@ struct pvrgpu_terrain_pco_observation;
 struct pvrgpu_context {
    struct pipe_context base;
    struct pipe_framebuffer_state framebuffer;
+   /* Targets still owned by one exact bridge submission for this framebuffer.
+    * Materializing a target consumes its bit; rebinding invalidates the set. */
+   uint64_t color_readback_generation;
+   unsigned color_readback_pending_mask;
    struct pvrgpu_blend_state *blend;
    struct pvrgpu_depth_stencil_alpha_state *dsa;
    struct pvrgpu_rasterizer_state *rasterizer;
@@ -176,6 +180,10 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx);
  */
 bool
 pvrgpu_context_has_recorded_geometry(const struct pvrgpu_context *ctx);
+
+/* Eager resource synchronization must not prematurely close an RDC frame. */
+bool
+pvrgpu_context_has_incomplete_replay(const struct pvrgpu_context *ctx);
 
 /*
  * Close the frame a readback has just observed: submit the geometry it

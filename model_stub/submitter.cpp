@@ -1471,6 +1471,18 @@ void Submitter::RunJob() {
     state.stage = PipelineStage::kSubmitted;
     state.memory_mode = options_.memory_mode;
     state.cache_bypass = options_.cache_bypass ? 1U : 0U;
+    /*
+     * Establish the stored pixel width before resolving sequence LOADs.  An
+     * aliased integer attachment can be 8 or 16 bytes per pixel; deriving its
+     * readback size from the zero-initialized state made the Submitter fetch
+     * only four bytes per pixel, then the PBE (after this field was populated
+     * below) correctly rejected the truncated LOAD.
+     */
+    if (driver_pco_triangles_command) {
+      state.color_attachment_raw_dwords =
+          ColorAttachmentRawDwords(command.format);
+    }
+
     // Colour attachments this draw writes.  Attachment 0 keeps whatever
     // address the single-target paths already chose; the rest are placed in
     // their own DRAM slots so no two attachments of a pass overlap.
@@ -1484,23 +1496,35 @@ void Submitter::RunJob() {
           static_cast<std::uint64_t>(submission) * kMaxRenderTargets + target;
       state.extra_framebuffer_gpu_address[target - 1] =
           kDriverPcoMrtColorAddressBase + slot * kDriverPcoSequenceAttachmentStride;
-      /* Every attachment of a pass stores the same pixel, and its width
-       * comes from the command's format.  Reading state.color_attachment_raw_
-       * dwords here took it before this submission had set it, so an integer
-       * attachment was sized as four bytes a pixel. */
+      /* Every attachment of a pass stores the same pixel width. */
       state.extra_framebuffer_bytes[target - 1] =
           static_cast<std::uint64_t>(state.width) * state.height *
-          ColorAttachmentBytesPerPixel(
-              static_cast<std::uint8_t>(ColorAttachmentRawDwords(
-                  command.format)));
+          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
     }
     if (driver_pco_sequence_command) {
       state.framebuffer_gpu_address = sequence_color_addresses[submission];
       const std::uint64_t color_bytes =
           static_cast<std::uint64_t>(state.width) * state.height *
           ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
+      if (!command.initial_color_attachment_bytes.empty()) {
+        if (command.color_attachment_source_command_index !=
+                kDriverPcoNewAttachment ||
+            state.render_target_count != 1 ||
+            command.initial_color_attachment_bytes.size() != color_bytes ||
+            color_bytes > kDriverPcoSequenceAttachmentStride) {
+          throw std::runtime_error(
+              "Submitter initial color attachment contract is invalid");
+        }
+        // A host snapshot establishes input storage only.  Reading it through
+        // the memory system records the dependency and feeds the same PBE
+        // LOAD path used by attachments produced by an earlier draw.
+        memory_->HostWrite(state.framebuffer_gpu_address,
+                           command.initial_color_attachment_bytes.data(),
+                           command.initial_color_attachment_bytes.size());
+      }
       if (command.color_attachment_source_command_index !=
-          kDriverPcoNewAttachment) {
+              kDriverPcoNewAttachment ||
+          !command.initial_color_attachment_bytes.empty()) {
         if (color_bytes == 0 ||
             color_bytes > std::numeric_limits<std::size_t>::max() ||
             !memory_->backing().Contains(

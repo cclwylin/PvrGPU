@@ -820,6 +820,8 @@ void DebugSequenceAttachments(const MemoryPool &pool,
             << state.framebuffer_gpu_address << std::dec
             << " color_source="
             << command.color_attachment_source_command_index
+            << " initial_color_bytes="
+            << command.initial_color_attachment_bytes.size()
             << " color_load="
             << static_cast<unsigned>(state.color_attachment_load_enable)
             << " color_bytes=" << color.size() << " color_fnv1a64="
@@ -1624,6 +1626,12 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     if (!options.driver_commands.empty()) {
       std::cout << ",\"driver_command_sequence_length\":"
                 << options.driver_commands.size();
+      std::uint64_t initial_color_bytes = 0;
+      for (const DriverCommand &draw : options.driver_commands)
+        initial_color_bytes += draw.initial_color_attachment_bytes.size();
+      if (initial_color_bytes != 0)
+        std::cout << ",\"driver_command_initial_color_attachment_bytes\":"
+                  << initial_color_bytes;
     }
     if (command.command == "draw_textured_triangles") {
       std::cout << ",\"driver_texture_width\":" << command.texture_width
@@ -2103,7 +2111,8 @@ void JsonReporter::RunJob() {
                   : 0;
           const bool color_load =
               physical_command.color_attachment_source_command_index !=
-              kDriverPcoNewAttachment;
+                  kDriverPcoNewAttachment ||
+              !physical_command.initial_color_attachment_bytes.empty();
           const bool depth_load =
               has_depth &&
               physical_command.depth_attachment_source_command_index !=

@@ -421,6 +421,11 @@ bool ReadFields(const std::string &path,
       return false;
     }
     const std::string value = line.substr(separator + 1);
+    if (key == "initial_color_attachment_replay") {
+      *error = "initial color attachments require API-v19 sequence submission; "
+               "standalone driver-command text replay is unsupported";
+      return false;
+    }
     if (!KnownFields().count(key)) {
       *error = "unknown driver command field: " + key;
       return false;

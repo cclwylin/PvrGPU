@@ -9,8 +9,8 @@
 extern "C" {
 #endif
 
-/* API-v18 lets a readback name which colour attachment it wants. */
-#define PVRGPU_SYSTEMC_API_VERSION 18u
+/* API-v19 can initialize a new sequence color attachment from host storage. */
+#define PVRGPU_SYSTEMC_API_VERSION 19u
 /*
  * Draws one sequence may describe; must match the model's own bound.  This is
  * independent of how many attachments the sequence creates, which the model's
@@ -377,6 +377,19 @@ struct pvrgpu_systemc_driver_command {
    const struct pvrgpu_systemc_driver_command *pco_sequence_commands;
    uint32_t pco_sequence_texture_count;
    const struct pvrgpu_systemc_pco_sequence_texture *pco_sequence_textures;
+
+   /*
+    * API-v19 optional initial contents for a nested PCO draw's single color
+    * attachment.  The source index must be ATTACHMENT_NEW_CLEAR and the
+    * effective render_target_count must be one.  Rows are tightly packed in
+    * the command format's model transport: RGBA8 is four bytes per pixel;
+    * R32, RG32 and RGBA32 integer targets are four, eight and sixteen bytes.
+    * Supply the complete framebuffer extent, or leave both fields zero.
+    * Submission deep-copies these bytes.  The model imports them into DRAM
+    * and performs a PBE LOAD before rasterizing the draw.
+    */
+   const uint8_t *initial_color_attachment_bytes;
+   size_t initial_color_attachment_bytes_size;
 };
 
 struct pvrgpu_systemc_submit_info {

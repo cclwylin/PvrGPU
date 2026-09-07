@@ -359,6 +359,9 @@ struct DriverCommand {
       kDriverPcoNewAttachment;
   std::uint32_t depth_attachment_source_command_index =
       kDriverPcoNewAttachment;
+  // Full tightly packed model transport for a newly allocated color target.
+  // Imported through DRAM and the normal PBE LOAD path, never CPU-rendered.
+  std::vector<std::uint8_t> initial_color_attachment_bytes;
   std::uint32_t draw_count = 0;
   std::uint32_t index_count = 0;
   std::uint32_t unique_vertices = 0;

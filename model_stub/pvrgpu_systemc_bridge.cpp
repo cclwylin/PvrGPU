@@ -455,6 +455,59 @@ void CopyPcoPayloadFields(
       source.color_attachment_source_command_index;
   destination->depth_attachment_source_command_index =
       source.depth_attachment_source_command_index;
+  destination->initial_color_attachment_bytes.clear();
+  if (source.initial_color_attachment_bytes_size != 0) {
+    destination->initial_color_attachment_bytes.assign(
+        source.initial_color_attachment_bytes,
+        source.initial_color_attachment_bytes +
+            source.initial_color_attachment_bytes_size);
+  }
+}
+
+bool InitialColorAttachmentIsValid(
+    const pvrgpu_systemc_driver_command &source, std::string *error) {
+  const auto reject = [&](const char *reason) {
+    *error = std::string("SystemC API initial color attachment is invalid: ") +
+             reason;
+    return false;
+  };
+  if (!source.initial_color_attachment_bytes &&
+      source.initial_color_attachment_bytes_size == 0)
+    return true;
+  if (!source.initial_color_attachment_bytes ||
+      source.initial_color_attachment_bytes_size == 0)
+    return reject("pointer/size mismatch");
+  if (source.color_attachment_source_command_index !=
+      PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR)
+    return reject("source must be NEW_CLEAR");
+  if (source.render_target_count > 1)
+    return reject("multiple color targets are unsupported");
+  const std::string_view format = source.format ? source.format : "";
+  std::uint64_t bytes_per_pixel = 0;
+  if (format == "PIPE_FORMAT_R8G8B8A8_UNORM" ||
+      format == "PIPE_FORMAT_R8G8B8A8_SRGB" ||
+      format == "PIPE_FORMAT_B8G8R8A8_SRGB" ||
+      format == "PIPE_FORMAT_R32_UINT" || format == "PIPE_FORMAT_R32_SINT")
+    bytes_per_pixel = 4;
+  else if (format == "PIPE_FORMAT_R32G32_UINT" ||
+           format == "PIPE_FORMAT_R32G32_SINT")
+    bytes_per_pixel = 8;
+  else if (format == "PIPE_FORMAT_R32G32B32A32_UINT" ||
+           format == "PIPE_FORMAT_R32G32B32A32_SINT")
+    bytes_per_pixel = 16;
+  else
+    return reject("unsupported transport format");
+  if (source.framebuffer_width == 0 || source.framebuffer_height == 0 ||
+      source.framebuffer_width > 4096 || source.framebuffer_height > 4096)
+    return reject("unsupported framebuffer extent");
+  const std::uint64_t expected =
+      static_cast<std::uint64_t>(source.framebuffer_width) *
+      source.framebuffer_height * bytes_per_pixel;
+  if (expected > pvrgpu::stub::kDriverPcoSequenceAttachmentStride)
+    return reject("transport exceeds attachment address slot");
+  if (expected != source.initial_color_attachment_bytes_size)
+    return reject("byte count does not match framebuffer transport");
+  return true;
 }
 
 bool SetMemoryMode(const char *text, pvrgpu::stub::Options *options,
@@ -1209,6 +1262,8 @@ bool CopyPcoSequenceDraw(
     *error = detail.str();
     return false;
   }
+  if (!InitialColorAttachmentIsValid(source, error))
+    return false;
 
   pvrgpu::stub::DriverCommand command;
   command.enabled = true;
@@ -1271,6 +1326,11 @@ bool CopyCommand(const pvrgpu_systemc_driver_command &source,
   }
   if (!source.format || !source.format[0]) {
     *error = "missing SystemC API format";
+    return false;
+  }
+  if (source.initial_color_attachment_bytes ||
+      source.initial_color_attachment_bytes_size != 0) {
+    *error = "SystemC API initial color attachment requires a nested PCO draw";
     return false;
   }
 
@@ -1349,7 +1409,8 @@ std::uint64_t CommandOwnedPayloadBytes(
   std::uint64_t byte_vectors =
       static_cast<std::uint64_t>(command.raw_vertex_data.size()) +
       command.vertex_pco.size() + command.fragment_pco.size() +
-      command.sampled_texture_bytes.size() + command.texture_rgba8_bytes.size();
+      command.sampled_texture_bytes.size() + command.texture_rgba8_bytes.size() +
+      command.initial_color_attachment_bytes.size();
   for (const pvrgpu::stub::DriverPcoSampledTexture &texture :
        command.sampled_textures) {
     if (texture.bytes.size() >

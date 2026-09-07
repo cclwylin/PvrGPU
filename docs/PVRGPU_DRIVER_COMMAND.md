@@ -8,6 +8,33 @@ bring-up seam: small enough to debug quickly, strict enough to prevent fake
 passes, and close enough to Gallium state that the driver can grow phase by
 phase.
 
+## Current FBO continuity extension (SystemC API v19)
+
+The in-process API supports a nested PCO draw's initial color attachment via
+`initial_color_attachment_bytes` and `initial_color_attachment_bytes_size`.
+This is input storage captured before the first draw of a new sequence, so a
+framebuffer switch or CPU blit does not implicitly clear the existing image.
+The bridge owns a deep copy; Submitter imports it into DRAM and reads it through
+the normal PBE LOAD path before executing the shaders.
+
+The payload requires `ATTACHMENT_NEW_CLEAR`, one color target, and the complete
+tightly packed framebuffer extent. RGBA8 transport uses 4 bytes per pixel;
+integer R32, RG32 and RGBA32 transport uses 4, 8 and 16. Narrow integer native
+formats are unpacked/packed by the driver. The payload must fit the 16 MiB
+attachment slot. Noninteger targets still use RGBA8 precision. Initial depth,
+stencil and additional MRT target contents are not represented by this field.
+
+Readback ownership includes a submission generation and exact framebuffer
+surface identity (resource, format, level, layers and extent). FBO changes and
+supported CPU blits/copies materialize pending attachments before changing their
+backing. Each target is read once from the corresponding submission; a later
+map cannot reuse another FBO's cached pixels.
+
+The sequence text file remains a summary rather than a complete payload
+serialization. When initial contents are present, it contains
+`initial_color_attachment_replay=api-v19-only`; standalone text replay rejects
+it explicitly. Such sequences require the API v19 driver and bridge together.
+
 ## Producer
 
 The Phase 1 producer is:

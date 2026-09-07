@@ -17,6 +17,13 @@
 
 static bool pvrgpu_global_driver_draw_command_emitted;
 static bool pvrgpu_global_driver_counter_sequence_command_emitted;
+static uint64_t pvrgpu_global_submission_generation;
+
+uint64_t
+pvrgpu_systemc_submission_generation(void)
+{
+   return pvrgpu_global_submission_generation;
+}
 
 bool
 pvrgpu_driver_draw_command_has_been_emitted(void)
@@ -319,6 +326,8 @@ pvrgpu_submit_systemc_api(const struct pvrgpu_systemc_driver_command *command,
                           char *error,
                           size_t error_size)
 {
+   /* Even a failed replacement must invalidate ownership of the old cache. */
+   ++pvrgpu_global_submission_generation;
    const char *library_path = pvrgpu_nonempty_env("PVRGPU_SYSTEMC_API_LIB");
    if (!library_path) {
       const bool native_sequence =
@@ -2151,6 +2160,7 @@ pvrgpu_write_draw_pco_sequence_command(
       return false;
    }
 
+   bool has_initial_color_attachment = false;
    for (uint32_t ordinal = 0;
         ordinal < cmd->pco_sequence_command_count;
         ++ordinal) {
@@ -2168,6 +2178,9 @@ pvrgpu_write_draw_pco_sequence_command(
                           "invalid nested API-v6 PCO sequence draw");
          return false;
       }
+      has_initial_color_attachment = has_initial_color_attachment ||
+         nested->initial_color_attachment_bytes ||
+         nested->initial_color_attachment_bytes_size != 0;
    }
 
    FILE *file = fopen(path, "w");
@@ -2180,6 +2193,7 @@ pvrgpu_write_draw_pco_sequence_command(
    }
    const int written = fprintf(
       file,
+      "%s"
       "schema=%s\n"
       "producer=%s\n"
       "command=draw_pco_sequence\n"
@@ -2202,6 +2216,10 @@ pvrgpu_write_draw_pco_sequence_command(
       "semantic_texel_fetches=%" PRIu64 "\n"
       "pco_sequence_command_count=%u\n"
       "pco_sequence_texture_count=%u\n",
+      /* The text file is a summary, not a nested payload serialization.
+       * Make replay reject explicitly before it can lose imported pixels. */
+      has_initial_color_attachment
+         ? "initial_color_attachment_replay=api-v19-only\n" : "",
       cmd->schema && cmd->schema[0] ? cmd->schema :
                                       PVRGPU_DRIVER_COMMAND_SCHEMA,
       cmd->producer && cmd->producer[0] ? cmd->producer :

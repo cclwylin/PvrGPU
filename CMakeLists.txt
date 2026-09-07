@@ -414,6 +414,33 @@ target_link_libraries(pco-systemc-api-bridge-test PRIVATE
 pvrgpu_target_warnings(pco-systemc-api-bridge-test)
 add_test(NAME pco-systemc-api-bridge-unit COMMAND pco-systemc-api-bridge-test)
 
+add_executable(pco-sequence-integer-load-test
+    tests/pco_sequence_integer_load_test.cpp
+)
+target_include_directories(pco-sequence-integer-load-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu"
+)
+target_link_libraries(pco-sequence-integer-load-test PRIVATE
+    pvrgpu-systemc-bridge
+)
+pvrgpu_target_warnings(pco-sequence-integer-load-test)
+add_test(NAME pco-sequence-integer-load-unit
+    COMMAND pco-sequence-integer-load-test)
+
+add_executable(pco-initial-color-load-test
+    tests/pco_initial_color_load_test.cpp
+)
+target_include_directories(pco-initial-color-load-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu"
+)
+target_link_libraries(pco-initial-color-load-test PRIVATE
+    pvrgpu-systemc-bridge
+)
+pvrgpu_target_warnings(pco-initial-color-load-test)
+add_test(NAME pco-initial-color-load-unit COMMAND pco-initial-color-load-test)
+
 add_executable(json-reporter-opcode-test
     tests/json_reporter_opcode_test.cpp
 )
@@ -582,6 +609,23 @@ target_include_directories(isp-depth-attachment-test PRIVATE
 target_link_libraries(isp-depth-attachment-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(isp-depth-attachment-test)
 add_test(NAME isp-depth-attachment-unit COMMAND isp-depth-attachment-test)
+
+add_executable(fragment-frontend-test
+    tests/fragment_frontend_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/fragment/fragment_frontend.cpp
+)
+target_include_directories(fragment-frontend-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(fragment-frontend-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(fragment-frontend-test)
+add_test(NAME fragment-frontend-unit COMMAND fragment-frontend-test)
 
 add_executable(ordered-blend-pipeline-test
     tests/ordered_blend_pipeline_test.cpp
