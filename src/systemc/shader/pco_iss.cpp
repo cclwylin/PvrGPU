@@ -876,8 +876,18 @@ void ValidateGenericSource(PcoRegisterRef source, std::size_t offset) {
     if (source.index >= kPcoMaximumSharedCount)
       DecodeError(offset, "shared register exceeds the modeled USC file");
     return;
+  case PcoRegisterBank::kCoefficient:
+    /* An uninterpolated varying is read straight out of its plane, which the
+     * two-source decode has always allowed; a single-source operand reaches
+     * the same value the same way. */
+    if (source.index >= kPcoMaximumVaryingCoefficientCount)
+      DecodeError(offset, "coefficient register exceeds the modeled USC file");
+    return;
   default:
-    DecodeError(offset, "source register bank is outside this PCO subset");
+    DecodeError(offset,
+                "source register bank is outside this PCO subset [bank=" +
+                    std::to_string(static_cast<std::uint32_t>(source.bank)) +
+                    " index=" + std::to_string(source.index) + "]");
   }
 }
 
@@ -982,7 +992,10 @@ TwoLowerSources DecodeTwoLowerSources(
         DecodeError(offset, "two-source coefficient exceeds the USC file");
       return;
     }
-    DecodeError(offset, "two-source register bank is outside this PCO subset");
+    DecodeError(offset,
+                "two-source register bank is outside this PCO subset [bank=" +
+                    std::to_string(static_cast<std::uint32_t>(bank)) +
+                    " index=" + std::to_string(index) + "]");
   };
   validate_source(source0_bank, index0, source_offset);
   if (allow_internal_true_source1 &&
@@ -2346,10 +2359,18 @@ PcoInstruction DecodeGenericBooleanCompareGroup(
       0x87,
   };
   for (std::uint8_t expected : tail) {
-    if (cursor >= group_end || binary[cursor++] != expected) {
-      DecodeError(cursor - 1,
-                  std::string("unsupported ") + form + " MOVC phase sequence");
+    if (cursor >= group_end) {
+      DecodeError(cursor, std::string(form) + " MOVC phase sequence is "
+                                              "truncated");
     }
+    if (binary[cursor] != expected) {
+      DecodeError(cursor, std::string("unsupported ") + form +
+                              " MOVC phase byte " +
+                              std::to_string(cursor - (header.offset + 3)) +
+                              " is " + std::to_string(binary[cursor]) +
+                              ", expected " + std::to_string(expected));
+    }
+    ++cursor;
   }
 
   const TwoLowerSources lower =
