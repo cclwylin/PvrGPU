@@ -465,9 +465,9 @@ one read plus 128 writes, and the PNG is published only from the separate
 
 | Field | Unit | Meaning |
 |---|---|---|
-| `pbe_color_reads` | fragments | Destination render-target colors read for blend read-modify-write |
-| `pbe_blended_fragments` | fragments | Post-depth fragment outputs evaluated by the enabled fixed-function blend equation |
-| `pbe_fragment_writes` | fragments | Post-blend fragment colors written to the render target |
+| `pbe_color_reads` | sample-colors | Destination render-target sample colors read for blend read-modify-write, per attachment |
+| `pbe_blended_fragments` | sample-colors | Post-depth sample colors evaluated by the enabled fixed-function blend equation, per attachment |
+| `pbe_fragment_writes` | sample-colors | Post-blend sample colors with at least one enabled stored channel written to a render target, per attachment |
 
 These counters describe PBE fixed-function work and are intentionally separate
 from `fs_alu_instructions`, `fs_tex_instructions`, and
@@ -475,6 +475,18 @@ from `fs_alu_instructions`, `fs_tex_instructions`, and
 the DrawList totals. With blending disabled, `pbe_color_reads` and
 `pbe_blended_fragments` are zero; `pbe_fragment_writes` still counts fragment
 color writes that survive the preceding tests.
+
+For MSAA, these counters sum each invocation's surviving sample-mask bits;
+they do not multiply every invocation by the nominal sample count. MRT work
+is counted independently for each attachment. `ps_invocations` remains the
+number of pixel-frequency shader invocations. Integer attachments bypass
+blending, so they contribute no blend reads or blend evaluations. A fully
+disabled color mask produces no fragment color writes; the current PBE still
+evaluates an enabled non-integer blend equation before applying that mask.
+Attachment LOAD is not a blend read. `pbe_pixels_written` counts the full
+serialized surface in sample colors per attachment, including untouched clear
+or LOAD samples. PBE serialization and blend batch cycles use their respective
+sample-color counts; these are not shader instruction cycles.
 
 ### TCU, PixelDM, SLC and DRAM counter meanings
 

@@ -153,10 +153,12 @@ inline constexpr std::uint64_t kDriverPcoTextureBytes =
 // Mesa 26.2.1 pipe_format values transported verbatim by the v8 API.
 inline constexpr std::uint32_t kDriverPcoDepthFormatZ16Unorm = 268;
 inline constexpr std::uint32_t kDriverPcoDepthFormatZ32Unorm = 270;
+inline constexpr std::uint32_t kDriverPcoDepthFormatZ32Float = 271;
 inline constexpr std::uint32_t kDriverPcoDepthFormatZ24X8Unorm = 276;
-// A packed depth-stencil attachment carries the same 24-bit depth as Z24X8;
-// the model has no stencil unit, so the stencil byte is simply not read.
+// Packed depth-stencil attachments keep separate depth and stencil planes
+// internally and reassemble their native little-endian storage on readback.
 inline constexpr std::uint32_t kDriverPcoDepthFormatZ24UnormS8Uint = 272;
+inline constexpr std::uint32_t kDriverPcoDepthFormatZ32FloatS8X24Uint = 279;
 inline constexpr std::uint32_t kDriverPcoNewAttachment = UINT32_MAX;
 inline constexpr std::size_t kDriverPcoRefractSequenceCommands = 2;
 inline constexpr std::size_t kDriverPcoRefractSampledTextures = 3;
@@ -362,6 +364,8 @@ struct DriverCommand {
   // Full tightly packed model transport for a newly allocated color target.
   // Imported through DRAM and the normal PBE LOAD path, never CPU-rendered.
   std::vector<std::uint8_t> initial_color_attachment_bytes;
+  std::uint32_t raster_samples = 1;
+  std::vector<std::uint8_t> initial_depth_attachment_bytes;
   std::uint32_t draw_count = 0;
   std::uint32_t index_count = 0;
   std::uint32_t unique_vertices = 0;

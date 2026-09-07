@@ -534,6 +534,10 @@ std::uint32_t TextureBytesPerTexel(TextureFormat format) {
     return 2U;
   case TextureFormat::kRgba16Float:
     return 8U;
+  case TextureFormat::kRgba32Uint:
+  case TextureFormat::kRgba32Sint:
+  case TextureFormat::kRgba32Float:
+    return 16U;
   case TextureFormat::kRgba8Unorm:
   case TextureFormat::kRgbx8Unorm:
   case TextureFormat::kBgra8Unorm:
@@ -549,6 +553,40 @@ std::uint32_t TextureBytesPerTexel(TextureFormat format) {
     // ASTC has no per-texel width (128-bit blocks).
     throw std::runtime_error("TextureUnit format has no per-texel byte width");
   }
+}
+
+std::array<std::uint32_t, 4> DecodeTexelToInteger(
+    TextureFormat format, const std::array<std::uint8_t, 16> &texel) {
+  if (format != TextureFormat::kRgba32Uint &&
+      format != TextureFormat::kRgba32Sint) {
+    throw std::runtime_error("TextureUnit format has no integer channel decode");
+  }
+  std::array<std::uint32_t, 4> result{};
+  for (std::size_t channel = 0; channel < result.size(); ++channel) {
+    for (std::size_t byte = 0; byte < 4; ++byte) {
+      result[channel] |=
+          static_cast<std::uint32_t>(texel[channel * 4 + byte]) << (byte * 8);
+    }
+  }
+  return result;
+}
+
+std::array<float, 4> DecodeTexelToFloat(
+    TextureFormat format, const std::array<std::uint8_t, 16> &texel) {
+  if (format == TextureFormat::kRgba32Float) {
+    std::array<float, 4> result{};
+    for (std::size_t channel = 0; channel < result.size(); ++channel) {
+      std::uint32_t bits = 0;
+      for (std::size_t byte = 0; byte < 4; ++byte) {
+        bits |= static_cast<std::uint32_t>(texel[channel * 4 + byte]) << (byte * 8);
+      }
+      std::memcpy(&result[channel], &bits, sizeof(bits));
+    }
+    return result;
+  }
+  std::array<std::uint8_t, 8> narrow{};
+  std::copy_n(texel.begin(), narrow.size(), narrow.begin());
+  return DecodeTexelToFloat(format, narrow);
 }
 
 std::array<float, 4> DecodeTexelToFloat(

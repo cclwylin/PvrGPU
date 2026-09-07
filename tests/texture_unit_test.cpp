@@ -746,6 +746,40 @@ void CheckSequenceColorMipMaterialization() {
       "overlapping sequence mip layout");
 }
 
+void CheckIntegerImageDescriptors() {
+  const auto fixture = MakeGlbenchFillTextureFixture(TextureFilter::kNearest);
+  auto words = DescriptorDwords(fixture, 0);
+  // A tight two-texel row, one mip, at the fixture's real address.
+  for (const std::uint64_t format : {62U, 63U}) {
+    const std::uint64_t word0 = UINT64_C(4) | (UINT64_C(3) << 5U) |
+        (UINT64_C(2) << 8U) | (UINT64_C(1) << 11U) | (format << 27U) |
+        (UINT64_C(1) << 34U);
+    const std::uint64_t word1 =
+        ((fixture.resource.gpu_address >> 2U) << 16U) |
+        (UINT64_C(1) << 60U) | UINT64_C(1);
+    words = {static_cast<std::uint32_t>(word0),
+             static_cast<std::uint32_t>(word0 >> 32U),
+             static_cast<std::uint32_t>(word1),
+             static_cast<std::uint32_t>(word1 >> 32U)};
+    const auto image = DecodeRogueTextureImageDescriptor(words);
+    Check(image.format == (format == 62U ? TextureFormat::kRgba32Uint
+                                        : TextureFormat::kRgba32Sint) &&
+              image.width == 2 && image.height == 1 &&
+              image.row_pitch_bytes == 32 && image.mip_count == 1,
+          "Rogue integer format descriptor uses a sixteen-byte texel stride");
+    auto sampler = DecodeRogueTextureSamplerDescriptor(DescriptorDwords(fixture, 8));
+    Check(DriverPcoTextureDescriptorClassSupported(image, sampler, 1),
+          "integer image admits nearest sampling");
+    sampler.mag_filter = TextureFilter::kLinear;
+    Check(!DriverPcoTextureDescriptorClassSupported(image, sampler, 1),
+          "integer image rejects a linear filter");
+    auto gamma = words;
+    gamma[0] |= UINT32_C(1) << 3U;
+    ExpectFailure([&] { (void)DecodeRogueTextureImageDescriptor(gamma); },
+                  "integer image rejects gamma conversion");
+  }
+}
+
 Rgba8 FixtureTexel(const GlbenchFillTextureFixture &fixture,
                    const pvrgpu::stub::TextureMipLevel &mip,
                    std::uint32_t x, std::uint32_t y) {
@@ -1223,10 +1257,85 @@ void CheckEventPaths() {
   vertex_responder.cache_input(vertex_cache_request);
   vertex_responder.cache_output(vertex_cache_response);
 
+  // Two neighboring 128-bit texels travel through the modeled memory path.
+  // Their values cannot be represented exactly as floats, so a floating
+  // conversion or an eight-byte fetch is detected by the returned DWORDs.
+  MemoryPool integer_pool;
+  GpuMemorySystem integer_memory(pvrgpu::stub::MemoryMode::kDirect);
+  const std::array<std::array<std::uint32_t, 4>, 2> integer_texels = {{
+      {{UINT32_C(0xffffffff), UINT32_C(0x80000000), UINT32_C(0x01000001), 1}},
+      {{UINT32_C(0x76543210), UINT32_C(0xfedcba98), UINT32_C(0x7fffffff), 0}},
+  }};
+  std::vector<std::uint8_t> integer_bytes(32);
+  for (std::size_t texel = 0; texel < 2; ++texel) {
+    for (std::size_t channel = 0; channel < 4; ++channel) {
+      for (std::size_t byte = 0; byte < 4; ++byte) {
+        integer_bytes[texel * 16 + channel * 4 + byte] =
+            static_cast<std::uint8_t>(integer_texels[texel][channel] >> (byte * 8));
+      }
+    }
+  }
+  integer_memory.HostWrite(base, integer_bytes.data(), integer_bytes.size());
+  TextureResource integer_resource;
+  integer_resource.gpu_address = base;
+  integer_resource.byte_size = 32;
+  integer_resource.format = TextureFormat::kRgba32Uint;
+  integer_resource.mip_count = 1;
+  integer_resource.mip[0] = {2, 1, 32, 0};
+  std::vector<std::uint32_t> integer_shared(
+      driver_fixture.fragment_shared.begin(), driver_fixture.fragment_shared.end());
+  const std::uint64_t integer_word0 = UINT64_C(4) | (UINT64_C(3) << 5U) |
+      (UINT64_C(2) << 8U) | (UINT64_C(1) << 11U) | (UINT64_C(62) << 27U) |
+      (UINT64_C(1) << 34U);
+  const std::uint64_t integer_word1 =
+      ((base >> 2U) << 16U) | (UINT64_C(1) << 60U) | UINT64_C(1);
+  integer_shared[0] = static_cast<std::uint32_t>(integer_word0);
+  integer_shared[1] = static_cast<std::uint32_t>(integer_word0 >> 32U);
+  integer_shared[2] = static_cast<std::uint32_t>(integer_word1);
+  integer_shared[3] = static_cast<std::uint32_t>(integer_word1 >> 32U);
+  integer_shared[4] = 32;
+  std::vector<TextureSampleRequest> integer_requests(2, driver_request);
+  for (std::size_t lane = 0; lane < integer_requests.size(); ++lane) {
+    auto &request = integer_requests[lane];
+    request.shader_lane_index = static_cast<std::uint32_t>(lane);
+    request.request_id = lane;
+    request.coordinates[0] = FloatBits(lane == 0 ? 0.25F : 0.75F);
+    request.fcnorm = 0;
+    request.quad_lane = static_cast<std::uint8_t>(lane);
+    std::copy_n(integer_shared.begin(), 4, request.texture_state);
+  }
+  PipelineState integer_state;
+  integer_state.memory_mode = pvrgpu::stub::MemoryMode::kDirect;
+  integer_state.sequence = 5;
+  integer_state.functional_case = FunctionalCase::kDriverPcoTriangles;
+  integer_state.stage = PipelineStage::kFragmentTexturePending;
+  integer_state.sampled_texture_count = 1;
+  integer_state.fragment_pco_abi.shareds = integer_shared.size();
+  integer_state.fragment_shader_lane_count = integer_requests.size();
+  integer_state.texture_sample_requests = StoreNewArray(integer_pool, integer_requests);
+  integer_state.texture_resources = StoreNewArray(
+      integer_pool, std::vector<TextureResource>{integer_resource});
+  integer_state.sampler_states = StoreNewArray(
+      integer_pool, std::vector<pvrgpu::stub::SamplerState>{driver_fixture.sampler});
+  integer_state.fragment_shared_registers = StoreNewArray(integer_pool, integer_shared);
+  const auto integer_state_handle = integer_pool.Allocate(sizeof(PipelineState));
+  StorePipelineState(integer_pool, integer_state_handle, integer_state);
+  const PipelineTxn integer_transaction{integer_state_handle, 5, 5};
+  sc_core::sc_fifo<PipelineTxn> integer_module_input("integer_module_input", 1);
+  sc_core::sc_fifo<PipelineTxn> integer_module_output("integer_module_output", 1);
+  sc_core::sc_fifo<PipelineTxn> integer_sample_input("integer_sample_input", 1);
+  sc_core::sc_fifo<PipelineTxn> integer_sample_output("integer_sample_output", 1);
+  TextureUnit integer_texture("integer_texture", integer_pool, &integer_memory);
+  integer_texture.input(integer_module_input);
+  integer_texture.output(integer_module_output);
+  integer_texture.sample_input(integer_sample_input);
+  integer_texture.sample_output(integer_sample_output);
+
   sample_input.write(transaction);
   gate_sample_input.write(gate_transaction);
   driver_sample_input.write(driver_transaction);
   vertex_sample_input.write(vertex_transaction);
+  integer_sample_input.write(integer_transaction);
   sc_core::sc_start(sc_core::sc_time(100, sc_core::SC_NS));
   PipelineTxn completed;
   Check(sample_output.nb_read(completed) &&
@@ -1354,6 +1463,92 @@ void CheckEventPaths() {
             vertex_responses[0].rgba[3] == FloatBits(1.0F),
         "vertex LOD0 request uses its own bank, response stage, and counters");
 
+  PipelineTxn integer_completed;
+  Check(integer_sample_output.nb_read(integer_completed) &&
+            integer_completed.sequence == 5,
+        "integer sample completion identity");
+  const auto integer_final_state = LoadPipelineState(integer_pool, integer_state_handle);
+  const auto integer_responses = LoadArray<TextureSampleResponse>(
+      integer_pool, integer_final_state.texture_sample_responses);
+  Check(integer_final_state.counters.texel_fetches == 2 &&
+            integer_responses.size() == 2,
+        "two integer requests execute two physical texel reads");
+  for (std::size_t lane = 0; lane < integer_responses.size(); ++lane) {
+    Check(std::equal(integer_texels[lane].begin(), integer_texels[lane].end(),
+                     std::begin(integer_responses[lane].rgba)),
+          "integer memory samples preserve all four DWORDs at the selected address");
+  }
+  ReleaseFunctionalPayloads(integer_pool, integer_final_state);
+
+  // Reuse the elaborated TPU for a different format and filter. The four
+  // physical taps must decode full binary32 channels before interpolation,
+  // preserving signed values and values outside the normalized color range.
+  const std::array<std::array<float, 4>, 2> float_texels = {{
+      {{-4.0F, 0.125F, 1024.5F, 0.25F}},
+      {{8.0F, 0.875F, 2048.5F, 0.75F}},
+  }};
+  for (std::size_t texel = 0; texel < 2; ++texel) {
+    for (std::size_t channel = 0; channel < 4; ++channel) {
+      const std::uint32_t bits = FloatBits(float_texels[texel][channel]);
+      for (std::size_t byte = 0; byte < 4; ++byte) {
+        integer_bytes[texel * 16 + channel * 4 + byte] =
+            static_cast<std::uint8_t>(bits >> (byte * 8));
+      }
+    }
+  }
+  integer_memory.HostWrite(base, integer_bytes.data(), integer_bytes.size());
+  integer_resource.format = TextureFormat::kRgba32Float;
+  const std::uint64_t float_word0 =
+      (integer_word0 & ~(UINT64_C(127) << 27U)) | (UINT64_C(61) << 27U);
+  integer_shared[0] = static_cast<std::uint32_t>(float_word0);
+  integer_shared[1] = static_cast<std::uint32_t>(float_word0 >> 32U);
+  integer_shared[9] |= (UINT32_C(1) << 4U) | (UINT32_C(1) << 6U);
+  integer_shared[17] = integer_shared[9];
+  auto float_sampler = driver_fixture.sampler;
+  float_sampler.min_filter = TextureFilter::kLinear;
+  float_sampler.mag_filter = TextureFilter::kLinear;
+  auto float_request = integer_requests[0];
+  float_request.fcnorm = 1;
+  float_request.coordinates[0] = FloatBits(0.5F);
+  float_request.coordinates[1] = FloatBits(0.5F);
+  std::copy_n(integer_shared.begin(), 4, float_request.texture_state);
+  std::copy_n(integer_shared.begin() + 8, 4, float_request.sampler_state);
+  PipelineState float_state;
+  float_state.memory_mode = pvrgpu::stub::MemoryMode::kDirect;
+  float_state.sequence = 6;
+  float_state.functional_case = FunctionalCase::kDriverPcoTriangles;
+  float_state.stage = PipelineStage::kFragmentTexturePending;
+  float_state.sampled_texture_count = 1;
+  float_state.fragment_pco_abi.shareds = integer_shared.size();
+  float_state.fragment_shader_lane_count = 1;
+  float_state.texture_sample_requests = StoreNewArray(
+      integer_pool, std::vector<TextureSampleRequest>{float_request});
+  float_state.texture_resources = StoreNewArray(
+      integer_pool, std::vector<TextureResource>{integer_resource});
+  float_state.sampler_states = StoreNewArray(
+      integer_pool, std::vector<pvrgpu::stub::SamplerState>{float_sampler});
+  float_state.fragment_shared_registers = StoreNewArray(integer_pool, integer_shared);
+  StorePipelineState(integer_pool, integer_state_handle, float_state);
+  integer_sample_input.write(PipelineTxn{integer_state_handle, 6, 6});
+  sc_core::sc_start(sc_core::sc_time(100, sc_core::SC_NS));
+  Check(integer_sample_output.nb_read(integer_completed) &&
+            integer_completed.sequence == 6,
+        "float32 sample completion identity");
+  const auto float_final_state = LoadPipelineState(integer_pool, integer_state_handle);
+  const auto float_responses = LoadArray<TextureSampleResponse>(
+      integer_pool, float_final_state.texture_sample_responses);
+  const std::array<float, 4> expected_float = {{2.0F, 0.5F, 1536.5F, 0.5F}};
+  Check(float_final_state.counters.texel_fetches == 4 && float_responses.size() == 1,
+        "float32 bilinear sample executes four physical sixteen-byte reads");
+  for (std::size_t channel = 0; channel < 4; ++channel) {
+    Check(float_responses[0].rgba[channel] == FloatBits(expected_float[channel]),
+          "float32 bilinear filter preserves negative, high-range and alpha channels");
+  }
+  ReleaseFunctionalPayloads(integer_pool, float_final_state);
+  integer_pool.Release(integer_state_handle);
+  Check(integer_pool.bytes_in_flight() == 0,
+        "integer texture MemoryPool ownership balanced");
+
   ReleaseFunctionalPayloads(pool, final_state);
   pool.Release(state_handle);
   Check(pool.bytes_in_flight() == 0 &&
@@ -1381,6 +1576,7 @@ void CheckEventPaths() {
 int sc_main(int, char **) {
   try {
     CheckDescriptorAndArithmetic();
+    CheckIntegerImageDescriptors();
     CheckSequenceColorMipMaterialization();
     CheckEventPaths();
     std::cout << "texture_unit_test: PASS\n";

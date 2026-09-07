@@ -54,6 +54,13 @@ Listed so they are removed rather than copied:
 
 Current status:
 
+- The generic native PCO path now supplies typed integer/float texture and
+  framebuffer transport, attachment continuity, per-sample MSAA and late
+  shader-depth tests through SystemC. Typed CPU clears/blits preserve native
+  resource storage and materialize pending model output first. API v20 carries
+  initial color/depth/stencil payloads and exact sample-count readback.
+- The historical Phase 0–6 observations below remain available alongside that
+  generic path; their counter-only limits do not describe all current draws.
 - Phase 0/1/2/3/4/5/6 bring-up driver.
 - `pipe_screen` / `pipe_context` names and file boundaries are established.
 - Mesa software-loader selection is explicit through `GALLIUM_DRIVER=pvrgpu`.
@@ -75,7 +82,12 @@ Current status:
 - Phase 6 GLES2 uniform uploads are retained as Gallium constant-buffer state and one uniform-driven triangle is observable through `draw_uniform_triangles` counters.
 - Mesa's upload manager is initialized for state-tracker internal uploads, and resource release hooks are wired so teardown is clean.
 - narrow draw lowering/rasterization exists for the supported command profiles; all other draw shapes still record `unsupported_draw`.
-- arbitrary texture sampling and shader lowering, scaled/format-converting blits, resolves, FBO draw pixels, UBO layout correctness, EGL image import/export, general depth/stencil/blend pixel behavior, compute, and real synchronization paths are still intentionally fail-closed, tracked-only, or no-op.
+- Shader/texture forms beyond the implemented generic ISA and sampler contract,
+  UBO layout correctness, EGL image import/export, compute, and asynchronous
+  synchronization remain unsupported or separately unvalidated. Incomplete
+  RDC replay's intermediate ordered stencil-clear capsule still does not
+  express a partial write mask; the live path instead LOADs its already-masked
+  native storage and retires that clear without replaying it.
 - `meson.build` is the Mesa source/build seam; the repository CMake build
   produces the native `pvrgpu` replay entry point, which consumes the
   separately configured Mesa install prefix at runtime.

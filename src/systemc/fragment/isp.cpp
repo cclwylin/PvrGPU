@@ -1,13 +1,14 @@
 // ISP (Image Synthesis Processor) functional module.
 // It consumes each 32x32 tile's ordered Parameter Buffer primitive references,
-// evaluates exact fixed-point top-left coverage at the reference uArch's one
-// sample center, and performs opaque-safe HSR (Hidden Surface Removal). Opaque
+// evaluates exact fixed-point top-left coverage at every declared sample
+// position, and performs opaque-safe HSR (Hidden Surface Removal). Opaque
 // draws retain only the final owner; blending preserves every depth-passing
 // candidate in API order for later PBE destination read/modify/write. FIFO
 // traffic remains MemoryPool handles and completion is event-driven.
 #include "fragment/isp.h"
 
 #include "common/functional_types.h"
+#include "common/msaa.h"
 
 #include <algorithm>
 #include <cmath>
@@ -99,8 +100,8 @@ float BitsFloat(std::uint32_t bits) {
 }
 
 float InterpolateDepth(const ParameterTriangle &triangle,
-                       const std::int64_t edge_values[3], std::uint32_t x,
-                       std::uint32_t y, bool llvmpipe_driver_plane,
+                       const std::int64_t edge_values[3], float x,
+                       float y, bool llvmpipe_driver_plane,
                        float barycentric[3]) {
   if (triangle.signed_area <= 0)
     throw std::runtime_error("ISP received a non-positive triangle area");
@@ -154,20 +155,29 @@ void Isp::Run() {
     // If the fragment shader may discard, we cannot perform opaque early HSR because
     // a front-most fragment might be discarded later, revealing fragments behind it.
     // Likewise, if early HSR is not safe, we disable early culling.
-    if (state.raster_state.shader_may_discard || !state.fragment_early_hsr_safe) {
+    const bool late_depth_stencil = state.raster_state.shader_writes_depth != 0;
+    if (state.raster_state.shader_may_discard || late_depth_stencil ||
+        !state.fragment_early_hsr_safe) {
       opaque_early_hsr = false;
     }
     // If the shader writes custom depth, early depth writes are not allowed because
     // the final depth value is determined during shader execution.
     const bool early_depth_write = state.raster_state.depth.write_enable &&
                                    !state.raster_state.shader_writes_depth;
-    if (state.raster_state.sample_count != 1)
-      throw std::runtime_error("reference ISP currently requires one sample");
+    const std::uint32_t sample_count = state.raster_state.sample_count;
+    if (state.raster_state.multisample_enable > 1)
+      throw std::runtime_error("ISP multisample rasterization flag is invalid");
+    const bool multisample_rasterization =
+        sample_count > 1 && state.raster_state.multisample_enable != 0;
+    const std::uint32_t enabled_samples =
+        RasterSampleMask(sample_count) & state.raster_state.sample_mask;
 
     const std::uint64_t pixel_count =
         static_cast<std::uint64_t>(state.width) * state.height;
-    if (pixel_count > std::numeric_limits<std::size_t>::max())
+    if (pixel_count > std::numeric_limits<std::size_t>::max() / sample_count)
       throw std::overflow_error("ISP surface is too large");
+    const std::size_t storage_count =
+        static_cast<std::size_t>(pixel_count) * sample_count;
     const std::vector<TileRecord> tiles =
         LoadArray<TileRecord>(pool_, state.tile_records);
     const std::vector<TilePrimitiveRef> primitive_refs =
@@ -202,8 +212,7 @@ void Isp::Run() {
     std::vector<FragmentCandidate> candidates;
     candidates.reserve(static_cast<std::size_t>(pixel_count));
     constexpr std::size_t kNoOwner = std::numeric_limits<std::size_t>::max();
-    std::vector<std::size_t> owner(static_cast<std::size_t>(pixel_count),
-                                   kNoOwner);
+    std::vector<std::size_t> owner(storage_count, kNoOwner);
     std::vector<std::uint8_t> covered(static_cast<std::size_t>(pixel_count), 0);
     if (state.depth_attachment_load_enable > 1 ||
         (state.depth_attachment_load_enable != 0) !=
@@ -214,8 +223,7 @@ void Isp::Run() {
          state.depth_attachment_format == 0)) {
       throw std::runtime_error("ISP depth attachment LOAD state is invalid");
     }
-    const std::size_t pixel_count_size =
-        static_cast<std::size_t>(pixel_count);
+    const std::size_t pixel_count_size = storage_count;
     std::vector<std::uint32_t> encoded_depth(pixel_count_size, 0);
     std::vector<float> depth(pixel_count_size, 0.0F);
     // The stencil plane of a combined attachment.  Formats without one keep an
@@ -226,7 +234,7 @@ void Isp::Run() {
     if (state.depth_attachment_load_enable != 0) {
       const std::size_t bytes_per_pixel =
           DepthAttachmentBytesPerPixel(state.depth_attachment_format);
-      const std::uint64_t expected_bytes = pixel_count * bytes_per_pixel;
+      const std::uint64_t expected_bytes = storage_count * bytes_per_pixel;
       const std::vector<std::uint8_t> encoded =
           LoadArray<std::uint8_t>(pool_, state.depth_attachment_load);
       if (state.depth_attachment_load_bytes != expected_bytes ||
@@ -300,15 +308,19 @@ void Isp::Run() {
         const std::uint8_t stencil_value =
             static_cast<std::uint8_t>(clear.stencil_value & 0xFFU);
         for (std::uint32_t y = clear.y; y < y_end; ++y) {
-          const std::size_t row = static_cast<std::size_t>(y) * state.width;
+          const std::size_t row =
+              static_cast<std::size_t>(y) * state.width * sample_count;
           if (clears_stencil) {
-            std::fill_n(stencil.begin() + row + clear.x, clear.width,
+            std::fill_n(stencil.begin() + row + clear.x * sample_count,
+                        clear.width * sample_count,
                         stencil_value);
           }
           if (clears_depth) {
-            std::fill_n(encoded_depth.begin() + row + clear.x, clear.width,
+            std::fill_n(encoded_depth.begin() + row + clear.x * sample_count,
+                        clear.width * sample_count,
                         encoded_clear);
-            std::fill_n(depth.begin() + row + clear.x, clear.width,
+            std::fill_n(depth.begin() + row + clear.x * sample_count,
+                        clear.width * sample_count,
                         decoded_clear);
           }
         }
@@ -384,14 +396,42 @@ void Isp::Run() {
             static_cast<std::uint32_t>(std::max(0, triangle.max_x))});
         for (std::uint32_t y = y_begin; y < y_end; ++y) {
           for (std::uint32_t x = x_begin; x < x_end; ++x) {
-            const std::int64_t sample_x =
+            const std::int64_t center_x =
                 static_cast<std::int64_t>(x) * kSubpixelScale +
                 kSubpixelScale / 2;
-            const std::int64_t sample_y =
+            const std::int64_t center_y =
                 static_cast<std::int64_t>(y) * kSubpixelScale +
                 kSubpixelScale / 2;
             std::int64_t edge_values[3]{};
-            if (!CoversSample(triangle, sample_x, sample_y, edge_values))
+            std::uint32_t coverage_mask = 0;
+            std::array<float, 16> sample_depth{};
+            for (std::uint32_t sample = 0; sample < sample_count; ++sample) {
+              const std::uint32_t sample_bit = 1U << sample;
+              if ((enabled_samples & sample_bit) == 0)
+                continue;
+              // With multisample rasterization disabled, one center test
+              // supplies coverage to all selected samples. Depth/stencil
+              // still reads and writes each sample's independent storage.
+              const auto position = multisample_rasterization
+                  ? RasterSamplePosition(sample_count, sample)
+                  : RasterSamplePosition(1, 0);
+              const std::int64_t sample_x =
+                  static_cast<std::int64_t>(x) * kSubpixelScale +
+                  position[0] * (kSubpixelScale / 16);
+              const std::int64_t sample_y =
+                  static_cast<std::int64_t>(y) * kSubpixelScale +
+                  position[1] * (kSubpixelScale / 16);
+              if (!CoversSample(triangle, sample_x, sample_y, edge_values))
+                continue;
+              float barycentric[3];
+              sample_depth[sample] = InterpolateDepth(
+                  triangle, edge_values,
+                  static_cast<float>(x) + position[0] / 16.0F - 0.5F,
+                  static_cast<float>(y) + position[1] / 16.0F - 0.5F,
+                  llvmpipe_driver_depth, barycentric);
+              coverage_mask |= sample_bit;
+            }
+            if (coverage_mask == 0)
               continue;
             /*
              * A width-1 line: the quad decided the region, the segment decides
@@ -403,9 +443,18 @@ void Isp::Run() {
              * exact; the fill rule already gives a shared edge to one of the
              * quad's two triangles, so no pixel is produced twice.
              */
-            if (triangle.line.valid != 0 &&
+            if (!multisample_rasterization && triangle.line.valid != 0 &&
                 !LineCoversPixel(triangle.line, x, y))
               continue;
+
+            // Pixel-frequency shading still interpolates at the pixel center;
+            // sample positions govern coverage and depth/stencil individually.
+            // Evaluate every center edge even when the center is uncovered.
+            for (std::size_t edge = 0; edge < 3; ++edge) {
+              const EdgeEquation &equation = triangle.edge[edge];
+              edge_values[edge] = equation.a * center_x +
+                                  equation.b * center_y + equation.c;
+            }
 
             FragmentCandidate candidate;
             candidate.x = x;
@@ -413,16 +462,31 @@ void Isp::Run() {
             candidate.primitive_id = triangle.key.api_primitive_id;
             candidate.parameter_index = ref.parameter_index;
             candidate.submit_ordinal = ref.submit_ordinal;
-            candidate.sample_mask = 1;
+            candidate.sample_mask = 0;
             candidate.depth = InterpolateDepth(
                 triangle, edge_values, x, y, llvmpipe_driver_depth,
                 candidate.barycentric);
-            const std::size_t pixel_index =
+            const std::size_t coverage_index =
                 static_cast<std::size_t>(y) * state.width + x;
-            if (covered[pixel_index] == 0) {
-              covered[pixel_index] = 1;
+            if (covered[coverage_index] == 0) {
+              covered[coverage_index] = 1;
               ++covered_pixels;
             }
+            const std::size_t candidate_index = candidates.size();
+            candidates.push_back(candidate);
+            for (std::uint32_t sample = 0; sample < sample_count; ++sample) {
+              const std::uint32_t sample_bit = 1U << sample;
+              if ((coverage_mask & sample_bit) == 0)
+                continue;
+              const std::size_t pixel_index =
+                  coverage_index * sample_count + sample;
+              if (late_depth_stencil) {
+                // gl_FragDepth is unknown until USC executes. Preserve all
+                // coverage and API order without changing either attachment.
+                candidates[candidate_index].sample_mask |= sample_bit;
+                candidates[candidate_index].visibility = FragmentVisibility::kVisible;
+                continue;
+              }
             /*
              * GLES 3.0 4.1.4: the stencil test runs before the depth test, and
              * the operation applied depends on which of the two failed.  A
@@ -454,7 +518,7 @@ void Isp::Run() {
               ++depth_tested;
               if (state.depth_attachment_format == 0) {
                 passes = DepthPass(state.raster_state.depth.compare_op,
-                                   candidate.depth, depth[pixel_index]);
+                                   sample_depth[sample], depth[pixel_index]);
               } else {
                 // llvmpipe converts an incoming floating-point fragment Z to
                 // the attachment's integer UNORM domain before testing it.
@@ -462,7 +526,7 @@ void Isp::Run() {
                 // incorrectly reject two depths that quantize to the same
                 // Z16/Z24/Z32 value under LEQUAL/EQUAL.
                 incoming_encoded_depth = EncodeDepthAttachmentUnorm(
-                    candidate.depth, state.depth_attachment_format);
+                    sample_depth[sample], state.depth_attachment_format);
                 passes = DepthPass(state.raster_state.depth.compare_op,
                                    incoming_encoded_depth,
                                    encoded_depth[pixel_index]);
@@ -488,22 +552,24 @@ void Isp::Run() {
                 stencil[pixel_index] = written;
               }
             }
-            const std::size_t candidate_index = candidates.size();
-            candidates.push_back(candidate);
             if (!passes)
               continue;
 
+            candidates[candidate_index].sample_mask |= sample_bit;
             candidates[candidate_index].visibility =
                 FragmentVisibility::kVisible;
             if (opaque_early_hsr) {
-              if (owner[pixel_index] != kNoOwner)
-                candidates[owner[pixel_index]].visibility =
-                    FragmentVisibility::kRejected;
+              if (owner[pixel_index] != kNoOwner) {
+                FragmentCandidate &previous = candidates[owner[pixel_index]];
+                previous.sample_mask &= ~sample_bit;
+                if (previous.sample_mask == 0)
+                  previous.visibility = FragmentVisibility::kRejected;
+              }
               owner[pixel_index] = candidate_index;
             }
             if (state.raster_state.depth.test_enable && early_depth_write) {
               if (state.depth_attachment_format == 0) {
-                depth[pixel_index] = candidate.depth;
+                depth[pixel_index] = sample_depth[sample];
               } else {
                 encoded_depth[pixel_index] = incoming_encoded_depth;
                 depth[pixel_index] = DecodeDepthAttachmentUnorm(
@@ -511,6 +577,7 @@ void Isp::Run() {
                     state.depth_attachment_format);
               }
               ++depth_written;
+            }
             }
           }
         }
@@ -527,12 +594,16 @@ void Isp::Run() {
       throw std::overflow_error("ISP visible pixel count exceeds uint32_t");
 
     state.fragment_candidates = StoreNewArray(pool_, candidates);
-    if (state.capture_depth_attachment != 0) {
-      if (state.capture_depth_attachment != 1 ||
-          state.depth_attachment_format == 0 ||
+    if (state.capture_depth_attachment != 0 || late_depth_stencil) {
+      if (state.capture_depth_attachment > 1 ||
+          (state.capture_depth_attachment && state.depth_attachment_format == 0) ||
           HasPoolHandle(state.isp_depth_attachment)) {
         throw std::runtime_error(
             "ISP depth attachment capture state is invalid");
+      }
+      if (state.depth_attachment_format == 0) {
+        for (std::size_t sample = 0; sample < depth.size(); ++sample)
+          std::memcpy(&encoded_depth[sample], &depth[sample], sizeof(float));
       }
       state.isp_depth_attachment = StoreNewArray(pool_, encoded_depth);
       if (has_stencil)

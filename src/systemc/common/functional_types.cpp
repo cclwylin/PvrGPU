@@ -56,9 +56,12 @@ std::size_t DepthAttachmentBytesPerPixel(std::uint32_t format) {
     return sizeof(std::uint16_t);
   if (format == kDriverPcoDepthFormatZ24X8Unorm ||
       format == kDriverPcoDepthFormatZ24UnormS8Uint ||
-      format == kDriverPcoDepthFormatZ32Unorm) {
+      format == kDriverPcoDepthFormatZ32Unorm ||
+      format == kDriverPcoDepthFormatZ32Float) {
     return sizeof(std::uint32_t);
   }
+  if (format == kDriverPcoDepthFormatZ32FloatS8X24Uint)
+    return 2U * sizeof(std::uint32_t);
   throw std::runtime_error("unsupported native depth attachment format");
 }
 
@@ -66,6 +69,17 @@ std::uint32_t EncodeDepthAttachmentUnorm(float depth,
                                          std::uint32_t format) {
   if (!std::isfinite(depth) || depth < 0.0F || depth > 1.0F)
     throw std::runtime_error("native depth value is outside [0, 1]");
+  if (format == kDriverPcoDepthFormatZ32Float ||
+      format == kDriverPcoDepthFormatZ32FloatS8X24Uint) {
+    // Nonnegative IEEE binary32 words compare in the same order as floats.
+    // Canonicalize signed zero so the integer depth comparator also treats
+    // -0 and +0 as equal; every other representable bit is retained exactly.
+    if (depth == 0.0F)
+      return 0;
+    std::uint32_t encoded = 0;
+    std::memcpy(&encoded, &depth, sizeof(encoded));
+    return encoded;
+  }
   const std::uint64_t maximum =
       format == kDriverPcoDepthFormatZ16Unorm
           ? UINT64_C(0xffff)
@@ -89,6 +103,14 @@ std::uint32_t EncodeDepthAttachmentUnorm(float depth,
 
 float DecodeDepthAttachmentUnorm(std::uint32_t encoded,
                                  std::uint32_t format) {
+  if (format == kDriverPcoDepthFormatZ32Float ||
+      format == kDriverPcoDepthFormatZ32FloatS8X24Uint) {
+    float depth = 0.0F;
+    std::memcpy(&depth, &encoded, sizeof(depth));
+    if (!std::isfinite(depth) || depth < 0.0F || depth > 1.0F)
+      throw std::runtime_error("native floating-point depth is outside [0, 1]");
+    return depth == 0.0F ? 0.0F : depth;
+  }
   const std::uint32_t maximum =
       format == kDriverPcoDepthFormatZ16Unorm
           ? UINT32_C(0xffff)
@@ -152,7 +174,8 @@ bool StencilPass(DepthCompareOp op, std::uint8_t reference,
 }
 
 bool DepthAttachmentHasStencil(std::uint32_t format) {
-  return format == kDriverPcoDepthFormatZ24UnormS8Uint;
+  return format == kDriverPcoDepthFormatZ24UnormS8Uint ||
+         format == kDriverPcoDepthFormatZ32FloatS8X24Uint;
 }
 
 std::vector<std::uint32_t> DecodeDepthAttachmentUnormBytes(
@@ -167,13 +190,21 @@ std::vector<std::uint32_t> DecodeDepthAttachmentUnormBytes(
     stencil->assign(encoded.size(), 0);
   for (std::size_t pixel = 0; pixel < encoded.size(); ++pixel) {
     std::uint32_t word = 0;
-    std::memcpy(&word, bytes.data() + pixel * bytes_per_pixel,
-                bytes_per_pixel);
+    const std::size_t offset = pixel * bytes_per_pixel;
+    for (std::size_t byte = 0; byte < std::min(bytes_per_pixel, sizeof(word)); ++byte)
+      word |= static_cast<std::uint32_t>(bytes[offset + byte]) << (byte * 8U);
     if (has_stencil) {
+      const std::size_t stencil_byte =
+          format == kDriverPcoDepthFormatZ32FloatS8X24Uint ? 4U : 3U;
       if (stencil)
-        (*stencil)[pixel] = static_cast<std::uint8_t>((word >> 24) & 0xFFU);
-      word &= UINT32_C(0x00ffffff);
+        (*stencil)[pixel] = bytes[offset + stencil_byte];
+      if (format == kDriverPcoDepthFormatZ24UnormS8Uint)
+        word &= UINT32_C(0x00ffffff);
     }
+    if ((format == kDriverPcoDepthFormatZ32Float ||
+         format == kDriverPcoDepthFormatZ32FloatS8X24Uint) &&
+        word == UINT32_C(0x80000000))
+      word = 0;
     encoded[pixel] = word;
     (void)DecodeDepthAttachmentUnorm(encoded[pixel], format);
   }
@@ -198,11 +229,18 @@ std::vector<std::uint8_t> EncodeDepthAttachmentUnormBytes(
   for (std::size_t pixel = 0; pixel < encoded.size(); ++pixel) {
     (void)DecodeDepthAttachmentUnorm(encoded[pixel], format);
     std::uint32_t word = encoded[pixel];
+    if ((format == kDriverPcoDepthFormatZ32Float ||
+         format == kDriverPcoDepthFormatZ32FloatS8X24Uint) &&
+        word == UINT32_C(0x80000000))
+      word = 0;
+    const std::size_t offset = pixel * bytes_per_pixel;
+    for (std::size_t byte = 0; byte < std::min(bytes_per_pixel, sizeof(word)); ++byte)
+      bytes[offset + byte] = static_cast<std::uint8_t>(word >> (byte * 8U));
     if (has_stencil && stencil) {
-      word |= static_cast<std::uint32_t>((*stencil)[pixel]) << 24;
+      const std::size_t stencil_byte =
+          format == kDriverPcoDepthFormatZ32FloatS8X24Uint ? 4U : 3U;
+      bytes[offset + stencil_byte] = (*stencil)[pixel];
     }
-    std::memcpy(bytes.data() + pixel * bytes_per_pixel, &word,
-                bytes_per_pixel);
   }
   return bytes;
 }

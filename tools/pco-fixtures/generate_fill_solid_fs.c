@@ -103,25 +103,51 @@ static pco_shader *build_shader(pco_ctx *ctx, nir_shader *nir,
    pco_preprocess_nir(ctx, nir);
    pco_lower_nir(ctx, nir, data);
    pco_postprocess_nir(ctx, nir, data);
+   if (getenv("PVRGPU_DEBUG_PCO_NIR"))
+      nir_print_shader(nir, stderr);
+   if (data->common.push_consts.used) {
+      data->common.push_consts.range = (pco_range){
+         .start = 0, .count = data->common.push_consts.used,
+      };
+      data->common.shareds = data->common.push_consts.used;
+   }
+   if (data->fs.uses.depth_feedback) {
+      nir_builder b = nir_builder_create(nir_shader_get_entrypoint(nir));
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_isp_feedback_pco)
+               continue;
+            b.cursor = nir_before_instr(instr);
+            nir_src_rewrite(&intr->src[0], nir_undef(&b, 1, 32));
+         }
+      }
+   }
 
    pco_shader *shader = pco_trans_nir(ctx, nir, data, NULL);
    pco_process_ir(ctx, shader);
+   if (getenv("PVRGPU_DEBUG_PCO_NIR"))
+      pco_print_shader(shader, stderr, "fixture");
    pco_encode_ir(ctx, shader);
    return shader;
 }
 
 int main(int argc, char **argv)
 {
-   if (argc < 2 || argc > 3) {
+   if (argc < 2 || argc > 4 ||
+       (argc == 4 && strcmp(argv[3], "depth-feedback") != 0)) {
       fprintf(stderr,
               "Usage: %s OUTPUT.bin "
               "[red|red-half-alpha|green-half-alpha|"
-              "triangle-setup-orange|triangle-setup-half-culled-cyan]\n",
+              "triangle-setup-orange|triangle-setup-half-culled-cyan] "
+              "[depth-feedback]\n",
               argv[0]);
       return 2;
    }
 
-   const struct fixture *fixture = find_fixture(argc == 3 ? argv[2] : "red");
+   const struct fixture *fixture = find_fixture(argc >= 3 ? argv[2] : "red");
    if (!fixture) {
       fprintf(stderr, "unknown fixture: %s\n", argv[2]);
       return 2;
@@ -142,6 +168,15 @@ int main(int argc, char **argv)
                                                    "%s",
                                                    fixture->shader_name);
 
+   /* A genuine public DEPTHF, with the same fsat lowering used for
+    * gl_FragDepth.  Shared register 0 permits independent clamp probes. */
+   if (argc == 4) {
+      b.shader->info.internal = true;
+      nir_def *depth = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                              .base = 0, .range = 4);
+      nir_isp_feedback_pco(&b, nir_undef(&b, 1, 32), nir_fsat(&b, depth));
+   }
+
    /* Raw IEEE-754 float32 values written to pixout0..3. */
    for (unsigned component = 0; component < 4; ++component) {
       nir_frag_store_pco(&b,
@@ -151,6 +186,7 @@ int main(int argc, char **argv)
    nir_jump(&b, nir_jump_return);
 
    pco_data data = { 0 };
+   data.fs.uses.depth_feedback = argc == 4;
    pco_shader *shader = build_shader(ctx, b.shader, &data);
    const unsigned size = pco_shader_binary_size(shader);
    const void *bytes = pco_shader_binary_data(shader);

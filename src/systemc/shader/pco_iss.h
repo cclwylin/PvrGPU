@@ -193,6 +193,7 @@ enum class PcoOpcode : std::uint8_t {
   /* Mesa fcsel_gt lowered as TST.F32.GZ + MOVC.  Keep this distinct from
    * Boolean BCSEL: the condition is an ordered float comparison with +0. */
   kConditionalSelectGreaterZero,
+  kDepthFeedback,
 };
 
 enum class PcoWriteTarget : std::uint8_t {
@@ -300,6 +301,10 @@ struct PcoInstruction {
   // SMP `.tao`: the sample takes its texture base from a shader-computed
   // 64-bit address (array layer folded in) at coordinate_base+3/+4.
   std::uint8_t texture_address_offset = 0;
+  // SMP FCNORM converts the sampled channels to floating-point results.
+  // Mesa leaves it clear for integer samplers; it does not control whether
+  // the texture coordinates are normalized.
+  std::uint8_t texture_fcnorm = 1;
   std::uint8_t data_request = 0;
   PcoIterationMode iteration_mode = PcoIterationMode::kPixel;
   std::uint8_t perspective = 0;
@@ -389,6 +394,7 @@ struct PcoProgramSummary {
   std::uint64_t vertex_output_mask = 0;
   std::uint16_t pixel_output_mask = 0;
   std::uint8_t early_hsr_safe = 0;
+  std::uint8_t writes_depth = 0;
   std::uint8_t ends_task = 0;
 };
 
@@ -399,7 +405,7 @@ struct PcoDecodedProgram {
   std::vector<PcoInstruction> instructions;
 };
 
-/* One exact public SMP.2D.FCNORM request emitted by either shader-stage ISS. The
+/* One decoded public SMP request emitted by either shader-stage ISS. The
  * normalized coordinates and hardware texture/sampler state are the values
  * read by the decoded USC instruction, not a precomputed texel or case name.
  */
@@ -417,6 +423,7 @@ struct PcoTextureRequest {
   std::uint8_t binding = 0;
   std::uint8_t dimension = 0;
   std::uint8_t normalized = 0;
+  std::uint8_t fcnorm = 1;
   std::uint8_t data_request = 0;
 };
 
@@ -485,6 +492,8 @@ struct PcoFragmentContinuation {
   std::uint8_t pending_component_count = 0;
   std::uint8_t data_request = 0;
   std::uint8_t valid = 0;
+  std::uint32_t depth = 0;
+  std::uint8_t depth_written = 0;
 };
 
 struct PcoFragmentExecution {
@@ -496,6 +505,8 @@ struct PcoFragmentExecution {
   std::uint8_t texture_request_valid = 0;
   std::uint8_t suspended = 0;
   bool discarded = false;
+  std::uint32_t depth = 0;
+  std::uint8_t depth_written = 0;
 };
 
 /*

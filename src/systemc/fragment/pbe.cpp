@@ -7,6 +7,7 @@
 #include "fragment/pbe.h"
 
 #include "common/functional_types.h"
+#include "common/msaa.h"
 
 #include <algorithm>
 #include <array>
@@ -24,6 +25,82 @@ float BitsFloat(std::uint32_t bits) {
   static_assert(sizeof(value) == sizeof(bits));
   std::memcpy(&value, &bits, sizeof(value));
   return value;
+}
+
+template <typename T>
+bool LateDepthPass(pvrgpu::stub::DepthCompareOp operation, T incoming, T stored) {
+  using pvrgpu::stub::DepthCompareOp;
+  switch (operation) {
+  case DepthCompareOp::kNever: return false;
+  case DepthCompareOp::kLess: return incoming < stored;
+  case DepthCompareOp::kEqual: return incoming == stored;
+  case DepthCompareOp::kLessOrEqual: return incoming <= stored;
+  case DepthCompareOp::kGreater: return incoming > stored;
+  case DepthCompareOp::kNotEqual: return incoming != stored;
+  case DepthCompareOp::kGreaterOrEqual: return incoming >= stored;
+  case DepthCompareOp::kAlways: return true;
+  }
+  throw std::runtime_error("PBE late depth comparison is invalid");
+}
+
+bool TestLateDepthStencil(pvrgpu::stub::PipelineState &state,
+                          const pvrgpu::stub::FragmentInvocation &invocation,
+                          float shader_depth, std::size_t sample_index,
+                          std::vector<std::uint32_t> &depth,
+                          std::vector<std::uint8_t> &stencil) {
+  using namespace pvrgpu::stub;
+  const StencilState &stencil_state = state.raster_state.stencil;
+  const StencilFaceState &face = invocation.front_facing
+      ? stencil_state.front : stencil_state.back;
+  bool stencil_passes = true;
+  if (stencil_state.test_enable && !stencil.empty()) {
+    ++state.counters.stencil_tested_fragments;
+    const auto mask = static_cast<std::uint8_t>(face.value_mask);
+    stencil_passes = StencilPass(face.compare_op,
+        static_cast<std::uint8_t>(face.reference & mask),
+        static_cast<std::uint8_t>(stencil[sample_index] & mask));
+    if (!stencil_passes)
+      ++state.counters.stencil_rejected_fragments;
+  }
+  bool passes = stencil_passes;
+  std::uint32_t encoded = 0;
+  if (stencil_passes && state.raster_state.depth.test_enable) {
+    ++state.counters.depth_tested_fragments;
+    // GLES restricts the shader's final depth to [0,1] before native-format
+    // conversion, as llvmpipe's late-Z lp_build_depth_clamp path does.
+    if (std::isnan(shader_depth))
+      throw std::runtime_error("PBE shader depth is NaN");
+    shader_depth = std::clamp(shader_depth, 0.0F, 1.0F);
+    if (state.depth_attachment_format == 0) {
+      std::memcpy(&encoded, &shader_depth, sizeof(encoded));
+      passes = LateDepthPass(state.raster_state.depth.compare_op,
+                             shader_depth, BitsFloat(depth[sample_index]));
+    } else {
+      encoded = EncodeDepthAttachmentUnorm(shader_depth, state.depth_attachment_format);
+      passes = LateDepthPass(state.raster_state.depth.compare_op,
+                             encoded, depth[sample_index]);
+    }
+    if (!passes)
+      ++state.counters.depth_rejected_fragments;
+  }
+  if (stencil_state.test_enable && !stencil.empty()) {
+    const StencilOp operation = !stencil_passes ? face.fail_op
+        : passes ? face.pass_op : face.depth_fail_op;
+    const auto write_mask = static_cast<std::uint8_t>(face.write_mask);
+    const std::uint8_t old = stencil[sample_index];
+    const std::uint8_t updated = ApplyStencilOp(
+        operation, old, static_cast<std::uint8_t>(face.reference));
+    stencil[sample_index] = static_cast<std::uint8_t>(
+        (old & ~write_mask) | (updated & write_mask));
+    if (stencil[sample_index] != old)
+      ++state.counters.stencil_written_fragments;
+  }
+  if (passes && state.raster_state.depth.test_enable &&
+      state.raster_state.depth.write_enable) {
+    depth[sample_index] = encoded;
+    ++state.counters.depth_written_fragments;
+  }
+  return passes;
 }
 
 std::uint8_t FloatValueToUnorm8(float value) {
@@ -185,7 +262,9 @@ float BlendEquationFloat(pvrgpu::stub::BlendEquation equation, float source,
     result = term2 - term1;
   else
     throw std::runtime_error("PBE received an unsupported blend equation in calculation");
-  return std::clamp(result, 0.0F, 1.0F);
+  // Floating-point attachments retain values outside [0,1].  A normalized
+  // attachment performs its clamp when the result is encoded for storage.
+  return result;
 }
 
 void ValidateBlendState(const pvrgpu::stub::BlendState &blend) {
@@ -242,12 +321,22 @@ void Pbe::Run() {
 
     const std::uint64_t pixel_count =
         static_cast<std::uint64_t>(state.width) * state.height;
+    const std::uint32_t sample_count = state.raster_state.sample_count;
+    if (!IsSupportedRasterSampleCount(sample_count) ||
+        pixel_count > std::numeric_limits<std::size_t>::max() / sample_count)
+      throw std::runtime_error("PBE sample count or framebuffer size is invalid");
+    const std::size_t stored_samples =
+        static_cast<std::size_t>(pixel_count) * sample_count;
     // An integer attachment stores one dword per channel, so a pixel is not
     // always four bytes wide.  Everything below sizes and indexes through
     // this rather than assuming.
     const std::size_t bytes_per_pixel =
-        ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
-    if (pixel_count > std::numeric_limits<std::size_t>::max() / bytes_per_pixel)
+        ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
+                                     state.color_attachment_float32);
+    if (state.color_attachment_float32 &&
+        (state.color_attachment_raw_dwords != 0 || state.color_is_srgb))
+      throw std::runtime_error("PBE floating-point attachment state is invalid");
+    if (stored_samples > std::numeric_limits<std::size_t>::max() / bytes_per_pixel)
       throw std::overflow_error("PBE framebuffer size overflow");
     const std::vector<FragmentInvocation> invocations =
         LoadArray<FragmentInvocation>(pool_, state.fragment_invocations);
@@ -258,7 +347,7 @@ void Pbe::Run() {
       throw std::runtime_error("PBE fragment input/output count mismatch");
     }
 
-    const std::uint64_t framebuffer_bytes = pixel_count * bytes_per_pixel;
+    const std::uint64_t framebuffer_bytes = stored_samples * bytes_per_pixel;
     if (state.color_attachment_load_enable > 1 ||
         (state.color_attachment_load_enable != 0) !=
             HasPoolHandle(state.color_attachment_load) ||
@@ -286,7 +375,12 @@ void Pbe::Run() {
         continue;
       }
       attachment.assign(static_cast<std::size_t>(framebuffer_bytes), 0);
-      if (state.color_attachment_raw_dwords != 0) {
+      if (state.color_attachment_float32) {
+        for (std::size_t pixel = 0; pixel < stored_samples; ++pixel) {
+          std::memcpy(attachment.data() + pixel * bytes_per_pixel,
+                      state.raster_state.clear_color, bytes_per_pixel);
+        }
+      } else if (state.color_attachment_raw_dwords != 0) {
         // An integer attachment clears to the raw value, not a colour, and to
         // one such value per channel it stores.
         const std::size_t channels = state.color_attachment_raw_dwords;
@@ -295,12 +389,12 @@ void Pbe::Run() {
           std::memcpy(&raw[channel], &state.raster_state.clear_color[channel],
                       sizeof(raw[channel]));
         }
-        for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
+        for (std::size_t pixel = 0; pixel < stored_samples; ++pixel) {
           std::memcpy(attachment.data() + pixel * bytes_per_pixel, raw.data(),
                       channels * sizeof(std::uint32_t));
         }
       } else {
-        for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
+        for (std::size_t pixel = 0; pixel < stored_samples; ++pixel) {
           for (std::size_t component = 0; component < 4; ++component) {
             attachment[pixel * bytes_per_pixel + component] =
                 FloatValueToUnorm8(state.raster_state.clear_color[component]);
@@ -308,10 +402,24 @@ void Pbe::Run() {
         }
       }
     }
-    std::vector<std::uint32_t> written_map(
-        static_cast<std::size_t>(pixel_count), 0);
-    std::vector<std::uint64_t> last_submit_ordinal(
-        static_cast<std::size_t>(pixel_count), 0);
+    std::vector<std::uint32_t> written_map(stored_samples, 0);
+    std::vector<std::uint64_t> last_submit_ordinal(stored_samples, 0);
+    const bool late_depth_stencil = state.raster_state.shader_writes_depth != 0;
+    std::vector<std::uint32_t> late_depth;
+    std::vector<std::uint8_t> late_stencil;
+    std::uint64_t late_tested_samples = 0;
+    if (late_depth_stencil) {
+      if (!HasPoolHandle(state.isp_depth_attachment))
+        throw std::runtime_error("PBE has no late depth attachment state");
+      late_depth = LoadArray<std::uint32_t>(pool_, state.isp_depth_attachment);
+      if (late_depth.size() != stored_samples)
+        throw std::runtime_error("PBE late depth sample count is invalid");
+      if (DepthAttachmentHasStencil(state.depth_attachment_format)) {
+        late_stencil = LoadArray<std::uint8_t>(pool_, state.isp_stencil_attachment);
+        if (late_stencil.size() != stored_samples)
+          throw std::runtime_error("PBE late stencil sample count is invalid");
+      }
+    }
     for (std::size_t index = 0; index < outputs.size(); ++index) {
       const FragmentInvocation &invocation = invocations[index];
       const FragmentOutput &output = outputs[index];
@@ -354,17 +462,70 @@ void Pbe::Run() {
         throw std::runtime_error("PBE fragment coordinate is out of bounds");
       const std::size_t pixel_index =
           static_cast<std::size_t>(output.y) * state.width + output.x;
-      if (written_map[pixel_index] != 0) {
-        if (!state.raster_state.blend.enable)
+      const std::uint32_t coverage = invocation.sample_mask;
+      if (coverage == 0 || (coverage & ~RasterSampleMask(sample_count)) != 0)
+        throw std::runtime_error("PBE fragment sample coverage is invalid");
+      if (late_depth_stencil &&
+          (output.depth_written != 1 || invocation.front_facing > 1))
+        throw std::runtime_error("PBE shader depth output or facing is invalid");
+      for (std::uint32_t sample = 0; sample < sample_count; ++sample) {
+      if ((coverage & (1U << sample)) == 0)
+        continue;
+      const std::size_t stored_index = pixel_index * sample_count + sample;
+      if (late_depth_stencil) {
+        ++late_tested_samples;
+        if (!TestLateDepthStencil(state, invocation, output.depth, stored_index,
+                                  late_depth, late_stencil))
+          continue;
+      }
+      if (written_map[stored_index] != 0) {
+        if (!state.raster_state.blend.enable && !late_depth_stencil)
           throw std::runtime_error("PBE attempted to shade one opaque owner twice");
-        if (output.submit_ordinal < last_submit_ordinal[pixel_index])
+        if (output.submit_ordinal < last_submit_ordinal[stored_index])
           throw std::runtime_error("PBE blended fragments lost API order");
       }
-      ++written_map[pixel_index];
-      last_submit_ordinal[pixel_index] = output.submit_ordinal;
-      const std::size_t byte_offset = pixel_index * bytes_per_pixel;
+      ++written_map[stored_index];
+      last_submit_ordinal[stored_index] = output.submit_ordinal;
+      const std::size_t byte_offset = stored_index * bytes_per_pixel;
       for (std::uint32_t target = 0; target < render_target_count; ++target) {
       std::vector<std::uint8_t> &framebuffer = framebuffers[target];
+      if (state.color_attachment_float32) {
+        std::array<float, 4> source{};
+        std::array<float, 4> destination{};
+        std::memcpy(source.data(), &output.pixel_output[target * 4],
+                    sizeof(source));
+        std::memcpy(destination.data(), framebuffer.data() + byte_offset,
+                    sizeof(destination));
+        std::array<float, 4> result = source;
+        if (state.raster_state.blend.enable) {
+          const BlendState &blend = state.raster_state.blend;
+          std::array<float, 4> constant{};
+          for (std::size_t component = 0; component < 4; ++component)
+            constant[component] = std::clamp(
+                BitsFloat(blend.constant_color_bits[component]), 0.0F, 1.0F);
+          for (std::size_t component = 0; component < 4; ++component) {
+            const BlendFactor source_factor = component == 3
+                ? blend.source_alpha_factor : blend.source_rgb_factor;
+            const BlendFactor destination_factor = component == 3
+                ? blend.destination_alpha_factor : blend.destination_rgb_factor;
+            const BlendEquation equation = component == 3
+                ? blend.alpha_equation : blend.rgb_equation;
+            result[component] = BlendEquationFloat(
+                equation, source[component], destination[component],
+                FactorToFloat(source_factor, source, destination, constant,
+                              component),
+                FactorToFloat(destination_factor, source, destination, constant,
+                              component));
+          }
+        }
+        for (std::size_t component = 0; component < 4; ++component) {
+          if ((state.raster_state.color_mask & (1U << component)) != 0) {
+            std::memcpy(framebuffer.data() + byte_offset + component * 4U,
+                        &result[component], sizeof(float));
+          }
+        }
+        continue;
+      }
       if (state.color_attachment_raw_dwords != 0) {
         /*
          * A 32-bit integer attachment stores the shader's PIXOUT lanes
@@ -374,6 +535,8 @@ void Pbe::Run() {
          */
         const std::size_t channels = state.color_attachment_raw_dwords;
         for (std::size_t channel = 0; channel < channels; ++channel) {
+          if ((state.raster_state.color_mask & (1U << channel)) == 0)
+            continue;
           const std::uint32_t raw = output.pixel_output[target * 4 + channel];
           std::memcpy(framebuffer.data() + byte_offset +
                           channel * sizeof(raw),
@@ -485,14 +648,21 @@ void Pbe::Run() {
         }
       }
       }
+      }
     }
     const std::uint64_t pixels_touched = static_cast<std::uint64_t>(
         std::count_if(written_map.begin(), written_map.end(),
                       [](std::uint32_t writes) { return writes != 0; }));
-    if ((!state.raster_state.blend.enable &&
+    if ((!state.raster_state.blend.enable && !late_depth_stencil && sample_count == 1 &&
          pixels_touched != state.active_fragment_invocations) ||
         outputs.size() != state.active_fragment_invocations)
       throw std::runtime_error("PBE fragment write count mismatch");
+
+    if (late_depth_stencil) {
+      StoreArray(pool_, state.isp_depth_attachment, late_depth);
+      if (!late_stencil.empty())
+        StoreArray(pool_, state.isp_stencil_attachment, late_stencil);
+    }
 
     state.pbe_framebuffer = StoreNewArray(pool_, framebuffers[0]);
     state.framebuffer_bytes = framebuffers[0].size();
@@ -500,21 +670,35 @@ void Pbe::Run() {
       state.extra_pbe_framebuffer[target - 1] =
           StoreNewArray(pool_, framebuffers[target]);
     }
-    // Every attachment is written for each covered pixel.
-    state.counters.pbe_pixels_written = pixel_count * render_target_count;
-    state.counters.pbe_fragment_writes = outputs.size();
-    if (state.raster_state.blend.enable) {
-      state.counters.pbe_color_reads = outputs.size();
-      state.counters.pbe_blended_fragments = outputs.size();
-    }
+    // Pixel-frequency shader outputs can own several samples, and each
+    // attachment has an independent destination. Count the work performed
+    // above, including overdraw, separately from full-surface serialization.
+    std::uint64_t sample_colors = 0;
+    for (const std::uint32_t writes : written_map)
+      sample_colors += static_cast<std::uint64_t>(writes) * render_target_count;
+    const std::uint32_t stored_channel_mask =
+        state.color_attachment_raw_dwords != 0
+            ? (1U << state.color_attachment_raw_dwords) - 1U : 0x0fU;
+    state.counters.pbe_pixels_written = stored_samples * render_target_count;
+    state.counters.pbe_fragment_writes =
+        (state.raster_state.color_mask & stored_channel_mask) != 0
+            ? sample_colors : 0;
+    // Integer attachments bypass the blend equation even if API blend state
+    // is enabled. A masked floating/UNORM output still runs that equation in
+    // this model, but does not produce a color write when all lanes are off.
+    const std::uint64_t blended_colors =
+        state.raster_state.blend.enable &&
+                state.color_attachment_raw_dwords == 0
+            ? sample_colors : 0;
+    state.counters.pbe_color_reads = blended_colors;
+    state.counters.pbe_blended_fragments = blended_colors;
     const std::uint64_t blend_cycles =
-        state.raster_state.blend.enable
-            ? CeilDivide(outputs.size(),
-                         kReferenceUarch.pbe_blend_fragments_per_batch)
-            : 0;
+        CeilDivide(blended_colors, kReferenceUarch.pbe_blend_fragments_per_batch);
     const std::uint64_t cycles =
         kReferenceUarch.pbe_base_cycles +
-        CeilDivide(pixel_count, kReferenceUarch.pbe_pixels_per_batch) +
+        CeilDivide(state.counters.pbe_pixels_written,
+                   kReferenceUarch.pbe_pixels_per_batch) +
+        CeilDivide(late_tested_samples, kReferenceUarch.isp_candidates_per_batch) +
         blend_cycles;
     state.counters.pbe_cycles = cycles;
     state.counters.renderer_cycles += cycles;

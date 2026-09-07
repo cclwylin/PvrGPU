@@ -242,8 +242,8 @@ void VerifyDepthAttachmentFormats() {
 
 int main() {
   using namespace pvrgpu::stub;
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 19U,
-                "native sequence bridge test requires API-v19");
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 20U,
+                "native sequence bridge test requires API-v20");
   static_assert(PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS == 15U);
   static_assert(kDriverPcoMaximumTextureMipLevels == 15U);
   static_assert(kMaximumTextureMipLevels == 15U);

@@ -179,6 +179,9 @@ struct PipelineState {
   // ColorAttachmentBytesPerPixel() turns this into the stored pixel width;
   // nothing downstream may assume four bytes.
   std::uint8_t color_attachment_raw_dwords = 0;
+  // Canonical linear RGBA32F storage.  This is separate from raw integer
+  // PIXOUT transport: floating-point attachments still blend and honor masks.
+  std::uint8_t color_attachment_float32 = 0;
   // The UNORM8 colour attachment stores sRGB-encoded bytes: the PBE encodes the
   // shader's linear PIXOUT on write and, when blending, decodes the stored
   // destination to linear, blends there and re-encodes.  Zero is a plain linear

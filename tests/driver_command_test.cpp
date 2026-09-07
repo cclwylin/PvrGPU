@@ -250,6 +250,52 @@ int main() {
 
   // An indexed PCO draw carries its index payload; the loader keeps the
   // fields verbatim so vertex fetch can walk the real index buffer.
+  // A generic draw states its attribute ABI instead of relying on a pinned
+  // capture.  Its viewport is independent of the framebuffer dimensions.
+  const std::filesystem::path pco_large_viewport = TempFile("pco-large-viewport.txt");
+  std::string pco_large_text = pco_text;
+  if (!ReplaceOnce(&pco_large_text, "framebuffer_width=80\n", "framebuffer_width=40\n") ||
+      !ReplaceOnce(&pco_large_text, "framebuffer_height=60\n", "framebuffer_height=30\n") ||
+      !ReplaceOnce(&pco_large_text, "vertex_count=6144\n", "vertex_count=3\nvertex_attribute_count=1\n") ||
+      !ReplaceOnce(&pco_large_text, "raw_vertex_data_size=73728\n", "raw_vertex_data_size=36\n"))
+    return 1;
+  WriteText(pco_large_viewport, pco_large_text);
+  error.clear();
+  if (int failed = Expect(LoadDriverCommand(pco_large_viewport.string(), &command, &error), error))
+    return failed;
+  if (int failed = Expect(command.width == 80 && command.height == 60 &&
+          command.framebuffer_width == 40 && command.framebuffer_height == 30,
+          "generic audit parser resized the oversized viewport"))
+    return failed;
+  std::string pco_translated_text = pco_large_text;
+  if (!ReplaceOnce(&pco_translated_text,
+          "viewport_translate_bits=1109393408,1106247680,1056964608",
+          "viewport_translate_bits=0,0,1056964608"))
+    return 1;
+  WriteText(pco_large_viewport, pco_translated_text);
+  error.clear();
+  if (int failed = Expect(LoadDriverCommand(pco_large_viewport.string(), &command, &error), error))
+    return failed;
+  if (!ReplaceOnce(&pco_translated_text,
+          "viewport_translate_bits=0,0,1056964608",
+          "viewport_translate_bits=2143289344,0,1056964608"))
+    return 1;
+  WriteText(pco_large_viewport, pco_translated_text);
+  error.clear();
+  if (int failed = Expect(!LoadDriverCommand(pco_large_viewport.string(), &command, &error),
+          "generic audit parser accepted a non-finite viewport offset"))
+    return failed;
+  std::string pco_legacy_large_text = pco_large_text;
+  if (!ReplaceOnce(&pco_legacy_large_text, "vertex_attribute_count=1\n", ""))
+    return 1;
+  WriteText(pco_large_viewport, pco_legacy_large_text);
+  error.clear();
+  if (int failed = Expect(!LoadDriverCommand(pco_large_viewport.string(), &command, &error) &&
+          error.find("framebuffer-sized") != std::string::npos,
+          "legacy PCO parser lost its pinned viewport contract"))
+    return failed;
+  std::filesystem::remove(pco_large_viewport);
+
   const std::filesystem::path pco_indexed = TempFile("pco-indexed.txt");
   std::string pco_indexed_text = pco_text;
   if (!ReplaceOnce(&pco_indexed_text, "indexed=0\n",

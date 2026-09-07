@@ -184,7 +184,8 @@ pvrgpu_cmd_format_supported(const char *format)
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32UI) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R32I) == 0 ||
            strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RG32I) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32I) == 0);
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32I) == 0 ||
+           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32F) == 0);
 }
 
 /*
@@ -221,11 +222,12 @@ pvrgpu_pco_single_draw_resolution_supported(uint32_t framebuffer_width,
 {
    /*
     * The model's rasterizer is resolution independent and applies the stated
-    * viewport transform, so a draw may render to part of its attachment.  The
-    * viewport just has to fit inside it.
+    * viewport transform.  The viewport and attachment are independent extents:
+    * tile generation clips rasterization to the attachment, including when
+    * the viewport is larger or extends beyond one of its edges.
     */
    return width != 0 && height != 0 &&
-          width <= framebuffer_width && height <= framebuffer_height &&
+          width <= 4096 && height <= 4096 &&
           framebuffer_width != 0 && framebuffer_height != 0 &&
           framebuffer_width <= 4096 && framebuffer_height <= 4096;
 }
@@ -466,6 +468,8 @@ pvrgpu_systemc_flush_readback_pixels(uint32_t width,
                                      uint32_t height,
                                      uint32_t bytes_per_pixel,
                                      uint32_t attachment,
+                                     uint32_t sample_count,
+                                     uint32_t depth_format,
                                      uint8_t *pixels,
                                      size_t pixels_size,
                                      bool *out_written,
@@ -510,6 +514,8 @@ pvrgpu_systemc_flush_readback_pixels(uint32_t width,
    readback.height = height;
    readback.attachment = attachment;
    readback.bytes_per_pixel = bytes_per_pixel;
+   readback.sample_count = sample_count;
+   readback.depth_format = depth_format;
    readback.pixels = pixels;
    readback.pixels_size = pixels_size;
 
@@ -854,7 +860,8 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32UI) == 0 ||
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_R32I) == 0 ||
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RG32I) == 0 ||
-      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32I) == 0;
+      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32I) == 0 ||
+      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32F) == 0;
    if (!resolution_ok || !format_ok) {
       /*
        * Say which half of the requirement failed and with what.  A
@@ -864,8 +871,8 @@ pvrgpu_cmd_validate_draw_pco_triangles(
        */
       char message[320];
       snprintf(message, sizeof(message),
-               "draw PCO triangles requires a full-surface RGBA8 render "
-               "target within the model extent (%s%s%s: viewport=%ux%u "
+               "draw PCO triangles requires a supported render target and "
+               "viewport within the model extent (%s%s%s: viewport=%ux%u "
                "framebuffer=%ux%u format=%s)",
                resolution_ok ? "" : "resolution",
                (!resolution_ok && !format_ok) ? " and " : "",
@@ -884,12 +891,14 @@ pvrgpu_cmd_validate_draw_pco_triangles(
     * anything else was declined here and fell through to a shape recogniser.
     * Only a value the float bits cannot describe is a reason to refuse.
     */
-   for (unsigned channel = 0; channel < 4; ++channel) {
+   const bool integer_attachment = strstr(cmd->format, "_UINT") != NULL ||
+                                   strstr(cmd->format, "_SINT") != NULL;
+   for (unsigned channel = 0; channel < 4 && !integer_attachment; ++channel) {
       float value = 0.0f;
       memcpy(&value, &cmd->clear_color_bits[channel], sizeof(value));
-      if (!isfinite(value) || value < 0.0f || value > 1.0f) {
+      if (!isfinite(value)) {
          pvrgpu_cmd_error(error, error_size,
-                          "draw PCO triangles clear color is outside [0, 1]");
+                          "draw PCO triangles clear color is non-finite");
          return false;
       }
    }
@@ -1332,15 +1341,20 @@ pvrgpu_cmd_validate_draw_pco_triangles(
            cmd->depth_func == 3 && cmd->depth_format != 0));
    /*
     * Scale is half the viewport extent in each axis; the offset places that
-    * extent inside the attachment.  A pinned capture renders to the whole
-    * surface, where offset equals scale, but a draw that does not is only
-    * required to stay inside the render target.
+    * extent relative to the attachment.  Generic geometry is clipped to its
+    * framebuffer by tile generation, so a finite viewport translation may
+    * place some or all of it outside the framebuffer.  Pinned profiles keep
+    * their original inside-attachment contract.
     */
    const bool viewport_scale_ok =
       pvrgpu_cmd_viewport_scale_matches(cmd->viewport_scale_bits,
                                         cmd->width,
                                         cmd->height);
-   const bool viewport_offset_ok =
+   float viewport_offset[3];
+   memcpy(viewport_offset, cmd->viewport_translate_bits, sizeof(viewport_offset));
+   const bool viewport_offset_ok = color_layout ?
+      (isfinite(viewport_offset[0]) && isfinite(viewport_offset[1]) &&
+       isfinite(viewport_offset[2]) && viewport_offset[2] == 0.5f) :
       pvrgpu_cmd_viewport_offset_is_inside(cmd->viewport_translate_bits,
                                            cmd->width,
                                            cmd->height,
@@ -1402,7 +1416,7 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       raster_reason = "depth_clip";
    else if (cmd->depth_clamp != 0)
       raster_reason = "depth_clamp";
-   else if (cmd->sample_mask != UINT32_MAX)
+   else if (!color_layout && cmd->sample_mask != UINT32_MAX)
       raster_reason = "sample_mask";
    else if (cmd->color_mask > 0xf)
       raster_reason = "color_mask";
@@ -2180,7 +2194,10 @@ pvrgpu_write_draw_pco_sequence_command(
       }
       has_initial_color_attachment = has_initial_color_attachment ||
          nested->initial_color_attachment_bytes ||
-         nested->initial_color_attachment_bytes_size != 0;
+         nested->initial_color_attachment_bytes_size != 0 ||
+         nested->initial_depth_attachment_bytes ||
+         nested->initial_depth_attachment_bytes_size != 0 ||
+         nested->raster_samples > 1;
    }
 
    FILE *file = fopen(path, "w");
@@ -2219,7 +2236,7 @@ pvrgpu_write_draw_pco_sequence_command(
       /* The text file is a summary, not a nested payload serialization.
        * Make replay reject explicitly before it can lose imported pixels. */
       has_initial_color_attachment
-         ? "initial_color_attachment_replay=api-v19-only\n" : "",
+         ? "initial_color_attachment_replay=api-v20-only\n" : "",
       cmd->schema && cmd->schema[0] ? cmd->schema :
                                       PVRGPU_DRIVER_COMMAND_SCHEMA,
       cmd->producer && cmd->producer[0] ? cmd->producer :

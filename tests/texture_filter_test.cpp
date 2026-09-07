@@ -376,6 +376,28 @@ void CheckPackedFormatDecode() {
         "RGB9E5 shared-exponent red 1.0, alpha one");
 }
 
+void CheckIntegerFormatDecode() {
+  const std::array<std::uint8_t, 16> texel = {
+      0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x80,
+      0x01, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00};
+  const std::array<std::uint32_t, 4> expected = {
+      UINT32_C(0xffffffff), UINT32_C(0x80000000),
+      UINT32_C(0x01000001), UINT32_C(1)};
+  for (const TextureFormat format : {TextureFormat::kRgba32Uint,
+                                     TextureFormat::kRgba32Sint}) {
+    Check(TextureBytesPerTexel(format) == 16 &&
+              pvrgpu::stub::DecodeTexelToInteger(format, texel) == expected,
+          "integer texels retain signed extrema and low bits beyond float precision");
+  }
+  bool threw = false;
+  try {
+    (void)pvrgpu::stub::DecodeTexelToInteger(TextureFormat::kRgba8Unorm, texel);
+  } catch (const std::runtime_error &) {
+    threw = true;
+  }
+  Check(threw, "integer texel decode rejects a normalized color format");
+}
+
 } // namespace
 
 int main() {
@@ -385,6 +407,7 @@ int main() {
   CheckFixedPointAxes();
   CheckFloatAxes();
   CheckPackedFormatDecode();
+  CheckIntegerFormatDecode();
   if (failures != 0) {
     std::cerr << failures << " texture filter check(s) failed\n";
     return 1;

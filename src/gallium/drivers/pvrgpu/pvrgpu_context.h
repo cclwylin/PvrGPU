@@ -161,6 +161,22 @@ pvrgpu_context(struct pipe_context *pipe)
    return (struct pvrgpu_context *)pipe;
 }
 
+/* Pending rectangles describe changes since the last recorded draw. A first
+ * draw's successful native LOAD already contains those CPU changes, including
+ * stencil write masks the rectangle capsule cannot encode. Later draws of an
+ * incomplete replay have no new LOAD and must keep their ordered rectangles.
+ * A framebuffer boundary retires only unconsumed rectangles, not the copies
+ * already owned by recorded draws for the previous attachment. */
+static inline void
+pvrgpu_retire_materialized_attachment_clears(struct pvrgpu_context *ctx,
+                                             bool framebuffer_changed,
+                                             size_t initial_depth_bytes)
+{
+   if (framebuffer_changed ||
+       (ctx->array_primitive_draw_count == 0 && initial_depth_bytes != 0))
+      ctx->pending_attachment_clear_count = 0;
+}
+
 struct pipe_context *
 pvrgpu_create_context(struct pipe_screen *screen, void *priv,
                       unsigned flags);

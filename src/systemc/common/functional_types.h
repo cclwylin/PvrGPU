@@ -317,8 +317,10 @@ bool StencilPass(DepthCompareOp op, std::uint8_t reference,
                  std::uint8_t stored);
 
 // Public pipe-format values are transported verbatim by the native sequence
-// ABI. These helpers centralize the exact little-endian UNORM attachment
-// conversion used by Submitter, ISP and FragmentFrontend.
+// ABI. These helpers centralize exact little-endian attachment conversion
+// used by Submitter, ISP and FragmentFrontend. The legacy "Unorm" names also
+// accept Z32_FLOAT formats: their encoded key is the nonnegative binary32
+// payload, whose unsigned ordering agrees with the floating-point ordering.
 std::size_t DepthAttachmentBytesPerPixel(std::uint32_t format);
 
 // One colour pixel's stored width, from the channel count in
@@ -328,15 +330,18 @@ std::size_t DepthAttachmentBytesPerPixel(std::uint32_t format);
 // their framebuffer through here, so a wider attachment widens all three at
 // once instead of overrunning a buffer one of them still thought was 4 bytes
 // per pixel.
-constexpr std::size_t ColorAttachmentBytesPerPixel(std::uint8_t raw_dwords) {
+constexpr std::size_t ColorAttachmentBytesPerPixel(std::uint8_t raw_dwords,
+                                                  bool float32 = false) {
+  if (float32)
+    return 4U * sizeof(float);
   return raw_dwords != 0 ? static_cast<std::size_t>(raw_dwords) * 4U : 4U;
 }
 std::uint32_t EncodeDepthAttachmentUnorm(float depth, std::uint32_t format);
 float DecodeDepthAttachmentUnorm(std::uint32_t encoded,
                                  std::uint32_t format);
-// Z24_UNORM_S8_UINT packs the stencil in bits 24..31 of the same word.  The
-// depth codec refuses a nonzero value there, so the planes are split on the way
-// in and recombined on the way out.  Passing no stencil vector keeps the old
+// Z24_UNORM_S8_UINT stores stencil in byte 3; Z32_FLOAT_S8X24_UINT stores it
+// in byte 4 after the full binary32 depth. The planes are split on the way
+// in and recombined on the way out. Passing no stencil vector keeps the old
 // behaviour: the stencil plane reads as zero and is written back as zero, which
 // is what a format without one requires anyway.
 bool DepthAttachmentHasStencil(std::uint32_t format);
@@ -446,6 +451,10 @@ struct RasterState {
   float viewport_translate[3] = {0.0f, 0.0f, 0.0f};
   float clear_color[4] = {0.0F, 0.0F, 0.0F, 1.0F};
   std::uint32_t sample_count = 1;
+  std::uint32_t sample_mask = UINT32_MAX;
+  // Disabling multisample rasterization uses center coverage/depth while
+  // retaining independent storage and tests for every selected sample.
+  std::uint8_t multisample_enable = 1;
   std::uint8_t shader_may_discard = 0;
   std::uint8_t shader_writes_depth = 0;
   std::uint8_t shader_writes_sample_mask = 0;
@@ -574,6 +583,14 @@ enum class TextureFormat : std::uint8_t {
   // the texture unit realises it by swapping the red and blue bytes at fetch,
   // so every datapath downstream treats the texel as plain 8-bit unorm.
   kBgra8Unorm,
+  // Canonical uncompressed integer texels. All four channels retain their
+  // exact 32-bit payload, including signed two's-complement values. SMP
+  // without FCNORM returns those DWORDs rather than binary32 conversions.
+  kRgba32Uint,
+  kRgba32Sint,
+  // Canonical floating-point storage for views whose native channel count
+  // or packed format is expanded by the driver, without UNORM8 quantization.
+  kRgba32Float,
 };
 
 // One sRGB-encoded channel, as a linear value.  This is the GL/IEC 61966-2-1
@@ -826,9 +843,9 @@ struct ParameterCoefficientSet {
   std::uint32_t pad = 0;
 };
 
-// ISP records every covered sample candidate, rather than a union mask. Opaque
-// HSR marks one final owner visible per sample; blending keeps every passing
-// candidate visible in submit order.
+// ISP records one candidate per covered primitive/pixel with the samples that
+// survived coverage, depth and stencil. Opaque HSR removes only superseded
+// sample bits; different primitives can own disjoint samples of one pixel.
 struct FragmentCandidate {
   std::uint32_t x = 0;
   std::uint32_t y = 0;
@@ -837,7 +854,7 @@ struct FragmentCandidate {
   std::uint64_t submit_ordinal = 0;
   float depth = 0.0f;
   float barycentric[3]{};
-  std::uint8_t sample_mask = 0;
+  std::uint32_t sample_mask = 0;
   FragmentVisibility visibility = FragmentVisibility::kRejected;
   std::uint8_t reserved[2]{};
 };
@@ -850,15 +867,17 @@ struct FragmentInvocation {
   std::uint64_t submit_ordinal = 0;
   std::uint32_t quad_id = 0;
   std::uint8_t quad_lane = 0;
-  std::uint8_t sample_mask = 0;
-  std::uint8_t reserved[2]{};
+  std::uint32_t sample_mask = 0;
+  // Late stencil testing uses the primitive's original facing.
+  std::uint8_t front_facing = 1;
+  std::uint8_t reserved[1]{};
   float depth = 0.0f;
   float barycentric[3]{};
 };
 
 // A shader lane may be a covered invocation or a helper lane. Helpers execute
 // interpolation and texture instructions but never create FragmentOutput, so
-// standard ps_invocations remains the number of visible samples.
+// standard ps_invocations remains the number of visible pixel invocations.
 struct FragmentShaderLane {
   std::uint32_t x = 0;
   std::uint32_t y = 0;
@@ -868,7 +887,7 @@ struct FragmentShaderLane {
   std::uint32_t quad_id = 0;
   std::uint32_t visible_invocation_index = kInvalidFragmentInvocationIndex;
   std::uint8_t quad_lane = 0;
-  std::uint8_t sample_mask = 0;
+  std::uint32_t sample_mask = 0;
   std::uint8_t helper = 0;
   std::uint8_t reserved = 0;
   float depth = 0.0f;
@@ -925,6 +944,9 @@ struct TextureSampleRequest {
   std::uint8_t binding = 0;
   std::uint8_t dimension = 0;
   std::uint8_t normalized = 0;
+  // SMP's result conversion is independent of coordinate normalization.
+  // Clear for raw integer channels, set for floating-point conversion.
+  std::uint8_t fcnorm = 1;
   std::uint8_t data_request = 0;
   std::uint8_t quad_lane = 0;
   ShaderStage shader_stage = ShaderStage::kFragment;
@@ -953,7 +975,9 @@ struct FragmentOutput {
   // PIXOUT channel mask per attachment; entries past the count stay zero.
   std::uint8_t written_mask[kMaxRenderTargets]{};
   std::uint8_t render_target_count = 1;
-  std::uint8_t reserved[3]{};
+  // Set only by an executed public DEPTHF shader feedback operation.
+  std::uint8_t depth_written = 0;
+  std::uint8_t reserved[2]{};
 };
 
 inline constexpr std::size_t kDramLineWriteBytes = 128;

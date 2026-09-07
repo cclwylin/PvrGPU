@@ -247,6 +247,7 @@ void PcoDecoder::Run() {
       state.fragment_program_summary = decoded.summary;
       state.fragment_instructions = StoreNewArray(pool_, decoded.instructions);
       state.fragment_early_hsr_safe = decoded.summary.early_hsr_safe;
+      state.raster_state.shader_writes_depth = decoded.summary.writes_depth;
       state.stage = PipelineStage::kFragmentDecoded;
     }
 

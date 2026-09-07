@@ -104,6 +104,7 @@ bool SameTextureSampleRequest(const TextureSampleRequest &left,
          left.descriptor_set == right.descriptor_set &&
          left.binding == right.binding && left.dimension == right.dimension &&
          left.normalized == right.normalized &&
+         left.fcnorm == right.fcnorm &&
          left.data_request == right.data_request &&
          left.quad_lane == right.quad_lane &&
          left.shader_stage == right.shader_stage && left.reserved[0] == 0 &&
@@ -401,6 +402,7 @@ void UscCluster::Run() {
               request.binding = issued.binding;
               request.dimension = issued.dimension;
               request.normalized = issued.normalized;
+              request.fcnorm = issued.fcnorm;
               request.data_request = issued.data_request;
               request.texture_address_lo = issued.texture_address_lo;
               request.texture_address_hi = issued.texture_address_hi;
@@ -665,6 +667,9 @@ void UscCluster::Run() {
         fragment_output.parameter_index = invocation.parameter_index;
         fragment_output.submit_ordinal = invocation.submit_ordinal;
         fragment_output.depth = invocation.depth;
+        fragment_output.depth_written = execution.depth_written;
+        if (execution.depth_written)
+          std::memcpy(&fragment_output.depth, &execution.depth, sizeof(float));
         StoreFragmentPixelOutputs(fragment_output, execution.pixel_outputs,
                                   execution.written_mask,
                                   state.render_target_count);
@@ -806,6 +811,9 @@ void UscCluster::Run() {
           fragment_output.parameter_index = invocation.parameter_index;
           fragment_output.submit_ordinal = invocation.submit_ordinal;
           fragment_output.depth = invocation.depth;
+          fragment_output.depth_written = execution.depth_written;
+          if (execution.depth_written)
+            std::memcpy(&fragment_output.depth, &execution.depth, sizeof(float));
           StoreFragmentPixelOutputs(fragment_output, execution.pixel_outputs,
                                     execution.written_mask,
                                     state.render_target_count);
@@ -880,6 +888,7 @@ void UscCluster::Run() {
           request.binding = execution.texture_request.binding;
           request.dimension = execution.texture_request.dimension;
           request.normalized = execution.texture_request.normalized;
+          request.fcnorm = execution.texture_request.fcnorm;
           request.data_request = execution.texture_request.data_request;
           request.texture_address_lo =
               execution.texture_request.texture_address_lo;

@@ -9,6 +9,7 @@
  * instead of falling back to shader-name-specific behavior.
  */
 #include "shader/pco_iss.h"
+#include "pco_depth_feedback_fixture.h"
 
 #include <algorithm>
 #include <cmath>
@@ -3529,6 +3530,57 @@ void TestFillTexNearestFailsClosed() {
       "serialized SMP coordinate range exceeds TEMP31");
 }
 
+void TestTextureIntegerResultModifier() {
+  // Public pco_isa.py SMP byte 0 bit 4 is FCNORM. pco_nir_tex.c emits
+  // it for a float destination and leaves it clear for integer samplers.
+  // Change that independent field in an ordinary compiler-produced shader;
+  // coordinates, register allocation, DRC/WDF and exports remain unchanged.
+  for (const std::uint8_t dimension : {2U, 3U}) {
+    for (const std::uint8_t fcnorm : {0U, 1U}) {
+      auto binary = FillTexNearestFragmentPcoBinary();
+      binary[131] = static_cast<std::uint8_t>(
+          (binary[131] & ~0x10U) | (fcnorm << 4U));
+      binary[132] = static_cast<std::uint8_t>(
+          (binary[132] & ~0x60U) | (dimension << 5U));
+      const auto program = Decode(ShaderStage::kFragment, binary);
+      Check(program.instructions[16].texture_fcnorm == fcnorm &&
+                program.instructions[16].texture_dimension == dimension,
+            "SMP decodes FCNORM independently of dimension");
+      const auto execution = ExecuteFragment(
+          program.summary, program.instructions, MakeFillTexNearestContext());
+      Check(execution.suspended == 1 &&
+                execution.texture_request.fcnorm == fcnorm &&
+                execution.texture_request.normalized == 1 &&
+                execution.texture_request.dimension == dimension &&
+                execution.texture_request.coordinates[0] == FloatBits(0.25F) &&
+                execution.texture_request.coordinates[1] == FloatBits(0.75F),
+            "integer SMP retains normalized coordinates and result type");
+      // Signed extrema, unsigned values above float's exact integer range,
+      // and alpha one must all survive WDF without numeric conversion.
+      const std::array<std::uint32_t, 4> response = {
+          UINT32_C(0x80000000), UINT32_C(0xffffffff),
+          UINT32_C(0x01000001), UINT32_C(1)};
+      const auto completed = ResumeFragment(
+          program.summary, program.instructions, execution.continuation,
+          response);
+      Check(completed.suspended == 0 &&
+                std::equal(response.begin(), response.end(),
+                           completed.pixel_outputs.begin()),
+            "SMP WDF and exports preserve every integer response bit");
+    }
+  }
+
+  auto program = Decode(ShaderStage::kFragment,
+                        FillTexNearestFragmentPcoBinary());
+  program.instructions[16].texture_fcnorm = 2;
+  ExpectFailure(
+      [&] {
+        (void)ExecuteFragment(program.summary, program.instructions,
+                              MakeFillTexNearestContext());
+      },
+      "SMP rejects a non-boolean result conversion modifier");
+}
+
 void TestDecodeAndExecuteGlmarkTexture() {
   const auto fragment_binary = BytesFromHex(R"hex(
 56 a0 00 b0 03 c4 40 10 c0 40 00 ff 02 80 6a ff
@@ -6395,6 +6447,95 @@ void TestExecuteVertexTextureContinuations() {
       "saved unmodified VTXIN must still agree with the original caller lane");
 }
 
+void TestFragmentRepeatedTemporaryMove() {
+  // Three SH-to-TEMP moves, rpt2 MBYP r1..2,r0..1, then four exports.
+  // The public one-byte destination 0x41 is TEMP1, not register 65.
+  const auto binary = BytesFromHex(R"hex(
+35 82 00 87 80 08 00 00 00 40
+35 82 00 87 81 08 00 00 00 41
+35 82 00 87 82 08 00 00 00 42
+34 82 02 87 40 00 00 41
+34 8a 00 87 41 00 00 20
+34 8a 00 87 42 00 00 21
+34 8a 00 87 40 00 00 22
+35 8a 80 87 80 01 00 00 00 23
+)hex");
+  const auto decoded = Decode(ShaderStage::kFragment, binary);
+  auto instructions = decoded.instructions;
+  Check(instructions[3].repeat_count == 2 &&
+            instructions[3].output_index == 1,
+        "fragment MBYP decodes its repeated TEMP range");
+  PcoFragmentExecutionContext context;
+  context.shared_count = 20;
+  context.shared_registers[0] = FloatBits(0.25F);
+  context.shared_registers[1] = FloatBits(0.5F);
+  context.shared_registers[2] = FloatBits(0.75F);
+  const auto forward = ExecuteFragment(decoded.summary, instructions, context);
+  Check(forward.pixel_outputs[0] == FloatBits(0.25F) &&
+            forward.pixel_outputs[1] == FloatBits(0.25F),
+        "overlapping forward MBYP observes earlier repetition's write");
+  instructions[3].source.index = 1;
+  instructions[3].output_index = 0;
+  instructions[4].source.index = 0;
+  instructions[5].source.index = 1;
+  const auto backward = ExecuteFragment(decoded.summary, instructions, context);
+  Check(backward.pixel_outputs[0] == FloatBits(0.5F) &&
+            backward.pixel_outputs[1] == FloatBits(0.75F),
+        "overlapping backward MBYP retains the two distinct source values");
+  auto bad = instructions;
+  bad[3].source.index = 63;
+  ExpectFailure([&] { (void)ExecuteFragment(decoded.summary, bad, context); },
+                "repeated fragment MBYP rejects source range overflow");
+  bad = instructions;
+  bad[3].output_index = 63;
+  ExpectFailure([&] { (void)ExecuteFragment(decoded.summary, bad, context); },
+                "repeated fragment MBYP rejects destination range overflow");
+  bad = instructions;
+  bad[3].source.index = 2;
+  ExpectFailure([&] { (void)ExecuteFragment(decoded.summary, bad, context); },
+                "repeated fragment MBYP rejects an unwritten second source");
+
+  // Preserve both new destination registers across a texture continuation.
+  instructions[3].source.index = 0;
+  instructions[3].output_index = 4;
+  instructions[4].source.index = 4;
+  instructions[5].source.index = 5;
+  PcoInstruction sample;
+  sample.opcode = PcoOpcode::kTextureSample;
+  sample.target = PcoWriteTarget::kTemporary;
+  sample.source = {PcoRegisterBank::kTemporary, 4};
+  sample.source1 = {PcoRegisterBank::kShared, 0};
+  sample.source2 = {PcoRegisterBank::kShared, 8};
+  sample.source_count = 3;
+  sample.component_count = 4;
+  sample.output_index = 8;
+  PcoInstruction wait;
+  wait.opcode = PcoOpcode::kWaitDataFence;
+  wait.target = PcoWriteTarget::kNone;
+  wait.source_count = 0;
+  instructions.insert(instructions.begin() + 4, {sample, wait});
+  auto summary = decoded.summary;
+  summary.instruction_count += 2;
+  summary.group_count += 2;
+  summary.binary_size = summary.group_count * 8;
+  for (std::size_t index = 0; index < instructions.size(); ++index) {
+    instructions[index].group_index = static_cast<std::uint16_t>(index);
+    instructions[index].binary_offset = static_cast<std::uint32_t>(index * 8 + 3);
+  }
+  auto suspended = ExecuteFragment(summary, instructions, context);
+  Check(suspended.suspended == 1 &&
+            suspended.texture_request.coordinates[0] == FloatBits(0.25F) &&
+            suspended.texture_request.coordinates[1] == FloatBits(0.5F) &&
+            suspended.continuation.temporary_written_mask == UINT64_C(0x37),
+        "repeated fragment MBYP supplies both coordinates and saved TEMP bits");
+  context.continuation = suspended.continuation;
+  context.texture_response_valid = 1;
+  const auto resumed = ExecuteFragment(summary, instructions, context);
+  Check(resumed.pixel_outputs[0] == FloatBits(0.25F) &&
+            resumed.pixel_outputs[1] == FloatBits(0.5F),
+        "both repeated fragment MBYP destinations survive SMP resume");
+}
+
 void TestExecuteThreeTextureContinuations() {
   std::vector<PcoInstruction> instructions(12);
   for (std::size_t index = 0; index < instructions.size(); ++index) {
@@ -6638,6 +6779,36 @@ void TestLoweredPowSpecialValues() {
 
 } // namespace
 
+void TestDepthFeedback() {
+  const auto binary = DepthFeedbackFragmentFixture();
+  const auto program = Decode(ShaderStage::kFragment, binary);
+  Check(program.summary.writes_depth == 1 && program.summary.early_hsr_safe == 0,
+        "DEPTHF must select late depth testing from its actual opcode");
+  Check(CountPcoInstructions(program.instructions, true).memory == 1,
+        "DEPTHF is one backend feedback instruction");
+  for (const float input : {-1.0F, 0.0F, 0.25F, 1.0F, 2.0F, 0x1p-100F}) {
+    PcoFragmentExecutionContext context;
+    context.shared_count = 1;
+    context.shared_registers[0] = FloatBits(input);
+    const auto result = ExecuteFragment(program.summary, program.instructions, context);
+    Check(result.depth_written == 1 &&
+              result.depth == FloatBits(std::clamp(input, 0.0F, 1.0F)) &&
+              result.pixel_outputs[0] == FloatBits(1.0F) &&
+              result.pixel_outputs[1] == 0 && result.written_mask == 0x0f,
+          "shader depth clamp/export must retain exact F32 precision and colour");
+  }
+  auto invalid = binary;
+  invalid[23] |= 2; // VISTEST.ATST is not DEPTHF.
+  ExpectFailure([&] { Decode(ShaderStage::kFragment, invalid); }, "DEPTHF opcode gate");
+  invalid = binary;
+  invalid[28] = 0x20; // w0 no longer receives the feed-through depth source.
+  ExpectFailure([&] { Decode(ShaderStage::kFragment, invalid); }, "DEPTHF route gate");
+  invalid = binary;
+  invalid.erase(invalid.begin() + 30, invalid.begin() + 34); // Remove DRC0 fence.
+  ExpectFailure([&] { Decode(ShaderStage::kFragment, invalid); }, "DEPTHF fence gate");
+  ExpectFailure([&] { Decode(ShaderStage::kVertex, binary); }, "DEPTHF stage gate");
+}
+
 int main() {
   try {
     TestEmbeddedBinaries();
@@ -6654,6 +6825,7 @@ int main() {
     TestDecodeAndExecuteEightAttributeFetch();
     TestIntegerFloatAddRoundingAndClasses();
     TestDecodeAndExecuteFragment();
+    TestDepthFeedback();
     TestDecodeAndExecuteHalfAlphaFragments();
     TestDecodeAndExecuteTriangleSetupOrange();
     TestDecodeAndExecuteTriangleSetupHalfCulledCyan();
@@ -6673,6 +6845,7 @@ int main() {
     TestVaryingsEightFailsClosed();
     TestDecodeAndExecuteFillTexNearest();
     TestFillTexNearestFailsClosed();
+    TestTextureIntegerResultModifier();
     TestDecodeAndExecuteGlmarkTexture();
     TestDecodeAndExecuteGlmarkTextureMediump();
     TestDecodeAndExecuteConditionals();
@@ -6699,6 +6872,7 @@ int main() {
     TestSharedRegisterFileBoundary();
     TestBitfieldInsertFourSourceValidation();
     TestExecuteVertexTextureContinuations();
+    TestFragmentRepeatedTemporaryMove();
     TestExecuteThreeTextureContinuations();
     TestLoweredPowSpecialValues();
     TestExecuteFailsClosed();

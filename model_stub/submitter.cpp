@@ -194,6 +194,7 @@ std::uint32_t ColorAttachmentRawDwords(const std::string &format) {
  * two or four raw 32-bit integer channels of either signedness. */
 bool DriverPcoColorAttachmentFormatSupported(const std::string &format) {
   return format == "PIPE_FORMAT_R8G8B8A8_UNORM" ||
+         format == "PIPE_FORMAT_R32G32B32A32_FLOAT" ||
          ColorAttachmentRawDwords(format) != 0U;
 }
 
@@ -1469,6 +1470,11 @@ void Submitter::RunJob() {
     state.sequence = frame;
     state.functional_case = functional_case;
     state.stage = PipelineStage::kSubmitted;
+    state.raster_state.sample_count = command.raster_samples ? command.raster_samples : 1;
+    state.raster_state.sample_mask = driver_pco_triangles_command ?
+        command.sample_mask : UINT32_MAX;
+    state.raster_state.multisample_enable = driver_pco_triangles_command ?
+        (command.multisample ? 1 : 0) : 1;
     state.memory_mode = options_.memory_mode;
     state.cache_bypass = options_.cache_bypass ? 1U : 0U;
     /*
@@ -1481,6 +1487,8 @@ void Submitter::RunJob() {
     if (driver_pco_triangles_command) {
       state.color_attachment_raw_dwords =
           ColorAttachmentRawDwords(command.format);
+      state.color_attachment_float32 =
+          command.format == "PIPE_FORMAT_R32G32B32A32_FLOAT" ? 1U : 0U;
     }
 
     // Colour attachments this draw writes.  Attachment 0 keeps whatever
@@ -1499,13 +1507,17 @@ void Submitter::RunJob() {
       /* Every attachment of a pass stores the same pixel width. */
       state.extra_framebuffer_bytes[target - 1] =
           static_cast<std::uint64_t>(state.width) * state.height *
-          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
+          state.raster_state.sample_count *
+          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
+                                       state.color_attachment_float32);
     }
     if (driver_pco_sequence_command) {
       state.framebuffer_gpu_address = sequence_color_addresses[submission];
       const std::uint64_t color_bytes =
           static_cast<std::uint64_t>(state.width) * state.height *
-          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
+          state.raster_state.sample_count *
+          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
+                                       state.color_attachment_float32);
       if (!command.initial_color_attachment_bytes.empty()) {
         if (command.color_attachment_source_command_index !=
                 kDriverPcoNewAttachment ||
@@ -1546,28 +1558,6 @@ void Submitter::RunJob() {
         state.color_attachment_load_enable = 1;
         state.color_attachment_load_bytes = color_bytes;
       }
-      bool depth_is_consumed = false;
-      for (std::size_t future = submission + 1U;
-           future < options_.driver_commands.size(); ++future) {
-        const DriverCommand &future_command =
-            options_.driver_commands[future];
-        depth_is_consumed =
-            depth_is_consumed ||
-            (future_command.depth_format != 0 &&
-             future_command.depth_attachment_source_command_index !=
-                 kDriverPcoNewAttachment &&
-             sequence_depth_addresses[future] ==
-                 sequence_depth_addresses[submission]);
-        for (const DriverPcoSampledTexture &texture :
-             future_command.sampled_textures) {
-          depth_is_consumed =
-              depth_is_consumed ||
-              (texture.source ==
-                   DriverPcoTextureSource::kPreviousDepthAttachment &&
-               sequence_depth_addresses.at(texture.producer_command_index) ==
-                   sequence_depth_addresses[submission]);
-        }
-      }
       if (command.depth_format != 0) {
         state.depth_attachment_format = command.depth_format;
         state.depth_attachment_gpu_address =
@@ -1576,15 +1566,23 @@ void Submitter::RunJob() {
             DepthAttachmentBytesPerPixel(command.depth_format);
         const std::uint64_t depth_bytes =
             static_cast<std::uint64_t>(state.width) * state.height *
-            depth_bytes_per_pixel;
+            depth_bytes_per_pixel * state.raster_state.sample_count;
         if (depth_bytes == 0 ||
             depth_bytes > kDriverPcoSequenceAttachmentStride ||
             depth_bytes > std::numeric_limits<std::size_t>::max()) {
           throw std::runtime_error(
               "Submitter depth attachment byte size is invalid");
         }
-        if (command.depth_attachment_source_command_index !=
-            kDriverPcoNewAttachment) {
+        if (!command.initial_depth_attachment_bytes.empty()) {
+          if (command.depth_attachment_source_command_index != kDriverPcoNewAttachment ||
+              command.initial_depth_attachment_bytes.size() != depth_bytes)
+            throw std::runtime_error("Submitter initial depth attachment contract is invalid");
+          memory_->HostWrite(state.depth_attachment_gpu_address,
+              command.initial_depth_attachment_bytes.data(),
+              command.initial_depth_attachment_bytes.size());
+        }
+        if (command.depth_attachment_source_command_index != kDriverPcoNewAttachment ||
+            !command.initial_depth_attachment_bytes.empty()) {
           if (!memory_->backing().Contains(
                   state.depth_attachment_gpu_address,
                   static_cast<std::size_t>(depth_bytes))) {
@@ -1605,7 +1603,7 @@ void Submitter::RunJob() {
           state.depth_attachment_load_bytes = depth_bytes;
         }
       }
-      if (depth_is_consumed && command.depth_format != 0) {
+      if (command.depth_format != 0) {
         state.capture_depth_attachment = 1;
       }
       ApplyMemoryAccessStats(state.counters, sequence_dependency_stats);
@@ -1662,7 +1660,7 @@ void Submitter::RunJob() {
               ? command.fragment_sampled_texture_count
               : command.sampled_texture_count;
     }
-    state.raster_state.sample_count = 1;
+    state.raster_state.sample_count = command.raster_samples ? command.raster_samples : 1;
     const bool triangle_setup = IsTriangleSetupFamily(functional_case);
     const bool attribute_fetch = IsAttributeFetchFamily(functional_case);
     const bool varyings = IsVaryingsFamily(functional_case);
@@ -2299,7 +2297,13 @@ void Submitter::RunJob() {
                   ? TextureDimensionType::kCube
                   : TextureDimensionType::k2D;
           resource.format =
-              texture.format == "PIPE_FORMAT_Z32_UNORM"
+              texture.format == "PIPE_FORMAT_R32G32B32A32_UINT"
+                  ? TextureFormat::kRgba32Uint
+              : texture.format == "PIPE_FORMAT_R32G32B32A32_SINT"
+                  ? TextureFormat::kRgba32Sint
+              : texture.format == "PIPE_FORMAT_R32G32B32A32_FLOAT"
+                  ? TextureFormat::kRgba32Float
+              : texture.format == "PIPE_FORMAT_Z32_UNORM"
                   ? TextureFormat::kZ32Unorm
                   : texture.format == "PIPE_FORMAT_Z24_UNORM_S8_UINT"
                         ? TextureFormat::kZ24UnormS8Uint

@@ -8,7 +8,7 @@ bring-up seam: small enough to debug quickly, strict enough to prevent fake
 passes, and close enough to Gallium state that the driver can grow phase by
 phase.
 
-## Current FBO continuity extension (SystemC API v19)
+## Current FBO continuity and MSAA extension (SystemC API v20)
 
 The in-process API supports a nested PCO draw's initial color attachment via
 `initial_color_attachment_bytes` and `initial_color_attachment_bytes_size`.
@@ -19,10 +19,40 @@ the normal PBE LOAD path before executing the shaders.
 
 The payload requires `ATTACHMENT_NEW_CLEAR`, one color target, and the complete
 tightly packed framebuffer extent. RGBA8 transport uses 4 bytes per pixel;
-integer R32, RG32 and RGBA32 transport uses 4, 8 and 16. Narrow integer native
-formats are unpacked/packed by the driver. The payload must fit the 16 MiB
-attachment slot. Noninteger targets still use RGBA8 precision. Initial depth,
-stencil and additional MRT target contents are not represented by this field.
+integer R32, RG32 and RGBA32 transport uses 4, 8 and 16. Floating-point color
+targets use 16-byte RGBA32F transport, preserving negative values and HDR.
+Native formats are unpacked/packed by the driver. The payload must fit the
+16 MiB attachment slot. Other normalized targets still use RGBA8 transport.
+Additional MRT target initial contents are not represented by this field.
+
+API v20 adds `raster_samples` (zero defaults to one), with pixel-interleaved
+samples throughout LOAD, ISP depth/stencil, PBE blending and DRAM readback.
+Samples 1, 2, 4, 8 and 16 have actual per-sample coverage; one pixel-frequency
+shader invocation may write several covered samples. Color resolve averages
+noninteger samples and selects sample zero for integer formats, following
+Mesa's resolve semantics. Depth/stencil resolves select sample zero.
+Disabling multisample rasterization uses center coverage for all selected
+samples without collapsing their independent depth/stencil and color storage.
+
+Typed color blits preserve the original source/destination transform while
+clipping writes to destination bounds and the Gallium scissor. This matters for
+out-of-bounds scaled or flipped rectangles: rounding replacement integer boxes
+would shift fractional texture samples. Linear filtering clamps taps at source
+edges, and source snapshots keep overlapping resource copies well-defined.
+
+`initial_depth_attachment_bytes` and its size import the complete native
+depth/stencil attachment before the first draw. Every depth-producing pass
+publishes its real DRAM contents: readback attachment `UINT32_MAX` selects it
+and must state the matching `depth_format`, `sample_count` and native pixel
+width. Z16, Z24X8, Z24S8, Z32 UNORM, Z32F and Z32F/S8 are supported; float
+depth is not quantized to an integer depth plane.
+
+Explicit fragment depth outputs are compiled to PCO `DEPTHF` feedback and
+executed by USC. Such shaders bypass early depth/stencil tests and opaque HSR;
+the PBE applies late per-sample tests using the shader's clamped depth, and
+writeback commits the final native depth/stencil planes through DRAM before
+the next sequence draw can LOAD them. The output is never evaluated on the CPU
+from GLSL or inferred from a case name.
 
 Readback ownership includes a submission generation and exact framebuffer
 surface identity (resource, format, level, layers and extent). FBO changes and
@@ -32,8 +62,8 @@ map cannot reuse another FBO's cached pixels.
 
 The sequence text file remains a summary rather than a complete payload
 serialization. When initial contents are present, it contains
-`initial_color_attachment_replay=api-v19-only`; standalone text replay rejects
-it explicitly. Such sequences require the API v19 driver and bridge together.
+`initial_color_attachment_replay=api-v20-only`; standalone text replay rejects
+it explicitly. Such sequences require the API v20 driver and bridge together.
 
 ## Producer
 

@@ -10,6 +10,22 @@ DRIVER_ROOT = PROJECT_ROOT / "src" / "gallium" / "drivers" / "pvrgpu"
 
 
 class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
+    def test_pending_clears_retire_after_initial_load_and_framebuffer_change(self) -> None:
+        context = (DRIVER_ROOT / "pvrgpu_context.c").read_text(encoding="utf-8")
+        capture = context.index("!pvrgpu_capture_initial_depth_attachment(ctx, recorded)")
+        retire = context.index("pvrgpu_retire_materialized_attachment_clears(", capture)
+        transfer = context.index("if (ctx->pending_attachment_clear_count != 0)", capture)
+        self.assertLess(capture, retire)
+        self.assertLess(retire, transfer)
+        self.assertIn("recorded->command.initial_depth_attachment_bytes_size",
+                      context[retire:transfer])
+        start = context.index("static void\npvrgpu_set_framebuffer_state")
+        end = context.index("util_copy_framebuffer_state", start)
+        boundary = context[start:end]
+        self.assertIn("!pvrgpu_framebuffer_key_equal", boundary)
+        self.assertIn("pvrgpu_retire_materialized_attachment_clears(ctx, true, 0)",
+                      boundary)
+
     def test_phase1_skeleton_files_exist(self) -> None:
         expected = {
             "README.md",
@@ -21,6 +37,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             "pvrgpu_context.h",
             "pvrgpu_counter.c",
             "pvrgpu_counter.h",
+            "pvrgpu_msaa.h",
             "pvrgpu_pco.c",
             "pvrgpu_pco.h",
             "pvrgpu_public.h",
@@ -210,7 +227,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("full_depth_clear_resource", context_header)
         self.assertIn("pvrgpu_note_full_depth_clear_one", clear)
         self.assertIn("pvrgpu_invalidate_full_depth_clear_for_resource", resource)
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 19u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 20u", systemc_api)
         for field in (
             "const uint8_t *raw_vertex_data;",
             "size_t raw_vertex_data_size;",
@@ -755,7 +772,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 19u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 20u", systemc_api)
         for field in (
             "uint32_t vertex_stride;",
             "uint32_t position_output_start;",
@@ -891,7 +908,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 19u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 20u", systemc_api)
         self.assertIn("command=draw_pco_triangles", command)
         self.assertIn("pvrgpu_write_draw_pco_triangles_command", command_header)
         self.assertIn("PVRGPU_DRAW_PCO_TRIANGLES_VERTEX_COUNT 6144u", command_header)

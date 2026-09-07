@@ -1539,6 +1539,32 @@ PcoInstruction DecodeWdfGroup(
   return instruction;
 }
 
+PcoInstruction DecodeFragmentDepthFeedbackGroup(
+    const std::vector<std::uint8_t> &binary, const GroupHeader &header,
+    std::uint16_t group_index) {
+  // Public pco_map.py O_DEPTHF: backend VISTEST.DEPTHF, s0 -> is0 ->
+  // feed-through -> is4 -> w0, no register destination, implicit DRC0.
+  if (header.operation_origin != 2 || header.write0_present ||
+      header.write1_present || header.repeat_count != 1)
+    DecodeError(header.offset, "unsupported DEPTHF group header");
+  const std::size_t group_end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  if (cursor >= group_end || binary[cursor++] != 0x80U)
+    DecodeError(cursor - 1, "unsupported VISTEST.DEPTHF fields");
+  const PcoRegisterRef source = DecodeOneLowerSource(binary, group_end, cursor);
+  if (group_end - cursor < 2 || binary[cursor++] != 0x00U ||
+      binary[cursor++] != 0x30U)
+    DecodeError(cursor, "unsupported DEPTHF feed-through selectors");
+  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
+  PcoInstruction instruction;
+  instruction.opcode = PcoOpcode::kDepthFeedback;
+  instruction.source = source;
+  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
+  instruction.group_index = group_index;
+  instruction.end_group = header.end ? 1U : 0U;
+  return instruction;
+}
+
 PcoInstruction DecodeTextureSampleGroup(
     const std::vector<std::uint8_t> &binary, const GroupHeader &header,
     std::uint16_t group_index) {
@@ -1553,8 +1579,10 @@ PcoInstruction DecodeTextureSampleGroup(
   if (group_end - cursor < 11)
     DecodeError(cursor, "truncated public SMP.2D.FCNORM group");
 
-  /* Mesa pco_backend_smp_brief: backend_op=DMA, fcnorm=1, drc0,
+  /* Mesa pco_backend_smp_brief: backend_op=DMA, FCNORM, drc0,
    * dma_op=SMP; extb=0, dmn=2D, exta=0, chan=4, lodm=AUTO.
+   * pco_emit_nir_smp sets FCNORM only for a floating-point destination.
+   * A clear bit requests raw integer channels with the same coordinates.
    */
   const std::uint8_t backend0 = binary[cursor++];
   const std::uint8_t backend1 = binary[cursor++];
@@ -1574,13 +1602,13 @@ PcoInstruction DecodeTextureSampleGroup(
    * decoded; what the texture unit can then sample is its own question.
    */
   const bool address_offset = exta;
-  if (backend_op != kBackendOpDma || !fcnorm || drc != 0 || dma_op != 4 ||
+  if (backend_op != kBackendOpDma || drc != 0 || dma_op != 4 ||
       extb || (dimension != 2 && dimension != 3) ||
       channel_encoding != 3 ||
       (!address_offset && lod_mode != 0) ||
       (address_offset && lod_mode != 1)) {
     DecodeError(header.offset + 3,
-                "SMP must be FCNORM/count4/drc0, AUTO 2D/3D or BIAS+TAO");
+                "SMP must be count4/drc0, AUTO 2D/3D or BIAS+TAO");
   }
   /*
    * The .tao/.bias/.pplod extension byte follows the backend words.  A 2D
@@ -1648,6 +1676,7 @@ PcoInstruction DecodeTextureSampleGroup(
   instruction.opcode = PcoOpcode::kTextureSample;
   instruction.texture_dimension = dimension;
   instruction.texture_address_offset = address_offset ? 1U : 0U;
+  instruction.texture_fcnorm = fcnorm ? 1U : 0U;
   instruction.target = PcoWriteTarget::kTemporary;
   instruction.source = sources.source1;
   instruction.source1 = sources.source0;
@@ -3706,6 +3735,8 @@ PcoInstruction DecodeFragmentGroup(const std::vector<std::uint8_t> &binary,
                                       group_index);
   }
   if (header.operation_origin == 2) {
+    if (binary[header.offset + 3] >> 5U == 0b100)
+      return DecodeFragmentDepthFeedbackGroup(binary, header, group_index);
     if (binary[header.offset + 3] >> 5U == kBackendOpDma)
       return DecodeTextureSampleGroup(binary, header, group_index);
     return DecodeFragmentFitrpGroup(binary, header, group_index);
@@ -4117,6 +4148,9 @@ bool SameConditionalsInstruction(const PcoInstruction &left,
          left.loop_count == right.loop_count &&
          left.immediate == right.immediate &&
          left.component_count == right.component_count &&
+         left.texture_dimension == right.texture_dimension &&
+         left.texture_address_offset == right.texture_address_offset &&
+         left.texture_fcnorm == right.texture_fcnorm &&
          left.data_request == right.data_request &&
          left.iteration_mode == right.iteration_mode &&
          left.perspective == right.perspective &&
@@ -4470,6 +4504,7 @@ void ValidateVertexTemporaryProgram(
               ? (((UINT64_C(1) << coordinate_count) - 1U) << coordinate_base)
               : UINT64_C(0);
       if (++texture_sample_count > kPcoMaximumTextureSampleInstructions ||
+          instruction.texture_fcnorm > 1U ||
           instruction.target != PcoWriteTarget::kTemporary ||
           instruction.source_count != 3 || instruction.repeat_count != 1 ||
           instruction.component_count != kPcoTextureResponseCount ||
@@ -4736,6 +4771,7 @@ void ValidateFragmentProgram(
               ? (((UINT64_C(1) << coordinate_count) - 1U) << coordinate_base)
               : UINT64_C(0);
       if (request_pending || instruction.target != PcoWriteTarget::kTemporary ||
+          instruction.texture_fcnorm > 1U ||
           instruction.source_count != 3 || instruction.repeat_count != 1 ||
           instruction.component_count != 4 || instruction.data_request != 0 ||
           instruction.iteration_mode != PcoIterationMode::kPixel ||
@@ -4768,6 +4804,19 @@ void ValidateFragmentProgram(
       pending_components = instruction.component_count;
       continue;
     }
+    if (instruction.opcode == PcoOpcode::kDepthFeedback) {
+      if (request_pending || instruction.target != PcoWriteTarget::kNone ||
+          instruction.source_count != 1 || instruction.repeat_count != 1 ||
+          !HasDefaultNonFitrpFields(instruction) ||
+          !HasCanonicalUnusedSources(instruction) ||
+          !HasDefaultControlFields(instruction))
+        DecodeError(instruction.binary_offset, "invalid fragment DEPTHF");
+      require_source(instruction.source);
+      request_pending = true;
+      pending_output = 0;
+      pending_components = 0; // Feedback fence has no TEMP response.
+      continue;
+    }
     if (instruction.opcode == PcoOpcode::kWaitDataFence) {
       if (!request_pending || instruction.target != PcoWriteTarget::kNone ||
           instruction.source_count != 0 || instruction.repeat_count != 1 ||
@@ -4791,6 +4840,30 @@ void ValidateFragmentProgram(
          instruction.immediate != 0)) {
       DecodeError(instruction.binary_offset,
                   "generic fragment instruction has noncanonical metadata");
+    }
+
+    /* PCO folds vector copies into a register-range MBYP (rpt2..4).
+     * Each repetition advances TEMP source and destination, just as the
+     * vertex executor does.  Validate in execution order so overlapping
+     * ranges retain their ordinary sequential register effects. */
+    if (instruction.opcode == PcoOpcode::kMoveBypass &&
+        instruction.repeat_count > 1) {
+      if (instruction.repeat_count > 4 || instruction.source_count != 1 ||
+          instruction.source.bank != PcoRegisterBank::kTemporary ||
+          instruction.target != PcoWriteTarget::kTemporary ||
+          static_cast<std::size_t>(instruction.source.index) +
+                  instruction.repeat_count > kPcoTemporaryCount ||
+          static_cast<std::size_t>(instruction.output_index) +
+                  instruction.repeat_count > kPcoTemporaryCount)
+        DecodeError(instruction.binary_offset,
+                    "invalid repeated generic fragment TEMP move");
+      for (std::uint8_t repeat = 0; repeat < instruction.repeat_count; ++repeat) {
+        const PcoRegisterRef source{PcoRegisterBank::kTemporary,
+            static_cast<std::uint16_t>(instruction.source.index + repeat)};
+        require_source(source);
+        written_mask |= UINT64_C(1) << (instruction.output_index + repeat);
+      }
+      continue;
     }
 
     if (instruction.source_count >= 1)
@@ -6391,6 +6464,7 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
     case PcoOpcode::kDiscard:
     case PcoOpcode::kAtomicAdd:
     case PcoOpcode::kAtomicCompSwap:
+    case PcoOpcode::kDepthFeedback:
       counts.memory += amount;
       break;
     default:
@@ -6507,13 +6581,19 @@ PcoDecodedProgram DecodePcoProgram(ShaderStage stage,
       CheckedU32(decoded.instructions.size(), "PCO group count");
   decoded.summary.instruction_count = decoded.summary.group_count;
   decoded.summary.ends_task = saw_end_task ? 1U : 0U;
+  decoded.summary.writes_depth = std::any_of(
+      decoded.instructions.begin(), decoded.instructions.end(),
+      [](const PcoInstruction &instruction) {
+        return instruction.opcode == PcoOpcode::kDepthFeedback;
+      }) ? 1U : 0U;
   // A shader that can kill its own fragment has not decided whether the pixel
   // is covered until it has run, so opaque early HSR must not award the pixel
   // to it beforehand. Read that off the program rather than trusting the
   // submitter to declare it.
   if (std::any_of(decoded.instructions.begin(), decoded.instructions.end(),
                   [](const PcoInstruction &instruction) {
-                    return instruction.opcode == PcoOpcode::kDiscard;
+                    return instruction.opcode == PcoOpcode::kDiscard ||
+                           instruction.opcode == PcoOpcode::kDepthFeedback;
                   })) {
     decoded.summary.early_hsr_safe = 0;
   }
@@ -6830,6 +6910,7 @@ PcoVertexExecution ExecuteVertexPco(
           instruction.texture_address_offset ? instruction.texture_dimension
                                              : coordinate_count);
       result.texture_request.normalized = 1;
+      result.texture_request.fcnorm = instruction.texture_fcnorm;
       result.texture_request.data_request = instruction.data_request;
       result.texture_request_valid = 1;
 
@@ -7514,9 +7595,10 @@ PcoFragmentExecution ExecuteFragmentPco(
   if (summary.early_hsr_safe == 0 &&
       std::none_of(instructions.begin(), instructions.end(),
                    [](const PcoInstruction &instruction) {
-                     return instruction.opcode == PcoOpcode::kDiscard;
+                     return instruction.opcode == PcoOpcode::kDiscard ||
+                            instruction.opcode == PcoOpcode::kDepthFeedback;
                    })) {
-    ExecuteError("fragment program is HSR-unsafe without discarding");
+    ExecuteError("fragment program is HSR-unsafe without discard/depth feedback");
   }
   if (context.shared_count > kPcoMaximumFragmentSharedCount)
     ExecuteError("fragment shared-register count exceeds modeled USC file");
@@ -7680,12 +7762,14 @@ PcoFragmentExecution ExecuteFragmentPco(
          index + 1 < continuation.resume_instruction_index; ++index) {
       const PcoInstruction &prior = instructions[index];
       if (prior.opcode == PcoOpcode::kFloatInterpolatePerspective ||
-          prior.opcode == PcoOpcode::kTextureSample) {
+          prior.opcode == PcoOpcode::kTextureSample ||
+          prior.opcode == PcoOpcode::kDepthFeedback) {
         if (expected_request_pending)
           ExecuteError("overlapping DRC0 requests precede continuation");
         expected_request_pending = true;
         expected_pending_output = prior.output_index;
-        expected_pending_components = prior.component_count;
+        expected_pending_components = prior.opcode == PcoOpcode::kDepthFeedback
+                                          ? 0 : prior.component_count;
         continue;
       }
       if (prior.opcode == PcoOpcode::kWaitDataFence) {
@@ -7700,7 +7784,8 @@ PcoFragmentExecution ExecuteFragmentPco(
         continue;
       }
       if (prior.target == PcoWriteTarget::kTemporary) {
-        expected_written_mask |= UINT64_C(1) << prior.output_index;
+        for (std::uint8_t repeat = 0; repeat < prior.repeat_count; ++repeat)
+          expected_written_mask |= UINT64_C(1) << (prior.output_index + repeat);
         if (prior.opcode == PcoOpcode::kIntegerAdd64_32)
           expected_written_mask |= UINT64_C(1) << prior.output_index1;
       }
@@ -7711,6 +7796,8 @@ PcoFragmentExecution ExecuteFragmentPco(
     }
     temporaries = continuation.temporaries;
     temporary_written_mask = continuation.temporary_written_mask;
+    result.depth = continuation.depth;
+    result.depth_written = continuation.depth_written;
     pending = context.texture_response;
     pending_output_index = continuation.pending_output_index;
     pending_component_count = continuation.pending_component_count;
@@ -7932,10 +8019,13 @@ PcoFragmentExecution ExecuteFragmentPco(
           instruction.texture_address_offset ? instruction.texture_dimension
                                              : coordinate_count);
       result.texture_request.normalized = 1;
+      result.texture_request.fcnorm = instruction.texture_fcnorm;
       result.texture_request.data_request = instruction.data_request;
       result.texture_request_valid = 1;
       result.continuation.temporaries = temporaries;
       result.continuation.temporary_written_mask = temporary_written_mask;
+      result.continuation.depth = result.depth;
+      result.continuation.depth_written = result.depth_written;
       result.continuation.program_binary_size = summary.binary_size;
       result.continuation.program_instruction_count =
           summary.instruction_count;
@@ -7950,6 +8040,34 @@ PcoFragmentExecution ExecuteFragmentPco(
       return result;
     }
 
+    if (instruction.opcode == PcoOpcode::kDepthFeedback) {
+      if (drc0_pending || instruction.target != PcoWriteTarget::kNone)
+        ExecuteError("DEPTHF overlaps a pending DRC0 request");
+      const PcoRegisterRef source = instruction.source;
+      if (source.bank == PcoRegisterBank::kShared) {
+        if (source.index >= context.shared_count)
+          ExecuteError("DEPTHF shared source is absent");
+        result.depth = context.shared_registers[source.index];
+      } else if (source.bank == PcoRegisterBank::kCoefficient) {
+        if (source.index >= context.coefficient_count)
+          ExecuteError("DEPTHF coefficient source is absent");
+        result.depth = context.coefficients[source.index];
+      } else if (source.bank == PcoRegisterBank::kSpecial &&
+                 IsFragmentCoordinateSpecialRegister(source.index)) {
+        result.depth = (source.index == kSpecialFragmentXPixel ||
+                        source.index == kSpecialFragmentXSample)
+                           ? context.sample_x : context.sample_y;
+      } else {
+        result.depth = ReadSource(source, no_vertex_inputs, temporaries,
+                                  temporary_written_mask, 0, ShaderStage::kFragment);
+      }
+      result.depth_written = 1;
+      pending_output_index = 0;
+      pending_component_count = 0;
+      drc0_pending = true;
+      ++pc;
+      continue;
+    }
     if (instruction.opcode == PcoOpcode::kDiscard) {
       result.discarded = true;
       break;
@@ -7978,6 +8096,27 @@ PcoFragmentExecution ExecuteFragmentPco(
                   << instruction.binary_offset << " op=ADD64_32 dst=t"
                   << instruction.output_index << ",t"
                   << instruction.output_index1 << '\n';
+      }
+      ++pc;
+      continue;
+    }
+
+    if (instruction.opcode == PcoOpcode::kMoveBypass &&
+        instruction.target == PcoWriteTarget::kTemporary &&
+        instruction.repeat_count > 1) {
+      if (instruction.repeat_count > 4 || instruction.source_count != 1 ||
+          instruction.source.bank != PcoRegisterBank::kTemporary ||
+          static_cast<std::size_t>(instruction.source.index) +
+                  instruction.repeat_count > temporaries.size() ||
+          static_cast<std::size_t>(instruction.output_index) +
+                  instruction.repeat_count > temporaries.size())
+        ExecuteError("repeated fragment TEMP move exceeds its register files");
+      for (std::uint8_t repeat = 0; repeat < instruction.repeat_count; ++repeat) {
+        const std::uint32_t value = ReadSource(instruction.source,
+            no_vertex_inputs, temporaries, temporary_written_mask, repeat,
+            ShaderStage::kFragment);
+        temporaries[instruction.output_index + repeat] = value;
+        temporary_written_mask |= UINT64_C(1) << (instruction.output_index + repeat);
       }
       ++pc;
       continue;

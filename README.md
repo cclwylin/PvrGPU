@@ -103,6 +103,15 @@ Detail per component: [PvrGPU.md §3.5](PvrGPU.md), the
 
 ## Current Status
 
+- The native generic PCO path now executes FBO shaders through the SystemC
+  pipeline with typed integer/float texture and color transport, persistent
+  color/depth/stencil LOAD/readback, per-sample MSAA, and shader-depth late tests.
+  The driver also implements typed clear and scaled/format-converting blits,
+  including color and depth/stencil resolves. See the
+  [API v20 contract](docs/PVRGPU_DRIVER_COMMAND.md).
+- The numbered Phase 0–6 entries below describe the original narrow bring-up
+  paths, not the full extent of the newer generic PCO path. UBO layout and
+  broader synchronization support remain separate validation work.
 - GLBench/RDC counter infrastructure exists for fixed captured workloads.
 - dEQP capture cataloging is ready through Phase 0 to Phase 6.
 - `pvrgpu-deqp` now runs EGL/GLES2/GLES3/GLES31 dEQP cases directly through
@@ -114,7 +123,7 @@ Detail per component: [PvrGPU.md §3.5](PvrGPU.md), the
 - Phase 2 driver bring-up can now observe a minimal GLES2 VS/FS + client vertex array + `glDrawArrays(GL_TRIANGLES, 0, 3)` path and emits `event=draw_triangles` in the driver counter log. This is not pixel-correct rasterization yet.
 - Phase 3 driver bring-up can now copy/bind fixed-function blend, depth/stencil/alpha, and rasterizer state, track scissor/blend-color/stencil-ref state, observe one indexed `glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, ...)` path, and emit `event=draw_indexed_triangles`. This is still counter-only, not depth/blend/stencil pixel correctness.
 - Phase 4 driver bring-up observes RGBA8 upload, sampler/view state, and textured draws. The generic smoke remains counter-oriented, while the strictly matched glmark2 `effect2d` six-vertex full-screen draw now lowers through a tight RGBA8 sidecar into the SystemC depth/varying/nearest-sampling/readback path. Other texture draws remain fail-closed.
-- Phase 5 driver bring-up can now observe texture-backed FBO attachment/framebuffer-state traffic, FBO clear/readback, same-format 2D copy/blit traffic, one triangle draw into the FBO, and `glFlush`/`glFinish` visibility via driver counters. This is still counter-only for draw/sync correctness; scaled blits and resolves are not implemented.
+- The original Phase 5 path observes texture-backed FBO traffic and flush/finish via driver counters. The newer generic path supplies model-rendered FBO pixels and typed scaled blits/resolves; it does not provide asynchronous GPU fences.
 - Phase 6 driver bring-up can now retain GLES2 uniform uploads as Gallium constant-buffer state, expose first payload words in the driver counter log, and observe one uniform-driven triangle via `event=draw_uniform_triangles`. This is still counter-only, not uniform math or UBO/model correctness.
 - `src/gallium/drivers/pvrgpu/meson.build` is the Mesa integration seam for
   `-Dgallium-drivers=llvmpipe,zink,pvrgpu`.
@@ -242,10 +251,11 @@ This is the first real driver/model seam. The strictly matched glmark2
 `effect2d` draw additionally crosses the seam with six positions/UVs and a
 tight RGBA8 texture sidecar, then runs SystemC depth, interpolation, nearest
 sampling, and readback. Phase 2/3/5/6 still have counter-oriented or narrowly
-modeled portions; arbitrary draws and shaders, general texture sampling,
-UBO/model layout correctness, scaled blits, resolves, real fences/sync,
-pixel-correct FBO draws and general depth/blend/stencil behavior remain future
-work. Live dEQP is now an executable integration gate for the supported slice.
+modeled portions. The newer generic PCO path adds typed texture sampling,
+model-rendered FBO pixels, depth/blend/stencil, MSAA and driver blits/resolves.
+Arbitrary shaders beyond its decoded ISA, UBO/model layout correctness and real
+fences/sync remain separate work. Live dEQP is an executable integration gate
+for the supported slice.
 
 When testing through Mesa, select the driver explicitly:
 

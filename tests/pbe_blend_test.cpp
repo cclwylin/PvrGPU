@@ -183,6 +183,74 @@ void CheckResult(MemoryPool &pool, const TestStateHandles &handles,
   pool.Release(handles.state);
 }
 
+void SetFloatAttachment(MemoryPool &pool, const TestStateHandles &handles,
+                        const std::array<float, 4> &initial, bool load) {
+  PipelineState state = LoadPipelineState(pool, handles.state);
+  state.color_attachment_float32 = 1;
+  std::memcpy(state.raster_state.clear_color, initial.data(), sizeof(initial));
+  if (load) {
+    std::vector<std::uint8_t> bytes(sizeof(initial));
+    std::memcpy(bytes.data(), initial.data(), bytes.size());
+    state.color_attachment_load = StoreNewArray(pool, bytes);
+    state.color_attachment_load_enable = 1;
+    state.color_attachment_load_bytes = bytes.size();
+  }
+  StorePipelineState(pool, handles.state, state);
+}
+
+void CheckFloatResult(MemoryPool &pool, const TestStateHandles &handles,
+                      const std::array<float, 4> &expected) {
+  const PipelineState state = LoadPipelineState(pool, handles.state);
+  Check(state.stage == PipelineStage::kPbeComplete,
+        "float attachment completion stage");
+  Check(state.framebuffer_bytes == sizeof(expected),
+        "float attachment has four full-width channels");
+  const auto bytes = LoadArray<std::uint8_t>(pool, state.pbe_framebuffer);
+  Check(bytes.size() == sizeof(expected) &&
+            std::memcmp(bytes.data(), expected.data(), bytes.size()) == 0,
+        "float attachment retains range, precision, blending and write masks");
+  pool.Release(state.pbe_framebuffer);
+  if (pvrgpu::stub::HasPoolHandle(state.color_attachment_load))
+    pool.Release(state.color_attachment_load);
+  pool.Release(handles.invocations);
+  pool.Release(handles.outputs);
+  pool.Release(handles.state);
+}
+
+void SetSampleCoverage(MemoryPool &pool, const TestStateHandles &handles,
+                       const std::vector<std::uint32_t> &coverage,
+                       const std::vector<std::uint8_t> &initial = {}) {
+  PipelineState state = LoadPipelineState(pool, handles.state);
+  state.raster_state.sample_count = 4;
+  auto invocations = LoadArray<FragmentInvocation>(pool, handles.invocations);
+  Check(invocations.size() == coverage.size(), "sample coverage size");
+  for (std::size_t index = 0; index < coverage.size(); ++index)
+    invocations[index].sample_mask = coverage[index];
+  pvrgpu::stub::StoreArray(pool, handles.invocations, invocations);
+  if (!initial.empty()) {
+    state.color_attachment_load = StoreNewArray(pool, initial);
+    state.color_attachment_load_enable = 1;
+    state.color_attachment_load_bytes = initial.size();
+  }
+  StorePipelineState(pool, handles.state, state);
+}
+
+void CheckSampleResult(MemoryPool &pool, const TestStateHandles &handles,
+                       const std::vector<std::uint8_t> &expected) {
+  const PipelineState state = LoadPipelineState(pool, handles.state);
+  Check(state.stage == PipelineStage::kPbeComplete &&
+            state.framebuffer_bytes == expected.size(),
+        "multisample completion and byte count");
+  Check(LoadArray<std::uint8_t>(pool, state.pbe_framebuffer) == expected,
+        "each covered sample uses its own destination and untouched samples survive");
+  pool.Release(state.pbe_framebuffer);
+  if (pvrgpu::stub::HasPoolHandle(state.color_attachment_load))
+    pool.Release(state.color_attachment_load);
+  pool.Release(handles.invocations);
+  pool.Release(handles.outputs);
+  pool.Release(handles.state);
+}
+
 } // namespace
 
 
@@ -304,7 +372,44 @@ int sc_main(int, char **) {
     input.write({loaded_additive.state, 8, 8});
     input.write({mrt.state, 9, 9});
 
-    sc_core::sc_start(sc_core::sc_time(200, sc_core::SC_NS));
+    PcoFragmentExecution wide_color;
+    wide_color.written_mask = 0x0f;
+    wide_color.pixel_outputs = {FloatBits(-4.5F), FloatBits(70000.0F),
+                                FloatBits(0.1234567F), FloatBits(-0.0F)};
+    const TestStateHandles float_store = MakeState(pool, 10, {wide_color}, false);
+    SetFloatAttachment(pool, float_store, {}, false);
+    PcoFragmentExecution float_add;
+    float_add.written_mask = 0x0f;
+    float_add.pixel_outputs = {FloatBits(-0.5F), FloatBits(4.0F),
+                              FloatBits(-8.0F), FloatBits(0.75F)};
+    const TestStateHandles float_blend = MakeState(
+        pool, 11, {float_add}, true, BlendEquation::kAdd, BlendEquation::kAdd,
+        BlendFactor::kOne, BlendFactor::kOne, 0x0d,
+        BlendFactor::kOne, BlendFactor::kOne);
+    SetFloatAttachment(pool, float_blend, {-2.0F, 8.0F, 1024.0F, 0.125F}, true);
+    const TestStateHandles float_clear = MakeState(
+        pool, 12, {wide_color}, false, BlendEquation::kAdd, BlendEquation::kAdd,
+        BlendFactor::kOne, BlendFactor::kZero, 0);
+    SetFloatAttachment(pool, float_clear, {-8.0F, 0.125F, 65504.0F, 2.0F}, false);
+    input.write({float_store.state, 10, 10});
+    input.write({float_blend.state, 11, 11});
+    input.write({float_clear.state, 12, 12});
+
+    const TestStateHandles sample_opaque =
+        MakeState(pool, 13, {red_half, green_half}, false);
+    SetSampleCoverage(pool, sample_opaque, {0x3, 0xc});
+    const TestStateHandles sample_blend =
+        MakeState(pool, 14, {red_half, green_half});
+    SetSampleCoverage(pool, sample_blend, {0x3, 0x6});
+    const TestStateHandles sample_load = MakeState(pool, 15, {red_half});
+    SetSampleCoverage(pool, sample_load, {0x5},
+                      {10, 20, 30, 40, 10, 20, 30, 40,
+                       10, 20, 30, 40, 10, 20, 30, 40});
+    input.write({sample_opaque.state, 13, 13});
+    input.write({sample_blend.state, 14, 14});
+    input.write({sample_load.state, 15, 15});
+
+    sc_core::sc_start(sc_core::sc_time(500, sc_core::SC_NS));
     sc_core::sc_start(sc_core::SC_ZERO_TIME);
 
     PipelineTxn completed;
@@ -326,6 +431,25 @@ int sc_main(int, char **) {
           "attachment-LOAD FIFO completion order");
     Check(output.nb_read(completed) && completed.sequence == 9,
           "multiple-render-target FIFO completion order");
+    for (std::uint32_t sequence = 10; sequence <= 12; ++sequence)
+      Check(output.nb_read(completed) && completed.sequence == sequence,
+            "float-attachment FIFO completion order");
+    for (std::uint32_t sequence = 13; sequence <= 15; ++sequence)
+      Check(output.nb_read(completed) && completed.sequence == sequence,
+            "multisample FIFO completion order");
+
+    CheckFloatResult(pool, float_store, {-4.5F, 70000.0F, 0.1234567F, -0.0F});
+    CheckFloatResult(pool, float_blend, {-2.5F, 8.0F, 1016.0F, 0.875F});
+    CheckFloatResult(pool, float_clear, {-8.0F, 0.125F, 65504.0F, 2.0F});
+    CheckSampleResult(pool, sample_opaque,
+                       {255, 0, 0, 128, 255, 0, 0, 128,
+                        0, 255, 0, 128, 0, 255, 0, 128});
+    CheckSampleResult(pool, sample_blend,
+                       {128, 0, 127, 191, 64, 128, 63, 159,
+                        0, 128, 127, 191, 0, 0, 255, 255});
+    CheckSampleResult(pool, sample_load,
+                       {133, 10, 15, 84, 10, 20, 30, 40,
+                        133, 10, 15, 84, 10, 20, 30, 40});
 
     CheckResult(pool, single, {128, 0, 127, 191}, 1);
     CheckResult(pool, red_green, {64, 128, 63, 159}, 2);

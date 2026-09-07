@@ -4,6 +4,7 @@
 #include "pvrgpu_cmd.h"
 #include "pvrgpu_context.h"
 #include "pvrgpu_counter.h"
+#include "pvrgpu_msaa.h"
 #include "pvrgpu_screen.h"
 
 #include "frontend/sw_winsys.h"
@@ -1078,6 +1079,8 @@ pvrgpu_resource_readback_format_is_supported(enum pipe_format format)
       return pack->pack_rgba_uint != NULL;
    if (util_format_is_pure_sint(format))
       return pack->pack_rgba_sint != NULL;
+   if (util_format_is_float(format))
+      return pack->pack_rgba_float != NULL;
    return pack->pack_rgba_8unorm != NULL;
 }
 
@@ -1091,6 +1094,8 @@ pvrgpu_resource_readback_format_is_supported(enum pipe_format format)
 static unsigned
 pvrgpu_resource_readback_bytes_per_pixel(enum pipe_format format)
 {
+   if (util_format_is_float(format))
+      return 4u * sizeof(float);
    const unsigned raw_channels =
       pvrgpu_resource_readback_raw_channels(format);
    return raw_channels ? raw_channels * sizeof(uint32_t) : 4u;
@@ -1114,6 +1119,15 @@ pvrgpu_resource_readback_store_row(enum pipe_format format,
       util_format_pack_description(pack_format);
    const unsigned raw_channels =
       pvrgpu_resource_readback_raw_channels(format);
+
+   if (util_format_is_float(format)) {
+      pack->pack_rgba_float(destination,
+                            util_format_get_stride(pack_format, width),
+                            (const float *)source_row,
+                            width * 4u * sizeof(float),
+                            width, 1);
+      return;
+   }
 
    if (raw_channels == 0) {
       /*
@@ -1295,8 +1309,9 @@ pvrgpu_resource_read_back_color_surface(struct pipe_context *pipe,
 
    const unsigned bytes_per_pixel =
       pvrgpu_resource_readback_bytes_per_pixel(surface->format);
+   const unsigned samples = pvrgpu_resource_storage_sample_count(resource);
    const size_t pixels_size =
-      (size_t)width * (size_t)height * (size_t)bytes_per_pixel;
+      (size_t)width * (size_t)height * (size_t)bytes_per_pixel * samples;
    uint8_t *pixels = MALLOC(pixels_size);
    if (!pixels)
       return false;
@@ -1305,7 +1320,7 @@ pvrgpu_resource_read_back_color_surface(struct pipe_context *pipe,
    char error[512] = { 0 };
    const bool flushed =
       pvrgpu_systemc_flush_readback_pixels(width, height, bytes_per_pixel,
-                                           (uint32_t)attachment, pixels,
+                                           (uint32_t)attachment, samples, 0, pixels,
                                            pixels_size, &written,
                                            error, sizeof(error));
    if (!flushed || !written) {
@@ -1333,8 +1348,8 @@ pvrgpu_resource_read_back_color_surface(struct pipe_context *pipe,
       pvrgpu_resource_readback_store_row(
          surface->format,
          destination + (size_t)row * stride,
-         pixels + (size_t)row * (size_t)width * (size_t)bytes_per_pixel,
-         width);
+         pixels + (size_t)row * (size_t)width * (size_t)bytes_per_pixel * samples,
+         width * samples);
    }
    FREE(pixels);
 
@@ -1349,6 +1364,47 @@ pvrgpu_resource_read_back_color_surface(struct pipe_context *pipe,
                          surface->level,
                          surface->first_layer);
    return true;
+}
+
+static void
+pvrgpu_resource_read_back_depth_surface(struct pipe_context *pipe)
+{
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   const struct pipe_surface *surface = &ctx->framebuffer.zsbuf;
+   struct pipe_resource *texture = surface->texture;
+   struct pvrgpu_resource *resource = pvrgpu_resource(texture);
+   if (!texture || !resource || !resource->data ||
+       surface->format != texture->format ||
+       !pvrgpu_resource_level_valid(resource, surface->level) ||
+       surface->first_layer != surface->last_layer ||
+       surface->first_layer >= pvrgpu_resource_level_layer_count(texture, surface->level))
+      return;
+   const unsigned width = ctx->framebuffer.width;
+   const unsigned height = ctx->framebuffer.height;
+   if (!width || !height ||
+       width > pvrgpu_resource_level_width(texture, surface->level) ||
+       height > pvrgpu_resource_level_height(texture, surface->level))
+      return;
+   const unsigned samples = pvrgpu_resource_storage_sample_count(texture);
+   const unsigned bpp = util_format_get_blocksize(surface->format);
+   const size_t row_size = (size_t)width * samples * bpp;
+   const size_t size = row_size * height;
+   uint8_t *pixels = malloc(size);
+   if (!pixels)
+      return;
+   char error[512] = {0};
+   bool written = false;
+   if (pvrgpu_systemc_flush_readback_pixels(width, height, bpp, UINT32_MAX,
+         samples, surface->format, pixels, size, &written, error, sizeof(error)) && written) {
+      uint8_t *destination = resource->data + resource->level_offsets[surface->level] +
+         (size_t)surface->first_layer * resource->level_layer_strides[surface->level];
+      for (unsigned y = 0; y < height; ++y)
+         memcpy(destination + (size_t)y * resource->level_strides[surface->level],
+                pixels + (size_t)y * row_size, row_size);
+      pvrgpu_counter_eventf("depth_stencil_readback", "res=%p format=%s samples=%u",
+                           (void *)texture, util_format_name(surface->format), samples);
+   }
+   free(pixels);
 }
 
 /*
@@ -1374,6 +1430,8 @@ pvrgpu_flush_current_color_attachments(struct pipe_context *pipe)
       pvrgpu_context_end_frame_at_readback(ctx);
    if (ctx->color_readback_pending_mask == 0)
       return;
+   const bool read_depth = ctx->color_readback_generation ==
+                           pvrgpu_systemc_submission_generation();
 
    unsigned written = 0;
    for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target) {
@@ -1382,6 +1440,8 @@ pvrgpu_flush_current_color_attachments(struct pipe_context *pipe)
           pvrgpu_resource_read_back_color_surface(pipe, surface, target))
          ++written;
    }
+   if (read_depth)
+      pvrgpu_resource_read_back_depth_surface(pipe);
    pvrgpu_counter_eventf("framebuffer_boundary_flush",
                          "draws=%u targets=%u written=%u",
                          recorded,
@@ -1398,6 +1458,12 @@ pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
    if (!(usage & PIPE_MAP_READ) || !ctx || !resource)
       return;
+
+   if (ctx->framebuffer.zsbuf.texture == resource &&
+       ctx->framebuffer.zsbuf.level == level) {
+      pvrgpu_flush_current_color_attachments(pipe);
+      return;
+   }
 
    const int attachment =
       pvrgpu_resource_color_attachment_index(ctx, resource, level);
@@ -1928,8 +1994,10 @@ pvrgpu_can_copy_texture_region(struct pipe_resource *dst,
       return false;
    if (dst->format != src->format)
       return false;
-   if (dst->nr_samples > 1 || src->nr_samples > 1 ||
-       dst->nr_storage_samples > 1 || src->nr_storage_samples > 1)
+   if (pvrgpu_resource_storage_sample_count(dst) !=
+       pvrgpu_resource_storage_sample_count(src) ||
+       MAX2(1, dst->nr_samples) != MAX2(1, src->nr_samples) ||
+       pvrgpu_resource_storage_sample_count(dst) != MAX2(1, dst->nr_samples))
       return false;
    if (src_box->width <= 0 || src_box->height <= 0 ||
        src_box->depth <= 0)
@@ -1977,14 +2045,16 @@ pvrgpu_copy_texture_region_unchecked(struct pipe_resource *dst,
                pvrgpu_dst->level_layer_strides[dst_level] +
             (uintptr_t)(dsty + (unsigned)row) *
                pvrgpu_dst->level_strides[dst_level] +
-            (uintptr_t)dstx * block_size;
+            pvrgpu_msaa_texel_index(dstx, 0,
+               pvrgpu_resource_storage_sample_count(dst)) * block_size;
          const uint8_t *src_row =
             pvrgpu_src->data + pvrgpu_src->level_offsets[src_level] +
             (uintptr_t)(src_box->z + layer) *
                pvrgpu_src->level_layer_strides[src_level] +
             (uintptr_t)(src_box->y + row) *
                pvrgpu_src->level_strides[src_level] +
-            (uintptr_t)src_box->x * block_size;
+            pvrgpu_msaa_texel_index((unsigned)src_box->x, 0,
+               pvrgpu_resource_storage_sample_count(src)) * block_size;
          memmove(dst_row, src_row, row_bytes);
       }
    }
@@ -2030,7 +2100,7 @@ pvrgpu_read_texture_pixel_4ub(struct pipe_resource *resource,
                         4,
                         base,
                         pvrgpu->level_strides[level],
-                        x,
+                        x * pvrgpu_resource_storage_sample_count(resource),
                         y,
                         1,
                         1);
@@ -2430,39 +2500,74 @@ struct pvrgpu_blit_source_window {
    unsigned height;
 };
 
+/* Blits keep their original source/destination transform when clipped. Mesa's
+ * GL frontend supplies the clipped destination as a scissor precisely because
+ * rounding new integer box endpoints would change fractional sampling. */
+static bool
+pvrgpu_blit_layers_in_bounds(const struct pipe_resource *resource,
+                             unsigned level, const struct pipe_box *box)
+{
+   if (!box)
+      return false;
+   const struct pipe_box layers = {.x = 0, .y = 0, .z = box->z,
+                                    .width = 1, .height = 1, .depth = box->depth};
+   return pvrgpu_transfer_box_in_bounds(resource, level, &layers);
+}
+
+static struct pvrgpu_blit_source_window
+pvrgpu_blit_destination_window(const struct pipe_blit_info *info)
+{
+   int64_t x0 = MAX2((int64_t)info->dst.box.x, 0);
+   int64_t y0 = MAX2((int64_t)info->dst.box.y, 0);
+   int64_t x1 = MIN2((int64_t)info->dst.box.x + info->dst.box.width,
+                    pvrgpu_resource_level_width(info->dst.resource, info->dst.level));
+   int64_t y1 = MIN2((int64_t)info->dst.box.y + info->dst.box.height,
+                    pvrgpu_resource_level_height(info->dst.resource, info->dst.level));
+   if (info->scissor_enable) {
+      x0 = MAX2(x0, info->scissor.minx);
+      y0 = MAX2(y0, info->scissor.miny);
+      x1 = MIN2(x1, info->scissor.maxx);
+      y1 = MIN2(y1, info->scissor.maxy);
+   }
+   if (x1 <= x0 || y1 <= y0)
+      return (struct pvrgpu_blit_source_window){0};
+   return (struct pvrgpu_blit_source_window){x0, y0, x1 - x0, y1 - y0};
+}
+
 static bool
 pvrgpu_blit_get_source_window(const struct pipe_blit_info *info,
                               struct pvrgpu_blit_source_window *window)
 {
    if (!info || !window ||
-       !pvrgpu_blit_source_box_in_bounds(info->src.resource,
-                                         info->src.level,
-                                         &info->src.box))
+       !pvrgpu_blit_layers_in_bounds(info->src.resource, info->src.level,
+                                      &info->src.box))
       return false;
 
    const int64_t x0 = info->src.box.x;
    const int64_t y0 = info->src.box.y;
    const int64_t x1 = x0 + (int64_t)info->src.box.width;
    const int64_t y1 = y0 + (int64_t)info->src.box.height;
-   uint64_t min_x = (uint64_t)(x0 < x1 ? x0 : x1);
-   uint64_t min_y = (uint64_t)(y0 < y1 ? y0 : y1);
-   uint64_t max_x = (uint64_t)(x0 > x1 ? x0 : x1);
-   uint64_t max_y = (uint64_t)(y0 > y1 ? y0 : y1);
+   int64_t min_x = MIN2(x0, x1);
+   int64_t min_y = MIN2(y0, y1);
+   int64_t max_x = MAX2(x0, x1);
+   int64_t max_y = MAX2(y0, y1);
+   const int64_t level_width = pvrgpu_resource_level_width(
+      info->src.resource, info->src.level);
+   const int64_t level_height = pvrgpu_resource_level_height(
+      info->src.resource, info->src.level);
 
    if (info->filter == PIPE_TEX_FILTER_LINEAR) {
-      const uint64_t level_width = pvrgpu_resource_level_width(
-         info->src.resource, info->src.level);
-      const uint64_t level_height = pvrgpu_resource_level_height(
-         info->src.resource, info->src.level);
-      if (min_x > 0)
-         --min_x;
-      if (min_y > 0)
-         --min_y;
-      if (max_x < level_width)
-         ++max_x;
-      if (max_y < level_height)
-         ++max_y;
+      --min_x;
+      --min_y;
+      ++max_x;
+      ++max_y;
    }
+   /* Include edge texels used by clamp-to-edge filtering even when an entire
+    * original box lies beyond the resource. Destination coverage is separate. */
+   min_x = CLAMP(min_x, 0, level_width - 1);
+   min_y = CLAMP(min_y, 0, level_height - 1);
+   max_x = CLAMP(max_x, 1, level_width);
+   max_y = CLAMP(max_y, 1, level_height);
 
    if (max_x <= min_x || max_y <= min_y ||
        max_x - min_x > UINT_MAX || max_y - min_y > UINT_MAX)
@@ -2485,7 +2590,7 @@ pvrgpu_can_blit_as_texture_region(const struct pipe_blit_info *info)
       return false;
    if (info->dst.resource->target != info->src.resource->target)
       return false;
-   if (info->mask != PIPE_MASK_RGBA)
+   if (!(info->mask & PIPE_MASK_RGBA) || (info->mask & ~PIPE_MASK_RGBA))
       return false;
    if (info->dst.box.width <= 0 || info->dst.box.height <= 0 ||
        info->dst.box.depth <= 0)
@@ -2497,24 +2602,27 @@ pvrgpu_can_blit_as_texture_region(const struct pipe_blit_info *info)
    if (info->filter != PIPE_TEX_FILTER_NEAREST &&
        info->filter != PIPE_TEX_FILTER_LINEAR)
       return false;
-   if (info->dst_sample || info->sample0_only || info->scissor_enable ||
-       info->render_condition_enable || info->alpha_blend ||
+   if (info->render_condition_enable || info->alpha_blend ||
        info->num_window_rectangles ||
        !pvrgpu_blit_swizzle_is_valid(info))
       return false;
-   if (info->dst.resource->nr_samples > 1 ||
-       info->src.resource->nr_samples > 1 ||
-       info->dst.resource->nr_storage_samples > 1 ||
-       info->src.resource->nr_storage_samples > 1 ||
-       pvrgpu_resource_storage_sample_count(info->dst.resource) != 1 ||
-       pvrgpu_resource_storage_sample_count(info->src.resource) != 1)
+   const unsigned src_samples =
+      pvrgpu_resource_storage_sample_count(info->src.resource);
+   const unsigned dst_samples =
+      pvrgpu_resource_storage_sample_count(info->dst.resource);
+   /* Coverage/storage sample counts that differ require an explicit mapping,
+    * which this storage layout does not provide. Ordinary MSAA has one stored
+    * value per coverage sample. */
+   if (src_samples != MAX2(1, info->src.resource->nr_samples) ||
+       dst_samples != MAX2(1, info->dst.resource->nr_samples) ||
+       (src_samples > 1 && dst_samples > 1 && src_samples != dst_samples) ||
+       info->dst_sample > dst_samples ||
+       (info->sample0_only && dst_samples != 1))
       return false;
-   if (!pvrgpu_transfer_box_in_bounds(info->dst.resource,
-                                      info->dst.level,
+   if (!pvrgpu_blit_layers_in_bounds(info->dst.resource, info->dst.level,
                                       &info->dst.box) ||
-       !pvrgpu_blit_source_box_in_bounds(info->src.resource,
-                                         info->src.level,
-                                         &info->src.box))
+       !pvrgpu_blit_layers_in_bounds(info->src.resource, info->src.level,
+                                      &info->src.box))
       return false;
    if (!pvrgpu_blit_view_matches_resource(info->src.resource,
                                           info->src.format) ||
@@ -2532,6 +2640,11 @@ pvrgpu_can_blit_as_texture_region(const struct pipe_blit_info *info)
                                                 info->dst.format,
                                                 value_type))
       return false;
+   if ((info->mask != PIPE_MASK_RGBA || info->dst_sample) &&
+       !pvrgpu_blit_format_access_is_supported(info->dst.format,
+                                                info->dst.format,
+                                                value_type))
+      return false;
 
    struct pvrgpu_resource *pvrgpu_dst =
       pvrgpu_resource(info->dst.resource);
@@ -2546,9 +2659,9 @@ pvrgpu_can_blit_as_texture_region(const struct pipe_blit_info *info)
 
    struct pvrgpu_blit_source_window window;
    if (!pvrgpu_blit_get_source_window(info, &window) ||
-       window.width > UINT_MAX / sizeof(union pipe_color_union) ||
+       window.width > UINT_MAX / sizeof(union pipe_color_union) / src_samples ||
        (unsigned)info->dst.box.width >
-          UINT_MAX / sizeof(union pipe_color_union))
+          UINT_MAX / sizeof(union pipe_color_union) / dst_samples)
       return false;
 
    if (window.height > SIZE_MAX / window.width)
@@ -2556,7 +2669,7 @@ pvrgpu_can_blit_as_texture_region(const struct pipe_blit_info *info)
    const size_t window_pixels = (size_t)window.width * window.height;
    if ((size_t)info->src.box.depth > SIZE_MAX / window_pixels ||
        window_pixels * (size_t)info->src.box.depth >
-          SIZE_MAX / sizeof(union pipe_color_union))
+          SIZE_MAX / sizeof(union pipe_color_union) / src_samples)
       return false;
 
    return true;
@@ -2639,8 +2752,221 @@ pvrgpu_blit_lerp(const union pipe_color_union *top_left,
 }
 
 static bool
+pvrgpu_blit_zs_view_matches_resource(const struct pipe_resource *resource,
+                                    enum pipe_format format)
+{
+   if (!resource || format <= PIPE_FORMAT_NONE || format >= PIPE_FORMAT_COUNT ||
+       resource->format <= PIPE_FORMAT_NONE || resource->format >= PIPE_FORMAT_COUNT)
+      return false;
+   const struct util_format_description *view = util_format_description(format);
+   const struct util_format_description *storage =
+      util_format_description(resource->format);
+   if (!(view && storage && view->colorspace == UTIL_FORMAT_COLORSPACE_ZS &&
+          storage->colorspace == UTIL_FORMAT_COLORSPACE_ZS &&
+          view->block.width == 1 && view->block.height == 1 &&
+          view->block.depth == 1 && storage->block.width == 1 &&
+          storage->block.height == 1 && storage->block.depth == 1 &&
+          view->block.bits != 0 && view->block.bits % 8 == 0 &&
+          view->block.bits == storage->block.bits))
+      return false;
+   for (unsigned aspect = 0; aspect < 2; ++aspect) {
+      const unsigned view_channel = view->swizzle[aspect];
+      const unsigned storage_channel = storage->swizzle[aspect];
+      if (view_channel >= 4)
+         continue;
+      if (storage_channel >= 4 ||
+          view->channel[view_channel].shift != storage->channel[storage_channel].shift ||
+          view->channel[view_channel].size != storage->channel[storage_channel].size ||
+          view->channel[view_channel].type != storage->channel[storage_channel].type ||
+          view->channel[view_channel].normalized != storage->channel[storage_channel].normalized)
+         return false;
+   }
+   return true;
+}
+
+static bool
+pvrgpu_blit_zs_uses_float_depth(const struct pipe_blit_info *info)
+{
+   return util_get_depth_format_type(util_format_description(info->src.format)) ==
+             UTIL_FORMAT_TYPE_FLOAT ||
+          util_get_depth_format_type(util_format_description(info->dst.format)) ==
+             UTIL_FORMAT_TYPE_FLOAT;
+}
+
+static bool
+pvrgpu_can_blit_depth_stencil(const struct pipe_blit_info *info)
+{
+   if (!info || !info->src.resource || !info->dst.resource ||
+       !(info->mask & PIPE_MASK_ZS) || (info->mask & ~PIPE_MASK_ZS) ||
+       info->dst.box.width <= 0 || info->dst.box.height <= 0 ||
+       info->dst.box.depth <= 0 ||
+       info->src.box.depth != info->dst.box.depth ||
+       info->filter != PIPE_TEX_FILTER_NEAREST || info->swizzle_enable ||
+       info->render_condition_enable || info->alpha_blend ||
+       info->num_window_rectangles ||
+       !pvrgpu_blit_zs_view_matches_resource(info->src.resource, info->src.format) ||
+       !pvrgpu_blit_zs_view_matches_resource(info->dst.resource, info->dst.format) ||
+       !pvrgpu_transfer_box_in_bounds(info->dst.resource, info->dst.level,
+                                      &info->dst.box) ||
+       !pvrgpu_blit_source_box_in_bounds(info->src.resource, info->src.level,
+                                         &info->src.box))
+      return false;
+
+   const unsigned src_samples = pvrgpu_resource_storage_sample_count(info->src.resource);
+   const unsigned dst_samples = pvrgpu_resource_storage_sample_count(info->dst.resource);
+   if (src_samples != MAX2(1, info->src.resource->nr_samples) ||
+       dst_samples != MAX2(1, info->dst.resource->nr_samples) ||
+       (src_samples > 1 && dst_samples > 1 && src_samples != dst_samples) ||
+       info->dst_sample > dst_samples ||
+       (info->sample0_only && dst_samples != 1))
+      return false;
+
+   const struct util_format_unpack_description *unpack =
+      util_format_unpack_description(info->src.format);
+   const struct util_format_pack_description *pack =
+      util_format_pack_description(info->dst.resource->format);
+   const struct util_format_description *src_view = util_format_description(info->src.format);
+   const struct util_format_description *dst_view = util_format_description(info->dst.format);
+   if (!unpack || !pack)
+      return false;
+   if (((info->mask & PIPE_MASK_Z) &&
+        (!util_format_has_depth(src_view) || !util_format_has_depth(dst_view))) ||
+       ((info->mask & PIPE_MASK_S) &&
+        (!util_format_has_stencil(src_view) || !util_format_has_stencil(dst_view))))
+      return false;
+   if ((info->mask & PIPE_MASK_Z) &&
+       (pvrgpu_blit_zs_uses_float_depth(info)
+           ? (!unpack->unpack_z_float || !pack->pack_z_float)
+           : (!unpack->unpack_z_32unorm || !pack->pack_z_32unorm)))
+      return false;
+   if ((info->mask & PIPE_MASK_S) &&
+       (!unpack->unpack_s_8uint || !pack->pack_s_8uint))
+      return false;
+
+   const struct pvrgpu_resource *src = pvrgpu_resource(info->src.resource);
+   const struct pvrgpu_resource *dst = pvrgpu_resource(info->dst.resource);
+   struct pvrgpu_blit_source_window window;
+   if (!src->data || !dst->data ||
+       !pvrgpu_blit_get_source_window(info, &window) ||
+       window.width > UINT_MAX / sizeof(uint32_t) / src_samples ||
+       window.height > SIZE_MAX / window.width)
+      return false;
+   const size_t pixels = (size_t)window.width * window.height;
+   return (size_t)info->src.box.depth <= SIZE_MAX / pixels &&
+          pixels * (size_t)info->src.box.depth <=
+             SIZE_MAX / sizeof(uint32_t) / src_samples;
+}
+
+static bool
+pvrgpu_blit_depth_stencil_unchecked(const struct pipe_blit_info *info)
+{
+   struct pvrgpu_blit_source_window window;
+   if (!pvrgpu_blit_get_source_window(info, &window))
+      return false;
+   struct pvrgpu_resource *src = pvrgpu_resource(info->src.resource);
+   struct pvrgpu_resource *dst = pvrgpu_resource(info->dst.resource);
+   const unsigned src_samples = pvrgpu_resource_storage_sample_count(info->src.resource);
+   const unsigned dst_samples = pvrgpu_resource_storage_sample_count(info->dst.resource);
+   const unsigned src_bpp = util_format_get_blocksize(info->src.format);
+   const unsigned dst_bpp = util_format_get_blocksize(info->dst.format);
+   const unsigned depth = (unsigned)info->src.box.depth;
+   const size_t layer_samples = (size_t)window.width * window.height * src_samples;
+   const size_t samples = layer_samples * depth;
+   void *depth_values = info->mask & PIPE_MASK_Z ? MALLOC(samples * 4u) : NULL;
+   uint8_t *stencil_values = info->mask & PIPE_MASK_S ? MALLOC(samples) : NULL;
+   if (((info->mask & PIPE_MASK_Z) && !depth_values) ||
+       ((info->mask & PIPE_MASK_S) && !stencil_values)) {
+      FREE(depth_values);
+      FREE(stencil_values);
+      return false;
+   }
+   const struct util_format_unpack_description *unpack =
+      util_format_unpack_description(info->src.format);
+   const struct util_format_pack_description *pack =
+      util_format_pack_description(info->dst.resource->format);
+   const bool float_depth = pvrgpu_blit_zs_uses_float_depth(info);
+   const unsigned row_samples = window.width * src_samples;
+
+   /* Decode every source layer before the first destination write.  The two
+    * resources may alias; masked stores must still read the original source.
+    * Normalized depth keeps 32-bit precision rather than taking a float detour. */
+   for (unsigned layer = 0; layer < depth; ++layer) {
+      const uint8_t *source = src->data + src->level_offsets[info->src.level] +
+         ((size_t)info->src.box.z + layer) * src->level_layer_strides[info->src.level] +
+         (size_t)window.y * src->level_strides[info->src.level] +
+         (size_t)window.x * src_samples * src_bpp;
+      const size_t offset = (size_t)layer * layer_samples;
+      if (depth_values) {
+         if (float_depth)
+            unpack->unpack_z_float((float *)depth_values + offset, row_samples * 4u,
+                                    source, src->level_strides[info->src.level],
+                                    row_samples, window.height);
+         else
+            unpack->unpack_z_32unorm((uint32_t *)depth_values + offset, row_samples * 4u,
+                                      source, src->level_strides[info->src.level],
+                                      row_samples, window.height);
+      }
+      if (stencil_values)
+         unpack->unpack_s_8uint(stencil_values + offset, row_samples,
+                                 source, src->level_strides[info->src.level],
+                                 row_samples, window.height);
+   }
+   for (unsigned layer = 0; layer < depth; ++layer) {
+      uint8_t *destination = dst->data + dst->level_offsets[info->dst.level] +
+         ((size_t)info->dst.box.z + layer) * dst->level_layer_strides[info->dst.level];
+      for (unsigned y = 0; y < (unsigned)info->dst.box.height; ++y) {
+         const unsigned dst_y = (unsigned)info->dst.box.y + y;
+         if (info->scissor_enable &&
+             (dst_y < info->scissor.miny || dst_y >= info->scissor.maxy))
+            continue;
+         const unsigned src_y = pvrgpu_get_blit_axis_sample(
+            info->src.box.y, info->src.box.height, y, info->dst.box.height,
+            pvrgpu_resource_level_height(info->src.resource, info->src.level), false).first;
+         for (unsigned x = 0; x < (unsigned)info->dst.box.width; ++x) {
+            const unsigned dst_x = (unsigned)info->dst.box.x + x;
+            if (info->scissor_enable &&
+                (dst_x < info->scissor.minx || dst_x >= info->scissor.maxx))
+               continue;
+            const unsigned src_x = pvrgpu_get_blit_axis_sample(
+               info->src.box.x, info->src.box.width, x, info->dst.box.width,
+               pvrgpu_resource_level_width(info->src.resource, info->src.level), false).first;
+            const size_t src_pixel = (size_t)layer * layer_samples +
+               ((size_t)(src_y - window.y) * window.width + src_x - window.x) * src_samples;
+            for (unsigned sample = 0; sample < dst_samples; ++sample) {
+               if (info->dst_sample && sample != info->dst_sample - 1)
+                  continue;
+               /* A depth/stencil resolve selects one actual source sample;
+                * unlike normalized color, it never averages the samples. */
+               const size_t source_index = src_pixel +
+                  (src_samples == dst_samples ? sample : 0);
+               uint8_t *pixel = destination + (size_t)dst_y * dst->level_strides[info->dst.level] +
+                  ((size_t)dst_x * dst_samples + sample) * dst_bpp;
+               if (depth_values) {
+                  if (float_depth)
+                     pack->pack_z_float(pixel, dst_bpp,
+                                         (const float *)depth_values + source_index, 4u, 1, 1);
+                  else
+                     pack->pack_z_32unorm(pixel, dst_bpp,
+                                           (const uint32_t *)depth_values + source_index, 4u, 1, 1);
+               }
+               if (stencil_values)
+                  pack->pack_s_8uint(pixel, dst_bpp, stencil_values + source_index, 1, 1, 1);
+            }
+         }
+      }
+   }
+   FREE(depth_values);
+   FREE(stencil_values);
+   return true;
+}
+
+static bool
 pvrgpu_blit_texture_region_unchecked(const struct pipe_blit_info *info)
 {
+   const struct pvrgpu_blit_source_window destination =
+      pvrgpu_blit_destination_window(info);
+   if (!destination.width || !destination.height)
+      return true;
    struct pvrgpu_resource *pvrgpu_dst =
       pvrgpu_resource(info->dst.resource);
    struct pvrgpu_resource *pvrgpu_src =
@@ -2648,6 +2974,10 @@ pvrgpu_blit_texture_region_unchecked(const struct pipe_blit_info *info)
    const unsigned dst_width = (unsigned)info->dst.box.width;
    const unsigned dst_height = (unsigned)info->dst.box.height;
    const unsigned depth = (unsigned)info->dst.box.depth;
+   const unsigned src_samples =
+      pvrgpu_resource_storage_sample_count(info->src.resource);
+   const unsigned dst_samples =
+      pvrgpu_resource_storage_sample_count(info->dst.resource);
    const bool linear = info->filter == PIPE_TEX_FILTER_LINEAR;
    const unsigned src_level_width =
       pvrgpu_resource_level_width(info->src.resource, info->src.level);
@@ -2662,11 +2992,11 @@ pvrgpu_blit_texture_region_unchecked(const struct pipe_blit_info *info)
       return false;
 
    const size_t window_pixels = (size_t)window.width * window.height;
-   const size_t source_pixel_count = window_pixels * depth;
+   const size_t source_pixel_count = window_pixels * depth * src_samples;
    const unsigned source_row_stride =
-      window.width * sizeof(union pipe_color_union);
+      window.width * src_samples * sizeof(union pipe_color_union);
    const unsigned destination_row_stride =
-      dst_width * sizeof(union pipe_color_union);
+      destination.width * dst_samples * sizeof(union pipe_color_union);
    union pipe_color_union *source_pixels =
       MALLOC(source_pixel_count * sizeof(*source_pixels));
    union pipe_color_union *destination_row =
@@ -2685,14 +3015,29 @@ pvrgpu_blit_texture_region_unchecked(const struct pipe_blit_info *info)
          (uintptr_t)((unsigned)info->src.box.z + layer) *
             pvrgpu_src->level_layer_strides[info->src.level];
       util_format_read_4(info->src.format,
-                         source_pixels + (size_t)layer * window_pixels,
+                         source_pixels + (size_t)layer * window_pixels * src_samples,
                          source_row_stride,
                          src_layer_data,
                          pvrgpu_src->level_strides[info->src.level],
-                         window.x,
+                         window.x * src_samples,
                          window.y,
-                         window.width,
+                         window.width * src_samples,
                          window.height);
+   }
+
+   /* Resolve each source pixel before spatial filtering. Read every actual
+    * sample, as util_blitter's resolve shader does; never manufacture missing
+    * samples from sample zero. sRGB unpacking/packing linearizes/re-encodes
+    * through the normal Mesa format callbacks. */
+   if (src_samples > 1 && dst_samples == 1 && !info->sample0_only &&
+       value_type == PVRGPU_BLIT_VALUE_FLOAT) {
+      for (size_t pixel = 0; pixel < window_pixels * depth; ++pixel) {
+         union pipe_color_union *samples = source_pixels + pixel * src_samples;
+         float resolved[4];
+         pvrgpu_msaa_resolve_float(samples, src_samples, sizeof(*samples),
+                                    resolved);
+         memcpy(samples[0].f, resolved, sizeof(resolved));
+      }
    }
 
    for (unsigned layer = 0; layer < depth; ++layer) {
@@ -2701,9 +3046,21 @@ pvrgpu_blit_texture_region_unchecked(const struct pipe_blit_info *info)
          (uintptr_t)((unsigned)info->dst.box.z + layer) *
             pvrgpu_dst->level_layer_strides[info->dst.level];
       const union pipe_color_union *source_layer =
-         source_pixels + (size_t)layer * window_pixels;
+         source_pixels + (size_t)layer * window_pixels * src_samples;
 
-      for (unsigned dst_y = 0; dst_y < dst_height; ++dst_y) {
+      for (unsigned row = 0; row < destination.height; ++row) {
+         const unsigned dst_y = (int64_t)destination.y + row - info->dst.box.y;
+         if (info->mask != PIPE_MASK_RGBA || info->dst_sample) {
+            util_format_read_4(info->dst.format,
+                                destination_row,
+                                destination_row_stride,
+                                dst_layer_data,
+                                pvrgpu_dst->level_strides[info->dst.level],
+                                destination.x * dst_samples,
+                                destination.y + row,
+                                destination.width * dst_samples,
+                                1);
+         }
          const struct pvrgpu_blit_axis_sample y_sample =
             pvrgpu_get_blit_axis_sample(info->src.box.y,
                                         info->src.box.height,
@@ -2716,7 +3073,8 @@ pvrgpu_blit_texture_region_unchecked(const struct pipe_blit_info *info)
          const size_t second_row =
             (size_t)(y_sample.second - window.y) * window.width;
 
-         for (unsigned dst_x = 0; dst_x < dst_width; ++dst_x) {
+         for (unsigned column = 0; column < destination.width; ++column) {
+            const unsigned dst_x = (int64_t)destination.x + column - info->dst.box.x;
             const struct pvrgpu_blit_axis_sample x_sample =
                pvrgpu_get_blit_axis_sample(info->src.box.x,
                                            info->src.box.width,
@@ -2726,37 +3084,49 @@ pvrgpu_blit_texture_region_unchecked(const struct pipe_blit_info *info)
                                            linear);
             const unsigned first_x = x_sample.first - window.x;
             const unsigned second_x = x_sample.second - window.x;
-            const union pipe_color_union *top_left =
-               source_layer + first_row + first_x;
-            union pipe_color_union result;
+            for (unsigned dst_sample = 0; dst_sample < dst_samples;
+                 ++dst_sample) {
+               if (info->dst_sample && dst_sample != info->dst_sample - 1)
+                  continue;
+               const unsigned src_sample =
+                  src_samples == dst_samples ? dst_sample : 0;
+               const union pipe_color_union *top_left =
+                  source_layer + (first_row + first_x) * src_samples + src_sample;
+               union pipe_color_union result;
 
-            if (linear) {
-               const union pipe_color_union *top_right =
-                  source_layer + first_row + second_x;
-               const union pipe_color_union *bottom_left =
-                  source_layer + second_row + first_x;
-               const union pipe_color_union *bottom_right =
-                  source_layer + second_row + second_x;
-               result = pvrgpu_blit_lerp(top_left,
-                                         top_right,
-                                         bottom_left,
-                                         bottom_right,
-                                         x_sample.weight,
-                                         y_sample.weight);
-            } else {
-               result = *top_left;
-            }
+               if (linear) {
+                  const union pipe_color_union *top_right =
+                     source_layer + (first_row + second_x) * src_samples + src_sample;
+                  const union pipe_color_union *bottom_left =
+                     source_layer + (second_row + first_x) * src_samples + src_sample;
+                  const union pipe_color_union *bottom_right =
+                     source_layer + (second_row + second_x) * src_samples + src_sample;
+                  result = pvrgpu_blit_lerp(top_left,
+                                            top_right,
+                                            bottom_left,
+                                            bottom_right,
+                                            x_sample.weight,
+                                            y_sample.weight);
+               } else {
+                  result = *top_left;
+               }
 
-            if (info->swizzle_enable) {
-               union pipe_color_union swizzled;
-               util_format_apply_color_swizzle(
-                  &swizzled,
-                  &result,
-                  info->swizzle,
-                  value_type != PVRGPU_BLIT_VALUE_FLOAT);
-               result = swizzled;
+               if (info->swizzle_enable) {
+                  union pipe_color_union swizzled;
+                  util_format_apply_color_swizzle(
+                     &swizzled,
+                     &result,
+                     info->swizzle,
+                     value_type != PVRGPU_BLIT_VALUE_FLOAT);
+                  result = swizzled;
+               }
+               union pipe_color_union *dst_pixel = destination_row +
+                  pvrgpu_msaa_texel_index(column, dst_sample, dst_samples);
+               for (unsigned channel = 0; channel < 4; ++channel) {
+                  if (info->mask & (PIPE_MASK_R << channel))
+                     dst_pixel->ui[channel] = result.ui[channel];
+               }
             }
-            destination_row[dst_x] = result;
          }
 
          util_format_write_4(info->dst.format,
@@ -2764,9 +3134,9 @@ pvrgpu_blit_texture_region_unchecked(const struct pipe_blit_info *info)
                              destination_row_stride,
                              dst_layer_data,
                              pvrgpu_dst->level_strides[info->dst.level],
-                             (unsigned)info->dst.box.x,
-                             (unsigned)info->dst.box.y + dst_y,
-                             dst_width,
+                             destination.x * dst_samples,
+                             destination.y + row,
+                             destination.width * dst_samples,
                              1);
       }
    }
@@ -3080,13 +3450,15 @@ pvrgpu_blit(struct pipe_context *pipe,
    const bool copy_2d = pvrgpu_can_blit_as_2d_copy(info);
    const bool texture_blit =
       !copy_2d && pvrgpu_can_blit_as_texture_region(info);
+   const bool depth_stencil_blit =
+      !copy_2d && !texture_blit && pvrgpu_can_blit_depth_stencil(info);
 
    /*
     * The CPU paths below consume resource backing directly.  If the source is
     * the framebuffer a generic sequence just drew, its newest pixels still
     * live in the model until this materializes every current colour target.
     */
-   if (copy_2d || texture_blit)
+   if (copy_2d || texture_blit || depth_stencil_blit)
       pvrgpu_flush_current_color_attachments(pipe);
 
    if (copy_2d) {
@@ -3103,6 +3475,11 @@ pvrgpu_blit(struct pipe_context *pipe,
          pvrgpu_emit_unsupported_blit(pipe,
                                       "texture-blit-allocation-failed",
                                       info);
+         return;
+      }
+   } else if (depth_stencil_blit) {
+      if (!pvrgpu_blit_depth_stencil_unchecked(info)) {
+         pvrgpu_emit_unsupported_blit(pipe, "depth-stencil-blit-allocation-failed", info);
          return;
       }
    } else {

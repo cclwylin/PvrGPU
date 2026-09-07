@@ -38,6 +38,15 @@ geometry and loop/order semantics for differential testing.
 
 ## Mesa / PowerVR PCO encoding
 
+`src/systemc/common/msaa.h` adapts the standard 1x/2x/4x/8x/16x
+sample-position tables from Mesa's
+`src/gallium/auxiliary/util/u_sample_positions.c`, copyright 2023 Alyssa
+Rosenzweig, under the MIT license reproduced below. The 4x and 8x positions
+also match llvmpipe's `lp_rast.c`. The driver resolve implementation follows
+llvmpipe's use of `util_blitter`: normalized/floating-point samples are
+averaged in linear color space and integer resolves select sample zero.
+No llvmpipe shader or rasterizer implementation is linked into the model.
+
 The current runtime points to an external Mesa 26.2.1 build with local
 llvmpipe telemetry patches. Most Mesa source and binaries are not redistributed
 by this workspace. The following source artifacts do, however, preserve a
@@ -58,6 +67,7 @@ USC binaries. The locked core fixture provenance is:
 |---|---|---:|---|
 | Fill.Solid passthrough VS | Mesa `VS_PASSTHROUGH_COMMON` precompiled data | 32 | `81aeeb897687ca7e9e5997c90378a4e094d15b9c47df24ee2d0092d47d78a3b3` |
 | Fill.Solid red FS | `tools/pco-fixtures/generate_fill_solid_fs.c` | 48 | `731542be4e64da704e3576248a6d234f8ea56e999e1a9ab447a182e7a03eb3dd` |
+| Red FS + SH0 depth feedback | `tools/pco-fixtures/generate_fill_solid_fs.c` (`red depth-feedback`) | 80 | `163561de2918bd44913dac20eb45c759eb69960004326a96b645b924132715bf` |
 | Attribute fetch case-1 VS | `tools/pco-fixtures/generate_attribute_fetch_shader.c` | 56 | `01fb08add3c710fb9062ed0033fecc15e5cfbce56a38a49ed17db4e43f2bf026` |
 | Attribute fetch case-2 VS | `tools/pco-fixtures/generate_attribute_fetch_shader.c` | 56 | `a275bcd7b146f7243e995528c197a04ee24e17f11d313313c7a5bea78030b88f` |
 | Attribute fetch case-4 VS | `tools/pco-fixtures/generate_attribute_fetch_shader.c` | 96 | `81b4bf2b412eb2ba35adcd1076d965918336ffb0ffb860e66547695ef4a6ae28` |

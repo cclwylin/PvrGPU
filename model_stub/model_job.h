@@ -56,6 +56,9 @@ struct ModelJob {
   std::uint32_t framebuffer_width = 0;
   std::uint32_t framebuffer_height = 0;
   std::uint32_t framebuffer_bytes_per_pixel = 4;
+  std::uint32_t framebuffer_sample_count = 1;
+  std::vector<std::uint8_t> depth_framebuffer;
+  std::uint32_t depth_format = 0;
 
   void Begin(const Options &job_options) {
     options = job_options;
@@ -69,6 +72,9 @@ struct ModelJob {
     framebuffer_width = 0;
     framebuffer_height = 0;
     framebuffer_bytes_per_pixel = 4;
+    framebuffer_sample_count = 1;
+    depth_framebuffer.clear();
+    depth_format = 0;
   }
 
   // Records the first failure only: a later stage failing because an earlier
@@ -83,10 +89,11 @@ struct ModelJob {
   void PublishFramebuffer(const std::vector<std::uint8_t> &pixels,
                           std::uint32_t width, std::uint32_t height,
                           std::uint32_t bytes_per_pixel,
-                          std::vector<std::vector<std::uint8_t>> extra = {}) {
+                          std::vector<std::vector<std::uint8_t>> extra = {},
+                          std::uint32_t sample_count = 1) {
     const std::uint64_t expected =
-        static_cast<std::uint64_t>(width) * height * bytes_per_pixel;
-    if (bytes_per_pixel == 0 ||
+        static_cast<std::uint64_t>(width) * height * bytes_per_pixel * sample_count;
+    if (bytes_per_pixel == 0 || sample_count == 0 ||
         static_cast<std::uint64_t>(pixels.size()) != expected) {
       return;
     }
@@ -99,6 +106,7 @@ struct ModelJob {
     framebuffer_width = width;
     framebuffer_height = height;
     framebuffer_bytes_per_pixel = bytes_per_pixel;
+    framebuffer_sample_count = sample_count;
   }
 };
 

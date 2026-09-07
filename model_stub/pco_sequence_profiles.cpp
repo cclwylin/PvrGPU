@@ -1,6 +1,7 @@
 #include "pco_sequence_profiles.h"
 
 #include "model_types.h"
+#include "common/functional_types.h"
 #include "shader/pco_iss.h"
 
 #include <array>
@@ -28,6 +29,7 @@ constexpr char kRgba32Ui[] = "PIPE_FORMAT_R32G32B32A32_UINT";
 constexpr char kR32I[] = "PIPE_FORMAT_R32_SINT";
 constexpr char kRg32I[] = "PIPE_FORMAT_R32G32_SINT";
 constexpr char kRgba32I[] = "PIPE_FORMAT_R32G32B32A32_SINT";
+constexpr char kRgba32F[] = "PIPE_FORMAT_R32G32B32A32_FLOAT";
 
 // The colour formats the PBE can write a generic draw into: four UNORM8
 // channels, or one, two or four raw 32-bit integer channels.  dEQP's shader
@@ -38,7 +40,8 @@ constexpr char kRgba32I[] = "PIPE_FORMAT_R32G32B32A32_SINT";
 bool IsGenericDrawFormat(const std::string &format) {
   return format == kRgba8 || format == kRgba8Srgb || format == kBgra8Srgb ||
          format == kR32Ui || format == kRg32Ui || format == kRgba32Ui ||
-         format == kR32I || format == kRg32I || format == kRgba32I;
+         format == kR32I || format == kRg32I || format == kRgba32I ||
+         format == kRgba32F;
 }
 constexpr char kRgbx8[] = "PIPE_FORMAT_R8G8B8X8_UNORM";
 constexpr char kZ32[] = "PIPE_FORMAT_Z32_UNORM";
@@ -1162,12 +1165,12 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
       !RootPayloadIsEmpty(logical)) {
     return Reject(error, "generic PCO logical command envelope is invalid");
   }
-  // The viewport may cover part of the attachment; it just has to fit.
+  // The viewport can extend beyond the attachment.  Its actual transform is
+  // preserved; framebuffer-bounded tiles determine which pixels can be written.
   if (logical.framebuffer_width == 0 || logical.framebuffer_height == 0 ||
       logical.framebuffer_width > 4096 || logical.framebuffer_height > 4096 ||
       logical.width == 0 || logical.height == 0 ||
-      logical.width > logical.framebuffer_width ||
-      logical.height > logical.framebuffer_height) {
+      logical.width > 4096 || logical.height > 4096) {
     return Reject(error, "generic PCO sequence render target is invalid");
   }
   if (options.driver_commands.empty()) {
@@ -1180,16 +1183,15 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
     // Every draw writes the sequence's render target (framebuffer extent), but
     // each may render into its own viewport sub-rectangle: dEQP's
     // fragment_ops.depth_stencil grid gives every cell its own viewport.  The
-    // draw's width/height therefore only have to fit the attachment, not match
-    // the logical command's -- SystemC positions the geometry from the draw's
-    // own viewport scale/translate and clips it with the draw's scissor.
+    // draw's width/height are independent of the logical command and attachment
+    // -- SystemC positions geometry from the draw's viewport scale/translate,
+    // then limits tile coverage to the attachment and the draw's scissor.
     if (draw.command != kDrawPcoTriangles || draw.test_case != logical.test_case ||
         !IsGenericDrawFormat(draw.format) || draw.frame != 1 ||
         draw.framebuffer_width != logical.framebuffer_width ||
         draw.framebuffer_height != logical.framebuffer_height ||
         draw.width == 0 || draw.height == 0 ||
-        draw.width > draw.framebuffer_width ||
-        draw.height > draw.framebuffer_height) {
+        draw.width > 4096 || draw.height > 4096) {
       return Reject(error, "generic PCO sequence draw envelope is invalid");
     }
     // A draw either states its own attribute layout or matches the pinned
@@ -1253,12 +1255,14 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
     }
     if (!draw.initial_color_attachment_bytes.empty()) {
       const std::uint64_t bytes_per_pixel =
-          draw.format == kRgba32Ui || draw.format == kRgba32I
+          draw.format == kRgba32Ui || draw.format == kRgba32I ||
+              draw.format == kRgba32F
               ? 16U
               : draw.format == kRg32Ui || draw.format == kRg32I ? 8U : 4U;
       const std::uint64_t expected_bytes =
           static_cast<std::uint64_t>(draw.framebuffer_width) *
-          draw.framebuffer_height * bytes_per_pixel;
+          draw.framebuffer_height * bytes_per_pixel *
+          (draw.raster_samples == 0 ? 1U : draw.raster_samples);
       if (ordinal != 0 || draw.render_target_count > 1 ||
           draw.initial_color_attachment_bytes.size() != expected_bytes ||
           expected_bytes > kDriverPcoSequenceAttachmentStride) {
@@ -1277,6 +1281,16 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
         draw.depth_format == 0 ? kDriverPcoNewAttachment : expected_source;
     if (draw.depth_attachment_source_command_index != expected_depth_source) {
       return Reject(error, "generic PCO sequence depth attachment chain is invalid");
+    }
+    if (!draw.initial_depth_attachment_bytes.empty()) {
+      const std::uint64_t expected_bytes =
+          static_cast<std::uint64_t>(draw.framebuffer_width) * draw.framebuffer_height *
+          (draw.raster_samples ? draw.raster_samples : 1U) *
+          DepthAttachmentBytesPerPixel(draw.depth_format);
+      if (ordinal != 0 || draw.depth_format == 0 ||
+          draw.initial_depth_attachment_bytes.size() != expected_bytes ||
+          expected_bytes > kDriverPcoSequenceAttachmentStride)
+        return Reject(error, "generic PCO initial depth attachment is invalid");
     }
   }
   return true;

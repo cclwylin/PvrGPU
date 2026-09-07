@@ -423,6 +423,7 @@ void CopyPcoPayloadFields(
   destination->depth_func = source.depth_func;
   destination->depth_clear_bits = source.depth_clear_bits;
   destination->depth_format = source.depth_format;
+  destination->raster_samples = source.raster_samples ? source.raster_samples : 1;
   destination->stencil_enable = source.stencil_enable;
   destination->stencil_clear = source.stencil_clear;
   for (std::size_t face = 0; face < 2; ++face) {
@@ -456,6 +457,11 @@ void CopyPcoPayloadFields(
   destination->depth_attachment_source_command_index =
       source.depth_attachment_source_command_index;
   destination->initial_color_attachment_bytes.clear();
+  destination->initial_depth_attachment_bytes.clear();
+  if (source.initial_depth_attachment_bytes_size != 0)
+    destination->initial_depth_attachment_bytes.assign(
+        source.initial_depth_attachment_bytes,
+        source.initial_depth_attachment_bytes + source.initial_depth_attachment_bytes_size);
   if (source.initial_color_attachment_bytes_size != 0) {
     destination->initial_color_attachment_bytes.assign(
         source.initial_color_attachment_bytes,
@@ -493,7 +499,8 @@ bool InitialColorAttachmentIsValid(
            format == "PIPE_FORMAT_R32G32_SINT")
     bytes_per_pixel = 8;
   else if (format == "PIPE_FORMAT_R32G32B32A32_UINT" ||
-           format == "PIPE_FORMAT_R32G32B32A32_SINT")
+           format == "PIPE_FORMAT_R32G32B32A32_SINT" ||
+           format == "PIPE_FORMAT_R32G32B32A32_FLOAT")
     bytes_per_pixel = 16;
   else
     return reject("unsupported transport format");
@@ -502,11 +509,34 @@ bool InitialColorAttachmentIsValid(
     return reject("unsupported framebuffer extent");
   const std::uint64_t expected =
       static_cast<std::uint64_t>(source.framebuffer_width) *
-      source.framebuffer_height * bytes_per_pixel;
+      source.framebuffer_height * bytes_per_pixel *
+      (source.raster_samples ? source.raster_samples : 1);
   if (expected > pvrgpu::stub::kDriverPcoSequenceAttachmentStride)
     return reject("transport exceeds attachment address slot");
   if (expected != source.initial_color_attachment_bytes_size)
     return reject("byte count does not match framebuffer transport");
+  return true;
+}
+
+bool InitialDepthAttachmentIsValid(
+    const pvrgpu_systemc_driver_command &source, std::string *error) {
+  if (!source.initial_depth_attachment_bytes &&
+      source.initial_depth_attachment_bytes_size == 0)
+    return true;
+  if (!source.initial_depth_attachment_bytes ||
+      source.depth_attachment_source_command_index != PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR ||
+      source.depth_format == 0) {
+    *error = "SystemC API initial depth attachment has invalid pointer/source/format";
+    return false;
+  }
+  const std::uint64_t expected = static_cast<std::uint64_t>(source.framebuffer_width) *
+      source.framebuffer_height * (source.raster_samples ? source.raster_samples : 1) *
+      pvrgpu::stub::DepthAttachmentBytesPerPixel(source.depth_format);
+  if (expected == 0 || expected != source.initial_depth_attachment_bytes_size ||
+      expected > pvrgpu::stub::kDriverPcoSequenceAttachmentStride) {
+    *error = "SystemC API initial depth attachment byte count is invalid";
+    return false;
+  }
   return true;
 }
 
@@ -1004,7 +1034,8 @@ bool CopyPcoSequenceDraw(
        std::string_view(source.format) != "PIPE_FORMAT_R32G32B32A32_UINT" &&
        std::string_view(source.format) != "PIPE_FORMAT_R32_SINT" &&
        std::string_view(source.format) != "PIPE_FORMAT_R32G32_SINT" &&
-       std::string_view(source.format) != "PIPE_FORMAT_R32G32B32A32_SINT")) {
+       std::string_view(source.format) != "PIPE_FORMAT_R32G32B32A32_SINT" &&
+       std::string_view(source.format) != "PIPE_FORMAT_R32G32B32A32_FLOAT")) {
     return refuse(std::string("format=") +
                   (source.format ? source.format : "<none>"));
   }
@@ -1028,10 +1059,8 @@ bool CopyPcoSequenceDraw(
       return "framebuffer extent is beyond the model's limit";
     if (source.width == 0 || source.height == 0)
       return "viewport extent is zero";
-    if (source.width > source.framebuffer_width ||
-        source.height > source.framebuffer_height) {
-      return "viewport does not fit the framebuffer";
-    }
+    if (source.width > 4096 || source.height > 4096)
+      return "viewport extent is beyond the model's limit";
     /*
      * One register word is the smallest a vertex can be: an attribute occupies
      * the words its source format does, and a packed one -- four bytes of
@@ -1184,7 +1213,9 @@ bool CopyPcoSequenceDraw(
       source.depth_format ==
           pvrgpu::stub::kDriverPcoDepthFormatZ24X8Unorm ||
       source.depth_format ==
-          pvrgpu::stub::kDriverPcoDepthFormatZ24UnormS8Uint;
+          pvrgpu::stub::kDriverPcoDepthFormatZ24UnormS8Uint ||
+      source.depth_format == pvrgpu::stub::kDriverPcoDepthFormatZ32Float ||
+      source.depth_format == pvrgpu::stub::kDriverPcoDepthFormatZ32FloatS8X24Uint;
   const bool color_attachment_source_valid =
       source.color_attachment_source_command_index ==
           PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR ||
@@ -1228,8 +1259,10 @@ bool CopyPcoSequenceDraw(
     nested_reason = "depth_clip";
   else if (source.depth_clamp != 0)
     nested_reason = "depth_clamp";
-  else if (source.sample_mask != UINT32_MAX)
-    nested_reason = "sample_mask";
+  else if (source.raster_samples > 16 ||
+           (source.raster_samples != 0 &&
+            (source.raster_samples & (source.raster_samples - 1)) != 0))
+    nested_reason = "raster_samples";
   else if (source.color_mask > 0x0f)
     nested_reason = "color_mask";
   else if (source.blend_enable > 1 || !blend_enums_valid ||
@@ -1262,7 +1295,8 @@ bool CopyPcoSequenceDraw(
     *error = detail.str();
     return false;
   }
-  if (!InitialColorAttachmentIsValid(source, error))
+  if (!InitialColorAttachmentIsValid(source, error) ||
+      !InitialDepthAttachmentIsValid(source, error))
     return false;
 
   pvrgpu::stub::DriverCommand command;
@@ -1329,7 +1363,9 @@ bool CopyCommand(const pvrgpu_systemc_driver_command &source,
     return false;
   }
   if (source.initial_color_attachment_bytes ||
-      source.initial_color_attachment_bytes_size != 0) {
+      source.initial_color_attachment_bytes_size != 0 ||
+      source.initial_depth_attachment_bytes ||
+      source.initial_depth_attachment_bytes_size != 0) {
     *error = "SystemC API initial color attachment requires a nested PCO draw";
     return false;
   }
@@ -1410,7 +1446,8 @@ std::uint64_t CommandOwnedPayloadBytes(
       static_cast<std::uint64_t>(command.raw_vertex_data.size()) +
       command.vertex_pco.size() + command.fragment_pco.size() +
       command.sampled_texture_bytes.size() + command.texture_rgba8_bytes.size() +
-      command.initial_color_attachment_bytes.size();
+      command.initial_color_attachment_bytes.size() +
+      command.initial_depth_attachment_bytes.size();
   for (const pvrgpu::stub::DriverPcoSampledTexture &texture :
        command.sampled_textures) {
     if (texture.bytes.size() >
@@ -1530,6 +1567,15 @@ bool CopyPcoSequenceTexture(
   } else if (format == "PIPE_FORMAT_R16G16B16A16_FLOAT") {
     block_bytes = 8U;
     texture_format = pvrgpu::stub::TextureFormat::kRgba16Float;
+  } else if (format == "PIPE_FORMAT_R32G32B32A32_UINT" ||
+             format == "PIPE_FORMAT_R32G32B32A32_SINT") {
+    block_bytes = 16U;
+    texture_format = format == "PIPE_FORMAT_R32G32B32A32_UINT"
+        ? pvrgpu::stub::TextureFormat::kRgba32Uint
+        : pvrgpu::stub::TextureFormat::kRgba32Sint;
+  } else if (format == "PIPE_FORMAT_R32G32B32A32_FLOAT") {
+    block_bytes = 16U;
+    texture_format = pvrgpu::stub::TextureFormat::kRgba32Float;
   } else if (format == "PIPE_FORMAT_R11G11B10_FLOAT") {
     block_bytes = 4U;
     texture_format = pvrgpu::stub::TextureFormat::kR11fG11fB10f;
@@ -1814,6 +1860,7 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
       const pvrgpu::stub::DriverCommand &producer = commands[source_ordinal];
       return producer.framebuffer_width == command.framebuffer_width &&
              producer.framebuffer_height == command.framebuffer_height &&
+             producer.raster_samples == command.raster_samples &&
              (depth ? producer.depth_format == command.depth_format
                     : producer.format == command.format);
     };
@@ -1907,6 +1954,14 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
       }
       const pvrgpu::stub::DriverCommand &producer =
           commands.at(texture.producer_command_index);
+      /* Ordinary sampled images address one texel per pixel.  Multisample
+       * attachments instead interleave every sample inside each pixel; an
+       * alias is not a resolve and this capsule has no sample-index operand. */
+      if (producer.raster_samples > 1U) {
+        *error = "SystemC API PCO sequence sampled attachment requires a "
+                 "single-sample producer";
+        return false;
+      }
       const auto &base = texture.mip[0];
       if (base.width != producer.framebuffer_width ||
           base.height != producer.framebuffer_height) {
@@ -2381,6 +2436,11 @@ extern "C" int pvrgpu_systemc_flush_readback(
     return 2;
   }
   readback->pixels_written = 0;
+  const std::uint32_t samples = readback->sample_count ? readback->sample_count : 1;
+  if (samples > 16 || (samples & (samples - 1)) != 0) {
+    CopyError(error, error_size, "unsupported SystemC API readback sample count");
+    return 2;
+  }
   if (!readback->pixels || readback->width == 0 || readback->height == 0 ||
       readback->bytes_per_pixel == 0) {
     CopyError(error, error_size, "missing SystemC API readback destination");
@@ -2388,7 +2448,7 @@ extern "C" int pvrgpu_systemc_flush_readback(
   }
   const std::uint64_t required = static_cast<std::uint64_t>(readback->width) *
                                  readback->height *
-                                 readback->bytes_per_pixel;
+                                 readback->bytes_per_pixel * samples;
   if (static_cast<std::uint64_t>(readback->pixels_size) < required) {
     CopyError(error, error_size,
               "SystemC API readback destination is too small");
@@ -2422,8 +2482,18 @@ extern "C" int pvrgpu_systemc_flush_readback(
    */
   if (framebuffer.width != readback->width ||
       framebuffer.height != readback->height ||
-      framebuffer.bytes_per_pixel != readback->bytes_per_pixel)
+      framebuffer.sample_count != samples)
     return 0;
+  const bool depth_readback = readback->attachment == UINT32_MAX;
+  if (depth_readback) {
+    if (framebuffer.depth_format == 0 ||
+        framebuffer.depth_format != readback->depth_format ||
+        pvrgpu::stub::DepthAttachmentBytesPerPixel(framebuffer.depth_format) !=
+            readback->bytes_per_pixel)
+      return 0;
+  } else if (framebuffer.bytes_per_pixel != readback->bytes_per_pixel) {
+    return 0;
+  }
 
   /*
    * Attachment zero is the frame's own surface; the rest are the additional
@@ -2431,7 +2501,9 @@ extern "C" int pvrgpu_systemc_flush_readback(
    * pass did not write publishes nothing rather than the first one's pixels.
    */
   const std::vector<std::uint8_t> *source = nullptr;
-  if (readback->attachment == 0) {
+  if (depth_readback) {
+    source = &framebuffer.depth_pixels;
+  } else if (readback->attachment == 0) {
     source = &framebuffer.pixels;
   } else if (readback->attachment - 1 < framebuffer.extra.size()) {
     source = &framebuffer.extra[readback->attachment - 1];

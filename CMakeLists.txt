@@ -343,6 +343,13 @@ if(PVRGPU_ENABLE_LIVE_DEQP)
     set_tests_properties(pvrgpu-deqp-clear-smoke PROPERTIES TIMEOUT 60)
 endif()
 
+add_executable(msaa-resolve-test
+    tests/msaa_resolve_test.cpp
+)
+target_include_directories(msaa-resolve-test PRIVATE "${CMAKE_SOURCE_DIR}/src")
+pvrgpu_target_warnings(msaa-resolve-test)
+add_test(NAME msaa-resolve-unit COMMAND msaa-resolve-test)
+
 add_executable(pco-iss-test
     tests/pco_iss_test.cpp
     src/systemc/shader/pco_iss.cpp
@@ -357,6 +364,8 @@ add_test(NAME pco-iss-unit COMMAND pco-iss-test)
 add_executable(pco-sequence-profiles-test
     tests/pco_sequence_profiles_test.cpp
     model_stub/pco_sequence_profiles.cpp
+    model_stub/memory_pool.cpp
+    src/systemc/common/functional_types.cpp
 )
 target_include_directories(pco-sequence-profiles-test PRIVATE
     "${CMAKE_SOURCE_DIR}/model_stub"
@@ -440,6 +449,15 @@ target_link_libraries(pco-initial-color-load-test PRIVATE
 )
 pvrgpu_target_warnings(pco-initial-color-load-test)
 add_test(NAME pco-initial-color-load-unit COMMAND pco-initial-color-load-test)
+
+add_executable(pco-initial-depth-load-test tests/pco_initial_depth_load_test.cpp)
+target_include_directories(pco-initial-depth-load-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu"
+)
+target_link_libraries(pco-initial-depth-load-test PRIVATE pvrgpu-systemc-bridge)
+pvrgpu_target_warnings(pco-initial-depth-load-test)
+add_test(NAME pco-initial-depth-load-unit COMMAND pco-initial-depth-load-test)
 
 add_executable(json-reporter-opcode-test
     tests/json_reporter_opcode_test.cpp
@@ -592,6 +610,43 @@ target_include_directories(pbe-blend-test PRIVATE
 target_link_libraries(pbe-blend-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(pbe-blend-test)
 add_test(NAME pbe-blend-unit COMMAND pbe-blend-test)
+
+add_executable(pbe-sample-counter-test
+    tests/pbe_sample_counter_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/fragment/pbe.cpp
+)
+target_include_directories(pbe-sample-counter-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(pbe-sample-counter-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(pbe-sample-counter-test)
+add_test(NAME pbe-sample-counter-unit COMMAND pbe-sample-counter-test)
+
+add_executable(late-depth-stencil-test
+    tests/late_depth_stencil_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/fragment/isp.cpp
+    src/systemc/fragment/fragment_frontend.cpp
+    src/systemc/fragment/pbe.cpp
+    src/systemc/fragment/pbe_write_back.cpp
+)
+target_include_directories(late-depth-stencil-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(late-depth-stencil-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(late-depth-stencil-test)
+add_test(NAME late-depth-stencil-unit COMMAND late-depth-stencil-test)
 
 add_executable(isp-depth-attachment-test
     tests/isp_depth_attachment_test.cpp

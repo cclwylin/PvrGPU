@@ -27,11 +27,17 @@ struct ModelFramebuffer {
   // Four while the attachment packs UNORM8 channels; an integer attachment
   // stores one 32-bit channel per dword and is 8 or 16 bytes wide.
   std::uint32_t bytes_per_pixel = 4;
+  // Samples are stored next to each other within each pixel, without resolve.
+  std::uint32_t sample_count = 1;
+  std::vector<std::uint8_t> depth_pixels;
+  std::uint32_t depth_format = 0;
 
   bool valid() const {
     return width != 0 && height != 0 && bytes_per_pixel != 0 &&
+           sample_count != 0 &&
            static_cast<std::uint64_t>(pixels.size()) ==
-               static_cast<std::uint64_t>(width) * height * bytes_per_pixel;
+               static_cast<std::uint64_t>(width) * height * bytes_per_pixel *
+                   sample_count;
   }
 };
 

@@ -895,6 +895,9 @@ int ModelSession::Run(const Options &options, ModelFramebuffer *framebuffer,
     framebuffer->width = job.framebuffer_width;
     framebuffer->height = job.framebuffer_height;
     framebuffer->bytes_per_pixel = job.framebuffer_bytes_per_pixel;
+    framebuffer->sample_count = job.framebuffer_sample_count;
+    framebuffer->depth_pixels = job.depth_framebuffer;
+    framebuffer->depth_format = job.depth_format;
   }
   return 0;
 }

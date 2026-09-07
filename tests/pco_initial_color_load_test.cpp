@@ -231,6 +231,53 @@ void VerifyInitialLoad(const std::filesystem::path &root,
   }
 }
 
+void VerifyOversizedViewport(const std::filesystem::path &root, bool translated) {
+  Fixture fixture("PIPE_FORMAT_R32G32B32A32_FLOAT", 4, false);
+  fixture.draw.width = fixture.draw.height = 8;
+  fixture.sequence.width = fixture.sequence.height = 8;
+  fixture.draw.viewport_scale_bits[0] = FloatBits(4.0F);
+  fixture.draw.viewport_scale_bits[1] = FloatBits(4.0F);
+  const float offset_x = translated ? 6.0F : 4.0F;
+  const float offset_y = translated ? 5.0F : 4.0F;
+  fixture.draw.viewport_translate_bits[0] = FloatBits(offset_x);
+  fixture.draw.viewport_translate_bits[1] = FloatBits(offset_y);
+  Submission submission(root / (translated ? "viewport-translated" : "viewport-large"),
+                        &fixture.sequence);
+  std::array<char, 512> error{};
+  if (pvrgpu_systemc_submit_driver_command(&submission.info,
+          error.data(), error.size()) != 0)
+    Fail(std::string("oversized viewport submit: ") + error.data());
+  std::vector<std::uint8_t> pixels(fixture.initial.size());
+  pvrgpu_systemc_readback_info readback{};
+  readback.version = PVRGPU_SYSTEMC_API_VERSION;
+  readback.width = kWidth;
+  readback.height = kHeight;
+  readback.bytes_per_pixel = 16;
+  readback.pixels = pixels.data();
+  readback.pixels_size = pixels.size();
+  if (pvrgpu_systemc_flush_readback(&readback, error.data(), error.size()) != 0 ||
+      readback.pixels_written != 1)
+    Fail(std::string("oversized viewport readback: ") + error.data());
+  for (unsigned y = 0; y < kHeight; ++y) {
+    for (unsigned x = 0; x < kWidth; ++x) {
+      const std::size_t offset = (y * kWidth + x) * 16;
+      const bool covered = !translated || (x >= 2 && y >= 1);
+      if (!covered) {
+        if (std::memcmp(pixels.data() + offset,
+                        fixture.initial.data() + offset, 16) != 0)
+          Fail("translated oversized viewport damaged an exterior LOAD pixel");
+        continue;
+      }
+      const std::array<std::uint32_t, 4> expected = {
+          FloatBits((static_cast<float>(x) + 0.5F - offset_x) / 4.0F),
+          FloatBits((static_cast<float>(y) + 0.5F - offset_y) / 4.0F),
+          0, FloatBits(1.0F)};
+      if (std::memcmp(pixels.data() + offset, expected.data(), 16) != 0)
+        Fail("oversized viewport was resized instead of clipped to its framebuffer");
+    }
+  }
+}
+
 void VerifyRejectedPayloads(const std::filesystem::path &root) {
   const auto reject = [&](Fixture &fixture, const char *reason) {
     Submission submission(root / reason, &fixture.sequence);
@@ -300,10 +347,13 @@ int main() {
   VerifyInitialLoad(root, "r32ui", "PIPE_FORMAT_R32_UINT", 1, false);
   VerifyInitialLoad(root, "rg32ui", "PIPE_FORMAT_R32G32_UINT", 2, false);
   VerifyInitialLoad(root, "rgba32ui", "PIPE_FORMAT_R32G32B32A32_UINT", 4, false);
+  VerifyInitialLoad(root, "rgba32f", "PIPE_FORMAT_R32G32B32A32_FLOAT", 4, false);
   VerifyInitialLoad(root, "fully-clipped", "PIPE_FORMAT_R8G8B8A8_UNORM",
                     4, true, true);
   VerifyInitialLoad(root, "implicit-single-target", "PIPE_FORMAT_R32G32_UINT",
                     2, false, false, true);
+  VerifyOversizedViewport(root, false);
+  VerifyOversizedViewport(root, true);
   std::error_code error;
   std::filesystem::remove_all(root, error);
   std::puts("pco-initial-color-load-test: PASS");

@@ -182,6 +182,7 @@ struct FragmentPcoEvidence {
   std::uint64_t binary_fnv1a64 = UINT64_C(14695981039346656037);
   std::uint64_t binary_bytes = 0;
   std::uint64_t fitrp = 0;
+  std::uint64_t depthf = 0;
   std::uint64_t wdf = 0;
   std::uint64_t fadd = 0;
   std::uint64_t mbyp = 0;
@@ -469,6 +470,9 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kFloatInterpolatePerspective:
       ++evidence.fitrp;
       break;
+    case PcoOpcode::kDepthFeedback:
+      ++evidence.depthf;
+      break;
     case PcoOpcode::kWaitDataFence:
       ++evidence.wdf;
       break;
@@ -606,7 +610,7 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
           std::to_string(static_cast<unsigned>(instruction.opcode)));
     }
   }
-  if (evidence.fitrp + evidence.wdf + evidence.fadd + evidence.fmul +
+  if (evidence.fitrp + evidence.depthf + evidence.wdf + evidence.fadd + evidence.fmul +
           evidence.mbyp + evidence.smp + evidence.internal + evidence.fneg +
           evidence.fabs +
           evidence.movi + evidence.pck_cov + evidence.shr +
@@ -712,6 +716,7 @@ void AppendFragmentPcoEvidence(const MemoryPool &pool,
   AddEvidenceCounter(&aggregate->field, evidence.field)
   PVRGPU_ADD_FRAGMENT_EVIDENCE(binary_bytes);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(fitrp);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(depthf);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(wdf);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(fadd);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(mbyp);
@@ -791,10 +796,11 @@ void DebugSequenceAttachments(const MemoryPool &pool,
   // or 16 bytes.  The RGB tallies and the sampled words below therefore read
   // the pixel's first four bytes, which are a colour only on a UNORM8
   // attachment and its first channel on an integer one.
-  const std::size_t debug_bytes_per_pixel = ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
+  const std::size_t debug_bytes_per_pixel = ColorAttachmentBytesPerPixel(
+      state.color_attachment_raw_dwords, state.color_attachment_float32);
   const std::uint64_t expected_color_bytes =
       static_cast<std::uint64_t>(state.width) * state.height *
-      debug_bytes_per_pixel;
+      state.raster_state.sample_count * debug_bytes_per_pixel;
   if (color.size() != expected_color_bytes)
     throw std::runtime_error(
         "JsonReporter attachment debug color byte count mismatch");
@@ -844,7 +850,8 @@ void DebugSequenceAttachments(const MemoryPool &pool,
     if (x >= state.width || y >= state.height)
       continue;
     const std::size_t offset =
-        (static_cast<std::size_t>(y) * state.width + x) * debug_bytes_per_pixel;
+        (static_cast<std::size_t>(y) * state.width + x) *
+        state.raster_state.sample_count * debug_bytes_per_pixel;
     std::uint32_t rgba = 0;
     for (std::size_t component = 0; component < 4; ++component)
       rgba |= static_cast<std::uint32_t>(color[offset + component])
@@ -1811,6 +1818,8 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"internal\":" << fragment_pco.internal;
   if (fragment_pco.smp != 0)
     std::cout << ",\"smp\":" << fragment_pco.smp;
+  if (fragment_pco.depthf != 0)
+    std::cout << ",\"depthf\":" << fragment_pco.depthf;
   std::cout << ",\"mbyp\":" << fragment_pco.mbyp << "}"
             << ",\"frame\":" << counters.frame << ",\"marker\":\""
             << JsonEscape(options.test_case) << "\""
@@ -2020,11 +2029,14 @@ void JsonReporter::RunJob() {
     VertexPcoEvidence vertex_pco;
     FragmentPcoEvidence fragment_pco;
     std::vector<std::uint8_t> final_framebuffer;
+    std::vector<std::uint8_t> final_depth_framebuffer;
+    std::uint32_t final_depth_format = 0;
     /* Colour attachments past the first, from the same submission the frame
      * is published from.  A shader returning more than one result writes one
      * per target and the driver reads back each in turn. */
     std::vector<std::vector<std::uint8_t>> final_extra_framebuffers;
     std::uint32_t final_bytes_per_pixel = 4;
+    std::uint32_t final_sample_count = 1;
     std::uint32_t final_width = 0;
     std::uint32_t final_height = 0;
     std::vector<std::uint64_t> sequence_color_addresses(
@@ -2086,26 +2098,11 @@ void JsonReporter::RunJob() {
             throw std::runtime_error(
                 "JsonReporter PCO sequence color attachment address mismatch");
           }
-          bool depth_producer = false;
-          for (std::size_t future = completed + 1U;
-               future < options_.driver_commands.size(); ++future) {
-            depth_producer =
-                depth_producer ||
-                options_.driver_commands[future]
-                        .depth_attachment_source_command_index == completed;
-            for (const DriverPcoSampledTexture &texture :
-                 options_.driver_commands[future].sampled_textures) {
-              depth_producer =
-                  depth_producer ||
-                  (texture.source ==
-                       DriverPcoTextureSource::kPreviousDepthAttachment &&
-                   texture.producer_command_index == completed);
-            }
-          }
           const bool has_depth = physical_command.depth_format != 0;
           const std::uint64_t expected_depth_bytes =
               has_depth
                   ? static_cast<std::uint64_t>(state.width) * state.height *
+                        state.raster_state.sample_count *
                         DepthAttachmentBytesPerPixel(
                             physical_command.depth_format)
                   : 0;
@@ -2115,11 +2112,14 @@ void JsonReporter::RunJob() {
               !physical_command.initial_color_attachment_bytes.empty();
           const bool depth_load =
               has_depth &&
-              physical_command.depth_attachment_source_command_index !=
-                  kDriverPcoNewAttachment;
+              (physical_command.depth_attachment_source_command_index !=
+                  kDriverPcoNewAttachment ||
+               !physical_command.initial_depth_attachment_bytes.empty());
           const std::uint64_t expected_color_bytes =
               static_cast<std::uint64_t>(state.width) * state.height *
-              ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
+              state.raster_state.sample_count *
+              ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
+                                           state.color_attachment_float32);
           if (state.color_attachment_load_enable != (color_load ? 1U : 0U) ||
               state.color_attachment_load_bytes !=
                   (color_load ? expected_color_bytes : 0U) ||
@@ -2135,7 +2135,7 @@ void JsonReporter::RunJob() {
             throw std::runtime_error(
                 "JsonReporter PCO sequence attachment LOAD evidence mismatch");
           }
-          if (depth_producer
+          if (has_depth
                   ? (state.capture_depth_attachment != 1 ||
                      state.depth_attachment_ready != 1 ||
                      !HasPoolHandle(state.depth_attachment) ||
@@ -2153,7 +2153,9 @@ void JsonReporter::RunJob() {
             LoadArray<std::uint8_t>(pool_, state.dram_framebuffer);
         const std::uint64_t expected_framebuffer_bytes =
             static_cast<std::uint64_t>(state.width) * state.height *
-            ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
+            state.raster_state.sample_count *
+            ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
+                                         state.color_attachment_float32);
         const std::uint64_t submission_render_target_count =
             state.render_target_count == 0 ? 1U : state.render_target_count;
         if (state.framebuffer_bytes != expected_framebuffer_bytes ||
@@ -2195,9 +2197,20 @@ void JsonReporter::RunJob() {
               pool_, state.extra_dram_framebuffer[target - 1]));
         }
         final_bytes_per_pixel = static_cast<std::uint32_t>(
-            ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords));
+            ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
+                                         state.color_attachment_float32));
+        final_sample_count = state.raster_state.sample_count;
         final_width = state.width;
         final_height = state.height;
+        final_depth_framebuffer.clear();
+        final_depth_format = state.depth_attachment_format;
+        if (state.depth_attachment_ready) {
+          if (!HasPoolHandle(state.depth_attachment))
+            throw std::runtime_error("JsonReporter depth readback has no storage");
+          /* The fragment pipeline already wrote and read these bytes through
+           * DRAM; retain that verified readback before releasing the pool. */
+          final_depth_framebuffer = LoadArray<std::uint8_t>(pool_, state.depth_attachment);
+        }
 
         cleanup_attempted = true;
         ReleaseFunctionalPayloads(pool_, state);
@@ -2230,7 +2243,7 @@ void JsonReporter::RunJob() {
       if (final_width != options_.width || final_height != options_.height ||
           final_framebuffer.size() !=
               static_cast<std::uint64_t>(final_width) * final_height *
-                  final_bytes_per_pixel) {
+                  final_bytes_per_pixel * final_sample_count) {
         throw std::runtime_error(
             "JsonReporter PCO sequence final framebuffer is invalid");
       }
@@ -2257,13 +2270,17 @@ void JsonReporter::RunJob() {
       if (job_) {
         job_->PublishFramebuffer(final_framebuffer, final_width, final_height,
                                  final_bytes_per_pixel,
-                                 std::move(final_extra_framebuffers));
+                                 std::move(final_extra_framebuffers),
+                                 final_sample_count);
+        job_->depth_framebuffer = std::move(final_depth_framebuffer);
+        job_->depth_format = final_depth_format;
       }
       std::filesystem::path artifact_path;
       // An integer attachment's pixel is not an RGBA8 colour, so there is no
       // PNG to write for one.  The readback above still carries its real
       // bytes; only the human-facing artifact is skipped.
-      if (!options_.output_dir.empty() && final_bytes_per_pixel == 4U) {
+      if (!options_.output_dir.empty() && final_bytes_per_pixel == 4U &&
+          final_sample_count == 1U) {
         artifact_path = FramePath(options_, 1);
         // Ordered native PCO sequences publish only the final physical DRAM
         // readback.  No command sidecar/golden/CPU framebuffer is consulted.
@@ -2338,7 +2355,9 @@ void JsonReporter::RunJob() {
           LoadArray<std::uint8_t>(pool_, state.dram_framebuffer);
       const std::uint64_t expected_framebuffer_bytes =
           static_cast<std::uint64_t>(state.width) * state.height *
-          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
+          state.raster_state.sample_count *
+          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
+                                       state.color_attachment_float32);
       const std::uint64_t sequence_render_target_count =
           state.render_target_count == 0 ? 1U : state.render_target_count;
       if (state.framebuffer_bytes != expected_framebuffer_bytes ||
@@ -2375,16 +2394,19 @@ void JsonReporter::RunJob() {
       // What the driver reads back is the model's own DRAM contents, never the
       // command sidecar the artifact may be overlaid with below.
       const std::uint32_t frame_bytes_per_pixel = static_cast<std::uint32_t>(
-          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords));
+          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
+                                       state.color_attachment_float32));
       if (job_) {
         job_->PublishFramebuffer(framebuffer, state.width, state.height,
                                  frame_bytes_per_pixel,
-                                 std::move(extra_framebuffers));
+                                 std::move(extra_framebuffers),
+                                 state.raster_state.sample_count);
       }
       std::filesystem::path artifact_path;
       // As above: an integer attachment has no RGBA8 rendering, so it gets no
       // PNG.  The pixels the driver reads back are unaffected.
-      if (!options_.output_dir.empty() && frame_bytes_per_pixel == 4U) {
+      if (!options_.output_dir.empty() && frame_bytes_per_pixel == 4U &&
+          state.raster_state.sample_count == 1U) {
         artifact_path = FramePath(options_, state.counters.frame);
         std::vector<std::uint8_t> artifact_framebuffer = framebuffer;
         LoadDriverFramebufferSnapshot(options_,

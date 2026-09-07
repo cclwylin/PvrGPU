@@ -583,6 +583,12 @@ pvrgpu_pco_build_terrain_texture_descriptor(
       packed_rogue_format = 27U; packed_three_channel = true;  break;
    case PIPE_FORMAT_R16G16B16A16_FLOAT:
       packed_rogue_format = 28U; break;
+   case PIPE_FORMAT_R32G32B32A32_UINT:
+      packed_rogue_format = 62U; break;
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+      packed_rogue_format = 61U; break;
+   case PIPE_FORMAT_R32G32B32A32_SINT:
+      packed_rogue_format = 63U; break;
    default:
       packed = false; break;
    }
@@ -4047,7 +4053,8 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                                 (unsigned long long)nir->info.outputs_written);
       }
    } else {
-      uint64_t allowed_fs_outputs = BITFIELD64_BIT(FRAG_RESULT_COLOR);
+      uint64_t allowed_fs_outputs = BITFIELD64_BIT(FRAG_RESULT_COLOR) |
+                                    BITFIELD64_BIT(FRAG_RESULT_DEPTH);
       for (unsigned target = 0; target < render_target_count; ++target)
          allowed_fs_outputs |= BITFIELD64_BIT(FRAG_RESULT_DATA0 + target);
       if (nir->info.outputs_written == 0 ||
@@ -4521,6 +4528,54 @@ static bool pvrgpu_color_primitive_varyings(const nir_shader *vs,
    return true;
 }
 
+/* The internal profile omits Vulkan sample-mask feedback, but an explicit
+ * GLSL depth output still needs the public DEPTHF operation.  Mirror Mesa's
+ * pco_nir_pvfio depth store lowering: clamp the shader-computed scalar, then
+ * issue ISP feedback.  No CPU evaluation of the expression is involved. */
+static bool
+pvrgpu_lower_fragment_depth_feedback(nir_builder *b,
+                                      nir_intrinsic_instr *intr,
+                                      void *data)
+{
+   nir_def *depth = NULL;
+   if (intr->intrinsic == nir_intrinsic_store_deref) {
+      nir_variable *var = nir_deref_instr_get_variable(
+         nir_src_as_deref(intr->src[0]));
+      if (var && var->data.mode == nir_var_shader_out &&
+          var->data.location == FRAG_RESULT_DEPTH)
+         depth = intr->src[1].ssa;
+   } else if (intr->intrinsic == nir_intrinsic_store_output &&
+              nir_intrinsic_io_semantics(intr).location == FRAG_RESULT_DEPTH) {
+      depth = intr->src[0].ssa;
+   }
+   if (!depth)
+      return false;
+   assert(depth->num_components == 1 && depth->bit_size == 32);
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_isp_feedback_pco(b, nir_undef(b, 1, 32), nir_fsat(b, depth));
+   nir_instr_remove(&intr->instr);
+   *(bool *)data = true;
+   return true;
+}
+
+static bool
+pvrgpu_restore_depth_feedback_no_discard(nir_builder *b,
+                                         nir_intrinsic_instr *intr,
+                                         void *data)
+{
+   (void)data;
+   if (intr->intrinsic != nir_intrinsic_isp_feedback_pco)
+      return false;
+   /* pco_trans_nir uses undef as the absent-discard operand, whereas NIR's
+    * general undef optimization may replace it with zero.  Re-establish
+    * that documented PCO intrinsic contract after all general NIR passes.
+    * Every feedback intrinsic in this internal profile was inserted above
+    * for depth only; shader discard lowering remains a separate operation. */
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_src_rewrite(&intr->src[0], nir_undef(b, 1, 32));
+   return true;
+}
+
 bool pvrgpu_pco_compile_color_triangle(
    struct pvrgpu_pco_compiler *compiler,
    const struct nir_shader *vertex_nir,
@@ -4831,25 +4886,13 @@ bool pvrgpu_pco_compile_color_triangle(
     */
    unsigned descriptor_dwords = 0;
    if (texture_count != 0) {
-      unsigned texture_ops = 0;
-      nir_foreach_function_impl(impl, fs)
-      {
-         nir_foreach_block (block, impl) {
-            nir_foreach_instr (instr, block) {
-               if (instr->type == nir_instr_type_tex)
-                  ++texture_ops;
-            }
-         }
-      }
-      if (!pvrgpu_pack_terrain_texture_bindings(fs,
-                                                texture_count,
-                                                texture_ops,
-                                                "color primitive",
-                                                error,
-                                                error_size)) {
-         ralloc_free(compile_mem_ctx);
-         return false;
-      }
+      /* Mesa pco_pack_desc(set, binding) is set | (binding << 16).
+       * A validated Gallium texture unit N already encodes set N/binding 0,
+       * matching the captured resource in slot N.  Do not apply Terrain's
+       * first-use remapping to set 0/binding N: these sets each allocate only
+       * one binding, so that encoding reads past bindings[0].  Keeping the
+       * unit also preserves shaders that sample units out of order or reuse
+       * a unit in several texture instructions. */
       for (unsigned texture = 0; texture < texture_count; ++texture) {
          pco_descriptor_set_data *set =
             &fragment_data.common.desc_sets[texture];
@@ -4941,6 +4984,10 @@ bool pvrgpu_pco_compile_color_triangle(
    pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=lower_vs");
    pco_lower_nir(compiler->pco, vs, &vertex_data);
    pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=lower_fs");
+   bool depth_feedback = false;
+   nir_shader_intrinsics_pass(fs, pvrgpu_lower_fragment_depth_feedback,
+                               nir_metadata_control_flow, &depth_feedback);
+   fragment_data.fs.uses.depth_feedback = depth_feedback;
    /*
     * PCO aborts rather than reporting, so when it dies the only way to see
     * what it was given is to print it first.  Mesa's own NIR_DEBUG is compiled
@@ -4977,6 +5024,9 @@ bool pvrgpu_pco_compile_color_triangle(
       return false;
    }
 
+   if (depth_feedback)
+      nir_shader_intrinsics_pass(fs, pvrgpu_restore_depth_feedback_no_discard,
+                                  nir_metadata_control_flow, NULL);
    pco_shader *vertex =
       pco_trans_nir(compiler->pco, vs, &vertex_data, compile_mem_ctx);
    pco_shader *fragment =

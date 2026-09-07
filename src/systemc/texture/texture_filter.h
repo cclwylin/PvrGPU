@@ -223,5 +223,12 @@ std::uint32_t TextureBytesPerTexel(TextureFormat format);
 // and throw.
 std::array<float, 4> DecodeTexelToFloat(TextureFormat format,
                                         const std::array<std::uint8_t, 8> &texel);
+std::array<float, 4> DecodeTexelToFloat(
+    TextureFormat format, const std::array<std::uint8_t, 16> &texel);
+
+// Integer nearest filtering returns all 128 stored bits unchanged. Signed
+// and unsigned shader result types share the raw DWORD response contract.
+std::array<std::uint32_t, 4> DecodeTexelToInteger(
+    TextureFormat format, const std::array<std::uint8_t, 16> &texel);
 
 } // namespace pvrgpu::stub

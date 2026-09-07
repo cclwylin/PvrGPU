@@ -5,6 +5,7 @@
 #include "fragment/pbe_write_back.h"
 
 #include "common/functional_types.h"
+#include "common/depth_attachment.h"
 #include "memory/gpu_memory_system.h"
 
 #include <limits>
@@ -47,13 +48,17 @@ void PbeWriteBack::Run() {
       throw std::runtime_error("PbeWriteBack memory mode mismatch");
     if (!HasPoolHandle(state.pbe_framebuffer))
       throw std::runtime_error("PbeWriteBack received no PBE framebuffer");
+    if (state.raster_state.shader_writes_depth && state.capture_depth_attachment)
+      MaterializeDepthAttachment(pool_, memory_, &state);
 
     // A pixel is four bytes only while the attachment packs UNORM8 channels.
     // An integer attachment stores a dword per channel, and the byte counts
     // this stage reports and moves have to follow it.
     const std::uint64_t expected_bytes =
         static_cast<std::uint64_t>(state.width) * state.height *
-        ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords);
+        state.raster_state.sample_count *
+        ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
+                                     state.color_attachment_float32);
     if (expected_bytes == 0 || state.framebuffer_bytes != expected_bytes ||
         pool_.Read(state.pbe_framebuffer).size() != expected_bytes) {
       throw std::runtime_error(

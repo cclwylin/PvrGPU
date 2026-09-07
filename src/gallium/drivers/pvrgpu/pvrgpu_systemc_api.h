@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 /* API-v19 can initialize a new sequence color attachment from host storage. */
-#define PVRGPU_SYSTEMC_API_VERSION 19u
+#define PVRGPU_SYSTEMC_API_VERSION 20u
 /*
  * Draws one sequence may describe; must match the model's own bound.  This is
  * independent of how many attachments the sequence creates, which the model's
@@ -390,6 +390,12 @@ struct pvrgpu_systemc_driver_command {
     */
    const uint8_t *initial_color_attachment_bytes;
    size_t initial_color_attachment_bytes_size;
+   /* API-v20: samples per pixel, stored pixel-interleaved in attachment
+    * payloads. Zero retains the single-sample default of older producers. */
+   uint32_t raster_samples;
+   /* Optional complete native depth/stencil LOAD, using depth_format. */
+   const uint8_t *initial_depth_attachment_bytes;
+   size_t initial_depth_attachment_bytes_size;
 };
 
 struct pvrgpu_systemc_submit_info {
@@ -436,6 +442,11 @@ struct pvrgpu_systemc_readback_info {
    uint8_t *pixels;
    size_t pixels_size;
    uint32_t pixels_written;
+   /* Zero means one. Multisample output retains every sample, not a resolve. */
+   uint32_t sample_count;
+   /* UINT32_MAX attachment selects depth/stencil and requires this exact
+    * native format, so equal-byte-width layouts cannot be confused. */
+   uint32_t depth_format;
 };
 
 /*

@@ -422,7 +422,7 @@ bool ReadFields(const std::string &path,
     }
     const std::string value = line.substr(separator + 1);
     if (key == "initial_color_attachment_replay") {
-      *error = "initial color attachments require API-v19 sequence submission; "
+      *error = "initial attachments and multisampling require API-v20 sequence submission; "
                "standalone driver-command text replay is unsupported";
       return false;
     }
@@ -511,8 +511,9 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
       *error = parsed.command + " framebuffer_height must be positive";
       return false;
     }
-    if (parsed.width > parsed.framebuffer_width ||
-        parsed.height > parsed.framebuffer_height) {
+    if (parsed.command != kDrawPcoTrianglesCommand &&
+        (parsed.width > parsed.framebuffer_width ||
+         parsed.height > parsed.framebuffer_height)) {
       *error = parsed.command +
                " viewport width/height must fit framebuffer";
       return false;
@@ -771,23 +772,45 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     parsed.depth_func = depth_state[2];
     parsed.depth_clear_bits = depth_state[3];
     parsed.depth_format = depth_state[4];
-    if (!PcoSingleDrawResolutionSupported(
+    const bool describes_attributes = parsed.vertex_attribute_count != 0;
+    const bool resolution_supported = describes_attributes ?
+        (parsed.width <= 4096 && parsed.height <= 4096 &&
+         parsed.framebuffer_width <= 4096 && parsed.framebuffer_height <= 4096) :
+        PcoSingleDrawResolutionSupported(
             parsed.framebuffer_width, parsed.framebuffer_height,
-            parsed.width, parsed.height)) {
-      *error = "draw_pco_triangles resolution must use a framebuffer-sized "
-               "80x60 or 800x600 viewport";
+            parsed.width, parsed.height);
+    if (!resolution_supported) {
+      *error = describes_attributes ?
+          "draw_pco_triangles framebuffer/viewport exceeds model extent" :
+          "draw_pco_triangles resolution must use a framebuffer-sized "
+          "80x60 or 800x600 viewport";
       return false;
     }
     const std::array<std::uint32_t, 3> expected_viewport =
-        PcoViewportBits(parsed.framebuffer_width,
-                        parsed.framebuffer_height);
+        PcoViewportBits(describes_attributes ? parsed.width : parsed.framebuffer_width,
+                        describes_attributes ? parsed.height : parsed.framebuffer_height);
+    bool viewport_valid = parsed.viewport_scale_bits == expected_viewport &&
+                          parsed.viewport_translate_bits == expected_viewport;
+    if (describes_attributes) {
+      // Audit metadata keeps the exact same finite transform as the native
+      // generic API.  Framebuffer clipping does not resize the viewport.
+      std::array<float, 3> translate;
+      std::memcpy(translate.data(), parsed.viewport_translate_bits.data(),
+                  sizeof(translate));
+      viewport_valid = parsed.viewport_scale_bits[0] == expected_viewport[0] &&
+          (parsed.viewport_scale_bits[1] == expected_viewport[1] ||
+           parsed.viewport_scale_bits[1] == (expected_viewport[1] ^ UINT32_C(0x80000000))) &&
+          parsed.viewport_scale_bits[2] == expected_viewport[2] &&
+          std::isfinite(translate[0]) && std::isfinite(translate[1]) &&
+          std::isfinite(translate[2]) && translate[2] == 0.5F;
+    }
     const std::uint64_t end_vertex =
         static_cast<std::uint64_t>(parsed.first_vertex) +
         parsed.vertex_count;
     const std::uint64_t expected_vertex_bytes =
         end_vertex * parsed.vertex_stride;
     const bool conditionals_geometry =
-        parsed.vertex_stride == 12 && parsed.vertex_count == 6144 &&
+        !describes_attributes && parsed.vertex_stride == 12 && parsed.vertex_count == 6144 &&
         parsed.first_vertex == 0 && parsed.primitive_mode == 4;
     const auto abi_bounded = [](const DriverPcoStageAbi &abi,
                                 bool allow_zero_temps) {
@@ -811,6 +834,8 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         /* A pass-through VS forwarding position and colour uses no temps. */
         !abi_bounded(parsed.vertex_pco_abi, true) ||
         !abi_bounded(parsed.fragment_pco_abi, true) ||
+        (describes_attributes && parsed.vertex_pco_abi.vertex_inputs !=
+                                     parsed.vertex_attribute_count * 4U) ||
         parsed.position_output_start != 0 ||
         parsed.position_output_count != 4 ||
         parsed.vertex_pco_abi.vertex_outputs !=
@@ -838,8 +863,7 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         parsed.dither != 1 || parsed.depth_enable > 1 ||
         parsed.depth_write > 1 || parsed.depth_func > 7 ||
         parsed.depth_format == 0 ||
-        parsed.viewport_scale_bits != expected_viewport ||
-        parsed.viewport_translate_bits != expected_viewport) {
+        !viewport_valid) {
       *error = conditionals_geometry
                    ? "draw_pco_triangles metadata is malformed or outside "
                      "the strict supported-resolution conditionals profile "

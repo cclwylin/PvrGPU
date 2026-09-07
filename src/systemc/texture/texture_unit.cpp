@@ -386,8 +386,16 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
   const bool rgb9e5 = identity_rgb && format == 26U && alpha_swizzle == 4U;
   const bool r11g11b10 = identity_rgb && format == 27U && alpha_swizzle == 4U;
   const bool rgba16f = identity_rgb && format == 28U && alpha_swizzle == 3U;
+  // Public Rogue FORMAT values in texstate.xml: U32U32U32U32=62,
+  // S32S32S32S32=63. The driver may canonicalize narrower integer formats
+  // into these texels without losing bits or interpreting them as floats.
+  const bool rgba32_uint = identity_rgb && format == 62U && alpha_swizzle == 3U;
+  const bool rgba32_sint = identity_rgb && format == 63U && alpha_swizzle == 3U;
+  const bool integer_colour = rgba32_uint || rgba32_sint;
+  const bool rgba32_float = identity_rgb && format == 61U && alpha_swizzle == 3U;
   const bool packed_colour =
-      rgb565 || rgba8_snorm || rgb10_a2 || rgb9e5 || r11g11b10 || rgba16f;
+      rgb565 || rgba8_snorm || rgb10_a2 || rgb9e5 || r11g11b10 || rgba16f ||
+      rgba32_float;
   /*
    * Rogue IMAGE_WORD0 bit 3 is GAMMA and bit 4 is the second half of
    * TWOCOMP_GAMMA.  Gamma on a four-channel image is sRGB, which this unit
@@ -407,7 +415,7 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
       (gamma && !rgba8 && !astc) ||
       ExtractBits(word0, 17, 26) != 0U ||
       (!rgba8 && !bgra8 && !astc && !z32_unorm && !z24_unorm_s8_uint &&
-       !packed_colour) ||
+       !packed_colour && !integer_colour) ||
       ExtractBits(word0, 62, 63) != 0U) {
     throw std::runtime_error(
         "TextureUnit unsupported raw Rogue image word0");
@@ -447,7 +455,8 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
   // The colour formats' byte width drives both the stride decode and the
   // minimum-pitch floor.  ASTC's stride is measured in blocks, not texels.
   const std::uint32_t bytes_per_texel =
-      astc ? 0U : rgba16f ? 8U : rgb565 ? 2U : 4U;
+      astc ? 0U : (integer_colour || rgba32_float) ? 16U
+                : rgba16f ? 8U : rgb565 ? 2U : 4U;
   /* Public STRIDE_IMAGE_WORD1 expresses stride in texels. The pinned GLBench
    * literals predate that decoder contract and encode byte stride instead.
    * Their value is at least one complete RGBA8 byte row; a new tight public
@@ -480,6 +489,9 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
       : r11g11b10         ? TextureFormat::kR11fG11fB10f
       : rgb9e5            ? TextureFormat::kRgb9e5Float
       : rgba16f           ? TextureFormat::kRgba16Float
+      : rgba32_uint       ? TextureFormat::kRgba32Uint
+      : rgba32_sint       ? TextureFormat::kRgba32Sint
+      : rgba32_float      ? TextureFormat::kRgba32Float
       : bgra8             ? TextureFormat::kBgra8Unorm
       : gamma             ? TextureFormat::kRgba8Srgb
       : alpha_swizzle == 4U ? TextureFormat::kRgbx8Unorm
@@ -602,11 +614,17 @@ bool DriverPcoTextureDescriptorClassSupported(
       image.format == TextureFormat::kRgb10A2Unorm ||
       image.format == TextureFormat::kRgba8Snorm ||
       image.format == TextureFormat::kRgba16Float ||
+      image.format == TextureFormat::kRgba32Uint ||
+      image.format == TextureFormat::kRgba32Sint ||
+      image.format == TextureFormat::kRgba32Float ||
       image.format == TextureFormat::kR11fG11fB10f ||
       image.format == TextureFormat::kRgb9e5Float;
-  // Z32 is one uint32 per texel with no filter datapath: nearest taps only.
+  // Integer texture completeness requires nearest image/mip filtering.
+  // Z32 also has no linear filter datapath in this model.
   const bool depth32_nearest_only =
-      image.format != TextureFormat::kZ32Unorm ||
+      (image.format != TextureFormat::kZ32Unorm &&
+       image.format != TextureFormat::kRgba32Uint &&
+       image.format != TextureFormat::kRgba32Sint) ||
       (sampler.min_filter == TextureFilter::kNearest &&
        sampler.mag_filter == TextureFilter::kNearest &&
        sampler.mip_filter == TextureFilter::kNearest);
@@ -1345,6 +1363,8 @@ void TextureUnit::SampleRunForStage(
     const std::uint8_t expected_coordinate_count = 2U;
     const std::uint8_t expected_dimension =
         (volume_texture || cube_texture) ? 3U : 2U;
+    const bool integer_texture = image.format == TextureFormat::kRgba32Uint ||
+                                 image.format == TextureFormat::kRgba32Sint;
     std::uint64_t texel_fetch_count = 0;
     std::uint64_t expected_texel_fetches = 0;
     for (std::size_t index = 0; index < requests.size(); ++index) {
@@ -1361,6 +1381,7 @@ void TextureUnit::SampleRunForStage(
           request.descriptor_set != descriptor_set || request.binding != 0 ||
           request.dimension != expected_dimension ||
           request.normalized != 1 ||
+          request.fcnorm != (integer_texture ? 0U : 1U) ||
           request.data_request != 0 ||
           (vertex_stage
                ? (request.quad_id != 0 || request.quad_lane != 0)
@@ -1445,7 +1466,7 @@ void TextureUnit::SampleRunForStage(
       std::array<std::uint8_t, 16> astc_block_bytes{};
       bool astc_block_decoded = false;
 
-      const auto read_texel = [&](const TextureMipLevel &mip,
+      const auto read_texel_bytes = [&](const TextureMipLevel &mip,
                                   std::uint32_t x, std::uint32_t y,
                                   std::uint64_t memory_request_id) {
         const std::uint32_t fetch_x =
@@ -1510,7 +1531,7 @@ void TextureUnit::SampleRunForStage(
         if (texel_fetch_count == std::numeric_limits<std::uint64_t>::max())
           throw std::overflow_error("TextureUnit texel fetch overflow");
         ++texel_fetch_count;
-        std::array<std::uint8_t, 8> texel{};
+        std::array<std::uint8_t, 16> texel{};
         if (astc_image) {
           if (!astc_block_decoded ||
               !std::equal(payload.begin(), payload.end(),
@@ -1540,6 +1561,19 @@ void TextureUnit::SampleRunForStage(
         if (image.format == TextureFormat::kBgra8Unorm)
           std::swap(texel[0], texel[2]);
         return texel;  // valid bytes: fetch_bytes; upper bytes stay zero
+      };
+      // The existing floating-point unpackers need at most eight bytes;
+      // keep that contract explicit while the raw integer path consumes all
+      // sixteen bytes from the same modeled memory/cache transaction.
+      const auto read_texel = [&](const TextureMipLevel &mip,
+                                  std::uint32_t x, std::uint32_t y,
+                                  std::uint64_t memory_request_id) {
+        if (integer_texture)
+          throw std::runtime_error("TextureUnit integer texel entered float unpack");
+        const auto bytes = read_texel_bytes(mip, x, y, memory_request_id);
+        std::array<std::uint8_t, 8> texel{};
+        std::copy_n(bytes.begin(), texel.size(), texel.begin());
+        return texel;
       };
 
       const auto sample_bilinear_depth =
@@ -1653,7 +1687,7 @@ void TextureUnit::SampleRunForStage(
             plane_t, mip.height,
             decoded_sampler.wrap_v);
         return DecodeTexelToFloat(image.format,
-                                  read_texel(mip, x, y, request_id));
+                                  read_texel_bytes(mip, x, y, request_id));
       };
 
       const auto sample_bilinear_float =
@@ -1666,16 +1700,16 @@ void TextureUnit::SampleRunForStage(
             decoded_sampler.wrap_v);
         const std::array<float, 4> texel00 = DecodeTexelToFloat(
             image.format,
-            read_texel(mip, x.lower, y.lower, first_request_id + 0U));
+            read_texel_bytes(mip, x.lower, y.lower, first_request_id + 0U));
         const std::array<float, 4> texel10 = DecodeTexelToFloat(
             image.format,
-            read_texel(mip, x.upper, y.lower, first_request_id + 1U));
+            read_texel_bytes(mip, x.upper, y.lower, first_request_id + 1U));
         const std::array<float, 4> texel01 = DecodeTexelToFloat(
             image.format,
-            read_texel(mip, x.lower, y.upper, first_request_id + 2U));
+            read_texel_bytes(mip, x.lower, y.upper, first_request_id + 2U));
         const std::array<float, 4> texel11 = DecodeTexelToFloat(
             image.format,
-            read_texel(mip, x.upper, y.upper, first_request_id + 3U));
+            read_texel_bytes(mip, x.upper, y.upper, first_request_id + 3U));
         std::array<float, 4> result{};
         for (std::size_t component = 0; component < result.size();
              ++component) {
@@ -1702,6 +1736,7 @@ void TextureUnit::SampleRunForStage(
       };
 
       std::array<float, 4> filtered{};
+      std::array<std::uint32_t, 4> integer_result{};
       if (debug_request) {
         std::cerr << "sequence-fragment-texture phase=request set="
                   << static_cast<unsigned>(descriptor_set) << " lane="
@@ -1765,7 +1800,20 @@ void TextureUnit::SampleRunForStage(
         return d == 0U ? 1U : d;
       };
 
-      if (image.format == TextureFormat::kZ32Unorm) {
+      if (integer_texture) {
+        if (linear_filter || two_levels)
+          throw std::runtime_error("TextureUnit cannot linearly filter integer texels");
+        if (volume_texture) {
+          selected_layer = ComputeTextureFloatNearest(
+              volume_r, level_depth(lod.level0), wrap_r);
+        }
+        const std::uint32_t x = ComputeTextureFloatNearest(
+            plane_s, level0.width, decoded_sampler.wrap_u);
+        const std::uint32_t y = ComputeTextureFloatNearest(
+            plane_t, level0.height, decoded_sampler.wrap_v);
+        integer_result = DecodeTexelToInteger(
+            image.format, read_texel_bytes(level0, x, y, tap_request_base));
+      } else if (image.format == TextureFormat::kZ32Unorm) {
         if (linear_filter || two_levels)
           throw std::runtime_error("TextureUnit cannot filter Z32_UNORM");
         const std::uint32_t x = ComputeTextureNearestRepeat(
@@ -1883,7 +1931,7 @@ void TextureUnit::SampleRunForStage(
                 selected_layer = static_cast<std::uint32_t>(face_i);
                 colors[i] = DecodeTexelToFloat(
                     image.format,
-                    read_texel(mip, static_cast<std::uint32_t>(cs),
+                    read_texel_bytes(mip, static_cast<std::uint32_t>(cs),
                                static_cast<std::uint32_t>(ct),
                                rid + static_cast<std::uint64_t>(i)));
               } else {
@@ -1965,7 +2013,9 @@ void TextureUnit::SampleRunForStage(
       response.request_id = request.request_id;
       response.shader_stage = shader_stage;
       for (std::size_t component = 0; component < 4; ++component)
-        response.rgba[component] = FloatBits(filtered[component]);
+        response.rgba[component] = integer_texture
+                                       ? integer_result[component]
+                                       : FloatBits(filtered[component]);
       if (debug_request) {
         std::cerr << "sequence-fragment-texture phase=response set="
                   << static_cast<unsigned>(descriptor_set) << " rgba_bits=";

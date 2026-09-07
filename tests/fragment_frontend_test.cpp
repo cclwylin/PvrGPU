@@ -91,6 +91,49 @@ int sc_main(int, char **) {
 
     ReleaseFunctionalPayloads(pool, result);
     pool.Release(state_handle);
+
+    PipelineState multisample;
+    multisample.width = multisample.height = 1;
+    multisample.sequence = 2;
+    multisample.functional_case = FunctionalCase::kFillTexNearest;
+    multisample.stage = PipelineStage::kVisibilityReady;
+    multisample.raster_state.sample_count = 16;
+    multisample.active_fragment_invocations = 2;
+    std::vector<ParameterTriangle> parameters(2, parameter);
+    parameters[1].key.api_primitive_id = 8;
+    parameters[1].key.submit_ordinal = 2;
+    std::vector<FragmentCandidate> visible(2, rejected);
+    for (std::uint32_t primitive = 0; primitive < 2; ++primitive) {
+      visible[primitive].primitive_id = parameters[primitive].key.api_primitive_id;
+      visible[primitive].parameter_index = primitive;
+      visible[primitive].submit_ordinal = parameters[primitive].key.submit_ordinal;
+      visible[primitive].sample_mask = primitive == 0 ? 0x00ffU : 0xff00U;
+      visible[primitive].visibility = FragmentVisibility::kVisible;
+    }
+    multisample.parameter_triangles = StoreNewArray(pool, parameters);
+    multisample.fragment_candidates = StoreNewArray(pool, visible);
+    const PoolHandle msaa_handle = pool.Allocate(sizeof(PipelineState));
+    StorePipelineState(pool, msaa_handle, multisample);
+    input.write(PipelineTxn{msaa_handle, 2, multisample.sequence});
+    sc_core::sc_start(sc_core::sc_time(100, sc_core::SC_NS));
+    sc_core::sc_start(sc_core::SC_ZERO_TIME);
+    Check(output.nb_read(completed) && completed.sequence == 2,
+          "disjoint multisample owners did not complete");
+    const PipelineState msaa_result = LoadPipelineState(pool, msaa_handle);
+    const auto msaa_invocations =
+        LoadArray<FragmentInvocation>(pool, msaa_result.fragment_invocations);
+    const auto msaa_lanes =
+        LoadArray<FragmentShaderLane>(pool, msaa_result.fragment_shader_lanes);
+    Check(msaa_invocations.size() == 2 && msaa_lanes.size() == 2 &&
+              msaa_result.counters.ps_invocations == 2,
+          "MSAA frontend did not preserve pixel-frequency shading");
+    for (std::size_t primitive = 0; primitive < 2; ++primitive) {
+      Check(msaa_invocations[primitive].sample_mask == visible[primitive].sample_mask &&
+                msaa_lanes[primitive].sample_mask == visible[primitive].sample_mask,
+            "MSAA frontend lost 16-bit sample coverage");
+    }
+    ReleaseFunctionalPayloads(pool, msaa_result);
+    pool.Release(msaa_handle);
     Check(pool.bytes_in_flight() == 0 &&
               pool.allocations() == pool.releases(),
           "MemoryPool balance");

@@ -18,8 +18,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Widest packed color block the driver lowers (32-bit RGBA/10:10:10:2). */
-#define PVRGPU_MAX_COLOR_BLOCK_SIZE 4u
+/* A native RGBA32 attachment has four 32-bit components. */
+#define PVRGPU_MAX_COLOR_BLOCK_SIZE 16u
 
 static const char *
 pvrgpu_command_output_path(void)
@@ -153,12 +153,30 @@ pvrgpu_can_lower_clear_color_format(enum pipe_format format)
 }
 
 static bool
-pvrgpu_rgba8_cbuf_bound(const struct pipe_framebuffer_state *fb)
+pvrgpu_can_pack_clear_color_format(enum pipe_format format)
+{
+   const struct util_format_description *desc = util_format_description(format);
+   const struct util_format_pack_description *pack =
+      util_format_pack_description(format);
+   if (!desc || !pack || desc->colorspace == UTIL_FORMAT_COLORSPACE_ZS ||
+       desc->block.width != 1 || desc->block.height != 1 ||
+       desc->block.depth != 1 ||
+       util_format_get_blocksize(format) > PVRGPU_MAX_COLOR_BLOCK_SIZE)
+      return false;
+   if (util_format_is_pure_uint(format))
+      return pack->pack_rgba_uint != NULL;
+   if (util_format_is_pure_sint(format))
+      return pack->pack_rgba_sint != NULL;
+   return pack->pack_rgba_float != NULL;
+}
+
+static bool
+pvrgpu_color_cbuf_bound(const struct pipe_framebuffer_state *fb)
 {
    return fb &&
           fb->nr_cbufs == 1 &&
           fb->cbufs[0].texture &&
-          pvrgpu_can_lower_clear_color_format(fb->cbufs[0].format) &&
+          pvrgpu_can_pack_clear_color_format(fb->cbufs[0].format) &&
           fb->width != 0 &&
           fb->height != 0;
 }
@@ -234,7 +252,7 @@ pvrgpu_color_surface_rect_supported(const struct pipe_surface *surface,
 {
    if (!surface ||
        !surface->texture ||
-       !pvrgpu_can_lower_clear_color_format(surface->format) ||
+       !pvrgpu_can_pack_clear_color_format(surface->format) ||
        width == 0 ||
        height == 0 ||
        util_format_get_blocksize(surface->format) == 0)
@@ -275,18 +293,13 @@ pvrgpu_depth_surface_rect_supported(const struct pipe_surface *surface,
 {
    if (!surface || !surface->texture || width == 0 || height == 0)
       return false;
-   switch (surface->format) {
-   case PIPE_FORMAT_Z16_UNORM:
-   case PIPE_FORMAT_Z24X8_UNORM:
-   case PIPE_FORMAT_X8Z24_UNORM:
-   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
-   case PIPE_FORMAT_S8_UINT_Z24_UNORM:
-   case PIPE_FORMAT_Z32_UNORM:
-   case PIPE_FORMAT_Z32_FLOAT:
-      break;
-   default:
+   const struct util_format_description *desc =
+      util_format_description(surface->format);
+   const struct util_format_pack_description *pack =
+      util_format_pack_description(surface->format);
+   if (!desc || !pack || desc->colorspace != UTIL_FORMAT_COLORSPACE_ZS ||
+       (!pack->pack_z_float && !pack->pack_s_8uint))
       return false;
-   }
 
    struct pvrgpu_resource *resource = pvrgpu_resource(surface->texture);
    if (!resource || !resource->data ||
@@ -308,48 +321,41 @@ pvrgpu_depth_surface_rect_supported(const struct pipe_surface *surface,
           resource->level_layer_strides[surface->level] != 0;
 }
 
-/*
- * Write the stencil plane of a combined attachment, leaving the depth alone.
- *
- * Only the packed 24/8 formats have one; every other depth format reports no
- * stencil and is left untouched rather than being guessed at.
- */
+/* Mesa's depth/stencil packers preserve the other aspect of combined
+ * attachments. The sample layout is pixel-interleaved, shared with blits. */
 static bool
 pvrgpu_fill_surface_rect_with_clear_stencil(struct pipe_surface *surface,
                                             unsigned dstx,
                                             unsigned dsty,
                                             unsigned width,
                                             unsigned height,
-                                            unsigned stencil)
+                                            unsigned stencil,
+                                            unsigned stencil_mask)
 {
-   if (!pvrgpu_depth_surface_rect_supported(surface, dstx, dsty, width,
-                                            height))
+   if (!pvrgpu_depth_surface_rect_supported(surface, dstx, dsty, width, height))
       return false;
-   if (surface->format != PIPE_FORMAT_Z24_UNORM_S8_UINT &&
-       surface->format != PIPE_FORMAT_S8_UINT_Z24_UNORM)
+   const struct util_format_pack_description *pack =
+      util_format_pack_description(surface->format);
+   if (!pack->pack_s_8uint)
       return false;
-
    struct pvrgpu_resource *resource = pvrgpu_resource(surface->texture);
    const unsigned level = surface->level;
    const unsigned block_size = util_format_get_blocksize(surface->format);
-   if (block_size != sizeof(uint32_t))
-      return false;
-   const uint32_t value = stencil & 0xffu;
+   const unsigned samples = MAX2(1, surface->texture->nr_storage_samples ?
+                                   surface->texture->nr_storage_samples :
+                                   surface->texture->nr_samples);
    uint8_t *base = resource->data + resource->level_offsets[level];
    for (unsigned y = 0; y < height; ++y) {
       uint8_t *row = base +
                      (uintptr_t)(dsty + y) * resource->level_strides[level] +
-                     (uintptr_t)dstx * block_size;
-      for (unsigned x = 0; x < width; ++x) {
+                     (uintptr_t)dstx * samples * block_size;
+      for (unsigned x = 0; x < width * samples; ++x) {
          uint8_t *pixel = row + (uintptr_t)x * block_size;
-         uint32_t packed = 0;
-         memcpy(&packed, pixel, sizeof(packed));
-         if (surface->format == PIPE_FORMAT_Z24_UNORM_S8_UINT) {
-            packed = (packed & UINT32_C(0x00ffffff)) | (value << 24);
-         } else {
-            packed = (packed & UINT32_C(0xffffff00)) | value;
-         }
-         memcpy(pixel, &packed, sizeof(packed));
+         uint8_t old_stencil = 0;
+         util_format_unpack_s_8uint(surface->format, &old_stencil, pixel, 1);
+         const uint8_t value = (old_stencil & ~stencil_mask) |
+                               (stencil & stencil_mask);
+         util_format_pack_s_8uint(surface->format, pixel, &value, 1);
       }
    }
    return true;
@@ -363,76 +369,28 @@ pvrgpu_fill_surface_rect_with_clear_depth(struct pipe_surface *surface,
                                           unsigned height,
                                           double depth)
 {
-   if (!pvrgpu_depth_surface_rect_supported(surface,
-                                            dstx,
-                                            dsty,
-                                            width,
-                                            height) ||
+   if (!pvrgpu_depth_surface_rect_supported(surface, dstx, dsty, width, height) ||
        !isfinite(depth))
       return false;
-
-   const double clamped = depth < 0.0 ? 0.0 : depth > 1.0 ? 1.0 : depth;
+   const struct util_format_pack_description *pack =
+      util_format_pack_description(surface->format);
+   if (!pack->pack_z_float)
+      return false;
+   const float value = depth < 0.0 ? 0.0f : depth > 1.0 ? 1.0f : (float)depth;
    struct pvrgpu_resource *resource = pvrgpu_resource(surface->texture);
    const unsigned level = surface->level;
    const unsigned block_size = util_format_get_blocksize(surface->format);
-   if (block_size == 0)
-      return false;
+   const unsigned samples = MAX2(1, surface->texture->nr_storage_samples ?
+                                   surface->texture->nr_storage_samples :
+                                   surface->texture->nr_samples);
    uint8_t *base = resource->data + resource->level_offsets[level];
    for (unsigned y = 0; y < height; ++y) {
       uint8_t *row = base +
                      (uintptr_t)(dsty + y) * resource->level_strides[level] +
-                     (uintptr_t)dstx * block_size;
-      for (unsigned x = 0; x < width; ++x) {
-         uint8_t *pixel = row + (uintptr_t)x * block_size;
-         switch (surface->format) {
-         case PIPE_FORMAT_Z16_UNORM: {
-            const uint16_t packed = (uint16_t)llround(clamped * 65535.0);
-            memcpy(pixel, &packed, sizeof(packed));
-            break;
-         }
-         case PIPE_FORMAT_Z24X8_UNORM: {
-            const uint32_t packed =
-               (uint32_t)llround(clamped * 16777215.0);
-            memcpy(pixel, &packed, sizeof(packed));
-            break;
-         }
-         case PIPE_FORMAT_X8Z24_UNORM: {
-            const uint32_t packed =
-               (uint32_t)llround(clamped * 16777215.0) << 8;
-            memcpy(pixel, &packed, sizeof(packed));
-            break;
-         }
-         case PIPE_FORMAT_Z24_UNORM_S8_UINT: {
-            uint32_t packed = 0;
-            memcpy(&packed, pixel, sizeof(packed));
-            packed = (packed & UINT32_C(0xff000000)) |
-                     (uint32_t)llround(clamped * 16777215.0);
-            memcpy(pixel, &packed, sizeof(packed));
-            break;
-         }
-         case PIPE_FORMAT_S8_UINT_Z24_UNORM: {
-            uint32_t packed = 0;
-            memcpy(&packed, pixel, sizeof(packed));
-            packed = (packed & UINT32_C(0x000000ff)) |
-                     ((uint32_t)llround(clamped * 16777215.0) << 8);
-            memcpy(pixel, &packed, sizeof(packed));
-            break;
-         }
-         case PIPE_FORMAT_Z32_UNORM: {
-            const uint32_t packed =
-               (uint32_t)llround(clamped * 4294967295.0);
-            memcpy(pixel, &packed, sizeof(packed));
-            break;
-         }
-         case PIPE_FORMAT_Z32_FLOAT: {
-            const float packed = (float)clamped;
-            memcpy(pixel, &packed, sizeof(packed));
-            break;
-         }
-         default:
-            return false;
-         }
-      }
+                     (uintptr_t)dstx * samples * block_size;
+      for (unsigned x = 0; x < width * samples; ++x)
+         util_format_pack_z_float(surface->format,
+                                  row + (uintptr_t)x * block_size, &value, 1);
    }
    return true;
 }
@@ -445,26 +403,6 @@ pvrgpu_float_to_unorm8(float value)
    if (value >= 1.0f)
       return 255;
    return (uint8_t)(value * 255.0f + 0.5f);
-}
-
-static uint32_t
-pvrgpu_float_to_unorm10(float value)
-{
-   if (!(value > 0.0f))
-      return 0;
-   if (value >= 1.0f)
-      return 1023;
-   return (uint32_t)(value * 1023.0f + 0.5f);
-}
-
-static uint32_t
-pvrgpu_float_to_unorm2(float value)
-{
-   if (!(value > 0.0f))
-      return 0;
-   if (value >= 1.0f)
-      return 3;
-   return (uint32_t)(value * 3.0f + 0.5f);
 }
 
 static const char *
@@ -489,87 +427,6 @@ pvrgpu_command_format_for_color_surface(enum pipe_format format)
 }
 
 static void
-pvrgpu_store_clear_color_pixel(enum pipe_format format,
-                               uint8_t *pixel,
-                               uint8_t r,
-                               uint8_t g,
-                               uint8_t b,
-                               uint8_t a,
-                               uint32_t r10,
-                               uint32_t g10,
-                               uint32_t b10,
-                               uint32_t a2)
-{
-   switch (format) {
-   case PIPE_FORMAT_R10G10B10A2_UNORM: {
-      const uint32_t packed = r10 | (g10 << 10) | (b10 << 20) | (a2 << 30);
-      memcpy(pixel, &packed, sizeof(packed));
-      break;
-   }
-   case PIPE_FORMAT_B10G10R10A2_UNORM: {
-      const uint32_t packed = b10 | (g10 << 10) | (r10 << 20) | (a2 << 30);
-      memcpy(pixel, &packed, sizeof(packed));
-      break;
-   }
-   case PIPE_FORMAT_R5G6B5_UNORM: {
-      const uint16_t r5 = (uint16_t)((r * 31u + 127u) / 255u);
-      const uint16_t g6 = (uint16_t)((g * 63u + 127u) / 255u);
-      const uint16_t b5 = (uint16_t)((b * 31u + 127u) / 255u);
-      const uint16_t packed = r5 | (g6 << 5) | (b5 << 11);
-      memcpy(pixel, &packed, sizeof(packed));
-      break;
-   }
-   case PIPE_FORMAT_B5G6R5_UNORM: {
-      const uint16_t r5 = (uint16_t)((r * 31u + 127u) / 255u);
-      const uint16_t g6 = (uint16_t)((g * 63u + 127u) / 255u);
-      const uint16_t b5 = (uint16_t)((b * 31u + 127u) / 255u);
-      const uint16_t packed = b5 | (g6 << 5) | (r5 << 11);
-      memcpy(pixel, &packed, sizeof(packed));
-      break;
-   }
-   case PIPE_FORMAT_B8G8R8A8_UNORM:
-   case PIPE_FORMAT_B8G8R8X8_UNORM:
-      pixel[0] = b;
-      pixel[1] = g;
-      pixel[2] = r;
-      pixel[3] = format == PIPE_FORMAT_B8G8R8X8_UNORM ? 255 : a;
-      break;
-   case PIPE_FORMAT_R8G8B8A8_UNORM:
-   case PIPE_FORMAT_R8G8B8X8_UNORM:
-   default:
-      pixel[0] = r;
-      pixel[1] = g;
-      pixel[2] = b;
-      pixel[3] = format == PIPE_FORMAT_R8G8B8X8_UNORM ? 255 : a;
-      break;
-   }
-}
-
-static void
-pvrgpu_clear_color_write_mask(enum pipe_format format,
-                              unsigned colormask,
-                              uint8_t *mask_pixel)
-{
-   /*
-    * Every lowered color format packs its channels into disjoint bit ranges,
-    * so storing the maximum value for the enabled channels and zero for the
-    * disabled ones yields the exact write mask of the packed pixel.  The
-    * ignored alpha lane of an X8 format always reads back as one, so its mask
-    * bits stay set regardless of the requested colormask.
-    */
-   pvrgpu_store_clear_color_pixel(format,
-                                  mask_pixel,
-                                  (colormask & PIPE_MASK_R) ? 255 : 0,
-                                  (colormask & PIPE_MASK_G) ? 255 : 0,
-                                  (colormask & PIPE_MASK_B) ? 255 : 0,
-                                  (colormask & PIPE_MASK_A) ? 255 : 0,
-                                  (colormask & PIPE_MASK_R) ? 1023 : 0,
-                                  (colormask & PIPE_MASK_G) ? 1023 : 0,
-                                  (colormask & PIPE_MASK_B) ? 1023 : 0,
-                                  (colormask & PIPE_MASK_A) ? 3 : 0);
-}
-
-static void
 pvrgpu_fill_surface_rect_with_clear_color(struct pipe_surface *surface,
                                           unsigned dstx,
                                           unsigned dsty,
@@ -578,49 +435,45 @@ pvrgpu_fill_surface_rect_with_clear_color(struct pipe_surface *surface,
                                           unsigned colormask,
                                           const union pipe_color_union *color)
 {
-   struct pvrgpu_resource *resource = pvrgpu_resource(surface->texture);
-   if (!resource ||
-       !resource->data ||
+   if (!color ||
        !pvrgpu_color_surface_rect_supported(surface, dstx, dsty, width, height))
       return;
 
+   struct pvrgpu_resource *resource = pvrgpu_resource(surface->texture);
    const unsigned level = surface->level;
    const unsigned block_size = util_format_get_blocksize(surface->format);
-   if (block_size == 0 || block_size > PVRGPU_MAX_COLOR_BLOCK_SIZE)
-      return;
-
+   const unsigned samples = MAX2(1, surface->texture->nr_storage_samples ?
+                                   surface->texture->nr_storage_samples :
+                                   surface->texture->nr_samples);
+   const struct util_format_description *desc =
+      util_format_description(surface->format);
    uint8_t value_pixel[PVRGPU_MAX_COLOR_BLOCK_SIZE] = {0};
    uint8_t mask_pixel[PVRGPU_MAX_COLOR_BLOCK_SIZE] = {0};
-   pvrgpu_store_clear_color_pixel(surface->format,
-                                  value_pixel,
-                                  pvrgpu_float_to_unorm8(color->f[0]),
-                                  pvrgpu_float_to_unorm8(color->f[1]),
-                                  pvrgpu_float_to_unorm8(color->f[2]),
-                                  pvrgpu_float_to_unorm8(color->f[3]),
-                                  pvrgpu_float_to_unorm10(color->f[0]),
-                                  pvrgpu_float_to_unorm10(color->f[1]),
-                                  pvrgpu_float_to_unorm10(color->f[2]),
-                                  pvrgpu_float_to_unorm2(color->f[3]));
-   pvrgpu_clear_color_write_mask(surface->format, colormask, mask_pixel);
-   for (unsigned byte = 0; byte < block_size; ++byte)
-      value_pixel[byte] &= mask_pixel[byte];
-
-   const unsigned stride = resource->level_strides[level];
-   const uintptr_t layer_stride = resource->level_layer_strides[level];
-   const uintptr_t level_offset = resource->level_offsets[level];
+   util_format_pack_rgba(surface->format, value_pixel, color, 1);
+   /* A logical channel selects its native bit range, including float sign
+    * and exponent bits. Preserve disabled channels bit-for-bit, without a
+    * decode/re-encode round trip or integer-to-float conversion. */
+   for (unsigned channel = 0; channel < 4; ++channel) {
+      if (!(colormask & (1u << channel)) || desc->swizzle[channel] >= 4)
+         continue;
+      const struct util_format_channel_description *field =
+         &desc->channel[desc->swizzle[channel]];
+      for (unsigned bit = field->shift; bit < field->shift + field->size; ++bit)
+         mask_pixel[bit / 8] |= 1u << (bit % 8);
+   }
    for (unsigned layer = surface->first_layer; layer <= surface->last_layer;
         ++layer) {
-      uint8_t *layer_base = resource->data + level_offset +
-                            (uintptr_t)layer * layer_stride;
+      uint8_t *base = resource->data + resource->level_offsets[level] +
+                     (uintptr_t)layer * resource->level_layer_strides[level];
       for (unsigned y = 0; y < height; ++y) {
-         uint8_t *row = layer_base + (uintptr_t)(dsty + y) * stride +
-                        (uintptr_t)dstx * block_size;
-         for (unsigned x = 0; x < width; ++x) {
+         uint8_t *row = base +
+                        (uintptr_t)(dsty + y) * resource->level_strides[level] +
+                        (uintptr_t)dstx * samples * block_size;
+         for (unsigned x = 0; x < width * samples; ++x) {
             uint8_t *pixel = row + (uintptr_t)x * block_size;
-            for (unsigned byte = 0; byte < block_size; ++byte) {
-               pixel[byte] = (uint8_t)((pixel[byte] & ~mask_pixel[byte]) |
-                                       value_pixel[byte]);
-            }
+            for (unsigned byte = 0; byte < block_size; ++byte)
+               pixel[byte] = (pixel[byte] & ~mask_pixel[byte]) |
+                             (value_pixel[byte] & mask_pixel[byte]);
          }
       }
    }
@@ -649,15 +502,18 @@ pvrgpu_surface_uniform_color(const struct pipe_surface *surface,
    const unsigned level = surface->level;
    const unsigned block_size = util_format_get_blocksize(surface->format);
    const unsigned stride = resource->level_strides[level];
+   const unsigned samples = MAX2(1, surface->texture->nr_storage_samples ?
+                                   surface->texture->nr_storage_samples :
+                                   surface->texture->nr_samples);
    const uint8_t *base = resource->data + resource->level_offsets[level] +
                          (uintptr_t)surface->first_layer *
                             resource->level_layer_strides[level];
 
-   const size_t row_size = (size_t)width * block_size;
+   const size_t row_size = (size_t)width * samples * block_size;
    uint8_t *reference = malloc(row_size);
    if (!reference)
       return false;
-   for (unsigned x = 0; x < width; ++x)
+   for (unsigned x = 0; x < width * samples; ++x)
       memcpy(reference + (size_t)x * block_size, base, block_size);
 
    bool uniform = true;
@@ -809,7 +665,7 @@ pvrgpu_clear(struct pipe_context *pipe,
                                   rect_height == ctx->framebuffer.height;
 
    if (clear_color &&
-       (!color || !pvrgpu_rgba8_cbuf_bound(&ctx->framebuffer))) {
+       (!color || !pvrgpu_color_cbuf_bound(&ctx->framebuffer))) {
       debug_printf("pvrgpu: unsupported clear target; fail closed\n");
       if (clear_depth)
          pvrgpu_invalidate_full_depth_clear(ctx);
@@ -838,7 +694,7 @@ pvrgpu_clear(struct pipe_context *pipe,
    }
    /* Preserve submitted draw output before a CPU clear changes its backing.
     * Pending generic draws retain their ordered depth/stencil clear stream. */
-   if (clear_color && !pvrgpu_context_has_recorded_geometry(ctx))
+   if (clear_color || clear_depth || clear_stencil)
       pvrgpu_flush_current_color_attachments(pipe);
    const bool depth_backing_written =
       !clear_depth ||
@@ -861,7 +717,8 @@ pvrgpu_clear(struct pipe_context *pipe,
                                                         rect_y,
                                                         rect_width,
                                                         rect_height,
-                                                        stencil);
+                                                        stencil,
+                                                        stencil_clear_mask);
       if (full_surface_rect)
          ctx->stencil_clear_value = stencil & 0xffu;
       pvrgpu_counter_eventf("clear_stencil",
@@ -995,7 +852,9 @@ pvrgpu_clear(struct pipe_context *pipe,
          pvrgpu_resource(ctx->framebuffer.cbufs[0].texture);
       if (cbuf0) {
          cbuf0->driver_writes_model_cannot_reproduce =
-            !full_surface_rect || colormask != PIPE_MASK_RGBA;
+            !full_surface_rect || colormask != PIPE_MASK_RGBA ||
+            !pvrgpu_can_lower_clear_color_format(ctx->framebuffer.cbufs[0].format) ||
+            ctx->framebuffer.cbufs[0].texture->nr_samples > 1;
       }
    }
    pvrgpu_counter_eventf("clear_color",
@@ -1024,6 +883,12 @@ pvrgpu_clear(struct pipe_context *pipe,
    if (pvrgpu_case_reserves_native_pco_sequence() ||
        ctx->driver_draw_command_emitted ||
        pvrgpu_driver_draw_command_has_been_emitted())
+      return;
+   /* The legacy clear-only capsule is RGBA/UNORM and single-sample. Other
+    * formats have already been cleared exactly in native resource storage;
+    * a later draw imports that storage as its initial attachment. */
+   if (!pvrgpu_can_lower_clear_color_format(ctx->framebuffer.cbufs[0].format) ||
+       ctx->framebuffer.cbufs[0].texture->nr_samples > 1)
       return;
    if (full_surface_rect && colormask == PIPE_MASK_RGBA) {
       pvrgpu_emit_clear_color_command(ctx->framebuffer.width,
@@ -1075,8 +940,7 @@ pvrgpu_clear_render_target(struct pipe_context *pipe,
       debug_printf("pvrgpu: unsupported clear_render_target; fail closed\n");
       return;
    }
-   if (!pvrgpu_context_has_recorded_geometry(ctx))
-      pvrgpu_flush_current_color_attachments(pipe);
+   pvrgpu_flush_current_color_attachments(pipe);
    pvrgpu_fill_surface_rect_with_clear_color(dst,
                                              dstx,
                                              dsty,
@@ -1132,8 +996,8 @@ pvrgpu_clear_depth_stencil(struct pipe_context *pipe,
       pvrgpu_invalidate_full_depth_clear(ctx);
       return;
    }
-   if ((clear_flags & PIPE_CLEAR_DEPTH) == 0 ||
-       (clear_flags & ~PIPE_CLEAR_DEPTH) != 0 ||
+   if ((clear_flags & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL)) == 0 ||
+       (clear_flags & ~(PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL)) != 0 ||
        !pvrgpu_depth_surface_rect_supported(dst,
                                             dstx,
                                             dsty,
@@ -1144,19 +1008,24 @@ pvrgpu_clear_depth_stencil(struct pipe_context *pipe,
       return;
    }
 
-   const bool backing_written =
+   pvrgpu_flush_current_color_attachments(pipe);
+   const bool depth_written = !(clear_flags & PIPE_CLEAR_DEPTH) ||
       pvrgpu_fill_surface_rect_with_clear_depth(dst,
                                                 dstx,
                                                 dsty,
                                                 width,
                                                 height,
                                                 depth);
+   const bool stencil_written = !(clear_flags & PIPE_CLEAR_STENCIL) ||
+      pvrgpu_fill_surface_rect_with_clear_stencil(dst, dstx, dsty, width, height,
+                                                 stencil, 0xffu);
+   const bool backing_written = depth_written && stencil_written;
    const unsigned level_width =
       pvrgpu_surface_level_width(dst->texture, dst->level);
    const unsigned level_height =
       pvrgpu_surface_level_height(dst->texture, dst->level);
    if (dstx == 0 && dsty == 0 && width == level_width &&
-       height == level_height && depth == 1.0) {
+       height == level_height && depth == 1.0 && (clear_flags & PIPE_CLEAR_DEPTH)) {
       pvrgpu_note_full_depth_clear_one(ctx, dst, width, height);
    } else {
       pvrgpu_invalidate_full_depth_clear(ctx);

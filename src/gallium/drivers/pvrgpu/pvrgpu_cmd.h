@@ -49,6 +49,8 @@ extern "C" {
 #define PVRGPU_DRIVER_COMMAND_FORMAT_R32I "PIPE_FORMAT_R32_SINT"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_RG32I "PIPE_FORMAT_R32G32_SINT"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32I "PIPE_FORMAT_R32G32B32A32_SINT"
+/* Linear floating-point transport; PBE blending retains its full range. */
+#define PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32F "PIPE_FORMAT_R32G32B32A32_FLOAT"
 
 struct pvrgpu_clear_color_command {
    const char *case_name;
@@ -362,6 +364,8 @@ pvrgpu_systemc_flush_readback_pixels(uint32_t width,
                                      uint32_t height,
                                      uint32_t bytes_per_pixel,
                                      uint32_t attachment,
+                                     uint32_t sample_count,
+                                     uint32_t depth_format,
                                      uint8_t *pixels,
                                      size_t pixels_size,
                                      bool *out_written,
