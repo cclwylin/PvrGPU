@@ -4,6 +4,7 @@
 | --- | --- |
 | `run_deqp_dynamic.sh` | 執行引擎：把已 build 好的 dEQP binary、PCO driver、PvrGPU bridge 在 runtime 串起來 |
 | `deqp_dynamic_ui.py` | PySide6 桌面前端：預設選單 → 即時 run status → 最後的 dashboard |
+| `deqp_4level_ui.py` | 同一個引擎的四層回歸前端：L1–L4 × 30 組目錄、等距取樣、分片、合併與分組統計（見 [docs/dEQP_4level.md](../docs/dEQP_4level.md)）|
 | `run_deqp_group_sample.sh` | 取 `tools/deqp_groups.py` 其中一組的樣本跑，列出 tally 與每個失敗的 QPA 理由（`--list` 列出 24 組）|
 
 **dEQP 一律走這條路。** `script/run_regression.sh` 不跑 dEQP：`2.dEQP` 的 RDC
@@ -222,3 +223,33 @@ UI 只做三件事：組參數、解析 `PVRGPU_DYN {json}` 事件、呈現。
 `resolved / check_ok / discovery_started / discovery_finished / run_start /
 case_start / case_end / run_end` 這幾個事件就是兩者之間的全部介面，
 所以 CLI 單獨跑出來的結果與 UI 完全一致，CI 也可以只用 script。
+
+
+## `deqp_4level_ui.py` — 四層回歸前端
+
+`deqp_dynamic_ui.py` 一次選一個 group 或一個 case；這一支選的是
+[docs/dEQP_4level.md](../docs/dEQP_4level.md) 定義的**層**。
+
+```bash
+python3 script/deqp_4level_ui.py
+```
+
+四層都涵蓋全部 30 組，差別只在每組取幾條：L1 每組 `min(N, 100)`、L2
+`min(N, 400)`、L3 全跑、L4 是四個 module 列舉出的全部案例。取樣用文件第 4.2 節
+的等距取法 `c[i*len(c)//n]`，不是整數 stride——後者在 N 小於配額兩倍時會退化成
+「取前 N 條」，第 19 組因此會整批漏掉 `indirect_dispatch`。
+
+- **分片**：L1–L3 預設 8 片，round-robin 切，每片自己的 `--output-dir`。
+  驅動是附加寫入 counter 檔的，兩片共用一個目錄會讀到交錯的舊事件。
+  L4 強制 1 片並開啟存圖，這是文件刻意的規定。
+- **gl-config 例外**：第 22、30 組的 `multisample.default_framebuffer.` 自動
+  切到 `rgba8888d24s8ms4`，並分到獨立的 caselist 與輸出目錄。
+- **30 組目錄**寫在這支 UI 裡，不在 `tools/deqp_groups.py`（那裡還是舊的 24
+  組）。表格與文件的三個層總數（2534 / 7904 / 30491）在 import 時互相檢查，
+  對不上就直接拋例外，不會安靜地跑成另一份回歸。
+- **計畫分頁**會把文件記的 N 與這台機器 discovery 到的條數並排；不一致代表 CTS
+  換過，取樣落在另一批案例上。
+
+每次 run 的目錄裡有 `plan.json`（這次的計畫）、`commands.sh`（等效的手動指令，
+可以直接貼進終端機重跑同一批 case）、合併後的 `summary.tsv`、以及
+`stats.txt`（每組的 pass/fail 與分片的 exit code）。
