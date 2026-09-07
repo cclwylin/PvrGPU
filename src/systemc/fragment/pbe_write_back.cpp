@@ -155,7 +155,16 @@ void PbeWriteBack::Run() {
         throw std::logic_error("PbeWriteBack reused a live source handle");
       }
 
+      /* Each attachment's payload is handed over the same way attachment
+       * zero's is: taken off the state before it is stored, then released
+       * once the store has succeeded.  Leaving the extra ones on the state
+       * kept them alive past the frame and the pool reported the leak. */
       const PoolHandle pbe_source = state.pbe_framebuffer;
+      PoolHandle extra_sources[kMaxRenderTargets - 1]{};
+      for (std::uint32_t target = 1; target < render_target_count; ++target) {
+        extra_sources[target - 1] = state.extra_pbe_framebuffer[target - 1];
+        state.extra_pbe_framebuffer[target - 1] = {};
+      }
       state.pbe_framebuffer = {};
       state.slc_writeback_lines = {};
       state.dram_framebuffer = readback_handle;
@@ -175,13 +184,21 @@ void PbeWriteBack::Run() {
       state.stage = PipelineStage::kFramebufferReady;
       WaitForCycles(memory_cycles);
 
+      const auto release_sources = [&]() {
+        pool_.Release(pbe_source);
+        for (PoolHandle &extra : extra_sources) {
+          if (HasPoolHandle(extra))
+            pool_.Release(extra);
+        }
+      };
       try {
         StorePipelineState(pool_, txn.state, state);
       } catch (...) {
         pool_.Release(readback_handle);
+        release_sources();
         throw;
       }
-      pool_.Release(pbe_source);
+      release_sources();
       completion->write(txn);
       continue;
     }

@@ -1145,16 +1145,44 @@ void ValidateDrawListStats(const CounterTxn &counters,
 void ValidateMemoryPath(const Options &options, const PipelineState &state,
                         std::uint64_t expected_bytes) {
   const CounterTxn &counters = state.counters;
+  /* The pixel data master moves one transaction per colour attachment, so a
+   * draw writing two of them -- as a shader returning two results does --
+   * moves twice the bytes.  Only the first attachment is read back.  Each
+   * condition is checked on its own so a mismatch names the counter rather
+   * than reporting the memory path as a whole. */
+  const std::uint64_t render_target_count =
+      state.render_target_count == 0 ? 1U : state.render_target_count;
   if (state.memory_mode != options.memory_mode ||
-      state.cache_bypass != static_cast<std::uint8_t>(options.cache_bypass) ||
-      counters.pixel_data_master_transactions != 1 ||
-      counters.pixel_data_master_bytes != expected_bytes ||
-      counters.pixel_data_master_cycles == 0 ||
-      counters.framebuffer_dram_readback_bytes != expected_bytes ||
-      counters.dram_cycles !=
-          counters.dram_read_transactions + counters.dram_write_transactions) {
+      state.cache_bypass != static_cast<std::uint8_t>(options.cache_bypass)) {
+    throw std::runtime_error("JsonReporter memory mode or cache bypass "
+                             "does not match the run options");
+  }
+  if (counters.pixel_data_master_transactions != render_target_count) {
     throw std::runtime_error(
-        "JsonReporter framebuffer memory-path counter mismatch");
+        "JsonReporter pixel data master made " +
+        std::to_string(counters.pixel_data_master_transactions) +
+        " transactions, expected one per colour attachment (" +
+        std::to_string(render_target_count) + ")");
+  }
+  if (counters.pixel_data_master_bytes !=
+      expected_bytes * render_target_count) {
+    throw std::runtime_error(
+        "JsonReporter pixel data master moved " +
+        std::to_string(counters.pixel_data_master_bytes) + " bytes, expected " +
+        std::to_string(expected_bytes * render_target_count));
+  }
+  if (counters.pixel_data_master_cycles == 0)
+    throw std::runtime_error("JsonReporter pixel data master spent no cycles");
+  if (counters.framebuffer_dram_readback_bytes != expected_bytes) {
+    throw std::runtime_error(
+        "JsonReporter framebuffer read back " +
+        std::to_string(counters.framebuffer_dram_readback_bytes) +
+        " bytes, expected " + std::to_string(expected_bytes));
+  }
+  if (counters.dram_cycles !=
+      counters.dram_read_transactions + counters.dram_write_transactions) {
+    throw std::runtime_error(
+        "JsonReporter DRAM cycles do not match its transaction count");
   }
 
   if (counters.tcu_line_accesses != 0 || counters.tcu_read_accesses != 0 ||
