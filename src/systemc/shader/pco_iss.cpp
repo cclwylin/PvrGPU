@@ -2710,10 +2710,19 @@ PcoInstruction DecodeGenericConditionalSelectGroup(
    * itself in phase 1; fsign multiplies by a saturating infinity.  Reading
    * both as main-ALU operations is what admits the whole family.
    */
-  const PcoPhaseOperation phase0 =
+  /*
+   * The operations arrive phase 1 first, while the source blocks arrive
+   * lower first and the lower block belongs to phase 0 -- fsign shows both
+   * halves of that: its bytes are a one-source move of -1.0 followed by a
+   * two-source saturating multiply, against a two-source lower block and a
+   * one-source upper one.
+   */
+  const PcoPhaseOperation phase1_operation =
       DecodePhaseOperation(binary, group_end, cursor, header.offset);
-  const PcoPhaseOperation phase1 =
+  const PcoPhaseOperation phase0_operation =
       DecodePhaseOperation(binary, group_end, cursor, header.offset);
+  const PcoPhaseOperation &phase0 = phase0_operation;
+  const PcoPhaseOperation &phase1 = phase1_operation;
 
   /*
    * Sources are packed as a lower block holding s0..s2 and an upper block
@@ -2825,8 +2834,8 @@ PcoInstruction DecodeGenericConditionalSelectGroup(
   instruction.comparison_test_type = test.type;
   instruction.conditional_select_inverted = 1U;
   instruction.phase_composed = 1U;
-  instruction.phase0 = phase0;
-  instruction.phase1 = phase1;
+  instruction.phase0 = phase0_operation;
+  instruction.phase1 = phase1_operation;
   instruction.phase0.source = lower_sources[0];
   instruction.phase0.source1 = lower_sources[1];
   instruction.phase0.source2 = lower_sources[2];
@@ -2862,15 +2871,24 @@ PcoInstruction DecodeGenericPhase2Group(
   if (operation_offset >= header.offset + header.total_bytes)
     DecodeError(operation_offset, "missing phase-2 ALU operation");
   switch (binary[operation_offset]) {
-  /*
-   * A MOVC that moves phase 0's result.  min, max and the CSEL forms are
-   * decoded here; group_map shows the sign functions to be the same
-   * phase-composed shape with a different test, but routing them by the
-   * test operation alone also caught the CSEL and trunc groups that share
-   * it, so they stay with the form that already serves them.
-   */
-  case 0xd0:
+  case 0xd0: {
+    /*
+     * A MOVC that moves phase 0's result.  The pair select -- min and max --
+     * chooses between the two operands it compares, so its test is one of
+     * the ordered binary forms over the phases' own results; the sign
+     * functions test their input against zero and compute something from it
+     * in each phase.  group_map(O_MIN) and group_map(O_FSIGN) differ in
+     * exactly that test.
+     */
+    const DecodedTestPhase peek = DecodeTestPhase(
+        binary, header.offset + header.total_bytes, operation_offset + 2,
+        /*expect_phase2_end=*/true);
+    if (peek.op == kTstOpGreaterZero || peek.op == kTstOpGreaterEqualZero) {
+      return DecodeGenericConditionalSelectGroup(stage, binary, header,
+                                                 group_index);
+    }
     return DecodeGenericTestSelectGroup(binary, header, group_index);
+  }
   case 0xd1:
     return DecodeGenericConditionalSelectGroup(stage, binary, header,
                                                 group_index);

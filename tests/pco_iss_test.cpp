@@ -4959,15 +4959,15 @@ void TestDecodeAndExecuteIdeasNegatedBcsel() {
 34 8a 80 87 00 00 00 23
 )hex");
   const auto decoded = Decode(ShaderStage::kFragment, fragment_binary);
-  /* The negate is a source modifier of the value phase 1 moves, carried on
-   * that phase rather than selecting a separate opcode: phase 0 moves the
-   * value the MOVC takes when the test fails, phase 1 the one it takes when
-   * the test passes. */
+  /* The negate is a source modifier of the phase that computes ft0 -- the
+   * value the MOVC takes when the test fails -- carried on that phase rather
+   * than selecting a separate opcode.  The operations arrive phase 1 first,
+   * so this one is the second operation byte and reads the lower block. */
   Check(decoded.summary.group_count == 8 &&
             decoded.instructions[3].opcode ==
                 PcoOpcode::kTestConditionalSelect &&
             decoded.instructions[3].phase_composed == 1 &&
-            decoded.instructions[3].phase1.opcode ==
+            decoded.instructions[3].phase0.opcode ==
                 PcoOpcode::kFloatNegate &&
             decoded.instructions[3].comparison_test_op == 0x0 &&
             decoded.instructions[3].comparison_test_type == 0x5 &&
@@ -4976,18 +4976,13 @@ void TestDecodeAndExecuteIdeasNegatedBcsel() {
             decoded.instructions[3].phase1.source.index == 13 &&
             decoded.instructions[3].output_index == 13,
         "Ideas negated BCSEL preserves condition/true/false/destination ABI");
-  /*
-   * The negate belongs to phase 1, whose operand is the upper block's slot --
-   * group_map(O_BCSEL) gives phase 1 SRC(2) and s3 -- not to the value phase
-   * 0 moves.  This fixture's test reads a nonzero condition, so the MOVC
-   * takes phase 0's value, which is the 2.0 the first MOVI wrote and carries
-   * no sign change.  Reading the negate as phase 0's produced -2.0 here and
-   * put ceil's added one on the wrong side of its select.
-   */
+  /* The test reads a nonzero condition, so the MOVC takes internal source 4
+   * -- phase 0's result -- which is the negate applied to the 2.0 the first
+   * MOVI wrote. */
   const auto true_pixel =
       ExecuteFragment(decoded.summary, decoded.instructions);
-  Check(true_pixel.pixel_outputs[0] == FloatBits(2.0F),
-        "a failing test takes the value phase 0 moves, unnegated");
+  Check(true_pixel.pixel_outputs[0] == FloatBits(-2.0F),
+        "a failing test takes phase 0's result, with its negate");
 
   auto false_binary = fragment_binary;
   false_binary[16] = 0;
@@ -4997,11 +4992,11 @@ void TestDecodeAndExecuteIdeasNegatedBcsel() {
   const auto false_decoded = Decode(ShaderStage::kFragment, false_binary);
   const auto false_pixel = ExecuteFragment(
       false_decoded.summary, false_decoded.instructions);
-  /* Zeroing the condition makes the test pass, so the MOVC takes phase 1 --
-   * the phase whose operation byte carries the negate -- and the 7.0 the
-   * third MOVI wrote comes back negated. */
-  Check(false_pixel.pixel_outputs[0] == FloatBits(-7.0F),
-        "a passing test takes the value phase 1 moves, negated");
+  /* Zeroing the condition makes the test pass, so the MOVC moves what its
+   * movw0 names -- phase 1's result, which carries no modifier -- and the
+   * 7.0 the third MOVI wrote comes back unchanged. */
+  Check(false_pixel.pixel_outputs[0] == FloatBits(7.0F),
+        "a passing test takes phase 1's result, unmodified");
 
   /* The two modifier bits are independent: setting both makes the phase
    * move the negated absolute of its source, which is an instruction the
@@ -5009,9 +5004,9 @@ void TestDecodeAndExecuteIdeasNegatedBcsel() {
   auto mutation = fragment_binary;
   mutation[45] = 0x03;
   const auto negated_absolute = Decode(ShaderStage::kFragment, mutation);
-  Check(negated_absolute.instructions[3].phase1.opcode ==
+  Check(negated_absolute.instructions[3].phase0.opcode ==
                 PcoOpcode::kFloatNegate &&
-            negated_absolute.instructions[3].phase1.source0_absolute == 1,
+            negated_absolute.instructions[3].phase0.source0_absolute == 1,
         "a phase move takes the negate and absolute modifiers together");
   mutation = fragment_binary;
   mutation[44] = 0x96;
@@ -5037,18 +5032,28 @@ void TestDecodeAndExecuteConditionalSelectGreaterZero() {
 
   const auto positive = make_binary(FloatBits(1.0F));
   const auto decoded = Decode(ShaderStage::kFragment, positive);
+  /*
+   * group_map(O_CSEL) is the same phase-composed shape as bcsel and ceil:
+   * a phase moves each candidate, the TST reads the fed-through condition,
+   * and the MOVC takes phase 1's result when it passes.  The comparison is
+   * the greater-than-zero the TST phase encodes rather than an opcode of its
+   * own, so the operands are the phases' sources.
+   */
   Check(decoded.summary.group_count == 4 &&
             decoded.instructions[2].opcode ==
-                PcoOpcode::kConditionalSelectGreaterZero &&
+                PcoOpcode::kTestConditionalSelect &&
+            decoded.instructions[2].phase_composed == 1 &&
+            decoded.instructions[2].comparison_test_op ==
+                0x1 /* greater than zero */ &&
             decoded.instructions[2].source.bank ==
                 PcoRegisterBank::kTemporary &&
             decoded.instructions[2].source.index == 14 &&
-            decoded.instructions[2].source1.bank ==
+            decoded.instructions[2].phase0.source.bank ==
                 PcoRegisterBank::kSpecial &&
-            decoded.instructions[2].source1.index == 0 &&
-            decoded.instructions[2].source2.bank ==
+            decoded.instructions[2].phase0.source.index == 0 &&
+            decoded.instructions[2].phase1.source.bank ==
                 PcoRegisterBank::kTemporary &&
-            decoded.instructions[2].source2.index == 17 &&
+            decoded.instructions[2].phase1.source.index == 17 &&
             decoded.instructions[2].output_index == 16,
         "Refract CSEL.GZ preserves condition/true/false/destination ABI");
   Check(ExecuteFragment(decoded.summary, decoded.instructions)
@@ -5082,9 +5087,24 @@ void TestDecodeAndExecuteConditionalSelectGreaterZero() {
         "Refract CSEL.GZ positive infinity is greater than zero");
 
   constexpr std::size_t group = 24;
+  /* Clearing this source byte names a different register rather than
+   * malforming the group, now that the source blocks are read at whatever
+   * width their own encoding gives. */
+  auto other_source = positive;
+  other_source[group + 12] = 0x00;
+  const auto with_other_source = Decode(ShaderStage::kFragment, other_source);
+  Check(with_other_source.instructions[2].opcode ==
+                PcoOpcode::kTestConditionalSelect &&
+            (with_other_source.instructions[2].source.index !=
+                 decoded.instructions[2].source.index ||
+             with_other_source.instructions[2].phase0.source.index !=
+                 decoded.instructions[2].phase0.source.index ||
+             with_other_source.instructions[2].phase1.source.index !=
+                 decoded.instructions[2].phase1.source.index),
+        "a cleared source byte names different registers");
+
   for (const std::pair<std::size_t, std::uint8_t> mutation : {
            std::pair<std::size_t, std::uint8_t>{group + 5, 0xf3},
-           {group + 12, 0x00},
            {group + 14, 0x10},
            {group + 9, 0xbf},
            {group + 12, 0x11},
@@ -5093,7 +5113,9 @@ void TestDecodeAndExecuteConditionalSelectGreaterZero() {
     auto malformed = positive;
     malformed[mutation.first] = mutation.second;
     ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, malformed); },
-                  "Refract CSEL.GZ phase/selector/ISS/register mutation");
+                  "Refract CSEL.GZ mutation at byte " +
+                      std::to_string(mutation.first) + " = " +
+                      std::to_string(mutation.second));
   }
 }
 
