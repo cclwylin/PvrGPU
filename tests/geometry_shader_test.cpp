@@ -3,8 +3,11 @@
 #include "memory/gpu_memory_system.h"
 #include "pco_geometry_fixtures.h"
 #include "pco_geometry_compiler_fixtures.h"
+#include "pco_geometry_texture_fixtures.h"
+#include "common/glbench_texture_fixture.h"
 #include "shader/geometry_iss.h"
 #include "shader/geometry_shader.h"
+#include "texture/texture_unit.h"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -301,6 +304,192 @@ void PureNative() {
   Reject([&]{MakeGeometryTask(badabi,{0x1000,0x80,16,0,0},0,0);});
 }
 
+void SampleExecution() {
+  const auto native = DecodeGeometryPcoProgram(GeometryTextureNativeFixture());
+  ValidateGeometryProgram(native, GeometryTextureNativeAbi());
+  unsigned native_samples = 0;
+  for (const auto &i : native.instructions) if (i.opcode == PcoOpcode::kTextureSample) {
+    Check(i.source1.index == 4 + native_samples * 20 && i.source2.index == 12 + native_samples * 20,
+          "genuine GS binary decodes SH4/SH24 texture sets independently");
+    auto bad = GeometryTextureNativeFixture();
+    bad[i.binary_offset + 1] |= 3U;
+    Reject([&] { DecodeGeometryPcoProgram(bad); });
+    ++native_samples;
+  }
+  Check(native_samples == 2, "native GS compiler fixture retains both true SMP instructions");
+  auto program = DecodeGeometryPcoProgram(GeometryNativeLoadFixture());
+  auto abi = GeometryNativeLoadAbi();
+  abi.temps = 8; abi.shareds = 44;
+  abi.uniform_buffer_descriptor_start = abi.push_constant_start = 44;
+  auto &sample = program.instructions[0];
+  sample = {};
+  sample.opcode = PcoOpcode::kTextureSample;
+  sample.source = {PcoRegisterBank::kTemporary, 4};
+  sample.source1 = {PcoRegisterBank::kShared, 4};
+  sample.source2 = {PcoRegisterBank::kShared, 12};
+  sample.source_count = 3; sample.repeat_count = 1;
+  sample.component_count = 4; sample.texture_dimension = 2;
+  sample.texture_fcnorm = 1; sample.target = PcoWriteTarget::kTemporary;
+  ValidateGeometryProgram(program, abi);
+  struct Record {
+    PcoTextureRequest request;
+    unsigned calls = 0;
+    std::array<std::uint32_t, 4> words{0x80000000U, 0x7fc0abcdU, 0x12345678U, 0xffffffffU};
+  } record;
+  GeometryExecutionCallbacks cb;
+  cb.user_data = &record;
+  cb.sample = [](void *opaque, const PcoTextureRequest &request, std::uint32_t *response) {
+    auto &r = *static_cast<Record *>(opaque);
+    r.request = request; ++r.calls; std::copy(r.words.begin(), r.words.end(), response);
+  };
+  for (unsigned set : {0U, 1U}) for (unsigned dimension : {2U, 3U}) {
+    std::vector<std::uint32_t> shared(44);
+    for (unsigned word = 4; word < shared.size(); ++word) shared[word] = 0x01020300U + word;
+    auto task = MakeGeometryTask(abi, shared, 5, 7);
+    for (unsigned c = 4; c < 8; ++c) {
+      task.temporaries[c] = FloatBits(0.125F * (c - 3)); task.temporary_written.set(c);
+    }
+    sample.source1.index = 4 + set * 20; sample.source2.index = 12 + set * 20;
+    sample.texture_dimension = dimension;
+    ValidateGeometryProgram(program, abi);
+    GeometryExecutionStats stats;
+    record.calls = 0;
+    StepGeometryTask(program, abi, task, cb, stats);
+    Check(record.calls == 1 && task.pending_count == 4 && !task.temporary_written.test(0),
+          "GS SMP real response is pending until WDF");
+    Check(record.request.descriptor_set == set && record.request.dimension == dimension &&
+          record.request.coordinates[0] == task.temporaries[4] &&
+          record.request.coordinates[1] == task.temporaries[5] &&
+          record.request.coordinates[2] == (dimension == 3 ? task.temporaries[6] : 0U),
+          "GS SMP preserves raw coordinates and independent descriptor namespace");
+    for (unsigned word = 0; word < 4; ++word)
+      Check(record.request.texture_state[word] == shared[4 + set * 20 + word] &&
+            record.request.sampler_state[word] == shared[12 + set * 20 + word],
+            "GS SMP raw descriptors begin after primitive input SH0..3");
+    StepGeometryTask(program, abi, task, cb, stats);
+    Check(!task.pending_count && task.temporary_written.contains_range(0, 4) &&
+          std::equal(record.words.begin(), record.words.end(), task.temporaries.begin()),
+          "GS WDF commits exact raw float/integer response DWORDs");
+    Check(stats.texture_instructions == 1 && !stats.memory_instructions && !stats.load_instructions,
+          "GS SMP instruction accounting is separate from primitive LD");
+    task = MakeGeometryTask(abi, shared, 0, 0);
+    Reject([&] { StepGeometryTask(program, abi, task, cb, stats); });
+    sample.exec_cnd = 1; task.predicate = 0; record.calls = 0;
+    StepGeometryTask(program, abi, task, cb, stats);
+    StepGeometryTask(program, abi, task, cb, stats);
+    Check(!record.calls && !task.pending_count && !task.temporary_written.test(0),
+          "predicated-away GS SMP neither reads unwritten coords nor requests memory");
+    sample.exec_cnd = 0;
+  }
+  for (unsigned mutation = 0; mutation < 13; ++mutation) {
+    auto bad = program;
+    auto &s = bad.instructions[0];
+    switch (mutation) {
+      case 0: s.source1.index = 0; break;
+      case 1: s.source1.index = 5; break;
+      case 2: s.source1.index = 44; s.source2.index = 52; break;
+      case 3: s.source2.index = s.source1.index + 4; break;
+      case 4: s.source.bank = PcoRegisterBank::kShared; break;
+      case 5: s.source.index = 7; break;
+      case 6: s.output_index = 6; break;
+      case 7: s.component_count = 3; break;
+      case 8: s.texture_dimension = 1; break;
+      case 9: s.texture_non_normalized_coords = 1; break;
+      case 10: s.data_request = 1; break;
+      case 11: s.repeat_count = 2; break;
+      case 12: bad.instructions[1].opcode = PcoOpcode::kNop; break;
+    }
+    Reject([&] { ValidateGeometryProgram(bad, abi); });
+  }
+  for (unsigned start : {0U, 3U, 5U, 20U, 184U}) {
+    auto bad = abi; bad.uniform_buffer_descriptor_start = bad.push_constant_start = bad.shareds = start;
+    Reject([&] { ValidateGeometryProgram(program, bad); });
+  }
+}
+
+PipelineTxn MakePipeline(MemoryPool &pool, MemoryMode mode, unsigned epoch, unsigned max_vertices);
+PipelineTxn MakeTexturePipeline(MemoryPool &pool, GpuMemorySystem &memory, unsigned epoch) {
+  auto txn = MakePipeline(pool, memory.mode(), epoch, 1);
+  auto s = LoadPipelineState(pool, txn.state);
+  pool.Release(s.geometry_code); pool.Release(s.geometry_shared_registers);
+  s.functional_case = FunctionalCase::kDriverPcoTriangles;
+  s.geometry_code = StoreNewArray(pool, GeometryTextureNativeFixture());
+  s.geometry_pco_abi = GeometryTextureNativeAbi();
+  s.geometry_sampled_texture_count = 2;
+  std::vector<std::uint32_t> shared(52);
+  std::vector<TextureResource> resources;
+  std::vector<SamplerState> samplers;
+  for (unsigned set = 0; set < 2; ++set) {
+    auto fixture = MakeGlbenchFillTextureFixture(TextureFilter::kNearest);
+    const std::array<std::uint8_t, 4> color = set ? std::array<std::uint8_t,4>{16, 32, 64, 255}
+                                               : std::array<std::uint8_t,4>{128, 64, 32, 255};
+    for (std::size_t word = 0; word < fixture.texture_bytes.size(); ++word)
+      fixture.texture_bytes[word] = color[word % 4];
+    fixture.resource.gpu_address += set * UINT64_C(0x200000);
+    fixture.resource.descriptor_set = set; fixture.sampler.descriptor_set = set;
+    const auto address_mask = ((UINT64_C(1) << 38) - 1) << 16;
+    auto image_word1 = std::uint64_t(fixture.fragment_shared[2]) |
+                       (std::uint64_t(fixture.fragment_shared[3]) << 32);
+    image_word1 = (image_word1 & ~address_mask) | ((fixture.resource.gpu_address >> 2) << 16);
+    fixture.fragment_shared[2] = image_word1; fixture.fragment_shared[3] = image_word1 >> 32;
+    std::copy(fixture.fragment_shared.begin(), fixture.fragment_shared.end(), shared.begin() + 4 + set * 20);
+    memory.HostWrite(fixture.resource.gpu_address, fixture.texture_bytes.data(), fixture.texture_bytes.size());
+    resources.push_back(fixture.resource); samplers.push_back(fixture.sampler);
+  }
+  s.geometry_texture_resources = StoreNewArray(pool, resources);
+  s.geometry_sampler_states = StoreNewArray(pool, samplers);
+  const std::uint64_t uniform_address = UINT64_C(0x8000020000);
+  const std::array<std::uint32_t,4> uniform{FloatBits(-1), FloatBits(0.5F), FloatBits(4), FloatBits(2)};
+  memory.HostWrite(uniform_address, reinterpret_cast<const std::uint8_t *>(uniform.data()), sizeof(uniform));
+  shared[44] = static_cast<std::uint32_t>(uniform_address);
+  shared[45] = static_cast<std::uint32_t>(uniform_address >> 32); shared[46] = sizeof(uniform);
+  shared[48] = FloatBits(0.5F);
+  s.geometry_uniform_buffer_resources = StoreNewArray(pool,
+      std::vector<UniformBufferResource>{{uniform_address, sizeof(uniform), 0, 44}});
+  s.geometry_shared_registers = StoreNewArray(pool, shared);
+  auto lanes = LoadArray<VertexLane>(pool, s.vertex_lanes);
+  for (auto &lane : lanes) {
+    const std::array<std::uint32_t,4> position{FloatBits(0.125F), FloatBits(0.375F), 0, FloatBits(1)};
+    std::copy(position.begin(), position.end(), lane.vertex_output);
+  }
+  StoreArray(pool, s.vertex_lanes, lanes);
+  StorePipelineState(pool, txn.state, s);
+  return txn;
+}
+
+void VerifyTextureAndRelease(MemoryPool &pool, PipelineTxn txn) {
+  const auto s = LoadPipelineState(pool, txn.state);
+  const auto lanes = LoadArray<VertexLane>(pool, s.vertex_lanes);
+  std::cout << "GS texture memorymode=" << static_cast<unsigned>(s.memory_mode)
+      << " lanes=" << lanes.size() << " invocations=" << s.counters.gs_invocations
+      << " load=" << s.counters.gs_load_instructions << " memory=" << s.counters.gs_memory_instructions
+      << " smp=" << s.geometry_texture_instruction_count << " request=" << s.geometry_texture_request_count
+      << " fetch=" << s.geometry_texel_fetch_count << '\n';
+  Check(s.stage == PipelineStage::kVertexShaded && lanes.size() == 6 &&
+        s.counters.gs_invocations == 6 && s.counters.gs_load_instructions == 12 &&
+        s.counters.gs_memory_instructions == 78 && s.counters.gs_tex_instructions == 12 &&
+        s.geometry_texture_instruction_count == 12 &&
+        s.geometry_texture_request_count == 12 && s.geometry_texel_fetch_count == 12 &&
+        s.counters.texture_requests == 12 && s.counters.texel_fetches == 12 &&
+        !s.vertex_texture_request_count && !s.fragment_texture_request_count,
+        "native GS+UBO+two SMP FIFO rounds conserve per-invocation traffic across all memory modes");
+  const auto drawlists = LoadArray<DrawListStats>(pool, s.drawlist_stats);
+  Check(drawlists.size() == 1 && drawlists[0].geometry.program_tex_instructions == 2 &&
+        drawlists[0].geometry.executed_tex_instructions == 12 &&
+        drawlists[0].geometry.program_memory_instructions == 13 &&
+        drawlists[0].geometry.executed_memory_instructions == 78,
+        "GS DrawList distinguishes native texture from other memory instructions");
+  const std::array<float,4> ubo{-1, 0.5F, 4, 2}, tex0{128,64,32,255}, tex1{16,32,64,255};
+  for (const auto &lane : lanes) for (unsigned component = 0; component < 4; ++component) {
+    const float expected = ((ubo[component] + tex0[component] / 255.0F) + tex1[component] / 255.0F) * 0.5F;
+    Check(lane.vertex_output[4 + component] == FloatBits(expected),
+          "native GS varying comes from real TextureUnit texels, UBO and CB0 arithmetic");
+  }
+  Check(!HasPoolHandle(s.texture_sample_requests) && !HasPoolHandle(s.texture_sample_responses),
+        "native GS retires every FIFO response before publishing completed vertices");
+  ReleaseFunctionalPayloads(pool, s); pool.Release(txn.state);
+}
+
 PipelineTxn MakePipeline(MemoryPool &pool,MemoryMode mode,unsigned epoch,unsigned max_vertices) {
   PipelineState s;
   s.stage=PipelineStage::kVertexShaded; s.memory_mode=mode;
@@ -356,6 +545,7 @@ void VerifyAndRelease(MemoryPool &pool,PipelineTxn txn,unsigned epoch,unsigned m
 int sc_main(int,char**) {
   try {
     PureNative();
+    SampleExecution();
     CompilerNative();
     LoopNative();
     DynamicPushNative();
@@ -365,6 +555,13 @@ int sc_main(int,char**) {
     sc_core::sc_fifo<PipelineTxn> di("di",1),do_("do",1),bi("bi",1),bo("bo",1),ci("ci",1),co("co",1);
     GeometryShader d("geometry_direct",pool,&direct),b("geometry_bypass",pool,&bypass),c("geometry_cache",pool,&cache);
     d.input(di);d.output(do_);b.input(bi);b.output(bo);c.input(ci);c.output(co);
+    sc_core::sc_fifo<PipelineTxn> drq("drq",1),drs("drs",1),brq("brq",1),brs("brs",1),crq("crq",1),crs("crs",1);
+    sc_core::sc_fifo<PipelineTxn> dti("dti",1),dto("dto",1),bti("bti",1),bto("bto",1),cti("cti",1),cto("cto",1);
+    TextureUnit dt("texture_direct",pool,&direct),bt("texture_bypass",pool,&bypass),ct("texture_cache",pool,&cache);
+    dt.input(dti);dt.output(dto);bt.input(bti);bt.output(bto);ct.input(cti);ct.output(cto);
+    d.texture_request_output(drq);d.texture_response_input(drs);dt.geometry_sample_input(drq);dt.geometry_sample_output(drs);
+    b.texture_request_output(brq);b.texture_response_input(brs);bt.geometry_sample_input(brq);bt.geometry_sample_output(brs);
+    c.texture_request_output(crq);c.texture_response_input(crs);ct.geometry_sample_input(crq);ct.geometry_sample_output(crs);
     const std::array<MemoryMode,3> modes{MemoryMode::kDirect,MemoryMode::kBypass,MemoryMode::kCache};
     const std::array<sc_core::sc_fifo<PipelineTxn>*,3> inputs{&di,&bi,&ci},outputs{&do_,&bo,&co};
     for(unsigned mode=0;mode<3;++mode) {
@@ -381,6 +578,16 @@ int sc_main(int,char**) {
       sc_core::sc_start(sc_core::sc_time(1,sc_core::SC_US));
       Check(outputs[mode]->nb_read(done)&&done.sequence==2,"output data_read event releases pending GS completion");
       VerifyAndRelease(pool,done,2,0);
+    }
+    const std::array<GpuMemorySystem *,3> memories{&direct,&bypass,&cache};
+    for (unsigned mode = 0; mode < 3; ++mode) {
+      const auto textured = MakeTexturePipeline(pool, *memories[mode], 3 + mode);
+      Check(inputs[mode]->nb_write(textured), "native textured GS task enters bounded FIFO");
+      sc_core::sc_start(sc_core::sc_time(100,sc_core::SC_US));
+      PipelineTxn done;
+      Check(outputs[mode]->nb_read(done) && done.sequence == 3 + mode,
+            "native GS TextureUnit WDF continuation completes in each memory mode");
+      VerifyTextureAndRelease(pool, done);
     }
     Check(pool.bytes_in_flight()==0&&pool.allocations()==pool.releases(),"GS pool ownership is balanced");
     std::cout<<"native GeometryShader "<<checks<<" checks PASS\n";

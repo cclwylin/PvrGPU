@@ -18,7 +18,11 @@ void ValidateAbi(ShaderStage stage, const DriverPcoStageAbi &abi) {
   if (!control && stage != ShaderStage::kTessellationEvaluation)
     Fail("stage is neither TCS nor TES");
   const auto descriptors = control ? 8U : 4U;
-  if (abi.temps > kPcoTemporaryCount || abi.vertex_inputs != (control ? 3U : 5U) ||
+  // Reserved system-input prefix plus PCO's aligned writable VTXIN scratch.
+  // MakeTask initializes only the prefix, so spare words still require a
+  // native write before any read and every access stays within this ABI.
+  if (abi.temps > kPcoTemporaryCount || abi.vertex_inputs < (control ? 3U : 5U) ||
+      abi.vertex_inputs > kPcoVertexInputCount ||
       (control ? abi.vertex_outputs != 0 : abi.vertex_outputs < 4 || abi.vertex_outputs > 64) ||
       abi.coefficients || abi.entry_offset || abi.shareds < descriptors ||
       abi.shareds > kPcoMaximumSharedCount || abi.uniform_buffer_descriptor_count > 15 ||
@@ -157,6 +161,7 @@ void ValidateTessellationProgram(const PcoDecodedProgram &program,
     Fail("program metadata is not complete native TCS/TES");
   bool pending = false, ended = false;
   for (const auto &i : program.instructions) {
+    if (!HasCanonicalTextureLodMode(i)) Fail("texture LOD replacement flag is not canonical for opcode");
     if (!HasCanonicalNativeIntegerSignedness(i))
       Fail("integer signedness flag is not canonical for the native opcode");
     if (ended || !i.repeat_count || i.repeat_count > 16 || i.source_count > 4 ||
@@ -273,6 +278,7 @@ void StepTessellationTask(const PcoDecodedProgram &program,
       task.lane_count > 32 || task.instruction_index >= program.instructions.size())
     Fail("task stepped outside its native stage program");
   const auto &i = program.instructions[task.instruction_index];
+  if (!HasCanonicalTextureLodMode(i)) Fail("texture LOD replacement flag is not canonical for opcode");
   if (!HasCanonicalNativeIntegerSignedness(i))
     Fail("integer signedness flag is not canonical for the native opcode");
   if (++task.steps > UINT64_C(10000000)) Fail("native instruction watchdog");

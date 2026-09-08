@@ -409,6 +409,7 @@ bool UsesTextureSampling(FunctionalCase functional_case) {
 
 bool UsesTextureSampling(const PipelineState &state) {
   return UsesTextureSampling(state, ShaderStage::kVertex) ||
+         UsesTextureSampling(state, ShaderStage::kGeometry) ||
          UsesTextureSampling(state, ShaderStage::kFragment);
 }
 
@@ -417,9 +418,12 @@ bool UsesTextureSampling(const PipelineState &state, ShaderStage stage) {
     return stage == ShaderStage::kFragment &&
            UsesTextureSampling(state.functional_case);
   }
-  return stage == ShaderStage::kVertex
-             ? state.vertex_sampled_texture_count != 0
-             : state.sampled_texture_count != 0;
+  switch (stage) {
+    case ShaderStage::kVertex: return state.vertex_sampled_texture_count != 0;
+    case ShaderStage::kGeometry: return state.geometry_sampled_texture_count != 0;
+    case ShaderStage::kFragment: return state.sampled_texture_count != 0;
+    default: return false;
+  }
 }
 
 bool UsesShaderVaryings(FunctionalCase functional_case) {
@@ -599,11 +603,30 @@ bool IsExactVaryingBinding(const PipelineState &state,
   const std::uint32_t binding_count = VaryingVectorCount(state);
   if (state.driver_varying_bindings_explicit) {
     const auto coefficient_count = state.fragment_pco_abi.coefficients / 4;
+    const auto output_dwords = HasPoolHandle(state.tessellation_state)
+        ? state.tessellation_output_dwords : HasPoolHandle(state.geometry_code)
+        ? state.geometry_pco_abi.vertex_outputs : state.vertex_pco_abi.vertex_outputs;
+    if (HasPoolHandle(state.geometry_code) &&
+        binding.interpolation != InterpolationMode::kFlat) {
+      for (const auto &range : {
+               std::pair{state.geometry_primitive_id_output_start,
+                         state.geometry_primitive_id_output_count},
+               std::pair{state.geometry_layer_output_start,
+                         state.geometry_layer_output_count}}) {
+        if (range.second && std::uint64_t(binding.vertex_output_base) <
+                                std::uint64_t(range.first) + range.second &&
+            std::uint64_t(range.first) <
+                std::uint64_t(binding.vertex_output_base) + binding.component_count) {
+          if (out_refusal) *out_refusal = "geometry_integer_varying_not_flat";
+          return false;
+        }
+      }
+    }
     const bool valid = binding_index < binding_count && binding_count <= 64 &&
         binding.component_count >= 1 && binding.component_count <= 4 &&
         binding.vertex_output_base >= state.varying_output_start &&
-        binding.vertex_output_base <= state.vertex_pco_abi.vertex_outputs &&
-        binding.component_count <= state.vertex_pco_abi.vertex_outputs - binding.vertex_output_base &&
+        binding.vertex_output_base <= output_dwords &&
+        binding.component_count <= output_dwords - binding.vertex_output_base &&
         binding.coefficient_set_base >= 1 && binding.coefficient_set_base <= coefficient_count &&
         binding.component_count <= coefficient_count - binding.coefficient_set_base &&
         binding.w_coefficient_set == 0 &&
@@ -726,6 +749,10 @@ const char *PipelineStageName(PipelineStage stage) {
     return "vertex-texture-pending";
   case PipelineStage::kVertexTextureSamplesReady:
     return "vertex-texture-samples-ready";
+  case PipelineStage::kGeometryTexturePending:
+    return "geometry-texture-pending";
+  case PipelineStage::kGeometryTextureSamplesReady:
+    return "geometry-texture-samples-ready";
   case PipelineStage::kVertexShaded:
     return "vertex-shaded";
   case PipelineStage::kClipCullComplete:
@@ -813,6 +840,10 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
     for (const TextureResource &resource : resources)
       release_unique(resource.data);
   }
+  if (HasPoolHandle(state.geometry_texture_resources)) {
+    for (const auto &resource : LoadArray<TextureResource>(pool, state.geometry_texture_resources))
+      release_unique(resource.data);
+  }
 
   if (HasPoolHandle(state.tessellation_state)) {
     const auto tess = LoadArray<TessellationState>(pool, state.tessellation_state);
@@ -852,6 +883,8 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
       state.shader_varying_bindings,
       state.vertex_texture_resources,
       state.vertex_sampler_states,
+      state.geometry_texture_resources,
+      state.geometry_sampler_states,
       state.texture_resources,
       state.sampler_states,
       state.fragment_shared_registers,

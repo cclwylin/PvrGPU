@@ -26,7 +26,8 @@ void ValidateAbi(const ComputePcoAbi &abi) {
       stage.vertex_inputs > kPcoVertexInputCount || stage.vertex_outputs != 0 ||
       stage.coefficients > kPcoMaximumVaryingCoefficientCount ||
       stage.shareds > kPcoMaximumSharedCount || stage.entry_offset != 0 ||
-      abi.shared_memory_bytes != 0 || abi.scratch_bytes != 0)
+      abi.shared_memory_bytes > kComputeMaximumSharedBytes ||
+      (abi.shared_memory_bytes & 3U) || abi.scratch_bytes != 0)
     Fail("unsupported register, entry point, shared-memory or scratch ABI");
   if (abi.local_invocation_index_count > 1 ||
       !Fits(abi.local_invocation_index_start, abi.local_invocation_index_count,
@@ -40,13 +41,22 @@ void ValidateAbi(const ComputePcoAbi &abi) {
       abi.workgroup_id_start < abi.num_workgroups_start + abi.num_workgroups_count &&
       abi.num_workgroups_start < abi.workgroup_id_start + abi.workgroup_id_count)
     Fail("compute system-value coefficient spans overlap");
+  const std::uint32_t private_count = abi.shared_memory_bytes ? 4U : 0U;
+  const std::uint32_t user_prefix = 4U *
+      (stage.uniform_buffer_descriptor_count + abi.storage_buffer_descriptor_count);
+  const std::uint32_t image_end = user_prefix + 8U * abi.image_descriptor_count;
+  if (abi.image_descriptor_count > 32 ||
+      abi.image_descriptor_start != (abi.image_descriptor_count ? user_prefix : 0U))
+    Fail("compute image descriptor layout is invalid");
+  if (abi.shared_memory_descriptor_count != private_count ||
+      abi.shared_memory_descriptor_start != (private_count ? image_end : 0U))
+    Fail("compute private workgroup descriptor layout is invalid");
   if (stage.uniform_buffer_descriptor_count > 15 ||
       abi.storage_buffer_descriptor_count > 32 ||
       stage.uniform_buffer_descriptor_start != 0 ||
       abi.storage_buffer_descriptor_start !=
           stage.uniform_buffer_descriptor_count * 4U ||
-      stage.push_constant_start != abi.storage_buffer_descriptor_start +
-                                       abi.storage_buffer_descriptor_count * 4U ||
+      stage.push_constant_start != image_end + private_count ||
       !Fits(stage.push_constant_start, stage.push_constant_count, stage.shareds))
     Fail("compute shared-register descriptor/push layout is invalid");
   const auto mask_fits = [](std::uint32_t mask, std::uint32_t count) {
@@ -55,6 +65,8 @@ void ValidateAbi(const ComputePcoAbi &abi) {
   if (!mask_fits(abi.uniform_buffer_used_mask,
                  stage.uniform_buffer_descriptor_count) ||
       !mask_fits(abi.storage_buffer_used_mask, abi.storage_buffer_descriptor_count) ||
+      !mask_fits(abi.image_used_mask, abi.image_descriptor_count) ||
+      ((abi.image_read_mask | abi.image_write_mask) & ~abi.image_used_mask) ||
       ((abi.storage_buffer_read_mask | abi.storage_buffer_write_mask) &
        ~abi.storage_buffer_used_mask) != 0)
     Fail("compute resource mask exceeds its declared descriptor span");
@@ -260,6 +272,7 @@ void ValidateComputeProgram(const PcoDecodedProgram &program,
   bool pending = false;
   bool end = false;
   for (const auto &instruction : program.instructions) {
+    if (!HasCanonicalTextureLodMode(instruction)) Fail("texture LOD replacement flag is not canonical for opcode");
     if (!HasCanonicalNativeIntegerSignedness(instruction))
       Fail("integer signedness flag is not canonical for the native opcode");
     if (!instruction.repeat_count || instruction.repeat_count > 16 ||
@@ -281,7 +294,7 @@ void ValidateComputeProgram(const PcoDecodedProgram &program,
     if (mutex && (instruction.source_count || instruction.repeat_count != 1 ||
                   instruction.exec_cnd || instruction.end_group || instruction.writes_predicate ||
                   instruction.target != PcoWriteTarget::kNone || instruction.immediate >= 16 ||
-                  (instruction.control_operation != 0 && instruction.control_operation != 3)))
+                  instruction.control_operation > 3))
       Fail("invalid native MUTEX metadata");
     if (load || store || atomic) {
       if (instruction.repeat_count != 1 || instruction.data_request != 0 ||
@@ -305,7 +318,8 @@ void ValidateComputeProgram(const PcoDecodedProgram &program,
       const bool loop = instruction.control_operation == 3;
       if (instruction.repeat_count != 1 ||
           instruction.source_count != (set ? 2U : 1U) ||
-          instruction.target != PcoWriteTarget::kTemporary ||
+          (instruction.target != PcoWriteTarget::kTemporary &&
+           instruction.target != PcoWriteTarget::kVertexInput) ||
           instruction.control_operation > 4 || instruction.control_condition > 3 ||
           (set ? instruction.immediate != 0 : instruction.immediate == 0) ||
           instruction.writes_predicate != (loop ? 1U : 0U) ||
@@ -404,6 +418,7 @@ void StepComputeTask(const PcoDecodedProgram &program, const ComputePcoAbi &abi,
       task.instruction_index >= program.instructions.size())
     Fail("task stepped outside its native program");
   const auto &instruction = program.instructions[task.instruction_index];
+  if (!HasCanonicalTextureLodMode(instruction)) Fail("texture LOD replacement flag is not canonical for opcode");
   if (!HasCanonicalNativeIntegerSignedness(instruction))
     Fail("integer signedness flag is not canonical for the native opcode");
   // Finite watchdog bounds runaway native control flow; it never substitutes
@@ -430,21 +445,36 @@ void StepComputeTask(const PcoDecodedProgram &program, const ComputePcoAbi &abi,
   } else if (instruction.opcode == PcoOpcode::kMutex) {
     // MUTEX is task control, not 32 separate lock operations. Real ownership
     // lives across the CDM FIFO; this mask also rejects an unterminated END.
-    if (!memory.mutex) Fail("native MUTEX has no modeled ownership callback");
+    if (!memory.mutex && !memory.try_mutex)
+      Fail("native MUTEX has no modeled ownership callback");
     if (instruction.immediate >= 16) Fail("native MUTEX ID exceeds its field");
     for (const auto &lane : task.lanes)
       if (lane.pending_operation) Fail("MUTEX precedes a pending request WDF");
     const auto bit = UINT32_C(1) << instruction.immediate;
+    task.mutex_blocked = 0;
+    task.mutex_wakeup_mask = 0;
+    const auto exchange = [&](unsigned operation) {
+      if (memory.try_mutex)
+        return memory.try_mutex(memory.user_data, instruction.immediate, operation);
+      memory.mutex(memory.user_data, instruction.immediate, operation);
+      return true;
+    };
     if (instruction.control_operation == 3) {
       if (task.mutex_held_mask & bit) Fail("native MUTEX is not reentrant");
-      memory.mutex(memory.user_data, instruction.immediate, 3);
+      if (!exchange(3)) {
+        task.mutex_blocked = 1;
+        return; // Contention neither advances PC nor fabricates an instruction.
+      }
       task.mutex_held_mask |= bit;
-    } else if (instruction.control_operation == 0) {
+    } else if (instruction.control_operation <= 2) {
       if (!(task.mutex_held_mask & bit)) Fail("native MUTEX release has no matching lock");
-      memory.mutex(memory.user_data, instruction.immediate, 0);
+      if (!exchange(instruction.control_operation))
+        Fail("native MUTEX release was blocked");
       task.mutex_held_mask &= ~bit;
+      if (instruction.control_operation == 1) task.mutex_sleep_mask |= bit;
+      if (instruction.control_operation == 2) task.mutex_wakeup_mask |= bit;
     } else {
-      Fail("native MUTEX sleep/wakeup is not implemented");
+      Fail("native MUTEX operation is invalid");
     }
     ++result.instructions_executed;
   } else if (instruction.opcode == PcoOpcode::kBranch) {

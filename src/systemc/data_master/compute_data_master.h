@@ -28,7 +28,7 @@ class ComputeDataMaster final : public sc_core::sc_module {
  private:
   void DispatchRun();
   void MemoryRun();
-  void ApplyMutex(const ComputeMemoryTxn &request);
+  bool ApplyMutex(const ComputeMemoryTxn &request);
   struct MutexOwner {
     PoolHandle dispatch;
     PoolHandle task;

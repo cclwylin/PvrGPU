@@ -29,7 +29,7 @@ class ComputeShader final : public sc_core::sc_module {
                            std::uint32_t count, const std::uint32_t *words);
   static std::uint32_t Atomic32Memory(void *context, ComputeMemoryOperation operation,
                                       std::uint64_t address, std::uint32_t operand);
-  static void MutexMemory(void *context, std::uint32_t id, std::uint32_t operation);
+  static bool MutexMemory(void *context, std::uint32_t id, std::uint32_t operation);
   void ReleaseTaskMutexes();
   ComputeMemoryTxn ExchangeMemory(std::uint64_t address, std::uint32_t count,
                                   ComputeMemoryOperation operation,

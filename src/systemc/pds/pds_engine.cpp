@@ -48,7 +48,7 @@ void PdsEngine::Run() {
 
     const std::vector<FragmentInvocation> invocations =
         LoadArray<FragmentInvocation>(pool_, state.fragment_invocations);
-    const bool texture_case = UsesTextureSampling(state);
+    const bool texture_case = UsesTextureSampling(state, ShaderStage::kFragment);
     std::vector<FragmentShaderLane> shader_lanes;
     if (texture_case) {
       if (!HasPoolHandle(state.fragment_shader_lanes))

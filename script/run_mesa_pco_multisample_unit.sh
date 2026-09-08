@@ -42,7 +42,7 @@ cxx = (cpp_entry['arguments'] || Shellwords.split(cpp_entry.fetch('command'))).f
 generator = File.join(output, 'generate')
 abort 'generator linking failed' unless system(cxx, object, *Shellwords.split(link_line),
   '-o', generator, chdir: build)
-21.times do |kind|
+25.times do |kind|
   abort "native fixture #{kind} generation failed" unless system(generator, kind.to_s,
     File.join(output, "texture-#{kind}.bin"), out: File.join(output, "texture-#{kind}.log"),
     err: [:child, :out])

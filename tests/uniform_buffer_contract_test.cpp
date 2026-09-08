@@ -66,6 +66,29 @@ int main() {
   three_stages.uniform_buffers.push_back(
       {DriverPcoShaderStage::kGeometry, 0, {2, 4, 6, 8}});
   Accept(three_stages);
+  auto geometry_textures = three_stages;
+  geometry_textures.geometry_sampled_texture_count = 2;
+  geometry_textures.geometry_pco_abi.uniform_buffer_descriptor_start = 44;
+  geometry_textures.geometry_pco_abi.push_constant_start = 48;
+  geometry_textures.geometry_pco_abi.push_constant_count = 1;
+  geometry_textures.geometry_pco_abi.shareds = 49;
+  geometry_textures.geometry_shared.assign(49, 0);
+  geometry_textures.geometry_shared[46] = 4;
+  geometry_textures.geometry_shared[48] = 0x7fc0abcdU;
+  Accept(geometry_textures); // SH4 image/sampler sets, then UBO, then raw CB0.
+  for (unsigned start : {4U, 40U, 45U}) {
+    auto bad = geometry_textures;
+    bad.geometry_pco_abi.uniform_buffer_descriptor_start = start;
+    std::string error;
+    if (ValidateDriverUniformBuffers(bad, &error))
+      Fail("GS sampler/UBO prefix overlap was accepted");
+  }
+  geometry_textures.uniform_buffers.pop_back();
+  geometry_textures.geometry_pco_abi.uniform_buffer_descriptor_count = 0;
+  geometry_textures.geometry_pco_abi.shareds = 45;
+  geometry_textures.geometry_pco_abi.push_constant_start = 44;
+  geometry_textures.geometry_shared.resize(45);
+  Accept(geometry_textures); // No UBO still preserves the GS texture prefix.
   auto tessellation_stages = Fixture();
   tessellation_stages.tessellation.control_pco = {0};
   tessellation_stages.tessellation.evaluation_pco = {0};

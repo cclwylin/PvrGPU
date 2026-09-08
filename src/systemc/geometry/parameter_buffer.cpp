@@ -127,6 +127,19 @@ BuildPlane(const pvrgpu::stub::RasterTriangle &triangle,
 pvrgpu::stub::ParameterCoefficientSet
 BuildLlvmPipeDriverPlane(const pvrgpu::stub::RasterTriangle &triangle,
                          const float value[3]) {
+  // A constant attribute has no derivatives, even when the floating-point
+  // area collapses while the fixed-point raster triangle remains nonzero.
+  // In particular, tessellation can generate collinear edge vertices whose
+  // independently rounded subpixel coordinates form a tiny setup triangle.
+  // Do not turn its constant depth/reciprocal-W into 0 * infinity / NaN.
+  if (std::isfinite(value[0]) && value[0] == value[1] && value[0] == value[2]) {
+    pvrgpu::stub::ParameterCoefficientSet coefficient;
+    coefficient.a = FloatBits(0.f);
+    coefficient.b = FloatBits(0.f);
+    coefficient.c = FloatBits(value[0]);
+    coefficient.pad = 0;
+    return coefficient;
+  }
   const std::size_t i0 = triangle.setup_vertex_order[0];
   const std::size_t i1 = triangle.setup_vertex_order[1];
   const std::size_t i2 = triangle.setup_vertex_order[2];
@@ -160,7 +173,12 @@ BuildLlvmPipeDriverPlane(const pvrgpu::stub::RasterTriangle &triangle,
   if (!std::isfinite(dadx) || !std::isfinite(dady) ||
       !std::isfinite(attr0)) {
     throw std::runtime_error(
-        "ParameterBuffer produced a non-finite llvmpipe driver plane");
+        "ParameterBuffer produced a non-finite llvmpipe driver plane: "
+        "xy=(" + std::to_string(triangle.x[i0]) + "," + std::to_string(triangle.y[i0]) +
+        "),(" + std::to_string(triangle.x[i1]) + "," + std::to_string(triangle.y[i1]) +
+        "),(" + std::to_string(triangle.x[i2]) + "," + std::to_string(triangle.y[i2]) +
+        ") values=" + std::to_string(value[i0]) + "," + std::to_string(value[i1]) +
+        "," + std::to_string(value[i2]) + " area=" + std::to_string(e-f));
   }
 
   pvrgpu::stub::ParameterCoefficientSet coefficient;

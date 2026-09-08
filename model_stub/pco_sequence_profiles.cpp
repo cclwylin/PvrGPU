@@ -235,7 +235,8 @@ std::uint64_t Fnv1a64(const std::vector<T> &payload) {
 }
 
 bool RootPayloadIsEmpty(const DriverCommand &command) {
-  return command.raw_vertex_data.empty() && command.vertex_pco.empty() &&
+  return command.framebuffer_layers == 0 &&
+         command.raw_vertex_data.empty() && command.vertex_pco.empty() &&
          command.tessellation.control_pco.empty() && command.tessellation.evaluation_pco.empty() &&
          command.tessellation.control_shared.empty() && command.tessellation.evaluation_shared.empty() &&
          command.geometry_pco.empty() && command.geometry_shared.empty() &&
@@ -244,6 +245,7 @@ bool RootPayloadIsEmpty(const DriverCommand &command) {
          command.sampled_texture_count == 0 &&
          command.vertex_sampled_texture_count == 0 &&
          command.fragment_sampled_texture_count == 0 &&
+         command.geometry_sampled_texture_count == 0 &&
          command.initial_color_attachment_bytes.empty() &&
          command.sampled_texture_bytes.empty() &&
          command.declared_sampled_texture_bytes_size == 0 &&
@@ -1197,9 +1199,21 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
         draw.framebuffer_width != logical.framebuffer_width ||
         draw.framebuffer_height != logical.framebuffer_height ||
         draw.width == 0 || draw.height == 0 ||
-        draw.width > 4096 || draw.height > 4096) {
+        draw.width > 4096 || draw.height > 4096 || draw.framebuffer_layers > 256 ||
+        (ordinal && draw.framebuffer_layers != options.driver_commands[ordinal-1].framebuffer_layers)) {
       return Reject(error, "generic PCO sequence draw envelope is invalid");
     }
+    const std::uint64_t color_bpp =
+        draw.format == kRgba32Ui || draw.format == kRgba32I || draw.format == kRgba32F ? 16U :
+        draw.format == kRg32Ui || draw.format == kRg32I ? 8U : 4U;
+    if ((draw.raster_samples && (draw.raster_samples > 16 ||
+         (draw.raster_samples & (draw.raster_samples - 1)))) ||
+        static_cast<std::uint64_t>(draw.framebuffer_width) * draw.framebuffer_height *
+            (draw.raster_samples ? draw.raster_samples : 1U) *
+            (draw.framebuffer_layers ? draw.framebuffer_layers : 1U) *
+            std::max<std::uint64_t>(color_bpp, draw.depth_format ? DepthAttachmentBytesPerPixel(draw.depth_format) : 0U) >
+                kDriverPcoSequenceAttachmentStride)
+      return Reject(error, "generic PCO attachment exceeds its address slot");
     // A draw either states its own attribute layout or matches the pinned
     // position/colour one.  Sampled textures are carried by the sequence, and
     // each draw takes the slice its descriptor count names.
@@ -1214,7 +1228,7 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
           draw.vertex_pco_abi.vertex_inputs != 8)) ||
         draw.sampled_textures.size() != draw.sampled_texture_count ||
         draw.sampled_texture_count >
-            2U * pvrgpu::stub::kPcoMaximumTextureDescriptorSets) {
+            3U * pvrgpu::stub::kPcoMaximumTextureDescriptorSets) {
       return Reject(error, "generic PCO sequence draw is not the colour layout");
     }
     // Topologies the submitter expands for setup.  An indexed draw assembles
@@ -1280,7 +1294,8 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
       const std::uint64_t expected_bytes =
           static_cast<std::uint64_t>(draw.framebuffer_width) *
           draw.framebuffer_height * bytes_per_pixel *
-          (draw.raster_samples == 0 ? 1U : draw.raster_samples);
+          (draw.raster_samples == 0 ? 1U : draw.raster_samples) *
+          (draw.framebuffer_layers ? draw.framebuffer_layers : 1);
       if (ordinal != 0 || draw.render_target_count > 1 ||
           draw.initial_color_attachment_bytes.size() != expected_bytes ||
           expected_bytes > kDriverPcoSequenceAttachmentStride) {
@@ -1304,6 +1319,7 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
       const std::uint64_t expected_bytes =
           static_cast<std::uint64_t>(draw.framebuffer_width) * draw.framebuffer_height *
           (draw.raster_samples ? draw.raster_samples : 1U) *
+          (draw.framebuffer_layers ? draw.framebuffer_layers : 1U) *
           DepthAttachmentBytesPerPixel(draw.depth_format);
       if (ordinal != 0 || draw.depth_format == 0 ||
           draw.initial_depth_attachment_bytes.size() != expected_bytes ||

@@ -41,7 +41,8 @@ inline bool ValidateDriverUniformBuffers(const DriverCommand &command,
     const std::size_t count = abi.uniform_buffer_descriptor_count;
     const std::size_t start = abi.uniform_buffer_descriptor_start;
     const std::size_t native_base = stage >= 3 && !command.tessellation.evaluation_pco.empty()
-        ? (stage == 3 ? 8U : 4U) : stage == 2 && !command.geometry_pco.empty() ? 4U : 0U;
+        ? (stage == 3 ? 8U : 4U) : stage == 2 && !command.geometry_pco.empty()
+            ? 4U + 20U * command.geometry_sampled_texture_count : 0U;
     if (count > kMaximumUniformBuffersPerStage ||
         (count == 0 && start != native_base))
       return reject("descriptor range is invalid");

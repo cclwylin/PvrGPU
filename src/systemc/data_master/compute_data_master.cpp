@@ -129,6 +129,16 @@ void ComputeDataMaster::DispatchRun() {
       if (groups > std::numeric_limits<std::uint64_t>::max() / lanes)
         throw std::runtime_error("compute invocation count overflows");
       for (std::uint64_t ordinal = 0; ordinal < groups; ++ordinal) {
+        if (state.abi.shared_memory_bytes) {
+          if (state.abi.shared_memory_bytes > kComputeMaximumSharedBytes ||
+              (state.abi.shared_memory_bytes & 3U))
+            throw std::runtime_error("compute shared backing exceeds 32 KiB");
+          // Workgroup allocation, not shader execution. Zero is a permitted
+          // initial value for undefined GLSL shared storage and initializes
+          // the compiler's barrier counters. HostWrite invalidates stale cache.
+          const std::vector<std::uint8_t> zero(state.abi.shared_memory_bytes, 0);
+          memory_.HostWrite(kComputeSharedAddress, zero.data(), zero.size());
+        }
         ComputeWorkgroupResult result;
         result_handle = pool_.Allocate(sizeof(result));
         WritePod(pool_, result_handle, result);
@@ -191,9 +201,12 @@ void ComputeDataMaster::MemoryRun() {
     try {
       const auto state = ReadPod<ComputeDispatchState>(pool_, request.state);
       if (IsComputeMutexOperation(request.operation)) {
-        ApplyMutex(request);
+        response.blocked = !ApplyMutex(request);
       } else {
-        const auto ranges = LoadArray<ComputeBufferRange>(pool_, state.buffer_ranges);
+        auto ranges = LoadArray<ComputeBufferRange>(pool_, state.buffer_ranges);
+        if (state.abi.shared_memory_bytes)
+          ranges.push_back({kComputeSharedAddress, state.abi.shared_memory_bytes,
+                            kComputeAccessRead | kComputeAccessWrite, 0, 2});
         ValidateMemoryAccess(request, ranges);
         if (request.operation == ComputeMemoryOperation::kRead) {
           if (HasPoolHandle(request.payload))
@@ -251,7 +264,7 @@ void ComputeDataMaster::MemoryRun() {
   }
 }
 
-void ComputeDataMaster::ApplyMutex(const ComputeMemoryTxn &request) {
+bool ComputeDataMaster::ApplyMutex(const ComputeMemoryTxn &request) {
   if (request.bytes || HasPoolHandle(request.payload) || !HasPoolHandle(request.task) ||
       (request.operation == ComputeMemoryOperation::kMutexCleanup ? request.address != 0 : request.address >= 16))
     throw std::runtime_error("compute MUTEX has invalid ID, task or payload");
@@ -264,13 +277,14 @@ void ComputeDataMaster::ApplyMutex(const ComputeMemoryTxn &request) {
   if (request.operation == ComputeMemoryOperation::kMutexCleanup) {
     for (auto &owner : mutex_owners_)
       if (owns(owner)) owner = {};
-    return;
+    return true;
   }
   auto &owner = mutex_owners_[request.address];
   if (request.operation == ComputeMemoryOperation::kMutexLock) {
-    if (HasPoolHandle(owner.task))
-      throw std::runtime_error(owns(owner) ? "compute MUTEX lock is not reentrant" :
-          "compute MUTEX contention requires a resident-task scheduler");
+    if (HasPoolHandle(owner.task)) {
+      if (owns(owner)) throw std::runtime_error("compute MUTEX lock is not reentrant");
+      return false;
+    }
     owner = {request.state,request.task};
   } else if (request.operation == ComputeMemoryOperation::kMutexRelease) {
     if (!owns(owner)) throw std::runtime_error("compute MUTEX release is not owned by this task");
@@ -278,6 +292,7 @@ void ComputeDataMaster::ApplyMutex(const ComputeMemoryTxn &request) {
   } else {
     throw std::runtime_error("compute MUTEX operation is unsupported");
   }
+  return true;
 }
 
 }  // namespace pvrgpu::stub

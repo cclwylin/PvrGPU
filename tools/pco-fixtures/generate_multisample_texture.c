@@ -9,6 +9,8 @@
  * Kind 17 exports native gl_FragCoord x/y and floor(19-y), for origin tests.
  * Kinds 18/19 export MS size x/y/layers and sample count, with no SMP.
  * Kind 20 exports ordinary sampler2D size with dynamic LOD in SHARED20.
+ * Kinds 21..23 export ordinary texelFetch on 2D, 2D-array, 3D; kind 24
+ * exports cube textureLod. SHARED20..23 are coords and explicit LOD.
  * Command arguments: KIND OUTPUT.bin. Descriptors SHARED0..19; dynamic
  * integer x,y,layer,sample DWORD inputs SHARED20..23, except query-only cases.
  */
@@ -28,6 +30,36 @@ static nir_shader *multisample_fragment(unsigned kind)
     * than Vulkan's extra alpha/sample-mask epilogue. No instruction bytes
     * are constructed here; all operations pass through native Mesa PCO. */
    b.shader->info.internal = true;
+   if (kind >= 21 && kind <= 24) {
+      const bool array = kind == 22;
+      const bool fetch = kind != 24;
+      const enum glsl_sampler_dim dim = kind == 23 ? GLSL_SAMPLER_DIM_3D :
+         kind == 24 ? GLSL_SAMPLER_DIM_CUBE : GLSL_SAMPLER_DIM_2D;
+      const unsigned dimensions = kind == 21 ? 2 : 3;
+      nir_variable *sampler = nir_variable_create(b.shader, nir_var_uniform,
+         glsl_sampler_type(dim, false, array, GLSL_TYPE_FLOAT), "image");
+      sampler->data.descriptor_set = 0;
+      sampler->data.binding = 0;
+      nir_deref_instr *deref = nir_build_deref_var(&b, sampler);
+      nir_def *inputs = nir_load_push_constant(&b, 4, 32, nir_imm_int(&b, 0), .base=0, .range=16);
+      nir_tex_instr *tex = nir_tex_instr_create(b.shader, 4);
+      tex->op = fetch ? nir_texop_txf : nir_texop_txl;
+      tex->sampler_dim = dim;
+      tex->is_array = array;
+      tex->coord_components = dimensions;
+      tex->dest_type = nir_type_float32;
+      tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, &deref->def);
+      tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_sampler_deref, &deref->def);
+      tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_coord, nir_trim_vector(&b, inputs, dimensions));
+      tex->src[3] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_channel(&b, inputs, 3));
+      nir_def_init(&tex->instr, &tex->def, 4, 32);
+      nir_builder_instr_insert(&b, &tex->instr);
+      for (unsigned c=0; c<4; ++c)
+         nir_frag_store_pco(&b, nir_channel(&b, &tex->def, c), .base=c);
+      nir_jump(&b, nir_jump_return);
+      nir_shader_gather_info(b.shader, b.impl);
+      return b.shader;
+   }
    if (kind == 20) {
       nir_variable *sampler = nir_variable_create(b.shader, nir_var_uniform,
          glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, false, GLSL_TYPE_UINT), "image");
@@ -137,7 +169,7 @@ int main(int argc, char **argv)
 {
    if (argc != 3) return 2;
    unsigned kind = strtoul(argv[1], NULL, 0);
-   if (kind > 20) return 2;
+   if (kind > 24) return 2;
    glsl_type_singleton_init_or_ref();
    void *mem = ralloc_context(NULL);
    struct pvr_device_info device;
@@ -158,7 +190,7 @@ int main(int argc, char **argv)
    pco_postprocess_nir(ctx, nir, &data);
    if (kind != 17 && !allocate_fragment_shared_data(&data)) return 2;
    data.common.push_consts.range = (pco_range){.start=kind == 17 ? 0 : 20,
-      .count=(kind<6 || (kind>=11 && kind<=16)) ? 4 : kind == 20 ? 1 : 0};
+      .count=(kind<6 || (kind>=11 && kind<=16) || kind>=21) ? 4 : kind == 20 ? 1 : 0};
    data.common.shareds += data.common.push_consts.range.count;
    pco_shader *shader = translate_shader(ctx, nir, &data);
    pco_print_shader(shader, stdout, "native multisample texture");

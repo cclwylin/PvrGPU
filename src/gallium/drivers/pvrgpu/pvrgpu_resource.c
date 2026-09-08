@@ -1274,15 +1274,11 @@ pvrgpu_resource_read_back_color_surface(struct pipe_context *pipe,
       return false;
    }
 
-   /*
-    * One model attachment is a 2D image.  A single selected array or 3D layer
-    * maps to that image exactly; a layered framebuffer would require one
-    * model result per layer and is therefore left untouched.
-    */
+   /* Read every attached layer from the same completed model submission. */
    const unsigned level_layers =
       pvrgpu_resource_level_layer_count(resource, surface->level);
-   if (surface->first_layer != surface->last_layer ||
-       surface->first_layer >= level_layers) {
+   if (surface->first_layer > surface->last_layer ||
+       surface->last_layer >= level_layers) {
       pvrgpu_counter_eventf("framebuffer_readback_declined",
                             "reason=layered_surface res=%p target=%u "
                             "level=%u layers=%u-%u level_layers=%u",
@@ -1352,8 +1348,15 @@ pvrgpu_resource_read_back_color_surface(struct pipe_context *pipe,
    const unsigned bytes_per_pixel =
       pvrgpu_resource_readback_bytes_per_pixel(surface->format);
    const unsigned samples = pvrgpu_resource_storage_sample_count(resource);
+   const unsigned layer_count = (unsigned)surface->last_layer - surface->first_layer + 1;
+   size_t destination_offset = 0;
+   if (!pvrgpu_surface_span(pvrgpu, surface,
+          (size_t)width * samples * util_format_get_blocksize(surface->format),
+          height, layer_count, &destination_offset) ||
+       (size_t)width * samples > SIZE_MAX / height / bytes_per_pixel / layer_count)
+      return false;
    const size_t pixels_size =
-      (size_t)width * (size_t)height * (size_t)bytes_per_pixel * samples;
+      (size_t)width * (size_t)height * (size_t)bytes_per_pixel * samples * layer_count;
    uint8_t *pixels = MALLOC(pixels_size);
    if (!pixels)
       return false;
@@ -1362,7 +1365,7 @@ pvrgpu_resource_read_back_color_surface(struct pipe_context *pipe,
    char error[512] = { 0 };
    const bool flushed =
       pvrgpu_systemc_flush_readback_pixels(width, height, bytes_per_pixel,
-                                           (uint32_t)attachment, samples, 0, pixels,
+                                           (uint32_t)attachment, samples, 0, layer_count, pixels,
                                            pixels_size, &written,
                                            error, sizeof(error));
    if (!flushed || !written) {
@@ -1381,16 +1384,14 @@ pvrgpu_resource_read_back_color_surface(struct pipe_context *pipe,
     * The model's framebuffer is tightly packed; the resource's level may be
     * padded, so store a row at a time rather than the whole block.
     */
-   uint8_t *destination =
-      pvrgpu->data + pvrgpu->level_offsets[surface->level] +
-      (uintptr_t)surface->first_layer *
-         pvrgpu->level_layer_strides[surface->level];
+   uint8_t *destination = pvrgpu->data + destination_offset;
    const unsigned stride = pvrgpu->level_strides[surface->level];
+   for (unsigned layer = 0; layer < layer_count; ++layer)
    for (unsigned row = 0; row < height; ++row) {
       pvrgpu_resource_readback_store_row(
          surface->format,
-         destination + (size_t)row * stride,
-         pixels + (size_t)row * (size_t)width * (size_t)bytes_per_pixel * samples,
+         destination + (size_t)layer * pvrgpu->level_layer_strides[surface->level] + (size_t)row * stride,
+         pixels + ((size_t)layer * height + row) * (size_t)width * (size_t)bytes_per_pixel * samples,
          width * samples);
    }
    FREE(pixels);
@@ -1418,8 +1419,8 @@ pvrgpu_resource_read_back_depth_surface(struct pipe_context *pipe)
    if (!texture || !resource || !resource->data ||
        surface->format != texture->format ||
        !pvrgpu_resource_level_valid(resource, surface->level) ||
-       surface->first_layer != surface->last_layer ||
-       surface->first_layer >= pvrgpu_resource_level_layer_count(texture, surface->level))
+       surface->first_layer > surface->last_layer ||
+       surface->last_layer >= pvrgpu_resource_level_layer_count(texture, surface->level))
       return;
    const unsigned width = ctx->framebuffer.width;
    const unsigned height = ctx->framebuffer.height;
@@ -1430,19 +1431,25 @@ pvrgpu_resource_read_back_depth_surface(struct pipe_context *pipe)
    const unsigned samples = pvrgpu_resource_storage_sample_count(texture);
    const unsigned bpp = util_format_get_blocksize(surface->format);
    const size_t row_size = (size_t)width * samples * bpp;
-   const size_t size = row_size * height;
+   const unsigned layer_count = (unsigned)surface->last_layer - surface->first_layer + 1;
+   size_t destination_offset = 0;
+   if (!pvrgpu_surface_span(resource, surface, row_size, height, layer_count, &destination_offset) ||
+       row_size > SIZE_MAX / height / layer_count)
+      return;
+   const size_t size = row_size * height * layer_count;
    uint8_t *pixels = malloc(size);
    if (!pixels)
       return;
    char error[512] = {0};
    bool written = false;
    if (pvrgpu_systemc_flush_readback_pixels(width, height, bpp, UINT32_MAX,
-         samples, surface->format, pixels, size, &written, error, sizeof(error)) && written) {
-      uint8_t *destination = resource->data + resource->level_offsets[surface->level] +
-         (size_t)surface->first_layer * resource->level_layer_strides[surface->level];
+         samples, surface->format, layer_count, pixels, size, &written, error, sizeof(error)) && written) {
+      uint8_t *destination = resource->data + destination_offset;
+      for (unsigned layer = 0; layer < layer_count; ++layer)
       for (unsigned y = 0; y < height; ++y)
-         memcpy(destination + (size_t)y * resource->level_strides[surface->level],
-                pixels + (size_t)y * row_size, row_size);
+         memcpy(destination + (size_t)layer * resource->level_layer_strides[surface->level] +
+                   (size_t)y * resource->level_strides[surface->level],
+                pixels + ((size_t)layer * height + y) * row_size, row_size);
       pvrgpu_counter_eventf("depth_stencil_readback", "res=%p format=%s samples=%u",
                            (void *)texture, util_format_name(surface->format), samples);
    }

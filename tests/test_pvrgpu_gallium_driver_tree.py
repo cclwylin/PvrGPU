@@ -41,6 +41,8 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             "pvrgpu_msaa.h",
             "pvrgpu_pco.c",
             "pvrgpu_pco.h",
+            "pvrgpu_point_restart.h",
+            "pvrgpu_indirect_draw.h",
             "pvrgpu_public.h",
             "pvrgpu_resource.c",
             "pvrgpu_resource.h",
@@ -231,7 +233,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("full_depth_clear_resource", context_header)
         self.assertIn("pvrgpu_note_full_depth_clear_one", clear)
         self.assertIn("pvrgpu_invalidate_full_depth_clear_for_resource", resource)
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 26u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 27u", systemc_api)
         for field in (
             "const uint8_t *raw_vertex_data;",
             "size_t raw_vertex_data_size;",
@@ -776,7 +778,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 26u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 27u", systemc_api)
         for field in (
             "uint32_t vertex_stride;",
             "uint32_t position_output_start;",
@@ -912,7 +914,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 26u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 27u", systemc_api)
         self.assertIn("command=draw_pco_triangles", command)
         self.assertIn("pvrgpu_write_draw_pco_triangles_command", command_header)
         self.assertIn("PVRGPU_DRAW_PCO_TRIANGLES_VERTEX_COUNT 6144u", command_header)

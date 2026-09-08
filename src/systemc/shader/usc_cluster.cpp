@@ -122,6 +122,8 @@ bool SameTextureSampleRequest(const TextureSampleRequest &left,
          left.fcnorm == right.fcnorm &&
          left.sample_index == right.sample_index &&
          left.sample_index_present == right.sample_index_present &&
+         left.explicit_lod == right.explicit_lod &&
+         left.explicit_lod_present == right.explicit_lod_present &&
          left.data_request == right.data_request &&
          left.quad_lane == right.quad_lane &&
          left.shader_stage == right.shader_stage && left.reserved[0] == 0 &&
@@ -433,6 +435,8 @@ void UscCluster::Run() {
               request.fcnorm = issued.fcnorm;
               request.sample_index = issued.sample_index;
               request.sample_index_present = issued.sample_index_present;
+              request.explicit_lod = issued.explicit_lod;
+              request.explicit_lod_present = issued.explicit_lod_present;
               request.data_request = issued.data_request;
               request.texture_address_lo = issued.texture_address_lo;
               request.texture_address_hi = issued.texture_address_hi;
@@ -934,6 +938,8 @@ void UscCluster::Run() {
           request.sample_index = execution.texture_request.sample_index;
           request.sample_index_present =
               execution.texture_request.sample_index_present;
+          request.explicit_lod = execution.texture_request.explicit_lod;
+          request.explicit_lod_present = execution.texture_request.explicit_lod_present;
           request.data_request = execution.texture_request.data_request;
           request.texture_address_lo =
               execution.texture_request.texture_address_lo;

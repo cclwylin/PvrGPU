@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "shader/pco_iss.h"
 #include "pco_multisample_texture_fixtures.h"
+#include "pco_explicit_texture_fixtures.h"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -72,6 +73,78 @@ void CheckRequest(const PcoTextureRequest &request, unsigned samples,
   Check(address == (array ? kBaseAddress + 2 * 13 * 19 * 16 * samples : 0),
         "array TAO must preserve native base plus true per-layer stride");
 }
+void TestNativeExplicitSampling() {
+  const std::array<std::uint32_t, 4> response{FloatBits(0.25F), FloatBits(0.5F), FloatBits(0.75F), FloatBits(1)};
+  for (unsigned kind = 21; kind <= 24; ++kind) {
+    const auto binary = test::ExplicitTextureFixture(kind);
+    const auto program = DecodePcoProgram(ShaderStage::kFragment, binary);
+    const auto smp = SampleInstruction(program);
+    const auto &instruction = program.instructions[smp];
+    Check(instruction.texture_lod_replace == 1 && !instruction.texture_sample_index_present &&
+          instruction.texture_non_normalized_coords == (kind != 24) &&
+          instruction.texture_address_offset == (kind == 22) &&
+          instruction.texture_dimension == (kind >= 23 ? 3 : 2),
+          "native REPLACE/PPLod/NNCOORDS/TAO decoded independently");
+    for (int level : {-1, 0, 1, 2, 15}) {
+      PcoFragmentExecutionContext context;
+      context.shared_count = 24;
+      context.shared_registers = Shared(1, 0, kind == 22);
+      context.shared_registers[23] = kind == 24 ? FloatBits(static_cast<float>(level)) : static_cast<std::uint32_t>(level);
+      if (kind == 24) {
+        context.shared_registers[20] = FloatBits(1);
+        context.shared_registers[21] = FloatBits(-0.5F);
+        context.shared_registers[22] = FloatBits(0.25F);
+      }
+      const auto first = ExecuteFragmentPco(program.summary, program.instructions, context);
+      const auto &request = first.texture_request;
+      Check(first.suspended && first.texture_request_valid && request.explicit_lod_present == 1 &&
+            request.explicit_lod == FloatBits(static_cast<float>(level)) &&
+            request.normalized == (kind == 24) && !request.sample_index_present,
+            "native float LOD survives without substitution or implicit derivatives");
+      Check(request.coordinates[0] == FloatBits(kind == 24 ? 1.0F : 4.0F) &&
+            request.coordinates[1] == FloatBits(kind == 24 ? -0.5F : 7.0F) &&
+            request.coordinates[2] == (kind >= 23 ? FloatBits(kind == 24 ? 0.25F : 2.0F) : 0),
+            "native integer-to-float texel coordinates remain distinct from cube direction");
+      const std::uint64_t address = request.texture_address_lo | (std::uint64_t(request.texture_address_hi) << 32);
+      Check(address == (kind == 22 ? kBaseAddress + 2 * 13 * 19 * 16 : 0),
+            "explicit LOD must not displace the array TAO pair");
+      const auto done = ResumeFragmentPco(program.summary, program.instructions, first.continuation, response);
+      Check(!done.suspended && std::equal(response.begin(), response.end(), done.pixel_outputs.begin()),
+            "native explicit SMP/WDF returns the raw TPU response");
+    }
+    for (unsigned reserved : {2U, 4U, 16U, 32U, 64U}) {
+      auto bad = binary;
+      bad[instruction.binary_offset + 2] |= static_cast<std::uint8_t>(reserved);
+      Reject([&] { (void)DecodePcoProgram(ShaderStage::kFragment, bad); },
+             "unsupported REPLACE extension accepted");
+    }
+    for (unsigned mutation = 0; mutation < 3; ++mutation) {
+      auto bad = program;
+      if (mutation == 0) bad.instructions[smp].texture_lod_replace = 2;
+      if (mutation == 1) bad.instructions[smp].texture_sample_index_present = 1;
+      if (mutation == 2) bad.instructions[smp].source.index = kPcoTemporaryCount - 2;
+      PcoFragmentExecutionContext context;
+      context.shared_count = 24; context.shared_registers = Shared(1, 0, kind == 22);
+      Reject([&] { (void)ExecuteFragmentPco(bad.summary, bad.instructions, context); },
+             "malformed REPLACE semantic flags/span accepted");
+    }
+    for (std::size_t index = 0; index < program.instructions.size(); ++index) {
+      if (index == smp) continue;
+      for (unsigned flag : {1U,2U,255U}) {
+        auto bad = program; bad.instructions[index].texture_lod_replace = flag;
+        PcoFragmentExecutionContext context;
+        context.shared_count = 24; context.shared_registers = Shared(1,0,kind==22);
+        bool rejected = false;
+        try { (void)ExecuteFragmentPco(bad.summary,bad.instructions,context); }
+        catch (const std::exception &error) {
+          rejected = std::string(error.what()).find("texture LOD replacement") != std::string::npos;
+        }
+        Check(rejected, "unrelated opcode must reject replacement flag before special branch");
+      }
+    }
+  }
+}
+
 void TestNativeSampling() {
   const std::array<std::uint32_t, 4> response = {
       UINT32_C(0xffffffff), UINT32_C(0x80000000), UINT32_C(0x01000001), UINT32_C(0x3f800000)};
@@ -288,13 +361,15 @@ void TestNativeFragmentCoordinates() {
 int main(int argc, char **argv) {
   try {
     if (argc == 2) {
-      for (unsigned kind = 0; kind <= 20; ++kind) {
+      for (unsigned kind = 0; kind <= 24; ++kind) {
         std::ifstream file(std::string(argv[1]) + "/texture-" + std::to_string(kind) + ".bin", std::ios::binary);
         const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(file), {}};
-        Check(bytes == MultisampleTextureFixture(kind), "fixture differs from freshly compiled native binary");
+        Check(bytes == (kind <= 20 ? MultisampleTextureFixture(kind) : test::ExplicitTextureFixture(kind)),
+              "fixture differs from freshly compiled native binary");
       }
     }
     TestNativeSampling();
+    TestNativeExplicitSampling();
     TestNativeQueries();
     TestNativeStrideQueryLayout();
     TestMalformedFields();

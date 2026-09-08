@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -40,6 +41,20 @@ GeometryOutputTopology OutputTopology(PrimitiveTopology topology) {
   default: throw std::runtime_error("geometry output topology is invalid");
   }
 }
+bool SameSample(const TextureSampleRequest &a, const TextureSampleRequest &b) {
+  return std::equal(std::begin(a.coordinates), std::end(a.coordinates), std::begin(b.coordinates)) &&
+      std::equal(std::begin(a.texture_state), std::end(a.texture_state), std::begin(b.texture_state)) &&
+      std::equal(std::begin(a.sampler_state), std::end(a.sampler_state), std::begin(b.sampler_state)) &&
+      a.shader_stage == b.shader_stage && a.shader_lane_index == b.shader_lane_index &&
+      a.request_id == b.request_id && a.quad_id == b.quad_id && a.quad_lane == b.quad_lane &&
+      a.texture_address_lo == b.texture_address_lo && a.texture_address_hi == b.texture_address_hi &&
+      a.coordinate_count == b.coordinate_count && a.component_count == b.component_count &&
+      a.descriptor_set == b.descriptor_set && a.binding == b.binding && a.dimension == b.dimension &&
+      a.normalized == b.normalized && a.fcnorm == b.fcnorm && a.data_request == b.data_request &&
+      a.sample_index == b.sample_index && a.sample_index_present == b.sample_index_present &&
+      a.explicit_lod == b.explicit_lod && a.explicit_lod_present == b.explicit_lod_present &&
+      a.reserved[0] == b.reserved[0];
+}
 struct InvocationContext {
   GpuMemorySystem &memory;
   UscUniformBufferMemory &uniforms;
@@ -47,6 +62,10 @@ struct InvocationContext {
   CounterTxn &counters;
   std::uint64_t input_address, input_bytes, required_mask;
   std::uint32_t maximum_vertices;
+  std::function<void(const PcoTextureRequest &, std::uint32_t *)> sample;
+  static void Sample(void *opaque, const PcoTextureRequest &request, std::uint32_t *response) {
+    static_cast<InvocationContext *>(opaque)->sample(request, response);
+  }
   static void Read(void *opaque, std::uint64_t address, std::uint32_t count, std::uint32_t *destination) {
     auto &self = *static_cast<InvocationContext *>(opaque);
     if (!destination || !count || count > 16 || address % 4)
@@ -77,7 +96,55 @@ struct InvocationContext {
 GeometryShader::GeometryShader(sc_core::sc_module_name name, MemoryPool &pool, GpuMemorySystem *memory)
     : sc_module(name), pool_(pool), memory_(memory) { SC_THREAD(Run); }
 
-void GeometryShader::Execute(PipelineState &state) {
+void GeometryShader::Sample(PipelineState &state, const PipelineTxn &txn,
+                            const PcoTextureRequest &issued, std::uint32_t *response) {
+  if (!response || !texture_request_output.size() || !texture_response_input.size() ||
+      !UsesTextureSampling(state, ShaderStage::kGeometry) ||
+      HasPoolHandle(state.texture_sample_requests) || HasPoolHandle(state.texture_sample_responses))
+    throw std::runtime_error("geometry SMP FIFO/payload contract is invalid");
+  TextureSampleRequest request;
+  request.shader_stage = ShaderStage::kGeometry;
+  std::copy_n(issued.coordinates.begin(), 3, request.coordinates);
+  std::copy_n(issued.texture_state.begin(), 4, request.texture_state);
+  std::copy_n(issued.sampler_state.begin(), 4, request.sampler_state);
+  request.texture_address_lo = issued.texture_address_lo;
+  request.texture_address_hi = issued.texture_address_hi;
+  request.coordinate_count = issued.coordinate_count;
+  request.component_count = issued.component_count;
+  request.descriptor_set = issued.descriptor_set;
+  request.binding = issued.binding;
+  request.dimension = issued.dimension;
+  request.normalized = issued.normalized;
+  request.fcnorm = issued.fcnorm;
+  request.data_request = issued.data_request;
+  request.sample_index = issued.sample_index;
+  request.sample_index_present = issued.sample_index_present;
+  request.explicit_lod = issued.explicit_lod;
+  request.explicit_lod_present = issued.explicit_lod_present;
+  state.texture_sample_requests = StoreNewArray(pool_, std::vector<TextureSampleRequest>{request});
+  state.stage = PipelineStage::kGeometryTexturePending;
+  StorePipelineState(pool_, txn.state, state);
+  texture_request_output->write(txn);
+  const auto completion = texture_response_input->read();
+  if (completion.state.slot != txn.state.slot || completion.state.generation != txn.state.generation ||
+      completion.sequence != txn.sequence || completion.frame != txn.frame)
+    throw std::runtime_error("geometry SMP response identity mismatch");
+  state = LoadPipelineState(pool_, txn.state);
+  RequireStage(state.stage, PipelineStage::kGeometryTextureSamplesReady, name());
+  const auto requests = LoadArray<TextureSampleRequest>(pool_, state.texture_sample_requests);
+  const auto responses = LoadArray<TextureSampleResponse>(pool_, state.texture_sample_responses);
+  if (requests.size() != 1 || responses.size() != 1 ||
+      !SameSample(requests[0], request) ||
+      responses[0].shader_stage != ShaderStage::kGeometry ||
+      responses[0].shader_lane_index != 0 || responses[0].request_id != 0)
+    throw std::runtime_error("geometry SMP completion ordering/payload mismatch");
+  std::copy_n(responses[0].rgba, 4, response);
+  pool_.Release(state.texture_sample_requests); state.texture_sample_requests = {};
+  pool_.Release(state.texture_sample_responses); state.texture_sample_responses = {};
+  state.stage = PipelineStage::kVertexShaded;
+}
+
+void GeometryShader::Execute(PipelineState &state, const PipelineTxn &txn) {
   if (state.stage != PipelineStage::kVertexShaded || !memory_ || memory_->mode() != state.memory_mode ||
       !state.geometry_input_buffer_gpu_address || !state.geometry_invocations || state.geometry_invocations > 32 ||
       state.geometry_max_vertices > 256 || !state.geometry_input_stride_dwords ||
@@ -146,9 +213,12 @@ void GeometryShader::Execute(PipelineState &state) {
           state.geometry_max_vertices, strips.data<GeometryStripRange>(), state.geometry_max_vertices},
           state.geometry_max_vertices, stride);
       InvocationContext context{*memory_, uniforms, emission, state.counters, state.geometry_input_buffer_gpu_address,
-          input_words * sizeof(std::uint32_t), required_mask, state.geometry_max_vertices};
+          input_words * sizeof(std::uint32_t), required_mask, state.geometry_max_vertices,
+          [this, &state, &txn](const PcoTextureRequest &request, std::uint32_t *response) {
+            Sample(state, txn, request, response);
+          }};
       const GeometryExecutionCallbacks callbacks{&context, InvocationContext::Read,
-          InvocationContext::Emit, InvocationContext::Cut, InvocationContext::Finish};
+          InvocationContext::Emit, InvocationContext::Cut, InvocationContext::Finish, InvocationContext::Sample};
       while (!task.ended) StepGeometryTask(program, state.geometry_pco_abi, task, callbacks, execution);
       ++state.counters.gs_invocations;
       std::size_t complete = 0;
@@ -178,8 +248,10 @@ void GeometryShader::Execute(PipelineState &state) {
   state.counters.usc_groups += execution.instructions;
   state.counters.usc_cluster_cycles += execution.instructions;
   state.counters.gs_alu_instructions += execution.alu_instructions;
+  state.counters.gs_tex_instructions += execution.texture_instructions;
   state.counters.gs_memory_instructions += execution.memory_instructions;
   state.counters.gs_load_instructions += execution.load_instructions;
+  state.geometry_texture_instruction_count += execution.texture_instructions;
   state.counters.gs_emitted_vertices += lanes.size();
   if (HasPoolHandle(state.drawlist_stats)) {
     auto stats = LoadArray<DrawListStats>(pool_, state.drawlist_stats);
@@ -190,6 +262,8 @@ void GeometryShader::Execute(PipelineState &state) {
     gs.program_groups = program.summary.group_count; gs.program_instructions = program.summary.instruction_count;
     gs.program_alu_instructions = composition.alu; gs.program_memory_instructions = composition.memory;
     gs.executed_alu_instructions = execution.alu_instructions; gs.executed_memory_instructions = execution.memory_instructions;
+    gs.program_tex_instructions = composition.texture;
+    gs.executed_tex_instructions = execution.texture_instructions;
     gs.program_recorded = gs.executions_recorded = 1;
     StoreArray(pool_, state.drawlist_stats, stats);
   }
@@ -223,7 +297,7 @@ void GeometryShader::Run() {
     while (!input.nb_read(txn)) wait(input.data_written_event());
     auto state = LoadPipelineState(pool_, txn.state);
     if (HasPoolHandle(state.geometry_code)) {
-      try { Execute(state); }
+      try { Execute(state, txn); }
       catch (...) {
         // Root cancellation owns the current handles, including any decoder
         // payload allocated before a later task failed. Never leave stale

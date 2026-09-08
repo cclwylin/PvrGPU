@@ -75,6 +75,28 @@ int main() {
       }
       std::cout << "compute fixture " << kind << ": " << d.instructions.size() << " groups PASS\n";
     }
+    // Two unchanged CND groups from the compiler's 12000-byte output for
+    // stock ssbo.layout.random.all_per_block_buffers.8 (FNV 407a33653404f6cc).
+    // vi0 was consumed by the local-ID guard and is now the execution mask.
+    // Append the real empty-CS NOP.end to make a bounded decode-only program.
+    auto vtxin_mask = std::vector<std::uint8_t>{
+      0x44,0x82,0x67,0x20,0x00,0x00,0x80,0x04,
+      0x45,0x82,0x67,0x38,0x80,0x04,0x00,0x00,0x80,0x04};
+    const auto nop = ComputePcoFixture(0);
+    vtxin_mask.insert(vtxin_mask.end(), nop.begin(), nop.end());
+    const auto masks_in_input = DecodeComputePcoProgram(vtxin_mask);
+    Check(masks_in_input.instructions.size() == 3,
+          "native VTXIN mask groups retain their instruction boundaries");
+    for (unsigned index = 0; index != 2; ++index) {
+      const auto &mask = masks_in_input.instructions[index];
+      Check(mask.opcode == PcoOpcode::kConditionalMask &&
+            mask.target == PcoWriteTarget::kVertexInput && !mask.output_index &&
+            mask.control_operation == 0 && mask.immediate == 1 && mask.exec_cnd == 2,
+            "CND writes the actual allocated per-lane VTXIN counter");
+    }
+    Check(masks_in_input.instructions[1].source.bank == PcoRegisterBank::kVertexInput &&
+          !masks_in_input.instructions[1].source.index,
+          "nested CND reads the same VTXIN counter");
     const auto cas = DecodeComputePcoProgram(ComputePcoFixture(21));
     unsigned mutexes = 0, instances = 0;
     for (const auto &instruction : cas.instructions) {
@@ -83,12 +105,22 @@ int main() {
         Check(instruction.immediate == 0 && instruction.control_operation == (mutexes ? 0U : 3U),
               "native CAS lock/release order or mutex ID changed");
         ++mutexes;
-        for (const unsigned invalid : {0x10U,0x20U,0x40U,0x80U}) {
+        for (const unsigned invalid : {0x10U,0x20U}) {
           auto corrupt = ComputePcoFixture(21);
-          // MUTEX payload follows its 3-byte header. Reserved bits and
-          // release-sleep/wakeup are not quietly treated as a plain release.
+          // MUTEX payload follows its 3-byte header. Reserved bits stay fatal.
           corrupt[instruction.binary_offset + 3] = invalid;
           Reject([&] { DecodeComputePcoProgram(corrupt); });
+        }
+        for (const unsigned operation : {1U,2U}) {
+          auto native = ComputePcoFixture(21);
+          native[instruction.binary_offset + 3] = operation << 6;
+          const auto decoded = DecodeComputePcoProgram(native);
+          bool found = false;
+          for (const auto &candidate : decoded.instructions)
+            if (candidate.binary_offset == instruction.binary_offset)
+              found = candidate.opcode == PcoOpcode::kMutex &&
+                      candidate.control_operation == operation && candidate.immediate == 0;
+          Check(found, "native MUTEX sleep/wakeup was mistaken for plain release");
         }
       }
       instances += instruction.source.bank == PcoRegisterBank::kSpecial &&

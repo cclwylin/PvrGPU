@@ -744,6 +744,10 @@ private:
       "vertex_cluster_to_texture_samples", ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> texture_samples_to_vertex_cluster{
       "texture_samples_to_vertex_cluster", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> geometry_to_texture_samples{
+      "geometry_to_texture_samples", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> texture_samples_to_geometry{
+      "texture_samples_to_geometry", ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> vertex_cluster_to_clip{"vertex_cluster_to_clip",
                                                        ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> geometry_to_clip{"geometry_to_clip", ModelFifoDepth()};
@@ -869,6 +873,8 @@ ModelSession::ModelSession(MemoryMode memory_mode, bool cache_bypass)
   tessellation_evaluation_shader.output(evaluation_to_geometry);
   geometry_shader.input(evaluation_to_geometry);
   geometry_shader.output(geometry_to_stream_output);
+  geometry_shader.texture_request_output(geometry_to_texture_samples);
+  geometry_shader.texture_response_input(texture_samples_to_geometry);
   stream_output.input(geometry_to_stream_output);
   stream_output.output(geometry_to_clip);
   clip_cull.input(geometry_to_clip);
@@ -899,6 +905,8 @@ ModelSession::ModelSession(MemoryMode memory_mode, bool cache_bypass)
   texture_unit.sample_output(texture_samples_to_fragment_cluster);
   texture_unit.vertex_sample_input(vertex_cluster_to_texture_samples);
   texture_unit.vertex_sample_output(texture_samples_to_vertex_cluster);
+  texture_unit.geometry_sample_input(geometry_to_texture_samples);
+  texture_unit.geometry_sample_output(texture_samples_to_geometry);
   texture_unit.input(fragment_cluster_to_texture);
   texture_unit.output(texture_to_pbe);
   pbe.input(texture_to_pbe);
@@ -964,6 +972,7 @@ int ModelSession::Run(const Options &options, ModelFramebuffer *framebuffer,
     framebuffer->height = job.framebuffer_height;
     framebuffer->bytes_per_pixel = job.framebuffer_bytes_per_pixel;
     framebuffer->sample_count = job.framebuffer_sample_count;
+    framebuffer->layer_count = job.framebuffer_layer_count;
     framebuffer->depth_pixels = job.depth_framebuffer;
     framebuffer->depth_format = job.depth_format;
   }
@@ -1049,6 +1058,33 @@ int ModelSession::RunCompute(ModelComputeDispatch *dispatch,
       shared[descriptor + 3U] = 0U;
       ranges.push_back({base, binding.bytes_size, binding.access,
                          binding.slot, binding.kind});
+    }
+    for (const auto &binding : dispatch->images) {
+      if (binding.resource_index >= dispatch->resources.size() ||
+          binding.slot >= dispatch->abi.image_descriptor_count || binding.format != 1 ||
+          !binding.width || !binding.height || binding.width > UINT32_MAX / 4U ||
+          binding.row_stride_bytes < binding.width * 4U ||
+          (binding.row_stride_bytes & 3U) || (binding.offset & 3U) || (binding.access & ~3U))
+        return fail("compute image binding is invalid");
+      const auto bytes = dispatch->resources[binding.resource_index].bytes.size();
+      const std::uint64_t footprint = static_cast<std::uint64_t>(binding.height - 1U) *
+          binding.row_stride_bytes + binding.width * 4U;
+      if (binding.offset > bytes || binding.bytes_size > bytes - binding.offset ||
+          binding.bytes_size > UINT32_MAX || footprint > binding.bytes_size)
+        return fail("compute image exceeds its backing resource");
+      const auto base = address(binding.resource_index) + binding.offset;
+      const auto descriptor = dispatch->abi.image_descriptor_start + 8U * binding.slot;
+      if (descriptor > shared.size() || 8U > shared.size() - descriptor)
+        return fail("compute image descriptor exceeds shared registers");
+      shared[descriptor] = static_cast<std::uint32_t>(base);
+      shared[descriptor + 1U] = static_cast<std::uint32_t>(base >> 32U);
+      shared[descriptor + 2U] = static_cast<std::uint32_t>(binding.bytes_size);
+      shared[descriptor + 3U] = 0;
+      shared[descriptor + 4U] = binding.width;
+      shared[descriptor + 5U] = binding.height;
+      shared[descriptor + 6U] = binding.row_stride_bytes;
+      shared[descriptor + 7U] = binding.format;
+      ranges.push_back({base, binding.bytes_size, binding.access, binding.slot, 3});
     }
     ComputeDispatchState state;
     state.abi = dispatch->abi;

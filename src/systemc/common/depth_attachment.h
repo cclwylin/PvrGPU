@@ -56,7 +56,7 @@ inline void MaterializeDepthAttachment(MemoryPool &pool, GpuMemorySystem *memory
   }
   const std::uint64_t pixel_count =
       static_cast<std::uint64_t>(state->width) * state->height *
-      state->raster_state.sample_count;
+      state->raster_state.sample_count * state->attachment_layers;
   if (pixel_count == 0 ||
       pixel_count > std::numeric_limits<std::size_t>::max()) {
     throw std::overflow_error(

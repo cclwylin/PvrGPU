@@ -387,6 +387,7 @@ struct DriverCommand {
   std::vector<DriverPcoSampledTexture> sampled_textures;
   std::uint32_t vertex_sampled_texture_count = 0;
   std::uint32_t fragment_sampled_texture_count = 0;
+  std::uint32_t geometry_sampled_texture_count = 0;
   std::uint64_t declared_raw_vertex_data_size = 0;
   std::uint64_t declared_vertex_pco_size = 0;
   std::uint64_t declared_fragment_pco_size = 0;
@@ -503,6 +504,7 @@ struct DriverCommand {
   // Imported through DRAM and the normal PBE LOAD path, never CPU-rendered.
   std::vector<std::uint8_t> initial_color_attachment_bytes;
   std::uint32_t raster_samples = 1;
+  std::uint32_t framebuffer_layers = 0;
   std::vector<std::uint8_t> initial_depth_attachment_bytes;
   std::uint32_t draw_count = 0;
   std::uint32_t index_count = 0;
@@ -790,6 +792,7 @@ struct CounterTxn {
   std::uint64_t pbe_pixels_written = 0;
   std::uint32_t functional_frame = 0;
   std::uint64_t gs_alu_instructions = 0;
+  std::uint64_t gs_tex_instructions = 0;
   std::uint64_t gs_memory_instructions = 0;
   std::uint64_t gs_load_instructions = 0;
   std::uint64_t gs_emitted_vertices = 0;

@@ -175,11 +175,47 @@ PipelineState RasterStateFor(MemoryPool &pool, unsigned shape, bool clipped,
     state.geometry_primitives = StoreNewArray(pool, primitives);
   return state;
 }
+
+void VerifyExplicitGeometryBindings(MemoryPool &pool) {
+  auto state = Base(pool);
+  state.vertex_pco_abi.vertex_outputs = 4;
+  state.geometry_pco_abi.vertex_outputs = 6;
+  state.varying_output_start = 4; state.varying_output_count = 2;
+  state.fragment_pco_abi.coefficients = 8;
+  state.driver_varying_bindings_explicit = 1;
+  state.driver_varying_binding_count = 1;
+  state.geometry_primitive_id_output_start = 4; state.geometry_primitive_id_output_count = 1;
+  state.geometry_layer_output_start = 5; state.geometry_layer_output_count = 1;
+  ShaderVaryingBinding binding;
+  binding.vertex_output_base = 5; binding.coefficient_set_base = 1;
+  binding.component_count = 1; binding.interpolation = InterpolationMode::kFlat;
+  Check(IsExactVaryingBinding(state, binding, 0), "explicit raw Layer follows final GS ABI, not smaller VS ABI");
+  binding.vertex_output_base = 6;
+  Check(!IsExactVaryingBinding(state, binding, 0), "explicit GS binding rejects final output overflow");
+  binding.vertex_output_base = 5; binding.interpolation = InterpolationMode::kSmooth;
+  const char *reason = nullptr;
+  Check(!IsExactVaryingBinding(state, binding, 0, &reason) && reason &&
+        std::strcmp(reason, "geometry_integer_varying_not_flat") == 0,
+        "Layer cannot reach smooth float plane interpolation");
+  binding.vertex_output_base = 4;
+  Check(!IsExactVaryingBinding(state, binding, 0), "PrimitiveID also remains raw integer flat data");
+  state.geometry_primitive_id_output_count = 0;
+  Check(IsExactVaryingBinding(state, binding, 0), "ordinary float varying before Layer may stay smooth");
+  binding.component_count = 2; state.fragment_pco_abi.coefficients = 12;
+  Check(!IsExactVaryingBinding(state, binding, 0), "mixed smooth range cannot overlap raw Layer");
+  binding.interpolation = InterpolationMode::kFlat;
+  Check(IsExactVaryingBinding(state, binding, 0), "flat range may transport both raw DWORDs");
+  Check(!IsExactVaryingBinding(state, binding, 1), "explicit GS binding count is bounded");
+  binding.vertex_output_base = UINT16_MAX;
+  Check(!IsExactVaryingBinding(state, binding, 0), "explicit GS output arithmetic cannot wrap");
+  ReleaseFunctionalPayloads(pool, state);
+}
 }  // namespace
 
 int sc_main(int, char **) {
   try {
     MemoryPool pool;
+    VerifyExplicitGeometryBindings(pool);
     sc_core::sc_fifo<PipelineTxn> source_in("source_in", 1);
     sc_core::sc_fifo<PipelineTxn> source_mid("source_mid", 1);
     sc_core::sc_fifo<PipelineTxn> source_out("source_out", 1);
@@ -322,6 +358,86 @@ int sc_main(int, char **) {
           Check(std::isnan(varying), "legal smooth NaN varying survives clipping");
         }
       Retire(pool, state_handle);
+    }
+    // A finite homogeneous position is legal even at/behind the eye. The
+    // clip cone's apex has no projective area, but clipping a w=0 non-apex
+    // vertex or a negative-w vertex can still produce visible geometry.
+    // Test both final programmable stages, independent of TF or case names.
+    const std::array<std::array<std::array<float, 4>, 3>, 7> eye_positions = {{
+        {{{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}}},
+        {{{0, 0, 0, 0}, {1, 0, 0, 0}, {2, 0, 0, 0}}},
+        {{{-0.5f, -0.5f, 0, -1}, {0.5f, -0.5f, 0, -1}, {0, 0.5f, 0, -1}}},
+        {{{-0.5f, -0.5f, 0, 1}, {0.5f, -0.5f, 0, 1}, {0, 0, 0, 0}}},
+        {{{-0.5f, -0.5f, 0, 1}, {0.5f, -0.5f, 0, 1}, {0, 0, 0, -0.5f}}},
+        {{{-0.5f, -0.5f, 0, 1}, {0.5f, -0.5f, 0, 1}, {0, 0.5f, 0, 0}}},
+        // Clipping the first edge synthesizes the apex rather than reading
+        // it from the shader. All finite projections lie on x+y=1.
+        {{{-1, 0, 0, -1}, {1, 0, 0, 1}, {0, 1, 0, 1}}},
+    }};
+    for (bool geometry : {false, true}) {
+      for (bool depth_clamp : {false, true}) {
+        for (unsigned fixture = 0; fixture < eye_positions.size(); ++fixture) {
+          for (unsigned shape : {1U, 2U, 3U}) {
+            // Mixed-eye visible coverage is a triangle-specific assertion;
+            // the degenerate origin/all-zero/all-behind fixtures cover all
+            // three topologies (including widened point/line fallbacks).
+            if (fixture >= 3 && shape != 3) continue;
+            auto initial = RasterStateFor(pool, shape, false, geometry);
+            auto original_lanes = LoadArray<VertexLane>(pool, initial.vertex_lanes);
+            for (unsigned i = 0; i < shape; ++i)
+              for (unsigned c = 0; c < 4; ++c)
+                original_lanes[i].vertex_output[c] = Bits(eye_positions[fixture][i][c]);
+            // Depth-clamped apex keeps a finite, nonzero clip Z and still
+            // has no XY projection. It must not create synthetic fragments.
+            if (depth_clamp && fixture == 0)
+              for (auto &lane : original_lanes)
+                lane.vertex_output[2] = Bits(3.0f);
+            pool.Release(initial.vertex_lanes);
+            initial.vertex_lanes = StoreNewArray(pool, original_lanes);
+            initial.raster_state.depth_clamp_enable = depth_clamp;
+            const auto state_handle = Publish(pool, initial);
+            raster_in.write({state_handle, 1, 1});
+            sc_core::sc_start(sc_core::sc_time(10, sc_core::SC_US));
+            PipelineTxn completion;
+            Check(raster_out.nb_read(completion), "eye-plane raster FIFO completes");
+            const auto state = LoadPipelineState(pool, completion.state);
+            const auto triangles = LoadArray<RasterTriangle>(pool, state.raster_triangles);
+            const auto output_lanes = LoadArray<VertexLane>(pool, state.vertex_lanes);
+            Check(state.stage == PipelineStage::kParameterBufferReady,
+                  "eye-plane completion reaches parameter buffer");
+            Check(state.counters.c_invocations == 1,
+                  "eye-plane discard retains clipping invocation");
+            Check(output_lanes.size() == original_lanes.size(),
+                  "clipping never removes original stream-output lanes");
+            for (unsigned i = 0; i < output_lanes.size(); ++i)
+              Check(std::memcmp(output_lanes[i].vertex_output,
+                                original_lanes[i].vertex_output,
+                                sizeof(output_lanes[i].vertex_output)) == 0,
+                    "eye-plane clipping preserves every original VTXOUT DWORD");
+            if (fixture < 4) {
+              Check(triangles.empty(), "nonprojectable primitive has no raster output");
+              Check(state.counters.c_primitives == 0,
+                    "no synthetic setup primitive for clip apex");
+            } else if (fixture == 6) {
+              for (const auto &triangle : triangles)
+                Check(!triangle.rasterizable,
+                      "generated apex does not turn a projective line into coverage");
+            } else {
+              bool covered = false;
+              for (const auto &triangle : triangles) {
+                covered |= triangle.rasterizable != 0;
+                for (unsigned i = 0; i < 3; ++i)
+                  Check(std::isfinite(triangle.x[i]) && std::isfinite(triangle.y[i]) &&
+                            std::isfinite(triangle.reciprocal_w[i]) &&
+                            triangle.reciprocal_w[i] > 0,
+                        "eye-crossing survivors have finite positive projection");
+              }
+              Check(covered, "eye-crossing input retains genuinely visible coverage");
+            }
+            Retire(pool, state_handle);
+          }
+        }
+      }
     }
     Check(pool.allocations() == pool.releases(), "all GS boundary pool handles retired");
     std::cout << "geometry-frontend-test: " << checks << " checks PASS\n";

@@ -177,7 +177,7 @@ void Isp::Run() {
         RasterSampleMask(sample_count) & state.raster_state.sample_mask;
 
     const std::uint64_t pixel_count =
-        static_cast<std::uint64_t>(state.width) * state.height;
+        static_cast<std::uint64_t>(state.width) * state.height * state.attachment_layers;
     if (pixel_count > std::numeric_limits<std::size_t>::max() / sample_count)
       throw std::overflow_error("ISP surface is too large");
     const std::size_t storage_count =
@@ -311,9 +311,10 @@ void Isp::Run() {
                          : 0.0F;
         const std::uint8_t stencil_value =
             static_cast<std::uint8_t>(clear.stencil_value & 0xFFU);
+        for (std::uint32_t layer = 0; layer < state.attachment_layers; ++layer)
         for (std::uint32_t y = clear.y; y < y_end; ++y) {
           const std::size_t row =
-              static_cast<std::size_t>(y) * state.width * sample_count;
+              (static_cast<std::size_t>(layer) * state.height + y) * state.width * sample_count;
           if (clears_stencil) {
             std::fill_n(stencil.begin() + row + clear.x * sample_count,
                         clear.width * sample_count,
@@ -473,7 +474,9 @@ void Isp::Run() {
             std::copy(sample_depth.begin(), sample_depth.end(),
                       candidate.sample_depth);
             const std::size_t coverage_index =
-                static_cast<std::size_t>(y) * state.width + x;
+                (static_cast<std::size_t>(triangle.key.layer) * state.height + y) * state.width + x;
+            if (triangle.key.layer >= state.attachment_layers)
+              throw std::runtime_error("ISP primitive layer is outside its attachment");
             if (covered[coverage_index] == 0) {
               covered[coverage_index] = 1;
               ++covered_pixels;

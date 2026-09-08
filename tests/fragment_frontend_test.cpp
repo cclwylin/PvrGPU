@@ -134,6 +134,32 @@ int sc_main(int, char **) {
     }
     ReleaseFunctionalPayloads(pool, msaa_result);
     pool.Release(msaa_handle);
+    for (unsigned stage = 0; stage < 3; ++stage) {
+      PipelineState sampled;
+      sampled.width = 4; sampled.height = 2; sampled.sequence = 3 + stage;
+      sampled.functional_case = FunctionalCase::kDriverPcoTriangles;
+      sampled.stage = PipelineStage::kVisibilityReady;
+      sampled.vertex_sampled_texture_count = stage == 0;
+      sampled.sampled_texture_count = stage == 1;
+      sampled.geometry_sampled_texture_count = stage == 2;
+      sampled.active_fragment_invocations = 1;
+      auto p = parameter; p.depth_plane_valid = 1;
+      auto candidate = rejected; candidate.visibility = FragmentVisibility::kVisible;
+      sampled.parameter_triangles = StoreNewArray(pool, std::vector<ParameterTriangle>{p});
+      sampled.fragment_candidates = StoreNewArray(pool, std::vector<FragmentCandidate>{candidate});
+      const auto handle = pool.Allocate(sizeof(PipelineState));
+      StorePipelineState(pool, handle, sampled);
+      input.write(PipelineTxn{handle, 3 + stage, sampled.sequence});
+      sc_core::sc_start(sc_core::sc_time(100, sc_core::SC_NS));
+      Check(output.nb_read(completed) && completed.sequence == sampled.sequence,
+            "stage-local texture frontend did not complete");
+      const auto done = LoadPipelineState(pool, handle);
+      Check(done.active_fragment_invocations == 1 && done.counters.ps_invocations == 1 &&
+            done.fragment_shader_lane_count == (stage == 1 ? 8U : 1U) &&
+            HasPoolHandle(done.fragment_shader_lanes) == (stage == 1),
+            "only fragment-stage SMP may create fragment helper lanes; VS/GS samplers remain independent");
+      ReleaseFunctionalPayloads(pool, done); pool.Release(handle);
+    }
     Check(pool.bytes_in_flight() == 0 &&
               pool.allocations() == pool.releases(),
           "MemoryPool balance");

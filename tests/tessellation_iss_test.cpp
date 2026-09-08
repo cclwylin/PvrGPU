@@ -168,6 +168,58 @@ void UnequalPatches() {
     }
   }
 }
+void NativeAndWritableInputs() {
+  // Byte-identical TES LOGICAL.AND at byte 1770 in dEQP per_vertex_block:
+  // r12 & r8 -> vi3. The surrounding MOVI and UVSW groups supply an isolated
+  // native executable; no expected TES exports are supplied by the host.
+  std::vector<std::uint8_t> bytes = {
+    0x86,0x92,0x40,0x13,0x5a,0xa5,0xf0,0xf0,0,0,0x4c,0xff,
+    0x86,0x92,0x40,0x13,0xf0,0x0f,0xf0,0x0f,0,0,0x48,0xff,
+    0x56,0xb2,0x40,0x41,0x02,0x80,0x40,0,0x4c,0x48,0x83,0x04,
+  };
+  const auto &exports=FillSolidVertexPcoBinary();
+  bytes.insert(bytes.end(),exports.begin(),exports.end());
+  auto program=DecodeTessellationPcoProgram(ShaderStage::kTessellationEvaluation,bytes);
+  Check(program.instructions[2].opcode==PcoOpcode::kBitwiseAnd &&
+        program.instructions[2].target==PcoWriteTarget::kVertexInput &&
+        program.instructions[2].output_index==3,
+        "real TES AND keeps its writable VTXIN destination");
+  DriverPcoStageAbi abi;
+  abi.temps=13;abi.vertex_inputs=6;abi.vertex_outputs=4;abi.shareds=4;
+  abi.uniform_buffer_descriptor_start=abi.push_constant_start=4;
+  ValidateTessellationProgram(program,abi);
+  const std::array<std::uint32_t,3> coords{{Bits(.25f),Bits(.5f),Bits(.25f)}};
+  auto task=MakeTessellationEvaluationTask(abi,{0,0,0,0},17,5,&coords,1);
+  Check(task.lanes[0].inputs_written==31,"only the five TES system inputs are initialized");
+  TessellationExecutionStats stats;
+  while(!task.ended)StepTessellationTask(program,abi,task,{},stats);
+  Check(task.lanes[0].inputs[3]==UINT32_C(0x00f00550),
+        "TES native AND preserves all 32 bits in the reused input bank");
+  Check(!(task.lanes[0].inputs_written&(UINT64_C(1)<<5)),
+        "declaring RA padding does not fabricate an initialized VI5");
+  bytes[34]=0x85; // The same native destination encoding addresses spare vi5.
+  auto spare=DecodeTessellationPcoProgram(ShaderStage::kTessellationEvaluation,bytes);
+  ValidateTessellationProgram(spare,abi);
+  task=MakeTessellationEvaluationTask(abi,{0,0,0,0},17,5,&coords,1);
+  stats={};
+  while(!task.ended)StepTessellationTask(spare,abi,task,{},stats);
+  Check(task.lanes[0].inputs[5]==UINT32_C(0x00f00550) &&
+        (task.lanes[0].inputs_written&(UINT64_C(1)<<5)),
+        "native write initializes aligned spare VI5");
+  auto bad=abi;bad.vertex_inputs=5;
+  Reject([&]{ValidateTessellationProgram(spare,bad);});
+  for(auto count:{4U,65U}) { bad=abi;bad.vertex_inputs=count;Reject([&]{ValidateTessellationProgram(program,bad);}); }
+  auto unread=program;
+  unread.instructions[2].source={PcoRegisterBank::kVertexInput,5};
+  ValidateTessellationProgram(unread,abi);
+  task=MakeTessellationEvaluationTask(abi,{0,0,0,0},17,5,&coords,1);
+  Reject([&]{while(!task.ended)StepTessellationTask(unread,abi,task,{},stats);});
+  // An ALU output is neither a UVSW export nor fragment PIXOUT.
+  bytes[34]=0xa0;bytes[35]=0; // extended SPECIAL32 = PIXOUT0
+  Reject([&]{DecodeTessellationPcoProgram(ShaderStage::kTessellationEvaluation,bytes);});
+  bytes[34]=0x83;bytes[35]=4;
+  Reject([&]{Decode(ShaderStage::kFragment,bytes);});
+}
 void Fixtures() {
   const std::vector<std::uint8_t>*controls[]={&kTess0tcs,&kTess1tcs,&kTess2tcs,&kTess3tcs,&kTess4tcs};
   const std::vector<std::uint8_t>*evaluations[]={&kTess0tes,&kTess1tes,&kTess2tes,&kTess3tes,&kTess4tes};
@@ -244,6 +296,6 @@ void Fixtures() {
 }
 } // namespace
 int main() {
-  try { SignedNativeAlu();UnequalPatches();Fixtures();std::cout<<"native tessellation ISS: PASS "<<checks<<" checks\n";return 0; }
+  try { SignedNativeAlu();UnequalPatches();NativeAndWritableInputs();Fixtures();std::cout<<"native tessellation ISS: PASS "<<checks<<" checks\n";return 0; }
   catch(const std::exception&e){std::cerr<<e.what()<<" after "<<checks<<" checks\n";return 1;}
 }

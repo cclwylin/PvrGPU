@@ -167,8 +167,8 @@ not be used to claim public support for the active 32×32 choice.
 ## DrawList shader instruction accounting
 
 The current SystemC producer includes `drawlist_stats[]` in each `counter`
-message. Each entry identifies one DrawList and splits vertex (`vs`) and
-fragment (`fs`) statistics into:
+message. Each entry identifies one DrawList and splits vertex (`vs`),
+fragment (`fs`), and enabled geometry/tessellation stages into:
 
 - `program`: static decoded program composition. `groups`, `instructions`,
   `alu`, `tex`, and `memory` count semantic program items once, before PCO
@@ -178,6 +178,14 @@ fragment (`fs`) statistics into:
   program also counts raster/helper lanes that genuinely execute `SMP` and
   wait for a response; logical `ps_invocations` continues to count covered
   fragments rather than helper work.
+
+Native GS sampling contributes to `gs_tex_instructions`, separately from
+`gs_memory_instructions` (LD/WDF/export work) and from VS/FS TEX counts.
+The reporter checks the sum of physical DrawList GS TEX counts against the
+producer total; TextureUnit separately checks issued GS requests against
+completed native SMP work. Zero-invocation and zero-emission GS programs are
+valid, but an absent GS cannot carry stale static or dynamic shader evidence.
+Static TEX presence alone does not imply that an instruction executed.
 
 The Fill.Solid reference fixture has this exact accounting:
 
@@ -398,6 +406,7 @@ usable. PvrGPU-only fields use semantic names such as:
 - `vertex_attribute_fetches`, `vertex_attribute_bytes`
 - `pco_decode_cycles`, `pco_instructions`, `usc_slot_cycles`, `usc_cluster_cycles`
 - `vs_alu_instructions`, `vs_tex_instructions`, `vs_memory_instructions`
+- `gs_alu_instructions`, `gs_tex_instructions`, `gs_memory_instructions`
 - `fs_alu_instructions`, `fs_tex_instructions`, `fs_memory_instructions`
 - `clip_cull_cycles`, `tiler_bin_cycles`, `parameter_buffer_cycles`
 - `parameter_coefficient_sets`, `parameter_write_bytes`

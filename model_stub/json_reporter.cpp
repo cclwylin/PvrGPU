@@ -821,7 +821,7 @@ void DebugSequenceAttachments(const MemoryPool &pool,
       state.color_attachment_raw_dwords, state.color_attachment_float32);
   const std::uint64_t expected_color_bytes =
       static_cast<std::uint64_t>(state.width) * state.height *
-      state.raster_state.sample_count * debug_bytes_per_pixel;
+      state.raster_state.sample_count * state.attachment_layers * debug_bytes_per_pixel;
   if (color.size() != expected_color_bytes)
     throw std::runtime_error(
         "JsonReporter attachment debug color byte count mismatch");
@@ -1061,6 +1061,7 @@ void AccumulatePhysicalCounters(CounterTxn *aggregate,
   PVRGPU_ADD_COUNTER(gs_invocations);
   PVRGPU_ADD_COUNTER(gs_primitives);
   PVRGPU_ADD_COUNTER(gs_alu_instructions);
+  PVRGPU_ADD_COUNTER(gs_tex_instructions);
   PVRGPU_ADD_COUNTER(gs_memory_instructions);
   PVRGPU_ADD_COUNTER(gs_load_instructions);
   PVRGPU_ADD_COUNTER(gs_emitted_vertices);
@@ -1197,6 +1198,7 @@ void ValidateDrawListStats(const CounterTxn &counters,
   std::uint64_t vs_memory = 0;
   std::uint64_t gs_invocations = 0;
   std::uint64_t gs_alu = 0;
+  std::uint64_t gs_tex = 0;
   std::uint64_t gs_memory = 0;
   std::uint64_t tcs_invocations = 0, tcs_alu = 0, tcs_memory = 0;
   std::uint64_t tes_invocations = 0, tes_alu = 0, tes_memory = 0;
@@ -1219,15 +1221,19 @@ void ValidateDrawListStats(const CounterTxn &counters,
     AddDrawListCounter(vs_memory, drawlist.vertex.executed_memory_instructions);
     const DrawListShaderStats &gs = drawlist.geometry;
     if (gs.program_recorded != gs.executions_recorded ||
-        gs.program_recorded > 1 || gs.executed_tex_instructions != 0 ||
+        gs.program_recorded > 1 ||
         (gs.program_recorded == 0 &&
-         (gs.invocations != 0 || gs.executed_alu_instructions != 0 ||
+         (gs.invocations != 0 || gs.program_groups != 0 ||
+          gs.program_instructions != 0 || gs.program_alu_instructions != 0 ||
+          gs.program_tex_instructions != 0 || gs.program_memory_instructions != 0 ||
+          gs.executed_alu_instructions != 0 || gs.executed_tex_instructions != 0 ||
           gs.executed_memory_instructions != 0))) {
       throw std::runtime_error(
           "JsonReporter received incomplete geometry DrawList statistics");
     }
     AddDrawListCounter(gs_invocations, gs.invocations);
     AddDrawListCounter(gs_alu, gs.executed_alu_instructions);
+    AddDrawListCounter(gs_tex, gs.executed_tex_instructions);
     AddDrawListCounter(gs_memory, gs.executed_memory_instructions);
     for (const auto *shader : {&drawlist.tessellation_control,
                               &drawlist.tessellation_evaluation}) {
@@ -1260,6 +1266,7 @@ void ValidateDrawListStats(const CounterTxn &counters,
       vs_memory != counters.vs_memory_instructions ||
       gs_invocations != counters.gs_invocations ||
       gs_alu != counters.gs_alu_instructions ||
+      gs_tex != counters.gs_tex_instructions ||
       gs_memory != counters.gs_memory_instructions ||
       tcs_invocations != counters.tcs_invocations ||
       tcs_alu != counters.tcs_alu_instructions ||
@@ -1742,6 +1749,9 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     if (!options.driver_commands.empty()) {
       std::cout << ",\"driver_command_sequence_length\":"
                 << options.driver_commands.size();
+      if (options.driver_commands.back().framebuffer_layers)
+        std::cout << ",\"driver_command_framebuffer_layers\":"
+                  << options.driver_commands.back().framebuffer_layers;
       std::uint64_t initial_color_bytes = 0;
       for (const DriverCommand &draw : options.driver_commands)
         initial_color_bytes += draw.initial_color_attachment_bytes.size();
@@ -1953,6 +1963,7 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
       << ",\"gs_invocations\":" << counters.gs_invocations
       << ",\"gs_primitives\":" << counters.gs_primitives
       << ",\"gs_alu_instructions\":" << counters.gs_alu_instructions
+      << ",\"gs_tex_instructions\":" << counters.gs_tex_instructions
       << ",\"gs_memory_instructions\":" << counters.gs_memory_instructions
       << ",\"gs_load_instructions\":" << counters.gs_load_instructions
       << ",\"gs_emitted_vertices\":" << counters.gs_emitted_vertices
@@ -2135,6 +2146,11 @@ void EmitError(std::uint32_t frame, const std::string &message) {
 
 } // namespace
 
+void ValidateDrawListShaderStatistics(
+    const CounterTxn &counters, const std::vector<DrawListStats> &drawlists) {
+  ValidateDrawListStats(counters, drawlists);
+}
+
 JsonReporter::JsonReporter(sc_core::sc_module_name name, const Options &options,
                            MemoryPool &pool,
                            sc_core::sc_event *sequence_completion,
@@ -2208,6 +2224,7 @@ void JsonReporter::RunJob() {
     std::vector<std::vector<std::uint8_t>> final_extra_framebuffers;
     std::uint32_t final_bytes_per_pixel = 4;
     std::uint32_t final_sample_count = 1;
+    std::uint32_t final_layer_count = 1;
     std::uint32_t final_width = 0;
     std::uint32_t final_height = 0;
     std::vector<std::uint64_t> sequence_color_addresses(
@@ -2273,7 +2290,7 @@ void JsonReporter::RunJob() {
           const std::uint64_t expected_depth_bytes =
               has_depth
                   ? static_cast<std::uint64_t>(state.width) * state.height *
-                        state.raster_state.sample_count *
+                        state.raster_state.sample_count * state.attachment_layers *
                         DepthAttachmentBytesPerPixel(
                             physical_command.depth_format)
                   : 0;
@@ -2288,7 +2305,7 @@ void JsonReporter::RunJob() {
                !physical_command.initial_depth_attachment_bytes.empty());
           const std::uint64_t expected_color_bytes =
               static_cast<std::uint64_t>(state.width) * state.height *
-              state.raster_state.sample_count *
+              state.raster_state.sample_count * state.attachment_layers *
               ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
                                            state.color_attachment_float32);
           if (state.color_attachment_load_enable != (color_load ? 1U : 0U) ||
@@ -2324,7 +2341,7 @@ void JsonReporter::RunJob() {
             LoadArray<std::uint8_t>(pool_, state.dram_framebuffer);
         const std::uint64_t expected_framebuffer_bytes =
             static_cast<std::uint64_t>(state.width) * state.height *
-            state.raster_state.sample_count *
+            state.raster_state.sample_count * state.attachment_layers *
             ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
                                          state.color_attachment_float32);
         const std::uint64_t submission_render_target_count =
@@ -2382,6 +2399,7 @@ void JsonReporter::RunJob() {
             ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
                                          state.color_attachment_float32));
         final_sample_count = state.raster_state.sample_count;
+        final_layer_count = state.attachment_layers;
         final_width = state.width;
         final_height = state.height;
         final_depth_framebuffer.clear();
@@ -2425,7 +2443,7 @@ void JsonReporter::RunJob() {
       if (final_width != options_.width || final_height != options_.height ||
           final_framebuffer.size() !=
               static_cast<std::uint64_t>(final_width) * final_height *
-                  final_bytes_per_pixel * final_sample_count) {
+                  final_bytes_per_pixel * final_sample_count * final_layer_count) {
         throw std::runtime_error(
             "JsonReporter PCO sequence final framebuffer is invalid");
       }
@@ -2453,7 +2471,7 @@ void JsonReporter::RunJob() {
         job_->PublishFramebuffer(final_framebuffer, final_width, final_height,
                                  final_bytes_per_pixel,
                                  std::move(final_extra_framebuffers),
-                                 final_sample_count);
+                                 final_sample_count, final_layer_count);
         job_->depth_framebuffer = std::move(final_depth_framebuffer);
         job_->depth_format = final_depth_format;
       }
@@ -2462,7 +2480,7 @@ void JsonReporter::RunJob() {
       // PNG to write for one.  The readback above still carries its real
       // bytes; only the human-facing artifact is skipped.
       if (!options_.output_dir.empty() && final_bytes_per_pixel == 4U &&
-          final_sample_count == 1U) {
+          final_sample_count == 1U && final_layer_count == 1U) {
         artifact_path = FramePath(options_, 1);
         // Ordered native PCO sequences publish only the final physical DRAM
         // readback.  No command sidecar/golden/CPU framebuffer is consulted.
@@ -2537,7 +2555,7 @@ void JsonReporter::RunJob() {
           LoadArray<std::uint8_t>(pool_, state.dram_framebuffer);
       const std::uint64_t expected_framebuffer_bytes =
           static_cast<std::uint64_t>(state.width) * state.height *
-          state.raster_state.sample_count *
+          state.raster_state.sample_count * state.attachment_layers *
           ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
                                        state.color_attachment_float32);
       const std::uint64_t sequence_render_target_count =
@@ -2592,13 +2610,13 @@ void JsonReporter::RunJob() {
         job_->PublishFramebuffer(framebuffer, state.width, state.height,
                                  frame_bytes_per_pixel,
                                  std::move(extra_framebuffers),
-                                 state.raster_state.sample_count);
+                                 state.raster_state.sample_count, state.attachment_layers);
       }
       std::filesystem::path artifact_path;
       // As above: an integer attachment has no RGBA8 rendering, so it gets no
       // PNG.  The pixels the driver reads back are unaffected.
       if (!options_.output_dir.empty() && frame_bytes_per_pixel == 4U &&
-          state.raster_state.sample_count == 1U) {
+          state.raster_state.sample_count == 1U && state.attachment_layers == 1U) {
         artifact_path = FramePath(options_, state.counters.frame);
         std::vector<std::uint8_t> artifact_framebuffer = framebuffer;
         LoadDriverFramebufferSnapshot(options_,

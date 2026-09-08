@@ -14,12 +14,14 @@ bool Fits(std::uint32_t first, std::uint32_t count, std::uint32_t limit) {
   return first <= limit && count <= limit - first;
 }
 void ValidateAbi(const DriverPcoStageAbi &abi) {
+  const auto descriptors = abi.uniform_buffer_descriptor_start;
   if (abi.temps > kPcoTemporaryCount || abi.vertex_inputs != 2 ||
       abi.vertex_outputs < 4 || abi.vertex_outputs > kPcoVertexOutputCount || abi.coefficients ||
       abi.shareds < 4 || abi.shareds > kPcoMaximumSharedCount || abi.entry_offset ||
       abi.uniform_buffer_descriptor_count > 15 ||
-      abi.uniform_buffer_descriptor_start != 4 ||
-      abi.push_constant_start != 4 + 4 * abi.uniform_buffer_descriptor_count ||
+      descriptors < 4 || (descriptors - 4) % kPcoTextureDescriptorDwordCount ||
+      (descriptors - 4) / kPcoTextureDescriptorDwordCount > kPcoMaximumTextureDescriptorSets ||
+      abi.push_constant_start != descriptors + 4 * abi.uniform_buffer_descriptor_count ||
       !Fits(abi.push_constant_start, abi.push_constant_count, abi.shareds) ||
       std::uint64_t{abi.push_constant_start} + abi.push_constant_count != abi.shareds)
     Fail("register or primitive/UBO/push ABI is invalid");
@@ -135,6 +137,77 @@ bool Condition(unsigned condition, const GeometryTaskState &task) {
   default: Fail("invalid execution-mask condition");
   }
 }
+
+unsigned TextureDataCount(const PcoInstruction &i) {
+  return i.texture_dimension + ((i.texture_address_offset || i.texture_lod_replace) ? 1U : 0U) +
+         (i.texture_address_offset ? 2U : 0U) +
+         (i.texture_sample_index_present ? 1U : 0U);
+}
+void ValidateSample(const PcoInstruction &i, const DriverPcoStageAbi &abi) {
+  // The first four GS shared words describe its primitive input buffer.
+  // Descriptor set zero starts at SH4, not VS/FS's SH0.
+  if (i.repeat_count != 1 || i.source_count != 3 || i.data_request ||
+      i.component_count != kPcoTextureResponseCount || i.end_group ||
+      i.target != PcoWriteTarget::kTemporary ||
+      i.source.bank != PcoRegisterBank::kTemporary ||
+      (i.texture_dimension != 2 && i.texture_dimension != 3) ||
+      i.texture_address_offset > 1 || i.texture_fcnorm > 1 ||
+      i.texture_non_normalized_coords > 1 || i.texture_sample_index_present > 1 ||
+      i.texture_lod_replace > 1 ||
+      (i.texture_non_normalized_coords && !i.texture_sample_index_present && !i.texture_lod_replace) ||
+      (i.texture_sample_index_present && (!i.texture_non_normalized_coords ||
+         i.texture_lod_replace || i.texture_dimension != 2)) ||
+      !Fits(i.source.index, TextureDataCount(i), abi.temps) ||
+      !Fits(i.output_index, kPcoTextureResponseCount, abi.temps) ||
+      i.source1.bank != PcoRegisterBank::kShared || i.source1.index < 4 ||
+      (i.source1.index - 4) % kPcoTextureDescriptorDwordCount ||
+      !Fits(i.source1.index, kPcoTextureDescriptorDwordCount,
+            abi.uniform_buffer_descriptor_start) ||
+      i.source2.bank != PcoRegisterBank::kShared ||
+      i.source2.index != i.source1.index + 8)
+    Fail("native SMP source/response/descriptor layout is invalid");
+}
+PcoTextureRequest SampleRequest(const PcoInstruction &i,
+                               const DriverPcoStageAbi &abi,
+                               const GeometryTaskState &task) {
+  ValidateSample(i, abi);
+  if (!task.temporary_written.contains_range(i.source.index, TextureDataCount(i)))
+    Fail("native SMP coordinate/payload read before write");
+  PcoTextureRequest request;
+  unsigned next = i.source.index;
+  for (unsigned component = 0; component < i.texture_dimension; ++component)
+    request.coordinates[component] = task.temporaries[next++];
+  request.explicit_lod_present = i.texture_lod_replace;
+  if (i.texture_lod_replace)
+    request.explicit_lod = task.temporaries[next++];
+  if (i.texture_address_offset) {
+    // Native TAO currently uses the supported zero-bias form, not an
+    // arbitrary explicit LOD. Never silently erase a shader's LOD value.
+    if (!i.texture_lod_replace && (task.temporaries[next++] & UINT32_C(0x7fffffff)))
+      Fail("native SMP TAO requires zero LOD bias");
+    request.texture_address_lo = task.temporaries[next++];
+    request.texture_address_hi = task.temporaries[next++];
+  }
+  if (i.texture_sample_index_present) {
+    const auto lookup = task.temporaries[next];
+    if (lookup & ~UINT32_C(0x00070000))
+      Fail("native SMP SNO lookup carries reserved/spatial-offset bits");
+    request.sample_index = static_cast<std::uint8_t>((lookup >> 16) & 7);
+  }
+  for (unsigned word = 0; word < 4; ++word) {
+    request.texture_state[word] = task.shared[i.source1.index + word];
+    request.sampler_state[word] = task.shared[i.source2.index + word];
+  }
+  request.descriptor_set = static_cast<std::uint8_t>((i.source1.index - 4) / kPcoTextureDescriptorDwordCount);
+  request.component_count = kPcoTextureResponseCount;
+  request.coordinate_count = 2;
+  request.dimension = i.texture_dimension;
+  request.normalized = !i.texture_non_normalized_coords;
+  request.sample_index_present = i.texture_sample_index_present;
+  request.fcnorm = i.texture_fcnorm;
+  request.data_request = i.data_request;
+  return request;
+}
 } // namespace
 
 void ValidateGeometryProgram(const PcoDecodedProgram &program,
@@ -146,24 +219,29 @@ void ValidateGeometryProgram(const PcoDecodedProgram &program,
     Fail("program is not a complete native geometry program");
   bool pending = false, ended = false;
   for (const auto &i : program.instructions) {
+    if (!HasCanonicalTextureLodMode(i)) Fail("texture LOD replacement flag is not canonical for opcode");
     if (!HasCanonicalNativeIntegerSignedness(i))
       Fail("integer signedness flag is not canonical for the native opcode");
     if (ended || !i.repeat_count || i.repeat_count > 16 || i.source_count > 4 ||
         i.exec_cnd > 3 || i.writes_predicate > 1)
       Fail("invalid instruction metadata or bytes following ENDTASK");
     const bool load = i.opcode == PcoOpcode::kBufferLoad;
+    const bool sample = i.opcode == PcoOpcode::kTextureSample;
     const bool wdf = i.opcode == PcoOpcode::kWaitDataFence;
     const bool mask = i.opcode == PcoOpcode::kConditionalMask;
     const bool branch = i.opcode == PcoOpcode::kBranch;
     if (!IsAlu(i.opcode) && !IsWrite(i.opcode) && !IsEmit(i.opcode) && !IsCut(i.opcode) &&
-        !IsEnd(i.opcode) && !load && !wdf && !mask && !branch && i.opcode != PcoOpcode::kNop)
+        !IsEnd(i.opcode) && !load && !sample && !wdf && !mask && !branch && i.opcode != PcoOpcode::kNop)
       Fail("opcode requires unimplemented geometry functionality");
-    if (pending && !wdf) Fail("native LD is not followed by WDF");
+    if (pending && !wdf) Fail("native memory request is not followed by WDF");
     if (load) {
       if (i.repeat_count != 1 || i.source_count != 2 || i.data_request ||
           !i.component_count || i.component_count > 16 || i.memory_cache_mode > 1 ||
           i.end_group || i.target != PcoWriteTarget::kTemporary)
         Fail("invalid native LD metadata");
+      pending = true;
+    } else if (sample) {
+      ValidateSample(i, abi);
       pending = true;
     } else if (wdf) {
       if (!pending || i.exec_cnd || i.data_request) Fail("unmatched WDF");
@@ -189,7 +267,7 @@ void ValidateGeometryProgram(const PcoDecodedProgram &program,
     if (i.target == PcoWriteTarget::kPixelOutput ||
         (i.target == PcoWriteTarget::kVertexOutput && !IsWrite(i.opcode)))
       Fail("non-UVSW graphics export in geometry program");
-    const auto count = load ? i.component_count : i.repeat_count;
+    const auto count = (load || sample) ? i.component_count : i.repeat_count;
     if ((i.target == PcoWriteTarget::kTemporary && !Fits(i.output_index, count, abi.temps)) ||
         (i.target == PcoWriteTarget::kVertexInput && !Fits(i.output_index, count, abi.vertex_inputs)) ||
         (i.target == PcoWriteTarget::kVertexOutput && !Fits(i.output_index, count, abi.vertex_outputs)))
@@ -234,6 +312,7 @@ void StepGeometryTask(const PcoDecodedProgram &program,
   if (task.ended || task.instruction_index >= program.instructions.size())
     Fail("task stepped outside its native program");
   const auto &i = program.instructions[task.instruction_index];
+  if (!HasCanonicalTextureLodMode(i)) Fail("texture LOD replacement flag is not canonical for opcode");
   if (!HasCanonicalNativeIntegerSignedness(i))
     Fail("integer signedness flag is not canonical for the native opcode");
   if (++task.steps > UINT64_C(10000000)) Fail("native task instruction watchdog");
@@ -251,7 +330,7 @@ void StepGeometryTask(const PcoDecodedProgram &program,
     if (take) next = i.branch_target_index;
     ++stats.instructions; ++stats.alu_instructions;
   } else if (Selected(i, task)) {
-    if (task.pending_count) Fail("instruction before its LD completion WDF");
+    if (task.pending_count) Fail("instruction before its memory completion WDF");
     ++stats.instructions;
     if (i.opcode == PcoOpcode::kConditionalMask) {
       const auto old = Read(i.source, 0, abi, task);
@@ -284,6 +363,13 @@ void StepGeometryTask(const PcoDecodedProgram &program,
       cb.read(cb.user_data, address, i.component_count, task.pending_words.data());
       task.pending_output = i.output_index; task.pending_count = i.component_count;
       ++stats.load_instructions; ++stats.memory_instructions;
+    } else if (i.opcode == PcoOpcode::kTextureSample) {
+      if (!cb.sample) Fail("native SMP has no TextureUnit request callback");
+      const auto request = SampleRequest(i, abi, task);
+      cb.sample(cb.user_data, request, task.pending_words.data());
+      task.pending_output = i.output_index;
+      task.pending_count = kPcoTextureResponseCount;
+      ++stats.texture_instructions;
     } else if (IsWrite(i.opcode) || IsEmit(i.opcode) || IsCut(i.opcode) || IsEnd(i.opcode)) {
       if (IsWrite(i.opcode)) for (unsigned r = 0; r < i.repeat_count; ++r)
         Write(PcoWriteTarget::kVertexOutput, i.output_index + r, Read(i.source, r, abi, task), abi, task);

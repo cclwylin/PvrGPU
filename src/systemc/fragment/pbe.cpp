@@ -320,7 +320,7 @@ void Pbe::Run() {
     ValidateBlendState(state.raster_state.blend);
 
     const std::uint64_t pixel_count =
-        static_cast<std::uint64_t>(state.width) * state.height;
+        static_cast<std::uint64_t>(state.width) * state.height * state.attachment_layers;
     const std::uint32_t sample_count = state.raster_state.sample_count;
     if (!IsSupportedRasterSampleCount(sample_count) ||
         pixel_count > std::numeric_limits<std::size_t>::max() / sample_count)
@@ -461,10 +461,11 @@ void Pbe::Run() {
               std::to_string(expected_pixel_output_mask));
         }
       }
-      if (output.x >= state.width || output.y >= state.height)
+      if (output.x >= state.width || output.y >= state.height ||
+          invocation.layer >= state.attachment_layers)
         throw std::runtime_error("PBE fragment coordinate is out of bounds");
       const std::size_t pixel_index =
-          static_cast<std::size_t>(output.y) * state.width + output.x;
+          (static_cast<std::size_t>(invocation.layer) * state.height + output.y) * state.width + output.x;
       std::uint32_t coverage = invocation.sample_mask;
       if (coverage == 0 || (coverage & ~RasterSampleMask(sample_count)) != 0)
         throw std::runtime_error("PBE fragment sample coverage is invalid");

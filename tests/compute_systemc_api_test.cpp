@@ -114,17 +114,18 @@ void GuardedVersion() {
   // Align the envelope as its ABI requires; only the version is initialized.
   constexpr std::size_t readable = alignof(pvrgpu_systemc_compute_dispatch);
   auto *bytes = static_cast<std::uint8_t *>(mapping) + page - readable;
-  const std::uint32_t invalid_version = 0;
-  std::memcpy(bytes, &invalid_version, sizeof(invalid_version));
   auto *old = reinterpret_cast<pvrgpu_systemc_compute_dispatch *>(bytes);
-  Reject(*old, "old envelope with inaccessible tail");
+  for (const std::uint32_t invalid_version : {0U,1U,2U,3U}) {
+    std::memcpy(bytes, &invalid_version, sizeof(invalid_version));
+    Reject(*old, "old envelope with inaccessible tail");
+  }
   munmap(mapping, 2U * page);
 #endif
 }
 
 void GuardedOldStats(unsigned mode) {
 #if !defined(_WIN32)
-  static_assert(PVRGPU_SYSTEMC_COMPUTE_API_VERSION == 2);
+  static_assert(PVRGPU_SYSTEMC_COMPUTE_API_VERSION == 4);
   // API v1 had thirteen uint64_t counters. Its caller may allocate exactly
   // that much: rejecting v1 must happen before clearing the larger v2 stats.
   constexpr std::size_t old_stats_size = 13U * sizeof(std::uint64_t);
@@ -157,6 +158,31 @@ void GuardedOldStats(unsigned mode) {
 }
 
 void InvalidEnvelopes(unsigned mode) {
+  for (const unsigned bad : {0U,1U,2U,3U,4U,5U,6U}) {
+    auto shared = Fixture(0, mode);
+    shared.abi.shared_memory_bytes = 4;
+    shared.abi.shared_memory_descriptor_count = 4;
+    shared.abi.stage.shareds = shared.abi.stage.push_constant_start = 4;
+    if (bad == 0) shared.abi.shared_memory_bytes = 32772;
+    if (bad == 1) shared.abi.shared_memory_bytes = 3;
+    if (bad == 2) shared.abi.shared_memory_descriptor_count = 3;
+    if (bad == 3) shared.abi.shared_memory_descriptor_start = 1;
+    if (bad == 4) shared.abi.stage.push_constant_start = 0;
+    if (bad == 5) shared.abi.stage.shareds = 3;
+    if (bad == 6) shared.abi.shared_memory_bytes = 0;
+    Reject(shared, "private shared descriptor extent/overlap/count/size");
+  }
+  // A genuine empty CS may reserve exactly the supported workgroup bound.
+  // This validates allocation and descriptor transport without host shaders.
+  for (const unsigned bytes : {4U,32768U}) {
+    auto shared = Fixture(0, mode);
+    shared.abi.shared_memory_bytes = bytes;
+    shared.abi.shared_memory_descriptor_count = 4;
+    shared.abi.stage.shareds = shared.abi.stage.push_constant_start = 4;
+    const auto stats = Run(shared);
+    Check(stats.workgroups == 1 && stats.invocations == 30 &&
+          stats.memory_instructions == 0, "shared legal boundary invented shader accesses");
+  }
   auto invalid = Fixture(1, mode);
   Reject(invalid, "shader resource masks reference absent bindings");
   invalid = Fixture(0, mode);

@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 /* API-v26 adds independent native transform-feedback transport/readback. */
-#define PVRGPU_SYSTEMC_API_VERSION 26u
+#define PVRGPU_SYSTEMC_API_VERSION 27u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE 15u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES (64u * 1024u)
 /*
@@ -529,6 +529,10 @@ struct pvrgpu_systemc_driver_command {
    /* Non-null with count zero explicitly means no FS varying linkage. */
    const struct pvrgpu_systemc_varying_binding *varying_bindings;
    uint32_t varying_binding_count;
+   /* API-v27: zero is a non-layered framebuffer. Otherwise every attachment
+    * contains this many tightly packed layer-major images and gl_Layer
+    * selects one. Pixel/sample layout within each layer is unchanged. */
+   uint32_t framebuffer_layers;
 };
 
 struct pvrgpu_systemc_submit_info {
@@ -582,6 +586,8 @@ struct pvrgpu_systemc_readback_info {
    /* UINT32_MAX attachment selects depth/stencil and requires this exact
     * native format, so equal-byte-width layouts cannot be confused. */
    uint32_t depth_format;
+   /* Zero means one; must match the complete rendered attachment extent. */
+   uint32_t layer_count;
 };
 
 /*

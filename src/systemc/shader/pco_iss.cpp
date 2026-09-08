@@ -1585,11 +1585,11 @@ PcoInstruction DecodeFragmentDepthFeedbackGroup(
 
 PcoInstruction DecodeTextureSampleGroup(
     const std::vector<std::uint8_t> &binary, const GroupHeader &header,
-    std::uint16_t group_index) {
+    std::uint16_t group_index, std::uint16_t descriptor_start = 0) {
   if (header.control || (header.da != 5 && header.da != 6) ||
       header.operation_origin != 2 || header.output_load_check ||
       header.write0_present || header.write1_present ||
-      header.repeat_count != 1 || header.end || header.total_bytes != 14) {
+      header.repeat_count != 1 || header.end) {
     DecodeError(header.offset, "unsupported SMP instruction-group header");
   }
   const std::size_t group_end = header.offset + header.total_bytes;
@@ -1635,6 +1635,7 @@ PcoInstruction DecodeTextureSampleGroup(
   bool address_offset = false;
   bool non_normalized_coords = false;
   bool sample_index_present = false;
+  const bool lod_replace = lod_mode == 2U;
   if (exta) {
     if (cursor >= group_end)
       DecodeError(cursor, "truncated SMP extension byte");
@@ -1646,17 +1647,19 @@ PcoInstruction DecodeTextureSampleGroup(
     // Public I_SMP byte 2: no projection, sample-buffer mode or spatial
     // offset in this subset. In particular, never ignore NNCOORDS/SNO on
     // an otherwise familiar TAO group: that would lose the selected sample.
-    if ((extension & 0x72U) != 0 || pplod != address_offset ||
-        non_normalized_coords != sample_index_present ||
-        (!address_offset && !sample_index_present) ||
-        (sample_index_present && dimension != 2))
+    if ((extension & 0x72U) != 0 || pplod != (address_offset || lod_replace) ||
+        (sample_index_present && (!non_normalized_coords || lod_replace || dimension != 2)) ||
+        (non_normalized_coords && !sample_index_present && !lod_replace) ||
+        (!address_offset && !sample_index_present && !lod_replace))
       DecodeError(cursor - 1, "unsupported SMP extension flags");
   }
-  if (lod_mode != (address_offset ? 1U : 0U))
+  if ((lod_replace && !exta) ||
+      (!lod_replace && lod_mode != (address_offset ? 1U : 0U)))
     DecodeError(header.offset + 4, "SMP LOD mode disagrees with TAO payload");
   // Coordinates, optional bias/address pair, then optional lookup DWORD.
   const std::uint8_t coordinate_span = static_cast<std::uint8_t>(
-      dimension + (address_offset ? 3U : 0U) +
+      dimension + ((address_offset || lod_replace) ? 1U : 0U) +
+      (address_offset ? 2U : 0U) +
       (sample_index_present ? 1U : 0U));
 
   /* The three lower sources are the four-word texture state, two normalized
@@ -1677,10 +1680,11 @@ PcoInstruction DecodeTextureSampleGroup(
       sources.source2.bank != PcoRegisterBank::kShared ||
       static_cast<std::size_t>(sources.source2.index) + 4U >
           kPcoMaximumSharedCount ||
-      sources.source0.index % kPcoTextureDescriptorDwordCount != 0 ||
+      sources.source0.index < descriptor_start ||
+      (sources.source0.index - descriptor_start) % kPcoTextureDescriptorDwordCount != 0 ||
       sources.source2.index !=
           sources.source0.index + 8U ||
-      sources.source0.index / kPcoTextureDescriptorDwordCount >=
+      (sources.source0.index - descriptor_start) / kPcoTextureDescriptorDwordCount >=
           kPcoMaximumTextureDescriptorSets ||
       static_cast<std::size_t>(sources.source0.index) +
               kPcoTextureDescriptorDwordCount >
@@ -1689,15 +1693,19 @@ PcoInstruction DecodeTextureSampleGroup(
                 "SMP source registers exceed the public layout");
   }
 
-  if (group_end - cursor < 3 || binary[cursor++] != 0x80U)
-    DecodeError(cursor - 1, "unsupported SMP upper-source selector");
-  const std::uint8_t response = binary[cursor++];
-  if ((response & 0xe0U) != 0xa0U)
+  // Public I_TWO_UP has both brief and extended register-index forms.
+  // s3 is the unused canonical sc0; s4 is the native SMP response base.
+  // Real multi-sample shaders allocate s4 above r31, extending the group
+  // from 14 to 16 bytes. Decode the register fields, never truncate to 5 bits.
+  const TwoLowerSources response = DecodeTwoLowerSources(binary, group_end, cursor);
+  if (response.source0.bank != PcoRegisterBank::kSpecial || response.source0.index != 0)
+    DecodeError(cursor, "unsupported SMP upper-source selector");
+  if (response.source1.bank != PcoRegisterBank::kTemporary)
     DecodeError(cursor - 1, "SMP response is not a temporary range");
-  const std::uint16_t response_base = response & 0x1fU;
+  const std::uint16_t response_base = response.source1.index;
   if (static_cast<std::size_t>(response_base) + 4U > kPcoTemporaryCount)
     DecodeError(cursor - 1, "SMP response exceeds the temporary file");
-  if (binary[cursor++] != 0x00U)
+  if (cursor >= group_end || binary[cursor++] != 0x00U)
     DecodeError(cursor - 1, "unsupported SMP ISS selection");
   ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
 
@@ -1708,6 +1716,7 @@ PcoInstruction DecodeTextureSampleGroup(
   instruction.texture_fcnorm = fcnorm ? 1U : 0U;
   instruction.texture_non_normalized_coords = non_normalized_coords ? 1U : 0U;
   instruction.texture_sample_index_present = sample_index_present ? 1U : 0U;
+  instruction.texture_lod_replace = lod_replace ? 1U : 0U;
   instruction.target = PcoWriteTarget::kTemporary;
   instruction.source = sources.source1;
   instruction.source1 = sources.source0;
@@ -3294,7 +3303,7 @@ PcoInstruction DecodeGenericImmediateGroup(
 }
 
 PcoInstruction DecodeGenericBitwiseAndGroup(
-    ShaderStage, const std::vector<std::uint8_t> &binary,
+    ShaderStage stage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
   /* Ideas lighting emits this public two-phase form for Boolean conjunction:
    *   p0: bbyp0s1 ft2, ft3, s2
@@ -3334,8 +3343,13 @@ PcoInstruction DecodeGenericBitwiseAndGroup(
       DecodeOneLowerSource(binary, group_end, cursor);
   const DecodedDestination destination =
       DecodeGenericDestination(binary, group_end, cursor);
-  if (destination.target != PcoWriteTarget::kTemporary)
-    DecodeError(header.offset, "LOGICAL.AND destination must be temporary");
+  // Native task stages reuse dead VTXIN registers during allocation, just
+  // like MOVI. The task ABI validator bounds that writable input bank; pixel
+  // outputs and UVSW exports are not valid destinations for this ALU group.
+  if (destination.target != PcoWriteTarget::kTemporary &&
+      (!IsNativeTaskStage(stage) ||
+       destination.target != PcoWriteTarget::kVertexInput))
+    DecodeError(header.offset, "unsupported LOGICAL.AND destination bank");
   ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
 
   PcoInstruction instruction;
@@ -4347,9 +4361,8 @@ PcoInstruction DecodeComputeControl(const std::vector<std::uint8_t> &binary,
     const auto control = binary[cursor++];
     out.control_operation = control >> 6U;
     out.immediate = control & 15U;
-    if ((control & 0x30U) != 0 ||
-        (out.control_operation != 0 && out.control_operation != 3))
-      DecodeError(header.offset, "compute MUTEX supports LOCK/RELEASE, not sleep/wakeup or reserved bits");
+    if ((control & 0x30U) != 0)
+      DecodeError(header.offset, "compute MUTEX has reserved bits");
     out.opcode = PcoOpcode::kMutex;
   } else if (header.control_op == 7) {
     if (header.da || header.write0_present || header.write1_present ||
@@ -4402,8 +4415,12 @@ PcoInstruction DecodeComputeControl(const std::vector<std::uint8_t> &binary,
     if (upper.bank != PcoRegisterBank::kSpecial || upper.index != 0)
       DecodeError(cursor, "compute CND upper source must be unused");
     const auto dest = DecodeGenericDestination(binary, end, cursor);
-    if (dest.target != PcoWriteTarget::kTemporary)
-      DecodeError(cursor, "compute CND counter must use TEMP");
+    // Register allocation can reuse a dead local-ID VTXIN for the execution
+    // mask counter, just as for ALU values. This is a per-instance register,
+    // not a graphics export; the compute ABI validates its actual extent.
+    if (dest.target != PcoWriteTarget::kTemporary &&
+        dest.target != PcoWriteTarget::kVertexInput)
+      DecodeError(cursor, "compute CND counter must use TEMP or VTXIN");
     out.opcode = PcoOpcode::kConditionalMask;
     out.writes_predicate = out.control_operation == 3;
     out.target = dest.target;
@@ -4666,6 +4683,13 @@ PcoInstruction DecodeNativeRasterTaskGroup(ShaderStage stage,
                                    const GroupHeader &header,
                                    std::uint16_t group_index) {
   const auto backend = binary[header.offset + 3];
+  // GS reserves SH0..3 for its primitive-input memory descriptor; its
+  // combined image/sampler sets therefore begin at SH4, independently of
+  // the VS/FS descriptor namespaces.
+  if (stage == ShaderStage::kGeometry && !header.control && !header.bitwise &&
+      header.operation_origin == 2 && (backend >> 5U) == kBackendOpDma &&
+      (backend & 7U) == 4)
+    return DecodeTextureSampleGroup(binary, header, group_index, 4);
   if (header.control || header.bitwise || header.operation_origin != 2 ||
       (backend >> 5U) != kBackendOpUvs)
     return DecodeNativeTaskGroup(stage, binary, header,
@@ -4730,6 +4754,7 @@ bool SameConditionalsInstruction(const PcoInstruction &left,
          left.texture_fcnorm == right.texture_fcnorm &&
          left.texture_non_normalized_coords == right.texture_non_normalized_coords &&
          left.texture_sample_index_present == right.texture_sample_index_present &&
+         left.texture_lod_replace == right.texture_lod_replace &&
          left.data_request == right.data_request &&
          left.iteration_mode == right.iteration_mode &&
          left.perspective == right.perspective &&
@@ -4919,15 +4944,18 @@ bool HasCanonicalTextureFields(const PcoInstruction &instruction) {
          instruction.texture_fcnorm <= 1 &&
          instruction.texture_non_normalized_coords <= 1 &&
          instruction.texture_sample_index_present <= 1 &&
-         instruction.texture_non_normalized_coords ==
-             instruction.texture_sample_index_present &&
+         instruction.texture_lod_replace <= 1 &&
+         (!instruction.texture_non_normalized_coords ||
+          instruction.texture_sample_index_present || instruction.texture_lod_replace) &&
          (!instruction.texture_sample_index_present ||
-          instruction.texture_dimension == 2);
+          (instruction.texture_non_normalized_coords && !instruction.texture_lod_replace &&
+           instruction.texture_dimension == 2));
 }
 
 std::size_t TextureDataDwordCount(const PcoInstruction &instruction) {
   return static_cast<std::size_t>(instruction.texture_dimension) +
-         (instruction.texture_address_offset ? 3U : 0U) +
+         ((instruction.texture_address_offset || instruction.texture_lod_replace) ? 1U : 0U) +
+         (instruction.texture_address_offset ? 2U : 0U) +
          (instruction.texture_sample_index_present ? 1U : 0U);
 }
 
@@ -4943,10 +4971,14 @@ void SetTextureRequestData(
   for (std::size_t component = 0; component < dimensions; ++component)
     request.coordinates[component] = temporaries[base + component];
   std::size_t tail = base + dimensions;
+  request.explicit_lod_present = instruction.texture_lod_replace;
+  if (instruction.texture_lod_replace)
+    request.explicit_lod = temporaries[tail++];
   if (instruction.texture_address_offset) {
     // pco_emit_nir_smp injects a zero bias before the address pair. A nonzero
     // BIAS needs its own LOD datapath; never silently discard it here.
-    if ((temporaries[tail++] & UINT32_C(0x7fffffff)) != 0)
+    if (!instruction.texture_lod_replace &&
+        (temporaries[tail++] & UINT32_C(0x7fffffff)) != 0)
       ExecuteError("SMP TAO requires the supported zero LOD bias");
     request.texture_address_lo = temporaries[tail++];
     request.texture_address_hi = temporaries[tail++];
@@ -6906,6 +6938,8 @@ void ValidateExecutionEnvelope(const PcoProgramSummary &summary,
   }
   for (std::size_t index = 0; index < instructions.size(); ++index) {
     const PcoInstruction &instruction = instructions[index];
+    if (!HasCanonicalTextureLodMode(instruction))
+      ExecuteError("texture LOD replacement flag is not canonical for opcode");
     if (instruction.integer_signed)
       ExecuteError("integer signedness flag is native-task-only");
     if (instruction.group_index != index)

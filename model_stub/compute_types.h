@@ -29,6 +29,13 @@ struct ComputePcoAbi {
   std::uint32_t storage_buffer_write_mask = 0;
   std::uint32_t shared_memory_bytes = 0;
   std::uint32_t scratch_bytes = 0;
+  std::uint32_t shared_memory_descriptor_start = 0;
+  std::uint32_t shared_memory_descriptor_count = 0;
+  std::uint32_t image_descriptor_start = 0;
+  std::uint32_t image_descriptor_count = 0;
+  std::uint32_t image_used_mask = 0;
+  std::uint32_t image_read_mask = 0;
+  std::uint32_t image_write_mask = 0;
 };
 
 struct ModelComputeResource {
@@ -54,6 +61,18 @@ struct ModelComputeDispatch {
   std::vector<ModelComputeResource> resources;
   std::vector<ModelComputeBinding> bindings;
   MemoryMode memory_mode = MemoryMode::kDirect;
+  struct ImageBinding {
+    std::uint32_t slot = 0;
+    std::uint32_t resource_index = 0;
+    std::uint32_t access = 0;
+    std::uint32_t format = 0;
+    std::uint64_t offset = 0;
+    std::uint64_t bytes_size = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t row_stride_bytes = 0;
+  };
+  std::vector<ImageBinding> images;
 };
 
 struct ModelComputeStats {
@@ -76,6 +95,10 @@ struct ModelComputeStats {
 inline constexpr std::uint32_t kComputeAccessRead = 1;
 inline constexpr std::uint32_t kComputeAccessWrite = 2;
 inline constexpr std::uint32_t kComputeTaskWidth = 32;
+inline constexpr std::uint32_t kComputeMaximumSharedBytes = 32U * 1024U;
+// CDM admits one workgroup at a time; user BOs occupy the disjoint 0x100...
+// aperture. This modeled backing is reinitialized at each workgroup admission.
+inline constexpr std::uint64_t kComputeSharedAddress = UINT64_C(0x2000000000000);
 
 // A binding view, not a backing BO. Overlapping views intentionally preserve
 // their shared GPU address; each complete access must fit a permitted view.
@@ -184,6 +207,7 @@ struct ComputeMemoryTxn {
   std::uint32_t bytes = 0;
   ComputeMemoryOperation operation = ComputeMemoryOperation::kRead;
   std::uint32_t failed = 0;
+  std::uint32_t blocked = 0; // MUTEX lock contention: retry the same native group.
 };
 
 inline std::ostream &operator<<(std::ostream &out,

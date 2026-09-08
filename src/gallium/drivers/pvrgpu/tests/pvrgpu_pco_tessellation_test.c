@@ -152,12 +152,88 @@ static void save_stage(unsigned kind, const char *name, const struct pvrgpu_pco_
    require(fwrite(s->data, 1, s->size, f) == s->size, "fixture write");
    require(fclose(f) == 0, "fixture close");
 }
+
+static void
+test_stream_output_layout(struct pvrgpu_pco_compiler *compiler)
+{
+   for (unsigned raster = 0; raster < 2; ++raster) {
+      nir_shader *vs = make_vertex(false), *tcs = make_control(0), *tes = make_evaluation(0);
+      nir_builder b = nir_builder_create(nir_shader_get_entrypoint(tes));
+      b.cursor = nir_before_impl(b.impl);
+      nir_variable *size = variable(tes, nir_var_shader_out, glsl_float_type(), "gl_PointSize", VARYING_SLOT_PSIZ);
+      size->data.always_active_io = true;
+      nir_store_var(&b, size, nir_imm_float(&b, 2), 1);
+      nir_variable *array = variable(tes, nir_var_shader_out,
+         glsl_array_type(glsl_uvec2_type(), 2, 0), "tf_only_array", VARYING_SLOT_VAR0 + 3);
+      array->data.always_active_io = true;
+      for (unsigned i = 0; i < 2; ++i)
+         nir_store_deref(&b, nir_build_deref_array_imm(&b, nir_build_deref_var(&b, array), i),
+            nir_vec2(&b, nir_load_primitive_id(&b), nir_imm_int(&b, 0xffabcdefu + i)), 3);
+      nir_variable *tag = variable(tes, nir_var_shader_out, glsl_uint_type(), "flat_tag", VARYING_SLOT_VAR0 + 8);
+      tag->data.always_active_io = true;
+      tag->data.interpolation = INTERP_MODE_FLAT;
+      nir_store_var(&b, tag, nir_load_primitive_id(&b), 1);
+      nir_shader_gather_info(tes, nir_shader_get_entrypoint(tes));
+      const uint64_t original_outputs = tes->info.outputs_written;
+
+      nir_builder f = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, pco_nir_options(), "tf_fixture_fs");
+      nir_variable *color = variable(f.shader, nir_var_shader_out, glsl_vec4_type(), "color", FRAG_RESULT_DATA0);
+      nir_def *value = nir_imm_vec4(&f, 1, 0, 0, 1);
+      if (raster) {
+         nir_variable *smooth = variable(f.shader, nir_var_shader_in, glsl_vec4_type(), "smooth", VARYING_SLOT_VAR0);
+         nir_variable *flat = variable(f.shader, nir_var_shader_in, glsl_uint_type(), "flat", VARYING_SLOT_VAR0 + 8);
+         flat->data.interpolation = INTERP_MODE_FLAT;
+         value = nir_fmul(&f, nir_load_var(&f, smooth), nir_u2f32(&f, nir_load_var(&f, flat)));
+      }
+      nir_store_var(&f, color, value, 15);
+      nir_jump(&f, nir_jump_return);
+      nir_shader_gather_info(f.shader, f.impl);
+
+      struct pvrgpu_pco_tessellation_pipeline_binary binary = {0};
+      char error[512] = {0};
+      require(pvrgpu_pco_compile_tessellation_pipeline(compiler, vs, tcs, tes, f.shader,
+         NULL, 1, 0, 0, 0, 0, 0, 0, &binary, error, sizeof(error)), error);
+      require(tes->info.outputs_written == original_outputs, "TF caller output ordinals unchanged");
+      require(binary.output.count[VARYING_SLOT_PSIZ] == 1 && binary.output.start[VARYING_SLOT_PSIZ] == 4,
+         "TF-only TES PointSize retained");
+      require(binary.output.count[VARYING_SLOT_VAR0 + 3] == 2 &&
+              binary.output.count[VARYING_SLOT_VAR0 + 4] == 2 &&
+              binary.output.count[VARYING_SLOT_VAR0 + 8] == 1,
+         "TF-only sparse TES scalar/array locations retained");
+      for (unsigned location = 0; location < 64; ++location) {
+         require(binary.graphics.vertex_output_start[location] == binary.output.start[location] &&
+                 binary.graphics.vertex_output_count[location] == binary.output.count[location],
+            "stream-output physical mapping describes TES, not feeding VS");
+      }
+      require(binary.evaluation.shader.abi.vertex_outputs == binary.output.stride_dwords,
+         "TES export extent is its native ABI");
+      require(binary.graphics.explicit_varying_bindings &&
+              binary.graphics.varying_binding_count == raster * 2,
+         "TF-only TES outputs create no raster bindings");
+      require(binary.graphics.fragment.abi.coefficients == 4 + raster * 20 &&
+              binary.graphics.fragment_varying_count == raster * 20,
+         "only actual FS inputs allocate coefficients");
+      if (raster) {
+         const struct pvrgpu_pco_varying_binding *bindings = binary.graphics.varying_bindings;
+         require(bindings[0].output_dword == binary.output.start[VARYING_SLOT_VAR0] &&
+                 bindings[0].num_components == 4 && bindings[0].coefficient_dword == 4 && !bindings[0].flat,
+            "smooth TES varying physical linkage");
+         require(bindings[1].output_dword == binary.output.start[VARYING_SLOT_VAR0 + 8] &&
+                 bindings[1].num_components == 1 && bindings[1].coefficient_dword == 20 && bindings[1].flat,
+            "flat TES varying after TF-only gap physical linkage");
+      }
+      pvrgpu_pco_tessellation_pipeline_binary_finish(&binary);
+      ralloc_free(vs); ralloc_free(tcs); ralloc_free(tes); ralloc_free(f.shader);
+   }
+}
+
 int main(void)
 {
    glsl_type_singleton_init_or_ref();
    char error[512] = {0};
    struct pvrgpu_pco_compiler *compiler = pvrgpu_pco_compiler_create(error, sizeof(error));
    require(compiler != NULL, error);
+   test_stream_output_layout(compiler);
    for (unsigned kind = 0; kind < 5; ++kind) {
       nir_shader *vs = make_vertex(kind != 0), *tcs = make_control(kind), *tes = make_evaluation(kind), *fs = make_fragment();
       struct pvrgpu_pco_tessellation_pipeline_binary binary = {0};

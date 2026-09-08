@@ -15,6 +15,45 @@ static void check(bool ok, const char *message)
    if (!ok) { fprintf(stderr, "%s\n", message); abort(); }
 }
 
+static nir_shader *make_shared_shader(unsigned kind)
+{
+   const unsigned sizes[] = {1, 30, 33, 64, 96, 1024, 64};
+   const unsigned count = sizes[kind - 24];
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+      pco_nir_options(), "native_workgroup_shared");
+   b.shader->info.workgroup_size[0] = count;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   nir_def *id = nir_load_local_invocation_index(&b);
+   nir_def *group = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+   nir_def *output = nir_imul_imm(&b,
+      nir_iadd(&b, nir_imul_imm(&b, group, count), id), 4);
+   nir_variable *array = nir_variable_create(b.shader, nir_var_mem_shared,
+      glsl_array_type(glsl_uint_type(), count, 0), "workgroup_values");
+   nir_deref_instr *base = nir_build_deref_var(&b, array);
+   nir_def *reverse = nir_isub(&b, nir_imm_int(&b, count - 1), id);
+   nir_store_deref(&b, nir_build_deref_array(&b, base, reverse),
+      nir_iadd(&b, nir_imul(&b, id, id), nir_imul_imm(&b, group, count)), 1);
+   nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+      .memory_scope = SCOPE_WORKGROUP, .memory_semantics = NIR_MEMORY_ACQ_REL,
+      .memory_modes = nir_var_mem_shared);
+   nir_def *value = nir_load_deref(&b, nir_build_deref_array(&b, base, id));
+   if (kind == 30) {
+      /* Real shared atomic results, followed by a second reusable barrier. */
+      nir_deref_instr *cell = nir_build_deref_array(&b, base, nir_imm_int(&b, 0));
+      value = nir_deref_atomic(&b, 32, &cell->def, nir_imm_int(&b, 1),
+                               .atomic_op = nir_atomic_op_iadd);
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+         .memory_scope = SCOPE_WORKGROUP, .memory_semantics = NIR_MEMORY_ACQ_REL,
+         .memory_modes = nir_var_mem_shared);
+      value = nir_iadd(&b, value, nir_load_deref(&b, cell));
+   }
+   nir_store_ssbo(&b, value, nir_imm_int(&b, 0), output,
+                   .write_mask = 1, .align_mul = 4);
+   nir_shader_gather_info(b.shader, b.impl);
+   b.shader->info.num_ssbos = 1;
+   return b.shader;
+}
+
 static nir_shader *make_shader(unsigned kind)
 {
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
@@ -151,6 +190,8 @@ static void save_binary(const char *dir, unsigned kind,
       a->stage.push_constant_start, a->stage.push_constant_count,
       a->uniform_buffer_used_mask, a->storage_buffer_used_mask,
       a->storage_buffer_read_mask, a->storage_buffer_write_mask);
+   fprintf(file, "workgroup_shared=%u,%u,%u\n", a->shared_memory_bytes,
+      a->shared_memory_descriptor_start, a->shared_memory_descriptor_count);
    check(fclose(file) == 0, "closing compute ABI");
 }
 
@@ -198,20 +239,38 @@ int main(int argc, char **argv)
       nir_builder b = nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(nir)));
       if (bad == 0) nir->info.workgroup_size[0] = 0;
       if (bad == 1) nir->info.workgroup_size_variable = true;
-      if (bad == 2) nir->info.shared_size = 4;
+      if (bad == 2) nir->info.shared_size = 32 * 1024 + 4;
       if (bad == 3) {
          nir->info.workgroup_size[0] = 32;
-         nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+         nir_barrier(&b, .execution_scope = SCOPE_DEVICE,
                                   .memory_scope = SCOPE_WORKGROUP,
                                   .memory_semantics = NIR_MEMORY_ACQ_REL,
                                   .memory_modes = nir_var_mem_ssbo);
       }
       if (bad == 4) nir_ssbo_atomic(&b, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
                                      nir_imm_float(&b, 1), .atomic_op = nir_atomic_op_fadd);
-      if (bad == 5) nir->info.num_images = 1;
+      if (bad == 5) nir->info.num_images = 33;
       struct pvrgpu_pco_compute_binary binary = {0};
       check(!pvrgpu_pco_compile_compute(compiler, nir, 0, &binary, error, sizeof(error)) &&
                !binary.data && !binary.size && error[0], "unsupported CS fails closed");
+      ralloc_free(nir);
+   }
+   for (unsigned kind = 24; kind <= 30; ++kind) {
+      nir_shader *nir = make_shared_shader(kind);
+      struct pvrgpu_pco_compute_binary native = {0};
+      check(pvrgpu_pco_compile_compute(compiler, nir, 0, &native,
+                                       error, sizeof(error)), error);
+      check(native.data && native.size && native.abi.shared_memory_bytes &&
+         native.abi.shared_memory_bytes <= 32768 &&
+         native.abi.shared_memory_descriptor_start == 4 &&
+         native.abi.shared_memory_descriptor_count == 4 &&
+         native.abi.stage.push_constant_start == 8 &&
+         native.abi.stage.shareds == 8 && !native.abi.stage.vertex_outputs &&
+         native.abi.storage_buffer_descriptor_count == 1 &&
+         native.abi.storage_buffer_used_mask == 1,
+         "shared memory has a private descriptor, not an extra user SSBO");
+      save_binary(argc > 1 ? argv[1] : NULL, kind, &native);
+      pvrgpu_pco_compute_binary_finish(&native);
       ralloc_free(nir);
    }
    nir_shader *push = make_shader(4);
@@ -319,6 +378,6 @@ int main(int argc, char **argv)
    }
    pvrgpu_pco_compiler_destroy(compiler);
    glsl_type_singleton_decref();
-   puts("native compute compiler tests: PASS (29 programs, 12 fail-closed inputs)");
+   puts("native compute compiler tests: PASS (36 programs, 12 fail-closed inputs)");
    return 0;
 }

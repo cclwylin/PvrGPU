@@ -645,6 +645,7 @@ pvrgpu_systemc_flush_readback_pixels(uint32_t width,
                                      uint32_t attachment,
                                      uint32_t sample_count,
                                      uint32_t depth_format,
+                                     uint32_t layer_count,
                                      uint8_t *pixels,
                                      size_t pixels_size,
                                      bool *out_written,
@@ -691,6 +692,7 @@ pvrgpu_systemc_flush_readback_pixels(uint32_t width,
    readback.bytes_per_pixel = bytes_per_pixel;
    readback.sample_count = sample_count;
    readback.depth_format = depth_format;
+   readback.layer_count = layer_count;
    readback.pixels = pixels;
    readback.pixels_size = pixels_size;
 
@@ -1019,8 +1021,14 @@ pvrgpu_cmd_validate_uniform_buffers(
       const struct pvrgpu_systemc_pco_stage_abi *abi = abis[stage];
       const uint32_t *shared = banks[stage];
       const size_t shared_count = sizes[stage];
-      const uint32_t native_base = stage >= 3 && t ? (stage == 3 ? 8u : 4u)
+      uint32_t native_base = stage >= 3 && t ? (stage == 3 ? 8u : 4u)
          : stage == 2 && cmd->geometry_pco_size ? 4u : 0u;
+      if (stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_GEOMETRY && cmd->geometry_pco_size) {
+         const uint32_t start = abi->uniform_buffer_descriptor_start;
+         if (start < 4 || start > 4 + 8 * 20 || (start - 4) % 20)
+            goto invalid;
+         native_base = start;
+      }
       const uint32_t blocks = abi->uniform_buffer_descriptor_count;
       const uint64_t end = (uint64_t)abi->uniform_buffer_descriptor_start +
                            4u * blocks;
@@ -1254,9 +1262,13 @@ pvrgpu_cmd_validate_draw_pco_triangles(
        cmd->geometry_shared_count < 4 || cmd->geometry_shared_count > 256 ||
        cmd->geometry_pco_abi.temps > 256 || cmd->geometry_pco_abi.vertex_inputs != 2 ||
        cmd->geometry_pco_abi.coefficients || cmd->geometry_pco_abi.entry_offset ||
-       cmd->geometry_pco_abi.uniform_buffer_descriptor_start != 4 ||
+       cmd->geometry_pco_abi.uniform_buffer_descriptor_count > 15 ||
+       cmd->geometry_pco_abi.uniform_buffer_descriptor_start < 4 ||
+       cmd->geometry_pco_abi.uniform_buffer_descriptor_start > 4 + 8 * 20 ||
+       (cmd->geometry_pco_abi.uniform_buffer_descriptor_start - 4) % 20 != 0 ||
        cmd->geometry_pco_abi.push_constant_start !=
-          4u + 4u * cmd->geometry_pco_abi.uniform_buffer_descriptor_count ||
+          cmd->geometry_pco_abi.uniform_buffer_descriptor_start +
+             4u * cmd->geometry_pco_abi.uniform_buffer_descriptor_count ||
        (uint64_t)cmd->geometry_pco_abi.push_constant_start +
           cmd->geometry_pco_abi.push_constant_count != cmd->geometry_pco_abi.shareds ||
        cmd->geometry_pco_abi.vertex_outputs < 4 || cmd->geometry_pco_abi.vertex_outputs > 64 ||

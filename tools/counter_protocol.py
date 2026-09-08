@@ -70,6 +70,7 @@ MODEL_COUNTER_FIELDS: tuple[str, ...] = (
     "vs_tex_instructions",
     "vs_memory_instructions",
     "gs_alu_instructions",
+    "gs_tex_instructions",
     "gs_memory_instructions",
     "gs_load_instructions",
     "gs_emitted_vertices",
@@ -373,6 +374,7 @@ COUNTER_INFO: Mapping[str, tuple[str, str, str]] = {
     ),
     "gs_alu_instructions": ("GS ALU", "instructions", "Executed native geometry ALU instructions."),
     "gs_memory_instructions": ("GS memory", "instructions", "Executed native geometry memory/export instructions."),
+    "gs_tex_instructions": ("GS TEX", "instructions", "Executed native geometry texture instructions."),
     "gs_load_instructions": ("GS loads", "instructions", "Executed native geometry LD instructions."),
     "gs_emitted_vertices": ("GS emitted vertices", "vertices", "Vertex snapshots emitted by native geometry tasks."),
     "gs_input_write_bytes": ("GS input writes", "bytes", "Modeled primitive-input staging bytes."),
@@ -795,6 +797,7 @@ def _drawlist_records(
         "tes_memory_instructions": sum(item.tessellation_evaluation.executed_memory_instructions for item in records if item.tessellation_evaluation),
         "gs_invocations": sum(item.geometry.invocations for item in records if item.geometry),
         "gs_alu_instructions": sum(item.geometry.executed_alu_instructions for item in records if item.geometry),
+        "gs_tex_instructions": sum(item.geometry.executed_tex_instructions for item in records if item.geometry),
         "gs_memory_instructions": sum(item.geometry.executed_memory_instructions for item in records if item.geometry),
         "vs_alu_instructions": sum(
             item.vertex.executed_alu_instructions for item in records

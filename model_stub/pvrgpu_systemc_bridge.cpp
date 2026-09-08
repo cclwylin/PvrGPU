@@ -123,11 +123,23 @@ bool PrepareComputeDispatch(
       stage.shareds > pvrgpu::stub::kPcoMaximumSharedCount ||
       stage.uniform_buffer_descriptor_count > 15U ||
       abi.storage_buffer_descriptor_count > 32U ||
-      abi.shared_memory_bytes != 0 || abi.scratch_bytes != 0)
+      abi.image_descriptor_count > PVRGPU_SYSTEMC_COMPUTE_MAX_IMAGES ||
+      abi.shared_memory_bytes > PVRGPU_SYSTEMC_COMPUTE_MAX_SHARED_BYTES ||
+      (abi.shared_memory_bytes & 3U) || abi.scratch_bytes != 0)
     return fail("compute ABI exceeds supported native execution bounds");
-  const std::uint32_t prefix = 4U *
+  const std::uint32_t user_prefix = 4U *
       (stage.uniform_buffer_descriptor_count +
        abi.storage_buffer_descriptor_count);
+  const std::uint32_t image_end = user_prefix + 8U * abi.image_descriptor_count;
+  if (abi.image_descriptor_start != (abi.image_descriptor_count ? user_prefix : 0U) ||
+      (abi.image_used_mask & ~ComputeLowMask(abi.image_descriptor_count)) != 0 ||
+      ((abi.image_read_mask | abi.image_write_mask) & ~abi.image_used_mask) != 0)
+    return fail("invalid compute image descriptor layout or use masks");
+  const std::uint32_t private_count = abi.shared_memory_bytes ? 4U : 0U;
+  if (abi.shared_memory_descriptor_count != private_count ||
+      abi.shared_memory_descriptor_start != (private_count ? image_end : 0U))
+    return fail("invalid compute private workgroup descriptor layout");
+  const std::uint32_t prefix = image_end + private_count;
   if (stage.uniform_buffer_descriptor_start != 0 ||
       abi.storage_buffer_descriptor_start !=
           4U * stage.uniform_buffer_descriptor_count ||
@@ -173,8 +185,10 @@ bool PrepareComputeDispatch(
     return fail("compute workgroup exceeds 1024 invocations");
   if (source.resource_count > PVRGPU_SYSTEMC_COMPUTE_MAX_RESOURCES ||
       source.binding_count > PVRGPU_SYSTEMC_COMPUTE_MAX_BINDINGS ||
+      source.image_count > PVRGPU_SYSTEMC_COMPUTE_MAX_IMAGES ||
       (source.resource_count != 0 && !source.resources) ||
-      (source.binding_count != 0 && !source.bindings))
+      (source.binding_count != 0 && !source.bindings) ||
+      (source.image_count != 0 && !source.images))
     return fail("invalid compute resource or binding array");
   std::uint64_t total_bytes = 0;
   for (std::size_t index = 0; index < source.resource_count; ++index) {
@@ -221,6 +235,34 @@ bool PrepareComputeDispatch(
   if ((abi.uniform_buffer_used_mask & ~present_ubos) != 0 ||
       (abi.storage_buffer_used_mask & ~present_ssbos) != 0)
     return fail("compute shader uses an unbound buffer");
+  std::uint32_t present_images = 0;
+  for (std::size_t index = 0; index < source.image_count; ++index) {
+    const auto &binding = source.images[index];
+    if (binding.slot >= abi.image_descriptor_count ||
+        binding.resource_index >= source.resource_count ||
+        (binding.access & ~3U) || binding.reserved ||
+        binding.format != PVRGPU_SYSTEMC_COMPUTE_IMAGE_R32UI ||
+        !binding.width || !binding.height || binding.width > UINT32_MAX / 4U ||
+        binding.row_stride_bytes < 4U * binding.width ||
+        (binding.row_stride_bytes & 3U) || (binding.offset & 3U))
+      return fail("invalid compute R32UI image2D view");
+    const std::uint32_t bit = UINT32_C(1) << binding.slot;
+    if (present_images & bit) return fail("duplicate compute image slot");
+    present_images |= bit;
+    const auto &resource = source.resources[binding.resource_index];
+    const std::uint64_t footprint = static_cast<std::uint64_t>(binding.height - 1U) *
+        binding.row_stride_bytes + 4U * binding.width;
+    if (binding.offset > resource.bytes_size ||
+        binding.bytes_size > resource.bytes_size - binding.offset ||
+        binding.bytes_size > UINT32_MAX || footprint > binding.bytes_size)
+      return fail("compute image row/mip extent exceeds its backing resource");
+    const auto required = ((abi.image_read_mask & bit) ? 1U : 0U) |
+                          ((abi.image_write_mask & bit) ? 2U : 0U);
+    if ((binding.access & required) != required)
+      return fail("compute image permissions do not cover shader accesses");
+  }
+  if (abi.image_used_mask & ~present_images)
+    return fail("compute shader uses an unbound image");
 
   pvrgpu::stub::ModelComputeDispatch prepared;
   auto &target = prepared.abi;
@@ -248,6 +290,13 @@ bool PrepareComputeDispatch(
   target.storage_buffer_write_mask = abi.storage_buffer_write_mask;
   target.shared_memory_bytes = abi.shared_memory_bytes;
   target.scratch_bytes = abi.scratch_bytes;
+  target.shared_memory_descriptor_start = abi.shared_memory_descriptor_start;
+  target.shared_memory_descriptor_count = abi.shared_memory_descriptor_count;
+  target.image_descriptor_start = abi.image_descriptor_start;
+  target.image_descriptor_count = abi.image_descriptor_count;
+  target.image_used_mask = abi.image_used_mask;
+  target.image_read_mask = abi.image_read_mask;
+  target.image_write_mask = abi.image_write_mask;
   prepared.memory_mode = static_cast<pvrgpu::stub::MemoryMode>(source.memory_mode);
   prepared.binary.assign(source.binary, source.binary + source.binary_size);
   if (source.push_word_count != 0)
@@ -267,6 +316,13 @@ bool PrepareComputeDispatch(
                                 binding.offset, binding.bytes_size});
     if ((binding.access & 2U) != 0)
       prepared.resources[binding.resource_index].writable = true;
+  }
+  for (std::size_t index = 0; index < source.image_count; ++index) {
+    const auto &binding = source.images[index];
+    prepared.images.push_back({binding.slot, binding.resource_index,
+      binding.access, binding.format, binding.offset, binding.bytes_size,
+      binding.width, binding.height, binding.row_stride_bytes});
+    if (binding.access & 2U) prepared.resources[binding.resource_index].writable = true;
   }
   *out = std::move(prepared);
   return true;
@@ -764,6 +820,7 @@ void CopyPcoPayloadFields(
   destination->depth_clear_bits = source.depth_clear_bits;
   destination->depth_format = source.depth_format;
   destination->raster_samples = source.raster_samples ? source.raster_samples : 1;
+  destination->framebuffer_layers = source.framebuffer_layers;
   destination->stencil_enable = source.stencil_enable;
   destination->stencil_clear = source.stencil_clear;
   for (std::size_t face = 0; face < 2; ++face) {
@@ -850,7 +907,8 @@ bool InitialColorAttachmentIsValid(
   const std::uint64_t expected =
       static_cast<std::uint64_t>(source.framebuffer_width) *
       source.framebuffer_height * bytes_per_pixel *
-      (source.raster_samples ? source.raster_samples : 1);
+      (source.raster_samples ? source.raster_samples : 1) *
+      (source.framebuffer_layers ? source.framebuffer_layers : 1);
   if (expected > pvrgpu::stub::kDriverPcoSequenceAttachmentStride)
     return reject("transport exceeds attachment address slot");
   if (expected != source.initial_color_attachment_bytes_size)
@@ -871,6 +929,7 @@ bool InitialDepthAttachmentIsValid(
   }
   const std::uint64_t expected = static_cast<std::uint64_t>(source.framebuffer_width) *
       source.framebuffer_height * (source.raster_samples ? source.raster_samples : 1) *
+      (source.framebuffer_layers ? source.framebuffer_layers : 1) *
       pvrgpu::stub::DepthAttachmentBytesPerPixel(source.depth_format);
   if (expected == 0 || expected != source.initial_depth_attachment_bytes_size ||
       expected > pvrgpu::stub::kDriverPcoSequenceAttachmentStride) {
@@ -1417,16 +1476,14 @@ bool CopyPcoSequenceDraw(
   }
   const auto &raster_abi = geometry ? source.geometry_pco_abi
       : tessellation ? source.tessellation->evaluation_abi : source.vertex_pco_abi;
-  if (source.stream_output && (geometry || tessellation))
-    return refuse("stream output currently requires a vertex-only pipeline");
+  if (source.stream_output && geometry)
+    return refuse("stream output from geometry shaders is not implemented");
   if (!ValidateStreamOutput(source.stream_output, raster_abi.vertex_outputs, error))
     return false;
   if (source.varying_binding_count > PVRGPU_SYSTEMC_MAX_VARYING_BINDINGS ||
       (!source.varying_bindings && source.varying_binding_count))
     return refuse("explicit varying binding list is invalid");
   if (source.varying_bindings) {
-    if (geometry || tessellation)
-      return refuse("explicit varying bindings require a vertex-only pipeline");
     std::uint32_t next_coefficient = 4;
     for (std::uint32_t i = 0; i < source.varying_binding_count; ++i) {
       const auto &b = source.varying_bindings[i];
@@ -1436,6 +1493,19 @@ bool CopyPcoSequenceDraw(
           b.num_components > raster_abi.vertex_outputs - b.output_dword ||
           b.coefficient_dword != next_coefficient)
         return refuse("explicit varying binding output/coefficient range is invalid");
+      if (geometry && !b.flat) {
+        for (const auto &range : {
+                 std::pair{source.geometry_primitive_id_output_start,
+                           source.geometry_primitive_id_output_count},
+                 std::pair{source.geometry_layer_output_start,
+                           source.geometry_layer_output_count}}) {
+          if (range.second && std::uint64_t(b.output_dword) <
+                                  std::uint64_t(range.first) + range.second &&
+              std::uint64_t(range.first) <
+                  std::uint64_t(b.output_dword) + b.num_components)
+            return refuse("explicit geometry integer varying must be flat");
+        }
+      }
       next_coefficient += b.num_components * 4;
     }
     if (next_coefficient != source.fragment_pco_abi.coefficients)
@@ -1448,8 +1518,11 @@ bool CopyPcoSequenceDraw(
         source.geometry_pco_size > pvrgpu::stub::kDriverPcoMaximumBinaryBytes ||
         !PcoStageAbiIsBounded(gs, true, true) || gs.coefficients != 0 ||
         gs.vertex_inputs != 2 || gs.vertex_outputs < 4 ||
-        gs.uniform_buffer_descriptor_start != 4 ||
-        gs.push_constant_start != 4U + 4U * gs.uniform_buffer_descriptor_count ||
+        gs.uniform_buffer_descriptor_start < 4 ||
+        (gs.uniform_buffer_descriptor_start - 4U) % pvrgpu::stub::kPcoTextureDescriptorDwordCount != 0 ||
+        (gs.uniform_buffer_descriptor_start - 4U) / pvrgpu::stub::kPcoTextureDescriptorDwordCount >
+            pvrgpu::stub::kPcoMaximumTextureDescriptorSets ||
+        gs.push_constant_start != gs.uniform_buffer_descriptor_start + 4U * gs.uniform_buffer_descriptor_count ||
         uint64_t(gs.push_constant_start) + gs.push_constant_count != gs.shareds ||
         source.geometry_shared_count != gs.shareds || gs.shareds < 4 ||
         (inputs != 1 && inputs != 2 && inputs != 3 && inputs != 4 && inputs != 6) ||
@@ -1665,7 +1738,7 @@ bool CopyPcoSequenceDraw(
   // capture actually needs.
   const char *nested_reason = nullptr;
   if (source.sampled_texture_count >
-      2U * pvrgpu::stub::kPcoMaximumTextureDescriptorSets)
+      3U * pvrgpu::stub::kPcoMaximumTextureDescriptorSets)
     nested_reason = "sampled_texture_count";
   else if (source.sampled_texture_bytes ||
            source.sampled_texture_bytes_size != 0 ||
@@ -1705,6 +1778,22 @@ bool CopyPcoSequenceDraw(
            (source.raster_samples != 0 &&
             (source.raster_samples & (source.raster_samples - 1)) != 0))
     nested_reason = "raster_samples";
+  else if (source.framebuffer_layers > 256 ||
+           (source.framebuffer_layers && source.render_target_count > 1))
+    nested_reason = "framebuffer_layers";
+  else if (static_cast<std::uint64_t>(source.framebuffer_width) *
+               source.framebuffer_height * (source.raster_samples ? source.raster_samples : 1U) *
+               (source.framebuffer_layers ? source.framebuffer_layers : 1U) *
+               std::max<std::uint32_t>(
+                   (std::string_view(source.format) == "PIPE_FORMAT_R32G32B32A32_UINT" ||
+                    std::string_view(source.format) == "PIPE_FORMAT_R32G32B32A32_SINT" ||
+                    std::string_view(source.format) == "PIPE_FORMAT_R32G32B32A32_FLOAT") ? 16U :
+                   (std::string_view(source.format) == "PIPE_FORMAT_R32G32_UINT" ||
+                    std::string_view(source.format) == "PIPE_FORMAT_R32G32_SINT") ? 8U : 4U,
+                   depth_format_supported && source.depth_format ?
+                       pvrgpu::stub::DepthAttachmentBytesPerPixel(source.depth_format) : 0U) >
+           pvrgpu::stub::kDriverPcoSequenceAttachmentStride)
+    nested_reason = "framebuffer_attachment_extent";
   else if (source.color_mask > 0x0f)
     nested_reason = "color_mask";
   else if (source.blend_enable > 1 || !blend_enums_valid ||
@@ -1818,6 +1907,10 @@ bool CopyCommand(const pvrgpu_systemc_driver_command &source,
   }
   if (source.stream_output || source.varying_bindings || source.varying_binding_count) {
     *error = "SystemC API stream output/explicit varying bindings require a nested PCO draw";
+    return false;
+  }
+  if (source.framebuffer_layers) {
+    *error = "SystemC API layered framebuffer requires a nested PCO draw";
     return false;
   }
   if (!source.command || !source.command[0]) {
@@ -2093,7 +2186,7 @@ bool CopyPcoSequenceTexture(
   };
   if (source.source > PVRGPU_SYSTEMC_PCO_TEXTURE_PREVIOUS_DEPTH_ATTACHMENT)
     return reject("source");
-  if (source.stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT)
+  if (source.stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_GEOMETRY)
     return reject("stage");
   if (source.descriptor_set >=
       pvrgpu::stub::kPcoMaximumTextureDescriptorSets)
@@ -2368,6 +2461,7 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
       return producer.framebuffer_width == command.framebuffer_width &&
              producer.framebuffer_height == command.framebuffer_height &&
              producer.raster_samples == command.raster_samples &&
+             producer.framebuffer_layers == command.framebuffer_layers &&
              (depth ? producer.depth_format == command.depth_format
                     : producer.format == command.format);
     };
@@ -2392,7 +2486,8 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
         vertex_sets{};
     std::array<bool, pvrgpu::stub::kPcoMaximumTextureDescriptorSets>
         fragment_sets{};
-    bool saw_fragment_texture = false;
+    std::array<bool, pvrgpu::stub::kPcoMaximumTextureDescriptorSets> geometry_sets{};
+    auto previous_stage = pvrgpu::stub::DriverPcoShaderStage::kVertex;
     for (std::size_t texture_index = 0; texture_index < texture_count;
          ++texture_index) {
       pvrgpu::stub::DriverPcoSampledTexture texture;
@@ -2404,14 +2499,13 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
       auto &sets =
           texture.stage == pvrgpu::stub::DriverPcoShaderStage::kVertex
               ? vertex_sets
-              : fragment_sets;
-      if (texture.stage == pvrgpu::stub::DriverPcoShaderStage::kFragment) {
-        saw_fragment_texture = true;
-      } else if (saw_fragment_texture) {
+              : texture.stage == pvrgpu::stub::DriverPcoShaderStage::kGeometry ? geometry_sets : fragment_sets;
+      if (texture.stage < previous_stage) {
         *error =
-            "SystemC API PCO sequence texture stages are not VS-then-FS";
+            "SystemC API PCO sequence texture stages are not VS-then-FS-then-GS";
         return false;
       }
+      previous_stage = texture.stage;
       if (sets[texture.descriptor_set]) {
         *error = "SystemC API PCO sequence descriptor set is duplicated";
         return false;
@@ -2419,6 +2513,8 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
       sets[texture.descriptor_set] = true;
       if (texture.stage == pvrgpu::stub::DriverPcoShaderStage::kVertex)
         ++command.vertex_sampled_texture_count;
+      else if (texture.stage == pvrgpu::stub::DriverPcoShaderStage::kGeometry)
+        ++command.geometry_sampled_texture_count;
       else
         ++command.fragment_sampled_texture_count;
       command.sampled_textures.push_back(std::move(texture));
@@ -2432,7 +2528,8 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
     if (!sets_are_dense(vertex_sets,
                         command.vertex_sampled_texture_count) ||
         !sets_are_dense(fragment_sets,
-                        command.fragment_sampled_texture_count)) {
+                        command.fragment_sampled_texture_count) ||
+        !sets_are_dense(geometry_sets, command.geometry_sampled_texture_count)) {
       *error =
           "SystemC API PCO sequence descriptor sets are not stage-dense";
       return false;
@@ -2442,7 +2539,12 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
     if (command.vertex_shared.size() <
             command.vertex_sampled_texture_count * descriptor_dwords ||
         command.fragment_shared.size() <
-            command.fragment_sampled_texture_count * descriptor_dwords) {
+            command.fragment_sampled_texture_count * descriptor_dwords ||
+        (command.geometry_sampled_texture_count &&
+         (command.geometry_pco.empty() || command.geometry_shared.size() <
+            4U + command.geometry_sampled_texture_count * descriptor_dwords)) ||
+        (!command.geometry_pco.empty() && command.geometry_pco_abi.uniform_buffer_descriptor_start !=
+            4U + command.geometry_sampled_texture_count * descriptor_dwords)) {
       *error =
           "SystemC API PCO sequence descriptor prefix exceeds stage shareds";
       return false;
@@ -2456,10 +2558,13 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
               });
     for (const auto &texture : command.sampled_textures) {
       const auto &shared = texture.stage == pvrgpu::stub::DriverPcoShaderStage::kVertex
-                               ? command.vertex_shared : command.fragment_shared;
+                               ? command.vertex_shared
+                               : texture.stage == pvrgpu::stub::DriverPcoShaderStage::kGeometry
+                                   ? command.geometry_shared : command.fragment_shared;
       // Rogue TEXSTATE_IMAGE_WORD0[63:62] 保存 log2(samples)，與結構化
       // payload 必須一致，不能由 host metadata 蓋過 shader descriptor。
-      const std::size_t image_word1 = texture.descriptor_set * descriptor_dwords + 1U;
+      const std::size_t image_word1 = texture.descriptor_set * descriptor_dwords + 1U +
+          (texture.stage == pvrgpu::stub::DriverPcoShaderStage::kGeometry ? 4U : 0U);
       const std::uint32_t descriptor_samples = 1U << (shared.at(image_word1) >> 30U);
       if (descriptor_samples != texture.sample_count) {
         *error = "SystemC API PCO sequence texture descriptor/sample count mismatch";
@@ -3149,18 +3254,24 @@ extern "C" int pvrgpu_systemc_flush_readback(
   }
   readback->pixels_written = 0;
   const std::uint32_t samples = readback->sample_count ? readback->sample_count : 1;
+  const std::uint32_t layers = readback->layer_count ? readback->layer_count : 1;
+  if (layers > 256) {
+    CopyError(error, error_size, "unsupported SystemC API readback layer count");
+    return 2;
+  }
   if (samples > 16 || (samples & (samples - 1)) != 0) {
     CopyError(error, error_size, "unsupported SystemC API readback sample count");
     return 2;
   }
   if (!readback->pixels || readback->width == 0 || readback->height == 0 ||
-      readback->bytes_per_pixel == 0) {
+      readback->width > 4096 || readback->height > 4096 ||
+      readback->bytes_per_pixel == 0 || readback->bytes_per_pixel > 16) {
     CopyError(error, error_size, "missing SystemC API readback destination");
     return 2;
   }
   const std::uint64_t required = static_cast<std::uint64_t>(readback->width) *
                                  readback->height *
-                                 readback->bytes_per_pixel * samples;
+                                 readback->bytes_per_pixel * samples * layers;
   if (static_cast<std::uint64_t>(readback->pixels_size) < required) {
     CopyError(error, error_size,
               "SystemC API readback destination is too small");
@@ -3194,7 +3305,7 @@ extern "C" int pvrgpu_systemc_flush_readback(
    */
   if (framebuffer.width != readback->width ||
       framebuffer.height != readback->height ||
-      framebuffer.sample_count != samples)
+      framebuffer.sample_count != samples || framebuffer.layer_count != layers)
     return 0;
   const bool depth_readback = readback->attachment == UINT32_MAX;
   if (depth_readback) {

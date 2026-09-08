@@ -225,7 +225,8 @@ void MutexServiceOwnership(MemoryPool &pool,
   const auto second = pool.Allocate(sizeof(ComputeTaskState));
   std::uint64_t id = 9000;
   const auto exchange = [&](ComputeMemoryOperation operation, PoolHandle task,
-                            unsigned mutex, bool fail, unsigned bad = 0) {
+                            unsigned mutex, bool fail, unsigned bad = 0,
+                            bool blocked = false) {
     ComputeMemoryTxn request;
     request.state = handle; request.task = task;
     request.request_id = ++id; request.address = mutex; request.operation = operation;
@@ -244,7 +245,8 @@ void MutexServiceOwnership(MemoryPool &pool,
     }
     Check(received && response.request_id == id &&
               (response.failed != 0) == fail && response.task.slot == task.slot &&
-              response.task.generation == task.generation,
+              response.task.generation == task.generation &&
+              (response.blocked != 0) == blocked,
           "MUTEX ownership reply was incorrect");
     if (fail) {
       const auto &bytes = pool.Read(response.payload);
@@ -255,10 +257,10 @@ void MutexServiceOwnership(MemoryPool &pool,
   for (unsigned mutex = 0; mutex < 16; ++mutex) {
     exchange(ComputeMemoryOperation::kMutexLock,first,mutex,false);
     exchange(ComputeMemoryOperation::kMutexLock,first,mutex,true); // no reentry
-    exchange(ComputeMemoryOperation::kMutexLock,second,mutex,true); // busy owner
+    exchange(ComputeMemoryOperation::kMutexLock,second,mutex,false,0,true); // busy owner
     exchange(ComputeMemoryOperation::kMutexRelease,second,mutex,true);
     exchange(ComputeMemoryOperation::kMutexCleanup,second,0,false);
-    exchange(ComputeMemoryOperation::kMutexLock,second,mutex,true); // cleanup cannot steal
+    exchange(ComputeMemoryOperation::kMutexLock,second,mutex,false,0,true); // cleanup cannot steal
     exchange(ComputeMemoryOperation::kMutexRelease,first,mutex,false);
     exchange(ComputeMemoryOperation::kMutexLock,second,mutex,false);
     exchange(ComputeMemoryOperation::kMutexCleanup,second,0,false);
@@ -409,20 +411,21 @@ void RepeatedAluCounters() {
           "repeated native ALU did not transfer both registers");
 }
 
-void TaskLoopReconvergence() {
+void TaskLoopReconvergence(bool input_counter) {
   // The decoded CNDLT invariant includes running, continuing, broken and
   // outer-if-masked lanes in one task. A break must not reactivate merely
   // because another lane reaches the loop epilogue earlier.
   ComputePcoAbi abi;
   abi.local_size = {32,1,1};
   abi.stage.temps = 1;
+  abi.stage.vertex_inputs = input_counter ? 1 : 0;
   PcoInstruction loop;
   loop.opcode = PcoOpcode::kConditionalMask;
   loop.control_operation = 3;
   loop.exec_cnd = 2;
   loop.writes_predicate = 1;
-  loop.source = {PcoRegisterBank::kTemporary,0};
-  loop.target = PcoWriteTarget::kTemporary;
+  loop.source = {input_counter ? PcoRegisterBank::kVertexInput : PcoRegisterBank::kTemporary,0};
+  loop.target = input_counter ? PcoWriteTarget::kVertexInput : PcoWriteTarget::kTemporary;
   loop.immediate = 2;
   PcoInstruction branch;
   branch.opcode = PcoOpcode::kBranch;
@@ -440,27 +443,31 @@ void TaskLoopReconvergence() {
   program.instructions = {loop,branch,end};
   ValidateComputeProgram(program, abi);
   auto task = MakeComputeTask(abi, {}, {1,1,1}, {0,0,0}, 0, 32);
+  const auto counter = [&](ComputeLaneState &lane) -> std::uint32_t & {
+    return input_counter ? lane.inputs[0] : lane.temporaries[0];
+  };
   for (unsigned i = 0; i < task.lane_count; ++i) {
-    task.lanes[i].temporaries[0] = i / 8;
+    counter(task.lanes[i]) = i / 8;
     task.lanes[i].temporary_written.set(0);
+    if (input_counter) task.lanes[i].inputs_written = 1;
     task.lanes[i].execution_predicate = i < 8;
   }
   ComputeWorkgroupResult result;
   StepComputeTask(program, abi, task, {}, result);
   for (unsigned i = 0; i < task.lane_count; ++i)
-    Check(task.lanes[i].temporaries[0] == (i < 16 ? 0U : i / 8) &&
+    Check(counter(task.lanes[i]) == (i < 16 ? 0U : i / 8) &&
               task.lanes[i].execution_predicate == (i < 16) &&
               task.lanes[i].predicate == (i < 16),
           "CNDLT released a broken/outer-masked lane before task reconvergence");
   StepComputeTask(program, abi, task, {}, result);
   Check(task.instruction_index == 0, "partial-task native loop branch was not taken");
   for (unsigned i = 0; i < 16; ++i) {
-    task.lanes[i].temporaries[0] = 2;
+    counter(task.lanes[i]) = 2;
     task.lanes[i].execution_predicate = 0;
   }
   StepComputeTask(program, abi, task, {}, result);
   for (unsigned i = 0; i < task.lane_count; ++i)
-    Check(task.lanes[i].temporaries[0] == (i < 24 ? 0U : 1U) &&
+    Check(counter(task.lanes[i]) == (i < 24 ? 0U : 1U) &&
               task.lanes[i].execution_predicate == (i < 24) && !task.lanes[i].predicate,
           "finished CNDLT failed to restore the enclosing execution mask");
   StepComputeTask(program, abi, task, {}, result);
@@ -774,7 +781,8 @@ int sc_main(int argc, char **argv) {
     Check(mode <= 2, "invalid test memory mode");
     RejectMetadata();
     RepeatedAluCounters();
-    TaskLoopReconvergence();
+    TaskLoopReconvergence(false);
+    TaskLoopReconvergence(true);
     UnpredicatedFence();
     AtomicMaskAndFence();
     MemoryPool pool;

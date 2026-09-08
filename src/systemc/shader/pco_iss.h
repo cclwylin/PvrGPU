@@ -399,6 +399,8 @@ struct PcoInstruction {
   // SNO appends a lookup DWORD; bits 18:16 name one sample, never a resolve.
   std::uint8_t texture_non_normalized_coords = 0;
   std::uint8_t texture_sample_index_present = 0;
+  // SMP LODM=REPLACE/PPLod carries one float LOD before optional TAO.
+  std::uint8_t texture_lod_replace = 0;
   std::uint8_t data_request = 0;
   PcoIterationMode iteration_mode = PcoIterationMode::kPixel;
   std::uint8_t perspective = 0;
@@ -496,6 +498,10 @@ inline bool HasCanonicalNativeIntegerSignedness(const PcoInstruction &i) {
        (i.opcode == PcoOpcode::kIntegerMultiplyAdd64High ||
         i.opcode == PcoOpcode::kShiftRight));
 }
+inline bool HasCanonicalTextureLodMode(const PcoInstruction &i) {
+  return i.texture_lod_replace == 0 ||
+      (i.texture_lod_replace == 1 && i.opcode == PcoOpcode::kTextureSample);
+}
 
 /* Stored directly in PipelineState; no owning container appears here. */
 struct PcoProgramSummary {
@@ -542,6 +548,8 @@ struct PcoTextureRequest {
   std::uint8_t sample_index = 0;
   std::uint8_t sample_index_present = 0;
   std::uint8_t data_request = 0;
+  std::uint32_t explicit_lod = 0;
+  std::uint8_t explicit_lod_present = 0;
 };
 
 /* Complete lane-local vertex state captured immediately after an SMP request.

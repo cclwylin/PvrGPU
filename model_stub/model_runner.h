@@ -35,15 +35,18 @@ struct ModelFramebuffer {
   std::uint32_t bytes_per_pixel = 4;
   // Samples are stored next to each other within each pixel, without resolve.
   std::uint32_t sample_count = 1;
+  std::uint32_t layer_count = 1;
   std::vector<std::uint8_t> depth_pixels;
   std::uint32_t depth_format = 0;
 
   bool valid() const {
-    return width != 0 && height != 0 && bytes_per_pixel != 0 &&
-           sample_count != 0 &&
+    return width != 0 && height != 0 && width <= 4096 && height <= 4096 &&
+           bytes_per_pixel != 0 && bytes_per_pixel <= 16 &&
+           sample_count != 0 && sample_count <= 16 &&
+           layer_count != 0 && layer_count <= 256 &&
            static_cast<std::uint64_t>(pixels.size()) ==
                static_cast<std::uint64_t>(width) * height * bytes_per_pixel *
-                   sample_count;
+                   sample_count * layer_count;
   }
 };
 

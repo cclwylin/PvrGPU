@@ -57,7 +57,7 @@ void PbeWriteBack::Run() {
     // this stage reports and moves have to follow it.
     const std::uint64_t expected_bytes =
         static_cast<std::uint64_t>(state.width) * state.height *
-        state.raster_state.sample_count *
+        state.raster_state.sample_count * state.attachment_layers *
         ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
                                      state.color_attachment_float32);
     if (expected_bytes == 0 || state.framebuffer_bytes != expected_bytes ||

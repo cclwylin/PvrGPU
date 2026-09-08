@@ -36,6 +36,9 @@ struct ComputeTaskState {
   std::uint32_t ended = 0;
   std::uint64_t steps = 0;
   std::uint32_t mutex_held_mask = 0;
+  std::uint32_t mutex_sleep_mask = 0;
+  std::uint32_t mutex_wakeup_mask = 0;
+  std::uint32_t mutex_blocked = 0;
 };
 
 using ComputeMemoryRead = void (*)(void *, std::uint64_t,
@@ -45,12 +48,14 @@ using ComputeMemoryWrite = void (*)(void *, std::uint64_t,
 using ComputeMemoryAtomic32 = std::uint32_t (*)(void *, ComputeMemoryOperation,
                                                std::uint64_t, std::uint32_t);
 using ComputeMutex = void (*)(void *, std::uint32_t, std::uint32_t);
+using ComputeTryMutex = bool (*)(void *, std::uint32_t, std::uint32_t);
 struct ComputeMemoryCallbacks {
   void *user_data = nullptr;
   ComputeMemoryRead read = nullptr;
   ComputeMemoryWrite write = nullptr;
   ComputeMemoryAtomic32 atomic32 = nullptr;
   ComputeMutex mutex = nullptr;
+  ComputeTryMutex try_mutex = nullptr;
 };
 
 void ValidateComputeProgram(const PcoDecodedProgram &program,

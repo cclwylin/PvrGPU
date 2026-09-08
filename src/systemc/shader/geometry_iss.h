@@ -30,6 +30,7 @@ struct GeometryExecutionStats {
   std::uint64_t alu_instructions = 0;
   std::uint64_t memory_instructions = 0;
   std::uint64_t load_instructions = 0;
+  std::uint64_t texture_instructions = 0;
   std::uint64_t emit_instructions = 0;
   std::uint64_t cut_instructions = 0;
 };
@@ -42,6 +43,7 @@ struct GeometryExecutionCallbacks {
   void (*emit)(void *, const std::uint32_t *, std::uint32_t, std::uint64_t) = nullptr;
   void (*cut)(void *) = nullptr;
   void (*finish)(void *) = nullptr;
+  void (*sample)(void *, const PcoTextureRequest &, std::uint32_t *) = nullptr;
 };
 
 void ValidateGeometryProgram(const PcoDecodedProgram &program,

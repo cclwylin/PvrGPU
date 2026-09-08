@@ -123,7 +123,7 @@ test_ranges_limits_and_raw_bytes(void)
    CHECK(memcmp(entry.bytes, raw, sizeof(raw)) == 0);
    free((void *)entry.bytes);
    CHECK(!pvrgpu_snapshot_uniform_buffer(&binding, 1, 15, &entry, descriptor));
-   CHECK(!pvrgpu_snapshot_uniform_buffer(&binding, 4, 0, &entry, descriptor));
+   CHECK(!pvrgpu_snapshot_uniform_buffer(&binding, 5, 0, &entry, descriptor));
    binding = (struct pipe_constant_buffer){0};
    CHECK(pvrgpu_snapshot_uniform_buffer(&binding, 0, 0, &entry, descriptor));
    CHECK(!entry.bytes && !entry.bytes_size && !descriptor[0] &&
@@ -183,10 +183,58 @@ test_ranges_limits_and_raw_bytes(void)
    CHECK(count == 0);
 }
 
+static void
+test_geometry_sampler_descriptor_prefix(void)
+{
+   /* Producer envelope only: all calls stop at a named later attribute
+    * sentinel. They never submit these placeholder executable bytes. */
+   uint8_t code=1;
+   uint32_t shared[256]={0};
+   struct pvrgpu_draw_pco_triangles_command cmd={0};
+   cmd.case_name="native.geometry.sampler.abi";cmd.frame=1;
+   cmd.framebuffer_width=cmd.framebuffer_height=cmd.width=cmd.height=16;
+   cmd.format=PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8;
+   cmd.geometry_pco=&code;cmd.geometry_pco_size=1;
+   cmd.geometry_shared=shared;cmd.geometry_input_primitive_vertices=1;
+   cmd.geometry_input_stride_dwords=cmd.vertex_pco_abi.vertex_outputs=4;
+   cmd.geometry_max_vertices=cmd.geometry_invocations=cmd.geometry_vertices_per_instance=1;
+   cmd.geometry_pco_abi.vertex_inputs=2;cmd.geometry_pco_abi.vertex_outputs=4;
+   cmd.vertex_attribute_count=17;
+   char error[256];
+   for(unsigned textures=0;textures<=8;++textures) {
+      for(unsigned ubos=0;ubos<=15;++ubos) {
+         cmd.geometry_pco_abi.uniform_buffer_descriptor_start=4+20*textures;
+         cmd.geometry_pco_abi.uniform_buffer_descriptor_count=ubos;
+         cmd.geometry_pco_abi.push_constant_start=4+20*textures+4*ubos;
+         cmd.geometry_pco_abi.push_constant_count=4;
+         cmd.geometry_shared_count=cmd.geometry_pco_abi.shareds=8+20*textures+4*ubos;
+         CHECK(!pvrgpu_validate_draw_pco_triangles_command("unused",&cmd,error,sizeof(error)));
+         CHECK(strstr(error,"vertex attribute count")!=NULL);
+         struct pvrgpu_systemc_driver_command api;
+         pvrgpu_pco_triangles_command_to_systemc(&cmd,&api);
+         CHECK(pvrgpu_cmd_validate_uniform_buffers(&api,error,sizeof(error)));
+      }
+   }
+   const unsigned invalid[]={0,3,5,23,25,165,184,UINT32_MAX};
+   for(unsigned i=0;i<sizeof(invalid)/sizeof(invalid[0]);++i) {
+      cmd.geometry_pco_abi.uniform_buffer_descriptor_start=invalid[i];
+      CHECK(!pvrgpu_validate_draw_pco_triangles_command("unused",&cmd,error,sizeof(error)));
+      CHECK(strstr(error,"independent geometry program ABI")!=NULL);
+      struct pvrgpu_systemc_driver_command api;
+      pvrgpu_pco_triangles_command_to_systemc(&cmd,&api);
+      CHECK(!pvrgpu_cmd_validate_uniform_buffers(&api,error,sizeof(error)));
+   }
+   cmd.geometry_pco_abi.uniform_buffer_descriptor_start=164;
+   cmd.geometry_pco_abi.uniform_buffer_descriptor_count=16;
+   CHECK(!pvrgpu_validate_draw_pco_triangles_command("unused",&cmd,error,sizeof(error)));
+   CHECK(strstr(error,"independent geometry program ABI")!=NULL);
+}
+
 int main(void)
 {
    test_draw_snapshot_lifetime();
    test_ranges_limits_and_raw_bytes();
+   test_geometry_sampler_descriptor_prefix();
    printf("UBO snapshot/descriptor tests: %u checks, %u failures\n", checks, failures);
    return failures != 0;
 }

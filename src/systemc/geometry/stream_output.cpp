@@ -1,6 +1,7 @@
 #include "geometry/stream_output.h"
 
 #include "common/stream_output_types.h"
+#include "common/tessellation_state.h"
 #include "memory/gpu_memory_system.h"
 
 #include <array>
@@ -87,16 +88,26 @@ StreamOutput::StreamOutput(sc_core::sc_module_name name, MemoryPool &pool,
 void StreamOutput::Execute(PipelineState &state) {
   if (state.stage != PipelineStage::kVertexShaded || !memory_ ||
       memory_->mode() != state.memory_mode || HasPoolHandle(state.geometry_code) ||
-      HasPoolHandle(state.tessellation_state) ||
       state.draw.topology != PrimitiveTopology::kTriangleList ||
       state.stream_output_complete || state.stream_output_primitives_written ||
       state.stream_output_primitives_storage_needed)
     throw std::runtime_error("stream output pipeline stage/memory contract is invalid");
+  auto output_dwords = state.vertex_pco_abi.vertex_outputs;
+  if (HasPoolHandle(state.tessellation_state)) {
+    const auto tess = LoadArray<TessellationState>(pool_, state.tessellation_state);
+    if (tess.size() != 1 || tess[0].phase != TessellationPhase::kEvaluationComplete ||
+        state.tessellation_output_dwords != tess[0].evaluation_abi.vertex_outputs ||
+        state.source_topology != (tess[0].point_mode ? PrimitiveTopology::kPoints :
+            tess[0].domain == TessellationDomain::kIsolines ? PrimitiveTopology::kLines :
+                                                           PrimitiveTopology::kTriangleList))
+      throw std::runtime_error("stream output requires completed TES exports and topology");
+    output_dwords = tess[0].evaluation_abi.vertex_outputs;
+  }
   const auto bindings = HasPoolHandle(state.stream_output_bindings) ?
       LoadArray<StreamOutputBinding>(pool_, state.stream_output_bindings) : std::vector<StreamOutputBinding>{};
   auto targets = HasPoolHandle(state.stream_output_targets) ?
       LoadArray<StreamOutputTarget>(pool_, state.stream_output_targets) : std::vector<StreamOutputTarget>{};
-  ValidateStreamOutputLayout(bindings, targets, state.vertex_pco_abi.vertex_outputs);
+  ValidateStreamOutputLayout(bindings, targets, output_dwords);
   const auto lanes = LoadArray<VertexLane>(pool_, state.vertex_lanes);
   const auto refs = LoadArray<VertexLaneRef>(pool_, state.vertex_lane_refs);
   const auto vertex_count = PrimitiveVertices(state.source_topology);
@@ -120,9 +131,9 @@ void StreamOutput::Execute(PipelineState &state) {
   }
   for (const auto &binding : bindings) used[binding.output_buffer] = true;
 
-  // VertexFetch already decomposed restart/strip/fan topology into ordered
-  // primitive occurrences. Consume those references, not the deduplicated VS
-  // lane array or padded point/line vertices. Whole-primitive preflight and
+  // VertexFetch, or the completed TES stage, already produced ordered complete
+  // primitive occurrences. Consume those references, not the deduplicated
+  // shader lane array or padded point/line vertices. Whole-primitive preflight and
   // per-vertex cursor advancement follow Mesa draw_pt_so_emit.c semantics.
   for (std::size_t first = 0; first < refs.size() && !bindings.empty(); first += 3) {
     ++state.stream_output_primitives_storage_needed;

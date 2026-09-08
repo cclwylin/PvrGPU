@@ -10,6 +10,37 @@
 void check_generic_texture_program(const uint8_t *bytes, size_t size,
                                    const unsigned *units, unsigned count);
 void test_generic_texture_bindings(void);
+void check_generic_explicit_texture_program(const uint8_t *bytes, size_t size,
+                                            unsigned kind);
+
+static nir_shader *explicit_texture_shader(unsigned kind)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+      pco_nir_options(), "generic_explicit_texture_fs");
+   nir_variable *output = nir_variable_create(b.shader, nir_var_shader_out,
+      glsl_vec4_type(), "color");
+   output->data.location = FRAG_RESULT_DATA0;
+   nir_def *input = nir_load_uniform(&b, 4, 32, nir_imm_int(&b, 0),
+      .base=0, .range=1, .dest_type=nir_type_uint32);
+   nir_tex_instr *tex = nir_tex_instr_create(b.shader, 2);
+   tex->op = kind == 3 ? nir_texop_txl : nir_texop_txf;
+   tex->sampler_dim = kind == 2 || kind == 5 ? GLSL_SAMPLER_DIM_3D :
+      kind == 3 || kind == 4 ? GLSL_SAMPLER_DIM_CUBE : GLSL_SAMPLER_DIM_2D;
+   tex->is_array = kind == 1 || kind == 5;
+   tex->coord_components = kind == 0 || kind == 6 ? 2 : 3;
+   tex->texture_index = kind == 6 ? 1 : 0;
+   tex->sampler_index = tex->texture_index;
+   tex->dest_type = nir_type_float32;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord,
+      nir_trim_vector(&b, input, tex->coord_components));
+   tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_channel(&b, input, 3));
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(&b, &tex->instr);
+   nir_store_var(&b, output, &tex->def, 15);
+   nir_shader_gather_info(b.shader, b.impl);
+   b.shader->info.num_textures = 1;
+   return b.shader;
+}
 
 static nir_shader *vertex_shader(void)
 {
@@ -105,6 +136,21 @@ void test_generic_texture_bindings(void)
       pvrgpu_pco_graphics_binary_finish(&binary);
       ralloc_free(vs);
       ralloc_free(fs);
+   }
+   for (unsigned kind = 0; kind < 7; ++kind) {
+      nir_shader *vs = vertex_shader(), *fs = explicit_texture_shader(kind);
+      struct pvrgpu_pco_graphics_binary binary;
+      const bool accepted = pvrgpu_pco_compile_color_triangle(compiler, vs, fs, &format,
+         false, 1, 0, 4, 1, 1, &binary, error, sizeof(error));
+      if (accepted != (kind < 4)) {
+         fprintf(stderr, "explicit texture kind %u acceptance mismatch: %s\n", kind, error);
+         abort();
+      }
+      if (accepted) {
+         check_generic_explicit_texture_program(binary.fragment.data, binary.fragment.size, kind);
+         pvrgpu_pco_graphics_binary_finish(&binary);
+      }
+      ralloc_free(vs); ralloc_free(fs);
    }
    pvrgpu_pco_compiler_destroy(compiler);
    glsl_type_singleton_decref();

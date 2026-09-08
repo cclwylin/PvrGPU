@@ -38,10 +38,10 @@ Geometry and tessellation execute in separate `GeometryShader`,
 and top-level instance, with event-driven processes and bounded POD/PoolHandle
 FIFOs. They are not aliases for VS/FS/CS, and `DomainDataMaster` does not replace
 the tessellation stages. Absent stages forward only the original transaction;
-enabled stages execute native programs and modeled memory operations. Vertex
+enabled stages execute native programs and modeled memory operations. Vertex/TES
 Transform Feedback uses a separate event-driven `StreamOutput` module before
 clipping and writes raw shader output through the modeled memory hierarchy.
-Combined Tessellation+GS and GS/TES Transform Feedback remain explicitly
+Combined Tessellation+GS and GS Transform Feedback remain explicitly
 unsupported.
 
 ### Forbidden
@@ -117,6 +117,10 @@ Detail per component: [PvrGPU.md §3.5](PvrGPU.md), the
 
 ## Current Status
 
+- The 2026-09-08 frozen API27/compute4 sweep of Tessellation, Geometry,
+  Basic Compute and SSBO totals **2698 Pass / 17 NotSupported / 0 Fail**
+  across all 2715 cases. See the [four-group repair report](docs/DEQP_FAIL_DEBUG_20260908.md)
+  for exact runtime hashes, native execution evidence and remaining limits.
 - Graphics API v26 adds native vertex Transform Feedback through the independent
   event-driven `StreamOutput` module. Raw PCO exports are written to modeled GPU
   memory before clipping, with whole-primitive capacity checks, generation-owned
@@ -124,31 +128,32 @@ Detail per component: [PvrGPU.md §3.5](PvrGPU.md), the
   VS-to-FS linkage preserves TF-only and packed scalar/vector outputs. The full
   stock GLES3 Transform Feedback group is 1212 Pass / 108 NotSupported / 0 Fail
   across 1320 cases, with exact per-case status parity against llvmpipe and no
-  unsupported draws or model errors in Pass cases. GS/TES feedback remains
-  gated and is validated separately. See the
+  unsupported draws or model errors in Pass cases. TES feedback is now supported
+  and validated separately; GS feedback remains gated. See the
   [Transform Feedback validation](docs/TRANSFORM_FEEDBACK_VALIDATION.md).
 - Graphics API v25 adds independent native TCS and TES execution around a
   fixed-function tessellator ported from the pinned Mesa/llvmpipe helper.
   Triangle/quad/isoline domains, all three spacing modes, winding and point
   mode have bit-exact helper differential coverage. Live tessellation dEQP
-  is 89 Pass / 311 Fail / 6 NotSupported across 406 cases; the 47 non-TF
-  render cases all pass. TES Transform Feedback remains unimplemented, so this
-  is not all-pass or llvmpipe parity. These tessellation results predate the
-  independent GLES3 vertex Transform Feedback implementation. See the
+  is now 400 Pass / 0 Fail / 6 NotSupported across 406 cases, including native
+  TES Transform Feedback. The six ES3.2 capability skips remain a difference
+  from llvmpipe's 406 Pass. See the exact runtime receipts and scope in the
   [tessellation validation](docs/TESSELLATION_VALIDATION.md).
 - Graphics API v24 adds a real native Geometry Shader path through its own
   event-driven SystemC module between VS and ClipCull. Native LD/WDF and
   UVSW WRITE/EMIT/CUT/ENDTASK execute with bounded pool-backed export storage.
   Tessellation now has its own native stages; GS is not a VS/CS alias.
-  Live geometry-shading dEQP is 168 Pass / 29 Fail / 10 NotSupported across
-  207 cases (llvmpipe: 206 Pass / 1 NotSupported), not all-pass. Only 83 Pass
-  cases establish actual native GS execution; two indirect TF Pass cases
-  still refuse their draws. See the [validation](docs/GEOMETRY_SHADER_VALIDATION.md)
+  Graphics API v27 adds layered attachment LOAD/render/readback and native GS
+  texture sampling. The complete geometry-shading group is now 197 Pass /
+  0 Fail / 10 NotSupported across 207 cases (llvmpipe baseline: 206 Pass /
+  1 NotSupported). This is zero Fail, not full capability parity. Indirect
+  TF cases now execute real VS/StreamOutput work with no refused draws.
+  See the [validation](docs/GEOMETRY_SHADER_VALIDATION.md)
   and [geometry contract](docs/PVRGPU_DRIVER_COMMAND.md).
 - Graphics API v23 adds native multisample texture fetch transport: real
   SMP.NNCOORDS.SNO selects one of 1/2/4/8 pixel-interleaved samples, including
   integer/float/depth views and single-level 2D arrays. Size/sample queries
-  read native descriptors. Compute API remains independently versioned at 2.
+  read native descriptors. Compute API is independently versioned (currently 4).
   See the [sampled-image contract](docs/PVRGPU_DRIVER_COMMAND.md).
 - Live GLES31 `functional.texture.multisample` is 87 Pass, 70 NotSupported,
   and 0 Fail on both backends (157 cases). Requests above the native 8-sample
@@ -394,21 +399,21 @@ which only the three EGL groups start and the GLES3/GLES31 groups show their
 blocked reason again. Graphics readback executes the pending SystemC work and
 returns its actual attachment bytes to `glReadPixels`; a model PNG alone is
 not a passing dEQP result. Compute bring-up uses a separate synchronous API
-(`pvrgpu_systemc_compute_api.h`, independently versioned from graphics API 23).
+(`pvrgpu_systemc_compute_api.h`, version 4, independently versioned from graphics API 27).
 Its current slice implements direct static-size dispatch, native UBO/SSBO
 loads/stores (including vec8/vec16), scalar integer SSBO atomics, loops and
 primitive system-value registers. The atomic path follows llvmpipe's
 return-old, signed/unsigned min/max and uint32-wrapping semantics: native DMA
 ADD/SUB/XCHG/MIN/MAX/AND/OR/XOR execute through the CDM memory FIFO; compare-swap
-executes PCO's real MUTEX/SR51/per-instance LD/ST sequence. Compute API 2 counts
+executes PCO's real MUTEX/SR51/per-instance LD/ST sequence. The API counts
 DMA atomic instructions separately; emulated CAS counts its actual LD/ST,
-not a synthetic atomic opcode. Graphics API is now 23. The current serial
-task scheduler supports single-task execution barriers (up to 32 lanes) and
-memory-only fences; multi-task workgroup rendezvous, shared memory and images
-(including their atomics),
-64-bit/float atomics, variable local sizes and indirect dispatch remain
-explicitly fail-closed. Out-of-range views are rejected, not treated as
-llvmpipe-style robust zero loads/no-op stores.
+not a synthetic atomic opcode. Resident tasks now support multi-task workgroup
+rendezvous using native usclib instructions and workgroup-private modeled shared
+memory. R32UI image2D load/store/atomic operations use their own descriptor and
+binding namespace, preserving SSBO/image aliases and mip/row padding. Invalid
+views are rejected; out-of-range image coordinates produce bounded zero/no-op
+behavior in native code. Other image formats/array/MS operations, 64-bit/float
+atomics, variable local sizes and indirect compute dispatch remain fail-closed.
 CAS access qualifiers are normalized on an owned NIR clone before PCO's
 coherent usclib lowering. Sparse SSBO vector-store masks that remain after
 preprocessing are rejected until their component runs can be lowered safely;
@@ -418,13 +423,16 @@ The focused atomic CTS suite is 346/346 Pass: all 48 SSBO atomic cases and
 native dispatch cases and five expected compile-failure cases. The independent
 atomic probe additionally validates return-old serialization, partial tasks,
 aliasing, extrema and guard words in direct/bypass/cache modes; it does not
-claim shared/image atomic support or scheduler-dependent bytewise equality.
-The 41-case Basic compute baseline was 3 Pass / 38 Fail with no actual compute
-execution. The native buffer/atomic slice improves this to 24 Pass / 17 Fail
-in complete direct/bypass/cache runs: 22 passes have completed native dispatches, while
-`ssbo_local_barrier_single_invocation` and `shared_var_single_invocation`
-still pass their QPA checks despite unsupported dispatch and are not evidence
-of implemented compute support. This is not an all-pass Basic group.
+by itself establish shared/image atomic support or scheduler-dependent bytewise
+equality; those paths now have separate native memory/module/live tests.
+The original pre-native 41-case Basic compute baseline was 3 Pass / 38 Fail with no actual compute
+execution. After native shared-memory/barrier and image implementation, the
+complete stock Basic group is **41/41 Pass**, all with completed native dispatch
+evidence and no unsupported dispatches. The complete SSBO group is
+**2060 Pass / 1 NotSupported / 0 Fail** across 2061 cases. A separate live
+graphics → image compute → graphics/readback generation probe passes 599 checks
+on both PvrGPU and llvmpipe; it does not assert arbitrary scheduling-dependent
+atomic bytewise equality.
 
 Run an exact case on the fly; the executable configures the surfaceless PvrGPU
 runtime and artifact paths itself:

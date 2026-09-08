@@ -179,6 +179,12 @@ count, not a base level. The native compiler still emits and executes the
 descriptor-query instructions. Both patches are applied to both Mesa trees;
 the fixture lock records compiler-patch provenance and regenerated hashes.
 
+`third_party/mesa-26.2.1-failed-query-state.patch` preserves the same revision's
+Mesa query-object and conditional-rendering file notices. It propagates an
+already reported Gallium query failure without polling forever, reporting a
+successful zero, or overwriting application result memory. It also balances
+query lifetime bookkeeping and permits a fresh query interval after failure.
+
 The current runtime points to an external Mesa 26.2.1 build with local
 llvmpipe telemetry patches. Most Mesa source and binaries are not redistributed
 by this workspace. The following source artifacts do, however, preserve a

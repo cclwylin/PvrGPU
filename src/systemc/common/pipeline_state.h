@@ -135,6 +135,8 @@ struct PipelineState {
   std::uint32_t driver_varying_binding_count = 0;
   PoolHandle vertex_texture_resources;
   PoolHandle vertex_sampler_states;
+  PoolHandle geometry_texture_resources;
+  PoolHandle geometry_sampler_states;
   PoolHandle texture_resources;
   PoolHandle sampler_states;
   PoolHandle fragment_shared_registers;
@@ -228,19 +230,25 @@ struct PipelineState {
   // TextureUnit cross-checks each raw 20-dword combined descriptor against
   // the correspondingly numbered owned resource and sampler.
   std::uint32_t vertex_sampled_texture_count = 0;
+  std::uint32_t geometry_sampled_texture_count = 0;
   std::uint32_t sampled_texture_count = 0;
   // Internal stage-bank accounting.  Public counters remain aggregate, while
   // these totals prove that VS and FS FIFO traffic cannot be silently charged
   // to the other stage and that multi-round SMP continuations are not lost.
   std::uint64_t vertex_texture_request_count = 0;
+  std::uint64_t geometry_texture_request_count = 0;
+  std::uint64_t geometry_texture_instruction_count = 0;
   std::uint64_t fragment_texture_request_count = 0;
   std::uint64_t vertex_texel_fetch_count = 0;
+  std::uint64_t geometry_texel_fetch_count = 0;
   std::uint64_t fragment_texel_fetch_count = 0;
   // Colour attachment 0.  A multiple-render-target pass keeps attachment 0
   // on these fields so every single-target path stays byte identical, and
   // describes attachments 1..render_target_count-1 alongside them.
   std::uint64_t framebuffer_gpu_address = 0;
   std::uint64_t framebuffer_bytes = 0;
+  std::uint32_t attachment_layers = 1;
+  std::uint8_t layered_framebuffer = 0;
   std::uint32_t render_target_count = 1;
   // Resolved attachments 1..render_target_count-1; attachment 0 stays in
   // pbe_framebuffer so every single-target consumer is unchanged.

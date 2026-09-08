@@ -2,6 +2,7 @@
 #include "pvrgpu_systemc_api.h"
 #include "pco_geometry_fixtures.h"
 #include "pco_geometry_compiler_fixtures.h"
+#include "pco_geometry_layer_fixtures.h"
 #include "pco_geometry_stats_checks.h"
 #include "shader/pco_iss.h"
 
@@ -140,7 +141,7 @@ void VerifyBinaryStages() {
 }
 
 void VerifyPreviousVersionGuard(Submission &submit) {
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 26);
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 27);
   constexpr auto previous_size = offsetof(pvrgpu_systemc_driver_command, geometry_pco);
   static_assert(previous_size % alignof(pvrgpu_systemc_driver_command) == 0);
 #if defined(_WIN32)
@@ -167,7 +168,7 @@ void VerifyPreviousVersionGuard(Submission &submit) {
   Check(pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) == 2 &&
             std::string(error.data()).find("command version") != std::string::npos,
         "top-level API23 short command is rejected before API24 tail access");
-  submit.Rejected(old_command, "version=23 expected=26", "nested guarded API23 command");
+  submit.Rejected(old_command, "version=23 expected=27", "nested guarded API23 command");
 #if defined(_WIN32)
   Check(VirtualFree(pages, 0, MEM_RELEASE) != 0, "release API23 guard");
 #else
@@ -431,6 +432,107 @@ void VerifyAcceptedNativePipeline(Fixture &fixture, Submission &submit,
   std::filesystem::remove_all(root);
   std::cout << "native Geometry API pipeline " << kind << " PASS\n";
 }
+
+void VerifyExplicitLayerPipeline(Fixture &fixture, Submission &submit,
+                                 const std::filesystem::path &root) {
+  // The real compiler exports an unconsumed PrimitiveID at UVSW4, then the
+  // scalar Layer at UVSW5. A packed/ordinal mapping would read the wrong slot.
+  auto vs = pvrgpu::stub::GeometryLayerVSFixture();
+  auto gs = pvrgpu::stub::GeometryLayerGSFixture();
+  auto fs = pvrgpu::stub::GeometryLayerFSFixture();
+  std::array<float, 24> vertices = {
+      -.75f,-.75f,0,1, .75f,-.75f,0,1, 0,.75f,0,1,
+      -.75f,-.75f,0,1, .75f,-.75f,0,1, 0,.75f,0,1};
+  std::array<std::uint32_t, 4> shared{};
+  pvrgpu_systemc_varying_binding binding{5,1,4,1};
+  auto draw = fixture.Draw();
+  draw.case_name = submit.sequence.case_name = "bridge.geometry.explicit_layer";
+  draw.frame = submit.sequence.frame = 1;
+  draw.framebuffer_layers = 2;
+  draw.vertex_attribute_count = 1; draw.vertex_attribute_components[0] = 4;
+  draw.raw_vertex_data = reinterpret_cast<const std::uint8_t *>(vertices.data());
+  draw.raw_vertex_data_size = sizeof(vertices);
+  draw.vertex_count = draw.geometry_vertices_per_instance = 6;
+  draw.primitive_mode = 4;
+  draw.vertex_pco = vs.data(); draw.vertex_pco_size = vs.size();
+  draw.geometry_pco = gs.data(); draw.geometry_pco_size = gs.size();
+  draw.fragment_pco = fs.data(); draw.fragment_pco_size = fs.size();
+  draw.vertex_shared = draw.fragment_shared = nullptr;
+  draw.vertex_shared_count = draw.fragment_shared_count = 0;
+  draw.geometry_shared = shared.data();
+  draw.vertex_pco_abi = {0,4,4,0,0,0,0,0,0,0};
+  draw.geometry_pco_abi = {6,2,6,0,4,4,0,0,4,0};
+  draw.fragment_pco_abi = {1,0,0,8,0,0,0,0,0,0};
+  draw.geometry_input_primitive_vertices = 3;
+  draw.geometry_output_primitive = 5;
+  draw.geometry_max_vertices = 3;
+  draw.geometry_primitive_id_output_start = 4;
+  draw.geometry_primitive_id_output_count = 1;
+  draw.geometry_layer_output_start = 5;
+  draw.geometry_layer_output_count = 1;
+  draw.varying_output_count = 2; draw.fragment_varying_count = 4;
+  draw.varying_bindings = &binding; draw.varying_binding_count = 1;
+  draw.fragment_output_mask[0] = 15;
+  submit.Rejected(draw, "blend", "GS explicit mapping with a physical output gap reaches later gate");
+  binding.output_dword = 6;
+  submit.Rejected(draw, "explicit varying binding output", "GS binding uses GS output ABI bounds");
+  binding.output_dword = 5; binding.coefficient_dword = 8;
+  submit.Rejected(draw, "explicit varying binding output", "GS binding cannot omit FS coefficients");
+  binding.coefficient_dword = 4; binding.flat = 0;
+  submit.Rejected(draw, "geometry integer varying must be flat", "raw Layer cannot be float-interpolated");
+  binding.output_dword = 4;
+  submit.Rejected(draw, "geometry integer varying must be flat", "raw PrimitiveID cannot be float-interpolated");
+  binding.output_dword = 5; binding.flat = 1;
+  pvrgpu_systemc_stream_output stream_output{};
+  draw.stream_output = &stream_output;
+  submit.Rejected(draw, "stream output from geometry", "GS explicit mapping does not enable GS transform feedback");
+  draw.stream_output = nullptr;
+  Check(!std::filesystem::exists(root), "invalid GS linkage enqueues no model work");
+  draw.blend_enable = 0;
+  draw.clear_color_bits[0] = draw.clear_color_bits[2] = draw.clear_color_bits[3] = 0x3f800000;
+  std::memcpy(submit.sequence.clear_color_bits, draw.clear_color_bits, sizeof(draw.clear_color_bits));
+  std::filesystem::create_directories(root / "out");
+  submit.sequence.pco_sequence_commands = &draw;
+  submit.info.submission_generation = 300;
+  std::array<char, 1024> error{};
+  Check(pvrgpu_systemc_submit_driver_command(&submit.info, error.data(), error.size()) == 0,
+        std::string("accept genuine GS Layer -> flat FS pipeline: ") + error.data());
+  // Explicit binding ownership is just as important as executable ownership.
+  std::fill(vs.begin(), vs.end(), 0); std::fill(gs.begin(), gs.end(), 0);
+  std::fill(fs.begin(), fs.end(), 0); vertices.fill(0); shared.fill(UINT32_MAX);
+  binding = {UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX}; draw = {};
+  VerifyGeometryStats(submit.info.submission_generation, 2, 2, Check, 2);
+  std::array<std::uint8_t, 2 * 16 * 16 * 4 + 32> pixels;
+  pixels.fill(0xa5);
+  pvrgpu_systemc_readback_info read{};
+  read.version = PVRGPU_SYSTEMC_API_VERSION;
+  read.width = read.height = 16; read.bytes_per_pixel = 4; read.layer_count = 2;
+  read.pixels = pixels.data() + 16; read.pixels_size = pixels.size() - 32;
+  Check(pvrgpu_systemc_flush_readback(&read, error.data(), error.size()) == 0 && read.pixels_written,
+        std::string("native GS Layer to FS all-layer readback: ") + error.data());
+  std::array<unsigned, 2> covered{};
+  for (unsigned layer = 0; layer != 2; ++layer) for (unsigned p = 0; p != 256; ++p) {
+    const auto *rgba = pixels.data() + 16 + (layer * 256 + p) * 4;
+    const unsigned color = layer ? 255 : 0;
+    const bool shader = rgba[0] == color && rgba[1] == color && rgba[2] == color && rgba[3] == 255;
+    const bool clear = rgba[0] == 255 && rgba[1] == 0 && rgba[2] == 255 && rgba[3] == 255;
+    Check(shader || clear, "FS must convert the selected layer's raw integer, not float reinterpretation");
+    covered[layer] += shader;
+    if (p == 8 * 16 + 8) Check(shader, "actual Layer value reaches FS for the interior pixel");
+    if (layer == 1)
+      Check(shader == (pixels[16 + p * 4] == 0), "two equal XY triangles retain identical per-layer coverage");
+  }
+  Check(covered[0] > 30 && covered[0] == covered[1], "native GS emits both layer primitives with real FS output");
+  for (unsigned i = 0; i != 16; ++i)
+    Check(pixels[i] == 0xa5 && pixels[pixels.size() - 1 - i] == 0xa5, "layer readback guard bytes remain intact");
+  std::ifstream log(submit.jsonl, std::ios::binary);
+  const std::string json{std::istreambuf_iterator<char>(log), std::istreambuf_iterator<char>()};
+  for (const char *evidence : {"\"gs_invocations\":2", "\"gs_emitted_vertices\":6",
+                               "\"gs_primitives\":2", "\"pool_bytes_in_flight\":0", "\"pool_leaks\":0"})
+    Check(json.find(evidence) != std::string::npos, std::string("native Layer linkage evidence missing: ") + evidence);
+  std::filesystem::remove_all(root);
+  std::cout << "native Geometry API explicit Layer two-layer pipeline PASS\n";
+}
 } // namespace
 
 int main() {
@@ -447,6 +549,11 @@ int main() {
       const auto pipeline_root = root / ("pipeline-" + std::to_string(kind));
       Submission pipeline_submit(pipeline_root);
       VerifyAcceptedNativePipeline(fixture, pipeline_submit, pipeline_root, kind);
+    }
+    {
+      const auto layer_root = root / "explicit-layer";
+      Submission layer_submit(layer_root);
+      VerifyExplicitLayerPipeline(fixture, layer_submit, layer_root);
     }
     std::filesystem::remove(root);
     std::cout << "native Geometry API24 " << checks << " checks PASS\n";

@@ -14,6 +14,7 @@ struct pvrgpu_pco_compiler;
 /* Lower float builtins whose NIR semantics are wider than native PCO's
  * instruction sequence before public PCO instruction selection. */
 bool pvrgpu_lower_float_builtins_nir(struct nir_shader *nir);
+bool pvrgpu_lower_uniform_fragment_texture_selects(struct nir_shader *nir);
 
 /* Run the common PCO preprocessing pipeline with the compiler-owned NIR
  * options, including the builtin lowerings above. */
@@ -56,8 +57,10 @@ struct pvrgpu_pco_owned_binary {
 /* Compute has its own transport contract; it is never a graphics stage.
  * LOCAL_INVOCATION_INDEX uses VTXIN. WORKGROUP_ID and NUM_WORKGROUPS use
  * COEFF, as in Mesa's public PDS compute ABI. All other IDs are shader ALU.
- * Shared registers contain UBO descriptors, SSBO descriptors, then CB0.
- * Descriptor words are baseLo/baseHi/byteSize/dynamicByteOffset. */
+ * Shared registers contain UBO descriptors, SSBO descriptors, image descriptors,
+ * optional private workgroup-memory descriptor, then CB0. Buffer descriptors
+ * are baseLo/baseHi/byteSize/dynamicByteOffset; images append width/height/
+ * rowStride/format to baseLo/baseHi/byteSize/zero. Zero images preserve old SH. */
 struct pvrgpu_pco_compute_abi {
    struct pvrgpu_pco_stage_abi stage;
    uint32_t local_size[3];
@@ -75,6 +78,13 @@ struct pvrgpu_pco_compute_abi {
    uint32_t storage_buffer_write_mask;
    uint32_t shared_memory_bytes;
    uint32_t scratch_bytes;
+   uint32_t shared_memory_descriptor_start;
+   uint32_t shared_memory_descriptor_count;
+   uint32_t image_descriptor_start;
+   uint32_t image_descriptor_count;
+   uint32_t image_used_mask;
+   uint32_t image_read_mask;
+   uint32_t image_write_mask;
 };
 
 struct pvrgpu_pco_compute_binary {
@@ -86,7 +96,8 @@ struct pvrgpu_pco_compute_binary {
 /* Input NIR is cloned. A successful caller owns data until finish(). The
  * initial native subset accepts static workgroups, IDs, CB0 and 32-bit
  * UBO/SSBO accesses with static bindings and runtime byte offsets. Unsupported
- * image, shared, atomic and barrier operations fail before PCO lowering. */
+ * images and scratch fail before PCO lowering. Shared storage is bounded to
+ * 32 KiB, and native MUTEX sleep/wakeup implements multi-task barriers. */
 bool pvrgpu_pco_compile_compute(
    struct pvrgpu_pco_compiler *compiler,
    const struct nir_shader *compute_nir,
@@ -107,7 +118,8 @@ struct pvrgpu_pco_varying_binding {
 struct pvrgpu_pco_graphics_binary {
    struct pvrgpu_pco_owned_binary vertex;
    struct pvrgpu_pco_owned_binary fragment;
-   /* Actual final VS output placement, keyed by NIR varying location.
+   /* Actual final pre-raster output placement (VS or TES), keyed by the
+    * original NIR varying location of that stage.
     * Gallium stream-output register indices are ordinals in outputs_written,
     * not physical VTXOUT indices. */
    uint32_t vertex_output_start[64];
@@ -148,6 +160,9 @@ struct pvrgpu_pco_graphics_binary {
 #define PVRGPU_PCO_GEOMETRY_LOCATIONS 64u
 #define PVRGPU_PCO_GEOMETRY_MAX_DWORDS 64u
 #define PVRGPU_PCO_GEOMETRY_INPUT_DESCRIPTOR_START 0u
+/* After the four primitive-input descriptor words, N combined samplers use
+ * 20 DWORDs each. This is the zero-texture UBO origin; the actual UBO origin
+ * is stage.uniform_buffer_descriptor_start = 4 + 20*N, then CB0 follows. */
 #define PVRGPU_PCO_GEOMETRY_UBO_DESCRIPTOR_START 4u
 #define PVRGPU_PCO_GEOMETRY_PRIMITIVE_ID_INPUT 0u
 #define PVRGPU_PCO_GEOMETRY_INVOCATION_ID_INPUT 1u

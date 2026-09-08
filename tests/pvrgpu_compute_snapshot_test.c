@@ -170,12 +170,76 @@ test_aggregate_limit_before_allocation(void)
    CHECK(resource.base.reference.count == 1);
 }
 
+static void
+test_image_views_and_padding(void)
+{
+   uint8_t bytes[160], original[160];
+   for (unsigned i = 0; i < sizeof(bytes); ++i) bytes[i] = original[i] = i * 13U + 7;
+   struct pvrgpu_resource resource;
+   init_buffer(&resource, bytes, sizeof(bytes));
+   resource.base.target = PIPE_TEXTURE_2D;
+   resource.base.format = PIPE_FORMAT_R32_UINT;
+   resource.base.width0 = 5; resource.base.height0 = 3;
+   resource.base.depth0 = resource.base.array_size = 1;
+   resource.base.last_level = 1;
+   resource.level_count = 2;
+   resource.level_offsets[0] = 16; resource.level_strides[0] = 32;
+   resource.level_layer_strides[0] = 96;
+   resource.level_offsets[1] = 128; resource.level_strides[1] = 16;
+   resource.level_layer_strides[1] = 16;
+   struct pipe_image_view view = {.resource = &resource.base,
+      .format = PIPE_FORMAT_R32_UINT, .access = PIPE_IMAGE_ACCESS_READ_WRITE};
+   struct pvrgpu_compute_snapshot snapshot = {0};
+   const char *reason = NULL;
+   CHECK(pvrgpu_compute_snapshot_add_image(&snapshot, 1, 3, &view, &reason));
+   view.u.tex.level = 1;
+   CHECK(pvrgpu_compute_snapshot_add_image(&snapshot, 3, 2, &view, &reason));
+   CHECK(pvrgpu_compute_snapshot_add_image(&snapshot, 0, 1, &view, &reason));
+   CHECK(snapshot.resource_count == 1 && snapshot.image_count == 3 &&
+         snapshot.binding_count == 0 && resource.base.reference.count == 2);
+   CHECK(snapshot.images[0].offset == 16 && snapshot.images[0].width == 5 &&
+         snapshot.images[0].height == 3 && snapshot.images[0].row_stride_bytes == 32 &&
+         snapshot.images[0].bytes_size == 84);
+   CHECK(snapshot.images[1].offset == 128 && snapshot.images[1].width == 2 &&
+         snapshot.images[1].height == 1 && snapshot.images[1].resource_index == 0);
+   memset(snapshot.resources[0].bytes, 0x6a, sizeof(bytes));
+   pvrgpu_compute_snapshot_writeback(&snapshot);
+   for (unsigned i = 0; i < sizeof(bytes); ++i) {
+      const bool written = (i >= 16 && i < 36) || (i >= 48 && i < 68) ||
+                           (i >= 80 && i < 100) || (i >= 128 && i < 136);
+      CHECK(bytes[i] == (written ? 0x6a : original[i]));
+   }
+   CHECK(resource.driver_writes_model_cannot_reproduce);
+   pvrgpu_compute_snapshot_finish(&snapshot);
+   CHECK(resource.base.reference.count == 1);
+   resource.driver_writes_model_cannot_reproduce = false;
+   const struct pvrgpu_resource valid = resource;
+   const struct pipe_image_view valid_view = view;
+   for (unsigned bad = 0; bad < 10; ++bad) {
+      resource = valid; view = valid_view;
+      if (bad == 0) view.access = PIPE_IMAGE_ACCESS_READ;
+      if (bad == 1) view.format = PIPE_FORMAT_R32_SINT;
+      if (bad == 2) view.u.tex.level = 2;
+      if (bad == 3) view.u.tex.first_layer = 1;
+      if (bad == 4) resource.level_strides[1] = 7;
+      if (bad == 5) resource.level_offsets[1] = 156;
+      if (bad == 6) resource.level_offsets[1] = 127;
+      if (bad == 7) resource.level_layer_strides[1] = 4;
+      if (bad == 8) resource.base.nr_samples = 4;
+      if (bad == 9) resource.base.width0 = 0;
+      CHECK(!pvrgpu_compute_snapshot_add_image(&snapshot, 0, 2, &view, &reason));
+      CHECK(snapshot.resource_count == 0 && snapshot.image_count == 0 &&
+            resource.base.reference.count == 1 && !resource.driver_writes_model_cannot_reproduce);
+   }
+}
+
 int main(void)
 {
    test_alias_and_writeback();
    test_abort_and_bound_ranges();
    test_user_uniform_range_start();
    test_aggregate_limit_before_allocation();
+   test_image_views_and_padding();
    printf("compute snapshot checks=%u failures=%u\n", checks, failures);
    return failures ? 1 : 0;
 }

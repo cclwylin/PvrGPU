@@ -56,6 +56,11 @@ RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
 bool ComputeTextureMultisampleTexelOffset(
     const TextureResource &resource, const TextureSampleRequest &request,
     std::uint32_t layer, std::uint64_t *offset);
+// Non-MS NNCOORDS + REPLACE: integer-valued float coordinates/LOD emitted
+// by native PCO. No sampler clamp, wrap or filtering changes the selected texel.
+bool ComputeTextureTexelOffset(
+    const TextureResource &resource, const TextureSampleRequest &request,
+    std::uint32_t array_layer, std::uint64_t *offset);
 // Cross-check the raw one-level array depth/TEXTYPE used by native TAO and
 // textureSize against the resource extent; structured metadata cannot replace
 // or widen a shader-visible descriptor field.
@@ -73,6 +78,9 @@ TextureImplicitLod ComputeTextureImplicitLod(
     const std::array<std::array<float, 2>, 4>& coordinates,
     const RogueTextureImageDescriptor& image,
     const RogueTextureSamplerDescriptor& sampler);
+TextureImplicitLod ComputeTextureExplicitLod(
+    float level, const RogueTextureImageDescriptor &image,
+    const RogueTextureSamplerDescriptor &sampler);
 
 class TextureUnit final : public sc_core::sc_module {
  public:
@@ -90,6 +98,12 @@ class TextureUnit final : public sc_core::sc_module {
   sc_core::sc_port<sc_core::sc_fifo_out_if<PipelineTxn>, 0,
                    sc_core::SC_ZERO_OR_MORE_BOUND>
       vertex_sample_output{"vertex_sample_output"};
+  sc_core::sc_port<sc_core::sc_fifo_in_if<PipelineTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND>
+      geometry_sample_input{"geometry_sample_input"};
+  sc_core::sc_port<sc_core::sc_fifo_out_if<PipelineTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND>
+      geometry_sample_output{"geometry_sample_output"};
   sc_core::sc_port<sc_core::sc_fifo_out_if<MemoryTxn>, 0,
                    sc_core::SC_ZERO_OR_MORE_BOUND>
       cache_request{"cache_request"};
@@ -110,6 +124,7 @@ class TextureUnit final : public sc_core::sc_module {
   void Run();
   void SampleRun();
   void VertexSampleRun();
+  void GeometrySampleRun();
   void SampleRunForStage(
       ShaderStage stage,
       sc_core::sc_port<sc_core::sc_fifo_in_if<PipelineTxn>, 0,
@@ -119,16 +134,16 @@ class TextureUnit final : public sc_core::sc_module {
 
   MemoryPool& pool_;
   GpuMemorySystem *memory_;
-  // VS and FS descriptor-set namespaces are independent. Residency is kept
+  // VS, FS and GS descriptor-set namespaces are independent. Residency is kept
   // within one PipelineState (including all of its SMP continuation rounds)
   // and reset when the next physical draw receives a new state handle.
-  std::array<std::array<bool, kDriverPcoMaximumSequenceTextures>, 2>
+  std::array<std::array<bool, kDriverPcoMaximumSequenceTextures>, 3>
       texture_preloaded_{};
-  std::array<std::array<std::uint64_t, kDriverPcoMaximumSequenceTextures>, 2>
+  std::array<std::array<std::uint64_t, kDriverPcoMaximumSequenceTextures>, 3>
       preloaded_address_{};
-  std::array<std::array<std::uint64_t, kDriverPcoMaximumSequenceTextures>, 2>
+  std::array<std::array<std::uint64_t, kDriverPcoMaximumSequenceTextures>, 3>
       preloaded_bytes_{};
-  std::array<PoolHandle, 2> residency_state_{};
+  std::array<PoolHandle, 3> residency_state_{};
 };
 
 }  // namespace pvrgpu::stub

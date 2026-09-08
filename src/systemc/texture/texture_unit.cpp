@@ -517,6 +517,7 @@ bool ComputeTextureMultisampleTexelOffset(
     const TextureResource &resource, const TextureSampleRequest &request,
     std::uint32_t layer, std::uint64_t *offset) {
   if (offset == nullptr || request.sample_index_present != 1U ||
+      request.explicit_lod_present != 0U || request.explicit_lod != 0U ||
       request.normalized != 0U || resource.mip_count != 1U ||
       (resource.sample_count != 1U && resource.sample_count != 2U &&
        resource.sample_count != 4U && resource.sample_count != 8U) ||
@@ -559,10 +560,59 @@ bool ComputeTextureMultisampleTexelOffset(
   return true;
 }
 
+bool ComputeTextureTexelOffset(
+    const TextureResource &resource, const TextureSampleRequest &request,
+    std::uint32_t array_layer, std::uint64_t *offset) {
+  if (!offset || request.normalized != 0 || request.sample_index_present ||
+      request.sample_index || request.explicit_lod_present != 1 ||
+      resource.sample_count != 1 || !resource.layer_count || !resource.mip_count ||
+      resource.mip_count > kMaximumTextureMipLevels ||
+      resource.block_width != 1 || resource.block_height != 1 ||
+      (resource.dimension_type != TextureDimensionType::k2D &&
+       resource.dimension_type != TextureDimensionType::k2DArray &&
+       resource.dimension_type != TextureDimensionType::k3D) ||
+      (resource.dimension_type == TextureDimensionType::k2D && resource.layer_count != 1) ||
+      resource.format == TextureFormat::kAstcLdr || resource.format == TextureFormat::kAstcLdrSrgb)
+    throw std::runtime_error("TextureUnit invalid non-MS texelFetch metadata");
+  *offset = 0;
+  const float level = BitsFloat(request.explicit_lod);
+  if (!std::isfinite(level) || level < 0 || level >= resource.mip_count || std::floor(level) != level)
+    return false;
+  const unsigned index = static_cast<unsigned>(level);
+  const auto &mip = resource.mip[index];
+  const std::uint64_t texel_size = TextureBytesPerTexel(resource.format);
+  const unsigned slices = resource.dimension_type == TextureDimensionType::k3D
+      ? std::max<unsigned>(1U, resource.layer_count >> index) : resource.layer_count;
+  const std::uint64_t slice_stride = static_cast<std::uint64_t>(mip.row_pitch_bytes) * mip.height;
+  if (!mip.width || !mip.height || !texel_size ||
+      mip.row_pitch_bytes < static_cast<std::uint64_t>(mip.width) * texel_size ||
+      mip.offset_bytes > resource.byte_size ||
+      slice_stride > (resource.byte_size - mip.offset_bytes) / slices)
+    throw std::runtime_error("TextureUnit invalid non-MS texelFetch storage");
+  const float x = BitsFloat(request.coordinates[0]), y = BitsFloat(request.coordinates[1]);
+  if (!std::isfinite(x) || !std::isfinite(y) || x < 0 || y < 0 ||
+      x >= mip.width || y >= mip.height || std::floor(x) != x || std::floor(y) != y)
+    return false;
+  unsigned slice = array_layer;
+  if (resource.dimension_type == TextureDimensionType::k3D) {
+    const float z = BitsFloat(request.coordinates[2]);
+    if (!std::isfinite(z) || z < 0 || z >= slices || std::floor(z) != z) return false;
+    slice = static_cast<unsigned>(z);
+  }
+  if (slice >= slices) return false;
+  const std::uint64_t address_offset = mip.offset_bytes + slice_stride * slice +
+      static_cast<std::uint64_t>(y) * mip.row_pitch_bytes + static_cast<std::uint64_t>(x) * texel_size;
+  if (address_offset > resource.byte_size - texel_size ||
+      address_offset > std::numeric_limits<std::uint64_t>::max() - resource.gpu_address)
+    throw std::runtime_error("TextureUnit non-MS texel address is out of range");
+  *offset = address_offset;
+  return true;
+}
+
 void ValidateTextureSingleLevelDimensions(
     const std::array<std::uint32_t, 4> &words,
     const TextureResource &resource) {
-  if (resource.mip_count != 1U)
+  if (resource.mip_count != 1U && resource.dimension_type != TextureDimensionType::k2DArray)
     return;
   const std::uint64_t textype = ExtractBits(ReadU64(words, 0), 0, 2);
   if ((resource.dimension_type == TextureDimensionType::k2D &&
@@ -803,12 +853,38 @@ TextureImplicitLod ComputeTextureImplicitLod(
   return result;
 }
 
+TextureImplicitLod ComputeTextureExplicitLod(
+    float level, const RogueTextureImageDescriptor &image,
+    const RogueTextureSamplerDescriptor &sampler) {
+  if (!std::isfinite(level) || !image.mip_count || image.mip_count > kMaximumTextureMipLevels ||
+      sampler.min_lod_u4_6 > sampler.max_lod_u4_6)
+    throw std::runtime_error("TextureUnit explicit LOD state is invalid");
+  // lp_build_lod_selector uses the explicit word directly, then sampler LOD
+  // bounds. Unlike texelFetch, textureLod retains image/mip filtering.
+  TextureLodSelection lod;
+  lod.lambda = std::clamp(level, sampler.min_lod_u4_6 / 64.0F, sampler.max_lod_u4_6 / 64.0F);
+  lod.minified = lod.lambda > 0;
+  lod.clamp_active = true; // explicit float LOD uses lp_build_iround, not rho.
+  const auto levels = SelectTextureLevels(lod, sampler, image.mip_count);
+  TextureImplicitLod result;
+  result.lambda = lod.lambda;
+  result.minified = lod.minified;
+  result.image_filter = levels.image_filter;
+  result.mip_mode = levels.mip_mode;
+  result.level0 = levels.level0;
+  result.level1 = levels.level1;
+  result.mip_weight = levels.mip_weight;
+  result.mip_weight_u8 = levels.mip_weight_u8;
+  return result;
+}
+
 TextureUnit::TextureUnit(sc_core::sc_module_name name, MemoryPool &pool,
                          GpuMemorySystem *memory)
     : sc_module(name), pool_(pool), memory_(memory) {
   SC_THREAD(Run);
   SC_THREAD(SampleRun);
   SC_THREAD(VertexSampleRun);
+  SC_THREAD(GeometrySampleRun);
 }
 
 void TextureUnit::SampleRun() {
@@ -818,6 +894,11 @@ void TextureUnit::SampleRun() {
 void TextureUnit::VertexSampleRun() {
   SampleRunForStage(ShaderStage::kVertex, vertex_sample_input,
                     vertex_sample_output);
+}
+
+void TextureUnit::GeometrySampleRun() {
+  SampleRunForStage(ShaderStage::kGeometry, geometry_sample_input,
+                    geometry_sample_output);
 }
 
 void TextureUnit::SampleRunForStage(
@@ -836,24 +917,30 @@ void TextureUnit::SampleRunForStage(
     const PipelineTxn txn = sample_input_port->read();
     PipelineState state = LoadPipelineState(pool_, txn.state);
     const bool vertex_stage = shader_stage == ShaderStage::kVertex;
-    const std::size_t stage_index = vertex_stage ? 0U : 1U;
+    const bool geometry_stage = shader_stage == ShaderStage::kGeometry;
+    const bool fragment_stage = shader_stage == ShaderStage::kFragment;
+    const std::size_t stage_index = vertex_stage ? 0U : geometry_stage ? 2U : 1U;
+    const std::uint32_t descriptor_start = geometry_stage ? 4U : 0U;
     const PipelineStage pending_stage =
         vertex_stage ? PipelineStage::kVertexTexturePending
-                     : PipelineStage::kFragmentTexturePending;
+                     : geometry_stage ? PipelineStage::kGeometryTexturePending
+                                      : PipelineStage::kFragmentTexturePending;
     const PipelineStage ready_stage =
         vertex_stage ? PipelineStage::kVertexTextureSamplesReady
-                     : PipelineStage::kTextureSamplesReady;
+                     : geometry_stage ? PipelineStage::kGeometryTextureSamplesReady
+                                      : PipelineStage::kTextureSamplesReady;
     RequireStage(state.stage, pending_stage, name());
     if (memory_ && state.memory_mode != memory_->mode())
       throw std::runtime_error("TextureUnit memory mode mismatch");
     const PoolHandle resources_handle =
         vertex_stage ? state.vertex_texture_resources
-                     : state.texture_resources;
+                     : geometry_stage ? state.geometry_texture_resources : state.texture_resources;
     const PoolHandle samplers_handle =
-        vertex_stage ? state.vertex_sampler_states : state.sampler_states;
+        vertex_stage ? state.vertex_sampler_states
+                     : geometry_stage ? state.geometry_sampler_states : state.sampler_states;
     const PoolHandle shared_handle =
         vertex_stage ? state.vertex_shared_registers
-                     : state.fragment_shared_registers;
+                     : geometry_stage ? state.geometry_shared_registers : state.fragment_shared_registers;
     if (!UsesTextureSampling(state, shader_stage) ||
         !HasPoolHandle(state.texture_sample_requests) ||
         !HasPoolHandle(resources_handle) || !HasPoolHandle(samplers_handle) ||
@@ -882,24 +969,24 @@ void TextureUnit::SampleRunForStage(
     const std::uint32_t descriptor_count =
         driver_pco
             ? (vertex_stage ? state.vertex_sampled_texture_count
-                            : state.sampled_texture_count)
+                            : geometry_stage ? state.geometry_sampled_texture_count : state.sampled_texture_count)
             : 1U;
     const std::uint32_t expected_shared_dwords =
         driver_pco
             ? (vertex_stage ? state.vertex_pco_abi.shareds
-                            : state.fragment_pco_abi.shareds)
+                            : geometry_stage ? state.geometry_pco_abi.shareds : state.fragment_pco_abi.shareds)
             : kFillTexNearestSharedDwordCount;
     const std::uint64_t expected_lane_count =
         vertex_stage ? state.counters.vs_invocations
-                     : state.fragment_shader_lane_count;
-    if ((vertex_stage && !driver_pco) || requests.empty() ||
+                     : geometry_stage ? 1U : state.fragment_shader_lane_count;
+    if ((!fragment_stage && !driver_pco) || requests.empty() ||
         requests.size() != expected_lane_count ||
         descriptor_count == 0 ||
         descriptor_count > kPcoMaximumTextureDescriptorSets ||
         resources.size() != descriptor_count ||
         samplers.size() != descriptor_count ||
         expected_shared_dwords <
-            descriptor_count * kFillTexNearestSharedDwordCount ||
+            descriptor_start + descriptor_count * kFillTexNearestSharedDwordCount ||
         shared.size() != expected_shared_dwords) {
       throw std::runtime_error("TextureUnit resource/request count mismatch");
     }
@@ -950,7 +1037,7 @@ void TextureUnit::SampleRunForStage(
       residency_state_[stage_index] = txn.state;
     }
     const std::size_t descriptor_base =
-        static_cast<std::size_t>(descriptor_set) *
+        descriptor_start + static_cast<std::size_t>(descriptor_set) *
         kFillTexNearestSharedDwordCount;
     const TextureResource &resource = resources[descriptor_set];
     const SamplerState &sampler = samplers[descriptor_set];
@@ -1015,8 +1102,7 @@ void TextureUnit::SampleRunForStage(
                                                     descriptor_count)
               ? "descriptor class is unsupported"
           : shared[descriptor_base + 4U] !=
-                (resource.dimension_type == TextureDimensionType::k2DArray &&
-                         resource.mip_count == 1U
+                (resource.dimension_type == TextureDimensionType::k2DArray
                      ? static_cast<std::uint64_t>(resource.mip[0].row_pitch_bytes) *
                            resource.mip[0].height
                      : resource.byte_size)
@@ -1128,8 +1214,15 @@ void TextureUnit::SampleRunForStage(
      * and so does this unit.
      */
     const bool multisample_fetch = requests.front().sample_index_present != 0;
+    const bool texel_fetch = !multisample_fetch && requests.front().normalized == 0;
+    const bool explicit_lod = requests.front().explicit_lod_present != 0;
+    const bool direct_fetch = multisample_fetch || texel_fetch;
     for (const TextureSampleRequest &request : requests) {
       if (request.sample_index_present != (multisample_fetch ? 1U : 0U) ||
+          request.normalized != (direct_fetch ? 0U : 1U) ||
+          request.explicit_lod_present != (explicit_lod ? 1U : 0U) ||
+          (!explicit_lod && request.explicit_lod != 0) ||
+          (multisample_fetch && explicit_lod) || (texel_fetch && !explicit_lod) ||
           (multisample_fetch &&
            (image.mip_count != 1U || resource.block_width != 1U ||
             resource.block_height != 1U ||
@@ -1139,7 +1232,7 @@ void TextureUnit::SampleRunForStage(
         throw std::runtime_error("TextureUnit invalid multisample request class");
     }
     const bool needs_lod =
-        !multisample_fetch && !vertex_stage && decoded_sampler.max_lod_u4_6 != 0 &&
+        !direct_fetch && !explicit_lod && fragment_stage && decoded_sampler.max_lod_u4_6 != 0 &&
         (image.mip_count > 1U ||
          decoded_sampler.min_filter != decoded_sampler.mag_filter);
     std::vector<TextureImplicitLod> implicit_lods(requests.size());
@@ -1182,7 +1275,10 @@ void TextureUnit::SampleRunForStage(
         for (std::size_t lane = 0; lane < 4U; ++lane)
           implicit_lods[first + lane] = lod;
       }
-    } else if (!multisample_fetch) {
+    } else if (explicit_lod && !texel_fetch) {
+      for (std::size_t i = 0; i < requests.size(); ++i)
+        implicit_lods[i] = ComputeTextureExplicitLod(BitsFloat(requests[i].explicit_lod), image, decoded_sampler);
+    } else if (!direct_fetch) {
       // Zero derivatives: the window's minimum LOD, the base level.
       const std::array<std::array<float, 2>, 4> degenerate_quad{};
       const TextureImplicitLod base_level =
@@ -1194,7 +1290,7 @@ void TextureUnit::SampleRunForStage(
     // Report architectural request counts plus the exact selected mip pair and
     // TFRAC distributions; this deliberately observes the already-computed
     // datapath and cannot change sampling or descriptor semantics.
-    if (!vertex_stage &&
+    if (fragment_stage &&
         std::getenv("PVRGPU_SEQUENCE_DEBUG_LOD_HISTOGRAM") != nullptr) {
       std::array<std::array<std::uint64_t, kMaximumTextureMipLevels>,
                  kMaximumTextureMipLevels>
@@ -1311,7 +1407,7 @@ void TextureUnit::SampleRunForStage(
     std::vector<TextureSampleResponse> responses;
     responses.reserve(requests.size());
     const bool debug_fragment =
-        !vertex_stage &&
+        fragment_stage &&
         std::getenv("PVRGPU_SEQUENCE_DEBUG_FRAGMENT") != nullptr;
     const std::uint32_t debug_x =
         debug_fragment
@@ -1463,10 +1559,10 @@ void TextureUnit::SampleRunForStage(
           request.component_count != 4 ||
           request.descriptor_set != descriptor_set || request.binding != 0 ||
           request.dimension != expected_dimension ||
-          request.normalized != (multisample_fetch ? 0U : 1U) ||
+          request.normalized != (direct_fetch ? 0U : 1U) ||
           request.fcnorm != (integer_texture ? 0U : 1U) ||
           request.data_request != 0 ||
-          (vertex_stage
+          (!fragment_stage
                ? (request.quad_id != 0 || request.quad_lane != 0)
                : request.quad_lane > 3U) ||
           request.reserved[0] != 0) {
@@ -1493,8 +1589,8 @@ void TextureUnit::SampleRunForStage(
       // A 2D-array sample folds the layer into the texture address through
       // native base + layer * PCO_IMAGE_META_LAYER_SIZE. For a one-level
       // image this is the real layer stride, including all actual samples.
-      // Existing multi-level arrays retain their legacy whole-allocation
-      // meta convention and level-major storage until that path is revised.
+      // For every mip count, TAO identifies the layer using the base-level
+      // stride. Actual texels then use the selected mip's own layer stride.
       std::uint32_t selected_layer = 0U;
       if (array_texture) {
         const std::uint64_t sample_address =
@@ -1503,18 +1599,16 @@ void TextureUnit::SampleRunForStage(
         if (sample_address < image.gpu_address || resource.byte_size == 0)
           throw std::runtime_error(
               "TextureUnit array sample address is out of range");
-        const std::uint64_t address_layer_stride = resource.mip_count == 1U
-            ? static_cast<std::uint64_t>(resource.mip[0].row_pitch_bytes) *
-                  resource.mip[0].height
-            : resource.byte_size;
+        const std::uint64_t address_layer_stride =
+            static_cast<std::uint64_t>(resource.mip[0].row_pitch_bytes) * resource.mip[0].height;
         if (address_layer_stride == 0)
           throw std::runtime_error("TextureUnit array layer stride is empty");
         std::uint64_t layer =
             (sample_address - image.gpu_address) / address_layer_stride;
-        if (multisample_fetch &&
+        if (direct_fetch &&
             (sample_address - image.gpu_address) % address_layer_stride != 0U)
-          throw std::runtime_error("TextureUnit multisample array address is not layer-aligned");
-        if (multisample_fetch && layer >= resource.layer_count)
+          throw std::runtime_error("TextureUnit texelFetch array address is not layer-aligned");
+        if (direct_fetch && layer >= resource.layer_count)
           layer = resource.layer_count;
         else if (layer >= resource.layer_count)
           layer = resource.layer_count - 1U;
@@ -1547,9 +1641,9 @@ void TextureUnit::SampleRunForStage(
       const std::uint32_t fetch_bytes =
           astc_image ? 16U : TextureBytesPerTexel(image.format);
       std::uint64_t multisample_offset = 0;
-      const bool multisample_in_bounds = !multisample_fetch ||
-          ComputeTextureMultisampleTexelOffset(resource, request, selected_layer,
-                                               &multisample_offset);
+      const bool direct_in_bounds = multisample_fetch ?
+          ComputeTextureMultisampleTexelOffset(resource, request, selected_layer, &multisample_offset) :
+          texel_fetch ? ComputeTextureTexelOffset(resource, request, selected_layer, &multisample_offset) : true;
       /*
        * The block most recently decoded, and the bytes it was decoded from.
        * The TPU decodes a block once as it arrives from the TCU and hands
@@ -1571,7 +1665,7 @@ void TextureUnit::SampleRunForStage(
             astc_image ? y / astc_footprint.height : y;
         const std::uint64_t layer_stride =
             static_cast<std::uint64_t>(mip.row_pitch_bytes) * mip.height;
-        const std::uint64_t texel_offset = multisample_fetch ? multisample_offset :
+        const std::uint64_t texel_offset = direct_fetch ? multisample_offset :
             static_cast<std::uint64_t>(mip.offset_bytes) +
             static_cast<std::uint64_t>(selected_layer) * layer_stride +
             static_cast<std::uint64_t>(fetch_y) * mip.row_pitch_bytes +
@@ -1672,12 +1766,12 @@ void TextureUnit::SampleRunForStage(
         return texel;
       };
 
-      if (multisample_fetch) {
+      if (direct_fetch) {
         TextureSampleResponse response;
         response.shader_lane_index = request.shader_lane_index;
         response.request_id = request.request_id;
         response.shader_stage = shader_stage;
-        if (multisample_in_bounds) {
+        if (direct_in_bounds) {
           const auto texel = read_texel_bytes(resource.mip[0], 0, 0,
               request.request_id * kTextureSampleTapRequestStride);
           ++expected_texel_fetches;
@@ -2192,10 +2286,10 @@ void TextureUnit::SampleRunForStage(
     state.counters.texel_fetches += texel_fetch_count;
     std::uint64_t &stage_requests =
         vertex_stage ? state.vertex_texture_request_count
-                     : state.fragment_texture_request_count;
+                     : geometry_stage ? state.geometry_texture_request_count : state.fragment_texture_request_count;
     std::uint64_t &stage_fetches =
         vertex_stage ? state.vertex_texel_fetch_count
-                     : state.fragment_texel_fetch_count;
+                     : geometry_stage ? state.geometry_texel_fetch_count : state.fragment_texel_fetch_count;
     if (requests.size() >
             std::numeric_limits<std::uint64_t>::max() - stage_requests ||
         texel_fetch_count >
@@ -2215,7 +2309,7 @@ void TextureUnit::SampleRunForStage(
     const std::uint64_t cycles =
         functional_cycles + MemoryAccessDelayCycles(memory_stats);
     state.counters.texture_cycles += cycles;
-    if (vertex_stage)
+    if (!fragment_stage)
       state.counters.tiler_cycles += cycles;
     else
       state.counters.renderer_cycles += cycles;
@@ -2254,14 +2348,20 @@ void TextureUnit::Run() {
         UsesTextureSampling(state, ShaderStage::kVertex);
     const bool fragment_texture_case =
         UsesTextureSampling(state, ShaderStage::kFragment);
-    const bool texture_case = vertex_texture_case || fragment_texture_case;
+    const bool geometry_texture_case =
+        UsesTextureSampling(state, ShaderStage::kGeometry);
+    const bool texture_case = vertex_texture_case || fragment_texture_case || geometry_texture_case;
     if (!texture_case &&
         (state.counters.texture_requests != 0 ||
          state.counters.texel_fetches != 0 ||
          state.vertex_texture_request_count != 0 ||
          state.fragment_texture_request_count != 0 ||
+         state.geometry_texture_request_count != 0 ||
+         state.geometry_texture_instruction_count != 0 ||
+         state.counters.gs_tex_instructions != 0 ||
          state.vertex_texel_fetch_count != 0 ||
-         state.fragment_texel_fetch_count != 0)) {
+         state.fragment_texel_fetch_count != 0 ||
+         state.geometry_texel_fetch_count != 0)) {
       throw std::runtime_error(
           "solid-color raster case unexpectedly issued texture requests");
     }
@@ -2276,29 +2376,32 @@ void TextureUnit::Run() {
       state.counters.texture_requests = 0;
       state.counters.texel_fetches = 0;
     } else {
+      const auto sum = [](std::uint64_t a, std::uint64_t b, std::uint64_t c) {
+        if (a > std::numeric_limits<std::uint64_t>::max() - b ||
+            a + b > std::numeric_limits<std::uint64_t>::max() - c)
+          throw std::overflow_error("TextureUnit stage traffic sum overflow");
+        return a + b + c;
+      };
       const std::uint64_t stage_requests =
-          state.vertex_texture_request_count +
-          state.fragment_texture_request_count;
+          sum(state.vertex_texture_request_count, state.fragment_texture_request_count,
+              state.geometry_texture_request_count);
       const std::uint64_t stage_fetches =
-          state.vertex_texel_fetch_count + state.fragment_texel_fetch_count;
+          sum(state.vertex_texel_fetch_count, state.fragment_texel_fetch_count,
+              state.geometry_texel_fetch_count);
       const std::uint64_t executed_texture_instructions =
-          state.counters.vs_tex_instructions +
-          state.counters.fs_tex_instructions;
-      const bool request_sum_overflow =
-          stage_requests < state.vertex_texture_request_count;
-      const bool fetch_sum_overflow =
-          stage_fetches < state.vertex_texel_fetch_count;
-      const bool instruction_sum_overflow =
-          executed_texture_instructions < state.counters.vs_tex_instructions;
-      if (request_sum_overflow || fetch_sum_overflow ||
-          instruction_sum_overflow ||
-          state.counters.texture_requests != stage_requests ||
+          sum(state.counters.vs_tex_instructions, state.counters.fs_tex_instructions,
+              state.geometry_texture_instruction_count);
+      if (state.counters.texture_requests != stage_requests ||
           state.counters.texel_fetches != stage_fetches ||
           state.counters.texture_requests != executed_texture_instructions ||
           state.vertex_texture_request_count !=
               state.counters.vs_tex_instructions ||
           state.fragment_texture_request_count !=
               state.counters.fs_tex_instructions ||
+          state.geometry_texture_request_count != state.geometry_texture_instruction_count ||
+          state.geometry_texture_instruction_count != state.counters.gs_tex_instructions ||
+          (!geometry_texture_case &&
+           (state.geometry_texture_request_count != 0 || state.geometry_texel_fetch_count != 0)) ||
           (!vertex_texture_case &&
            (state.vertex_texture_request_count != 0 ||
             state.vertex_texel_fetch_count != 0)) ||

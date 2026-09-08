@@ -36,6 +36,11 @@ enum class PcoShiftEvidenceClass : std::uint8_t {
 
 PcoShiftEvidenceClass ClassifyPcoShiftEvidenceOpcode(PcoOpcode opcode);
 
+// Read-only validation shared with regression tests. This is the same
+// invariant applied before either per-draw or aggregated readback publication.
+void ValidateDrawListShaderStatistics(
+    const CounterTxn &counters, const std::vector<DrawListStats> &drawlists);
+
 class JsonReporter final : public sc_core::sc_module {
 public:
   sc_core::sc_fifo_in<PipelineTxn> input{"input"};

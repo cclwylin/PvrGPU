@@ -29,7 +29,10 @@ pvrgpu_tessellation_payload_error(const struct pvrgpu_systemc_tessellation *t)
       const uint32_t *shared = stage ? t->evaluation_shared : t->control_shared;
       const uint32_t count = stage ? t->evaluation_shared_count : t->control_shared_count;
       const uint32_t descriptors = stage ? 4u : 8u;
-      if (a->temps > 256 || a->vertex_inputs != (stage ? 5u : 3u) ||
+      /* PCO may use aligned spare VTXIN words as writable registers. Only
+       * the fixed 3/5-word system-input prefix is initialized by the task. */
+      if (a->temps > 256 || a->vertex_inputs < (stage ? 5u : 3u) ||
+          a->vertex_inputs > 64 ||
           (stage ? (a->vertex_outputs < 4 || a->vertex_outputs > 64) : a->vertex_outputs != 0) ||
           a->coefficients || a->entry_offset || !shared || count != a->shareds ||
           count < descriptors || count > 256 ||

@@ -61,7 +61,7 @@ void FragmentFrontend::Run() {
           LoadArray<ParameterTriangle>(pool_, state.parameter_triangles);
     }
     const std::uint64_t pixel_count =
-        static_cast<std::uint64_t>(state.width) * state.height;
+        static_cast<std::uint64_t>(state.width) * state.height * state.attachment_layers;
     const std::uint32_t valid_sample_mask =
         RasterSampleMask(state.raster_state.sample_count);
     if (pixel_count > std::numeric_limits<std::size_t>::max())
@@ -99,6 +99,7 @@ void FragmentFrontend::Run() {
           !HasCanonicalDepthPlaneMetadata(state.functional_case, parameter) ||
           parameter.key.api_primitive_id != candidate.primitive_id ||
           parameter.key.submit_ordinal != candidate.submit_ordinal ||
+          parameter.key.layer >= state.attachment_layers ||
           candidate.x >= state.width || candidate.y >= state.height ||
           (candidate.sample_mask & ~valid_sample_mask) != 0 ||
           (candidate.visibility == FragmentVisibility::kVisible &&
@@ -118,7 +119,7 @@ void FragmentFrontend::Run() {
       if (candidate.visibility != FragmentVisibility::kVisible)
         continue;
       const std::size_t pixel_index =
-          static_cast<std::size_t>(candidate.y) * state.width + candidate.x;
+          (static_cast<std::size_t>(parameter.key.layer) * state.height + candidate.y) * state.width + candidate.x;
       if (pixel_seen[pixel_index] != 0) {
         if (!state.raster_state.blend.enable &&
             !RasterRequiresLateDepthStencil(state.raster_state) &&
@@ -152,6 +153,7 @@ void FragmentFrontend::Run() {
           (candidate.x % kReferenceUarch.fragment_quad_width));
       invocation.sample_mask = candidate.sample_mask;
       invocation.front_facing = parameter.front_facing;
+      invocation.layer = parameter.key.layer;
       invocation.depth = candidate.depth;
       for (std::uint32_t sample = 0; sample < state.raster_state.sample_count;
            ++sample) {
@@ -204,7 +206,7 @@ void FragmentFrontend::Run() {
     if (!RasterRequiresLateDepthStencil(state.raster_state))
       MaterializeDepthAttachment(pool_, memory_, &state);
     std::vector<FragmentShaderLane> shader_lanes;
-    if (UsesTextureSampling(state)) {
+    if (UsesTextureSampling(state, ShaderStage::kFragment)) {
       // The selected reference USC dispatches a touched 4x2 SIMD half-stamp as
       // two architectural 2x2 quads. Lanes outside coverage are helpers: they
       // execute interpolation/SMP for derivatives and texture issue but never
@@ -318,7 +320,7 @@ void FragmentFrontend::Run() {
     }
     std::uint64_t grouped_invocations = 0;
     for (const FragmentQuad &quad : fragment_quads) {
-      const bool texture_case = UsesTextureSampling(state);
+      const bool texture_case = UsesTextureSampling(state, ShaderStage::kFragment);
       const std::uint8_t active_mask = static_cast<std::uint8_t>(
           quad.coverage_mask | quad.helper_mask);
       if ((!texture_case &&
@@ -363,7 +365,7 @@ void FragmentFrontend::Run() {
     }
 
     state.fragment_invocations = StoreNewArray(pool_, invocations);
-    if (UsesTextureSampling(state)) {
+    if (UsesTextureSampling(state, ShaderStage::kFragment)) {
       state.fragment_shader_lanes = StoreNewArray(pool_, shader_lanes);
       state.fragment_shader_lane_count =
           static_cast<std::uint32_t>(shader_lanes.size());

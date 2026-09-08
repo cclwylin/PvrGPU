@@ -1331,11 +1331,52 @@ void CheckEventPaths() {
   integer_texture.sample_input(integer_sample_input);
   integer_texture.sample_output(integer_sample_output);
 
+  // GS owns a third stage bank and reserves SH0..3 for primitive input.
+  // A scalar request cannot accidentally enter the FS derivative/quad path.
+  MemoryPool geometry_pool;
+  GpuMemorySystem geometry_memory(pvrgpu::stub::MemoryMode::kDirect);
+  geometry_memory.HostWrite(base, driver_fixture.texture_bytes.data(), driver_fixture.texture_bytes.size());
+  geometry_memory.HostWrite(base, driver_texel.data(), driver_texel.size());
+  auto geometry_resource = driver_fixture.resource;
+  geometry_resource.data = {};
+  TextureSampleRequest geometry_request = driver_request;
+  geometry_request.shader_stage = pvrgpu::stub::ShaderStage::kGeometry;
+  PipelineState geometry_state;
+  geometry_state.memory_mode = pvrgpu::stub::MemoryMode::kDirect;
+  geometry_state.functional_case = FunctionalCase::kDriverPcoTriangles;
+  geometry_state.stage = PipelineStage::kGeometryTexturePending;
+  geometry_state.geometry_sampled_texture_count = 1;
+  geometry_state.geometry_pco_abi.shareds = 24;
+  geometry_state.geometry_pco_abi.uniform_buffer_descriptor_start = 24;
+  geometry_state.geometry_pco_abi.push_constant_start = 24;
+  geometry_state.texture_sample_requests = StoreNewArray(
+      geometry_pool, std::vector<TextureSampleRequest>{geometry_request});
+  geometry_state.geometry_texture_resources = StoreNewArray(
+      geometry_pool, std::vector<TextureResource>{geometry_resource});
+  geometry_state.geometry_sampler_states = StoreNewArray(
+      geometry_pool, std::vector<pvrgpu::stub::SamplerState>{driver_fixture.sampler});
+  std::vector<std::uint32_t> geometry_shared(24, 0xa5a5a5a5U);
+  std::copy(driver_fixture.fragment_shared.begin(), driver_fixture.fragment_shared.end(), geometry_shared.begin() + 4);
+  geometry_state.geometry_shared_registers = StoreNewArray(geometry_pool, geometry_shared);
+  const auto geometry_state_handle = geometry_pool.Allocate(sizeof(PipelineState));
+  StorePipelineState(geometry_pool, geometry_state_handle, geometry_state);
+  const PipelineTxn geometry_transaction{geometry_state_handle, 7, 7};
+  sc_core::sc_fifo<PipelineTxn> geometry_module_input("geometry_module_input", 1);
+  sc_core::sc_fifo<PipelineTxn> geometry_module_output("geometry_module_output", 1);
+  sc_core::sc_fifo<PipelineTxn> geometry_sample_input("geometry_sample_input", 1);
+  sc_core::sc_fifo<PipelineTxn> geometry_sample_output("geometry_sample_output", 1);
+  TextureUnit geometry_texture("geometry_texture", geometry_pool, &geometry_memory);
+  geometry_texture.input(geometry_module_input);
+  geometry_texture.output(geometry_module_output);
+  geometry_texture.geometry_sample_input(geometry_sample_input);
+  geometry_texture.geometry_sample_output(geometry_sample_output);
+
   sample_input.write(transaction);
   gate_sample_input.write(gate_transaction);
   driver_sample_input.write(driver_transaction);
   vertex_sample_input.write(vertex_transaction);
   integer_sample_input.write(integer_transaction);
+  geometry_sample_input.write(geometry_transaction);
   sc_core::sc_start(sc_core::sc_time(100, sc_core::SC_NS));
   PipelineTxn completed;
   Check(sample_output.nb_read(completed) &&
@@ -1479,6 +1520,27 @@ void CheckEventPaths() {
           "integer memory samples preserve all four DWORDs at the selected address");
   }
   ReleaseFunctionalPayloads(integer_pool, integer_final_state);
+  PipelineTxn geometry_completed;
+  Check(geometry_sample_output.nb_read(geometry_completed) && geometry_completed.sequence == 7,
+        "independent GS texture FIFO completion identity");
+  const auto geometry_final_state = LoadPipelineState(geometry_pool, geometry_state_handle);
+  const auto geometry_responses = LoadArray<TextureSampleResponse>(
+      geometry_pool, geometry_final_state.texture_sample_responses);
+  Check(geometry_final_state.stage == PipelineStage::kGeometryTextureSamplesReady &&
+        geometry_final_state.counters.texture_requests == 1 && geometry_final_state.counters.texel_fetches == 1 &&
+        geometry_final_state.geometry_texture_request_count == 1 && geometry_final_state.geometry_texel_fetch_count == 1 &&
+        !geometry_final_state.vertex_texture_request_count && !geometry_final_state.fragment_texture_request_count &&
+        geometry_final_state.counters.tiler_cycles > 0 && !geometry_final_state.counters.renderer_cycles &&
+        geometry_responses.size() == 1 && geometry_responses[0].shader_stage == pvrgpu::stub::ShaderStage::kGeometry &&
+        geometry_responses[0].rgba[0] == FloatBits(17.0F / 255.0F) &&
+        geometry_responses[0].rgba[1] == FloatBits(34.0F / 255.0F) &&
+        geometry_responses[0].rgba[2] == FloatBits(51.0F / 255.0F) &&
+        geometry_responses[0].rgba[3] == FloatBits(1.0F),
+        "GS raw SH4 descriptor samples modeled memory without FS derivatives or stage leakage");
+  ReleaseFunctionalPayloads(geometry_pool, geometry_final_state);
+  geometry_pool.Release(geometry_state_handle);
+  Check(!geometry_pool.bytes_in_flight() && geometry_pool.allocations() == geometry_pool.releases(),
+        "GS texture nested resource ownership is balanced");
 
   // Reuse the elaborated TPU for a different format and filter. The four
   // physical taps must decode full binary32 channels before interpolation,

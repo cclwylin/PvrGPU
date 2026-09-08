@@ -551,6 +551,16 @@ target_link_libraries(geometry-frontend-test PRIVATE pvrgpu-systemc-bridge PkgCo
 pvrgpu_target_warnings(geometry-frontend-test)
 add_test(NAME geometry-frontend-unit COMMAND geometry-frontend-test)
 
+add_executable(point-restart-test tests/point_restart_test.cpp)
+target_include_directories(point-restart-test PRIVATE "${CMAKE_SOURCE_DIR}/src")
+pvrgpu_target_warnings(point-restart-test)
+add_test(NAME point-restart-unit COMMAND point-restart-test)
+
+add_executable(indirect-draw-test tests/indirect_draw_test.cpp)
+target_include_directories(indirect-draw-test PRIVATE "${CMAKE_SOURCE_DIR}/src")
+pvrgpu_target_warnings(indirect-draw-test)
+add_test(NAME indirect-draw-unit COMMAND indirect-draw-test)
+
 add_executable(pco-systemc-api-bridge-test
     tests/pco_systemc_api_bridge_test.cpp
 )
@@ -576,9 +586,20 @@ target_link_libraries(pco-geometry-api-bridge-test PRIVATE pvrgpu-systemc-bridge
 pvrgpu_target_warnings(pco-geometry-api-bridge-test)
 add_test(NAME pco-geometry-api-bridge-unit COMMAND pco-geometry-api-bridge-test)
 
+add_executable(pco-layered-api-test tests/pco_layered_api_test.cpp)
+target_include_directories(pco-layered-api-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src/systemc"
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu")
+target_link_libraries(pco-layered-api-test PRIVATE pvrgpu-systemc-bridge)
+pvrgpu_target_warnings(pco-layered-api-test)
+add_test(NAME pco-layered-api-direct COMMAND pco-layered-api-test direct)
+add_test(NAME pco-layered-api-bypass COMMAND pco-layered-api-test bypass)
+add_test(NAME pco-layered-api-cache COMMAND pco-layered-api-test cache)
+
 add_executable(pco-tessellation-api-bridge-test tests/pco_tessellation_api_bridge_test.cpp)
 target_include_directories(pco-tessellation-api-bridge-test PRIVATE
-    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu")
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu"
+    "${CMAKE_SOURCE_DIR}/src/systemc")
 target_link_libraries(pco-tessellation-api-bridge-test PRIVATE pvrgpu-systemc-bridge)
 pvrgpu_target_warnings(pco-tessellation-api-bridge-test)
 add_test(NAME pco-tessellation-api-bridge-unit COMMAND pco-tessellation-api-bridge-test)
@@ -695,6 +716,39 @@ pvrgpu_target_warnings(compute-shader-fifo-test)
 foreach(compute_memory_mode RANGE 0 2)
     add_test(NAME compute-shader-fifo-mode-${compute_memory_mode}
         COMMAND compute-shader-fifo-test ${compute_memory_mode})
+endforeach()
+
+add_executable(compute-shared-fifo-test
+    tests/compute_shared_fifo_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/data_master/compute_data_master.cpp
+    src/systemc/shader/compute_shader.cpp
+    src/systemc/shader/compute_iss.cpp
+    src/systemc/shader/pco_iss.cpp
+)
+target_include_directories(compute-shared-fifo-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc")
+target_link_libraries(compute-shared-fifo-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(compute-shared-fifo-test)
+foreach(compute_memory_mode RANGE 0 2)
+    add_test(NAME compute-shared-fifo-mode-${compute_memory_mode}
+        COMMAND compute-shared-fifo-test ${compute_memory_mode})
+endforeach()
+
+add_executable(compute-image-api-test tests/compute_image_api_test.cpp)
+target_include_directories(compute-image-api-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu")
+target_link_libraries(compute-image-api-test PRIVATE pvrgpu-systemc-bridge)
+pvrgpu_target_warnings(compute-image-api-test)
+foreach(compute_memory_mode RANGE 0 2)
+    add_test(NAME compute-image-api-mode-${compute_memory_mode}
+        COMMAND compute-image-api-test ${compute_memory_mode})
 endforeach()
 
 add_executable(pco-sequence-integer-load-test

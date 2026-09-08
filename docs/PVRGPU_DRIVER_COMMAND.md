@@ -8,16 +8,100 @@ bring-up seam: small enough to debug quickly, strict enough to prevent fake
 passes, and close enough to Gallium state that the driver can grow phase by
 phase.
 
+## Current contracts: graphics API 27 and compute API 4
+
+The numbered sections below describe the features at their introduction.
+Current callers must use graphics version **27** and independent compute
+version **4**; both entry points reject older versions before reading new
+tails. They must be rebuilt with the matching headers and runtime together.
+
+Graphics API 27 adds `framebuffer_layers` to physical nested PCO draws: zero
+means a non-layered attachment, otherwise 1–256 layer-major images. The model
+selects a whole primitive's layer from the original provoking GS output;
+non-layered attachments ignore that output. Invalid layer indices cannot
+address another image. Color/depth/stencil/sample ownership, LOAD, PBE and
+DRAM writeback include the layer in their pixel address. Each complete modeled
+attachment must fit its 16 MiB address slot. Layered MRT and unequal color/depth
+layer spans remain rejected. No new field is silently accepted on the logical
+sequence envelope.
+
+Readback's `layer_count` (zero defaults to one) must match the full completed
+attachment. The API does not return a prefix or rescale a mismatched surface;
+it leaves caller memory untouched and reports no pixels. The driver validates
+the complete mip/row/layer span before converting any rows, preserving physical
+row padding, unrelated mip levels and layers outside the attached range.
+
+GS texture snapshots use public stage 2 and the existing 20-DWORD sampled-image
+descriptor. GS SHARED contains its four-DWORD primitive descriptor, then
+20 DWORDs per sampler, four per UBO, then CB0. Native GS SMP/WDF communicates
+with the real TextureUnit through bounded FIFOs; GS TEX/MEM counters remain
+separate from VS/FS. Explicit last-stage varying bindings now apply to GS and
+TES as well as VS. Layer/PrimitiveID bindings must be flat and preserve raw
+DWORDs; only actual FS consumers receive coefficients. TF-only outputs remain
+in the native output bank without fabricated FS inputs.
+
+Non-MS `texelFetch` uses real `SMP.NNCOORDS.LODREPLACE` for uncompressed
+2D, 2D-array and 3D views. Coordinates and mip level remain native shader
+operands; fetches do not wrap/filter and out-of-range coordinates produce
+zero without issuing out-of-range TCU reads. Normalized `textureLod` uses the
+same TextureUnit with an explicit floating-point LOD, including cube views.
+Array descriptors retain the base-mip layer stride while the selected mip's
+metadata determines its physical layer address; 3D depth shrinks per mip.
+MS fetch continues to use the separate SNO path. Compressed non-MS fetch,
+cube fetch and 3D-array views remain rejected.
+
+Native TES Transform Feedback uses the independent StreamOutput module after
+evaluation, capturing complete domain-output primitives rather than patch
+inputs. It shares VS range/cursor/overflow/generation rules. GS Transform
+Feedback and combined tessellation+GS remain unsupported.
+
+Compute API 3 introduced workgroup-private modeled storage (at most 32 KiB,
+including native barrier state) and a resident-task scheduler. Barrier
+rendezvous executes pinned PCO usclib LD/ST/MUTEX instructions; it is not a
+host-side replacement for the shader's control flow. Compute API 4 adds an
+independent image binding namespace, sharing the deduplicated `resources[]`
+ownership of UBO/SSBO views. The canonical SHARED layout is UBO4, SSBO4,
+image8 per slot, optional private-workgroup4, then CB0. Each image descriptor
+contains base low/high, byte extent, zero, width, height, row stride, and format.
+The current image format is linear R32UI image2D, including mip/view offsets;
+array/multisample image operations and other image formats remain rejected.
+
+The compiler calculates real image texel addresses and executes native
+LD/ST/AMO through ComputeShader's memory FIFO. It checks image-coordinate
+bounds in native code; out-of-range image reads yield `(0,0,0,1)` and stores/
+atomics issue no out-of-range memory access. Invalid resource views/descriptor
+layouts still fail closed. Read/write masks, readonly views, image/SSBO aliases,
+padding and data outside the views are preserved. Successful writeback updates
+resource generations so later graphics and compute consumers see completed
+native work. Failure does not publish partially computed results.
+
+Single indirect graphics draws decode the actual argument-buffer bytes after
+pending graphics/TF writes have completed. Arrays and elements preserve
+instance count, first/base vertex and base instance, and then enter the same
+native direct-draw path. Zero count or zero instance count is a true no-op;
+it cannot become a one-instance draw. Misaligned/truncated/wrapping argument
+ranges, multi-draw, count buffers and unsupported negative base vertices fail
+closed. No indirect parameter or shader output is substituted on the host.
+
+The pinned Mesa frontend also needs
+`third_party/mesa-26.2.1-failed-query-state.patch`: apply it with `git apply`
+inside the selected Mesa source tree before building. A failed Gallium query
+becomes a terminal failure, retaining the GL error and leaving result memory
+untouched, instead of polling forever or publishing a successful zero. This
+changes failure recovery only; it does not alter shader execution or CTS
+comparison rules. The precise backend patch sets and runtime hashes belong
+to each validation receipt.
+
 ## Native vertex Transform Feedback (introduced in SystemC API v26)
 
 API 26 adds `stream_output` to nested VS draws. The bridge owns a deep copy of
 the raw VTXOUT binding table, target ranges/cursors, native binaries, and initial
-resource bytes before submission returns. API 25 and older callers are rejected
-before reading the new tail; Compute API remains at version 2.
+resource bytes before submission returns. API 25 and older callers were rejected
+before reading the new tail; see the current versions above.
 
 `StreamOutput` is an independent event-driven SystemC module between
 `GeometryShader` and `ClipCull`, connected through bounded PoolHandle FIFOs. The
-current enabled path captures ordinary VS output; GS and TES feedback remain
+enabled paths capture ordinary VS and completed TES output; GS feedback remains
 explicitly rejected. The module consumes the actual shaded lane references and
 pre-clipping VTXOUT DWORDs. Points and lines discard the triangle-adapter padding;
 triangle strip/fan/loop decomposition follows the input assembler's occurrence
@@ -54,7 +138,8 @@ array-layout gaps that cannot be represented by the legacy per-vec4 flat mask.
 Graphics API 25 appends an optional `pvrgpu_systemc_tessellation` pointer to a
 nested draw. Top-level and nested version checks happen before reading the new
 tail. The bridge deep-copies both binaries, both shared-register snapshots and
-stage-local UBO ranges before returning. Compute API remains independently at 2.
+stage-local UBO ranges before returning. Compute was independently versioned
+at 2 when this feature was introduced; see the current contracts above.
 TCS/TES graphics API stage IDs are 3/4, distinct from the internal shader enum.
 
 The executable chain is VS → independent `TessellationControlShader` → fixed
@@ -100,8 +185,9 @@ lanes, and `ds_invocations` counts evaluated domain points. Fixed generated
 primitives, native instructions and each stage's memory bytes are distinct
 counters. Primitive-generated queries select actual TES output rather than
 input patches, and never report that work as GS execution. TF primitives-written
-is a separate capability; the API26 VS feedback implementation does not yet
-enable TES feedback. See [validation and limitations](TESSELLATION_VALIDATION.md).
+uses actual complete TES output primitives, with native buffer writeback rather
+than a generated-primitive counter substitute. See
+[validation and limitations](TESSELLATION_VALIDATION.md).
 
 ## Native geometry stage (introduced in SystemC API v24)
 
@@ -160,7 +246,8 @@ with a refused draw is not native execution evidence.
 The sampled-texture payload appends `sample_count` (zero is the canonical
 single-sample default). Graphics API 23 rejects older top-level and nested
 commands before reading the expanded texture array; the separate Compute API
-remains version 2. Supported sampled storage counts are 1, 2, 4, and 8, matching
+was version 2 at this feature's introduction. Supported sampled storage counts
+are 1, 2, 4, and 8, matching
 the two-bit Rogue IMAGE_WORD0 SMPCNT field. Render-only storage can still use
 16 samples, but cannot be bound through the sampled-image ABI.
 
@@ -228,9 +315,9 @@ are outside this sampled-image change.
 Each physical draw snapshots three boolean fields: `alpha_to_coverage`,
 `alpha_to_coverage_dither`, and `alpha_to_one`. The driver and bridge validate
 them and copy them into the draw's `RasterState`; they are not context-global
-values read after a deferred draw. The graphics API version is now 23 and
-both top-level and nested old-version commands are rejected before accessing
-their new tail. The independent Compute API remains version 2.
+values read after a deferred draw. Both top-level and nested old-version
+commands are rejected before accessing their new tail. Current callers use
+graphics API 27 and the independent compute API 4, as described above.
 
 The model adapts Mesa 26.2.1 llvmpipe's pixel-frequency alpha-to-coverage
 algorithm: sample s survives when the original DATA0 alpha is greater than

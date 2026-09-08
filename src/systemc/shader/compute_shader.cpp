@@ -138,10 +138,10 @@ std::uint32_t ComputeShader::Atomic32Memory(void *context,
   return old;
 }
 
-void ComputeShader::MutexMemory(void *context, std::uint32_t id,
+bool ComputeShader::MutexMemory(void *context, std::uint32_t id,
                                 std::uint32_t operation) {
   auto &self = *static_cast<ComputeShader *>(context);
-  if (id >= 16 || (operation != 0 && operation != 3))
+  if (id >= 16 || operation > 3)
     throw std::runtime_error("compute issued an invalid native MUTEX");
   const auto response = self.ExchangeMemory(id, 0, operation == 3 ?
       ComputeMemoryOperation::kMutexLock : ComputeMemoryOperation::kMutexRelease, nullptr);
@@ -149,9 +149,11 @@ void ComputeShader::MutexMemory(void *context, std::uint32_t id,
     self.pool_.Release(response.payload);
     throw std::runtime_error("compute MUTEX response unexpectedly owns bytes");
   }
+  if (response.blocked) return false;
   const auto bit = UINT32_C(1) << id;
   if (operation == 3) self.current_mutex_mask_ |= bit;
   else self.current_mutex_mask_ &= ~bit;
+  return true;
 }
 
 void ComputeShader::ReleaseTaskMutexes() {
@@ -170,7 +172,7 @@ void ComputeShader::Run() {
     while (!input.nb_read(work))
       wait(input.data_written_event());
     ComputeWorkgroupResult result;
-    PoolHandle task_handle{};
+    std::vector<PoolHandle> resident;
     try {
       current_dispatch_ = work.state;
       const auto state = ReadPod<ComputeDispatchState>(pool_, work.state);
@@ -186,30 +188,63 @@ void ComputeShader::Run() {
       }
       const PcoDecodedProgram program{
           cached_summary_, LoadArray<PcoInstruction>(pool_, cached_instructions_)};
-      const auto shared =
+      auto shared =
           LoadArray<std::uint32_t>(pool_, state.shared_registers);
+      if (state.abi.shared_memory_bytes) {
+        const auto first = state.abi.shared_memory_descriptor_start;
+        if (first > shared.size() || 4U > shared.size() - first)
+          throw std::runtime_error("compute shared descriptor exceeds register payload");
+        shared[first] = static_cast<std::uint32_t>(kComputeSharedAddress);
+        shared[first + 1] = static_cast<std::uint32_t>(kComputeSharedAddress >> 32);
+        shared[first + 2] = state.abi.shared_memory_bytes;
+        shared[first + 3] = 0;
+      }
       const std::uint32_t local_count = state.abi.local_size[0] *
           state.abi.local_size[1] * state.abi.local_size[2];
       const ComputeMemoryCallbacks memory{this, ReadMemory, WriteMemory,
-                                            Atomic32Memory, MutexMemory};
+                                            Atomic32Memory, nullptr, MutexMemory};
       for (std::uint32_t first = 0; first < local_count;
            first += kComputeTaskWidth) {
         const std::uint32_t count = std::min(kComputeTaskWidth, local_count-first);
         auto task = MakeComputeTask(state.abi, shared, state.grid, work.group,
                                     first, count);
-        task_handle = pool_.Allocate(sizeof(task));
-        current_task_ = task_handle;
-        current_mutex_mask_ = 0;
-        WritePod(pool_, task_handle, task);
-        while (!task.ended) {
-          StepComputeTask(program, state.abi, task, memory, result);
-          WritePod(pool_, task_handle, task);
-        }
+        const auto handle = pool_.Allocate(sizeof(task));
+        resident.push_back(handle);
+        WritePod(pool_, handle, task);
         result.stats.invocations += count;
-        pool_.Release(task_handle);
-        task_handle = {};
-        current_task_ = {};
       }
+      // All tasks in a workgroup are resident. One native instruction group
+      // per runnable task gives FIFO-completed memory a deterministic fair
+      // ordering without running a task through another task's barrier.
+      std::size_t remaining = resident.size();
+      while (remaining) {
+        bool progress = false;
+        for (const auto handle : resident) {
+          auto task = ReadPod<ComputeTaskState>(pool_, handle);
+          if (task.ended || task.mutex_sleep_mask) continue;
+          current_task_ = handle;
+          current_mutex_mask_ = task.mutex_held_mask;
+          task.mutex_wakeup_mask = 0;
+          task.mutex_blocked = 0;
+          StepComputeTask(program, state.abi, task, memory, result);
+          WritePod(pool_, handle, task);
+          progress |= !task.mutex_blocked;
+          if (task.ended) --remaining;
+          if (task.mutex_wakeup_mask) {
+            for (const auto sleeper_handle : resident) {
+              auto sleeper = ReadPod<ComputeTaskState>(pool_, sleeper_handle);
+              sleeper.mutex_sleep_mask &= ~task.mutex_wakeup_mask;
+              WritePod(pool_, sleeper_handle, sleeper);
+            }
+          }
+        }
+        if (!progress)
+          throw std::runtime_error("compute resident tasks deadlocked on native MUTEX wait");
+      }
+      for (const auto handle : resident) pool_.Release(handle);
+      resident.clear();
+      current_task_ = {};
+      current_mutex_mask_ = 0;
       result.stats.workgroups = 1;
       const std::uint64_t total_groups =
           static_cast<std::uint64_t>(state.grid[0]) * state.grid[1] * state.grid[2];
@@ -220,12 +255,18 @@ void ComputeShader::Run() {
       }
     } catch (const std::exception &error) {
       std::string message = error.what();
-      try { ReleaseTaskMutexes(); }
-      catch (const std::exception &cleanup) {
-        message += "; MUTEX cleanup failed: "; message += cleanup.what();
+      for (const auto handle : resident) {
+        current_task_ = handle;
+        // The failed step may have acquired a lock before publishing its
+        // task snapshot. Cleanup all task-owned locks through the CDM FIFO.
+        current_mutex_mask_ = UINT32_MAX;
+        try { ReleaseTaskMutexes(); }
+        catch (const std::exception &cleanup) {
+          message += "; MUTEX cleanup failed: "; message += cleanup.what();
+        }
+        pool_.Release(handle);
       }
-      if (HasPoolHandle(task_handle))
-        pool_.Release(task_handle);
+      resident.clear();
       current_task_ = {};
       if (HasPoolHandle(cached_instructions_))
         pool_.Release(cached_instructions_);

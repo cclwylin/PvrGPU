@@ -165,7 +165,8 @@ std::uint64_t SequenceExternalTextureAddress(
     DriverPcoExternalTextureAllocation *allocation) {
   if (submission >= kDriverPcoMaximumNestedSequenceCommands ||
       (stage != DriverPcoShaderStage::kVertex &&
-       stage != DriverPcoShaderStage::kFragment) ||
+       stage != DriverPcoShaderStage::kFragment &&
+       stage != DriverPcoShaderStage::kGeometry) ||
       descriptor_set >= kPcoMaximumTextureDescriptorSets) {
     throw std::runtime_error(
         "Submitter sequence external texture slot is out of bounds");
@@ -718,14 +719,15 @@ void StoreU64(
 
 void PatchPcoDescriptorAddress(std::vector<std::uint32_t> *shared,
                                std::uint32_t descriptor_set,
-                               std::uint64_t gpu_address) {
+                               std::uint64_t gpu_address,
+                               std::uint32_t descriptor_start = 0) {
   if (!shared || descriptor_set >= kPcoMaximumTextureDescriptorSets ||
       gpu_address == 0 || (gpu_address & 3U) != 0) {
     throw std::runtime_error(
         "Submitter PCO descriptor relocation arguments are invalid");
   }
   const std::size_t base =
-      static_cast<std::size_t>(descriptor_set) *
+      descriptor_start + static_cast<std::size_t>(descriptor_set) *
       kPcoTextureDescriptorDwordCount;
   if (base + 3U >= shared->size())
     throw std::runtime_error(
@@ -1533,12 +1535,16 @@ void Submitter::RunJob() {
            command.sampled_textures) {
         const std::uint32_t samples = texture.sample_count ? texture.sample_count : 1U;
         const auto &shared = texture.stage == DriverPcoShaderStage::kVertex
-                                 ? command.vertex_shared : command.fragment_shared;
+                                 ? command.vertex_shared
+                                 : texture.stage == DriverPcoShaderStage::kGeometry
+                                     ? command.geometry_shared : command.fragment_shared;
         const std::size_t descriptor_end =
             (static_cast<std::size_t>(texture.descriptor_set) + 1U) *
-                kPcoTextureDescriptorDwordCount;
+                kPcoTextureDescriptorDwordCount +
+                (texture.stage == DriverPcoShaderStage::kGeometry ? 4U : 0U);
         if ((texture.stage != DriverPcoShaderStage::kVertex &&
-             texture.stage != DriverPcoShaderStage::kFragment) ||
+             texture.stage != DriverPcoShaderStage::kFragment &&
+             texture.stage != DriverPcoShaderStage::kGeometry) ||
             (samples != 1U && samples != 2U && samples != 4U && samples != 8U) ||
             descriptor_end > shared.size() ||
             (1U << (shared[descriptor_end - kPcoTextureDescriptorDwordCount + 1U] >> 30U)) != samples ||
@@ -1575,6 +1581,10 @@ void Submitter::RunJob() {
     state.height = driver_pco_sequence_command
                        ? command.framebuffer_height
                        : options_.height;
+    state.attachment_layers = command.framebuffer_layers ? command.framebuffer_layers : 1;
+    state.layered_framebuffer = command.framebuffer_layers != 0;
+    if (state.attachment_layers > 256)
+      throw std::runtime_error("Submitter framebuffer layer count is unsupported");
     state.workload_class = WorkloadClass(options_.test_case);
     state.sequence = frame;
     state.functional_case = functional_case;
@@ -1619,7 +1629,7 @@ void Submitter::RunJob() {
       /* Every attachment of a pass stores the same pixel width. */
       state.extra_framebuffer_bytes[target - 1] =
           static_cast<std::uint64_t>(state.width) * state.height *
-          state.raster_state.sample_count *
+          state.raster_state.sample_count * state.attachment_layers *
           ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
                                        state.color_attachment_float32);
     }
@@ -1627,7 +1637,7 @@ void Submitter::RunJob() {
       state.framebuffer_gpu_address = sequence_color_addresses[submission];
       const std::uint64_t color_bytes =
           static_cast<std::uint64_t>(state.width) * state.height *
-          state.raster_state.sample_count *
+          state.raster_state.sample_count * state.attachment_layers *
           ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
                                        state.color_attachment_float32);
       if (!command.initial_color_attachment_bytes.empty()) {
@@ -1678,7 +1688,7 @@ void Submitter::RunJob() {
             DepthAttachmentBytesPerPixel(command.depth_format);
         const std::uint64_t depth_bytes =
             static_cast<std::uint64_t>(state.width) * state.height *
-            depth_bytes_per_pixel * state.raster_state.sample_count;
+            depth_bytes_per_pixel * state.raster_state.sample_count * state.attachment_layers;
         if (depth_bytes == 0 ||
             depth_bytes > kDriverPcoSequenceAttachmentStride ||
             depth_bytes > std::numeric_limits<std::size_t>::max()) {
@@ -1872,6 +1882,7 @@ void Submitter::RunJob() {
               : 0U;
       state.vertex_sampled_texture_count =
           command.vertex_sampled_texture_count;
+      state.geometry_sampled_texture_count = command.geometry_sampled_texture_count;
       state.sampled_texture_count =
           command.fragment_sampled_texture_count != 0 ||
                   !command.sampled_textures.empty()
@@ -2487,8 +2498,6 @@ void Submitter::RunJob() {
         if (!geometry_uniform_buffers.empty())
           state.geometry_uniform_buffer_resources = StoreNewArray(pool_, geometry_uniform_buffers);
       }
-      if (!geometry_shared.empty())
-        state.geometry_shared_registers = StoreNewArray(pool_, geometry_shared);
       if (HasPoolHandle(state.tessellation_state)) {
         auto tess = LoadArray<TessellationState>(pool_, state.tessellation_state);
         tess[0].control_shared = StoreNewArray(pool_, control_shared);
@@ -2504,7 +2513,7 @@ void Submitter::RunJob() {
             command.sampled_textures.size() !=
                 command.sampled_texture_count ||
             command.vertex_sampled_texture_count +
-                    command.fragment_sampled_texture_count !=
+                    command.fragment_sampled_texture_count + command.geometry_sampled_texture_count !=
                 command.sampled_texture_count) {
           throw std::runtime_error(
               "Submitter PCO sequence texture state is inconsistent");
@@ -2517,6 +2526,9 @@ void Submitter::RunJob() {
             command.fragment_sampled_texture_count);
         std::vector<SamplerState> fragment_samplers(
             command.fragment_sampled_texture_count);
+        std::vector<TextureResource> geometry_resources(command.geometry_sampled_texture_count);
+        std::vector<SamplerState> geometry_samplers(command.geometry_sampled_texture_count);
+        std::vector<bool> geometry_present(command.geometry_sampled_texture_count, false);
         std::vector<bool> vertex_present(command.vertex_sampled_texture_count,
                                          false);
         std::vector<bool> fragment_present(
@@ -2525,12 +2537,13 @@ void Submitter::RunJob() {
              command.sampled_textures) {
           const bool vertex_stage =
               texture.stage == DriverPcoShaderStage::kVertex;
+          const bool geometry_stage = texture.stage == DriverPcoShaderStage::kGeometry;
           auto &resources =
-              vertex_stage ? vertex_resources : fragment_resources;
+              vertex_stage ? vertex_resources : geometry_stage ? geometry_resources : fragment_resources;
           auto &samplers =
-              vertex_stage ? vertex_samplers : fragment_samplers;
+              vertex_stage ? vertex_samplers : geometry_stage ? geometry_samplers : fragment_samplers;
           auto &present =
-              vertex_stage ? vertex_present : fragment_present;
+              vertex_stage ? vertex_present : geometry_stage ? geometry_present : fragment_present;
           if (texture.declared_bytes_size == 0 ||
               texture.declared_bytes_size >
                   std::numeric_limits<std::uint32_t>::max() ||
@@ -2581,8 +2594,8 @@ void Submitter::RunJob() {
                 "Submitter PCO sequence resource is absent from DRAM");
           }
           PatchPcoDescriptorAddress(
-              vertex_stage ? &vertex_shared_words : &fragment_shared,
-              texture.descriptor_set, gpu_address);
+              vertex_stage ? &vertex_shared_words : geometry_stage ? &geometry_shared : &fragment_shared,
+              texture.descriptor_set, gpu_address, geometry_stage ? 4U : 0U);
 
           TextureResource resource;
           resource.gpu_address = gpu_address;
@@ -2772,6 +2785,7 @@ void Submitter::RunJob() {
         }
         if (std::find(vertex_present.begin(), vertex_present.end(), false) !=
                 vertex_present.end() ||
+            std::find(geometry_present.begin(), geometry_present.end(), false) != geometry_present.end() ||
             std::find(fragment_present.begin(), fragment_present.end(),
                       false) != fragment_present.end()) {
           throw std::runtime_error(
@@ -2786,6 +2800,10 @@ void Submitter::RunJob() {
         if (!fragment_resources.empty()) {
           state.texture_resources = StoreNewArray(pool_, fragment_resources);
           state.sampler_states = StoreNewArray(pool_, fragment_samplers);
+        }
+        if (!geometry_resources.empty()) {
+          state.geometry_texture_resources = StoreNewArray(pool_, geometry_resources);
+          state.geometry_sampler_states = StoreNewArray(pool_, geometry_samplers);
         }
       } else if (driver_pco_texture) {
         TextureResource resource;
@@ -2821,6 +2839,8 @@ void Submitter::RunJob() {
             pool_, std::vector<SamplerState>{sampler});
       }
       std::vector<ShaderSharedRegister> vertex_shared;
+      if (!geometry_shared.empty())
+        state.geometry_shared_registers = StoreNewArray(pool_, geometry_shared);
       vertex_shared.reserve(vertex_shared_words.size());
       for (const std::uint32_t value : vertex_shared_words)
         vertex_shared.push_back({value});

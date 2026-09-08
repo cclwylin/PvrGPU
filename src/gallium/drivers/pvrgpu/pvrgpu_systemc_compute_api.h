@@ -10,7 +10,11 @@ extern "C" {
 
 /* Independent, synchronous compute ABI. No graphics command or framebuffer
  * carries compute results. Check version before reading any later field. */
-#define PVRGPU_SYSTEMC_COMPUTE_API_VERSION 2u
+#define PVRGPU_SYSTEMC_COMPUTE_API_VERSION 4u
+#define PVRGPU_SYSTEMC_COMPUTE_MAX_SHARED_BYTES (32u * 1024u)
+#define PVRGPU_SYSTEMC_COMPUTE_MAX_IMAGES 32u
+#define PVRGPU_SYSTEMC_COMPUTE_IMAGE_DESCRIPTOR_DWORDS 8u
+#define PVRGPU_SYSTEMC_COMPUTE_IMAGE_R32UI 1u
 #define PVRGPU_SYSTEMC_COMPUTE_MAX_RESOURCES 64u
 #define PVRGPU_SYSTEMC_COMPUTE_MAX_BINDINGS 47u
 #define PVRGPU_SYSTEMC_COMPUTE_MAX_BINARY_BYTES (1024u * 1024u)
@@ -33,6 +37,15 @@ struct pvrgpu_systemc_compute_abi {
    uint32_t storage_buffer_write_mask;
    uint32_t shared_memory_bytes;
    uint32_t scratch_bytes;
+   /* Canonical SH layout: UBO4, SSBO4, image8 per slot, optional private
+    * workgroup4, then CB0. Private count is four iff shared bytes is nonzero. */
+   uint32_t shared_memory_descriptor_start;
+   uint32_t shared_memory_descriptor_count;
+   uint32_t image_descriptor_start;
+   uint32_t image_descriptor_count;
+   uint32_t image_used_mask;
+   uint32_t image_read_mask;
+   uint32_t image_write_mask;
 };
 
 enum pvrgpu_systemc_compute_binding_kind {
@@ -61,6 +74,23 @@ struct pvrgpu_systemc_compute_binding {
    uint64_t bytes_size;
 };
 
+/* Separate image binding namespace, sharing resources[] backing ownership.
+ * One linear R32UI image2D view. Byte offsets include the selected mip/layer;
+ * dimensions exclude row padding. The compiler computes actual texel addresses.
+ * Image descriptor: baseLo/baseHi/extent/0, width/height/row_stride/format. */
+struct pvrgpu_systemc_compute_image_binding {
+   uint32_t slot;
+   uint32_t resource_index;
+   uint32_t access;
+   uint32_t format;
+   uint64_t offset;
+   uint64_t bytes_size;
+   uint32_t width;
+   uint32_t height;
+   uint32_t row_stride_bytes;
+   uint32_t reserved;
+};
+
 struct pvrgpu_systemc_compute_dispatch {
    uint32_t version;
    struct pvrgpu_systemc_compute_abi abi;
@@ -76,6 +106,8 @@ struct pvrgpu_systemc_compute_dispatch {
    size_t binding_count;
    /* 0=direct, 1=DRAM bypass, 2=SLC cache; fixed after session elaboration. */
    uint32_t memory_mode;
+   const struct pvrgpu_systemc_compute_image_binding *images;
+   size_t image_count;
 };
 
 struct pvrgpu_systemc_compute_stats {

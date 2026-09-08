@@ -66,8 +66,9 @@ std::vector<std::uint32_t> Descriptor(const TextureResource &resource) {
       (static_cast<std::uint64_t>(mip.height - 1U) << 48U) |
       (static_cast<std::uint64_t>(log_samples) << 62U);
   const std::uint64_t word1 = ((resource.gpu_address >> 2U) << 16U) |
-      (array ? 1U | (static_cast<std::uint64_t>(resource.layer_count - 1U) << 4U)
-             : (UINT64_C(1) << 60U) | (mip.width - 1U));
+      (array ? resource.mip_count | (static_cast<std::uint64_t>(resource.layer_count - 1U) << 4U)
+             : (static_cast<std::uint64_t>(resource.mip_count) << 60U) | (mip.width - 1U)) |
+      (resource.mip_count > 1 ? UINT64_C(1) << 15U : 0U);
   std::vector<std::uint32_t> words(20, 0);
   words[0] = static_cast<std::uint32_t>(word0);
   words[1] = static_cast<std::uint32_t>(word0 >> 32U);
@@ -164,6 +165,65 @@ void CheckAddresses() {
   previous.declared_bytes_size = 4;
   Reject([&] { MaterializeSequenceColorMipChain(memory, previous); },
          "legacy previous-color mip path cannot resolve a multisample resource");
+}
+
+void CheckExplicitAddresses() {
+  TextureResource resource;
+  resource.gpu_address = kBase;
+  resource.format = TextureFormat::kRgba8Unorm;
+  resource.dimension_type = TextureDimensionType::k2DArray;
+  resource.layer_count = 4; resource.sample_count = 1; resource.mip_count = 3;
+  resource.mip[0] = {7,5,32,64};
+  resource.mip[1] = {3,2,16,768};
+  resource.mip[2] = {1,1,8,960};
+  resource.byte_size = 1000;
+  TextureSampleRequest request;
+  request.normalized = 0; request.explicit_lod_present = 1;
+  request.explicit_lod = FloatBits(1);
+  request.coordinates[0] = FloatBits(2); request.coordinates[1] = FloatBits(1);
+  std::uint64_t offset;
+  Check(ComputeTextureTexelOffset(resource, request, 3, &offset) && offset == 888,
+        "array mip1 must apply its own padded slice stride and prefix");
+  request.explicit_lod = FloatBits(2);
+  request.coordinates[0] = request.coordinates[1] = FloatBits(0);
+  Check(ComputeTextureTexelOffset(resource, request, 3, &offset) && offset == 984,
+        "array mip2 layer remains 3 while pixel extent shrinks");
+  resource.dimension_type = TextureDimensionType::k3D;
+  request.coordinates[2] = FloatBits(0);
+  Check(ComputeTextureTexelOffset(resource, request, 0, &offset) && offset == 960,
+        "3D mip2 depth shrinks to one slice");
+  request.coordinates[2] = FloatBits(1);
+  Check(!ComputeTextureTexelOffset(resource, request, 0, &offset), "3D mip2 slice1 is OOB");
+  request.coordinates[2] = 0;
+  for (float invalid : {-1.0F,3.0F,0.5F,std::numeric_limits<float>::infinity(),std::numeric_limits<float>::quiet_NaN()}) {
+    auto bad = request; bad.explicit_lod = FloatBits(invalid);
+    Check(!ComputeTextureTexelOffset(resource, bad, 0, &offset), "LOD OOB must not wrap or clamp");
+    bad = request; bad.coordinates[0] = FloatBits(invalid);
+    Check(!ComputeTextureTexelOffset(resource, bad, 0, &offset), "texel OOB must not wrap or filter");
+  }
+  for (unsigned bad = 0; bad < 8; ++bad) {
+    auto r = resource; auto q = request;
+    if (bad == 0) r.sample_count = 2;
+    if (bad == 1) r.mip_count = 0;
+    if (bad == 2) r.mip[2].row_pitch_bytes = 3;
+    if (bad == 3) r.byte_size = 963;
+    if (bad == 4) r.dimension_type = TextureDimensionType::kCube;
+    if (bad == 5) q.sample_index_present = 1;
+    if (bad == 6) q.explicit_lod_present = 2;
+    if (bad == 7) q.normalized = 1;
+    Reject([&]{ ComputeTextureTexelOffset(r,q,0,&offset); }, "malformed explicit texel metadata accepted");
+  }
+  RogueTextureImageDescriptor image; image.mip_count = 4;
+  RogueTextureSamplerDescriptor sampler; sampler.max_lod_u4_6 = 192;
+  const auto nearest = ComputeTextureExplicitLod(1.5F,image,sampler);
+  Check(nearest.level0 == 2 && nearest.level1 == 2, "explicit mip nearest uses float LOD rounding");
+  sampler.mip_filter = TextureFilter::kLinear;
+  const auto linear = ComputeTextureExplicitLod(1.75F,image,sampler);
+  Check(linear.level0 == 1 && linear.level1 == 2 && linear.mip_weight == 0.75F && linear.mip_weight_u8 == 192,
+        "textureLod retains trilinear LOD fraction instead of becoming texelFetch");
+  sampler.max_lod_u4_6 = sampler.min_lod_u4_6 = 64;
+  const auto clamped = ComputeTextureExplicitLod(3,image,sampler);
+  Check(clamped.level0 == 1 && clamped.mip_weight == 0, "textureLod honors sampler LOD clamp");
 }
 
 struct Harness {
@@ -271,6 +331,86 @@ struct Harness {
       requests.push_back(request);
       expected.push_back({});
     }
+    Submit(resource, shared, bytes, requests, expected, valid_reads, vertex);
+  }
+
+  void RunExplicit(TextureDimensionType dimension, bool vertex, unsigned epoch, bool normalized = false) {
+    TextureResource resource;
+    resource.gpu_address = kBase + 0x40000U + epoch * 0x10000U;
+    resource.format = TextureFormat::kRgba8Unorm;
+    resource.dimension_type = dimension;
+    resource.layer_count = dimension == TextureDimensionType::k2D ? 1 : dimension == TextureDimensionType::kCube ? 6 : 4;
+    resource.sample_count = 1; resource.mip_count = 3;
+    unsigned total = 0;
+    for (unsigned level = 0; level < 3; ++level) {
+      const unsigned extent = 4U >> level;
+      resource.mip[level] = {extent,extent,extent*4,total};
+      total += extent*extent*4*(dimension == TextureDimensionType::k3D ? 4U >> level : resource.layer_count);
+    }
+    resource.byte_size = total;
+    std::vector<std::uint8_t> bytes(total+64,0xa7);
+    std::vector<std::array<std::uint32_t,4>> expected;
+    std::vector<TextureSampleRequest> requests;
+    auto shared = Descriptor(resource);
+    if (normalized) {
+      shared[8] |= 128U << 23U;
+      shared[16] = shared[8];
+    }
+    for (unsigned level=0; level<3; ++level) {
+      const auto &mip=resource.mip[level];
+      const unsigned slices=dimension==TextureDimensionType::k3D ? 4U>>level : resource.layer_count;
+      for (unsigned layer=0; layer<slices; ++layer)
+      for (unsigned y=0; y<mip.height; ++y)
+      for (unsigned x=0; x<mip.width; ++x) {
+        const unsigned offset=mip.offset_bytes+(layer*mip.height+y)*mip.row_pitch_bytes+x*4;
+        std::array<std::uint32_t,4> value{};
+        for (unsigned c=0;c<4;++c) {
+          const auto b=static_cast<std::uint8_t>(level*71+layer*31+x*13+y*17+c*29+epoch);
+          bytes[offset+c]=b; value[c]=FloatBits(b/255.0F);
+        }
+        TextureSampleRequest q;
+        q.shader_lane_index=q.request_id=requests.size();
+        q.coordinates[0]=FloatBits(static_cast<float>(x)); q.coordinates[1]=FloatBits(static_cast<float>(y));
+        q.coordinates[2]=dimension==TextureDimensionType::k3D ? FloatBits(static_cast<float>(layer)) : 0;
+        q.dimension=(dimension==TextureDimensionType::k3D || dimension==TextureDimensionType::kCube) ? 3 : 2; q.coordinate_count=2;
+        q.component_count=4; q.normalized=normalized; q.explicit_lod_present=1; q.explicit_lod=FloatBits(static_cast<float>(level));
+        if (normalized) {
+          const float u=(x+0.5F)/mip.width, v=(y+0.5F)/mip.height;
+          q.coordinates[0]=FloatBits(u); q.coordinates[1]=FloatBits(v);
+          if (dimension==TextureDimensionType::k3D) q.coordinates[2]=FloatBits((layer+0.5F)/slices);
+          if (dimension==TextureDimensionType::kCube) {
+            const float s=2*u-1, t=2*v-1;
+            const std::array<std::array<float,3>,6> direction{{{1,-t,-s},{-1,-t,s},{s,1,t},{s,-1,-t},{s,-t,1},{-s,-t,-1}}};
+            for (unsigned c=0;c<3;++c) q.coordinates[c]=FloatBits(direction[layer][c]);
+          }
+        }
+        q.shader_stage=vertex?ShaderStage::kVertex:ShaderStage::kFragment;
+        std::copy_n(shared.begin(),4,q.texture_state); std::copy_n(shared.begin()+8,4,q.sampler_state);
+        if (dimension==TextureDimensionType::k2DArray) {
+          const std::uint64_t address=resource.gpu_address+layer*resource.mip[0].row_pitch_bytes*resource.mip[0].height;
+          q.texture_address_lo=address; q.texture_address_hi=address>>32;
+        }
+        requests.push_back(q); expected.push_back(value);
+      }
+    }
+    const auto valid=requests.size();
+    for (unsigned bad=0;!normalized && bad<5;++bad) {
+      auto q=requests.back(); q.shader_lane_index=q.request_id=requests.size();
+      if (bad==0) q.coordinates[0]=FloatBits(-1);
+      if (bad==1) q.coordinates[1]=FloatBits(1); // last mip is 1x1
+      if (bad==2) q.explicit_lod=FloatBits(-1);
+      if (bad==3) q.explicit_lod=FloatBits(3);
+      if (bad==4) q.coordinates[0]=FloatBits(0.5F);
+      requests.push_back(q); expected.push_back({});
+    }
+    Submit(resource,shared,bytes,requests,expected,valid,vertex,normalized ? 128 : 0);
+  }
+
+  void Submit(const TextureResource &resource, const std::vector<std::uint32_t> &shared,
+              const std::vector<std::uint8_t> &bytes, const std::vector<TextureSampleRequest> &requests,
+              const std::vector<std::array<std::uint32_t,4>> &expected, std::size_t valid_reads, bool vertex,
+              std::uint16_t maximum_lod = 0) {
+    const auto bpp=TextureBytesPerTexel(resource.format);
     memory.HostWrite(resource.gpu_address, bytes.data(), bytes.size());
     PipelineState state;
     state.memory_mode = memory.mode();
@@ -279,7 +419,8 @@ struct Harness {
     state.stage = vertex ? PipelineStage::kVertexTexturePending : PipelineStage::kFragmentTexturePending;
     state.texture_sample_requests = StoreNewArray(pool, requests);
     const auto resources = StoreNewArray(pool, std::vector<TextureResource>{resource});
-    const auto samplers = StoreNewArray(pool, std::vector<SamplerState>{SamplerState{}});
+    SamplerState sampler; sampler.max_lod_u4_6=maximum_lod;
+    const auto samplers = StoreNewArray(pool, std::vector<SamplerState>{sampler});
     if (vertex) {
       state.vertex_sampled_texture_count = 1;
       state.vertex_pco_abi.shareds = shared.size();
@@ -340,6 +481,7 @@ struct Harness {
 int sc_main(int, char **) {
   try {
     CheckAddresses();
+    CheckExplicitAddresses();
     Harness direct("direct", MemoryMode::kDirect);
     Harness bypass("bypass", MemoryMode::kBypass);
     Harness cache("cache", MemoryMode::kCache);
@@ -352,6 +494,13 @@ int sc_main(int, char **) {
               for (unsigned epoch : {0U, 1U})
                 harness->Run(format, samples, dimension == 2 ? 3U : 1U,
                              dimension != 0, vertex, epoch);
+    for (Harness *harness : {&direct,&bypass,&cache})
+      for (auto dimension : {TextureDimensionType::k2D,TextureDimensionType::k2DArray,TextureDimensionType::k3D})
+        for (bool vertex : {false,true})
+          for (unsigned epoch : {0U,1U}) harness->RunExplicit(dimension,vertex,epoch);
+    for (Harness *harness : {&direct,&bypass,&cache})
+      for (auto dimension : {TextureDimensionType::k2D,TextureDimensionType::k2DArray,TextureDimensionType::k3D,TextureDimensionType::kCube})
+        for (bool vertex : {false,true}) harness->RunExplicit(dimension,vertex,0,true);
     std::cout << "texture_multisample_test: PASS batches=" << batches << " checks=" << checks << '\n';
     return 0;
   } catch (const std::exception &error) {

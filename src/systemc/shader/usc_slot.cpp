@@ -36,7 +36,7 @@ void UscSlot::Run() {
 
     const bool texture_fragment =
         stage_ == ShaderStage::kFragment &&
-        UsesTextureSampling(state);
+        UsesTextureSampling(state, ShaderStage::kFragment);
     const std::uint64_t lanes = stage_ == ShaderStage::kVertex
                                     ? state.counters.vs_invocations
                                     : texture_fragment

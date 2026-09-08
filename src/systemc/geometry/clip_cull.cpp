@@ -1018,11 +1018,16 @@ void ClipCull::Run() {
             if (state.geometry_layer_output_count) {
               const std::uint32_t layer = provoking->vertex_output[
                   state.geometry_layer_output_start];
-              // Layered attachment addressing is a separate capability. Do
-              // not silently send a computed nonzero layer to attachment 0.
-              if (layer)
-                throw std::runtime_error("ClipCull GS nonzero_layer is unsupported");
-              raster_layer = static_cast<std::uint16_t>(layer);
+              // gl_Layer is ignored for a non-layered framebuffer. A
+              // layered framebuffer routes whole primitives using the same
+              // original provoking vertex as flat interpolation. Values
+              // outside the attached range (including signed negatives)
+              // discard this primitive without addressing another resource.
+              if (state.layered_framebuffer) {
+                if (layer >= state.attachment_layers)
+                  continue;
+                raster_layer = static_cast<std::uint16_t>(layer);
+              }
             }
           }
           std::uint64_t flat_mask = 0;
@@ -1110,8 +1115,24 @@ void ClipCull::Run() {
                   return ClipMask(vertex, depth_clamp, clip_dist_mask,
                                   clip_dist_reg) != 0;
                 });
-            const std::vector<ClipVertex> polygon =
+            std::vector<ClipVertex> polygon =
                 ClipTriangle(tri, depth_clamp, clip_dist_mask, clip_dist_reg);
+            // The closed homogeneous clip volume includes its apex. A
+            // shader may legally output (0,0,0,0), and clipping an edge may
+            // produce it too. The apex has no finite perspective projection
+            // and contributes no independent projected vertex: remove it
+            // before fan setup, not before homogeneous clipping. In
+            // particular, a w=0 input with nonzero x/y can still intersect
+            // the visible volume and must not be discarded in advance.
+            // With depth clamp, z is irrelevant to the XY projection.
+            // Original VTXOUT/stream-output storage remains untouched.
+            polygon.erase(std::remove_if(polygon.begin(), polygon.end(),
+                [depth_clamp](const ClipVertex &vertex) {
+                  return vertex.output[3] == 0.0F &&
+                         vertex.output[0] == 0.0F &&
+                         vertex.output[1] == 0.0F &&
+                         (depth_clamp || vertex.output[2] == 0.0F);
+                }), polygon.end());
             for (std::size_t fan = 2; fan < polygon.size(); ++fan) {
               if (fan - 2 > std::numeric_limits<std::uint16_t>::max())
                 throw std::overflow_error(
@@ -1191,7 +1212,7 @@ void ClipCull::Run() {
             if (preclip_ndc_defined) {
               (void)ClassifyFrontFacing(
                   vertices, classification_winding, !driver_pco_triangles);
-            } else if (!generic_clip_path) {
+            } else if (!generic_clip_path && !driver_pco_triangles) {
               throw std::runtime_error(
                   "ClipCull clean segment has non-positive homogeneous W");
             }

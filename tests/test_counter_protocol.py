@@ -104,16 +104,20 @@ class CounterProtocolTests(unittest.TestCase):
                  "alu": 0, "tex": 0, "memory": 0},
                  "executed": {"alu": 0, "tex": 0, "memory": 0}}
         gs = {"invocations": 2, "program": {"groups": 4, "instructions": 4,
-              "alu": 1, "tex": 0, "memory": 3},
-              "executed": {"alu": 2, "tex": 0, "memory": 6}}
+              "alu": 1, "tex": 1, "memory": 2},
+              "executed": {"alu": 2, "tex": 2, "memory": 4}}
         message = {"schema": "pvrgpu.counter.v1", "type": "counter",
                    "counters": {"drawlists": 1, "gs_invocations": 2,
-                                "gs_alu_instructions": 2, "gs_memory_instructions": 6},
+                                "gs_alu_instructions": 2, "gs_tex_instructions": 2,
+                                "gs_memory_instructions": 4},
                    "drawlist_stats": [{"drawlist": 0, "draw_id": 0,
                                        "vs": empty, "fs": empty, "gs": gs}]}
         record = counter_record_from_message(message)
         self.assertEqual(record.drawlist_stats[0].geometry.invocations, 2)
-        for field in ("gs_invocations", "gs_alu_instructions", "gs_memory_instructions"):
+        self.assertEqual(record.drawlist_stats[0].geometry.executed_tex_instructions, 2)
+        self.assertIn("gs_tex_instructions", ALL_COUNTER_FIELDS)
+        self.assertEqual(COUNTER_INFO["gs_tex_instructions"][1], "instructions")
+        for field in ("gs_invocations", "gs_alu_instructions", "gs_tex_instructions", "gs_memory_instructions"):
             message["counters"][field] += 1
             with self.assertRaises(CounterProtocolError):
                 counter_record_from_message(message)

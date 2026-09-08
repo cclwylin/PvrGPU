@@ -214,7 +214,7 @@ class GuardedBytes {
 };
 
 void VerifyVersions(Submission &submit) {
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 26);
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 27);
   constexpr auto previous_size = offsetof(pvrgpu_systemc_driver_command, tessellation);
   static_assert(previous_size % alignof(pvrgpu_systemc_driver_command) == 0);
   GuardedBytes previous(previous_size);
@@ -223,20 +223,27 @@ void VerifyVersions(Submission &submit) {
   const auto &old = *reinterpret_cast<const pvrgpu_systemc_driver_command *>(previous.data());
   auto info = submit.info; info.command = &old;
   submit.Call(info, "command version", "API24 short top-level command before API25 tail");
-  submit.Reject(old, "version=24 expected=26", "API24 short nested command before API25 tail");
+  submit.Reject(old, "version=24 expected=27", "API24 short nested command before API25 tail");
   GuardedBytes api25(offsetof(pvrgpu_systemc_driver_command, stream_output));
   const std::uint32_t api25_version = 25;
   std::memcpy(api25.data(), &api25_version, sizeof(api25_version));
   const auto &old25 = *reinterpret_cast<const pvrgpu_systemc_driver_command *>(api25.data());
   info.command = &old25;
   submit.Call(info, "command version", "API25 short command before API26 stream output tail");
-  submit.Reject(old25, "version=25 expected=26", "API25 short nested command before API26 tail");
+  submit.Reject(old25, "version=25 expected=27", "API25 short nested command before API26 tail");
+  GuardedBytes api26(offsetof(pvrgpu_systemc_driver_command, framebuffer_layers));
+  const std::uint32_t api26_version = 26;
+  std::memcpy(api26.data(), &api26_version, sizeof(api26_version));
+  const auto &old26 = *reinterpret_cast<const pvrgpu_systemc_driver_command *>(api26.data());
+  info.command = &old26;
+  submit.Call(info, "command version", "API26 short command before API27 layer tail");
+  submit.Reject(old26, "version=26 expected=27", "API26 short nested command before API27 tail");
   Fixture fixture;
   auto full = fixture.draw; full.version = 24;
-  submit.Reject(full, "version=24 expected=26", "full allocation with old nested version");
+  submit.Reject(full, "version=24 expected=27", "full allocation with old nested version");
   info.command = &full;
   submit.Call(info, "command version", "full allocation with old top-level version");
-  for (auto version : {0u,24u,25u,27u,UINT32_MAX}) {
+  for (auto version : {0u,24u,25u,26u,28u,UINT32_MAX}) {
     info = submit.info; info.version = version;
     submit.Call(info, "submit version", "invalid submit-info version " + std::to_string(version));
     full.version = version;
@@ -333,8 +340,10 @@ void VerifyStageAbis(Submission &submit) {
     for (auto value : {0u,256u})
       Probe(submit, [&](auto &f) { f.Abi(stage).temps = value; }, kLateGate, "legal TEMP endpoint");
     Probe(submit, [&](auto &f) { f.Abi(stage).temps = 257; }, kAbi, "TEMP exceeds 256");
-    for (auto value : {0u,vi - 1,vi + 1,UINT32_MAX})
-      Probe(submit, [&](auto &f) { f.Abi(stage).vertex_inputs = value; }, kAbi, "exact stage-specific VI count");
+    for (auto value : {0u,vi - 1,65u,UINT32_MAX})
+      Probe(submit, [&](auto &f) { f.Abi(stage).vertex_inputs = value; }, kAbi, "stage-specific VI prefix and bounded writable extent");
+    for (auto value : {vi,vi + 1,64u})
+      Probe(submit, [&](auto &f) { f.Abi(stage).vertex_inputs = value; }, kLateGate, "PCO writable VI extent after fixed system-input prefix");
     for (auto value : stage == 3 ? std::vector<unsigned>{1,4,64,UINT32_MAX} : std::vector<unsigned>{0,3,65,UINT32_MAX})
       Probe(submit, [&](auto &f) { f.Abi(stage).vertex_outputs = value; }, kAbi, "stage-specific VO bounds");
     if (stage == 4)

@@ -4114,7 +4114,7 @@ def verify_fill_tex_trilinear_linear_04_or_05(
             f"{case_name}: {field}={values.get(field)!r}, expected {expected}"
         )
     expected_values.update({field: 0 for field in (
-        "gs_alu_instructions", "gs_memory_instructions", "gs_load_instructions",
+        "gs_alu_instructions", "gs_tex_instructions", "gs_memory_instructions", "gs_load_instructions",
         "gs_emitted_vertices", "gs_input_write_bytes", "gs_input_read_bytes",
         "tcs_invocations",
         "tcs_alu_instructions",

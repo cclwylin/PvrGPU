@@ -153,6 +153,8 @@ enum class PipelineStage : std::uint32_t {
   kPixelDataMasterComplete,
   kSlcComplete,
   kFramebufferReady,
+  kGeometryTexturePending,
+  kGeometryTextureSamplesReady,
 };
 
 enum class PrimitiveTopology : std::uint32_t {
@@ -896,6 +898,7 @@ struct FragmentInvocation {
   std::uint32_t y = 0;
   std::uint32_t primitive_id = 0;
   std::uint32_t parameter_index = 0;
+  std::uint32_t layer = 0;
   std::uint64_t submit_ordinal = 0;
   std::uint32_t quad_id = 0;
   std::uint8_t quad_lane = 0;
@@ -989,6 +992,10 @@ struct TextureSampleRequest {
   std::uint8_t sample_index = 0;
   std::uint8_t sample_index_present = 0;
   std::uint8_t reserved[1]{};
+  // Native SMP REPLACE float word. NNCOORDS distinguishes texelFetch from
+  // normalized textureLod; neither consumes implicit quad derivatives.
+  std::uint32_t explicit_lod = 0;
+  std::uint8_t explicit_lod_present = 0;
 };
 
 struct TextureSampleResponse {

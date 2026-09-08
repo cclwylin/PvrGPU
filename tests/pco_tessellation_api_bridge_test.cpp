@@ -3,9 +3,11 @@
 // modules and raster/readback. The test supplies no product-side answer data.
 #include "pvrgpu_systemc_api.h"
 #include "pco_tessellation_compiler_fixtures.h"
+#include "common/tessellation.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -25,9 +27,19 @@ struct Fixture {
       tes = kTess0tes, fs = Tess0FragmentPco();
   std::array<std::uint32_t, 8> control_shared{};
   std::array<std::uint32_t, 4> evaluation_shared{};
+  std::array<std::uint8_t, 256> feedback{};
+  pvrgpu_systemc_stream_output_binding binding{0,4,0,1,0};
+  pvrgpu_systemc_stream_output_target target{};
+  pvrgpu_systemc_stream_output stream_output{};
+  pvrgpu_systemc_varying_binding unused_varying{};
   pvrgpu_systemc_tessellation tess{};
   pvrgpu_systemc_driver_command draw{};
   Fixture() {
+    feedback.fill(0xa5);
+    // Append one complete triangle; the second overflows. Each captured
+    // vertex has a leading untouched DWORD, plus prefix/suffix guard bytes.
+    target = {0,101,201,feedback.data(),feedback.size(),16,112,16,5};
+    stream_output = {&binding,1,&target,1};
     tess.control_pco = tcs.data(); tess.control_pco_size = tcs.size();
     tess.evaluation_pco = tes.data(); tess.evaluation_pco_size = tes.size();
     tess.control_shared = control_shared.data(); tess.control_shared_count = 8;
@@ -61,13 +73,15 @@ struct Fixture {
     draw.color_attachment_source_command_index = draw.depth_attachment_source_command_index = PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR;
     draw.clear_color_bits[0] = draw.clear_color_bits[2] = draw.clear_color_bits[3] = 0x3f800000;
     draw.tessellation = &tess;
+    draw.stream_output = &stream_output;
+    draw.varying_bindings = &unused_varying; // Real empty TES -> FS mapping.
   }
 };
 }
 
 int main(int argc, char **argv) {
   try {
-    static_assert(PVRGPU_SYSTEMC_API_VERSION == 26);
+    static_assert(PVRGPU_SYSTEMC_API_VERSION == 27);
     const bool incomplete_patch = argc > 2 && std::string(argv[2]) == "incomplete";
     const auto nonce = std::chrono::high_resolution_clock::now().time_since_epoch().count();
     const auto root = std::filesystem::temp_directory_path() / ("pvrgpu-tess-api25-" + std::to_string(nonce));
@@ -82,6 +96,7 @@ int main(int argc, char **argv) {
       sequence.vertex_pco_size = sequence.fragment_pco_size = 0;
       sequence.vertex_pco_abi = sequence.fragment_pco_abi = {};
       sequence.tessellation = nullptr;
+      sequence.stream_output = nullptr; sequence.varying_bindings = nullptr;
       sequence.vertex_count = sequence.instance_count = sequence.primitive_mode = 0;
       sequence.pco_sequence_commands = &f.draw; sequence.pco_sequence_command_count = 1;
       const auto dir = root / mode;
@@ -109,8 +124,27 @@ int main(int argc, char **argv) {
       f.draw.vertex_count = UINT32_MAX; f.tess.vertices_per_instance = 1; f.tess.input_vertices = 32;
       reject("input occurrence count exceeds");
       f.draw.vertex_count = f.tess.input_vertices = 1;
+      f.binding.output_dword = 4; reject("binding output"); f.binding.output_dword = 0;
       Check(!std::filesystem::exists(dir), "invalid envelopes create no model output");
       if (incomplete_patch) f.tess.input_vertices = 2;
+      auto expected_feedback = f.feedback;
+      using namespace pvrgpu::stub;
+      std::array<TessellationDomainPoint,kTessellationMaxPoints> domain_points{};
+      std::array<std::uint32_t,kTessellationMaxIndices> domain_indices{};
+      TessellationRequest request;
+      std::fill_n(request.outer,4,5.f); std::fill_n(request.inner,2,5.f);
+      TessellationResult generated;
+      Check(TessellatePatch(request,{domain_points.data(),domain_points.size(),
+          domain_indices.data(),domain_indices.size()},generated) == TessellationStatus::kSuccess,
+          "reference topology for API transport test");
+      // The unit test exercises transport, not the tessellator's algorithm:
+      // derive only connectivity here; independently calculate shader values.
+      if (!incomplete_patch) for (unsigned vertex = 0; vertex != 3; ++vertex) {
+        const auto point = domain_points[domain_indices[vertex]];
+        const std::array<float,4> value{std::fma(point.u,1.6f,-.8f),
+            std::fma(point.v,1.6f,-.8f),0.f,1.f};
+        std::memcpy(expected_feedback.data()+16+16+vertex*20+4,value.data(),16);
+      }
       for (unsigned stage = 0; stage != 2; ++stage) {
         const auto &bytes = stage ? f.tes : f.tcs;
         const int result = pvrgpu_systemc_can_execute_pco_binary(stage + 3,
@@ -123,6 +157,7 @@ int main(int argc, char **argv) {
       Check(accepted == 0, std::string("accept native four-stage pipeline: ") + error.data());
       for (auto *bytes : {&f.vs, &f.tcs, &f.tes, &f.fs}) std::fill(bytes->begin(), bytes->end(), 0);
       f.control_shared.fill(UINT32_MAX); f.evaluation_shared.fill(UINT32_MAX);
+      f.feedback.fill(0x3c); f.binding = {}; f.target = {}; f.stream_output = {};
       f.tess = {}; f.draw = {};
       pvrgpu_systemc_graphics_stats stats{};
       stats.version = PVRGPU_SYSTEMC_API_VERSION; stats.submission_generation = info.submission_generation;
@@ -132,6 +167,20 @@ int main(int argc, char **argv) {
                 (incomplete_patch ? stats.primitives_generated == 0 : stats.primitives_generated > 1) &&
                 stats.gs_primitives == 0 && stats.gs_invocations == 0,
             "primitive query counts generated TES geometry, not input patches or GS work");
+      Check(stats.stream_output_primitives_written == (incomplete_patch ? 0U : 1U) &&
+            stats.stream_output_primitives_storage_needed ==
+                (incomplete_patch ? 0U : generated.index_count / generated.primitive_size),
+            "TES feedback query counts complete generated primitives and overflow");
+      std::array<std::uint8_t,256> feedback_result{};
+      pvrgpu_systemc_stream_output_readback feedback_readback{};
+      feedback_readback.version = PVRGPU_SYSTEMC_API_VERSION;
+      feedback_readback.submission_generation = info.submission_generation;
+      feedback_readback.resource_token = 101; feedback_readback.target_token = 201;
+      feedback_readback.bytes = feedback_result.data(); feedback_readback.bytes_size = feedback_result.size();
+      Check(pvrgpu_systemc_flush_stream_output(&feedback_readback,error.data(),error.size()) == 0 &&
+            feedback_readback.data_written && feedback_result == expected_feedback &&
+            feedback_readback.internal_offset == (incomplete_patch ? 16U : 76U),
+            std::string("owned TES exports, append cursor and all guard bytes: ") + error.data());
       std::array<std::uint8_t, 16 * 16 * 4> pixels{};
       pvrgpu_systemc_readback_info readback{};
       readback.version = PVRGPU_SYSTEMC_API_VERSION; readback.width = readback.height = 16;

@@ -36,6 +36,35 @@ struct pvrgpu_resource {
    bool driver_writes_model_cannot_reproduce;
 };
 
+/* Validate a complete row-padded, layer-major surface span before either
+ * snapshot or readback touches backing memory. No partial write is allowed. */
+static inline bool
+pvrgpu_surface_span(const struct pvrgpu_resource *resource,
+                    const struct pipe_surface *surface, size_t row_bytes,
+                    unsigned height, unsigned layer_count, size_t *offset)
+{
+   if (!resource || !surface || !offset || !row_bytes || !height || !layer_count ||
+       layer_count > 256 || surface->level >= resource->level_count ||
+       surface->level >= PIPE_MAX_TEXTURE_LEVELS ||
+       surface->first_layer > surface->last_layer ||
+       layer_count > (unsigned)surface->last_layer - surface->first_layer + 1)
+      return false;
+   const size_t base = resource->level_offsets[surface->level];
+   const size_t stride = resource->level_strides[surface->level];
+   const size_t layer_stride = resource->level_layer_strides[surface->level];
+   const size_t last_layer = (size_t)surface->first_layer + layer_count - 1;
+   if (base > resource->size || !layer_stride || stride < row_bytes ||
+       row_bytes > layer_stride || (size_t)(height - 1) > (layer_stride - row_bytes) / stride ||
+       last_layer > (resource->size - base) / layer_stride)
+      return false;
+   const size_t last_offset = base + last_layer * layer_stride;
+   if ((size_t)(height - 1) > (resource->size - last_offset) / stride ||
+       row_bytes > resource->size - last_offset - (size_t)(height - 1) * stride)
+      return false;
+   *offset = base + (size_t)surface->first_layer * layer_stride;
+   return true;
+}
+
 static inline struct pvrgpu_resource *
 pvrgpu_resource(struct pipe_resource *resource)
 {

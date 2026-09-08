@@ -1,6 +1,8 @@
 // Native TCS -> fixed tessellation -> native TES, bounded depth-one channels.
 #include "common/geometry_emission.h"
 #include "common/tessellation_state.h"
+#include "common/stream_output_types.h"
+#include "geometry/stream_output.h"
 #include "geometry/tessellator.h"
 #include "memory/gpu_memory_system.h"
 #include "pco_tessellation_compiler_fixtures.h"
@@ -70,19 +72,29 @@ PipelineTxn Make(MemoryPool &pool,GpuMemorySystem &memory,unsigned sequence) {
   state.drawlist_stats=StoreNewArray(pool,std::vector<DrawListStats>(1));
   state.tessellation_output_dwords=t.evaluation_abi.vertex_outputs;
   state.tessellation_state=StoreNewArray(pool,std::vector<TessellationState>{t});
+  // Alternate unchanged raster-only draws with complete TES -> SO draws.
+  // The last fixture captures the TES-only color export at DWORD4..7; the
+  // preceding VS exports only position, so using its ABI would reject this.
+  state.vertex_pco_abi.vertex_outputs=4;
+  if(sequence%2==0) {
+    StreamOutputTarget target;
+    target.output_buffer=0;target.resource_token=sequence;target.target_token=sequence+100;
+    target.gpu_address=UINT64_C(0x700000000)+sequence*0x10000;
+    target.bytes_size=16384;target.buffer_offset=16;
+    target.buffer_size=kind==0?16352:160;target.internal_offset=kind==0?0:16;
+    target.stride_dwords=kind==2?6:4;
+    const std::vector<std::uint8_t> initial(target.bytes_size,0xa5);
+    memory.HostWrite(target.gpu_address,initial.data(),initial.size());
+    state.stream_output_bindings=StoreNewArray(pool,std::vector<StreamOutputBinding>{
+        {kind==2?4U:0U,4,0,kind==2?1U:0U,0}});
+    state.stream_output_targets=StoreNewArray(pool,std::vector<StreamOutputTarget>{target});
+  }
   PipelineTxn txn;txn.sequence=sequence;txn.state=pool.Allocate(sizeof(PipelineState));
   StorePipelineState(pool,txn.state,state);return txn;
 }
 void Release(MemoryPool &pool,PipelineTxn txn) {
   const auto state=LoadPipelineState(pool,txn.state);
-  if(HasPoolHandle(state.tessellation_state)) {
-    const auto records=LoadArray<TessellationState>(pool,state.tessellation_state);
-    for(const auto &t:records)for(auto h:{t.control_code,t.control_instructions,t.control_shared,t.control_uniform_buffers,
-        t.evaluation_code,t.evaluation_instructions,t.evaluation_shared,t.evaluation_uniform_buffers,t.patches,t.domain_points,t.domain_indices})
-      if(HasPoolHandle(h))pool.Release(h);
-  }
-  for(auto h:{state.vertex_lanes,state.vertex_lane_refs,state.geometry_primitives,state.drawlist_stats,state.tessellation_state,txn.state})
-    if(HasPoolHandle(h))pool.Release(h);
+  ReleaseFunctionalPayloads(pool,state);pool.Release(txn.state);
 }
 void Verify(MemoryPool &pool,GpuMemorySystem &memory,PipelineTxn txn) {
   const auto state=LoadPipelineState(pool,txn.state);
@@ -137,6 +149,28 @@ void Verify(MemoryPool &pool,GpuMemorySystem &memory,PipelineTxn txn) {
           refs[primitive_index*3+c].lane_index==primitive.refs.vertex_indices[c],"generated raster references map exact patch-local domain indices");
     }
   }
+  if(txn.sequence%2==0) {
+    const auto target=LoadArray<StreamOutputTarget>(pool,state.stream_output_targets).at(0);
+    const auto binding=LoadArray<StreamOutputBinding>(pool,state.stream_output_bindings).at(0);
+    const auto initial_cursor=kind==0?0U:16U;
+    const auto admitted=std::min<std::size_t>(primitives.size(),
+        (target.buffer_size-initial_cursor)/(3*target.stride_dwords*4));
+    Check(state.stream_output_complete && state.stream_output_primitives_written==admitted &&
+          state.stream_output_primitives_storage_needed==primitives.size(),
+          "TES feedback queries count completed primitives, not distinct domain points");
+    Check(target.internal_offset==initial_cursor+admitted*3*target.stride_dwords*4,
+          "TES feedback append cursor advances only whole admitted primitives");
+    std::vector<std::uint8_t> expected(target.bytes_size,0xa5);
+    for(unsigned primitive=0;primitive<admitted;++primitive)for(unsigned c=0;c<3;++c) {
+      const auto vertex=primitives[primitive].refs.vertex_indices[c];
+      const auto offset=target.buffer_offset+initial_cursor+
+          (primitive*3+c)*target.stride_dwords*4+binding.dst_offset_dwords*4;
+      std::memcpy(expected.data()+offset,lanes[vertex].vertex_output+binding.output_dword,16);
+    }
+    const auto actual=LoadArray<std::uint8_t>(pool,target.readback);
+    Check(actual==expected && memory.backing().Read(target.gpu_address,target.bytes_size)==expected,
+          "real TES raw export memory preserves primitive order, holes, append prefix and overflow guards");
+  } else Check(!state.stream_output_complete,"draws without feedback pass through unchanged");
   Release(pool,txn);
 }
 } // namespace
@@ -144,22 +178,26 @@ int sc_main(int argc,char **argv) {
   try {
     MemoryPool pool;
     std::array<std::unique_ptr<GpuMemorySystem>,3> memories;
-    std::array<std::unique_ptr<sc_core::sc_fifo<PipelineTxn>>,3> input,tc,te,output;
+    std::array<std::unique_ptr<sc_core::sc_fifo<PipelineTxn>>,3> input,tc,te,so,output;
     std::array<std::unique_ptr<TessellationControlShader>,3> controls;
     std::array<std::unique_ptr<Tessellator>,3> fixed;
     std::array<std::unique_ptr<TessellationEvaluationShader>,3> evaluations;
+    std::array<std::unique_ptr<StreamOutput>,3> feedback;
     for(unsigned mode=0;mode<3;++mode) {
       memories[mode]=std::make_unique<GpuMemorySystem>(static_cast<MemoryMode>(mode));
       input[mode]=std::make_unique<sc_core::sc_fifo<PipelineTxn>>(sc_core::sc_gen_unique_name("input"),1);
       tc[mode]=std::make_unique<sc_core::sc_fifo<PipelineTxn>>(sc_core::sc_gen_unique_name("tc"),1);
       te[mode]=std::make_unique<sc_core::sc_fifo<PipelineTxn>>(sc_core::sc_gen_unique_name("te"),1);
+      so[mode]=std::make_unique<sc_core::sc_fifo<PipelineTxn>>(sc_core::sc_gen_unique_name("so"),1);
       output[mode]=std::make_unique<sc_core::sc_fifo<PipelineTxn>>(sc_core::sc_gen_unique_name("output"),1);
       controls[mode]=std::make_unique<TessellationControlShader>(sc_core::sc_gen_unique_name("tcs"),pool,memories[mode].get());
       fixed[mode]=std::make_unique<Tessellator>(sc_core::sc_gen_unique_name("fixed"),pool,memories[mode].get());
       evaluations[mode]=std::make_unique<TessellationEvaluationShader>(sc_core::sc_gen_unique_name("tes"),pool,memories[mode].get());
+      feedback[mode]=std::make_unique<StreamOutput>(sc_core::sc_gen_unique_name("stream_output"),pool,memories[mode].get());
       controls[mode]->input(*input[mode]);controls[mode]->output(*tc[mode]);
       fixed[mode]->input(*tc[mode]);fixed[mode]->output(*te[mode]);
-      evaluations[mode]->input(*te[mode]);evaluations[mode]->output(*output[mode]);
+      evaluations[mode]->input(*te[mode]);evaluations[mode]->output(*so[mode]);
+      feedback[mode]->input(*so[mode]);feedback[mode]->output(*output[mode]);
     }
     if(argc==2) {
       const auto invalid=static_cast<unsigned>(std::atoi(argv[1]));
