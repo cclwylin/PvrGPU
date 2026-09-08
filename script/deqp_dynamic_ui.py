@@ -224,6 +224,32 @@ def status_bucket(status: str) -> str:
     return "fail"
 
 
+QPA_RESULT_RE = re.compile(r'<Result StatusCode="([^"]*)">([^<]*)')
+
+
+def qpa_reason(qpa_path: Path, byte_cap: int = 262_144) -> tuple[str, str]:
+    """The ``<Result>`` line dEQP wrote for one case.
+
+    Only the tail is read: the result element closes the log, and a case that
+    logged a large image comparison would otherwise be pulled into memory in
+    full just to read its last line.
+    """
+    try:
+        size = qpa_path.stat().st_size
+        with qpa_path.open("r", encoding="utf-8", errors="replace") as handle:
+            if size > byte_cap:
+                handle.seek(size - byte_cap)
+                handle.readline()
+            text = handle.read()
+    except OSError:
+        return ("", "")
+    matches = QPA_RESULT_RE.findall(text)
+    if not matches:
+        return ("", "")
+    code, detail = matches[-1]
+    return (code, " ".join(detail.split()))
+
+
 def format_bytes(size: int) -> str:
     value = float(size)
     for suffix in ("B", "KiB", "MiB", "GiB"):
@@ -1604,6 +1630,34 @@ class MainWindow(QMainWindow):
             self.artifacts_table.setItem(rows, 2, QTableWidgetItem(format_bytes(size)))
             rows += 1
 
+    def _reconcile_running_rows(self, exit_code: int) -> None:
+        """A process killed (stop-on-fail) or crashed mid-case never emits
+        that case's case_end event, so its row is stuck at status="Running"
+        forever -- which status_bucket() then falls through to "fail" for,
+        even when the case actually passed (its own results.qpa says so).
+        Re-derive the real outcome from disk before the row is used anywhere
+        (counters, "first Fail", diagnostics)."""
+        for row in self.state.rows:
+            if row.status.strip().lower() != "running":
+                continue
+            qpa_path = row.qpa
+            if qpa_path is None and row.case_dir is not None:
+                qpa_path = row.case_dir / "results.qpa"
+            code = ""
+            if qpa_path is not None and Path(qpa_path).is_file():
+                code, _ = qpa_reason(Path(qpa_path))
+            if code:
+                row.status = code
+                row.qpa = Path(qpa_path)
+                if row.bucket == "pass":
+                    self.known_pass_cases.add(row.case_name)
+                else:
+                    self.known_pass_cases.discard(row.case_name)
+            else:
+                row.status = "Interrupted"
+            row.exit_code = exit_code
+            self._update_result_row(row)
+
     # --------------------------------------------------------------------------
     # Completion
     # --------------------------------------------------------------------------
@@ -1659,6 +1713,7 @@ class MainWindow(QMainWindow):
             return
 
         self.elapsed_timer.stop()
+        self._reconcile_running_rows(exit_code)
         self._refresh_counters()
         self._refresh_dashboard()
         self.tabs.setCurrentIndex(2)

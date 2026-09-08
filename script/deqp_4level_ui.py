@@ -2743,10 +2743,40 @@ class MainWindow(QMainWindow):
         if process is not None:
             self.active_jobs.pop(process, None)
         self._append_log(f"--- [{job.tag}] finished, exit {exit_code} ---")
+        self._reconcile_running_rows(job)
         self._refresh_shards_table()
+        self._refresh_counters()
         self._pump_jobs()
         if not self.active_jobs and not self.pending_jobs:
             self._run_complete()
+
+    def _reconcile_running_rows(self, job: Job) -> None:
+        """A shard killed (stop-on-fail) or crashed mid-case never emits that
+        case's case_end event, so its row is stuck at status="Running"
+        forever -- which status_bucket() then falls through to "fail" for,
+        even when the case actually passed (its own results.qpa says so).
+        Re-derive the real outcome from disk before the row is used anywhere
+        (counters, "first Fail", diagnostics)."""
+        for row in self.state.rows:
+            if row.job_tag != job.tag or row.status.strip().lower() != "running":
+                continue
+            qpa_path = row.qpa
+            if qpa_path is None and row.case_dir is not None:
+                qpa_path = row.case_dir / "results.qpa"
+            code = ""
+            if qpa_path is not None and Path(qpa_path).is_file():
+                code, _ = qpa_reason(Path(qpa_path))
+            if code:
+                row.status = code
+                row.qpa = Path(qpa_path)
+                if row.bucket == "pass":
+                    self.known_pass_cases.add(row.case_name)
+                else:
+                    self.known_pass_cases.discard(row.case_name)
+            else:
+                row.status = "Interrupted"
+            row.exit_code = job.exit_code if job.exit_code is not None else -1
+            self._update_result_row(row)
 
     def cancel_run(self) -> None:
         if self.aux_process is not None:
