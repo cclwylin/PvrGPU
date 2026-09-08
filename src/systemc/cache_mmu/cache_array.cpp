@@ -235,9 +235,13 @@ CacheLineAccess CacheArray::AccessLine(std::uint64_t line_address,
     // A full-line store supplies every byte, so write-allocate can install it
     // without a synchronous lower read.  Read misses still fetch before any
     // set mutation, preserving cache state if a lower callback fails.
-    CacheLineData fill = is_write && write_data
-                             ? *write_data
-                             : ReadLower(line_address, lower_read);
+    // Full stores already own their input bytes. Keep the victim's allocated
+    // line storage and copy into it below, after a successful dirty writeback.
+    // Read fills still happen before any tag/LRU mutation or victim callback.
+    const bool full_store = is_write && write_data;
+    CacheLineData fill;
+    if (!full_store)
+      fill = ReadLower(line_address, lower_read);
     way = ChooseVictim(fields);
     Line &victim = sets_[set_index][way];
     if (victim.valid) {
@@ -253,7 +257,8 @@ CacheLineAccess CacheArray::AccessLine(std::uint64_t line_address,
     victim.valid = true;
     victim.dirty = false;
     victim.tag = fields.tag;
-    victim.data = std::move(fill);
+    if (!full_store)
+      victim.data = std::move(fill);
   }
 
   Line &line = sets_[set_index][way];
@@ -281,8 +286,9 @@ CacheLineAccess CacheArray::ReadLine(std::uint64_t line_address,
 CacheLineAccess CacheArray::WriteLine(std::uint64_t line_address,
                                       const CacheLineData &data,
                                       const CacheLineRead &lower_read,
-                                      const CacheLineWrite &lower_write) {
-  return AccessLine(line_address, true, &data, lower_read, lower_write, true);
+                                      const CacheLineWrite &lower_write,
+                                      bool return_data) {
+  return AccessLine(line_address, true, &data, lower_read, lower_write, return_data);
 }
 
 CacheStats CacheArray::AccessRange(std::uint64_t address, std::size_t bytes,

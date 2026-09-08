@@ -118,7 +118,7 @@ int main(int argc, char **argv)
    const enum pipe_format format = PIPE_FORMAT_R32G32B32A32_FLOAT;
    struct pvrgpu_pco_graphics_binary binary = {0};
    check(pvrgpu_pco_compile_color_triangle(compiler, vs, fs, &format,
-      false, 1, 0, variant ? 28 : 4, 1, 1, &binary, error, sizeof(error)), error);
+      false, false, 1, 0, variant ? 28 : 4, 1, 1, &binary, error, sizeof(error)), error);
    FILE *file = fopen(argv[variant + 1], "wb"); check(file != NULL, "open native FS fixture");
    check(fwrite(binary.fragment.data, 1, binary.fragment.size, file) == binary.fragment.size,
       "write genuine native FS bytes");

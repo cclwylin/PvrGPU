@@ -154,9 +154,7 @@ class NativeMesaIntegrationTests(unittest.TestCase):
             'environment["PVRGPU_DRIVER_COMMAND_OUT"] = PathToUtf8(command)',
             'environment["PVRGPU_DRIVER_COUNTER_OUT"] = PathToUtf8(driver_counter)',
             'environment["PVRGPU_RDC_CASE_NAME"] = options.case_name',
-            'environment["PVRGPU_RDC_OUTPUT_WIDTH"]',
-            'environment["PVRGPU_RDC_OUTPUT_HEIGHT"]',
-            'environment["PVRGPU_RDC_TRACE_DRAW_ACTIONS"]',
+            'environment["PVRGPU_RDC_FINAL_OUTPUT_RECEIPT"]',
             'environment["PVRGPU_SYSTEMC_API_LIB"] = PathToUtf8(bridge)',
             'environment["PVRGPU_SYSTEMC_JSONL_OUT"] = PathToUtf8(model_stdout)',
             'environment["PVRGPU_SYSTEMC_STDERR_OUT"] = PathToUtf8(model_stderr)',
@@ -166,7 +164,6 @@ class NativeMesaIntegrationTests(unittest.TestCase):
                 self.assertIn(contract, runner)
 
         self.assertIn('options.case_name.rfind("dEQP-GLES32.", 0)', runner)
-        self.assertIn('options.case_name.rfind("dEQP-GLES31.", 0)', runner)
         self.assertIn('std::string gles = "3.1"', runner)
         self.assertIn('config.Get("PVRGPU_MESA_GLES_VERSION_OVERRIDE")', runner)
         self.assertIn('config.Path("PVRGPU_MESA_PVRGPU_PREFIX"', runner)
@@ -177,13 +174,12 @@ class NativeMesaIntegrationTests(unittest.TestCase):
         self.assertIn('artifact_root / "driver-counter.txt"', runner)
         self.assertIn('artifact_root / "model.stdout.jsonl"', runner)
         self.assertIn('artifact_root / "model.stderr.log"', runner)
-        self.assertIn("pvrgpu.rdc-native-runner.v1", runner)
-        self.assertIn("ValidatePvrgpuCompletion(bound_jsonl", runner)
-        self.assertIn('type == "error"', runner)
-        self.assertIn('"PvrGPU done message is missing pool_leaks"', runner)
-        self.assertIn(
-            '"PvrGPU model reported a non-zero MemoryPool leak count"', runner
-        )
+        self.assertIn("pvrgpu.rdc-native-runner.v2", runner)
+        self.assertIn("ParseNativeReport(model_text, driver_text", runner)
+        self.assertNotIn("probe_request", runner)
+        for metadata_only in ("PVRGPU_RDC_TRACE_DRAW_ACTIONS", "PVRGPU_RDC_OUTPUT_WIDTH", "PVRGPU_RDC_OUTPUT_HEIGHT"):
+            self.assertNotIn(f'environment["{metadata_only}"]', runner)
+            self.assertIn(f'"{metadata_only}"', runner)
 
     def test_cmake_uses_compiler_appropriate_flags_and_exports_windows_bridge(
         self,
@@ -288,17 +284,20 @@ class NativeMesaIntegrationTests(unittest.TestCase):
 
     def test_native_runner_fails_closed_on_unsupported_draws_and_bad_png_extent(self) -> None:
         runner = read_text(RUNNER_MAIN)
-        self.assertIn('CountDriverEvents(driver_counter_text, "unsupported_draw")', runner)
-        self.assertIn("unsupported draw event(s) across replay passes", runner)
-        self.assertIn("a later framebuffer blit as the workload result", runner)
+        protocol = read_text(PROJECT_ROOT / "src" / "rdc_runner" / "native_report.cpp")
+        self.assertIn('event.find("unsupported")', protocol)
+        self.assertIn('event.find("error")', protocol)
+        self.assertIn('event.find("fail")', protocol)
+        self.assertIn('"incomplete native hello/counter/done report"', protocol)
+        self.assertIn('"native submit has no completion"', protocol)
+        self.assertIn('"compute_api_done"', protocol)
         self.assertIn("ReadPngExtent(source_frame", runner)
         self.assertIn("PvrGPU model framebuffer extent mismatch", runner)
-        self.assertIn("source_frame.empty() && !explicit_no_color_output", runner)
-        self.assertIn("selected replay range has no color output", runner)
-        self.assertIn("did not emit a framebuffer PNG", runner)
-        self.assertIn("const bool bridge_started", runner)
-        self.assertIn("!bridge_completed && !bridge_started", runner)
-        self.assertIn("Preserve the native JSONL", runner)
+        self.assertIn("ParseFinalOutputReceipt(receipt_text", runner)
+        self.assertIn("Final-output receipt does not identify the requested replay PNG", runner)
+        self.assertIn("No-color receipt contradicts the replay PNG", runner)
+        self.assertNotIn("CapturePng(", runner)
+        self.assertNotIn("model_request", runner)
 
 
 if __name__ == "__main__":

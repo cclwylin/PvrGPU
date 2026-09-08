@@ -134,7 +134,7 @@ void Run(unsigned kind, unsigned mode, bool oob) {
 }
 
 void RejectBoundaries(unsigned mode) {
-  for (unsigned bad = 0; bad < 15; ++bad) {
+  for (unsigned bad = 0; bad < 19; ++bad) {
     Fixture fixture(34);
     auto d = fixture.Dispatch(mode);
     const auto original = fixture.backing;
@@ -145,7 +145,7 @@ void RejectBoundaries(unsigned mode) {
     if (bad == 4) d.images = nullptr;
     if (bad == 5) d.image_count = 33;
     if (bad == 6) fixture.images[0].access = 1;
-    if (bad == 7) fixture.images[0].format = 2;
+    if (bad == 7) fixture.images[0].format = 3;
     if (bad == 8) fixture.images[0].offset++;
     if (bad == 9) fixture.images[0].bytes_size = 4;
     if (bad == 10) fixture.images[0].row_stride_bytes = fixture.width * 4 - 4;
@@ -153,6 +153,10 @@ void RejectBoundaries(unsigned mode) {
     if (bad == 12) fixture.images[0].reserved = 1;
     if (bad == 13) fixture.images[0].resource_index = 1;
     if (bad == 14) d.abi.shared_memory_bytes = 4; // private descriptor overlaps image suffix
+    if (bad == 15) fixture.images[0].depth = UINT32_MAX;
+    if (bad == 16) fixture.images[0].layer_stride_bytes = 4;
+    if (bad == 17) fixture.images[0].texel_bytes = 6;
+    if (bad == 18) fixture.images[0].texel_bytes = 8; // R32UI format requires 4 bytes
     pvrgpu_systemc_compute_stats stats{};
     std::array<char,512> error{};
     Check(pvrgpu_systemc_submit_compute(&d, &stats, error.data(), error.size()) != 0 && error[0],
@@ -167,12 +171,13 @@ void RejectBoundaries(unsigned mode) {
   Check(mapping != MAP_FAILED && mprotect(mapping, page, PROT_READ | PROT_WRITE) == 0,
         "old image API guard mapping");
   auto *version = mapping + page - alignof(pvrgpu_systemc_compute_dispatch);
-  const std::uint32_t old = 3;
-  std::memcpy(version, &old, 4);
   std::array<char,128> error{};
-  Check(pvrgpu_systemc_submit_compute(reinterpret_cast<pvrgpu_systemc_compute_dispatch *>(version),
+  for (const std::uint32_t old : {3U, 4U, 5U}) {
+    std::memcpy(version, &old, 4);
+    Check(pvrgpu_systemc_submit_compute(reinterpret_cast<pvrgpu_systemc_compute_dispatch *>(version),
           nullptr, error.data(), error.size()) != 0 && std::string(error.data()).find("version") != std::string::npos,
-        "API3 inaccessible image tail was read");
+          "old API inaccessible image tail was read");
+  }
   munmap(mapping, page * 2);
 #endif
 }
@@ -180,7 +185,7 @@ void RejectBoundaries(unsigned mode) {
 
 int main(int argc, char **argv) {
   try {
-    static_assert(PVRGPU_SYSTEMC_COMPUTE_API_VERSION == 4);
+    static_assert(PVRGPU_SYSTEMC_COMPUTE_API_VERSION == 6);
     const unsigned mode = argc > 1 ? static_cast<unsigned>(std::stoul(argv[1])) : 0;
     Check(mode <= 2, "image memory mode");
     for (unsigned epoch = 0; epoch < 2; ++epoch)

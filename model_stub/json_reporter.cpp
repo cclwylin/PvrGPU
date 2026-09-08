@@ -170,6 +170,7 @@ struct VertexPcoEvidence {
   std::uint64_t f2i = 0;
   // IMADD32, likewise reached by any vertex shader doing integer arithmetic.
   std::uint64_t imadd32 = 0;
+  std::uint64_t imadd64_high = 0;
   // UBFE/IBFE: unpacking a narrow integer attribute, one per component.
   std::uint64_t ubfe = 0;
   std::uint64_t add64_32 = 0;
@@ -186,7 +187,12 @@ struct FragmentPcoEvidence {
   std::uint64_t binary_bytes = 0;
   std::uint64_t nop = 0;
   std::uint64_t fitrp = 0;
+  std::uint64_t fitr = 0;
   std::uint64_t depthf = 0;
+  std::uint64_t alphaf = 0;
+  std::uint64_t atomic32 = 0;
+  std::uint64_t branch = 0;
+  std::uint64_t cnd = 0;
   std::uint64_t ld = 0;
   std::uint64_t wdf = 0;
   std::uint64_t fadd = 0;
@@ -198,6 +204,7 @@ struct FragmentPcoEvidence {
   std::uint64_t fabs = 0;
   std::uint64_t movi = 0;
   std::uint64_t pck_cov = 0;
+  std::uint64_t savmsk_vm = 0;
   std::uint64_t shr = 0;
   std::uint64_t tstz = 0;
   std::uint64_t ffloor = 0;
@@ -227,6 +234,9 @@ struct FragmentPcoEvidence {
   // f2i32 the layer coordinate, multiply by the layer size and add the base).
   std::uint64_t iadd = 0;
   std::uint64_t imadd32 = 0;
+  std::uint64_t imadd64_high = 0;
+  std::uint64_t fdsx = 0;
+  std::uint64_t fdsy = 0;
   std::uint64_t bfi = 0;
   std::uint64_t ubfe = 0;
   std::uint64_t add64_32 = 0;
@@ -378,6 +388,9 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kIntegerMultiplyAdd32:
       ++evidence.imadd32;
       break;
+    case PcoOpcode::kIntegerMultiplyAdd64High:
+      ++evidence.imadd64_high;
+      break;
     case PcoOpcode::kBitfieldExtractUnsigned:
     case PcoOpcode::kBitfieldExtractSigned:
       ++evidence.ubfe;
@@ -430,7 +443,7 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
       evidence.csel + evidence.fmad + evidence.fmin + evidence.fmax +
       evidence.frcp + evidence.frsq + evidence.flog2 + evidence.fexp2 +
       evidence.pck_f16 + evidence.unpck_f16 + evidence.unpck_int +
-      evidence.f2i + evidence.imadd32 + evidence.ubfe + evidence.smp +
+      evidence.f2i + evidence.imadd32 + evidence.imadd64_high + evidence.ubfe + evidence.smp +
       evidence.wdf + evidence.add64_32 + evidence.ld;
   if (opcode_total != instructions.size()) {
     throw std::runtime_error(
@@ -484,8 +497,32 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kFloatInterpolatePerspective:
       ++evidence.fitrp;
       break;
+    case PcoOpcode::kFloatInterpolate:
+      ++evidence.fitr;
+      break;
     case PcoOpcode::kDepthFeedback:
       ++evidence.depthf;
+      break;
+    case PcoOpcode::kAlphaFeedback:
+      ++evidence.alphaf;
+      break;
+    case PcoOpcode::kBranch:
+      ++evidence.branch;
+      break;
+    case PcoOpcode::kConditionalMask:
+      ++evidence.cnd;
+      break;
+    case PcoOpcode::kAtomicAdd32:
+    case PcoOpcode::kAtomicUnsignedMin32:
+    case PcoOpcode::kAtomicUnsignedMax32:
+    case PcoOpcode::kAtomicSignedMin32:
+    case PcoOpcode::kAtomicSignedMax32:
+    case PcoOpcode::kAtomicAnd32:
+    case PcoOpcode::kAtomicOr32:
+    case PcoOpcode::kAtomicXor32:
+    case PcoOpcode::kAtomicExchange32:
+    case PcoOpcode::kAtomicSub32:
+      ++evidence.atomic32;
       break;
     case PcoOpcode::kBufferLoad:
       ++evidence.ld;
@@ -514,6 +551,9 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
       break;
     case PcoOpcode::kPackCoverageMask:
       ++evidence.pck_cov;
+      break;
+    case PcoOpcode::kSaveVisibilityMask:
+      ++evidence.savmsk_vm;
       break;
     case PcoOpcode::kTestZero:
       ++evidence.tstz;
@@ -592,6 +632,15 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kIntegerMultiplyAdd32:
       ++evidence.imadd32;
       break;
+    case PcoOpcode::kIntegerMultiplyAdd64High:
+      ++evidence.imadd64_high;
+      break;
+    case PcoOpcode::kDerivativeX:
+      ++evidence.fdsx;
+      break;
+    case PcoOpcode::kDerivativeY:
+      ++evidence.fdsy;
+      break;
     case PcoOpcode::kBitfieldInsert:
       ++evidence.bfi;
       break;
@@ -627,10 +676,10 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
           std::to_string(static_cast<unsigned>(instruction.opcode)));
     }
   }
-  if (evidence.nop + evidence.fitrp + evidence.depthf + evidence.ld + evidence.wdf + evidence.fadd + evidence.fmul +
+  if (evidence.nop + evidence.fitrp + evidence.fitr + evidence.depthf + evidence.alphaf + evidence.atomic32 + evidence.branch + evidence.cnd + evidence.ld + evidence.wdf + evidence.fadd + evidence.fmul +
           evidence.mbyp + evidence.smp + evidence.internal + evidence.fneg +
           evidence.fabs +
-          evidence.movi + evidence.pck_cov + evidence.shr +
+          evidence.movi + evidence.pck_cov + evidence.savmsk_vm + evidence.shr +
           evidence.tstz + evidence.ffloor +
           evidence.fsub + evidence.fge + evidence.feq + evidence.flt +
       evidence.bcmp +
@@ -639,7 +688,7 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
           evidence.fmin + evidence.fmax + evidence.frcp + evidence.frsq +
           evidence.flog2 + evidence.fexp2 +
           evidence.pck_f16 + evidence.unpck_f16 + evidence.unpck_int +
-          evidence.iadd + evidence.imadd32 + evidence.bfi + evidence.ubfe +
+          evidence.iadd + evidence.imadd32 + evidence.imadd64_high + evidence.fdsx + evidence.fdsy + evidence.bfi + evidence.ubfe +
           evidence.add64_32 + evidence.bitwise_or + evidence.bitwise_xor +
           evidence.shl + evidence.imax_s32 + evidence.imin_s32 +
           evidence.f2i !=
@@ -708,6 +757,7 @@ void AppendVertexPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_VERTEX_EVIDENCE(unpck_int);
   PVRGPU_ADD_VERTEX_EVIDENCE(f2i);
   PVRGPU_ADD_VERTEX_EVIDENCE(imadd32);
+  PVRGPU_ADD_VERTEX_EVIDENCE(imadd64_high);
   PVRGPU_ADD_VERTEX_EVIDENCE(ubfe);
   PVRGPU_ADD_VERTEX_EVIDENCE(add64_32);
   PVRGPU_ADD_VERTEX_EVIDENCE(ld);
@@ -736,7 +786,12 @@ void AppendFragmentPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_FRAGMENT_EVIDENCE(binary_bytes);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(nop);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(fitrp);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(fitr);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(depthf);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(alphaf);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(atomic32);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(branch);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(cnd);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(ld);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(wdf);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(fadd);
@@ -748,6 +803,7 @@ void AppendFragmentPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_FRAGMENT_EVIDENCE(fabs);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(movi);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(pck_cov);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(savmsk_vm);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(shr);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(tstz);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(ffloor);
@@ -771,6 +827,9 @@ void AppendFragmentPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_FRAGMENT_EVIDENCE(unpck_int);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(iadd);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(imadd32);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(imadd64_high);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(fdsx);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(fdsy);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(bfi);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(ubfe);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(add64_32);
@@ -1804,6 +1863,8 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"f2i\":" << vertex_pco.f2i;
   if (vertex_pco.imadd32 != 0)
     std::cout << ",\"imadd32\":" << vertex_pco.imadd32;
+  if (vertex_pco.imadd64_high != 0)
+    std::cout << ",\"imadd64_high\":" << vertex_pco.imadd64_high;
   if (vertex_pco.ubfe != 0)
     std::cout << ",\"ubfe\":" << vertex_pco.ubfe;
   if (vertex_pco.smp != 0)
@@ -1860,7 +1921,8 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
             << Fnv1a64Text(fragment_pco.binary_fnv1a64)
             << "\",\"bytes\":" << fragment_pco.binary_bytes << "}"
             << ",\"fragment_pco_opcodes\":{\"fitrp\":"
-            << fragment_pco.fitrp << ",\"wdf\":" << fragment_pco.wdf;
+            << fragment_pco.fitrp << ",\"fitr\":" << fragment_pco.fitr
+            << ",\"wdf\":" << fragment_pco.wdf;
   if (fragment_pco.fadd != 0)
     std::cout << ",\"fadd\":" << fragment_pco.fadd;
   if (fragment_pco.fmul != 0)
@@ -1887,6 +1949,8 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"fabs\":" << fragment_pco.fabs;
   if (fragment_pco.pck_cov != 0)
     std::cout << ",\"pck_cov\":" << fragment_pco.pck_cov;
+  if (fragment_pco.savmsk_vm != 0)
+    std::cout << ",\"savmsk_vm\":" << fragment_pco.savmsk_vm;
   if (fragment_pco.shr != 0)
     std::cout << ",\"shr\":" << fragment_pco.shr;
   if (fragment_pco.tstz != 0)
@@ -1917,6 +1981,12 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"iadd\":" << fragment_pco.iadd;
   if (fragment_pco.imadd32 != 0)
     std::cout << ",\"imadd32\":" << fragment_pco.imadd32;
+  if (fragment_pco.imadd64_high != 0)
+    std::cout << ",\"imadd64_high\":" << fragment_pco.imadd64_high;
+  if (fragment_pco.fdsx != 0)
+    std::cout << ",\"fdsx\":" << fragment_pco.fdsx;
+  if (fragment_pco.fdsy != 0)
+    std::cout << ",\"fdsy\":" << fragment_pco.fdsy;
   if (fragment_pco.bfi != 0)
     std::cout << ",\"bfi\":" << fragment_pco.bfi;
   if (fragment_pco.ubfe != 0)
@@ -1947,6 +2017,14 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"smp\":" << fragment_pco.smp;
   if (fragment_pco.depthf != 0)
     std::cout << ",\"depthf\":" << fragment_pco.depthf;
+  if (fragment_pco.alphaf != 0)
+    std::cout << ",\"alphaf\":" << fragment_pco.alphaf;
+  if (fragment_pco.atomic32 != 0)
+    std::cout << ",\"atomic32\":" << fragment_pco.atomic32;
+  if (fragment_pco.branch != 0)
+    std::cout << ",\"branch\":" << fragment_pco.branch;
+  if (fragment_pco.cnd != 0)
+    std::cout << ",\"cnd\":" << fragment_pco.cnd;
   std::cout << ",\"mbyp\":" << fragment_pco.mbyp << "}"
             << ",\"frame\":" << counters.frame << ",\"marker\":\""
             << JsonEscape(options.test_case) << "\""
@@ -2119,6 +2197,38 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
 }
 
 void PublishStreamOutputs(ModelJob &job, const MemoryPool &pool, const PipelineState &state) {
+  if (HasPoolHandle(state.fragment_image_resources)) {
+    if (!state.fragment_images_complete)
+      throw std::runtime_error("JsonReporter fragment image execution/readback is incomplete");
+    const auto resources = LoadArray<ShaderImageResource>(pool, state.fragment_image_resources);
+    std::vector<ModelShaderImageReadback> current;
+    for (const auto &resource : resources) {
+      if (!(resource.access & 2U)) continue;
+      if (!HasPoolHandle(resource.readback))
+        throw std::runtime_error("JsonReporter fragment image has no modeled readback");
+      ModelShaderImageReadback result;
+      result.resource_token = resource.resource_token;
+      result.bytes = LoadArray<std::uint8_t>(pool, resource.readback);
+      if (result.bytes.size() != resource.bytes)
+        throw std::runtime_error("JsonReporter fragment image readback extent mismatch");
+      const auto alias = std::find_if(current.begin(), current.end(), [&](const auto &prior) {
+        return prior.resource_token == result.resource_token;
+      });
+      if (alias != current.end()) {
+        if (alias->bytes != result.bytes)
+          throw std::runtime_error("JsonReporter aliased fragment image readbacks disagree");
+        continue;
+      }
+      current.push_back(std::move(result));
+    }
+    for (auto &result : current) {
+      const auto prior = std::find_if(job.shader_images.begin(), job.shader_images.end(), [&](const auto &image) {
+        return image.resource_token == result.resource_token;
+      });
+      if (prior == job.shader_images.end()) job.shader_images.push_back(std::move(result));
+      else *prior = std::move(result);
+    }
+  }
   if (!HasPoolHandle(state.stream_output_targets))
     return;
   const auto targets = LoadArray<StreamOutputTarget>(pool, state.stream_output_targets);
@@ -2308,9 +2418,23 @@ void JsonReporter::RunJob() {
               state.raster_state.sample_count * state.attachment_layers *
               ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
                                            state.color_attachment_float32);
+          const std::uint32_t targets = physical_command.render_target_count ?
+              physical_command.render_target_count : 1U;
+          const std::uint64_t color_owner =
+              (expected_color_address - kDriverPcoSequenceColorAddressBase) /
+                  kDriverPcoSequenceAttachmentStride;
+          if (state.render_target_count != targets)
+            throw std::runtime_error("JsonReporter PCO sequence MRT count mismatch");
+          for (std::uint32_t target = 1; target < targets; ++target) {
+            const std::uint64_t expected_address = kDriverPcoMrtColorAddressBase +
+                (color_owner * kMaxRenderTargets + target) * kDriverPcoSequenceAttachmentStride;
+            if (state.extra_framebuffer_gpu_address[target - 1] != expected_address ||
+                state.extra_framebuffer_bytes[target - 1] != expected_color_bytes)
+              throw std::runtime_error("JsonReporter PCO sequence MRT ownership mismatch");
+          }
           if (state.color_attachment_load_enable != (color_load ? 1U : 0U) ||
               state.color_attachment_load_bytes !=
-                  (color_load ? expected_color_bytes : 0U) ||
+                  (color_load ? expected_color_bytes * targets : 0U) ||
               HasPoolHandle(state.color_attachment_load) != color_load ||
               state.depth_attachment_load_enable != (depth_load ? 1U : 0U) ||
               state.depth_attachment_load_bytes !=

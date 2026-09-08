@@ -176,14 +176,14 @@ void Run(const std::filesystem::path &root, const char *mode, unsigned layers, b
 }
 int main(int argc,char **argv) {
   try {
-    static_assert(PVRGPU_SYSTEMC_API_VERSION==27);
+    static_assert(PVRGPU_SYSTEMC_API_VERSION==30);
     const char *mode=argc>1?argv[1]:"direct";
     const auto root=std::filesystem::temp_directory_path()/("pvrgpu-layered-api-"+
         std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
     Run(root/"three",mode,3,false); Run(root/"depth",mode,3,true);
     Run(root/"one",mode,1,false); Run(root/"nonlayered",mode,0,false);
     std::filesystem::remove(root);
-    std::cout<<"layered API27 "<<mode<<" "<<checks<<" checks PASS\n";
+    std::cout<<"layered API30 "<<mode<<" "<<checks<<" checks PASS\n";
     return 0;
   } catch(const std::exception &e) {std::cerr<<e.what()<<'\n';return 1;}
 }

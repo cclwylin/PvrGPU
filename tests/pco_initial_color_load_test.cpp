@@ -321,7 +321,7 @@ void VerifyRejectedPayloads(const std::filesystem::path &root) {
   {
     Fixture fixture("PIPE_FORMAT_R8G8B8A8_UNORM", 4, true);
     fixture.draw.render_target_count = 2;
-    reject(fixture, "external-load-with-mrt");
+    reject(fixture, "truncated-mrt-payload");
   }
   {
     Fixture fixture("PIPE_FORMAT_R8G8B8A8_UNORM", 4, true);
@@ -337,6 +337,119 @@ void VerifyRejectedPayloads(const std::filesystem::path &root) {
     fixture.sequence.pco_sequence_command_count = 2;
     fixture.sequence.pco_sequence_commands = draws.data();
     reject(fixture, "alias-and-external-load");
+  }
+}
+
+void VerifyMrtContinuity(const std::filesystem::path &root, bool sparse) {
+  Fixture fixture("PIPE_FORMAT_R32G32B32A32_FLOAT", 4, false);
+  fixture.vertex_pco = pvrgpu::stub::AttributeFetchVertexPcoBinary();
+  fixture.draw.vertex_pco = fixture.vertex_pco.data();
+  fixture.draw.vertex_pco_size = fixture.vertex_pco.size();
+  fixture.draw.vertex_pco_abi.vertex_outputs = 4;
+  fixture.draw.varying_output_count = 0;
+  fixture.draw.fragment_varying_count = 0;
+  fixture.draw.fragment_pco_abi.coefficients = 4;
+  fixture.draw.render_target_count = 4;
+  fixture.draw.scissor = 1;
+  fixture.draw.scissor_width = 1;
+  fixture.draw.scissor_height = kHeight;
+
+  // Public native MBYP groups export sc64 (1.0) or sc75 (0.5) through the
+  // extended PIXOUT destination encoding. Each target has distinct output.
+  fixture.fragment_pco.clear();
+  for (unsigned output = 0; output < 16; ++output) {
+    const unsigned target = output / 4;
+    if (sparse && target == 2)
+      continue;
+    const unsigned special = output < 4 ? 32 + output : 160 + output;
+    const bool one = (target & (1U << (output % 2))) != 0;
+    const std::array<std::uint8_t, 16> group = {
+      0x38, 0x8a, static_cast<std::uint8_t>(output == 15 ? 0x80 : 0),
+      0x87, static_cast<std::uint8_t>(one ? 0x80 : 0x8b),
+      0x01, 0, 0, 0, static_cast<std::uint8_t>(0x80 | (special & 0x3f)),
+      static_cast<std::uint8_t>(special >> 6), 0xff, 0xf2, 0xff, 0xff, 0xff};
+    fixture.fragment_pco.insert(fixture.fragment_pco.end(), group.begin(), group.end());
+  }
+  fixture.draw.fragment_pco = fixture.fragment_pco.data();
+  fixture.draw.fragment_pco_size = fixture.fragment_pco.size();
+  for (unsigned target = 0; target < 4; ++target)
+    fixture.draw.fragment_output_mask[target] = sparse && target == 2 ? 0 : 15;
+
+  constexpr std::size_t target_bytes = kWidth * kHeight * 16;
+  fixture.initial.resize(target_bytes * 4);
+  for (unsigned target = 0; target < 4; ++target)
+    for (unsigned pixel = 0; pixel < kWidth * kHeight; ++pixel)
+      for (unsigned component = 0; component < 4; ++component) {
+        const float value = -float(1 + target * 100 + pixel * 4 + component);
+        std::memcpy(fixture.initial.data() + target * target_bytes + pixel * 16 + component * 4,
+                    &value, sizeof(value));
+      }
+  std::vector<std::uint8_t> expected = fixture.initial;
+  const auto verify_and_read = [&](const std::string &name) {
+    std::vector<std::uint8_t> result(target_bytes * 4);
+    for (unsigned target = 0; target < 4; ++target) {
+      pvrgpu_systemc_readback_info readback{};
+      readback.version = PVRGPU_SYSTEMC_API_VERSION;
+      readback.width = kWidth;
+      readback.height = kHeight;
+      readback.attachment = target;
+      readback.bytes_per_pixel = 16;
+      readback.pixels = result.data() + target * target_bytes;
+      readback.pixels_size = target_bytes;
+      std::array<char, 512> error{};
+      if (pvrgpu_systemc_flush_readback(&readback, error.data(), error.size()) != 0 ||
+          readback.pixels_written != 1)
+        Fail(name + " MRT readback failed: " + error.data());
+    }
+    // Row zero's x=0,1,2 are strictly inside the triangle. The top-right
+    // texel is strictly outside, so every target must retain its own input.
+    for (unsigned target = 0; target < 4; ++target) {
+      const std::size_t outside = target * target_bytes + 15 * 16;
+      if (std::memcmp(result.data() + outside, expected.data() + outside, 16))
+        Fail(name + " lost an untouched MRT texel");
+      if (sparse && target == 2 &&
+          std::memcmp(result.data() + target * target_bytes,
+                      expected.data() + target * target_bytes, target_bytes))
+        Fail(name + " modified a shader-unwritten MRT target");
+    }
+    return result;
+  };
+  for (unsigned pass = 0; pass < 2; ++pass) {
+    // Pass 0 has two aliased draws; pass 1 imports all four readbacks and
+    // resumes rendering. This covers both in-sequence and cross-flush LOAD.
+    fixture.draw.initial_color_attachment_bytes = fixture.initial.data();
+    fixture.draw.initial_color_attachment_bytes_size = fixture.initial.size();
+    std::array<pvrgpu_systemc_driver_command, 2> draws = {fixture.draw, fixture.draw};
+    draws[0].scissor_x = pass ? 2 : 0;
+    draws[1].scissor_x = 1;
+    draws[1].color_attachment_source_command_index = 0;
+    draws[1].initial_color_attachment_bytes = nullptr;
+    draws[1].initial_color_attachment_bytes_size = 0;
+    const unsigned count = pass ? 1 : 2;
+    fixture.sequence.pco_sequence_commands = draws.data();
+    fixture.sequence.pco_sequence_command_count = fixture.sequence.draw_count = count;
+    fixture.sequence.ia_vertices = count * 3;
+    fixture.sequence.ia_primitives = fixture.sequence.clip_invocations = count;
+    const std::string name = std::string(sparse ? "mrt-sparse-" : "mrt-dense-") + std::to_string(pass);
+    Submission submission(root / name, &fixture.sequence);
+    std::array<char, 512> error{};
+    if (pvrgpu_systemc_submit_driver_command(&submission.info, error.data(), error.size()) != 0)
+      Fail(name + " submit failed: " + error.data());
+    std::fill(fixture.initial.begin(), fixture.initial.end(), 0xcc);
+    auto result = verify_and_read(name);
+    for (unsigned target = 0; target < 4; ++target) {
+      if (sparse && target == 2)
+        continue;
+      for (unsigned x = 0; x < (pass ? 3U : 2U); ++x)
+        for (unsigned component = 0; component < 4; ++component) {
+          const float value = target & (1U << (component % 2)) ? 1.0F : 0.5F;
+          if (std::memcmp(result.data() + target * target_bytes + x * 16 + component * 4,
+                          &value, sizeof(value)))
+            Fail(name + " lost a previously shaded MRT texel or routed the wrong target");
+        }
+    }
+    fixture.initial = std::move(result);
+    expected = fixture.initial;
   }
 }
 
@@ -481,6 +594,8 @@ int main(int argc, char **argv) {
     VerifyDeferredUniformBuffers(root, "cache");
   } else if (argc == 1) {
     VerifyRejectedPayloads(root);
+    VerifyMrtContinuity(root, false);
+    VerifyMrtContinuity(root, true);
     VerifyUniformBufferRejections(root);
     VerifyInitialLoad(root, "rgba8", "PIPE_FORMAT_R8G8B8A8_UNORM", 4, true);
     VerifyInitialLoad(root, "r32ui", "PIPE_FORMAT_R32_UINT", 1, false);

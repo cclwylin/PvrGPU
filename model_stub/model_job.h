@@ -46,6 +46,7 @@ struct ModelJob {
   std::string error;
   ModelGraphicsStats graphics_stats;
   std::vector<ModelStreamOutputReadback> stream_outputs;
+  std::vector<ModelShaderImageReadback> shader_images;
 
   // The job's last physical DRAM readback.  This is what a `glReadPixels` on a
   // colour attachment ends up copying.  It is RGBA8 only while the attachment
@@ -73,6 +74,7 @@ struct ModelJob {
     error.clear();
     graphics_stats = {};
     stream_outputs.clear();
+    shader_images.clear();
     framebuffer.clear();
     extra_framebuffers.clear();
     framebuffer_width = 0;

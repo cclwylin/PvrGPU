@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <exception>
@@ -893,6 +894,70 @@ class TextureMemoryResponder final : public sc_core::sc_module {
   std::size_t taps_per_sample_;
 };
 
+void CheckCubeNonfiniteLod() {
+  using pvrgpu::stub::ComputeTextureCubeImplicitLod;
+  auto fixture = MakeGlbenchFillTextureFixture(TextureFilter::kLinear);
+  std::array<std::uint32_t, 4> image_words{}, sampler_words{};
+  std::copy_n(fixture.fragment_shared.begin(), 4, image_words.begin());
+  std::copy_n(fixture.fragment_shared.begin() + 8, 4, sampler_words.begin());
+  auto image = DecodeRogueTextureImageDescriptor(image_words);
+  auto sampler = DecodeRogueTextureSamplerDescriptor(sampler_words);
+  image.width = image.height = 64;
+  image.mip_count = 7;
+  sampler.min_lod_u4_6 = 0;
+  sampler.max_lod_u4_6 = 6 * 64;
+  sampler.mip_filter = TextureFilter::kLinear;
+  const std::array<std::array<float, 3>, 4> finite = {{{1, 0, 0},
+      {1, 0, -0.125F}, {1, -0.125F, 0}, {1, -0.125F, -0.125F}}};
+  const auto control = ComputeTextureCubeImplicitLod(finite, image, sampler);
+  Check(control.rho_squared == 16 && control.lambda == 2 &&
+        control.dsdx == 4 && control.dtdy == 4,
+        "finite cube projection retains the exact derivative and LOD");
+  const std::array<float, 4> undefined = {{
+      std::numeric_limits<float>::quiet_NaN(),
+      -std::numeric_limits<float>::quiet_NaN(),
+      std::numeric_limits<float>::infinity(),
+      -std::numeric_limits<float>::infinity()}};
+  for (float value : undefined) {
+    for (unsigned lane = 0; lane < 3; ++lane) {
+      auto directions = finite;
+      directions[lane] = {value, value, value};
+      for (unsigned minimum : {0U, 96U}) {
+        sampler.min_lod_u4_6 = minimum;
+        const auto lod = ComputeTextureCubeImplicitLod(directions, image, sampler);
+        Check(!std::isfinite(lod.rho_squared) &&
+              lod.lambda == minimum / 64.0F &&
+              lod.level0 == minimum / 64,
+              "nonfinite cube footprint retains raw evidence and selects minimum LOD");
+      }
+    }
+  }
+  sampler.min_lod_u4_6 = 0;
+  const std::array<std::array<float, 3>, 4> zero{};
+  const auto zero_lod = ComputeTextureCubeImplicitLod(zero, image, sampler);
+  Check(std::isnan(zero_lod.rho_squared) && zero_lod.lambda == 0,
+        "zero cube directions use the undefined-footprint minimum LOD policy");
+  auto unused_corner = finite;
+  unused_corner[3].fill(undefined[0]);
+  const auto unused_lod = ComputeTextureCubeImplicitLod(unused_corner, image, sampler);
+  Check(unused_lod.rho_squared == control.rho_squared &&
+        unused_lod.lambda == control.lambda,
+        "unused coarse-derivative corner cannot erase a valid footprint");
+  auto singular_projection = finite;
+  singular_projection[1] = {0, 1, 0};
+  ExpectFailure([&] {
+    ComputeTextureCubeImplicitLod(singular_projection, image, sampler);
+  }, "valid nonzero directions cannot hide an unmodeled common-face singularity");
+  auto overflowing_projection = finite;
+  overflowing_projection[1] = {std::numeric_limits<float>::min(), 1, 1};
+  ExpectFailure([&] {
+    ComputeTextureCubeImplicitLod(overflowing_projection, image, sampler);
+  }, "finite nonzero direction cannot hide projection derivative overflow");
+  image.width = 0;
+  ExpectFailure([&] { ComputeTextureCubeImplicitLod(zero, image, sampler); },
+                "nonfinite direction cannot bypass invalid image metadata");
+}
+
 void CheckEventPaths() {
   MemoryPool pool;
   GlbenchFillTextureFixture fixture =
@@ -1640,6 +1705,7 @@ int sc_main(int, char **) {
     CheckDescriptorAndArithmetic();
     CheckIntegerImageDescriptors();
     CheckSequenceColorMipMaterialization();
+    CheckCubeNonfiniteLod();
     CheckEventPaths();
     std::cout << "texture_unit_test: PASS\n";
     return 0;

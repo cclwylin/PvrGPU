@@ -85,6 +85,10 @@ struct pvrgpu_pco_compute_abi {
    uint32_t image_used_mask;
    uint32_t image_read_mask;
    uint32_t image_write_mask;
+   /* Driver-only mapping: nonzero is (native UBO slot + 1) containing CB0.
+    * Large current-uniform arrays use a real read-only DMA descriptor. */
+   uint32_t cb0_uniform_buffer_slot;
+   uint32_t sampled_texture_count;
 };
 
 struct pvrgpu_pco_compute_binary {
@@ -150,6 +154,12 @@ struct pvrgpu_pco_graphics_binary {
    uint32_t fragment_texture_descriptor_start;
    uint32_t fragment_texture_descriptor_count;
    uint32_t fragment_texture_descriptor_stride;
+   /* Separate graphics image ABI; do not change the shared Compute stage ABI. */
+   uint32_t fragment_image_descriptor_start;
+   uint32_t fragment_image_descriptor_count;
+   uint32_t fragment_image_read_mask;
+   uint32_t fragment_image_write_mask;
+   bool fragment_early_tests;
 };
 
 /* Independent Geometry stage. These are compiler/driver contracts, not a
@@ -376,6 +386,7 @@ bool pvrgpu_pco_compile_color_triangle(
    const struct nir_shader *fragment_nir,
    const enum pipe_format *attribute_formats,
    bool topology_uses_point_size,
+   bool multisample_target,
    unsigned render_target_count,
    unsigned vertex_uniform_dwords,
    unsigned fragment_uniform_dwords,

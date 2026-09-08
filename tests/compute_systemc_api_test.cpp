@@ -115,7 +115,7 @@ void GuardedVersion() {
   constexpr std::size_t readable = alignof(pvrgpu_systemc_compute_dispatch);
   auto *bytes = static_cast<std::uint8_t *>(mapping) + page - readable;
   auto *old = reinterpret_cast<pvrgpu_systemc_compute_dispatch *>(bytes);
-  for (const std::uint32_t invalid_version : {0U,1U,2U,3U}) {
+  for (const std::uint32_t invalid_version : {0U,1U,2U,3U,4U,5U}) {
     std::memcpy(bytes, &invalid_version, sizeof(invalid_version));
     Reject(*old, "old envelope with inaccessible tail");
   }
@@ -125,12 +125,12 @@ void GuardedVersion() {
 
 void GuardedOldStats(unsigned mode) {
 #if !defined(_WIN32)
-  static_assert(PVRGPU_SYSTEMC_COMPUTE_API_VERSION == 4);
+  static_assert(PVRGPU_SYSTEMC_COMPUTE_API_VERSION == 6);
   // API v1 had thirteen uint64_t counters. Its caller may allocate exactly
-  // that much: rejecting v1 must happen before clearing the larger v2 stats.
+  // that much: rejecting v1 must happen before clearing the larger stats.
   constexpr std::size_t old_stats_size = 13U * sizeof(std::uint64_t);
   static_assert(sizeof(pvrgpu_systemc_compute_stats) ==
-                old_stats_size + sizeof(std::uint64_t));
+                old_stats_size + 3U * sizeof(std::uint64_t));
   const long page = sysconf(_SC_PAGESIZE);
   Check(page > 0 && static_cast<std::size_t>(page) >= old_stats_size,
         "old-stats guard-page size unavailable");

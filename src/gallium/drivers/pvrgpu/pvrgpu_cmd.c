@@ -124,7 +124,8 @@ pvrgpu_cmd_error(char *error, size_t error_size, const char *message)
 static bool
 pvrgpu_cmd_viewport_scale_matches(const uint32_t scale_bits[3],
                                   uint32_t width,
-                                  uint32_t height)
+                                  uint32_t height,
+                                  bool generic_depth_range)
 {
    float scale[3];
    memcpy(scale, scale_bits, sizeof(scale));
@@ -132,7 +133,25 @@ pvrgpu_cmd_viewport_scale_matches(const uint32_t scale_bits[3],
       return false;
    return scale[0] == (float)width * 0.5f &&
           fabsf(scale[1]) == (float)height * 0.5f &&
-          scale[2] == 0.5f;
+          (generic_depth_range || scale[2] == 0.5f);
+}
+
+/* GLES depth range endpoints are independently clamped to [0,1]. There is
+ * no near<=far requirement: a negative scale reverses depth, and zero scale
+ * produces constant window depth. Reconstruct in float, as Mesa stores the
+ * separately rounded half-difference and half-sum in pipe_viewport_state. */
+static bool
+pvrgpu_cmd_viewport_depth_range_valid(const uint32_t scale_bits[3],
+                                      const uint32_t offset_bits[3])
+{
+   float scale, offset;
+   memcpy(&scale, &scale_bits[2], sizeof(scale));
+   memcpy(&offset, &offset_bits[2], sizeof(offset));
+   const float near_depth = offset - scale;
+   const float far_depth = offset + scale;
+   return isfinite(scale) && isfinite(offset) &&
+          near_depth >= 0.0f && near_depth <= 1.0f &&
+          far_depth >= 0.0f && far_depth <= 1.0f;
 }
 
 static bool
@@ -278,12 +297,15 @@ pvrgpu_submit_compute_command(
    }
    struct pvrgpu_systemc_compute_dispatch submitted = *dispatch;
    const char *mode = pvrgpu_nonempty_env("PVRGPU_MODEL_MEMORY_MODE");
-   if (!mode || strcmp(mode, "direct") == 0)
+   /* Graphics defaults to cache. A SystemC session cannot change memory
+    * architecture after elaboration, including at a compute/graphics barrier.
+    * Explicit direct and bypass remain supported for both kinds of command. */
+   if (!mode || strcmp(mode, "cache") == 0)
+      submitted.memory_mode = 2;
+   else if (strcmp(mode, "direct") == 0)
       submitted.memory_mode = 0;
    else if (strcmp(mode, "bypass") == 0)
       submitted.memory_mode = 1;
-   else if (strcmp(mode, "cache") == 0)
-      submitted.memory_mode = 2;
    else {
       pvrgpu_cmd_error(error, error_size, "invalid compute memory_mode");
       return false;
@@ -314,12 +336,12 @@ pvrgpu_submit_compute_command(
    pvrgpu_counter_eventf(
       "compute_api_submit",
       "api=%u binary_bytes=%zu grid=%ux%ux%u block=%ux%ux%u "
-      "resources=%zu bindings=%zu push_words=%zu memory_mode=%u",
+      "resources=%zu bindings=%zu push_words=%zu memory_mode=%u textures=%zu",
       submitted.version, submitted.binary_size,
       submitted.grid[0], submitted.grid[1], submitted.grid[2],
       submitted.block[0], submitted.block[1], submitted.block[2],
       submitted.resource_count, submitted.binding_count,
-      submitted.push_word_count, submitted.memory_mode);
+      submitted.push_word_count, submitted.memory_mode, submitted.texture_count);
    if (error && error_size)
       error[0] = '\0';
    const int result = submit(&submitted, stats, error, error_size);
@@ -337,14 +359,14 @@ pvrgpu_submit_compute_command(
       " dram_read_bytes=%" PRIu64 " dram_write_bytes=%" PRIu64
       " direct_read_bytes=%" PRIu64 " direct_write_bytes=%" PRIu64
       " readback_bytes=%" PRIu64 " pool_allocations=%" PRIu64
-      " pool_releases=%" PRIu64,
+      " pool_releases=%" PRIu64 " texture_requests=%" PRIu64 " texel_fetches=%" PRIu64,
       stats->workgroups, stats->invocations, stats->alu_instructions,
       stats->memory_instructions, stats->atomic_instructions,
       stats->load_instructions,
       stats->store_instructions, stats->dram_read_bytes,
       stats->dram_write_bytes, stats->direct_read_bytes,
       stats->direct_write_bytes, stats->readback_bytes,
-      stats->pool_allocations, stats->pool_releases);
+      stats->pool_allocations, stats->pool_releases, stats->texture_requests, stats->texel_fetches);
    return true;
 }
 
@@ -394,6 +416,41 @@ pvrgpu_read_stream_output(
    if (!readback->data_written || readback->submission_generation != generation ||
        readback->resource_token != resource_token || readback->target_token != target_token) {
       pvrgpu_cmd_error(error, error_size, "stream output readback identity mismatch");
+      return false;
+   }
+   return true;
+}
+
+bool
+pvrgpu_read_shader_image(
+   struct pvrgpu_systemc_shader_image_readback *readback,
+   char *error, size_t error_size)
+{
+   const char *library_path = pvrgpu_nonempty_env("PVRGPU_SYSTEMC_API_LIB");
+   if (!library_path || !readback || !readback->submission_generation) {
+      pvrgpu_cmd_error(error, error_size, "shader image requires a model submission");
+      return false;
+   }
+   static void *handle;
+   static pvrgpu_systemc_flush_shader_image_fn flush_shader_image;
+   if (!handle) {
+      handle = dlopen(library_path, RTLD_NOW | RTLD_GLOBAL);
+      if (handle)
+         flush_shader_image = (pvrgpu_systemc_flush_shader_image_fn)
+            dlsym(handle, "pvrgpu_systemc_flush_shader_image");
+   }
+   if (!flush_shader_image) {
+      pvrgpu_cmd_error(error, error_size, "shader image readback entry point is unavailable");
+      return false;
+   }
+   const uint64_t generation = readback->submission_generation;
+   const uint64_t token = readback->resource_token;
+   const size_t bytes = readback->bytes_size;
+   readback->version = PVRGPU_SYSTEMC_API_VERSION;
+   if (flush_shader_image(readback, error, error_size) != 0) return false;
+   if (!readback->data_written || readback->submission_generation != generation ||
+       readback->resource_token != token || readback->bytes_size != bytes) {
+      pvrgpu_cmd_error(error, error_size, "shader image readback identity mismatch");
       return false;
    }
    return true;
@@ -1670,12 +1727,13 @@ pvrgpu_cmd_validate_draw_pco_triangles(
    const bool viewport_scale_ok =
       pvrgpu_cmd_viewport_scale_matches(cmd->viewport_scale_bits,
                                         cmd->width,
-                                        cmd->height);
+                                        cmd->height, color_layout);
    float viewport_offset[3];
    memcpy(viewport_offset, cmd->viewport_translate_bits, sizeof(viewport_offset));
    const bool viewport_offset_ok = color_layout ?
       (isfinite(viewport_offset[0]) && isfinite(viewport_offset[1]) &&
-       isfinite(viewport_offset[2]) && viewport_offset[2] == 0.5f) :
+       pvrgpu_cmd_viewport_depth_range_valid(cmd->viewport_scale_bits,
+                                              cmd->viewport_translate_bits)) :
       pvrgpu_cmd_viewport_offset_is_inside(cmd->viewport_translate_bits,
                                            cmd->width,
                                            cmd->height,
@@ -1717,9 +1775,9 @@ pvrgpu_cmd_validate_draw_pco_triangles(
    const char *raster_reason = NULL;
    if (cmd->front_ccw > 1)
       raster_reason = "front_ccw";
-   else if ((!ideas_layout && !color_layout && cmd->cull_face != 2) ||
-            ((ideas_layout || color_layout) && cmd->cull_face != 0 &&
-             cmd->cull_face != 2))
+   else if ((color_layout && cmd->cull_face > 3) ||
+            (!ideas_layout && !color_layout && cmd->cull_face != 2) ||
+            (ideas_layout && cmd->cull_face != 0 && cmd->cull_face != 2))
       raster_reason = "cull_face";
    else if (cmd->fill_front != 0 || cmd->fill_back != 0)
       raster_reason = "polygon_fill_mode";
@@ -1727,6 +1785,8 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       raster_reason = "rasterizer_discard";
    else if (cmd->multisample > 1)
       raster_reason = "multisample";
+   else if (cmd->sample_frequency > 1)
+      raster_reason = "sample_frequency";
    else if (cmd->half_pixel_center != 1)
       raster_reason = "half_pixel_center";
    else if (cmd->bottom_edge_rule > 1)
@@ -2225,6 +2285,7 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->depth_clip_far = cmd->depth_clip_far;
    out->depth_clamp = cmd->depth_clamp;
    out->sample_mask = cmd->sample_mask;
+   out->sample_frequency = cmd->sample_frequency;
    out->alpha_to_coverage = cmd->alpha_to_coverage;
    out->alpha_to_coverage_dither = cmd->alpha_to_coverage_dither;
    out->alpha_to_one = cmd->alpha_to_one;
@@ -2419,6 +2480,7 @@ pvrgpu_write_draw_pco_triangles_command(
       "primitive_width=%u,%u\n"
       "point_size_output=%u,%u\n"
       "sample_mask=%u\n"
+      "sample_frequency=%u\n"
       "alpha_to_coverage=%u\n"
       "alpha_to_coverage_dither=%u\n"
       "alpha_to_one=%u\n"
@@ -2476,6 +2538,7 @@ pvrgpu_write_draw_pco_triangles_command(
       cmd->point_size_output_start,
       cmd->point_size_output_count,
       cmd->sample_mask,
+      cmd->sample_frequency,
       cmd->alpha_to_coverage,
       cmd->alpha_to_coverage_dither,
       cmd->alpha_to_one,

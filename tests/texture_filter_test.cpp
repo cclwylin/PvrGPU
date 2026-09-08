@@ -398,6 +398,43 @@ void CheckIntegerFormatDecode() {
   Check(threw, "integer texel decode rejects a normalized color format");
 }
 
+void CheckSpatialOffsets() {
+  Check(ComputeTextureNearestRepeat(-0.25F, 4, TextureWrapMode::kClampToEdge, 2) == 1,
+        "spatial offset precedes clamp, not clamped index plus offset");
+  Check(ComputeTextureNearestRepeat(0.0F, 4, TextureWrapMode::kRepeat, -1) == 3,
+        "negative spatial offset wraps a POT nearest tap");
+  Check(ComputeTextureNearestRepeat(0.25F, 8, TextureWrapMode::kRepeat, 1) == 3 &&
+        ComputeTextureNearestRepeat(0.25F, 4, TextureWrapMode::kRepeat, 1) == 2,
+        "one spatial offset is one texel at each selected mip, not base-level UV");
+  Check(ComputeTextureFloatNearest(0.25F, 8, TextureWrapMode::kRepeat, 1) == 3 &&
+        ComputeTextureFloatNearest(0.25F, 4, TextureWrapMode::kRepeat, 1) == 2,
+        "float nearest applies offset separately for both mip extents");
+  Check(ComputeTextureFloatNearest(1.125F, 4, TextureWrapMode::kMirroredRepeat, 1) == 2,
+        "offset is applied before mirrored wrapping");
+  const auto fixed = ComputeTextureLinearRepeat(0.0F, 4, TextureWrapMode::kRepeat, 0.5F, 1);
+  Check(fixed.lower == 0 && fixed.upper == 1 && fixed.weight == 128,
+        "fixed linear moves both taps and preserves half-texel weight");
+  const auto fixed_npot = ComputeTextureLinearRepeat(0.25F, 3, TextureWrapMode::kRepeat, 0.5F, -1);
+  Check(fixed_npot.lower == 2 && fixed_npot.upper == 0 && fixed_npot.weight == 64,
+        "fixed NPOT repeat accepts signed texel offset");
+  const auto floating = ComputeTextureFloatLinear(0.0F, 4, TextureWrapMode::kClampToEdge, 1);
+  Check(floating.lower == 0 && floating.upper == 1 && Near(floating.weight, 0.5F),
+        "float linear offset is applied before clamp");
+  const auto float_npot = ComputeTextureFloatLinear(0.25F, 3, TextureWrapMode::kRepeat, -1);
+  Check(float_npot.lower == 2 && float_npot.upper == 0 && Near(float_npot.weight, 0.25F),
+        "float NPOT repeat signed offset preserves filter weight");
+  for (unsigned extent : {1U, 3U, 4U, 8U}) {
+    for (int offset = -7; offset <= 7; ++offset) {
+      const auto axis = ComputeTextureFloatLinear(0.37F, extent, TextureWrapMode::kRepeat, offset);
+      const auto fixed_axis = ComputeTextureLinearRepeat(0.37F, extent, TextureWrapMode::kRepeat, 0.5F, offset);
+      Check(axis.lower < extent && axis.upper < extent && axis.weight >= 0 && axis.weight <= 1,
+            "float offset taps remain in mip allocation");
+      Check(fixed_axis.lower < extent && fixed_axis.upper < extent && fixed_axis.weight <= 255,
+            "fixed offset taps remain in mip allocation");
+    }
+  }
+}
+
 } // namespace
 
 int main() {
@@ -406,6 +443,7 @@ int main() {
   CheckDatapathSelection();
   CheckFixedPointAxes();
   CheckFloatAxes();
+  CheckSpatialOffsets();
   CheckPackedFormatDecode();
   CheckIntegerFormatDecode();
   if (failures != 0) {

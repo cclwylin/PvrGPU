@@ -171,17 +171,6 @@ pvrgpu_can_pack_clear_color_format(enum pipe_format format)
 }
 
 static bool
-pvrgpu_color_cbuf_bound(const struct pipe_framebuffer_state *fb)
-{
-   return fb &&
-          fb->nr_cbufs == 1 &&
-          fb->cbufs[0].texture &&
-          pvrgpu_can_pack_clear_color_format(fb->cbufs[0].format) &&
-          fb->width != 0 &&
-          fb->height != 0;
-}
-
-static bool
 pvrgpu_surface_level_valid(const struct pvrgpu_resource *resource,
                            unsigned level)
 {
@@ -271,7 +260,7 @@ pvrgpu_color_surface_rect_supported(const struct pipe_surface *surface,
    const unsigned layer_count =
       pvrgpu_surface_level_layer_count(surface->texture, surface->level);
 
-   return level_width != 0 &&
+   if (!(level_width != 0 &&
           level_height != 0 &&
           layer_count != 0 &&
           surface->first_layer <= surface->last_layer &&
@@ -281,7 +270,21 @@ pvrgpu_color_surface_rect_supported(const struct pipe_surface *surface,
           width <= level_width - dstx &&
           height <= level_height - dsty &&
           resource->level_strides[surface->level] != 0 &&
-          resource->level_layer_strides[surface->level] != 0;
+          resource->level_layer_strides[surface->level] != 0))
+      return false;
+   const unsigned block_size = util_format_get_blocksize(surface->format);
+   const unsigned samples = MAX2(1, surface->texture->nr_storage_samples ?
+                                   surface->texture->nr_storage_samples :
+                                   surface->texture->nr_samples);
+   const unsigned level = surface->level;
+   const size_t stride = resource->level_strides[level];
+   const size_t layer_stride = resource->level_layer_strides[level];
+   const size_t offset = resource->level_offsets[level];
+   return block_size == util_format_get_blocksize(surface->texture->format) &&
+          samples <= SIZE_MAX / block_size && offset <= resource->size &&
+          level_width <= stride / ((size_t)samples * block_size) &&
+          level_height <= layer_stride / stride &&
+          surface->last_layer < (resource->size - offset) / layer_stride;
 }
 
 static bool
@@ -653,15 +656,14 @@ pvrgpu_clear(struct pipe_context *pipe,
 {
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
 
-   const bool clear_color = (buffers & PIPE_CLEAR_COLOR0) != 0;
+   const bool clear_color = (buffers & PIPE_CLEAR_COLOR) != 0;
    const bool clear_depth = (buffers & PIPE_CLEAR_DEPTH) != 0;
-   const bool clear_stencil = (buffers & PIPE_CLEAR_STENCIL) != 0;
+   const bool clear_stencil = (buffers & PIPE_CLEAR_STENCIL) != 0 &&
+                              stencil_clear_mask != 0;
    const unsigned supported_buffers =
-      PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL;
-   /* Gallium packs four colormask bits per draw buffer; only cbuf0 is lowered. */
-   const unsigned colormask = color_clear_mask & PIPE_MASK_RGBA;
+      PIPE_CLEAR_COLOR | PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL;
    if ((buffers & ~supported_buffers) != 0 ||
-       (!clear_color && !clear_depth && !clear_stencil)) {
+       (buffers & supported_buffers) == 0) {
       debug_printf("pvrgpu: unsupported clear flags; fail closed\n");
       if (clear_depth)
          pvrgpu_invalidate_full_depth_clear(ctx);
@@ -690,39 +692,56 @@ pvrgpu_clear(struct pipe_context *pipe,
    const bool full_surface_rect = rect_x == 0 && rect_y == 0 &&
                                   rect_width == ctx->framebuffer.width &&
                                   rect_height == ctx->framebuffer.height;
+   bool color_write = false;
 
-   if (clear_color &&
-       (!color || !pvrgpu_color_cbuf_bound(&ctx->framebuffer))) {
-      debug_printf("pvrgpu: unsupported clear target; fail closed\n");
-      if (clear_depth)
-         pvrgpu_invalidate_full_depth_clear(ctx);
-      return;
+   /* Validate every selected target and both depth/stencil aspects before
+    * storing anything. One bad MRT must not leave a partially cleared FBO. */
+   for (unsigned target = 0; target < PIPE_MAX_COLOR_BUFS; ++target) {
+      if (!(buffers & (PIPE_CLEAR_COLOR0 << target)) ||
+          !((color_clear_mask >> (target * 4)) & PIPE_MASK_RGBA))
+         continue;
+      color_write = true;
+      if (!color || target >= ctx->framebuffer.nr_cbufs ||
+          !pvrgpu_color_surface_rect_supported(&ctx->framebuffer.cbufs[target],
+                                               rect_x, rect_y, rect_width, rect_height)) {
+         pvrgpu_counter_eventf("clear_error", "reason=color_target target=%u", target);
+         ++ctx->query_statistics_failures;
+         if (clear_depth)
+            pvrgpu_invalidate_full_depth_clear(ctx);
+         return;
+      }
    }
-   if (clear_color &&
-       !pvrgpu_color_surface_rect_supported(&ctx->framebuffer.cbufs[0],
+   const struct util_format_pack_description *depth_pack =
+      clear_depth || clear_stencil ?
+         util_format_pack_description(ctx->framebuffer.zsbuf.format) : NULL;
+   if ((clear_depth || clear_stencil) &&
+       (!pvrgpu_depth_surface_rect_supported(&ctx->framebuffer.zsbuf,
                                             rect_x,
                                             rect_y,
                                             rect_width,
-                                            rect_height)) {
-      debug_printf("pvrgpu: unsupported clear surface rect; fail closed\n");
-      if (clear_depth)
-         pvrgpu_invalidate_full_depth_clear(ctx);
-      return;
-   }
-   if (clear_depth &&
-       !pvrgpu_depth_surface_rect_supported(&ctx->framebuffer.zsbuf,
-                                            rect_x,
-                                            rect_y,
-                                            rect_width,
-                                            rect_height)) {
+                                            rect_height) ||
+        !depth_pack || (clear_depth && (!isfinite(depth) || !depth_pack->pack_z_float)) ||
+        (clear_stencil && !depth_pack->pack_s_8uint))) {
       debug_printf("pvrgpu: unsupported clear depth target; fail closed\n");
+      pvrgpu_counter_event("clear_error", "reason=depth_stencil_target");
+      ++ctx->query_statistics_failures;
       pvrgpu_invalidate_full_depth_clear(ctx);
       return;
    }
    /* Preserve submitted draw output before a CPU clear changes its backing.
     * Pending generic draws retain their ordered depth/stencil clear stream. */
-   if (clear_color || clear_depth || clear_stencil)
-      pvrgpu_flush_current_color_attachments(pipe);
+   const uint64_t failures_before_flush = ctx->query_statistics_failures;
+   pvrgpu_flush_current_color_attachments(pipe);
+   if (ctx->query_statistics_failures != failures_before_flush ||
+       (color_write && (ctx->array_primitive_draw_count ||
+                        ctx->color_readback_pending_mask))) {
+      pvrgpu_counter_event("clear_error", "reason=preceding_graphics_incomplete");
+      if (ctx->query_statistics_failures == failures_before_flush)
+         ++ctx->query_statistics_failures;
+      if (clear_depth)
+         pvrgpu_invalidate_full_depth_clear(ctx);
+      return;
+   }
    const bool depth_backing_written =
       !clear_depth ||
       pvrgpu_fill_surface_rect_with_clear_depth(&ctx->framebuffer.zsbuf,
@@ -746,7 +765,7 @@ pvrgpu_clear(struct pipe_context *pipe,
                                                         rect_height,
                                                         stencil,
                                                         stencil_clear_mask);
-      if (full_surface_rect)
+      if (full_surface_rect && stencil_clear_mask == 0xff)
          ctx->stencil_clear_value = stencil & 0xffu;
       pvrgpu_counter_eventf("clear_stencil",
                             "res=%p x=%u y=%u width=%u height=%u format=%s "
@@ -834,16 +853,22 @@ pvrgpu_clear(struct pipe_context *pipe,
 
    if (!clear_color)
       return;
+   for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs &&
+                             target < PIPE_MAX_COLOR_BUFS; ++target) {
+   if (!(buffers & (PIPE_CLEAR_COLOR0 << target)))
+      continue;
+   const unsigned colormask = (color_clear_mask >> (target * 4)) & PIPE_MASK_RGBA;
+   struct pipe_surface *surface = &ctx->framebuffer.cbufs[target];
    if (colormask == 0) {
       pvrgpu_counter_eventf("clear_color_masked_out",
                             "res=%p width=%u height=%u",
-                            (void *)ctx->framebuffer.cbufs[0].texture,
+                            (void *)surface->texture,
                             rect_width,
                             rect_height);
-      return;
+      continue;
    }
 
-   pvrgpu_fill_surface_rect_with_clear_color(&ctx->framebuffer.cbufs[0],
+   pvrgpu_fill_surface_rect_with_clear_color(surface,
                                              rect_x,
                                              rect_y,
                                              rect_width,
@@ -860,7 +885,7 @@ pvrgpu_clear(struct pipe_context *pipe,
     * requested colour for either; only a partial (masked) RGBA clear leaves a
     * colour the single sequence clear cannot reproduce.
     */
-   if (colormask == PIPE_MASK_RGBA) {
+   if (target == 0 && colormask == PIPE_MASK_RGBA) {
       for (unsigned channel = 0; channel < 4; ++channel) {
          const float value = color->f[channel];
          memcpy(&ctx->color_clear_bits[channel], &value,
@@ -875,28 +900,27 @@ pvrgpu_clear(struct pipe_context *pipe,
     * those, its framebuffer must not be copied back over them.
     */
    {
-      struct pvrgpu_resource *cbuf0 =
-         pvrgpu_resource(ctx->framebuffer.cbufs[0].texture);
-      if (cbuf0) {
-         cbuf0->driver_writes_model_cannot_reproduce =
-            !full_surface_rect || colormask != PIPE_MASK_RGBA ||
-            !pvrgpu_can_lower_clear_color_format(ctx->framebuffer.cbufs[0].format) ||
-            ctx->framebuffer.cbufs[0].texture->nr_samples > 1;
-      }
+      pvrgpu_resource(surface->texture)->driver_writes_model_cannot_reproduce =
+         ctx->framebuffer.nr_cbufs != 1 ||
+         !full_surface_rect || colormask != PIPE_MASK_RGBA ||
+         !pvrgpu_can_lower_clear_color_format(surface->format) ||
+         MAX2(surface->texture->nr_samples, surface->texture->nr_storage_samples) > 1 ||
+         surface->first_layer != surface->last_layer;
    }
    pvrgpu_counter_eventf("clear_color",
-                         "res=%p x=%u y=%u width=%u height=%u format=%s "
+                         "target=%u res=%p x=%u y=%u width=%u height=%u format=%s "
                          "level=%u layers=%u-%u colormask=0x%x scissored=%u "
                          "rgba=%u,%u,%u,%u floats=%f,%f,%f,%f",
-                         (void *)ctx->framebuffer.cbufs[0].texture,
+                         target,
+                         (void *)surface->texture,
                          rect_x,
                          rect_y,
                          rect_width,
                          rect_height,
-                         util_format_name(ctx->framebuffer.cbufs[0].format),
-                         ctx->framebuffer.cbufs[0].level,
-                         ctx->framebuffer.cbufs[0].first_layer,
-                         ctx->framebuffer.cbufs[0].last_layer,
+                         util_format_name(surface->format),
+                         surface->level,
+                         surface->first_layer,
+                         surface->last_layer,
                          colormask,
                          full_surface_rect ? 0 : 1,
                          pvrgpu_float_to_unorm8(color->f[0]),
@@ -907,6 +931,14 @@ pvrgpu_clear(struct pipe_context *pipe,
                          color->f[1],
                          color->f[2],
                          color->f[3]);
+   }
+   /* The legacy capsule describes exactly one target. MRT clears remain
+    * authoritative native backing until the next draw's all-target LOAD. */
+   if (ctx->framebuffer.nr_cbufs != 1 || !(buffers & PIPE_CLEAR_COLOR0))
+      return;
+   const unsigned colormask = color_clear_mask & PIPE_MASK_RGBA;
+   if (!colormask)
+      return;
    if (pvrgpu_case_reserves_native_pco_sequence() ||
        ctx->driver_draw_command_emitted ||
        pvrgpu_driver_draw_command_has_been_emitted())
@@ -915,7 +947,9 @@ pvrgpu_clear(struct pipe_context *pipe,
     * formats have already been cleared exactly in native resource storage;
     * a later draw imports that storage as its initial attachment. */
    if (!pvrgpu_can_lower_clear_color_format(ctx->framebuffer.cbufs[0].format) ||
-       ctx->framebuffer.cbufs[0].texture->nr_samples > 1)
+       MAX2(ctx->framebuffer.cbufs[0].texture->nr_samples,
+            ctx->framebuffer.cbufs[0].texture->nr_storage_samples) > 1 ||
+       ctx->framebuffer.cbufs[0].first_layer != ctx->framebuffer.cbufs[0].last_layer)
       return;
    if (full_surface_rect && colormask == PIPE_MASK_RGBA) {
       pvrgpu_emit_clear_color_command(ctx->framebuffer.width,

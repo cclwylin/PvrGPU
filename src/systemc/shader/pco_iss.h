@@ -258,6 +258,11 @@ enum class PcoOpcode : std::uint8_t {
   kUvsCut,
   kUvsEmitCut,
   kUvsEndTask,
+  // Native backend SAVMSK.VM writes the invocation's covered sample bits.
+  kSaveVisibilityMask,
+  kAlphaFeedback,
+  // Native FITR evaluates a coefficient plane without a perspective-W source.
+  kFloatInterpolate,
 };
 
 inline bool IsPcoAtomic32(PcoOpcode opcode) {
@@ -306,6 +311,9 @@ struct PcoInstructionCounts {
   std::uint64_t texture = 0;
   std::uint64_t memory = 0;
 };
+// Accounting counts issued native groups (including encoded repeats), not
+// internal ALU phases or result DWORDs. This is also the execution gate.
+inline constexpr std::uint8_t kPcoMaximumCountedGroupRepeat = 4;
 
 /*
  * A canonical, serializable instruction produced from a real PCO group.
@@ -377,6 +385,8 @@ struct PcoInstruction {
   // unsigned multiply/shift that only happens to work for small positive IDs.
   std::uint8_t integer_signed = 0;
   std::uint16_t branch_target_index = 0;
+  // FDSXF/FDSYF select row/column-local rather than coarse quad differences.
+  std::uint8_t derivative_fine = 0;
   std::uint32_t loop_count = 0;
   // Raw binary32/integer payload for compiler-emitted immediate groups.
   std::uint32_t immediate = 0;
@@ -399,6 +409,8 @@ struct PcoInstruction {
   // SNO appends a lookup DWORD; bits 18:16 name one sample, never a resolve.
   std::uint8_t texture_non_normalized_coords = 0;
   std::uint8_t texture_sample_index_present = 0;
+  // SMP.SOO appends signed texel offsets in the shared lookup DWORD.
+  std::uint8_t texture_spatial_offset_present = 0;
   // SMP LODM=REPLACE/PPLod carries one float LOD before optional TAO.
   std::uint8_t texture_lod_replace = 0;
   std::uint8_t data_request = 0;
@@ -489,7 +501,7 @@ struct PcoInstruction {
   std::uint8_t memory_cache_mode = 0;
 };
 
-// The standalone signed flag belongs only to native task IMADD64High and
+// The standalone signed flag belongs only to native IMADD64High and
 // SHR/ASR_TWB. Other signed integer ALU forms carry their existing, distinct
 // phase metadata. Validate before opcode-specific early-return branches.
 inline bool HasCanonicalNativeIntegerSignedness(const PcoInstruction &i) {
@@ -499,8 +511,15 @@ inline bool HasCanonicalNativeIntegerSignedness(const PcoInstruction &i) {
         i.opcode == PcoOpcode::kShiftRight));
 }
 inline bool HasCanonicalTextureLodMode(const PcoInstruction &i) {
-  return i.texture_lod_replace == 0 ||
-      (i.texture_lod_replace == 1 && i.opcode == PcoOpcode::kTextureSample);
+  return (i.texture_lod_replace == 0 ||
+          (i.texture_lod_replace == 1 && i.opcode == PcoOpcode::kTextureSample)) &&
+         (i.texture_spatial_offset_present == 0 ||
+          (i.texture_spatial_offset_present == 1 && i.opcode == PcoOpcode::kTextureSample));
+}
+inline bool HasCanonicalDerivativeMode(const PcoInstruction &i) {
+  return i.derivative_fine == 0 ||
+      (i.derivative_fine == 1 &&
+       (i.opcode == PcoOpcode::kDerivativeX || i.opcode == PcoOpcode::kDerivativeY));
 }
 
 /* Stored directly in PipelineState; no owning container appears here. */
@@ -516,6 +535,7 @@ struct PcoProgramSummary {
   std::uint16_t pixel_output_mask = 0;
   std::uint8_t early_hsr_safe = 0;
   std::uint8_t writes_depth = 0;
+  std::uint8_t uses_derivatives = 0;
   std::uint8_t ends_task = 0;
 };
 
@@ -533,6 +553,7 @@ struct PcoDecodedProgram {
 struct PcoTextureRequest {
   // Float coordinates: normalized normally, or texel-space with NNCOORDS.
   std::array<std::uint32_t, 3> coordinates{};
+  std::array<std::int32_t, 3> spatial_offsets{};
   std::array<std::uint32_t, 4> texture_state{};
   std::array<std::uint32_t, 4> sampler_state{};
   // The `.tao` sample's shader-computed 64-bit texture base address.
@@ -595,6 +616,9 @@ struct PcoVertexExecution {
 using PcoMemoryReadCallback = void (*)(void *user_data, std::uint64_t address,
                                       std::uint32_t dword_count,
                                       std::uint32_t *destination);
+using PcoMemoryAtomic32Callback = std::uint32_t (*)(
+    void *user_data, PcoOpcode operation, std::uint64_t address,
+    std::uint32_t operand);
 
 /* Lane-local shared-register input supplied by the PDS/USC ABI. The explicit
  * shared_count keeps every access outside the producer-declared transport
@@ -621,13 +645,30 @@ struct PcoFragmentContinuation {
   PcoTemporaryMask temporary_written_mask{};
   std::uint32_t program_binary_size = 0;
   std::uint32_t program_instruction_count = 0;
+  std::uint64_t program_signature = 0;
   std::uint16_t resume_instruction_index = 0;
   std::uint16_t pending_output_index = 0;
   std::uint8_t pending_component_count = 0;
   std::uint8_t data_request = 0;
   std::uint8_t valid = 0;
+  // Zero is the original SMP/WDF checkpoint; one is a quad derivative.
+  std::uint8_t kind = 0;
+  std::array<std::uint32_t, kPcoPixelOutputCount> pixel_outputs{};
+  std::uint16_t written_mask = 0;
   std::uint32_t depth = 0;
   std::uint8_t depth_written = 0;
+  std::uint8_t predicate = 0;
+  std::uint8_t predicate_valid = 0;
+  std::uint8_t discarded = 0;
+  struct LoopState {
+    std::uint32_t start_pc = 0;
+    std::uint32_t count = 0;
+  };
+  std::array<LoopState, 32> loops{};
+  std::uint8_t loop_depth = 0;
+  std::uint8_t execution_predicate = 1;
+  std::uint64_t native_steps = 0;
+  PcoInstructionCounts executed_instructions{};
 };
 
 struct PcoFragmentExecution {
@@ -635,8 +676,14 @@ struct PcoFragmentExecution {
   PcoTextureRequest texture_request{};
   PcoFragmentContinuation continuation{};
   std::uint32_t executed_instruction_count = 0;
+  // Cumulative native visits and selected opcode issues, including earlier
+  // SMP/derivative segments. The legacy count above remains segment-local.
+  std::uint64_t native_steps = 0;
+  PcoInstructionCounts executed_instructions{};
   std::uint16_t written_mask = 0;
   std::uint8_t texture_request_valid = 0;
+  std::uint32_t derivative_source = 0;
+  std::uint8_t derivative_request_valid = 0;
   std::uint8_t suspended = 0;
   bool discarded = false;
   std::uint32_t depth = 0;
@@ -661,18 +708,41 @@ struct PcoFragmentExecutionContext {
       coefficients{};
   std::uint32_t sample_x = 0;
   std::uint32_t sample_y = 0;
+  // PIXEL coefficient coordinates above never change under sample shading.
+  // These separate SAMPLE coordinates use the same coefficient-plane origin.
+  std::uint32_t sample_position_x = 0;
+  std::uint32_t sample_position_y = 0;
+  std::uint8_t sample_position_valid = 0;
+  std::uint32_t sample_id = 0;
+  std::uint32_t coverage_mask = 1;
   std::uint32_t special_coordinate_offset = 0;
-  // CENTROID equals PIXEL only for a single-sample raster surface.
+  // CENTROID has a separate, coverage-selected position on MSAA surfaces.
   std::uint32_t raster_sample_count = 1;
+  std::uint32_t centroid_x = 0;
+  std::uint32_t centroid_y = 0;
+  std::uint8_t centroid_position_valid = 0;
   std::array<std::uint32_t, kPcoMaximumSharedCount> shared_registers{};
   std::array<std::uint32_t, kPcoTextureResponseCount> texture_response{};
   PcoFragmentContinuation continuation{};
   std::uint8_t coefficient_count = 0;
   std::uint16_t shared_count = 0;
   std::uint8_t texture_response_valid = 0;
+  std::uint32_t derivative_response = 0;
+  std::uint8_t derivative_response_valid = 0;
   PcoMemoryReadCallback memory_read = nullptr;
   void *memory_user_data = nullptr;
+  PcoMemoryAtomic32Callback memory_atomic32 = nullptr;
+  void *image_memory_user_data = nullptr;
+  // Raster/helper scheduling supplies this flag. No pointer is persisted in
+  // the continuation; every resumed invocation receives its current adapter.
+  std::uint8_t memory_side_effects_enabled = 1;
 };
+
+// Native FDSX/FDSY quad exchange, after lane-local source modifiers. The
+// scheduler must provide all four lanes from one quad at the same native PC.
+std::array<std::uint32_t, 4> EvaluatePcoDerivativeQuad(
+    const PcoInstruction &instruction,
+    const std::array<std::uint32_t, 4> &sources);
 
 /* Immutable raw PCO binaries generated by the identified public Mesa backend.
  */
@@ -761,6 +831,37 @@ PcoFragmentExecution ExecuteFragmentPco(
 PcoFragmentExecution ResumeFragmentPco(
     const PcoProgramSummary &summary,
     const std::vector<PcoInstruction> &instructions,
+    const PcoFragmentContinuation &continuation,
+    const std::array<std::uint32_t, kPcoTextureResponseCount> &texture_response);
+
+// Host-side, draw-owned immutable program. This is deliberately NOT a FIFO or
+// MemoryPool payload. Construction copies and fully validates the caller's
+// decoded program; no public API accepts a caller-provided trusted signature.
+// Per-lane context, continuation and sampler/derivative response checks still
+// execute on every invocation. The vector-based API retains full revalidation.
+class PcoPreparedFragmentProgram final {
+ public:
+  PcoPreparedFragmentProgram(const PcoProgramSummary &summary,
+                            const std::vector<PcoInstruction> &instructions);
+  PcoPreparedFragmentProgram(const PcoPreparedFragmentProgram &) = delete;
+  PcoPreparedFragmentProgram &operator=(const PcoPreparedFragmentProgram &) = delete;
+  PcoPreparedFragmentProgram(PcoPreparedFragmentProgram &&) = delete;
+  PcoPreparedFragmentProgram &operator=(PcoPreparedFragmentProgram &&) = delete;
+
+ private:
+  const PcoProgramSummary summary_;
+  const std::vector<PcoInstruction> instructions_;
+  const bool texture_program_;
+  const std::uint64_t program_signature_;
+  friend PcoFragmentExecution ExecuteFragmentPco(
+      const PcoPreparedFragmentProgram &, const PcoFragmentExecutionContext &);
+};
+
+PcoFragmentExecution ExecuteFragmentPco(
+    const PcoPreparedFragmentProgram &program,
+    const PcoFragmentExecutionContext &context = {});
+PcoFragmentExecution ResumeFragmentPco(
+    const PcoPreparedFragmentProgram &program,
     const PcoFragmentContinuation &continuation,
     const std::array<std::uint32_t, kPcoTextureResponseCount> &texture_response);
 

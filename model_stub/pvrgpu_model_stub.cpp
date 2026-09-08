@@ -716,6 +716,8 @@ private:
       "compute_memory_responses", ModelFifoDepth()};
   ComputeDataMaster compute_data_master{"compute_data_master", pool, memory};
   ComputeShader compute_shader{"compute_shader", pool};
+  sc_core::sc_fifo<PipelineTxn> compute_texture_requests{"compute_texture_requests", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> compute_texture_responses{"compute_texture_responses", ModelFifoDepth()};
   std::uint64_t compute_sequence_ = 0;
 
   // MMU/fabric modules remain structural placeholders. MCU, TCU and USC-L2
@@ -843,6 +845,10 @@ ModelSession::ModelSession(MemoryMode memory_mode, bool cache_bypass)
   compute_shader.output(compute_workgroups_done);
   compute_shader.memory_request_output(compute_memory_requests);
   compute_shader.memory_response_input(compute_memory_responses);
+  compute_shader.texture_request_output(compute_texture_requests);
+  compute_shader.texture_response_input(compute_texture_responses);
+  texture_unit.compute_sample_input(compute_texture_requests);
+  texture_unit.compute_sample_output(compute_texture_responses);
   mixed_cache.input(idle_mcu_input);
   mixed_cache.output(idle_mcu_output);
   texture_cache.input(idle_tcu_input);
@@ -966,6 +972,7 @@ int ModelSession::Run(const Options &options, ModelFramebuffer *framebuffer,
   if (framebuffer) {
     framebuffer->graphics_stats = job.graphics_stats;
     framebuffer->stream_outputs = job.stream_outputs;
+    framebuffer->shader_images = job.shader_images;
     framebuffer->pixels = job.framebuffer;
     framebuffer->extra = job.extra_framebuffers;
     framebuffer->width = job.framebuffer_width;
@@ -1008,7 +1015,14 @@ int ModelSession::RunCompute(ModelComputeDispatch *dispatch,
   owned.reserve(4);
   bool submitted = false;
   bool completed = false;
+  PoolHandle texture_state_handle;
   const auto release = [&]() {
+    if (HasPoolHandle(texture_state_handle)) {
+      const auto texture_state = LoadPipelineState(pool, texture_state_handle);
+      if (HasPoolHandle(texture_state.texture_sample_requests)) pool.Release(texture_state.texture_sample_requests);
+      if (HasPoolHandle(texture_state.texture_sample_responses)) pool.Release(texture_state.texture_sample_responses);
+      texture_state_handle = {};
+    }
     for (auto it = owned.rbegin(); it != owned.rend(); ++it)
       pool.Release(*it);
     owned.clear();
@@ -1033,6 +1047,12 @@ int ModelSession::RunCompute(ModelComputeDispatch *dispatch,
         memory.HostWrite(address(index), bytes.data(), bytes.size());
     }
     std::vector<std::uint32_t> shared(dispatch->abi.stage.shareds, 0U);
+    if (dispatch->textures.size() != dispatch->abi.sampled_texture_count ||
+        dispatch->texture_resources.size() != dispatch->textures.size() ||
+        dispatch->texture_words.size() != 20U * dispatch->textures.size() ||
+        dispatch->texture_words.size() > shared.size())
+      throw std::runtime_error("compute texture descriptor/captured payload count mismatch");
+    std::copy(dispatch->texture_words.begin(), dispatch->texture_words.end(), shared.begin());
     const auto push_start = dispatch->abi.stage.push_constant_start;
     if (push_start > shared.size() ||
         dispatch->push_words.size() > shared.size() - push_start)
@@ -1060,17 +1080,25 @@ int ModelSession::RunCompute(ModelComputeDispatch *dispatch,
                          binding.slot, binding.kind});
     }
     for (const auto &binding : dispatch->images) {
+      const auto layer_stride = binding.layer_stride_bytes ? binding.layer_stride_bytes
+          : static_cast<std::uint64_t>(binding.height) * binding.row_stride_bytes;
       if (binding.resource_index >= dispatch->resources.size() ||
-          binding.slot >= dispatch->abi.image_descriptor_count || binding.format != 1 ||
-          !binding.width || !binding.height || binding.width > UINT32_MAX / 4U ||
-          binding.row_stride_bytes < binding.width * 4U ||
+          binding.slot >= dispatch->abi.image_descriptor_count ||
+          (binding.format != 1 && binding.format != 2) ||
+          (binding.texel_bytes != 4 && binding.texel_bytes != 8 && binding.texel_bytes != 16) ||
+          !binding.width || !binding.height || !binding.depth ||
+          binding.width > UINT32_MAX / binding.texel_bytes ||
+          binding.row_stride_bytes < binding.width * binding.texel_bytes ||
+          layer_stride > UINT32_MAX || (layer_stride & 3U) ||
           (binding.row_stride_bytes & 3U) || (binding.offset & 3U) || (binding.access & ~3U))
         return fail("compute image binding is invalid");
       const auto bytes = dispatch->resources[binding.resource_index].bytes.size();
-      const std::uint64_t footprint = static_cast<std::uint64_t>(binding.height - 1U) *
-          binding.row_stride_bytes + binding.width * 4U;
+      const std::uint64_t row_extent = static_cast<std::uint64_t>(binding.height - 1U) *
+          binding.row_stride_bytes + binding.width * binding.texel_bytes;
+      const std::uint64_t footprint = static_cast<std::uint64_t>(binding.depth - 1U) *
+          layer_stride + row_extent;
       if (binding.offset > bytes || binding.bytes_size > bytes - binding.offset ||
-          binding.bytes_size > UINT32_MAX || footprint > binding.bytes_size)
+          binding.bytes_size > UINT32_MAX || row_extent > layer_stride || footprint > binding.bytes_size)
         return fail("compute image exceeds its backing resource");
       const auto base = address(binding.resource_index) + binding.offset;
       const auto descriptor = dispatch->abi.image_descriptor_start + 8U * binding.slot;
@@ -1078,12 +1106,12 @@ int ModelSession::RunCompute(ModelComputeDispatch *dispatch,
         return fail("compute image descriptor exceeds shared registers");
       shared[descriptor] = static_cast<std::uint32_t>(base);
       shared[descriptor + 1U] = static_cast<std::uint32_t>(base >> 32U);
-      shared[descriptor + 2U] = static_cast<std::uint32_t>(binding.bytes_size);
-      shared[descriptor + 3U] = 0;
+      shared[descriptor + 2U] = binding.depth;
+      shared[descriptor + 3U] = static_cast<std::uint32_t>(layer_stride);
       shared[descriptor + 4U] = binding.width;
       shared[descriptor + 5U] = binding.height;
       shared[descriptor + 6U] = binding.row_stride_bytes;
-      shared[descriptor + 7U] = binding.format;
+      shared[descriptor + 7U] = binding.texel_bytes;
       ranges.push_back({base, binding.bytes_size, binding.access, binding.slot, 3});
     }
     ComputeDispatchState state;
@@ -1095,6 +1123,55 @@ int ModelSession::RunCompute(ModelComputeDispatch *dispatch,
                                           shared.size() * sizeof(shared[0]));
     state.buffer_ranges = store_bytes(ranges.data(),
                                        ranges.size() * sizeof(ranges[0]));
+    if (!dispatch->textures.empty()) {
+      std::vector<TextureResource> textures = dispatch->texture_resources;
+      std::vector<SamplerState> samplers(textures.size());
+      for (std::size_t slot = 0; slot < textures.size(); ++slot) {
+        const auto &captured = dispatch->textures[slot];
+        auto &resource = textures[slot];
+        // Rogue image descriptors encode forty-bit addresses. This disjoint
+        // aperture is never a graphics attachment or compute buffer slot.
+        const std::uint64_t gpu_address = UINT64_C(0x3000000000) + slot * kComputeResourceStride;
+        if (captured.bytes.empty() || captured.bytes.size() != resource.byte_size ||
+            resource.byte_size > kComputeResourceStride || resource.descriptor_set != slot)
+          throw std::runtime_error("compute texture payload exceeds its GPU aperture");
+        memory.HostWrite(gpu_address, captured.bytes.data(), captured.bytes.size());
+        resource.gpu_address = gpu_address;
+        const auto base = 20U * slot;
+        std::uint64_t word1 = shared[base + 2] | (static_cast<std::uint64_t>(shared[base + 3]) << 32U);
+        constexpr auto address_mask = ((UINT64_C(1) << 38U) - 1U) << 16U;
+        if (word1 & address_mask) throw std::runtime_error("compute texture descriptor address is not relocation-free");
+        word1 |= (gpu_address >> 2U) << 16U;
+        shared[base + 2] = static_cast<std::uint32_t>(word1);
+        shared[base + 3] = static_cast<std::uint32_t>(word1 >> 32U);
+        auto &sampler = samplers[slot];
+        sampler.min_filter = static_cast<TextureFilter>(captured.min_filter);
+        sampler.mag_filter = static_cast<TextureFilter>(captured.mag_filter);
+        sampler.mip_filter = static_cast<TextureFilter>(captured.mip_filter);
+        const auto wrap = [](std::uint32_t mode) {
+          return mode == 1 ? TextureWrapMode::kRepeat : mode == 2 ? TextureWrapMode::kMirroredRepeat : TextureWrapMode::kClampToEdge;
+        };
+        sampler.wrap_u = wrap(captured.wrap_u);
+        sampler.wrap_v = wrap(captured.wrap_v);
+        sampler.min_lod_u4_6 = captured.min_lod_u4_6;
+        sampler.max_lod_u4_6 = captured.max_lod_u4_6;
+        sampler.normalized_coordinates = captured.normalized_coordinates;
+        sampler.descriptor_set = slot;
+      }
+      // The private state is only a TPU request/resource rendezvous. It has
+      // no graphics command, framebuffer, VS/FS code or graphics invocations.
+      PipelineState texture_state;
+      texture_state.memory_mode = dispatch->memory_mode;
+      texture_state.compute_pco_abi = dispatch->abi.stage;
+      texture_state.compute_sampled_texture_count = textures.size();
+      texture_state.compute_texture_resources = store_bytes(textures.data(), textures.size() * sizeof(textures[0]));
+      texture_state.compute_sampler_states = store_bytes(samplers.data(), samplers.size() * sizeof(samplers[0]));
+      texture_state.compute_shared_registers = state.shared_registers;
+      auto &shared_bytes = pool.Write(state.shared_registers);
+      std::memcpy(shared_bytes.data(), shared.data(), shared_bytes.size());
+      texture_state_handle = store_bytes(&texture_state, sizeof(texture_state));
+      state.texture_state = texture_state_handle;
+    }
     const auto state_handle = store_bytes(&state, sizeof(state));
     const ComputeDispatchTxn request{state_handle, state.sequence};
     if (!compute_submit.nb_write(request))
@@ -1115,6 +1192,15 @@ int ModelSession::RunCompute(ModelComputeDispatch *dispatch,
       throw std::runtime_error("compute completion state has an invalid size");
     std::memcpy(&state, state_bytes.data(), sizeof(state));
     *stats = state.stats;
+    if (HasPoolHandle(texture_state_handle)) {
+      const auto texture_state = LoadPipelineState(pool, texture_state_handle);
+      stats->dram_read_bytes += texture_state.counters.dram_read_bytes;
+      stats->dram_write_bytes += texture_state.counters.dram_write_bytes;
+      stats->direct_read_bytes += texture_state.compute_texture_direct_read_bytes;
+      stats->direct_write_bytes += texture_state.compute_texture_direct_write_bytes;
+      stats->texture_requests = texture_state.counters.texture_requests;
+      stats->texel_fetches = texture_state.counters.texel_fetches;
+    }
     if (state.failed != 0) {
       const std::string diagnostic(state.error.data(),
           std::find(state.error.begin(), state.error.end(), '\0') -

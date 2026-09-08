@@ -28,6 +28,7 @@ function(pvrgpu_target_warnings target)
 endfunction()
 
 add_library(pvrgpu-rdc-runner-support STATIC
+    src/rdc_runner/native_report.cpp
     src/rdc_runner/process.cpp
     src/rdc_runner/runtime_config.cpp
     src/rdc_runner/sha256.cpp
@@ -368,6 +369,10 @@ if(PVRGPU_ENABLE_LIVE_DEQP)
 endif()
 
 enable_testing()
+add_executable(rdc-native-report-test tests/rdc_native_report_test.cpp)
+target_link_libraries(rdc-native-report-test PRIVATE pvrgpu-rdc-runner-support)
+pvrgpu_target_warnings(rdc-native-report-test)
+add_test(NAME rdc-native-report-test COMMAND rdc-native-report-test)
 add_test(NAME llvmpipe-native-cli-help COMMAND llvmpipe --help)
 add_test(NAME pvrgpu-native-cli-help COMMAND pvrgpu --help)
 if(PVRGPU_ENABLE_LIVE_DEQP)
@@ -401,6 +406,16 @@ target_include_directories(pco-iss-test PRIVATE
 )
 pvrgpu_target_warnings(pco-iss-test)
 add_test(NAME pco-iss-unit COMMAND pco-iss-test)
+
+add_executable(pco-prepared-fragment-test
+    tests/pco_prepared_fragment_test.cpp
+    src/systemc/shader/pco_iss.cpp
+)
+target_include_directories(pco-prepared-fragment-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(pco-prepared-fragment-test)
+add_test(NAME pco-prepared-fragment-unit COMMAND pco-prepared-fragment-test)
 
 add_executable(pco-multisample-texture-test
     tests/pco_multisample_texture_test.cpp
@@ -530,6 +545,17 @@ pvrgpu_target_warnings(stream-output-api-test)
 foreach(stream_output_mode IN ITEMS direct bypass cache)
     add_test(NAME stream-output-api-${stream_output_mode}-unit
         COMMAND stream-output-api-test ${stream_output_mode})
+endforeach()
+
+add_executable(fragment-image-api-test tests/fragment_image_api_test.cpp)
+target_include_directories(fragment-image-api-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc" "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu")
+target_link_libraries(fragment-image-api-test PRIVATE pvrgpu-systemc-bridge PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(fragment-image-api-test)
+foreach(fragment_image_mode IN ITEMS direct bypass cache)
+    add_test(NAME fragment-image-api-${fragment_image_mode}-unit
+        COMMAND fragment-image-api-test ${fragment_image_mode})
 endforeach()
 
 add_executable(pco-decoder-boundary-test tests/pco_decoder_boundary_test.cpp)
@@ -749,6 +775,30 @@ foreach(compute_memory_mode RANGE 0 2)
         COMMAND compute-shared-fifo-test ${compute_memory_mode})
 endforeach()
 
+add_executable(compute-texture-fifo-test
+    tests/compute_texture_fifo_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/common/glbench_texture_fixture.cpp
+    src/systemc/data_master/compute_data_master.cpp
+    src/systemc/shader/compute_shader.cpp
+    src/systemc/shader/compute_iss.cpp
+    src/systemc/shader/pco_iss.cpp
+    src/systemc/texture/texture_unit.cpp
+    src/systemc/texture/texture_filter.cpp
+    src/systemc/texture/astc_decoder.cpp)
+target_include_directories(compute-texture-fifo-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc")
+target_link_libraries(compute-texture-fifo-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(compute-texture-fifo-test)
+foreach(compute_memory_mode RANGE 0 2)
+    add_test(NAME compute-texture-fifo-mode-${compute_memory_mode}
+        COMMAND compute-texture-fifo-test ${compute_memory_mode})
+endforeach()
+
 add_executable(compute-image-api-test tests/compute_image_api_test.cpp)
 target_include_directories(compute-image-api-test PRIVATE
     "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
@@ -837,6 +887,22 @@ target_include_directories(gpu-memory-system-test PRIVATE
 pvrgpu_target_warnings(gpu-memory-system-test)
 add_test(NAME gpu-memory-system-unit COMMAND gpu-memory-system-test)
 
+add_executable(dram-address-space-contains-test
+    tests/dram_address_space_contains_test.cpp
+)
+target_include_directories(dram-address-space-contains-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(dram-address-space-contains-test)
+add_test(NAME dram-address-space-contains-unit COMMAND dram-address-space-contains-test)
+
+add_executable(cache-write-allocation-test
+    tests/cache_write_allocation_test.cpp)
+target_include_directories(cache-write-allocation-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/systemc" "${CMAKE_SOURCE_DIR}/model_stub")
+pvrgpu_target_warnings(cache-write-allocation-test)
+add_test(NAME cache-write-allocation-unit COMMAND cache-write-allocation-test)
+
 add_executable(cache-controller-test
     tests/cache_controller_test.cpp
     model_stub/memory_pool.cpp
@@ -893,6 +959,37 @@ target_include_directories(texture-multisample-test PRIVATE
 target_link_libraries(texture-multisample-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(texture-multisample-test)
 add_test(NAME texture-multisample-unit COMMAND texture-multisample-test)
+
+add_executable(texture-cube-nonfinite-test
+    tests/texture_cube_nonfinite_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/texture/astc_decoder.cpp
+    src/systemc/texture/texture_filter.cpp
+    src/systemc/texture/texture_unit.cpp
+)
+target_include_directories(texture-cube-nonfinite-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(texture-cube-nonfinite-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(texture-cube-nonfinite-test)
+add_test(NAME texture-cube-nonfinite-unit COMMAND texture-cube-nonfinite-test)
+
+add_executable(centroid-geometry-test tests/centroid_geometry_test.cpp)
+target_include_directories(centroid-geometry-test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/systemc")
+pvrgpu_target_warnings(centroid-geometry-test)
+add_test(NAME centroid-geometry-unit COMMAND centroid-geometry-test)
+
+add_executable(shader-image-payload-test tests/shader_image_payload_test.cpp)
+target_include_directories(shader-image-payload-test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/model_stub")
+pvrgpu_target_warnings(shader-image-payload-test)
+add_test(NAME shader-image-payload-unit COMMAND shader-image-payload-test)
 
 add_executable(astc-decoder-test
     tests/astc_decoder_test.cpp
@@ -974,6 +1071,48 @@ add_test(
     NAME usc-cluster-texture-response-order-fail-closed
     COMMAND usc-cluster-texture-continuation-test response-order
 )
+foreach(field count steps mask)
+    add_test(
+        NAME usc-cluster-texture-continuation-${field}-fail-closed
+        COMMAND usc-cluster-texture-continuation-test continuation-${field}
+    )
+endforeach()
+
+add_executable(usc-fragment-residency-test
+    tests/usc_fragment_residency_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/shader/pco_iss.cpp
+    src/systemc/shader/usc_cluster.cpp
+    src/systemc/texture/astc_decoder.cpp
+    src/systemc/texture/texture_filter.cpp
+    src/systemc/texture/texture_unit.cpp
+)
+target_include_directories(usc-fragment-residency-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(usc-fragment-residency-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(usc-fragment-residency-test)
+add_test(NAME usc-fragment-residency-unit COMMAND usc-fragment-residency-test)
+foreach(residency_invalid_state
+        duplicate-task duplicate-lane missing-lane missing-quad
+        lane-out-of-range task-out-of-range overlapping-mask
+        high-coverage-mask high-helper-mask high-write-mask empty-mask
+        partial-derivative-quad coefficient-offset coefficient-span output-collision
+        program-stage program-bytes program-groups program-instructions
+        program-vertex-input program-vertex-output program-pixel-output
+        program-early-hsr program-depth program-derivatives program-ends-task
+        program-handle-slot program-handle-generation)
+    add_test(NAME usc-fragment-residency-reject-${residency_invalid_state}
+        COMMAND usc-fragment-residency-test ${residency_invalid_state})
+    set_tests_properties(usc-fragment-residency-reject-${residency_invalid_state}
+        PROPERTIES TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "reject ${residency_invalid_state} PASS diagnostic=")
+endforeach()
 
 add_executable(pbe-blend-test
     tests/pbe_blend_test.cpp
@@ -993,6 +1132,28 @@ target_include_directories(pbe-blend-test PRIVATE
 target_link_libraries(pbe-blend-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(pbe-blend-test)
 add_test(NAME pbe-blend-unit COMMAND pbe-blend-test)
+
+add_executable(pbe-nonfinite-output-test
+    tests/pbe_nonfinite_output_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/fragment/pbe.cpp
+    src/systemc/shader/pco_iss.cpp
+)
+target_include_directories(pbe-nonfinite-output-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(pbe-nonfinite-output-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(pbe-nonfinite-output-test)
+add_test(NAME pbe-nonfinite-output-unit COMMAND pbe-nonfinite-output-test)
+foreach(pbe_invalid_state IN ITEMS output-mask load-size identity clear-nan blend-constant-nan)
+    add_test(NAME pbe-nonfinite-reject-${pbe_invalid_state}
+        COMMAND pbe-nonfinite-output-test ${pbe_invalid_state})
+endforeach()
 
 add_executable(pbe-sample-counter-test
     tests/pbe_sample_counter_test.cpp
@@ -1569,6 +1730,11 @@ set_tests_properties(
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+    add_test(NAME rdc-native-runner-process-test
+        COMMAND "${CMAKE_COMMAND}" -E env
+                "PYTHONDONTWRITEBYTECODE=1"
+                "PVRGPU_NATIVE_RUNNER_TEST_BIN=$<TARGET_FILE:pvrgpu>"
+                "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_rdc_native_runner.py")
     add_test(
         NAME systemc-module-layout
         COMMAND "${Python3_EXECUTABLE}"

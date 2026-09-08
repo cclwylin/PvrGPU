@@ -153,7 +153,7 @@ void ValidateSample(const PcoInstruction &i, const DriverPcoStageAbi &abi) {
       (i.texture_dimension != 2 && i.texture_dimension != 3) ||
       i.texture_address_offset > 1 || i.texture_fcnorm > 1 ||
       i.texture_non_normalized_coords > 1 || i.texture_sample_index_present > 1 ||
-      i.texture_lod_replace > 1 ||
+      i.texture_lod_replace > 1 || i.texture_spatial_offset_present != 0 ||
       (i.texture_non_normalized_coords && !i.texture_sample_index_present && !i.texture_lod_replace) ||
       (i.texture_sample_index_present && (!i.texture_non_normalized_coords ||
          i.texture_lod_replace || i.texture_dimension != 2)) ||
@@ -219,6 +219,7 @@ void ValidateGeometryProgram(const PcoDecodedProgram &program,
     Fail("program is not a complete native geometry program");
   bool pending = false, ended = false;
   for (const auto &i : program.instructions) {
+    if (!HasCanonicalDerivativeMode(i)) Fail("derivative mode is not canonical for opcode");
     if (!HasCanonicalTextureLodMode(i)) Fail("texture LOD replacement flag is not canonical for opcode");
     if (!HasCanonicalNativeIntegerSignedness(i))
       Fail("integer signedness flag is not canonical for the native opcode");
@@ -312,6 +313,7 @@ void StepGeometryTask(const PcoDecodedProgram &program,
   if (task.ended || task.instruction_index >= program.instructions.size())
     Fail("task stepped outside its native program");
   const auto &i = program.instructions[task.instruction_index];
+  if (!HasCanonicalDerivativeMode(i)) Fail("derivative mode is not canonical for opcode");
   if (!HasCanonicalTextureLodMode(i)) Fail("texture LOD replacement flag is not canonical for opcode");
   if (!HasCanonicalNativeIntegerSignedness(i))
     Fail("integer signedness flag is not canonical for the native opcode");

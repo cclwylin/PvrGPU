@@ -2,10 +2,11 @@
 # Mechanical capture of real compiler output; no shader results are generated.
 require 'digest'
 abort 'usage: generate_compute_shared_fixtures.rb compiler-artifact-dir output.h [images]' unless (2..3).cover?(ARGV.size)
-abort 'third argument must be images (omit it for shared fixtures)' if ARGV.size == 3 && ARGV[2] != 'images'
+abort 'third argument must be images or textures (omit it for shared fixtures)' if ARGV.size == 3 && !%w[images textures].include?(ARGV[2])
 images = ARGV[2] == 'images'
-first, last = images ? [32, 38] : [24, 30]
-stem = images ? 'ComputeImagePco' : 'ComputeSharedPco'
+textures = ARGV[2] == 'textures'
+first, last = textures ? [300, 303] : images ? [32, 38] : [24, 30]
+stem = textures ? 'ComputeTexturePco' : images ? 'ComputeImagePco' : 'ComputeSharedPco'
 origin = images ? 'actual compute compiler NIR tests' : 'pvrgpu_compute_compiler_test.c'
 lines = ["// Generated from #{origin}, native gx6250 PCO.",
          '#pragma once', '#include "compute_types.h"', '#include <stdexcept>',
@@ -52,6 +53,7 @@ abis.each_with_index do |abi, index|
       lines << "    a.image_#{mode}_mask = #{abi.fetch('image_' + mode)};"
     end
   end
+  lines << '    a.sampled_texture_count = 1;' if textures
   lines << '    break;'
 end
 lines += ['  default: throw std::runtime_error("shared fixture ABI kind");', '  }', '  return a;', '}', '} // namespace pvrgpu::stub']

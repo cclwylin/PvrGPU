@@ -30,7 +30,8 @@ std::uint32_t FloatBits(float value) {
 void RunCase(MemoryPool &pool, sc_core::sc_fifo<PipelineTxn> &input,
              sc_core::sc_fifo<PipelineTxn> &output, std::uint64_t sequence,
              std::uint32_t samples, std::uint32_t targets, bool blend,
-             std::uint8_t color_mask, bool integer, bool empty) {
+             std::uint8_t color_mask, bool integer, bool empty,
+             bool discarded = false) {
   const std::uint32_t valid_mask = RasterSampleMask(samples);
   std::vector<std::uint32_t> coverage;
   if (!empty) {
@@ -53,15 +54,16 @@ void RunCase(MemoryPool &pool, sc_core::sc_fifo<PipelineTxn> &input,
     result.submit_ordinal = invocation.submit_ordinal;
     result.primitive_id = invocation.primitive_id;
     result.render_target_count = static_cast<std::uint8_t>(targets);
+    result.discarded = discarded;
     for (std::uint32_t target = 0; target < targets; ++target) {
-      result.written_mask[target] = 0xf;
+      result.written_mask[target] = discarded ? 0 : 0xf;
       for (std::uint32_t channel = 0; channel < 4; ++channel)
         result.pixel_output[target * 4 + channel] = integer
             ? 0xf1234560U + channel : FloatBits(0.25F);
     }
     outputs.push_back(result);
     for (std::uint32_t sample = 0; sample < samples; ++sample)
-      covered_samples += (coverage[index] >> sample) & 1U;
+      covered_samples += discarded ? 0 : (coverage[index] >> sample) & 1U;
   }
 
   PipelineState state;
@@ -75,6 +77,11 @@ void RunCase(MemoryPool &pool, sc_core::sc_fifo<PipelineTxn> &input,
   state.render_target_count = targets;
   state.raster_state.sample_count = samples;
   state.raster_state.color_mask = color_mask;
+  if (discarded) {
+    state.raster_state.shader_may_discard = 1;
+    state.isp_depth_attachment = StoreNewArray(pool,
+        std::vector<std::uint32_t>(samples, FloatBits(0.75F)));
+  }
   state.raster_state.blend.enable = blend ? 1 : 0;
   state.raster_state.blend.source_rgb_factor = BlendFactor::kOne;
   state.raster_state.blend.source_alpha_factor = BlendFactor::kOne;
@@ -82,7 +89,9 @@ void RunCase(MemoryPool &pool, sc_core::sc_fifo<PipelineTxn> &input,
   state.raster_state.blend.destination_alpha_factor = BlendFactor::kOne;
   state.color_attachment_raw_dwords = integer ? 4 : 0;
   if (integer) {
-    std::vector<std::uint32_t> initial(samples * 4);
+    // API-v30 LOAD is target-major, with independent sample/channel bytes
+    // for every MRT, not a single attachment reused for all targets.
+    std::vector<std::uint32_t> initial(targets * samples * 4);
     for (std::size_t index = 0; index < initial.size(); ++index)
       initial[index] = 0x80000000U + static_cast<std::uint32_t>(index);
     std::vector<std::uint8_t> bytes(initial.size() * sizeof(initial[0]));
@@ -120,18 +129,27 @@ void RunCase(MemoryPool &pool, sc_core::sc_fifo<PipelineTxn> &input,
   Check(state.counters.ps_invocations == invocations.size(),
         "PBE must preserve pixel-frequency shader invocation count");
   if (integer) {
-    const auto bytes = LoadArray<std::uint8_t>(pool, state.pbe_framebuffer);
-    for (std::uint32_t sample = 0; sample < samples; ++sample) {
-      for (std::uint32_t channel = 0; channel < 4; ++channel) {
-        const std::size_t index = sample * 4 + channel;
-        std::uint32_t actual;
-        std::memcpy(&actual, bytes.data() + index * sizeof(actual), sizeof(actual));
-        const std::uint32_t expected = !empty && (color_mask & (1U << channel))
-            ? 0xf1234560U + channel : 0x80000000U + index;
-        Check(actual == expected, "integer LOAD must retain each masked sample lane");
+    for (std::uint32_t target = 0; target < targets; ++target) {
+      const auto bytes = LoadArray<std::uint8_t>(pool, target == 0
+          ? state.pbe_framebuffer : state.extra_pbe_framebuffer[target - 1]);
+      Check(bytes.size() == samples * 4 * sizeof(std::uint32_t),
+            "each integer MRT must retain its complete sample/channel extent");
+      for (std::uint32_t sample = 0; sample < samples; ++sample) {
+        for (std::uint32_t channel = 0; channel < 4; ++channel) {
+          const std::size_t index = sample * 4 + channel;
+          std::uint32_t actual;
+          std::memcpy(&actual, bytes.data() + index * sizeof(actual), sizeof(actual));
+          const std::uint32_t expected = !empty && !discarded && (color_mask & (1U << channel))
+              ? 0xf1234560U + channel : 0x80000000U + target * samples * 4 + index;
+          Check(actual == expected, "integer LOAD must retain each masked sample lane");
+        }
       }
     }
   }
+  if (discarded)
+    Check(LoadArray<std::uint32_t>(pool, state.isp_depth_attachment) ==
+              std::vector<std::uint32_t>(samples, FloatBits(0.75F)),
+          "native discard must not update any late depth sample");
   // This focused test stops before PbeWriteBack, which normally retires the
   // extra pre-memory attachment handles.
   for (std::uint32_t target = 1; target < targets; ++target)
@@ -158,6 +176,11 @@ int sc_main(int, char **) {
               for (bool empty : {false, true})
                 RunCase(pool, input, output, ++sequence, samples, targets,
                         blend, mask, integer, empty);
+    for (std::uint32_t samples : {1U, 2U, 4U, 8U, 16U})
+      for (std::uint32_t targets : {1U, 2U, 4U})
+        for (bool integer : {false, true})
+          RunCase(pool, input, output, ++sequence, samples, targets,
+                  true, 0xf, integer, false, true);
     Check(pool.bytes_in_flight() == 0 && pool.allocations() == pool.releases(),
           "PBE counter MemoryPool balance");
     std::cout << "pbe_sample_counter_test: PASS (" << sequence << " cases)\n";

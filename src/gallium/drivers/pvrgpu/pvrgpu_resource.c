@@ -1409,7 +1409,7 @@ pvrgpu_resource_read_back_color_surface(struct pipe_context *pipe,
    return true;
 }
 
-static void
+static bool
 pvrgpu_resource_read_back_depth_surface(struct pipe_context *pipe)
 {
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
@@ -1421,13 +1421,13 @@ pvrgpu_resource_read_back_depth_surface(struct pipe_context *pipe)
        !pvrgpu_resource_level_valid(resource, surface->level) ||
        surface->first_layer > surface->last_layer ||
        surface->last_layer >= pvrgpu_resource_level_layer_count(texture, surface->level))
-      return;
+      return false;
    const unsigned width = ctx->framebuffer.width;
    const unsigned height = ctx->framebuffer.height;
    if (!width || !height ||
        width > pvrgpu_resource_level_width(texture, surface->level) ||
        height > pvrgpu_resource_level_height(texture, surface->level))
-      return;
+      return false;
    const unsigned samples = pvrgpu_resource_storage_sample_count(texture);
    const unsigned bpp = util_format_get_blocksize(surface->format);
    const size_t row_size = (size_t)width * samples * bpp;
@@ -1435,15 +1435,16 @@ pvrgpu_resource_read_back_depth_surface(struct pipe_context *pipe)
    size_t destination_offset = 0;
    if (!pvrgpu_surface_span(resource, surface, row_size, height, layer_count, &destination_offset) ||
        row_size > SIZE_MAX / height / layer_count)
-      return;
+      return false;
    const size_t size = row_size * height * layer_count;
    uint8_t *pixels = malloc(size);
    if (!pixels)
-      return;
+      return false;
    char error[512] = {0};
    bool written = false;
-   if (pvrgpu_systemc_flush_readback_pixels(width, height, bpp, UINT32_MAX,
-         samples, surface->format, layer_count, pixels, size, &written, error, sizeof(error)) && written) {
+   const bool flushed = pvrgpu_systemc_flush_readback_pixels(width, height, bpp, UINT32_MAX,
+         samples, surface->format, layer_count, pixels, size, &written, error, sizeof(error));
+   if (flushed && written) {
       uint8_t *destination = resource->data + destination_offset;
       for (unsigned layer = 0; layer < layer_count; ++layer)
       for (unsigned y = 0; y < height; ++y)
@@ -1454,6 +1455,7 @@ pvrgpu_resource_read_back_depth_surface(struct pipe_context *pipe)
                            (void *)texture, util_format_name(surface->format), samples);
    }
    free(pixels);
+   return flushed && written;
 }
 
 /*
@@ -1479,12 +1481,18 @@ pvrgpu_flush_current_color_attachments(struct pipe_context *pipe)
       pvrgpu_context_end_frame_at_readback(ctx);
    if (ctx->color_readback_pending_mask == 0)
       return;
+   const unsigned expected = ctx->color_readback_pending_mask;
    unsigned written = 0;
+   bool failed = false;
    for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target) {
+      if (!(expected & (1u << target)))
+         continue;
       const struct pipe_surface *surface = &ctx->framebuffer.cbufs[target];
       if (surface->texture &&
           pvrgpu_resource_read_back_color_surface(pipe, surface, target))
          ++written;
+      else
+         failed = true;
    }
    /* A failed color execution clears the entire pending mask. Do not read
     * stale cached depth from an earlier successful sequence after that. */
@@ -1492,8 +1500,16 @@ pvrgpu_flush_current_color_attachments(struct pipe_context *pipe)
       (ctx->color_readback_pending_mask & PVRGPU_DEPTH_READBACK_PENDING) &&
       ctx->color_readback_generation == pvrgpu_systemc_submission_generation();
    ctx->color_readback_pending_mask &= ~PVRGPU_DEPTH_READBACK_PENDING;
-   if (read_depth)
-      pvrgpu_resource_read_back_depth_surface(pipe);
+   if ((expected & PVRGPU_DEPTH_READBACK_PENDING) &&
+       (!read_depth || !pvrgpu_resource_read_back_depth_surface(pipe)))
+      failed = true;
+   if (failed) {
+      ++ctx->query_statistics_failures;
+      ctx->color_readback_pending_mask = 0;
+      pvrgpu_counter_eventf("framebuffer_boundary_flush_error",
+                            "draws=%u expected=0x%x color_written=%u",
+                            recorded, expected, written);
+   }
    pvrgpu_counter_eventf("framebuffer_boundary_flush",
                          "draws=%u targets=%u written=%u",
                          recorded,

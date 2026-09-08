@@ -9,9 +9,12 @@
 #include "shader/usc_cluster.h"
 
 #include "common/functional_types.h"
+#include "common/centroid.h"
 #include "common/pipeline_state.h"
+#include "common/msaa.h"
 #include "shader/pco_iss.h"
 #include "shader/usc_uniform_buffer_memory.h"
+#include "shader/usc_shader_image_memory.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -27,7 +30,8 @@
 namespace pvrgpu::stub {
 
 bool DriverPcoTextureSharedLayoutSupported(
-    const DriverPcoStageAbi &abi, std::uint32_t descriptor_set_count) {
+    const DriverPcoStageAbi &abi, std::uint32_t descriptor_set_count,
+    std::uint32_t image_descriptor_count) {
   if (descriptor_set_count == 0 ||
       descriptor_set_count > kPcoMaximumTextureDescriptorSets) {
     return false;
@@ -44,6 +48,8 @@ bool DriverPcoTextureSharedLayoutSupported(
   descriptor_shared_dwords +=
       static_cast<std::uint64_t>(abi.uniform_buffer_descriptor_count) *
       kUniformBufferDescriptorDwordCount;
+  if (image_descriptor_count > 32) return false;
+  descriptor_shared_dwords += 8U * image_descriptor_count;
   if (abi.shareds > kPcoMaximumFragmentSharedCount)
     return false;
   if (abi.push_constant_count == 0) {
@@ -99,9 +105,48 @@ std::uint32_t DebugFragmentCoordinate(const char *name,
   return static_cast<std::uint32_t>(parsed);
 }
 
+void SetFragmentCentroidContext(PcoFragmentExecutionContext &context,
+                                std::uint32_t coverage,
+                                std::uint32_t state_mask,
+                                const RasterTriangle *primitive = nullptr) {
+  const auto position = RasterCentroidPosition(context.raster_sample_count,
+                                               coverage, state_mask);
+  float x, y;
+  std::memcpy(&x, &context.sample_x, sizeof(x));
+  std::memcpy(&y, &context.sample_y, sizeof(y));
+  std::array<float, 2> physical{x + static_cast<float>(position[0]) / 16.0F,
+                               y + static_cast<float>(position[1]) / 16.0F};
+  if (primitive && coverage)
+    physical = CentroidInsidePrimitive(primitive->x, primitive->y,
+        static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), physical);
+  context.centroid_x = FloatBits(physical[0] - 0.5F);
+  context.centroid_y = FloatBits(physical[1] - 0.5F);
+  context.centroid_position_valid = 1;
+}
+
+void SetFragmentSampleContext(PcoFragmentExecutionContext &context,
+                              std::uint32_t sample_id,
+                              std::uint32_t coverage,
+                              bool sample_frequency) {
+  const auto position = RasterSamplePosition(context.raster_sample_count, sample_id);
+  float x, y;
+  std::memcpy(&x, &context.sample_x, sizeof(x));
+  std::memcpy(&y, &context.sample_y, sizeof(y));
+  context.sample_id = sample_id;
+  context.coverage_mask = coverage;
+  context.sample_position_x = sample_frequency
+      ? FloatBits(x + static_cast<float>(position[0]) / 16.0F - 0.5F) : context.sample_x;
+  context.sample_position_y = sample_frequency
+      ? FloatBits(y + static_cast<float>(position[1]) / 16.0F - 0.5F) : context.sample_y;
+  context.sample_position_valid = 1;
+}
+
 bool SameTextureSampleRequest(const TextureSampleRequest &left,
                               const TextureSampleRequest &right) {
   return left.shader_lane_index == right.shader_lane_index &&
+         left.sample_id == right.sample_id &&
+         std::equal(std::begin(left.spatial_offsets), std::end(left.spatial_offsets),
+                    std::begin(right.spatial_offsets)) &&
          left.quad_id == right.quad_id &&
          std::equal(std::begin(left.coordinates), std::end(left.coordinates),
                     std::begin(right.coordinates)) &&
@@ -153,7 +198,8 @@ bool SameVertexContinuation(const PcoVertexContinuation &left,
 void RecordInstructionExecutions(
     CounterTxn &counters, DrawListShaderStats &stats, ShaderStage stage,
     const std::vector<PcoInstruction> &instructions,
-    std::uint64_t logical_invocations, std::uint64_t execution_lanes) {
+    std::uint64_t logical_invocations, std::uint64_t execution_lanes,
+    const PcoInstructionCounts *fragment_dynamic = nullptr) {
   const PcoInstructionCounts static_counts =
       CountPcoInstructions(instructions, false);
   if (stats.program_recorded != 1 ||
@@ -166,16 +212,21 @@ void RecordInstructionExecutions(
   if (stats.executions_recorded != 0) {
     throw std::runtime_error("USC DrawList executions were counted twice");
   }
+  if ((stage == ShaderStage::kFragment) != (fragment_dynamic != nullptr))
+    throw std::runtime_error("USC fragment instruction accounting is not native");
 
   const PcoInstructionCounts per_invocation =
       CountPcoInstructions(instructions, true);
   stats.invocations = logical_invocations;
   stats.executed_alu_instructions =
-      CheckedInstructionTotal(per_invocation.alu, execution_lanes);
+      fragment_dynamic ? fragment_dynamic->alu :
+          CheckedInstructionTotal(per_invocation.alu, execution_lanes);
   stats.executed_tex_instructions =
-      CheckedInstructionTotal(per_invocation.texture, execution_lanes);
+      fragment_dynamic ? fragment_dynamic->texture :
+          CheckedInstructionTotal(per_invocation.texture, execution_lanes);
   stats.executed_memory_instructions =
-      CheckedInstructionTotal(per_invocation.memory, execution_lanes);
+      fragment_dynamic ? fragment_dynamic->memory :
+          CheckedInstructionTotal(per_invocation.memory, execution_lanes);
   stats.executions_recorded = 1;
 
   if (stage == ShaderStage::kVertex) {
@@ -248,6 +299,11 @@ void UscCluster::Run() {
         HasPoolHandle(uniform_resources)
             ? LoadArray<UniformBufferResource>(pool_, uniform_resources)
             : std::vector<UniformBufferResource>{});
+    std::vector<ShaderImageResource> image_resources =
+        stage_ == ShaderStage::kFragment && HasPoolHandle(state.fragment_image_resources)
+            ? LoadArray<ShaderImageResource>(pool_, state.fragment_image_resources)
+            : std::vector<ShaderImageResource>{};
+    UscShaderImageMemory image_memory(memory_, state.memory_mode, image_resources);
 
     const std::uint64_t groups = stage_ == ShaderStage::kVertex
                                      ? state.vertex_groups
@@ -324,7 +380,6 @@ void UscCluster::Run() {
             descriptor_set_count > kPcoMaximumTextureDescriptorSets ||
             !shared_layout_valid ||
             state.vertex_pco_abi.shareds > kPcoMaximumVertexSharedCount ||
-            sample_instruction_count == 0 ||
             sample_instruction_count > kPcoMaximumTextureSampleInstructions ||
             !HasPoolHandle(state.vertex_shared_registers)) {
           throw std::runtime_error(
@@ -426,6 +481,8 @@ void UscCluster::Run() {
                 request.texture_state[dword] = issued.texture_state[dword];
                 request.sampler_state[dword] = issued.sampler_state[dword];
               }
+              std::copy(issued.spatial_offsets.begin(), issued.spatial_offsets.end(),
+                        std::begin(request.spatial_offsets));
               request.coordinate_count = issued.coordinate_count;
               request.component_count = issued.component_count;
               request.descriptor_set = issued.descriptor_set;
@@ -446,9 +503,10 @@ void UscCluster::Run() {
               ++lane_request_count[lane_index];
             };
 
-        std::vector<TextureSampleRequest> pending_requests(lanes.size());
-        std::vector<PcoVertexContinuation> pending_continuations(lanes.size());
-        std::vector<std::uint8_t> pending_queued(lanes.size(), 0);
+        const auto pending_lanes = sample_instruction_count == 0 ? 0 : lanes.size();
+        std::vector<TextureSampleRequest> pending_requests(pending_lanes);
+        std::vector<PcoVertexContinuation> pending_continuations(pending_lanes);
+        std::vector<std::uint8_t> pending_queued(pending_lanes, 0);
         for (std::size_t lane_index = 0; lane_index < lanes.size();
              ++lane_index) {
           const VertexLane &lane = lanes[lane_index];
@@ -457,8 +515,11 @@ void UscCluster::Run() {
           const PcoVertexExecution execution = ExecuteVertexPco(
               state.vertex_program_summary, instructions, inputs,
               vertex_context);
-          queue_suspension(lane_index, execution, pending_requests,
-                           pending_continuations, pending_queued);
+          if (sample_instruction_count == 0)
+            commit_output(lane_index, execution);
+          else
+            queue_suspension(lane_index, execution, pending_requests,
+                             pending_continuations, pending_queued);
         }
         if (std::any_of(pending_queued.begin(), pending_queued.end(),
                         [](std::uint8_t value) { return value != 1; })) {
@@ -631,11 +692,57 @@ void UscCluster::Run() {
           LoadArray<FragmentInvocation>(pool_, state.fragment_invocations);
       const std::vector<PcoInstruction> instructions =
           LoadArray<PcoInstruction>(pool_, state.fragment_instructions);
+      const PcoProgramSummary fragment_summary = state.fragment_program_summary;
+      const PoolHandle fragment_program_handle = state.fragment_instructions;
+      // One immutable, fully checked program owns this draw's execution. Only
+      // static validation/signature work is shared; each lane still interprets
+      // its ISA and validates its own continuation and memory responses.
+      const PcoPreparedFragmentProgram fragment_program(fragment_summary,
+                                                       instructions);
+      const auto fragment_program_identity_valid = [&] {
+        const auto &summary = state.fragment_program_summary;
+        return state.fragment_instructions.slot == fragment_program_handle.slot &&
+            state.fragment_instructions.generation == fragment_program_handle.generation &&
+            summary.stage == fragment_summary.stage &&
+            summary.binary_size == fragment_summary.binary_size &&
+            summary.group_count == fragment_summary.group_count &&
+            summary.instruction_count == fragment_summary.instruction_count &&
+            summary.vertex_input_mask == fragment_summary.vertex_input_mask &&
+            summary.vertex_output_mask == fragment_summary.vertex_output_mask &&
+            summary.pixel_output_mask == fragment_summary.pixel_output_mask &&
+            summary.early_hsr_safe == fragment_summary.early_hsr_safe &&
+            summary.writes_depth == fragment_summary.writes_depth &&
+            summary.uses_derivatives == fragment_summary.uses_derivatives &&
+            summary.ends_task == fragment_summary.ends_task;
+      };
+      const bool geometry_centroid = IsDriverPcoTrianglesCase(state.functional_case) &&
+          std::any_of(instructions.begin(), instructions.end(), [](const auto &instruction) {
+            return instruction.iteration_mode == PcoIterationMode::kCentroid;
+          });
+      const std::vector<RasterTriangle> centroid_primitives = geometry_centroid
+          ? LoadArray<RasterTriangle>(pool_, state.raster_triangles)
+          : std::vector<RasterTriangle>{};
+      const auto centroid_primitive = [&](std::uint32_t index) -> const RasterTriangle * {
+        if (!geometry_centroid)
+          return nullptr;
+        if (index >= centroid_primitives.size())
+          throw std::runtime_error("fragment centroid primitive identity is out of range");
+        return &centroid_primitives[index];
+      };
       if (invocations.size() != state.active_fragment_invocations)
         throw std::runtime_error("fragment USC invocation count mismatch");
 
       std::vector<FragmentOutput> outputs(invocations.size());
       std::vector<std::uint8_t> output_written(invocations.size(), 0);
+      PcoInstructionCounts fragment_dynamic{};
+      const auto record_fragment_execution = [&](const PcoFragmentExecution &execution) {
+        if (execution.suspended || execution.continuation.valid ||
+            execution.texture_request_valid || execution.derivative_request_valid)
+          throw std::runtime_error("USC cannot commit partial fragment counters");
+        AddInstructionCounter(fragment_dynamic.alu, execution.executed_instructions.alu);
+        AddInstructionCounter(fragment_dynamic.texture, execution.executed_instructions.texture);
+        AddInstructionCounter(fragment_dynamic.memory, execution.executed_instructions.memory);
+      };
       const bool debug_fragment =
           std::getenv("PVRGPU_SEQUENCE_DEBUG_FRAGMENT") != nullptr;
       const std::uint32_t debug_x =
@@ -660,18 +767,25 @@ void UscCluster::Run() {
           if (context)
             raster_context = *context;
           raster_context.raster_sample_count = state.raster_state.sample_count;
+          raster_context.memory_atomic32 = UscShaderImageMemory::Atomic32;
+          raster_context.image_memory_user_data = &image_memory;
+          raster_context.memory_side_effects_enabled = 1;
           raster_context.sample_x = FloatBits(static_cast<float>(invocation.x));
           raster_context.sample_y = FloatBits(static_cast<float>(invocation.y));
           // Driver commands require half_pixel_center=1. Keep the integer
           // llvmpipe interpolation origin and the physical SR origin apart.
           raster_context.special_coordinate_offset = FloatBits(0.5F);
+          SetFragmentCentroidContext(raster_context, invocation.sample_mask,
+                                      state.raster_state.sample_mask,
+                                      centroid_primitive(invocation.parameter_index));
+          SetFragmentSampleContext(raster_context, invocation.sample_id,
+                                    invocation.sample_mask,
+                                    state.raster_state.sample_frequency != 0);
           context = &raster_context;
         }
         const PcoFragmentExecution execution =
-            context ? ExecuteFragmentPco(state.fragment_program_summary,
-                                         instructions, *context)
-                    : ExecuteFragmentPco(state.fragment_program_summary,
-                                         instructions);
+            context ? ExecuteFragmentPco(fragment_program, *context)
+                    : ExecuteFragmentPco(fragment_program);
         if (debug_fragment && invocation.x == debug_x &&
             invocation.y == debug_y) {
           std::cerr << "sequence-fragment-usc phase=execution invocation="
@@ -679,11 +793,16 @@ void UscCluster::Run() {
                     << " primitive=" << invocation.primitive_id
                     << " parameter=" << invocation.parameter_index
                     << " submit=" << invocation.submit_ordinal
-                    << " quad=" << invocation.quad_id;
+                    << " quad=" << invocation.quad_id
+                    << " sample_id=" << static_cast<unsigned>(invocation.sample_id)
+                    << " coverage=0x" << std::hex << invocation.sample_mask
+                    << std::dec;
           if (context) {
             std::cerr << " sample=0x" << std::hex << std::setw(8)
                       << std::setfill('0') << context->sample_x << ",0x"
-                      << std::setw(8) << context->sample_y << std::dec
+                      << std::setw(8) << context->sample_y
+                      << " centroid=0x" << std::setw(8) << context->centroid_x
+                      << ",0x" << std::setw(8) << context->centroid_y << std::dec
                       << std::setfill(' ') << " coefficients=";
             for (std::size_t coefficient = 0;
                  coefficient < context->coefficient_count; ++coefficient) {
@@ -693,6 +812,15 @@ void UscCluster::Run() {
                         << std::setfill('0')
                         << context->coefficients[coefficient] << std::dec
                         << std::setfill(' ');
+            }
+            if (const RasterTriangle *primitive =
+                    centroid_primitive(invocation.parameter_index)) {
+              std::cerr << " triangle=";
+              for (std::size_t vertex = 0; vertex < 3; ++vertex) {
+                if (vertex)
+                  std::cerr << ';';
+                std::cerr << primitive->x[vertex] << ',' << primitive->y[vertex];
+              }
             }
           }
           std::cerr << " pixout=";
@@ -714,6 +842,7 @@ void UscCluster::Run() {
         fragment_output.submit_ordinal = invocation.submit_ordinal;
         fragment_output.depth = invocation.depth;
         fragment_output.depth_written = execution.depth_written;
+        fragment_output.discarded = execution.discarded;
         if (execution.depth_written)
           std::memcpy(&fragment_output.depth, &execution.depth, sizeof(float));
         StoreFragmentPixelOutputs(fragment_output, execution.pixel_outputs,
@@ -721,10 +850,13 @@ void UscCluster::Run() {
                                   state.render_target_count);
         outputs[invocation_index] = fragment_output;
         output_written[invocation_index] = 1;
+        record_fragment_execution(execution);
       };
 
       std::uint64_t fragment_execution_lanes = invocations.size();
-      if (UsesTextureSampling(state, ShaderStage::kFragment)) {
+      if (UsesFragmentQuadLanes(state)) {
+        const bool has_fragment_texture =
+            UsesTextureSampling(state, ShaderStage::kFragment);
         const bool driver_pco_texture =
             IsDriverPcoTrianglesCase(state.functional_case);
         const std::uint32_t descriptor_set_count =
@@ -738,8 +870,10 @@ void UscCluster::Run() {
         const bool shared_layout_valid =
             !driver_pco_texture
                 ? expected_shared_dwords == descriptor_shared_dwords
-                : DriverPcoTextureSharedLayoutSupported(
-                      state.fragment_pco_abi, descriptor_set_count);
+                : (!has_fragment_texture ||
+                   DriverPcoTextureSharedLayoutSupported(
+                       state.fragment_pco_abi, descriptor_set_count,
+                       state.fragment_image_descriptor_count));
         const std::uint32_t expected_coefficient_dwords =
             VaryingCoefficientDwordCount(state);
         const std::size_t sample_instruction_count =
@@ -754,7 +888,8 @@ void UscCluster::Run() {
             !HasPoolHandle(state.fragment_shader_lanes) ||
             !HasPoolHandle(state.usc_fragment_tasks) ||
             !HasPoolHandle(state.usc_coefficient_banks) ||
-            !HasPoolHandle(state.fragment_shared_registers)) {
+            (expected_shared_dwords != 0 &&
+             !HasPoolHandle(state.fragment_shared_registers))) {
           throw std::runtime_error(
               "texture fragment USC has incomplete request plumbing");
         }
@@ -765,26 +900,27 @@ void UscCluster::Run() {
           throw std::runtime_error(
               "texture fragment USC received stale continuation payloads");
         }
-        const std::vector<FragmentQuad> quads =
+        const std::vector<FragmentQuad> all_quads =
             LoadArray<FragmentQuad>(pool_, state.fragment_quads);
-        const std::vector<FragmentShaderLane> shader_lanes =
+        const std::vector<FragmentShaderLane> all_shader_lanes =
             LoadArray<FragmentShaderLane>(pool_, state.fragment_shader_lanes);
-        const std::vector<UscFragmentTask> tasks =
+        const std::vector<UscFragmentTask> all_tasks =
             LoadArray<UscFragmentTask>(pool_, state.usc_fragment_tasks);
         const std::vector<std::uint32_t> coefficient_bank =
             LoadArray<std::uint32_t>(pool_, state.usc_coefficient_banks);
         const std::vector<std::uint32_t> shared_registers =
-            LoadArray<std::uint32_t>(pool_,
-                                     state.fragment_shared_registers);
-        if (shader_lanes.size() != state.fragment_shader_lane_count ||
-            tasks.size() != state.fragment_groups ||
-            quads.size() != tasks.size() ||
-            descriptor_set_count == 0 ||
+            expected_shared_dwords == 0 ? std::vector<std::uint32_t>{}
+                : LoadArray<std::uint32_t>(pool_,
+                                          state.fragment_shared_registers);
+        if (all_shader_lanes.size() != state.fragment_shader_lane_count ||
+            all_tasks.size() != state.fragment_groups ||
+            all_quads.size() != all_tasks.size() ||
+            (has_fragment_texture && descriptor_set_count == 0) ||
             descriptor_set_count > kPcoMaximumTextureDescriptorSets ||
             !shared_layout_valid ||
             expected_shared_dwords > kPcoMaximumFragmentSharedCount ||
             shared_registers.size() != expected_shared_dwords ||
-            expected_coefficient_dwords == 0 ||
+            (UsesShaderVaryings(state) && expected_coefficient_dwords == 0) ||
             expected_coefficient_dwords >
                 kPcoMaximumVaryingCoefficientCount ||
             (!driver_pco_texture && sample_instruction_count == 0) ||
@@ -796,473 +932,692 @@ void UscCluster::Run() {
           throw std::runtime_error(
               "texture fragment USC task/shared count mismatch");
         }
-        fragment_execution_lanes = shader_lanes.size();
-        std::vector<PcoFragmentExecutionContext> lane_contexts(
-            shader_lanes.size());
-        std::vector<std::uint8_t> lane_context_initialized(
-            shader_lanes.size(), 0);
-        std::vector<std::uint8_t> lane_request_count(shader_lanes.size(), 0);
-        std::vector<std::uint8_t> lane_completed(shader_lanes.size(), 0);
-
-        const auto commit_output =
-            [&](std::size_t shader_lane_index,
-                const PcoFragmentExecution &execution) {
-          if (shader_lane_index >= shader_lanes.size() ||
-              lane_completed[shader_lane_index] != 0 ||
-              execution.suspended != 0 ||
-              execution.texture_request_valid != 0 ||
-              execution.continuation.valid != 0 ||
-              execution.written_mask != 0x0f || execution.discarded ||
-              lane_request_count[shader_lane_index] !=
-                  sample_instruction_count) {
-            throw std::runtime_error(
-                "texture fragment USC lane did not complete exact PIXOUT");
-          }
-          lane_completed[shader_lane_index] = 1;
-          const FragmentShaderLane &shader_lane =
-              shader_lanes[shader_lane_index];
-          if (debug_fragment && shader_lane.x == debug_x &&
-              shader_lane.y == debug_y &&
-              shader_lane.helper == 0) {
-            std::cerr << "sequence-fragment-usc phase=final lane="
-                      << shader_lane_index
-                      << " primitive=" << shader_lane.primitive_id
-                      << " parameter=" << shader_lane.parameter_index
-                      << " submit=" << shader_lane.submit_ordinal
-                      << " quad=" << shader_lane.quad_id << " pixout=";
-            for (std::size_t component = 0; component < 4; ++component) {
-              if (component)
-                std::cerr << ',';
-              std::cerr << "0x" << std::hex << std::setw(8)
-                        << std::setfill('0')
-                        << execution.pixel_outputs[component] << std::dec
-                        << std::setfill(' ');
-            }
-            std::cerr << '\n';
-          }
-          if (shader_lane.helper)
-            return;
-          const std::uint32_t invocation_index =
-              shader_lane.visible_invocation_index;
-          if (invocation_index >= invocations.size() ||
-              output_written[invocation_index] != 0) {
-            throw std::runtime_error(
-                "texture fragment USC visible-lane mapping is invalid");
-          }
-          const FragmentInvocation &invocation = invocations[invocation_index];
-          FragmentOutput fragment_output;
-          fragment_output.x = invocation.x;
-          fragment_output.y = invocation.y;
-          fragment_output.primitive_id = invocation.primitive_id;
-          fragment_output.parameter_index = invocation.parameter_index;
-          fragment_output.submit_ordinal = invocation.submit_ordinal;
-          fragment_output.depth = invocation.depth;
-          fragment_output.depth_written = execution.depth_written;
-          if (execution.depth_written)
-            std::memcpy(&fragment_output.depth, &execution.depth, sizeof(float));
-          StoreFragmentPixelOutputs(fragment_output, execution.pixel_outputs,
-                                    execution.written_mask,
-                                    state.render_target_count);
-          outputs[invocation_index] = fragment_output;
-          output_written[invocation_index] = 1;
-        };
-
-        const auto queue_suspension =
-            [&](std::size_t shader_lane_index,
-                const PcoFragmentExecution &execution,
-                std::vector<TextureSampleRequest> &requests,
-                std::vector<PcoFragmentContinuation> &continuations,
-                std::vector<std::uint8_t> &queued) {
-          if (shader_lane_index >= shader_lanes.size() ||
-              requests.size() != shader_lanes.size() ||
-              continuations.size() != shader_lanes.size() ||
-              queued.size() != shader_lanes.size() ||
-              queued[shader_lane_index] != 0 ||
-              lane_completed[shader_lane_index] != 0) {
-            throw std::runtime_error(
-                "texture fragment USC suspension lane is invalid");
-          }
-          if (execution.suspended == 0) {
-            commit_output(shader_lane_index, execution);
-            return;
-          }
-          if (execution.suspended != 1 ||
-              execution.texture_request_valid != 1 ||
-              execution.continuation.valid != 1 ||
-              execution.written_mask != 0 || execution.discarded ||
-              lane_request_count[shader_lane_index] >=
-                  sample_instruction_count ||
-              lane_request_count[shader_lane_index] >=
-                  kPcoMaximumTextureSampleInstructions ||
-              execution.texture_request.descriptor_set >=
-                  descriptor_set_count ||
-              execution.texture_request.binding != 0 ||
-              execution.texture_request.data_request !=
-                  execution.continuation.data_request) {
-            throw std::runtime_error(
-                "texture fragment USC received an invalid SMP suspension");
-          }
-
-          const FragmentShaderLane &shader_lane =
-              shader_lanes[shader_lane_index];
-          TextureSampleRequest request;
-          request.shader_lane_index =
-              static_cast<std::uint32_t>(shader_lane_index);
-          request.quad_id = shader_lane.quad_id;
-          request.quad_lane = shader_lane.quad_lane;
-          // TextureUnit's public batch ABI numbers requests locally in every
-          // round.  Lane identity remains stable across all continuations.
-          request.request_id = shader_lane_index;
-          request.shader_stage = ShaderStage::kFragment;
-          for (std::size_t component = 0;
-               component < std::size(request.coordinates); ++component) {
-            request.coordinates[component] =
-                execution.texture_request.coordinates[component];
-          }
-          for (std::size_t dword = 0; dword < 4; ++dword) {
-            request.texture_state[dword] =
-                execution.texture_request.texture_state[dword];
-            request.sampler_state[dword] =
-                execution.texture_request.sampler_state[dword];
-          }
-          request.coordinate_count =
-              execution.texture_request.coordinate_count;
-          request.component_count =
-              execution.texture_request.component_count;
-          request.descriptor_set =
-              execution.texture_request.descriptor_set;
-          request.binding = execution.texture_request.binding;
-          request.dimension = execution.texture_request.dimension;
-          request.normalized = execution.texture_request.normalized;
-          request.fcnorm = execution.texture_request.fcnorm;
-          request.sample_index = execution.texture_request.sample_index;
-          request.sample_index_present =
-              execution.texture_request.sample_index_present;
-          request.explicit_lod = execution.texture_request.explicit_lod;
-          request.explicit_lod_present = execution.texture_request.explicit_lod_present;
-          request.data_request = execution.texture_request.data_request;
-          request.texture_address_lo =
-              execution.texture_request.texture_address_lo;
-          request.texture_address_hi =
-              execution.texture_request.texture_address_hi;
-          if (debug_fragment && shader_lane.x == debug_x &&
-              shader_lane.y == debug_y &&
-              shader_lane.helper == 0) {
-            std::cerr << "sequence-fragment-usc phase=suspend lane="
-                      << shader_lane_index << " round="
-                      << static_cast<unsigned>(
-                             lane_request_count[shader_lane_index])
-                      << " set="
-                      << static_cast<unsigned>(request.descriptor_set)
-                      << " resume="
-                      << execution.continuation.resume_instruction_index
-                      << " pending="
-                      << execution.continuation.pending_output_index
-                      << " temp_mask=0x" << std::hex << std::setfill('0');
-            for (auto word = execution.continuation.temporary_written_mask.words.rbegin();
-                 word != execution.continuation.temporary_written_mask.words.rend();
-                 ++word)
-              std::cerr << std::setw(16) << *word;
-            std::cerr << std::dec << std::setfill(' ') << " temps=";
-            for (std::size_t temporary = 0;
-                 temporary < execution.continuation.temporaries.size();
-                 ++temporary) {
-              if (!execution.continuation.temporary_written_mask.test(temporary))
-                continue;
-              std::cerr << temporary << ":0x" << std::hex << std::setw(8)
-                        << std::setfill('0')
-                        << execution.continuation.temporaries[temporary]
-                        << std::dec << std::setfill(' ') << ';';
-            }
-            std::cerr << '\n';
-          }
-          requests[shader_lane_index] = request;
-          continuations[shader_lane_index] = execution.continuation;
-          queued[shader_lane_index] = 1;
-          ++lane_request_count[shader_lane_index];
-        };
-
-        // Descriptor-only queries are ordinary native ALU. The bound image
-        // still supplies SHARED words and position inputs, but only an actual
-        // decoded SMP may allocate/send a texture continuation round.
-        const std::size_t pending_lane_count =
-            sample_instruction_count == 0 ? 0 : shader_lanes.size();
-        std::vector<TextureSampleRequest> pending_requests(pending_lane_count);
-        std::vector<PcoFragmentContinuation> pending_continuations(
-            pending_lane_count);
-        std::vector<std::uint8_t> pending_queued(pending_lane_count, 0);
-        for (const UscFragmentTask &task : tasks) {
-          if (task.fragment_quad_index >= quads.size() ||
-              task.coefficient_dword_count !=
-                  expected_coefficient_dwords ||
-              task.first_coefficient_dword > coefficient_bank.size() ||
-              task.coefficient_dword_count >
-                  coefficient_bank.size() - task.first_coefficient_dword) {
-            throw std::runtime_error(
-                "texture fragment USC coefficient task is out of range");
-          }
-          const FragmentQuad &quad = quads[task.fragment_quad_index];
-          const std::uint8_t active_mask = static_cast<std::uint8_t>(
-              quad.coverage_mask | quad.helper_mask);
-          if (active_mask == 0 ||
-              (quad.coverage_mask & quad.helper_mask) != 0 ||
-              quad.write_mask != quad.coverage_mask) {
-            throw std::runtime_error(
-                "texture fragment USC received an invalid quad mask");
-          }
-          PcoFragmentExecutionContext context;
-          context.raster_sample_count = state.raster_state.sample_count;
-          context.memory_read = UscUniformBufferMemory::Read;
-          context.memory_user_data = &uniform_memory;
-          if (driver_pco_texture || state.functional_case ==
-                                        FunctionalCase::kDriverTexturedTriangles)
-            context.special_coordinate_offset = FloatBits(0.5F);
-          context.coefficient_count = static_cast<std::uint8_t>(
-              task.coefficient_dword_count);
-          context.shared_count = static_cast<std::uint16_t>(
-              shared_registers.size());
-          for (std::size_t dword = 0;
-               dword < task.coefficient_dword_count; ++dword) {
-            context.coefficients[dword] =
-                coefficient_bank[task.first_coefficient_dword + dword];
-          }
-          for (std::size_t dword = 0; dword < shared_registers.size();
-               ++dword)
-            context.shared_registers[dword] = shared_registers[dword];
-          for (std::uint8_t lane = 0; lane < 4U; ++lane) {
-            if ((active_mask & (1U << lane)) == 0)
-              continue;
-            const std::uint32_t shader_lane_index =
-                quad.invocation_indices[lane];
-            if (shader_lane_index >= shader_lanes.size())
+        fragment_execution_lanes = all_shader_lanes.size();
+        // Bound host-side live register/continuation storage independently of
+        // frame size and overdraw. Every complete quad still runs to
+        // completion; this is not a shader-work limit or a claim about physical
+        // Rogue occupancy. Output indices and external FIFO lane IDs stay
+        // global.
+        constexpr std::size_t kResidentQuadLimit = 256;
+        std::vector<std::uint8_t> visited_quads(all_quads.size(), 0);
+        std::vector<std::uint8_t> visited_lanes(all_shader_lanes.size(), 0);
+        for (std::size_t task_begin = 0; task_begin < all_tasks.size();
+             task_begin += kResidentQuadLimit) {
+          const std::size_t task_end =
+              std::min(task_begin + kResidentQuadLimit, all_tasks.size());
+          std::vector<std::uint32_t> global_lane_indices;
+          std::vector<FragmentQuad> quads;
+          std::vector<UscFragmentTask> tasks;
+          global_lane_indices.reserve((task_end - task_begin) * 4);
+          quads.reserve(task_end - task_begin);
+          tasks.reserve(task_end - task_begin);
+          for (std::size_t index = task_begin; index < task_end; ++index) {
+            UscFragmentTask task = all_tasks[index];
+            if (task.fragment_quad_index >= all_quads.size() ||
+                visited_quads[task.fragment_quad_index]++)
               throw std::runtime_error(
-                  "texture fragment USC shader lane is out of range");
+                  "fragment residency repeats or loses a quad");
+            quads.push_back(all_quads[task.fragment_quad_index]);
+            task.fragment_quad_index =
+                static_cast<std::uint32_t>(quads.size() - 1);
+            tasks.push_back(task);
+            const auto &quad = quads.back();
+            const auto active = quad.coverage_mask | quad.helper_mask;
+            if (active == 0 || (active & ~0x0fU) != 0 ||
+                (quad.coverage_mask & quad.helper_mask) != 0 ||
+                quad.write_mask != quad.coverage_mask)
+              throw std::runtime_error(
+                  "fragment residency received an invalid quad mask");
+            for (std::size_t lane = 0; lane < 4; ++lane) {
+              if (!(active & (1U << lane)))
+                continue;
+              const auto global = quad.invocation_indices[lane];
+              if (global >= all_shader_lanes.size() || visited_lanes[global]++)
+                throw std::runtime_error(
+                    "fragment residency repeats or loses a shader lane");
+              global_lane_indices.push_back(global);
+            }
+          }
+          // TextureUnit's compact batch contract retains ascending global lane
+          // identity, even if PDS task order differs from the lane allocation.
+          std::sort(global_lane_indices.begin(), global_lane_indices.end());
+          std::vector<FragmentShaderLane> shader_lanes;
+          shader_lanes.reserve(global_lane_indices.size());
+          for (const auto global : global_lane_indices)
+            shader_lanes.push_back(all_shader_lanes[global]);
+          for (auto &quad : quads) {
+            const auto active = quad.coverage_mask | quad.helper_mask;
+            for (std::size_t lane = 0; lane < 4; ++lane) {
+              if (!(active & (1U << lane)))
+                continue;
+              const auto global = quad.invocation_indices[lane];
+              quad.invocation_indices[lane] = static_cast<std::uint32_t>(
+                  std::lower_bound(global_lane_indices.begin(),
+                                   global_lane_indices.end(), global) -
+                  global_lane_indices.begin());
+            }
+          }
+          std::vector<PcoFragmentExecutionContext> lane_contexts(
+              shader_lanes.size());
+          std::vector<std::uint8_t> lane_context_initialized(
+              shader_lanes.size(), 0);
+          std::vector<std::uint32_t> lane_request_count(shader_lanes.size(), 0);
+          std::vector<std::uint8_t> lane_completed(shader_lanes.size(), 0);
+          std::vector<PcoFragmentExecution> lane_executions(
+              shader_lanes.size());
+
+          // Native derivative instructions are quad rendezvous points. Each
+          // lane resumes its saved ISA state; interpolation, ALU and preceding
+          // texture instructions are never replayed to obtain a neighbour.
+          const auto resolve_quad_derivatives = [&](const FragmentQuad &quad) {
+            const std::uint8_t active = quad.coverage_mask | quad.helper_mask;
+            std::uint32_t rounds = 0;
+            for (;;) {
+              bool pending = false;
+              for (std::uint8_t lane = 0; lane < 4; ++lane) {
+                if ((active & (1U << lane)) != 0) {
+                  const auto index = quad.invocation_indices[lane];
+                  if (index >= lane_executions.size())
+                    throw std::runtime_error(
+                        "derivative quad lane out of range");
+                  pending |=
+                      lane_executions[index].derivative_request_valid != 0;
+                }
+              }
+              if (!pending)
+                return;
+              if (active != 0x0f || ++rounds > 65536)
+                throw std::runtime_error("derivative quad is incomplete or "
+                                         "exceeds instruction budget");
+              std::array<std::uint32_t, 4> sources{};
+              const auto &first = lane_executions[quad.invocation_indices[0]];
+              const auto resume_pc =
+                  first.continuation.resume_instruction_index;
+              if (resume_pc == 0 || resume_pc > instructions.size())
+                throw std::runtime_error(
+                    "derivative quad continuation PC is invalid");
+              for (std::uint8_t lane = 0; lane < 4; ++lane) {
+                const auto &execution =
+                    lane_executions[quad.invocation_indices[lane]];
+                if (execution.suspended != 1 ||
+                    execution.derivative_request_valid != 1 ||
+                    execution.texture_request_valid != 0 ||
+                    execution.continuation.valid != 1 ||
+                    execution.continuation.kind != 1 ||
+                    execution.continuation.resume_instruction_index !=
+                        resume_pc)
+                  throw std::runtime_error("fragment lanes diverged at native "
+                                           "derivative rendezvous");
+                sources[lane] = execution.derivative_source;
+              }
+              const auto values = EvaluatePcoDerivativeQuad(
+                  instructions[resume_pc - 1], sources);
+              for (std::uint8_t lane = 0; lane < 4; ++lane) {
+                const auto index = quad.invocation_indices[lane];
+                auto context = lane_contexts[index];
+                context.continuation = lane_executions[index].continuation;
+                context.derivative_response = values[lane];
+                context.derivative_response_valid = 1;
+                lane_executions[index] = ExecuteFragmentPco(
+                    fragment_program, context);
+              }
+            }
+          };
+
+          const auto commit_output = [&](std::size_t shader_lane_index,
+                                         const PcoFragmentExecution
+                                             &execution) {
+            if (shader_lane_index >= shader_lanes.size() ||
+                lane_completed[shader_lane_index] != 0 ||
+                execution.suspended != 0 ||
+                execution.texture_request_valid != 0 ||
+                execution.derivative_request_valid != 0 ||
+                execution.continuation.valid != 0 ||
+                (!execution.discarded &&
+                 execution.written_mask !=
+                     state.fragment_program_summary.pixel_output_mask)) {
+              throw std::runtime_error(
+                  "texture fragment USC lane did not complete exact PIXOUT: "
+                  "lane=" +
+                  std::to_string(shader_lane_index) + " written=" +
+                  std::to_string(execution.written_mask) + " expected=" +
+                  std::to_string(
+                      state.fragment_program_summary.pixel_output_mask) +
+                  " discarded=" + std::to_string(execution.discarded) +
+                  " suspended=" + std::to_string(execution.suspended) +
+                  " continuation=" +
+                  std::to_string(execution.continuation.valid) + " samples=" +
+                  (shader_lane_index < lane_request_count.size()
+                       ? std::to_string(lane_request_count[shader_lane_index])
+                       : "out-of-range") +
+                  " static_samples=" +
+                  std::to_string(sample_instruction_count));
+            }
+            lane_completed[shader_lane_index] = 1;
+            // Include real helper ALU/texture work exactly once, before
+            // skipping its pixel output. Each final result already includes all
+            // resumes.
+            record_fragment_execution(execution);
             const FragmentShaderLane &shader_lane =
                 shader_lanes[shader_lane_index];
-            if (shader_lane.quad_id != quad.quad_id ||
-                shader_lane.quad_lane != lane ||
-                shader_lane.parameter_index != quad.parameter_index ||
-                shader_lane.submit_ordinal != quad.submit_ordinal ||
-                lane_context_initialized[shader_lane_index] != 0) {
-              throw std::runtime_error(
-                  "texture fragment USC lost shader-lane identity");
-            }
-            // The strict driver profile carries llvmpipe's coefficients,
-            // whose origin already includes its half-pixel setup offset.
-            const float interpolation_offset =
-                driver_pco_texture ||
-                        state.functional_case ==
-                            FunctionalCase::kDriverTexturedTriangles
-                    ? 0.0F
-                    : 0.5F;
-            context.sample_x = FloatBits(
-                static_cast<float>(shader_lane.x) + interpolation_offset);
-            context.sample_y = FloatBits(
-                static_cast<float>(shader_lane.y) + interpolation_offset);
-            lane_contexts[shader_lane_index] = context;
-            lane_context_initialized[shader_lane_index] = 1;
             if (debug_fragment && shader_lane.x == debug_x &&
-                shader_lane.y == debug_y &&
-                shader_lane.helper == 0) {
-              std::cerr << "sequence-fragment-usc phase=context lane="
-                        << shader_lane_index << " parameter="
-                        << shader_lane.parameter_index << " coefficients=";
-              for (std::size_t dword = 0;
-                   dword < task.coefficient_dword_count; ++dword) {
-                if (dword)
-                  std::cerr << ',';
-                std::cerr << "0x" << std::hex << std::setw(8)
-                          << std::setfill('0') << context.coefficients[dword]
-                          << std::dec << std::setfill(' ');
-              }
-              std::cerr << '\n';
-            }
-            const PcoFragmentExecution execution = ExecuteFragmentPco(
-                state.fragment_program_summary, instructions, context);
-            if (sample_instruction_count == 0)
-              commit_output(shader_lane_index, execution);
-            else
-              queue_suspension(shader_lane_index, execution, pending_requests,
-                               pending_continuations, pending_queued);
-          }
-        }
-        if (std::any_of(lane_context_initialized.begin(),
-                        lane_context_initialized.end(),
-                        [](std::uint8_t value) { return value != 1; }) ||
-            std::any_of(pending_queued.begin(), pending_queued.end(),
-                        [](std::uint8_t value) { return value != 1; })) {
-          throw std::runtime_error(
-              "texture fragment USC did not issue one SMP per shader lane");
-        }
-
-        while (!pending_requests.empty()) {
-          const std::uint8_t descriptor_set =
-              pending_requests.front().descriptor_set;
-          for (std::size_t lane_index = 0;
-               lane_index < pending_requests.size(); ++lane_index) {
-            const TextureSampleRequest &request =
-                pending_requests[lane_index];
-            if (pending_queued[lane_index] != 1 ||
-                request.shader_stage != ShaderStage::kFragment ||
-                request.shader_lane_index != lane_index ||
-                request.request_id != lane_index ||
-                request.reserved[0] != 0 ||
-                request.descriptor_set != descriptor_set ||
-                request.data_request !=
-                    pending_continuations[lane_index].data_request ||
-                pending_continuations[lane_index].valid != 1) {
-              throw std::runtime_error(
-                  "texture fragment USC request batch ordering is invalid");
-            }
-          }
-
-          state.texture_sample_requests =
-              StoreNewArray(pool_, pending_requests);
-          state.fragment_continuations =
-              StoreNewArray(pool_, pending_continuations);
-          state.stage = PipelineStage::kFragmentTexturePending;
-          StorePipelineState(pool_, txn.state, state);
-          texture_request_output->write(txn);
-
-          const PipelineTxn response_txn = texture_response_input->read();
-          if (response_txn.state.slot != txn.state.slot ||
-              response_txn.state.generation != txn.state.generation ||
-              response_txn.sequence != txn.sequence ||
-              response_txn.frame != txn.frame) {
-            throw std::runtime_error(
-                "texture fragment USC response identity mismatch");
-          }
-          state = LoadPipelineState(pool_, txn.state);
-          RequireStage(state.stage, PipelineStage::kTextureSamplesReady,
-                       name());
-          if (!HasPoolHandle(state.texture_sample_requests) ||
-              !HasPoolHandle(state.texture_sample_responses) ||
-              !HasPoolHandle(state.fragment_continuations) ||
-              HasPoolHandle(state.vertex_continuations)) {
-            throw std::runtime_error(
-                "texture fragment USC received no response/continuation");
-          }
-          const std::vector<TextureSampleRequest> carried_requests =
-              LoadArray<TextureSampleRequest>(pool_,
-                                              state.texture_sample_requests);
-          const std::vector<TextureSampleResponse> responses =
-              LoadArray<TextureSampleResponse>(pool_,
-                                               state.texture_sample_responses);
-          const std::vector<PcoFragmentContinuation> saved_continuations =
-              LoadArray<PcoFragmentContinuation>(
-                  pool_, state.fragment_continuations);
-          if (carried_requests.size() != shader_lanes.size() ||
-              responses.size() != shader_lanes.size() ||
-              saved_continuations.size() != shader_lanes.size()) {
-            throw std::runtime_error(
-                "texture fragment USC response lane count mismatch");
-          }
-
-          std::vector<TextureSampleRequest> next_requests(
-              shader_lanes.size());
-          std::vector<PcoFragmentContinuation> next_continuations(
-              shader_lanes.size());
-          std::vector<std::uint8_t> next_queued(shader_lanes.size(), 0);
-          for (std::size_t lane_index = 0;
-               lane_index < shader_lanes.size(); ++lane_index) {
-            const TextureSampleRequest &issued = carried_requests[lane_index];
-            const TextureSampleRequest &expected =
-                pending_requests[lane_index];
-            const TextureSampleResponse &response = responses[lane_index];
-            const PcoFragmentContinuation &saved =
-                saved_continuations[lane_index];
-            const PcoFragmentContinuation &expected_continuation =
-                pending_continuations[lane_index];
-            if (!SameTextureSampleRequest(issued, expected) ||
-                response.shader_stage != ShaderStage::kFragment ||
-                response.shader_lane_index != issued.shader_lane_index ||
-                response.request_id != issued.request_id || saved.valid != 1 ||
-                saved.data_request != issued.data_request ||
-                saved.program_binary_size !=
-                    expected_continuation.program_binary_size ||
-                saved.program_instruction_count !=
-                    expected_continuation.program_instruction_count ||
-                saved.resume_instruction_index !=
-                    expected_continuation.resume_instruction_index ||
-                saved.pending_output_index !=
-                    expected_continuation.pending_output_index ||
-                saved.pending_component_count !=
-                    expected_continuation.pending_component_count ||
-                saved.temporary_written_mask !=
-                    expected_continuation.temporary_written_mask ||
-                saved.temporaries != expected_continuation.temporaries) {
-              throw std::runtime_error(
-                  "texture fragment USC response ordering is invalid");
-            }
-
-            PcoFragmentExecutionContext resume_context =
-                lane_contexts[lane_index];
-            if (debug_fragment &&
-                shader_lanes[lane_index].x == debug_x &&
-                shader_lanes[lane_index].y == debug_y &&
-                shader_lanes[lane_index].helper == 0) {
-              std::cerr << "sequence-fragment-usc phase=resume lane="
-                        << lane_index << " round="
-                        << static_cast<unsigned>(
-                               lane_request_count[lane_index] - 1U)
-                        << " set="
-                        << static_cast<unsigned>(issued.descriptor_set)
-                        << " rgba=";
+                shader_lane.y == debug_y && shader_lane.helper == 0) {
+              std::cerr << "sequence-fragment-usc phase=final lane="
+                        << global_lane_indices[shader_lane_index]
+                        << " primitive=" << shader_lane.primitive_id
+                        << " parameter=" << shader_lane.parameter_index
+                        << " submit=" << shader_lane.submit_ordinal
+                        << " quad=" << shader_lane.quad_id << " pixout=";
               for (std::size_t component = 0; component < 4; ++component) {
                 if (component)
                   std::cerr << ',';
                 std::cerr << "0x" << std::hex << std::setw(8)
-                          << std::setfill('0') << response.rgba[component]
-                          << std::dec << std::setfill(' ');
+                          << std::setfill('0')
+                          << execution.pixel_outputs[component] << std::dec
+                          << std::setfill(' ');
               }
               std::cerr << '\n';
             }
-            resume_context.continuation = saved;
-            for (std::size_t component = 0; component < 4; ++component) {
-              resume_context.texture_response[component] =
-                  response.rgba[component];
+            if (shader_lane.helper)
+              return;
+            const std::uint32_t invocation_index =
+                shader_lane.visible_invocation_index;
+            if (invocation_index >= invocations.size() ||
+                output_written[invocation_index] != 0) {
+              throw std::runtime_error(
+                  "texture fragment USC visible-lane mapping is invalid");
             }
-            resume_context.texture_response_valid = 1;
-            const PcoFragmentExecution execution = ExecuteFragmentPco(
-                state.fragment_program_summary, instructions, resume_context);
-            queue_suspension(lane_index, execution, next_requests,
-                             next_continuations, next_queued);
+            const FragmentInvocation &invocation =
+                invocations[invocation_index];
+            FragmentOutput fragment_output;
+            fragment_output.x = invocation.x;
+            fragment_output.y = invocation.y;
+            fragment_output.primitive_id = invocation.primitive_id;
+            fragment_output.parameter_index = invocation.parameter_index;
+            fragment_output.submit_ordinal = invocation.submit_ordinal;
+            fragment_output.depth = invocation.depth;
+            fragment_output.depth_written = execution.depth_written;
+            fragment_output.discarded = execution.discarded;
+            if (execution.depth_written)
+              std::memcpy(&fragment_output.depth, &execution.depth,
+                          sizeof(float));
+            StoreFragmentPixelOutputs(fragment_output, execution.pixel_outputs,
+                                      execution.written_mask,
+                                      state.render_target_count);
+            outputs[invocation_index] = fragment_output;
+            output_written[invocation_index] = 1;
+          };
+
+          const auto queue_suspension = [&](std::size_t shader_lane_index,
+                                            const PcoFragmentExecution
+                                                &execution,
+                                            std::vector<TextureSampleRequest>
+                                                &requests,
+                                            std::vector<PcoFragmentContinuation>
+                                                &continuations,
+                                            std::vector<std::uint8_t> &queued) {
+            if (shader_lane_index >= shader_lanes.size() ||
+                requests.size() != shader_lanes.size() ||
+                continuations.size() != shader_lanes.size() ||
+                queued.size() != shader_lanes.size() ||
+                queued[shader_lane_index] != 0 ||
+                lane_completed[shader_lane_index] != 0) {
+              throw std::runtime_error(
+                  "texture fragment USC suspension lane is invalid");
+            }
+            if (execution.suspended == 0) {
+              commit_output(shader_lane_index, execution);
+              return;
+            }
+            if (execution.suspended != 1 ||
+                execution.texture_request_valid != 1 ||
+                execution.derivative_request_valid != 0 ||
+                execution.continuation.valid != 1 ||
+                lane_request_count[shader_lane_index] >= 65536U ||
+                execution.texture_request.descriptor_set >=
+                    descriptor_set_count ||
+                execution.texture_request.binding != 0 ||
+                execution.texture_request.data_request !=
+                    execution.continuation.data_request) {
+              throw std::runtime_error(
+                  "texture fragment USC received an invalid SMP suspension");
+            }
+
+            const FragmentShaderLane &shader_lane =
+                shader_lanes[shader_lane_index];
+            TextureSampleRequest request;
+            request.shader_lane_index = global_lane_indices[shader_lane_index];
+            request.quad_id = shader_lane.quad_id;
+            request.quad_lane = shader_lane.quad_lane;
+            request.sample_id = shader_lane.sample_id;
+            // TextureUnit's public batch ABI numbers requests locally in every
+            // round.  Lane identity remains stable across all continuations.
+            request.request_id = shader_lane_index;
+            request.shader_stage = ShaderStage::kFragment;
+            for (std::size_t component = 0;
+                 component < std::size(request.coordinates); ++component) {
+              request.coordinates[component] =
+                  execution.texture_request.coordinates[component];
+            }
+            for (std::size_t dword = 0; dword < 4; ++dword) {
+              request.texture_state[dword] =
+                  execution.texture_request.texture_state[dword];
+              request.sampler_state[dword] =
+                  execution.texture_request.sampler_state[dword];
+            }
+            std::copy(execution.texture_request.spatial_offsets.begin(),
+                      execution.texture_request.spatial_offsets.end(),
+                      std::begin(request.spatial_offsets));
+            request.coordinate_count =
+                execution.texture_request.coordinate_count;
+            request.component_count = execution.texture_request.component_count;
+            request.descriptor_set = execution.texture_request.descriptor_set;
+            request.binding = execution.texture_request.binding;
+            request.dimension = execution.texture_request.dimension;
+            request.normalized = execution.texture_request.normalized;
+            request.fcnorm = execution.texture_request.fcnorm;
+            request.sample_index = execution.texture_request.sample_index;
+            request.sample_index_present =
+                execution.texture_request.sample_index_present;
+            request.explicit_lod = execution.texture_request.explicit_lod;
+            request.explicit_lod_present =
+                execution.texture_request.explicit_lod_present;
+            request.data_request = execution.texture_request.data_request;
+            request.texture_address_lo =
+                execution.texture_request.texture_address_lo;
+            request.texture_address_hi =
+                execution.texture_request.texture_address_hi;
+            if (debug_fragment && shader_lane.x == debug_x &&
+                shader_lane.y == debug_y && shader_lane.helper == 0) {
+              std::cerr << "sequence-fragment-usc phase=suspend lane="
+                        << global_lane_indices[shader_lane_index] << " round="
+                        << static_cast<unsigned>(
+                               lane_request_count[shader_lane_index])
+                        << " set="
+                        << static_cast<unsigned>(request.descriptor_set)
+                        << " resume="
+                        << execution.continuation.resume_instruction_index
+                        << " pending="
+                        << execution.continuation.pending_output_index
+                        << " temp_mask=0x" << std::hex << std::setfill('0');
+              for (auto word = execution.continuation.temporary_written_mask
+                                   .words.rbegin();
+                   word !=
+                   execution.continuation.temporary_written_mask.words.rend();
+                   ++word)
+                std::cerr << std::setw(16) << *word;
+              std::cerr << std::dec << std::setfill(' ') << " temps=";
+              for (std::size_t temporary = 0;
+                   temporary < execution.continuation.temporaries.size();
+                   ++temporary) {
+                if (!execution.continuation.temporary_written_mask.test(
+                        temporary))
+                  continue;
+                std::cerr << temporary << ":0x" << std::hex << std::setw(8)
+                          << std::setfill('0')
+                          << execution.continuation.temporaries[temporary]
+                          << std::dec << std::setfill(' ') << ';';
+              }
+              std::cerr << '\n';
+            }
+            requests[shader_lane_index] = request;
+            continuations[shader_lane_index] = execution.continuation;
+            queued[shader_lane_index] = 1;
+            ++lane_request_count[shader_lane_index];
+          };
+
+          // Descriptor-only queries are ordinary native ALU. The bound image
+          // still supplies SHARED words and position inputs, but only an actual
+          // decoded SMP may allocate/send a texture continuation round.
+          const std::size_t pending_lane_count =
+              sample_instruction_count == 0 ? 0 : shader_lanes.size();
+          std::vector<TextureSampleRequest> pending_requests(
+              pending_lane_count);
+          std::vector<PcoFragmentContinuation> pending_continuations(
+              pending_lane_count);
+          std::vector<std::uint8_t> pending_queued(pending_lane_count, 0);
+          for (const UscFragmentTask &task : tasks) {
+            if (task.fragment_quad_index >= quads.size() ||
+                task.coefficient_dword_count != expected_coefficient_dwords ||
+                task.first_coefficient_dword > coefficient_bank.size() ||
+                task.coefficient_dword_count >
+                    coefficient_bank.size() - task.first_coefficient_dword) {
+              throw std::runtime_error(
+                  "texture fragment USC coefficient task is out of range");
+            }
+            const FragmentQuad &quad = quads[task.fragment_quad_index];
+            const std::uint8_t active_mask = static_cast<std::uint8_t>(
+                quad.coverage_mask | quad.helper_mask);
+            if (active_mask == 0 ||
+                (quad.coverage_mask & quad.helper_mask) != 0 ||
+                quad.write_mask != quad.coverage_mask) {
+              throw std::runtime_error(
+                  "texture fragment USC received an invalid quad mask");
+            }
+            PcoFragmentExecutionContext context;
+            context.raster_sample_count = state.raster_state.sample_count;
+            context.memory_read = UscUniformBufferMemory::Read;
+            context.memory_user_data = &uniform_memory;
+            if (driver_pco_texture ||
+                state.functional_case ==
+                    FunctionalCase::kDriverTexturedTriangles)
+              context.special_coordinate_offset = FloatBits(0.5F);
+            context.coefficient_count =
+                static_cast<std::uint8_t>(task.coefficient_dword_count);
+            context.shared_count =
+                static_cast<std::uint16_t>(shared_registers.size());
+            for (std::size_t dword = 0; dword < task.coefficient_dword_count;
+                 ++dword) {
+              context.coefficients[dword] =
+                  coefficient_bank[task.first_coefficient_dword + dword];
+            }
+            for (std::size_t dword = 0; dword < shared_registers.size();
+                 ++dword)
+              context.shared_registers[dword] = shared_registers[dword];
+            for (std::uint8_t lane = 0; lane < 4U; ++lane) {
+              if ((active_mask & (1U << lane)) == 0)
+                continue;
+              const std::uint32_t shader_lane_index =
+                  quad.invocation_indices[lane];
+              if (shader_lane_index >= shader_lanes.size())
+                throw std::runtime_error(
+                    "texture fragment USC shader lane is out of range");
+              const FragmentShaderLane &shader_lane =
+                  shader_lanes[shader_lane_index];
+              if (shader_lane.quad_id != quad.quad_id ||
+                  shader_lane.sample_id != quad.sample_id ||
+                  shader_lane.quad_lane != lane ||
+                  shader_lane.parameter_index != quad.parameter_index ||
+                  shader_lane.submit_ordinal != quad.submit_ordinal ||
+                  lane_context_initialized[shader_lane_index] != 0) {
+                throw std::runtime_error(
+                    "texture fragment USC lost shader-lane identity");
+              }
+              // The strict driver profile carries llvmpipe's coefficients,
+              // whose origin already includes its half-pixel setup offset.
+              const float interpolation_offset =
+                  driver_pco_texture ||
+                          state.functional_case ==
+                              FunctionalCase::kDriverTexturedTriangles
+                      ? 0.0F
+                      : 0.5F;
+              context.sample_x = FloatBits(static_cast<float>(shader_lane.x) +
+                                           interpolation_offset);
+              context.sample_y = FloatBits(static_cast<float>(shader_lane.y) +
+                                           interpolation_offset);
+              SetFragmentCentroidContext(
+                  context, shader_lane.sample_mask,
+                  state.raster_state.sample_mask,
+                  centroid_primitive(shader_lane.parameter_index));
+              SetFragmentSampleContext(
+                  context, shader_lane.sample_id, shader_lane.sample_mask,
+                  state.raster_state.sample_frequency != 0);
+              context.memory_atomic32 = UscShaderImageMemory::Atomic32;
+              context.image_memory_user_data = &image_memory;
+              context.memory_side_effects_enabled = shader_lane.helper ? 0 : 1;
+              lane_contexts[shader_lane_index] = context;
+              lane_context_initialized[shader_lane_index] = 1;
+              if (debug_fragment && shader_lane.x == debug_x &&
+                  shader_lane.y == debug_y && shader_lane.helper == 0) {
+                std::cerr << "sequence-fragment-usc phase=context lane="
+                          << global_lane_indices[shader_lane_index]
+                          << " parameter=" << shader_lane.parameter_index
+                          << " coefficients=";
+                for (std::size_t dword = 0;
+                     dword < task.coefficient_dword_count; ++dword) {
+                  if (dword)
+                    std::cerr << ',';
+                  std::cerr << "0x" << std::hex << std::setw(8)
+                            << std::setfill('0') << context.coefficients[dword]
+                            << std::dec << std::setfill(' ');
+                }
+                std::cerr << '\n';
+              }
+              lane_executions[shader_lane_index] = ExecuteFragmentPco(
+                  fragment_program, context);
+            }
+            resolve_quad_derivatives(quad);
+            for (std::uint8_t lane = 0; lane < 4; ++lane) {
+              if ((active_mask & (1U << lane)) == 0)
+                continue;
+              const auto shader_lane_index = quad.invocation_indices[lane];
+              const auto &execution = lane_executions[shader_lane_index];
+              if (sample_instruction_count == 0)
+                commit_output(shader_lane_index, execution);
+              else
+                queue_suspension(shader_lane_index, execution, pending_requests,
+                                 pending_continuations, pending_queued);
+            }
           }
-
-          const PoolHandle request_payload = state.texture_sample_requests;
-          const PoolHandle response_payload = state.texture_sample_responses;
-          const PoolHandle continuation_payload = state.fragment_continuations;
-          state.texture_sample_requests = {};
-          state.texture_sample_responses = {};
-          state.fragment_continuations = {};
-          pool_.Release(request_payload);
-          pool_.Release(response_payload);
-          pool_.Release(continuation_payload);
-
-          const bool another_round = std::any_of(
-              next_queued.begin(), next_queued.end(),
-              [](std::uint8_t value) { return value != 0; });
-          if (another_round &&
-              std::any_of(next_queued.begin(), next_queued.end(),
+          if (std::any_of(lane_context_initialized.begin(),
+                          lane_context_initialized.end(),
                           [](std::uint8_t value) { return value != 1; })) {
             throw std::runtime_error(
-                "texture fragment USC lanes diverged across SMP rounds");
+                "texture fragment USC did not initialize every shader lane");
           }
-          if (another_round) {
+
+          while (std::any_of(pending_queued.begin(), pending_queued.end(),
+                             [](std::uint8_t value) { return value != 0; })) {
+            // Native branches may finish lanes or reach different SMPs. Send
+            // only real suspended requests, retaining stable shader-lane IDs
+            // and assigning dense request IDs within each texture FIFO batch.
+            const auto first = static_cast<std::size_t>(
+                std::find(pending_queued.begin(), pending_queued.end(), 1) -
+                pending_queued.begin());
+            const std::uint8_t descriptor_set =
+                pending_requests[first].descriptor_set;
+            const auto resume_pc =
+                pending_continuations[first].resume_instruction_index;
+            std::vector<std::size_t> batch_lanes;
+            std::vector<TextureSampleRequest> batch_requests;
+            std::vector<PcoFragmentContinuation> batch_continuations;
+            for (std::size_t lane_index = 0;
+                 lane_index < pending_requests.size(); ++lane_index) {
+              if (!pending_queued[lane_index] ||
+                  pending_requests[lane_index].descriptor_set !=
+                      descriptor_set ||
+                  pending_continuations[lane_index].resume_instruction_index !=
+                      resume_pc)
+                continue;
+              const TextureSampleRequest &request =
+                  pending_requests[lane_index];
+              if (pending_queued[lane_index] != 1 ||
+                  request.shader_stage != ShaderStage::kFragment ||
+                  request.shader_lane_index !=
+                      global_lane_indices[lane_index] ||
+                  request.request_id != lane_index ||
+                  request.reserved[0] != 0 ||
+                  request.descriptor_set != descriptor_set ||
+                  request.data_request !=
+                      pending_continuations[lane_index].data_request ||
+                  pending_continuations[lane_index].valid != 1) {
+                throw std::runtime_error(
+                    "texture fragment USC request batch ordering is invalid");
+              }
+              batch_lanes.push_back(lane_index);
+              batch_requests.push_back(request);
+              batch_requests.back().request_id = batch_requests.size() - 1;
+              batch_continuations.push_back(pending_continuations[lane_index]);
+            }
+
+            state.texture_sample_requests =
+                StoreNewArray(pool_, batch_requests);
+            state.fragment_continuations =
+                StoreNewArray(pool_, batch_continuations);
+            state.stage = PipelineStage::kFragmentTexturePending;
+            StorePipelineState(pool_, txn.state, state);
+            texture_request_output->write(txn);
+
+            const PipelineTxn response_txn = texture_response_input->read();
+            if (response_txn.state.slot != txn.state.slot ||
+                response_txn.state.generation != txn.state.generation ||
+                response_txn.sequence != txn.sequence ||
+                response_txn.frame != txn.frame) {
+              throw std::runtime_error(
+                  "texture fragment USC response identity mismatch");
+            }
+            state = LoadPipelineState(pool_, txn.state);
+            RequireStage(state.stage, PipelineStage::kTextureSamplesReady,
+                         name());
+            if (!fragment_program_identity_valid())
+              throw std::runtime_error(
+                  "texture fragment USC response changed its immutable program");
+            if (!HasPoolHandle(state.texture_sample_requests) ||
+                !HasPoolHandle(state.texture_sample_responses) ||
+                !HasPoolHandle(state.fragment_continuations) ||
+                HasPoolHandle(state.vertex_continuations)) {
+              throw std::runtime_error(
+                  "texture fragment USC received no response/continuation");
+            }
+            const std::vector<TextureSampleRequest> carried_requests =
+                LoadArray<TextureSampleRequest>(pool_,
+                                                state.texture_sample_requests);
+            const std::vector<TextureSampleResponse> responses =
+                LoadArray<TextureSampleResponse>(
+                    pool_, state.texture_sample_responses);
+            const std::vector<PcoFragmentContinuation> saved_continuations =
+                LoadArray<PcoFragmentContinuation>(
+                    pool_, state.fragment_continuations);
+            if (carried_requests.size() != batch_lanes.size() ||
+                responses.size() != batch_lanes.size() ||
+                saved_continuations.size() != batch_lanes.size()) {
+              throw std::runtime_error(
+                  "texture fragment USC response lane count mismatch");
+            }
+
+            auto next_requests = pending_requests;
+            auto next_continuations = pending_continuations;
+            auto next_queued = pending_queued;
+            for (std::size_t batch_index = 0; batch_index < batch_lanes.size();
+                 ++batch_index) {
+              const auto lane_index = batch_lanes[batch_index];
+              next_queued[lane_index] = 0;
+              const TextureSampleRequest &issued =
+                  carried_requests[batch_index];
+              const TextureSampleRequest &expected =
+                  batch_requests[batch_index];
+              const TextureSampleResponse &response = responses[batch_index];
+              const PcoFragmentContinuation &saved =
+                  saved_continuations[batch_index];
+              const PcoFragmentContinuation &expected_continuation =
+                  pending_continuations[lane_index];
+              if (!SameTextureSampleRequest(issued, expected) ||
+                  response.shader_stage != ShaderStage::kFragment ||
+                  response.shader_lane_index != issued.shader_lane_index ||
+                  response.request_id != issued.request_id ||
+                  saved.valid != 1 ||
+                  saved.data_request != issued.data_request ||
+                  saved.program_binary_size !=
+                      expected_continuation.program_binary_size ||
+                  saved.program_instruction_count !=
+                      expected_continuation.program_instruction_count ||
+                  saved.program_signature !=
+                      expected_continuation.program_signature ||
+                  saved.resume_instruction_index !=
+                      expected_continuation.resume_instruction_index ||
+                  saved.pending_output_index !=
+                      expected_continuation.pending_output_index ||
+                  saved.pending_component_count !=
+                      expected_continuation.pending_component_count ||
+                  saved.temporary_written_mask !=
+                      expected_continuation.temporary_written_mask ||
+                  saved.temporaries != expected_continuation.temporaries ||
+                  saved.kind != expected_continuation.kind ||
+                  saved.pixel_outputs != expected_continuation.pixel_outputs ||
+                  saved.written_mask != expected_continuation.written_mask ||
+                  saved.depth != expected_continuation.depth ||
+                  saved.depth_written != expected_continuation.depth_written ||
+                  saved.predicate != expected_continuation.predicate ||
+                  saved.predicate_valid !=
+                      expected_continuation.predicate_valid ||
+                  saved.discarded != expected_continuation.discarded ||
+                  saved.execution_predicate !=
+                      expected_continuation.execution_predicate ||
+                  saved.native_steps != expected_continuation.native_steps ||
+                  saved.executed_instructions.alu !=
+                      expected_continuation.executed_instructions.alu ||
+                  saved.executed_instructions.texture !=
+                      expected_continuation.executed_instructions.texture ||
+                  saved.executed_instructions.memory !=
+                      expected_continuation.executed_instructions.memory ||
+                  saved.loop_depth != expected_continuation.loop_depth ||
+                  !std::equal(saved.loops.begin(), saved.loops.end(),
+                              expected_continuation.loops.begin(),
+                              [](const auto &left, const auto &right) {
+                                return left.start_pc == right.start_pc &&
+                                       left.count == right.count;
+                              })) {
+                throw std::runtime_error(
+                    "texture fragment USC response ordering is invalid");
+              }
+
+              PcoFragmentExecutionContext resume_context =
+                  lane_contexts[lane_index];
+              if (debug_fragment && shader_lanes[lane_index].x == debug_x &&
+                  shader_lanes[lane_index].y == debug_y &&
+                  shader_lanes[lane_index].helper == 0) {
+                std::cerr << "sequence-fragment-usc phase=resume lane="
+                          << global_lane_indices[lane_index] << " round="
+                          << static_cast<unsigned>(
+                                 lane_request_count[lane_index] - 1U)
+                          << " set="
+                          << static_cast<unsigned>(issued.descriptor_set)
+                          << " rgba=";
+                for (std::size_t component = 0; component < 4; ++component) {
+                  if (component)
+                    std::cerr << ',';
+                  std::cerr << "0x" << std::hex << std::setw(8)
+                            << std::setfill('0') << response.rgba[component]
+                            << std::dec << std::setfill(' ');
+                }
+                std::cerr << '\n';
+              }
+              resume_context.continuation = saved;
+              for (std::size_t component = 0; component < 4; ++component) {
+                resume_context.texture_response[component] =
+                    response.rgba[component];
+              }
+              resume_context.texture_response_valid = 1;
+              lane_executions[lane_index] = ExecuteFragmentPco(
+                  fragment_program, resume_context);
+            }
+            for (const FragmentQuad &quad : quads)
+              resolve_quad_derivatives(quad);
+            for (const auto index : batch_lanes)
+              queue_suspension(index, lane_executions[index], next_requests,
+                               next_continuations, next_queued);
+
+            const PoolHandle request_payload = state.texture_sample_requests;
+            const PoolHandle response_payload = state.texture_sample_responses;
+            const PoolHandle continuation_payload =
+                state.fragment_continuations;
+            state.texture_sample_requests = {};
+            state.texture_sample_responses = {};
+            state.fragment_continuations = {};
+            pool_.Release(request_payload);
+            pool_.Release(response_payload);
+            pool_.Release(continuation_payload);
+            // A later residency batch may fail its input checks before the
+            // next FIFO write. Keep the pool-owned state recoverable instead
+            // of leaving already-released handles in its last response copy.
+            StorePipelineState(pool_, txn.state, state);
+
             pending_requests = std::move(next_requests);
             pending_continuations = std::move(next_continuations);
             pending_queued = std::move(next_queued);
-          } else {
-            pending_requests.clear();
-            pending_continuations.clear();
-            pending_queued.clear();
+          }
+          if (std::any_of(lane_completed.begin(), lane_completed.end(),
+                          [](std::uint8_t value) { return value != 1; })) {
+            throw std::runtime_error(
+                "texture fragment USC did not complete every shader lane");
           }
         }
-        if (std::any_of(lane_completed.begin(), lane_completed.end(),
-                        [](std::uint8_t value) { return value != 1; })) {
+        if (std::any_of(visited_quads.begin(), visited_quads.end(),
+                        [](std::uint8_t visited) { return visited != 1; }) ||
+            std::any_of(visited_lanes.begin(), visited_lanes.end(),
+                        [](std::uint8_t visited) { return visited != 1; }))
           throw std::runtime_error(
-              "texture fragment USC did not complete every shader lane");
-        }
+              "fragment residency did not execute every quad/lane");
       } else if (IsDriverPcoTrianglesCase(state.functional_case) &&
                  !UsesShaderVaryings(state)) {
         const std::size_t expected_shared_count =
@@ -1278,8 +1633,8 @@ void UscCluster::Run() {
         const std::vector<std::uint32_t> shared_registers =
             expected_shared_count == 0
                 ? std::vector<std::uint32_t>{}
-                : LoadArray<std::uint32_t>(
-                      pool_, state.fragment_shared_registers);
+                : LoadArray<std::uint32_t>(pool_,
+                                           state.fragment_shared_registers);
         if (shared_registers.size() != expected_shared_count) {
           throw std::runtime_error(
               "driver PCO fragment USC shared-register count mismatch");
@@ -1290,8 +1645,7 @@ void UscCluster::Run() {
           context.raster_sample_count = state.raster_state.sample_count;
           context.memory_read = UscUniformBufferMemory::Read;
           context.memory_user_data = &uniform_memory;
-          context.sample_x =
-              FloatBits(static_cast<float>(invocation.x) + 0.5F);
+          context.sample_x = FloatBits(static_cast<float>(invocation.x) + 0.5F);
           context.sample_y =
               FloatBits(static_cast<float>(invocation.y) + 0.5F);
           context.shared_count = static_cast<std::uint16_t>(
@@ -1409,6 +1763,7 @@ void UscCluster::Run() {
                 invocations[invocation_index];
             if (invocation.parameter_index != quad.parameter_index ||
                 invocation.quad_id != quad.quad_id ||
+                invocation.sample_id != quad.sample_id ||
                 invocation.quad_lane != lane ||
                 invocation.submit_ordinal != quad.submit_ordinal) {
               throw std::runtime_error(
@@ -1434,8 +1789,21 @@ void UscCluster::Run() {
       }
       RecordInstructionExecutions(state.counters, drawlists[0].fragment, stage_,
                                   instructions, invocations.size(),
-                                  fragment_execution_lanes);
+                                  fragment_execution_lanes, &fragment_dynamic);
       state.fragment_outputs = StoreNewArray(pool_, outputs);
+      for (auto &image : image_resources) {
+        if (!(image.access & 2)) continue;
+        const auto bytes = image_memory.Readback(image);
+        if (HasPoolHandle(image.readback))
+          StoreArray(pool_, image.readback, bytes);
+        else
+          image.readback = StoreNewArray(pool_, bytes);
+      }
+      if (!image_resources.empty()) {
+        StoreArray(pool_, state.fragment_image_resources, image_resources);
+        state.fragment_images_complete = 1;
+        state.fragment_image_atomics += image_memory.atomics();
+      }
       state.stage = PipelineStage::kFragmentShaded;
     }
 
@@ -1448,6 +1816,8 @@ void UscCluster::Run() {
     // Texture suspension can reload PipelineState; apply the independent LD
     // accounting once to the latest state, after all shader lanes complete.
     ApplyMemoryAccessStats(state.counters, uniform_memory.stats());
+    ApplyMemoryAccessStats(state.counters, image_memory.stats());
+    AddInstructionCounter(cycles, MemoryAccessDelayCycles(image_memory.stats()));
     AddInstructionCounter(cycles, MemoryAccessDelayCycles(uniform_memory.stats()));
     state.counters.usc_groups += groups;
     state.counters.usc_cluster_cycles += cycles;

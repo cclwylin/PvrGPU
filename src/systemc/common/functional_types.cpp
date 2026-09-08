@@ -408,12 +408,15 @@ bool UsesTextureSampling(FunctionalCase functional_case) {
 }
 
 bool UsesTextureSampling(const PipelineState &state) {
-  return UsesTextureSampling(state, ShaderStage::kVertex) ||
+  return UsesTextureSampling(state, ShaderStage::kCompute) ||
+         UsesTextureSampling(state, ShaderStage::kVertex) ||
          UsesTextureSampling(state, ShaderStage::kGeometry) ||
          UsesTextureSampling(state, ShaderStage::kFragment);
 }
 
 bool UsesTextureSampling(const PipelineState &state, ShaderStage stage) {
+  if (stage == ShaderStage::kCompute)
+    return state.compute_sampled_texture_count != 0;
   if (!IsDriverPcoTrianglesCase(state.functional_case)) {
     return stage == ShaderStage::kFragment &&
            UsesTextureSampling(state.functional_case);
@@ -428,6 +431,11 @@ bool UsesTextureSampling(const PipelineState &state, ShaderStage stage) {
 
 bool UsesShaderVaryings(FunctionalCase functional_case) {
   return IsVaryingsFamily(functional_case) || IsTextureFamily(functional_case);
+}
+
+bool UsesFragmentQuadLanes(const PipelineState &state) {
+  return UsesTextureSampling(state, ShaderStage::kFragment) ||
+         state.fragment_program_summary.uses_derivatives != 0;
 }
 
 bool UsesShaderVaryings(const PipelineState &state) {
@@ -753,6 +761,10 @@ const char *PipelineStageName(PipelineStage stage) {
     return "geometry-texture-pending";
   case PipelineStage::kGeometryTextureSamplesReady:
     return "geometry-texture-samples-ready";
+  case PipelineStage::kComputeTexturePending:
+    return "compute-texture-pending";
+  case PipelineStage::kComputeTextureSamplesReady:
+    return "compute-texture-samples-ready";
   case PipelineStage::kVertexShaded:
     return "vertex-shaded";
   case PipelineStage::kClipCullComplete:
@@ -861,6 +873,10 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
     for (const auto &target : LoadArray<StreamOutputTarget>(pool, state.stream_output_targets))
       release_unique(target.readback);
   }
+  if (HasPoolHandle(state.fragment_image_resources)) {
+    for (const auto &image : LoadArray<ShaderImageResource>(pool, state.fragment_image_resources))
+      release_unique(image.readback);
+  }
   const PoolHandle handles[] = {
       state.drawlist_stats,
       state.vertex_buffer_resources,
@@ -870,6 +886,7 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
       state.vertex_lane_refs,
       state.stream_output_bindings,
       state.stream_output_targets,
+      state.fragment_image_resources,
       state.geometry_input_primitives,
       state.geometry_primitives,
       state.geometry_code,

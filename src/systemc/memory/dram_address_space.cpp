@@ -76,12 +76,16 @@ bool DramAddressSpace::Contains(std::uint64_t address,
     return false;
   const std::uint64_t end = address + bytes;
   std::uint64_t page = address - address % kPageBytes;
+  auto resident = pages_.find(page);
   while (page < end) {
-    if (pages_.find(page) == pages_.end())
+    // The map is ordered and remains const for this query. Seek only once,
+    // then check every consecutive page explicitly; a gap is still a miss.
+    if (resident == pages_.end() || resident->first != page)
       return false;
     if (kPageBytes > std::numeric_limits<std::uint64_t>::max() - page)
       return false;
     page += kPageBytes;
+    ++resident;
   }
   return true;
 }

@@ -5,6 +5,7 @@
 #include "pvrgpu_resource.h"
 #include "pvrgpu_systemc_compute_api.h"
 #include "util/u_inlines.h"
+#include "util/format/u_format.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,22 @@ pvrgpu_compute_snapshot_finish(struct pvrgpu_compute_snapshot *snapshot)
       pipe_resource_reference(&snapshot->owners[i], NULL);
    }
    memset(snapshot, 0, sizeof(*snapshot));
+}
+
+static inline bool
+pvrgpu_compute_read_indirect_grid(const struct pipe_grid_info *info,
+                                  uint32_t grid[3])
+{
+   if (!info || !info->indirect || !grid) return false;
+   const struct pvrgpu_resource *resource = pvrgpu_resource(info->indirect);
+   const uint64_t offset = info->indirect_offset;
+   const size_t bytes = 3 * sizeof(uint32_t);
+   if (info->indirect->target != PIPE_BUFFER || !resource->data || (offset & 3U) ||
+       offset > info->indirect->width0 || bytes > info->indirect->width0 - offset ||
+       offset > resource->size || bytes > resource->size - offset)
+      return false;
+   memcpy(grid, resource->data + offset, bytes);
+   return true;
 }
 
 static inline bool
@@ -140,13 +157,20 @@ pvrgpu_compute_snapshot_add_image(struct pvrgpu_compute_snapshot *snapshot,
    if (!image || !image->resource || slot >= PVRGPU_SYSTEMC_COMPUTE_MAX_IMAGES ||
        snapshot->image_count >= PVRGPU_SYSTEMC_COMPUTE_MAX_IMAGES ||
        (access & ~3U) || (image->access & access) != access ||
-       image->format != PIPE_FORMAT_R32_UINT ||
-       image->resource->target != PIPE_TEXTURE_2D ||
-       image->resource->format != PIPE_FORMAT_R32_UINT ||
+       (image->resource->target != PIPE_TEXTURE_2D &&
+        image->resource->target != PIPE_TEXTURE_3D &&
+        image->resource->target != PIPE_TEXTURE_CUBE &&
+        image->resource->target != PIPE_TEXTURE_2D_ARRAY &&
+        image->resource->target != PIPE_TEXTURE_CUBE_ARRAY) ||
        !image->resource->width0 || !image->resource->height0 ||
-       image->resource->depth0 != 1 || image->resource->array_size != 1 ||
-       image->resource->nr_samples > 1 || image->resource->nr_storage_samples > 1 ||
-       image->u.tex.first_layer != 0 || image->u.tex.last_layer != 0)
+       image->resource->nr_samples > 1 || image->resource->nr_storage_samples > 1)
+      return false;
+   const unsigned texel_bytes = util_format_get_blocksize(image->format);
+   const struct util_format_description *format = util_format_description(image->format);
+   if ((texel_bytes != 4 && texel_bytes != 8 && texel_bytes != 16) ||
+       format->layout != UTIL_FORMAT_LAYOUT_PLAIN ||
+       format->block.width != 1 || format->block.height != 1 ||
+       texel_bytes != util_format_get_blocksize(image->resource->format))
       return false;
    struct pvrgpu_resource *resource = pvrgpu_resource(image->resource);
    const unsigned level = image->u.tex.level;
@@ -157,15 +181,23 @@ pvrgpu_compute_snapshot_add_image(struct pvrgpu_compute_snapshot *snapshot,
       return false;
    const unsigned width = MAX2(1U, image->resource->width0 >> level);
    const unsigned height = MAX2(1U, image->resource->height0 >> level);
-   const uint64_t offset = resource->level_offsets[level];
+   const unsigned layers = image->resource->target == PIPE_TEXTURE_3D ?
+      MAX2(1U, image->resource->depth0 >> level) : image->resource->array_size;
+   const unsigned first_layer = image->u.tex.first_layer;
+   const unsigned last_layer = image->u.tex.last_layer;
+   if (first_layer > last_layer || last_layer >= layers) return false;
+   const unsigned depth = last_layer - first_layer + 1;
+   const uint64_t layer_stride = resource->level_layer_strides[level];
+   if (layer_stride > UINT32_MAX || (layer_stride & 3U)) return false;
+   const uint64_t offset = resource->level_offsets[level] + first_layer * layer_stride;
    const uint32_t stride = resource->level_strides[level];
-   if (width > UINT32_MAX / 4U || stride < width * 4U || (stride & 3U) ||
+   if (width > UINT32_MAX / texel_bytes || stride < width * texel_bytes || (stride & 3U) ||
        (offset & 3U) || offset > resource->size)
       return false;
-   const uint64_t extent = (uint64_t)(height - 1) * stride + (uint64_t)width * 4;
+   const uint64_t row_extent = (uint64_t)(height - 1) * stride + (uint64_t)width * texel_bytes;
+   const uint64_t extent = (uint64_t)(depth - 1) * layer_stride + row_extent;
    if (extent > resource->size - offset || extent > UINT32_MAX ||
-       extent > resource->level_layer_strides[level] ||
-       resource->level_layer_strides[level] > resource->size - offset)
+       row_extent > layer_stride || layer_stride > resource->size - offset)
       return false;
    size_t index = snapshot->resource_count;
    for (size_t i = 0; i < snapshot->resource_count; ++i) {
@@ -194,9 +226,11 @@ pvrgpu_compute_snapshot_add_image(struct pvrgpu_compute_snapshot *snapshot,
    snapshot->images[snapshot->image_count++] =
       (struct pvrgpu_systemc_compute_image_binding){
          .slot = slot, .resource_index = index, .access = access,
-         .format = PVRGPU_SYSTEMC_COMPUTE_IMAGE_R32UI,
+         .format = image->format == PIPE_FORMAT_R32_UINT ?
+            PVRGPU_SYSTEMC_COMPUTE_IMAGE_R32UI : PVRGPU_SYSTEMC_COMPUTE_IMAGE_RAW,
          .offset = offset, .bytes_size = extent,
          .width = width, .height = height, .row_stride_bytes = stride,
+         .depth = depth, .layer_stride_bytes = layer_stride, .texel_bytes = texel_bytes,
       };
    *reason = NULL;
    return true;
@@ -223,11 +257,13 @@ pvrgpu_compute_snapshot_writeback(struct pvrgpu_compute_snapshot *snapshot)
       const struct pvrgpu_systemc_compute_image_binding *image = &snapshot->images[i];
       if (!(image->access & PVRGPU_SYSTEMC_COMPUTE_ACCESS_WRITE)) continue;
       struct pvrgpu_resource *resource = pvrgpu_resource(snapshot->owners[image->resource_index]);
+      for (unsigned layer = 0; layer < image->depth; ++layer)
       for (unsigned row = 0; row < image->height; ++row) {
-         const size_t offset = image->offset + (size_t)row * image->row_stride_bytes;
+         const size_t offset = image->offset + (size_t)layer * image->layer_stride_bytes +
+                               (size_t)row * image->row_stride_bytes;
          memcpy(resource->data + offset,
                 snapshot->resources[image->resource_index].bytes + offset,
-                (size_t)image->width * 4);
+                (size_t)image->width * image->texel_bytes);
       }
       // The separate graphics framebuffer snapshot predates these genuine
       // model writes. Its cached readback must not overwrite compute results.

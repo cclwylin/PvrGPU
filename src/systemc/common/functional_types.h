@@ -105,6 +105,7 @@ bool IsDriverPcoTrianglesCase(FunctionalCase functional_case);
 bool UsesTextureSampling(FunctionalCase functional_case);
 bool UsesTextureSampling(const PipelineState &state);
 bool UsesTextureSampling(const PipelineState &state, ShaderStage stage);
+bool UsesFragmentQuadLanes(const PipelineState &state);
 bool UsesShaderVaryings(FunctionalCase functional_case);
 bool UsesShaderVaryings(const PipelineState &state);
 bool IsIndexedTriangleRasterCase(FunctionalCase functional_case);
@@ -155,6 +156,8 @@ enum class PipelineStage : std::uint32_t {
   kFramebufferReady,
   kGeometryTexturePending,
   kGeometryTextureSamplesReady,
+  kComputeTexturePending,
+  kComputeTextureSamplesReady,
 };
 
 enum class PrimitiveTopology : std::uint32_t {
@@ -462,6 +465,9 @@ struct RasterState {
   float clear_color[4] = {0.0F, 0.0F, 0.0F, 1.0F};
   std::uint32_t sample_count = 1;
   std::uint32_t sample_mask = UINT32_MAX;
+  // Execute a distinct native fragment invocation for every covered sample.
+  // Zero retains the ordinary pixel-frequency path and its coverage mask.
+  std::uint8_t sample_frequency = 0;
   // Disabling multisample rasterization uses center coverage/depth while
   // retaining independent storage and tests for every selected sample.
   std::uint8_t multisample_enable = 1;
@@ -471,6 +477,12 @@ struct RasterState {
   std::uint8_t shader_may_discard = 0;
   std::uint8_t shader_writes_depth = 0;
   std::uint8_t shader_writes_sample_mask = 0;
+  // Observable image/SSBO stores and atomics must run for every eligible
+  // fragment, including fragments which fail ordinary late depth tests.
+  std::uint8_t shader_writes_memory = 0;
+  // Explicit early_fragment_tests makes raster depth/stencil authoritative
+  // before shader side effects; shader depth exports cannot replace it.
+  std::uint8_t shader_early_tests = 0;
   std::uint8_t depth_clamp_enable = 0;
   std::uint8_t color_mask = 0x0f;
   // Fill convention for pixels exactly on an edge.  0 is Gallium's top-left
@@ -483,7 +495,10 @@ struct RasterState {
 inline bool RasterRequiresLateDepthStencil(const RasterState &state) {
   // Alpha-to-coverage can remove samples after shading. Neither opaque HSR
   // nor depth/stencil writes may consume the unfiltered geometry coverage.
-  return state.shader_writes_depth != 0 || state.alpha_to_coverage != 0;
+  return state.shader_early_tests == 0 &&
+         (state.shader_writes_depth != 0 || state.alpha_to_coverage != 0 ||
+          state.shader_may_discard != 0 || state.shader_writes_sample_mask != 0 ||
+          state.shader_writes_memory != 0);
 }
 
 struct InputVertex {
@@ -902,6 +917,7 @@ struct FragmentInvocation {
   std::uint64_t submit_ordinal = 0;
   std::uint32_t quad_id = 0;
   std::uint8_t quad_lane = 0;
+  std::uint8_t sample_id = 0;
   std::uint32_t sample_mask = 0;
   // Late stencil testing uses the primitive's original facing.
   std::uint8_t front_facing = 1;
@@ -923,6 +939,7 @@ struct FragmentShaderLane {
   std::uint32_t quad_id = 0;
   std::uint32_t visible_invocation_index = kInvalidFragmentInvocationIndex;
   std::uint8_t quad_lane = 0;
+  std::uint8_t sample_id = 0;
   std::uint32_t sample_mask = 0;
   std::uint8_t helper = 0;
   std::uint8_t reserved = 0;
@@ -943,6 +960,7 @@ struct FragmentQuad {
   std::uint8_t coverage_mask = 0;
   std::uint8_t helper_mask = 0;
   std::uint8_t write_mask = 0;
+  std::uint8_t sample_id = 0;
   std::uint8_t reserved = 0;
 };
 
@@ -959,6 +977,8 @@ struct UscFragmentTask {
 // image/sampler words and normalized coordinate bits are preserved end to end;
 // TextureUnit derives the texel address from this payload and the resource.
 struct TextureSampleRequest {
+  std::int32_t spatial_offsets[3]{};
+  std::uint8_t sample_id = 0;
   std::uint32_t shader_lane_index = 0;
   // Implicit-derivative SMP is a spatial quad operation.  These fields retain
   // the FragmentFrontend/PDS quad identity across the USC -> TPU FIFO instead
@@ -1022,7 +1042,9 @@ struct FragmentOutput {
   std::uint8_t render_target_count = 1;
   // Set only by an executed public DEPTHF shader feedback operation.
   std::uint8_t depth_written = 0;
-  std::uint8_t reserved[2]{};
+  // Native shader kill suppresses color and late depth/stencil writes.
+  std::uint8_t discarded = 0;
+  std::uint8_t reserved[1]{};
 };
 
 inline constexpr std::size_t kDramLineWriteBytes = 128;

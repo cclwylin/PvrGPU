@@ -224,6 +224,20 @@ void CheckExplicitAddresses() {
   sampler.max_lod_u4_6 = sampler.min_lod_u4_6 = 64;
   const auto clamped = ComputeTextureExplicitLod(3,image,sampler);
   Check(clamped.level0 == 1 && clamped.mip_weight == 0, "textureLod honors sampler LOD clamp");
+  sampler.min_lod_u4_6 = 0;
+  sampler.max_lod_u4_6 = 192;
+  const auto zero_gradient = ComputeTextureExplicitLod(
+      -std::numeric_limits<float>::infinity(), image, sampler);
+  Check(zero_gradient.level0 == 0 && zero_gradient.mip_weight == 0 &&
+            !zero_gradient.minified,
+        "zero textureGrad gradient clamps negative infinite lambda to minimum LOD");
+  const auto infinite_gradient = ComputeTextureExplicitLod(
+      std::numeric_limits<float>::infinity(), image, sampler);
+  Check(infinite_gradient.level0 == 3 && infinite_gradient.level1 == 3 &&
+            infinite_gradient.minified,
+        "positive infinite explicit lambda clamps to maximum LOD");
+  Reject([&]{ ComputeTextureExplicitLod(std::numeric_limits<float>::quiet_NaN(), image, sampler); },
+         "NaN explicit lambda must remain invalid");
 }
 
 struct Harness {
@@ -334,7 +348,8 @@ struct Harness {
     Submit(resource, shared, bytes, requests, expected, valid_reads, vertex);
   }
 
-  void RunExplicit(TextureDimensionType dimension, bool vertex, unsigned epoch, bool normalized = false) {
+  void RunExplicit(TextureDimensionType dimension, bool vertex, unsigned epoch,
+                   bool normalized = false, int shadow_compare = -1) {
     TextureResource resource;
     resource.gpu_address = kBase + 0x40000U + epoch * 0x10000U;
     resource.format = TextureFormat::kRgba8Unorm;
@@ -352,6 +367,10 @@ struct Harness {
     std::vector<std::array<std::uint32_t,4>> expected;
     std::vector<TextureSampleRequest> requests;
     auto shared = Descriptor(resource);
+    if (shadow_compare >= 0) {
+      shared[7] = 0x100; // Native IMAGE_META.PCK_INFO: UNORM reference clamp.
+      shared[12] = static_cast<std::uint32_t>(shadow_compare);
+    }
     if (normalized) {
       shared[8] |= 128U << 23U;
       shared[16] = shared[8];
@@ -501,6 +520,12 @@ int sc_main(int, char **) {
     for (Harness *harness : {&direct,&bypass,&cache})
       for (auto dimension : {TextureDimensionType::k2D,TextureDimensionType::k2DArray,TextureDimensionType::k3D,TextureDimensionType::kCube})
         for (bool vertex : {false,true}) harness->RunExplicit(dimension,vertex,0,true);
+    // The texture unit returns original samples. Native shader ALU reads
+    // compare metadata independently; it must not be erased or applied twice.
+    for (Harness *harness : {&direct,&bypass,&cache})
+      for (bool vertex : {false,true})
+        for (int compare = 0; compare <= 7; ++compare)
+          harness->RunExplicit(TextureDimensionType::k2D, vertex, 0, true, compare);
     std::cout << "texture_multisample_test: PASS batches=" << batches << " checks=" << checks << '\n';
     return 0;
   } catch (const std::exception &error) {

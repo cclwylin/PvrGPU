@@ -161,6 +161,7 @@ void ValidateTessellationProgram(const PcoDecodedProgram &program,
     Fail("program metadata is not complete native TCS/TES");
   bool pending = false, ended = false;
   for (const auto &i : program.instructions) {
+    if (!HasCanonicalDerivativeMode(i)) Fail("derivative mode is not canonical for opcode");
     if (!HasCanonicalTextureLodMode(i)) Fail("texture LOD replacement flag is not canonical for opcode");
     if (!HasCanonicalNativeIntegerSignedness(i))
       Fail("integer signedness flag is not canonical for the native opcode");
@@ -278,6 +279,7 @@ void StepTessellationTask(const PcoDecodedProgram &program,
       task.lane_count > 32 || task.instruction_index >= program.instructions.size())
     Fail("task stepped outside its native stage program");
   const auto &i = program.instructions[task.instruction_index];
+  if (!HasCanonicalDerivativeMode(i)) Fail("derivative mode is not canonical for opcode");
   if (!HasCanonicalTextureLodMode(i)) Fail("texture LOD replacement flag is not canonical for opcode");
   if (!HasCanonicalNativeIntegerSignedness(i))
     Fail("integer signedness flag is not canonical for the native opcode");

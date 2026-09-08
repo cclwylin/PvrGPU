@@ -18,11 +18,17 @@ class ComputeShader final : public sc_core::sc_module {
       "memory_request_output"};
   sc_core::sc_fifo_in<ComputeMemoryTxn> memory_response_input{
       "memory_response_input"};
+  sc_core::sc_port<sc_core::sc_fifo_out_if<PipelineTxn>, 0,
+      sc_core::SC_ZERO_OR_MORE_BOUND> texture_request_output{"texture_request_output"};
+  sc_core::sc_port<sc_core::sc_fifo_in_if<PipelineTxn>, 0,
+      sc_core::SC_ZERO_OR_MORE_BOUND> texture_response_input{"texture_response_input"};
 
   ComputeShader(sc_core::sc_module_name name, MemoryPool &pool);
 
  private:
   void Run();
+  static void SampleTexture(void *context, const PcoTextureRequest &issued,
+                             std::uint32_t *response);
   static void ReadMemory(void *context, std::uint64_t address,
                           std::uint32_t count, std::uint32_t *words);
   static void WriteMemory(void *context, std::uint64_t address,

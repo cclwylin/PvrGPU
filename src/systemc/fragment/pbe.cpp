@@ -103,10 +103,16 @@ bool TestLateDepthStencil(pvrgpu::stub::PipelineState &state,
   return passes;
 }
 
+float ClampShaderUnorm(float value) {
+  // GLES 3.1 section 2.3.4.2 clamps floating-point colors before UNORM
+  // conversion. Mesa util/u_math.h float_to_ubyte also maps NaN to zero.
+  // This is a fixed-function conversion policy, not an ISS value rewrite:
+  // +Inf saturates to one, -Inf to zero, and finite arithmetic is unchanged.
+  return std::isnan(value) ? 0.0F : std::clamp(value, 0.0F, 1.0F);
+}
+
 std::uint8_t FloatValueToUnorm8(float value) {
-  if (!std::isfinite(value))
-    throw std::runtime_error("PBE cannot convert a non-finite PIXOUT value");
-  const float clamped = std::clamp(value, 0.0f, 1.0f);
+  const float clamped = ClampShaderUnorm(value);
   const float scaled = clamped * 255.0F;
   // The Gallivm/Mesa RGBA8 store path uses the UNORM conversion
   // floor(value * 255 + 0.5), including exact half-way values.  This is not
@@ -119,6 +125,14 @@ std::uint8_t FloatValueToUnorm8(float value) {
 
 std::uint8_t FloatBitsToUnorm8(std::uint32_t raw_bits) {
   return FloatValueToUnorm8(BitsFloat(raw_bits));
+}
+
+std::uint8_t FiniteStateToUnorm8(float value) {
+  // Clear/blend-constant state retains its existing validation contract;
+  // accepting nonfinite shader results must not relax command metadata.
+  if (!std::isfinite(value))
+    throw std::runtime_error("PBE cannot convert non-finite UNORM state");
+  return FloatValueToUnorm8(value);
 }
 
 std::uint8_t FactorToUnorm8(pvrgpu::stub::BlendFactor factor,
@@ -359,21 +373,26 @@ void Pbe::Run() {
         state.render_target_count == 0 ? 1U : state.render_target_count;
     if (render_target_count > kMaxRenderTargets)
       throw std::runtime_error("PBE render target count is unsupported");
+    const bool explicit_output_masks = HasPoolHandle(state.fragment_code) ||
+        HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state);
     if ((HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state)) && render_target_count > 1)
       throw std::runtime_error(
           "PBE geometry MRT requires independent attachment LOAD");
-    // Attachment 0 honours the API-v7 LOAD payload; the remaining attachments
-    // of a multiple-render-target pass start from the clear colour.
+    // API-v30 LOAD is target-major. Each target retains its independent
+    // samples/layers, including targets or channels this draw never writes.
+    std::vector<std::uint8_t> initial_colors;
+    if (state.color_attachment_load_enable) {
+      initial_colors = LoadArray<std::uint8_t>(pool_, state.color_attachment_load);
+      if (state.color_attachment_load_bytes != framebuffer_bytes * render_target_count ||
+          initial_colors.size() != state.color_attachment_load_bytes)
+        throw std::runtime_error("PBE color attachment LOAD byte count mismatch");
+    }
     std::vector<std::vector<std::uint8_t>> framebuffers(render_target_count);
     for (std::uint32_t target = 0; target < render_target_count; ++target) {
       std::vector<std::uint8_t> &attachment = framebuffers[target];
-      if (target == 0 && state.color_attachment_load_enable != 0) {
-        attachment = LoadArray<std::uint8_t>(pool_, state.color_attachment_load);
-        if (state.color_attachment_load_bytes != framebuffer_bytes ||
-            attachment.size() != framebuffer_bytes) {
-          throw std::runtime_error(
-              "PBE color attachment LOAD byte count mismatch");
-        }
+      if (state.color_attachment_load_enable != 0) {
+        attachment.assign(initial_colors.begin() + target * framebuffer_bytes,
+                          initial_colors.begin() + (target + 1) * framebuffer_bytes);
         continue;
       }
       attachment.assign(static_cast<std::size_t>(framebuffer_bytes), 0);
@@ -399,7 +418,7 @@ void Pbe::Run() {
         for (std::size_t pixel = 0; pixel < stored_samples; ++pixel) {
           for (std::size_t component = 0; component < 4; ++component) {
             attachment[pixel * bytes_per_pixel + component] =
-                FloatValueToUnorm8(state.raster_state.clear_color[component]);
+                FiniteStateToUnorm8(state.raster_state.clear_color[component]);
           }
         }
       }
@@ -443,6 +462,14 @@ void Pbe::Run() {
         throw std::runtime_error(std::string("PBE lost fragment identity: ") +
                                  identity_reason);
       }
+      if (output.discarded > 1)
+        throw std::runtime_error("PBE received noncanonical shader discard flag");
+      if (output.discarded) {
+        if (!state.raster_state.shader_may_discard ||
+            (!late_depth_stencil && !state.raster_state.shader_early_tests))
+          throw std::runtime_error("PBE shader discard lacks late depth/stencil scheduling");
+        continue;
+      }
       // Every lane the attachment expects, which is four only when it has
       // four channels, and which each target declares for itself.
       for (std::uint32_t target = 0; target < render_target_count; ++target) {
@@ -451,7 +478,7 @@ void Pbe::Run() {
                 ? state.fragment_output_mask[target]
                 : 0U;
         const std::uint32_t expected_pixel_output_mask =
-            declared != 0 || HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state) ? declared : 0x0fU;
+            declared != 0 || explicit_output_masks ? declared : 0x0fU;
         if (output.written_mask[target] != expected_pixel_output_mask) {
           throw std::runtime_error(
               "PBE fragment did not write every expected PIXOUT lane of "
@@ -469,7 +496,8 @@ void Pbe::Run() {
       std::uint32_t coverage = invocation.sample_mask;
       if (coverage == 0 || (coverage & ~RasterSampleMask(sample_count)) != 0)
         throw std::runtime_error("PBE fragment sample coverage is invalid");
-      if ((state.raster_state.shader_writes_depth && output.depth_written != 1) ||
+      if ((state.raster_state.shader_writes_depth &&
+           !state.raster_state.shader_early_tests && output.depth_written != 1) ||
           (late_depth_stencil && invocation.front_facing > 1))
         throw std::runtime_error("PBE shader depth output or facing is invalid");
       // Coverage is derived only from a declared/written DATA0 alpha, before
@@ -501,7 +529,9 @@ void Pbe::Run() {
           continue;
       }
       if (written_map[stored_index] != 0) {
-        if (!state.raster_state.blend.enable && !late_depth_stencil)
+        if (!state.raster_state.blend.enable && !late_depth_stencil &&
+            !state.raster_state.shader_writes_memory &&
+            !state.raster_state.shader_may_discard && state.fragment_early_hsr_safe)
           throw std::runtime_error("PBE attempted to shade one opaque owner twice");
         if (output.submit_ordinal < last_submit_ordinal[stored_index])
           throw std::runtime_error("PBE blended fragments lost API order");
@@ -510,9 +540,9 @@ void Pbe::Run() {
       last_submit_ordinal[stored_index] = output.submit_ordinal;
       const std::size_t byte_offset = stored_index * bytes_per_pixel;
       for (std::uint32_t target = 0; target < render_target_count; ++target) {
-      // A GS-linked FS may genuinely have no output for this attachment.
+      // A native FS may genuinely have no output for this attachment.
       // Preserve its pixels; no default color export or blend is fabricated.
-      if ((HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state)) && state.fragment_output_mask[target] == 0)
+      if (explicit_output_masks && state.fragment_output_mask[target] == 0)
         continue;
       std::vector<std::uint8_t> &framebuffer = framebuffers[target];
       if (state.color_attachment_float32) {
@@ -579,9 +609,8 @@ void Pbe::Run() {
          */
         std::array<float, 4> source_linear{};
         for (std::size_t component = 0; component < 4; ++component) {
-          source_linear[component] = std::clamp(
-              BitsFloat(output.pixel_output[target * 4 + component]), 0.0F,
-              1.0F);
+          source_linear[component] = ClampShaderUnorm(
+              BitsFloat(output.pixel_output[target * 4 + component]));
         }
         std::array<float, 4> result_linear = source_linear;
         if (state.raster_state.blend.enable) {
@@ -625,7 +654,8 @@ void Pbe::Run() {
           framebuffer[byte_offset + component] =
               component == 3
                   ? FloatValueToUnorm8(result_linear[3])
-                  : LinearChannelToSrgbUnorm8(result_linear[component]);
+                  : LinearChannelToSrgbUnorm8(
+                        ClampShaderUnorm(result_linear[component]));
         }
         continue;
       }
@@ -644,7 +674,7 @@ void Pbe::Run() {
         std::array<std::uint8_t, 4> constant_color{};
         for (std::size_t component = 0; component < 4; ++component) {
           constant_color[component] =
-              FloatBitsToUnorm8(blend.constant_color_bits[component]);
+              FiniteStateToUnorm8(BitsFloat(blend.constant_color_bits[component]));
         }
         for (std::size_t component = 0; component < 4; ++component) {
           const BlendFactor source_factor =
@@ -680,6 +710,8 @@ void Pbe::Run() {
         std::count_if(written_map.begin(), written_map.end(),
                       [](std::uint32_t writes) { return writes != 0; }));
     if ((!state.raster_state.blend.enable && !late_depth_stencil && sample_count == 1 &&
+         !state.raster_state.shader_writes_memory && !state.raster_state.shader_may_discard &&
+         state.fragment_early_hsr_safe &&
          pixels_touched != state.active_fragment_invocations) ||
         outputs.size() != state.active_fragment_invocations)
       throw std::runtime_error("PBE fragment write count mismatch");
@@ -701,7 +733,7 @@ void Pbe::Run() {
     // above, including overdraw, separately from full-surface serialization.
     std::uint64_t sample_colors = 0;
     std::uint32_t color_output_targets = render_target_count;
-    if (HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state)) {
+    if (explicit_output_masks) {
       color_output_targets = 0;
       for (std::uint32_t target = 0; target < render_target_count; ++target)
         color_output_targets += state.fragment_output_mask[target] != 0;

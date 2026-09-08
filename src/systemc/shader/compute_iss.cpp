@@ -42,7 +42,10 @@ void ValidateAbi(const ComputePcoAbi &abi) {
       abi.num_workgroups_start < abi.workgroup_id_start + abi.workgroup_id_count)
     Fail("compute system-value coefficient spans overlap");
   const std::uint32_t private_count = abi.shared_memory_bytes ? 4U : 0U;
-  const std::uint32_t user_prefix = 4U *
+  if (abi.sampled_texture_count > kPcoMaximumTextureDescriptorSets)
+    Fail("compute texture descriptor span is invalid");
+  const std::uint32_t texture_prefix = 20U * abi.sampled_texture_count;
+  const std::uint32_t user_prefix = texture_prefix + 4U *
       (stage.uniform_buffer_descriptor_count + abi.storage_buffer_descriptor_count);
   const std::uint32_t image_end = user_prefix + 8U * abi.image_descriptor_count;
   if (abi.image_descriptor_count > 32 ||
@@ -53,9 +56,9 @@ void ValidateAbi(const ComputePcoAbi &abi) {
     Fail("compute private workgroup descriptor layout is invalid");
   if (stage.uniform_buffer_descriptor_count > 15 ||
       abi.storage_buffer_descriptor_count > 32 ||
-      stage.uniform_buffer_descriptor_start != 0 ||
+      stage.uniform_buffer_descriptor_start != texture_prefix ||
       abi.storage_buffer_descriptor_start !=
-          stage.uniform_buffer_descriptor_count * 4U ||
+          texture_prefix + stage.uniform_buffer_descriptor_count * 4U ||
       stage.push_constant_start != image_end + private_count ||
       !Fits(stage.push_constant_start, stage.push_constant_count, stage.shareds))
     Fail("compute shared-register descriptor/push layout is invalid");
@@ -258,6 +261,57 @@ ComputeMemoryOperation AtomicMemoryOperation(PcoOpcode opcode) {
   }
 }
 
+unsigned TextureDataCount(const PcoInstruction &i) {
+  return i.texture_dimension + ((i.texture_address_offset || i.texture_lod_replace) ? 1U : 0U) +
+         (i.texture_address_offset ? 2U : 0U);
+}
+
+void ValidateSample(const PcoInstruction &i, const ComputePcoAbi &abi) {
+  if (i.repeat_count != 1 || i.source_count != 3 || i.data_request ||
+      i.component_count != 4 || i.end_group || i.target != PcoWriteTarget::kTemporary ||
+      i.source.bank != PcoRegisterBank::kTemporary ||
+      (i.texture_dimension != 2 && i.texture_dimension != 3) ||
+      i.texture_address_offset > 1 || i.texture_fcnorm > 1 ||
+      i.texture_non_normalized_coords > 1 || i.texture_sample_index_present ||
+      i.texture_lod_replace > 1 || i.texture_spatial_offset_present ||
+      (i.texture_non_normalized_coords && !i.texture_lod_replace) ||
+      !Fits(i.source.index, TextureDataCount(i), abi.stage.temps) ||
+      !Fits(i.output_index, 4, abi.stage.temps) ||
+      i.source1.bank != PcoRegisterBank::kShared || i.source1.index % 20 ||
+      !Fits(i.source1.index, 20, 20 * abi.sampled_texture_count) ||
+      i.source2.bank != PcoRegisterBank::kShared || i.source2.index != i.source1.index + 8)
+    Fail("native SMP source/response/descriptor layout is invalid");
+}
+
+PcoTextureRequest SampleRequest(const PcoInstruction &i, const ComputePcoAbi &abi,
+                                const ComputeTaskState &task, const ComputeLaneState &lane) {
+  ValidateSample(i, abi);
+  if (!lane.temporary_written.contains_range(i.source.index, TextureDataCount(i)))
+    Fail("native SMP coordinate/payload read before write");
+  PcoTextureRequest request;
+  unsigned next = i.source.index;
+  for (unsigned c = 0; c < i.texture_dimension; ++c)
+    request.coordinates[c] = lane.temporaries[next++];
+  request.explicit_lod_present = i.texture_lod_replace;
+  if (i.texture_lod_replace) request.explicit_lod = lane.temporaries[next++];
+  if (i.texture_address_offset) {
+    if (!i.texture_lod_replace && (lane.temporaries[next++] & UINT32_C(0x7fffffff)))
+      Fail("native SMP TAO requires zero LOD bias");
+    request.texture_address_lo = lane.temporaries[next++];
+    request.texture_address_hi = lane.temporaries[next++];
+  }
+  for (unsigned c = 0; c < 4; ++c) {
+    request.texture_state[c] = task.shared[i.source1.index + c];
+    request.sampler_state[c] = task.shared[i.source2.index + c];
+  }
+  request.descriptor_set = i.source1.index / 20;
+  request.component_count = 4;
+  request.coordinate_count = 2;
+  request.dimension = i.texture_dimension;
+  request.normalized = !i.texture_non_normalized_coords;
+  request.fcnorm = i.texture_fcnorm;
+  return request;
+}
 } // namespace
 
 void ValidateComputeProgram(const PcoDecodedProgram &program,
@@ -272,6 +326,7 @@ void ValidateComputeProgram(const PcoDecodedProgram &program,
   bool pending = false;
   bool end = false;
   for (const auto &instruction : program.instructions) {
+    if (!HasCanonicalDerivativeMode(instruction)) Fail("derivative mode is not canonical for opcode");
     if (!HasCanonicalTextureLodMode(instruction)) Fail("texture LOD replacement flag is not canonical for opcode");
     if (!HasCanonicalNativeIntegerSignedness(instruction))
       Fail("integer signedness flag is not canonical for the native opcode");
@@ -282,13 +337,14 @@ void ValidateComputeProgram(const PcoDecodedProgram &program,
     if (pending && instruction.opcode != PcoOpcode::kWaitDataFence)
       Fail("native memory request is not followed by its WDF");
     const bool load = instruction.opcode == PcoOpcode::kBufferLoad;
+    const bool sample = instruction.opcode == PcoOpcode::kTextureSample;
     const bool store = instruction.opcode == PcoOpcode::kBufferStore;
     const bool atomic = IsPcoAtomic32(instruction.opcode);
     const bool mask = instruction.opcode == PcoOpcode::kConditionalMask;
     const bool branch = instruction.opcode == PcoOpcode::kBranch;
     const bool wdf = instruction.opcode == PcoOpcode::kWaitDataFence;
     const bool mutex = instruction.opcode == PcoOpcode::kMutex;
-    if (!IsAlu(instruction.opcode) && !load && !store && !atomic && !mask && !branch &&
+    if (!IsAlu(instruction.opcode) && !sample && !load && !store && !atomic && !mask && !branch &&
         !wdf && !mutex && instruction.opcode != PcoOpcode::kNop)
       Fail("native opcode requires unimplemented compute functionality");
     if (mutex && (instruction.source_count || instruction.repeat_count != 1 ||
@@ -307,6 +363,9 @@ void ValidateComputeProgram(const PcoDecodedProgram &program,
                      instruction.memory_cache_mode != 0 ||
                      instruction.target != PcoWriteTarget::kTemporary))
         Fail("invalid native atomic32 metadata");
+      pending = true;
+    } else if (sample) {
+      ValidateSample(instruction, abi);
       pending = true;
     } else if (wdf) {
       if (!pending || instruction.data_request != 0 || instruction.exec_cnd != 0)
@@ -335,7 +394,7 @@ void ValidateComputeProgram(const PcoDecodedProgram &program,
         instruction.target != PcoWriteTarget::kTemporary &&
         instruction.target != PcoWriteTarget::kVertexInput)
       Fail("compute program contains a graphics export");
-    const std::uint32_t output_count = load ? instruction.component_count :
+    const std::uint32_t output_count = (load || sample) ? instruction.component_count :
                                               instruction.repeat_count;
     if ((instruction.target == PcoWriteTarget::kTemporary &&
          !Fits(instruction.output_index, output_count, abi.stage.temps)) ||
@@ -418,6 +477,7 @@ void StepComputeTask(const PcoDecodedProgram &program, const ComputePcoAbi &abi,
       task.instruction_index >= program.instructions.size())
     Fail("task stepped outside its native program");
   const auto &instruction = program.instructions[task.instruction_index];
+  if (!HasCanonicalDerivativeMode(instruction)) Fail("derivative mode is not canonical for opcode");
   if (!HasCanonicalTextureLodMode(instruction)) Fail("texture LOD replacement flag is not canonical for opcode");
   if (!HasCanonicalNativeIntegerSignedness(instruction))
     Fail("integer signedness flag is not canonical for the native opcode");
@@ -534,13 +594,22 @@ void StepComputeTask(const PcoDecodedProgram &program, const ComputePcoAbi &abi,
       const bool load = instruction.opcode == PcoOpcode::kBufferLoad;
       const bool store = instruction.opcode == PcoOpcode::kBufferStore;
       const bool atomic = IsPcoAtomic32(instruction.opcode);
-      if (load || store || atomic)
+      if (load || store || atomic || instruction.opcode == PcoOpcode::kTextureSample)
         ++result.stats.memory_instructions;
       else
         result.stats.alu_instructions += instruction.repeat_count;
       if (lane.pending_operation)
         Fail("lane executes before its native memory request WDF");
       if (instruction.opcode == PcoOpcode::kNop) continue;
+      if (instruction.opcode == PcoOpcode::kTextureSample) {
+        if (!memory.sample) Fail("native SMP has no TextureUnit FIFO callback");
+        memory.sample(memory.user_data, SampleRequest(instruction, abi, task, lane),
+                      lane.pending_words.data());
+        lane.pending_operation = 1;
+        lane.pending_output = instruction.output_index;
+        lane.pending_count = 4;
+        continue;
+      }
       if (instruction.opcode == PcoOpcode::kConditionalMask) {
         const auto old = Read(instruction.source, 0, abi, task, lane);
         std::uint32_t value = old;

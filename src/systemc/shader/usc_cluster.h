@@ -22,7 +22,8 @@ class GpuMemorySystem;
 // {start=0,count=0} pair or the canonical range at the prefix end. API-v21
 // UBO layouts always use the canonical prefix end, even for an empty suffix.
 bool DriverPcoTextureSharedLayoutSupported(
-    const DriverPcoStageAbi &abi, std::uint32_t descriptor_set_count);
+    const DriverPcoStageAbi &abi, std::uint32_t descriptor_set_count,
+    std::uint32_t image_descriptor_count = 0);
 
 class UscCluster final : public sc_core::sc_module {
 public:

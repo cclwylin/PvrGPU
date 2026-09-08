@@ -286,11 +286,13 @@ public:
                    std::size_t expected_rounds,
                    std::size_t descriptor_count,
                    bool corrupt_response_order = false,
-                   bool native_multisample = false)
+                   bool native_multisample = false,
+                   std::string corrupt_continuation = {})
       : sc_module(name), pool_(pool), expected_rounds_(expected_rounds),
         descriptor_count_(descriptor_count),
         corrupt_response_order_(corrupt_response_order),
-        native_multisample_(native_multisample) {
+        native_multisample_(native_multisample),
+        corrupt_continuation_(std::move(corrupt_continuation)) {
     SC_THREAD(Run);
   }
 
@@ -336,6 +338,15 @@ private:
             "response handle starts empty");
       state.texture_sample_responses =
           StoreNewArray(pool_, std::vector<TextureSampleResponse>{response});
+      if (!corrupt_continuation_.empty()) {
+        auto saved = LoadArray<pvrgpu::stub::PcoFragmentContinuation>(pool_, state.fragment_continuations);
+        Check(saved.size() == 1, "malformed continuation target must be one native lane");
+        if (corrupt_continuation_ == "count") ++saved[0].executed_instructions.alu;
+        else if (corrupt_continuation_ == "steps") ++saved[0].native_steps;
+        else if (corrupt_continuation_ == "mask") saved[0].execution_predicate ^= 1;
+        else throw std::runtime_error("unknown continuation mutation");
+        StoreArray(pool_, state.fragment_continuations, saved);
+      }
       state.stage = PipelineStage::kTextureSamplesReady;
       StorePipelineState(pool_, txn.state, state);
       output.write(txn);
@@ -347,6 +358,7 @@ private:
   std::size_t descriptor_count_ = 0;
   bool corrupt_response_order_ = false;
   bool native_multisample_ = false;
+  std::string corrupt_continuation_;
   std::vector<std::uint8_t> descriptor_sets_;
 };
 
@@ -514,7 +526,13 @@ void CheckCompletedCase(MemoryPool &pool, const CasePayload &payload,
           "descriptor sets advance in program order");
   }
   Check(state.counters.fs_tex_instructions == sample_count,
-        "static SMP count is expanded once per lane");
+        "native SMP issues are counted once across all continuation rounds");
+  const auto golden = pvrgpu::stub::CountPcoInstructions(
+      LoadArray<pvrgpu::stub::PcoInstruction>(pool, state.fragment_instructions), true);
+  Check(state.counters.fs_alu_instructions == golden.alu &&
+            state.counters.fs_tex_instructions == golden.texture &&
+            state.counters.fs_memory_instructions == golden.memory,
+        "straight-line native USC counters retain the original ALU/TEX/MEM golden");
 
   ReleaseFunctionalPayloads(pool, state);
   pool.Release(payload.state);
@@ -726,6 +744,13 @@ public:
     }
     Check((vertex ? c.vs_tex_instructions : c.fs_tex_instructions) == 1,
           "texture suspension does not repeat the SMP instruction");
+    if (!vertex) {
+      const auto golden = CountPcoInstructions(
+          LoadArray<PcoInstruction>(pool_, state.fragment_instructions), true);
+      Check(c.fs_alu_instructions == golden.alu && c.fs_tex_instructions == golden.texture &&
+                c.fs_memory_instructions == golden.memory && c.fs_memory_instructions == 2,
+            "native LD/SMP/LD counter totals exclude checkpoint replay in every memory mode");
+    }
     Check(!HasPoolHandle(state.vertex_continuations) &&
               !HasPoolHandle(state.fragment_continuations) &&
               !HasPoolHandle(state.texture_sample_requests) &&
@@ -879,7 +904,380 @@ private:
   TextureResponder responder_;
 };
 
-int RunExpectedFailure(bool too_many_requests) {
+enum class TextureControlFlowCase {
+  kMixedSkipRemaining,
+  kAllSkipRemaining,
+  kAllSkipAll,
+  kMixedSkipAll,
+  kDiscardThenMixed,
+  kDivergentSites,
+};
+
+// Execute real native TST/P0, BR, ALPHAF, SMP and WDF semantics through the
+// USC FIFOs. The responder services only issued requests, including helper
+// work; a skipped instruction never gets a synthetic texture response.
+class TextureControlFlowHarness final : public sc_core::sc_module {
+public:
+  TextureControlFlowHarness(sc_core::sc_module_name name,
+                           TextureControlFlowCase mode)
+      : sc_module(name), mode_(mode),
+        cluster_("cluster", pool_, ShaderStage::kFragment) {
+    payload_ = MakeCase(pool_, 2, 300, 2, 0, false, 4);
+    auto state = LoadPipelineState(pool_, payload_.state);
+    const auto straight = MakeTextureProgram(2, 2);
+    std::vector<PcoInstruction> program{straight[0], straight[1]};
+    for (unsigned component = 0; component < 4; ++component) {
+      auto move = straight[0];
+      move.output_index = 4 + component;
+      move.immediate = Fallback()[component];
+      program.push_back(move);
+    }
+    auto half = straight[0];
+    half.output_index = 2;
+    half.immediate = UINT32_C(0xbf000000);
+    program.push_back(half);
+    PcoInstruction subtract;
+    subtract.opcode = PcoOpcode::kFloatAdd;
+    subtract.target = PcoWriteTarget::kTemporary;
+    subtract.output_index = 3;
+    subtract.source = {PcoRegisterBank::kSpecial, 97};
+    subtract.source1 = {PcoRegisterBank::kTemporary, 2};
+    subtract.source_count = 2;
+    program.push_back(subtract);
+    PcoInstruction predicate;
+    predicate.opcode = PcoOpcode::kBooleanCompare;
+    predicate.source = {PcoRegisterBank::kTemporary, 3};
+    predicate.writes_predicate = 1;
+    program.push_back(predicate); // P0 = (pixel center X - 0.5 == 0).
+    if (mode_ == TextureControlFlowCase::kDiscardThenMixed) {
+      PcoInstruction feedback;
+      feedback.opcode = PcoOpcode::kAlphaFeedback;
+      feedback.source_count = 0;
+      feedback.exec_cnd = 1;
+      program.push_back(feedback);
+      program.push_back(straight[3]);
+      state.fragment_program_summary.early_hsr_safe = 0;
+    }
+    const bool pre_branch = mode_ == TextureControlFlowCase::kAllSkipAll ||
+        mode_ == TextureControlFlowCase::kMixedSkipAll ||
+        mode_ == TextureControlFlowCase::kDivergentSites;
+    const bool post_branch = mode_ == TextureControlFlowCase::kMixedSkipRemaining ||
+        mode_ == TextureControlFlowCase::kAllSkipRemaining ||
+        mode_ == TextureControlFlowCase::kDiscardThenMixed ||
+        mode_ == TextureControlFlowCase::kDivergentSites;
+    PcoInstruction branch;
+    branch.opcode = PcoOpcode::kBranch;
+    branch.source_count = 0;
+    branch.exec_cnd = mode_ == TextureControlFlowCase::kAllSkipAll ? 0 : 1;
+    const auto pre_index = program.size();
+    if (pre_branch)
+      program.push_back(branch);
+    program.push_back(straight[2]);
+    program.push_back(straight[3]);
+    const auto post_index = program.size();
+    branch.exec_cnd = mode_ == TextureControlFlowCase::kAllSkipRemaining ||
+        mode_ == TextureControlFlowCase::kDivergentSites ? 0 : 1;
+    if (post_branch)
+      program.push_back(branch);
+    const auto second_sample = program.size();
+    auto sample = straight[4];
+    sample.output_index = 4; // Both paths write the same final color registers.
+    program.push_back(sample);
+    program.push_back(straight[5]);
+    const auto output_index = program.size();
+    for (unsigned component = 0; component < 4; ++component) {
+      auto output = straight[6 + component];
+      output.source.index = 4 + component;
+      program.push_back(output);
+    }
+    if (pre_branch)
+      program[pre_index].branch_target_index =
+          mode_ == TextureControlFlowCase::kDivergentSites ? second_sample : output_index;
+    if (post_branch)
+      program[post_index].branch_target_index = output_index;
+    for (std::size_t pc = 0; pc < program.size(); ++pc) {
+      program[pc].binary_offset = 1 + pc * 8;
+      program[pc].group_index = pc;
+    }
+    pool_.Release(state.fragment_instructions);
+    state.fragment_instructions = StoreNewArray(pool_, program);
+    auto &summary = state.fragment_program_summary;
+    summary.binary_size = program.size() * 8;
+    summary.group_count = summary.instruction_count = program.size();
+    const auto counts = CountPcoInstructions(program, false);
+    auto stats = LoadArray<DrawListStats>(pool_, state.drawlist_stats);
+    stats[0].fragment.program_groups = summary.group_count;
+    stats[0].fragment.program_instructions = summary.instruction_count;
+    stats[0].fragment.program_alu_instructions = counts.alu;
+    stats[0].fragment.program_tex_instructions = counts.texture;
+    stats[0].fragment.program_memory_instructions = counts.memory;
+    pvrgpu::stub::StoreArray(pool_, state.drawlist_stats, stats);
+
+    auto invocations = LoadArray<FragmentInvocation>(pool_, state.fragment_invocations);
+    invocations.resize(2, invocations[0]);
+    auto lanes = LoadArray<FragmentShaderLane>(pool_, state.fragment_shader_lanes);
+    lanes.resize(4, lanes[0]);
+    for (unsigned lane = 0; lane < 4; ++lane) {
+      lanes[lane].x = lane % 2;
+      lanes[lane].y = lane / 2;
+      lanes[lane].quad_lane = lane;
+      lanes[lane].sample_mask = lane < 2 ? 1 : 0;
+      lanes[lane].helper = lane >= 2;
+      lanes[lane].visible_invocation_index = lane;
+      if (lane < 2) {
+        invocations[lane].x = lanes[lane].x;
+        invocations[lane].y = lanes[lane].y;
+        invocations[lane].quad_lane = lane;
+        invocations[lane].sample_mask = 1;
+      }
+    }
+    pool_.Release(state.fragment_invocations);
+    pool_.Release(state.fragment_shader_lanes);
+    state.fragment_invocations = StoreNewArray(pool_, invocations);
+    state.fragment_shader_lanes = StoreNewArray(pool_, lanes);
+    auto quads = LoadArray<FragmentQuad>(pool_, state.fragment_quads);
+    quads[0].coverage_mask = quads[0].write_mask = 0x03;
+    quads[0].helper_mask = 0x0c;
+    for (unsigned lane = 0; lane < 4; ++lane)
+      quads[0].invocation_indices[lane] = lane;
+    pvrgpu::stub::StoreArray(pool_, state.fragment_quads, quads);
+    state.active_fragment_invocations = 2;
+    state.fragment_shader_lane_count = 4;
+    state.counters.ps_invocations = 2;
+    StorePipelineState(pool_, payload_.state, state);
+    cluster_.input(input_);
+    cluster_.output(output_);
+    cluster_.texture_request_output(requests_);
+    cluster_.texture_response_input(responses_);
+    SC_THREAD(Respond);
+    input_.write(payload_.txn);
+  }
+
+  void Verify() {
+    PipelineTxn completed;
+    Check(output_.nb_read(completed), std::string(name()) + " must complete");
+    const auto state = LoadPipelineState(pool_, payload_.state);
+    Check(state.stage == PipelineStage::kFragmentShaded &&
+              !HasPoolHandle(state.fragment_continuations) &&
+              !HasPoolHandle(state.texture_sample_requests) &&
+              !HasPoolHandle(state.texture_sample_responses) &&
+              requests_.num_available() == 0 && responses_.num_available() == 0,
+          "native branch completion retires every sparse response payload");
+    unsigned total = 0;
+    for (unsigned lane = 0; lane < 4; ++lane) {
+      const auto expected = ExpectedSets(lane);
+      Check(issued_[lane] == expected, "only the lane's reached SMP sites request samples");
+      total += expected.size();
+      const bool discarded = mode_ == TextureControlFlowCase::kDiscardThenMixed && (lane & 1);
+      Check(discarded_requests_[lane] == (discarded ? expected.size() : 0),
+            "ALPHAF rejection survives every helper SMP checkpoint");
+    }
+    Check(state.counters.fs_tex_instructions == total &&
+              state.counters.fs_alu_instructions ==
+                  (mode_ == TextureControlFlowCase::kDivergentSites ? 58U : 56U) &&
+              state.counters.fs_memory_instructions ==
+                  (mode_ == TextureControlFlowCase::kDiscardThenMixed ? 4U : 0U),
+          "actual native branches/helpers count once; skipped SMPs count zero");
+    const auto outputs = LoadArray<FragmentOutput>(pool_, state.fragment_outputs);
+    Check(outputs.size() == 2, "geometric helpers publish no fragment outputs");
+    for (unsigned lane = 0; lane < outputs.size(); ++lane) {
+      const auto sets = ExpectedSets(lane);
+      const auto expected = sets.empty() ? Fallback() : ResponseForRound(lane * 2 + sets.back());
+      Check(outputs[lane].written_mask[0] == 0x0f &&
+                std::equal(expected.begin(), expected.end(), outputs[lane].pixel_output) &&
+                outputs[lane].discarded ==
+                    (mode_ == TextureControlFlowCase::kDiscardThenMixed && (lane & 1)),
+            "native branch selects color and feedback rejection remains set for PBE");
+    }
+    ReleaseFunctionalPayloads(pool_, state);
+    pool_.Release(payload_.state);
+    Check(pool_.bytes_in_flight() == 0 && pool_.allocations() == pool_.releases(),
+          "sparse native continuation ownership balances");
+  }
+
+private:
+  static std::array<std::uint32_t, 4> Fallback() {
+    return {UINT32_C(0x3e000000), UINT32_C(0x3e800000),
+            UINT32_C(0x3f000000), UINT32_C(0x3f800000)};
+  }
+
+  std::vector<std::uint8_t> ExpectedSets(unsigned lane) const {
+    const bool left = (lane & 1) == 0;
+    switch (mode_) {
+    case TextureControlFlowCase::kAllSkipAll: return {};
+    case TextureControlFlowCase::kAllSkipRemaining: return {0};
+    case TextureControlFlowCase::kMixedSkipAll:
+      return left ? std::vector<std::uint8_t>{} : std::vector<std::uint8_t>{0, 1};
+    case TextureControlFlowCase::kDivergentSites:
+      return {static_cast<std::uint8_t>(left ? 1 : 0)};
+    default:
+      return left ? std::vector<std::uint8_t>{0} : std::vector<std::uint8_t>{0, 1};
+    }
+  }
+
+  void Respond() {
+    for (;;) {
+      const auto txn = requests_.read();
+      auto state = LoadPipelineState(pool_, txn.state);
+      const auto requests = LoadArray<TextureSampleRequest>(pool_, state.texture_sample_requests);
+      const auto saved = LoadArray<pvrgpu::stub::PcoFragmentContinuation>(pool_, state.fragment_continuations);
+      Check(state.stage == PipelineStage::kFragmentTexturePending &&
+                !requests.empty() && requests.size() <= 4 && saved.size() == requests.size(),
+            "only nonempty native SMP batches cross the FIFO");
+      std::vector<TextureSampleResponse> replies;
+      for (std::size_t index = 0; index < requests.size(); ++index) {
+        const auto &request = requests[index];
+        const auto lane = request.shader_lane_index;
+        Check(lane < 4 && request.request_id == index &&
+                  request.quad_lane == lane && request.shader_stage == ShaderStage::kFragment &&
+                  request.descriptor_set == requests[0].descriptor_set &&
+                  saved[index].resume_instruction_index == saved[0].resume_instruction_index,
+              "sparse batches preserve shader lane identity and group actual SMP sites");
+        const auto expected = ExpectedSets(lane);
+        Check(issued_[lane].size() < expected.size() &&
+                  request.descriptor_set == expected[issued_[lane].size()],
+              "no sampler call may be invented for a skipped or completed lane");
+        issued_[lane].push_back(request.descriptor_set);
+        discarded_requests_[lane] += saved[index].discarded != 0;
+        TextureSampleResponse response;
+        response.shader_lane_index = lane;
+        response.shader_stage = ShaderStage::kFragment;
+        response.request_id = request.request_id;
+        const auto rgba = ResponseForRound(lane * 2 + request.descriptor_set);
+        std::copy(rgba.begin(), rgba.end(), response.rgba);
+        replies.push_back(response);
+      }
+      Check(!HasPoolHandle(state.texture_sample_responses), "response handle starts empty");
+      state.texture_sample_responses = StoreNewArray(pool_, replies);
+      state.stage = PipelineStage::kTextureSamplesReady;
+      StorePipelineState(pool_, txn.state, state);
+      responses_.write(txn);
+    }
+  }
+
+  TextureControlFlowCase mode_;
+  MemoryPool pool_;
+  CasePayload payload_;
+  std::array<std::vector<std::uint8_t>, 4> issued_;
+  std::array<unsigned, 4> discarded_requests_{};
+  sc_core::sc_fifo<PipelineTxn> input_{"input", 1}, output_{"output", 1},
+      requests_{"requests", 1}, responses_{"responses", 1};
+  UscCluster cluster_;
+};
+
+class DerivativeQuadHarness final : public sc_core::sc_module {
+public:
+  explicit DerivativeQuadHarness(sc_core::sc_module_name name)
+      : sc_module(name), slot_("slot", pool_, ShaderStage::kFragment),
+        cluster_("cluster", pool_, ShaderStage::kFragment) {
+    payload_ = MakeCase(pool_, 1, 250, 1, 0, false, 4);
+    auto state = LoadPipelineState(pool_, payload_.state);
+    std::vector<PcoInstruction> instructions(7);
+    for (std::size_t pc = 0; pc < instructions.size(); ++pc) {
+      auto &op = instructions[pc];
+      op.group_index = pc;
+      op.binary_offset = 1 + pc * 8;
+      op.opcode = PcoOpcode::kMoveBypass;
+      op.target = PcoWriteTarget::kTemporary;
+      op.output_index = pc;
+    }
+    instructions[0].source = {PcoRegisterBank::kSpecial, 97};
+    for (unsigned axis = 0; axis < 2; ++axis) {
+      auto &op = instructions[axis + 1];
+      op.opcode = axis ? PcoOpcode::kDerivativeY : PcoOpcode::kDerivativeX;
+      op.source = {PcoRegisterBank::kTemporary, 0};
+      op.derivative_fine = 1;
+    }
+    for (unsigned channel = 0; channel < 4; ++channel) {
+      auto &op = instructions[channel + 3];
+      op.target = PcoWriteTarget::kPixelOutput;
+      op.output_index = channel;
+      op.source = {PcoRegisterBank::kTemporary,
+                   static_cast<std::uint16_t>(channel == 1 ? 2 : 1)};
+    }
+    instructions.back().end_group = 1;
+    pool_.Release(state.fragment_instructions);
+    state.fragment_instructions = StoreNewArray(pool_, instructions);
+    auto &summary = state.fragment_program_summary;
+    summary.binary_size = instructions.size() * 8;
+    summary.group_count = summary.instruction_count = instructions.size();
+    summary.uses_derivatives = 1;
+    auto stats = LoadArray<DrawListStats>(pool_, state.drawlist_stats);
+    const auto counts = CountPcoInstructions(instructions, false);
+    stats[0].fragment.program_groups = summary.group_count;
+    stats[0].fragment.program_instructions = summary.instruction_count;
+    stats[0].fragment.program_alu_instructions = counts.alu;
+    stats[0].fragment.program_tex_instructions = counts.texture;
+    stats[0].fragment.program_memory_instructions = counts.memory;
+    pvrgpu::stub::StoreArray(pool_, state.drawlist_stats, stats);
+    auto invocations = LoadArray<FragmentInvocation>(pool_, state.fragment_invocations);
+    invocations[0].x = invocations[0].y = 0;
+    invocations[0].sample_mask = 1;
+    pvrgpu::stub::StoreArray(pool_, state.fragment_invocations, invocations);
+    auto lanes = LoadArray<FragmentShaderLane>(pool_, state.fragment_shader_lanes);
+    lanes.resize(4, lanes[0]);
+    for (unsigned lane = 0; lane < 4; ++lane) {
+      lanes[lane].x = lane % 2;
+      lanes[lane].y = lane / 2;
+      lanes[lane].quad_lane = lane;
+      lanes[lane].sample_mask = 1;
+      lanes[lane].helper = lane != 0;
+    }
+    pool_.Release(state.fragment_shader_lanes);
+    state.fragment_shader_lanes = StoreNewArray(pool_, lanes);
+    auto quads = LoadArray<FragmentQuad>(pool_, state.fragment_quads);
+    quads[0].helper_mask = 0x0e;
+    for (unsigned lane = 0; lane < 4; ++lane)
+      quads[0].invocation_indices[lane] = lane;
+    pvrgpu::stub::StoreArray(pool_, state.fragment_quads, quads);
+    pool_.Release(state.fragment_shared_registers);
+    state.fragment_shared_registers = {};
+    state.fragment_pco_abi.shareds = 0;
+    state.fragment_pco_abi.coefficients = 0;
+    state.fragment_position_count = 0;
+    state.fragment_varying_start = 0;
+    auto tasks = LoadArray<UscFragmentTask>(pool_, state.usc_fragment_tasks);
+    tasks[0].coefficient_dword_count = 0;
+    pvrgpu::stub::StoreArray(pool_, state.usc_fragment_tasks, tasks);
+    pool_.Release(state.usc_coefficient_banks);
+    state.usc_coefficient_banks = StoreNewArray(pool_, std::vector<std::uint32_t>{});
+    state.sampled_texture_count = 0;
+    state.fragment_shader_lane_count = 4;
+    state.stage = PipelineStage::kPdsReady;
+    state.counters.ps_invocations = 1;
+    StorePipelineState(pool_, payload_.state, state);
+    slot_.input(input_); slot_.output(issued_);
+    cluster_.input(issued_); cluster_.output(output_);
+    cluster_.texture_request_output(requests_);
+    cluster_.texture_response_input(responses_);
+    input_.write(payload_.txn);
+  }
+  void Verify() {
+    PipelineTxn completed;
+    Check(output_.nb_read(completed), "derivative quad must complete through USC FIFO");
+    const auto state = LoadPipelineState(pool_, payload_.state);
+    const auto outputs = LoadArray<FragmentOutput>(pool_, state.fragment_outputs);
+    Check(outputs.size() == 1 && outputs[0].pixel_output[0] == 0x3f800000U &&
+              outputs[0].pixel_output[1] == 0 && outputs[0].pixel_output[2] == 0x3f800000U &&
+              outputs[0].pixel_output[3] == 0x3f800000U &&
+              state.counters.fs_tex_instructions == 0 &&
+              requests_.num_available() == 0 && responses_.num_available() == 0,
+          "helper lanes supply native fine derivatives without texture traffic or helper writes");
+    ReleaseFunctionalPayloads(pool_, state);
+    pool_.Release(payload_.state);
+    Check(pool_.bytes_in_flight() == 0 && pool_.allocations() == pool_.releases(),
+          "derivative quad payload ownership balances");
+  }
+private:
+  MemoryPool pool_;
+  CasePayload payload_;
+  sc_core::sc_fifo<PipelineTxn> input_{"input", 1}, output_{"output", 1},
+      issued_{"issued", 1}, requests_{"requests", 1}, responses_{"responses", 1};
+  pvrgpu::stub::UscSlot slot_;
+  UscCluster cluster_;
+};
+
+int RunExpectedFailure(bool too_many_requests, std::string corrupt_continuation = {}) {
   MemoryPool pool;
   const std::size_t sample_count =
       too_many_requests
@@ -894,7 +1292,9 @@ int RunExpectedFailure(bool too_many_requests) {
   sc_core::sc_fifo<PipelineTxn> output("failure_output", 1);
   UscCluster cluster("failure_cluster", pool, ShaderStage::kFragment);
   TextureResponder responder("failure_responder", pool, sample_count,
-                             descriptor_count, !too_many_requests);
+                             descriptor_count,
+                             !too_many_requests && corrupt_continuation.empty(),
+                             false, corrupt_continuation);
   cluster.input(input);
   cluster.texture_request_output(requests);
   cluster.texture_response_input(responses);
@@ -930,6 +1330,12 @@ int sc_main(int argc, char **argv) {
       return RunExpectedFailure(true);
     if (argc == 2 && std::string(argv[1]) == "response-order")
       return RunExpectedFailure(false);
+    if (argc == 2 && std::string(argv[1]) == "continuation-count")
+      return RunExpectedFailure(false, "count");
+    if (argc == 2 && std::string(argv[1]) == "continuation-steps")
+      return RunExpectedFailure(false, "steps");
+    if (argc == 2 && std::string(argv[1]) == "continuation-mask")
+      return RunExpectedFailure(false, "mask");
     Check(argc == 1, "unknown test mode");
 
     DriverPcoStageAbi terrain_d4_fragment_abi;
@@ -1000,6 +1406,17 @@ int sc_main(int argc, char **argv) {
     NativeMultisampleHarness native_ms_array("native_ms_array", true);
     NativeMultisampleHarness native_ms_query("native_ms_query", false, true);
     NativeMultisampleHarness native_ms_array_query("native_ms_array_query", true, true);
+    DerivativeQuadHarness derivative_quad("derivative_quad");
+    std::vector<std::unique_ptr<TextureControlFlowHarness>> control_flow_cases;
+    for (auto mode : {TextureControlFlowCase::kMixedSkipRemaining,
+                      TextureControlFlowCase::kAllSkipRemaining,
+                      TextureControlFlowCase::kAllSkipAll,
+                      TextureControlFlowCase::kMixedSkipAll,
+                      TextureControlFlowCase::kDiscardThenMixed,
+                      TextureControlFlowCase::kDivergentSites}) {
+      control_flow_cases.emplace_back(new TextureControlFlowHarness(
+          sc_core::sc_gen_unique_name("texture_control_flow"), mode));
+    }
     for (auto mode : {pvrgpu::stub::MemoryMode::kDirect,
                       pvrgpu::stub::MemoryMode::kBypass,
                       pvrgpu::stub::MemoryMode::kCache}) {
@@ -1108,6 +1525,9 @@ int sc_main(int argc, char **argv) {
     native_ms_array.Verify();
     native_ms_query.Verify();
     native_ms_array_query.Verify();
+    derivative_quad.Verify();
+    for (const auto &test : control_flow_cases)
+      test->Verify();
 
     std::cout << "usc_cluster_texture_continuation_test: PASS\n";
     return 0;

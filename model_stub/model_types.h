@@ -6,6 +6,7 @@
 #include <iosfwd>
 #include <string>
 #include <vector>
+#include "../src/gallium/drivers/pvrgpu/pvrgpu_systemc_limits.h"
 
 namespace pvrgpu::stub {
 
@@ -82,6 +83,7 @@ enum class DriverPcoShaderStage : std::uint8_t {
   kGeometry = 2,
   kTessellationControl = 3,
   kTessellationEvaluation = 4,
+  kCompute = 5,
 };
 
 inline constexpr std::size_t kMaximumUniformBuffersPerStage = 15;
@@ -159,9 +161,10 @@ inline constexpr std::size_t kDriverPcoMaximumSequenceCommands = 4096;
  * to build but the model refuses leaves the frame with no output at all.
  */
 inline constexpr std::size_t kDriverPcoMaximumNestedSequenceCommands = 256;
-inline constexpr std::size_t kDriverPcoMaximumSequenceTextures = 16;
+inline constexpr std::size_t kDriverPcoMaximumSequenceTextures =
+    kDriverPcoMaximumNestedSequenceCommands * 3U * 8U;
 inline constexpr std::uint64_t kDriverPcoMaximumSequencePayloadBytes =
-    UINT64_C(512) * 1024U * 1024U;
+    PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_PAYLOAD_BYTES;
 inline constexpr std::uint32_t kDriverPcoTextureWidth = 512;
 inline constexpr std::uint32_t kDriverPcoTextureHeight = 512;
 inline constexpr std::uint32_t kDriverPcoTextureRowPitch = 2048;
@@ -336,6 +339,26 @@ struct ModelStreamOutputReadback {
   std::uint32_t internal_offset = 0;
 };
 
+struct DriverShaderImage {
+  std::uint32_t image_slot = 0;
+  std::uint32_t format = 0;
+  std::uint32_t access = 0;
+  std::uint64_t resource_token = 0;
+  std::vector<std::uint8_t> bytes;
+  std::uint64_t offset = 0;
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  std::uint32_t depth = 0;
+  std::uint32_t row_stride = 0;
+  std::uint32_t layer_stride = 0;
+  std::uint32_t texel_bytes = 0;
+};
+
+struct ModelShaderImageReadback {
+  std::uint64_t resource_token = 0;
+  std::vector<std::uint8_t> bytes;
+};
+
 struct DriverCommand {
   bool enabled = false;
   std::string schema;
@@ -370,6 +393,12 @@ struct DriverCommand {
   std::vector<std::uint32_t> geometry_shared;
   DriverTessellation tessellation;
   DriverStreamOutput stream_output;
+  std::vector<DriverShaderImage> fragment_images;
+  std::uint32_t fragment_image_descriptor_start = 0;
+  std::uint32_t fragment_image_descriptor_count = 0;
+  std::uint32_t fragment_image_read_mask = 0;
+  std::uint32_t fragment_image_write_mask = 0;
+  std::uint32_t fragment_early_tests = 0;
   bool explicit_varying_bindings = false;
   std::vector<DriverVaryingBinding> varying_bindings;
   std::vector<DriverPcoUniformBuffer> uniform_buffers;
@@ -462,6 +491,7 @@ struct DriverCommand {
   std::uint32_t depth_clip_far = 0;
   std::uint32_t depth_clamp = 0;
   std::uint32_t sample_mask = 0;
+  std::uint32_t sample_frequency = 0;
   std::uint32_t alpha_to_coverage = 0;
   std::uint32_t alpha_to_coverage_dither = 0;
   std::uint32_t alpha_to_one = 0;
@@ -500,7 +530,7 @@ struct DriverCommand {
       kDriverPcoNewAttachment;
   std::uint32_t depth_attachment_source_command_index =
       kDriverPcoNewAttachment;
-  // Full tightly packed model transport for a newly allocated color target.
+  // Target-major tightly packed transport for all newly allocated color targets.
   // Imported through DRAM and the normal PBE LOAD path, never CPU-rendered.
   std::vector<std::uint8_t> initial_color_attachment_bytes;
   std::uint32_t raster_samples = 1;
@@ -583,6 +613,17 @@ inline bool ResolveSequenceAttachmentAddresses(
                                     next_color_slot++ *
                                         kDriverPcoSequenceAttachmentStride;
     } else if (draw.color_attachment_source_command_index < ordinal) {
+      const DriverCommand &producer = draws[draw.color_attachment_source_command_index];
+      if (draw.format != producer.format ||
+          draw.framebuffer_width != producer.framebuffer_width ||
+          draw.framebuffer_height != producer.framebuffer_height ||
+          (draw.render_target_count ? draw.render_target_count : 1U) !=
+              (producer.render_target_count ? producer.render_target_count : 1U) ||
+          (draw.raster_samples ? draw.raster_samples : 1U) !=
+              (producer.raster_samples ? producer.raster_samples : 1U) ||
+          (draw.framebuffer_layers ? draw.framebuffer_layers : 1U) !=
+              (producer.framebuffer_layers ? producer.framebuffer_layers : 1U))
+        return false;
       (*color_addresses)[ordinal] =
           (*color_addresses)[draw.color_attachment_source_command_index];
     } else {
@@ -652,6 +693,8 @@ enum class MemoryClient : std::uint8_t {
   kTessellator = 16,
   kTessellationEvaluation = 17,
   kStreamOutput = 18,
+  kFragmentImage = 19,
+  kShaderImageReadback = 20,
 };
 
 enum class MemoryPayloadFormat : std::uint8_t {

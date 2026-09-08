@@ -11,7 +11,7 @@ case "${MESA_TEST_SELECTION}" in
     -h|--help)
         echo "usage: $0 [all|shared|images]"
         echo 'all (default): buffer/shared 0..30 and image 32..38 compiler tests.'
-        echo 'shared: existing buffer tests plus shared fixtures 24..30.'
+        echo 'shared: buffer/shared compiler tests and native sparse-store memory checks.'
         echo 'images: image fixtures 32..38 and invalid-image compiler tests.'
         echo 'Native binaries, ABI files and generated headers stay in a fresh private directory.'
         exit 0 ;;
@@ -76,6 +76,22 @@ tests.each do |kind, source, name|
   generator << 'images' if kind == 'images'
   abort "#{kind} fixture header generation failed" unless system('ruby', *generator)
   puts "Generated native #{kind} fixture header: #{header}"
+  if kind == 'shared'
+    texture_header = File.join(output, 'pco_compute_texture_fixtures.h')
+    abort 'texture fixture header generation failed' unless system('ruby',
+      File.join(repo, 'script/generate_compute_shared_fixtures.rb'), output, texture_header, 'textures')
+    puts "Generated native texture fixture header: #{texture_header}"
+    native = File.join(output, 'native-masked-store-test')
+    abort 'Native masked-store test compilation failed' unless system(cpp_command.first,
+      '-std=c++17', '-O1', '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
+      '-I' + File.join(repo, 'model_stub'), '-I' + File.join(repo, 'src'),
+      '-I' + File.join(repo, 'src/systemc'),
+      File.join(repo, 'tests/pco_compute_masked_store_test.cpp'),
+      File.join(repo, 'src/systemc/shader/pco_iss.cpp'),
+      File.join(repo, 'src/systemc/shader/compute_iss.cpp'), '-o', native)
+    abort 'Native masked-store execution failed' unless system(
+      {'ASAN_OPTIONS' => 'detect_leaks=0', 'UBSAN_OPTIONS' => 'halt_on_error=1'}, native, output)
+  end
 end
 puts "Compute compiler unit artifacts: #{output}"
 RUBY

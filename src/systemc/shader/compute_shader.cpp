@@ -1,6 +1,7 @@
 #include "shader/compute_shader.h"
 
 #include "common/functional_types.h"
+#include "common/pipeline_state.h"
 
 #include <algorithm>
 #include <cstring>
@@ -36,6 +37,70 @@ void WritePod(MemoryPool &pool, PoolHandle handle, const T &value) {
 ComputeShader::ComputeShader(sc_core::sc_module_name name, MemoryPool &pool)
     : sc_module(name), pool_(pool) {
   SC_THREAD(Run);
+}
+
+void ComputeShader::SampleTexture(void *context, const PcoTextureRequest &issued,
+                                  std::uint32_t *response) {
+  auto &self = *static_cast<ComputeShader *>(context);
+  const auto dispatch = ReadPod<ComputeDispatchState>(self.pool_, self.current_dispatch_);
+  if (!response || !self.texture_request_output.size() || !self.texture_response_input.size() ||
+      !HasPoolHandle(dispatch.texture_state))
+    throw std::runtime_error("compute SMP FIFO/state is unbound");
+  auto state = LoadPipelineState(self.pool_, dispatch.texture_state);
+  if (!UsesTextureSampling(state, ShaderStage::kCompute) ||
+      HasPoolHandle(state.texture_sample_requests) || HasPoolHandle(state.texture_sample_responses))
+    throw std::runtime_error("compute SMP rendezvous payload is already occupied");
+  TextureSampleRequest request;
+  request.shader_stage = ShaderStage::kCompute;
+  std::copy_n(issued.coordinates.begin(), 3, request.coordinates);
+  std::copy_n(issued.texture_state.begin(), 4, request.texture_state);
+  std::copy_n(issued.sampler_state.begin(), 4, request.sampler_state);
+  request.texture_address_lo = issued.texture_address_lo;
+  request.texture_address_hi = issued.texture_address_hi;
+  request.coordinate_count = issued.coordinate_count;
+  request.component_count = issued.component_count;
+  request.descriptor_set = issued.descriptor_set;
+  request.binding = issued.binding;
+  request.dimension = issued.dimension;
+  request.normalized = issued.normalized;
+  request.fcnorm = issued.fcnorm;
+  request.data_request = issued.data_request;
+  request.explicit_lod = issued.explicit_lod;
+  request.explicit_lod_present = issued.explicit_lod_present;
+  state.texture_sample_requests = StoreNewArray(self.pool_, std::vector<TextureSampleRequest>{request});
+  state.stage = PipelineStage::kComputeTexturePending;
+  StorePipelineState(self.pool_, dispatch.texture_state, state);
+  PipelineTxn txn;
+  txn.state = dispatch.texture_state;
+  txn.sequence = dispatch.sequence;
+  self.texture_request_output->write(txn);
+  const auto completion = self.texture_response_input->read();
+  if (!SameHandle(completion.state, txn.state) || completion.sequence != txn.sequence || completion.frame != txn.frame)
+    throw std::runtime_error("compute SMP response identity mismatch");
+  state = LoadPipelineState(self.pool_, txn.state);
+  RequireStage(state.stage, PipelineStage::kComputeTextureSamplesReady, self.name());
+  const auto requests = LoadArray<TextureSampleRequest>(self.pool_, state.texture_sample_requests);
+  const auto responses = LoadArray<TextureSampleResponse>(self.pool_, state.texture_sample_responses);
+  if (requests.size() != 1 || responses.size() != 1 ||
+      !std::equal(std::begin(requests[0].coordinates), std::end(requests[0].coordinates), std::begin(request.coordinates)) ||
+      !std::equal(std::begin(requests[0].texture_state), std::end(requests[0].texture_state), std::begin(request.texture_state)) ||
+      !std::equal(std::begin(requests[0].sampler_state), std::end(requests[0].sampler_state), std::begin(request.sampler_state)) ||
+      requests[0].shader_stage != request.shader_stage ||
+      requests[0].descriptor_set != request.descriptor_set || requests[0].binding != request.binding ||
+      requests[0].texture_address_lo != request.texture_address_lo ||
+      requests[0].texture_address_hi != request.texture_address_hi ||
+      requests[0].explicit_lod != request.explicit_lod ||
+      requests[0].explicit_lod_present != request.explicit_lod_present ||
+      requests[0].dimension != request.dimension || requests[0].normalized != request.normalized ||
+      requests[0].fcnorm != request.fcnorm || requests[0].coordinate_count != request.coordinate_count ||
+      requests[0].component_count != request.component_count || requests[0].data_request != request.data_request ||
+      responses[0].shader_stage != ShaderStage::kCompute ||
+      responses[0].shader_lane_index || responses[0].request_id)
+    throw std::runtime_error("compute SMP completion ordering/payload mismatch");
+  std::copy_n(responses[0].rgba, 4, response);
+  self.pool_.Release(state.texture_sample_requests); state.texture_sample_requests = {};
+  self.pool_.Release(state.texture_sample_responses); state.texture_sample_responses = {};
+  StorePipelineState(self.pool_, txn.state, state);
 }
 
 ComputeMemoryTxn ComputeShader::ExchangeMemory(
@@ -202,7 +267,7 @@ void ComputeShader::Run() {
       const std::uint32_t local_count = state.abi.local_size[0] *
           state.abi.local_size[1] * state.abi.local_size[2];
       const ComputeMemoryCallbacks memory{this, ReadMemory, WriteMemory,
-                                            Atomic32Memory, nullptr, MutexMemory};
+                                            Atomic32Memory, nullptr, MutexMemory, SampleTexture};
       for (std::uint32_t first = 0; first < local_count;
            first += kComputeTaskWidth) {
         const std::uint32_t count = std::min(kComputeTaskWidth, local_count-first);

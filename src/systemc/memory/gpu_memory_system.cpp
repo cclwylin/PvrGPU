@@ -102,6 +102,8 @@ void GpuMemorySystem::ValidateClient(MemoryClient client) {
   case MemoryClient::kTessellator:
   case MemoryClient::kTessellationEvaluation:
   case MemoryClient::kStreamOutput:
+  case MemoryClient::kFragmentImage:
+  case MemoryClient::kShaderImageReadback:
     return;
   case MemoryClient::kMixedCache:
   case MemoryClient::kUscL2:
@@ -229,6 +231,9 @@ MemoryAccessStats GpuMemorySystem::Write(std::uint64_t address,
   }
 
   const std::size_t line_bytes = slc_.config().line_size_bytes;
+  // This is host scratch only: preserve every modeled line lookup, lower
+  // request and counter while reusing storage across a multi-line write.
+  CacheLineData line;
   std::size_t copied = 0;
   while (copied < bytes) {
     const std::uint64_t current = address + copied;
@@ -248,9 +253,8 @@ MemoryAccessStats GpuMemorySystem::Write(std::uint64_t address,
       AddDramWrite(lower, data.size());
     };
 
-    CacheLineData line;
     if (line_offset == 0 && chunk == line_bytes) {
-      line.assign(input + copied, input + copied + chunk);
+      line.resize(line_bytes);
     } else {
       // A previous GPU store may own the only copy of this line in dirty
       // SLC; no DRAM page need exist yet. Always consult the cache before
@@ -264,16 +268,16 @@ MemoryAccessStats GpuMemorySystem::Write(std::uint64_t address,
           return CacheLineData(lower_bytes, 0);
         return read_lower(lower_address, lower_bytes);
       };
-      const CacheLineAccess read =
+      CacheLineAccess read =
           slc_.ReadLine(line_address, read_for_store, write_lower);
       result.slc += read.delta;
       result += lower;
       lower = {};
-      line = read.data;
+      line = std::move(read.data);
     }
     std::copy_n(input + copied, chunk, line.begin() + line_offset);
     const CacheLineAccess write =
-        slc_.WriteLine(line_address, line, read_lower, write_lower);
+        slc_.WriteLine(line_address, line, read_lower, write_lower, false);
     result.slc += write.delta;
     result += lower;
     copied += chunk;

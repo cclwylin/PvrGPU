@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build focused resource/clear tests with an existing Mesa build's actual
 # compiler configuration. Generated executables stay outside the source tree.
-# Usage: bash script/run_mesa_resource_unit.sh [all|blit|clear|ubo|compute|surface|vertex]
+# Usage: bash script/run_mesa_resource_unit.sh [all|blit|clear|ubo|compute|surface|vertex|command|texture|boundary|flush|depth-upload|payload-budget]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,14 +24,20 @@ abort 'Mesa test build/output must be outside the source tree' if
   [build, output].any? { |path| path == repo || path.start_with?(repo + '/') }
 database = JSON.parse(File.read(File.join(build, 'compile_commands.json')))
 selected = ARGV.fetch(0)
-abort 'usage: run_mesa_resource_unit.sh [all|blit|clear|ubo|compute|surface|vertex]' unless
-  %w[all blit clear ubo compute surface vertex].include?(selected)
+abort 'usage: run_mesa_resource_unit.sh [all|blit|clear|ubo|compute|surface|vertex|command|texture|boundary|flush|depth-upload|payload-budget]' unless
+  %w[all blit clear ubo compute surface vertex command texture boundary flush depth-upload payload-budget].include?(selected)
 tests = { 'blit' => ['pvrgpu_resource.c', 'pvrgpu_msaa_blit_test.c'],
           'clear' => ['pvrgpu_clear.c', 'pvrgpu_clear_storage_test.c'],
           'ubo' => ['pvrgpu_context.c', 'pvrgpu_uniform_buffer_snapshot_test.c'],
           'compute' => ['pvrgpu_context.c', 'pvrgpu_compute_snapshot_test.c'],
           'surface' => ['pvrgpu_resource.c', 'pvrgpu_surface_span_test.c'],
-          'vertex' => ['pvrgpu_context.c', 'pvrgpu_vertex_attribute_fetch_test.c'] }
+          'boundary' => ['pvrgpu_resource.c', 'pvrgpu_framebuffer_boundary_test.c'],
+          'flush' => ['pvrgpu_context.c', 'pvrgpu_flush_test.c'],
+          'depth-upload' => ['pvrgpu_resource.c', 'pvrgpu_depth_upload_copy_test.c'],
+          'payload-budget' => ['pvrgpu_context.c', 'pvrgpu_payload_budget_test.c'],
+          'vertex' => ['pvrgpu_context.c', 'pvrgpu_vertex_attribute_fetch_test.c'],
+          'texture' => ['pvrgpu_context.c', 'pvrgpu_texture_view_snapshot_test.c'],
+          'command' => ['pvrgpu_cmd.c', 'pvrgpu_command_defaults_test.c'] }
 tests.each do |name, (driver, source)|
   next unless selected == 'all' || selected == name
   entry = database.find { |item| File.basename(item.fetch('file')) == driver }
@@ -55,6 +61,14 @@ tests.each do |name, (driver, source)|
     args << '-Wl,-dead_strip'
   else
     args.concat(%w[-ffunction-sections -fdata-sections -Wl,--gc-sections])
+  end
+  args << 'src/compiler/nir/libnir.a' if name == 'texture'
+  if name == 'depth-upload'
+    pack = database.find { |item| item.fetch('file').end_with?('/main/pack.c') }
+    abort 'Mesa compile command missing for main/pack.c' unless pack
+    mesa = File.dirname(File.dirname(File.expand_path(pack.fetch('file'), pack.fetch('directory'))))
+    args.concat(["-I#{mesa}", 'src/mesa/libmesa.a',
+                 'src/mesa/glapi/shared-glapi/libglapi.a'])
   end
   args.concat(['src/util/libmesa_util.a', 'src/c11/impl/libmesa_util_c11.a',
                '-lm', '-lpthread', '-o', executable])

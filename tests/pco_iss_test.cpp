@@ -9,6 +9,7 @@
  * instead of falling back to shader-name-specific behavior.
  */
 #include "shader/pco_iss.h"
+#include "common/msaa.h"
 #include "pco_depth_feedback_fixture.h"
 #include "pco_uniform_buffer_fixtures.h"
 #include "pco_temp256_fixtures.h"
@@ -2355,6 +2356,36 @@ void TestDecodeAndExecuteVaryingsOne() {
   msaa_context.raster_sample_count = 4;
   ExpectFailure([&] { (void)ExecuteFragment(centroid.summary, centroid.instructions, msaa_context); },
                 "multisample centroid cannot silently use pixel coordinates");
+  for (std::uint32_t count : {1U, 2U, 4U, 8U, 16U}) {
+    const auto all = pvrgpu::stub::RasterSampleMask(count);
+    for (std::uint32_t coverage = 0; coverage <= all; ++coverage) {
+      const auto position = pvrgpu::stub::RasterCentroidPosition(count, coverage);
+      if (coverage == 0 || coverage == all) {
+        Check(position == std::array<std::uint8_t, 2>{8, 8},
+              "fully covered and full-mask helper centroids use pixel centre");
+      } else {
+        unsigned first = 0;
+        while (!(coverage & (1U << first))) ++first;
+        Check(position == pvrgpu::stub::RasterSamplePosition(count, first),
+              "partial centroid uses the lowest covered sample");
+      }
+    }
+    for (unsigned sample = 0; sample < count; ++sample) {
+      const auto position = pvrgpu::stub::RasterCentroidPosition(count, 1U << sample);
+      msaa_context = MakeVaryingsOneContext();
+      msaa_context.raster_sample_count = count;
+      msaa_context.centroid_x = FloatBits(32.0F + position[0] / 16.0F);
+      msaa_context.centroid_y = FloatBits(47.0F + position[1] / 16.0F);
+      msaa_context.centroid_position_valid = 1;
+      auto pixel_context = msaa_context;
+      pixel_context.sample_x = msaa_context.centroid_x;
+      pixel_context.sample_y = msaa_context.centroid_y;
+      const auto actual = ExecuteFragment(centroid.summary, centroid.instructions, msaa_context);
+      const auto expected = ExecuteFragment(fragment.summary, fragment.instructions, pixel_context);
+      Check(actual.pixel_outputs == expected.pixel_outputs,
+            "centroid numerator and reciprocal-W planes use the selected sample position");
+    }
+  }
 }
 
 void TestDecodeAndExecuteVaryingsTwo() {
@@ -3095,10 +3126,10 @@ void TestVaryingsOneFailsClosed() {
                 "FITRP changed from drc0 to drc1");
 
   auto bad_fitrp_iteration = VaryingsOneFragmentPcoBinary();
-  bad_fitrp_iteration[3] = 0xb1;
+  bad_fitrp_iteration[3] = 0xb3;
   ExpectFailure(
       [&] { (void)Decode(ShaderStage::kFragment, bad_fitrp_iteration); },
-      "FITRP PIXEL iteration mode changed");
+      "FITRP reserved iteration mode rejected");
 
   auto bad_fitrp_count = VaryingsOneFragmentPcoBinary();
   bad_fitrp_count[4] = 0x03;
@@ -3172,13 +3203,13 @@ void TestVaryingsOneFailsClosed() {
       "FITRP semantic repeat mutation");
 
   semantic = decoded;
-  semantic.instructions[0].iteration_mode = PcoIterationMode::kSample;
+  semantic.instructions[0].iteration_mode = static_cast<PcoIterationMode>(3);
   ExpectFailure(
       [&] {
         (void)ExecuteFragment(semantic.summary, semantic.instructions,
                               MakeVaryingsOneContext());
       },
-      "FITRP PIXEL mode mutation");
+      "FITRP reserved semantic mode mutation");
 
   semantic = decoded;
   const auto wdf = semantic.instructions[1];
@@ -5981,6 +6012,356 @@ void TestShiftCountUsesLowFiveBits() {
   }
 }
 
+void TestGraphicsIntegerOpcodeParity() {
+  // Field-level native groups captured from Mesa's ordinary integer
+  // operators. Only register indices and operand words are varied here.
+  for (ShaderStage stage : {ShaderStage::kVertex, ShaderStage::kFragment}) {
+    for (unsigned operation = 0; operation < 4; ++operation) {
+      for (std::uint32_t a : {0U, 1U, 0x7fffffffU, 0x80000000U, 0xffffffffU}) {
+        for (std::uint32_t b : {0U, 1U, 17U, 31U, 32U, 0xffffffffU}) {
+          std::vector<std::uint8_t> binary;
+          for (unsigned reg = 0; reg < 2; ++reg) {
+            auto move = BytesFromHex("86 92 40 13 00 00 00 00 00 00 40 ff");
+            const std::uint32_t value = reg ? b : a;
+            for (unsigned byte = 0; byte < 4; ++byte)
+              move[4 + byte] = static_cast<std::uint8_t>(value >> (8 * byte));
+            move[10] += reg;
+            binary.insert(binary.end(), move.begin(), move.end());
+          }
+          auto group = operation == 0
+              ? BytesFromHex("56 b2 40 42 02 80 40 00 40 41 40 ff")
+              : operation == 1
+                ? BytesFromHex("55 d2 40 04 02 80 a0 80 a1 40")
+                : BytesFromHex("36 84 00 e3 c0 61 20 00 00 c0 40 ff");
+          if (operation == 3) group[3] = 0xeb;
+          binary.insert(binary.end(), group.begin(), group.end());
+          if (stage == ShaderStage::kVertex) {
+            const auto move = BytesFromHex("35 82 00 87 40 00 00 80 04 ff");
+            binary.insert(binary.end(), move.begin(), move.end());
+            const auto &tail = FillSolidVertexPcoBinary();
+            binary.insert(binary.end(), tail.begin(), tail.end());
+          } else {
+            for (unsigned component = 0; component < 4; ++component) {
+              auto move = BytesFromHex("34 8a 00 87 40 00 00 20");
+              move[7] += component;
+              if (component == 3) move[2] = 0x80;
+              binary.insert(binary.end(), move.begin(), move.end());
+            }
+          }
+          const auto program = Decode(stage, binary);
+          const auto &instruction = program.instructions[2];
+          Check(instruction.opcode == (operation == 0 ? PcoOpcode::kBitwiseXor :
+                operation == 1 ? PcoOpcode::kShiftRight : PcoOpcode::kIntegerMultiplyAdd64High),
+                "graphics decodes ordinary XOR, ASR and multiply-high groups");
+          std::uint32_t expected = a ^ b;
+          if (operation == 1) {
+            const auto count = b & 31U;
+            expected = a >> count;
+            if (count && (a & 0x80000000U)) expected |= 0xffffffffU << (32 - count);
+          } else if (operation >= 2) {
+            const std::int64_t left = operation == 3 && a >= 0x80000000U
+                ? static_cast<std::int64_t>(a) - 0x100000000LL : a;
+            const std::int64_t right = operation == 3 && b >= 0x80000000U
+                ? static_cast<std::int64_t>(b) - 0x100000000LL : b;
+            expected = operation == 3
+                ? static_cast<std::uint64_t>(left * right) >> 32
+                : (static_cast<std::uint64_t>(a) * b) >> 32;
+          }
+          const auto actual = stage == ShaderStage::kVertex
+              ? ExecuteVertex(program.summary, program.instructions, std::vector<std::uint32_t>(8)).outputs[0]
+              : ExecuteFragment(program.summary, program.instructions).pixel_outputs[0];
+          Check(actual == expected, "graphics native integer result matches the independent word reference");
+        }
+      }
+    }
+  }
+}
+
+void TestNativeFragmentSampleInputs() {
+  // Native MBYP from SAMP_NUM into TEMP; scalar exports are untouched PCO.
+  auto binary = BytesFromHex("34 82 00 87 35 00 00 40");
+  for (unsigned channel = 0; channel < 4; ++channel) {
+    auto output = BytesFromHex("34 8a 00 87 40 00 00 20");
+    output[7] += channel;
+    if (channel == 3) output[2] = 0x80;
+    binary.insert(binary.end(), output.begin(), output.end());
+  }
+  const auto id_program = Decode(ShaderStage::kFragment, binary);
+  auto mask_binary = BytesFromHex("44 a2 00 20 00 00 00 40");
+  mask_binary.insert(mask_binary.end(), binary.begin() + 8, binary.end());
+  const auto mask_program = Decode(ShaderStage::kFragment, mask_binary);
+  Check(mask_program.instructions[0].opcode == PcoOpcode::kSaveVisibilityMask,
+        "native backend SAVMSK.VM writes the exact W0 TEMP destination");
+  for (unsigned changed : {0x21U, 0x22U, 0x23U, 0x24U, 0x28U, 0x30U}) {
+    auto invalid = mask_binary;
+    invalid[3] = changed;
+    ExpectFailure([&] { Decode(ShaderStage::kFragment, invalid); },
+                  "SAVMSK rejects other mask modes and MOVMSK forms");
+  }
+  for (unsigned selector : {4U, 5U, 6U}) {
+    auto invalid = mask_binary;
+    invalid[selector] = 1;
+    ExpectFailure([&] { Decode(ShaderStage::kFragment, invalid); },
+                  "SAVMSK rejects noncanonical null selectors");
+  }
+  auto packed_program = mask_program;
+  packed_program.instructions[0].opcode = PcoOpcode::kPackCoverageMask;
+  auto sample_binary = VaryingsOneFragmentPcoBinary();
+  sample_binary[3] = 0xb1;
+  const auto sample_program = Decode(ShaderStage::kFragment, sample_binary);
+  const auto pixel_program = Decode(ShaderStage::kFragment, VaryingsOneFragmentPcoBinary());
+  for (unsigned count : {1U, 2U, 4U, 8U, 16U}) {
+    for (unsigned sample = 0; sample < count; ++sample) {
+      auto context = MakeVaryingsOneContext();
+      const auto position = pvrgpu::stub::RasterSamplePosition(count, sample);
+      context.raster_sample_count = count;
+      context.sample_id = sample;
+      context.coverage_mask = 1U << sample;
+      context.sample_position_x = FloatBits(16.F + position[0] / 16.F - .5F);
+      context.sample_position_y = FloatBits(23.F + position[1] / 16.F - .5F);
+      context.sample_position_valid = 1;
+      context.special_coordinate_offset = FloatBits(.5F);
+      const auto id = ExecuteFragment(id_program.summary, id_program.instructions, context);
+      Check(id.pixel_outputs[0] == sample, "native SAMP_NUM preserves each actual sample ID");
+      Check(ExecuteFragment(mask_program.summary, mask_program.instructions, context).pixel_outputs[0] ==
+                context.coverage_mask &&
+            ExecuteFragment(packed_program.summary, packed_program.instructions, context).pixel_outputs[0] ==
+                pvrgpu::stub::RasterSampleMask(count),
+            "SAVMSK.VM reads coverage while PCK.COV(1.0) covers every framebuffer sample");
+      auto helper = context;
+      helper.coverage_mask = 0;
+      Check(ExecuteFragment(mask_program.summary, mask_program.instructions, helper).pixel_outputs[0] == 0,
+            "helper SAVMSK.VM does not fabricate visible sample coverage");
+
+      auto moved_pixel_context = context;
+      moved_pixel_context.sample_x = context.sample_position_x;
+      moved_pixel_context.sample_y = context.sample_position_y;
+      const auto expected = ExecuteFragment(pixel_program.summary, pixel_program.instructions,
+                                             moved_pixel_context);
+      const auto actual = ExecuteFragment(sample_program.summary, sample_program.instructions, context);
+      Check(actual.pixel_outputs == expected.pixel_outputs,
+            "native SAMPLE interpolation evaluates all numerator/W planes at its own position");
+      const auto original_pixel = ExecuteFragment(pixel_program.summary, pixel_program.instructions, context);
+      auto no_sample_position = context;
+      no_sample_position.sample_position_valid = 0;
+      Check(ExecuteFragment(pixel_program.summary, pixel_program.instructions, no_sample_position).pixel_outputs ==
+                original_pixel.pixel_outputs,
+            "sample-frequency context never shifts ordinary PIXEL interpolation");
+
+      for (unsigned coordinate : {97U, 98U, 100U, 101U}) {
+        auto coordinate_program = id_program;
+        coordinate_program.instructions[0].source.index = coordinate;
+        const auto output = ExecuteFragment(coordinate_program.summary,
+                                             coordinate_program.instructions, context);
+        const auto wanted = coordinate == 97 ? context.sample_x :
+                            coordinate == 100 ? context.sample_y :
+                            coordinate == 98 ? context.sample_position_x : context.sample_position_y;
+        float value;
+        std::memcpy(&value, &wanted, sizeof(value));
+        Check(output.pixel_outputs[0] == FloatBits(value + .5F),
+              "native X_P/Y_P and X_S/Y_S retain distinct physical positions");
+      }
+      if (count > 1)
+        ExpectFailure([&] { ExecuteFragment(sample_program.summary, sample_program.instructions,
+                                             no_sample_position); },
+                      "MSAA SAMPLE cannot fabricate an absent per-sample location");
+      auto invalid = context;
+      invalid.sample_id = count;
+      ExpectFailure([&] { ExecuteFragment(id_program.summary, id_program.instructions, invalid); },
+                    "sample ID outside framebuffer sample count is rejected");
+      invalid = context;
+      invalid.coverage_mask = 1U << count;
+      ExpectFailure([&] { ExecuteFragment(id_program.summary, id_program.instructions, invalid); },
+                    "sample coverage outside framebuffer sample count is rejected");
+    }
+  }
+}
+
+void TestNativeFragmentVisibilityFeedback() {
+  // Unmodified native PCO emitted for gl_SampleMask[0] = 0xAAAA. The first
+  // LSL addresses SAMP_NUM/sc53 through extended I_TWO_UP; TST writes P0,
+  // then predicated ALPHAF sends visibility before ordinary color exports.
+  auto binary = BytesFromHex(R"hex(
+56 d2 40 00 02 80 81 80 d5 01 40 ff
+86 92 40 13 aa aa 00 00 00 00 41 ff
+56 b2 40 41 02 80 40 00 41 40 40 ff
+99 d2 00 d3 3c f8 c0 9c 1e 87 87 c0 cf 80 11 00 20 40
+98 c0 00 d3 3c f1 a0 9c 1e 87 c0 cf 80 11 00 20
+45 a9 00 82 80 40 00 07 00 00
+02 80 6a ff
+34 8a 00 87 00 00 00 20
+34 8a 00 87 00 00 00 21
+36 8a 00 87 00 00 00 22 f2 ff ff ff
+38 8a 80 87 80 01 00 00 00 23 f3 ff ff ff ff ff
+)hex");
+  const auto program = Decode(ShaderStage::kFragment, binary);
+  Check(program.summary.early_hsr_safe == 0 &&
+        program.instructions[4].writes_predicate == 1 &&
+        program.instructions[5].opcode == PcoOpcode::kAlphaFeedback &&
+        program.instructions[5].exec_cnd == 1,
+        "native P0 and ALPHAF retain ISP visibility semantics");
+  for (unsigned count : {1U, 2U, 4U, 8U, 16U}) {
+    for (unsigned id = 0; id < count; ++id) {
+      PcoFragmentExecutionContext context;
+      context.raster_sample_count = count;
+      context.sample_id = id;
+      const auto result = ExecuteFragment(program.summary, program.instructions, context);
+      Check(result.discarded == !(id & 1) && result.written_mask == 15 &&
+            result.executed_instruction_count == program.instructions.size(),
+            "native mask kills only its excluded sample while retaining helper ALU execution");
+    }
+  }
+  auto suspended_binary = binary;
+  const auto derivative = BytesFromHex("34 82 00 88 40 00 00 41");
+  suspended_binary.insert(suspended_binary.begin() + 70, derivative.begin(), derivative.end());
+  const auto suspended_program = Decode(ShaderStage::kFragment, suspended_binary);
+  for (unsigned id = 0; id < 2; ++id) {
+    PcoFragmentExecutionContext context;
+    context.raster_sample_count = 2;
+    context.sample_id = id;
+    const auto waiting = ExecuteFragment(suspended_program.summary, suspended_program.instructions, context);
+    Check(waiting.suspended && waiting.continuation.predicate_valid &&
+          waiting.continuation.predicate == (id & 1),
+          "derivative checkpoint retains live P0 before visibility feedback");
+    context.continuation = waiting.continuation;
+    context.derivative_response_valid = 1;
+    const auto result = ExecuteFragment(suspended_program.summary, suspended_program.instructions, context);
+    Check(result.discarded == !(id & 1), "resumed native feedback reads saved P0 without replay");
+    for (unsigned mutation = 0; mutation < 3; ++mutation) {
+      auto invalid = context;
+      if (mutation == 0) invalid.continuation.predicate_valid = 0;
+      if (mutation == 1) invalid.continuation.predicate = 2;
+      if (mutation == 2) invalid.continuation.discarded = 1;
+      ExpectFailure([&] { ExecuteFragment(suspended_program.summary, suspended_program.instructions, invalid); },
+                    "malformed predicate/visibility checkpoints fail closed");
+    }
+  }
+  for (unsigned mutation = 0; mutation < 4; ++mutation) {
+    auto invalid = binary;
+    if (mutation == 0) invalid[73] |= 1; // ALPHATST has different semantics.
+    if (mutation == 1) invalid[77] = 6; // ISP epilog requires ALWAYS.
+    if (mutation == 2) invalid[1] |= 1; // Predicated ordinary LSL is unsupported.
+    if (mutation == 3) invalid[59] &= ~1; // Predicate-only TST must write P0.
+    ExpectFailure([&] { Decode(ShaderStage::kFragment, invalid); },
+                  "feedback rejects unsupported native operand/predicate variants");
+  }
+  auto post_feedback_binary = binary;
+  post_feedback_binary.insert(post_feedback_binary.begin() + 84, derivative.begin(), derivative.end());
+  const auto post_feedback_program = Decode(ShaderStage::kFragment, post_feedback_binary);
+  PcoFragmentExecutionContext context;
+  const auto waiting = ExecuteFragment(post_feedback_program.summary, post_feedback_program.instructions, context);
+  Check(waiting.suspended && waiting.discarded && waiting.continuation.discarded,
+        "discarded native lanes still supply subsequent derivative helper work");
+  context.continuation = waiting.continuation;
+  context.derivative_response_valid = 1;
+  const auto result = ExecuteFragment(post_feedback_program.summary, post_feedback_program.instructions, context);
+  Check(result.discarded && result.written_mask == 15,
+        "post-feedback checkpoint cannot revive killed samples");
+}
+
+void TestNativeDerivativeDecode() {
+  for (unsigned operation = 0x88; operation <= 0x8b; ++operation) {
+    for (unsigned modifier = 0; modifier <= 3; ++modifier) {
+      auto binary = BytesFromHex("86 92 40 13 00 00 80 3f 00 00 40 ff");
+      auto derivative = modifier
+          ? BytesFromHex("35 82 00 98 00 40 00 00 41 ff")
+          : BytesFromHex("34 82 00 88 40 00 00 41");
+      derivative[3] = operation | (modifier ? 0x10U : 0U);
+      if (modifier) derivative[4] = modifier;
+      binary.insert(binary.end(), derivative.begin(), derivative.end());
+      for (unsigned channel = 0; channel < 4; ++channel) {
+        auto move = BytesFromHex("34 8a 00 87 41 00 00 20");
+        move[7] += channel;
+        if (channel == 3) move[2] = 0x80;
+        binary.insert(binary.end(), move.begin(), move.end());
+      }
+      const auto decoded = Decode(ShaderStage::kFragment, binary);
+      const auto &instruction = decoded.instructions[1];
+      Check(instruction.opcode == ((operation & 1U) ? PcoOpcode::kDerivativeY : PcoOpcode::kDerivativeX) &&
+            instruction.derivative_fine == ((operation & 2U) ? 1 : 0) &&
+            instruction.source0_absolute == (modifier & 1U) &&
+            instruction.source0_negate == ((modifier >> 1U) & 1U),
+            "native coarse/fine derivatives retain independent source modifiers");
+      auto malformed = decoded;
+      malformed.instructions[0].derivative_fine = 1;
+      ExpectFailure([&] { ExecuteFragment(malformed.summary, malformed.instructions); },
+                    "non-derivative opcode cannot carry the fine flag");
+    }
+  }
+}
+
+void TestNativeDerivativeExchange() {
+  for (bool fine : {false, true}) {
+    auto binary = BytesFromHex(R"hex(
+35 82 00 87 80 08 00 00 00 40
+34 8a 00 87 40 00 00 20
+34 82 00 88 40 00 00 41
+34 8a 00 87 41 00 00 21
+34 82 00 89 40 00 00 42
+34 8a 00 87 42 00 00 22
+35 8a 80 87 80 01 00 00 00 23
+)hex");
+    if (fine) { binary[21] = 0x8a; binary[37] = 0x8b; }
+    const auto program = Decode(ShaderStage::kFragment, binary);
+    Check(program.summary.uses_derivatives == 1, "native summary requests true helper-lane quads");
+    std::array<PcoFragmentExecutionContext, 4> contexts;
+    std::array<pvrgpu::stub::PcoFragmentExecution, 4> lanes;
+    const std::array<float, 4> inputs{1, 3, 6, 12};
+    std::array<unsigned, 4> executed{};
+    for (unsigned lane = 0; lane < 4; ++lane) {
+      contexts[lane].shared_count = 1;
+      contexts[lane].shared_registers[0] = FloatBits(inputs[lane]);
+      lanes[lane] = ExecuteFragment(program.summary, program.instructions, contexts[lane]);
+      executed[lane] += lanes[lane].executed_instruction_count;
+      Check(lanes[lane].suspended && lanes[lane].derivative_request_valid &&
+            !lanes[lane].texture_request_valid && lanes[lane].continuation.kind == 1 &&
+            lanes[lane].continuation.written_mask == 1 && lanes[lane].derivative_source == FloatBits(inputs[lane]),
+            "native derivative captures source and previously written PIXOUT before yielding");
+    }
+    for (unsigned round = 0; round < 2; ++round) {
+      std::array<std::uint32_t, 4> sources;
+      for (unsigned lane = 0; lane < 4; ++lane) sources[lane] = lanes[lane].derivative_source;
+      const auto &instruction = program.instructions[lanes[0].continuation.resume_instruction_index - 1];
+      const auto values = pvrgpu::stub::EvaluatePcoDerivativeQuad(instruction, sources);
+      for (unsigned lane = 0; lane < 4; ++lane) {
+        contexts[lane].continuation = lanes[lane].continuation;
+        contexts[lane].derivative_response_valid = 1;
+        contexts[lane].derivative_response = values[lane];
+        lanes[lane] = ExecuteFragment(program.summary, program.instructions, contexts[lane]);
+        executed[lane] += lanes[lane].executed_instruction_count;
+      }
+    }
+    for (unsigned lane = 0; lane < 4; ++lane) {
+      Check(!lanes[lane].suspended && lanes[lane].written_mask == 15 &&
+            lanes[lane].pixel_outputs[0] == FloatBits(inputs[lane]) &&
+            lanes[lane].pixel_outputs[1] == FloatBits(fine && lane >= 2 ? 6 : 2) &&
+            lanes[lane].pixel_outputs[2] == FloatBits(fine && (lane & 1) ? 9 : 5) &&
+            lanes[lane].pixel_outputs[3] == FloatBits(1),
+            "coarse/fine exchange retains independent row/column values and earlier outputs");
+      Check(executed[lane] == program.instructions.size(),
+            "native derivative continuation executes every instruction exactly once");
+    }
+    for (unsigned mutation = 0; mutation < 10; ++mutation) {
+      auto context = contexts[0];
+      auto changed = program;
+      switch (mutation) {
+      case 0: context.continuation.kind = 0; break;
+      case 1: context.continuation.valid = 2; break;
+      case 2: context.continuation.resume_instruction_index = 2; break;
+      case 3: context.continuation.pending_output_index = 255; break;
+      case 4: context.continuation.pending_component_count = 4; break;
+      case 5: context.continuation.program_signature ^= 1; break;
+      case 6: context.continuation.temporary_written_mask.set(255); break;
+      case 7: context.continuation.written_mask ^= 1; break;
+      case 8: context.continuation.loop_depth = 33; break;
+      case 9: changed.instructions[0].source.index = 1; context.shared_count = 2; break;
+      }
+      ExpectFailure([&] { ExecuteFragment(changed.summary, changed.instructions, context); },
+                    "derivative checkpoint mutation must fail closed before resuming native work");
+    }
+  }
+}
+
 void TestVertexInputRegisterReuse() {
   // Compact field-level program: MBYP vi0 -> vi2, FRCP vi2 -> vi1,
   // then the ordinary passthrough UVSW exports vi0..vi2. The destination
@@ -7064,6 +7445,225 @@ void TestUniformBufferLoads() {
   }
 }
 
+void TestVertexInputMemoryAndAddressReuse() {
+  using namespace pvrgpu::stub;
+  struct Memory {
+    unsigned count;
+    unsigned reads = 0;
+    std::array<std::uint32_t, 16> words{};
+  };
+  const auto read = +[](void *opaque, std::uint64_t address,
+                        std::uint32_t count, std::uint32_t *destination) {
+    auto &memory = *static_cast<Memory *>(opaque);
+    Check(address == UINT64_C(0x100002000) && count == memory.count,
+          "VTXIN LD retains the exact address and burst size");
+    std::copy_n(memory.words.begin(), count, destination);
+    ++memory.reads;
+  };
+  // Keep the compiler's address preparation, LD, WDF and UVSW groups. Only
+  // enumerate public upper-response/lower-source bank/index fields and the
+  // positive-wrap burst length, independent of any captured shader.
+  const auto make_load = [](unsigned base, unsigned count, unsigned window,
+                            bool vertex_address = false) {
+    auto binary = test::UniformBufferFixture(true, std::min(count, 4U));
+    const auto original = Decode(ShaderStage::kVertex, binary);
+    for (const auto &instruction : original.instructions) {
+      if (instruction.target != PcoWriteTarget::kVertexOutput) continue;
+      const auto cursor = instruction.binary_offset + 2U;
+      const unsigned index = base + window + instruction.source.index;
+      binary[cursor] = 0x80U | (index & 63U);
+      binary[cursor + 1U] = 0x04U | ((index >> 6U) & 3U);
+      binary[cursor + 2U] = 0;
+    }
+    binary[52] = (count & 7U) << 2U;
+    binary[53] = (count >> 3U) & 1U;
+    binary[48] += 1; // I_ONE_UP_3B11I adds two bytes.
+    binary[55] = 0x80U | (base & 63U);
+    binary.insert(binary.begin() + 56,
+                  {static_cast<std::uint8_t>(0x04U | ((base >> 6U) & 3U)), 0});
+    if (vertex_address) {
+      // Independently encoded ADD64_32 W0/W1 become vi1,vi2. The native
+      // extension replaces its alignment pad, preserving the group size.
+      binary[45] = 1; binary[46] = 0x82; binary[47] = 0x22;
+      binary[48] += 1;
+      binary[54] = 0x81; // LD s0=vi1, hence high word vi2.
+      binary.insert(binary.begin() + 55, {0x04, 0});
+    }
+    return binary;
+  };
+  const auto context_for = [&](Memory &memory) {
+    PcoVertexExecutionContext context;
+    context.shared_count = 5;
+    context.shared_registers[0] = 0x2000;
+    context.shared_registers[1] = 1;
+    context.shared_registers[2] = 65536;
+    context.memory_read = read;
+    context.memory_user_data = &memory;
+    return context;
+  };
+  for (unsigned count = 1; count <= 16; ++count) {
+    for (unsigned base : {0U, 21U, 64U - count}) {
+      for (bool vertex_address : {false, true}) {
+        Memory memory{count};
+        for (unsigned word = 0; word < count; ++word)
+          memory.words[word] = 0x7fa12345U ^ (0x01010101U * word);
+        const auto context = context_for(memory);
+        const std::vector<std::uint32_t> inputs(64, 0xfedcba98U);
+        for (unsigned window = 0; window < count; window += 4) {
+          const unsigned offset = count > 4 ? std::min(window, count - 4) : 0;
+          const auto binary = make_load(base, count, offset, vertex_address);
+          const auto program = Decode(ShaderStage::kVertex, binary);
+          Check(program.instructions[4].target == PcoWriteTarget::kVertexInput &&
+                    program.instructions[4].output_index == base &&
+                    program.instructions[4].component_count == count &&
+                    program.summary.vertex_input_mask == 0,
+                "every LD DWORD is a VTXIN definition after WDF, not an attribute read");
+          memory.reads = 0;
+          const auto output = ExecuteVertex(program.summary, program.instructions, inputs, context);
+          for (unsigned channel = 0; channel < std::min(count, 4U); ++channel)
+            Check(output.outputs[channel] == memory.words[offset + channel],
+                  "VTXIN response preserves all 1..16 raw DWORDs through real UVSW");
+          Check(memory.reads == 1 && output.ended_task &&
+                    output.executed_instruction_count == program.instructions.size() &&
+                    inputs[base] == 0xfedcba98U,
+                "register reuse performs one memory read and does not mutate caller input storage");
+        }
+      }
+    }
+  }
+  // An aliased vi1:vi2 address is consumed before its two response words are
+  // written. Removing WDF must fail before executing any memory side effect.
+  auto binary = make_load(1, 2, 0, true);
+  auto program = Decode(ShaderStage::kVertex, binary);
+  Memory memory{2}; memory.words[0] = 0x80000000U; memory.words[1] = 0xffffffffU;
+  auto context = context_for(memory);
+  const auto result = ExecuteVertex(program.summary, program.instructions,
+                                    std::vector<std::uint32_t>(3), context);
+  Check(result.outputs[0] == memory.words[0] && result.outputs[1] == memory.words[1],
+        "LD can overwrite its own VTXIN address pair only at the matching WDF");
+  for (unsigned mutation = 0; mutation < 8; ++mutation) {
+    auto bad = program;
+    switch (mutation) {
+    case 0: bad.instructions[4].output_index = 63; break;
+    case 1: bad.instructions[4].target = PcoWriteTarget::kPixelOutput; break;
+    case 2: bad.instructions[5].data_request = 1; break;
+    case 3: bad.instructions[4].component_count = 0; break;
+    case 4: bad.instructions[4].source1.index = 3; break;
+    case 5: bad.instructions[3].output_target1 = PcoWriteTarget::kPixelOutput; break;
+    case 6: bad.instructions[3].output_index1 = 64; break;
+    case 7: bad.instructions[3].repeat_count = 2; break;
+    }
+    memory.reads = 0;
+    ExpectFailure([&] { ExecuteVertex(bad.summary, bad.instructions,
+                                     std::vector<std::uint32_t>(64), context); },
+                  "malformed VTXIN memory/address metadata fails closed");
+    Check(memory.reads == 0, "invalid response, address or WDF is rejected before memory");
+  }
+  memory.reads = 0;
+  ExpectFailure([&] { ExecuteVertex(program.summary, program.instructions,
+                                    std::vector<std::uint32_t>(2), context); },
+                "ADD64 high VTXIN write outside the supplied span is rejected");
+  Check(memory.reads == 0, "missing address span cannot reach the memory callback");
+  ExpectFailure([&] { Decode(ShaderStage::kVertex, make_load(63, 2, 0)); },
+                "native VTXIN response cannot extend past vi63");
+  ExpectFailure([&] { Decode(ShaderStage::kFragment, make_load(0, 1, 0)); },
+                "VTXIN response support does not admit it in fragment shaders");
+  auto before_read = BytesFromHex("36 82 00 87 80 04 00 00 00 7f f1 ff");
+  const auto load = make_load(0, 4, 0);
+  before_read.insert(before_read.end(), load.begin(), load.end());
+  Check(Decode(ShaderStage::kVertex, before_read).summary.vertex_input_mask == 1,
+        "an initial VTXIN read remains required even when a later LD overwrites it");
+
+  // LD into vi21..24 followed by an independent native SMP/WDF must preserve
+  // VTXIN values without marking unrelated TEMP21..24 as initialized.
+  binary = make_load(21, 4, 0);
+  const auto sample = BytesFromHex(
+      "57 a0 00 f4 4c 94 60 80 1c 88 80 a0 00 ff 02 80 6a ff");
+  binary.insert(binary.begin() + 64, sample.begin(), sample.end());
+  program = Decode(ShaderStage::kVertex, binary);
+  memory = Memory{4};
+  memory.words = {0xffffffffU, 0x80000001U, 0x7fa12345U, 0x00000001U};
+  context = context_for(memory); context.shared_count = 40;
+  const auto first = ExecuteVertex(program.summary, program.instructions,
+                                    std::vector<std::uint32_t>(25), context);
+  Check(first.suspended && memory.reads == 1 &&
+            !first.continuation.temporary_written_mask.test(21) &&
+            first.continuation.vertex_inputs[24] == memory.words[3],
+        "texture continuation retains VTXIN LD result without TEMP mask pollution");
+  const std::array<std::uint32_t, kPcoTextureResponseCount> response{};
+  const auto done = ResumeVertexPco(program.summary, program.instructions,
+                                    first.continuation, response);
+  Check(!done.suspended && done.outputs[0] == memory.words[0] &&
+            done.outputs[3] == memory.words[3] && memory.reads == 1 &&
+            first.executed_instruction_count + done.executed_instruction_count ==
+                program.instructions.size(),
+        "resumed vertex executes after the texture WDF with its original VTXIN burst");
+}
+
+void TestVertexInputImmediateAndDualAddress() {
+  using namespace pvrgpu::stub;
+  // Native Mesa MOVI, then ordinary UVSW exports; vary only immediate/index
+  // fields to exercise bit preservation rather than float conversions.
+  for (unsigned index : {0U, 63U}) {
+    for (std::uint32_t bits : {0U, 3200U, 0xffffffffU, 0x7fa12345U, 0x80000000U}) {
+      auto binary = BytesFromHex("86 92 40 13 80 0c 00 00 00 00 80 04");
+      for (unsigned byte = 0; byte < 4; ++byte) binary[4 + byte] = bits >> (8U * byte);
+      binary[10] |= index;
+      auto exports = test::UniformBufferFixture(true, 1);
+      exports.erase(exports.begin(), exports.begin() + 64);
+      exports[5] = 0x80U | index; exports[6] = 4; exports[7] = 0;
+      binary.insert(binary.end(), exports.begin(), exports.end());
+      const auto program = Decode(ShaderStage::kVertex, binary);
+      Check(program.summary.vertex_input_mask == 0,
+            "MOVI scratch result is not a required input attribute");
+      const auto result = ExecuteVertex(program.summary, program.instructions,
+                                        std::vector<std::uint32_t>(64));
+      Check(result.outputs[0] == bits, "MOVI to VTXIN preserves every immediate bit");
+      auto bad = program;
+      bad.instructions[0].output_index = 64;
+      ExpectFailure([&] { ExecuteVertex(bad.summary, bad.instructions,
+                                         std::vector<std::uint32_t>(64)); },
+                    "decoded MOVI cannot write beyond vi63");
+    }
+  }
+  // First native UBO ADD64_32.S uses sh0:r1 + r0. Enumerate independently
+  // encoded TEMP/VTXIN low/high destinations and export both result words.
+  for (bool low_input : {false, true}) {
+    for (bool high_input : {false, true}) {
+      auto binary = test::UniformBufferFixture(true, 2);
+      binary.resize(34);
+      binary[31] = (low_input ? 0 : 0x80U) | 2U;
+      binary[32] = (high_input ? 0 : 0x40U) | 3U | 0x80U;
+      binary[33] = (low_input ? 0x02U : 0) | (high_input ? 0x20U : 0);
+      auto exports = test::UniformBufferFixture(true, 2);
+      exports.erase(exports.begin(), exports.begin() + 62);
+      exports[5] = (low_input ? 0x80U : 0xc0U) | 2U;
+      exports[6] = low_input ? 4 : 0;
+      exports[15] = (high_input ? 0x80U : 0xc0U) | 3U;
+      exports[16] = high_input ? 4 : 0;
+      binary.insert(binary.end(), exports.begin(), exports.end());
+      const auto program = Decode(ShaderStage::kVertex, binary);
+      Check(program.summary.vertex_input_mask == 0 &&
+                program.instructions[2].output_target1 == (high_input
+                    ? PcoWriteTarget::kVertexInput : PcoWriteTarget::kTemporary),
+            "ADD64 independently defines the high and low destination banks");
+      for (std::int32_t offset : {12, -8}) {
+        PcoVertexExecutionContext context; context.shared_count = 5;
+        context.shared_registers[0] = 0xfffffff8U;
+        context.shared_registers[1] = 1;
+        context.shared_registers[4] = static_cast<std::uint32_t>(offset);
+        const std::uint64_t expected = UINT64_C(0x1fffffff8) +
+            static_cast<std::uint64_t>(static_cast<std::int64_t>(offset));
+        const auto result = ExecuteVertex(program.summary, program.instructions,
+                                          std::vector<std::uint32_t>(4), context);
+        Check(result.outputs[0] == static_cast<std::uint32_t>(expected) &&
+                  result.outputs[1] == static_cast<std::uint32_t>(expected >> 32U),
+              "mixed-bank ADD64 retains signed offset, carry and both result words");
+      }
+    }
+  }
+}
+
 void TestTemporaryFile256() {
   using namespace pvrgpu::stub;
   PcoTemporaryMask mask;
@@ -7352,9 +7952,79 @@ void TestGraphicsIntegerSignednessFailsClosed() {
   std::cout << "graphics integer signedness: " << rejected << " strict diagnostic rejections PASS\n";
 }
 
+void TestNativeNonperspectiveInterpolation() {
+  // The FITR group is from Mesa sample-input-105.pco (noperspective input).
+  // Native WDF and MBYP PIXOUT groups export its scalar response four times.
+  const auto binary = BytesFromHex(
+      "55 a0 00 a0 01 c4 04 00 41 00 02 80 6a ff "
+      "34 8a 00 87 41 00 00 20 34 8a 00 87 41 00 00 21 "
+      "34 8a 00 87 41 00 00 22 34 8a 80 87 41 00 00 23");
+  for (unsigned mode = 0; mode < 3; ++mode) {
+    for (unsigned count = 1; count <= 4; ++count) {
+      for (unsigned coefficient : {4U, 64U, 128U, 236U}) {
+        auto bytes = binary;
+        bytes[3] |= mode; bytes[4] = count;
+        bytes[5] = 0xc0U | (coefficient & 63U);
+        bytes[6] = 4U | (coefficient >> 6U);
+        for (unsigned channel = 0; channel < 4; ++channel)
+          bytes[18 + channel * 8] = 0x41U + std::min(channel, count - 1);
+        const auto program = Decode(ShaderStage::kFragment, bytes);
+        const auto &instruction = program.instructions[0];
+        Check(instruction.opcode == PcoOpcode::kFloatInterpolate &&
+              instruction.source_count == 1 && !instruction.perspective &&
+              instruction.source.index == coefficient && instruction.output_index == 1 &&
+              instruction.component_count == count,
+              "FITR carries one native coefficient source without reciprocal W");
+        PcoFragmentExecutionContext context;
+        context.coefficient_count = coefficient + count * 4;
+        // W=0 deliberately: FITR must not evaluate or divide by this plane.
+        context.sample_x = FloatBits(.25F); context.sample_y = FloatBits(.5F);
+        context.raster_sample_count = 4;
+        context.sample_position_valid = context.centroid_position_valid = 1;
+        context.sample_position_x = FloatBits(.75F);
+        context.sample_position_y = FloatBits(.125F);
+        context.centroid_x = FloatBits(.5F); context.centroid_y = FloatBits(.75F);
+        for (unsigned component = 0; component < count; ++component) {
+          context.coefficients[coefficient + 4 * component] = FloatBits(2.F);
+          context.coefficients[coefficient + 4 * component + 1] = FloatBits(4.F);
+          context.coefficients[coefficient + 4 * component + 2] = FloatBits(1.F + component);
+        }
+        const auto result = ExecuteFragment(program.summary, program.instructions, context);
+        Check(result.written_mask == 15, "FITR native output completion");
+        for (unsigned channel = 0; channel < 4; ++channel) {
+          const auto expected = FloatBits((mode == 0 ? 3.5F : mode == 1 ? 3.F : 5.F) +
+                                          std::min(channel, count - 1));
+          Check(result.pixel_outputs[channel] == expected,
+                "native FITR pixel/sample/centroid selects each component plane");
+        }
+      }
+    }
+  }
+  for (unsigned invalid = 0; invalid < 8; ++invalid) {
+    auto malformed = binary;
+    if (invalid == 0) malformed[3] |= 4; // Reserved backend bit.
+    if (invalid == 1) malformed[3] |= 8; // DRC1 is outside the modeled channel.
+    if (invalid == 2) malformed[3] |= 3; // Reserved iteration mode.
+    if (invalid == 3) malformed[4] = 0; // Native count16 is not count0.
+    if (invalid == 4) malformed[4] |= 16; // Saturate is unsupported.
+    if (invalid == 5) malformed[5]++; // Unaligned coefficient base.
+    if (invalid == 6) malformed[8] = 1; // Response cannot target a special reg.
+    if (invalid == 7) malformed[9] = 1; // Noncanonical ISS selector.
+    ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, malformed); },
+                  "malformed native FITR encoding");
+  }
+  auto program = Decode(ShaderStage::kFragment, binary);
+  PcoFragmentExecutionContext context;
+  context.coefficient_count = 8;
+  program.instructions[0].perspective = 1;
+  ExpectFailure([&] { (void)ExecuteFragment(program.summary, program.instructions, context); },
+                "FITR cannot acquire a perspective-W source through IR mutation");
+}
+
 int main() {
   try {
     TestEmbeddedBinaries();
+    TestNativeNonperspectiveInterpolation();
     TestDecodeAndExecuteVertex();
     TestVertexOutput64BitBoundary();
     TestDecodeAndExecuteAttributeFetch();
@@ -7370,6 +8040,8 @@ int main() {
     TestDecodeAndExecuteFragment();
     TestDepthFeedback();
     TestUniformBufferLoads();
+    TestVertexInputMemoryAndAddressReuse();
+    TestVertexInputImmediateAndDualAddress();
     TestTemporaryFile256();
     TestGraphicsIntegerSignednessFailsClosed();
     TestDecodeAndExecuteHalfAlphaFragments();
@@ -7414,6 +8086,11 @@ int main() {
     TestDecodeAndExecuteConditionalSelectGreaterZero();
     TestDecodeAndExecuteLitShading();
     TestShiftCountUsesLowFiveBits();
+    TestGraphicsIntegerOpcodeParity();
+    TestNativeFragmentSampleInputs();
+    TestNativeFragmentVisibilityFeedback();
+    TestNativeDerivativeDecode();
+    TestNativeDerivativeExchange();
     TestVertexInputRegisterReuse();
     TestSharedRegisterFileBoundary();
     TestBitfieldInsertFourSourceValidation();

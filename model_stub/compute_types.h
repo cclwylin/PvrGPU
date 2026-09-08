@@ -3,6 +3,7 @@
 #pragma once
 
 #include "model_types.h"
+#include "common/functional_types.h"
 
 #include <array>
 #include <cstdint>
@@ -36,6 +37,7 @@ struct ComputePcoAbi {
   std::uint32_t image_used_mask = 0;
   std::uint32_t image_read_mask = 0;
   std::uint32_t image_write_mask = 0;
+  std::uint32_t sampled_texture_count = 0;
 };
 
 struct ModelComputeResource {
@@ -71,8 +73,14 @@ struct ModelComputeDispatch {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint32_t row_stride_bytes = 0;
+    std::uint32_t depth = 1;
+    std::uint32_t layer_stride_bytes = 0;
+    std::uint32_t texel_bytes = 4;
   };
   std::vector<ImageBinding> images;
+  std::vector<DriverPcoSampledTexture> textures;
+  std::vector<TextureResource> texture_resources;
+  std::vector<std::uint32_t> texture_words;
 };
 
 struct ModelComputeStats {
@@ -90,6 +98,8 @@ struct ModelComputeStats {
   std::uint64_t readback_bytes = 0;
   std::uint64_t pool_allocations = 0;
   std::uint64_t pool_releases = 0;
+  std::uint64_t texture_requests = 0;
+  std::uint64_t texel_fetches = 0;
 };
 
 inline constexpr std::uint32_t kComputeAccessRead = 1;
@@ -120,6 +130,8 @@ struct ComputeDispatchState {
   PoolHandle code;
   PoolHandle shared_registers;
   PoolHandle buffer_ranges;
+  // TPU rendezvous state only. Compute never enters a graphics executor.
+  PoolHandle texture_state;
   CounterTxn counters;
   ModelComputeStats stats;
   std::uint64_t instructions_executed = 0;

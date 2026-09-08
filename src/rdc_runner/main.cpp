@@ -2,6 +2,7 @@
 #include "rdc_runner/path_utf8.h"
 #include "rdc_runner/runtime_config.h"
 #include "rdc_runner/sha256.h"
+#include "rdc_runner/native_report.h"
 
 #include <algorithm>
 #include <array>
@@ -29,14 +30,7 @@ namespace {
 
 constexpr std::string_view kBackend = PVRGPU_RDC_BACKEND;
 constexpr std::string_view kResultSchema = "pvrgpu.backend-result.v1";
-constexpr std::array<std::string_view, 17> kCounterFields = {
-    "ia_vertices",     "ia_primitives",   "vs_invocations",
-    "gs_invocations",  "gs_primitives",   "c_invocations",
-    "c_primitives",    "ps_invocations",  "hs_invocations",
-    "ds_invocations",  "cs_invocations",  "ts_invocations",
-    "ms_invocations",  "ms_primitives",   "drawlists",
-    "setup_triangles", "texel_fetches",
-};
+constexpr auto &kCounterFields = kNativeCounterFields;
 
 struct Options {
   std::filesystem::path rdc;
@@ -269,28 +263,6 @@ std::filesystem::path RuntimeLibrary(const std::filesystem::path &prefix,
                        prefix / "lib" / windows_name});
 }
 
-bool ParseTraceDrawActions(const std::filesystem::path &log, unsigned *value) {
-  if (!value)
-    return false;
-  std::ifstream input(log);
-  std::string line;
-  const std::regex pattern(R"(^Trace draw actions:\s*([0-9]+)\s*$)");
-  std::smatch match;
-  while (std::getline(input, line)) {
-    if (!std::regex_match(line, match, pattern))
-      continue;
-    std::uint64_t parsed = 0;
-    for (char character : match[1].str()) {
-      parsed = parsed * 10U + static_cast<unsigned>(character - '0');
-      if (parsed > 0xffffffffULL)
-        return false;
-    }
-    *value = static_cast<unsigned>(parsed);
-    return true;
-  }
-  return false;
-}
-
 std::filesystem::path PlayerPath(const Options &options,
                                  const RuntimeConfig &config) {
   if (!options.player.empty())
@@ -298,6 +270,9 @@ std::filesystem::path PlayerPath(const Options &options,
   const std::filesystem::path configured = config.Path("PVRGPU_RDC_PLAYER");
   if (!configured.empty())
     return ResolveExecutable(configured);
+  if (kBackend == "pvrgpu")
+    return ResolveExecutable(config.Path("PVRGPU_BUILD_DIR", DefaultWorkRoot() / "build") /
+                             "bin" / "pvrgpu-rdc-player");
   return ResolveExecutable(options.renderdoc_root / "bin" /
                            "renderdoc-mesa-player");
 }
@@ -348,8 +323,8 @@ void PrintUsage(std::ostream &output) {
          << "  --renderdoc-root DIR   Override RenderDoc Mesa runtime root\n"
          << "  --player FILE          Override renderdoc-mesa-player executable\n";
   if (kBackend == "pvrgpu") {
-    output << "  --model FILE           Override pvrgpu-model-stub executable\n"
-           << "  --trace-draw-actions N Golden draw action metadata\n";
+    output << "  --model FILE           Legacy compatibility option (native replay never retries a stub)\n"
+           << "  --trace-draw-actions N Optional metadata only; never controls native work\n";
   }
   output << "  -h, --help             Show this help\n";
 }
@@ -613,112 +588,6 @@ bool ParseGoldenCounters(const std::string &report,
   return false;
 }
 
-bool ParsePvrgpuCounters(const std::string &jsonl,
-                         std::map<std::string, std::uint64_t> *counters,
-                         std::string *error) {
-  if (!counters || !error)
-    return false;
-  std::istringstream input(jsonl);
-  std::string line;
-  /*
-   * The model reports per flush now, so a workload that is read back more than
-   * once leaves more than one counter record.  The last one describes the
-   * frame as it finally stood, and that is what the golden report is compared
-   * against.
-   */
-  bool found = false;
-  while (std::getline(input, line)) {
-    if (line.find("\"type\":\"counter\"") == std::string::npos)
-      continue;
-    for (std::string_view field : kCounterFields) {
-      const std::regex pattern("\\\"" + std::string(field) +
-                               "\\\"\\s*:\\s*([0-9]+)");
-      std::smatch match;
-      if (!std::regex_search(line, match, pattern)) {
-        *error = "PvrGPU counter message is missing " + std::string(field);
-        return false;
-      }
-      try {
-        (*counters)[std::string(field)] = std::stoull(match[1].str());
-      } catch (const std::exception &exception) {
-        *error = "cannot parse PvrGPU counter " + std::string(field) + ": " +
-                 exception.what();
-        return false;
-      }
-    }
-    found = true;
-  }
-  if (found)
-    return true;
-  *error = "PvrGPU output has no counter message";
-  return false;
-}
-
-bool ValidatePvrgpuCompletion(const std::string &jsonl, std::string *error) {
-  if (!error)
-    return false;
-  const std::regex type_pattern(R"json("type"\s*:\s*"([^"]+)")json");
-  const std::regex leaks_pattern(
-      R"json("pool_leaks"\s*:\s*([0-9]+))json");
-  std::size_t hello_count = 0;
-  std::size_t counter_count = 0;
-  std::size_t done_count = 0;
-  std::istringstream input(jsonl);
-  std::string line;
-  while (std::getline(input, line)) {
-    std::smatch type_match;
-    if (!std::regex_search(line, type_match, type_pattern))
-      continue;
-    const std::string type = type_match[1].str();
-    if (type == "error") {
-      *error = "PvrGPU model emitted an error message";
-      return false;
-    }
-    if (type == "hello") {
-      ++hello_count;
-      continue;
-    }
-    if (type == "counter") {
-      ++counter_count;
-      continue;
-    }
-    if (type != "done")
-      continue;
-    ++done_count;
-    std::smatch leaks_match;
-    if (!std::regex_search(line, leaks_match, leaks_pattern)) {
-      *error = "PvrGPU done message is missing pool_leaks";
-      return false;
-    }
-    try {
-      if (std::stoull(leaks_match[1].str()) != 0) {
-        *error = "PvrGPU model reported a non-zero MemoryPool leak count";
-        return false;
-      }
-    } catch (const std::exception &exception) {
-      *error = "cannot parse PvrGPU pool_leaks: " +
-               std::string(exception.what());
-      return false;
-    }
-  }
-  /*
-   * A flush is one complete report: hello, counter, done.  A workload read
-   * back more than once therefore leaves more than one of each, and what has
-   * to hold is that they come in complete sets -- a missing counter or done
-   * still means a run that did not finish.
-   */
-  if (hello_count == 0 || hello_count != counter_count ||
-      hello_count != done_count) {
-    std::ostringstream reason;
-    reason << "PvrGPU protocol requires one complete hello/counter/done set "
-              "per flush (got hello="
-           << hello_count << ", counter=" << counter_count
-           << ", done=" << done_count << ')';
-    *error = reason.str();
-    return false;
-  }
-  return true;
-}
 
 std::string FormatCounters(
     const std::map<std::string, std::uint64_t> &counters) {
@@ -728,58 +597,6 @@ std::string FormatCounters(
   return output.str();
 }
 
-std::string InjectRdcDigest(const std::string &jsonl,
-                            const std::string &digest) {
-  std::istringstream input(jsonl);
-  std::ostringstream output;
-  std::string line;
-  while (std::getline(input, line)) {
-    if (line.find("\"type\":\"hello\"") != std::string::npos &&
-        line.find("\"backend\":\"pvrgpu\"") != std::string::npos &&
-        line.find("\"rdc_sha256\"") == std::string::npos) {
-      const std::size_t end = line.rfind('}');
-      if (end != std::string::npos)
-        line.insert(end, ",\"rdc_sha256\":\"" + digest + "\"");
-    }
-    output << line << '\n';
-  }
-  return output.str();
-}
-
-std::filesystem::path CapturePng(const std::string &jsonl,
-                                 const std::filesystem::path &directory) {
-  std::istringstream input(jsonl);
-  std::string line;
-  const std::regex marker(R"(^@CAPTURE:.*\spng=([A-Za-z0-9_.-]+)\s*$)");
-  std::smatch match;
-  while (std::getline(input, line)) {
-    if (!std::regex_match(line, match, marker))
-      continue;
-    const std::filesystem::path candidate = directory / match[1].str();
-    if (Lower(PathToUtf8(candidate.extension())) == ".png" &&
-        NonEmptyFile(candidate))
-      return candidate;
-  }
-  return {};
-}
-
-std::size_t CountDriverEvents(const std::string &text,
-                              std::string_view event) {
-  const std::string marker = "event=" + std::string(event);
-  std::istringstream input(text);
-  std::size_t count = 0;
-  std::string line;
-  while (std::getline(input, line)) {
-    const std::size_t position = line.find(marker);
-    if (position == std::string::npos)
-      continue;
-    const std::size_t end = position + marker.size();
-    if (end == line.size() ||
-        std::isspace(static_cast<unsigned char>(line[end])))
-      ++count;
-  }
-  return count;
-}
 
 bool ReadPngExtent(const std::filesystem::path &path, unsigned *width,
                    unsigned *height) {
@@ -1027,407 +844,214 @@ RunOutcome RunPvrgpu(const Options &options, const RuntimeConfig &config,
   RunOutcome outcome;
   const std::filesystem::path player = PlayerPath(options, config);
   if (!std::filesystem::is_regular_file(player)) {
-    outcome.reason = "RenderDoc player is missing: " + PathToUtf8(player);
+    outcome.reason = "Native final-output RenderDoc player is missing: " +
+                     PathToUtf8(player) +
+                     "; build the repository pvrgpu-rdc-player helper or set PVRGPU_RDC_PLAYER";
     return outcome;
   }
   if (!std::filesystem::is_directory(options.mesa_prefix)) {
-    outcome.reason = "PvrGPU Mesa prefix is missing: " +
-                     PathToUtf8(options.mesa_prefix);
-    return outcome;
-  }
-  if (!std::filesystem::is_regular_file(options.model)) {
-    outcome.reason = "PvrGPU model is missing: " + PathToUtf8(options.model);
+    outcome.reason = "PvrGPU Mesa prefix is missing: " + PathToUtf8(options.mesa_prefix);
     return outcome;
   }
 
   const std::filesystem::path artifact_root = options.outdir;
-  const std::filesystem::path model_png_dir = artifact_root / "png";
-  const std::filesystem::path player_png_dir = artifact_root / "player-png";
+  const auto model_png_dir = artifact_root / "png";
+  const auto player_png_dir = artifact_root / "player-png";
   std::filesystem::create_directories(model_png_dir);
   std::filesystem::create_directories(player_png_dir);
+  const auto driver_search = PrepareDriverSearchPath(options.mesa_prefix, artifact_root,
+                                                     &outcome.reason);
+  if (driver_search.empty()) return outcome;
+  const auto player_png = player_png_dir / (options.rdc.stem().string() + "_replay.png");
+  const auto receipt_path = artifact_root / "player-final-output.json";
+  const auto command = artifact_root / "driver-command.txt";
+  const auto driver_counter = artifact_root / "driver-counter.txt";
+  const auto player_stdout = artifact_root / "player.stdout.log";
+  const auto player_stderr = artifact_root / "player.stderr.log";
+  const auto model_stdout = artifact_root / "model.stdout.jsonl";
+  const auto model_stderr = artifact_root / "model.stderr.log";
+  const auto capture_report = artifact_root / "capture-report.jsonl";
 
-  const std::filesystem::path driver_search =
-      PrepareDriverSearchPath(options.mesa_prefix, artifact_root,
-                              &outcome.reason);
-  if (driver_search.empty())
-    return outcome;
-
-  std::filesystem::path replay_png_name = options.rdc.stem();
-  replay_png_name += "_replay.png";
-  const std::filesystem::path player_png =
-      player_png_dir / replay_png_name;
-  const std::filesystem::path command = artifact_root / "driver-command.txt";
-  const std::filesystem::path driver_counter =
-      artifact_root / "driver-counter.txt";
-  const std::filesystem::path player_stdout =
-      artifact_root / "player.stdout.log";
-  const std::filesystem::path player_stderr =
-      artifact_root / "player.stderr.log";
-  const std::filesystem::path model_stdout =
-      artifact_root / "model.stdout.jsonl";
-  const std::filesystem::path model_stderr =
-      artifact_root / "model.stderr.log";
-  /*
-   * The in-process bridge runs the model from an atexit handler, so its
-   * diagnosis lands in model.stderr.log after the replay has finished.  The
-   * fallback stub must not write over it: when the bridge produced nothing,
-   * the reason it produced nothing is the only thing worth reading.
-   */
-  const std::filesystem::path model_stub_stderr =
-      artifact_root / "model-stub.stderr.log";
-  std::filesystem::path probe_png_name = options.rdc.stem();
-  probe_png_name += "_trace_probe.png";
-  const std::filesystem::path probe_png =
-      player_png_dir / probe_png_name;
-  const std::filesystem::path probe_stdout =
-      artifact_root / "player.trace-probe.stdout.log";
-  const std::filesystem::path probe_stderr =
-      artifact_root / "player.trace-probe.stderr.log";
-
-  // RenderDoc's replay initial-state path queries every texture level before
-  // copying captured mip chains.  glGetTexLevelParameteriv is core in GLES
-  // 3.1, while forcing 3.0 sends the emulated DSA path through incomplete
-  // replay metadata and silently truncates the restore to level zero.
+  // Initial-state mip restoration needs glGetTexLevelParameteriv (GLES 3.1).
   std::string gles = "3.1";
-  if (options.case_name.rfind("dEQP-GLES32.", 0) == 0)
-    gles = "3.2";
-  else if (options.case_name.rfind("dEQP-GLES31.", 0) == 0)
-    gles = "3.1";
-  const std::string configured_gles =
-      config.Get("PVRGPU_MESA_GLES_VERSION_OVERRIDE");
-  if (!configured_gles.empty())
-    gles = configured_gles;
-
-  const std::filesystem::path egl =
-      RuntimeLibrary(options.mesa_prefix, "EGL", "libEGL.dll");
-  const std::filesystem::path gles_library =
-      RuntimeLibrary(options.mesa_prefix, "GLESv2", "libGLESv2.dll");
-  if (!std::filesystem::is_regular_file(egl) ||
-      !std::filesystem::is_regular_file(gles_library)) {
+  if (options.case_name.rfind("dEQP-GLES32.", 0) == 0) gles = "3.2";
+  const std::string configured_gles = config.Get("PVRGPU_MESA_GLES_VERSION_OVERRIDE");
+  if (!configured_gles.empty()) gles = configured_gles;
+  const auto egl = RuntimeLibrary(options.mesa_prefix, "EGL", "libEGL.dll");
+  const auto gles_library = RuntimeLibrary(options.mesa_prefix, "GLESv2", "libGLESv2.dll");
+  if (!std::filesystem::is_regular_file(egl) || !std::filesystem::is_regular_file(gles_library)) {
     outcome.reason = "PvrGPU Mesa EGL/GLES runtime is incomplete under: " +
                      PathToUtf8(options.mesa_prefix);
     return outcome;
   }
 
+  const auto build_dir = config.Path("PVRGPU_BUILD_DIR", DefaultWorkRoot() / "build");
   std::filesystem::path bridge = config.Path("PVRGPU_SYSTEMC_API_LIB");
-  if (bridge.empty())
-    bridge = config.Path("PVRGPU_SYSTEMC_BRIDGE");
+  if (bridge.empty()) bridge = config.Path("PVRGPU_SYSTEMC_BRIDGE");
   if (bridge.empty()) {
-    const std::filesystem::path build_dir =
-        config.Path("PVRGPU_BUILD_DIR", DefaultWorkRoot() / "build");
-    const std::filesystem::path build_lib = build_dir / "lib";
-    const std::filesystem::path build_bin = build_dir / "bin";
-    bridge = FindExisting({build_lib / "libpvrgpu_systemc_bridge.dylib",
-                           build_lib / "libpvrgpu_systemc_bridge.so",
-                           build_bin / "pvrgpu_systemc_bridge.dll",
-                           build_bin / "Debug" / "pvrgpu_systemc_bridge.dll",
-                           build_bin / "Release" / "pvrgpu_systemc_bridge.dll",
-                           build_bin / "RelWithDebInfo" /
-                               "pvrgpu_systemc_bridge.dll",
-                           build_bin / "MinSizeRel" /
-                               "pvrgpu_systemc_bridge.dll",
-                           build_lib / "pvrgpu_systemc_bridge.dll"});
+    bridge = FindExisting({build_dir / "lib" / "libpvrgpu_systemc_bridge.dylib",
+                           build_dir / "lib" / "libpvrgpu_systemc_bridge.so",
+                           build_dir / "bin" / "pvrgpu_systemc_bridge.dll",
+                           build_dir / "lib" / "pvrgpu_systemc_bridge.dll"});
+  }
+  if (!std::filesystem::is_regular_file(bridge)) {
+    outcome.reason = "PvrGPU native SystemC bridge is missing: " + PathToUtf8(bridge);
+    return outcome;
   }
 
-  auto make_environment = [&](bool enable_systemc, bool has_trace_actions,
-                              unsigned trace_actions) {
-    std::map<std::string, std::string> environment =
-        BaseEnvironment(artifact_root, options.mesa_prefix);
-    environment["GALLIUM_DRIVER"] = "pvrgpu";
-    environment["LIBGL_DRIVERS_PATH"] = PathToUtf8(driver_search);
-    environment["MESA_GLES_VERSION_OVERRIDE"] = gles;
-    environment["RENDERDOC_MESA_EGL_PATH"] = PathToUtf8(egl);
-    environment["RENDERDOC_MESA_GLES_PATH"] = PathToUtf8(gles_library);
-    environment["PVRGPU_DRIVER_COMMAND_OUT"] = PathToUtf8(command);
-    environment["PVRGPU_DRIVER_COUNTER_OUT"] = PathToUtf8(driver_counter);
-    environment["PVRGPU_RDC_CASE_NAME"] = options.case_name;
-    environment["PVRGPU_RDC_OUTPUT_WIDTH"] = std::to_string(options.width);
-    environment["PVRGPU_RDC_OUTPUT_HEIGHT"] = std::to_string(options.height);
-    if (has_trace_actions)
-      environment["PVRGPU_RDC_TRACE_DRAW_ACTIONS"] =
-          std::to_string(trace_actions);
-    if (enable_systemc && std::filesystem::is_regular_file(bridge)) {
-      environment["PVRGPU_SYSTEMC_API_LIB"] = PathToUtf8(bridge);
-      environment["PVRGPU_SYSTEMC_JSONL_OUT"] = PathToUtf8(model_stdout);
-      environment["PVRGPU_SYSTEMC_STDERR_OUT"] = PathToUtf8(model_stderr);
-      environment["PVRGPU_SYSTEMC_OUTDIR"] = PathToUtf8(model_png_dir);
-    }
-    return environment;
-  };
-
-  std::error_code cleanup_error;
-  for (const auto &stale : {player_png, probe_png, command, driver_counter,
-                            player_stdout, player_stderr, probe_stdout,
-                            probe_stderr, model_stdout, model_stderr,
-                            model_stub_stderr,
-                            artifact_root / "counter.txt",
-                            artifact_root / "frame.png"}) {
-    std::filesystem::remove(stale, cleanup_error);
-    cleanup_error.clear();
-  }
-
-  bool has_trace_actions = options.trace_draw_actions_explicit;
-  unsigned trace_actions = options.trace_draw_actions;
-  if (!has_trace_actions) {
-    outcome.stage = "trace-probe";
-    ProcessRequest probe_request;
-    probe_request.executable = player;
-    probe_request.arguments = {PathToUtf8(options.rdc),
-                               PathToUtf8(probe_png)};
-    probe_request.environment = make_environment(false, false, 0);
-    probe_request.unset_environment = {
-        "PVRGPU_SYSTEMC_API_LIB", "PVRGPU_SYSTEMC_BRIDGE",
-        "PVRGPU_SYSTEMC_JSONL_OUT", "PVRGPU_SYSTEMC_STDERR_OUT",
-        "PVRGPU_SYSTEMC_OUTDIR"};
-    probe_request.stdout_path = probe_stdout;
-    probe_request.stderr_path = probe_stderr;
-    const ProcessResult probe_result = RunProcess(probe_request);
-    outcome.player_exit_code = probe_result.exit_code;
-    outcome.stdout_log = probe_stdout;
-    outcome.stderr_log = probe_stderr;
-    if (!probe_result.started) {
-      outcome.reason = probe_result.error;
+  // A result from a previous run must never make a failed/missing receipt pass.
+  for (const auto &stale : {player_png, receipt_path, command, driver_counter,
+                           player_stdout, player_stderr, model_stdout, model_stderr,
+                           capture_report, artifact_root / "counter.txt",
+                           artifact_root / "frame.png"}) {
+    std::error_code error;
+    std::filesystem::remove(stale, error);
+    if (error) {
+      outcome.reason = "Cannot remove stale artifact " + PathToUtf8(stale) + ": " + error.message();
       return outcome;
-    }
-    if (probe_result.exit_code != 0) {
-      outcome.reason = "RenderDoc trace probe exited with code " +
-                       std::to_string(probe_result.exit_code);
-      return outcome;
-    }
-    if (!ParseTraceDrawActions(probe_stdout, &trace_actions)) {
-      outcome.reason =
-          "RenderDoc trace probe did not report 'Trace draw actions'";
-      return outcome;
-    }
-    has_trace_actions = true;
-    for (const auto &probe_artifact :
-         {command, driver_counter, model_stdout, model_stderr}) {
-      std::filesystem::remove(probe_artifact, cleanup_error);
-      cleanup_error.clear();
     }
   }
 
-  std::ostringstream runner_metadata;
-  runner_metadata << "schema=pvrgpu.rdc-native-runner.v1\n"
-                  << "backend=pvrgpu\n"
-                  << "rdc=" << PathToUtf8(options.rdc) << '\n'
-                  << "rdc_sha256=" << digest << '\n'
-                  << "case=" << options.case_name << '\n'
-                  << "mesa_prefix=" << PathToUtf8(options.mesa_prefix) << '\n'
-                  << "renderdoc_root=" << PathToUtf8(options.renderdoc_root)
-                  << '\n'
-                  << "gles_version_override=" << gles << '\n'
-                  << "trace_draw_actions="
-                  << (has_trace_actions ? std::to_string(trace_actions)
-                                        : std::string())
-                  << '\n'
-                  << "trace_draw_actions_source="
-                  << (options.trace_draw_actions_explicit ? "argument-or-env"
-                                                          : "player-probe")
-                  << '\n'
-                  << "systemc_api_lib="
-                  << (std::filesystem::is_regular_file(bridge)
-                          ? PathToUtf8(bridge)
-                          : std::string())
-                  << '\n';
-  std::string ignored;
-  AtomicWriteText(artifact_root / "runner.txt", runner_metadata.str(), &ignored);
+  auto environment = BaseEnvironment(artifact_root, options.mesa_prefix);
+  environment["GALLIUM_DRIVER"] = "pvrgpu";
+  environment["LIBGL_DRIVERS_PATH"] = PathToUtf8(driver_search);
+  environment["MESA_GLES_VERSION_OVERRIDE"] = gles;
+  environment["RENDERDOC_MESA_EGL_PATH"] = PathToUtf8(egl);
+  environment["RENDERDOC_MESA_GLES_PATH"] = PathToUtf8(gles_library);
+  environment["PVRGPU_DRIVER_COMMAND_OUT"] = PathToUtf8(command);
+  environment["PVRGPU_DRIVER_COUNTER_OUT"] = PathToUtf8(driver_counter);
+  environment["PVRGPU_RDC_CASE_NAME"] = options.case_name;
+  environment["PVRGPU_SYSTEMC_API_LIB"] = PathToUtf8(bridge);
+  environment["PVRGPU_SYSTEMC_JSONL_OUT"] = PathToUtf8(model_stdout);
+  environment["PVRGPU_SYSTEMC_STDERR_OUT"] = PathToUtf8(model_stderr);
+  environment["PVRGPU_SYSTEMC_OUTDIR"] = PathToUtf8(model_png_dir);
+  environment["PVRGPU_RDC_FINAL_OUTPUT_RECEIPT"] = PathToUtf8(receipt_path);
 
   outcome.stage = "player";
   ProcessRequest player_request;
   player_request.executable = player;
-  player_request.arguments = {PathToUtf8(options.rdc),
-                              PathToUtf8(player_png)};
-  player_request.environment =
-      make_environment(true, has_trace_actions, trace_actions);
+  player_request.arguments = {PathToUtf8(options.rdc), PathToUtf8(player_png)};
+  player_request.environment = std::move(environment);
+  // Action counts describe RenderDoc metadata, not Gallium submissions.
+  // In particular zero draws, helper draws, compute and framebuffer boundaries
+  // cannot be used as native submission caps or implicit completion fences.
   player_request.unset_environment = {
-      "PVRGPU_SYSTEMC_API_LIB", "PVRGPU_SYSTEMC_BRIDGE",
-      "PVRGPU_SYSTEMC_JSONL_OUT", "PVRGPU_SYSTEMC_STDERR_OUT",
-      "PVRGPU_SYSTEMC_OUTDIR"};
+      "PVRGPU_RDC_TRACE_DRAW_ACTIONS", "PVRGPU_RDC_OUTPUT_WIDTH",
+      "PVRGPU_RDC_OUTPUT_HEIGHT", "PVRGPU_SYSTEMC_API_LIB",
+      "PVRGPU_SYSTEMC_BRIDGE", "PVRGPU_SYSTEMC_JSONL_OUT",
+      "PVRGPU_SYSTEMC_STDERR_OUT", "PVRGPU_SYSTEMC_OUTDIR",
+      "PVRGPU_RDC_FINAL_OUTPUT_RECEIPT"};
   player_request.stdout_path = player_stdout;
   player_request.stderr_path = player_stderr;
+  // Keep the actual runtime/input identity even when replay fails before its
+  // final receipt. The completion-specific fields are added only on success.
+  std::ostringstream metadata;
+  metadata << "schema=pvrgpu.rdc-native-runner.v2\nbackend=pvrgpu\n"
+           << "rdc=" << PathToUtf8(options.rdc) << "\nrdc_sha256=" << digest
+           << "\nmesa_prefix=" << PathToUtf8(options.mesa_prefix)
+           << "\nplayer=" << PathToUtf8(player)
+           << "\nsystemc_api_lib=" << PathToUtf8(bridge)
+           << "\ngles_version_override=" << gles
+           << "\nrequested_trace_draw_actions="
+           << (options.trace_draw_actions_explicit ? std::to_string(options.trace_draw_actions) : "")
+           << '\n';
+  if (!AtomicWriteText(artifact_root / "runner.txt", metadata.str(), &outcome.reason)) return outcome;
   const ProcessResult player_result = RunProcess(player_request);
   outcome.player_exit_code = player_result.exit_code;
   outcome.stdout_log = player_stdout;
   outcome.stderr_log = player_stderr;
-  if (!player_result.started) {
-    outcome.reason = player_result.error;
-    return outcome;
-  }
+  if (!player_result.started) { outcome.reason = player_result.error; return outcome; }
   if (player_result.exit_code != 0) {
     outcome.reason = "RenderDoc Mesa/Gallium pvrgpu replay exited with code " +
                      std::to_string(player_result.exit_code);
     return outcome;
   }
-  std::string driver_counter_text;
-  if (!ReadText(driver_counter, &driver_counter_text)) {
-    outcome.stage = "driver-support";
+
+  // No standalone retry: only the native process owned the actual transient
+  // shader, vertex, texture, UBO, MRT and depth payloads.
+  std::string driver_text, model_text;
+  outcome.stage = "driver-support";
+  if (!ReadText(driver_counter, &driver_text)) {
     outcome.reason = "PvrGPU Gallium driver did not emit driver-counter.txt";
     return outcome;
   }
-  const std::size_t unsupported_draws =
-      CountDriverEvents(driver_counter_text, "unsupported_draw");
-  if (unsupported_draws != 0) {
-    outcome.stage = "driver-support";
-    outcome.reason =
-        "PvrGPU Gallium replay reported " +
-        std::to_string(unsupported_draws) +
-        " unsupported draw event(s) across replay passes; refusing to treat "
-        "a later framebuffer blit as the workload result";
-    return outcome;
-  }
-  if (!NonEmptyFile(command)) {
-    outcome.stage = "driver-support";
-    outcome.reason = "PvrGPU Gallium driver did not emit driver-command.txt";
-    return outcome;
-  }
-
-  std::string native_bridge_output;
-  const bool bridge_started =
-      ReadText(model_stdout, &native_bridge_output) &&
-      !native_bridge_output.empty();
-  const bool bridge_completed =
-      bridge_started &&
-      native_bridge_output.find("\"type\":\"done\"") !=
-          std::string::npos;
-  if (!bridge_completed && !bridge_started) {
-    /*
-     * Only the in-process bridge can consume a draw_pco_sequence capsule; the
-     * standalone stub reads the text form, which carries the outer command
-     * without its nested draws.  Running it here would replace the bridge's
-     * diagnosis with a parse error about a field it was never meant to see.
-     */
-    std::string capsule;
-    if (ReadText(command, &capsule) &&
-        capsule.find("command=draw_pco_sequence") != std::string::npos) {
-      outcome.stage = "model";
-      outcome.stdout_log = model_stdout;
-      outcome.stderr_log = model_stderr;
-      std::string bridge_error;
-      ReadText(model_stderr, &bridge_error);
-      const std::size_t last = bridge_error.find_last_not_of(" \t\r\n");
-      if (last != std::string::npos)
-        bridge_error.resize(last + 1);
-      const std::size_t line = bridge_error.rfind('\n');
-      outcome.reason =
-          "PvrGPU SystemC model produced no output for the PCO sequence" +
-          (bridge_error.empty()
-               ? std::string()
-               : ": " + bridge_error.substr(line == std::string::npos
-                                                ? 0
-                                                : line + 1));
-      return outcome;
-    }
-    outcome.stage = "model";
-    outcome.stdout_log = model_stdout;
-    outcome.stderr_log = model_stub_stderr;
-    ProcessRequest model_request;
-    model_request.executable = ResolveExecutable(options.model);
-    model_request.arguments = {"--driver-command", PathToUtf8(command),
-                               "--outdir", PathToUtf8(model_png_dir)};
-    model_request.stdout_path = model_stdout;
-    model_request.stderr_path = model_stub_stderr;
-    const ProcessResult model_result = RunProcess(model_request);
-    outcome.model_exit_code = model_result.exit_code;
-    if (!model_result.started) {
-      outcome.reason = model_result.error;
-      return outcome;
-    }
-    if (model_result.exit_code != 0) {
-      outcome.reason = "PvrGPU SystemC model exited with code " +
-                       std::to_string(model_result.exit_code);
-      return outcome;
-    }
-  } else if (bridge_completed) {
-    outcome.model_exit_code = 0;
-  } else {
-    // The in-process bridge already consumed the transient VBO, PCO binaries,
-    // shared registers and sampled-image bytes.  A standalone retry can only
-    // reload driver-command.txt metadata, so it would discard the real
-    // payload and overwrite the first actionable SystemC error with a false
-    // "empty PCO" failure.  Preserve the native JSONL and let protocol
-    // validation below report its exact error record.
-    outcome.model_exit_code = 1;
-  }
-
-  std::string model_text;
-  if (!ReadText(model_stdout, &model_text)) {
-    outcome.reason = "PvrGPU model stdout is missing";
-    return outcome;
-  }
-  const std::string bound_jsonl = InjectRdcDigest(model_text, digest);
-  if (!AtomicWriteText(model_stdout, bound_jsonl, &outcome.reason))
-    return outcome;
-  std::cout << bound_jsonl;
-
-  if (!ValidatePvrgpuCompletion(bound_jsonl, &outcome.reason)) {
+  ReadText(model_stdout, &model_text);  // A compute-only replay has no graphics JSONL.
+  NativeReport report;
+  if (!ParseNativeReport(model_text, driver_text, &report, &outcome.reason)) {
     outcome.stage = "model-protocol";
     outcome.stdout_log = model_stdout;
     outcome.stderr_log = model_stderr;
     return outcome;
   }
+  outcome.model_exit_code = 0;
 
-  std::map<std::string, std::uint64_t> counters;
-  if (!ParsePvrgpuCounters(bound_jsonl, &counters, &outcome.reason)) {
-    outcome.stage = "counter";
+  outcome.stage = "framebuffer";
+  std::string receipt_text;
+  FinalOutputReceipt receipt;
+  if (!ReadText(receipt_path, &receipt_text)) {
+    outcome.reason = "Player did not emit the versioned final-output receipt; rebuild pvrgpu-rdc-player";
     return outcome;
   }
-  const std::filesystem::path counter = artifact_root / "counter.txt";
-  if (!AtomicWriteText(counter, FormatCounters(counters), &outcome.reason)) {
-    outcome.stage = "counter";
+  if (!ParseFinalOutputReceipt(receipt_text, &receipt, &outcome.reason)) return outcome;
+  std::error_code path_error;
+  const bool same_rdc = std::filesystem::equivalent(
+      options.rdc, PathFromUtf8(receipt.rdc_path), path_error);
+  if (path_error || !same_rdc) {
+    outcome.reason = "Final-output receipt identifies a different RDC";
     return outcome;
   }
-  const std::filesystem::path source_frame =
-      CapturePng(bound_jsonl, model_png_dir);
   std::filesystem::path frame;
-  std::string player_output_text;
-  const bool explicit_no_color_output =
-      ReadText(player_stdout, &player_output_text) &&
-      player_output_text.find("selected replay range has no color output") !=
-          std::string::npos;
-  if (source_frame.empty() && !explicit_no_color_output) {
-    outcome.stage = "framebuffer";
-    outcome.reason =
-        "PvrGPU model did not emit a framebuffer PNG and the player did not "
-        "report explicit no-color output evidence";
+  std::string frame_digest;
+  if (receipt.color_output) {
+    const auto source_frame = PathFromUtf8(receipt.png_path);
+    path_error.clear();
+    const bool same_png = std::filesystem::equivalent(player_png, source_frame, path_error);
+    if (path_error || !same_png || !NonEmptyFile(source_frame)) {
+      outcome.reason = "Final-output receipt does not identify the requested replay PNG";
+      return outcome;
+    }
+    unsigned frame_width = 0, frame_height = 0;
+    if (!ReadPngExtent(source_frame, &frame_width, &frame_height) ||
+        frame_width != receipt.width || frame_height != receipt.height) {
+      outcome.reason = "Final replay PNG extent does not match its attachment receipt";
+      return outcome;
+    }
+    const bool extent_enforced = options.width_explicit || options.height_explicit ||
+                                 options.extent_from_manifest;
+    if (extent_enforced && (frame_width != options.width || frame_height != options.height)) {
+      outcome.reason = "PvrGPU model framebuffer extent mismatch: requested=" +
+          std::to_string(options.width) + "x" + std::to_string(options.height) +
+          " actual=" + std::to_string(frame_width) + "x" + std::to_string(frame_height);
+      return outcome;
+    }
+    outcome.frame_width = frame_width; outcome.frame_height = frame_height;
+    frame = artifact_root / "frame.png";
+    if (!CopyArtifact(source_frame, frame, &outcome.reason) ||
+        !Sha256File(frame, &frame_digest, &outcome.reason)) return outcome;
+  } else if (NonEmptyFile(player_png)) {
+    outcome.reason = "No-color receipt contradicts the replay PNG";
     return outcome;
   }
-  if (!source_frame.empty()) {
-    unsigned frame_width = 0;
-    unsigned frame_height = 0;
-    if (!ReadPngExtent(source_frame, &frame_width, &frame_height)) {
-      outcome.stage = "framebuffer";
-      outcome.reason = "PvrGPU model framebuffer is not a valid PNG";
-      return outcome;
-    }
-    const bool extent_enforced =
-        options.width_explicit || options.height_explicit ||
-        options.extent_from_manifest;
-    if (extent_enforced &&
-        (frame_width != options.width || frame_height != options.height)) {
-      outcome.stage = "framebuffer";
-      outcome.reason =
-          "PvrGPU model framebuffer extent mismatch: requested=" +
-          std::to_string(options.width) + "x" +
-          std::to_string(options.height) + " actual=" +
-          std::to_string(frame_width) + "x" +
-          std::to_string(frame_height);
-      return outcome;
-    }
-    outcome.frame_width = frame_width;
-    outcome.frame_height = frame_height;
-    frame = artifact_root / "frame.png";
-    if (!CopyArtifact(source_frame, frame, &outcome.reason)) {
-      outcome.stage = "framebuffer";
-      return outcome;
-    }
-  }
+
+  const auto counter = artifact_root / "counter.txt";
+  const auto normalized = FormatNativeReport(report, digest, PathToUtf8(frame));
+  if (!AtomicWriteText(counter, FormatCounters(report.counters), &outcome.reason) ||
+      !AtomicWriteText(capture_report, normalized, &outcome.reason)) return outcome;
+  metadata << "trace_draw_actions=" << receipt.trace_draw_actions
+           << "\ntrace_draw_actions_source=completed-player-metadata"
+           << "\nreplay_begin_event=" << receipt.replay_begin_event
+           << "\nreplay_end_event=" << receipt.replay_end_event
+           << "\ngraphics_reports=" << report.graphics_reports
+           << "\ngraphics_submissions=" << report.graphics_submissions
+           << "\ncompute_dispatches=" << report.compute_dispatches
+           << "\nfinal_output_receipt=" << PathToUtf8(receipt_path)
+           << "\nframe_sha256=" << frame_digest << '\n';
+  if (!AtomicWriteText(artifact_root / "runner.txt", metadata.str(), &outcome.reason)) return outcome;
+  std::cout << normalized;
   outcome.success = true;
   outcome.stage = "complete";
-  outcome.counter = counter;
-  outcome.frame = frame;
-  outcome.stdout_log = model_stdout;
-  outcome.stderr_log = model_stderr;
+  outcome.counter = counter; outcome.frame = frame;
+  outcome.stdout_log = model_stdout; outcome.stderr_log = model_stderr;
   return outcome;
 }
 

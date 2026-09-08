@@ -1,5 +1,6 @@
 // Focused FragmentFrontend regression. A texture-sampling draw whose complete
-// half-stamp was rejected by ISP must not launch helper-only USC quads.
+// 2x2 quad was rejected by ISP must not launch helper-only USC quads, even
+// when the adjacent child of its 4x2 half-stamp remains visible.
 
 #include "common/functional_types.h"
 #include "common/pipeline_state.h"
@@ -7,6 +8,7 @@
 
 #include <systemc>
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
@@ -134,7 +136,67 @@ int sc_main(int, char **) {
     }
     ReleaseFunctionalPayloads(pool, msaa_result);
     pool.Release(msaa_handle);
-    for (unsigned stage = 0; stage < 3; ++stage) {
+    for (unsigned samples : {1U, 2U, 4U, 8U, 16U}) {
+      for (bool helpers : {false, true}) {
+        PipelineState sampled;
+        sampled.width = 4; sampled.height = 2;
+        sampled.sequence = 30 + samples * 2 + helpers;
+        sampled.functional_case = FunctionalCase::kDriverPcoTriangles;
+        sampled.stage = PipelineStage::kVisibilityReady;
+        sampled.raster_state.sample_count = samples;
+        sampled.raster_state.sample_frequency = 1;
+        sampled.fragment_program_summary.uses_derivatives = helpers;
+        sampled.active_fragment_invocations = 1;
+        auto p = parameter; p.depth_plane_valid = 1;
+        auto candidate = rejected;
+        candidate.visibility = FragmentVisibility::kVisible;
+        candidate.sample_mask = (1U << samples) - 1U;
+        if (samples > 2) candidate.sample_mask &= ~2U;
+        for (unsigned sample = 0; sample < samples; ++sample)
+          candidate.sample_depth[sample] = static_cast<float>(sample + 1) / 32.0F;
+        const unsigned expected = samples > 2 ? samples - 1 : samples;
+        sampled.parameter_triangles = StoreNewArray(pool, std::vector<ParameterTriangle>{p});
+        sampled.fragment_candidates = StoreNewArray(pool, std::vector<FragmentCandidate>{candidate});
+        const auto handle = pool.Allocate(sizeof(PipelineState));
+        StorePipelineState(pool, handle, sampled);
+        input.write(PipelineTxn{handle, static_cast<std::uint32_t>(sampled.sequence), sampled.sequence});
+        sc_core::sc_start(sc_core::sc_time(1000, sc_core::SC_NS));
+        Check(output.nb_read(completed) && completed.sequence == sampled.sequence,
+              "sample-frequency frontend did not complete");
+        const auto done = LoadPipelineState(pool, handle);
+        const auto invocations = LoadArray<FragmentInvocation>(pool, done.fragment_invocations);
+        const auto quads = LoadArray<FragmentQuad>(pool, done.fragment_quads);
+        Check(invocations.size() == expected && done.active_fragment_invocations == expected &&
+                  done.counters.ps_invocations == expected &&
+                  done.fragment_shader_lane_count == expected * (helpers ? 4U : 1U),
+              "sample-frequency shading did not create one native invocation per covered sample");
+        std::uint32_t seen_samples = 0;
+        for (const auto &invocation : invocations) {
+          Check(invocation.sample_id < samples &&
+                    invocation.sample_mask == (1U << invocation.sample_id) &&
+                    invocation.depth == candidate.sample_depth[invocation.sample_id] &&
+                    (seen_samples & invocation.sample_mask) == 0,
+                "sample invocation lost unique ID/coverage/depth");
+          seen_samples |= invocation.sample_mask;
+        }
+        Check(seen_samples == candidate.sample_mask, "sample invocation coverage union changed");
+        if (helpers) {
+          const auto lanes = LoadArray<FragmentShaderLane>(pool, done.fragment_shader_lanes);
+          for (const auto &quad : quads) {
+            Check(quad.sample_id < samples && (candidate.sample_mask & (1U << quad.sample_id)),
+                  "helper quad belongs to an uncovered sample");
+            for (unsigned lane = 0; lane < 4; ++lane) {
+              const auto &work = lanes.at(quad.invocation_indices[lane]);
+              Check(work.sample_id == quad.sample_id && work.quad_lane == lane &&
+                        work.sample_mask == (work.helper ? 0U : 1U << quad.sample_id),
+                    "helper quad mixed sample IDs or invented covered helper samples");
+            }
+          }
+        }
+        ReleaseFunctionalPayloads(pool, done); pool.Release(handle);
+      }
+    }
+    for (unsigned stage = 0; stage < 4; ++stage) {
       PipelineState sampled;
       sampled.width = 4; sampled.height = 2; sampled.sequence = 3 + stage;
       sampled.functional_case = FunctionalCase::kDriverPcoTriangles;
@@ -142,6 +204,7 @@ int sc_main(int, char **) {
       sampled.vertex_sampled_texture_count = stage == 0;
       sampled.sampled_texture_count = stage == 1;
       sampled.geometry_sampled_texture_count = stage == 2;
+      sampled.fragment_program_summary.uses_derivatives = stage == 3;
       sampled.active_fragment_invocations = 1;
       auto p = parameter; p.depth_plane_valid = 1;
       auto candidate = rejected; candidate.visibility = FragmentVisibility::kVisible;
@@ -155,11 +218,163 @@ int sc_main(int, char **) {
             "stage-local texture frontend did not complete");
       const auto done = LoadPipelineState(pool, handle);
       Check(done.active_fragment_invocations == 1 && done.counters.ps_invocations == 1 &&
-            done.fragment_shader_lane_count == (stage == 1 ? 8U : 1U) &&
-            HasPoolHandle(done.fragment_shader_lanes) == (stage == 1),
-            "only fragment-stage SMP may create fragment helper lanes; VS/GS samplers remain independent");
+            done.fragment_shader_lane_count == (stage == 1 || stage == 3 ? 4U : 1U) &&
+            HasPoolHandle(done.fragment_shader_lanes) == (stage == 1 || stage == 3),
+            "fragment SMP and derivatives need helper quads; VS/GS samplers remain independent");
       ReleaseFunctionalPayloads(pool, done); pool.Release(handle);
     }
+
+    struct ExpectedQuad {
+      std::uint32_t parameter_index;
+      std::uint32_t quad_id;
+      std::uint8_t sample_id;
+      std::uint8_t coverage;
+    };
+    std::uint32_t fixture_sequence = 100;
+    auto candidate_at = [&](std::uint32_t x, std::uint32_t y,
+                            std::uint32_t primitive, std::uint16_t samples,
+                            bool is_visible = true) {
+      auto candidate = rejected;
+      candidate.x = x;
+      candidate.y = y;
+      candidate.parameter_index = primitive;
+      candidate.primitive_id = parameters.at(primitive).key.api_primitive_id;
+      candidate.submit_ordinal = parameters.at(primitive).key.submit_ordinal;
+      candidate.sample_mask = samples;
+      candidate.visibility = is_visible ? FragmentVisibility::kVisible
+                                        : FragmentVisibility::kRejected;
+      for (unsigned sample = 0; sample < 16; ++sample)
+        candidate.sample_depth[sample] = static_cast<float>(sample + 1) / 32.0F;
+      return candidate;
+    };
+    auto check_quad_fixture = [&](const std::string &name, unsigned width,
+                                  unsigned height, unsigned samples,
+                                  bool sample_frequency,
+                                  const std::vector<FragmentCandidate> &candidates,
+                                  const std::vector<ExpectedQuad> &expected) {
+      PipelineState fixture;
+      fixture.width = width;
+      fixture.height = height;
+      fixture.sequence = fixture_sequence++;
+      fixture.functional_case = FunctionalCase::kDriverPcoTriangles;
+      fixture.stage = PipelineStage::kVisibilityReady;
+      fixture.raster_state.sample_count = samples;
+      fixture.raster_state.sample_frequency = sample_frequency;
+      fixture.sampled_texture_count = 1;
+      fixture.fragment_program_summary.uses_derivatives = 1;
+      auto fixture_parameters = parameters;
+      for (auto &p : fixture_parameters)
+        p.depth_plane_valid = 1;
+      for (const auto &candidate : candidates)
+        fixture.active_fragment_invocations +=
+            candidate.visibility == FragmentVisibility::kVisible;
+      fixture.parameter_triangles = StoreNewArray(pool, fixture_parameters);
+      fixture.fragment_candidates = StoreNewArray(pool, candidates);
+      const auto handle = pool.Allocate(sizeof(PipelineState));
+      StorePipelineState(pool, handle, fixture);
+      input.write(PipelineTxn{handle, static_cast<std::uint32_t>(fixture.sequence), fixture.sequence});
+      sc_core::sc_start(sc_core::sc_time(1000, sc_core::SC_NS));
+      Check(output.nb_read(completed) && completed.sequence == fixture.sequence,
+            name + ": frontend did not complete");
+      const auto done = LoadPipelineState(pool, handle);
+      const auto quads = LoadArray<FragmentQuad>(pool, done.fragment_quads);
+      const auto lanes = LoadArray<FragmentShaderLane>(pool, done.fragment_shader_lanes);
+      const auto invocations = LoadArray<FragmentInvocation>(pool, done.fragment_invocations);
+      Check(done.stage == PipelineStage::kFragmentsReady &&
+                quads.size() == expected.size() &&
+                done.fragment_groups == expected.size() &&
+                lanes.size() == 4 * expected.size() &&
+                done.fragment_shader_lane_count == lanes.size(),
+            name + ": only nonempty 2x2 quads may issue four shader lanes");
+      std::vector<bool> seen_lanes(lanes.size(), false);
+      std::vector<bool> seen_invocations(invocations.size(), false);
+      unsigned covered_count = 0;
+      for (const auto &wanted : expected) {
+        const auto it = std::find_if(quads.begin(), quads.end(), [&](const auto &quad) {
+          return quad.parameter_index == wanted.parameter_index &&
+                 quad.quad_id == wanted.quad_id && quad.sample_id == wanted.sample_id;
+        });
+        Check(it != quads.end(), name + ": missing primitive/quad/sample identity");
+        const auto &quad = *it;
+        Check(wanted.coverage != 0 && quad.coverage_mask == wanted.coverage &&
+                  quad.write_mask == wanted.coverage &&
+                  quad.helper_mask == (0xfU ^ wanted.coverage),
+              name + ": visible coverage and required helper masks changed");
+        const unsigned quads_x = (width + 1) / 2;
+        const unsigned quad_x = (wanted.quad_id % quads_x) * 2;
+        const unsigned quad_y = (wanted.quad_id / quads_x) * 2;
+        for (unsigned lane = 0; lane < 4; ++lane) {
+          const unsigned index = quad.invocation_indices[lane];
+          Check(index < lanes.size() && !seen_lanes[index], name + ": shader lane alias");
+          seen_lanes[index] = true;
+          const auto &work = lanes[index];
+          const bool covered = (wanted.coverage & (1U << lane)) != 0;
+          Check(work.x == quad_x + lane % 2 && work.y == quad_y + lane / 2 &&
+                    work.quad_lane == lane && work.quad_id == wanted.quad_id &&
+                    work.parameter_index == wanted.parameter_index &&
+                    work.sample_id == wanted.sample_id && work.helper == !covered &&
+                    work.primitive_id == fixture_parameters[wanted.parameter_index].key.api_primitive_id &&
+                    work.submit_ordinal == quad.submit_ordinal,
+                name + ": lane coordinates, identity or helper state changed");
+          if (covered) {
+            ++covered_count;
+            const auto visible_index = work.visible_invocation_index;
+            Check(visible_index < invocations.size() && !seen_invocations[visible_index],
+                  name + ": visible invocation alias");
+            seen_invocations[visible_index] = true;
+            const auto &visible_work = invocations[visible_index];
+            Check(work.x < width && work.y < height &&
+                      visible_work.x == work.x && visible_work.y == work.y &&
+                      visible_work.parameter_index == work.parameter_index &&
+                      visible_work.sample_id == work.sample_id &&
+                      work.sample_mask == visible_work.sample_mask &&
+                      (!sample_frequency || work.sample_mask == (1U << work.sample_id)),
+                  name + ": covered lane lost its unique invocation/sample");
+          } else {
+            Check(work.sample_mask == 0 &&
+                      work.visible_invocation_index == kInvalidFragmentInvocationIndex,
+                  name + ": helper invented visible work or sample coverage");
+          }
+        }
+      }
+      Check(covered_count == invocations.size() &&
+                done.active_fragment_invocations == covered_count &&
+                done.counters.ps_invocations == covered_count &&
+                std::all_of(seen_lanes.begin(), seen_lanes.end(), [](bool seen) { return seen; }) &&
+                std::all_of(seen_invocations.begin(), seen_invocations.end(), [](bool seen) { return seen; }),
+            name + ": unmatched or lost shader/visible work");
+      ReleaseFunctionalPayloads(pool, done);
+      pool.Release(handle);
+    };
+    check_quad_fixture("left child only", 4, 2, 1, false,
+                       {candidate_at(0, 0, 0, 1)}, {{0, 0, 0, 0x1}});
+    check_quad_fixture("right child only", 4, 2, 1, false,
+                       {candidate_at(3, 1, 0, 1)}, {{0, 1, 0, 0x8}});
+    check_quad_fixture("both children", 4, 2, 1, false,
+                       {candidate_at(0, 0, 0, 1), candidate_at(1, 1, 0, 1),
+                        candidate_at(2, 0, 0, 1)},
+                       {{0, 0, 0, 0x9}, {0, 1, 0, 0x1}});
+    check_quad_fixture("children belong to different primitives", 4, 2, 1, false,
+                       {candidate_at(0, 0, 0, 1), candidate_at(3, 1, 1, 1)},
+                       {{0, 0, 0, 0x1}, {1, 1, 0, 0x8}});
+    check_quad_fixture("children belong to different samples", 4, 2, 4, true,
+                       {candidate_at(0, 0, 0, 0x2), candidate_at(3, 1, 0, 0x8)},
+                       {{0, 0, 1, 0x1}, {0, 1, 3, 0x8}});
+    check_quad_fixture("different primitive and sample identities", 4, 2, 4, true,
+                       {candidate_at(0, 0, 0, 0x5), candidate_at(3, 1, 1, 0xa)},
+                       {{0, 0, 0, 0x1}, {0, 0, 2, 0x1},
+                        {1, 1, 1, 0x8}, {1, 1, 3, 0x8}});
+    check_quad_fixture("odd viewport retains derivative helpers", 3, 3, 1, false,
+                       {candidate_at(2, 2, 0, 1)}, {{0, 3, 0, 0x1}});
+    check_quad_fixture("ISP rejected adjacent child", 4, 2, 1, false,
+                       {candidate_at(0, 0, 0, 1), candidate_at(2, 0, 0, 1, false)},
+                       {{0, 0, 0, 0x1}});
+    check_quad_fixture("ISP rejected entire primitive beside visible primitive", 4, 2, 1, false,
+                       {candidate_at(0, 0, 0, 1, false), candidate_at(2, 0, 1, 1)},
+                       {{1, 1, 0, 0x1}});
+    check_quad_fixture("ISP rejected all samples in both children", 4, 2, 4, true,
+                       {candidate_at(0, 0, 0, 0xf, false), candidate_at(2, 0, 1, 0xf, false)},
+                       {});
     Check(pool.bytes_in_flight() == 0 &&
               pool.allocations() == pool.releases(),
           "MemoryPool balance");

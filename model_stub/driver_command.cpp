@@ -52,7 +52,7 @@ const std::set<std::string> &KnownFields() {
       "fragment_shared_words", "vertex_pco_abi", "fragment_pco_abi",
       "position_linkage", "varying_linkage", "viewport_scale_bits",
       "viewport_translate_bits", "raster_state", "scissor_rect",
-      "primitive_width", "point_size_output", "sample_mask",
+      "primitive_width", "point_size_output", "sample_mask", "sample_frequency",
       "color_state", "depth_state",
       "alpha_to_coverage", "alpha_to_coverage_dither", "alpha_to_one",
       "sampled_texture_count", "sampled_texture_bytes_size",
@@ -350,7 +350,9 @@ bool RequireExactFields(const std::map<std::string, std::string> &fields,
         command == kDrawPcoTrianglesCommand &&
         (entry.first == "alpha_to_coverage" ||
          entry.first == "alpha_to_coverage_dither" || entry.first == "alpha_to_one");
-    if (!required.count(entry.first) && !optional_pco_counter &&
+    const bool optional_sample_frequency = command == kDrawPcoTrianglesCommand &&
+        entry.first == "sample_frequency";
+    if (!required.count(entry.first) && !optional_pco_counter && !optional_sample_frequency &&
         !optional_pco_texture && !optional_pco_linkage &&
         !optional_pco_index && !optional_pco_render_targets && !optional_pco_alpha) {
       *error = "field is not valid for " + command +
@@ -696,6 +698,8 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         !ParseU32List(fields["primitive_width"], &primitive_width) ||
         !ParseU32List(fields["point_size_output"], &point_size_output) ||
         !ParseU32(fields["sample_mask"], &parsed.sample_mask) ||
+        !ParseOptionalU32(fields, "sample_frequency", &parsed.sample_frequency) ||
+        parsed.sample_frequency > 1 ||
         !ParseU32List(fields["color_state"], &color_state) ||
         !ParseU32List(fields["depth_state"], &depth_state)) {
       *error = "draw_pco_triangles metadata is malformed or outside the "
@@ -816,12 +820,19 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
       std::array<float, 3> translate;
       std::memcpy(translate.data(), parsed.viewport_translate_bits.data(),
                   sizeof(translate));
+      float depth_scale;
+      std::memcpy(&depth_scale, &parsed.viewport_scale_bits[2], sizeof(depth_scale));
+      // GL permits forward, reversed and equal clamped depth endpoints.
+      // Float reconstruction matches Gallium's stored half-sum/difference.
+      const float near_depth = translate[2] - depth_scale;
+      const float far_depth = translate[2] + depth_scale;
       viewport_valid = parsed.viewport_scale_bits[0] == expected_viewport[0] &&
           (parsed.viewport_scale_bits[1] == expected_viewport[1] ||
            parsed.viewport_scale_bits[1] == (expected_viewport[1] ^ UINT32_C(0x80000000))) &&
-          parsed.viewport_scale_bits[2] == expected_viewport[2] &&
           std::isfinite(translate[0]) && std::isfinite(translate[1]) &&
-          std::isfinite(translate[2]) && translate[2] == 0.5F;
+          std::isfinite(translate[2]) && std::isfinite(depth_scale) &&
+          near_depth >= 0.0F && near_depth <= 1.0F &&
+          far_depth >= 0.0F && far_depth <= 1.0F;
     }
     const std::uint64_t end_vertex =
         static_cast<std::uint64_t>(parsed.first_vertex) +

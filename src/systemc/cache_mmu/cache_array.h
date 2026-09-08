@@ -94,14 +94,17 @@ public:
   // Line accesses require a line-aligned address.  On a read miss, lower_read
   // fills the allocated line.  A full-line write miss allocates directly from
   // incoming data and therefore needs no read-for-ownership.  Dirty victims
-  // and Flush() use lower_write.
+  // and Flush() use lower_write. A WriteLine caller that only consumes access
+  // metadata can omit the owned response copy with return_data=false; cache
+  // data, LRU, lower requests and counters are unaffected.
   CacheLineAccess ReadLine(std::uint64_t line_address,
                            const CacheLineRead &lower_read = {},
                            const CacheLineWrite &lower_write = {});
   CacheLineAccess WriteLine(std::uint64_t line_address,
                             const CacheLineData &data,
                             const CacheLineRead &lower_read = {},
-                            const CacheLineWrite &lower_write = {});
+                            const CacheLineWrite &lower_write = {},
+                            bool return_data = true);
 
   // Touch every line intersecting [address, address + bytes).  It is intended
   // for performance traffic where the actual bytes are held elsewhere.  The

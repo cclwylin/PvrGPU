@@ -49,6 +49,7 @@ using ComputeMemoryAtomic32 = std::uint32_t (*)(void *, ComputeMemoryOperation,
                                                std::uint64_t, std::uint32_t);
 using ComputeMutex = void (*)(void *, std::uint32_t, std::uint32_t);
 using ComputeTryMutex = bool (*)(void *, std::uint32_t, std::uint32_t);
+using ComputeTextureSample = void (*)(void *, const PcoTextureRequest &, std::uint32_t *);
 struct ComputeMemoryCallbacks {
   void *user_data = nullptr;
   ComputeMemoryRead read = nullptr;
@@ -56,6 +57,7 @@ struct ComputeMemoryCallbacks {
   ComputeMemoryAtomic32 atomic32 = nullptr;
   ComputeMutex mutex = nullptr;
   ComputeTryMutex try_mutex = nullptr;
+  ComputeTextureSample sample = nullptr;
 };
 
 void ValidateComputeProgram(const PcoDecodedProgram &program,

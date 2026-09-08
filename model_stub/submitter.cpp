@@ -13,6 +13,7 @@
 // PipelineTxn handle 與 frame/sequence metadata。
 #include "submitter.h"
 #include "uniform_buffers.h"
+#include "shader_images.h"
 #include "common/geometry_emission.h"
 #include "common/tessellation_state.h"
 #include "common/stream_output_types.h"
@@ -98,6 +99,11 @@ inline constexpr std::uint64_t kStreamOutputGpuAddressBase =
 static_assert(kStreamOutputGpuAddressBase <= UINT64_MAX -
                   kDriverSequenceAddressSlots * 4U * kStreamOutputResourceAddressStride,
               "stream output address region wraps");
+inline constexpr std::uint64_t kShaderImageGpuAddressBase = kStreamOutputGpuAddressBase +
+    kDriverSequenceAddressSlots * 4U * kStreamOutputResourceAddressStride;
+static_assert(kShaderImageGpuAddressBase <= UINT64_MAX -
+    kDriverSequenceAddressSlots * kMaximumFragmentImages * kMaximumFragmentImageBytes,
+    "fragment image address region wraps");
 // 以全部合法 slots 驗證區域，而非只以本輪實際 draw 數推測不會相撞。
 static_assert(kDriverPcoMrtColorAddressBase +
                   kDriverSequenceAddressSlots * kMaxRenderTargets *
@@ -1511,6 +1517,7 @@ void Submitter::RunJob() {
                                            : options_.driver_commands.size();
   std::vector<std::uint64_t> sequence_color_addresses(submission_count, 0);
   std::vector<std::uint64_t> sequence_depth_addresses(submission_count, 0);
+  std::vector<std::pair<const DriverShaderImage *, std::uint64_t>> sequence_image_storage;
   DriverPcoExternalTextureAllocation sequence_external_allocation;
   if (driver_pco_sequence_command &&
       !ResolveSequenceAttachmentAddresses(options_.driver_commands,
@@ -1592,6 +1599,11 @@ void Submitter::RunJob() {
     state.raster_state.sample_count = command.raster_samples ? command.raster_samples : 1;
     state.raster_state.sample_mask = driver_pco_triangles_command ?
         command.sample_mask : UINT32_MAX;
+    if (command.sample_frequency > 1)
+      throw std::runtime_error("Submitter sample frequency is invalid");
+    state.raster_state.sample_frequency = command.sample_frequency;
+    state.raster_state.shader_writes_memory = command.fragment_image_write_mask != 0;
+    state.raster_state.shader_early_tests = command.fragment_early_tests;
     state.raster_state.multisample_enable = driver_pco_triangles_command ?
         (command.multisample ? 1 : 0) : 1;
     state.raster_state.alpha_to_coverage = command.alpha_to_coverage;
@@ -1622,8 +1634,11 @@ void Submitter::RunJob() {
       throw std::runtime_error("Submitter render target count is unsupported");
     for (std::uint32_t target = 1; target < state.render_target_count;
          ++target) {
+      const std::uint64_t color_owner = driver_pco_sequence_command ?
+          (sequence_color_addresses[submission] - kDriverPcoSequenceColorAddressBase) /
+              kDriverPcoSequenceAttachmentStride : submission;
       const std::uint64_t slot =
-          static_cast<std::uint64_t>(submission) * kMaxRenderTargets + target;
+          color_owner * kMaxRenderTargets + target;
       state.extra_framebuffer_gpu_address[target - 1] =
           kDriverPcoMrtColorAddressBase + slot * kDriverPcoSequenceAttachmentStride;
       /* Every attachment of a pass stores the same pixel width. */
@@ -1640,11 +1655,15 @@ void Submitter::RunJob() {
           state.raster_state.sample_count * state.attachment_layers *
           ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
                                        state.color_attachment_float32);
+      const std::uint64_t all_color_bytes = color_bytes * state.render_target_count;
+      const auto color_address = [&](unsigned target) {
+        return target == 0 ? state.framebuffer_gpu_address :
+                            state.extra_framebuffer_gpu_address[target - 1];
+      };
       if (!command.initial_color_attachment_bytes.empty()) {
         if (command.color_attachment_source_command_index !=
                 kDriverPcoNewAttachment ||
-            state.render_target_count != 1 ||
-            command.initial_color_attachment_bytes.size() != color_bytes ||
+            command.initial_color_attachment_bytes.size() != all_color_bytes ||
             color_bytes > kDriverPcoSequenceAttachmentStride) {
           throw std::runtime_error(
               "Submitter initial color attachment contract is invalid");
@@ -1652,33 +1671,34 @@ void Submitter::RunJob() {
         // A host snapshot establishes input storage only.  Reading it through
         // the memory system records the dependency and feeds the same PBE
         // LOAD path used by attachments produced by an earlier draw.
-        memory_->HostWrite(state.framebuffer_gpu_address,
-                           command.initial_color_attachment_bytes.data(),
-                           command.initial_color_attachment_bytes.size());
+        for (unsigned target = 0; target < state.render_target_count; ++target)
+          memory_->HostWrite(color_address(target),
+              command.initial_color_attachment_bytes.data() + target * color_bytes,
+              static_cast<std::size_t>(color_bytes));
       }
       if (command.color_attachment_source_command_index !=
               kDriverPcoNewAttachment ||
           !command.initial_color_attachment_bytes.empty()) {
-        if (color_bytes == 0 ||
-            color_bytes > std::numeric_limits<std::size_t>::max() ||
-            !memory_->backing().Contains(
-                state.framebuffer_gpu_address,
-                static_cast<std::size_t>(color_bytes))) {
+        if (color_bytes == 0 || color_bytes > kDriverPcoSequenceAttachmentStride ||
+            all_color_bytes > std::numeric_limits<std::size_t>::max()) {
           throw std::runtime_error(
-              "Submitter aliased color attachment is absent from DRAM");
+              "Submitter aliased color attachment byte size is invalid");
         }
-        MemoryReadResult color_load = memory_->Readback(
-            state.framebuffer_gpu_address,
-            static_cast<std::size_t>(color_bytes),
-            MemoryClient::kFramebufferReadback);
-        if (color_load.data.size() != color_bytes)
-          throw std::runtime_error(
-              "Submitter aliased color attachment readback is truncated");
-        sequence_dependency_stats += color_load.stats;
-        state.color_attachment_load =
-            StoreNewArray(pool_, color_load.data);
+        std::vector<std::uint8_t> all_color_load(static_cast<std::size_t>(all_color_bytes));
+        for (unsigned target = 0; target < state.render_target_count; ++target) {
+          if (!memory_->backing().Contains(color_address(target), static_cast<std::size_t>(color_bytes)))
+            throw std::runtime_error("Submitter aliased color attachment is absent from DRAM");
+          MemoryReadResult color_load = memory_->Readback(color_address(target),
+              static_cast<std::size_t>(color_bytes), MemoryClient::kFramebufferReadback);
+          if (color_load.data.size() != color_bytes)
+            throw std::runtime_error("Submitter aliased color attachment readback is truncated");
+          sequence_dependency_stats += color_load.stats;
+          std::copy(color_load.data.begin(), color_load.data.end(),
+                    all_color_load.begin() + target * color_bytes);
+        }
+        state.color_attachment_load = StoreNewArray(pool_, all_color_load);
         state.color_attachment_load_enable = 1;
-        state.color_attachment_load_bytes = color_bytes;
+        state.color_attachment_load_bytes = all_color_bytes;
       }
       if (command.depth_format != 0) {
         state.depth_attachment_format = command.depth_format;
@@ -2453,8 +2473,49 @@ void Submitter::RunJob() {
       std::vector<UniformBufferResource> control_uniform_buffers;
       std::vector<UniformBufferResource> evaluation_uniform_buffers;
       std::string uniform_error;
-      if (!ValidateDriverUniformBuffers(command, &uniform_error))
+      if (!ValidateDriverUniformBuffers(command, &uniform_error) ||
+          !ValidateDriverShaderImages(command, &uniform_error))
         throw std::runtime_error(uniform_error);
+      state.fragment_image_descriptor_start = command.fragment_image_descriptor_start;
+      state.fragment_image_descriptor_count = command.fragment_image_descriptor_count;
+      state.fragment_image_read_mask = command.fragment_image_read_mask;
+      state.fragment_image_write_mask = command.fragment_image_write_mask;
+      if (!command.fragment_images.empty()) {
+        if (!driver_pco_sequence_command || !memory_)
+          throw std::runtime_error("Submitter fragment images require sequence GPU memory");
+        std::vector<ShaderImageResource> resources;
+        for (const auto &image : command.fragment_images) {
+          ShaderImageResource resource;
+          resource.resource_token = image.resource_token;
+          resource.bytes = image.bytes.size(); resource.offset = image.offset;
+          resource.image_slot = image.image_slot; resource.format = image.format;
+          resource.access = image.access; resource.width = image.width;
+          resource.height = image.height; resource.depth = image.depth;
+          resource.row_stride = image.row_stride; resource.layer_stride = image.layer_stride;
+          resource.texel_bytes = image.texel_bytes;
+          const auto alias = std::find_if(sequence_image_storage.begin(), sequence_image_storage.end(),
+              [&](const auto &prior) { return prior.first->resource_token == image.resource_token; });
+          if (alias != sequence_image_storage.end()) {
+            if (alias->first->bytes != image.bytes)
+              throw std::runtime_error("Submitter image resource changed without a sequence boundary");
+            resource.gpu_address = alias->second;
+          } else {
+            if (sequence_image_storage.size() >= kDriverSequenceAddressSlots * kMaximumFragmentImages)
+              throw std::runtime_error("Submitter fragment image address slots exhausted");
+            resource.gpu_address = kShaderImageGpuAddressBase +
+                sequence_image_storage.size() * kMaximumFragmentImageBytes;
+            memory_->HostWrite(resource.gpu_address, image.bytes.data(), image.bytes.size());
+            sequence_image_storage.emplace_back(&image, resource.gpu_address);
+          }
+          resource.readback = StoreNewArray(pool_, image.bytes);
+          const auto address = resource.gpu_address + resource.offset;
+          const auto word = command.fragment_image_descriptor_start + image.image_slot * 8U;
+          fragment_shared.at(word) = static_cast<std::uint32_t>(address);
+          fragment_shared.at(word + 1) = static_cast<std::uint32_t>(address >> 32);
+          resources.push_back(resource);
+        }
+        state.fragment_image_resources = StoreNewArray(pool_, resources);
+      }
       if (!command.uniform_buffers.empty()) {
         if (!driver_pco_sequence_command || !memory_)
           throw std::runtime_error("Submitter uniform buffers require sequence GPU memory");
@@ -2888,6 +2949,12 @@ void Submitter::RunJob() {
                    ? TriangleSetupCyanFragmentPcoBinary()
                    : triangle_setup ? TriangleSetupOrangeFragmentPcoBinary()
                                     : FillSolidFragmentPcoBinary());
+    if (!driver_pco_triangles) {
+      // The built-in fragment programs above export one complete vec4 to
+      // target zero. Declare their ABI just as the driver does; a zero mask
+      // in a real driver command still means that target is not written.
+      state.fragment_output_mask[0] = 0xf;
+    }
     state.drawlist_stats = StoreNewArray(pool_, std::vector<DrawListStats>{{}});
 
     const PoolHandle handle = pool_.Allocate(sizeof(PipelineState));

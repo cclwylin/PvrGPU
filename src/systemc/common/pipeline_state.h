@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/functional_types.h"
+#include "common/shader_image_types.h"
 #include "memory_pool.h"
 #include "model_types.h"
 #include "shader/pco_iss.h"
@@ -98,6 +99,13 @@ struct PipelineState {
   std::uint64_t stream_output_primitives_written = 0;
   std::uint64_t stream_output_primitives_storage_needed = 0;
   std::uint32_t stream_output_complete = 0;
+  PoolHandle fragment_image_resources;
+  std::uint32_t fragment_image_descriptor_start = 0;
+  std::uint32_t fragment_image_descriptor_count = 0;
+  std::uint32_t fragment_image_read_mask = 0;
+  std::uint32_t fragment_image_write_mask = 0;
+  std::uint32_t fragment_images_complete = 0;
+  std::uint64_t fragment_image_atomics = 0;
   // GS inputs retain complete API primitives (including adjacency). Native
   // emission produces new lanes and explicit primitive identities; neither
   // is inferred from a VS lane's single emitted flag.
@@ -110,6 +118,7 @@ struct PipelineState {
   PoolHandle tessellation_state;
   std::uint32_t tessellation_output_dwords = 0;
   DriverPcoStageAbi geometry_pco_abi;
+  DriverPcoStageAbi compute_pco_abi;
   PcoProgramSummary geometry_program_summary;
   std::uint64_t geometry_input_buffer_gpu_address = 0;
   std::uint32_t geometry_input_primitive_vertices = 0;
@@ -136,6 +145,9 @@ struct PipelineState {
   PoolHandle vertex_texture_resources;
   PoolHandle vertex_sampler_states;
   PoolHandle geometry_texture_resources;
+  PoolHandle compute_texture_resources;
+  PoolHandle compute_sampler_states;
+  PoolHandle compute_shared_registers;
   PoolHandle geometry_sampler_states;
   PoolHandle texture_resources;
   PoolHandle sampler_states;
@@ -154,7 +166,8 @@ struct PipelineState {
   // Initial attachment payloads for API-v7 alias+LOAD render passes. The
   // Submitter obtains these from the authoritative DRAM allocation at the
   // ordered sequence barrier; ISP/PBE consume them as initial destination
-  // state rather than re-clearing the aliased target.
+  // state rather than re-clearing the aliased target. Color LOAD concatenates
+  // every render target in target-major order (then layers/pixels/samples).
   PoolHandle color_attachment_load;
   PoolHandle depth_attachment_load;
   // ISP owns the complete post-depth-test surface (including untouched LOAD
@@ -231,6 +244,11 @@ struct PipelineState {
   // the correspondingly numbered owned resource and sampler.
   std::uint32_t vertex_sampled_texture_count = 0;
   std::uint32_t geometry_sampled_texture_count = 0;
+  std::uint32_t compute_sampled_texture_count = 0;
+  std::uint64_t compute_texture_request_count = 0;
+  std::uint64_t compute_texel_fetch_count = 0;
+  std::uint64_t compute_texture_direct_read_bytes = 0;
+  std::uint64_t compute_texture_direct_write_bytes = 0;
   std::uint32_t sampled_texture_count = 0;
   // Internal stage-bank accounting.  Public counters remain aggregate, while
   // these totals prove that VS and FS FIFO traffic cannot be silently charged

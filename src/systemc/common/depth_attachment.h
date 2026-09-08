@@ -47,8 +47,6 @@ inline void MaterializeDepthAttachment(MemoryPool &pool, GpuMemorySystem *memory
 
   if (state->width == 0 || state->height == 0 ||
       !IsSupportedRasterSampleCount(state->raster_state.sample_count) ||
-      state->raster_state.shader_may_discard != 0 ||
-      state->raster_state.shader_writes_sample_mask != 0 ||
       state->depth_attachment_format == 0 ||
       !HasPoolHandle(state->isp_depth_attachment)) {
     throw std::runtime_error(

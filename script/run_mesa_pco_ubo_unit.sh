@@ -36,8 +36,8 @@ objects = []
 ['src/gallium/drivers/pvrgpu/pvrgpu_pco.c',
  'tests/pvrgpu_generic_uniform_buffer_test.c'].each do |source|
   object = File.join(output, File.basename(source) + '.o')
-  abort 'C compilation failed' unless system(compiler, *flags,
-    '-I' + File.join(repo, 'src/gallium/drivers/pvrgpu'), '-c', File.join(repo, source),
+  abort 'C compilation failed' unless system(compiler,
+    '-I' + File.join(repo, 'src/gallium/drivers/pvrgpu'), *flags, '-c', File.join(repo, source),
     '-o', object, chdir: entry.fetch('directory'))
   objects << object
 end

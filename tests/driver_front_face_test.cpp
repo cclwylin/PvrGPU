@@ -46,7 +46,8 @@ std::uint32_t Bits(float value) {
 PipelineState MakeState(MemoryPool &pool, std::uint64_t sequence,
                         bool tessellation, FrontFaceWinding winding,
                         bool ndc_ccw, bool negative_viewport_y,
-                        unsigned cull) {
+                        unsigned cull, float depth_near = 0.0F,
+                        float depth_far = 1.0F, float clip_depth = 0.0F) {
   PipelineState state;
   state.width = state.height = kExtent;
   state.sequence = sequence;
@@ -70,9 +71,9 @@ PipelineState MakeState(MemoryPool &pool, std::uint64_t sequence,
       cull == 2 ? CullFaceMode::kBack : CullFaceMode::kFrontAndBack;
   raster.viewport_scale[0] = kExtent * 0.5f;
   raster.viewport_scale[1] = (negative_viewport_y ? -0.5f : 0.5f) * kExtent;
-  raster.viewport_scale[2] = 0.5f;
+  raster.viewport_scale[2] = (depth_far - depth_near) * 0.5F;
   raster.viewport_translate[0] = raster.viewport_translate[1] = kExtent * 0.5f;
-  raster.viewport_translate[2] = 0.5f;
+  raster.viewport_translate[2] = (depth_far + depth_near) * 0.5F;
   raster.depth.test_enable = raster.depth.write_enable = 0;
   raster.stencil.test_enable = 1;
   raster.stencil.clear_stencil = kClear;
@@ -89,7 +90,7 @@ PipelineState MakeState(MemoryPool &pool, std::uint64_t sequence,
   for (unsigned i = 0; i < 3; ++i) {
     lanes[i].vertex_output[0] = Bits(xy[i][0]);
     lanes[i].vertex_output[1] = Bits(xy[i][1]);
-    lanes[i].vertex_output[2] = Bits(0.0f);
+    lanes[i].vertex_output[2] = Bits(clip_depth);
     lanes[i].vertex_output[3] = Bits(1.0f);
     lanes[i].emitted = lanes[i].ended = 1;
   }
@@ -213,6 +214,49 @@ int sc_main(int, char **) {
               pool.Release(handle);
             }
     Check(sequence == 64, "complete independent winding/cull/viewport/stage matrix");
+    const std::array<std::array<float, 2>, 7> depth_ranges{{
+        {{0, 1}}, {{1, 0}}, {{.25F, .75F}}, {{.75F, .25F}},
+        {{0, 0}}, {{.375F, .375F}}, {{1, 1}},
+    }};
+    for (const auto &range : depth_ranges) {
+      for (float clip_z : {-1.0F, -.5F, 0.0F, .5F, 1.0F}) {
+        current_case = "depth range=" + std::to_string(range[0]) + "," +
+            std::to_string(range[1]) + " clip_z=" + std::to_string(clip_z);
+        auto state = MakeState(pool, ++sequence, false,
+            FrontFaceWinding::kClockwise, true, false, 0, range[0], range[1], clip_z);
+        state.raster_state.depth.test_enable = state.raster_state.depth.write_enable = 1;
+        state.raster_state.depth.compare_op = DepthCompareOp::kAlways;
+        const auto handle = pool.Allocate(sizeof(PipelineState));
+        StorePipelineState(pool, handle, state);
+        input.write({handle, static_cast<std::uint32_t>(sequence), sequence});
+        sc_core::sc_start(sc_core::sc_time(10, sc_core::SC_US));
+        PipelineTxn completion;
+        Check(output.nb_read(completion), "depth viewport bounded FIFO completion");
+        state = LoadPipelineState(pool, handle);
+        Verify(pool, state, true, false);
+        const float expected = clip_z * ((range[1] - range[0]) * .5F) +
+            (range[1] + range[0]) * .5F;
+        const auto raster = LoadArray<RasterTriangle>(pool, state.raster_triangles);
+        const auto parameters = LoadArray<ParameterTriangle>(pool, state.parameter_triangles);
+        for (unsigned vertex = 0; vertex < 3; ++vertex) {
+          Check(raster[0].window_z[vertex] == expected, "ClipCull uses actual depth scale/translate");
+          Check(parameters[0].window_z[vertex] == expected, "ParameterBuffer preserves window depth");
+        }
+        const auto candidates = LoadArray<FragmentCandidate>(pool, state.fragment_candidates);
+        const auto depth = LoadArray<std::uint32_t>(pool, state.isp_depth_attachment);
+        Check(!candidates.empty() && depth.size() == kExtent * kExtent,
+              "depth range produces real covered attachment writes");
+        for (const auto &candidate : candidates) {
+          Check(candidate.depth == expected, "ISP interpolates transformed window depth");
+          Check(depth[candidate.y * kExtent + candidate.x] ==
+                    EncodeDepthAttachmentUnorm(expected, state.depth_attachment_format),
+                "ISP stores the requested forward/reverse/constant depth");
+        }
+        ReleaseFunctionalPayloads(pool, state);
+        pool.Release(handle);
+      }
+    }
+    Check(sequence == 99, "complete depth range transform matrix");
     Check(pool.allocations() == pool.releases(), "all payload ownership retired");
     std::cout << "driver-front-face-test: " << checks << " checks PASS / "
               << sequence << " matrix cases\n";

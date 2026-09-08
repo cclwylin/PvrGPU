@@ -21,6 +21,11 @@ struct pipe_screen *
 pvrgpu_create_screen(struct sw_winsys *winsys,
                      const struct pipe_screen_config *config);
 
+/* Synchronous work that failed must not be represented by a signaled NULL
+ * fence. This immutable token has process lifetime and never completes. */
+struct pipe_fence_handle *
+pvrgpu_failed_fence(void);
+
 /*
  * What this screen can hold, as one answer.
  *

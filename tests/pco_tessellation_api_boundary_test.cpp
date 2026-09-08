@@ -152,7 +152,7 @@ struct Submission {
     info.stderr_path = stderr_path.c_str(); info.memory_mode = "cache";
     info.submission_generation = 1;
   }
-  void Call(const pvrgpu_systemc_submit_info &input, const char *expected, const std::string &label) {
+  void Call(const pvrgpu_systemc_submit_info &input, const std::string &expected, const std::string &label) {
     std::array<char, 1024> error{};
     const int status = pvrgpu_systemc_submit_driver_command(&input, error.data(), error.size());
     Check(status == 2, label + " must reject before model submission, status=" + std::to_string(status));
@@ -160,7 +160,7 @@ struct Submission {
           label + " rejected at wrong gate: " + error.data());
     Check(!std::filesystem::exists(root), label + " must not create model output");
   }
-  void Reject(const pvrgpu_systemc_driver_command &draw, const char *expected, const std::string &label) {
+  void Reject(const pvrgpu_systemc_driver_command &draw, const std::string &expected, const std::string &label) {
     sequence.pco_sequence_commands = &draw; sequence.pco_sequence_command_count = 1;
     Call(info, expected, label);
   }
@@ -214,7 +214,7 @@ class GuardedBytes {
 };
 
 void VerifyVersions(Submission &submit) {
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 27);
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 30);
   constexpr auto previous_size = offsetof(pvrgpu_systemc_driver_command, tessellation);
   static_assert(previous_size % alignof(pvrgpu_systemc_driver_command) == 0);
   GuardedBytes previous(previous_size);
@@ -223,24 +223,24 @@ void VerifyVersions(Submission &submit) {
   const auto &old = *reinterpret_cast<const pvrgpu_systemc_driver_command *>(previous.data());
   auto info = submit.info; info.command = &old;
   submit.Call(info, "command version", "API24 short top-level command before API25 tail");
-  submit.Reject(old, "version=24 expected=27", "API24 short nested command before API25 tail");
+  submit.Reject(old, "version=24 expected=" + std::to_string(PVRGPU_SYSTEMC_API_VERSION), "API24 short nested command before API25 tail");
   GuardedBytes api25(offsetof(pvrgpu_systemc_driver_command, stream_output));
   const std::uint32_t api25_version = 25;
   std::memcpy(api25.data(), &api25_version, sizeof(api25_version));
   const auto &old25 = *reinterpret_cast<const pvrgpu_systemc_driver_command *>(api25.data());
   info.command = &old25;
   submit.Call(info, "command version", "API25 short command before API26 stream output tail");
-  submit.Reject(old25, "version=25 expected=27", "API25 short nested command before API26 tail");
+  submit.Reject(old25, "version=25 expected=" + std::to_string(PVRGPU_SYSTEMC_API_VERSION), "API25 short nested command before API26 tail");
   GuardedBytes api26(offsetof(pvrgpu_systemc_driver_command, framebuffer_layers));
   const std::uint32_t api26_version = 26;
   std::memcpy(api26.data(), &api26_version, sizeof(api26_version));
   const auto &old26 = *reinterpret_cast<const pvrgpu_systemc_driver_command *>(api26.data());
   info.command = &old26;
   submit.Call(info, "command version", "API26 short command before API27 layer tail");
-  submit.Reject(old26, "version=26 expected=27", "API26 short nested command before API27 tail");
+  submit.Reject(old26, "version=26 expected=" + std::to_string(PVRGPU_SYSTEMC_API_VERSION), "API26 short nested command before API27 tail");
   Fixture fixture;
   auto full = fixture.draw; full.version = 24;
-  submit.Reject(full, "version=24 expected=27", "full allocation with old nested version");
+  submit.Reject(full, "version=24 expected=" + std::to_string(PVRGPU_SYSTEMC_API_VERSION), "full allocation with old nested version");
   info.command = &full;
   submit.Call(info, "command version", "full allocation with old top-level version");
   for (auto version : {0u,24u,25u,26u,28u,UINT32_MAX}) {

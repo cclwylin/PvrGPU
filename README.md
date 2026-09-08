@@ -225,7 +225,9 @@ Detail per component: [PvrGPU.md §3.5](PvrGPU.md), the
 - [script/README.md](script/README.md): running dEQP against the built PCO driver and PvrGPU model.
 - [docs/COUNTER_PROTOCOL.md](docs/COUNTER_PROTOCOL.md): counter protocol contract.
 - [docs/PVRGPU_DRIVER_COMMAND.md](docs/PVRGPU_DRIVER_COMMAND.md): first Gallium-driver command contract consumed by the model.
+- [docs/PCO_LOWERING.md](docs/PCO_LOWERING.md#mesa-build-integration): external Mesa compiler setup, required register-bank copy patch, and isolated compiler verification.
 - [docs/RDC_COUNTER_UI.md](docs/RDC_COUNTER_UI.md): RDC counter UI notes.
+- [docs/MANHATTAN_DEBUG_WORKFLOW.md](docs/MANHATTAN_DEBUG_WORKFLOW.md): reproducible Manhattan debug workflow and per-DrawList llvmpipe comparison methodology.
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): third-party provenance and notices.
 
 ## Local Setup

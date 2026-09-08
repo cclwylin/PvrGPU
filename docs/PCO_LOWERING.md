@@ -66,6 +66,50 @@ condition changes needed when `with_gallium_pvrgpu` is enabled.  Apply that
 tracked patch to the selected Mesa source tree; do not rely on an unrecorded
 edit in a developer checkout.
 
+The configured Mesa 26.2.1 source also requires
+[`mesa-26.2.1-pco-register-bank-copies.patch`](../third_party/mesa-26.2.1-pco-register-bank-copies.patch).
+PCO may allocate vector components in either TEMP or VTXIN. The patch removes
+TEMP-only array indexing from parallel-copy scheduling, keeps register-bank
+dependencies distinct, and preserves source modifiers while breaking cycles.
+It applies to real compiler IR independently of capture or test names.
+
+The repository CMake build uses an existing Mesa installation; it does not
+apply external Mesa patches or rebuild that installation. Before configuring
+a fresh Mesa tree, or rebuilding an existing one, run this idempotent step
+from the PvrGPU repository root after setting up `config/local.env`:
+
+```bash
+set -a
+source config/local.env
+set +a
+pvrgpu_ra_patch="$PWD/third_party/mesa-26.2.1-pco-register-bank-copies.patch"
+if git -C "$PVRGPU_MESA_POC_SOURCE_DIR" apply --reverse --check "$pvrgpu_ra_patch" 2>/dev/null; then
+    printf '%s\n' 'PCO register-bank copy patch is already applied.'
+elif git -C "$PVRGPU_MESA_POC_SOURCE_DIR" apply --check "$pvrgpu_ra_patch"; then
+    git -C "$PVRGPU_MESA_POC_SOURCE_DIR" apply "$pvrgpu_ra_patch"
+else
+    printf '%s\n' 'Mesa source differs from the pinned patch; resolve the mismatch before building.' >&2
+    exit 1
+fi
+```
+
+For an already configured Mesa build, rebuild the compiler, run the isolated
+ASan/UBSan parallel-copy test, and then rebuild/install the configured runtime:
+
+```bash
+ninja -C "$PVRGPU_MESA_PVRGPU_BUILD_DIR" src/imagination/pco/libpowervr_compiler.a
+bash script/run_mesa_pco_register_bank_unit.sh
+ninja -C "$PVRGPU_MESA_PVRGPU_BUILD_DIR" install
+```
+
+The isolated test includes the selected external `pco_ra.c`, emits real PCO
+MBYP/MBYP2/MOVS1 instructions, and compares their sequential execution against
+parallel assignment across all registers. Its 20,016 directed/randomized cases
+cover VTXIN-only copies, equal indices in different banks, cycles, repeated
+sources, constants/immediates/special registers, source modifiers, and execution
+conditions. Test outputs stay in a private temporary directory; the test itself
+does not apply patches or alter the installed Mesa runtime.
+
 With Mesa tests enabled, the `pvrgpu_pco_lowering` native test compiles a
 Gallium-style conditionals shader pair, checks clone ownership, non-empty owned
 binaries, VS SH0..15/FS SH0..3 metadata, and fail-closed vertex-format handling.

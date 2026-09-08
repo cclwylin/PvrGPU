@@ -36,6 +36,13 @@ std::uint32_t FloatBits(float value) {
   return bits;
 }
 
+void UploadParameters(MemoryPool &pool, GpuMemorySystem &memory, PipelineState &state) {
+  const auto &bytes = pool.Read(state.parameter_triangles);
+  state.parameter_triangles_gpu_address = kParameterTrianglesGpuAddress;
+  state.parameter_triangles_bytes = bytes.size();
+  memory.HostWrite(state.parameter_triangles_gpu_address, bytes.data(), bytes.size());
+}
+
 ParameterTriangle Triangle(std::uint32_t index) {
   ParameterTriangle result;
   result.key.submit_ordinal = index + 1;
@@ -105,11 +112,12 @@ void RunCase(MemoryPool &pool, GpuMemorySystem &memory,
   state.depth_attachment_load = StoreNewArray(pool, bytes);
   state.depth_attachment_load_enable = 1;
   state.depth_attachment_load_bytes = bytes.size();
+  UploadParameters(pool, memory, state);
   const PoolHandle handle = pool.Allocate(sizeof(PipelineState));
   StorePipelineState(pool, handle, state);
   const PipelineTxn txn{handle, static_cast<std::uint32_t>(sequence), sequence};
   isp_input.write(txn);
-  sc_core::sc_start(sc_core::sc_time(100, sc_core::SC_NS));
+  sc_core::sc_start(sc_core::sc_time(10, sc_core::SC_US));
   PipelineTxn received;
   Check(frontend_output.nb_read(received), "late-Z frontend completion");
   state = LoadPipelineState(pool, handle);
@@ -144,7 +152,7 @@ void RunCase(MemoryPool &pool, GpuMemorySystem &memory,
   state.stage = PipelineStage::kTextureComplete;
   StorePipelineState(pool, handle, state);
   pbe_input.write(txn);
-  sc_core::sc_start(sc_core::sc_time(100, sc_core::SC_NS));
+  sc_core::sc_start(sc_core::sc_time(10, sc_core::SC_US));
   Check(completion.nb_read(received), "late-Z PBE/DRAM completion");
   state = LoadPipelineState(pool, handle);
   Check(state.depth_attachment_ready == 1 && state.framebuffer_from_dram == 1,
@@ -174,6 +182,108 @@ void RunCase(MemoryPool &pool, GpuMemorySystem &memory,
                 (clamp_case ? 3 * samples : samples / 2) &&
             state.counters.ps_invocations == 3,
         "late-Z counters separate sample tests/writes from shader invocations");
+  ReleaseFunctionalPayloads(pool, state);
+  pool.Release(handle);
+}
+
+// Fixed-function scheduling test, not a shader/atomic emulator. Count the
+// actual invocations made available to USC, then inject explicit shader
+// outputs exactly as the existing depth-export tests above do.
+void RunMemorySideEffectCase(MemoryPool &pool, GpuMemorySystem &memory,
+    sc_core::sc_fifo<PipelineTxn> &isp_input,
+    sc_core::sc_fifo<PipelineTxn> &frontend_output,
+    sc_core::sc_fifo<PipelineTxn> &pbe_input,
+    sc_core::sc_fifo<PipelineTxn> &completion,
+    std::uint64_t sequence, std::uint32_t samples,
+    bool early, bool always, bool discard_last) {
+  constexpr auto format = kDriverPcoDepthFormatZ24UnormS8Uint;
+  PipelineState state;
+  state.width = state.height = 1;
+  state.sequence = sequence;
+  state.functional_case = FunctionalCase::kDriverPcoTriangles;
+  state.stage = PipelineStage::kTilesScheduled;
+  state.memory_mode = MemoryMode::kDirect;
+  state.raster_state.sample_count = samples;
+  state.raster_state.shader_writes_memory = 1;
+  state.raster_state.shader_early_tests = early;
+  state.raster_state.shader_may_discard = discard_last;
+  state.fragment_early_hsr_safe = !discard_last;
+  state.raster_state.depth.test_enable = state.raster_state.depth.write_enable = 1;
+  state.raster_state.depth.compare_op = always ? DepthCompareOp::kAlways : DepthCompareOp::kLess;
+  state.raster_state.stencil.test_enable = 1;
+  state.raster_state.stencil.front.pass_op = StencilOp::kIncrementClamp;
+  state.raster_state.stencil.front.depth_fail_op = StencilOp::kDecrementClamp;
+  state.raster_state.stencil.back = state.raster_state.stencil.front;
+  state.capture_depth_attachment = 1;
+  state.depth_attachment_format = format;
+  state.depth_attachment_gpu_address = kDriverPcoSequenceDepthAddressBase;
+  std::vector<ParameterTriangle> triangles{Triangle(0), Triangle(1), Triangle(2)};
+  const float depths[]{.1f, .2f, .05f};
+  for (unsigned i = 0; i < 3; ++i)
+    triangles[i].depth_plane[2] = FloatBits(depths[i]);
+  state.parameter_triangles = StoreNewArray(pool, triangles);
+  state.scheduled_tiles = 1;
+  state.tile_records = StoreNewArray(pool, std::vector<TileRecord>{{0, 0, 1, 1, 0, 3}});
+  state.tile_primitive_refs = StoreNewArray(pool,
+      std::vector<TilePrimitiveRef>{{0, 0, 1}, {1, 0, 2}, {2, 0, 3}});
+  std::vector<std::uint32_t> initial(samples, EncodeDepthAttachmentUnorm(.3f, format));
+  std::vector<std::uint8_t> initial_stencil(samples, 7);
+  const auto initial_bytes = EncodeDepthAttachmentUnormBytes(initial, format, &initial_stencil);
+  state.depth_attachment_load = StoreNewArray(pool, initial_bytes);
+  state.depth_attachment_load_enable = 1;
+  state.depth_attachment_load_bytes = initial_bytes.size();
+  UploadParameters(pool, memory, state);
+  const auto handle = pool.Allocate(sizeof(state));
+  StorePipelineState(pool, handle, state);
+  const PipelineTxn txn{handle, static_cast<std::uint32_t>(sequence), sequence};
+  isp_input.write(txn);
+  sc_core::sc_start(sc_core::sc_time(10, sc_core::SC_US));
+  PipelineTxn received;
+  Check(frontend_output.nb_read(received), "memory-side-effect frontend completion");
+  state = LoadPipelineState(pool, handle);
+  const auto invocations = LoadArray<FragmentInvocation>(pool, state.fragment_invocations);
+  Check(invocations.size() == (early && !always ? 2 : 3),
+        "image side effects retain all late invocations and every early-test survivor");
+  Check(state.counters.hsr_rejected_fragments == (early && !always ? 1 : 0),
+        "only an actual early depth failure may remove an observable memory side effect");
+  std::vector<FragmentOutput> outputs;
+  for (const auto &invocation : invocations) {
+    FragmentOutput output;
+    output.primitive_id = invocation.primitive_id;
+    output.parameter_index = invocation.parameter_index;
+    output.submit_ordinal = invocation.submit_ordinal;
+    output.discarded = discard_last && invocation.primitive_id == 2;
+    output.written_mask[0] = output.discarded ? 0 : 15;
+    output.pixel_output[invocation.primitive_id] = FloatBits(1);
+    output.pixel_output[3] = FloatBits(1);
+    outputs.push_back(output);
+  }
+  state.fragment_outputs = StoreNewArray(pool, outputs);
+  state.stage = PipelineStage::kTextureComplete;
+  StorePipelineState(pool, handle, state);
+  pbe_input.write(txn);
+  sc_core::sc_start(sc_core::sc_time(10, sc_core::SC_US));
+  Check(completion.nb_read(received), "memory-side-effect PBE/DRAM completion");
+  state = LoadPipelineState(pool, handle);
+  std::vector<std::uint8_t> final_stencil;
+  const auto depth_bytes = LoadArray<std::uint8_t>(pool, state.depth_attachment);
+  const auto final_depth = DecodeDepthAttachmentUnormBytes(depth_bytes, format, &final_stencil);
+  const auto color = LoadArray<std::uint8_t>(pool, state.dram_framebuffer);
+  const unsigned color_owner = discard_last ? (always ? 1 : 0) : 2;
+  const unsigned depth_owner = discard_last && !early ? (always ? 1 : 0) : 2;
+  const unsigned final_stencil_value = always ? (discard_last && !early ? 9 : 10)
+      : (discard_last && !early ? 7 : 8);
+  for (unsigned sample = 0; sample < samples; ++sample) {
+    Check(final_depth[sample] == EncodeDepthAttachmentUnorm(depths[depth_owner], format),
+          "explicit early tests retain depth even when the shader later discards");
+    Check(final_stencil[sample] == final_stencil_value,
+          "early and late discard differ only in the specified stencil side effects");
+    for (unsigned component = 0; component < 3; ++component)
+      Check(color[sample * 4 + component] == (component == color_owner ? 255 : 0),
+            "ordered image-side-effect fragments preserve final color ownership");
+  }
+  Check(memory.backing().Read(state.depth_attachment_gpu_address, depth_bytes.size()) == depth_bytes,
+        "image-side-effect scheduling publishes authoritative depth to DRAM");
   ReleaseFunctionalPayloads(pool, state);
   pool.Release(handle);
 }
@@ -305,11 +415,12 @@ void RunAlphaCase(MemoryPool &pool, GpuMemorySystem &memory,
   state.depth_attachment_load = StoreNewArray(pool, bytes);
   state.depth_attachment_load_enable = 1;
   state.depth_attachment_load_bytes = bytes.size();
+  UploadParameters(pool, memory, state);
   const PoolHandle handle = pool.Allocate(sizeof(PipelineState));
   StorePipelineState(pool, handle, state);
   const PipelineTxn txn{handle, static_cast<std::uint32_t>(sequence), sequence};
   isp_input.write(txn);
-  sc_core::sc_start(sc_core::sc_time(100, sc_core::SC_NS));
+  sc_core::sc_start(sc_core::sc_time(10, sc_core::SC_US));
   PipelineTxn received;
   Check(frontend_output.nb_read(received), "alpha frontend completion");
   state = LoadPipelineState(pool, handle);
@@ -352,7 +463,7 @@ void RunAlphaCase(MemoryPool &pool, GpuMemorySystem &memory,
   state.stage = PipelineStage::kTextureComplete;
   StorePipelineState(pool, handle, state);
   pbe_input.write(txn);
-  sc_core::sc_start(sc_core::sc_time(100, sc_core::SC_NS));
+  sc_core::sc_start(sc_core::sc_time(10, sc_core::SC_US));
   Check(completion.nb_read(received), "alpha PBE/DRAM completion");
   state = LoadPipelineState(pool, handle);
   Check(state.depth_attachment_ready && state.framebuffer_from_dram,
@@ -428,7 +539,7 @@ int sc_main(int, char **) {
         front_out("front_out", 1), pbe_in("pbe_in", 1), pbe_out("pbe_out", 1),
         completion("completion", 1);
     Isp isp("isp", pool);
-    FragmentFrontend frontend("frontend", pool);
+    FragmentFrontend frontend("frontend", pool, &memory);
     Pbe pbe("pbe", pool);
     PbeWriteBack writeback("writeback", pool, &memory);
     isp.input(input); isp.output(isp_out);
@@ -437,6 +548,12 @@ int sc_main(int, char **) {
     writeback.input(pbe_out); writeback.completion(completion);
     std::uint64_t sequence = 0;
     CheckAlphaThresholds();
+    for (std::uint32_t samples : {1U, 2U, 4U, 8U, 16U})
+      for (bool early : {false, true})
+        for (bool always : {false, true})
+          for (bool discard : {false, true})
+            RunMemorySideEffectCase(pool, memory, input, front_out, pbe_in, completion,
+                ++sequence, samples, early, always, discard);
     for (std::uint32_t samples : {1U, 4U, 16U})
       for (std::uint32_t format : {kDriverPcoDepthFormatZ16Unorm,
               kDriverPcoDepthFormatZ24UnormS8Uint, kDriverPcoDepthFormatZ32Float,

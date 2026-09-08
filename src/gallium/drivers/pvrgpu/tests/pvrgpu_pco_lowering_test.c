@@ -3203,7 +3203,7 @@ static void test_multisample_texture_lowering(struct pvrgpu_pco_compiler *compil
          char error[512] = {0};
          const enum pipe_format attribute = PIPE_FORMAT_R32G32B32A32_FLOAT;
          if (!pvrgpu_pco_compile_color_triangle(compiler, vb.shader, fb.shader,
-               &attribute, false, 1, 0, 0, 1, 1, &binary, error, sizeof(error)))
+               &attribute, false, true, 1, 0, 0, 1, 1, &binary, error, sizeof(error)))
             fail(error);
          if (!binary.fragment.size || binary.fragment_position_count != 4)
             fail("multisample fragment lost native code or position ABI");
@@ -4237,7 +4237,7 @@ test_stream_output_vertex_layout(struct pvrgpu_pco_compiler *compiler)
    struct pvrgpu_pco_graphics_binary binary = {0};
    char error[512] = {0};
    if (!pvrgpu_pco_compile_color_triangle(compiler, vb.shader, fb.shader,
-         &format, true, 1, 0, 0, 1, 0, &binary, error, sizeof(error)))
+         &format, true, false, 1, 0, 0, 1, 0, &binary, error, sizeof(error)))
       fail(error);
    if (!binary.vertex.size || binary.vertex.abi.vertex_outputs != 10 ||
        binary.vertex_output_start[VARYING_SLOT_POS] != 0 ||
@@ -4275,7 +4275,7 @@ test_stream_output_vertex_layout(struct pvrgpu_pco_compiler *compiler)
       nir_channel(&fb, value, 1), nir_load_var(&fb, scalar_in), nir_imm_float(&fb, 1)), 15);
    nir_shader_gather_info(fb.shader, nir_shader_get_entrypoint(fb.shader));
    if (!pvrgpu_pco_compile_color_triangle(compiler, vb.shader, fb.shader,
-         &format, true, 1, 0, 0, 1, 0, &binary, error, sizeof(error)))
+         &format, true, false, 1, 0, 0, 1, 0, &binary, error, sizeof(error)))
       fail(error);
    if (!binary.explicit_varying_bindings || binary.varying_binding_count != 3 ||
        binary.varying_bindings[0].output_dword != 5 ||

@@ -112,7 +112,7 @@ void TestNativeExplicitSampling() {
       Check(!done.suspended && std::equal(response.begin(), response.end(), done.pixel_outputs.begin()),
             "native explicit SMP/WDF returns the raw TPU response");
     }
-    for (unsigned reserved : {2U, 4U, 16U, 32U, 64U}) {
+    for (unsigned reserved : {4U, 16U, 32U, 64U}) {
       auto bad = binary;
       bad[instruction.binary_offset + 2] |= static_cast<std::uint8_t>(reserved);
       Reject([&] { (void)DecodePcoProgram(ShaderStage::kFragment, bad); },
@@ -142,6 +142,92 @@ void TestNativeExplicitSampling() {
         Check(rejected, "unrelated opcode must reject replacement flag before special branch");
       }
     }
+  }
+}
+
+void TestNativeSpatialOffsetLookup() {
+  for (unsigned kind : {21U, 23U}) {
+    const auto original = test::ExplicitTextureFixture(kind);
+    const auto original_program = DecodePcoProgram(ShaderStage::kFragment, original);
+    const auto smp_index = SampleInstruction(original_program);
+    const auto &smp = original_program.instructions[smp_index];
+    const unsigned dimensions = smp.texture_dimension;
+    const unsigned lookup_register = smp.source.index + dimensions + 1;
+    for (int u : {-32, -1, 0, 31})
+      for (int v : {-32, -1, 0, 31})
+        for (int w : {-8, -1, 0, 7}) {
+          const std::uint32_t lookup = (static_cast<std::uint32_t>(u) & 63U) |
+              ((static_cast<std::uint32_t>(v) & 63U) << 6U) |
+              (dimensions == 3 ? ((static_cast<std::uint32_t>(w) & 15U) << 12U) : 0U);
+          auto binary = original;
+          binary[smp.binary_offset + 2] |= 2U; // I_SMP.SOO, independent of LOD.
+          std::vector<std::uint8_t> move{0x86, 0x92, 0x40, 0x13,
+              0, 0, 0, 0, 0, 0, static_cast<std::uint8_t>(0x40U | lookup_register), 0xff};
+          for (unsigned byte = 0; byte < 4; ++byte)
+            move[4 + byte] = static_cast<std::uint8_t>(lookup >> (8 * byte));
+          binary.insert(binary.begin() + smp.binary_offset - 3, move.begin(), move.end());
+          const auto program = DecodePcoProgram(ShaderStage::kFragment, binary);
+          PcoFragmentExecutionContext context;
+          context.shared_count = 24;
+          context.shared_registers = Shared(1, 0, false);
+          const auto issued = ExecuteFragmentPco(program.summary, program.instructions, context);
+          Check(issued.suspended && issued.texture_request_valid,
+                "native SOO emits one ordinary texture continuation");
+          Check(issued.texture_request.spatial_offsets == std::array<std::int32_t, 3>{u, v, dimensions == 3 ? w : 0},
+                "native SOO sign extends U6/V6/W4 independently");
+          Check(issued.texture_request.explicit_lod_present == 1 &&
+                issued.texture_request.explicit_lod == FloatBits(0),
+                "SOO lookup preserves the separate explicit LOD word");
+          auto bad = program;
+          bad.instructions[SampleInstruction(program)].texture_spatial_offset_present = 2;
+          Reject([&] { ExecuteFragmentPco(bad.summary, bad.instructions, context); },
+                 "SOO must be a canonical Boolean metadata flag");
+        }
+  }
+}
+
+void TestTextureDerivativeContinuation() {
+  auto binary = test::ExplicitTextureFixture(21);
+  const auto original = DecodePcoProgram(ShaderStage::kFragment, binary);
+  const auto sample = SampleInstruction(original);
+  // First export follows SMP/WDF. Keep the real texture result in r0..3,
+  // then exchange r0 across the quad before the existing PIXOUT instructions.
+  const auto output_offset = original.instructions[sample + 2].binary_offset - 3;
+  const std::vector<std::uint8_t> derivative{0x34,0x82,0,0x8a,0x40,0,0,0x40};
+  binary.insert(binary.begin() + output_offset, derivative.begin(), derivative.end());
+  const auto program = DecodePcoProgram(ShaderStage::kFragment, binary);
+  std::array<PcoFragmentExecutionContext,4> contexts;
+  std::array<PcoFragmentExecution,4> lanes;
+  std::array<std::uint32_t,4> sources;
+  std::array<unsigned,4> steps{};
+  for (unsigned lane=0; lane<4; ++lane) {
+    auto &context=contexts[lane];
+    context.shared_count=24; context.shared_registers=Shared(1,0,false);
+    lanes[lane]=ExecuteFragmentPco(program.summary,program.instructions,context);
+    steps[lane]+=lanes[lane].executed_instruction_count;
+    Check(lanes[lane].texture_request_valid && lanes[lane].continuation.kind==0,
+          "texture checkpoint remains distinct from a later derivative");
+    context.continuation=lanes[lane].continuation;
+    context.texture_response_valid=1;
+    context.texture_response={FloatBits(float(lane*lane)),FloatBits(0.5F),FloatBits(0.25F),FloatBits(1)};
+    lanes[lane]=ExecuteFragmentPco(program.summary,program.instructions,context);
+    steps[lane]+=lanes[lane].executed_instruction_count;
+    Check(lanes[lane].derivative_request_valid && !lanes[lane].texture_request_valid &&
+          lanes[lane].continuation.kind==1, "SMP resume reaches the real derivative without replay");
+    sources[lane]=lanes[lane].derivative_source;
+  }
+  const auto values=EvaluatePcoDerivativeQuad(program.instructions[sample+2],sources);
+  for (unsigned lane=0; lane<4; ++lane) {
+    auto &context=contexts[lane];
+    context.continuation=lanes[lane].continuation;
+    context.texture_response_valid=0;
+    context.derivative_response_valid=1;
+    context.derivative_response=values[lane];
+    lanes[lane]=ExecuteFragmentPco(program.summary,program.instructions,context);
+    steps[lane]+=lanes[lane].executed_instruction_count;
+    Check(!lanes[lane].suspended && lanes[lane].pixel_outputs[0]==FloatBits(lane<2?1:5) &&
+          lanes[lane].pixel_outputs[1]==FloatBits(0.5F) && steps[lane]==program.instructions.size(),
+          "texture and derivative checkpoints preserve returned channels and exact instruction counts");
   }
 }
 
@@ -255,7 +341,7 @@ void TestMalformedFields() {
     const auto program = DecodePcoProgram(stage, binary);
     const auto smp = SampleInstruction(program);
     const std::size_t backend = program.instructions[smp].binary_offset;
-    for (unsigned bit : {1U, 4U, 5U, 6U}) {
+    for (unsigned bit : {4U, 5U, 6U}) {
       auto bad = binary;
       bad[backend + 2] |= static_cast<std::uint8_t>(1U << bit);
       Reject([&] { (void)DecodePcoProgram(stage, bad); }, "unsupported SMP extension bit was ignored");
@@ -370,6 +456,8 @@ int main(int argc, char **argv) {
     }
     TestNativeSampling();
     TestNativeExplicitSampling();
+    TestNativeSpatialOffsetLookup();
+    TestTextureDerivativeContinuation();
     TestNativeQueries();
     TestNativeStrideQueryLayout();
     TestMalformedFields();

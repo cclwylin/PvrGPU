@@ -76,6 +76,27 @@ RasterSamplePosition(std::uint32_t count, std::uint32_t index) {
   }
 }
 
+// llvmpipe lp_bld_interp.c calc_centroid_offsets: fully covered pixels use
+// the centre, otherwise the lowest covered sample. Helpers use the first
+// sample enabled by the state mask, or the centre when that mask is full.
+inline std::array<std::uint8_t, 2>
+RasterCentroidPosition(std::uint32_t count, std::uint32_t coverage,
+                       std::uint32_t state_mask = UINT32_MAX) {
+  const std::uint32_t all = RasterSampleMask(count);
+  state_mask &= all;
+  if (coverage & ~all)
+    throw std::runtime_error("centroid coverage exceeds the sample count");
+  if (coverage == all || (coverage == 0 && state_mask == all))
+    return {8, 8};
+  const std::uint32_t selected = coverage ? coverage : state_mask;
+  if (selected == 0)
+    return {8, 8}; // No active sample can observe this helper position.
+  for (std::uint32_t sample = 0; sample < count; ++sample)
+    if (selected & (1U << sample))
+      return RasterSamplePosition(count, sample);
+  throw std::runtime_error("centroid sample selection is invalid");
+}
+
 } // namespace pvrgpu::stub
 
 #endif

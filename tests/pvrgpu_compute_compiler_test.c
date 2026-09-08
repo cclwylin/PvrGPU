@@ -195,6 +195,88 @@ static void save_binary(const char *dir, unsigned kind,
    check(fclose(file) == 0, "closing compute ABI");
 }
 
+/* The native execution fixture checks every memory transaction, including
+ * holes between components and padding around each invocation's record. */
+static unsigned test_masked_stores(struct pvrgpu_pco_compiler *compiler,
+                                   const char *dir)
+{
+   FILE *manifest = NULL;
+   if (dir) {
+      char path[4096];
+      check(snprintf(path, sizeof(path), "%s/masked-stores.txt", dir) < (int)sizeof(path),
+            "masked fixture manifest path");
+      manifest = fopen(path, "w");
+      check(manifest != NULL, "opening masked fixture manifest");
+   }
+   const unsigned widths[] = {1, 2, 3, 4, 8, 16};
+   unsigned cases = 0;
+   for (unsigned w = 0; w < ARRAY_SIZE(widths); ++w) {
+      const unsigned width = widths[w], full = BITFIELD_MASK(width);
+      const unsigned wide_masks[] = {0, 1, 1u << (width - 1), full,
+         full & 0x5555, full & 0xaaaa, full & ~3u, 1u | (1u << (width - 1)), 6};
+      const unsigned mask_count = width <= 4 ? full + 1 : ARRAY_SIZE(wide_masks);
+      for (unsigned m = 0; m < mask_count; ++m) {
+         const unsigned mask = width <= 4 ? m : wide_masks[m];
+         for (unsigned branch = 0; branch < 2; ++branch) {
+            nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+               pco_nir_options(), "native_masked_ssbo_store");
+            b.shader->info.workgroup_size[0] = 37;
+            b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+            nir_def *local = nir_load_local_invocation_index(&b);
+            nir_def *group = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+            nir_def *index = nir_iadd(&b, nir_imul_imm(&b, group, 37), local);
+            const unsigned stride = branch ? ALIGN_POT(width + 1, 16) : ALIGN_POT(width, 4) + 4;
+            const unsigned align = branch ? 64 : 16, align_offset = branch ? 4 : 0;
+            nir_def *offset = nir_iadd_imm(&b, nir_imul_imm(&b, index, stride * 4), branch ? 4 : 16);
+            nir_def *components[16];
+            for (unsigned c = 0; c < width; ++c)
+               components[c] = nir_iadd_imm(&b, nir_imul_imm(&b, index, 256), 0x12340000 + c);
+            nir_def *value = nir_vec(&b, components, width);
+            if (branch)
+               nir_push_if(&b, nir_ine_imm(&b, nir_iand_imm(&b, local, 1), 0));
+            const unsigned access = branch ? ACCESS_COHERENT | ACCESS_VOLATILE : ACCESS_RESTRICT;
+            nir_intrinsic_instr *store = nir_store_ssbo(&b, value,
+               nir_imm_int(&b, branch ? 3 : 0), offset,
+               .write_mask = mask, .align_mul = align, .align_offset = align_offset, .access = access);
+            /* The builder treats zero as its default full mask. Explicitly
+             * construct the legal zero-write no-op after that defaulting. */
+            nir_intrinsic_set_write_mask(store, mask);
+            if (branch)
+               nir_pop_if(&b, NULL);
+            nir_shader_gather_info(b.shader, b.impl);
+            b.shader->info.num_ssbos = branch ? 4 : 1;
+            char error[512] = {0};
+            struct pvrgpu_pco_compute_binary binary = {0};
+            if (!pvrgpu_pco_compile_compute(compiler, b.shader, 0,
+                                             &binary, error, sizeof(error))) {
+               fprintf(stderr, "masked store width=%u mask=0x%x branch=%u: %s\n",
+                       width, mask, branch, error);
+               abort();
+            }
+            check(binary.abi.storage_buffer_read_mask == 0,
+                  "masked store invented a destination load");
+            check(binary.abi.storage_buffer_write_mask == (mask ? 1u << (branch ? 3 : 0) : 0),
+                  "masked store lost selected buffer or retained a zero-mask binding");
+            check(nir_intrinsic_write_mask(store) == mask &&
+                     nir_intrinsic_access(store) == access &&
+                     nir_intrinsic_align_mul(store) == align &&
+                     nir_intrinsic_align_offset(store) == align_offset &&
+                     store->src[0].ssa->num_components == width,
+                  "masked-store lowering mutated caller NIR");
+            const unsigned kind = 400 + cases++;
+            save_binary(dir, kind, &binary);
+            if (manifest)
+               fprintf(manifest, "%u %u %u %u\n", kind, width, mask, branch);
+            pvrgpu_pco_compute_binary_finish(&binary);
+            ralloc_free(b.shader);
+         }
+      }
+   }
+   if (manifest)
+      check(fclose(manifest) == 0, "closing masked fixture manifest");
+   return cases;
+}
+
 int main(int argc, char **argv)
 {
    glsl_type_singleton_init_or_ref();
@@ -278,6 +360,27 @@ int main(int argc, char **argv)
    check(!pvrgpu_pco_compile_compute(compiler, push, 4, &binary, error, sizeof(error)),
          "CB0 load past bound suffix rejected");
    ralloc_free(push);
+   for (unsigned components = 1; components <= 4; ++components) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+         pco_nir_options(), "native_dynamic_cb0");
+      b.shader->info.workgroup_size[0] = 8;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      nir_def *index = nir_load_local_invocation_index(&b);
+      nir_def *value = nir_load_uniform(&b, components, 32, index,
+         .base = 1, .range = 8, .dest_type = nir_type_uint32);
+      nir_store_ssbo(&b, value, nir_imm_int(&b, 0), nir_imul_imm(&b, index, 16),
+         .write_mask = (1u << components) - 1, .align_mul = 4);
+      nir_shader_gather_info(b.shader, b.impl);
+      b.shader->info.num_ssbos = 1;
+      check(pvrgpu_pco_compile_compute(compiler, b.shader, 36, &binary, error, sizeof(error)), error);
+      check(binary.abi.stage.push_constant_count == 36 &&
+            binary.abi.stage.push_constant_start == 4,
+            "invocation-indexed vec4-slot CB0 uses native bounded shared-register loads");
+      pvrgpu_pco_compute_binary_finish(&binary);
+      check(!pvrgpu_pco_compile_compute(compiler, b.shader, 32, &binary, error, sizeof(error)),
+            "dynamic CB0 extent beyond capture remains fail-closed");
+      ralloc_free(b.shader);
+   }
    for (unsigned dynamic = 0; dynamic < 2; ++dynamic) {
       nir_shader *nir = make_shader(1);
       nir_foreach_function_impl(impl, nir) {
@@ -297,6 +400,65 @@ int main(int argc, char **argv)
       check(ok == !dynamic, "constant binding SSA folds before strict validation; dynamic remains rejected");
       pvrgpu_pco_compute_binary_finish(&binary);
       ralloc_free(nir);
+   }
+   for (unsigned shape = 0; shape < 4; ++shape) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+         pco_nir_options(), "native_compute_texture_fifo");
+      b.shader->info.workgroup_size[0] = 4;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      nir_def *id = nir_load_local_invocation_index(&b);
+      nir_def *coords = nir_load_uniform(&b, 4, 32, id, .range = 4,
+                                         .dest_type = nir_type_float32);
+      nir_tex_instr *tex = nir_tex_instr_create(b.shader, 1);
+      tex->op = nir_texop_tex;
+      tex->sampler_dim = shape == 1 ? GLSL_SAMPLER_DIM_3D :
+         shape == 2 ? GLSL_SAMPLER_DIM_CUBE : GLSL_SAMPLER_DIM_2D;
+      tex->is_array = shape == 3;
+      tex->coord_components = shape ? 3 : 2;
+      tex->dest_type = nir_type_float32;
+      tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord,
+         nir_trim_vector(&b, coords, tex->coord_components));
+      nir_def_init(&tex->instr, &tex->def, 4, 32);
+      nir_builder_instr_insert(&b, &tex->instr);
+      nir_store_ssbo(&b, &tex->def, nir_imm_int(&b, 0), nir_imul_imm(&b, id, 16),
+                     .write_mask = 15, .align_mul = 16);
+      nir_shader_gather_info(b.shader, b.impl);
+      b.shader->info.num_textures = b.shader->info.num_ssbos = 1;
+      check(pvrgpu_pco_compile_compute(compiler, b.shader, 16, &binary, error, sizeof(error)), error);
+      check(binary.abi.sampled_texture_count == 1 &&
+            binary.abi.stage.uniform_buffer_descriptor_start == 20 &&
+            binary.abi.storage_buffer_descriptor_start == 20 &&
+            binary.abi.stage.push_constant_start == 24 && binary.abi.stage.shareds == 40,
+            "compute SMP descriptors have an independent native set before buffers and CB0");
+      save_binary(argc > 1 ? argv[1] : NULL, 300 + shape, &binary);
+      pvrgpu_pco_compute_binary_finish(&binary);
+      ralloc_free(b.shader);
+   }
+   for (unsigned ubos = 0; ubos < 2; ++ubos) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+         pco_nir_options(), "native_large_cb0_dma");
+      b.shader->info.workgroup_size[0] = 128;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      nir_def *id = nir_load_local_invocation_index(&b);
+      nir_def *value = nir_load_uniform(&b, 4, 32, nir_umod_imm(&b, id, 121),
+         .range = 121, .dest_type = nir_type_uint32);
+      if (ubos) value = nir_iadd(&b, value, nir_load_ubo(&b, 4, 32,
+         nir_imm_int(&b, 2), nir_imm_int(&b, 0), .align_mul = 16, .range = 16));
+      nir_store_ssbo(&b, value, nir_imm_int(&b, 0), nir_imul_imm(&b, id, 16),
+         .write_mask = 15, .align_mul = 16);
+      nir_shader_gather_info(b.shader, b.impl);
+      b.shader->info.num_ssbos = 1;
+      b.shader->info.num_ubos = ubos ? 3 : 0;
+      check(pvrgpu_pco_compile_compute(compiler, b.shader, 484, &binary, error, sizeof(error)), error);
+      check(binary.abi.cb0_uniform_buffer_slot == (ubos ? 4u : 1u) &&
+            binary.abi.stage.uniform_buffer_descriptor_count == (ubos ? 4u : 1u) &&
+            binary.abi.stage.push_constant_count == 0 &&
+            binary.abi.stage.shareds == (ubos ? 20u : 8u),
+            "large CB0 maps to its own native UBO DMA descriptor without register spills");
+      pvrgpu_pco_compute_binary_finish(&binary);
+      check(!pvrgpu_pco_compile_compute(compiler, b.shader, 480, &binary, error, sizeof(error)),
+            "large dynamic CB0 out-of-range extent remains fail-closed");
+      ralloc_free(b.shader);
    }
    for (unsigned bad = 0; bad < 2; ++bad) {
       nir_shader *nir = make_shader(10);
@@ -371,13 +533,17 @@ int main(int argc, char **argv)
             }
          }
       }
-      check(!pvrgpu_pco_compile_compute(compiler, nir, 0, &binary, error, sizeof(error)) &&
-               !binary.data && !binary.size && strstr(error, "full component write mask"),
-            "sparse vec8/vec16 store must not overwrite unselected components");
+      check(pvrgpu_pco_compile_compute(compiler, nir, 0, &binary, error, sizeof(error)),
+            "sparse vec8/vec16 stores lower to selected native component writes");
+      check(binary.abi.storage_buffer_read_mask == 1 &&
+               binary.abi.storage_buffer_write_mask == 2,
+            "sparse stores do not invent destination reads");
+      pvrgpu_pco_compute_binary_finish(&binary);
       ralloc_free(nir);
    }
+   const unsigned masked_cases = test_masked_stores(compiler, argc > 1 ? argv[1] : NULL);
    pvrgpu_pco_compiler_destroy(compiler);
    glsl_type_singleton_decref();
-   puts("native compute compiler tests: PASS (36 programs, 12 fail-closed inputs)");
+   printf("native compute compiler tests: PASS (including %u masked-store programs)\n", masked_cases);
    return 0;
 }

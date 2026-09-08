@@ -157,7 +157,8 @@ void Isp::Run() {
     // Likewise, if early HSR is not safe, we disable early culling.
     const bool late_depth_stencil =
         RasterRequiresLateDepthStencil(state.raster_state);
-    if (state.raster_state.shader_may_discard || late_depth_stencil ||
+    if (state.raster_state.shader_may_discard ||
+        state.raster_state.shader_writes_memory || late_depth_stencil ||
         !state.fragment_early_hsr_safe) {
       opaque_early_hsr = false;
     }
@@ -167,6 +168,8 @@ void Isp::Run() {
                                    !late_depth_stencil;
     const std::uint32_t sample_count = state.raster_state.sample_count;
     if (state.raster_state.multisample_enable > 1 ||
+        state.raster_state.shader_early_tests > 1 ||
+        state.raster_state.shader_writes_memory > 1 ||
         state.raster_state.alpha_to_coverage > 1 ||
         state.raster_state.alpha_to_coverage_dither > 1 ||
         state.raster_state.alpha_to_one > 1)

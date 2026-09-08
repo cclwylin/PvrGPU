@@ -218,7 +218,7 @@ test_image_views_and_padding(void)
    for (unsigned bad = 0; bad < 10; ++bad) {
       resource = valid; view = valid_view;
       if (bad == 0) view.access = PIPE_IMAGE_ACCESS_READ;
-      if (bad == 1) view.format = PIPE_FORMAT_R32_SINT;
+      if (bad == 1) view.format = PIPE_FORMAT_R32G32B32A32_SINT;
       if (bad == 2) view.u.tex.level = 2;
       if (bad == 3) view.u.tex.first_layer = 1;
       if (bad == 4) resource.level_strides[1] = 7;
@@ -233,6 +233,83 @@ test_image_views_and_padding(void)
    }
 }
 
+static void
+test_layered_image_reinterpretation(void)
+{
+   uint8_t bytes[512], original[512];
+   for (unsigned i = 0; i < sizeof(bytes); ++i) original[i] = i * 29U + 3;
+   for (unsigned target = 0; target < 4; ++target) {
+      memcpy(bytes, original, sizeof(bytes));
+      struct pvrgpu_resource resource;
+      init_buffer(&resource, bytes, sizeof(bytes));
+      const enum pipe_texture_target targets[] = {
+         PIPE_TEXTURE_3D, PIPE_TEXTURE_2D_ARRAY, PIPE_TEXTURE_CUBE, PIPE_TEXTURE_CUBE_ARRAY};
+      resource.base.target = targets[target];
+      resource.base.format = PIPE_FORMAT_R8G8B8A8_UINT;
+      resource.base.width0 = 2; resource.base.height0 = 2;
+      resource.base.depth0 = target == 0 ? 6 : 1;
+      resource.base.array_size = target == 0 ? 1 : 6;
+      resource.level_count = 1;
+      resource.level_offsets[0] = 16;
+      resource.level_strides[0] = 16;
+      resource.level_layer_strides[0] = 48;
+      struct pipe_image_view view = {.resource = &resource.base,
+         .format = PIPE_FORMAT_R32_SINT, .access = PIPE_IMAGE_ACCESS_READ_WRITE};
+      view.u.tex.first_layer = 2; view.u.tex.last_layer = 4;
+      struct pvrgpu_compute_snapshot snapshot = {0};
+      const char *reason = NULL;
+      CHECK(pvrgpu_compute_snapshot_add_image(&snapshot, 0, 3, &view, &reason));
+      CHECK(snapshot.images[0].depth == 3 && snapshot.images[0].offset == 112 &&
+            snapshot.images[0].layer_stride_bytes == 48 &&
+            snapshot.images[0].texel_bytes == 4 && snapshot.images[0].bytes_size == 120);
+      memset(snapshot.resources[0].bytes, 0x73, sizeof(bytes));
+      pvrgpu_compute_snapshot_writeback(&snapshot);
+      for (unsigned i = 0; i < sizeof(bytes); ++i) {
+         bool written = false;
+         for (unsigned layer = 2; layer <= 4; ++layer)
+         for (unsigned row = 0; row < 2; ++row) {
+            const unsigned start = 16 + layer * 48 + row * 16;
+            written |= i >= start && i < start + 8;
+         }
+         CHECK(bytes[i] == (written ? 0x73 : original[i]));
+      }
+      pvrgpu_compute_snapshot_finish(&snapshot);
+      view.u.tex.last_layer = 6;
+      CHECK(!pvrgpu_compute_snapshot_add_image(&snapshot, 0, 3, &view, &reason));
+      CHECK(resource.base.reference.count == 1 && snapshot.resource_count == 0);
+   }
+}
+
+static void
+test_indirect_grid(void)
+{
+   uint32_t words[] = {0xabcdef, 7, 8, 9, 0x123456};
+   struct pvrgpu_resource resource;
+   init_buffer(&resource, (uint8_t *)words, sizeof(words));
+   struct pipe_grid_info info = {.indirect = &resource.base, .indirect_offset = 4};
+   uint32_t grid[3] = {1, 2, 3};
+   CHECK(pvrgpu_compute_read_indirect_grid(&info, grid));
+   CHECK(grid[0] == 7 && grid[1] == 8 && grid[2] == 9);
+   words[1] = 0; words[2] = 65535; words[3] = 27;
+   CHECK(pvrgpu_compute_read_indirect_grid(&info, grid));
+   CHECK(grid[0] == 0 && grid[1] == 65535 && grid[2] == 27);
+   const uint32_t expected[] = {0, 65535, 27};
+   for (unsigned bad = 0; bad < 7; ++bad) {
+      info.indirect = &resource.base; info.indirect_offset = 4;
+      resource.size = sizeof(words); resource.data = (uint8_t *)words;
+      resource.base.target = PIPE_BUFFER;
+      if (bad == 0) info.indirect = NULL;
+      if (bad == 1) info.indirect_offset = 3;
+      if (bad == 2) info.indirect_offset = 12;
+      if (bad == 3) info.indirect_offset = UINT32_MAX;
+      if (bad == 4) resource.size = 15;
+      if (bad == 5) resource.data = NULL;
+      if (bad == 6) resource.base.target = PIPE_TEXTURE_2D;
+      CHECK(!pvrgpu_compute_read_indirect_grid(&info, grid));
+      CHECK(memcmp(grid, expected, sizeof(grid)) == 0);
+   }
+}
+
 int main(void)
 {
    test_alias_and_writeback();
@@ -240,6 +317,8 @@ int main(void)
    test_user_uniform_range_start();
    test_aggregate_limit_before_allocation();
    test_image_views_and_padding();
+   test_layered_image_reinterpretation();
+   test_indirect_grid();
    printf("compute snapshot checks=%u failures=%u\n", checks, failures);
    return failures ? 1 : 0;
 }

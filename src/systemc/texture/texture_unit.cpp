@@ -265,7 +265,17 @@ inline CubeProjection ProjectCubeDirection(float rx, float ry, float rz) {
     tc = ry >= 0.0F ? rz : -rz;
     face = ry >= 0.0F ? 2U : 3U;
   }
-  return CubeProjection{face, 0.5F * (sc / ma + 1.0F), 0.5F * (tc / ma + 1.0F)};
+  // Shader arithmetic can produce NaN/Inf directions (including normalize(0)).
+  // Their lookup result is not defined by GLES, but must not become a host
+  // float-to-integer exception or an out-of-allocation texel address. Keep the
+  // face-selection comparisons above and define NaN -> 0 at the addressing
+  // boundary, as llvmpipe's seamless cube path does. Infinities saturate to an
+  // edge. Finite directions still produce exactly the original coordinates.
+  const auto address_coordinate = [](float value) {
+    return std::isnan(value) ? 0.0F : std::clamp(value, 0.0F, 1.0F);
+  };
+  return CubeProjection{face, address_coordinate(0.5F * (sc / ma + 1.0F)),
+                        address_coordinate(0.5F * (tc / ma + 1.0F))};
 }
 
 // Projects a direction onto a *given* face (tcu projectToFace), the [0,1] face
@@ -803,14 +813,17 @@ float SampledDepth24ToFloat(std::uint32_t depth) {
                             static_cast<double>(kSampledDepth24Maximum));
 }
 
-TextureImplicitLod ComputeTextureImplicitLod(
+static TextureImplicitLod ComputeTextureImplicitLodImpl(
     const std::array<std::array<float, 2>, 4> &coordinates,
     const RogueTextureImageDescriptor &image,
-    const RogueTextureSamplerDescriptor &sampler) {
+    const RogueTextureSamplerDescriptor &sampler,
+    bool undefined_cube_input, std::size_t checked_lanes) {
   if (image.width == 0 || image.height == 0 || image.mip_count == 0)
     throw std::runtime_error("TextureUnit implicit LOD state is invalid");
-  for (const auto &coordinate : coordinates) {
-    if (!std::isfinite(coordinate[0]) || !std::isfinite(coordinate[1]))
+  for (std::size_t lane = 0; lane < checked_lanes; ++lane) {
+    const auto &coordinate = coordinates[lane];
+    if (!undefined_cube_input &&
+        (!std::isfinite(coordinate[0]) || !std::isfinite(coordinate[1])))
       throw std::runtime_error("TextureUnit implicit LOD coordinate is invalid");
   }
 
@@ -827,12 +840,21 @@ TextureImplicitLod ComputeTextureImplicitLod(
       (coordinates[2][1] - coordinates[0][1]) * image.height;
   const float rho_x_squared = dsdx * dsdx + dtdx * dtdx;
   const float rho_y_squared = dsdy * dsdy + dtdy * dtdy;
-  const float rho_squared = std::max(rho_x_squared, rho_y_squared);
-  if (rho_squared < 0.0F || !std::isfinite(rho_squared))
+  // Do not let std::max hide an unordered second operand. Preserve the raw
+  // derivative evidence, independently of the bounded LOD selector input.
+  const float rho_squared = std::isnan(rho_x_squared) || std::isnan(rho_y_squared)
+      ? std::numeric_limits<float>::quiet_NaN()
+      : std::max(rho_x_squared, rho_y_squared);
+  const bool nonfinite_rho = !std::isfinite(rho_squared);
+  if (rho_squared < 0.0F || (nonfinite_rho && !undefined_cube_input))
     throw std::runtime_error("TextureUnit implicit derivative rho is invalid");
 
+  // A nonfinite cube projection has no defined footprint. The reference TPU
+  // chooses the sampler's minimum LOD (rho = 0), then performs the normal
+  // descriptor-driven texel reads/filtering. This is a generic undefined-input
+  // policy, not a claim about a physical Rogue or exact llvmpipe NaN pixels.
   const TextureLodSelection lod =
-      SelectTextureLod(rho_squared, sampler, image.mip_count);
+      SelectTextureLod(nonfinite_rho ? 0.0F : rho_squared, sampler, image.mip_count);
   const TextureLevelSelection levels =
       SelectTextureLevels(lod, sampler, image.mip_count);
 
@@ -853,14 +875,49 @@ TextureImplicitLod ComputeTextureImplicitLod(
   return result;
 }
 
+TextureImplicitLod ComputeTextureImplicitLod(
+    const std::array<std::array<float, 2>, 4> &coordinates,
+    const RogueTextureImageDescriptor &image,
+    const RogueTextureSamplerDescriptor &sampler) {
+  return ComputeTextureImplicitLodImpl(coordinates, image, sampler, false, 4);
+}
+
+TextureImplicitLod ComputeTextureCubeImplicitLod(
+    const std::array<std::array<float, 3>, 4> &directions,
+    const RogueTextureImageDescriptor &image,
+    const RogueTextureSamplerDescriptor &sampler) {
+  const auto &first = directions[0];
+  const std::uint32_t face = ProjectCubeDirection(first[0], first[1], first[2]).face;
+  std::array<std::array<float, 2>, 4> projected{};
+  bool undefined_input = false;
+  for (std::size_t lane = 0; lane < directions.size(); ++lane) {
+    const auto &direction = directions[lane];
+    if (lane < 3) {
+      // Only lanes 0/1/2 participate in this coarse derivative. A singular
+      // common-face projection of otherwise valid nonzero directions is not
+      // shader undefined input and must not be hidden by this policy.
+      undefined_input |= !std::isfinite(direction[0]) ||
+          !std::isfinite(direction[1]) || !std::isfinite(direction[2]) ||
+          (direction[0] == 0 && direction[1] == 0 && direction[2] == 0);
+    }
+    // Unlike address generation, retain the unmodified projection here so a
+    // NaN cannot turn into a fabricated finite derivative across a mixed quad.
+    projected[lane] = ProjectCubeToFace(face, direction[0], direction[1], direction[2]);
+  }
+  return ComputeTextureImplicitLodImpl(projected, image, sampler, undefined_input, 3);
+}
+
 TextureImplicitLod ComputeTextureExplicitLod(
     float level, const RogueTextureImageDescriptor &image,
     const RogueTextureSamplerDescriptor &sampler) {
-  if (!std::isfinite(level) || !image.mip_count || image.mip_count > kMaximumTextureMipLevels ||
+  if (std::isnan(level) || !image.mip_count || image.mip_count > kMaximumTextureMipLevels ||
       sampler.min_lod_u4_6 > sampler.max_lod_u4_6)
     throw std::runtime_error("TextureUnit explicit LOD state is invalid");
   // lp_build_lod_selector uses the explicit word directly, then sampler LOD
   // bounds. Unlike texelFetch, textureLod retains image/mip filtering.
+  // Native lowering of textureGrad computes log2(rho); a zero gradient has
+  // lambda = -infinity and legitimately selects the sampler's minimum LOD.
+  // Clamp either infinity before level conversion, while NaN remains invalid.
   TextureLodSelection lod;
   lod.lambda = std::clamp(level, sampler.min_lod_u4_6 / 64.0F, sampler.max_lod_u4_6 / 64.0F);
   lod.minified = lod.lambda > 0;
@@ -885,6 +942,7 @@ TextureUnit::TextureUnit(sc_core::sc_module_name name, MemoryPool &pool,
   SC_THREAD(SampleRun);
   SC_THREAD(VertexSampleRun);
   SC_THREAD(GeometrySampleRun);
+  SC_THREAD(ComputeSampleRun);
 }
 
 void TextureUnit::SampleRun() {
@@ -899,6 +957,10 @@ void TextureUnit::VertexSampleRun() {
 void TextureUnit::GeometrySampleRun() {
   SampleRunForStage(ShaderStage::kGeometry, geometry_sample_input,
                     geometry_sample_output);
+}
+
+void TextureUnit::ComputeSampleRun() {
+  SampleRunForStage(ShaderStage::kCompute, compute_sample_input, compute_sample_output);
 }
 
 void TextureUnit::SampleRunForStage(
@@ -919,27 +981,30 @@ void TextureUnit::SampleRunForStage(
     const bool vertex_stage = shader_stage == ShaderStage::kVertex;
     const bool geometry_stage = shader_stage == ShaderStage::kGeometry;
     const bool fragment_stage = shader_stage == ShaderStage::kFragment;
-    const std::size_t stage_index = vertex_stage ? 0U : geometry_stage ? 2U : 1U;
+    const bool compute_stage = shader_stage == ShaderStage::kCompute;
+    const std::size_t stage_index = compute_stage ? 3U : vertex_stage ? 0U : geometry_stage ? 2U : 1U;
     const std::uint32_t descriptor_start = geometry_stage ? 4U : 0U;
     const PipelineStage pending_stage =
-        vertex_stage ? PipelineStage::kVertexTexturePending
+        compute_stage ? PipelineStage::kComputeTexturePending
+        : vertex_stage ? PipelineStage::kVertexTexturePending
                      : geometry_stage ? PipelineStage::kGeometryTexturePending
                                       : PipelineStage::kFragmentTexturePending;
     const PipelineStage ready_stage =
-        vertex_stage ? PipelineStage::kVertexTextureSamplesReady
+        compute_stage ? PipelineStage::kComputeTextureSamplesReady
+        : vertex_stage ? PipelineStage::kVertexTextureSamplesReady
                      : geometry_stage ? PipelineStage::kGeometryTextureSamplesReady
                                       : PipelineStage::kTextureSamplesReady;
     RequireStage(state.stage, pending_stage, name());
     if (memory_ && state.memory_mode != memory_->mode())
       throw std::runtime_error("TextureUnit memory mode mismatch");
     const PoolHandle resources_handle =
-        vertex_stage ? state.vertex_texture_resources
+        compute_stage ? state.compute_texture_resources : vertex_stage ? state.vertex_texture_resources
                      : geometry_stage ? state.geometry_texture_resources : state.texture_resources;
     const PoolHandle samplers_handle =
-        vertex_stage ? state.vertex_sampler_states
+        compute_stage ? state.compute_sampler_states : vertex_stage ? state.vertex_sampler_states
                      : geometry_stage ? state.geometry_sampler_states : state.sampler_states;
     const PoolHandle shared_handle =
-        vertex_stage ? state.vertex_shared_registers
+        compute_stage ? state.compute_shared_registers : vertex_stage ? state.vertex_shared_registers
                      : geometry_stage ? state.geometry_shared_registers : state.fragment_shared_registers;
     if (!UsesTextureSampling(state, shader_stage) ||
         !HasPoolHandle(state.texture_sample_requests) ||
@@ -965,22 +1030,23 @@ void TextureUnit::SampleRunForStage(
       shared = LoadArray<std::uint32_t>(pool_, shared_handle);
     }
     const bool driver_pco =
-        IsDriverPcoTrianglesCase(state.functional_case);
+        compute_stage || IsDriverPcoTrianglesCase(state.functional_case);
     const std::uint32_t descriptor_count =
         driver_pco
-            ? (vertex_stage ? state.vertex_sampled_texture_count
+            ? (compute_stage ? state.compute_sampled_texture_count : vertex_stage ? state.vertex_sampled_texture_count
                             : geometry_stage ? state.geometry_sampled_texture_count : state.sampled_texture_count)
             : 1U;
     const std::uint32_t expected_shared_dwords =
         driver_pco
-            ? (vertex_stage ? state.vertex_pco_abi.shareds
+            ? (compute_stage ? state.compute_pco_abi.shareds : vertex_stage ? state.vertex_pco_abi.shareds
                             : geometry_stage ? state.geometry_pco_abi.shareds : state.fragment_pco_abi.shareds)
             : kFillTexNearestSharedDwordCount;
     const std::uint64_t expected_lane_count =
-        vertex_stage ? state.counters.vs_invocations
+        compute_stage ? 1U : vertex_stage ? state.counters.vs_invocations
                      : geometry_stage ? 1U : state.fragment_shader_lane_count;
     if ((!fragment_stage && !driver_pco) || requests.empty() ||
-        requests.size() != expected_lane_count ||
+        (fragment_stage ? requests.size() > expected_lane_count
+                        : requests.size() != expected_lane_count) ||
         descriptor_count == 0 ||
         descriptor_count > kPcoMaximumTextureDescriptorSets ||
         resources.size() != descriptor_count ||
@@ -1109,8 +1175,11 @@ void TextureUnit::SampleRunForStage(
               ? "word4 is not the image layer size"
           : shared[descriptor_base + 5U] != 0   ? "word5 is not zero"
           : shared[descriptor_base + 6U] != 0   ? "word6 is not zero"
-          : shared[descriptor_base + 7U] != 0   ? "word7 is not zero"
-          : shared[descriptor_base + 12U] != 0  ? "word12 is not zero"
+          // Public PCO software metadata is consumed by native shader ALU:
+          // word7 bit8 clamps UNORM shadow references; word12 is compare op.
+          : (shared[descriptor_base + 7U] & ~UINT32_C(0x100)) != 0
+              ? "word7 has unsupported pack metadata"
+          : shared[descriptor_base + 12U] > 7  ? "word12 compare operation is invalid"
           : shared[descriptor_base + 13U] != 0  ? "word13 is not zero"
           : shared[descriptor_base + 14U] != 0  ? "word14 is not zero"
           : shared[descriptor_base + 15U] != 0  ? "word15 is not zero"
@@ -1242,13 +1311,17 @@ void TextureUnit::SampleRunForStage(
             "TextureUnit LOD request batch is not quad aligned");
       for (std::size_t first = 0; first < requests.size(); first += 4U) {
         std::array<std::array<float, 2>, 4> coordinates{};
+        std::array<std::array<float, 3>, 4> cube_directions{};
         const std::uint32_t quad_id = requests[first].quad_id;
+        const std::uint8_t sample_id = requests[first].sample_id;
         for (std::size_t lane = 0; lane < 4U; ++lane) {
           const TextureSampleRequest &request = requests[first + lane];
-          if (request.quad_id != quad_id || request.quad_lane != lane)
+          if (request.quad_id != quad_id || request.sample_id != sample_id || request.quad_lane != lane)
             throw std::runtime_error(
                 "TextureUnit LOD request lost 2x2 quad identity");
           if (resource.dimension_type == TextureDimensionType::kCube) {
+            for (std::size_t component = 0; component < 3; ++component)
+              cube_directions[lane][component] = BitsFloat(request.coordinates[component]);
             // The cube LOD comes from the derivatives of the projected face
             // coordinate, not the raw direction.  Project every lane onto the
             // face the first lane selects so the derivative stays smooth where
@@ -1270,8 +1343,37 @@ void TextureUnit::SampleRunForStage(
             coordinates[lane][1] = BitsFloat(request.coordinates[1]);
           }
         }
-        const TextureImplicitLod lod =
-            ComputeTextureImplicitLod(coordinates, image, decoded_sampler);
+        TextureImplicitLod lod;
+        try {
+          lod = resource.dimension_type == TextureDimensionType::kCube
+              ? ComputeTextureCubeImplicitLod(cube_directions, image, decoded_sampler)
+              : ComputeTextureImplicitLod(coordinates, image, decoded_sampler);
+        } catch (const std::runtime_error &error) {
+          // Retain the real failing inputs at this boundary. This does not
+          // replace nonfinite shader values or invent helper coordinates.
+          std::ostringstream detail;
+          detail << error.what() << "; set=" << descriptor_set
+                 << " dimension=" << static_cast<unsigned>(resource.dimension_type)
+                 << " quad=" << quad_id << " sample=" << unsigned(sample_id);
+          const auto lanes = HasPoolHandle(state.fragment_shader_lanes)
+              ? LoadArray<FragmentShaderLane>(pool_, state.fragment_shader_lanes)
+              : std::vector<FragmentShaderLane>{};
+          for (std::size_t lane = 0; lane < 4; ++lane) {
+            const auto &request = requests[first + lane];
+            detail << " lane" << lane << "={shader=" << request.shader_lane_index;
+            if (request.shader_lane_index < lanes.size()) {
+              const auto &fragment = lanes[request.shader_lane_index];
+              detail << " xy=" << fragment.x << ',' << fragment.y
+                     << " helper=" << unsigned(fragment.helper)
+                     << " parameter=" << fragment.parameter_index;
+            }
+            detail << " raw=" << std::hex << request.coordinates[0] << ','
+                   << request.coordinates[1] << ',' << request.coordinates[2]
+                   << std::dec << " projected=" << coordinates[lane][0] << ','
+                   << coordinates[lane][1] << '}';
+          }
+          throw std::runtime_error(detail.str());
+        }
         for (std::size_t lane = 0; lane < 4U; ++lane)
           implicit_lods[first + lane] = lod;
       }
@@ -1438,9 +1540,11 @@ void TextureUnit::SampleRunForStage(
     std::size_t debug_target_index = 0;
     std::uint32_t debug_target_parameter = 0;
     std::uint32_t debug_target_quad = 0;
-    if (debug_lanes.size() == requests.size()) {
+    if (debug_lanes.size() == expected_lane_count) {
       for (std::size_t index = 0; index < requests.size(); ++index) {
-        const FragmentShaderLane &lane = debug_lanes[index];
+        if (requests[index].shader_lane_index >= debug_lanes.size())
+          throw std::runtime_error("TextureUnit debug lane is out of range");
+        const FragmentShaderLane &lane = debug_lanes[requests[index].shader_lane_index];
         if (lane.x != debug_x || lane.y != debug_y || lane.helper != 0 ||
             (debug_parameter != std::numeric_limits<std::uint32_t>::max() &&
              lane.parameter_index != debug_parameter) ||
@@ -1468,7 +1572,7 @@ void TextureUnit::SampleRunForStage(
       std::array<std::size_t, 4> quad_indices = {
           kAbsent, kAbsent, kAbsent, kAbsent};
       for (std::size_t index = 0; index < requests.size(); ++index) {
-        if (debug_lanes[index].parameter_index != debug_target_parameter ||
+        if (debug_lanes[requests[index].shader_lane_index].parameter_index != debug_target_parameter ||
             requests[index].quad_id != debug_target_quad ||
             requests[index].quad_lane > 3U) {
           continue;
@@ -1490,9 +1594,10 @@ void TextureUnit::SampleRunForStage(
                 << " quad=" << debug_target_quad;
       for (std::size_t lane = 0; lane < quad_indices.size(); ++lane) {
         const std::size_t index = quad_indices[lane];
-        std::cerr << " lane" << lane << '=' << debug_lanes[index].x << ','
-                  << debug_lanes[index].y << ','
-                  << static_cast<unsigned>(debug_lanes[index].helper)
+        const auto &shader_lane = debug_lanes[requests[index].shader_lane_index];
+        std::cerr << " lane" << lane << '=' << shader_lane.x << ','
+                  << shader_lane.y << ','
+                  << static_cast<unsigned>(shader_lane.helper)
                   << ",0x" << std::hex << std::setw(8) << std::setfill('0')
                   << requests[index].coordinates[0] << ",0x" << std::setw(8)
                   << requests[index].coordinates[1] << std::dec
@@ -1550,10 +1655,20 @@ void TextureUnit::SampleRunForStage(
       const TextureSampleRequest &request = requests[index];
       const bool debug_request =
           debug_target_found &&
-          debug_lanes[index].parameter_index == debug_target_parameter &&
+          debug_lanes[request.shader_lane_index].parameter_index == debug_target_parameter &&
           request.quad_id == debug_target_quad;
       const TextureImplicitLod &lod = implicit_lods[index];
-      if (request.shader_lane_index != index || request.request_id != index ||
+      if (request.spatial_offsets[0] < -32 || request.spatial_offsets[0] > 31 ||
+          request.spatial_offsets[1] < -32 || request.spatial_offsets[1] > 31 ||
+          request.spatial_offsets[2] < -8 || request.spatial_offsets[2] > 7 ||
+          ((!volume_texture || direct_fetch) && request.spatial_offsets[2] != 0) ||
+          ((cube_texture || direct_fetch) &&
+           (request.spatial_offsets[0] != 0 || request.spatial_offsets[1] != 0)))
+        throw std::runtime_error("TextureUnit SMP spatial offset ABI mismatch");
+      if ((fragment_stage ? request.shader_lane_index >= expected_lane_count
+                          : request.shader_lane_index != index) ||
+          (index && fragment_stage && request.shader_lane_index <= requests[index - 1].shader_lane_index) ||
+          request.request_id != index ||
           request.shader_stage != shader_stage ||
           request.coordinate_count != expected_coordinate_count ||
           request.component_count != 4 ||
@@ -1563,8 +1678,8 @@ void TextureUnit::SampleRunForStage(
           request.fcnorm != (integer_texture ? 0U : 1U) ||
           request.data_request != 0 ||
           (!fragment_stage
-               ? (request.quad_id != 0 || request.quad_lane != 0)
-               : request.quad_lane > 3U) ||
+               ? (request.quad_id != 0 || request.quad_lane != 0 || request.sample_id != 0)
+               : (request.quad_lane > 3U || request.sample_id >= state.raster_state.sample_count)) ||
           request.reserved[0] != 0) {
         throw std::runtime_error("TextureUnit SMP request ABI mismatch");
       }
@@ -1808,14 +1923,17 @@ void TextureUnit::SampleRunForStage(
       }
 
       const auto sample_bilinear_depth =
+          // Keep SOO in texel units until the selected mip is known. All
+          // nearest/linear paths below offset before wrap; trilinear calls
+          // these helpers independently for level0 and level1.
           [&](const TextureMipLevel &mip,
               std::uint64_t first_request_id) -> std::uint32_t {
         const TextureLinearAxis x = ComputeTextureLinearRepeat(
             plane_s, mip.width,
-            decoded_sampler.wrap_u);
+            decoded_sampler.wrap_u, 0.5F, request.spatial_offsets[0]);
         const TextureLinearAxis y = ComputeTextureLinearRepeat(
             plane_t, mip.height,
-            decoded_sampler.wrap_v);
+            decoded_sampler.wrap_v, 0.5F, request.spatial_offsets[1]);
         const std::uint32_t depth00 = SampledDepth24FromTexel(
             read_texel(mip, x.lower, y.lower, first_request_id + 0U));
         const std::uint32_t depth10 = SampledDepth24FromTexel(
@@ -1840,10 +1958,10 @@ void TextureUnit::SampleRunForStage(
           [&](const TextureMipLevel &mip, std::uint64_t request_id) {
         const std::uint32_t x =
             ComputeTextureNearestRepeat(plane_s,
-                                        mip.width, decoded_sampler.wrap_u);
+                                        mip.width, decoded_sampler.wrap_u, request.spatial_offsets[0]);
         const std::uint32_t y =
             ComputeTextureNearestRepeat(plane_t,
-                                        mip.height, decoded_sampler.wrap_v);
+                                        mip.height, decoded_sampler.wrap_v, request.spatial_offsets[1]);
         return read_texel(mip, x, y, request_id);
       };
 
@@ -1852,10 +1970,10 @@ void TextureUnit::SampleRunForStage(
               std::uint64_t first_request_id) {
         const TextureLinearAxis x = ComputeTextureLinearRepeat(
             plane_s, mip.width,
-            decoded_sampler.wrap_u);
+            decoded_sampler.wrap_u, 0.5F, request.spatial_offsets[0]);
         const TextureLinearAxis y = ComputeTextureLinearRepeat(
             plane_t, mip.height,
-            decoded_sampler.wrap_v);
+            decoded_sampler.wrap_v, 0.5F, request.spatial_offsets[1]);
         const std::array<std::uint8_t, 8> texel00 =
             read_texel(mip, x.lower, y.lower, first_request_id + 0U);
         const std::array<std::uint8_t, 8> texel10 =
@@ -1913,10 +2031,10 @@ void TextureUnit::SampleRunForStage(
           [&](const TextureMipLevel &mip, std::uint64_t request_id) {
         const std::uint32_t x = ComputeTextureFloatNearest(
             plane_s, mip.width,
-            decoded_sampler.wrap_u);
+            decoded_sampler.wrap_u, request.spatial_offsets[0]);
         const std::uint32_t y = ComputeTextureFloatNearest(
             plane_t, mip.height,
-            decoded_sampler.wrap_v);
+            decoded_sampler.wrap_v, request.spatial_offsets[1]);
         return DecodeTexelToFloat(image.format,
                                   read_texel_bytes(mip, x, y, request_id));
       };
@@ -1925,10 +2043,10 @@ void TextureUnit::SampleRunForStage(
           [&](const TextureMipLevel &mip, std::uint64_t first_request_id) {
         const TextureFloatAxis x = ComputeTextureFloatLinear(
             plane_s, mip.width,
-            decoded_sampler.wrap_u);
+            decoded_sampler.wrap_u, request.spatial_offsets[0]);
         const TextureFloatAxis y = ComputeTextureFloatLinear(
             plane_t, mip.height,
-            decoded_sampler.wrap_v);
+            decoded_sampler.wrap_v, request.spatial_offsets[1]);
         const std::array<float, 4> texel00 = DecodeTexelToFloat(
             image.format,
             read_texel_bytes(mip, x.lower, y.lower, first_request_id + 0U));
@@ -2036,12 +2154,12 @@ void TextureUnit::SampleRunForStage(
           throw std::runtime_error("TextureUnit cannot linearly filter integer texels");
         if (volume_texture) {
           selected_layer = ComputeTextureFloatNearest(
-              volume_r, level_depth(lod.level0), wrap_r);
+              volume_r, level_depth(lod.level0), wrap_r, request.spatial_offsets[2]);
         }
         const std::uint32_t x = ComputeTextureFloatNearest(
-            plane_s, level0.width, decoded_sampler.wrap_u);
+            plane_s, level0.width, decoded_sampler.wrap_u, request.spatial_offsets[0]);
         const std::uint32_t y = ComputeTextureFloatNearest(
-            plane_t, level0.height, decoded_sampler.wrap_v);
+            plane_t, level0.height, decoded_sampler.wrap_v, request.spatial_offsets[1]);
         integer_result = DecodeTexelToInteger(
             image.format, read_texel_bytes(level0, x, y, tap_request_base));
       } else if (image.format == TextureFormat::kZ32Unorm) {
@@ -2049,10 +2167,10 @@ void TextureUnit::SampleRunForStage(
           throw std::runtime_error("TextureUnit cannot filter Z32_UNORM");
         const std::uint32_t x = ComputeTextureNearestRepeat(
             plane_s, level0.width,
-            decoded_sampler.wrap_u);
+            decoded_sampler.wrap_u, request.spatial_offsets[0]);
         const std::uint32_t y = ComputeTextureNearestRepeat(
             plane_t, level0.height,
-            decoded_sampler.wrap_v);
+            decoded_sampler.wrap_v, request.spatial_offsets[1]);
         const std::array<std::uint8_t, 8> texel =
             read_texel(level0, x, y, tap_request_base);
         std::uint32_t encoded = 0;
@@ -2076,10 +2194,10 @@ void TextureUnit::SampleRunForStage(
             return sample_bilinear_depth(mip, first_request_id);
           const std::uint32_t x = ComputeTextureNearestRepeat(
               plane_s, mip.width,
-              decoded_sampler.wrap_u);
+              decoded_sampler.wrap_u, request.spatial_offsets[0]);
           const std::uint32_t y = ComputeTextureNearestRepeat(
               plane_t, mip.height,
-              decoded_sampler.wrap_v);
+              decoded_sampler.wrap_v, request.spatial_offsets[1]);
           return SampledDepth24FromTexel(
               read_texel(mip, x, y, first_request_id));
         };
@@ -2108,7 +2226,7 @@ void TextureUnit::SampleRunForStage(
           const std::uint32_t d = level_depth(level_index);
           if (linear_filter) {
             const TextureLinearAxis z =
-                ComputeTextureLinearRepeat(volume_r, d, wrap_r);
+                ComputeTextureLinearRepeat(volume_r, d, wrap_r, 0.5F, request.spatial_offsets[2]);
             selected_layer = z.lower;
             const std::array<std::uint8_t, 8> lo = unorm8_plane(mip, rid);
             selected_layer = z.upper;
@@ -2119,7 +2237,7 @@ void TextureUnit::SampleRunForStage(
                   LerpTextureUnorm8(lo[component], hi[component], z.weight);
             return blended;
           }
-          selected_layer = ComputeTextureNearestRepeat(volume_r, d, wrap_r);
+          selected_layer = ComputeTextureNearestRepeat(volume_r, d, wrap_r, request.spatial_offsets[2]);
           return unorm8_plane(mip, rid);
         };
         std::array<std::uint8_t, 8> texel =
@@ -2212,7 +2330,7 @@ void TextureUnit::SampleRunForStage(
           const std::uint32_t d = level_depth(level_index);
           if (linear_filter) {
             const TextureFloatAxis z =
-                ComputeTextureFloatLinear(volume_r, d, wrap_r);
+                ComputeTextureFloatLinear(volume_r, d, wrap_r, request.spatial_offsets[2]);
             selected_layer = z.lower;
             const std::array<float, 4> lo = float_plane(mip, rid);
             selected_layer = z.upper;
@@ -2223,7 +2341,7 @@ void TextureUnit::SampleRunForStage(
                   LerpTextureFloat(lo[component], hi[component], z.weight);
             return blended;
           }
-          selected_layer = ComputeTextureFloatNearest(volume_r, d, wrap_r);
+          selected_layer = ComputeTextureFloatNearest(volume_r, d, wrap_r, request.spatial_offsets[2]);
           return float_plane(mip, rid);
         };
         filtered = float_level(level0, lod.level0, tap_request_base);
@@ -2285,10 +2403,10 @@ void TextureUnit::SampleRunForStage(
     }
     state.counters.texel_fetches += texel_fetch_count;
     std::uint64_t &stage_requests =
-        vertex_stage ? state.vertex_texture_request_count
+        compute_stage ? state.compute_texture_request_count : vertex_stage ? state.vertex_texture_request_count
                      : geometry_stage ? state.geometry_texture_request_count : state.fragment_texture_request_count;
     std::uint64_t &stage_fetches =
-        vertex_stage ? state.vertex_texel_fetch_count
+        compute_stage ? state.compute_texel_fetch_count : vertex_stage ? state.vertex_texel_fetch_count
                      : geometry_stage ? state.geometry_texel_fetch_count : state.fragment_texel_fetch_count;
     if (requests.size() >
             std::numeric_limits<std::uint64_t>::max() - stage_requests ||
@@ -2306,12 +2424,16 @@ void TextureUnit::SampleRunForStage(
     const std::uint64_t functional_cycles =
         requests.size() * kReferenceUarch.texture_bypass_cycles;
     ApplyMemoryAccessStats(state.counters, memory_stats);
+    if (compute_stage) {
+      state.compute_texture_direct_read_bytes += memory_stats.direct_read_bytes;
+      state.compute_texture_direct_write_bytes += memory_stats.direct_write_bytes;
+    }
     const std::uint64_t cycles =
         functional_cycles + MemoryAccessDelayCycles(memory_stats);
     state.counters.texture_cycles += cycles;
-    if (!fragment_stage)
+    if (!fragment_stage && !compute_stage)
       state.counters.tiler_cycles += cycles;
-    else
+    else if (fragment_stage)
       state.counters.renderer_cycles += cycles;
     state.stage = ready_stage;
     WaitForCycles(cycles);

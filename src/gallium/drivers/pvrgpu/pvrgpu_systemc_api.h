@@ -4,13 +4,14 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "pvrgpu_systemc_limits.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* API-v26 adds independent native transform-feedback transport/readback. */
-#define PVRGPU_SYSTEMC_API_VERSION 27u
+#define PVRGPU_SYSTEMC_API_VERSION 30u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE 15u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES (64u * 1024u)
 /*
@@ -19,7 +20,11 @@ extern "C" {
  * address map bounds separately.
  */
 #define PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_COMMANDS 256u
-#define PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_TEXTURES 16u
+/* A sequence contains per-draw slices, not just one draw's descriptor set.
+ * Each graphics stage (VS, FS, GS) can bind eight sampled textures. The
+ * independent payload-byte budget still bounds actual memory consumption. */
+#define PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_TEXTURES \
+   (PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_COMMANDS * 3u * 8u)
 #define PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS 15u
 #define PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR UINT32_MAX
 
@@ -73,6 +78,8 @@ enum pvrgpu_systemc_pco_shader_stage {
    PVRGPU_SYSTEMC_PCO_SHADER_STAGE_GEOMETRY = 2,
    PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_CONTROL = 3,
    PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION = 4,
+   /* Only the independent compute API accepts this stage. */
+   PVRGPU_SYSTEMC_PCO_SHADER_STAGE_COMPUTE = 5,
 };
 
 /* Immutable patch pipeline. Domain: triangles=0, quads=1, isolines=2;
@@ -143,6 +150,31 @@ struct pvrgpu_systemc_stream_output {
    uint32_t binding_count;
    const struct pvrgpu_systemc_stream_output_target *targets;
    uint32_t target_count;
+};
+
+#define PVRGPU_SYSTEMC_MAX_SHADER_IMAGES 32u
+#define PVRGPU_SYSTEMC_MAX_SHADER_IMAGE_BYTES (256u * 1024u * 1024u)
+#define PVRGPU_SYSTEMC_SHADER_IMAGE_R32_UINT 1u
+#define PVRGPU_SYSTEMC_SHADER_IMAGE_READ 1u
+#define PVRGPU_SYSTEMC_SHADER_IMAGE_WRITE 2u
+/* Whole backing-resource bytes preserve aliases and untouched padding. The
+ * view names its exact native image footprint. FS descriptors contain
+ * [baseLo, baseHi, depth, layer_stride, width, height, row_stride, texel_bytes].
+ * baseLo/baseHi are zero on input and relocated to backing base + offset. */
+struct pvrgpu_systemc_shader_image {
+   uint32_t image_slot;
+   uint32_t format;
+   uint32_t access;
+   uint64_t resource_token;
+   const uint8_t *bytes;
+   size_t bytes_size;
+   uint64_t offset;
+   uint32_t width;
+   uint32_t height;
+   uint32_t depth;
+   uint32_t row_stride;
+   uint32_t layer_stride;
+   uint32_t texel_bytes;
 };
 
 #define PVRGPU_SYSTEMC_MAX_VARYING_BINDINGS 64u
@@ -413,6 +445,7 @@ struct pvrgpu_systemc_driver_command {
    uint32_t depth_clip_far;
    uint32_t depth_clamp;
    uint32_t sample_mask;
+   uint32_t sample_frequency;
    uint32_t color_mask;
    uint32_t blend_enable;
    uint32_t dither;
@@ -478,12 +511,14 @@ struct pvrgpu_systemc_driver_command {
    const struct pvrgpu_systemc_pco_sequence_texture *pco_sequence_textures;
 
    /*
-    * API-v19 optional initial contents for a nested PCO draw's single color
-    * attachment.  The source index must be ATTACHMENT_NEW_CLEAR and the
-    * effective render_target_count must be one.  Rows are tightly packed in
+    * API-v19 optional initial contents; API-v30 extends the same byte buffer
+    * to all effective render_target_count color attachments in target order.
+    * The source index must be ATTACHMENT_NEW_CLEAR. Rows are tightly packed in
     * the command format's model transport: RGBA8 is four bytes per pixel;
     * R32, RG32 and RGBA32 integer targets are four, eight and sixteen bytes.
-    * Supply the complete framebuffer extent, or leave both fields zero.
+    * Each target contains every layer, pixel and sample before the next
+    * target; all targets use the command's format and framebuffer extent.
+    * Supply every target completely, or leave both fields zero.
     * Submission deep-copies these bytes.  The model imports them into DRAM
     * and performs a PBE LOAD before rasterizing the draw.
     */
@@ -533,6 +568,14 @@ struct pvrgpu_systemc_driver_command {
     * contains this many tightly packed layer-major images and gl_Layer
     * selects one. Pixel/sample layout within each layer is unchanged. */
    uint32_t framebuffer_layers;
+   /* API-v29: independent fragment image DMA, not a Compute dispatch. */
+   const struct pvrgpu_systemc_shader_image *fragment_images;
+   uint32_t fragment_image_count;
+   uint32_t fragment_image_descriptor_start;
+   uint32_t fragment_image_descriptor_count;
+   uint32_t fragment_image_read_mask;
+   uint32_t fragment_image_write_mask;
+   uint32_t fragment_early_tests;
 };
 
 struct pvrgpu_systemc_submit_info {
@@ -644,6 +687,21 @@ typedef int (*pvrgpu_systemc_flush_stream_output_fn)(
 
 int pvrgpu_systemc_flush_stream_output(
    struct pvrgpu_systemc_stream_output_readback *readback,
+   char *error, size_t error_size);
+
+struct pvrgpu_systemc_shader_image_readback {
+   uint32_t version;
+   uint64_t submission_generation;
+   uint64_t resource_token;
+   uint8_t *bytes;
+   size_t bytes_size;
+   uint32_t data_written;
+};
+typedef int (*pvrgpu_systemc_flush_shader_image_fn)(
+   struct pvrgpu_systemc_shader_image_readback *readback,
+   char *error, size_t error_size);
+int pvrgpu_systemc_flush_shader_image(
+   struct pvrgpu_systemc_shader_image_readback *readback,
    char *error, size_t error_size);
 
 /*

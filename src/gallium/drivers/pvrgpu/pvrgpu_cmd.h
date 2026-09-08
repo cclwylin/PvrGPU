@@ -28,6 +28,9 @@ bool pvrgpu_read_graphics_stats(
 bool pvrgpu_read_stream_output(
    struct pvrgpu_systemc_stream_output_readback *readback,
    char *error, size_t error_size);
+bool pvrgpu_read_shader_image(
+   struct pvrgpu_systemc_shader_image_readback *readback,
+   char *error, size_t error_size);
 
 #define PVRGPU_DRIVER_COMMAND_SCHEMA "pvrgpu.driver-command.v1"
 #define PVRGPU_DRIVER_COMMAND_PRODUCER "pvrgpu-gallium-driver"
@@ -293,6 +296,7 @@ struct pvrgpu_draw_pco_triangles_command {
    uint32_t depth_clip_far;
    uint32_t depth_clamp;
    uint32_t sample_mask;
+   uint32_t sample_frequency;
    uint32_t alpha_to_coverage;
    uint32_t alpha_to_coverage_dither;
    uint32_t alpha_to_one;

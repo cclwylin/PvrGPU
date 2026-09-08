@@ -10,11 +10,12 @@ extern "C" {
 
 /* Independent, synchronous compute ABI. No graphics command or framebuffer
  * carries compute results. Check version before reading any later field. */
-#define PVRGPU_SYSTEMC_COMPUTE_API_VERSION 4u
+#define PVRGPU_SYSTEMC_COMPUTE_API_VERSION 6u
 #define PVRGPU_SYSTEMC_COMPUTE_MAX_SHARED_BYTES (32u * 1024u)
 #define PVRGPU_SYSTEMC_COMPUTE_MAX_IMAGES 32u
 #define PVRGPU_SYSTEMC_COMPUTE_IMAGE_DESCRIPTOR_DWORDS 8u
 #define PVRGPU_SYSTEMC_COMPUTE_IMAGE_R32UI 1u
+#define PVRGPU_SYSTEMC_COMPUTE_IMAGE_RAW 2u
 #define PVRGPU_SYSTEMC_COMPUTE_MAX_RESOURCES 64u
 #define PVRGPU_SYSTEMC_COMPUTE_MAX_BINDINGS 47u
 #define PVRGPU_SYSTEMC_COMPUTE_MAX_BINARY_BYTES (1024u * 1024u)
@@ -37,7 +38,7 @@ struct pvrgpu_systemc_compute_abi {
    uint32_t storage_buffer_write_mask;
    uint32_t shared_memory_bytes;
    uint32_t scratch_bytes;
-   /* Canonical SH layout: UBO4, SSBO4, image8 per slot, optional private
+   /* Canonical SH layout: texture20, UBO4, SSBO4, image8 per slot, optional private
     * workgroup4, then CB0. Private count is four iff shared bytes is nonzero. */
    uint32_t shared_memory_descriptor_start;
    uint32_t shared_memory_descriptor_count;
@@ -46,6 +47,8 @@ struct pvrgpu_systemc_compute_abi {
    uint32_t image_used_mask;
    uint32_t image_read_mask;
    uint32_t image_write_mask;
+   /* Twenty native image/sampler DWORDs per set precede buffer descriptors. */
+   uint32_t sampled_texture_count;
 };
 
 enum pvrgpu_systemc_compute_binding_kind {
@@ -75,9 +78,10 @@ struct pvrgpu_systemc_compute_binding {
 };
 
 /* Separate image binding namespace, sharing resources[] backing ownership.
- * One linear R32UI image2D view. Byte offsets include the selected mip/layer;
+ * Linear image view. Byte offsets include the selected mip/first layer;
  * dimensions exclude row padding. The compiler computes actual texel addresses.
- * Image descriptor: baseLo/baseHi/extent/0, width/height/row_stride/format. */
+ * Image descriptor: baseLo/baseHi/depth/layer_stride,
+ * width/height/row_stride/texel_bytes. Formats are lowered in native PCO. */
 struct pvrgpu_systemc_compute_image_binding {
    uint32_t slot;
    uint32_t resource_index;
@@ -89,6 +93,10 @@ struct pvrgpu_systemc_compute_image_binding {
    uint32_t height;
    uint32_t row_stride_bytes;
    uint32_t reserved;
+   /* Zero trailing fields retain the original R32UI image2D defaults. */
+   uint32_t depth;
+   uint32_t layer_stride_bytes;
+   uint32_t texel_bytes;
 };
 
 struct pvrgpu_systemc_compute_dispatch {
@@ -108,6 +116,13 @@ struct pvrgpu_systemc_compute_dispatch {
    uint32_t memory_mode;
    const struct pvrgpu_systemc_compute_image_binding *images;
    size_t image_count;
+   /* Immutable external sampled images, never graphics attachment producers.
+    * Native SMP/WDF uses the independent ComputeShader/TextureUnit FIFO.
+    * Writable image aliases require a shared backing contract, not snapshots. */
+   const struct pvrgpu_systemc_pco_sequence_texture *textures;
+   size_t texture_count;
+   const uint32_t *texture_words;
+   size_t texture_word_count;
 };
 
 struct pvrgpu_systemc_compute_stats {
@@ -125,6 +140,8 @@ struct pvrgpu_systemc_compute_stats {
    uint64_t readback_bytes;
    uint64_t pool_allocations;
    uint64_t pool_releases;
+   uint64_t texture_requests;
+   uint64_t texel_fetches;
 };
 
 typedef int (*pvrgpu_systemc_submit_compute_fn)(

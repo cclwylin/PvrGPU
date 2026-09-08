@@ -2,13 +2,63 @@
 /* Run with script/run_mesa_resource_unit.sh clear. */
 #include "../src/gallium/drivers/pvrgpu/pvrgpu_clear.c"
 
-static unsigned failures;
+static unsigned failures, checks, flush_calls, flush_mode, color_events, depth_events;
+static unsigned stencil_events, clear_errors, command_calls;
+static struct pvrgpu_clear_color_command last_command;
 #define CHECK(condition) do { \
+   ++checks; \
    if (!(condition)) { \
       fprintf(stderr, "%s:%u: %s\n", __FILE__, __LINE__, #condition); \
       ++failures; \
    } \
 } while (0)
+
+/* Only the submission boundary and legacy capsule sink are mocked. The clear
+ * entry point, format packers and every byte store are the actual driver. */
+void pvrgpu_counter_event(const char *event, const char *detail)
+{ (void)detail; clear_errors += !strcmp(event, "clear_error"); }
+void pvrgpu_counter_eventf(const char *event, const char *format, ...)
+{
+   (void)format;
+   color_events += !strcmp(event, "clear_color");
+   depth_events += !strcmp(event, "clear_depth");
+   stencil_events += !strcmp(event, "clear_stencil");
+   clear_errors += !strcmp(event, "clear_error");
+}
+void pvrgpu_flush_current_color_attachments(struct pipe_context *pipe)
+{
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   ++flush_calls;
+   if (flush_mode == 1) {
+      ++ctx->query_statistics_failures;
+      return;
+   }
+   if (flush_mode == 2)
+      return;
+   ctx->array_primitive_draw_count = 0;
+   ctx->color_readback_pending_mask = 0;
+}
+void pvrgpu_invalidate_full_depth_clear(struct pvrgpu_context *ctx)
+{ ctx->full_depth_clear_is_one = false; }
+void pvrgpu_note_full_depth_clear_one(struct pvrgpu_context *ctx,
+                                    const struct pipe_surface *surface,
+                                    unsigned width, unsigned height)
+{ (void)surface; (void)width; (void)height; ctx->full_depth_clear_is_one = true; }
+bool pvrgpu_note_pending_attachment_clear(struct pvrgpu_context *ctx,
+   unsigned x, unsigned y, unsigned width, unsigned height, unsigned aspects,
+   uint32_t depth_bits, unsigned stencil)
+{
+   (void)x; (void)y; (void)width; (void)height; (void)aspects;
+   (void)depth_bits; (void)stencil; ++ctx->pending_attachment_clear_count; return true;
+}
+bool pvrgpu_case_reserves_native_pco_sequence(void) { return false; }
+bool pvrgpu_driver_draw_command_has_been_emitted(void) { return false; }
+bool pvrgpu_write_clear_color_command(const char *path,
+   const struct pvrgpu_clear_color_command *command, char *error, size_t error_size)
+{
+   (void)path; (void)error; (void)error_size;
+   ++command_calls; last_command = *command; return true;
+}
 
 static struct pvrgpu_resource
 test_resource(enum pipe_format format, unsigned samples)
@@ -323,6 +373,218 @@ test_pending_clear_lifecycle(void)
    free(other.data);
 }
 
+static void
+test_mrt_clear_entry(unsigned samples, unsigned targets, unsigned selected,
+                     unsigned channel_pattern, unsigned aspects, bool scissored,
+                     enum pipe_format format, bool shared_mask)
+{
+   struct pvrgpu_context ctx = {0};
+   struct pvrgpu_resource colors[PIPE_MAX_COLOR_BUFS] = {0};
+   struct pvrgpu_resource depth = test_resource(PIPE_FORMAT_Z24_UNORM_S8_UINT, samples);
+   ctx.framebuffer.width = 3;
+   ctx.framebuffer.height = 2;
+   ctx.framebuffer.nr_cbufs = targets;
+   ctx.framebuffer.zsbuf = test_surface(&depth);
+   memset(depth.data, 0xa5, depth.size);
+   ctx.stencil_clear_value = 0xa5;
+   ctx.array_primitive_draw_count = 1;
+   ctx.color_readback_pending_mask = selected;
+   union pipe_color_union color = {.f = {0.25f, 0.5f, 0.75f, 1.0f}};
+   uint8_t packed[16] = {0};
+   util_format_pack_rgba(format, packed, &color, 1);
+   const unsigned bpp = util_format_get_blocksize(format);
+   unsigned buffers = aspects, masks = 0;
+   for (unsigned target = 0; target < targets; ++target) {
+      colors[target] = test_resource(format, samples);
+      memset(colors[target].data, 0x31 + target, colors[target].size);
+      ctx.framebuffer.cbufs[target] = test_surface(&colors[target]);
+      if (selected & (1u << target))
+         buffers |= PIPE_CLEAR_COLOR0 << target;
+      masks |= ((channel_pattern + (shared_mask ? 0 : target)) & 15u) << (4 * target);
+   }
+   const struct pipe_scissor_state scissor = {.minx=1, .miny=1, .maxx=2, .maxy=2};
+   const unsigned prior_flush = flush_calls, prior_commands = command_calls;
+   const unsigned prior_depth = depth_events, prior_stencil = stencil_events;
+   flush_mode = 0;
+   pvrgpu_clear(&ctx.base, buffers, masks, 0x0f,
+                scissored ? &scissor : NULL, &color, 1.0, 0x32);
+   CHECK(flush_calls == prior_flush + 1);
+   CHECK(command_calls == prior_commands);
+   CHECK(ctx.query_statistics_failures == 0);
+   CHECK(ctx.array_primitive_draw_count == 0 && ctx.color_readback_pending_mask == 0);
+   CHECK(depth_events == prior_depth + !!(aspects & PIPE_CLEAR_DEPTH));
+   CHECK(stencil_events == prior_stencil + !!(aspects & PIPE_CLEAR_STENCIL));
+   CHECK(ctx.stencil_clear_value == 0xa5); /* Partial mask must not claim full 0x32. */
+   for (unsigned target = 0; target < targets; ++target) {
+      const unsigned mask = (masks >> (4 * target)) & 15;
+      const bool writes = (selected & (1u << target)) && mask;
+      CHECK(colors[target].driver_writes_model_cannot_reproduce == writes);
+      for (unsigned pixel = 0; pixel < 6; ++pixel)
+         for (unsigned sample = 0; sample < samples; ++sample)
+            for (unsigned byte = 0; byte < bpp; ++byte) {
+               const unsigned channel = byte / (bpp / 4);
+               const bool changed = writes && (!scissored || pixel == 4) && (mask & (1u << channel));
+               CHECK(colors[target].data[(pixel * samples + sample) * bpp + byte] ==
+                     (changed ? packed[byte] : 0x31 + target));
+            }
+      free(colors[target].data);
+   }
+   for (unsigned pixel = 0; pixel < 6; ++pixel)
+      for (unsigned sample = 0; sample < samples; ++sample) {
+         const bool inside = !scissored || pixel == 4;
+         const uint32_t z = inside && (aspects & PIPE_CLEAR_DEPTH) ? 0xffffff : 0xa5a5a5;
+         const uint32_t s = inside && (aspects & PIPE_CLEAR_STENCIL) ? 0xa2 : 0xa5;
+         CHECK(((uint32_t *)depth.data)[pixel * samples + sample] == (s << 24 | z));
+      }
+   free(depth.data);
+}
+
+static void
+test_mrt_clear_atomic_rejection(void)
+{
+   for (unsigned invalid = 0; invalid < 8; ++invalid) {
+      struct pvrgpu_context ctx = {0};
+      struct pvrgpu_resource colors[4];
+      struct pvrgpu_resource depth = test_resource(PIPE_FORMAT_Z24_UNORM_S8_UINT, 1);
+      ctx.framebuffer.width = 3;
+      ctx.framebuffer.height = 2;
+      ctx.framebuffer.nr_cbufs = 4;
+      ctx.framebuffer.zsbuf = test_surface(&depth);
+      memset(depth.data, 0x5a, depth.size);
+      for (unsigned target = 0; target < 4; ++target) {
+         colors[target] = test_resource(PIPE_FORMAT_R8G8B8A8_UNORM, 1);
+         memset(colors[target].data, 0x5a, colors[target].size);
+         ctx.framebuffer.cbufs[target] = test_surface(&colors[target]);
+      }
+      const size_t color_size = colors[3].size, depth_size = depth.size;
+      double depth_value = 1.0;
+      flush_mode = 0;
+      switch (invalid) {
+      case 0: colors[3].size = 1; break;
+      case 1: ctx.framebuffer.cbufs[3].texture = NULL; break;
+      case 2: depth.size = 1; break;
+      case 3: depth_value = NAN; break;
+      case 4: ctx.framebuffer.zsbuf.format = PIPE_FORMAT_Z32_FLOAT; break;
+      case 5: colors[3].level_strides[0] = 1; break;
+      case 6: flush_mode = 1; break;
+      case 7: flush_mode = 2; ctx.array_primitive_draw_count = 2; break;
+      }
+      const union pipe_color_union color = {.f = {1, 0, 0, 1}};
+      const unsigned prior_flush = flush_calls, prior_errors = clear_errors;
+      const unsigned prior_colors = color_events, prior_depth = depth_events;
+      pvrgpu_clear(&ctx.base, (PIPE_CLEAR_COLOR0 * 15) | PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL,
+                   0xffff, 0xff, NULL, &color, depth_value, 0xff);
+      CHECK(clear_errors == prior_errors + 1);
+      CHECK(ctx.query_statistics_failures == 1);
+      CHECK(color_events == prior_colors && depth_events == prior_depth);
+      CHECK(flush_calls == prior_flush + (invalid >= 6));
+      for (unsigned target = 0; target < 4; ++target) {
+         for (unsigned byte = 0; byte < color_size; ++byte)
+            CHECK(colors[target].data[byte] == 0x5a);
+         free(colors[target].data);
+      }
+      for (unsigned byte = 0; byte < depth_size; ++byte)
+         CHECK(depth.data[byte] == 0x5a);
+      free(depth.data);
+   }
+   flush_mode = 0;
+}
+
+static void
+test_mrt_clear_layers(void)
+{
+   struct pvrgpu_context ctx = {0};
+   struct pvrgpu_resource resources[5];
+   ctx.framebuffer.width = 3;
+   ctx.framebuffer.height = 2;
+   ctx.framebuffer.nr_cbufs = 4;
+   for (unsigned target = 0; target < 5; ++target) {
+      struct pvrgpu_resource *r = &resources[target];
+      *r = test_resource(target == 4 ? PIPE_FORMAT_Z24_UNORM_S8_UINT :
+                                     PIPE_FORMAT_R8G8B8A8_UNORM, 4);
+      free(r->data);
+      r->base.target = PIPE_TEXTURE_2D_ARRAY;
+      r->base.array_size = 3;
+      r->level_offsets[0] = 16;
+      r->level_strides[0] += 16;
+      r->level_layer_strides[0] = r->level_strides[0] * 2 + 16;
+      r->size = 32 + 3 * r->level_layer_strides[0];
+      r->data = malloc(r->size);
+      CHECK(r->data != NULL);
+      memset(r->data, 0x2a, r->size);
+      struct pipe_surface surface = test_surface(r);
+      surface.first_layer = 1;
+      surface.last_layer = 2;
+      if (target == 4) ctx.framebuffer.zsbuf = surface;
+      else ctx.framebuffer.cbufs[target] = surface;
+   }
+   const union pipe_color_union color = {.f = {0.25, 0.5, 0.75, 1}};
+   const struct pipe_scissor_state scissor = {.minx=1, .miny=1, .maxx=2, .maxy=2};
+   pvrgpu_clear(&ctx.base, (PIPE_CLEAR_COLOR0 * 15) | PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL,
+                0x8421, 0xf0, &scissor, &color, 0.5, 0xf3);
+   CHECK(ctx.query_statistics_failures == 0);
+   const uint8_t packed[] = {64, 128, 191, 255};
+   for (unsigned target = 0; target < 5; ++target) {
+      struct pvrgpu_resource *r = &resources[target];
+      uint8_t *expected = malloc(r->size);
+      CHECK(expected != NULL);
+      memset(expected, 0x2a, r->size);
+      for (unsigned layer = 1; layer <= 2; ++layer)
+         for (unsigned sample = 0; sample < 4; ++sample) {
+            const size_t offset = 16 + layer * r->level_layer_strides[0] +
+                                  r->level_strides[0] + (4 + sample) * 4;
+            if (target == 4) {
+               const uint32_t word = UINT32_C(0xfa7fffff);
+               memcpy(expected + offset, &word, sizeof(word));
+            } else {
+               expected[offset + target] = packed[target];
+            }
+         }
+      CHECK(memcmp(r->data, expected, r->size) == 0);
+      free(expected);
+      free(r->data);
+   }
+}
+
+static void
+test_clear_holes_and_legacy(void)
+{
+   struct pvrgpu_context ctx = {0};
+   struct pvrgpu_resource color = test_resource(PIPE_FORMAT_R8G8B8A8_UNORM, 1);
+   struct pvrgpu_resource depth = test_resource(PIPE_FORMAT_Z32_FLOAT, 1);
+   const union pipe_color_union value = {.f = {0.25, 0.5, 0.75, 1}};
+   ctx.framebuffer.width = 3;
+   ctx.framebuffer.height = 2;
+   ctx.framebuffer.nr_cbufs = 8;
+   ctx.framebuffer.cbufs[7] = test_surface(&color);
+   ctx.framebuffer.zsbuf = test_surface(&depth);
+   /* RT6 is selected but channel-masked out; RT0..5 are unselected holes.
+    * A zero stencil mask needs no stencil aspect in this depth-only format. */
+   pvrgpu_clear(&ctx.base, PIPE_CLEAR_COLOR7 | PIPE_CLEAR_COLOR6 |
+                PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL,
+                UINT32_C(0xf0000000), 0, NULL, &value, 1, 0xff);
+   CHECK(ctx.query_statistics_failures == 0);
+   for (unsigned pixel = 0; pixel < 6; ++pixel) {
+      CHECK(color.data[pixel * 4] == 64 && color.data[pixel * 4 + 3] == 255);
+      CHECK(((float *)depth.data)[pixel] == 1.0f);
+   }
+   memset(ctx.framebuffer.cbufs, 0, sizeof(ctx.framebuffer.cbufs));
+   ctx.framebuffer.nr_cbufs = 1;
+   ctx.framebuffer.cbufs[0] = test_surface(&color);
+   CHECK(setenv("PVRGPU_DRIVER_COMMAND_OUT", "/unused/mock-clear-command.txt", 1) == 0);
+   unsetenv("PVRGPU_RDC_TRACE_DRAW_ACTIONS");
+   const unsigned prior = command_calls;
+   pvrgpu_clear(&ctx.base, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH, 15, 0,
+                NULL, &value, 0.25, 0);
+   CHECK(command_calls == prior + 1);
+   CHECK(last_command.width == 3 && last_command.height == 2);
+   CHECK(memcmp(last_command.clear_color_bits, value.f, 16) == 0);
+   CHECK(!color.driver_writes_model_cannot_reproduce);
+   unsetenv("PVRGPU_DRIVER_COMMAND_OUT");
+   free(color.data);
+   free(depth.data);
+}
+
 int main(void)
 {
    test_integer_color(PIPE_FORMAT_R32G32B32A32_UINT);
@@ -342,7 +604,25 @@ int main(void)
    }
    test_uniform_includes_last_sample();
    test_pending_clear_lifecycle();
+   for (unsigned selected = 1; selected < 16; ++selected)
+      for (unsigned channels = 0; channels < 16; ++channels)
+         for (unsigned scoped = 0; scoped < 2; ++scoped)
+            for (unsigned samples = 1; samples <= 4; samples *= 4)
+               test_mrt_clear_entry(samples, 4, selected, channels,
+                  PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL, scoped, PIPE_FORMAT_R8G8B8A8_UNORM, false);
+   for (unsigned aspects = 0; aspects < 4; ++aspects) {
+      const unsigned flags = (aspects & 1 ? PIPE_CLEAR_DEPTH : 0) |
+                             (aspects & 2 ? PIPE_CLEAR_STENCIL : 0);
+      test_mrt_clear_entry(16, 8, 0x85, 9, flags, true, PIPE_FORMAT_R32G32B32A32_UINT, false);
+      test_mrt_clear_entry(4, 4, 15, 15, flags, false, PIPE_FORMAT_R32G32B32A32_FLOAT, false);
+   }
+   for (unsigned samples = 1; samples <= 16; samples *= 2)
+      test_mrt_clear_entry(samples, 4, 15, 15, PIPE_CLEAR_DEPTH,
+                           false, PIPE_FORMAT_R8G8B8A8_UNORM, true);
+   test_mrt_clear_atomic_rejection();
+   test_mrt_clear_layers();
+   test_clear_holes_and_legacy();
    if (!failures)
-      puts("Mesa clear storage tests passed");
+      printf("Mesa clear storage tests passed (%u checks)\n", checks);
    return failures ? 1 : 0;
 }

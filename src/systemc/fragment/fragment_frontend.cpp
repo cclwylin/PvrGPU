@@ -64,6 +64,10 @@ void FragmentFrontend::Run() {
         static_cast<std::uint64_t>(state.width) * state.height * state.attachment_layers;
     const std::uint32_t valid_sample_mask =
         RasterSampleMask(state.raster_state.sample_count);
+    if (state.raster_state.sample_frequency > 1)
+      throw std::runtime_error("FragmentFrontend sample frequency is invalid");
+    const std::uint32_t shader_samples = state.raster_state.sample_frequency
+        ? state.raster_state.sample_count : 1;
     if (pixel_count > std::numeric_limits<std::size_t>::max())
       throw std::overflow_error("FragmentFrontend surface is too large");
     const std::uint32_t quads_x = static_cast<std::uint32_t>(
@@ -81,10 +85,11 @@ void FragmentFrontend::Run() {
         static_cast<std::size_t>(pixel_count), 0);
     std::vector<std::uint64_t> last_submit_ordinal(
         static_cast<std::size_t>(pixel_count), 0);
-    std::map<std::pair<std::uint32_t, std::uint32_t>, std::size_t>
+    std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>, std::size_t>
         quad_indices;
     std::vector<FragmentQuad> fragment_quads;
     std::vector<FragmentInvocation> invocations;
+    std::uint64_t visible_pixels = 0;
     invocations.reserve(state.active_fragment_invocations);
     for (const FragmentCandidate &candidate : candidates) {
       if (candidate.parameter_index >= parameters.size()) {
@@ -123,6 +128,8 @@ void FragmentFrontend::Run() {
       if (pixel_seen[pixel_index] != 0) {
         if (!state.raster_state.blend.enable &&
             !RasterRequiresLateDepthStencil(state.raster_state) &&
+            !state.raster_state.shader_writes_memory &&
+            !state.raster_state.shader_may_discard && state.fragment_early_hsr_safe &&
             (pixel_seen[pixel_index] & candidate.sample_mask) != 0) {
           throw std::runtime_error(
               "FragmentFrontend received multiple opaque HSR owners");
@@ -140,6 +147,11 @@ void FragmentFrontend::Run() {
           candidate.y / kReferenceUarch.fragment_quad_height;
       const std::uint32_t quad_id = quad_y * quads_x + quad_x;
 
+      ++visible_pixels;
+      for (std::uint32_t sample_id = 0; sample_id < shader_samples; ++sample_id) {
+      if (state.raster_state.sample_frequency &&
+          (candidate.sample_mask & (1U << sample_id)) == 0)
+        continue;
       FragmentInvocation invocation;
       invocation.x = candidate.x;
       invocation.y = candidate.y;
@@ -147,14 +159,17 @@ void FragmentFrontend::Run() {
       invocation.parameter_index = candidate.parameter_index;
       invocation.submit_ordinal = candidate.submit_ordinal;
       invocation.quad_id = quad_id;
+      invocation.sample_id = static_cast<std::uint8_t>(sample_id);
       invocation.quad_lane = static_cast<std::uint8_t>(
           (candidate.y % kReferenceUarch.fragment_quad_height) *
               kReferenceUarch.fragment_quad_width +
           (candidate.x % kReferenceUarch.fragment_quad_width));
-      invocation.sample_mask = candidate.sample_mask;
+      invocation.sample_mask = state.raster_state.sample_frequency
+          ? (1U << sample_id) : candidate.sample_mask;
       invocation.front_facing = parameter.front_facing;
       invocation.layer = parameter.key.layer;
-      invocation.depth = candidate.depth;
+      invocation.depth = state.raster_state.sample_frequency
+          ? candidate.sample_depth[sample_id] : candidate.depth;
       for (std::uint32_t sample = 0; sample < state.raster_state.sample_count;
            ++sample) {
         if ((candidate.sample_mask & (1U << sample)) != 0 &&
@@ -168,20 +183,22 @@ void FragmentFrontend::Run() {
           static_cast<std::uint32_t>(invocations.size());
       invocations.push_back(invocation);
 
-      const std::pair<std::uint32_t, std::uint32_t> key = {
-          candidate.parameter_index, quad_id};
+      const std::tuple<std::uint32_t, std::uint32_t, std::uint32_t> key = {
+          candidate.parameter_index, quad_id, sample_id};
       auto [quad_it, inserted] =
           quad_indices.emplace(key, fragment_quads.size());
       if (inserted) {
         FragmentQuad quad;
         quad.parameter_index = candidate.parameter_index;
         quad.quad_id = quad_id;
+        quad.sample_id = static_cast<std::uint8_t>(sample_id);
         quad.submit_ordinal = candidate.submit_ordinal;
         fragment_quads.push_back(quad);
       }
       FragmentQuad &quad = fragment_quads[quad_it->second];
       if (quad.parameter_index != candidate.parameter_index ||
           quad.quad_id != quad_id ||
+          quad.sample_id != sample_id ||
           quad.submit_ordinal != candidate.submit_ordinal ||
           invocation.quad_lane >= 4) {
         throw std::runtime_error(
@@ -198,35 +215,39 @@ void FragmentFrontend::Run() {
       quad.invocation_indices[invocation.quad_lane] = invocation_index;
       quad.coverage_mask |= lane_bit;
       quad.write_mask |= lane_bit;
+      }
     }
-    if (invocations.size() != state.active_fragment_invocations) {
+    if (visible_pixels != state.active_fragment_invocations) {
       throw std::runtime_error(
           "FragmentFrontend visible invocation count mismatch");
     }
+    if (invocations.size() > std::numeric_limits<std::uint32_t>::max())
+      throw std::overflow_error("FragmentFrontend sample invocation count exceeds uint32_t");
+    state.active_fragment_invocations = invocations.size();
     if (!RasterRequiresLateDepthStencil(state.raster_state))
       MaterializeDepthAttachment(pool_, memory_, &state);
     std::vector<FragmentShaderLane> shader_lanes;
-    if (UsesTextureSampling(state, ShaderStage::kFragment)) {
-      // The selected reference USC dispatches a touched 4x2 SIMD half-stamp as
-      // two architectural 2x2 quads. Lanes outside coverage are helpers: they
-      // execute interpolation/SMP for derivatives and texture issue but never
-      // write. A half-stamp with no covered sample for that primitive is not
-      // issued. This spatial rule derives only from ISP work; it does not use
-      // an image size, case label, or expected texture counter.
+    if (UsesFragmentQuadLanes(state)) {
+      // Walk touched 4x2 half-stamps, but issue only their nonempty 2x2 quads.
+      // Within each issued quad, uncovered lanes execute as helpers for
+      // derivatives and texture issue without writing. The adjacent quad is
+      // not part of that derivative group: if it has no visible invocation,
+      // it has no functional shader work (regardless of any physical dispatch
+      // padding). Selection derives solely from ISP visibility.
       using PixelKey =
-          std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>;
+          std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>;
       std::map<PixelKey, std::uint32_t> visible_invocations;
       for (std::uint32_t index = 0; index < invocations.size(); ++index) {
         const FragmentInvocation &invocation = invocations[index];
         visible_invocations.emplace(
-            PixelKey{invocation.parameter_index, invocation.x, invocation.y},
+            PixelKey{invocation.parameter_index, invocation.x, invocation.y, invocation.sample_id},
             index);
       }
-      std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint8_t>
+      std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>, std::uint8_t>
           touched_half_stamps;
       const std::uint32_t half_stamps_x = static_cast<std::uint32_t>(
           CeilDivide(state.width, 4U));
-      for (const FragmentCandidate &candidate : candidates) {
+      for (const FragmentInvocation &candidate : invocations) {
         if (candidate.parameter_index >= parameters.size() ||
             candidate.x >= state.width || candidate.y >= state.height)
           throw std::runtime_error(
@@ -238,20 +259,19 @@ void FragmentFrontend::Run() {
          * alone created quads with no invocations when an early depth or
          * stencil test rejected the complete draw.
          */
-        if (candidate.visibility != FragmentVisibility::kVisible)
-          continue;
         const std::uint32_t half_stamp_id =
             (candidate.y / 2U) * half_stamps_x + candidate.x / 4U;
         touched_half_stamps.emplace(
-            std::make_pair(candidate.parameter_index, half_stamp_id), 1U);
+            std::make_tuple(candidate.parameter_index, half_stamp_id, candidate.sample_id), 1U);
       }
 
       fragment_quads.clear();
       shader_lanes.reserve(touched_half_stamps.size() * 8U);
       fragment_quads.reserve(touched_half_stamps.size() * 2U);
       for (const auto &entry : touched_half_stamps) {
-        const std::uint32_t parameter_index = entry.first.first;
-        const std::uint32_t half_stamp_id = entry.first.second;
+        const std::uint32_t parameter_index = std::get<0>(entry.first);
+        const std::uint32_t half_stamp_id = std::get<1>(entry.first);
+        const std::uint8_t sample_id = static_cast<std::uint8_t>(std::get<2>(entry.first));
         const std::uint32_t stamp_x =
             (half_stamp_id % half_stamps_x) * 4U;
         const std::uint32_t stamp_y =
@@ -265,11 +285,19 @@ void FragmentFrontend::Run() {
             FragmentQuad quad;
             quad.parameter_index = parameter_index;
             quad.quad_id = (quad_y / 2U) * quads_x + quad_x / 2U;
+            quad.sample_id = sample_id;
             quad.submit_ordinal = parameter.key.submit_ordinal;
+            if (quad_indices.find(std::make_tuple(parameter_index, quad.quad_id,
+                                                  std::uint32_t(sample_id))) ==
+                quad_indices.end())
+              continue;
             for (std::uint8_t lane = 0; lane < 4U; ++lane) {
               const std::uint32_t x = quad_x + lane % 2U;
               const std::uint32_t y = quad_y + lane / 2U;
-              if (x >= state.width || y >= state.height)
+              // Native derivatives need all four lanes even at an odd-sized
+              // viewport boundary. Out-of-bounds lanes are non-writing helpers.
+              if ((x >= state.width || y >= state.height) &&
+                  state.fragment_program_summary.uses_derivatives == 0)
                 continue;
               FragmentShaderLane shader_lane;
               shader_lane.x = x;
@@ -279,9 +307,10 @@ void FragmentFrontend::Run() {
               shader_lane.submit_ordinal = parameter.key.submit_ordinal;
               shader_lane.quad_id = quad.quad_id;
               shader_lane.quad_lane = lane;
-              shader_lane.sample_mask = 1;
+              shader_lane.sample_id = sample_id;
+              shader_lane.sample_mask = 0;
               const auto visible = visible_invocations.find(
-                  PixelKey{parameter_index, x, y});
+                  PixelKey{parameter_index, x, y, sample_id});
               const std::uint8_t lane_bit =
                   static_cast<std::uint8_t>(1U << lane);
               if (visible != visible_invocations.end()) {
@@ -320,7 +349,7 @@ void FragmentFrontend::Run() {
     }
     std::uint64_t grouped_invocations = 0;
     for (const FragmentQuad &quad : fragment_quads) {
-      const bool texture_case = UsesTextureSampling(state, ShaderStage::kFragment);
+      const bool texture_case = UsesFragmentQuadLanes(state);
       const std::uint8_t active_mask = static_cast<std::uint8_t>(
           quad.coverage_mask | quad.helper_mask);
       if ((!texture_case &&
@@ -365,7 +394,7 @@ void FragmentFrontend::Run() {
     }
 
     state.fragment_invocations = StoreNewArray(pool_, invocations);
-    if (UsesTextureSampling(state, ShaderStage::kFragment)) {
+    if (UsesFragmentQuadLanes(state)) {
       state.fragment_shader_lanes = StoreNewArray(pool_, shader_lanes);
       state.fragment_shader_lane_count =
           static_cast<std::uint32_t>(shader_lanes.size());

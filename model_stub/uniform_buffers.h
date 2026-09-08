@@ -52,7 +52,8 @@ inline bool ValidateDriverUniformBuffers(const DriverCommand &command,
       if (start != (stage >= 2 ? native_base : textures * 20U) || start > shared.size() ||
           count * kUniformBufferDescriptorDwordCount > shared.size() - start ||
           shared.size() != abi.shareds ||
-          abi.push_constant_start != start + count * kUniformBufferDescriptorDwordCount ||
+          abi.push_constant_start != start + count * kUniformBufferDescriptorDwordCount +
+              (stage == 1 ? command.fragment_image_descriptor_count * 8U : 0U) ||
           abi.push_constant_count > shared.size() - abi.push_constant_start ||
           abi.push_constant_start + abi.push_constant_count != shared.size())
         return reject("descriptor/texture/push-constant layout is inconsistent");

@@ -8,12 +8,70 @@ bring-up seam: small enough to debug quickly, strict enough to prevent fake
 passes, and close enough to Gallium state that the driver can grow phase by
 phase.
 
-## Current contracts: graphics API 27 and compute API 4
+## Current contracts: graphics API 30 and compute API 6
+
+Native fragment control flow supports relative group-boundary branches and
+ST/EF/SM/LT/END execution masks. The compiler admits fragment `break`, including
+uniform derivative loops and early-exit sample-mask scans; `continue` and
+vertex loops remain gated. Derivative rendezvous requires all four covered or
+helper lanes at the same native checkpoint. Repeated or conditionally omitted
+SMP requests still fail closed at the existing static texture-request contract.
+A per-lane 10,000,000-group watchdog persists across continuations; exceeding
+it is an execution failure, not successful completion of a long/infinite loop.
+
+Fragment ALU/TEX/MEM counters are accumulated while native instructions execute,
+then carried through SMP/derivative continuations and committed once per lane.
+They count selected opcode groups with their encoded repeats, not internal
+phases or result DWORDs. Predicated-off work is excluded; helper ALU/texture
+work is included, but suppressed helper/discarded image atomics are not memory
+requests. Branch visits retain the existing ALU classification; CND/WDF remain
+control-only. Static binary opcode histograms are separately reported and are
+not multiplied to manufacture loop execution counts.
 
 The numbered sections below describe the features at their introduction.
-Current callers must use graphics version **27** and independent compute
-version **4**; both entry points reject older versions before reading new
+Current callers must use graphics version **30** and independent compute
+version **6**; both entry points reject older versions before reading new
 tails. They must be rebuilt with the matching headers and runtime together.
+
+Graphics API 28 introduced native sample-frequency state described below.
+API 29 adds immutable fragment-image view snapshots and the explicit
+`fragment_early_tests` flag to physical nested draws, never the logical sequence
+envelope. Its current compiler path supports native R32UI 2D `imageAtomicAdd`;
+unsupported image formats/dimensions and combined image/discard shaders remain
+fail-closed. No ComputeShader dispatch substitutes for fragment execution.
+
+Fragment SHARED is sampled-texture20, UBO4, image8 per slot, then CB0. Each image
+descriptor is `[baseLo, baseHi, depth, layerStride, width, height, rowStride,
+texelBytes]`; the borrowed input has zero base words, relocated only after an
+owned whole-BO copy reaches modeled GPU memory. At most 32 slots and 256 MiB
+per backing BO are accepted. Slots, masks, alignment, extents, canonical holes,
+and alias snapshots must agree. Same-token views share storage, including
+different offsets and ordered draws. Helper fragments and native out-of-bounds
+paths issue no atomic write; continuation does not replay an earlier atomic.
+
+`pvrgpu_systemc_flush_shader_image` publishes only a completed submission's
+exact resource token and whole-BO extent. Readback and submit versions are
+checked before accessing their tails. Invalid payload copies return an error
+across the C ABI, and neither stale generations nor malformed requests publish
+bytes. Driver writeback preserves unrelated rows, padding and subresources.
+
+Memory-writing fragments disable opaque hidden-surface replacement. Without
+explicit early tests, depth/stencil runs after native shader side effects;
+with early tests, rejected samples never invoke the shader, while later shader
+discard cannot undo already committed depth/stencil. Native feedback, not host
+shader evaluation, determines discard and depth export.
+
+Live array-primitive sequences flush at their 256-draw capacity, retaining the
+actual per-sample color/depth contents as the next chunk's LOAD input. Failed
+attachment materialization invalidates the boundary instead of loading stale
+CPU bytes. API 30 extends the existing initial-color byte buffer to target-major
+contents for every color attachment (then layers, pixels, and samples). All
+targets retain the generic path's same-format constraint. Submission deep-copies
+and imports each target through modeled DRAM; ordered aliases preserve every
+target and PBE loads each target independently. This also preserves untouched
+pixels/channels across flush/readback boundaries. Older runtimes are rejected
+even though no struct fields were added. Explicit RDC frame-length ownership
+remains unchanged.
 
 Graphics API 27 adds `framebuffer_layers` to physical nested PCO draws: zero
 means a non-layered attachment, otherwise 1–256 layer-major images. The model
@@ -50,6 +108,37 @@ metadata determines its physical layer address; 3D depth shrinks per mip.
 MS fetch continues to use the separate SNO path. Compressed non-MS fetch,
 cube fetch and 3D-array views remain rejected.
 
+The reference TPU keeps nonfinite shader values in the ISS and sample request.
+For an undefined cube direction (NaN, infinity, or the zero vector), projected
+NaN address coordinates map to zero and infinities saturate to an edge before
+any float-to-integer conversion. An undefined coarse-quad footprint selects the
+sampler's minimum LOD, while diagnostic derivative fields retain their raw
+values. Sampling still performs descriptor-driven texel reads and filtering;
+it does not supply a replacement shader color. This is a deterministic model
+policy for undefined inputs, not physical Rogue behavior or a requirement to
+match llvmpipe's undefined pixels. Finite nonzero directions that encounter an
+unmodeled common-face projection singularity/overflow still fail closed.
+Descriptor, allocation, quad identity and memory-response checks are unchanged.
+PBE independently maps shader NaNs to zero for normalized color conversion and
+clamps infinities to the UNORM endpoints; raw float/integer attachments retain
+their typed transport. Shader arithmetic itself is not rewritten.
+
+Fragment USC register contexts and saved continuations have a bounded host
+working set of 256 complete quads. The scheduler runs every task, preserves
+global lane identity across texture FIFOs and writes results to the original
+visible-invocation indices. Derivative rendezvous and helper lanes remain
+within their original quad; suspended ISA is resumed, not re-executed. This
+host-memory policy neither caps draw work nor models physical Rogue occupancy.
+It may change cache traffic, FIFO rounds and modeled timing. Image atomics
+remain indivisible and execute exactly once in each invocation's ISA order;
+cross-invocation atomic return order is not fixed to the previous schedule.
+Each fragment draw also owns an immutable copy of its decoded program, validated
+and fingerprinted once. This removes repeated host-side static scans, not
+modeled shader instructions. Every resume still validates its checkpoint,
+register masks, counters, control-flow state and actual response. The public
+mutable-vector ISS interface continues to revalidate and fingerprint its input;
+callers cannot provide an unchecked trusted hash.
+
 Native TES Transform Feedback uses the independent StreamOutput module after
 evaluation, capturing complete domain-output primitives rather than patch
 inputs. It shares VS range/cursor/overflow/generation rules. GS Transform
@@ -63,8 +152,17 @@ independent image binding namespace, sharing the deduplicated `resources[]`
 ownership of UBO/SSBO views. The canonical SHARED layout is UBO4, SSBO4,
 image8 per slot, optional private-workgroup4, then CB0. Each image descriptor
 contains base low/high, byte extent, zero, width, height, row stride, and format.
-The current image format is linear R32UI image2D, including mip/view offsets;
-array/multisample image operations and other image formats remain rejected.
+API 4 initially supported linear R32UI image2D, including mip/view offsets.
+API 5 expands image views with depth, layer stride and texel width; supported
+format conversion and texel addressing execute in native PCO.
+
+Compute API 6 prefixes SHARED with 20 DWORDs per sampled texture. Independent
+ComputeShader SMP/WDF requests travel through its own TextureUnit FIFOs; VS/FS
+invocation counters remain zero. Sampled images use owned external snapshots,
+not graphics attachment producer indices, and do not alias writable image
+snapshots without an explicit shared-backing contract. Compute remains a
+separate SystemC module, as do geometry and tessellation stages. Graphics and
+compute use the same configured memory mode; live runs default to cache mode.
 
 The compiler calculates real image texel addresses and executes native
 LD/ST/AMO through ComputeShader's memory FIFO. It checks image-coordinate
@@ -326,6 +424,122 @@ QPA Pass with refused draws is not evidence of native completion. Multilevel
 array layout, sample-frequency shading, image atomics and shared-memory compute
 are outside this sampled-image change.
 
+### Native derivative compiler encoding
+
+The pinned PCO backend also requires
+`third_party/mesa-26.2.1-pco-fine-derivatives.patch`. Its unmodified FDSXF/FDSYF
+short encodings accidentally select coarse FDSX/FDSY. The patch preserves the
+NIR fine mode in the native opcode; it does not reinterpret coarse instructions
+in the ISS. Apply/check it from the selected external Mesa source directory:
+
+```sh
+git apply --check /absolute/PvrGPU/third_party/mesa-26.2.1-pco-fine-derivatives.patch
+git apply /absolute/PvrGPU/third_party/mesa-26.2.1-pco-fine-derivatives.patch
+# An already-patched checkout must instead pass this read-only check:
+git apply --reverse --check /absolute/PvrGPU/third_party/mesa-26.2.1-pco-fine-derivatives.patch
+```
+
+Regenerate the PCO encoder and compiler archive with
+`ninja -C /absolute/mesa-build src/imagination/pco/libpowervr_compiler.a`, then
+run `bash script/run_mesa_pco_texture_unit.sh` from PvrGPU. That isolated test
+compiles all six derivative variants to real PCO, checks the encoded axis and
+fine mode, and resumes four native fragment continuations after their quad
+exchange. Texture regressions additionally cover zero-gradient `textureGrad`
+producing negative-infinite LOD, which is clamped by sampler bounds before mip
+selection, and signed 3D spatial offsets.
+
+### Native sample-frequency shading (SystemC API v28)
+
+Generic graphics commands carry `sample_frequency` (0: pixel, 1: sample).
+Gallium's minimum-samples callback and fragment sample-variable/qualifier usage
+select the latter; a minimum greater than one may legally execute all samples.
+The ISP coverage remains authoritative. FragmentFrontend creates one native
+invocation per covered sample, preserving a single-bit mask and the sample's
+depth. Quad keys retain sample identity, including derivative/texture helper
+lanes, whose coverage is zero. Pixel-frequency commands retain the old path.
+
+`gl_SampleID` uses native SR_SAMP_NUM; `gl_SampleMaskIn` uses native SAVMSK.VM
+after the ISP has applied API sample masking. Sample positions are selected by
+native shader ALU from the standard sixteenth-pixel position table and actual
+PCK.COV sample-count state. The sample-coordinate registers and FITRP.SAMPLE
+position remain separate from the pixel-center interpolation origin.
+
+Fragment sample-mask stores preserve last-assignment semantics in NIR and
+become a per-sample native ISP feedback test at the epilog. Ordinary shader
+discard and depth feedback also use real PCO instructions; no output color is
+copied across samples as a replacement for shader execution. The model must
+select late depth/stencil for these instructions so discarded samples cannot
+commit either color or depth. Optional audit-text `sample_frequency` defaults
+to zero for older captures and rejects values above one.
+
+Sample-mask output is ignored for a true single-sample attachment, but applies
+to a multisample attachment even when its sample count is one. The per-draw
+generic compiler specializes this fixed-function distinction using the
+attachment's original `pipe_resource.nr_samples != 0`, not the normalized
+model raster count. Removing single-sample mask stores must not remove an
+ordinary shader `discard` or a depth write.
+
+### Generic nearest depth-shadow sampling
+
+The native VS/FS path supports non-array 2D shadow sampling with nearest
+magnification, nearest minification, and no mip filtering or nearest mip
+selection. The captured sampler descriptor stores the compare operation in
+SH12; SH7 bit 8 identifies an original UNORM depth view. Pinned PCO clamps the
+reference for UNORM, and native floating comparisons implement all eight
+`PIPE_FUNC` modes as `reference op sampled_depth`. The native SMP returns four
+channels and shader ALU selects depth channel zero. The isolated texture unit
+test checks both shader stages, implicit/explicit/gradient LOD, and all compare
+modes, including equality, out-of-range references and float-depth NaNs.
+
+Linear minification, magnification or mip filtering remains explicitly
+unsupported for shadow sampling. Comparing one already-filtered depth is not
+percentage-closer filtering: correct PCF compares each sampled depth before
+interpolating the comparison results. The nearest path does not claim PCF.
+
+### Explicit fragment interpolation
+
+For `interpolateAtOffset` and `interpolateAtSample`, the generic compiler uses
+standard NIR IO/barycentric lowering, then reads real native coefficient
+registers and evaluates the varying with FMA and perspective division in the
+shader. `floor(gl_FragCoord.xy) + offset` matches the model's existing
+center-biased coefficient constants; sample offsets are `samplePosition - 0.5`.
+There is no additional half-pixel bias and no substitution of global plane
+coefficients for hardware tile-local coefficients. Components and resolved
+array locations retain their independently allocated coefficient bindings.
+`interpolateAtCentroid` retains native FITRP.CENTROID and the runtime's geometric
+centroid selection. The isolated native tests cover smooth/noperspective
+offset/sample operations, scalar component selection, multiple array elements,
+centroid, every standard sample ID, and negative helper pixel coordinates.
+
+For a single-sample buffer, sample-position interpolation uses `(0.5, 0.5)`
+for every integer sample index, including large and negative bit patterns.
+Native centroid selection keeps its preferred covered-sample position when
+inside the original floating-point primitive; if fixed-point raster coverage
+has moved the edge past that point, it selects the centroid of the original
+triangle clipped to the pixel. It never clamps shader outputs or varyings.
+
+### Native fragment loop control
+
+The generic FS path supports native conditional execution masks and backward
+branches, including uniform derivative loops and early-break mask scans.
+Branch byte offsets must resolve to real native group boundaries; unknown
+targets and exhausted execution budgets fail closed. Continuations preserve
+the live temporary bank, conditional mask and execution progress across quad
+derivative rendezvous. A resumed loop must not replay already completed
+side effects. VS loops, generic `continue`, and repeated texture sampling
+inside a loop are not claimed by this bounded FS extension.
+For a non-multisample target, an arbitrary `interpolateAtSample` index still
+selects the pixel center; the native single-sample selector therefore ignores
+the index before returning `(0.5, 0.5)`.
+
+Generic fragment loops may use `break` after native branch/CND execution was
+validated, including saved execution masks across derivative suspension.
+Vertex loop control and generic `continue` remain gated independently. Run
+`bash script/run_mesa_pco_fragment_loop_unit.sh` to regenerate real compiler
+fixtures and exercise native uniform-loop derivatives, early sample-mask bit
+scan breaks, the subsequent runtime-bound loop, and malformed/resume negative
+tests under ASan/UBSan. No loop bound or output is substituted on the host.
+
 ## Multisample alpha operations (introduced in SystemC API v22)
 
 Each physical draw snapshots three boolean fields: `alpha_to_coverage`,
@@ -333,7 +547,7 @@ Each physical draw snapshots three boolean fields: `alpha_to_coverage`,
 them and copy them into the draw's `RasterState`; they are not context-global
 values read after a deferred draw. Both top-level and nested old-version
 commands are rejected before accessing their new tail. Current callers use
-graphics API 27 and the independent compute API 4, as described above.
+graphics API 30 and the independent compute API 6, as described above.
 
 The model adapts Mesa 26.2.1 llvmpipe's pixel-frequency alpha-to-coverage
 algorithm: sample s survives when the original DATA0 alpha is greater than
@@ -428,13 +642,16 @@ framebuffer switch or CPU blit does not implicitly clear the existing image.
 The bridge owns a deep copy; Submitter imports it into DRAM and reads it through
 the normal PBE LOAD path before executing the shaders.
 
-The payload requires `ATTACHMENT_NEW_CLEAR`, one color target, and the complete
-tightly packed framebuffer extent. RGBA8 transport uses 4 bytes per pixel;
+The payload requires `ATTACHMENT_NEW_CLEAR` and the complete tightly packed
+framebuffer extent. API v30 concatenates every bound color target in target-major
+order (then layer, pixel, sample); all targets use the command's common format.
+RGBA8 transport uses 4 bytes per pixel;
 integer R32, RG32 and RGBA32 transport uses 4, 8 and 16. Floating-point color
 targets use 16-byte RGBA32F transport, preserving negative values and HDR.
-Native formats are unpacked/packed by the driver. The payload must fit the
+Native formats are unpacked/packed by the driver. Each target must fit its
 16 MiB attachment slot. Other normalized targets still use RGBA8 transport.
-Additional MRT target initial contents are not represented by this field.
+Every MRT attachment keeps its own LOAD contents across sequence aliases and
+synchronous Gallium flush/readback boundaries; partial target payloads fail closed.
 
 API v20 adds `raster_samples` (zero defaults to one), with pixel-interleaved
 samples throughout LOAD, ISP depth/stencil, PBE blending and DRAM readback.

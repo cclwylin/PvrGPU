@@ -177,9 +177,12 @@ std::uint32_t WrapTexelIndex(std::int64_t integer, std::uint32_t extent,
 
 // lp_build_sample_image_nearest: floor(coord * extent), then the integer
 // wrap of lp_build_sample_wrap_nearest_int.
+// texel_offset is SMP.SOO's signed offset in this mip's texels. It is
+// applied before wrapping/clamping, independently at each selected level.
 std::uint32_t ComputeTextureNearestRepeat(float coordinate,
                                           std::uint32_t extent,
-                                          TextureWrapMode wrap);
+                                          TextureWrapMode wrap,
+                                          std::int32_t texel_offset = 0);
 
 // lp_build_sample_image_linear: iround(coord * extent * 256) - 128, the tap
 // is the quotient by 256 and the weight the remainder, then the integer wrap
@@ -188,7 +191,7 @@ std::uint32_t ComputeTextureNearestRepeat(float coordinate,
 TextureLinearAxis ComputeTextureLinearRepeat(
     float coordinate, std::uint32_t extent,
     TextureWrapMode wrap = TextureWrapMode::kRepeat,
-    float round_threshold = 0.5F);
+    float round_threshold = 0.5F, std::int32_t texel_offset = 0);
 
 // lp_build_lerp on an 8-bit normalized type: first + RNE(weight * (second -
 // first) / 256).
@@ -200,13 +203,15 @@ std::uint8_t LerpTextureUnorm8(std::uint8_t first, std::uint8_t second,
 // lp_build_sample_wrap_nearest.
 std::uint32_t ComputeTextureFloatNearest(float coordinate,
                                          std::uint32_t extent,
-                                         TextureWrapMode wrap);
+                                         TextureWrapMode wrap,
+                                         std::int32_t texel_offset = 0);
 
 // lp_build_sample_wrap_linear: coord * extent - 0.5, floor for the lower tap
 // and the fraction for the weight, then the per-mode wrap of both taps.
 TextureFloatAxis ComputeTextureFloatLinear(float coordinate,
                                            std::uint32_t extent,
-                                           TextureWrapMode wrap);
+                                           TextureWrapMode wrap,
+                                           std::int32_t texel_offset = 0);
 
 // lp_build_lerp_simple on a float type: first + weight * (second - first).
 float LerpTextureFloat(float first, float second, float weight);

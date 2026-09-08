@@ -15,6 +15,10 @@
 #include <stdlib.h>
 
 static const nir_shader_compiler_options pvrgpu_nir_options = {
+   /* Keep discarded fragments executing as helpers for later derivatives and
+    * implicit-LOD texture samples. Lowering terminate later also inserts a
+    * halt, which would incorrectly remove these lanes from their quads. */
+   .discard_is_demote = true,
    .max_unroll_iterations = 32,
 };
 
@@ -123,6 +127,13 @@ pvrgpu_get_screen_fd(struct pipe_screen *screen)
    return -1;
 }
 
+struct pipe_fence_handle *
+pvrgpu_failed_fence(void)
+{
+   static unsigned char failed;
+   return (struct pipe_fence_handle *)&failed;
+}
+
 static void
 pvrgpu_fence_reference(struct pipe_screen *screen,
                        struct pipe_fence_handle **ptr,
@@ -144,12 +155,18 @@ pvrgpu_fence_finish(struct pipe_screen *screen,
                     uint64_t timeout)
 {
    (void)screen;
+   /* Work is synchronous: only NULL denotes successful completion. The
+    * persistent failure token, and any unknown non-NULL handle, fail closed.
+    * Mesa's st_finish currently ignores this false return; callers still need
+    * the submission error diagnostics. Sync-object waits do honor it. */
+   const bool complete = fence == NULL;
    pvrgpu_counter_eventf("fence_finish",
-                         "has_context=%u has_fence=%u timeout=%llu complete=1",
+                         "has_context=%u has_fence=%u timeout=%llu complete=%u",
                          ctx ? 1 : 0,
                          fence ? 1 : 0,
-                         (unsigned long long)timeout);
-   return true;
+                         (unsigned long long)timeout,
+                         complete ? 1 : 0);
+   return complete;
 }
 
 static void

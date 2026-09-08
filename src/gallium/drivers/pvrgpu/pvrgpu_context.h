@@ -93,6 +93,7 @@ struct pvrgpu_context {
    struct pipe_blend_color blend_color;
    struct pipe_stencil_ref stencil_ref;
    unsigned sample_mask;
+   unsigned min_samples;
    struct pipe_viewport_state viewport;
    bool has_viewport;
    struct pipe_scissor_state scissor;

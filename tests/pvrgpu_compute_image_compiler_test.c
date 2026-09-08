@@ -43,7 +43,9 @@ static nir_shader *image_shader(unsigned kind, bool dereference_images)
             .atomic_op = nir_atomic_op_iadd);
          nir_store_ssbo(&b, old, zero, offset, .write_mask = 1, .align_mul = 4);
       } else {
-         nir_image_store(&b, slot, coords, sample, nir_vec4(&b, value, zero, zero, zero), zero,
+         nir_image_store(&b, slot, coords, sample, nir_vec4(&b, value,
+            nir_iadd_imm(&b, value, 1), nir_iadd_imm(&b, value, 2),
+            nir_iadd_imm(&b, value, 3)), zero,
             .image_dim = GLSL_SAMPLER_DIM_2D, .format = PIPE_FORMAT_R32_UINT,
             .src_type = nir_type_uint32);
          if (kind == 35 || kind == 38) {
@@ -130,7 +132,7 @@ int main(int argc, char **argv)
          nir_foreach_variable_with_modes(var, nir, nir_var_image) {
             if (bad == 0) var->data.bindless = true;
             if (bad == 1) var->data.driver_location = 32;
-            if (bad == 2) var->data.image.format = PIPE_FORMAT_R32_FLOAT;
+            if (bad == 2) var->data.image.format = PIPE_FORMAT_DXT1_RGB;
             if (bad == 3) var->data.driver_location = 31; // array element 1 exceeds slot 31
          }
       } else {
@@ -143,7 +145,7 @@ int main(int argc, char **argv)
                   if (intr->intrinsic != nir_intrinsic_image_load) continue;
                   b.cursor = nir_before_instr(instr);
                   if (bad == 4) nir_intrinsic_set_range_base(intr, 1);
-                  if (bad == 5) nir_intrinsic_set_image_array(intr, true);
+                  if (bad == 5) nir_intrinsic_set_image_dim(intr, GLSL_SAMPLER_DIM_MS);
                   if (bad == 6) nir_src_rewrite(&intr->src[3], nir_imm_int(&b, 1));
                   if (bad == 7) nir_src_rewrite(&intr->src[0], nir_load_local_invocation_index(&b));
                   if (bad == 8) nir_intrinsic_set_format(intr, PIPE_FORMAT_NONE);
@@ -158,8 +160,81 @@ int main(int argc, char **argv)
             "unsupported image binding/format/LOD must fail closed");
       ralloc_free(nir);
    }
+   const enum pipe_format formats[] = {
+      PIPE_FORMAT_R32_SINT, PIPE_FORMAT_R32_FLOAT,
+      PIPE_FORMAT_R32G32B32A32_UINT, PIPE_FORMAT_R32G32B32A32_SINT,
+      PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R16G16B16A16_UINT,
+      PIPE_FORMAT_R16G16B16A16_SINT, PIPE_FORMAT_R16G16B16A16_FLOAT,
+      PIPE_FORMAT_R8G8B8A8_UINT, PIPE_FORMAT_R8G8B8A8_SINT,
+      PIPE_FORMAT_R8G8B8A8_UNORM, PIPE_FORMAT_R8G8B8A8_SNORM,
+   };
+   for (unsigned shape = 0; shape < 4; ++shape)
+   for (unsigned f = 0; f < sizeof(formats) / sizeof(formats[0]); ++f)
+   for (unsigned write = 0; write < 2; ++write) {
+      nir_shader *nir = image_shader(write ? 33 : 32, false);
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic) continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != nir_intrinsic_image_load &&
+                   intr->intrinsic != nir_intrinsic_image_store &&
+                   intr->intrinsic != nir_intrinsic_image_size) continue;
+               nir_intrinsic_set_format(intr, formats[f]);
+               nir_intrinsic_set_image_dim(intr, shape == 1 ? GLSL_SAMPLER_DIM_3D :
+                  shape == 2 ? GLSL_SAMPLER_DIM_CUBE : GLSL_SAMPLER_DIM_2D);
+               nir_intrinsic_set_image_array(intr, shape == 3);
+               if (intr->intrinsic == nir_intrinsic_image_size && (shape == 1 || shape == 3))
+                  intr->def.num_components = 3;
+            }
+         }
+      }
+      struct pvrgpu_pco_compute_binary native = {0};
+      check(pvrgpu_pco_compile_compute(compiler, nir, 0, &native, error, sizeof(error)), error);
+      check(native.data && native.size && native.abi.image_used_mask == 2,
+            "native format/layered image program");
+      save_binary(argc > 1 ? argv[1] : NULL, 100 + shape * 24 + f * 2 + write, &native);
+      pvrgpu_pco_compute_binary_finish(&native);
+      ralloc_free(nir);
+   }
+   const nir_atomic_op operations[] = {nir_atomic_op_iadd, nir_atomic_op_xchg,
+      nir_atomic_op_umin, nir_atomic_op_imin, nir_atomic_op_umax, nir_atomic_op_imax,
+      nir_atomic_op_iand, nir_atomic_op_ior, nir_atomic_op_ixor, nir_atomic_op_cmpxchg};
+   for (unsigned format = 0; format < 3; ++format)
+   for (unsigned op = 0; op < 10; ++op) {
+      if (format == 2 && op != 1) continue;
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+         pco_nir_options(), "native_layered_image_atomic");
+      b.shader->info.workgroup_size[0] = 4;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      const enum pipe_format pixel_format = format == 0 ? PIPE_FORMAT_R32_UINT :
+         format == 1 ? PIPE_FORMAT_R32_SINT : PIPE_FORMAT_R32_FLOAT;
+      nir_def *id = nir_load_local_invocation_index(&b);
+      nir_def *zero = nir_imm_int(&b, 0);
+      nir_def *coords = nir_vec4(&b, zero, zero, zero, zero);
+      nir_def *value;
+      if (op == 9)
+         value = nir_image_atomic_swap(&b, 32, zero, coords, zero, id,
+            nir_iadd_imm(&b, id, 1), .image_dim = GLSL_SAMPLER_DIM_3D,
+            .format = pixel_format, .atomic_op = operations[op]);
+      else
+         value = nir_image_atomic(&b, 32, zero, coords, zero, id,
+            .image_dim = GLSL_SAMPLER_DIM_3D, .format = pixel_format,
+            .atomic_op = operations[op]);
+      nir_store_ssbo(&b, value, zero, nir_imul_imm(&b, id, 4),
+         .write_mask = 1, .align_mul = 4);
+      nir_shader_gather_info(b.shader, b.impl);
+      b.shader->info.num_images = b.shader->info.num_ssbos = 1;
+      struct pvrgpu_pco_compute_binary native = {0};
+      check(pvrgpu_pco_compile_compute(compiler, b.shader, 0, &native, error, sizeof(error)), error);
+      check(native.abi.image_read_mask == 1 && native.abi.image_write_mask == 1,
+            "image atomics require genuine native read-modify-write ownership");
+      save_binary(argc > 1 ? argv[1] : NULL, 200 + format * 10 + op, &native);
+      pvrgpu_pco_compute_binary_finish(&native);
+      ralloc_free(b.shader);
+   }
    pvrgpu_pco_compiler_destroy(compiler);
    glsl_type_singleton_decref();
-   puts("native image compiler: PASS 14 indexed/dereferenced image2D R32UI programs and 9 rejected inputs");
+   puts("native image compiler: PASS 14 R32UI + 96 format/layered + 21 atomic programs and 9 rejected inputs");
    return 0;
 }

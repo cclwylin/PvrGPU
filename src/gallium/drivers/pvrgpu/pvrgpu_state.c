@@ -700,8 +700,8 @@ pvrgpu_set_sample_mask(struct pipe_context *pipe, unsigned sample_mask)
 static void
 pvrgpu_set_min_samples(struct pipe_context *pipe, unsigned min_samples)
 {
-   (void)pipe;
-   (void)min_samples;
+   pvrgpu_context(pipe)->min_samples = min_samples;
+   pvrgpu_counter_eventf("set_min_samples", "count=%u", min_samples);
 }
 
 static void

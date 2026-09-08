@@ -40,8 +40,9 @@ float FractSafe(float coordinate) {
 
 std::int64_t FloorToInt64(float value) {
   const float floored = std::floor(value);
-  if (floored < static_cast<float>(std::numeric_limits<std::int64_t>::min()) ||
-      floored > static_cast<float>(std::numeric_limits<std::int64_t>::max())) {
+  if (!std::isfinite(floored) ||
+      floored < static_cast<float>(std::numeric_limits<std::int64_t>::min()) ||
+      floored >= static_cast<float>(std::numeric_limits<std::int64_t>::max())) {
     throw std::overflow_error("TextureUnit normalized coordinate overflow");
   }
   return static_cast<std::int64_t>(floored);
@@ -50,10 +51,17 @@ std::int64_t FloorToInt64(float value) {
 std::int64_t TruncToInt64(float value) {
   if (!std::isfinite(value) ||
       value < static_cast<float>(std::numeric_limits<std::int64_t>::min()) ||
-      value > static_cast<float>(std::numeric_limits<std::int64_t>::max())) {
+      value >= static_cast<float>(std::numeric_limits<std::int64_t>::max())) {
     throw std::overflow_error("TextureUnit normalized coordinate overflow");
   }
   return static_cast<std::int64_t>(value);
+}
+
+std::int64_t AddTexelOffset(std::int64_t value, std::int64_t offset) {
+  if ((offset > 0 && value > std::numeric_limits<std::int64_t>::max() - offset) ||
+      (offset < 0 && value < std::numeric_limits<std::int64_t>::min() - offset))
+    throw std::overflow_error("TextureUnit spatial offset overflows texel address");
+  return value + offset;
 }
 
 std::uint32_t ClampIndex(std::int64_t index, std::uint32_t extent) {
@@ -234,18 +242,21 @@ std::uint32_t WrapTexelIndex(std::int64_t integer, std::uint32_t extent,
 
 std::uint32_t ComputeTextureNearestRepeat(float coordinate,
                                           std::uint32_t extent,
-                                          TextureWrapMode wrap) {
+                                          TextureWrapMode wrap,
+                                          std::int32_t texel_offset) {
   RequireCoordinate(coordinate, extent);
   const float extent_f = static_cast<float>(extent);
   switch (wrap) {
   case TextureWrapMode::kRepeat:
     if (IsPowerOfTwo(extent))
-      return WrapTexelIndex(FloorToInt64(coordinate * extent_f), extent, wrap);
+      return WrapTexelIndex(AddTexelOffset(FloorToInt64(coordinate * extent_f), texel_offset), extent, wrap);
     // lp_build_sample_wrap_nearest_int, non-power-of-two: the fraction of
     // the coordinate scaled and truncated.
+    if (texel_offset)
+      coordinate += static_cast<float>(texel_offset) / extent_f;
     return ClampIndex(TruncToInt64(FractSafe(coordinate) * extent_f), extent);
   case TextureWrapMode::kClampToEdge:
-    return ClampIndex(FloorToInt64(coordinate * extent_f), extent);
+    return ClampIndex(AddTexelOffset(FloorToInt64(coordinate * extent_f), texel_offset), extent);
   default:
     throw std::runtime_error(
         "TextureUnit fixed-point nearest addressing supports repeat and clamp");
@@ -255,7 +266,8 @@ std::uint32_t ComputeTextureNearestRepeat(float coordinate,
 TextureLinearAxis ComputeTextureLinearRepeat(float coordinate,
                                              std::uint32_t extent,
                                              TextureWrapMode wrap,
-                                             float round_threshold) {
+                                             float round_threshold,
+                                             std::int32_t texel_offset) {
   RequireCoordinate(coordinate, extent);
   if (!std::isfinite(round_threshold) || round_threshold < 0.0F ||
       round_threshold > 1.0F) {
@@ -263,6 +275,8 @@ TextureLinearAxis ComputeTextureLinearRepeat(float coordinate,
   }
   const bool npot_repeat =
       wrap == TextureWrapMode::kRepeat && !IsPowerOfTwo(extent);
+  if (npot_repeat && texel_offset)
+    coordinate += static_cast<float>(texel_offset) / static_cast<float>(extent);
   // The 8-bit UNORM filter datapath multiplies the live binary32 coordinate
   // by N*256 in binary32, rounds to nearest-even, then subtracts the
   // half-texel centre (128).  A non-power-of-two repeat scales the fractional
@@ -291,7 +305,8 @@ TextureLinearAxis ComputeTextureLinearRepeat(float coordinate,
         (rounded & INT64_C(1)) != 0))) {
     ++rounded;
   }
-  const std::int64_t centered = rounded - 128;
+  const std::int64_t centered = AddTexelOffset(rounded - 128,
+      npot_repeat ? 0 : static_cast<std::int64_t>(texel_offset) * 256);
   const std::int64_t lower_integer =
       centered >= 0 ? centered / 256 : -((-centered + 255) / 256);
   const std::int64_t weight = centered - lower_integer * 256;
@@ -349,17 +364,22 @@ std::uint8_t LerpTextureUnorm8(std::uint8_t first, std::uint8_t second,
 
 std::uint32_t ComputeTextureFloatNearest(float coordinate,
                                          std::uint32_t extent,
-                                         TextureWrapMode wrap) {
+                                         TextureWrapMode wrap,
+                                         std::int32_t texel_offset) {
   RequireCoordinate(coordinate, extent);
   const float extent_f = static_cast<float>(extent);
   switch (wrap) {
   case TextureWrapMode::kRepeat:
     if (IsPowerOfTwo(extent))
-      return WrapTexelIndex(FloorToInt64(coordinate * extent_f), extent, wrap);
+      return WrapTexelIndex(AddTexelOffset(FloorToInt64(coordinate * extent_f), texel_offset), extent, wrap);
+    if (texel_offset)
+      coordinate += static_cast<float>(texel_offset) / extent_f;
     return ClampIndex(TruncToInt64(FractSafe(coordinate) * extent_f), extent);
   case TextureWrapMode::kClampToEdge:
-    return ClampIndex(TruncToInt64(coordinate * extent_f), extent);
+    return ClampIndex(TruncToInt64(coordinate * extent_f + static_cast<float>(texel_offset)), extent);
   case TextureWrapMode::kMirroredRepeat:
+    if (texel_offset)
+      coordinate += static_cast<float>(texel_offset) / extent_f;
     return ClampIndex(TruncToInt64(MirrorCoordinate(coordinate) * extent_f),
                       extent);
   default:
@@ -369,14 +389,15 @@ std::uint32_t ComputeTextureFloatNearest(float coordinate,
 
 TextureFloatAxis ComputeTextureFloatLinear(float coordinate,
                                            std::uint32_t extent,
-                                           TextureWrapMode wrap) {
+                                           TextureWrapMode wrap,
+                                           std::int32_t texel_offset) {
   RequireCoordinate(coordinate, extent);
   const float extent_f = static_cast<float>(extent);
   TextureFloatAxis result;
   switch (wrap) {
   case TextureWrapMode::kRepeat: {
     if (IsPowerOfTwo(extent)) {
-      const float centred = coordinate * extent_f - 0.5F;
+      const float centred = coordinate * extent_f - 0.5F + static_cast<float>(texel_offset);
       const std::int64_t lower = FloorToInt64(centred);
       result.weight = centred - static_cast<float>(lower);
       result.lower = WrapTexelIndex(lower, extent, wrap);
@@ -385,6 +406,8 @@ TextureFloatAxis ComputeTextureFloatLinear(float coordinate,
     }
     // lp_build_coord_repeat_npot_linear: scale the fraction, so the lower
     // tap is at most one texel before the first and wraps to the last.
+    if (texel_offset)
+      coordinate += static_cast<float>(texel_offset) / extent_f;
     const float centred =
         (coordinate - std::floor(coordinate)) * extent_f - 0.5F;
     std::int64_t lower = FloorToInt64(centred);
@@ -399,7 +422,7 @@ TextureFloatAxis ComputeTextureFloatLinear(float coordinate,
   case TextureWrapMode::kClampToEdge: {
     // Clamp the scaled coordinate to the image, centre it, and never let the
     // lower tap go below zero or the upper past the last texel.
-    const float scaled = std::min(coordinate * extent_f, extent_f);
+    const float scaled = std::min(coordinate * extent_f + static_cast<float>(texel_offset), extent_f);
     const float centred = std::max(scaled - 0.5F, 0.0F);
     const std::int64_t lower = FloorToInt64(centred);
     result.weight = centred - static_cast<float>(lower);
@@ -408,6 +431,8 @@ TextureFloatAxis ComputeTextureFloatLinear(float coordinate,
     return result;
   }
   case TextureWrapMode::kMirroredRepeat: {
+    if (texel_offset)
+      coordinate += static_cast<float>(texel_offset) / extent_f;
     const float centred = MirrorCoordinate(coordinate) * extent_f - 0.5F;
     const std::int64_t lower = FloorToInt64(centred);
     result.weight = centred - static_cast<float>(lower);

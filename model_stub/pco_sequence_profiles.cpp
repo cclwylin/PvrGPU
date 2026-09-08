@@ -1296,8 +1296,9 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
           draw.framebuffer_height * bytes_per_pixel *
           (draw.raster_samples == 0 ? 1U : draw.raster_samples) *
           (draw.framebuffer_layers ? draw.framebuffer_layers : 1);
-      if (ordinal != 0 || draw.render_target_count > 1 ||
-          draw.initial_color_attachment_bytes.size() != expected_bytes ||
+      const unsigned targets = draw.render_target_count ? draw.render_target_count : 1U;
+      if (ordinal != 0 || targets > kMaxRenderTargets ||
+          draw.initial_color_attachment_bytes.size() != expected_bytes * targets ||
           expected_bytes > kDriverPcoSequenceAttachmentStride) {
         return Reject(error, "generic PCO initial colour attachment is invalid");
       }

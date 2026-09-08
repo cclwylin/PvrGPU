@@ -1,9 +1,11 @@
 #include "driver_command.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -264,10 +266,56 @@ int main() {
   error.clear();
   if (int failed = Expect(LoadDriverCommand(pco_large_viewport.string(), &command, &error), error))
     return failed;
+  const auto float_bits = [](float value) {
+    std::uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+  };
+  const struct { float scale, translate; bool valid; } depth_viewports[] = {
+      {.5F, .5F, true}, {-.5F, .5F, true}, {.25F, .5F, true},
+      {-.25F, .5F, true}, {0, 0, true}, {0, .375F, true}, {0, 1, true},
+      {.5F, .25F, false}, {.5F, .75F, false}, {-.75F, .5F, false},
+      {0, -.125F, false}, {0, 1.125F, false},
+      {std::numeric_limits<float>::infinity(), .5F, false},
+      {.5F, std::numeric_limits<float>::quiet_NaN(), false},
+  };
+  for (const auto &depth : depth_viewports) {
+    std::string text = pco_large_text;
+    if (!ReplaceOnce(&text, "viewport_scale_bits=1109393408,1106247680,1056964608",
+            "viewport_scale_bits=1109393408,1106247680," + std::to_string(float_bits(depth.scale))) ||
+        !ReplaceOnce(&text, "viewport_translate_bits=1109393408,1106247680,1056964608",
+            "viewport_translate_bits=1109393408,1106247680," + std::to_string(float_bits(depth.translate))))
+      return 1;
+    WriteText(pco_large_viewport, text);
+    error.clear();
+    const bool accepted = LoadDriverCommand(pco_large_viewport.string(), &command, &error);
+    if (int failed = Expect(accepted == depth.valid &&
+            (!accepted || (command.viewport_scale_bits[2] == float_bits(depth.scale) &&
+                           command.viewport_translate_bits[2] == float_bits(depth.translate))),
+            "generic viewport parser did not preserve/reject depth range correctly: " + error))
+      return failed;
+  }
+  WriteText(pco_large_viewport, pco_large_text);
+  error.clear();
+  if (int failed = Expect(LoadDriverCommand(pco_large_viewport.string(), &command, &error), error))
+    return failed;
   if (int failed = Expect(command.width == 80 && command.height == 60 &&
           command.framebuffer_width == 40 && command.framebuffer_height == 30,
           "generic audit parser resized the oversized viewport"))
     return failed;
+  const auto sample_frequency_path = TempFile("sample-frequency.txt");
+  for (unsigned frequency : {0U, 1U, 2U}) {
+    WriteText(sample_frequency_path, pco_large_text + "sample_frequency=" +
+        std::to_string(frequency) + "\n");
+    error.clear();
+    const bool loaded = LoadDriverCommand(sample_frequency_path.string(), &command, &error);
+    if (int failed = Expect(loaded == (frequency <= 1) &&
+            (!loaded || command.sample_frequency == frequency),
+            "sample-frequency audit field was dropped or invalid value accepted: " +
+            std::to_string(frequency) + " " + error))
+      return failed;
+  }
+  std::filesystem::remove(sample_frequency_path);
   std::string pco_translated_text = pco_large_text;
   if (!ReplaceOnce(&pco_translated_text,
           "viewport_translate_bits=1109393408,1106247680,1056964608",

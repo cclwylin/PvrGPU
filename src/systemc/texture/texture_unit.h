@@ -12,6 +12,7 @@
 #include "common/functional_types.h"
 #include "memory/gpu_memory_system.h"
 #include "texture/texture_filter.h"
+#include "shader/pco_iss.h"
 #include "memory_pool.h"
 #include "model_types.h"
 
@@ -81,6 +82,13 @@ TextureImplicitLod ComputeTextureImplicitLod(
 TextureImplicitLod ComputeTextureExplicitLod(
     float level, const RogueTextureImageDescriptor &image,
     const RogueTextureSamplerDescriptor &sampler);
+// Cube directions use a common-face projection for implicit derivatives.
+// Undefined nonfinite footprints select minimum LOD, retaining raw derivative
+// fields for diagnostics; actual cube texel addressing is separately bounded.
+TextureImplicitLod ComputeTextureCubeImplicitLod(
+    const std::array<std::array<float, 3>, 4> &directions,
+    const RogueTextureImageDescriptor &image,
+    const RogueTextureSamplerDescriptor &sampler);
 
 class TextureUnit final : public sc_core::sc_module {
  public:
@@ -104,6 +112,10 @@ class TextureUnit final : public sc_core::sc_module {
   sc_core::sc_port<sc_core::sc_fifo_out_if<PipelineTxn>, 0,
                    sc_core::SC_ZERO_OR_MORE_BOUND>
       geometry_sample_output{"geometry_sample_output"};
+  sc_core::sc_port<sc_core::sc_fifo_in_if<PipelineTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND> compute_sample_input{"compute_sample_input"};
+  sc_core::sc_port<sc_core::sc_fifo_out_if<PipelineTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND> compute_sample_output{"compute_sample_output"};
   sc_core::sc_port<sc_core::sc_fifo_out_if<MemoryTxn>, 0,
                    sc_core::SC_ZERO_OR_MORE_BOUND>
       cache_request{"cache_request"};
@@ -125,6 +137,7 @@ class TextureUnit final : public sc_core::sc_module {
   void SampleRun();
   void VertexSampleRun();
   void GeometrySampleRun();
+  void ComputeSampleRun();
   void SampleRunForStage(
       ShaderStage stage,
       sc_core::sc_port<sc_core::sc_fifo_in_if<PipelineTxn>, 0,
@@ -137,13 +150,13 @@ class TextureUnit final : public sc_core::sc_module {
   // VS, FS and GS descriptor-set namespaces are independent. Residency is kept
   // within one PipelineState (including all of its SMP continuation rounds)
   // and reset when the next physical draw receives a new state handle.
-  std::array<std::array<bool, kDriverPcoMaximumSequenceTextures>, 3>
+  std::array<std::array<bool, kPcoMaximumTextureDescriptorSets>, 4>
       texture_preloaded_{};
-  std::array<std::array<std::uint64_t, kDriverPcoMaximumSequenceTextures>, 3>
+  std::array<std::array<std::uint64_t, kPcoMaximumTextureDescriptorSets>, 4>
       preloaded_address_{};
-  std::array<std::array<std::uint64_t, kDriverPcoMaximumSequenceTextures>, 3>
+  std::array<std::array<std::uint64_t, kPcoMaximumTextureDescriptorSets>, 4>
       preloaded_bytes_{};
-  std::array<PoolHandle, 3> residency_state_{};
+  std::array<PoolHandle, 4> residency_state_{};
 };
 
 }  // namespace pvrgpu::stub

@@ -419,6 +419,9 @@ export GALLIUM_DRIVER="pvrgpu"
 export MESA_LOADER_DRIVER_OVERRIDE="swrast"
 export LIBGL_ALWAYS_SOFTWARE="true"
 export MESA_SHADER_CACHE_DISABLE="${MESA_SHADER_CACHE_DISABLE:-true}"
+# Compute and graphics share one elaborated SystemC memory system. Keep the
+# default explicit in every run, while preserving an intentional override.
+export PVRGPU_MODEL_MEMORY_MODE="${PVRGPU_MODEL_MEMORY_MODE:-cache}"
 export PVRGPU_DEQP_LIVE="1"
 export PVRGPU_DEQP_OUTPUT_ROOT="${output_root}"
 export PVRGPU_SYSTEMC_API_LIB="${systemc_lib}"
@@ -437,7 +440,8 @@ if ((opt_print_env)); then
     info "Exported runtime environment:"
     for name in DYLD_LIBRARY_PATH LIBGL_DRIVERS_PATH EGL_PLATFORM GALLIUM_DRIVER \
                 MESA_LOADER_DRIVER_OVERRIDE LIBGL_ALWAYS_SOFTWARE \
-                MESA_SHADER_CACHE_DISABLE PVRGPU_DEQP_LIVE PVRGPU_SYSTEMC_API_LIB; do
+                MESA_SHADER_CACHE_DISABLE PVRGPU_MODEL_MEMORY_MODE \
+                PVRGPU_DEQP_LIVE PVRGPU_SYSTEMC_API_LIB; do
         info "  ${name}=${!name}"
     done
 fi
@@ -584,6 +588,7 @@ for one_case in "${cases[@]}"; do
         echo "archive_dir=${archive_dir}"
         echo "mesa_pco_prefix=${mesa_prefix}"
         echo "systemc_api_lib=${systemc_lib}"
+        echo "memory_mode=${PVRGPU_MODEL_MEMORY_MODE}"
         echo "host_arch=${host_arch}"
         echo "output_dir=${case_dir}"
     } > "${case_dir}/run.txt"
@@ -601,11 +606,12 @@ for one_case in "${cases[@]}"; do
 
     case_start_ms="$(now_ms)"
     if ((opt_verify_link)); then
-        run_one_case 2>&1 | tee "${log_path}" | grep -v '^dyld\[' || true
+        run_one_case 2>&1 | tee "${log_path}" | grep -v '^dyld\['
+        exit_code=${PIPESTATUS[0]}
     else
         run_one_case 2>&1 | tee "${log_path}"
+        exit_code=${PIPESTATUS[0]}
     fi
-    exit_code=${PIPESTATUS[0]}
     case_end_ms="$(now_ms)"
     duration_ms=$((case_end_ms - case_start_ms))
 
