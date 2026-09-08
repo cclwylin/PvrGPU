@@ -3,6 +3,7 @@
 # PvrGPU RDC Test Pattern Batch Regression Script
 # ==============================================================================
 # Usage:
+#   ./script/run_regression.sh --help               # Show options without building or checking Mesa
 #   ./script/run_regression.sh                       # Run all patterns (default: 4 jobs)
 #   ./script/run_regression.sh --suite GLBench       # Run only GLBench patterns
 #   ./script/run_regression.sh --suite glmark2       # Run only glmark2 patterns
@@ -61,11 +62,13 @@ note() {
 opt_build=1
 opt_allow_stale_mesa=0
 opt_list_only=0
+opt_help=0
 opt_has_pvrgpu_bin=0
 forwarded=()
 
 while (($#)); do
     case "$1" in
+        -h|--help)          opt_help=1 ;;
         --no-build)          opt_build=0 ;;
         --allow-stale-mesa)  opt_allow_stale_mesa=1 ;;
         --list-only)         opt_list_only=1; forwarded+=("$1") ;;
@@ -82,12 +85,23 @@ if ((opt_list_only)); then
 fi
 
 # Default pattern root
-PATTERNS_DIR="${PATTERNS_DIR:-/Users/linwanyi/Downloads/Working/GPU_TestPatterns}"
+PATTERNS_DIR="${PATTERNS_DIR:-/Users/linwanyi/Downloads/_Codex/GPU_TestPatterns}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_DIR}/outputs/rdc_regression}"
 
 # Ensure python3 exists
 if ! command -v python3 &>/dev/null; then
     die "python3 is not found in PATH"
+fi
+
+# Help needs no local configuration, build, or installed Mesa prefix.
+if ((opt_help)); then
+    python3 "${PYTHON_SCRIPT}" --help
+    printf '\nWrapper options (run_regression.sh):\n'
+    printf '  %-22s %s\n' \
+        '-h, --help' 'Show this help without building or checking Mesa, then exit' \
+        '--no-build' 'Skip the CMake build; the Mesa freshness check still applies' \
+        '--allow-stale-mesa' 'Allow an installed Mesa prefix older than the driver sources'
+    exit 0
 fi
 
 # ------------------------------------------------------------------------------

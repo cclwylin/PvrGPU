@@ -26,7 +26,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 
-DEFAULT_PATTERNS_DIR = Path("/Users/linwanyi/Downloads/Working/GPU_TestPatterns")
+DEFAULT_PATTERNS_DIR = Path("/Users/linwanyi/Downloads/_Codex/GPU_TestPatterns")
 DEFAULT_OUTPUT_DIR = Path("outputs/rdc_regression")
 DEFAULT_CANDIDATE_PVRGPU_BINS = [
     Path("/Users/linwanyi/Downloads/_Codex/Working/PvrGPU/build/bin/pvrgpu"),
