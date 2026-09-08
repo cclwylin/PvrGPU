@@ -1517,15 +1517,28 @@ class MainWindow(QMainWindow):
 
         self.current_case_label = QLabel("尚未執行")
         self.current_case_label.setObjectName("currentCase")
-        header_layout.addWidget(self.current_case_label, 0, 0, 1, 5)
+        header_layout.addWidget(self.current_case_label, 0, 0, 1, 4)
 
-        self.copy_diagnostics_button = QPushButton("複製診斷資訊")
+        self.copy_first_fail_button = QPushButton("複製第一個 Fail")
+        self.copy_first_fail_button.setToolTip(
+            "只把第一個 Fail 的 case（設定、命令與 log 尾巴）收成一份純文字，\n"
+            "複製到剪貼簿，同時寫成 run 目錄裡的 diagnostics-first-fail.txt。\n"
+            "沒有 Fail 的 case 時會提示，不會複製空白內容。"
+        )
+        self.copy_first_fail_button.clicked.connect(
+            lambda: self.copy_diagnostics(only_first_fail=True)
+        )
+        header_layout.addWidget(self.copy_first_fail_button, 0, 4)
+
+        self.copy_diagnostics_button = QPushButton("複製診斷資訊（全部）")
         self.copy_diagnostics_button.setToolTip(
             "把這次執行的計畫、解析後的路徑，以及有問題（fail/warn/\n"
             "NotSupported）case 的結果、命令與 log 尾巴收成一份純文字，\n"
             "複製到剪貼簿，同時寫成 run 目錄裡的 diagnostics.txt。"
         )
-        self.copy_diagnostics_button.clicked.connect(self.copy_diagnostics)
+        self.copy_diagnostics_button.clicked.connect(
+            lambda: self.copy_diagnostics(only_first_fail=False)
+        )
         header_layout.addWidget(self.copy_diagnostics_button, 0, 5)
 
         self.progress = QProgressBar()
@@ -3368,15 +3381,20 @@ class MainWindow(QMainWindow):
             out.append(f"   systemc png: {len(pngs)} file(s), e.g. {pngs[0].name}")
         return out
 
-    def build_diagnostics(self) -> str:
+    def build_diagnostics(self, only_first_fail: bool = False) -> str:
         """One self-contained plain-text report: which tier was asked for, what
         the plan came to, what the wiring resolved to, and the detail behind
-        each failure."""
+        each failure.
+
+        With only_first_fail, the problem-case sections are trimmed down to
+        just the first case whose bucket is "fail" -- a quick paste for one
+        bug report instead of a full-run dump."""
         now = datetime.now().astimezone()
         lines: list[str] = []
         add = lines.append
 
-        add("=== PvrGPU dEQP · 四層回歸 — diagnostics ===")
+        add("=== PvrGPU dEQP · 四層回歸 — diagnostics ==="
+            + (" (first Fail only)" if only_first_fail else ""))
         add(f"generated : {now.isoformat(timespec='seconds')}")
         add(f"ui        : {Path(__file__).resolve()}")
         add(f"doc       : {TIER_DOC}")
@@ -3502,7 +3520,10 @@ class MainWindow(QMainWindow):
                 or row.status.strip().casefold() == "notsupported"
             )
 
-        notable = [row for row in self.state.rows if _is_notable(row)]
+        if only_first_fail:
+            notable = [row for row in self.state.rows if row.bucket == "fail"][:1]
+        else:
+            notable = [row for row in self.state.rows if _is_notable(row)]
         add(
             f"[problem cases]  ({len(notable)} of {len(self.state.rows)};"
             f" first {min(len(notable), DIAGNOSTICS_MAX_SUMMARY_ROWS)} shown)"
@@ -3512,7 +3533,8 @@ class MainWindow(QMainWindow):
             f"{'shard':<18} case"
         )
         if not notable:
-            add("(none -- every case passed or was an accepted waiver)")
+            add("(no Fail case found)" if only_first_fail
+                else "(none -- every case passed or was an accepted waiver)")
         for row in notable[:DIAGNOSTICS_MAX_SUMMARY_ROWS]:
             add(
                 f"{row.index:>5}  {row.status:<13} "
@@ -3534,23 +3556,28 @@ class MainWindow(QMainWindow):
             lines.extend(self._case_detail(row))
             add("")
 
-        if notable:
+        if notable and not only_first_fail:
             add("[UI log tail]")
             add(self._tail(self.log_view.toPlainText(), DIAGNOSTICS_LOG_LINES))
             add("")
         add("=== end of diagnostics ===")
         return "\n".join(lines)
 
-    def copy_diagnostics(self) -> None:
+    def copy_diagnostics(self, only_first_fail: bool = False) -> None:
         try:
-            report = self.build_diagnostics()
+            report = self.build_diagnostics(only_first_fail=only_first_fail)
         except Exception as error:  # noqa: BLE001 - a diagnostic must not crash the UI
             QMessageBox.critical(self, "PvrGPU", f"產生診斷資訊失敗：{error}")
             return
 
+        if only_first_fail and not any(row.bucket == "fail" for row in self.state.rows):
+            self.statusBar().showMessage("目前沒有 Fail 的 case，沒有東西可以複製", 8000)
+            return
+
         saved: Path | None = None
+        filename = "diagnostics-first-fail.txt" if only_first_fail else "diagnostics.txt"
         if self.run_dir:
-            candidate = Path(self.run_dir) / "diagnostics.txt"
+            candidate = Path(self.run_dir) / filename
             try:
                 candidate.parent.mkdir(parents=True, exist_ok=True)
                 candidate.write_text(report, encoding="utf-8")
@@ -3562,7 +3589,8 @@ class MainWindow(QMainWindow):
             report = f"diagnostics file: {saved}\n\n{report}"
         QApplication.clipboard().setText(report)
 
-        message = f"診斷資訊已複製（{format_bytes(len(report.encode('utf-8')))}）"
+        label = "第一個 Fail 的診斷資訊" if only_first_fail else "診斷資訊"
+        message = f"{label}已複製（{format_bytes(len(report.encode('utf-8')))}）"
         if saved is not None:
             message += f" · 也寫到 {saved}"
         self.statusBar().showMessage(message, 8000)
