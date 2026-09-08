@@ -79,9 +79,25 @@ Single indirect graphics draws decode the actual argument-buffer bytes after
 pending graphics/TF writes have completed. Arrays and elements preserve
 instance count, first/base vertex and base instance, and then enter the same
 native direct-draw path. Zero count or zero instance count is a true no-op;
-it cannot become a one-instance draw. Misaligned/truncated/wrapping argument
-ranges, multi-draw, count buffers and unsupported negative base vertices fail
-closed. No indirect parameter or shader output is substituted on the host.
+it cannot become a one-instance draw. Indexed draws retain signed baseVertex:
+an owned, restart-free index snapshot is rebased to its referenced min/max
+range, with signed 64-bit validation before attribute fetch. Negative bases
+are supported when all effective vertex indices are nonnegative and fit the
+source-index ABI. Original gl_VertexID/base-vertex system-value inputs remain
+unsupported; rebased indices must never masquerade as those values.
+
+Gallium zero-stride attributes are constant, including disabled current/default
+attributes; GL's tightly-packed stride-zero shorthand is already normalized by
+the state tracker. Resource-backed EBO reads follow llvmpipe's DRAW_GET_IDX
+policy: a position outside the complete elements supplies raw index zero,
+before restart/baseVertex processing. Draw count is not truncated and the
+native pipeline still executes. This bounded policy does not establish a
+portable pixel result for undefined non-robust GL input.
+
+Misaligned/truncated/wrapping argument ranges, multi-draw, count buffers and
+invalid effective vertex ranges still fail closed. No shader output is
+substituted on the host; command decoding and attribute/index packing only
+transport application inputs to the native model.
 
 The pinned Mesa frontend also needs
 `third_party/mesa-26.2.1-failed-query-state.patch`: apply it with `git apply`

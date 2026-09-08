@@ -150,6 +150,13 @@ Detail per component: [PvrGPU.md §3.5](PvrGPU.md), the
   TF cases now execute real VS/StreamOutput work with no refused draws.
   See the [validation](docs/GEOMETRY_SHADER_VALIDATION.md)
   and [geometry contract](docs/PVRGPU_DRIVER_COMMAND.md).
+- Single-command indirect graphics now handles legal signed baseVertex,
+  constant/default zero-stride attributes, and bounded EBO fetches using
+  llvmpipe's raw-index-zero policy. The complete Draw-indirect 244-case matrix
+  is 226 Pass / 18 NotSupported / 0 Fail, matching llvmpipe's case statuses.
+  Native TF probes compare 16,640 DWORDs and 108 queries exactly across both
+  backends. No-crash stress cases are distinguished from image-oracle tests;
+  see the [scope and validation](docs/DRAW_INDIRECT_VALIDATION.md).
 - Graphics API v23 adds native multisample texture fetch transport: real
   SMP.NNCOORDS.SNO selects one of 1/2/4/8 pixel-interleaved samples, including
   integer/float/depth views and single-level 2D arrays. Size/sample queries

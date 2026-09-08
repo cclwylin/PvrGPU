@@ -561,6 +561,16 @@ target_include_directories(indirect-draw-test PRIVATE "${CMAKE_SOURCE_DIR}/src")
 pvrgpu_target_warnings(indirect-draw-test)
 add_test(NAME indirect-draw-unit COMMAND indirect-draw-test)
 
+add_executable(index-fetch-test tests/index_fetch_test.cpp)
+target_include_directories(index-fetch-test PRIVATE "${CMAKE_SOURCE_DIR}/src")
+pvrgpu_target_warnings(index-fetch-test)
+add_test(NAME index-fetch-unit COMMAND index-fetch-test)
+
+add_executable(vertex-fetch-test tests/vertex_fetch_test.cpp)
+target_include_directories(vertex-fetch-test PRIVATE "${CMAKE_SOURCE_DIR}/src")
+pvrgpu_target_warnings(vertex-fetch-test)
+add_test(NAME vertex-fetch-unit COMMAND vertex-fetch-test)
+
 add_executable(pco-systemc-api-bridge-test
     tests/pco_systemc_api_bridge_test.cpp
 )

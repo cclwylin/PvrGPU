@@ -43,6 +43,8 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             "pvrgpu_pco.h",
             "pvrgpu_point_restart.h",
             "pvrgpu_indirect_draw.h",
+            "pvrgpu_index_fetch.h",
+            "pvrgpu_vertex_fetch.h",
             "pvrgpu_public.h",
             "pvrgpu_resource.c",
             "pvrgpu_resource.h",

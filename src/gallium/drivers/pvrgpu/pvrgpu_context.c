@@ -5,6 +5,7 @@
 #include "pvrgpu_cmd.h"
 #include "pvrgpu_counter.h"
 #include "pvrgpu_indirect_draw.h"
+#include "pvrgpu_index_fetch.h"
 #include "pvrgpu_pco.h"
 #include "pvrgpu_point_restart.h"
 #include "pvrgpu_resource.h"
@@ -12,6 +13,7 @@
 #include "pvrgpu_systemc_api.h"
 #include "pvrgpu_tessellation.h"
 #include "pvrgpu_uniform_buffer.h"
+#include "pvrgpu_vertex_fetch.h"
 
 #include "pipe/p_defines.h"
 #include "nir/nir.h"
@@ -761,10 +763,11 @@ pvrgpu_read_draw_index(const struct pipe_draw_info *info,
       available = SIZE_MAX;
    } else if (info->index.resource) {
       struct pvrgpu_resource *resource = pvrgpu_resource(info->index.resource);
-      if (!resource || !resource->data || index_offset >= resource->size)
+      if (!resource || !resource->data)
          return false;
-      base = resource->data;
-      available = resource->size;
+      return pvrgpu_fetch_bounded_index(resource->data, resource->size,
+                                        info->index_size,
+                                        (uint64_t)start + occurrence, out_index);
    }
    if (!base || index_offset + info->index_size > available)
       return false;
@@ -9614,12 +9617,11 @@ pvrgpu_read_vertex_attribute(const struct pvrgpu_context *ctx,
    const unsigned blocksize = util_format_get_blocksize(format);
    const struct pipe_vertex_buffer *buffer =
       &ctx->vertex_buffers[element->vertex_buffer_index];
-   const unsigned stride =
-      element->src_stride ? element->src_stride : blocksize;
-   if (stride == 0) {
-      *reason = "stride";
-      return false;
-   }
+   /* Gallium stride zero means a constant/current attribute. Mesa has already
+    * expanded GL's tightly-packed stride-zero array shorthand before this
+    * point; st_setup_current deliberately retains zero for glVertexAttrib*.
+    */
+   const unsigned stride = element->src_stride;
 
    const uint64_t offset = (uint64_t)buffer->buffer_offset +
                            element->src_offset +
@@ -11112,14 +11114,23 @@ pvrgpu_record_color_primitive_pco_draw(
          return true;
       }
       index_data_size = (size_t)assembled_count * info->index_size;
-      if (max_index == UINT32_MAX ||
-          draw->index_bias < 0 ||
-          (uint64_t)max_index + 1u + (uint64_t)draw->index_bias > UINT_MAX) {
+      /* The native VS compiler still rejects load_vertex_id and related
+       * system values. Do not make a rebased index visible as gl_VertexID if
+       * a future compiler enables them without an original-ID input ABI. */
+      if (BITSET_TEST(ctx->vs->nir->info.system_values_read, SYSTEM_VALUE_VERTEX_ID) ||
+          BITSET_TEST(ctx->vs->nir->info.system_values_read, SYSTEM_VALUE_VERTEX_ID_ZERO_BASE) ||
+          BITSET_TEST(ctx->vs->nir->info.system_values_read, SYSTEM_VALUE_BASE_VERTEX) ||
+          !pvrgpu_rebase_vertex_indices(index_data, index_data_size,
+                                        info->index_size, assembled_count,
+                                        draw->index_bias,
+                                        &vertex_bias, &vertex_count)) {
+         pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                               "stage=indices reason=vertex_rebase_or_system_value "
+                               "base_vertex=%d max_index=%u",
+                               draw->index_bias, max_index);
          free(index_data);
          return false;
       }
-      vertex_count = max_index + 1u;
-      vertex_bias = (unsigned)draw->index_bias;
    }
    /*
     * Pack each attribute at the width its vertex shader declares.  The model
