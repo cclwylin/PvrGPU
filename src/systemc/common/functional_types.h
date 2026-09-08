@@ -634,6 +634,7 @@ enum class TextureFormat : std::uint8_t {
   // Canonical floating-point storage for views whose native channel count
   // or packed format is expanded by the driver, without UNORM8 quantization.
   kRgba32Float,
+  kBgr10A2Unorm,       // B10G10R10A2, descriptor-selected R/B exchange
 };
 
 // One sRGB-encoded channel, as a linear value.  This is the GL/IEC 61966-2-1
@@ -1016,6 +1017,10 @@ struct TextureSampleRequest {
   // normalized textureLod; neither consumes implicit quad derivatives.
   std::uint32_t explicit_lod = 0;
   std::uint8_t explicit_lod_present = 0;
+  // Raw fragment SMP BIAS/PPLOD payload, added to implicit lambda before
+  // sampler clamps. Preserve NaN/Inf bits until the fixed-function boundary.
+  std::uint32_t lod_bias = 0;
+  std::uint8_t lod_bias_present = 0;
 };
 
 struct TextureSampleResponse {

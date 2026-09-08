@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -108,6 +109,74 @@ bool SubmitFailsWith(pvrgpu_systemc_submit_info *info,
                             std::string::npos;
 }
 
+void TestPackedClearReadback() {
+  for (const bool bgr : {false, true}) {
+    const auto folder = g_test_root / (bgr ? "packed-clear-bgr" : "packed-clear-rgb");
+    std::filesystem::create_directory(folder);
+    const std::string jsonl = (folder / "model.jsonl").string();
+    const std::string stderr_path = (folder / "model.stderr.log").string();
+    const std::string outdir = folder.string();
+    pvrgpu_systemc_driver_command command{};
+    command.version = PVRGPU_SYSTEMC_API_VERSION;
+    command.schema = "pvrgpu.driver-command.v1";
+    command.producer = "pvrgpu-gallium-driver";
+    command.command = "clear_color";
+    command.case_name = "generic-packed-clear";
+    command.format = bgr ? "PIPE_FORMAT_B10G10R10A2_UNORM"
+                         : "PIPE_FORMAT_R10G10B10A2_UNORM";
+    command.frame = 1;
+    command.width = 3;
+    command.height = 2;
+    const std::array<float, 4> color{1.0F / 1023, 257.0F / 1023,
+                                    769.0F / 1023, 2.0F / 3};
+    std::memcpy(command.clear_color_bits, color.data(), sizeof(color));
+    pvrgpu_systemc_submit_info submit{};
+    submit.version = PVRGPU_SYSTEMC_API_VERSION;
+    submit.command = &command;
+    submit.jsonl_path = jsonl.c_str();
+    submit.stderr_path = stderr_path.c_str();
+    submit.outdir = outdir.c_str();
+    submit.memory_mode = "direct";
+    std::array<char, 512> error{};
+    if (pvrgpu_systemc_submit_driver_command(&submit, error.data(), error.size()) != 0)
+      Fail("packed clear submission: " + std::string(error.data()));
+    std::array<std::uint32_t, 6> words{};
+    words.fill(UINT32_C(0xdeadbeef));
+    pvrgpu_systemc_readback_info readback{};
+    readback.version = PVRGPU_SYSTEMC_API_VERSION;
+    readback.width = 3;
+    readback.height = 2;
+    readback.bytes_per_pixel = 4;
+    readback.sample_count = 1;
+    readback.layer_count = 1;
+    readback.pixels = reinterpret_cast<std::uint8_t *>(words.data());
+    readback.pixels_size = sizeof(words);
+    if (pvrgpu_systemc_flush_readback(&readback, error.data(), error.size()) != 0 ||
+        readback.pixels_written != 1)
+      Fail("packed clear readback: " + std::string(error.data()));
+    // These exact physical codes cannot survive a round trip through RGBA8.
+    const std::uint32_t expected = (bgr ? 769U : 1U) | (257U << 10) |
+        ((bgr ? 1U : 769U) << 20) | (2U << 30);
+    for (const auto word : words)
+      if (word != expected)
+        Fail("packed clear lost low bits or channel identity: got=" +
+             std::to_string(word) + " expected=" + std::to_string(expected));
+    const auto log = ReadText(folder / "model.jsonl");
+    if (log.find("\"type\":\"done\"") == std::string::npos ||
+        log.find("\"type\":\"error\"") != std::string::npos)
+      Fail("packed clear missing successful native model completion");
+    png_uint_32 width = 0, height = 0;
+    const auto rgba = ReadPngRgba(folder / "driver_clear_color_sample_000001.png", &width, &height);
+    if (width != 3 || height != 2 || rgba.size() != 24)
+      Fail("packed clear display extent");
+    const std::array<std::uint8_t, 4> expected_display{0, 64, 192, 170};
+    for (std::size_t pixel = 0; pixel < words.size(); ++pixel)
+      for (std::size_t channel = 0; channel < 4; ++channel)
+        if (rgba[pixel * 4 + channel] != expected_display[channel])
+          Fail("packed clear display must decode physical words without changing raw readback");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -203,6 +272,10 @@ int main() {
   WriteBytes(sidecar, texture);
   if (std::atexit(VerifyDeferredModelAtExit) != 0)
     Fail("cannot register deferred verifier");
+
+  // Register the verifier before the bridge's first submit registers its
+  // deferred flusher; preserve the original atexit ordering contract below.
+  TestPackedClearReadback();
 
   std::array<char, 256> error{};
   pvrgpu_systemc_driver_command clear{};

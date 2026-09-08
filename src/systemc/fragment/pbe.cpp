@@ -1,5 +1,5 @@
 // PBE (Pixel Back End) consumes ordered USC PIXOUT records, converts raw
-// float32 PIXOUT0..3 values to RGBA8 UNORM, and performs fixed-function GLES
+// float32 PIXOUT values to the declared attachment format, and performs GLES
 // blend destination read/modify/write when enabled. Untouched pixels come from
 // explicit render-target clear state. PixelDataMaster, SLC and DramModel then
 // commit/read the result; JsonReporter never consumes this pre-memory handle.
@@ -350,6 +350,14 @@ void Pbe::Run() {
     if (state.color_attachment_float32 &&
         (state.color_attachment_raw_dwords != 0 || state.color_is_srgb))
       throw std::runtime_error("PBE floating-point attachment state is invalid");
+    const bool packed_unorm =
+        state.color_attachment_packed_unorm != PackedUnormFormat::kNone;
+    if (packed_unorm) {
+      (void)PackedUnormShift(state.color_attachment_packed_unorm, 0);
+      if (state.color_attachment_raw_dwords || state.color_attachment_float32 ||
+          state.color_is_srgb)
+        throw std::runtime_error("PBE packed UNORM attachment state is invalid");
+    }
     if (stored_samples > std::numeric_limits<std::size_t>::max() / bytes_per_pixel)
       throw std::overflow_error("PBE framebuffer size overflow");
     const std::vector<FragmentInvocation> invocations =
@@ -396,7 +404,14 @@ void Pbe::Run() {
         continue;
       }
       attachment.assign(static_cast<std::size_t>(framebuffer_bytes), 0);
-      if (state.color_attachment_float32) {
+      if (packed_unorm) {
+        std::array<float, 4> clear{};
+        std::copy_n(state.raster_state.clear_color, 4, clear.begin());
+        const std::uint32_t word =
+            PackUnormColor(clear, state.color_attachment_packed_unorm);
+        for (std::size_t pixel = 0; pixel < stored_samples; ++pixel)
+          std::memcpy(attachment.data() + pixel * 4U, &word, sizeof(word));
+      } else if (state.color_attachment_float32) {
         for (std::size_t pixel = 0; pixel < stored_samples; ++pixel) {
           std::memcpy(attachment.data() + pixel * bytes_per_pixel,
                       state.raster_state.clear_color, bytes_per_pixel);
@@ -545,13 +560,22 @@ void Pbe::Run() {
       if (explicit_output_masks && state.fragment_output_mask[target] == 0)
         continue;
       std::vector<std::uint8_t> &framebuffer = framebuffers[target];
-      if (state.color_attachment_float32) {
+      if (state.color_attachment_float32 || packed_unorm) {
         std::array<float, 4> source{};
         std::array<float, 4> destination{};
         std::memcpy(source.data(), &output.pixel_output[target * 4],
                     sizeof(source));
-        std::memcpy(destination.data(), framebuffer.data() + byte_offset,
-                    sizeof(destination));
+        std::uint32_t packed_destination = 0;
+        if (packed_unorm) {
+          for (float &component : source)
+            component = ClampShaderUnorm(component);
+          std::memcpy(&packed_destination, framebuffer.data() + byte_offset, 4);
+          destination = UnpackUnormColor(packed_destination,
+                                         state.color_attachment_packed_unorm);
+        } else {
+          std::memcpy(destination.data(), framebuffer.data() + byte_offset,
+                      sizeof(destination));
+        }
         std::array<float, 4> result = source;
         if (state.raster_state.blend.enable) {
           const BlendState &blend = state.raster_state.blend;
@@ -573,6 +597,15 @@ void Pbe::Run() {
                 FactorToFloat(destination_factor, source, destination, constant,
                               component));
           }
+        }
+        if (packed_unorm) {
+          // Quantize after every fragment, before any later destination LOAD.
+          // Masked channels retain their original packed bits, not a recode.
+          const std::uint32_t word = PackUnormColor(result,
+              state.color_attachment_packed_unorm, packed_destination,
+              state.raster_state.color_mask);
+          std::memcpy(framebuffer.data() + byte_offset, &word, sizeof(word));
+          continue;
         }
         for (std::size_t component = 0; component < 4; ++component) {
           if ((state.raster_state.color_mask & (1U << component)) != 0) {

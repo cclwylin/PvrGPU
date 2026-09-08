@@ -37,6 +37,34 @@ std::uint32_t Bits(float value) {
   return bits;
 }
 
+void RejectFragmentOnlyBias() {
+  for (unsigned shape = 0; shape < 4; ++shape) {
+    const auto abi = ComputeTexturePcoAbi(300 + shape);
+    const auto original = DecodeComputePcoProgram(ComputeTexturePcoFixture(300 + shape));
+    ValidateComputeProgram(original, abi);
+    for (std::size_t index = 0; index < original.instructions.size(); ++index) {
+      for (std::uint8_t flag : {1U, 2U}) {
+        auto mutated = original;
+        mutated.instructions[index].texture_lod_bias = flag;
+        const auto reject_lod = [&](auto action) {
+          bool rejected = false;
+          try { action(); } catch (const std::runtime_error &error) {
+            rejected = std::string(error.what()).find("LOD") != std::string::npos;
+          }
+          Check(rejected, "CS must reject BIAS on SMP and auxiliary opcodes");
+        };
+        reject_lod([&] { ValidateComputeProgram(mutated, abi); });
+        auto task = MakeComputeTask(abi, std::vector<std::uint32_t>(abi.stage.shareds),
+                                    {1,1,1}, {0,0,0}, 0, 4);
+        task.instruction_index = index;
+        ComputeWorkgroupResult result;
+        reject_lod([&] { StepComputeTask(mutated, abi, task, {}, result); });
+        Check(task.steps == 0, "rejected CS BIAS must not execute an instruction");
+      }
+    }
+  }
+}
+
 void Run(MemoryPool &pool, GpuMemorySystem &memory,
          sc_core::sc_fifo<ComputeDispatchTxn> &input,
          sc_core::sc_fifo<ComputeDispatchTxn> &output,
@@ -174,6 +202,7 @@ void Run(MemoryPool &pool, GpuMemorySystem &memory,
 
 int sc_main(int argc, char **argv) {
   try {
+    RejectFragmentOnlyBias();
     const unsigned mode = argc > 1 ? std::stoul(argv[1]) : 0;
     Check(mode <= 2, "memory mode");
     MemoryPool pool;

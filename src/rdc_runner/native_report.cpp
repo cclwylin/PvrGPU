@@ -1,6 +1,7 @@
 #include "rdc_runner/native_report.h"
 
 #include <cctype>
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -230,7 +231,7 @@ template <typename Callback> void ForLines(const std::string &text, Callback cal
   }
 }
 
-std::map<std::string, std::string> EventFields(const std::string &line) {
+std::map<std::string, std::string> EventFields(const std::string &line, bool strict = false) {
   std::map<std::string, std::string> fields;
   std::vector<std::string> duplicates;
   std::size_t begin = 0;
@@ -250,13 +251,88 @@ std::map<std::string, std::string> EventFields(const std::string &line) {
   // cannot hide a duplicate numeric completion field before event= appears.
   const auto event = fields.find("event");
   for (const auto &key : duplicates)
-    Require(key != "schema" && key != "producer" && key != "event" &&
+    Require(!strict && key != "schema" && key != "producer" && key != "event" &&
             (event == fields.end() || event->second != "compute_api_done"),
             "duplicate driver event field");
   return fields;
 }
 
 }  // namespace
+
+bool ValidateInitialCopyAudit(const std::string &driver_events, std::string *error) {
+  if (!error) return false;
+  try {
+    Require(driver_events.empty() || driver_events.back() == '\n', "truncated initial-copy driver audit");
+    bool flushed = false;
+    ForLines(driver_events, [&](const std::string &line) {
+      if (line.find_first_not_of(" \t\r") == std::string::npos) return;
+      const auto fields = EventFields(line, true);
+      const auto get = [&](const char *key) -> const std::string & {
+        const auto found = fields.find(key);
+        Require(found != fields.end(), std::string("missing initial-copy driver event ") + key);
+        return found->second;
+      };
+      Require(get("schema") == "pvrgpu.driver-counter.v1" &&
+              get("producer") == "pvrgpu-gallium-driver", "invalid initial-copy driver provenance");
+      const auto &event = get("event");
+      Require(event.find("error") == std::string::npos && event.find("fail") == std::string::npos &&
+              event.find("unsupported") == std::string::npos && event.find("declined") == std::string::npos,
+              "initial-copy driver failure: " + line);
+      // Accept only known state/CPU-transfer diagnostics, never an unknown
+      // event whose failure happens to use a different spelling. These events
+      // are emitted by the actual driver implementation, not capture metadata.
+      static constexpr std::string_view allowed[] = {
+        "flush", "flush_resource", "memory_barrier", "framebuffer_boundary",
+        "fence_reference", "fence_finish",
+        "resource_create", "resource_destroy", "buffer_copy_region", "resource_copy_region",
+        "buffer_map", "buffer_unmap", "texture_map", "texture_unmap", "texture_unmap_hash",
+        "buffer_subdata", "texture_subdata", "clear_buffer", "clear_texture", "blit",
+        "create_blend_state", "create_sampler_state", "create_rasterizer_state",
+        "create_depth_stencil_alpha_state", "bind_blend_state", "bind_rasterizer_state",
+        "bind_depth_stencil_alpha_state", "create_shader", "bind_shader", "dump_nir",
+        "create_vertex_elements", "vertex_element", "bind_vertex_elements",
+        "bind_sampler_states", "create_sampler_view", "destroy_sampler_view", "set_blend_color",
+        "set_stencil_ref", "set_sample_mask", "set_min_samples", "set_inlinable_constants",
+        "set_tess_state", "set_patch_vertices", "set_constant_buffer", "set_sampler_views",
+        "set_scissor", "set_viewport", "set_vertex_buffers", "vertex_buffer",
+        "set_framebuffer_state", "set_shader_buffers", "set_shader_images", "compute_state_bind",
+        "compute_state_create", "set_active_query_state", "render_condition", "set_stream_output_targets",
+        "stream_output_binding", "create_stream_output_target", "stream_output_target_destroy"
+      };
+      Require(std::find(std::begin(allowed), std::end(allowed), event) != std::end(allowed),
+              "unrecognized initial-copy driver event: " + line);
+      if (event == "fence_reference" || event == "fence_finish") {
+        // This synchronous driver represents a failed/unknown fence with a
+        // non-NULL handle. A NULL reference is only lifecycle bookkeeping,
+        // never a substitute for the independent successful flush evidence.
+        const auto &present = get(event == "fence_reference" ? "has_ptr" : "has_context");
+        Require((present == "0" || present == "1") && get("has_fence") == "0",
+                "initial-copy invalid or failed fence: " + line);
+        if (event == "fence_finish") {
+          Require(get("complete") == "1", "initial-copy fence did not complete: " + line);
+          (void)Unsigned(get("timeout"), "initial-copy fence timeout");
+        }
+      }
+      for (const auto &[key, value] : fields) {
+        if (key == "status" || key == "result")
+          Require(value == "0" || value == "ok" || value == "success" || value == "completed",
+                  "initial-copy driver status failure: " + line);
+        if (key == "error" || key == "failed" || key == "rejected" || key == "recording_failure")
+          Require(value == "0" || value == "false", "initial-copy driver failure flag: " + line);
+        if (key == "success" || key == "supported")
+          Require(value == "1" || value == "true", "initial-copy driver incomplete transfer: " + line);
+      }
+      // A copy path needing shaders cannot silently succeed while the native
+      // APIs are isolated. State binds and raw resource transfers are allowed.
+      Require(event.rfind("draw", 0) != 0 && event.rfind("systemc_api_", 0) != 0 &&
+              event.rfind("compute_api_", 0) != 0 && event != "launch_grid",
+              "initial-copy requires non-isolated execution: " + line);
+      if (event == "flush") flushed = true;
+    });
+    Require(flushed, "missing initial-copy driver flush evidence");
+    return true;
+  } catch (const std::exception &failure) { *error = failure.what(); return false; }
+}
 
 bool ParseNativeReport(const std::string &model_jsonl, const std::string &driver_events,
                        NativeReport *report, std::string *error) {
@@ -313,7 +389,11 @@ bool ParseNativeReport(const std::string &model_jsonl, const std::string &driver
       const auto &event = get("event");
       Require(event.find("error") == std::string::npos &&
               event.find("fail") == std::string::npos &&
-              event.find("unsupported") == std::string::npos,
+              event.find("unsupported") == std::string::npos &&
+              // A rejected multisample upload returns void to Mesa without
+              // necessarily setting a GL error. Unlike benign readback-map
+              // declines, it means the requested transfer did not occur.
+              event != "texture_subdata_declined",
               "driver failure: " + event);
       if (event == "systemc_api_submit") {
         Require(!graphics_pending && !compute_pending, "overlapping native API submits");
@@ -369,12 +449,14 @@ bool ParseFinalOutputReceipt(const std::string &json, FinalOutputReceipt *receip
     Require(String(message, "schema") == "pvrgpu.rdc-final-output.v2" &&
             String(message, "backend") == "pvrgpu" && String(message, "status") == "PASS",
             "missing successful native final-output receipt");
-    for (const char *key : {"initial_native_isolated", "replay_completed", "replay_context_finished"})
+    for (const char *key : {"initial_native_isolated", "initial_contents_restored", "replay_completed", "replay_context_finished"})
       Require(Boolean(message, key), std::string("incomplete final-output evidence: ") + key);
     Require(String(message, "api_error_capture") == "synchronous-gl-debug-callback" &&
             Boolean(message, "debug_callback_verified"), "missing continuous replay API error observation");
     Require(Uint(message, "api_errors") == 0, "replay reported GL API errors");
     FinalOutputReceipt result;
+    result.initial_copy_driver_counter_path = String(message, "initial_copy_driver_counter_path");
+    Require(!result.initial_copy_driver_counter_path.empty(), "missing initial-copy audit identity");
     result.rdc_path = String(message, "rdc_path");
     result.replay_begin_event = Uint(message, "replay_begin_event");
     result.replay_end_event = Uint(message, "replay_end_event");

@@ -859,6 +859,28 @@ std::uint64_t Fnv1a64Bytes(const void *data, std::size_t bytes) {
   return hash;
 }
 
+// Display conversion is deliberately separate from the raw DRAM readback
+// published to the driver. No precision is lost in the rendering data path.
+std::vector<std::uint8_t> PackedUnormDisplayBytes(
+    const std::vector<std::uint8_t> &storage, PackedUnormFormat format) {
+  if (format == PackedUnormFormat::kNone)
+    return storage;
+  if (storage.size() % 4)
+    throw std::runtime_error("packed UNORM display has a partial pixel");
+  std::vector<std::uint8_t> rgba(storage.size());
+  for (std::size_t offset = 0; offset < storage.size(); offset += 4) {
+    std::uint32_t word = 0;
+    std::memcpy(&word, storage.data() + offset, sizeof(word));
+    for (unsigned component = 0; component < 4; ++component) {
+      const std::uint32_t maximum = component == 3 ? 3 : 1023;
+      const auto value = (word >> PackedUnormShift(format, component)) & maximum;
+      rgba[offset + component] = static_cast<std::uint8_t>(
+          (value * 255U + maximum / 2U) / maximum);
+    }
+  }
+  return rgba;
+}
+
 void DebugSequenceAttachments(const MemoryPool &pool,
                               const PipelineState &state,
                               const DriverCommand &command,
@@ -884,23 +906,26 @@ void DebugSequenceAttachments(const MemoryPool &pool,
   if (color.size() != expected_color_bytes)
     throw std::runtime_error(
         "JsonReporter attachment debug color byte count mismatch");
+  const auto display_color = PackedUnormDisplayBytes(
+      color, state.color_attachment_packed_unorm);
 
   std::size_t nonzero_rgb_pixels = 0;
   std::size_t nonopaque_black_pixels = 0;
   for (std::size_t pixel = 0; pixel < color.size() / debug_bytes_per_pixel;
        ++pixel) {
     const std::size_t offset = pixel * debug_bytes_per_pixel;
-    if (color[offset] != 0 || color[offset + 1U] != 0 ||
-        color[offset + 2U] != 0) {
+    if (display_color[offset] != 0 || display_color[offset + 1U] != 0 ||
+        display_color[offset + 2U] != 0) {
       ++nonzero_rgb_pixels;
     }
-    if (color[offset] != 0 || color[offset + 1U] != 0 ||
-        color[offset + 2U] != 0 || color[offset + 3U] != 255) {
+    if (display_color[offset] != 0 || display_color[offset + 1U] != 0 ||
+        display_color[offset + 2U] != 0 || display_color[offset + 3U] != 255) {
       ++nonopaque_black_pixels;
     }
   }
 
   std::cerr << "sequence-attachment-hash ordinal=" << ordinal
+            << " format=" << command.format
             << " extent=" << state.width << 'x' << state.height
             << " color_address=0x" << std::hex
             << state.framebuffer_gpu_address << std::dec
@@ -2333,6 +2358,7 @@ void JsonReporter::RunJob() {
      * per target and the driver reads back each in turn. */
     std::vector<std::vector<std::uint8_t>> final_extra_framebuffers;
     std::uint32_t final_bytes_per_pixel = 4;
+    PackedUnormFormat final_packed_unorm = PackedUnormFormat::kNone;
     std::uint32_t final_sample_count = 1;
     std::uint32_t final_layer_count = 1;
     std::uint32_t final_width = 0;
@@ -2523,6 +2549,7 @@ void JsonReporter::RunJob() {
             ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
                                          state.color_attachment_float32));
         final_sample_count = state.raster_state.sample_count;
+        final_packed_unorm = state.color_attachment_packed_unorm;
         final_layer_count = state.attachment_layers;
         final_width = state.width;
         final_height = state.height;
@@ -2608,7 +2635,8 @@ void JsonReporter::RunJob() {
         artifact_path = FramePath(options_, 1);
         // Ordered native PCO sequences publish only the final physical DRAM
         // readback.  No command sidecar/golden/CPU framebuffer is consulted.
-        WriteRgbaPngAtomic(artifact_path, final_framebuffer, final_width,
+        WriteRgbaPngAtomic(artifact_path,
+                           PackedUnormDisplayBytes(final_framebuffer, final_packed_unorm), final_width,
                            final_height);
       }
       EmitCounter(options_, aggregate, aggregate_drawlists, vertex_pco,
@@ -2742,7 +2770,8 @@ void JsonReporter::RunJob() {
       if (!options_.output_dir.empty() && frame_bytes_per_pixel == 4U &&
           state.raster_state.sample_count == 1U && state.attachment_layers == 1U) {
         artifact_path = FramePath(options_, state.counters.frame);
-        std::vector<std::uint8_t> artifact_framebuffer = framebuffer;
+        std::vector<std::uint8_t> artifact_framebuffer = PackedUnormDisplayBytes(
+            framebuffer, state.color_attachment_packed_unorm);
         LoadDriverFramebufferSnapshot(options_,
                                       state.width,
                                       state.height,

@@ -25,6 +25,7 @@ esac
   -isystem "${REPLAY_SOURCE}/renderdoc" -I "${REPLAY_REPO_DIR}/src" \
   "${REPLAY_REPO_DIR}/tools/renderdoc-mesa-player.cpp" \
   "${REPLAY_REPO_DIR}/src/support/png_writer.cpp" \
+  "${REPLAY_REPO_DIR}/src/rdc_runner/native_report.cpp" \
   "$REPLAY_LIBRARY" "${REPLAY_PNG_FLAGS[@]}" \
   -Wl,-rpath,"$(dirname "$REPLAY_LIBRARY")" \
   -o "${REPLAY_BUILD_OUT}/pvrgpu-rdc-player"

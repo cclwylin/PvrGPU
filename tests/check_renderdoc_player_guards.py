@@ -52,14 +52,44 @@ def main():
         run("input-receipt-alias", lambda d: [str(capture), str(d / "final.png")],
             "Input/output paths must be distinct", lambda _: {"PVRGPU_RDC_FINAL_OUTPUT_RECEIPT": str(capture)})
         run("output-alias", lambda d: [str(capture), str(d / "receipt.json")], "Input/output paths must be distinct")
+        run("input-trace-alias", lambda d: [str(capture), str(d / "final.png"), str(capture)],
+            "Input/output paths must be distinct")
+        run("png-trace-alias", lambda d: [str(capture), str(d / "final.png"), str(d / "final.png")],
+            "Input/output paths must be distinct")
+        run("receipt-trace-alias", lambda d: [str(capture), str(d / "final.png"), str(d / "receipt.json")],
+            "Input/output paths must be distinct")
         run("existing-png", lambda d: [str(capture), str(d / "final.png")], "Refusing existing final PNG/receipt",
             existing=lambda d: [d / "final.png"])
         run("existing-receipt", lambda d: [str(capture), str(d / "final.png")], "Refusing existing final PNG/receipt",
             existing=lambda d: [d / "receipt.json"])
+        run("existing-trace", lambda d: [str(capture), str(d / "final.png"), str(d / "trace.md")],
+            "Refusing existing final PNG/receipt", existing=lambda d: [d / "trace.md"])
+        def aliased_output(d):
+            (d / "alias").symlink_to(d, target_is_directory=True)
+            return {"PVRGPU_RDC_FINAL_OUTPUT_RECEIPT": str(d / "alias" / "final.png")}
+        run("symlink-parent-alias", lambda d: [str(capture), str(d / "final.png")],
+            "Input/output paths must be distinct", aliased_output)
         run("missing-native-receipt", lambda d: [str(capture), str(d / "final.png")],
             "requires a final-output receipt", lambda _: {"GALLIUM_DRIVER": "pvrgpu", "PVRGPU_RDC_FINAL_OUTPUT_RECEIPT": ""})
         run("missing-native-runtime", lambda d: [str(capture), str(d / "final.png")],
             "requires native API library", lambda _: {"GALLIUM_DRIVER": "pvrgpu"})
+        def native_environment(d):
+            bridge = d / "unused-runtime.dylib"
+            bridge.touch()  # Guard exits before loading this deliberate non-runtime fixture.
+            return {"GALLIUM_DRIVER": "pvrgpu", "PVRGPU_SYSTEMC_API_LIB": str(bridge),
+                    "PVRGPU_DRIVER_COUNTER_OUT": str(d / "driver-counter.txt"),
+                    "PVRGPU_SYSTEMC_JSONL_OUT": str(d / "model.jsonl")}
+        run("existing-initial-audit", lambda d: [str(capture), str(d / "final.png")],
+            "Refusing existing initial-copy driver audit", native_environment,
+            existing=lambda d: [d / "receipt.json.initial-copy-driver-counter.txt"])
+        run("initial-audit-png-alias", lambda d: [str(capture), str(d / "receipt.json.initial-copy-driver-counter.txt")],
+            "Initial-copy audit paths must be distinct", native_environment)
+        def counter_alias(d):
+            env = native_environment(d)
+            env["PVRGPU_DRIVER_COUNTER_OUT"] = str(d / "receipt.json.initial-copy-driver-counter.txt")
+            return env
+        run("initial-audit-native-counter-alias", lambda d: [str(capture), str(d / "final.png")],
+            "Initial-copy audit paths must be distinct", counter_alias)
     print(f"Formal player fail-closed guards PASS: {checks} cases")
 
 

@@ -1,0 +1,60 @@
+{
+  "schema": "pvrgpu.renderdoc-snapshot-source-lock.v1",
+  "source_git_head": "2fc0bc04cb95499635f63986a55bc6f67849dd9f",
+  "baseline_tracked_tree_sha256": "9ff036ab97e9ea1cf0be69b619b987466baf760718c6a5a5a2ed006dd795db04",
+  "patch_sha256": "f8a9b95c5505dde6d9bce8d43cbc4f5d581ce4d5a0a960e8f6a9322e31605083",
+  "files": {
+    "renderdoc/driver/gl/gl_driver.cpp": {
+      "base_sha256": "3dbf0eddeec4b4c10a13a90e5cd608889c0953d4256a3c17e6a627b6bb8f43e0",
+      "patched_sha256": "f124d27a506a0c8444737d0f0755e83be15e63c445de2f84bc20895dafb07867"
+    },
+    "renderdoc/driver/gl/gl_driver.h": {
+      "base_sha256": "20a50f311e41ed1a0f2d9abca3bff96319bc71cb020981adafb39ce6b49db899",
+      "patched_sha256": "819128fb52697e2b8370c4bbecff7c38851030c044ba009fb7363732b78f8d5c"
+    },
+    "renderdoc/driver/gl/gl_initstate.cpp": {
+      "base_sha256": "e7c7a3d29e868b951e84b765dc8b92075505935c807e56696a7539f48b99e96e",
+      "patched_sha256": "3ea2b1fa56b1e0aa104fb891a84f6353684dd5725c464ba3a337ac1ac5e753d4"
+    },
+    "renderdoc/driver/gl/gl_manager.h": {
+      "base_sha256": "5171d4484aa3f92ed2ba3c02dfb204b3e97155729b67976fd4a16b8fba604920",
+      "patched_sha256": "fa58f75be411629545044921af06fedd762c0996d7f795737ed2573d4db8a012"
+    },
+    "renderdoc/driver/gl/gl_replay.cpp": {
+      "base_sha256": "f82ea952bb680544a6f1151a9f16b411ed58e1ee9af56045d6afaf6d2c865a3d",
+      "patched_sha256": "6db526a14ee386900a5d67e3239e8534653c721ac9e650efd6145743e80c8bd8"
+    },
+    "renderdoc/driver/gl/gl_replay.h": {
+      "base_sha256": "1d63f8f1149dbd9ece91717d350385099bf4c00539e406ddb37aa3f53987945c",
+      "patched_sha256": "e34893188302d392ce4a34c4622f6659a606e5eba0a6606b6e70b8b07411a2c1"
+    },
+    "renderdoc/driver/gl/gl_replay_snapshot.inl": {
+      "base_sha256": null,
+      "patched_sha256": "c8900f8f6aef25ce3c918ee535af19974dde8197dfb2754450babf3808e870b5"
+    },
+    "renderdoc/driver/gl/gl_resources.cpp": {
+      "base_sha256": "d65874d178321a6c3ea603402fa18c3091d5f8b0a3b94fa5028ab9e7dd9addb0",
+      "patched_sha256": "b3c8c99f26355b0365d91648bd102a6d932346b1d3fa3766f021967fb8f81dad"
+    },
+    "renderdoc/driver/gl/gl_snapshot_codec_safety.inl": {
+      "base_sha256": null,
+      "patched_sha256": "bff6ffa6f074c10362786a00b26d52a4d97a8fde54e25d75ca8c82b29a7bf90c"
+    },
+    "renderdoc/replay/replay_controller.cpp": {
+      "base_sha256": "32664e3266044cd387db6225f7a2f835320ec61c9430887518c6d063e6a306f5",
+      "patched_sha256": "221912fd806b8e59e2ba72992443564c102e45ca509c5aadf88687957df3390f"
+    },
+    "renderdoc/replay/replay_controller.h": {
+      "base_sha256": "d20b45d52ca767f9645155215ff346cc21f51e339d30ee782dae0390b06441fd",
+      "patched_sha256": "6775566a4020218e40199c385b6f3d071acd70bdbae282ca1d9f661a474e073a"
+    },
+    "renderdoc/replay/replay_snapshot.h": {
+      "base_sha256": null,
+      "patched_sha256": "ad61649f34f6bbc589ca824258c1ff597930d2cc4c0dae0850826c52b8881499"
+    },
+    "renderdoc/replay/replay_snapshot_api.inl": {
+      "base_sha256": null,
+      "patched_sha256": "872c048e59c2024edcc7f2ef0795d53b63ce1dfd70a84842fd8134d3789c0637"
+    }
+  }
+}

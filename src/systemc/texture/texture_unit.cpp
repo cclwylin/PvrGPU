@@ -394,6 +394,9 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
   const bool rgb565 = identity_rgb && format == 5U && alpha_swizzle == 4U;
   const bool rgba8_snorm = identity_rgb && format == 13U && alpha_swizzle == 3U;
   const bool rgb10_a2 = identity_rgb && format == 14U && alpha_swizzle == 3U;
+  const bool bgr10_a2 = !compressed && format == 14U &&
+      red_swizzle == 2U && green_swizzle == 1U && blue_swizzle == 0U &&
+      alpha_swizzle == 3U;
   const bool rgb9e5 = identity_rgb && format == 26U && alpha_swizzle == 4U;
   const bool r11g11b10 = identity_rgb && format == 27U && alpha_swizzle == 4U;
   const bool rgba16f = identity_rgb && format == 28U && alpha_swizzle == 3U;
@@ -405,7 +408,7 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
   const bool integer_colour = rgba32_uint || rgba32_sint;
   const bool rgba32_float = identity_rgb && format == 61U && alpha_swizzle == 3U;
   const bool packed_colour =
-      rgb565 || rgba8_snorm || rgb10_a2 || rgb9e5 || r11g11b10 || rgba16f ||
+      rgb565 || rgba8_snorm || rgb10_a2 || bgr10_a2 || rgb9e5 || r11g11b10 || rgba16f ||
       rgba32_float;
   /*
    * Rogue IMAGE_WORD0 bit 3 is GAMMA and bit 4 is the second half of
@@ -502,6 +505,7 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
       : rgb565            ? TextureFormat::kRgb565Unorm
       : rgba8_snorm       ? TextureFormat::kRgba8Snorm
       : rgb10_a2          ? TextureFormat::kRgb10A2Unorm
+      : bgr10_a2          ? TextureFormat::kBgr10A2Unorm
       : r11g11b10         ? TextureFormat::kR11fG11fB10f
       : rgb9e5            ? TextureFormat::kRgb9e5Float
       : rgba16f           ? TextureFormat::kRgba16Float
@@ -527,6 +531,7 @@ bool ComputeTextureMultisampleTexelOffset(
     const TextureResource &resource, const TextureSampleRequest &request,
     std::uint32_t layer, std::uint64_t *offset) {
   if (offset == nullptr || request.sample_index_present != 1U ||
+      request.lod_bias_present || request.lod_bias ||
       request.explicit_lod_present != 0U || request.explicit_lod != 0U ||
       request.normalized != 0U || resource.mip_count != 1U ||
       (resource.sample_count != 1U && resource.sample_count != 2U &&
@@ -575,6 +580,7 @@ bool ComputeTextureTexelOffset(
     std::uint32_t array_layer, std::uint64_t *offset) {
   if (!offset || request.normalized != 0 || request.sample_index_present ||
       request.sample_index || request.explicit_lod_present != 1 ||
+      request.lod_bias_present || request.lod_bias ||
       resource.sample_count != 1 || !resource.layer_count || !resource.mip_count ||
       resource.mip_count > kMaximumTextureMipLevels ||
       resource.block_width != 1 || resource.block_height != 1 ||
@@ -737,6 +743,7 @@ bool DriverPcoTextureDescriptorClassSupported(
       image.format == TextureFormat::kZ24UnormS8Uint ||
       image.format == TextureFormat::kRgb565Unorm ||
       image.format == TextureFormat::kRgb10A2Unorm ||
+      image.format == TextureFormat::kBgr10A2Unorm ||
       image.format == TextureFormat::kRgba8Snorm ||
       image.format == TextureFormat::kRgba16Float ||
       image.format == TextureFormat::kRgba32Uint ||
@@ -932,6 +939,60 @@ TextureImplicitLod ComputeTextureExplicitLod(
   result.level1 = levels.level1;
   result.mip_weight = levels.mip_weight;
   result.mip_weight_u8 = levels.mip_weight_u8;
+  return result;
+}
+
+static void StoreLodSelection(TextureImplicitLod &result,
+                              const TextureLodSelection &lod,
+                              const RogueTextureSamplerDescriptor &sampler,
+                              std::uint32_t mip_count) {
+  const auto levels = SelectTextureLevels(lod, sampler, mip_count);
+  result.lambda = lod.lambda;
+  result.minified = lod.minified;
+  result.image_filter = levels.image_filter;
+  result.mip_mode = levels.mip_mode;
+  result.level0 = levels.level0;
+  result.level1 = levels.level1;
+  result.mip_weight = levels.mip_weight;
+  result.mip_weight_u8 = levels.mip_weight_u8;
+}
+
+TextureImplicitLod ComputeTexture3DImplicitLod(
+    const std::array<std::array<float, 3>, 4> &coordinates,
+    std::uint32_t depth, const RogueTextureImageDescriptor &image,
+    const RogueTextureSamplerDescriptor &sampler) {
+  if (!depth) throw std::runtime_error("TextureUnit 3D LOD depth is invalid");
+  std::array<std::array<float, 2>, 4> xy{};
+  for (std::size_t lane = 0; lane < 4; ++lane) {
+    xy[lane] = {coordinates[lane][0], coordinates[lane][1]};
+    if (!std::isfinite(coordinates[lane][2]))
+      throw std::runtime_error("TextureUnit 3D LOD coordinate is invalid");
+  }
+  auto result = ComputeTextureImplicitLod(xy, image, sampler);
+  const float drdx = (coordinates[1][2] - coordinates[0][2]) * depth;
+  const float drdy = (coordinates[2][2] - coordinates[0][2]) * depth;
+  const float rho_x = result.dsdx * result.dsdx + result.dtdx * result.dtdx + drdx * drdx;
+  const float rho_y = result.dsdy * result.dsdy + result.dtdy * result.dtdy + drdy * drdy;
+  if (!std::isfinite(rho_x) || !std::isfinite(rho_y))
+    throw std::runtime_error("TextureUnit 3D implicit derivative rho is invalid");
+  result.rho_squared = std::max(rho_x, rho_y);
+  StoreLodSelection(result, SelectTextureLod(result.rho_squared, sampler, image.mip_count),
+                    sampler, image.mip_count);
+  return result;
+}
+
+TextureImplicitLod ApplyTextureLodBias(
+    const TextureImplicitLod &implicit, float bias,
+    const RogueTextureImageDescriptor &image,
+    const RogueTextureSamplerDescriptor &sampler, bool undefined_cube_footprint) {
+  auto result = implicit;
+  // Nonfinite rho can only survive the validated cube undefined-coordinate
+  // path, whose defined selector input is zero; preserve its raw diagnostics.
+  if (!std::isfinite(implicit.rho_squared) && !undefined_cube_footprint)
+    throw std::runtime_error("TextureUnit biased derivative rho is invalid");
+  const float rho = std::isfinite(implicit.rho_squared) ? implicit.rho_squared : 0.0F;
+  StoreLodSelection(result, SelectTextureBiasedLod(rho, bias, sampler, image.mip_count),
+                    sampler, image.mip_count);
   return result;
 }
 
@@ -1285,11 +1346,16 @@ void TextureUnit::SampleRunForStage(
     const bool multisample_fetch = requests.front().sample_index_present != 0;
     const bool texel_fetch = !multisample_fetch && requests.front().normalized == 0;
     const bool explicit_lod = requests.front().explicit_lod_present != 0;
+    const bool biased_lod = requests.front().lod_bias_present != 0;
     const bool direct_fetch = multisample_fetch || texel_fetch;
     for (const TextureSampleRequest &request : requests) {
       if (request.sample_index_present != (multisample_fetch ? 1U : 0U) ||
           request.normalized != (direct_fetch ? 0U : 1U) ||
           request.explicit_lod_present != (explicit_lod ? 1U : 0U) ||
+          request.lod_bias_present != (biased_lod ? 1U : 0U) ||
+          (!biased_lod && request.lod_bias != 0) ||
+          (biased_lod && (!fragment_stage || direct_fetch || explicit_lod ||
+                         resource.dimension_type == TextureDimensionType::k2DArray)) ||
           (!explicit_lod && request.explicit_lod != 0) ||
           (multisample_fetch && explicit_lod) || (texel_fetch && !explicit_lod) ||
           (multisample_fetch &&
@@ -1341,12 +1407,17 @@ void TextureUnit::SampleRunForStage(
           } else {
             coordinates[lane][0] = BitsFloat(request.coordinates[0]);
             coordinates[lane][1] = BitsFloat(request.coordinates[1]);
+            if (resource.dimension_type == TextureDimensionType::k3D)
+              for (std::size_t component = 0; component < 3; ++component)
+                cube_directions[lane][component] = BitsFloat(request.coordinates[component]);
           }
         }
         TextureImplicitLod lod;
         try {
           lod = resource.dimension_type == TextureDimensionType::kCube
               ? ComputeTextureCubeImplicitLod(cube_directions, image, decoded_sampler)
+              : resource.dimension_type == TextureDimensionType::k3D
+              ? ComputeTexture3DImplicitLod(cube_directions, resource.layer_count, image, decoded_sampler)
               : ComputeTextureImplicitLod(coordinates, image, decoded_sampler);
         } catch (const std::runtime_error &error) {
           // Retain the real failing inputs at this boundary. This does not
@@ -1386,6 +1457,13 @@ void TextureUnit::SampleRunForStage(
       const TextureImplicitLod base_level =
           ComputeTextureImplicitLod(degenerate_quad, image, decoded_sampler);
       std::fill(implicit_lods.begin(), implicit_lods.end(), base_level);
+    }
+    if (biased_lod) {
+      // PPLOD is per lane: the implicit derivatives belong to the quad, but
+      // four different bias words can select four different mip pairs.
+      for (std::size_t i = 0; i < requests.size(); ++i)
+        implicit_lods[i] = ApplyTextureLodBias(implicit_lods[i], BitsFloat(requests[i].lod_bias),
+            image, decoded_sampler, resource.dimension_type == TextureDimensionType::kCube);
     }
 
     // Bounded, default-off evidence for diagnosing captured mip residency.

@@ -56,6 +56,12 @@ intermediate.write_bytes(png(1, 1, [255, 0, 0, 255]))
 color = mode not in ('no_color', 'compute_only')
 if color: out.write_bytes(png(2, 3, [11, 22, 33, 255]))
 receipt = dict(schema='pvrgpu.rdc-final-output.v2', backend='pvrgpu', status='PASS', rdc_path=str(p(sys.argv[1]).resolve()), initial_native_isolated=True, replay_completed=True, replay_context_finished=True, api_errors=0, replay_begin_event=1, replay_end_event=91, trace_draw_actions=0, color_output=color, api_error_capture='synchronous-gl-debug-callback', debug_callback_verified=True)
+audit = p(os.environ['PVRGPU_RDC_FINAL_OUTPUT_RECEIPT'] + '.initial-copy-driver-counter.txt')
+receipt.update(initial_contents_restored=True, initial_copy_driver_counter_path=str(audit.resolve()))
+if mode != 'missing_init_audit':
+    audit.write_text('schema=pvrgpu.driver-counter.v1 producer=pvrgpu-gallium-driver event=' + ('texture_subdata_declined' if mode == 'failed_init_copy' else 'flush') + '\n')
+if mode == 'unrestored_init': receipt['initial_contents_restored'] = False
+if mode == 'wrong_init_audit': receipt['initial_copy_driver_counter_path'] = str(out)
 if color: receipt.update(source='completed-replay-attachment', resource_id='123', mip=2, layer=1, sample=0, width=2, height=3, format='RGBA8_UNORM', png_path=str(out.resolve()))
 if mode == 'wrong_png': receipt['png_path'] = str(intermediate)
 if mode == 'wrong_rdc': receipt['rdc_path'] = str(out)
@@ -86,7 +92,8 @@ class NativeRunnerProcessTests(unittest.TestCase):
             rdc.write_bytes(b"process-contract-fixture-not-a-real-capture")
             for mode in ("pass", "no_color", "compute_only", "missing_receipt", "wrong_png", "wrong_rdc",
                          "unfinished", "api_error", "png_extent", "missing_compute_done", "driver_failure",
-                         "truncated_model", "stale"):
+                         "truncated_model", "stale", "missing_init_audit", "failed_init_copy",
+                         "unrestored_init", "wrong_init_audit"):
                 with self.subTest(mode=mode):
                     output = root / mode
                     output.mkdir()
@@ -94,6 +101,7 @@ class NativeRunnerProcessTests(unittest.TestCase):
                     (output / "frame.png").write_bytes(b"stale")
                     (output / "player-final-output.json").write_text("{}")
                     (output / "driver-counter.txt").write_text("stale")
+                    (output / "player-final-output.json.initial-copy-driver-counter.txt").write_text("stale")
                     calls = root / (mode + "-calls")
                     env = dict(os.environ, PVRGPU_TEST_MODE=mode, PVRGPU_TEST_CALLS=str(calls),
                                PVRGPU_SYSTEMC_API_LIB=str(bridge), PVRGPU_RDC_TRACE_DRAW_ACTIONS="999999",

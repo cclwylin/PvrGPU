@@ -172,6 +172,25 @@ void CheckDescriptorAndArithmetic() {
         "single-mip public texel-stride image descriptor is accepted");
 
   auto rgbx_image_words = single_mip_image_words;
+  // Rogue format14 is U10U10U10U2; the raw descriptor, not a host-side
+  // channel guess, selects RGB or BGR from the same four-byte packed word.
+  for (const bool bgr : {false, true}) {
+    auto packed_words = single_mip_image_words;
+    std::uint64_t word0 = static_cast<std::uint64_t>(packed_words[0]) |
+        (static_cast<std::uint64_t>(packed_words[1]) << 32U);
+    word0 &= ~((UINT64_C(127) << 27U) | (UINT64_C(0xfff) << 5U));
+    word0 |= (UINT64_C(14) << 27U) | (UINT64_C(3) << 5U) |
+        (static_cast<std::uint64_t>(bgr ? 0 : 2) << 8U) |
+        (UINT64_C(1) << 11U) |
+        (static_cast<std::uint64_t>(bgr ? 2 : 0) << 14U);
+    packed_words[0] = static_cast<std::uint32_t>(word0);
+    packed_words[1] = static_cast<std::uint32_t>(word0 >> 32U);
+    const auto packed_image = DecodeRogueTextureImageDescriptor(packed_words);
+    Check(packed_image.format == (bgr ? TextureFormat::kBgr10A2Unorm :
+                                       TextureFormat::kRgb10A2Unorm) &&
+          packed_image.row_pitch_bytes == 2048 && packed_image.mip_count == 1,
+          "packed ten-bit raw descriptor swizzle and storage width");
+  }
   rgbx_image_words[0] &= ~(UINT32_C(7) << 5U);
   rgbx_image_words[0] |= UINT32_C(4) << 5U; // SWIZ3=SRC_ONE.
   const RogueTextureImageDescriptor rgbx_image =

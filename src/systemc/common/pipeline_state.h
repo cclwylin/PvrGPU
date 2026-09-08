@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/functional_types.h"
+#include "common/packed_unorm.h"
 #include "common/shader_image_types.h"
 #include "memory_pool.h"
 #include "model_types.h"
@@ -234,6 +235,8 @@ struct PipelineState {
   // Canonical linear RGBA32F storage.  This is separate from raw integer
   // PIXOUT transport: floating-point attachments still blend and honor masks.
   std::uint8_t color_attachment_float32 = 0;
+  // Actual packed four-byte normalized storage, not RGBA8 or raw integers.
+  PackedUnormFormat color_attachment_packed_unorm = PackedUnormFormat::kNone;
   // The UNORM8 colour attachment stores sRGB-encoded bytes: the PBE encodes the
   // shader's linear PIXOUT on write and, when blending, decodes the stored
   // destination to linear, blends there and re-encodes.  Zero is a plain linear

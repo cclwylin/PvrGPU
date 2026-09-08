@@ -88,10 +88,11 @@ static_assert(std::is_trivially_copyable_v<PcoTemporaryMask>);
  * public workload/transport gates, not Rogue hardware-file limits. */
 inline constexpr std::size_t kPcoTextureDescriptorDwordCount = 20;
 inline constexpr std::size_t kPcoMaximumTextureDescriptorSets = 8;
-/* Sequential SMP instructions are not descriptor sets.  The captured
- * terrain post-process shaders issue as many as nine samples from one set,
- * so continuation depth has its own strict program bound. */
-inline constexpr std::size_t kPcoMaximumTextureSampleInstructions = 9;
+/* The vertex continuation path validates a bounded straight-line SMP
+ * sequence. Fragment programs instead support control flow and reuse one
+ * continuation per resident lane: their static SMP count is not continuation
+ * depth and must not inherit this vertex-only program bound. */
+inline constexpr std::size_t kPcoMaximumVertexTextureSampleInstructions = 9;
 inline constexpr std::size_t kPcoMaximumVertexSharedCount = 96;
 inline constexpr std::size_t kPcoMaximumFragmentSharedCount = 256;
 inline constexpr std::size_t kPcoMaximumSharedCount =
@@ -413,6 +414,9 @@ struct PcoInstruction {
   std::uint8_t texture_spatial_offset_present = 0;
   // SMP LODM=REPLACE/PPLod carries one float LOD before optional TAO.
   std::uint8_t texture_lod_replace = 0;
+  // Fragment SMP BIAS/PPLOD: a raw float bias follows the coordinates.
+  // The existing TAO zero-bias padding remains a distinct, bounded path.
+  std::uint8_t texture_lod_bias = 0;
   std::uint8_t data_request = 0;
   PcoIterationMode iteration_mode = PcoIterationMode::kPixel;
   std::uint8_t perspective = 0;
@@ -513,6 +517,10 @@ inline bool HasCanonicalNativeIntegerSignedness(const PcoInstruction &i) {
 inline bool HasCanonicalTextureLodMode(const PcoInstruction &i) {
   return (i.texture_lod_replace == 0 ||
           (i.texture_lod_replace == 1 && i.opcode == PcoOpcode::kTextureSample)) &&
+         (i.texture_lod_bias == 0 ||
+          (i.texture_lod_bias == 1 && i.opcode == PcoOpcode::kTextureSample &&
+           !i.texture_lod_replace && !i.texture_address_offset &&
+           !i.texture_non_normalized_coords && !i.texture_sample_index_present)) &&
          (i.texture_spatial_offset_present == 0 ||
           (i.texture_spatial_offset_present == 1 && i.opcode == PcoOpcode::kTextureSample));
 }
@@ -571,6 +579,8 @@ struct PcoTextureRequest {
   std::uint8_t data_request = 0;
   std::uint32_t explicit_lod = 0;
   std::uint8_t explicit_lod_present = 0;
+  std::uint32_t lod_bias = 0;
+  std::uint8_t lod_bias_present = 0;
 };
 
 /* Complete lane-local vertex state captured immediately after an SMP request.

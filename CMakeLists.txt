@@ -30,6 +30,7 @@ endfunction()
 add_library(pvrgpu-rdc-runner-support STATIC
     src/rdc_runner/native_report.cpp
     src/rdc_runner/process.cpp
+    src/rdc_runner/replay_range_audit.cpp
     src/rdc_runner/runtime_config.cpp
     src/rdc_runner/sha256.cpp
 )
@@ -373,6 +374,17 @@ add_executable(rdc-native-report-test tests/rdc_native_report_test.cpp)
 target_link_libraries(rdc-native-report-test PRIVATE pvrgpu-rdc-runner-support)
 pvrgpu_target_warnings(rdc-native-report-test)
 add_test(NAME rdc-native-report-test COMMAND rdc-native-report-test)
+add_executable(replay-range-audit-test tests/replay_range_audit_test.cpp)
+target_link_libraries(replay-range-audit-test PRIVATE pvrgpu-rdc-runner-support)
+pvrgpu_target_warnings(replay-range-audit-test)
+add_test(NAME replay-range-audit-test COMMAND replay-range-audit-test)
+if(UNIX)
+    add_executable(rdc-gl-debug-scope-test tests/rdc_gl_debug_scope_test.cpp)
+    target_include_directories(rdc-gl-debug-scope-test PRIVATE "${CMAKE_SOURCE_DIR}/src")
+    target_link_libraries(rdc-gl-debug-scope-test PRIVATE ${CMAKE_DL_LIBS})
+    pvrgpu_target_warnings(rdc-gl-debug-scope-test)
+    add_test(NAME rdc-gl-debug-scope-test COMMAND rdc-gl-debug-scope-test)
+endif()
 add_test(NAME llvmpipe-native-cli-help COMMAND llvmpipe --help)
 add_test(NAME pvrgpu-native-cli-help COMMAND pvrgpu --help)
 if(PVRGPU_ENABLE_LIVE_DEQP)
@@ -416,6 +428,16 @@ target_include_directories(pco-prepared-fragment-test PRIVATE
 )
 pvrgpu_target_warnings(pco-prepared-fragment-test)
 add_test(NAME pco-prepared-fragment-unit COMMAND pco-prepared-fragment-test)
+
+add_executable(pco-texture-sequence-test
+    tests/pco_texture_sequence_test.cpp
+    src/systemc/shader/pco_iss.cpp
+)
+target_include_directories(pco-texture-sequence-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(pco-texture-sequence-test)
+add_test(NAME pco-texture-sequence-unit COMMAND pco-texture-sequence-test)
 
 add_executable(pco-multisample-texture-test
     tests/pco_multisample_texture_test.cpp
@@ -979,6 +1001,30 @@ target_link_libraries(texture-cube-nonfinite-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(texture-cube-nonfinite-test)
 add_test(NAME texture-cube-nonfinite-unit COMMAND texture-cube-nonfinite-test)
 
+# Native Mesa-emitted BIAS/PPLOD, real USC/TextureUnit FIFOs, and mip data.
+# The private Mesa producer script also runs this fixture on freshly compiled
+# binaries, independently of the checked-in bytes used by ordinary CTest.
+add_executable(texture-bias-test
+    tests/texture_bias_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/shader/pco_iss.cpp
+    src/systemc/shader/usc_cluster.cpp
+    src/systemc/texture/astc_decoder.cpp
+    src/systemc/texture/texture_filter.cpp
+    src/systemc/texture/texture_unit.cpp
+)
+target_include_directories(texture-bias-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(texture-bias-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(texture-bias-test)
+add_test(NAME texture-bias-unit COMMAND texture-bias-test)
+
 add_executable(centroid-geometry-test tests/centroid_geometry_test.cpp)
 target_include_directories(centroid-geometry-test PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/systemc")
@@ -1068,6 +1114,16 @@ add_test(
     COMMAND usc-cluster-texture-continuation-test request-limit
 )
 add_test(
+    NAME usc-cluster-texture-request-boundary-unit
+    COMMAND usc-cluster-texture-continuation-test request-boundary
+)
+foreach(samples 10 16)
+    add_test(
+        NAME usc-cluster-texture-sequence-${samples}-unit
+        COMMAND usc-cluster-texture-continuation-test sequence${samples}
+    )
+endforeach()
+add_test(
     NAME usc-cluster-texture-response-order-fail-closed
     COMMAND usc-cluster-texture-continuation-test response-order
 )
@@ -1132,6 +1188,27 @@ target_include_directories(pbe-blend-test PRIVATE
 target_link_libraries(pbe-blend-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(pbe-blend-test)
 add_test(NAME pbe-blend-unit COMMAND pbe-blend-test)
+
+add_executable(pbe-packed-unorm-test
+    tests/pbe_packed_unorm_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/fragment/pbe.cpp
+)
+target_include_directories(pbe-packed-unorm-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(pbe-packed-unorm-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(pbe-packed-unorm-test)
+add_test(NAME pbe-packed-unorm-unit COMMAND pbe-packed-unorm-test)
+foreach(pbe_packed_invalid_state IN ITEMS float integer srgb format load-size)
+    add_test(NAME pbe-packed-unorm-reject-${pbe_packed_invalid_state}
+        COMMAND pbe-packed-unorm-test ${pbe_packed_invalid_state})
+endforeach()
 
 add_executable(pbe-nonfinite-output-test
     tests/pbe_nonfinite_output_test.cpp
@@ -1730,6 +1807,22 @@ set_tests_properties(
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+    add_test(NAME drawlist-replay-cli-test
+        COMMAND "${CMAKE_COMMAND}" -E env
+                "PYTHONDONTWRITEBYTECODE=1"
+                "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_drawlist_replay_cli.py")
+    add_test(NAME drawlist-checkpoint-integration-test
+        COMMAND "${CMAKE_COMMAND}" -E env
+                "PYTHONDONTWRITEBYTECODE=1"
+                "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_drawlist_checkpoint_integration.py")
+    add_test(NAME build-renderdoc-snapshot-test
+        COMMAND "${CMAKE_COMMAND}" -E env
+                "PYTHONDONTWRITEBYTECODE=1"
+                "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_build_renderdoc_snapshot.py")
+    add_test(NAME inspect-drawlist-snapshot-test
+        COMMAND "${CMAKE_COMMAND}" -E env
+                "PYTHONDONTWRITEBYTECODE=1"
+                "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_inspect_drawlist_snapshot.py")
     add_test(NAME rdc-native-runner-process-test
         COMMAND "${CMAKE_COMMAND}" -E env
                 "PYTHONDONTWRITEBYTECODE=1"

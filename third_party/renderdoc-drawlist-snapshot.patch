@@ -1,0 +1,2000 @@
+diff --git a/renderdoc/driver/gl/gl_driver.cpp b/renderdoc/driver/gl/gl_driver.cpp
+--- a/renderdoc/driver/gl/gl_driver.cpp
++++ b/renderdoc/driver/gl/gl_driver.cpp
+@@ -5269,6 +5269,56 @@
+ RDResult WrappedOpenGL::ContextReplayLog(CaptureState readType, uint32_t startEventID,
+                                          uint32_t endEventID, bool partial)
+ {
++  return ContextReplayLog(readType, startEventID, endEventID, partial, false);
++}
++
++void WrappedOpenGL::EndActiveReplayScopes(bool recordFeedbackResume)
++{
++  if(!IsActiveReplaying(m_State) || m_FetchCounters)
++    return;
++
++  // This is the existing standalone replay cleanup, shared by seek/reset,
++  // shutdown, and non-continuous replay. Continuous ranges leave these scopes
++  // open for the capture's real End commands in a later range.
++  for(size_t i = 0; i < MAX_QUERIES; i++)
++  {
++    GLenum q = QueryEnum(i);
++    if(q == eGL_NONE)
++      break;
++
++    int indices = IsGLES ? 1 : MAX_QUERY_INDICES;
++    for(int j = 0; j < indices; j++)
++    {
++      if(m_ActiveQueries[i][j])
++      {
++        if(IsGLES)
++          GL.glEndQuery(q);
++        else
++          GL.glEndQueryIndexed(q, j);
++        m_ActiveQueries[i][j] = false;
++      }
++    }
++  }
++
++  if(m_ActiveConditional)
++  {
++    GL.glEndConditionalRender();
++    m_ActiveConditional = false;
++  }
++
++  if(m_ActiveFeedback)
++  {
++    GL.glEndTransformFeedback();
++    m_ActiveFeedback = false;
++    if(recordFeedbackResume)
++      m_WasActiveFeedback = true;
++  }
++}
++
++RDResult WrappedOpenGL::ContextReplayLog(CaptureState readType, uint32_t startEventID,
++                                         uint32_t endEventID, bool partial,
++                                         bool preserveActiveScopes)
++{
+   m_FrameReader->SetOffset(0);
+ 
+   ReadSerialiser ser(m_FrameReader, Ownership::Nothing);
+@@ -5293,39 +5343,7 @@
+   RDCASSERTEQUAL(header, SystemChunk::CaptureBegin);
+ 
+   if(IsActiveReplaying(m_State) && !partial && !m_FetchCounters)
+-  {
+-    for(size_t i = 0; i < 8; i++)
+-    {
+-      GLenum q = QueryEnum(i);
+-      if(q == eGL_NONE)
+-        break;
+-
+-      int indices = IsGLES ? 1 : 8;    // GLES does not support indices
+-      for(int j = 0; j < indices; j++)
+-      {
+-        if(m_ActiveQueries[i][j])
+-        {
+-          if(IsGLES)
+-            GL.glEndQuery(q);
+-          else
+-            GL.glEndQueryIndexed(q, j);
+-          m_ActiveQueries[i][j] = false;
+-        }
+-      }
+-    }
+-
+-    if(m_ActiveConditional)
+-    {
+-      GL.glEndConditionalRender();
+-      m_ActiveConditional = false;
+-    }
+-
+-    if(m_ActiveFeedback)
+-    {
+-      GL.glEndTransformFeedback();
+-      m_ActiveFeedback = false;
+-    }
+-  }
++    EndActiveReplayScopes(false);
+ 
+   if(partial)
+     ser.SkipCurrentChunk();
+@@ -5422,41 +5440,8 @@
+     }
+   }
+ 
+-  if(IsActiveReplaying(m_State) && !m_FetchCounters)
+-  {
+-    for(size_t i = 0; i < MAX_QUERIES; i++)
+-    {
+-      GLenum q = QueryEnum(i);
+-      if(q == eGL_NONE)
+-        break;
+-
+-      int indices = IsGLES ? 1 : MAX_QUERY_INDICES;    // GLES does not support indices
+-      for(int j = 0; j < indices; j++)
+-      {
+-        if(m_ActiveQueries[i][j])
+-        {
+-          if(IsGLES)
+-            GL.glEndQuery(q);
+-          else
+-            GL.glEndQueryIndexed(q, j);
+-          m_ActiveQueries[i][j] = false;
+-        }
+-      }
+-    }
+-
+-    if(m_ActiveConditional)
+-    {
+-      GL.glEndConditionalRender();
+-      m_ActiveConditional = false;
+-    }
+-
+-    if(m_ActiveFeedback)
+-    {
+-      GL.glEndTransformFeedback();
+-      m_ActiveFeedback = false;
+-      m_WasActiveFeedback = true;
+-    }
+-  }
++  if(!preserveActiveScopes)
++    EndActiveReplayScopes(true);
+ 
+   return ResultCode::Succeeded;
+ }
+@@ -5903,6 +5888,12 @@
+ 
+ void WrappedOpenGL::ReplayLog(uint32_t startEventID, uint32_t endEventID, ReplayLogType replayType)
+ {
++  ReplayLog(startEventID, endEventID, replayType, false);
++}
++
++void WrappedOpenGL::ReplayLog(uint32_t startEventID, uint32_t endEventID,
++                             ReplayLogType replayType, bool preserveActiveScopes)
++{
+   bool partial = true;
+ 
+   if(startEventID == 0 && (replayType == eReplay_WithoutDraw || replayType == eReplay_Full))
+@@ -5910,6 +5901,12 @@
+     startEventID = 1;
+     partial = false;
+   }
++
++  // A seek/reset or return to standalone replay ends continuous scopes before
++  // restoring initial resources. In particular, ApplyInitialContents may
++  // rebind transform-feedback buffers and is not legal with feedback active.
++  if(!partial || !preserveActiveScopes)
++    EndActiveReplayScopes(false);
+ 
+   if(!partial)
+   {
+@@ -5930,11 +5927,12 @@
+   RDResult status = ResultCode::Succeeded;
+ 
+   if(replayType == eReplay_Full)
+-    status = ContextReplayLog(m_State, startEventID, endEventID, partial);
++    status = ContextReplayLog(m_State, startEventID, endEventID, partial, preserveActiveScopes);
+   else if(replayType == eReplay_WithoutDraw)
+-    status = ContextReplayLog(m_State, startEventID, RDCMAX(1U, endEventID) - 1, partial);
++    status = ContextReplayLog(m_State, startEventID, RDCMAX(1U, endEventID) - 1, partial,
++                             preserveActiveScopes);
+   else if(replayType == eReplay_OnlyDraw)
+-    status = ContextReplayLog(m_State, endEventID, endEventID, partial);
++    status = ContextReplayLog(m_State, endEventID, endEventID, partial, preserveActiveScopes);
+   else
+     RDCFATAL("Unexpected replay type");
+ 
+diff --git a/renderdoc/driver/gl/gl_driver.h b/renderdoc/driver/gl/gl_driver.h
+--- a/renderdoc/driver/gl/gl_driver.h
++++ b/renderdoc/driver/gl/gl_driver.h
+@@ -36,6 +36,7 @@
+ #include "gl_resources.h"
+ 
+ class GLReplay;
++class GLReplaySnapshot;
+ 
+ namespace glslang
+ {
+@@ -106,6 +107,7 @@
+ {
+ private:
+   friend class GLReplay;
++  friend class GLReplaySnapshot;
+   friend struct GLRenderState;
+   friend class GLResourceManager;
+ 
+@@ -350,6 +352,8 @@
+   bool ProcessChunk(ReadSerialiser &ser, GLChunk chunk);
+   RDResult ContextReplayLog(CaptureState readType, uint32_t startEventID, uint32_t endEventID,
+                             bool partial);
++  RDResult ContextReplayLog(CaptureState readType, uint32_t startEventID, uint32_t endEventID,
++                            bool partial, bool preserveActiveScopes);
+   bool ContextProcessChunk(ReadSerialiser &ser, GLChunk chunk);
+   void AddUsage(const ActionDescription &a);
+   void AddAction(const ActionDescription &a);
+@@ -683,6 +687,9 @@
+   // replay interface
+   void Initialise(GLInitParams &params, uint64_t sectionVersion, const ReplayOptions &opts);
+   void ReplayLog(uint32_t startEventID, uint32_t endEventID, ReplayLogType replayType);
++  void ReplayLog(uint32_t startEventID, uint32_t endEventID, ReplayLogType replayType,
++                 bool preserveActiveScopes);
++  void EndActiveReplayScopes(bool recordFeedbackResume);
+   RDResult ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers);
+ 
+   GLuint GetFakeVAO0() { return m_Global_VAO0; }
+diff --git a/renderdoc/driver/gl/gl_initstate.cpp b/renderdoc/driver/gl/gl_initstate.cpp
+--- a/renderdoc/driver/gl/gl_initstate.cpp
++++ b/renderdoc/driver/gl/gl_initstate.cpp
+@@ -25,6 +25,7 @@
+ #include <algorithm>
+ #include "gl_driver.h"
+ #include "gl_manager.h"
++#include "replay/replay_snapshot.h"
+ 
+ // declare emulated glCopyImageSubData in case we need to force its use when the driver's version is
+ // buggy
+@@ -177,6 +178,17 @@
+     el.maxAniso = 1.0f;    // no default is perfect, but at least set 1.0 instead of leaving it
+                            // uninitialised or 0.0
+ }
++
++// The private snapshot preflight re-encodes these otherwise internally inlined
++// metadata codecs to require canonical fixed-array lengths before any GL write.
++template void DoSerialise(Serialiser<SerialiserMode::Writing> &, VAOInitialData &);
++template void DoSerialise(Serialiser<SerialiserMode::Writing> &, FeedbackInitialData &);
++template void DoSerialise(Serialiser<SerialiserMode::Writing> &, PipelineInitialData &);
++template void DoSerialise(Serialiser<SerialiserMode::Writing> &, FramebufferInitialData &);
++template void DoSerialise(Serialiser<SerialiserMode::Reading> &, VAOInitialData &);
++template void DoSerialise(Serialiser<SerialiserMode::Reading> &, FeedbackInitialData &);
++template void DoSerialise(Serialiser<SerialiserMode::Reading> &, PipelineInitialData &);
++template void DoSerialise(Serialiser<SerialiserMode::Reading> &, FramebufferInitialData &);
+ 
+ void WrappedOpenGL::TextureData::GetCompressedImageDataGLES(int mip, GLenum target, size_t size,
+                                                             byte *buf)
+@@ -761,8 +773,17 @@
+       // We set max_level to mips - 1 (so mips=1 means MAX_LEVEL=0). Then restore it to the 'real'
+       // value we fetched above
+       int maxlevel = mips - 1;
+-      GL.glTextureParameterivEXT(res.name, details.curType, eGL_TEXTURE_MAX_LEVEL,
+-                                 (GLint *)&maxlevel);
++      // Snapshot copying must not alter immutable texture parameters: on some
++      // replay drivers changing the pristine MAX_LEVEL and then setting it back
++      // clamps the latter irreversibly to ImmutableLevels-1. Fixed immutable
++      // storage is already mip-complete and needs no temporary limit.
++      GLint immutable = GL_FALSE;
++      if(IsGLReplaySnapshotActive())
++        GL.glGetTextureParameterivEXT(res.name, details.curType, eGL_TEXTURE_IMMUTABLE_FORMAT,
++                                      &immutable);
++      if(!immutable)
++        GL.glTextureParameterivEXT(res.name, details.curType, eGL_TEXTURE_MAX_LEVEL,
++                                   (GLint *)&maxlevel);
+ 
+       // set min/mag filters to NEAREST since we are doing an identity copy. Avoids issues where the
+       // spec says that e.g. integer or stencil textures cannot have a LINEAR filter
+@@ -1670,7 +1691,10 @@
+                 else
+                 {
+                   // we avoid glGetTextureImageEXT as it seems buggy for cubemap faces
+-                  GL.glGetTexImage(targets[trg], i, fmt, type, scratchBuf);
++                  if(IsGLReplaySnapshotActive())
++                    ReadGLReplaySnapshotTexture(targets[trg], i, fmt, type, scratchBuf, (size_t)size);
++                  else
++                    GL.glGetTexImage(targets[trg], i, fmt, type, scratchBuf);
+                 }
+               }
+ 
+@@ -1966,8 +1990,13 @@
+         // We set max_level to mips - 1 (so mips=1 means MAX_LEVEL=0). Then below where we set the
+         // texture state, the correct MAX_LEVEL is set to whatever the program had.
+         int maxlevel = mips - 1;
+-        GL.glTextureParameterivEXT(res.name, details.curType, eGL_TEXTURE_MAX_LEVEL,
+-                                   (GLint *)&maxlevel);
++        GLint immutable = GL_FALSE;
++        if(IsGLReplaySnapshotActive())
++          GL.glGetTextureParameterivEXT(res.name, details.curType, eGL_TEXTURE_IMMUTABLE_FORMAT,
++                                        &immutable);
++        if(!immutable)
++          GL.glTextureParameterivEXT(res.name, details.curType, eGL_TEXTURE_MAX_LEVEL,
++                                     (GLint *)&maxlevel);
+ 
+         // set min/mag filters to NEAREST since we are doing an identity copy. Avoids issues where
+         // the spec says that e.g. integer or stencil textures cannot have a LINEAR filter
+diff --git a/renderdoc/driver/gl/gl_manager.h b/renderdoc/driver/gl/gl_manager.h
+--- a/renderdoc/driver/gl/gl_manager.h
++++ b/renderdoc/driver/gl/gl_manager.h
+@@ -41,6 +41,7 @@
+ 
+ class GLResourceManager : public ResourceManager<GLResourceManagerConfiguration>
+ {
++  friend class GLReplaySnapshot;
+ public:
+   GLResourceManager(CaptureState &state, WrappedOpenGL *driver);
+   ~GLResourceManager() {}
+diff --git a/renderdoc/driver/gl/gl_replay.cpp b/renderdoc/driver/gl/gl_replay.cpp
+--- a/renderdoc/driver/gl/gl_replay.cpp
++++ b/renderdoc/driver/gl/gl_replay.cpp
+@@ -37,6 +37,8 @@
+ #include "strings/string_utils.h"
+ #include "gl_driver.h"
+ #include "gl_resources.h"
++#include "replay/replay_snapshot.h"
++#include "gl_replay_snapshot.inl"
+ 
+ #define OPENGL 1
+ #include "data/glsl/glsl_ubos_cpp.h"
+@@ -48,6 +50,7 @@
+ 
+ GLReplay::GLReplay(WrappedOpenGL *d)
+ {
++  RegisterGLSnapshotDriver(this);
+   m_pDriver = d;
+ 
+   RenderDoc::Inst().RegisterMemoryRegion(this, sizeof(GLReplay));
+@@ -69,6 +72,9 @@
+ 
+ void GLReplay::Shutdown()
+ {
++  UnregisterGLSnapshotDriver(this);
++  MakeCurrentReplayContext(&m_ReplayCtx);
++  m_pDriver->EndActiveReplayScopes(false);
+   SAFE_DELETE(m_pAMDCounters);
+   SAFE_DELETE(m_pIntelCounters);
+   SAFE_DELETE(m_pARMCounters);
+@@ -133,8 +139,11 @@
+ bool GLReplay::ReplayLogRange(uint32_t startEventID, uint32_t endEventID,
+                              ReplayLogType replayType)
+ {
++  if(startEventID > endEventID || replayType != eReplay_Full)
++    return false;
+   MakeCurrentReplayContext(&m_ReplayCtx);
+-  m_pDriver->ReplayLog(startEventID, endEventID, replayType);
++  // Explicit ranges are continuous; normal SetFrameEvent previews are unchanged.
++  m_pDriver->ReplayLog(startEventID, endEventID, replayType, true);
+ 
+   for(size_t i = 0; i < ARRAY_COUNT(m_GetTexturePrevData); i++)
+   {
+diff --git a/renderdoc/driver/gl/gl_replay.h b/renderdoc/driver/gl/gl_replay.h
+--- a/renderdoc/driver/gl/gl_replay.h
++++ b/renderdoc/driver/gl/gl_replay.h
+@@ -181,6 +181,7 @@
+ 
+ class GLReplay : public IReplayDriver
+ {
++  friend class GLReplaySnapshot;
+ public:
+   GLReplay(WrappedOpenGL *d);
+   virtual ~GLReplay() {}
+diff --git a/renderdoc/driver/gl/gl_replay_snapshot.inl b/renderdoc/driver/gl/gl_replay_snapshot.inl
+new file mode 100644
+--- /dev/null
++++ b/renderdoc/driver/gl/gl_replay_snapshot.inl
+@@ -0,0 +1,1060 @@
++// Private functional GL checkpoint v1. Included in gl_replay.cpp so the extension
++// can be built with a few isolated objects without changing public class layouts.
++// This is not a GPU cache, clock, pending-work, or cycle-accurate checkpoint.
++#include <array>
++#include <fstream>
++#include <stdexcept>
++#include <vector>
++#include <cerrno>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <CommonCrypto/CommonDigest.h>
++
++namespace replay_snapshot
++{
++using Bytes = std::vector<byte>;
++constexpr uint64_t MaxBlob = 256ULL * 1024 * 1024;
++constexpr uint64_t MaxArchive = 2ULL * 1024 * 1024 * 1024;
++constexpr uint64_t MaxObjects = 16384;
++static std::map<IReplayDriver *, GLReplay *> drivers;
++static thread_local GLResourceManager *resolving = NULL;
++static thread_local const std::set<ResourceId> *allowed = NULL;
++
++static void Require(bool condition, const char *message)
++{
++  if(!condition)
++    throw std::runtime_error(message);
++}
++
++static uint64_t ID(ResourceId id)
++{
++  static_assert(sizeof(id) == sizeof(uint64_t), "ResourceId archive width");
++  uint64_t value;
++  memcpy(&value, &id, sizeof(value));
++  return value;
++}
++static ResourceId ID(uint64_t value)
++{
++  ResourceId id;
++  memcpy(&id, &value, sizeof(value));
++  return id;
++}
++
++struct Writer
++{
++  Bytes bytes;
++  void Raw(const void *p, size_t n)
++  {
++    Require(n <= MaxArchive && bytes.size() <= MaxArchive - n, "snapshot archive size limit");
++    if(n)
++      bytes.insert(bytes.end(), (const byte *)p, (const byte *)p + n);
++  }
++  void U64(uint64_t v)
++  {
++    for(unsigned i = 0; i < 8; ++i)
++      bytes.push_back(byte(v >> (8 * i)));
++  }
++  void Blob(const Bytes &b) { U64(b.size()); Raw(b.data(), b.size()); }
++  void String(const rdcstr &s) { U64(s.size()); Raw(s.data(), s.size()); }
++};
++struct Reader
++{
++  const Bytes &bytes;
++  size_t at = 0;
++  explicit Reader(const Bytes &b) : bytes(b) {}
++  void Raw(void *p, size_t n)
++  {
++    Require(n <= bytes.size() - at, "snapshot truncated field");
++    if(n)
++      memcpy(p, bytes.data() + at, n);
++    at += n;
++  }
++  uint64_t U64()
++  {
++    byte raw[8]; Raw(raw, 8);
++    uint64_t value = 0;
++    for(unsigned i = 0; i < 8; ++i)
++      value |= uint64_t(raw[i]) << (8 * i);
++    return value;
++  }
++  Bytes Blob(uint64_t limit = MaxBlob)
++  {
++    uint64_t n = U64();
++    Require(n <= limit && n <= bytes.size() - at, "snapshot invalid blob length");
++    Bytes b((size_t)n); Raw(b.data(), b.size()); return b;
++  }
++  rdcstr String(uint64_t limit = 4096)
++  {
++    Bytes b = Blob(limit);
++    return rdcstr((const char *)b.data(), b.size());
++  }
++  void Done() { Require(at == bytes.size(), "snapshot trailing bytes"); }
++};
++
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++static std::array<byte, 32> Digest(const Bytes &bytes)
++{
++  std::array<byte, 32> hash;
++  CC_SHA256(bytes.data(), (CC_LONG)bytes.size(), hash.data());
++  return hash;
++}
++#pragma clang diagnostic pop
++
++static void CheckCapture(const char *sha)
++{
++  Require(sha && strlen(sha) == 64, "snapshot requires a 64-character capture SHA-256");
++  for(size_t i = 0; i < 64; ++i)
++    Require((sha[i] >= '0' && sha[i] <= '9') || (sha[i] >= 'a' && sha[i] <= 'f'),
++            "snapshot capture SHA-256 must be lowercase hexadecimal");
++}
++static void CheckGL(const char *operation)
++{
++  GLenum error = GL.glGetError();
++  if(error != eGL_NONE)
++    throw std::runtime_error(std::string("snapshot GL error during ") + operation + ": " +
++                             std::to_string((unsigned)error));
++}
++static void Publish(const char *path, const Bytes &payload)
++{
++  Require(path && *path, "snapshot path is empty");
++  Writer archive;
++  const char magic[8] = {'R','D','G','L','S','N','0','1'};
++  archive.Raw(magic, 8);
++  archive.U64(payload.size());
++  auto hash = Digest(payload);
++  archive.Raw(hash.data(), hash.size());
++  archive.Raw(payload.data(), payload.size());
++  std::string temporary = std::string(path) + ".writing.XXXXXX";
++  std::vector<char> name(temporary.begin(), temporary.end()); name.push_back(0);
++  int fd = mkstemp(name.data());
++  Require(fd >= 0, "cannot create snapshot temporary file");
++  bool okay = true;
++  size_t at = 0;
++  while(at < archive.bytes.size())
++  {
++    ssize_t count = write(fd, archive.bytes.data() + at, archive.bytes.size() - at);
++    if(count < 0 && errno == EINTR) continue;
++    if(count <= 0) { okay = false; break; }
++    at += (size_t)count;
++  }
++  if(fsync(fd) != 0) okay = false;
++  if(close(fd) != 0) okay = false;
++  // link is atomic and fails if the requested final name already exists.
++  if(okay && link(name.data(), path) != 0) okay = false;
++  unlink(name.data());
++  Require(okay, "snapshot write/publish failed (existing files are never overwritten)");
++}
++static Bytes ReadArchive(const char *path)
++{
++  Require(path && *path, "snapshot path is empty");
++  struct Input
++  {
++    int fd;
++    explicit Input(const char *name) : fd(open(name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)) {}
++    ~Input() { if(fd >= 0) close(fd); }
++  } input(path);
++  Require(input.fd >= 0, "cannot open snapshot regular archive (symlinks are refused)");
++  struct stat info;
++  Require(fstat(input.fd, &info) == 0 && S_ISREG(info.st_mode) && info.st_size >= 48 &&
++              uint64_t(info.st_size) <= MaxArchive, "snapshot regular archive length is invalid");
++  Bytes file(size_t(info.st_size));
++  size_t at = 0;
++  while(at < file.size())
++  {
++    ssize_t count = read(input.fd, file.data() + at, file.size() - at);
++    if(count < 0 && errno == EINTR) continue;
++    Require(count > 0, "snapshot archive read failed or was truncated");
++    at += size_t(count);
++  }
++  byte extra;
++  Require(read(input.fd, &extra, 1) == 0, "snapshot archive grew during read");
++  Reader reader(file);
++  char magic[8]; reader.Raw(magic, 8);
++  Require(memcmp(magic, "RDGLSN01", 8) == 0, "snapshot magic/version mismatch");
++  uint64_t size = reader.U64();
++  Require(size == file.size() - 48, "snapshot payload length mismatch");
++  std::array<byte, 32> expected; reader.Raw(expected.data(), expected.size());
++  Bytes payload((size_t)size); reader.Raw(payload.data(), payload.size()); reader.Done();
++  Require(Digest(payload) == expected, "snapshot payload SHA-256 mismatch");
++  return payload;
++}
++
++struct Resource
++{
++  ResourceId id;
++  GLNamespace type;
++  Bytes signature, blob;
++  std::map<GLint, GLint> locations;
++};
++}
++
++bool IsGLReplaySnapshotActive()
++{
++  return replay_snapshot::resolving != NULL;
++}
++
++int GetGLReplaySnapshotMipCount(uint32_t targetValue, uint32_t texture)
++{
++  // MAX_LEVEL is sampling state, not the physical allocation inventory. The
++  // suffix can expose currently hidden levels, which must survive a checkpoint.
++  GLenum target = GLenum(targetValue);
++  GLint immutable = 0, levels = 0;
++  GL.glGetTextureParameterivEXT(texture, target, eGL_TEXTURE_IMMUTABLE_FORMAT, &immutable);
++  if(immutable)
++    GL.glGetTextureParameterivEXT(texture, target, eGL_TEXTURE_IMMUTABLE_LEVELS, &levels);
++  else
++  {
++    GLint maximum = 0;
++    GL.glGetIntegerv(target == eGL_TEXTURE_3D ? eGL_MAX_3D_TEXTURE_SIZE :
++                     target == eGL_TEXTURE_CUBE_MAP || target == eGL_TEXTURE_CUBE_MAP_ARRAY ?
++                     eGL_MAX_CUBE_MAP_TEXTURE_SIZE : eGL_MAX_TEXTURE_SIZE, &maximum);
++    replay_snapshot::Require(maximum > 0, "snapshot mutable texture limit query failed");
++    int possibleLevels = 1;
++    while(maximum > 1) { maximum >>= 1; ++possibleLevels; }
++    possibleLevels = RDCMIN(possibleLevels, 16);
++    if(target == eGL_TEXTURE_CUBE_MAP) target = eGL_TEXTURE_CUBE_MAP_POSITIVE_X;
++    bool missing = false;
++    for(int level = 0; level < possibleLevels; ++level)
++    {
++      GLint width = 0;
++      GL.glGetTextureLevelParameterivEXT(texture, target, level, eGL_TEXTURE_WIDTH, &width);
++      if(width == 0) missing = true;
++      else
++      {
++        replay_snapshot::Require(!missing, "snapshot v1 refuses holes in mutable texture storage");
++        levels = level + 1;
++      }
++    }
++  }
++  replay_snapshot::CheckGL("physical mip inventory");
++  replay_snapshot::Require(levels > 0 && levels <= 16, "snapshot physical mip count is invalid");
++  return levels;
++}
++
++void ReadGLReplaySnapshotTexture(uint32_t targetValue, int level, uint32_t formatValue,
++                                 uint32_t typeValue, void *pixels, size_t bytes)
++{
++  // GLES glGetTexImage emulation may execute shader conversions (notably for
++  // depth and RGB). A checkpoint may only preserve actual raw texture data.
++  // Use direct FBO readback, rejecting a driver/format that cannot support it.
++  using replay_snapshot::Require;
++  GLenum target = GLenum(targetValue), format = GLenum(formatValue), type = GLenum(typeValue);
++  GLint width = 0, height = 0, depth = 0, texture = 0;
++  GL.glGetTexLevelParameteriv(target, level, eGL_TEXTURE_WIDTH, &width);
++  GL.glGetTexLevelParameteriv(target, level, eGL_TEXTURE_HEIGHT, &height);
++  GL.glGetTexLevelParameteriv(target, level, eGL_TEXTURE_DEPTH, &depth);
++  GL.glGetIntegerv(TextureBinding(target), &texture);
++  const bool layered = target == eGL_TEXTURE_3D || target == eGL_TEXTURE_2D_ARRAY ||
++                       target == eGL_TEXTURE_CUBE_MAP_ARRAY;
++  const int layers = layered ? depth : 1;
++  Require(width > 0 && height > 0 && layers > 0 && texture,
++          "snapshot raw texture read has invalid storage");
++  uint64_t sliceBytes = GetByteSize(uint32_t(width), uint32_t(height), 1, format, type);
++  Require(sliceBytes && sliceBytes <= bytes && uint64_t(layers) == bytes / sliceBytes &&
++              bytes % sliceBytes == 0, "snapshot raw texture read extent mismatch");
++  GLenum attachment = eGL_COLOR_ATTACHMENT0;
++  if(format == eGL_DEPTH_COMPONENT) attachment = eGL_DEPTH_ATTACHMENT;
++  if(format == eGL_STENCIL_INDEX) attachment = eGL_STENCIL_ATTACHMENT;
++  if(format == eGL_DEPTH_STENCIL) attachment = eGL_DEPTH_STENCIL_ATTACHMENT;
++  const unsigned narrowChannels = type == eGL_UNSIGNED_BYTE ?
++      (format == eGL_RED ? 1U : format == eGL_RG ? 2U : format == eGL_RGB ? 3U : 0U) : 0U;
++  // GLES guarantees normalized RGBA8 readback, not RGB/RED/RG byte reads.
++  // Discard only synthetic unused channels on the CPU; preserve every stored
++  // component bit. This is packing, not shader/color-space conversion.
++  replay_snapshot::Bytes rgba;
++  if(narrowChannels)
++  {
++    uint64_t readBytes = uint64_t(width) * uint64_t(height) * 4;
++    Require(readBytes <= replay_snapshot::MaxBlob, "snapshot RGBA readback scratch limit");
++    rgba.resize(size_t(readBytes));
++  }
++  struct ReadGuard
++  {
++    GLuint fbo = 0; GLint previousFBO = 0, packBuffer = 0;
++    PixelPackState pack;
++    ReadGuard()
++    {
++      GL.glGetIntegerv(eGL_READ_FRAMEBUFFER_BINDING, &previousFBO);
++      GL.glGetIntegerv(eGL_PIXEL_PACK_BUFFER_BINDING, &packBuffer);
++      pack.Fetch(false); ResetPixelPackState(false, 1);
++      GL.glBindBuffer(eGL_PIXEL_PACK_BUFFER, 0);
++      GL.glGenFramebuffers(1, &fbo); GL.glBindFramebuffer(eGL_READ_FRAMEBUFFER, fbo);
++    }
++    ~ReadGuard()
++    {
++      GL.glBindFramebuffer(eGL_READ_FRAMEBUFFER, GLuint(previousFBO));
++      GL.glDeleteFramebuffers(1, &fbo);
++      pack.Apply(false); GL.glBindBuffer(eGL_PIXEL_PACK_BUFFER, GLuint(packBuffer));
++    }
++  } guard;
++  GL.glReadBuffer(attachment == eGL_COLOR_ATTACHMENT0 ? eGL_COLOR_ATTACHMENT0 : eGL_NONE);
++  for(int layer = 0; layer < layers; ++layer)
++  {
++    if(layered)
++      GL.glFramebufferTextureLayer(eGL_READ_FRAMEBUFFER, attachment, GLuint(texture), level, layer);
++    else
++      GL.glFramebufferTexture2D(eGL_READ_FRAMEBUFFER, attachment, target, GLuint(texture), level);
++    Require(GL.glCheckFramebufferStatus(eGL_READ_FRAMEBUFFER) == eGL_FRAMEBUFFER_COMPLETE,
++            "snapshot raw texture format/subresource is not framebuffer-readable");
++    byte *destination = (byte *)pixels + size_t(sliceBytes * layer);
++    GL.glReadPixels(0, 0, width, height, narrowChannels ? eGL_RGBA : format, type,
++                    narrowChannels ? rgba.data() : destination);
++    replay_snapshot::CheckGL("direct raw texture readback (no shader conversion)");
++    if(narrowChannels)
++      for(size_t pixel = 0; pixel < size_t(width) * size_t(height); ++pixel)
++        memcpy(destination + pixel * narrowChannels, rgba.data() + pixel * 4, narrowChannels);
++  }
++}
++
++void ValidateGLSnapshotResource(GLResourceManager *manager, const GLResource &resource, ResourceId id)
++{
++  using namespace replay_snapshot;
++  if(manager != resolving)
++    return;
++  if(id == ResourceId())
++    Require(resource.name == 0, "snapshot references an unregistered nonzero GL object");
++  else
++  {
++    Require(manager->HasResource(id), "snapshot references a missing ResourceId");
++    Require(allowed && allowed->count(id), "snapshot references an object outside its inventory");
++  }
++}
++
++class GLReplaySnapshot
++{
++  using Bytes = replay_snapshot::Bytes;
++  using Writer = replay_snapshot::Writer;
++  using Reader = replay_snapshot::Reader;
++  using Resource = replay_snapshot::Resource;
++  static void Require(bool c, const char *m) { replay_snapshot::Require(c, m); }
++
++  struct Arena
++  {
++    GLResourceManager &manager;
++    decltype(GLResourceManager::m_InitialContents) original;
++    explicit Arena(GLResourceManager &m) : manager(m) { original.swap(manager.m_InitialContents); }
++    ~Arena()
++    {
++      for(auto &entry : manager.m_InitialContents)
++        entry.second.Free(&manager);
++      manager.m_InitialContents.clear();
++      original.swap(manager.m_InitialContents);
++    }
++  };
++  struct ResolveScope
++  {
++    ResolveScope(GLResourceManager &m, const std::set<ResourceId> &ids)
++    {
++      Require(!replay_snapshot::resolving, "nested snapshot operation");
++      replay_snapshot::resolving = &m; replay_snapshot::allowed = &ids;
++    }
++    ~ResolveScope() { replay_snapshot::resolving = NULL; replay_snapshot::allowed = NULL; }
++  };
++  struct StateGuard
++  {
++    WrappedOpenGL &driver;
++    GLRenderState state;
++    PixelPackState pack;
++    PixelUnpackState unpack;
++    bool active = true;
++    explicit StateGuard(WrappedOpenGL &d) : driver(d)
++    { state.FetchState(&driver); pack.Fetch(true); unpack.Fetch(true); }
++    ~StateGuard() { if(active) { state.ApplyState(&driver); pack.Apply(true); unpack.Apply(true); } }
++  };
++
++  static Bytes StreamBytes(WriteSerialiser &ser)
++  {
++    Require(!ser.IsErrored(), "snapshot serializer write failed");
++    uint64_t n = ser.GetWriter()->GetOffset();
++    Require(n <= replay_snapshot::MaxBlob, "snapshot resource exceeds v1 blob limit");
++    return Bytes(ser.GetWriter()->GetData(), ser.GetWriter()->GetData() + (size_t)n);
++  }
++  static void Setup(WriteSerialiser &ser, WrappedOpenGL &d)
++  { ser.SetUserData(d.GetResourceManager()); ser.SetVersion(d.m_SectionVersion); }
++  static void Setup(ReadSerialiser &ser, WrappedOpenGL &d)
++  { ser.SetUserData(d.GetResourceManager()); ser.SetVersion(d.m_SectionVersion); }
++  static void Finish(ReadSerialiser &ser, size_t length)
++  {
++    ser.EndChunk();
++    Require(!ser.IsErrored() && ser.GetReader()->GetOffset() == length,
++            "snapshot resource codec error or trailing data");
++  }
++
++  static uint64_t Boundary(WrappedOpenGL &d, uint32_t event)
++  {
++    Require(event && event < d.m_Events.size() && d.m_Events[event].eventId == event,
++            "snapshot boundary is not an exact API event");
++    auto &selected = d.m_Events[event];
++    uint64_t next = d.m_FrameReader->GetSize();
++    for(size_t i = size_t(event) + 1; i < d.m_Events.size(); ++i)
++    {
++      if(!d.m_Events[i].eventId) continue;
++      Require(d.m_Events[i].fileOffset != selected.fileOffset,
++              "snapshot boundary is inside a multi-action API chunk");
++      next = d.m_Events[i].fileOffset; break;
++    }
++    // Parse only immutable chunk headers. This scan does not call ProcessChunk,
++    // replay state setters, draws, dispatches, or copy commands.
++    uint64_t oldOffset = d.m_FrameReader->GetOffset();
++    struct RestoreOffset
++    {
++      StreamReader *reader; uint64_t offset;
++      ~RestoreOffset() { reader->SetOffset(offset); }
++    } restore{d.m_FrameReader, oldOffset};
++    d.m_FrameReader->SetOffset(0);
++    ReadSerialiser ser(d.m_FrameReader, Ownership::Nothing);
++    Setup(ser, d);
++    int groups = 0;
++    while(!ser.GetReader()->AtEnd())
++    {
++      uint64_t offset = ser.GetReader()->GetOffset();
++      GLChunk chunk = ser.ReadChunk<GLChunk>();
++      rdcstr name = WrappedOpenGL::GetChunkName(uint32_t(chunk));
++      if(offset < next)
++      {
++        if(name == "glPushDebugGroup") ++groups;
++        if(name == "glPopDebugGroup") --groups;
++        Require(groups >= 0, "capture has an unbalanced debug group before snapshot");
++      }
++      else
++      {
++        Require(!name.contains("GetQueryBufferObject") &&
++                    !name.contains("BeginConditionalRender") &&
++                    !name.contains("DrawTransformFeedback") && !name.contains("WaitSync"),
++                "snapshot v1 cannot restore query/TF/sync results consumed by the suffix");
++      }
++      // Persistent/external state has no exact initial-content codec in v1.
++      Require(!name.contains("ImportMemory") && !name.contains("ImportSemaphore") &&
++                  !name.contains("TextureStorageMem") && !name.contains("BufferStorageMem"),
++              "snapshot v1 does not support imported/external storage");
++      ser.SkipCurrentChunk(); ser.EndChunk();
++      Require(!ser.IsErrored(), "snapshot immutable chunk scan failed");
++    }
++    Require(groups == 0, "snapshot v1 refuses a captured debug group spanning its boundary");
++    return next;
++  }
++
++  static void Quiescent(WrappedOpenGL &d)
++  {
++    Require(IsReplayMode(d.m_State) && !d.m_FetchCounters, "snapshot needs ordinary GL replay");
++    Require(!d.m_ActiveConditional && !d.m_ActiveFeedback,
++            "snapshot v1 refuses active conditional rendering or transform feedback");
++    for(auto &queries : d.m_ActiveQueries)
++      for(bool active : queries)
++        Require(!active, "snapshot v1 refuses an active query");
++    Require(d.m_PersistentMaps.empty() && d.m_CoherentMaps.empty(),
++            "snapshot v1 refuses persistent/coherent mapped buffers");
++    Require(d.m_ImplicitThreadSwitches == 0, "snapshot v1 refuses multi-context capture execution");
++    replay_snapshot::CheckGL("entry (pre-existing errors are not discarded)");
++    GL.glFinish();
++    replay_snapshot::CheckGL("synchronous completion");
++  }
++
++  static std::set<ResourceId> Inventory(GLReplay &r)
++  {
++    auto &d = *r.m_pDriver;
++    auto &m = *d.GetResourceManager();
++    std::set<ResourceId> ids;
++    for(auto &description : r.m_Resources)
++      if(m.HasResource(description.resourceId))
++        ids.insert(description.resourceId);
++    // Synthetic default VAO/backbuffer objects are persistent replay state too.
++    const GLResource special[] = {VertexArrayRes(d.GetCtx(), d.m_Global_VAO0),
++      FramebufferRes(d.GetCtx(), d.m_Global_FBO0),
++      FramebufferRes(d.GetCtx(), d.m_CurrentDefaultFBO)};
++    for(auto resource : special)
++      if(m.GetResID(resource) != ResourceId()) ids.insert(m.GetResID(resource));
++    Require(ids.size() <= replay_snapshot::MaxObjects, "snapshot object-count limit");
++    // Special RenderDoc descriptors are not actual mutable GL objects.
++    for(auto it = ids.begin(); it != ids.end();)
++    {
++      auto object = m.GetResource(*it);
++      if(object.Namespace == eResSpecial)
++        it = ids.erase(it);
++      else
++        ++it;
++    }
++    return ids;
++  }
++
++  static Bytes Signature(WrappedOpenGL &d, ResourceId id)
++  {
++    auto &m = *d.GetResourceManager();
++    GLResource res = m.GetResource(id);
++    auto &ctx = d.GetCtx();
++    Require(res.ContextShareGroup == ctx.ctx || res.ContextShareGroup == ctx.shareGroup,
++            "snapshot v1 resource belongs to another context/sharegroup");
++    Writer out; out.U64(uint32_t(res.Namespace));
++    switch(res.Namespace)
++    {
++      case eResBuffer:
++      {
++        GLint size = 0;
++        GL.glGetNamedBufferParameterivEXT(res.name, eGL_BUFFER_SIZE, &size);
++        GLint mapped = 0;
++        GL.glGetNamedBufferParameterivEXT(res.name, eGL_BUFFER_MAPPED, &mapped);
++        Require(!mapped, "snapshot v1 refuses a mapped buffer");
++        Require(size >= 0 && uint64_t(size) <= replay_snapshot::MaxBlob,
++                "snapshot v1 buffer allocation size limit");
++        out.U64(uint64_t(size));
++        const auto &data = d.m_Buffers.at(id);
++        out.U64(data.size); out.U64(uint32_t(data.curType));
++        break;
++      }
++      case eResTexture:
++      {
++        const auto &t = d.m_Textures.at(id);
++        Require(!t.view && !t.emulated, "snapshot v1 refuses texture views/emulated formats");
++        Require(t.samples <= 1, "snapshot v1 refuses multisample texture storage");
++        Require(t.curType == eGL_TEXTURE_2D || t.curType == eGL_TEXTURE_3D ||
++                    t.curType == eGL_TEXTURE_2D_ARRAY || t.curType == eGL_TEXTURE_CUBE_MAP ||
++                    t.curType == eGL_TEXTURE_CUBE_MAP_ARRAY || t.curType == eGL_TEXTURE_BUFFER,
++                "snapshot v1 texture target has no validated codec");
++        Require(t.internalFormat != eGL_NONE && t.width > 0 && t.height > 0 && t.depth > 0,
++                "snapshot v1 refuses unallocated/incomplete texture storage");
++        Require(t.width <= 32768 && t.height <= 32768 && t.depth <= 2048,
++                "snapshot texture extent limit");
++        out.U64(uint32_t(t.curType)); out.U64(uint32_t(t.internalFormat));
++        out.U64(uint32_t(t.width)); out.U64(uint32_t(t.height)); out.U64(uint32_t(t.depth));
++        out.U64(uint32_t(t.samples)); out.U64(uint32_t(t.dimension));
++        out.U64(uint32_t(t.initFormatHint)); out.U64(uint32_t(t.initTypeHint));
++        out.U64(t.mipsValid);
++        int mips = t.curType == eGL_TEXTURE_BUFFER ? 1 :
++                   GetGLReplaySnapshotMipCount(t.curType, res.name);
++        Require(mips > 0 && mips <= 16, "snapshot invalid mip count");
++        out.U64(uint32_t(mips));
++        // Query each physical subresource; metadata-only dimension matching is insufficient.
++        if(t.curType != eGL_TEXTURE_BUFFER)
++          for(int face = 0; face < (t.curType == eGL_TEXTURE_CUBE_MAP ? 6 : 1); ++face)
++            for(int mip = 0; mip < mips; ++mip)
++            {
++              GLenum target = t.curType == eGL_TEXTURE_CUBE_MAP ?
++                  GLenum(eGL_TEXTURE_CUBE_MAP_POSITIVE_X + face) : t.curType;
++              for(GLenum parameter : {eGL_TEXTURE_WIDTH, eGL_TEXTURE_HEIGHT, eGL_TEXTURE_DEPTH,
++                                       eGL_TEXTURE_INTERNAL_FORMAT})
++              {
++                GLint value = 0;
++                GL.glGetTextureLevelParameterivEXT(res.name, target, mip, parameter, &value);
++                out.U64(uint32_t(value));
++              }
++            }
++        break;
++      }
++      case eResProgram:
++      {
++        const auto &p = d.m_Programs.at(id);
++        Require(p.linked, "snapshot v1 refuses an unlinked program");
++        out.U64(p.shaderProgramUnlinkable);
++        for(ResourceId shader : p.stageShaders) out.U64(replay_snapshot::ID(shader));
++        break;
++      }
++      case eResShader:
++      {
++        const auto &s = d.m_Shaders.at(id);
++        out.U64(uint32_t(s.type));
++        out.U64(s.sources.size());
++        for(const auto &source : s.sources) out.String(source);
++        out.U64(s.spirvWords.size());
++        for(uint32_t word : s.spirvWords) out.U64(word);
++        out.String(s.entryPoint);
++        out.U64(s.specIDs.size());
++        for(uint32_t value : s.specIDs) out.U64(value);
++        for(uint32_t value : s.specValues) out.U64(value);
++        break;
++      }
++      case eResProgramPipe:
++      {
++        auto pipeline = d.m_Pipelines.find(id);
++        for(size_t stage = 0; stage < NumShaderStages; ++stage)
++        {
++          out.U64(pipeline == d.m_Pipelines.end() ? 0 : replay_snapshot::ID(pipeline->second.stagePrograms[stage]));
++          out.U64(pipeline == d.m_Pipelines.end() ? 0 : replay_snapshot::ID(pipeline->second.stageShaders[stage]));
++        }
++        break;
++      }
++      case eResFramebuffer: case eResSampler: case eResVertexArray:
++      case eResFeedback: case eResQuery:
++        break;
++      default:
++        throw std::runtime_error(std::string("snapshot v1 unsupported resource namespace: ") +
++                                 std::to_string(unsigned(res.Namespace)));
++    }
++    replay_snapshot::CheckGL("inventory/storage validation");
++    return out.bytes;
++  }
++
++  static Bytes State(WrappedOpenGL &d, GLRenderState &state)
++  {
++    WriteSerialiser ser(new StreamWriter(4096), Ownership::Stream); Setup(ser, d);
++    ser.BeginChunk(uint32_t(SystemChunk::CaptureBegin), 0);
++    ser.Serialise("state"_lit, state);
++    ser.EndChunk(); return StreamBytes(ser);
++  }
++  static void DecodeState(WrappedOpenGL &d, const Bytes &blob, GLRenderState &state)
++  {
++    SafetyDecodeState(d, blob, state);
++  }
++  static void Pack(Writer &w, const PixelStorageState &p)
++  {
++    for(int32_t value : {p.swapBytes,p.lsbFirst,p.rowlength,p.imageheight,p.skipPixels,p.skipRows,
++         p.skipImages,p.alignment,p.compressedBlockWidth,p.compressedBlockHeight,
++         p.compressedBlockDepth,p.compressedBlockSize}) w.U64(uint32_t(value));
++  }
++  static void Pack(Reader &r, PixelStorageState &p)
++  {
++    for(int32_t *value : {&p.swapBytes,&p.lsbFirst,&p.rowlength,&p.imageheight,&p.skipPixels,
++         &p.skipRows,&p.skipImages,&p.alignment,&p.compressedBlockWidth,&p.compressedBlockHeight,
++         &p.compressedBlockDepth,&p.compressedBlockSize})
++    {
++      uint64_t raw = r.U64(); Require(raw <= UINT32_MAX, "snapshot invalid pixel-store value");
++      *value = int32_t(uint32_t(raw));
++    }
++    Require(p.alignment == 1 || p.alignment == 2 || p.alignment == 4 || p.alignment == 8,
++            "snapshot invalid pixel-store alignment");
++  }
++
++  static Bytes CaptureResource(WrappedOpenGL &d, ResourceId id)
++  {
++    auto &m = *d.GetResourceManager();
++    GLResource res = m.GetResource(id);
++    if(res.Namespace == eResShader || res.Namespace == eResQuery) return {};
++    GLint originalMaxLevel = 0;
++    if(res.Namespace == eResTexture && d.m_Textures[id].curType != eGL_TEXTURE_BUFFER)
++      GL.glGetTextureParameterivEXT(res.name, d.m_Textures[id].curType, eGL_TEXTURE_MAX_LEVEL, &originalMaxLevel);
++    if(res.Namespace == eResProgram)
++    {
++      WriteSerialiser ser(new StreamWriter(4096), Ownership::Stream); Setup(ser, d);
++      ser.BeginChunk(uint32_t(SystemChunk::InitialContents), 0);
++      ser.Serialise("id"_lit, id); ser.Serialise("Type"_lit, res.Namespace);
++      PerStageReflections stages; d.FillReflectionArray(id, stages);
++      SerialiseProgramBindings(ser, CaptureState::ActiveCapturing, stages, res.name);
++      SerialiseProgramUniforms(ser, CaptureState::ActiveCapturing, stages, res.name, NULL);
++      ser.EndChunk(); replay_snapshot::CheckGL("program serialization");
++      return StreamBytes(ser);
++    }
++    // Avoid the capture-only persistent-context overload (replay resources have no records).
++    m.ContextPrepare_InitialState(res);
++    replay_snapshot::CheckGL("resource preparation");
++    if(res.Namespace == eResTexture && d.m_Textures[id].curType != eGL_TEXTURE_BUFFER)
++    {
++      GLint after = 0;
++      GL.glGetTextureParameterivEXT(res.name, d.m_Textures[id].curType, eGL_TEXTURE_MAX_LEVEL, &after);
++      if(after != originalMaxLevel)
++        throw std::runtime_error(std::string("snapshot preparation changed texture max-level: ") +
++              std::to_string(replay_snapshot::ID(id)) + " before=" + std::to_string(originalMaxLevel) +
++              " after=" + std::to_string(after));
++    }
++    auto it = m.m_InitialContents.find(id);
++    Require(it != m.m_InitialContents.end(), "snapshot resource preparation produced no contents");
++    WriteSerialiser ser(new StreamWriter(4096), Ownership::Stream); Setup(ser, d);
++    if(it->second.chunk)
++      it->second.chunk->Write(ser);
++    else
++    {
++      auto initial = it->second.data;
++      initial.type = res.Namespace;
++      if(res.Namespace == eResFramebuffer) Require(initial.fbo.valid, "snapshot invalid FBO state");
++      if(res.Namespace == eResVertexArray) Require(initial.vao.valid, "snapshot invalid VAO state");
++      if(res.Namespace == eResSampler) Require(initial.samp.valid, "snapshot invalid sampler state");
++      if(res.Namespace == eResFeedback) Require(initial.xfb.valid, "snapshot invalid TF binding state");
++      if(res.Namespace == eResProgramPipe) Require(initial.pipe.valid, "snapshot invalid pipeline state");
++      ser.BeginChunk(uint32_t(SystemChunk::InitialContents), 0);
++      m.Serialise_InitialState<WriteSerialiser>(ser, id, NULL, &initial);
++      ser.EndChunk();
++    }
++    replay_snapshot::CheckGL("resource serialization");
++    return StreamBytes(ser);
++  }
++
++  #include "gl_snapshot_codec_safety.inl"
++
++  static void RestoreResource(WrappedOpenGL &d, const Resource &record)
++  {
++    if(record.type == eResShader || record.type == eResQuery)
++    { Require(record.blob.empty(), "snapshot unexpected immutable/query contents"); return; }
++    Require(!record.blob.empty(), "snapshot missing resource contents");
++    auto &m = *d.GetResourceManager();
++    // Check the embedded identity/type before any codec is permitted to touch GL.
++    ReadSerialiser inspect(new StreamReader(record.blob.data(), record.blob.size()), Ownership::Stream);
++    Setup(inspect, d);
++    Require(inspect.ReadChunk<SystemChunk>() == SystemChunk::InitialContents,
++            "snapshot resource chunk type mismatch");
++    ResourceId id; GLNamespace type;
++    GLint expectedMaxLevel = -1;
++    inspect.Serialise("id"_lit, id); inspect.Serialise("Type"_lit, type);
++    Require(!inspect.IsErrored() && id == record.id && type == record.type,
++            "snapshot resource embedded identity mismatch");
++    if(type == eResProgram)
++    {
++      // Parse and validate all variable-length program metadata without GL side effects first.
++      SemanticProgram(d, id, record.blob);
++      PerStageReflections stages; d.FillReflectionArray(id, stages);
++      GLuint program = m.GetResource(id).name;
++      bool changed = SerialiseProgramBindings(inspect, CaptureState::ActiveReplaying, stages, program);
++      if(changed)
++      {
++        Require(!d.m_Programs[id].shaderProgramUnlinkable,
++                "snapshot needs to relink an unlinkable program");
++        GL.glLinkProgram(program);
++        GLint linked = 0; GL.glGetProgramiv(program, eGL_LINK_STATUS, &linked);
++        Require(linked != 0, "snapshot program re-link failed");
++      }
++      std::map<GLint, GLint> savedToNew;
++      SerialiseProgramUniforms(inspect, CaptureState::ActiveReplaying, stages, program, &savedToNew);
++      Finish(inspect, record.blob.size());
++      std::map<GLint, GLint> composed;
++      for(const auto &location : record.locations)
++      {
++        if(location.second < 0) composed[location.first] = -1;
++        else
++        {
++          auto found = savedToNew.find(location.second);
++          Require(found != savedToNew.end(), "snapshot uniform location composition is incomplete");
++          composed[location.first] = found->second;
++        }
++      }
++      d.m_Programs[id].locationTranslate.swap(composed);
++      replay_snapshot::CheckGL("program bindings/uniform restoration");
++      return;
++    }
++    if(type == eResBuffer)
++    {
++      uint32_t bytes = 0; inspect.Serialise("BufferContentsSize"_lit, bytes);
++      Reader signature(record.signature); signature.U64();
++      Require(bytes == signature.U64() && bytes <= replay_snapshot::MaxBlob,
++              "snapshot buffer content size mismatch");
++      InspectRawBytes(inspect, bytes, record.blob.size());
++      Finish(inspect, record.blob.size());
++    }
++    else if(type == eResTexture)
++    {
++      TextureStateInitialData texture;
++      inspect.Serialise("TextureState"_lit, texture);
++      expectedMaxLevel = texture.maxLevel;
++      const auto &original = d.m_Textures.at(id);
++      Require(!inspect.IsErrored() && !texture.isView && texture.samples <= 1 &&
++                  texture.type == original.curType && texture.internalformat == original.internalFormat &&
++                  texture.width == uint32_t(original.width) && texture.height == uint32_t(original.height) &&
++                  texture.depth == uint32_t(original.depth) && texture.mips > 0 && texture.mips <= 16,
++              "snapshot texture embedded storage mismatch");
++      if(texture.type != eGL_TEXTURE_BUFFER)
++      {
++        Require(texture.dim == uint32_t(original.dimension), "snapshot texture dimension mismatch");
++        bool compressed = IsCompressedFormat(texture.internalformat);
++        for(int mip = 0; mip < texture.mips; ++mip)
++        {
++          uint32_t w = RDCMAX(1U, texture.width >> mip);
++          uint32_t h = RDCMAX(1U, texture.height >> mip);
++          uint32_t depth = RDCMAX(1U, texture.depth >> mip);
++          if(texture.type == eGL_TEXTURE_2D_ARRAY || texture.type == eGL_TEXTURE_CUBE_MAP_ARRAY)
++            depth = texture.depth;
++          uint64_t bytes = compressed ? GetCompressedByteSize(w, h, depth, texture.internalformat) :
++              GetByteSize(w, h, depth, GetBaseFormat(texture.internalformat), GetDataType(texture.internalformat));
++          Require(bytes && bytes <= record.blob.size(), "snapshot texture subresource byte limit");
++          for(int face = 0; face < (texture.type == eGL_TEXTURE_CUBE_MAP ? 6 : 1); ++face)
++            InspectRawBytes(inspect, bytes, record.blob.size());
++        }
++      }
++      Finish(inspect, record.blob.size());
++    }
++    ReadSerialiser ser(new StreamReader(record.blob.data(), record.blob.size()), Ownership::Stream);
++    Setup(ser, d); ser.ReadChunk<SystemChunk>();
++    GLInitialContents empty;
++    m.Serialise_InitialState<ReadSerialiser>(ser, id, NULL, &empty);
++    Finish(ser, record.blob.size());
++    auto found = m.m_InitialContents.find(id);
++    Require(found != m.m_InitialContents.end(), "snapshot codec produced no restored resource");
++    m.Apply_InitialState(m.GetResource(id), found->second.data);
++    if(type == eResTexture && d.m_Textures[id].curType != eGL_TEXTURE_BUFFER)
++    {
++      GLint after = 0;
++      GL.glGetTextureParameterivEXT(m.GetResource(id).name, d.m_Textures[id].curType, eGL_TEXTURE_MAX_LEVEL, &after);
++      if(after != expectedMaxLevel)
++        throw std::runtime_error(std::string("snapshot texture max-level apply mismatch: ") +
++            std::to_string(replay_snapshot::ID(id)) + " expected=" + std::to_string(expectedMaxLevel) +
++            " actual=" + std::to_string(after) + " stored=" + std::to_string(found->second.data.tex.maxLevel));
++    }
++    replay_snapshot::CheckGL("resource restore");
++  }
++
++  static void InspectRawBytes(ReadSerialiser &ser, uint64_t expected, size_t length)
++  {
++    // NoFlags pointer arrays encode a SECOND uint64 byte count. The ordinary
++    // RenderDoc reader does not know the caller's mapped-buffer/scratch capacity.
++    // Verify that count and the exact aligned physical extent before invoking it.
++    uint64_t bytes = 0; ser.Serialise("encoded_byte_count"_lit, bytes);
++    Require(!ser.IsErrored() && bytes == expected, "snapshot embedded raw byte count/capacity mismatch");
++    ser.GetReader()->AlignTo<64>();
++    uint64_t offset = ser.GetReader()->GetOffset();
++    Require(offset <= length && bytes <= length - offset, "snapshot raw byte span exceeds its blob");
++    ser.GetReader()->SetOffset(offset + bytes);
++  }
++
++  static void CanonicalProgramObject(Writer &writer, const SDObject &object)
++  {
++    // Numeric GL uniform locations are process-local. Everything else (names,
++    // typed values, array order, resource/block bindings) is semantic state.
++    if(object.name == "Location") return;
++    if(object.name == "Binding")
++      Require(object.data.basic.i >= -1 && object.data.basic.i < 64,
++              "snapshot program binding is outside the codec's bitmask width");
++    writer.String(object.name); writer.String(object.type.name);
++    writer.U64(uint64_t(object.type.basetype)); writer.U64(object.type.byteSize);
++    writer.String(object.data.str); writer.U64(object.data.basic.u);
++    uint64_t count = 0;
++    for(size_t i = 0; i < object.NumChildren(); ++i)
++      if(object.GetChild(i)->name != "Location") ++count;
++    writer.U64(count);
++    for(size_t i = 0; i < object.NumChildren(); ++i)
++      CanonicalProgramObject(writer, *object.GetChild(i));
++  }
++  static Bytes SemanticProgram(WrappedOpenGL &d, ResourceId resource, const Bytes &blob)
++  {
++    ReadSerialiser ser(new StreamReader(blob.data(), blob.size()), Ownership::Stream);
++    Setup(ser, d); ser.ConfigureStructuredExport(&WrappedOpenGL::GetChunkName, false, 0, 1.0);
++    Require(ser.ReadChunk<SystemChunk>() == SystemChunk::InitialContents, "snapshot program chunk mismatch");
++    ResourceId id; GLNamespace type;
++    ser.Serialise("id"_lit, id); ser.Serialise("Type"_lit, type);
++    Require(id == resource && type == eResProgram, "snapshot program identity mismatch");
++    PerStageReflections stages; d.FillReflectionArray(id, stages);
++    SerialiseProgramBindings(ser, CaptureState::StructuredExport, stages, 0);
++    SerialiseProgramUniforms(ser, CaptureState::StructuredExport, stages, 0, NULL);
++    Finish(ser, blob.size());
++    Require(ser.GetStructuredFile().chunks.size() == 1, "snapshot program structured codec mismatch");
++    Writer out;
++    CanonicalProgramObject(out, *ser.GetStructuredFile().chunks[0]);
++    return out.bytes;
++  }
++  static void VerifyRestored(WrappedOpenGL &d, const std::vector<Resource> &records,
++                             const Bytes &stateBlob, const PixelPackState &pack,
++                             const PixelUnpackState &unpack)
++  {
++    StateGuard actual(d);
++    Require(State(d, actual.state) == stateBlob, "snapshot restored GL context state differs");
++    Writer expectedPixel, actualPixel;
++    Pack(expectedPixel, pack); Pack(expectedPixel, unpack);
++    Pack(actualPixel, actual.pack); Pack(actualPixel, actual.unpack);
++    Require(expectedPixel.bytes == actualPixel.bytes, "snapshot restored pixel-store state differs");
++    Arena verify(*d.GetResourceManager());
++    for(const auto &record : records)
++    {
++      Require(Signature(d, record.id) == record.signature, "snapshot restored storage signature differs");
++      Bytes bytes = CaptureResource(d, record.id);
++      bool equal = record.type == eResProgram ?
++          SemanticProgram(d, record.id, bytes) == SemanticProgram(d, record.id, record.blob) :
++          bytes == record.blob;
++      if(!equal)
++      {
++        size_t offset = 0;
++        while(offset < bytes.size() && offset < record.blob.size() && bytes[offset] == record.blob[offset]) ++offset;
++        throw std::runtime_error(std::string("snapshot restored resource contents/state differs: ") +
++             std::to_string(replay_snapshot::ID(record.id)) + " first_byte=" + std::to_string(offset) +
++             " expected_size=" + std::to_string(record.blob.size()) + " actual_size=" + std::to_string(bytes.size()) +
++             " expected=" + std::to_string(offset < record.blob.size() ? record.blob[offset] : 999) +
++             " actual=" + std::to_string(offset < bytes.size() ? bytes[offset] : 999));
++      }
++    }
++    replay_snapshot::CheckGL("full resource/context read-back verification");
++  }
++
++  static void RestoreCPUState(WrappedOpenGL &d, const GLRenderState &state)
++  {
++    auto &m = *d.GetResourceManager();
++    auto &context = d.GetCtxData();
++    context.m_Program = state.Program.name;
++    context.m_ProgramPipeline = state.Pipeline.name;
++    context.m_TextureUnit = int(state.ActiveTexture - eGL_TEXTURE0);
++    context.m_VertexArrayRecord = m.GetResourceRecord(state.VAO);
++    context.m_FeedbackRecord = m.GetResourceRecord(state.FeedbackObj);
++    context.m_DrawFramebufferRecord = m.GetResourceRecord(state.DrawFBO);
++    context.m_ReadFramebufferRecord = m.GetResourceRecord(state.ReadFBO);
++    // Replay serialisers use real GL bindings; never retain capture-process record pointers.
++    for(auto &record : context.m_BufferRecord) record = NULL;
++    for(auto &binding : m.m_FBOAttachmentsCache) delete binding.second;
++    m.m_FBOAttachmentsCache.clear();
++  }
++
++public:
++  static void Save(GLReplay &replay, uint32_t event, const char *path, const char *capture)
++  {
++    replay_snapshot::CheckCapture(capture);
++    Require(!replay.m_Proxy, "snapshot v1 refuses proxy replay devices");
++    replay.MakeCurrentReplayContext(&replay.m_ReplayCtx);
++    auto &d = *replay.m_pDriver;
++    Quiescent(d);
++    uint64_t next = Boundary(d, event);
++    auto ids = Inventory(replay);
++    StateGuard saved(d);
++    replay_snapshot::CheckGL("context-state fetch");
++    ResolveScope resolving(*d.GetResourceManager(), ids);
++    std::vector<Resource> records;
++    // Validate every object before allocating snapshots or publishing anything.
++    for(ResourceId id : ids)
++    {
++      Resource record; record.id = id;
++      record.type = d.GetResourceManager()->GetResource(id).Namespace;
++      try { record.signature = Signature(d, id); }
++      catch(const std::exception &error)
++      { throw std::runtime_error(std::string("resource ") + std::to_string(replay_snapshot::ID(id)) +
++                                 " namespace " + std::to_string(unsigned(record.type)) + ": " + error.what()); }
++      if(record.type == eResProgram) record.locations = d.m_Programs.at(id).locationTranslate;
++      records.push_back(std::move(record));
++    }
++    Bytes state = State(d, saved.state);
++    {
++      Arena arena(*d.GetResourceManager());
++      for(auto &record : records)
++      {
++        try { record.blob = CaptureResource(d, record.id); }
++        catch(const std::exception &error)
++        { throw std::runtime_error(std::string("snapshot capture resource ") +
++              std::to_string(replay_snapshot::ID(record.id)) + ": " + error.what()); }
++      }
++    }
++    Writer out;
++    out.String(capture); out.U64(d.m_SectionVersion); out.U64(event); out.U64(next);
++    out.String((const char *)GL.glGetString(eGL_VENDOR));
++    out.String((const char *)GL.glGetString(eGL_RENDERER));
++    out.String((const char *)GL.glGetString(eGL_VERSION));
++    out.Blob(state); Pack(out, saved.pack); Pack(out, saved.unpack);
++    out.U64(replay_snapshot::ID(d.GetResourceManager()->GetResID(
++        FramebufferRes(d.GetCtx(), d.m_CurrentDefaultFBO))));
++    out.U64(records.size());
++    for(const auto &record : records)
++    {
++      out.U64(replay_snapshot::ID(record.id)); out.U64(uint32_t(record.type));
++      out.Blob(record.signature); out.U64(record.locations.size());
++      for(const auto &location : record.locations)
++      { out.U64(uint32_t(location.first)); out.U64(uint32_t(location.second)); }
++      out.Blob(record.blob);
++    }
++    // Restore before publishing: a failed restoration must not yield a usable checkpoint.
++    saved.state.ApplyState(&d); saved.pack.Apply(true); saved.unpack.Apply(true);
++    replay_snapshot::CheckGL("save state restoration");
++    saved.active = false;
++    VerifyRestored(d, records, state, saved.pack, saved.unpack);
++    replay_snapshot::Publish(path, out.bytes);
++  }
++
++  static void Load(GLReplay &replay, const char *path, const char *capture, uint32_t &event)
++  {
++    replay_snapshot::CheckCapture(capture);
++    Bytes payload = replay_snapshot::ReadArchive(path);
++    Reader in(payload);
++    Require(in.String(64) == capture, "snapshot capture SHA-256 mismatch");
++    auto &d = *replay.m_pDriver;
++    Require(in.U64() == d.m_SectionVersion, "snapshot RenderDoc section version mismatch");
++    uint64_t restoredEvent = in.U64(), next = in.U64();
++    Require(restoredEvent && restoredEvent <= UINT32_MAX, "snapshot event outside range");
++    Require(!replay.m_Proxy, "snapshot v1 refuses proxy replay devices");
++    replay.MakeCurrentReplayContext(&replay.m_ReplayCtx);
++    Quiescent(d);
++    Require(Boundary(d, uint32_t(restoredEvent)) == next, "snapshot event/chunk boundary mismatch");
++    Require(in.String() == (const char *)GL.glGetString(eGL_VENDOR) &&
++                in.String() == (const char *)GL.glGetString(eGL_RENDERER) &&
++                in.String() == (const char *)GL.glGetString(eGL_VERSION),
++            "snapshot GL implementation signature mismatch");
++    Bytes stateBlob = in.Blob(65536);
++    PixelPackState pack; PixelUnpackState unpack;
++    Pack(in, pack); Pack(in, unpack);
++    ResourceId defaultFBO = replay_snapshot::ID(in.U64());
++    auto ids = Inventory(replay);
++    uint64_t count = in.U64();
++    Require(count == ids.size() && count <= replay_snapshot::MaxObjects, "snapshot inventory count mismatch");
++    std::vector<Resource> records;
++    std::set<ResourceId> seen;
++    for(uint64_t i = 0; i < count; ++i)
++    {
++      Resource record; record.id = replay_snapshot::ID(in.U64());
++      uint64_t type = in.U64();
++      Require(type <= UINT32_MAX && ids.count(record.id) && seen.insert(record.id).second,
++              "snapshot missing, duplicate, or foreign resource identity");
++      record.type = GLNamespace(type);
++      Require(d.GetResourceManager()->GetResource(record.id).Namespace == record.type,
++              "snapshot resource namespace mismatch");
++      record.signature = in.Blob(8 * 1024 * 1024);
++      Require(record.signature == Signature(d, record.id),
++              "snapshot boundary storage/program signature differs from fresh controller (v1 unsupported)");
++      uint64_t locations = in.U64();
++      Require(locations <= 65536 && (record.type == eResProgram || locations == 0),
++              "snapshot uniform-map count invalid");
++      for(uint64_t j = 0; j < locations; ++j)
++      {
++        uint64_t from = in.U64(), to = in.U64();
++        Require(from <= UINT32_MAX && to <= UINT32_MAX &&
++                    record.locations.emplace(GLint(uint32_t(from)), GLint(uint32_t(to))).second,
++                "snapshot invalid or duplicate uniform mapping");
++      }
++      record.blob = in.Blob(record.type == eResProgram ? 1024 * 1024 : replay_snapshot::MaxBlob);
++      records.push_back(std::move(record));
++    }
++    in.Done();
++    Require(defaultFBO == ResourceId() || ids.count(defaultFBO), "snapshot default FBO missing");
++    Require(defaultFBO == ResourceId() ||
++                d.GetResourceManager()->GetResource(defaultFBO).Namespace == eResFramebuffer,
++            "snapshot default FBO reference has the wrong namespace");
++    ResolveScope resolving(*d.GetResourceManager(), ids);
++    GLRenderState state;
++    DecodeState(d, stateBlob, state);
++    // Validate every nested wire length and typed reference before ANY live
++    // resource is written. Per-resource validation during restore is too late.
++    for(const auto &record : records) SafetyPreflightResource(d, record);
++    // Codec reads append display-only resource init chunk indices. Preserve the immutable catalog.
++    auto descriptions = replay.m_Resources;
++    struct DescriptionGuard
++    {
++      GLReplay &replay; decltype(GLReplay::m_Resources) &original;
++      ~DescriptionGuard() { replay.m_Resources.swap(original); }
++    } descriptionsGuard{replay, descriptions};
++    {
++      Arena arena(*d.GetResourceManager());
++      // Data/storage first; FBO/VAO/pipeline bindings last, preserving original ResourceIds.
++      for(int pass = 0; pass < 2; ++pass)
++        for(const auto &record : records)
++        {
++          bool binding = record.type == eResFramebuffer || record.type == eResVertexArray ||
++                         record.type == eResProgramPipe || record.type == eResFeedback;
++          if(binding == bool(pass)) RestoreResource(d, record);
++        }
++    }
++    if(defaultFBO != ResourceId())
++      d.m_CurrentDefaultFBO = d.GetResourceManager()->GetResource(defaultFBO).name;
++    state.ApplyState(&d); pack.Apply(true); unpack.Apply(true);
++    RestoreCPUState(d, state);
++    GL.glFinish(); replay_snapshot::CheckGL("restored resource completion");
++    VerifyRestored(d, records, stateBlob, pack, unpack);
++    d.m_CurEvents.clear();
++    d.m_CurEventID = uint32_t(restoredEvent) + 1;
++    d.m_FirstEventID = uint32_t(restoredEvent) + 1;
++    d.m_LastEventID = uint32_t(restoredEvent);
++    d.m_ReplayEventCount = 0; d.m_WasActiveFeedback = false;
++    d.m_FrameReader->SetOffset(next);
++    for(auto &cached : replay.m_GetTexturePrevData) { delete[] cached; cached = NULL; }
++    GL.glFinish(); replay_snapshot::CheckGL("completed restore");
++    event = uint32_t(restoredEvent);
++  }
++};
++
++void RegisterGLSnapshotDriver(GLReplay *driver)
++{ replay_snapshot::drivers[driver] = driver; }
++void UnregisterGLSnapshotDriver(GLReplay *driver)
++{ replay_snapshot::drivers.erase(driver); }
++
++rdcstr SaveGLReplaySnapshot(IReplayDriver *driver, uint32_t event, const char *path, const char *capture)
++{
++  auto found = replay_snapshot::drivers.find(driver);
++  if(found == replay_snapshot::drivers.end()) return "snapshot requires a live local OpenGL device";
++  try { GLReplaySnapshot::Save(*found->second, event, path, capture); return {}; }
++  catch(const std::exception &e) { return rdcstr("snapshot save refused: ") + e.what(); }
++  catch(...) { return "snapshot save failed with an unknown exception"; }
++}
++rdcstr LoadGLReplaySnapshot(IReplayDriver *driver, const char *path, const char *capture, uint32_t &event)
++{
++  auto found = replay_snapshot::drivers.find(driver);
++  if(found == replay_snapshot::drivers.end()) return "snapshot requires a live local OpenGL device";
++  try { GLReplaySnapshot::Load(*found->second, path, capture, event); return {}; }
++  catch(const std::exception &e) { return rdcstr("snapshot load refused: ") + e.what(); }
++  catch(...) { return "snapshot load failed with an unknown exception"; }
++}
+diff --git a/renderdoc/driver/gl/gl_resources.cpp b/renderdoc/driver/gl/gl_resources.cpp
+--- a/renderdoc/driver/gl/gl_resources.cpp
++++ b/renderdoc/driver/gl/gl_resources.cpp
+@@ -26,6 +26,7 @@
+ #include "gl_resources.h"
+ #include "gl_dispatch_table.h"
+ #include "gl_manager.h"
++#include "replay/replay_snapshot.h"
+ 
+ #include <cstdio>
+ #include <cstdlib>
+@@ -65,6 +66,9 @@
+   if(ser.IsWriting() && rm)
+     id = rm->GetResID(el);
+ 
++  if(ser.IsWriting() && rm)
++    ValidateGLSnapshotResource(rm, el, id);
++
+   DoSerialise(ser, id);
+ 
+   if(ser.IsReading())
+@@ -73,6 +77,8 @@
+       el = rm->GetResource(id);
+     else
+       el = GLResource(MakeNullResource);
++    if(rm)
++      ValidateGLSnapshotResource(rm, el, id);
+   }
+ }
+ 
+@@ -779,6 +785,8 @@
+ 
+ int GetNumMips(GLenum target, GLuint tex, GLuint w, GLuint h, GLuint d)
+ {
++  if(IsGLReplaySnapshotActive() && target != eGL_RENDERBUFFER)
++    return GetGLReplaySnapshotMipCount(target, tex);
+    int mips = 1;
+ 
+   // renderbuffers don't have mips
+diff --git a/renderdoc/driver/gl/gl_snapshot_codec_safety.inl b/renderdoc/driver/gl/gl_snapshot_codec_safety.inl
+new file mode 100644
+--- /dev/null
++++ b/renderdoc/driver/gl/gl_snapshot_codec_safety.inl
+@@ -0,0 +1,357 @@
++// Included inside GLReplaySnapshot. No GL calls or changes to the upstream
++// serializer. Untrusted archive fields are checked before ordinary GL codecs.
++// Fixed-array structured reads visit only N elements (plus at most one dummy);
++// canonical re-encoding rejects their permissive count conversion. Pointer
++// arrays require a separate capacity preflight even in structured-export mode.
++
++static void SafetyStructured(ReadSerialiser &ser, WrappedOpenGL &d)
++{
++  Setup(ser, d);
++  ser.ConfigureStructuredExport(&WrappedOpenGL::GetChunkName, false, 0, 1.0);
++}
++
++static void SafetyTyped(WrappedOpenGL &d, const GLResource &resource, GLNamespace type)
++{
++  const auto id = d.GetResourceManager()->GetResID(resource);
++  const bool null = resource.name == 0 && id == ResourceId();
++  Require(null || (id != ResourceId() && resource.Namespace == type),
++          "snapshot typed resource reference has the wrong namespace");
++}
++
++static void SafetyDecodeState(WrappedOpenGL &d, const Bytes &blob, GLRenderState &state)
++{
++  Require(blob.size() <= 65536, "snapshot GL state blob limit");
++  ReadSerialiser ser(new StreamReader(blob.data(), blob.size()), Ownership::Stream);
++  SafetyStructured(ser, d);
++  Require(ser.ReadChunk<SystemChunk>() == SystemChunk::CaptureBegin,
++          "snapshot GL state chunk mismatch");
++  ser.Serialise("state"_lit, state);
++  Finish(ser, blob.size());
++  Require(state.ContextPresent, "snapshot context state is absent");
++  // Besides exact fixed counts this rejects truncated/defaulted arrays,
++  // alternate headers and noncanonical padding before anything reaches GL.
++  Require(State(d, state) == blob, "snapshot GL state encoding/counts are not canonical");
++  for(const auto *array : {state.Tex1D,state.Tex2D,state.Tex3D,state.Tex1DArray,state.Tex2DArray,
++                          state.TexCubeArray,state.TexRect,state.TexBuffer,state.TexCube,
++                          state.Tex2DMS,state.Tex2DMSArray})
++    for(size_t i = 0; i < 128; ++i) SafetyTyped(d, array[i], eResTexture);
++  for(auto resource : state.Samplers) SafetyTyped(d, resource, eResSampler);
++  for(auto image : state.Images) SafetyTyped(d, image.res, eResTexture);
++  for(auto resource : state.BufferBindings) SafetyTyped(d, resource, eResBuffer);
++  for(auto binding : state.AtomicCounter) SafetyTyped(d, binding.res, eResBuffer);
++  for(auto binding : state.ShaderStorage) SafetyTyped(d, binding.res, eResBuffer);
++  for(auto binding : state.TransformFeedback) SafetyTyped(d, binding.res, eResBuffer);
++  for(auto binding : state.UniformBinding) SafetyTyped(d, binding.res, eResBuffer);
++  SafetyTyped(d, state.Program, eResProgram);
++  SafetyTyped(d, state.Pipeline, eResProgramPipe);
++  SafetyTyped(d, state.VAO, eResVertexArray);
++  SafetyTyped(d, state.FeedbackObj, eResFeedback);
++  SafetyTyped(d, state.ReadFBO, eResFramebuffer);
++  SafetyTyped(d, state.DrawFBO, eResFramebuffer);
++  for(const auto &subroutine : state.Subroutines)
++    Require(subroutine.numSubroutines >= 0 &&
++                uint32_t(subroutine.numSubroutines) <= ARRAY_COUNT(subroutine.Values),
++            "snapshot subroutine count exceeds fixed GL argument capacity");
++}
++
++// Read and copy one exact byte array. Never invoke a pointer-array reader with
++// an unverified wire length. Re-encoding uses the archive's existing bytes, not
++// synthesized zeros or a reference rendering.
++static void SafetyRaw(ReadSerialiser &input, WriteSerialiser &output,
++                      const Bytes &blob, uint64_t expected)
++{
++  uint64_t count = 0;
++  input.Serialise("byte_count"_lit, count);
++  Require(!input.IsErrored() && count == expected,
++          "snapshot raw byte count exceeds/differs from exact capacity");
++  input.GetReader()->AlignTo<64>();
++  const uint64_t offset = input.GetReader()->GetOffset();
++  Require(offset <= blob.size() && count <= blob.size() - offset,
++          "snapshot raw byte span exceeds resource blob");
++  byte *data = const_cast<byte *>(blob.data() + size_t(offset));
++  output.Serialise("raw"_lit, data, count, SerialiserFlags::NoFlags);
++  input.GetReader()->SetOffset(offset + count);
++}
++
++static uint64_t SafetyCount(ReadSerialiser &ser, size_t limit)
++{
++  uint64_t count = 0;
++  ser.Serialise("count"_lit, count);
++  Require(!ser.IsErrored() && count <= limit, "snapshot program collection count exceeds blob bound");
++  return count;
++}
++
++static void SafetyProgramBindings(ReadSerialiser &ser, size_t length)
++{
++  const uint64_t count = SafetyCount(ser, length / 8);
++  for(uint64_t i = 0; i < count; ++i)
++  {
++    rdcstr name; int32_t binding = 0;
++    ser.Serialise("Name"_lit, name); ser.Serialise("Binding"_lit, binding);
++    Require(!ser.IsErrored() && name.size() <= length && binding >= -1 && binding < 64,
++            "snapshot program binding is malformed or exceeds codec bitmask width");
++  }
++}
++
++static uint32_t SafetyUniformComponents(GLenum type)
++{
++  switch(type)
++  {
++    case eGL_FLOAT_MAT4: case eGL_DOUBLE_MAT4: return 16;
++    case eGL_FLOAT_MAT4x3: case eGL_FLOAT_MAT3x4:
++    case eGL_DOUBLE_MAT4x3: case eGL_DOUBLE_MAT3x4: return 12;
++    case eGL_FLOAT_MAT4x2: case eGL_FLOAT_MAT2x4:
++    case eGL_DOUBLE_MAT4x2: case eGL_DOUBLE_MAT2x4: return 8;
++    case eGL_FLOAT_MAT3: case eGL_DOUBLE_MAT3: return 9;
++    case eGL_FLOAT_MAT3x2: case eGL_FLOAT_MAT2x3:
++    case eGL_DOUBLE_MAT3x2: case eGL_DOUBLE_MAT2x3: return 6;
++    case eGL_FLOAT_MAT2: case eGL_DOUBLE_MAT2:
++    case eGL_FLOAT_VEC4: case eGL_DOUBLE_VEC4: case eGL_INT_VEC4:
++    case eGL_UNSIGNED_INT_VEC4: case eGL_BOOL_VEC4: return 4;
++    case eGL_FLOAT_VEC3: case eGL_DOUBLE_VEC3: case eGL_INT_VEC3:
++    case eGL_UNSIGNED_INT_VEC3: case eGL_BOOL_VEC3: return 3;
++    case eGL_FLOAT_VEC2: case eGL_DOUBLE_VEC2: case eGL_INT_VEC2:
++    case eGL_UNSIGNED_INT_VEC2: case eGL_BOOL_VEC2: return 2;
++    default: return 1;
++  }
++}
++
++static bool SafetyDoubleUniform(GLenum type)
++{
++  switch(type)
++  {
++    case eGL_DOUBLE: case eGL_DOUBLE_VEC2: case eGL_DOUBLE_VEC3: case eGL_DOUBLE_VEC4:
++    case eGL_DOUBLE_MAT2: case eGL_DOUBLE_MAT3: case eGL_DOUBLE_MAT4:
++    case eGL_DOUBLE_MAT2x3: case eGL_DOUBLE_MAT2x4: case eGL_DOUBLE_MAT3x2:
++    case eGL_DOUBLE_MAT3x4: case eGL_DOUBLE_MAT4x2: case eGL_DOUBLE_MAT4x3: return true;
++    default: return false;
++  }
++}
++
++static bool SafetyFloatUniform(GLenum type)
++{
++  switch(type)
++  {
++    case eGL_FLOAT: case eGL_FLOAT_VEC2: case eGL_FLOAT_VEC3: case eGL_FLOAT_VEC4:
++    case eGL_FLOAT_MAT2: case eGL_FLOAT_MAT3: case eGL_FLOAT_MAT4:
++    case eGL_FLOAT_MAT2x3: case eGL_FLOAT_MAT2x4: case eGL_FLOAT_MAT3x2:
++    case eGL_FLOAT_MAT3x4: case eGL_FLOAT_MAT4x2: case eGL_FLOAT_MAT4x3: return true;
++    default: return false;
++  }
++}
++
++static bool SafetyIntegerUniform(GLenum type)
++{
++  // Keep this list aligned with ProgramUniformValue's signed/unsigned arms.
++  // In particular an unknown GLenum must not fall through the old-version
++  // float union encoding and desynchronise our capacity prewalk.
++  switch(type)
++  {
++    case eGL_SAMPLER_1D: case eGL_SAMPLER_2D: case eGL_SAMPLER_3D: case eGL_SAMPLER_CUBE:
++    case eGL_SAMPLER_CUBE_MAP_ARRAY: case eGL_SAMPLER_1D_SHADOW: case eGL_SAMPLER_2D_SHADOW:
++    case eGL_SAMPLER_1D_ARRAY: case eGL_SAMPLER_2D_ARRAY: case eGL_SAMPLER_1D_ARRAY_SHADOW:
++    case eGL_SAMPLER_2D_ARRAY_SHADOW: case eGL_SAMPLER_2D_MULTISAMPLE:
++    case eGL_SAMPLER_2D_MULTISAMPLE_ARRAY: case eGL_SAMPLER_CUBE_SHADOW:
++    case eGL_SAMPLER_CUBE_MAP_ARRAY_SHADOW: case eGL_SAMPLER_BUFFER:
++    case eGL_SAMPLER_2D_RECT: case eGL_SAMPLER_2D_RECT_SHADOW:
++    case eGL_INT_SAMPLER_1D: case eGL_INT_SAMPLER_2D: case eGL_INT_SAMPLER_3D:
++    case eGL_INT_SAMPLER_CUBE: case eGL_INT_SAMPLER_CUBE_MAP_ARRAY:
++    case eGL_INT_SAMPLER_1D_ARRAY: case eGL_INT_SAMPLER_2D_ARRAY:
++    case eGL_INT_SAMPLER_2D_MULTISAMPLE: case eGL_INT_SAMPLER_2D_MULTISAMPLE_ARRAY:
++    case eGL_INT_SAMPLER_BUFFER: case eGL_INT_SAMPLER_2D_RECT:
++    case eGL_UNSIGNED_INT_SAMPLER_1D: case eGL_UNSIGNED_INT_SAMPLER_2D:
++    case eGL_UNSIGNED_INT_SAMPLER_3D: case eGL_UNSIGNED_INT_SAMPLER_CUBE:
++    case eGL_UNSIGNED_INT_SAMPLER_CUBE_MAP_ARRAY: case eGL_UNSIGNED_INT_SAMPLER_1D_ARRAY:
++    case eGL_UNSIGNED_INT_SAMPLER_2D_ARRAY: case eGL_UNSIGNED_INT_SAMPLER_2D_MULTISAMPLE:
++    case eGL_UNSIGNED_INT_SAMPLER_2D_MULTISAMPLE_ARRAY: case eGL_UNSIGNED_INT_SAMPLER_BUFFER:
++    case eGL_UNSIGNED_INT_SAMPLER_2D_RECT:
++    case eGL_IMAGE_1D: case eGL_IMAGE_2D: case eGL_IMAGE_3D: case eGL_IMAGE_2D_RECT:
++    case eGL_IMAGE_CUBE: case eGL_IMAGE_BUFFER: case eGL_IMAGE_1D_ARRAY:
++    case eGL_IMAGE_2D_ARRAY: case eGL_IMAGE_CUBE_MAP_ARRAY:
++    case eGL_IMAGE_2D_MULTISAMPLE: case eGL_IMAGE_2D_MULTISAMPLE_ARRAY:
++    case eGL_INT_IMAGE_1D: case eGL_INT_IMAGE_2D: case eGL_INT_IMAGE_3D:
++    case eGL_INT_IMAGE_2D_RECT: case eGL_INT_IMAGE_CUBE: case eGL_INT_IMAGE_BUFFER:
++    case eGL_INT_IMAGE_1D_ARRAY: case eGL_INT_IMAGE_2D_ARRAY:
++    case eGL_INT_IMAGE_2D_MULTISAMPLE: case eGL_INT_IMAGE_2D_MULTISAMPLE_ARRAY:
++    case eGL_UNSIGNED_INT_IMAGE_1D: case eGL_UNSIGNED_INT_IMAGE_2D:
++    case eGL_UNSIGNED_INT_IMAGE_3D: case eGL_UNSIGNED_INT_IMAGE_2D_RECT:
++    case eGL_UNSIGNED_INT_IMAGE_CUBE: case eGL_UNSIGNED_INT_IMAGE_BUFFER:
++    case eGL_UNSIGNED_INT_IMAGE_1D_ARRAY: case eGL_UNSIGNED_INT_IMAGE_2D_ARRAY:
++    case eGL_UNSIGNED_INT_IMAGE_CUBE_MAP_ARRAY: case eGL_UNSIGNED_INT_IMAGE_2D_MULTISAMPLE:
++    case eGL_UNSIGNED_INT_IMAGE_2D_MULTISAMPLE_ARRAY: case eGL_UNSIGNED_INT_ATOMIC_COUNTER:
++    case eGL_INT: case eGL_INT_VEC2: case eGL_INT_VEC3: case eGL_INT_VEC4:
++    case eGL_UNSIGNED_INT: case eGL_UNSIGNED_INT_VEC2: case eGL_UNSIGNED_INT_VEC3:
++    case eGL_UNSIGNED_INT_VEC4: case eGL_BOOL: case eGL_BOOL_VEC2:
++    case eGL_BOOL_VEC3: case eGL_BOOL_VEC4: return true;
++    default: return false;
++  }
++}
++
++static void SafetyProgram(ReadSerialiser &input, WrappedOpenGL &d, const Resource &record)
++{
++  // This direct bounded wire walk MUST precede SemanticProgram or the ordinary
++  // ProgramUniformValue decoder: both use NoFlags into its fixed data[16].
++  SafetyProgramBindings(input, record.blob.size());
++  SafetyProgramBindings(input, record.blob.size());
++  const uint64_t uniforms = SafetyCount(input, record.blob.size() / 13);
++  for(uint64_t i = 0; i < uniforms; ++i)
++  {
++    rdcstr name; bool array = false;
++    input.Serialise("Basename"_lit, name); input.Serialise("IsArray"_lit, array);
++    Require(!input.IsErrored() && name.size() <= record.blob.size(), "snapshot malformed uniform name");
++    const uint64_t values = SafetyCount(input, record.blob.size() / 20);
++    for(uint64_t j = 0; j < values; ++j)
++    {
++      GLenum type = eGL_NONE; int32_t location = 0;
++      input.Serialise("Type"_lit, type); input.Serialise("Location"_lit, location);
++      Require(SafetyFloatUniform(type) || SafetyDoubleUniform(type) || SafetyIntegerUniform(type),
++              "snapshot uniform type has no validated capacity codec");
++      const uint64_t components = SafetyCount(input, 16);
++      Require(components == SafetyUniformComponents(type), "snapshot uniform count/capacity mismatch");
++      // Older RenderDoc sections stored float/double data in the opposite
++      // union member. Preserve the codec's versioned physical layout exactly.
++      const bool wide = input.VersionAtLeast(0x1C) ? SafetyDoubleUniform(type) : SafetyFloatUniform(type);
++      const uint64_t bytes = components * (wide ? 8U : 4U);
++      const uint64_t offset = input.GetReader()->GetOffset();
++      Require(!input.IsErrored() && offset <= record.blob.size() && bytes <= record.blob.size() - offset,
++              "snapshot uniform data span exceeds blob");
++      input.GetReader()->SetOffset(offset + bytes);
++    }
++  }
++  SafetyProgramBindings(input, record.blob.size());
++  SafetyProgramBindings(input, record.blob.size());
++  Finish(input, record.blob.size());
++
++  // Now the existing structured helpers are safe to invoke. Re-encode every
++  // value, including process-local Location, for wire/capacity verification;
++  // semantic comparison later intentionally normalizes Location separately.
++  ReadSerialiser structured(new StreamReader(record.blob.data(), record.blob.size()), Ownership::Stream);
++  SafetyStructured(structured, d);
++  Require(structured.ReadChunk<SystemChunk>() == SystemChunk::InitialContents,
++          "snapshot program chunk mismatch");
++  ResourceId id; GLNamespace type;
++  structured.Serialise("id"_lit, id); structured.Serialise("Type"_lit, type);
++  PerStageReflections stages; d.FillReflectionArray(id, stages);
++  SerialiseProgramBindings(structured, CaptureState::StructuredExport, stages, 0);
++  SerialiseProgramUniforms(structured, CaptureState::StructuredExport, stages, 0, NULL);
++  Finish(structured, record.blob.size());
++  WriteSerialiser encoded(new StreamWriter(4096), Ownership::Stream); Setup(encoded, d);
++  encoded.WriteStructuredFile(structured.GetStructuredFile(), NULL);
++  Require(StreamBytes(encoded) == record.blob, "snapshot program encoding/counts are not canonical");
++}
++
++static void SafetyPreflightResource(WrappedOpenGL &d, const Resource &record)
++{
++  if(record.type == eResShader || record.type == eResQuery)
++  { Require(record.blob.empty(), "snapshot immutable/query resource has unexpected bytes"); return; }
++  Require(!record.blob.empty() && record.blob.size() <= replay_snapshot::MaxBlob,
++          "snapshot missing or oversized resource blob");
++  ReadSerialiser input(new StreamReader(record.blob.data(), record.blob.size()), Ownership::Stream);
++  SafetyStructured(input, d);
++  Require(input.ReadChunk<SystemChunk>() == SystemChunk::InitialContents,
++          "snapshot resource chunk mismatch");
++  ResourceId id; GLNamespace type;
++  input.Serialise("id"_lit, id); input.Serialise("Type"_lit, type);
++  Require(!input.IsErrored() && id == record.id && type == record.type,
++          "snapshot embedded resource identity mismatch");
++  if(type == eResProgram) { SafetyProgram(input, d, record); return; }
++
++  WriteSerialiser output(new StreamWriter(4096), Ownership::Stream); Setup(output, d);
++  output.BeginChunk(uint32_t(SystemChunk::InitialContents), 0);
++  output.Serialise("id"_lit, id); output.Serialise("Type"_lit, type);
++  switch(type)
++  {
++    case eResBuffer:
++    {
++      uint32_t bytes = 0; input.Serialise("BufferContentsSize"_lit, bytes);
++      Reader signature(record.signature); signature.U64();
++      Require(bytes == signature.U64() && bytes <= replay_snapshot::MaxBlob,
++              "snapshot buffer extent differs from validated storage");
++      output.Serialise("BufferContentsSize"_lit, bytes);
++      SafetyRaw(input, output, record.blob, bytes);
++      break;
++    }
++    case eResTexture:
++    {
++      TextureStateInitialData texture = {};
++      input.Serialise("TextureState"_lit, texture);
++      const auto &original = d.m_Textures.at(id);
++      Reader signature(record.signature);
++      for(int field = 0; field < 11; ++field) signature.U64();
++      const uint64_t physicalMips = signature.U64();
++      Require(!input.IsErrored() && !texture.isView && texture.samples <= 1 &&
++                  texture.type == original.curType && texture.internalformat == original.internalFormat &&
++                  texture.width == uint32_t(original.width) && texture.height == uint32_t(original.height) &&
++                  texture.depth == uint32_t(original.depth) && texture.dim == uint32_t(original.dimension) &&
++                  texture.mips > 0 && texture.mips <= 16 && uint64_t(texture.mips) == physicalMips,
++              "snapshot texture metadata differs from validated storage");
++      SafetyTyped(d, texture.texBuffer, eResBuffer);
++      output.Serialise("TextureState"_lit, texture);
++      if(texture.type != eGL_TEXTURE_BUFFER)
++        for(int mip = 0; mip < texture.mips; ++mip)
++        {
++          const uint32_t w = RDCMAX(1U, texture.width >> mip);
++          const uint32_t h = RDCMAX(1U, texture.height >> mip);
++          const uint32_t depth = texture.type == eGL_TEXTURE_2D_ARRAY || texture.type == eGL_TEXTURE_CUBE_MAP_ARRAY ?
++              texture.depth : RDCMAX(1U, texture.depth >> mip);
++          const uint64_t bytes = IsCompressedFormat(texture.internalformat) ?
++              GetCompressedByteSize(w, h, depth, texture.internalformat) :
++              GetByteSize(w, h, depth, GetBaseFormat(texture.internalformat), GetDataType(texture.internalformat));
++          Require(bytes && bytes <= record.blob.size(), "snapshot texture subresource size bound");
++          for(int face = 0; face < (texture.type == eGL_TEXTURE_CUBE_MAP ? 6 : 1); ++face)
++            SafetyRaw(input, output, record.blob, bytes);
++        }
++      break;
++    }
++    case eResVertexArray:
++    {
++      VAOInitialData state = {};
++      input.Serialise("VAOState"_lit, state);
++      Require(state.valid, "snapshot invalid VAO metadata");
++      for(auto buffer : state.VertexBuffers) SafetyTyped(d, buffer.Buffer, eResBuffer);
++      SafetyTyped(d, state.ElementArrayBuffer, eResBuffer);
++      output.Serialise("VAOState"_lit, state);
++      break;
++    }
++    case eResFramebuffer:
++    {
++      FramebufferInitialData state = {};
++      input.Serialise("FramebufferState"_lit, state);
++      Require(state.valid, "snapshot invalid framebuffer metadata");
++      for(auto attachment : state.Attachments) SafetyTyped(d, attachment.obj, eResTexture);
++      output.Serialise("FramebufferState"_lit, state);
++      break;
++    }
++    case eResFeedback:
++    {
++      FeedbackInitialData state = {};
++      input.Serialise("TransformFeedbackState"_lit, state);
++      Require(state.valid, "snapshot invalid feedback metadata");
++      for(auto buffer : state.Buffer) SafetyTyped(d, buffer, eResBuffer);
++      output.Serialise("TransformFeedbackState"_lit, state);
++      break;
++    }
++    case eResProgramPipe:
++    {
++      PipelineInitialData state = {};
++      input.Serialise("ProgramPipelineState"_lit, state);
++      Require(state.valid, "snapshot invalid pipeline metadata");
++      for(auto program : state.programs) SafetyTyped(d, program, eResProgram);
++      output.Serialise("ProgramPipelineState"_lit, state);
++      break;
++    }
++    case eResSampler:
++    {
++      SamplerInitialData state = {};
++      input.Serialise("SamplerState"_lit, state);
++      Require(state.valid, "snapshot invalid sampler metadata");
++      output.Serialise("SamplerState"_lit, state);
++      break;
++    }
++    default: Require(false, "snapshot resource has no safe preflight codec");
++  }
++  Require(!input.IsErrored(), "snapshot metadata decode failed");
++  Finish(input, record.blob.size());
++  output.EndChunk();
++  Require(StreamBytes(output) == record.blob, "snapshot resource encoding/counts are not canonical");
++}
+diff --git a/renderdoc/replay/replay_controller.cpp b/renderdoc/replay/replay_controller.cpp
+--- a/renderdoc/replay/replay_controller.cpp
++++ b/renderdoc/replay/replay_controller.cpp
+@@ -26,6 +26,7 @@
+ #include "replay_controller.h"
+ #include <string.h>
+ #include <time.h>
++#include "replay_snapshot.h"
+ #include <unordered_set>
+ #include "common/dds_readwrite.h"
+ #include "driver/ihv/amd/amd_isa.h"
+@@ -41,6 +42,11 @@
+ #include "strings/string_utils.h"
+ #include "tinyexr/tinyexr.h"
+ 
++// Pointer membership is checked before dereferencing an opaque public API argument.
++static std::map<IReplayController *, ReplayController *> snapshotControllers;
++static std::set<IReplayController *> snapshotUsedControllers;
++#include "replay_snapshot_api.inl"
++
+ static void fileWriteFunc(void *context, void *data, int size)
+ {
+   FileIO::fwrite(data, 1, size, (FILE *)context);
+@@ -48,6 +54,7 @@
+ 
+ ReplayController::ReplayController()
+ {
++  snapshotControllers[this] = this;
+   m_ThreadID = Threading::GetCurrentID();
+ 
+   m_pDevice = NULL;
+@@ -59,12 +66,16 @@
+ 
+ ReplayController::~ReplayController()
+ {
++  snapshotControllers.erase(this);
++  snapshotUsedControllers.erase(this);
+   RenderDoc::Inst().UnregisterMemoryRegion(this);
+   CHECK_REPLAY_THREAD();
+ }
+ 
+ void ReplayController::SetFrameEvent(uint32_t eventId, bool force)
+ {
++  if(eventId > 0)
++    snapshotUsedControllers.insert(this);
+   CHECK_REPLAY_THREAD();
+   RENDERDOC_PROFILEFUNCTION();
+ 
+@@ -92,6 +103,7 @@
+ 
+ bool ReplayController::ReplayEventRange(uint32_t startEventId, uint32_t endEventId)
+ {
++  snapshotUsedControllers.insert(this);
+   CHECK_REPLAY_THREAD();
+   RENDERDOC_PROFILEFUNCTION();
+ 
+diff --git a/renderdoc/replay/replay_controller.h b/renderdoc/replay/replay_controller.h
+--- a/renderdoc/replay/replay_controller.h
++++ b/renderdoc/replay/replay_controller.h
+@@ -134,6 +134,13 @@
+ struct ReplayController : public IReplayController
+ {
+ public:
++  // Internal nonvirtual snapshot access; callers must use the live-controller registry.
++  IReplayDriver *SnapshotDevice() { return m_pDevice; }
++  uint32_t SnapshotEvent() const { return m_EventID; }
++  bool SnapshotThread() const { return m_ThreadID == Threading::GetCurrentID(); }
++  // Match ReplayEventRange's lazy UI metadata contract. Descriptor inspection
++  // can change live GL bindings and must not run after verified restoration.
++  void SnapshotSetEvent(uint32_t event) { m_EventID = event; }
+   ReplayController();
+ 
+   APIProperties GetAPIProperties();
+diff --git a/renderdoc/replay/replay_snapshot.h b/renderdoc/replay/replay_snapshot.h
+new file mode 100644
+--- /dev/null
++++ b/renderdoc/replay/replay_snapshot.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++// Private, opt-in API. No change to IReplayController's public vtable.
++#include "api/replay/renderdoc_replay.h"
++
++extern "C" RENDERDOC_EXPORT_API uint32_t RENDERDOC_CC RENDERDOC_GetReplaySnapshotVersion();
++extern "C" RENDERDOC_EXPORT_API int RENDERDOC_CC RENDERDOC_SaveReplaySnapshot(
++    IReplayController *controller, uint32_t event, const char *path, const char *capture_sha256,
++    char *error, size_t errorSize);
++extern "C" RENDERDOC_EXPORT_API int RENDERDOC_CC RENDERDOC_LoadReplaySnapshot(
++    IReplayController *controller, const char *path, const char *capture_sha256, uint32_t *event,
++    char *error, size_t errorSize);
++
++class IReplayDriver;
++class GLReplay;
++rdcstr SaveGLReplaySnapshot(IReplayDriver *, uint32_t, const char *, const char *);
++rdcstr LoadGLReplaySnapshot(IReplayDriver *, const char *, const char *, uint32_t &);
++void RegisterGLSnapshotDriver(GLReplay *);
++void UnregisterGLSnapshotDriver(GLReplay *);
++class GLResourceManager;
++struct GLResource;
++void ValidateGLSnapshotResource(GLResourceManager *, const GLResource &, ResourceId);
++bool IsGLReplaySnapshotActive();
++void ReadGLReplaySnapshotTexture(uint32_t target, int level, uint32_t format, uint32_t type,
++                                 void *pixels, size_t bytes);
++int GetGLReplaySnapshotMipCount(uint32_t target, uint32_t texture);
+diff --git a/renderdoc/replay/replay_snapshot_api.inl b/renderdoc/replay/replay_snapshot_api.inl
+new file mode 100644
+--- /dev/null
++++ b/renderdoc/replay/replay_snapshot_api.inl
+@@ -0,0 +1,58 @@
++// Included by replay_controller.cpp; deliberately not part of the public vtable.
++static int SnapshotResult(const rdcstr &message, char *error, size_t size)
++{
++  if(error && size)
++  {
++    size_t count = RDCMIN(size - 1, message.size());
++    memcpy(error, message.c_str(), count);
++    error[count] = 0;
++  }
++  return message.empty() ? 0 : 1;
++}
++
++extern "C" RENDERDOC_EXPORT_API uint32_t RENDERDOC_CC RENDERDOC_GetReplaySnapshotVersion()
++{
++  return 1;
++}
++
++extern "C" RENDERDOC_EXPORT_API int RENDERDOC_CC RENDERDOC_SaveReplaySnapshot(
++    IReplayController *controller, uint32_t event, const char *path, const char *capture_sha256,
++    char *error, size_t errorSize)
++{
++  auto found = snapshotControllers.find(controller);
++  if(found == snapshotControllers.end())
++    return SnapshotResult("snapshot: invalid or foreign controller", error, errorSize);
++  ReplayController *c = found->second;
++  if(!c->SnapshotThread())
++    return SnapshotResult("snapshot: wrong replay thread", error, errorSize);
++  if(!event || c->SnapshotEvent() != event || !snapshotUsedControllers.count(controller))
++    return SnapshotResult("snapshot: boundary is not the completed current event", error, errorSize);
++  return SnapshotResult(SaveGLReplaySnapshot(c->SnapshotDevice(), event, path, capture_sha256),
++                        error, errorSize);
++}
++
++extern "C" RENDERDOC_EXPORT_API int RENDERDOC_CC RENDERDOC_LoadReplaySnapshot(
++    IReplayController *controller, const char *path, const char *capture_sha256, uint32_t *event,
++    char *error, size_t errorSize)
++{
++  if(event)
++    *event = 0;
++  auto found = snapshotControllers.find(controller);
++  if(found == snapshotControllers.end() || !event)
++    return SnapshotResult("snapshot: invalid controller or output event pointer", error, errorSize);
++  ReplayController *c = found->second;
++  if(!c->SnapshotThread())
++    return SnapshotResult("snapshot: wrong replay thread", error, errorSize);
++  if(snapshotUsedControllers.count(controller))
++    return SnapshotResult("snapshot: load requires an unused fresh controller", error, errorSize);
++  // A failed import may have modified temporary/live objects. Never reuse it.
++  snapshotUsedControllers.insert(controller);
++  uint32_t restored = 0;
++  rdcstr result = LoadGLReplaySnapshot(c->SnapshotDevice(), path, capture_sha256, restored);
++  if(result.empty())
++  {
++    c->SnapshotSetEvent(restored);
++    *event = restored;
++  }
++  return SnapshotResult(result, error, errorSize);
++}

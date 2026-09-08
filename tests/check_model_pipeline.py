@@ -25,6 +25,11 @@ SLC_LINE_BYTES = 128
 # fragment group because primitive interpolation state differs.
 USC_GROUP_COUNT = 1 + 323
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+# Host-side live FIFO storage, not GPU memory traffic. The C++ texture-bias
+# fixture statically checks these request/response/continuation ABI sizes;
+# usc-fragment-residency-test independently guards the 256 complete-quad cap.
+# BIAS grew only the request from 120 to 128 bytes (+8192 at full residency).
+TEXTURE_RESIDENT_HOST_BYTES = 256 * 4 * (128 + 40 + 1448)
 
 
 def verify_tessellation_stage_connections() -> None:
@@ -3132,9 +3137,9 @@ def verify_fill_tex_nearest(executable: Path, output_dir: Path) -> None:
         "fifo_stall_events": 0,
         "pool_bytes_in_flight": 0,
         # At most 256 complete quads have live FIFO payloads. The request,
-        # response and continuation span totals 1608 bytes per resident lane;
+        # response and continuation span totals 1616 bytes per resident lane;
         # all geometry/coverage/coefficients remain allocated for the draw.
-        "pool_high_water_bytes": 3016182,
+        "pool_high_water_bytes": 1369590 + TEXTURE_RESIDENT_HOST_BYTES,
         "vdm_cycles": 9,
         "vertex_fetch_cycles": 9,
         "vertex_attribute_fetches": 8,
@@ -3452,8 +3457,8 @@ def verify_fill_tex_bilinear(executable: Path, output_dir: Path) -> None:
         "texture_requests": work["texture_requests"],
         "fifo_stall_events": 0,
         "pool_bytes_in_flight": 0,
-        # Includes quad_id/quad_lane in the TextureSampleRequest ABI.
-        "pool_high_water_bytes": 3016182,
+        # Invariant geometry/coverage storage plus bounded resident FIFO data.
+        "pool_high_water_bytes": 1369590 + TEXTURE_RESIDENT_HOST_BYTES,
         "vdm_cycles": 9,
         "vertex_fetch_cycles": 9,
         "vertex_attribute_fetches": 8,
@@ -3751,7 +3756,7 @@ def verify_fill_tex_trilinear_linear_01(
         "texture_requests": work["texture_requests"],
         "fifo_stall_events": 0,
         "pool_bytes_in_flight": 0,
-        "pool_high_water_bytes": 2852286,
+        "pool_high_water_bytes": 1205694 + TEXTURE_RESIDENT_HOST_BYTES,
         "vdm_cycles": 9,
         "vertex_fetch_cycles": 9,
         "vertex_attribute_fetches": 8,
@@ -3923,7 +3928,7 @@ def verify_fill_tex_trilinear_linear_04_or_05(
             "renderer_cycles": 25024,
             "usc_groups": quad_work["fill_tex_trilinear_linear_04"]["usc_groups"],
             "texture_requests": quad_work["fill_tex_trilinear_linear_04"]["texture_requests"],
-            "pool_high_water_bytes": 2423766,
+            "pool_high_water_bytes": 777174 + TEXTURE_RESIDENT_HOST_BYTES,
             "fs_alu_instructions": quad_work["fill_tex_trilinear_linear_04"]["fs_alu_instructions"],
             "usc_slot_cycles": quad_work["fill_tex_trilinear_linear_04"]["usc_slot_cycles"],
             "usc_cluster_cycles": quad_work["fill_tex_trilinear_linear_04"]["usc_cluster_cycles"],
@@ -3956,7 +3961,7 @@ def verify_fill_tex_trilinear_linear_04_or_05(
             "renderer_cycles": 24941,
             "usc_groups": quad_work["fill_tex_trilinear_linear_05"]["usc_groups"],
             "texture_requests": quad_work["fill_tex_trilinear_linear_05"]["texture_requests"],
-            "pool_high_water_bytes": 2377934,
+            "pool_high_water_bytes": 731342 + TEXTURE_RESIDENT_HOST_BYTES,
             "fs_alu_instructions": quad_work["fill_tex_trilinear_linear_05"]["fs_alu_instructions"],
             "usc_slot_cycles": quad_work["fill_tex_trilinear_linear_05"]["usc_slot_cycles"],
             "usc_cluster_cycles": quad_work["fill_tex_trilinear_linear_05"]["usc_cluster_cycles"],

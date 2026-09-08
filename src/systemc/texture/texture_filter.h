@@ -149,6 +149,12 @@ float TextureFastLog2(float x);
 TextureLodSelection SelectTextureLod(float rho_squared,
                                      const RogueTextureSamplerDescriptor &sampler,
                                      std::uint32_t mip_count);
+// Fragment BIAS/PPLOD adds the shader's scalar to the *unclamped* implicit
+// lambda. NaN bias means zero bias; infinities select the corresponding LOD
+// bound. Raw shader bits remain in the request. Sampler DADJUST is separate.
+TextureLodSelection SelectTextureBiasedLod(float rho_squared, float bias,
+                                          const RogueTextureSamplerDescriptor &sampler,
+                                          std::uint32_t mip_count);
 
 // lp_build_sample_general: a minified fragment takes the minification filter
 // and the sampler's mip filter, a magnified one the magnification filter on

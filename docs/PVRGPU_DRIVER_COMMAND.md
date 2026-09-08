@@ -649,7 +649,15 @@ RGBA8 transport uses 4 bytes per pixel;
 integer R32, RG32 and RGBA32 transport uses 4, 8 and 16. Floating-point color
 targets use 16-byte RGBA32F transport, preserving negative values and HDR.
 Native formats are unpacked/packed by the driver. Each target must fit its
-16 MiB attachment slot. Other normalized targets still use RGBA8 transport.
+16 MiB attachment slot. `PIPE_FORMAT_R10G10B10A2_UNORM` and
+`PIPE_FORMAT_B10G10R10A2_UNORM` use their actual four-byte packed storage:
+LOAD, per-fragment PBE blending and DRAM readback preserve all ten RGB bits
+and both alpha bits. PBE blends normalized floating-point inputs/destinations,
+then clamps and rounds each written channel to nearest-even after every
+fragment; channel masks retain untouched packed bits. Sampler descriptors
+select RGB/BGR order when a rendered attachment is sampled. PNG conversion
+is display-only and never feeds the driver readback or subsequent draws.
+Other normalized targets still use RGBA8 transport.
 Every MRT attachment keeps its own LOAD contents across sequence aliases and
 synchronous Gallium flush/readback boundaries; partial target payloads fail closed.
 

@@ -1699,7 +1699,8 @@ PcoInstruction DecodeFragmentSaveVisibilityMaskGroup(
 
 PcoInstruction DecodeTextureSampleGroup(
     const std::vector<std::uint8_t> &binary, const GroupHeader &header,
-    std::uint16_t group_index, std::uint16_t descriptor_start = 0) {
+    std::uint16_t group_index, std::uint16_t descriptor_start = 0,
+    bool fragment_bias = false) {
   if (header.control || (header.da != 5 && header.da != 6) ||
       header.operation_origin != 2 || header.output_load_check ||
       header.write0_present || header.write1_present ||
@@ -1763,20 +1764,24 @@ PcoInstruction DecodeTextureSampleGroup(
     // Public I_SMP byte 2: projection and sample-buffer modes are separate
     // unsupported paths. SOO and SNO share one explicitly decoded lookup
     // word; neither may be dropped from an otherwise familiar TAO group.
-    if ((extension & 0x70U) != 0 || pplod != (address_offset || lod_replace) ||
+    if ((extension & 0x70U) != 0 || pplod != (address_offset || lod_replace || lod_mode == 1U) ||
         (sample_index_present && (!non_normalized_coords || lod_replace || dimension != 2)) ||
         (non_normalized_coords && !sample_index_present && !lod_replace) ||
-        (!address_offset && !sample_index_present && !lod_replace && !spatial_offset_present))
+        (!address_offset && !sample_index_present && !lod_replace &&
+         lod_mode != 1U && !spatial_offset_present))
       DecodeError(cursor - 1, "unsupported SMP extension flags");
   }
   if (descriptor_start != 0 && spatial_offset_present)
     DecodeError(header.offset, "SMP spatial offset transport is not enabled for task-stage textures");
-  if ((lod_replace && !exta) ||
-      (!lod_replace && lod_mode != (address_offset ? 1U : 0U)))
+  const bool lod_bias = lod_mode == 1U && !address_offset;
+  if (lod_bias && !fragment_bias)
+    DecodeError(header.offset + 4, "SMP shader LOD bias is fragment-only");
+  if (((lod_replace || lod_bias) && !exta) ||
+      (!lod_replace && !lod_bias && lod_mode != (address_offset ? 1U : 0U)))
     DecodeError(header.offset + 4, "SMP LOD mode disagrees with TAO payload");
   // Coordinates, optional bias/address pair, then optional lookup DWORD.
   const std::uint8_t coordinate_span = static_cast<std::uint8_t>(
-      dimension + ((address_offset || lod_replace) ? 1U : 0U) +
+      dimension + ((address_offset || lod_replace || lod_bias) ? 1U : 0U) +
       (address_offset ? 2U : 0U) +
       ((sample_index_present || spatial_offset_present) ? 1U : 0U));
 
@@ -1836,6 +1841,7 @@ PcoInstruction DecodeTextureSampleGroup(
   instruction.texture_sample_index_present = sample_index_present ? 1U : 0U;
   instruction.texture_spatial_offset_present = spatial_offset_present ? 1U : 0U;
   instruction.texture_lod_replace = lod_replace ? 1U : 0U;
+  instruction.texture_lod_bias = lod_bias ? 1U : 0U;
   instruction.target = PcoWriteTarget::kTemporary;
   instruction.source = sources.source1;
   instruction.source1 = sources.source0;
@@ -4146,7 +4152,7 @@ PcoInstruction DecodeFragmentGroup(const std::vector<std::uint8_t> &binary,
     if (binary[header.offset + 3] >> 5U == kBackendOpDma)
       return (binary[header.offset + 3] & 7U) == 1U
                  ? DecodeBufferLoadGroup(binary, header, group_index)
-                 : DecodeTextureSampleGroup(binary, header, group_index);
+                 : DecodeTextureSampleGroup(binary, header, group_index, 0, true);
     if (binary[header.offset + 3] >> 5U == kBackendOpFitr &&
         !(binary[header.offset + 3] & 0x10U))
       return DecodeFragmentFitrGroup(binary, header, group_index);
@@ -4971,6 +4977,7 @@ bool SameConditionalsInstruction(const PcoInstruction &left,
          left.texture_sample_index_present == right.texture_sample_index_present &&
          left.texture_spatial_offset_present == right.texture_spatial_offset_present &&
          left.texture_lod_replace == right.texture_lod_replace &&
+         left.texture_lod_bias == right.texture_lod_bias &&
          left.data_request == right.data_request &&
          left.iteration_mode == right.iteration_mode &&
          left.perspective == right.perspective &&
@@ -5166,6 +5173,7 @@ bool HasCanonicalTextureFields(const PcoInstruction &instruction) {
          instruction.texture_sample_index_present <= 1 &&
          instruction.texture_spatial_offset_present <= 1 &&
          instruction.texture_lod_replace <= 1 &&
+         HasCanonicalTextureLodMode(instruction) &&
          (!instruction.texture_non_normalized_coords ||
           instruction.texture_sample_index_present || instruction.texture_lod_replace) &&
          (!instruction.texture_sample_index_present ||
@@ -5175,7 +5183,8 @@ bool HasCanonicalTextureFields(const PcoInstruction &instruction) {
 
 std::size_t TextureDataDwordCount(const PcoInstruction &instruction) {
   return static_cast<std::size_t>(instruction.texture_dimension) +
-         ((instruction.texture_address_offset || instruction.texture_lod_replace) ? 1U : 0U) +
+         ((instruction.texture_address_offset || instruction.texture_lod_replace ||
+           instruction.texture_lod_bias) ? 1U : 0U) +
          (instruction.texture_address_offset ? 2U : 0U) +
          ((instruction.texture_sample_index_present ||
            instruction.texture_spatial_offset_present) ? 1U : 0U);
@@ -5196,6 +5205,9 @@ void SetTextureRequestData(
   request.explicit_lod_present = instruction.texture_lod_replace;
   if (instruction.texture_lod_replace)
     request.explicit_lod = temporaries[tail++];
+  request.lod_bias_present = instruction.texture_lod_bias;
+  if (instruction.texture_lod_bias)
+    request.lod_bias = temporaries[tail++];
   if (instruction.texture_address_offset) {
     // pco_emit_nir_smp injects a zero bias before the address pair. A nonzero
     // BIAS needs its own LOD datapath; never silently discard it here.
@@ -5472,7 +5484,8 @@ void ValidateVertexTemporaryProgram(
       const bool coordinate_range_valid = coordinate_count != 0 &&
           coordinate_base <= kPcoTemporaryCount &&
           coordinate_count <= kPcoTemporaryCount - coordinate_base;
-      if (++texture_sample_count > kPcoMaximumTextureSampleInstructions ||
+      if (++texture_sample_count > kPcoMaximumVertexTextureSampleInstructions ||
+          instruction.texture_lod_bias != 0 ||
           !HasCanonicalTextureFields(instruction) ||
           instruction.target != PcoWriteTarget::kTemporary ||
           instruction.source_count != 3 || instruction.repeat_count != 1 ||
@@ -7339,6 +7352,8 @@ void ValidateExecutionEnvelope(const PcoProgramSummary &summary,
       ExecuteError("decoded derivative metadata is not canonical");
     if (!HasCanonicalTextureLodMode(instruction))
       ExecuteError("texture LOD replacement flag is not canonical for opcode");
+    if (stage != ShaderStage::kFragment && instruction.texture_lod_bias)
+      ExecuteError("SMP shader LOD bias is fragment-only");
     if (!HasCanonicalNativeIntegerSignedness(instruction))
       ExecuteError("integer signedness flag is not canonical for opcode");
     if (instruction.group_index != index)
@@ -9176,7 +9191,8 @@ static std::uint64_t FragmentProgramSignature(
     PVRGPU_HASH_FIELD(texture_dimension); PVRGPU_HASH_FIELD(texture_address_offset);
     PVRGPU_HASH_FIELD(texture_fcnorm); PVRGPU_HASH_FIELD(texture_non_normalized_coords);
     PVRGPU_HASH_FIELD(texture_sample_index_present); PVRGPU_HASH_FIELD(texture_spatial_offset_present);
-    PVRGPU_HASH_FIELD(texture_lod_replace); PVRGPU_HASH_FIELD(data_request);
+    PVRGPU_HASH_FIELD(texture_lod_replace); PVRGPU_HASH_FIELD(texture_lod_bias);
+    PVRGPU_HASH_FIELD(data_request);
     PVRGPU_HASH_FIELD(iteration_mode); PVRGPU_HASH_FIELD(perspective); PVRGPU_HASH_FIELD(saturate);
     PVRGPU_HASH_FIELD(source0_floor); PVRGPU_HASH_FIELD(source0_absolute); PVRGPU_HASH_FIELD(source1_absolute);
     PVRGPU_HASH_FIELD(source2_floor); PVRGPU_HASH_FIELD(source2_absolute);

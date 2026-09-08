@@ -958,6 +958,8 @@ bool InitialColorAttachmentIsValid(
   const std::string_view format = source.format ? source.format : "";
   std::uint64_t bytes_per_pixel = 0;
   if (format == "PIPE_FORMAT_R8G8B8A8_UNORM" ||
+      format == "PIPE_FORMAT_R10G10B10A2_UNORM" ||
+      format == "PIPE_FORMAT_B10G10R10A2_UNORM" ||
       format == "PIPE_FORMAT_R8G8B8A8_SRGB" ||
       format == "PIPE_FORMAT_B8G8R8A8_SRGB" ||
       format == "PIPE_FORMAT_R32_UINT" || format == "PIPE_FORMAT_R32_SINT")
@@ -1511,6 +1513,8 @@ bool CopyPcoSequenceDraw(
   // (linear or sRGB-encoded), or one, two or four raw 32-bit integer channels.
   if (!source.format ||
       (std::string_view(source.format) != "PIPE_FORMAT_R8G8B8A8_UNORM" &&
+       std::string_view(source.format) != "PIPE_FORMAT_R10G10B10A2_UNORM" &&
+       std::string_view(source.format) != "PIPE_FORMAT_B10G10R10A2_UNORM" &&
        std::string_view(source.format) != "PIPE_FORMAT_R8G8B8A8_SRGB" &&
        std::string_view(source.format) != "PIPE_FORMAT_B8G8R8A8_SRGB" &&
        std::string_view(source.format) != "PIPE_FORMAT_R32_UINT" &&
@@ -2217,7 +2221,9 @@ bool CopyPcoSequenceTexture(
   } else if (format == "PIPE_FORMAT_R10G10B10A2_UNORM" ||
              format == "PIPE_FORMAT_B10G10R10A2_UNORM") {
     block_bytes = 4U;
-    texture_format = pvrgpu::stub::TextureFormat::kRgb10A2Unorm;
+    texture_format = format == "PIPE_FORMAT_B10G10R10A2_UNORM"
+        ? pvrgpu::stub::TextureFormat::kBgr10A2Unorm
+        : pvrgpu::stub::TextureFormat::kRgb10A2Unorm;
   } else if (format == "PIPE_FORMAT_R8G8B8A8_SNORM") {
     block_bytes = 4U;
     texture_format = pvrgpu::stub::TextureFormat::kRgba8Snorm;

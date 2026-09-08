@@ -194,7 +194,11 @@ class GLDebugScope {
     if (group_pushed_) {
       int depth = 0;
       api_.get(kGroupDepth, &depth);
-      if (depth == previous_depth_ + 1) api_.popGroup();
+      // A rejected replay can leave captured nested groups open. Pop those
+      // together with our own group, but never touch a pre-existing group.
+      // The initial count bounds cleanup even if a broken GL refuses a pop.
+      for (int remaining = depth - previous_depth_; remaining > 0; --remaining)
+        api_.popGroup();
       group_pushed_ = false;
     }
   }

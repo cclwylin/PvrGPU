@@ -327,7 +327,8 @@ void ValidateComputeProgram(const PcoDecodedProgram &program,
   bool end = false;
   for (const auto &instruction : program.instructions) {
     if (!HasCanonicalDerivativeMode(instruction)) Fail("derivative mode is not canonical for opcode");
-    if (!HasCanonicalTextureLodMode(instruction)) Fail("texture LOD replacement flag is not canonical for opcode");
+    if (!HasCanonicalTextureLodMode(instruction) || instruction.texture_lod_bias)
+      Fail("compute texture LOD mode is unsupported");
     if (!HasCanonicalNativeIntegerSignedness(instruction))
       Fail("integer signedness flag is not canonical for the native opcode");
     if (!instruction.repeat_count || instruction.repeat_count > 16 ||
@@ -478,7 +479,8 @@ void StepComputeTask(const PcoDecodedProgram &program, const ComputePcoAbi &abi,
     Fail("task stepped outside its native program");
   const auto &instruction = program.instructions[task.instruction_index];
   if (!HasCanonicalDerivativeMode(instruction)) Fail("derivative mode is not canonical for opcode");
-  if (!HasCanonicalTextureLodMode(instruction)) Fail("texture LOD replacement flag is not canonical for opcode");
+  if (!HasCanonicalTextureLodMode(instruction) || instruction.texture_lod_bias)
+    Fail("compute texture LOD mode is unsupported");
   if (!HasCanonicalNativeIntegerSignedness(instruction))
     Fail("integer signedness flag is not canonical for the native opcode");
   // Finite watchdog bounds runaway native control flow; it never substitutes

@@ -23,6 +23,31 @@ template<class Fn> void Reject(Fn fn) {
   throw std::runtime_error("expected fail-closed native GS rejection");
 }
 std::uint32_t FloatBits(float value) { std::uint32_t bits; std::memcpy(&bits,&value,4); return bits; }
+void RejectFragmentOnlyBias() {
+  const auto original = DecodeGeometryPcoProgram(GeometryTextureNativeFixture());
+  const auto abi = GeometryTextureNativeAbi();
+  ValidateGeometryProgram(original, abi);
+  for (std::size_t index = 0; index < original.instructions.size(); ++index) {
+    for (std::uint8_t flag : {1U, 2U}) {
+      auto mutated = original;
+      mutated.instructions[index].texture_lod_bias = flag;
+      const auto reject_lod = [&](auto action) {
+        bool rejected = false;
+        try { action(); } catch (const std::runtime_error &error) {
+          rejected = std::string(error.what()).find("LOD") != std::string::npos;
+        }
+        Check(rejected, "GS rejects BIAS on SMP and auxiliary opcodes before execution");
+      };
+      reject_lod([&] { ValidateGeometryProgram(mutated, abi); });
+      auto task = MakeGeometryTask(abi, std::vector<std::uint32_t>(abi.shareds), 0, 0);
+      task.instruction_index = index;
+      GeometryExecutionStats stats;
+      reject_lod([&] { StepGeometryTask(mutated, abi, task, {}, stats); });
+      Check(task.steps == 0 && stats.instructions == 0, "rejected GS BIAS has no shader work");
+    }
+  }
+}
+
 void CompilerNative() {
   for(unsigned kind=0;kind<8;++kind) {
     const auto program=DecodeGeometryPcoProgram(GeometryCompilerFixture(kind));
@@ -546,6 +571,7 @@ int sc_main(int,char**) {
   try {
     PureNative();
     SampleExecution();
+    RejectFragmentOnlyBias();
     CompilerNative();
     LoopNative();
     DynamicPushNative();

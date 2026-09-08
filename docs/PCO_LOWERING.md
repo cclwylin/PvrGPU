@@ -56,6 +56,46 @@ Mesa-version-specific pointers.  Call
 `pvrgpu_pco_graphics_binary_finish()` after the command bridge has deep-copied
 the byte arrays.
 
+## Fragment shader texture LOD bias
+
+The color-primitive compiler accepts fragment `txb` for bound, non-shadow,
+non-array 2D, 3D and cube textures with a scalar 32-bit floating-point bias.
+Other shader stages and shadow, array or sparse bias operations remain
+fail-closed. Shader LOD bias is distinct from sampler-state `lod_bias`; this
+compiler support does not expand the sampler-state contract.
+
+No additional external Mesa patch is required for this operation. The pinned
+`pco_nir_tex.c` already appends the original bias SSA value after the texture
+coordinates, sets `PPLOD` and `PCO_LOD_MODE_BIAS`, and preserves those flags
+through `pco_trans_nir.c` to public SMP encoding. Cube bias keeps its original
+three direction coordinates; it is not the separate cube-gradient lowering.
+The native consumer must obtain implicit derivatives from the complete
+fragment quad, add the per-lane shader bias before the effective LOD clamps,
+and perform real texture fetches. Replacing `txb` with `txl`, selecting a mip
+on the host, or dropping helper-lane bias is not equivalent.
+
+Compiler acceptance alone does not establish native support. Regression
+coverage must compile genuine NIR texture operations through Mesa PCO, decode
+their emitted BIAS operands, and exercise the native request/FIFO consumer
+with positive, negative and dynamic biases, LOD clamps and distinct mip data.
+Explicit-LOD and unbiased controls, plus the rejected stage/shape cases, keep
+the new path separate from existing contracts.
+
+Run the isolated current-driver producer and native consumer verification with:
+
+```bash
+bash script/run_mesa_pco_texture_bias_unit.sh
+```
+
+It compiles the repository's driver source explicitly, using the selected Mesa
+build only for compiler flags and dependencies, and writes private artifacts
+without installing a runtime. The native ASan/UBSan test exercises real PCO
+through raw/prepared ISS, USC continuations and TextureUnit memory fetches.
+`texture-bias-unit` provides a CTest entry using checked-in genuine PCO fixtures;
+the script also regenerates instructions with the current compiler. Include the
+separate stage-rejection and existing unbiased/explicit-LOD tests when changing
+the request ABI. Host FIFO allocation sizes are not GPU memory traffic.
+
 ## Mesa build integration
 
 The PvrGPU driver Meson file links `libpowervr_compiler` and
@@ -109,6 +149,32 @@ cover VTXIN-only copies, equal indices in different banks, cycles, repeated
 sources, constants/immediates/special registers, source modifiers, and execution
 conditions. Test outputs stay in a private temporary directory; the test itself
 does not apply patches or alter the installed Mesa runtime.
+
+The selected Mesa 26.2.1 source also requires
+[`mesa-26.2.1-nir-shrink-load-footprint.patch`](../third_party/mesa-26.2.1-nir-shrink-load-footprint.patch).
+NIR may combine adjacent memory loads and then trim unused leading components.
+When the remaining component count rounds up to a supported vector width, the
+new load must still end within the original byte footprint. For example,
+reading components 3 and 7 of a vec8 cannot become a vec8 load starting at
+component 3. The patch limits the leading trim before adjusting offsets and
+use swizzles; it does not enlarge a resource or relax runtime bounds.
+
+Apply this tracked patch using the same reverse-check / forward-check workflow
+above, substituting its path. Then run the isolated real-NIR regression before
+rebuilding a private runtime:
+
+```bash
+bash script/run_mesa_nir_shrink_load_unit.sh
+```
+
+The test exercises the actual selected shrink pass with ASan/UBSan, checks every
+fetched byte and selected output, and includes the real Mesa load-vectorizer
+followed by shrink. It covers UBO, SSBO and global loads at different offsets,
+8/16/32/64-bit elements, and vec2/3/4/5/8/16 component-use masks. The script reads
+the configured Mesa build's compile/link commands but never builds shared
+objects, applies patches, or installs a runtime. Set
+`PVRGPU_NIR_SHRINK_TEST_SOURCE` to an unpatched source copy for a negative
+control; the adjacent-vec4 regression must fail its original 32-byte bound.
 
 With Mesa tests enabled, the `pvrgpu_pco_lowering` native test compiles a
 Gallium-style conditionals shader pair, checks clone ownership, non-empty owned

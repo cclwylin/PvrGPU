@@ -45,6 +45,27 @@ static unsigned checks;
 
 int main(void)
 {
+   /* Change only the target format of an otherwise identical incomplete
+    * command: packed targets must reach exactly the RGBA8 payload gate,
+    * while a format lacking native PBE support must fail at the format gate. */
+   struct pvrgpu_draw_pco_triangles_command color = {0};
+   color.case_name = "generic-packed-format-control";
+   color.frame = 1;
+   color.width = color.height = color.framebuffer_width = color.framebuffer_height = 4;
+   color.format = PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8;
+   char rgba_error[256], packed_error[256];
+   CHECK(!pvrgpu_cmd_validate_draw_pco_triangles("unused", &color, rgba_error, sizeof(rgba_error)));
+   const char *packed_formats[] = {PVRGPU_DRIVER_COMMAND_FORMAT_RGB10_A2,
+                                  PVRGPU_DRIVER_COMMAND_FORMAT_BGRA10_A2};
+   for (unsigned i = 0; i < sizeof(packed_formats) / sizeof(packed_formats[0]); ++i) {
+      color.format = packed_formats[i];
+      CHECK(!pvrgpu_cmd_validate_draw_pco_triangles("unused", &color, packed_error, sizeof(packed_error)));
+      CHECK(!strcmp(rgba_error, packed_error));
+   }
+   color.format = PVRGPU_DRIVER_COMMAND_FORMAT_B5G6R5;
+   CHECK(!pvrgpu_cmd_validate_draw_pco_triangles("unused", &color, packed_error, sizeof(packed_error)));
+   CHECK(strstr(packed_error, "format") != NULL);
+   CHECK(strcmp(rgba_error, packed_error) != 0);
    const float depth_ranges[][2] = {
       {0, 1}, {1, 0}, {.25f, .75f}, {.75f, .25f},
       {0, 0}, {.375f, .375f}, {1, 1},

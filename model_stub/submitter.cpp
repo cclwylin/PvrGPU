@@ -243,6 +243,7 @@ std::uint32_t ColorAttachmentRawDwords(const std::string &format) {
  * two or four raw 32-bit integer channels of either signedness. */
 bool DriverPcoColorAttachmentFormatSupported(const std::string &format) {
   return format == "PIPE_FORMAT_R8G8B8A8_UNORM" ||
+         PackedUnormFormatFromName(format) != PackedUnormFormat::kNone ||
          format == "PIPE_FORMAT_R32G32B32A32_FLOAT" ||
          ColorAttachmentRawDwords(format) != 0U;
 }
@@ -1624,6 +1625,8 @@ void Submitter::RunJob() {
       state.color_attachment_float32 =
           command.format == "PIPE_FORMAT_R32G32B32A32_FLOAT" ? 1U : 0U;
     }
+    // Clear-only commands use the same physical packed storage as draws.
+    state.color_attachment_packed_unorm = PackedUnormFormatFromName(command.format);
 
     // Colour attachments this draw writes.  Attachment 0 keeps whatever
     // address the single-target paths already chose; the rest are placed in
@@ -2704,9 +2707,10 @@ void Submitter::RunJob() {
                         : (texture.format == "PIPE_FORMAT_R5G6B5_UNORM" ||
                            texture.format == "PIPE_FORMAT_B5G6R5_UNORM")
                               ? TextureFormat::kRgb565Unorm
-                        : (texture.format == "PIPE_FORMAT_R10G10B10A2_UNORM" ||
-                           texture.format == "PIPE_FORMAT_B10G10R10A2_UNORM")
+                        : texture.format == "PIPE_FORMAT_R10G10B10A2_UNORM"
                               ? TextureFormat::kRgb10A2Unorm
+                        : texture.format == "PIPE_FORMAT_B10G10R10A2_UNORM"
+                              ? TextureFormat::kBgr10A2Unorm
                         : texture.format == "PIPE_FORMAT_R8G8B8A8_SNORM"
                               ? TextureFormat::kRgba8Snorm
                         : texture.format == "PIPE_FORMAT_R16G16B16A16_FLOAT"

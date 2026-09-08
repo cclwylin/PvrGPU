@@ -804,6 +804,10 @@ pvrgpu_command_format_for_framebuffer(const struct pvrgpu_context *ctx)
       return PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8_SRGB;
    case PIPE_FORMAT_B8G8R8A8_SRGB:
       return PVRGPU_DRIVER_COMMAND_FORMAT_BGRA8_SRGB;
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_RGB10_A2;
+   case PIPE_FORMAT_B10G10R10A2_UNORM:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_BGRA10_A2;
    default:
       break;
    }
@@ -836,7 +840,7 @@ pvrgpu_command_format_for_framebuffer(const struct pvrgpu_context *ctx)
    if (util_format_is_float(format))
       return PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32F;
 
-   /* Normalized and packed targets use logical RGBA8 storage. */
+   /* Remaining normalized targets retain the logical RGBA8 transport. */
    return PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8;
 }
 
@@ -10498,6 +10502,8 @@ pvrgpu_capture_initial_color_target(
 
    const bool integer = util_format_is_pure_integer(surface->format);
    const bool float32 = util_format_is_float(surface->format);
+   const bool packed10 = surface->format == PIPE_FORMAT_R10G10B10A2_UNORM ||
+                         surface->format == PIPE_FORMAT_B10G10R10A2_UNORM;
    const unsigned components = util_format_get_nr_components(surface->format);
    const unsigned raw_channels = !integer ? 0u : components <= 2 ? components : 4u;
    const unsigned bytes_per_pixel = float32 ? 16u :
@@ -10514,10 +10520,10 @@ pvrgpu_capture_initial_color_target(
          : surface->format;
    const struct util_format_unpack_description *unpack =
       util_format_unpack_description(unpack_format);
-   if (!unpack ||
+   if (!unpack || (!packed10 &&
        ((integer || float32) ? (!unpack->unpack_rgba && !unpack->unpack_rgba_rect)
                 : (!unpack->unpack_rgba_8unorm &&
-                   !unpack->unpack_rgba_8unorm_rect)))
+                   !unpack->unpack_rgba_8unorm_rect))))
       return false;
 
    size_t offset = 0;
@@ -10539,7 +10545,13 @@ pvrgpu_capture_initial_color_target(
       (size_t)layer * resource->level_layer_strides[surface->level];
    for (unsigned y = 0; y < height; ++y) {
       uint8_t *destination = pixels + ((size_t)layer * height + y) * width * bytes_per_pixel;
-      if (float32) {
+      if (packed10) {
+         /* Preserve every normalized destination bit, including unwritten
+          * channels and two-bit alpha. The PBE decodes the declared packed
+          * format for blending; routing LOAD through 4ub loses low RGB bits.
+          * memcpy also accepts unaligned resource offsets and row pitches. */
+         memcpy(destination, source + (size_t)y * stride, row_bytes);
+      } else if (float32) {
          util_format_read_4(unpack_format, destination, width * 16u,
                             source, stride, 0, y, width, 1);
       } else if (integer) {
@@ -14089,6 +14101,32 @@ pvrgpu_note_unsupported_draw(
                          ctx->unsupported_draws);
 }
 
+/* The CPU presentation helper is only a driver-only diagnostic path. Once
+ * native execution is requested, an unlowered shader must leave its target
+ * untouched and be reported as unsupported; copying sampler zero would
+ * silently replace arbitrary shader semantics and contaminate later draws. */
+static bool
+pvrgpu_refuse_native_cpu_present(
+   struct pvrgpu_context *ctx,
+   const struct pipe_draw_info *info,
+   const struct pipe_draw_indirect_info *indirect,
+   const struct pipe_draw_start_count_bias *draws,
+   unsigned num_draws)
+{
+   const char *api = getenv("PVRGPU_SYSTEMC_API_LIB");
+   const char *bridge = getenv("PVRGPU_SYSTEMC_BRIDGE");
+   if ((!api || !api[0]) && (!bridge || !bridge[0]))
+      return false;
+   if (!pvrgpu_can_cpu_present_textured_quad(ctx, info, indirect, draws,
+                                            num_draws))
+      return false;
+   ++ctx->observed_draws;
+   pvrgpu_note_unsupported_draw(ctx, info, indirect, draws, num_draws,
+                                "cpu_present_without_model_command");
+   pvrgpu_invalidate_full_depth_clear(ctx);
+   return true;
+}
+
 static void
 pvrgpu_draw_vbo(struct pipe_context *pipe,
                 const struct pipe_draw_info *info,
@@ -15242,6 +15280,8 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
     * texel count that tracks the per-case filter (1 tap nearest, 4
     * bilinear, about 7 trilinear), which draw one cannot produce.
     */
+   if (pvrgpu_refuse_native_cpu_present(ctx, info, indirect, draws, num_draws))
+      return;
    if (pvrgpu_cpu_present_textured_quad(ctx, info, indirect, draws,
                                         num_draws)) {
       ctx->observed_draws++;

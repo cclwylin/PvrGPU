@@ -220,7 +220,8 @@ void ValidateGeometryProgram(const PcoDecodedProgram &program,
   bool pending = false, ended = false;
   for (const auto &i : program.instructions) {
     if (!HasCanonicalDerivativeMode(i)) Fail("derivative mode is not canonical for opcode");
-    if (!HasCanonicalTextureLodMode(i)) Fail("texture LOD replacement flag is not canonical for opcode");
+    if (!HasCanonicalTextureLodMode(i) || i.texture_lod_bias)
+      Fail("geometry texture LOD mode is unsupported");
     if (!HasCanonicalNativeIntegerSignedness(i))
       Fail("integer signedness flag is not canonical for the native opcode");
     if (ended || !i.repeat_count || i.repeat_count > 16 || i.source_count > 4 ||
@@ -314,7 +315,8 @@ void StepGeometryTask(const PcoDecodedProgram &program,
     Fail("task stepped outside its native program");
   const auto &i = program.instructions[task.instruction_index];
   if (!HasCanonicalDerivativeMode(i)) Fail("derivative mode is not canonical for opcode");
-  if (!HasCanonicalTextureLodMode(i)) Fail("texture LOD replacement flag is not canonical for opcode");
+  if (!HasCanonicalTextureLodMode(i) || i.texture_lod_bias)
+    Fail("geometry texture LOD mode is unsupported");
   if (!HasCanonicalNativeIntegerSignedness(i))
     Fail("integer signedness flag is not canonical for the native opcode");
   if (++task.steps > UINT64_C(10000000)) Fail("native task instruction watchdog");

@@ -481,8 +481,8 @@ static const unsigned pvrgpu_swizzle_rgba[4] = {
 static const unsigned pvrgpu_swizzle_rgb1[4] = {
    PVRGPU_SWIZ_CHAN0, PVRGPU_SWIZ_CHAN1, PVRGPU_SWIZ_CHAN2, PVRGPU_SWIZ_ONE,
 };
-/* B8G8R8A8: red reads source channel 2 and blue channel 0, so the sampled
- * texel presents as RGBA out of BGRA storage. */
+/* B8G8R8A8 and B10G10R10A2: red reads source channel 2 and blue channel 0,
+ * so the sampled texel presents as RGBA out of BGRA storage. */
 static const unsigned pvrgpu_swizzle_bgra[4] = {
    PVRGPU_SWIZ_CHAN2, PVRGPU_SWIZ_CHAN1, PVRGPU_SWIZ_CHAN0, PVRGPU_SWIZ_CHAN3,
 };
@@ -886,7 +886,8 @@ pvrgpu_pco_build_terrain_texture_descriptor(
            : depth_stencil ? 22U : packed ? packed_rogue_format : 12U,
       srgb,
       depth_stencil ? pvrgpu_swizzle_depth_x001
-      : format == PIPE_FORMAT_B8G8R8A8_UNORM ? pvrgpu_swizzle_bgra
+      : (format == PIPE_FORMAT_B8G8R8A8_UNORM ||
+         format == PIPE_FORMAT_B10G10R10A2_UNORM) ? pvrgpu_swizzle_bgra
       : (format == PIPE_FORMAT_R8G8B8X8_UNORM || packed_three_channel)
                          ? pvrgpu_swizzle_rgb1
                          : pvrgpu_swizzle_rgba,
@@ -4449,7 +4450,21 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                /* Multisample fetch is native SMP.NNCOORDS.SNO; size/sample
                 * queries are descriptor reads lowered by pinned PCO. Array
                 * layers are selected by its real address-override sequence. */
+               /* Shader bias uses the ordinary implicit-derivative path.
+                * Pinned Mesa PCO preserves the scalar after the coordinates
+                * and emits SMP.PPLOD.BIAS; do not replace it with explicit
+                * LOD or a host-computed mip. Only fragment quad execution
+                * supplies the derivatives required by this new operation. */
+               const int bias_src =
+                  nir_tex_instr_src_index(tex, nir_tex_src_bias);
+               const bool biased_sample = tex->op == nir_texop_txb &&
+                  expected_stage == MESA_SHADER_FRAGMENT &&
+                  !tex->is_shadow && !tex->is_array && !tex->is_sparse &&
+                  bias_src >= 0 &&
+                  tex->src[bias_src].src.ssa->num_components == 1 &&
+                  tex->src[bias_src].src.ssa->bit_size == 32;
                const bool ordinary_sample = (tex->op == nir_texop_tex ||
+                  biased_sample ||
                   tex->op == nir_texop_txl || tex->op == nir_texop_txd) &&
                   (tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
                    tex->sampler_dim == GLSL_SAMPLER_DIM_3D ||
@@ -4495,7 +4510,7 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                      "color primitive contains an unsupported texture "
                      "operation (op=%s dim=%s array=%u shadow=%u "
                      "texture_index=%u sampler_index=%u bound_textures=%u); "
-                     "the lowering covers non-shadow tex/txl/txd and size queries on 2D/3D/cube, nearest-only 2D shadow sampling, txf on 2D/3D, or "
+                     "the lowering covers non-shadow tex/txl/txd and size queries on 2D/3D/cube, fragment-only non-array txb with scalar f32 bias on 2D/3D/cube, nearest-only 2D shadow sampling, txf on 2D/3D, or "
                      "txf_ms/txs/texture_samples on MS with a bound texture",
                      op_name,
                      dim_name,

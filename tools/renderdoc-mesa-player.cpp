@@ -5,6 +5,7 @@
 #include "api/replay/renderdoc_replay.h"
 #include "support/png_writer.h"
 #include "rdc_runner/gl_debug_scope.h"
+#include "rdc_runner/native_report.h"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <fcntl.h>
+#include <unistd.h>
 
 REPLAY_PROGRAM_MARKER()
 namespace fs = std::filesystem;
@@ -441,12 +444,17 @@ int main(int argc, char **argv)
   try
   {
     const fs::path capture = fs::canonical(argv[1]);
-    const fs::path png = fs::absolute(argv[2]).lexically_normal();
+    // Resolve existing parent symlinks too: different spellings must not let
+    // optional trace output overwrite a capture, PNG, or receipt.
+    const fs::path png = fs::weakly_canonical(fs::absolute(argv[2]));
+    const fs::path trace = argc == 4 ? fs::weakly_canonical(fs::absolute(argv[3])) : fs::path{};
     if(const char *path = std::getenv("PVRGPU_RDC_FINAL_OUTPUT_RECEIPT"))
-      if(*path) receipt = fs::absolute(path).lexically_normal();
-    require(capture != png && capture != receipt && (receipt.empty() || png != receipt),
+      if(*path) receipt = fs::weakly_canonical(fs::absolute(path));
+    require(capture != png && capture != receipt && (receipt.empty() || png != receipt) &&
+            (trace.empty() || (trace != capture && trace != png && trace != receipt)),
             "Input/output paths must be distinct");
-    require(!fs::exists(png) && (receipt.empty() || !fs::exists(receipt)),
+    require(!fs::exists(png) && (receipt.empty() || !fs::exists(receipt)) &&
+            (trace.empty() || !fs::exists(trace)),
             "Refusing existing final PNG/receipt; use a fresh output path");
     const std::string backend = std::getenv("GALLIUM_DRIVER") ? std::getenv("GALLIUM_DRIVER") : "unknown";
     require(backend != "pvrgpu" || !receipt.empty(), "PvrGPU replay requires a final-output receipt path");
@@ -458,6 +466,12 @@ int main(int argc, char **argv)
       require(api && *api && fs::is_regular_file(api) && counter && *counter && report && *report,
               "PvrGPU formal replay requires native API library, driver counter and model JSONL paths");
     }
+    const fs::path initialAudit = backend == "pvrgpu" ?
+        fs::path(receipt.string() + ".initial-copy-driver-counter.txt") : fs::path{};
+    require(initialAudit.empty() || (initialAudit != capture && initialAudit != png && initialAudit != trace &&
+            initialAudit != fs::weakly_canonical(fs::absolute(std::getenv("PVRGPU_DRIVER_COUNTER_OUT")))),
+            "Initial-copy audit paths must be distinct");
+    require(initialAudit.empty() || !fs::exists(initialAudit), "Refusing existing initial-copy driver audit");
     NativeScope native;
     // The action count is reporting metadata, never permission to finish work.
     unsetenv("PVRGPU_RDC_TRACE_DRAW_ACTIONS");
@@ -495,17 +509,48 @@ int main(int argc, char **argv)
     for(unsigned i = 0; i < 64 && gl.error(); ++i) {}
     gl.check("Initialization error reset before attachment metadata");
     verifyLiveOutput(gl, output);
-    if(argc == 4) writeTrace(replay.renderer->GetStructuredFile(), fs::absolute(argv[3]), capture);
-    replay.renderer->SetFrameEvent(0, true);
+    if(!trace.empty()) writeTrace(replay.renderer->GetStructuredFile(), trace, capture);
+    // Preview work is isolated and is not the required initial resource copy.
+    // Clear only its old diagnostics, then retain every error from restoration
+    // itself, even when RenderDoc internally drains the sticky GL error flag.
+    for(unsigned i = 0; i < 64 && gl.error(); ++i) {}
+    gl.check("Preview error reset before initial resource restoration");
+    replay.renderer->GetDebugMessages();
+    if(!initialAudit.empty())
+    {
+      fs::create_directories(initialAudit.parent_path());
+      const int fd = open(initialAudit.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+      require(fd >= 0, "Could not exclusively create initial-copy driver audit");
+      require(close(fd) == 0, "Could not close initial-copy driver audit");
+      require(setenv("PVRGPU_DRIVER_COUNTER_OUT", initialAudit.c_str(), 1) == 0,
+              "Could not enable isolated initial-copy audit");
+    }
+    {
+      pvrgpu::rdc::GLDebugScope initialErrors(gl.debug);
+      replay.renderer->SetFrameEvent(0, true);
+      initialErrors.Check("Initial resource restoration");
+      gl.finish();
+      initialErrors.Finish();
+    }
     require(replay.renderer->GetFatalErrorStatus().code == ResultCode::Succeeded,
             "RenderDoc failed to restore initial capture state");
     require(gl.current() != nullptr, "Initial-state restoration left no replay EGL context");
     void *replayContext = gl.current();
-    // Initialization errors are isolated. Formal errors are never drained as
-    // though successful attachment queries had erased them.
-    for(unsigned i = 0; i < 64 && gl.error(); ++i) {}
-    gl.check("Initial error reset");
-    replay.renderer->GetDebugMessages();
+    for(const auto &message : replay.renderer->GetDebugMessages())
+      require(message.severity != MessageSeverity::High &&
+              message.source != MessageSource::IncorrectAPIUse &&
+              message.source != MessageSource::UnsupportedConfiguration,
+              "Initial resource restoration validation error: " + std::string(message.description.c_str()));
+    if(!initialAudit.empty())
+    {
+      unsetenv("PVRGPU_DRIVER_COUNTER_OUT");
+      std::ifstream audit(initialAudit);
+      require(bool(audit), "Could not read initial-copy driver audit");
+      const std::string text{std::istreambuf_iterator<char>(audit), {}};
+      require(!audit.bad(), "Could not finish reading initial-copy driver audit");
+      std::string error;
+      require(pvrgpu::rdc::ValidateInitialCopyAudit(text, &error), error);
+    }
     pvrgpu::rdc::GLDebugScope apiErrors(gl.debug);
     native.enable();
     require(replay.renderer->ReplayEventRange(1, endEvent), "Complete ordered replay failed");
@@ -540,10 +585,12 @@ int main(int argc, char **argv)
           << ",\"replay_begin_event\":1,\"replay_end_event\":" << endEvent
           << ",\"trace_draw_actions\":" << draws
           << ",\"initial_native_isolated\":true,\"replay_completed\":true"
+          << ",\"initial_contents_restored\":true"
           << ",\"replay_context_finished\":true,\"api_errors\":0,\"color_output\":"
           << (output.color ? "true" : "false")
           << ",\"api_error_capture\":\"synchronous-gl-debug-callback\",\"debug_callback_verified\":true"
           << ",\"source\":\"completed-replay-attachment\",\"readback_api\":\"replay-glReadPixels\"";
+      if(!initialAudit.empty()) out << ",\"initial_copy_driver_counter_path\":" << json(initialAudit.string());
       if(output.color)
         out << ",\"resource_id\":" << json(resourceString(output.resource))
             << ",\"mip\":" << output.mip << ",\"layer\":" << output.layer

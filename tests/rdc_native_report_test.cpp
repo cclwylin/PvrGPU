@@ -40,6 +40,7 @@ std::string Receipt() {
   return R"({"schema":"pvrgpu.rdc-final-output.v2","backend":"pvrgpu","status":"PASS",
     "api_error_capture":"synchronous-gl-debug-callback","debug_callback_verified":true,
     "initial_native_isolated":true,"replay_completed":true,"replay_context_finished":true,
+    "initial_contents_restored":true,"initial_copy_driver_counter_path":"/output/initial-copy-driver-counter.txt",
     "api_errors":0,"rdc_path":"/captures/actual.rdc","replay_begin_event":1,"replay_end_event":91,
     "trace_draw_actions":0,"color_output":true,"source":"completed-replay-attachment",
     "png_path":"/output/final.png","resource_id":"1234","mip":3,"layer":2,"sample":0,
@@ -50,6 +51,14 @@ std::string Receipt() {
 int main(int argc, char **argv) {
   std::string error;
   NativeReport report;
+  if (argc == 3 && std::string(argv[1]) == "--initial-copy-audit") {
+    std::ifstream input(argv[2]);
+    Check(input.good(), "initial-copy audit file exists");
+    const std::string audit{std::istreambuf_iterator<char>(input), {}};
+    Check(!input.bad() && ValidateInitialCopyAudit(audit, &error), error.c_str());
+    std::cout << "Initial-copy driver audit PASS\n";
+    return 0;
+  }
   if (argc == 3) {
     std::ifstream model(argv[1]), events(argv[2]);
     Check(model.good() && events.good(), "native evidence files exist");
@@ -60,6 +69,45 @@ int main(int argc, char **argv) {
     return 0;
   }
   Check(argc == 1, "usage: native-report-test [model.jsonl driver-counter.txt]");
+  Check(ValidateInitialCopyAudit(Event("buffer_copy_region") + Event("resource_copy_region") +
+        Event("compute_state_bind") + Event("flush"), &error), error.c_str());
+  Check(ValidateInitialCopyAudit(Event("flush"), &error), "empty-resource restoration still finishes");
+  for (unsigned present = 0; present <= 1; ++present) {
+    const auto reference = Event("fence_reference", "has_ptr=" + std::to_string(present) + " has_fence=0");
+    const auto finish = Event("fence_finish", "has_context=" + std::to_string(present) +
+                              " has_fence=0 timeout=18446744073709551615 complete=1");
+    Check(ValidateInitialCopyAudit(reference + Event("buffer_copy_region") + Event("flush") +
+          finish + reference, &error), "NULL fence lifecycle plus independent real flush is valid");
+    Check(!ValidateInitialCopyAudit(reference + finish, &error), "NULL fences alone are not flush evidence");
+  }
+  for (const auto &audit : {std::string{}, Event("resource_copy_region"),
+       Event("flush_error") + Event("flush"), Event("texture_subdata_declined") + Event("flush"),
+       Event("unsupported_draw") + Event("flush"), Event("draw_vbo") + Event("flush"),
+       Event("draw_pco_triangles") + Event("flush"), Event("systemc_api_disabled") + Event("flush"),
+       Event("compute_api_submit") + Event("flush"), Event("launch_grid") + Event("flush"),
+       Event("rejected") + Event("flush"), Event("not_supported") + Event("flush"),
+       Event("new_unknown_copy") + Event("flush"), Event("resource_copy_region", "status=rejected") + Event("flush"),
+       Event("resource_copy_region", "recording_failure=1") + Event("flush"),
+       Event("resource_copy_region", "success=0") + Event("flush"),
+       Event("resource_copy_region", "supported=false") + Event("flush"),
+       Event("resource_copy_region", "status=ok status=rejected") + Event("flush"),
+       Event("fence_reference", "has_ptr=1 has_fence=1") + Event("flush"),
+       Event("fence_reference", "has_ptr=2 has_fence=0") + Event("flush"),
+       Event("fence_reference", "has_ptr=1 has_fence=false") + Event("flush"),
+       Event("fence_reference", "has_ptr=1") + Event("flush"),
+       Event("fence_reference", "has_ptr=1 has_fence=0 has_fence=1") + Event("flush"),
+       Event("fence_finish", "has_context=1 has_fence=1 timeout=0 complete=0") + Event("flush"),
+       Event("fence_finish", "has_context=1 has_fence=1 timeout=0 complete=1") + Event("flush"),
+       Event("fence_finish", "has_context=1 has_fence=0 timeout=0 complete=0") + Event("flush"),
+       Event("fence_finish", "has_context=1 has_fence=0 timeout=-1 complete=1") + Event("flush"),
+       Event("fence_finish", "has_context=1 has_fence=0 timeout=18446744073709551616 complete=1") + Event("flush"),
+       Event("fence_finish", "has_context=1 has_fence=0 complete=1") + Event("flush"),
+       Event("fence_finish", "has_context=false has_fence=0 timeout=0 complete=1") + Event("flush"),
+       Event("fence_finish", "has_context=1 has_fence=0 timeout=0") + Event("flush"),
+       std::string("schema=pvrgpu.driver-counter.v1 producer=pvrgpu-gallium-driver event=flush"),
+       Replace(Event("flush"), "pvrgpu-gallium-driver", "foreign"),
+       Event("flush", "event=resource_copy_region"), std::string("broken event\n")})
+    Check(!ValidateInitialCopyAudit(audit, &error), "reject missing/failed/shader-dependent initial restoration");
   const auto two = Model(2) + "@CAPTURE: intermediate png=one.png\n" + Model(5);
   Check(ParseNativeReport(two, Graphics() + Graphics(), &report, &error), error.c_str());
   Check(report.graphics_reports == 2 && report.graphics_submissions == 2, "two complete native flushes");
@@ -117,6 +165,7 @@ int main(int argc, char **argv) {
     Graphics() + Replace(compute, "pool_releases=7", "pool_releases=6"),
     Graphics() + Replace(compute, "invocations=37", "invocations=18446744073709551616"),
     Graphics() + Event("clear_error"), Graphics() + Event("flush_error"),
+    Graphics() + Event("texture_subdata_declined"),
     Graphics() + Event("framebuffer_boundary_flush_error"),
     Graphics() + Event("compute_launch_unsupported"), Graphics() + Event("unsupported_draw"),
     Graphics() + Event("systemc_api_disabled"), Graphics() + Event("dump_nir_failed"),
@@ -124,6 +173,9 @@ int main(int argc, char **argv) {
   };
   for (const auto &events : bad_events)
     Check(!ParseNativeReport(Model(1), events, &report, &error), "reject failed/unpaired native API events");
+  Check(ParseNativeReport(Model(1), Graphics() + Event("framebuffer_readback_declined",
+          "reason=not_a_current_color_attachment"), &report, &error),
+        "unrelated-resource map decline does not imply a lost upload");
   Check(!ParseNativeReport(Replace(Model(1), "\"cs_invocations\":0", "\"cs_invocations\":37"),
                           Graphics() + compute, &report, &error), "reject ambiguous CS double accounting");
   Check(!ParseNativeReport(Model(UINT64_MAX), Graphics() + compute, &report, &error), "compute texel sum overflow");
@@ -132,7 +184,7 @@ int main(int argc, char **argv) {
   Check(ParseFinalOutputReceipt(Receipt(), &receipt, &error), error.c_str());
   Check(receipt.mip == 3 && receipt.layer == 2 && receipt.width == 23 &&
         receipt.trace_draw_actions == 0, "actual nonzero subresource; zero actions are metadata");
-  for (const auto &key : {"initial_native_isolated", "replay_completed", "replay_context_finished"})
+  for (const auto &key : {"initial_native_isolated", "initial_contents_restored", "replay_completed", "replay_context_finished"})
     Check(!ParseFinalOutputReceipt(Replace(Receipt(), std::string("\"") + key + "\":true",
                 std::string("\"") + key + "\":false"), &receipt, &error), "require all completion evidence");
   for (const auto &input : {
@@ -145,6 +197,7 @@ int main(int argc, char **argv) {
        Replace(Receipt(), "pvrgpu.rdc-final-output.v2", "pvrgpu.rdc-final-output.v1"),
        Replace(Receipt(), "\"debug_callback_verified\":true", "\"debug_callback_verified\":false"),
        Replace(Receipt(), "synchronous-gl-debug-callback", "end-only-glGetError"),
+       Replace(Receipt(), "/output/initial-copy-driver-counter.txt", ""),
        Replace(Receipt(), "\"mip\":3", "\"mip\":false"),
        Receipt() + "trailing"})
     Check(!ParseFinalOutputReceipt(input, &receipt, &error), "reject incorrect final-output evidence");

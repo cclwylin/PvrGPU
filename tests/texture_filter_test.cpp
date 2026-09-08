@@ -307,6 +307,7 @@ void CheckPackedFormatDecode() {
   Check(TextureBytesPerTexel(TextureFormat::kRgb565Unorm) == 2 &&
             TextureBytesPerTexel(TextureFormat::kRgba16Float) == 8 &&
             TextureBytesPerTexel(TextureFormat::kRgb10A2Unorm) == 4 &&
+            TextureBytesPerTexel(TextureFormat::kBgr10A2Unorm) == 4 &&
             TextureBytesPerTexel(TextureFormat::kR11fG11fB10f) == 4,
         "per-texel byte widths");
 
@@ -330,6 +331,21 @@ void CheckPackedFormatDecode() {
   Check(Near(ra[0], 1.0F) && Near(ra[1], 0.0F) && Near(ra[2], 0.0F) &&
             Near(ra[3], 1.0F),
         "R10G10B10A2 red and alpha full scale");
+  const auto ba = DecodeTexelToFloat(TextureFormat::kBgr10A2Unorm, ra1010102);
+  Check(Near(ba[0], 0.0F) && Near(ba[1], 0.0F) && Near(ba[2], 1.0F) &&
+            Near(ba[3], 1.0F), "B10G10R10A2 reverses only red/blue");
+  // Distinct low bits must survive rendering-to-texture; no UNORM8 expansion.
+  const std::uint32_t packed = 1U | (2U << 10U) | (3U << 20U) | (2U << 30U);
+  const std::array<std::uint8_t, 8> low_bits = {
+      static_cast<std::uint8_t>(packed), static_cast<std::uint8_t>(packed >> 8U),
+      static_cast<std::uint8_t>(packed >> 16U), static_cast<std::uint8_t>(packed >> 24U),
+      0, 0, 0, 0};
+  const auto rgb = DecodeTexelToFloat(TextureFormat::kRgb10A2Unorm, low_bits);
+  const auto bgr = DecodeTexelToFloat(TextureFormat::kBgr10A2Unorm, low_bits);
+  Check(rgb[0] == 1.0F / 1023.0F && rgb[1] == 2.0F / 1023.0F &&
+        rgb[2] == 3.0F / 1023.0F && rgb[3] == 2.0F / 3.0F &&
+        bgr[0] == rgb[2] && bgr[1] == rgb[1] && bgr[2] == rgb[0] && bgr[3] == rgb[3],
+        "packed 10-bit texture channels retain low bits and two-bit alpha");
 
   // RGBA8_SNORM: 127 -> +1, 129 (=-127) -> -1 (clamped), 0 -> 0.
   const std::array<std::uint8_t, 8> snorm = {127, 129, 0, 64, 0, 0, 0, 0};

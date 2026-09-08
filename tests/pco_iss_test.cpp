@@ -6745,6 +6745,22 @@ void TestExecuteVertexTextureContinuations() {
             executed_groups == vertex.instructions.size(),
         "two vertex SMP continuations finish without replay or state loss");
 
+  // A valid native vertex program must reject the new fragment-only field,
+  // including on ordinary auxiliary opcodes and before any continuation work.
+  for (const std::size_t index : {0U, 2U, 4U}) {
+    for (const std::uint8_t bias_flag : {1U, 2U}) {
+      auto mutated = vertex.instructions;
+      mutated[index].texture_lod_bias = bias_flag;
+      bool rejected = false;
+      try {
+        (void)ExecuteVertex(vertex.summary, mutated, inputs, context);
+      } catch (const std::runtime_error &error) {
+        rejected = std::string(error.what()).find("LOD") != std::string::npos;
+      }
+      Check(rejected, "VS rejects shader BIAS metadata with a LOD diagnostic");
+    }
+  }
+
   PcoVertexExecutionContext truncated = context;
   truncated.shared_count = 20;
   ExpectFailure(
@@ -6782,7 +6798,7 @@ void TestExecuteVertexTextureContinuations() {
 )hex");
   std::vector<std::uint8_t> ten_sample_pairs;
   for (std::size_t sample = 0;
-       sample < pvrgpu::stub::kPcoMaximumTextureSampleInstructions + 1U;
+       sample < pvrgpu::stub::kPcoMaximumVertexTextureSampleInstructions + 1U;
        ++sample) {
     ten_sample_pairs.insert(ten_sample_pairs.end(), one_sample_pair.begin(),
                             one_sample_pair.end());

@@ -10,6 +10,7 @@
 #include "memory/gpu_memory_system.h"
 #include "pco_uniform_buffer_fixtures.h"
 #include "pco_multisample_texture_fixtures.h"
+#include "pco_texture_sequence_fixtures.h"
 #include "pds/pds_engine.h"
 #include "shader/usc_slot.h"
 
@@ -68,9 +69,7 @@ void Check(bool condition, const std::string &message) {
 
 std::vector<PcoInstruction> MakeTextureProgram(std::size_t sample_count,
                                                std::size_t descriptor_count) {
-  Check(sample_count >= 1 &&
-            sample_count <=
-                pvrgpu::stub::kPcoMaximumTextureSampleInstructions + 1U &&
+  Check(sample_count >= 1 && sample_count <= 16 &&
             descriptor_count >= 1 &&
             descriptor_count <=
                 pvrgpu::stub::kPcoMaximumTextureDescriptorSets,
@@ -1277,12 +1276,201 @@ private:
   UscCluster cluster_;
 };
 
-int RunExpectedFailure(bool too_many_requests, std::string corrupt_continuation = {}) {
+// Unlike the original single-lane fixtures, this is a complete 2x2 quad. It
+// traverses real USC FIFO/MemoryPool continuations for every native request.
+CasePayload MakeQuadSequence(MemoryPool &pool, unsigned samples, bool loop) {
+  auto payload = MakeCase(pool, loop ? 1 : samples, 401, 1, loop ? 4 : 0, false, 4);
+  auto state = LoadPipelineState(pool, payload.state);
+  if (loop) {
+    const auto decoded = Decode(ShaderStage::kFragment, TextureUniformLoopPcoBinary());
+    Check(CountPcoInstructions(decoded.instructions, true).texture == 1 &&
+          std::any_of(decoded.instructions.begin(), decoded.instructions.end(),
+            [](const auto &instruction) { return instruction.opcode == PcoOpcode::kBranch; }),
+          "dynamic request bound fixture requires one real SMP and a native branch");
+    pool.Release(state.fragment_instructions);
+    state.fragment_instructions = StoreNewArray(pool, decoded.instructions);
+    state.fragment_program_summary = decoded.summary;
+    state.fragment_pco_abi.temps = 16;
+    auto shared = LoadArray<std::uint32_t>(pool, state.fragment_shared_registers);
+    shared[20] = 0;
+    shared[21] = UINT32_C(0x3f800000);
+    shared[22] = samples;
+    shared[23] = 0;
+    StoreArray(pool, state.fragment_shared_registers, shared);
+    auto stats = LoadArray<DrawListStats>(pool, state.drawlist_stats);
+    const auto counts = CountPcoInstructions(decoded.instructions, false);
+    stats[0].fragment.program_groups = decoded.summary.group_count;
+    stats[0].fragment.program_instructions = decoded.summary.instruction_count;
+    stats[0].fragment.program_alu_instructions = counts.alu;
+    stats[0].fragment.program_tex_instructions = counts.texture;
+    stats[0].fragment.program_memory_instructions = counts.memory;
+    StoreArray(pool, state.drawlist_stats, stats);
+  }
+  auto invocations = LoadArray<FragmentInvocation>(pool, state.fragment_invocations);
+  auto lanes = LoadArray<FragmentShaderLane>(pool, state.fragment_shader_lanes);
+  invocations.resize(4, invocations[0]);
+  lanes.resize(4, lanes[0]);
+  auto quads = LoadArray<FragmentQuad>(pool, state.fragment_quads);
+  quads[0].coverage_mask = quads[0].write_mask = 0x0f;
+  for (unsigned lane = 0; lane < 4; ++lane) {
+    invocations[lane].x = lanes[lane].x = lane % 2;
+    invocations[lane].y = lanes[lane].y = lane / 2;
+    invocations[lane].quad_lane = lanes[lane].quad_lane = static_cast<std::uint8_t>(lane);
+    invocations[lane].sample_mask = lanes[lane].sample_mask = 1;
+    lanes[lane].visible_invocation_index = lane;
+    quads[0].invocation_indices[lane] = lane;
+  }
+  pool.Release(state.fragment_invocations);
+  pool.Release(state.fragment_shader_lanes);
+  state.fragment_invocations = StoreNewArray(pool, invocations);
+  state.fragment_shader_lanes = StoreNewArray(pool, lanes);
+  StoreArray(pool, state.fragment_quads, quads);
+  state.active_fragment_invocations = state.fragment_shader_lane_count = 4;
+  state.counters.ps_invocations = 4;
+  StorePipelineState(pool, payload.state, state);
+  return payload;
+}
+
+std::uint32_t SequenceFloatBits(float value) {
+  std::uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+class QuadSequenceResponder final : public sc_core::sc_module {
+public:
+  sc_core::sc_fifo_in<PipelineTxn> input{"input"};
+  sc_core::sc_fifo_out<PipelineTxn> output{"output"};
+  QuadSequenceResponder(sc_core::sc_module_name name, MemoryPool &pool,
+                        unsigned maximum_rounds, bool loop)
+      : sc_module(name), pool_(pool), maximum_rounds_(maximum_rounds), loop_(loop) {
+    SC_THREAD(Run);
+  }
+  std::array<unsigned, 4> requests_per_lane{};
+  unsigned rounds = 0;
+private:
+  void Run() {
+    for (;;) {
+      const auto txn = input.read();
+      auto state = LoadPipelineState(pool_, txn.state);
+      const auto requests = LoadArray<TextureSampleRequest>(pool_, state.texture_sample_requests);
+      const auto continuations = LoadArray<pvrgpu::stub::PcoFragmentContinuation>(pool_, state.fragment_continuations);
+      Check(rounds < maximum_rounds_, "USC emitted requests beyond the tested dynamic bound");
+      Check(state.stage == PipelineStage::kFragmentTexturePending && requests.size() == 4 &&
+            continuations.size() == 4 && !HasPoolHandle(state.texture_sample_responses),
+            "sequence round must hold exactly one request/continuation per native quad lane");
+      std::vector<TextureSampleResponse> responses(4);
+      for (unsigned lane = 0; lane < 4; ++lane) {
+        const auto &request = requests[lane];
+        Check(request.shader_lane_index == lane && request.request_id == lane &&
+              request.quad_lane == lane && request.shader_stage == ShaderStage::kFragment &&
+              request.descriptor_set == 0 && request.binding == 0 && request.data_request == 0 &&
+              continuations[lane].valid == 1 &&
+              continuations[lane].executed_instructions.texture == rounds + 1U,
+              "quad lane identity or actual dynamic request count changed");
+        for (unsigned word = 0; word < 4; ++word)
+          Check(request.texture_state[word] == UINT32_C(0x5000) + word &&
+                request.sampler_state[word] == UINT32_C(0x5008) + word,
+                "quad request lost its shared descriptor words");
+        if (loop_) {
+          Check(request.coordinates[0] == SequenceFloatBits(float(rounds)) &&
+                request.coordinates[1] == SequenceFloatBits(1) &&
+                request.explicit_lod_present && request.explicit_lod == 0,
+                "native loop lost its iteration/coordinate state");
+          if (!rounds && !lane) loop_pc_ = continuations[lane].resume_instruction_index;
+          Check(continuations[lane].resume_instruction_index == loop_pc_,
+                "uniform loop must revisit the same real SMP in every lane");
+        }
+        auto &response = responses[lane];
+        response.shader_lane_index = lane;
+        response.shader_stage = ShaderStage::kFragment;
+        response.request_id = lane;
+        // Loop sums remain exactly representable binary32 integers even at
+        // 65536 trips. Static sequences return unique lane/round/component words.
+        for (unsigned component = 0; component < 4; ++component)
+          response.rgba[component] = SequenceFloatBits(float(
+              loop_ ? (lane + 1) * (component + 1) : 1 + lane * 16 + rounds + component));
+        ++requests_per_lane[lane];
+      }
+      ++rounds;
+      state.texture_sample_responses = StoreNewArray(pool_, responses);
+      state.stage = PipelineStage::kTextureSamplesReady;
+      StorePipelineState(pool_, txn.state, state);
+      output.write(txn);
+    }
+  }
+  MemoryPool &pool_;
+  unsigned maximum_rounds_;
+  bool loop_;
+  std::uint32_t loop_pc_ = 0;
+};
+
+int RunQuadSequence(unsigned samples, bool loop, bool expect_failure = false) {
   MemoryPool pool;
-  const std::size_t sample_count =
-      too_many_requests
-          ? pvrgpu::stub::kPcoMaximumTextureSampleInstructions + 1U
-          : 1U;
+  const auto payload = MakeQuadSequence(pool, samples, loop);
+  const unsigned delivered_rounds = expect_failure ? samples - 1U : samples;
+  sc_core::sc_fifo<PipelineTxn> input("sequence_input", 1), requests("sequence_requests", 1),
+      responses("sequence_responses", 1), output("sequence_output", 1);
+  UscCluster cluster("sequence_cluster", pool, ShaderStage::kFragment);
+  QuadSequenceResponder responder("sequence_responder", pool, delivered_rounds, loop);
+  cluster.input(input); cluster.output(output);
+  cluster.texture_request_output(requests); cluster.texture_response_input(responses);
+  responder.input(requests); responder.output(responses);
+  input.write(payload.txn);
+  bool refused = false;
+  try {
+    sc_core::sc_start(sc_core::sc_time(1, sc_core::SC_US));
+  } catch (const std::exception &error) {
+    if (!expect_failure) throw;
+    Check(std::string(error.what()).find("texture fragment USC dynamic SMP request limit exceeded") !=
+              std::string::npos,
+          "dynamic-bound fixture failed at an unrelated gate: " + std::string(error.what()));
+    refused = true;
+  }
+  Check(refused == expect_failure, "dynamic request-bound acceptance/refusal differs");
+  Check(responder.rounds == delivered_rounds &&
+        std::all_of(responder.requests_per_lane.begin(), responder.requests_per_lane.end(),
+          [&](unsigned count) { return count == delivered_rounds; }),
+        "actual native FIFO request count differs from the tested loop/sequence");
+  const auto final = LoadPipelineState(pool, payload.state);
+  PipelineTxn completed;
+  if (expect_failure) {
+    Check(!output.nb_read(completed) && final.stage != PipelineStage::kFragmentShaded &&
+          !HasPoolHandle(final.fragment_outputs),
+          "over-budget native shader published partial/fabricated completion");
+  } else {
+    Check(output.nb_read(completed) && completed.sequence == payload.txn.sequence &&
+          final.stage == PipelineStage::kFragmentShaded,
+          "quad sequence did not publish exact completion");
+    const auto outputs = LoadArray<FragmentOutput>(pool, final.fragment_outputs);
+    Check(outputs.size() == 4 && final.counters.fs_tex_instructions == UINT64_C(4) * samples,
+          "native quad output/texture execution count differs");
+    for (unsigned lane = 0; lane < 4; ++lane) {
+      Check(outputs[lane].written_mask[0] == 15 && !outputs[lane].discarded,
+            "native quad did not write each live lane exactly once");
+      for (unsigned component = 0; component < 4; ++component)
+        Check(outputs[lane].pixel_output[component] == SequenceFloatBits(float(
+                  loop ? samples * (lane + 1) * (component + 1)
+                       : 1 + lane * 16 + samples - 1 + component)),
+              "native FIFO response was lost/replayed or assigned to a different lane");
+    }
+    Check(!HasPoolHandle(final.texture_sample_requests) &&
+          !HasPoolHandle(final.texture_sample_responses) &&
+          !HasPoolHandle(final.fragment_continuations),
+          "successful long sequence retained a continuation payload");
+  }
+  ReleaseFunctionalPayloads(pool, final); pool.Release(payload.state);
+  Check(pool.bytes_in_flight() == 0 && pool.allocations() == pool.releases(),
+        "long sequence success/failure left unrecoverable pool ownership");
+  std::cout << "usc quad sequence static_smp=" << (loop ? 1 : samples)
+            << " trips=" << samples << " actual_requests_per_lane=" << responder.rounds
+            << " expected_refusal=" << expect_failure << " PASS\n";
+  return 0;
+}
+
+int RunExpectedFailure(std::string corrupt_continuation = {}) {
+  MemoryPool pool;
+  const std::size_t sample_count = 1U;
   const std::size_t descriptor_count = 1U;
   const CasePayload payload =
       MakeCase(pool, sample_count, 99, descriptor_count);
@@ -1293,7 +1481,7 @@ int RunExpectedFailure(bool too_many_requests, std::string corrupt_continuation 
   UscCluster cluster("failure_cluster", pool, ShaderStage::kFragment);
   TextureResponder responder("failure_responder", pool, sample_count,
                              descriptor_count,
-                             !too_many_requests && corrupt_continuation.empty(),
+                             corrupt_continuation.empty(),
                              false, corrupt_continuation);
   cluster.input(input);
   cluster.texture_request_output(requests);
@@ -1306,20 +1494,15 @@ int RunExpectedFailure(bool too_many_requests, std::string corrupt_continuation 
     sc_core::sc_start(sc_core::sc_time(1, sc_core::SC_US));
   } catch (const std::exception &error) {
     const std::string message = error.what();
-    const std::string expected =
-        too_many_requests ? "task/shared count mismatch"
-                          : "response ordering is invalid";
+    const std::string expected = "response ordering is invalid";
     Check(message.find(expected) != std::string::npos,
           "unexpected fail-closed diagnostic: " + message);
     std::cout << "usc_cluster_texture_continuation_test: expected failure "
-              << (too_many_requests ? "request-limit" : "response-order")
+              << "response-order"
               << " PASS\n";
     return 0;
   }
-  throw std::runtime_error(
-      too_many_requests
-          ? "USC accepted a tenth sequential SMP request"
-          : "USC accepted a response with the wrong batch-local request id");
+  throw std::runtime_error("USC accepted a response with the wrong batch-local request id");
 }
 
 } // namespace
@@ -1327,15 +1510,21 @@ int RunExpectedFailure(bool too_many_requests, std::string corrupt_continuation 
 int sc_main(int argc, char **argv) {
   try {
     if (argc == 2 && std::string(argv[1]) == "request-limit")
-      return RunExpectedFailure(true);
+      return RunQuadSequence(65537, true, true);
+    if (argc == 2 && std::string(argv[1]) == "request-boundary")
+      return RunQuadSequence(65536, true);
+    if (argc == 2 && std::string(argv[1]) == "sequence10")
+      return RunQuadSequence(10, false);
+    if (argc == 2 && std::string(argv[1]) == "sequence16")
+      return RunQuadSequence(16, false);
     if (argc == 2 && std::string(argv[1]) == "response-order")
-      return RunExpectedFailure(false);
+      return RunExpectedFailure();
     if (argc == 2 && std::string(argv[1]) == "continuation-count")
-      return RunExpectedFailure(false, "count");
+      return RunExpectedFailure("count");
     if (argc == 2 && std::string(argv[1]) == "continuation-steps")
-      return RunExpectedFailure(false, "steps");
+      return RunExpectedFailure("steps");
     if (argc == 2 && std::string(argv[1]) == "continuation-mask")
-      return RunExpectedFailure(false, "mask");
+      return RunExpectedFailure("mask");
     Check(argc == 1, "unknown test mode");
 
     DriverPcoStageAbi terrain_d4_fragment_abi;

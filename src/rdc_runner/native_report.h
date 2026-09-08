@@ -29,12 +29,17 @@ bool ParseNativeReport(const std::string &model_jsonl,
                        const std::string &driver_events,
                        NativeReport *report, std::string *error);
 
+// Initial resource restoration is not shader execution. Audit its own driver
+// events without adding them to graphics/compute reports or suppressing errors.
+bool ValidateInitialCopyAudit(const std::string &driver_events, std::string *error);
+
 struct FinalOutputReceipt {
   bool color_output = false;
   std::string rdc_path;
   std::string png_path;
   std::string resource_id;
   std::string format;
+  std::string initial_copy_driver_counter_path;
   std::uint64_t replay_begin_event = 0;
   std::uint64_t replay_end_event = 0;
   std::uint64_t trace_draw_actions = 0;

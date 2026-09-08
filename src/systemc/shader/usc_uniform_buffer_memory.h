@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -71,8 +72,16 @@ private:
           const std::uint64_t offset = address - range.gpu_address;
           return offset <= range.bytes && bytes <= range.bytes - offset;
         });
-    if (!in_range)
-      throw std::runtime_error("USC UBO load exceeds its stage bound buffer range");
+    if (!in_range) {
+      std::ostringstream message;
+      message << "USC UBO load exceeds its stage bound buffer range: address=0x"
+              << std::hex << address << std::dec << " bytes=" << bytes;
+      for (const auto &range : resources_)
+        message << " [block=" << range.block_index << " address=0x" << std::hex
+                << range.gpu_address << std::dec << " bytes=" << range.bytes
+                << ']';
+      throw std::runtime_error(message.str());
+    }
     const MemoryReadResult read =
         memory_->Read(address, bytes, MemoryClient::kUniformBuffer);
     if (read.data.size() != bytes)

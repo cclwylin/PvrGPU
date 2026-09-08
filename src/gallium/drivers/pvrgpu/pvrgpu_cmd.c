@@ -1163,13 +1163,15 @@ pvrgpu_cmd_validate_draw_pco_triangles(
                                                   cmd->height);
    /*
     * The colour formats the model can write a draw into: four UNORM8 channels,
-    * or one, two or four raw 32-bit integer channels.  The others are
-    * describable in a clear capsule but the PBE has no packing for them yet.
+    * packed RGB10_A2/BGRA10_A2, or canonical integer/float channels. Other
+    * formats may be describable in a clear capsule without a native PBE store.
     */
    const bool format_ok =
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8) == 0 ||
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8_SRGB) == 0 ||
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_BGRA8_SRGB) == 0 ||
+      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGB10_A2) == 0 ||
+      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_BGRA10_A2) == 0 ||
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_R32UI) == 0 ||
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RG32UI) == 0 ||
       strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32UI) == 0 ||

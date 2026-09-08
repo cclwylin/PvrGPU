@@ -1,4 +1,5 @@
 #include "pco_sequence_profiles.h"
+#include "common/packed_unorm.h"
 #include "uniform_buffers.h"
 
 #include "model_types.h"
@@ -40,6 +41,7 @@ constexpr char kRgba32F[] = "PIPE_FORMAT_R32G32B32A32_FLOAT";
 // stored pixel is the same raw dword per channel.
 bool IsGenericDrawFormat(const std::string &format) {
   return format == kRgba8 || format == kRgba8Srgb || format == kBgra8Srgb ||
+         PackedUnormFormatFromName(format) != PackedUnormFormat::kNone ||
          format == kR32Ui || format == kRg32Ui || format == kRgba32Ui ||
          format == kR32I || format == kRg32I || format == kRgba32I ||
          format == kRgba32F;

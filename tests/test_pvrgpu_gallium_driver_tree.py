@@ -186,6 +186,22 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertNotIn("framebuffer_width = output_width;", copy_body)
         self.assertNotIn("framebuffer_height = output_height;", copy_body)
 
+    def test_native_cpu_present_refusal_precedes_the_copy(self) -> None:
+        context = (DRIVER_ROOT / "pvrgpu_context.c").read_text(encoding="utf-8")
+        draw_start = context.index("static void\npvrgpu_draw_vbo")
+        draw_end = context.index("struct pipe_context *\npvrgpu_create_context", draw_start)
+        draw_body = context[draw_start:draw_end]
+        refusal = draw_body.index("if (pvrgpu_refuse_native_cpu_present(")
+        copy = draw_body.index("if (pvrgpu_cpu_present_textured_quad(")
+        self.assertLess(refusal, copy)
+        self.assertIn("return;", draw_body[refusal:copy])
+        guard_start = context.index("static bool\npvrgpu_refuse_native_cpu_present")
+        guard = context[guard_start:draw_start]
+        self.assertIn('getenv("PVRGPU_SYSTEMC_API_LIB")', guard)
+        self.assertIn('getenv("PVRGPU_SYSTEMC_BRIDGE")', guard)
+        self.assertIn("pvrgpu_note_unsupported_draw(", guard)
+        self.assertNotIn("pvrgpu_rdc_case_name", guard)
+
     def test_unlowered_draw_paths_are_reported_as_unsupported(self) -> None:
         context = (DRIVER_ROOT / "pvrgpu_context.c").read_text(encoding="utf-8")
         draw_start = context.index("static void\npvrgpu_draw_vbo")

@@ -1,0 +1,24 @@
+diff --git a/src/compiler/nir/nir_opt_shrink_vectors.c b/src/compiler/nir/nir_opt_shrink_vectors.c
+index ae6bece..758581b 100644
+--- a/src/compiler/nir/nir_opt_shrink_vectors.c
++++ b/src/compiler/nir/nir_opt_shrink_vectors.c
+@@ -111,8 +111,18 @@ shrink_dest_to_read_mask(nir_def *def, bool shrink_start)
+    int last_bit = util_last_bit(mask);
+    int first_bit = shrink_start ? (ffs(mask) - 1) : 0;
+ 
++   const unsigned rounded = round_up_components_no_vec5(last_bit - first_bit);
++
++   /* Rounding can retain more channels than are actually used.  Moving the
++    * start by all the unused leading channels would then extend a memory
++    * load past its original end (e.g. vec8 with channels 3 and 7 read becomes
++    * another vec8 starting at channel 3).  Keep the rounded load wholly within
++    * the original footprint, and reswizzle relative to that safe start.
++    */
++   if (rounded > def->num_components)
++      return false;
++   first_bit = MIN2(first_bit, def->num_components - rounded);
+    const unsigned comps = last_bit - first_bit;
+-   const unsigned rounded = round_up_components_no_vec5(comps);
+ 
+    if ((def->num_components > rounded) || first_bit > 0) {
+       def->num_components = rounded;

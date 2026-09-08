@@ -169,6 +169,8 @@ bool SameTextureSampleRequest(const TextureSampleRequest &left,
          left.sample_index_present == right.sample_index_present &&
          left.explicit_lod == right.explicit_lod &&
          left.explicit_lod_present == right.explicit_lod_present &&
+         left.lod_bias == right.lod_bias &&
+         left.lod_bias_present == right.lod_bias_present &&
          left.data_request == right.data_request &&
          left.quad_lane == right.quad_lane &&
          left.shader_stage == right.shader_stage && left.reserved[0] == 0 &&
@@ -380,7 +382,7 @@ void UscCluster::Run() {
             descriptor_set_count > kPcoMaximumTextureDescriptorSets ||
             !shared_layout_valid ||
             state.vertex_pco_abi.shareds > kPcoMaximumVertexSharedCount ||
-            sample_instruction_count > kPcoMaximumTextureSampleInstructions ||
+            sample_instruction_count > kPcoMaximumVertexTextureSampleInstructions ||
             !HasPoolHandle(state.vertex_shared_registers)) {
           throw std::runtime_error(
               "texture vertex USC task/shared count mismatch");
@@ -446,7 +448,7 @@ void UscCluster::Run() {
                   lane_request_count[lane_index] >=
                       sample_instruction_count ||
                   lane_request_count[lane_index] >=
-                      kPcoMaximumTextureSampleInstructions ||
+                      kPcoMaximumVertexTextureSampleInstructions ||
                   issued.descriptor_set >= descriptor_set_count ||
                   issued.binding != 0 ||
                   issued.data_request != execution.continuation.data_request) {
@@ -494,6 +496,8 @@ void UscCluster::Run() {
               request.sample_index_present = issued.sample_index_present;
               request.explicit_lod = issued.explicit_lod;
               request.explicit_lod_present = issued.explicit_lod_present;
+              if (issued.lod_bias_present || issued.lod_bias)
+                throw std::runtime_error("vertex SMP shader LOD bias is unsupported");
               request.data_request = issued.data_request;
               request.texture_address_lo = issued.texture_address_lo;
               request.texture_address_hi = issued.texture_address_hi;
@@ -924,8 +928,6 @@ void UscCluster::Run() {
             expected_coefficient_dwords >
                 kPcoMaximumVaryingCoefficientCount ||
             (!driver_pco_texture && sample_instruction_count == 0) ||
-            sample_instruction_count >
-                kPcoMaximumTextureSampleInstructions ||
             (driver_pco_texture &&
              state.fragment_pco_abi.coefficients !=
                  expected_coefficient_dwords)) {
@@ -933,6 +935,10 @@ void UscCluster::Run() {
               "texture fragment USC task/shared count mismatch");
         }
         fragment_execution_lanes = all_shader_lanes.size();
+        // Fragment SMP instructions may occur in arbitrary validated control
+        // flow. A lane owns only its current suspension, not a stack sized by
+        // the static instruction count. Bound actual dynamic requests below;
+        // do not impose the vertex path's straight-line sample-count gate.
         // Bound host-side live register/continuation storage independently of
         // frame size and overdraw. Every complete quad still runs to
         // completion; this is not a shader-work limit or a claim about physical
@@ -1169,11 +1175,14 @@ void UscCluster::Run() {
               commit_output(shader_lane_index, execution);
               return;
             }
+            if (lane_request_count[shader_lane_index] >= 65536U) {
+              throw std::runtime_error(
+                  "texture fragment USC dynamic SMP request limit exceeded");
+            }
             if (execution.suspended != 1 ||
                 execution.texture_request_valid != 1 ||
                 execution.derivative_request_valid != 0 ||
                 execution.continuation.valid != 1 ||
-                lane_request_count[shader_lane_index] >= 65536U ||
                 execution.texture_request.descriptor_set >=
                     descriptor_set_count ||
                 execution.texture_request.binding != 0 ||
@@ -1222,6 +1231,8 @@ void UscCluster::Run() {
             request.explicit_lod = execution.texture_request.explicit_lod;
             request.explicit_lod_present =
                 execution.texture_request.explicit_lod_present;
+            request.lod_bias = execution.texture_request.lod_bias;
+            request.lod_bias_present = execution.texture_request.lod_bias_present;
             request.data_request = execution.texture_request.data_request;
             request.texture_address_lo =
                 execution.texture_request.texture_address_lo;

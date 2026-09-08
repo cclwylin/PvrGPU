@@ -864,6 +864,7 @@ RunOutcome RunPvrgpu(const Options &options, const RuntimeConfig &config,
   if (driver_search.empty()) return outcome;
   const auto player_png = player_png_dir / (options.rdc.stem().string() + "_replay.png");
   const auto receipt_path = artifact_root / "player-final-output.json";
+  const std::filesystem::path initial_copy_audit = receipt_path.string() + ".initial-copy-driver-counter.txt";
   const auto command = artifact_root / "driver-command.txt";
   const auto driver_counter = artifact_root / "driver-counter.txt";
   const auto player_stdout = artifact_root / "player.stdout.log";
@@ -900,7 +901,7 @@ RunOutcome RunPvrgpu(const Options &options, const RuntimeConfig &config,
   }
 
   // A result from a previous run must never make a failed/missing receipt pass.
-  for (const auto &stale : {player_png, receipt_path, command, driver_counter,
+  for (const auto &stale : {player_png, receipt_path, initial_copy_audit, command, driver_counter,
                            player_stdout, player_stderr, model_stdout, model_stderr,
                            capture_report, artifact_root / "counter.txt",
                            artifact_root / "frame.png"}) {
@@ -994,6 +995,15 @@ RunOutcome RunPvrgpu(const Options &options, const RuntimeConfig &config,
   }
   if (!ParseFinalOutputReceipt(receipt_text, &receipt, &outcome.reason)) return outcome;
   std::error_code path_error;
+  std::string initial_copy_text;
+  const bool same_initial_audit = std::filesystem::equivalent(
+      initial_copy_audit, PathFromUtf8(receipt.initial_copy_driver_counter_path), path_error);
+  if (path_error || !same_initial_audit || !ReadText(initial_copy_audit, &initial_copy_text)) {
+    outcome.reason = "Final-output receipt lacks the requested initial-copy driver audit";
+    return outcome;
+  }
+  if (!ValidateInitialCopyAudit(initial_copy_text, &outcome.reason)) return outcome;
+  path_error.clear();
   const bool same_rdc = std::filesystem::equivalent(
       options.rdc, PathFromUtf8(receipt.rdc_path), path_error);
   if (path_error || !same_rdc) {

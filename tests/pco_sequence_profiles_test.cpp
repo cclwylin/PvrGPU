@@ -61,6 +61,38 @@ void TestRejectsUnknownProfile() {
         "unknown profile rejection reason changed");
 }
 
+void TestGenericPackedUnormFormatGates() {
+  for (const char *format : {"PIPE_FORMAT_R10G10B10A2_UNORM",
+                             "PIPE_FORMAT_B10G10R10A2_UNORM"}) {
+    Options options = SequenceEnvelope("generic.packed.format-test", 3, 2);
+    options.driver_command.format = format;
+    std::string error;
+    Check(!DriverPcoSequenceSupported(options, &error) &&
+              error == "generic PCO sequence has no physical draws",
+          "packed UNORM format did not pass the generic logical format gate");
+    auto physical = options.driver_command;
+    physical.command = "draw_pco_triangles";
+    options.driver_commands = {physical};
+    Check(!DriverPcoSequenceSupported(options, &error) &&
+              error == "generic PCO sequence draw is not the colour layout",
+          "packed UNORM physical format did not reach actual payload validation");
+    options.driver_commands[0].format = "PIPE_FORMAT_R10G10B10A2_UINT";
+    Check(!DriverPcoSequenceSupported(options, &error) &&
+              error == "generic PCO sequence draw envelope is invalid",
+          "unsupported packed integer storage escaped the physical format gate");
+  }
+  for (const char *format : {"", "PIPE_FORMAT_UNKNOWN",
+                             "PIPE_FORMAT_R10G10B10A2_UINT",
+                             "PIPE_FORMAT_B10G10R10A2_SNORM"}) {
+    Options options = SequenceEnvelope("generic.packed.format-test", 3, 2);
+    options.driver_command.format = format;
+    std::string error;
+    Check(!DriverPcoSequenceSupported(options, &error) &&
+              error == "generic PCO logical command envelope is invalid",
+          "unsupported format escaped the generic logical format gate");
+  }
+}
+
 void TestProfileCardinalityDispatch() {
   struct Case {
     const char *name;
@@ -307,6 +339,7 @@ int main() {
   try {
     TestRejectsNonSequenceAndClearsStaleError();
     TestRejectsUnknownProfile();
+    TestGenericPackedUnormFormatGates();
     TestProfileCardinalityDispatch();
     TestUnsupportedResolutionFailsClosed();
     TestLogicalCountersByResolution();

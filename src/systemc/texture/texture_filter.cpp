@@ -126,6 +126,32 @@ TextureLodSelection SelectTextureLod(
   return result;
 }
 
+TextureLodSelection SelectTextureBiasedLod(
+    float rho_squared, float bias, const RogueTextureSamplerDescriptor &sampler,
+    std::uint32_t mip_count) {
+  // Retain the ordinary descriptor/rho validation. Do not add bias to its
+  // clamped result: e.g. rho=0.5, bias=2 must select lambda=1, not 2.
+  TextureLodSelection result = SelectTextureLod(rho_squared, sampler, mip_count);
+  const float min_lod = sampler.min_lod_u4_6 / 64.0F;
+  const float max_lod = sampler.max_lod_u4_6 / 64.0F;
+  if (std::isnan(bias)) bias = 0.0F;
+  float lambda;
+  if (std::isinf(bias)) {
+    // Explicit bounded undefined-input policy, including rho=0 + bias=+Inf.
+    // This is not a rewrite of shader registers or fabricated texture data.
+    lambda = bias > 0.0F ? max_lod : min_lod;
+  } else {
+    lambda = rho_squared == 0.0F ? min_lod :
+        std::clamp(std::log2(rho_squared) * 0.5F + bias, min_lod, max_lod);
+  }
+  result.lambda = lambda;
+  result.minified = lambda > 0.0F;
+  // BIAS uses the float-lambda path even when the payload is zero:
+  // lp_build_lod_selector skips its rho/exponent shortcut for shader bias.
+  result.clamp_active = true;
+  return result;
+}
+
 TextureLevelSelection SelectTextureLevels(
     const TextureLodSelection &lod,
     const RogueTextureSamplerDescriptor &sampler, std::uint32_t mip_count) {
@@ -570,6 +596,7 @@ std::uint32_t TextureBytesPerTexel(TextureFormat format) {
   case TextureFormat::kZ32Unorm:
   case TextureFormat::kZ24UnormS8Uint:
   case TextureFormat::kRgb10A2Unorm:
+  case TextureFormat::kBgr10A2Unorm:
   case TextureFormat::kRgba8Snorm:
   case TextureFormat::kR11fG11fB10f:
   case TextureFormat::kRgb9e5Float:
@@ -651,12 +678,15 @@ std::array<float, 4> DecodeTexelToFloat(
     result[3] = 1.0F;
     return result;
   }
-  case TextureFormat::kRgb10A2Unorm: {
+  case TextureFormat::kRgb10A2Unorm:
+  case TextureFormat::kBgr10A2Unorm: {
     const std::uint32_t v = LoadLe32(texel);
     result[0] = static_cast<float>(v & 0x3ffU) / 1023.0F;
     result[1] = static_cast<float>((v >> 10U) & 0x3ffU) / 1023.0F;
     result[2] = static_cast<float>((v >> 20U) & 0x3ffU) / 1023.0F;
     result[3] = static_cast<float>((v >> 30U) & 0x3U) / 3.0F;
+    if (format == TextureFormat::kBgr10A2Unorm)
+      std::swap(result[0], result[2]);
     return result;
   }
   case TextureFormat::kR11fG11fB10f: {

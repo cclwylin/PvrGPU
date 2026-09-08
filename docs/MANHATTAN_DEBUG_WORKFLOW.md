@@ -120,7 +120,7 @@ macOS prefix 若沒有 `lib/dri/swrast_dri.dylib`，在該次獨立輸出目錄�
 
 正式路徑使用 repository 的 `tools/renderdoc-mesa-player.cpp`，不要把分段
 診斷 helper 的中途 PNG 當成完整 replay 輸出。私有建置 script 只編譯這個
-helper 與 PNG writer，不會重建 Mesa／SystemC，也不修改已安裝的 RenderDoc
+helper、PNG writer 與 audit parser，不會重建 Mesa／SystemC，也不修改已安裝的 RenderDoc
 或 `config/local.env`。指定與 header 相容、支援公開 `ReplayEventRange` API
 的標準 RenderDoc library；單次完整範圍不需要私有的跨範圍 scope 修正。
 
@@ -134,6 +134,19 @@ export PVRGPU_RDC_PLAYER="$(
 
 python3 "$PVRGPU_REPO/tests/check_renderdoc_player_guards.py" \
   "$PVRGPU_RDC_PLAYER" "$PVRGPU_CAPTURE"
+
+# Scope unit tests use a fresh private build. Optional library arguments add
+# a real Mesa error-drain and callback/filter restoration probe.
+CXX=/usr/local/opt/llvm/bin/clang++ PVRGPU_TEST_SANITIZERS=1 \
+  bash "$PVRGPU_REPO/script/run_rdc_gl_debug_scope_unit.sh"
+EGL_PLATFORM=surfaceless GALLIUM_DRIVER=llvmpipe \
+  MESA_LOADER_DRIVER_OVERRIDE=swrast \
+  LIBGL_DRIVERS_PATH="$PVRGPU_LLVMPIPE_MESA_PREFIX/lib/dri" \
+  DYLD_LIBRARY_PATH="$PVRGPU_LLVMPIPE_MESA_PREFIX/lib" \
+  CXX=/usr/local/opt/llvm/bin/clang++ \
+  bash "$PVRGPU_REPO/script/run_rdc_gl_debug_scope_unit.sh" \
+    "$PVRGPU_LLVMPIPE_MESA_PREFIX/lib/libEGL.dylib" \
+    "$PVRGPU_LLVMPIPE_MESA_PREFIX/lib/libGLESv2.dylib"
 
 "$PVRGPU_BUILD_DIR/bin/pvrgpu" "$PVRGPU_CAPTURE" \
   --player "$PVRGPU_RDC_PLAYER" \
@@ -154,27 +167,49 @@ llvmpipe reference 也可用相同 helper 配合 llvmpipe prefix 建立完整輸
    pipeline 的 attachment resource、mip、layer、格式與 live GL 物件身分，
    不讀取任何初始化圖片作為答案。
 2. 用 `SetFrameEvent(0, true)` 恢復 capture 的 initial contents／初始狀態，
-   然後才恢復 native 環境。frame 內的 resource dependency、graphics、compute
+   期間保留獨立同步 callback observer，完成 `glFinish` 並驗證還原過程無錯誤，
+   不把 initial-copy error 當 preview noise 清掉。native backend 將此段 driver
+   events 分開寫到 receipt 路徑加 `.initial-copy-driver-counter.txt`；要求真
+   flush evidence，只接受已核對的 driver state／raw-copy event allowlist，並
+   檢查 status／failure flags；未知事件、截斷、error／fail／unsupported／declined
+   或需要 shader/native submission 的 copy 路徑都拒絕。只接受原始資源 transfer，不假裝在隔離期間執行
+   shader。成功後才恢復 native 環境。frame 內的 resource dependency、graphics、compute
    與 transfer 都留在同一個正式 ordered replay；不把中途 warmup 關閉 native。
 3. 一次 `ReplayEventRange(1, lastEvent)` 完成整個 frame，不在 query／TF scope
    中途切段。action count 只是報告 metadata，不設定預期 draw-count flush gate。
    有 slice／split metadata 的 capture 明確拒絕，不能假定省略的 dependencies。
-4. 在真正 replay EGL context 呼叫所選 Mesa 的 `glFinish`，保留 native
-   counter／report scope，檢查 GL error、RenderDoc fatal status 與 validation
-   messages。再核對 completed draw FBO 的物件、subresource、extent，直接用
+4. 在 native range 前，於真正 replay EGL context 安裝同步 GL debug callback，
+   在獨立 debug group 啟用所有訊息。保留並 chain 原 callback／userdata，記住
+   原 enable bits；group 的 filter inheritance／pop 負責精確還原原本各
+   source、type、severity、ID filters。記錄所有 ERROR type 或 HIGH severity，
+   不只檢查結束時的 `glGetError`／RenderDoc messages：replay 內部可能已取走
+   sticky error，仍必須拒絕成功結果。先檢查 captured calls，會替換 callback、
+   改 filter、關閉同步 observation、切換 context，或 pop 超出自身 debug-group
+   範圍的 capture 明確拒絕；不靠最後才重新開啟 callback 來假裝全程有監測。
+5. 在同一 replay context 呼叫所選 Mesa 的 `glFinish`，保留 native
+   counter／report scope，檢查 GL error、retained callback errors、RenderDoc
+   fatal status 與 validation messages；驗證 callback、enable bits、group depth
+   未被替換。再核對 completed draw FBO 的物件、subresource、extent，直接用
    `glReadPixels` 讀回；保存／還原 read FBO、read buffer、PBO 與 PACK state。
    不以 `SaveTexture` debug draw 或另一次 replay 產生最後圖片。
-5. 成功讀回後才關閉測量 scope、atomic publish PNG 與
-   `pvrgpu.rdc-final-output.v1` receipt。最後附件目前只支援單 sample、非 layered
+6. 成功讀回並驗證／還原原 callback、debug group/filter 與 enable state 後，
+   才關閉測量 scope、atomic publish PNG 與 `pvrgpu.rdc-final-output.v2` receipt。
+   receipt 必須含 `api_error_capture=synchronous-gl-debug-callback` 與
+   `debug_callback_verified=true`、`initial_contents_restored=true`；native receipt
+   另外指定 `initial_copy_driver_counter_path`。不接受舊 v1 或僅末尾
+   `glGetError` 的證明。
+   最後附件只支援單 sample、非 layered
    texture／renderbuffer；integer PNG conversion 或未支援 readback 明確拒絕。
 
 直接呼叫 helper 的介面是 `TRACE.rdc OUTPUT.png [OUTPUT_trace.md]`。
 PvrGPU 必須提供 `PVRGPU_RDC_FINAL_OUTPUT_RECEIPT`、native API library、driver
 counter 與 model JSONL 路徑；正式 runner 負責配置這些新輸出路徑。helper
-拒絕既存 final PNG／receipt，避免留下舊 artifact 被誤判為本次結果。
+拒絕既存 final PNG／receipt／可選 trace，並解析既存 parent symlink 後確認
+所有 input/output 路徑不同，避免覆寫 capture 或把舊 artifact 當成本次結果。
 
 receipt 不是 native correctness 的單獨證明。runner 還必須 canonical match
 RDC path、核對完整 replay／finish／API error 欄位、保存 RDC／PNG hash，驗證
+initial-copy audit 路徑與無錯誤的 flush（不加進 native counters），再驗證
 所有 graphics model reports 和 compute submit／done 完整配對，拒絕任何
 driver／model error 或截斷。計數只累加真正完成的 report，最終圖片必須來自
 receipt 指定的 `completed-replay-attachment`，不能用其中某次 model PNG
@@ -252,14 +287,27 @@ trace action 數量只作為外部報告 metadata。不要把它當 native draw 
 PVRGPU_DEBUG_TOOLS='/Users/linwanyi/Downloads/_Codex/Working/PvrGPU/out/runs/manhattan-llvmpipe.L3027L'
 ```
 
-該目錄中的 `run_bounded.py`、`bounded_player.cpp`、`bounded-player` 是外部診斷工具，
-不是 repository 的正式 build target。執行前檢查原始碼、binary receipt、所依賴的
+該目錄中的 `run_bounded.py`、`bounded_player.cpp` 與另行固定的 helper binary 是外部
+診斷工具，不是 repository 的正式 build target。執行前檢查原始碼、binary receipt、所依賴的
 BenchScope／RenderDoc 路徑與 CLI；不要因為目錄存在就假定工具相容。搬機或臨時目錄
 遺失時，依本節契約重建工具；可先搜尋 `run_bounded.py`，不要自動挑一份舊 binary。
 
 ```bash
 rg --files "$PVRGPU_OUTPUT_ROOT" -g run_bounded.py
 python3 "$PVRGPU_DEBUG_TOOLS/run_bounded.py" --help
+```
+
+從同一份已驗證的 build receipt 指定 helper、獨立 evidence auditor，以及 helper
+實際連結的 continuous-range RenderDoc library；不要挑選工具目錄中同名的舊 binary。
+以下是需要替換的路徑，不是自動偵測設定：
+
+```bash
+PVRGPU_BOUNDED_PLAYER='/absolute/verified-build/bounded-player'
+PVRGPU_BOUNDED_AUDIT='/absolute/verified-build/bounded-audit'
+PVRGPU_BOUNDED_RENDERDOC='/absolute/verified-renderdoc/lib/librenderdoc-range.dylib'
+test -x "$PVRGPU_BOUNDED_PLAYER"
+test -x "$PVRGPU_BOUNDED_AUDIT"
+test -f "$PVRGPU_BOUNDED_RENDERDOC"
 ```
 
 設定要檢查的末端 draw，先產生同範圍 reference，再執行 PvrGPU：
@@ -270,6 +318,8 @@ PVRGPU_LAST_DRAW=0
 python3 "$PVRGPU_DEBUG_TOOLS/run_bounded.py" "$PVRGPU_CAPTURE" \
   --backend llvmpipe \
   --mesa-prefix "$PVRGPU_LLVMPIPE_MESA_PREFIX" \
+  --player "$PVRGPU_BOUNDED_PLAYER" --audit-tool "$PVRGPU_BOUNDED_AUDIT" \
+  --renderdoc-lib "$PVRGPU_BOUNDED_RENDERDOC" \
   --draw "$PVRGPU_LAST_DRAW" --every-draw \
   --outdir "$PVRGPU_DEBUG_RUN/reference-prefix" --timeout 300
 
@@ -277,16 +327,23 @@ python3 "$PVRGPU_DEBUG_TOOLS/run_bounded.py" "$PVRGPU_CAPTURE" \
   --backend pvrgpu \
   --mesa-prefix "$PVRGPU_MESA_PVRGPU_PREFIX" \
   --bridge "$PVRGPU_SYSTEMC_API_LIB" \
+  --player "$PVRGPU_BOUNDED_PLAYER" --audit-tool "$PVRGPU_BOUNDED_AUDIT" \
+  --renderdoc-lib "$PVRGPU_BOUNDED_RENDERDOC" \
   --draw "$PVRGPU_LAST_DRAW" --every-draw \
   --reference-dir "$PVRGPU_DEBUG_RUN/reference-prefix" \
   --outdir "$PVRGPU_DEBUG_RUN/native-prefix" --timeout 300
 ```
 
 `--draw` 為零起算，`--event` 可改用實際 Event ID，兩者擇一。
+若最後一筆 draw 後還有 transfer、barrier 或其他事件，完整 prefix 應以 capture 的
+最後 Event ID 為界，明確執行與稽核尾段，不能只停在最後 draw。
 `--every-draw` 保存 prefix 中每筆 draw；不加時只保存所選末端的附件。
 `--compile-only-init` 是前節所述的顯式初始化模式，只在理解且記錄其邊界後使用。
 `--outdir` 必須尚不存在；每次改末端 draw 或 runtime，使用新的目錄。
 timeout 按實際模型成本設定，timeout 只代表沒有完成，不代表像素錯誤。
+外層 runner 必須獨立稽核逐區間的 submit／done／新 model reports 與 snapshot scope，
+拒絕截斷 journal、失敗後繼續執行，以及 child exit 0 卻缺少完成證據的結果。
+診斷工具成功完成仍不是正式 full-frame 或圖片正確性的 PASS。
 
 可先用較大的 prefix 找到差異區間，再二分末端 Event ID；每次二分仍完整執行
 所需前綴。定位後，回到逐 draw 比對，檢查差異第一次出現的位置。
@@ -305,6 +362,12 @@ completion、generation／序號與 framebuffer readback。
 offset，辨識本區間新增的 reports；若一個區間含多次 flush，保留每次提交並按 counter
 語義彙整。排除舊檔、其他 helper／clear 或失敗後的舊快取。
 
+在 replay range 返回及同步完成後、保存 snapshot 前，分別檢查該區間的 compiler、
+driver、model 錯誤。`unsupported_draw`、編譯失敗或 CPU present fallback 必須令
+本區間失敗並停止向後重播，不能因 `glFinish` 返回、process exit 0 或最後有 PNG
+就略過。非零 draw 沒有本區間的 native completion，應標記證據缺失／待查；真正
+零工作 action 則獨立分類，不能借用上一筆 model report 冒充這一筆。
+
 ### 6.2 附件比較
 
 - 保存每個實際 color target，以及存在的 depth／stencil，不能只檢查 color0。
@@ -317,6 +380,11 @@ offset，辨識本區間新增的 reports；若一個區間含多次 flush，保
 - MSAA 的 sample readback 與 resolve 分開；不要把 resolve 隱藏在比較裡。
 - raw bytes 作為主要資料；PNG 用於目視定位。深度 PNG 若需額外 debug shader，
   優先保存 raw depth，將視覺化工作與 application draw 分開。
+- 原生路徑優先從已完成的 replay framebuffer 直接 `glReadPixels`，保存並還原
+  read FBO、read buffer、PBO 與 PACK state。RenderDoc 的 `SaveTexture`／
+  `GetTextureData` 可能插入額外 shader draw；此類工具工作與錯誤必須有獨立
+  scope，不可混入 application counters，亦不可用 CPU presentation 代替原生
+  shader。若 readback 轉成 RGBA8，分開記錄原 attachment 格式與保存格式。
 - readback 回傳非空 buffer 仍不足以證明資料有效。depth／stencil 須確認 API／extension
   支援與 GL error；必要時在實際 replay context，以已驗證的 `glReadPixels` 格式／型別
   交叉檢查。保存並還原 read framebuffer、pixel-pack buffer／布局等狀態，且確認讀的是
@@ -326,6 +394,12 @@ offset，辨識本區間新增的 reports；若一個區間含多次 flush，保
   每通道最大／平均誤差及差異區域。
 - 格式 padding 與真正的 depth／stencil bits 分開解讀；浮點差異依規格與運算精度
   說明容差，不能為了通過單一 capture 調整門檻。
+- packed normalized target 須區分模型的 canonical attachment、driver 打包後的
+  實體格式，以及 PNG 展開。RGB565 的 5／6-bit 色階以 bit replication 展開，
+  不可用另一種四捨五入轉換製造比較差異；但 float → RGBA8 → RGB565 與直接
+  float → RGB565 的兩段量化差異屬於真正的附件值差異，不能當成純顯示誤差。
+  對應 memory counters 也須標示模型實際使用的 bytes/pixel，不能把 canonical
+  RGBA8 流量宣稱為原生 RGB565 流量。
 - 無可見片元的 draw 可能正確地不改變影像，但仍要檢查 IA、VS、clipping／culling
   與後續附件內容；兩張零圖相同不能單獨證明有執行 draw。
 
@@ -364,6 +438,8 @@ PVRGPU_PCO_DECODE_DUMP=1 \
     --backend pvrgpu \
     --mesa-prefix "$PVRGPU_MESA_PVRGPU_PREFIX" \
     --bridge "$PVRGPU_SYSTEMC_API_LIB" \
+    --player "$PVRGPU_BOUNDED_PLAYER" --audit-tool "$PVRGPU_BOUNDED_AUDIT" \
+    --renderdoc-lib "$PVRGPU_BOUNDED_RENDERDOC" \
     --draw "$PVRGPU_LAST_DRAW" \
     --outdir "$PVRGPU_DEBUG_RUN/native-pco-dump" --timeout 300
 ```
@@ -407,6 +483,73 @@ shim 必須原封不動轉送實際提交；不支援的 archive shape 明確記
 這是同一筆真實輸入的冷啟動重播，不是 cache／timing checkpoint；不得據此要求
 cycle 相同。修正後仍須回到完整 ordered prefix，確認跨 draw 相依與正常執行流程。
 
+### 7.3 正規 DrawList snapshot／resume
+
+若要保存 DrawList N 完成後的整體狀態，讓新程序直接正常執行 N+1，使用
+[DrawList Snapshot / Replay 方法](DRAWLIST_SNAPSHOT_REPLAY.md)。這與上一節的單筆
+native API input capsule 不同：後續事件必須讀取接續執行所產生的新資源內容，不能逐筆
+載入舊 capsule 覆寫前一步的結果。
+
+### 7.4 UBO 越界與 compiler memory footprint
+
+先把失敗的 native LD 記成 stage、block、GPU base、綁定 bytes、實際 address、
+DWORD count 與指令 offset。以 `address - base` 計算相對範圍，核對 captured
+buffer binding 的 offset／size、driver snapshot、shared descriptor 與原始 NIR
+load；不能用 DRAM page 已配置或相鄰 buffer 有資料，取代 API 綁定範圍檢查。
+
+若原始存取合法而 native load 越界，分別驗證兩個邊界：
+
+1. 依 Mesa ISA 定義核對 PCO burst encoding、DWORD／byte 單位與 address
+   arithmetic，不由失敗的 byte count 推測 decoder 應如何改。
+2. 保存 vectorize、shrink、lowering 前後的 NIR。對每個 memory load 計算
+   實際讀取區間，而非只看 shader 最後使用的分量；未使用但仍被 LD 讀取的
+   lanes 也必須合法。合併／前端裁切／向量長度進位要一起檢查，並核對
+   reswizzle、alignment、offset shift 與 range metadata。
+
+建立不依賴 capture 的最小 pass pipeline，直接執行所選 Mesa source，避免
+連結到舊 archive 的同名實作。以不同向量寬度、bit size、使用分量遮罩與 offset
+驗證讀取範圍不擴張、使用值完全保留，並檢查 NIR validation／重複最佳化的
+固定點。使用未修正 source 作負面對照，確認同一測試確實重現相同錯誤；再以
+新 runtime 重播原 capture，不修改 UBO 大小、填補越界資料或替換 shader 答案。
+
+### 7.5 分離取樣精度與反射放大
+
+當 color／depth coverage 相同，但反射附件出現大幅差異時，先追蹤完整
+2×2 fragment quad，不只追蹤一個最終像素。保存各 lane 的 UV、normal map
+回應、未量化 normal、reflection vector、cube face、derivatives、LOD 與 mip
+weight；encoded normal 相同不代表 shader 的中間 normal 完全相同。
+
+分別重建 normal-map LOD 與 cube LOD。exact log2／fast approximation、先投影
+再差分／投影的導數、coarse／per-lane footprint 都要分開，不把其中一種差異
+套用到所有像素。用原始 texture bytes 與實際 filter／wrap／mip 狀態核對 sample。
+
+需要因果控制時，只在獨立診斷 replay 中修改單一取樣操作，例如以 native trace
+實際觀測到的 LOD 呼叫 `textureLod`；其他材質、shader 計算與 texture bytes
+保持不變。保存修改前後 source 與 hash，核對上游中間值未改變，再以真正
+GL readback 確認輸出變化。控制 shader 的結果不是原 capture 的 PASS 證據。
+只解釋已驗證的像素／quad；殘差要保留，並查相應 API 規範是否容許該精度選擇，
+不能為了模仿 llvmpipe 而改掉原本合法的模型算法。
+
+### 7.6 Packed render target 精度
+
+先查當下 attachment 的實際 channel bit sizes。RGBA8 PNG／`GL_UNSIGNED_BYTE`
+readback 無法證明 RGB10_A2 的低兩個 RGB bits 有被保留。使用對應的 packed
+readback type，另以小型 highp constant shader 避開 LOD、mediump 與幾何誤差。
+
+從格式定義選擇低位元、非對稱 RGB、alpha 邊界、半階上下值與 clamp 值，依序測：
+
+1. shader → PBE → packed readback；
+2. 精確 packed 資料 → initial LOAD → blend／channel mask → readback；
+3. 同一像素連續片段寫入，驗證每個片段後量化，而非只在最後 pack 一次；
+4. render → 下一個 draw 真正 `texelFetch` → 再寫回，驗證下游仍取得低位元；
+5. clear、MRT、layer／sample 與相反通道排列，以及非法格式／payload 的拒絕。
+
+同時核對 driver envelope、model format gate、LOAD、blend、DRAM、readback 與
+texture descriptor；只修最後的 pack 不能恢復前面已丟失的 bits。以實際儲存
+bytes 計算 memory traffic，顯示轉換不可回流到 native resources。
+llvmpipe 的 store 也可能採用規範容許的截位，須以實際 source／最小 GL 控制與
+規範分類，不把所有 1-code 差異稱為錯誤或無條件放寬整張圖的門檻。
+
 ## 8. Crash、heap corruption 與 sanitizer 流程
 
 1. 找出真正終止的 child process，保存 player stderr、系統 crash report 與完整 stack。
@@ -430,6 +573,8 @@ cycle 相同。修正後仍須回到完整 ordered prefix，確認跨 draw 相�
 bash script/run_mesa_pco_register_bank_unit.sh
 bash script/run_mesa_pco_ubo_unit.sh
 bash script/run_mesa_pco_texture_unit.sh
+bash script/run_mesa_pco_texture_sequence_unit.sh
+bash script/run_mesa_nir_shrink_load_unit.sh
 bash script/run_mesa_resource_unit.sh flush
 bash script/run_mesa_resource_unit.sh boundary
 ```
@@ -439,6 +584,10 @@ bash script/run_mesa_resource_unit.sh boundary
 採用固定順序：最小單元測試 → 第一個差異 draw → 前後相鄰 draw → 更長 prefix →
 完整 frame → 相關 dEQP／既有 graphics regression。每次 rebuild 後更新 receipt，
 不要覆蓋前一次的證據。
+
+完整 capture 的終點以最後 Event ID 為準；最後 DrawList 之後若仍有 blit、copy、
+clear 或其他收尾事件，必須保留獨立 trailing range 執行與稽核，不能用「最後一筆
+draw 已返回」代替整個 capture 完成。
 
 模型側可依修改範圍重建並選取相關 CTest；先確認本機 CMake target 名稱：
 

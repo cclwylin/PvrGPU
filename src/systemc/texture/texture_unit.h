@@ -82,6 +82,15 @@ TextureImplicitLod ComputeTextureImplicitLod(
 TextureImplicitLod ComputeTextureExplicitLod(
     float level, const RogueTextureImageDescriptor &image,
     const RogueTextureSamplerDescriptor &sampler);
+TextureImplicitLod ComputeTexture3DImplicitLod(
+    const std::array<std::array<float, 3>, 4> &coordinates,
+    std::uint32_t depth, const RogueTextureImageDescriptor &image,
+    const RogueTextureSamplerDescriptor &sampler);
+TextureImplicitLod ApplyTextureLodBias(
+    const TextureImplicitLod &implicit, float bias,
+    const RogueTextureImageDescriptor &image,
+    const RogueTextureSamplerDescriptor &sampler,
+    bool undefined_cube_footprint = false);
 // Cube directions use a common-face projection for implicit derivatives.
 // Undefined nonfinite footprints select minimum LOD, retaining raw derivative
 // fields for diagnostics; actual cube texel addressing is separately bounded.

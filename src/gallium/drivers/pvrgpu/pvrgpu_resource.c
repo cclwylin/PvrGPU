@@ -1155,6 +1155,14 @@ pvrgpu_resource_readback_store_row(enum pipe_format format,
                                    const uint8_t *source_row,
                                    unsigned width)
 {
+   if (format == PIPE_FORMAT_R10G10B10A2_UNORM ||
+       format == PIPE_FORMAT_B10G10R10A2_UNORM) {
+      /* The PBE already applied the destination's 10/10/10/2 quantization
+       * and channel order. No second conversion, swizzle, or aligned word
+       * access is needed between its packed framebuffer and this surface. */
+      memcpy(destination, source_row, (size_t)width * sizeof(uint32_t));
+      return;
+   }
    const enum pipe_format pack_format =
       pvrgpu_resource_readback_pack_format(format);
    const struct util_format_pack_description *pack =
