@@ -163,6 +163,11 @@ enum class PrimitiveTopology : std::uint32_t {
   kLineStrip = 4,
   kLineLoop = 5,
   kTriangleFan = 6,
+  kLinesAdjacency = 7,
+  kLineStripAdjacency = 8,
+  kTrianglesAdjacency = 9,
+  kTriangleStripAdjacency = 10,
+  kPatches = 11,
 };
 
 enum class IndexFormat : std::uint32_t {
@@ -220,6 +225,9 @@ struct DrawListStats {
   std::uint32_t draw_id = 0;
   DrawListShaderStats vertex;
   DrawListShaderStats fragment;
+  DrawListShaderStats geometry;
+  DrawListShaderStats tessellation_control;
+  DrawListShaderStats tessellation_evaluation;
 };
 
 struct DepthState {

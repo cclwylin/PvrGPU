@@ -1,14 +1,26 @@
-// 幾何著色器的獨立模組預留；目前尚未支援幾何著色器執行。
-// 不建立埠、處理程序或時序，也不接收、忽略或轉交任何工作。
+// Independent native geometry stage. Bounded FIFOs carry PipelineTxn handles;
+// native task state, exports and modeled memory belong to this stage.
 #pragma once
 
+#include "common/pipeline_state.h"
 #include <systemc>
 
 namespace pvrgpu::stub {
 
+class GpuMemorySystem;
+
 class GeometryShader final : public sc_core::sc_module {
  public:
-  explicit GeometryShader(sc_core::sc_module_name name);
+  sc_core::sc_fifo_in<PipelineTxn> input{"input"};
+  sc_core::sc_fifo_out<PipelineTxn> output{"output"};
+  GeometryShader(sc_core::sc_module_name name, MemoryPool &pool,
+                  GpuMemorySystem *memory = nullptr);
+
+ private:
+  void Run();
+  void Execute(PipelineState &state);
+  MemoryPool &pool_;
+  GpuMemorySystem *memory_;
 };
 
 }  // namespace pvrgpu::stub

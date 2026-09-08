@@ -1,0 +1,109 @@
+From: PvrGPU contributors
+Subject: [PATCH] pco: accept an explicitly legalized Geometry shader stage
+
+Pinned Mesa 26.2.1 da14d65e4499e66468094be52bff9ea0915a695e.
+The caller legalizes GS per-vertex IO to native memory/register operations
+and supplies the bounded dispatch/output ABI. Preserve the Geometry stage
+through every compiler pass. EmitVertex/EndPrimitive use the UVSW EMIT/CUT
+instructions already defined by the public ISA, not invented opcodes.
+Geometry task termination must not inject the VS's final implicit emit.
+
+--- a/src/imagination/pco/pco.h
++++ b/src/imagination/pco/pco.h
+@@ -27,6 +27,10 @@
+ typedef struct _pco_ctx pco_ctx;
+ typedef struct _pco_data pco_data;
+ 
++/* Native Geometry stage with UVSW write/emit/cut/endtask.  The Gallium
++ * caller owns explicit input-memory and output-slot layout legalization. */
++#define PCO_HAS_GEOMETRY_SHADER 1
++
+ pco_ctx *pco_ctx_create(const struct pvr_device_info *dev_info,
+                         const struct pvr_device_runtime_info *dev_runtime_info,
+                         void *mem_ctx);
+--- a/src/imagination/pco/pco_nir.c
++++ b/src/imagination/pco/pco_nir.c
+@@ -417,6 +417,9 @@
+    case MESA_SHADER_COMPUTE:
+       return gather_cs_data(nir, data);
+ 
++   case MESA_SHADER_GEOMETRY:
++      return;
++
+    default:
+       break;
+    }
+--- a/src/imagination/pco/pco_trans_nir.c
++++ b/src/imagination/pco/pco_trans_nir.c
+@@ -2062,6 +2062,18 @@
+ 
+    case nir_intrinsic_uvsw_write_pco:
+       instr = trans_uvsw_write(tctx, intr, src[0], src[1]);
++      break;
++
++   case nir_intrinsic_emit_vertex:
++      assert(tctx->stage == MESA_SHADER_GEOMETRY);
++      assert(nir_intrinsic_stream_id(intr) == 0);
++      instr = pco_uvsw_emit(&tctx->b);
++      break;
++
++   case nir_intrinsic_end_primitive:
++      assert(tctx->stage == MESA_SHADER_GEOMETRY);
++      assert(nir_intrinsic_stream_id(intr) == 0);
++      instr = pco_uvsw_cut(&tctx->b);
+       break;
+ 
+    case nir_intrinsic_load_vtxin_pco:
+--- a/src/imagination/pco/pco_end.c
++++ b/src/imagination/pco/pco_end.c
+@@ -48,6 +48,9 @@
+       }
+    }
+ 
++   if (shader->stage == MESA_SHADER_GEOMETRY)
++      last_instr = pco_uvsw_endtask(&b);
++
+    if (last_instr && pco_instr_has_end(last_instr)) {
+       pco_instr_set_end(last_instr, true);
+       return true;
+--- a/src/imagination/pco/pco_ops.py
++++ b/src/imagination/pco/pco_ops.py
+@@ -399,6 +399,7 @@
+ ## Backend.
+ O_UVSW_WRITE = hw_op('uvsw.write', [OM_EXEC_CND, OM_RPT], 0, 2)
+ O_UVSW_EMIT = hw_op('uvsw.emit', [OM_EXEC_CND])
++O_UVSW_CUT = hw_op('uvsw.cut', [OM_EXEC_CND])
+ O_UVSW_ENDTASK = hw_op('uvsw.endtask', [OM_END])
+ O_UVSW_EMIT_ENDTASK = hw_op('uvsw.emit.endtask', [OM_END])
+ O_UVSW_WRITE_EMIT_ENDTASK = hw_op('uvsw.write.emit.endtask', [OM_END], 0, 2)
+--- a/src/imagination/pco/pco_map.py
++++ b/src/imagination/pco/pco_map.py
+@@ -1310,6 +1310,7 @@
+ )
+ 
+ encode_map(O_UVSW_EMIT, encodings=[(I_UVSW_EMIT, [])], op_ref_maps=[('backend', [], [])])
++encode_map(O_UVSW_CUT, encodings=[(I_UVSW_CUT, [])], op_ref_maps=[('backend', [], [])])
+ encode_map(O_UVSW_ENDTASK, encodings=[(I_UVSW_ENDTASK, [])], op_ref_maps=[('backend', [], [])])
+ encode_map(O_UVSW_EMIT_ENDTASK, encodings=[(I_UVSW_EMIT_ENDTASK, [])], op_ref_maps=[('backend', [], [])])
+ 
+@@ -3214,6 +3215,20 @@
+    enc_ops=[('backend', O_UVSW_EMIT)]
+ )
+ 
++group_map(O_UVSW_CUT,
++   hdr=(I_IGRP_HDR_MAIN, [
++      ('oporg', 'be'),
++      ('olchk', False),
++      ('w1p', False),
++      ('w0p', False),
++      ('cc', OM_EXEC_CND),
++      ('end', False),
++      ('atom', False),
++      ('rpt', 1)
++   ]),
++   enc_ops=[('backend', O_UVSW_CUT)]
++)
++
+ group_map(O_UVSW_ENDTASK,
+    hdr=(I_IGRP_HDR_MAIN, [
+       ('oporg', 'be'),

@@ -97,6 +97,10 @@ void GpuMemorySystem::ValidateClient(MemoryClient client) {
   case MemoryClient::kUniformBuffer:
   case MemoryClient::kComputeShader:
   case MemoryClient::kComputeReadback:
+  case MemoryClient::kGeometryShader:
+  case MemoryClient::kTessellationControl:
+  case MemoryClient::kTessellator:
+  case MemoryClient::kTessellationEvaluation:
     return;
   case MemoryClient::kMixedCache:
   case MemoryClient::kUscL2:
@@ -246,15 +250,25 @@ MemoryAccessStats GpuMemorySystem::Write(std::uint64_t address,
     CacheLineData line;
     if (line_offset == 0 && chunk == line_bytes) {
       line.assign(input + copied, input + copied + chunk);
-    } else if (backing_.Contains(line_address, line_bytes)) {
+    } else {
+      // A previous GPU store may own the only copy of this line in dirty
+      // SLC; no DRAM page need exist yet. Always consult the cache before
+      // initializing unwritten bytes, otherwise a second partial store to a
+      // fresh line would silently erase the first store's bytes. The zero
+      // fill is used only on an actual cache miss to uninitialized backing;
+      // ordinary reads still reject addresses with no initialized storage.
+      const CacheLineRead read_for_store = [&](std::uint64_t lower_address,
+                                               std::size_t lower_bytes) {
+        if (!backing_.Contains(lower_address, lower_bytes))
+          return CacheLineData(lower_bytes, 0);
+        return read_lower(lower_address, lower_bytes);
+      };
       const CacheLineAccess read =
-          slc_.ReadLine(line_address, read_lower, write_lower);
+          slc_.ReadLine(line_address, read_for_store, write_lower);
       result.slc += read.delta;
       result += lower;
       lower = {};
       line = read.data;
-    } else {
-      line.assign(line_bytes, 0);
     }
     std::copy_n(input + copied, chunk, line.begin() + line_offset);
     const CacheLineAccess write =

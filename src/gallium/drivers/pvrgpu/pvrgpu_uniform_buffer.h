@@ -21,7 +21,7 @@ pvrgpu_snapshot_uniform_buffer(const struct pipe_constant_buffer *binding,
                                 uint32_t descriptor[4])
 {
    if (!binding || !entry || !descriptor ||
-       stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT ||
+       stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION ||
        block_index >= PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE)
       return false;
    memset(entry, 0, sizeof(*entry));
@@ -75,7 +75,7 @@ pvrgpu_snapshot_stage_uniform_buffers(
    unsigned *entry_count, unsigned entry_capacity)
 {
    if (!bindings || !entries || !entry_count ||
-       stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT ||
+       stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION ||
        active_blocks > PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
        (uint64_t)descriptor_start + 4u * active_blocks > shared_count ||
        (shared_count && !shared) || *entry_count > entry_capacity ||

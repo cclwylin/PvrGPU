@@ -1,0 +1,44 @@
+From: PvrGPU contributors
+Subject: [PATCH] pco: preserve explicitly legalized native TCS/TES stages
+
+Pinned Mesa 26.2.1 da14d65e4499e66468094be52bff9ea0915a695e.
+Apply after mesa-26.2.1-pco-geometry-stage.patch. The caller lowers actual
+per-vertex/per-patch IO to native LD/ST and TES exports to UVSW writes.
+TCS ends a native task without an implicit vertex export; TES exports one
+evaluated vertex. Stage identities remain TESS_CTRL/TESS_EVAL throughout.
+The caller executes each bounded <=32 invocation TCS patch in one native
+instruction-group-lockstep task, matching PCO's single-task barrier rule.
+
+--- a/src/imagination/pco/pco.h
++++ b/src/imagination/pco/pco.h
+@@ -30,6 +30,7 @@
+ /* Native Geometry stage with UVSW write/emit/cut/endtask.  The Gallium
+  * caller owns explicit input-memory and output-slot layout legalization. */
+ #define PCO_HAS_GEOMETRY_SHADER 1
++#define PCO_HAS_TESSELLATION_SHADERS 1
+ 
+ pco_ctx *pco_ctx_create(const struct pvr_device_info *dev_info,
+                         const struct pvr_device_runtime_info *dev_runtime_info,
+--- a/src/imagination/pco/pco_nir.c
++++ b/src/imagination/pco/pco_nir.c
+@@ -418,6 +418,8 @@
+       return gather_cs_data(nir, data);
+ 
+    case MESA_SHADER_GEOMETRY:
++   case MESA_SHADER_TESS_CTRL:
++   case MESA_SHADER_TESS_EVAL:
+       return;
+ 
+    default:
+--- a/src/imagination/pco/pco_end.c
++++ b/src/imagination/pco/pco_end.c
+@@ -32,7 +32,8 @@
+    pco_builder b =
+       pco_builder_create(entry, pco_cursor_after_block(last_block));
+ 
+-   if (shader->stage == MESA_SHADER_VERTEX) {
++   if (shader->stage == MESA_SHADER_VERTEX ||
++       shader->stage == MESA_SHADER_TESS_EVAL) {
+       if (last_instr && last_instr->op == PCO_OP_UVSW_WRITE &&
+           pco_instr_has_default_exec(last_instr) &&
+           pco_instr_get_rpt(last_instr) == 1) {

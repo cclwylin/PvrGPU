@@ -54,13 +54,42 @@ void Reject(Mutation mutation, const char *reason) {
 int main() {
   Accept(DriverCommand{});
   Accept(Fixture());  // Sparse VS index, independent FS index, two textures.
+  auto three_stages = Fixture();
+  // Descriptor transport only: executable GS bytes are checked by the
+  // separate native API test, not by this uniform-buffer contract helper.
+  three_stages.geometry_pco = {0};
+  three_stages.geometry_pco_abi.shareds = 8;
+  three_stages.geometry_pco_abi.uniform_buffer_descriptor_start = 4;
+  three_stages.geometry_pco_abi.uniform_buffer_descriptor_count = 1;
+  three_stages.geometry_pco_abi.push_constant_start = 8;
+  three_stages.geometry_shared = {0, 0, 0, 0, 0, 0, 4, 0};
+  three_stages.uniform_buffers.push_back(
+      {DriverPcoShaderStage::kGeometry, 0, {2, 4, 6, 8}});
+  Accept(three_stages);
+  auto tessellation_stages = Fixture();
+  tessellation_stages.tessellation.control_pco = {0};
+  tessellation_stages.tessellation.evaluation_pco = {0};
+  for (unsigned stage = 3; stage <= 4; ++stage) {
+    auto &abi = stage == 3 ? tessellation_stages.tessellation.control_abi
+                          : tessellation_stages.tessellation.evaluation_abi;
+    auto &shared = stage == 3 ? tessellation_stages.tessellation.control_shared
+                             : tessellation_stages.tessellation.evaluation_shared;
+    const auto base = stage == 3 ? 8U : 4U;
+    abi.uniform_buffer_descriptor_start = base;
+    abi.uniform_buffer_descriptor_count = 1;
+    abi.push_constant_start = abi.shareds = base + 4;
+    shared.assign(abi.shareds, 0); shared[base + 2] = 4;
+    tessellation_stages.uniform_buffers.push_back(
+        {static_cast<DriverPcoShaderStage>(stage), 0, {3, 5, 7, 9}});
+  }
+  Accept(tessellation_stages);
   auto maximum = Fixture();
   maximum.uniform_buffers[0].bytes.resize(kMaximumUniformBufferBytes);
   maximum.vertex_shared[6] = kMaximumUniformBufferBytes;
   Accept(maximum);
   Reject([](auto &c) { c.uniform_buffers.push_back(c.uniform_buffers[0]); },
          "duplicated");
-  Reject([](auto &c) { c.uniform_buffers[0].stage = static_cast<DriverPcoShaderStage>(2); },
+  Reject([](auto &c) { c.uniform_buffers[0].stage = static_cast<DriverPcoShaderStage>(5); },
          "stage/index/size");
   Reject([](auto &c) { c.uniform_buffers[0].block_index = 15; }, "stage/index/size");
   Reject([](auto &c) { c.uniform_buffers[0].block_index = 2; }, "descriptor");

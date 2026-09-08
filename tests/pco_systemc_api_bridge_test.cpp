@@ -44,7 +44,7 @@ void VerifyGuardedPreviousVersionCommand(
   // API-v22 added alpha-to-sample state after the uniform-buffer list.
   // Reconstruct the aligned API-v21 byte extent, not a zeroed
   // current-size command whose readable tail would hide the invalid access.
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 23U,
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 25U,
                 "update the frozen API-v21 guard-page fixture on ABI changes");
   constexpr std::size_t kApi21Tail =
       offsetof(pvrgpu_systemc_driver_command, uniform_buffer_count) +
@@ -117,7 +117,7 @@ void VerifyGuardedPreviousVersionCommand(
   if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) !=
           2 ||
       std::string(error.data()).find(
-          "nested PCO sequence draw header is invalid: version=21 expected=23") ==
+          "nested PCO sequence draw header is invalid: version=21 expected=25") ==
           std::string::npos)
     Fail("guarded old-size nested command was not rejected by version");
 #if defined(_WIN32)
@@ -394,8 +394,8 @@ void VerifySequenceExternalTextureAllocation() {
 
 int main() {
   using namespace pvrgpu::stub;
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 23U,
-                "native sequence bridge test requires API-v23");
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 25U,
+                "native sequence bridge test requires API-v24");
   static_assert(PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS == 15U);
   static_assert(kDriverPcoMaximumTextureMipLevels == 15U);
   static_assert(kMaximumTextureMipLevels == 15U);

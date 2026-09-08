@@ -125,6 +125,131 @@ struct pvrgpu_pco_graphics_binary {
    uint32_t fragment_texture_descriptor_stride;
 };
 
+/* Independent Geometry stage. These are compiler/driver contracts, not a
+ * claim that Geometry shares the Compute data master or shader module.
+ * Every location maps to a contiguous range of raw 32-bit components.
+ * The input layout is the preceding VS's actual UVSW output layout; its
+ * per-primitive AoS bytes are read by native LD instructions. */
+#define PVRGPU_PCO_GEOMETRY_LOCATIONS 64u
+#define PVRGPU_PCO_GEOMETRY_MAX_DWORDS 64u
+#define PVRGPU_PCO_GEOMETRY_INPUT_DESCRIPTOR_START 0u
+#define PVRGPU_PCO_GEOMETRY_UBO_DESCRIPTOR_START 4u
+#define PVRGPU_PCO_GEOMETRY_PRIMITIVE_ID_INPUT 0u
+#define PVRGPU_PCO_GEOMETRY_INVOCATION_ID_INPUT 1u
+
+struct pvrgpu_pco_geometry_layout {
+   uint32_t start[PVRGPU_PCO_GEOMETRY_LOCATIONS];
+   uint32_t count[PVRGPU_PCO_GEOMETRY_LOCATIONS];
+   uint32_t stride_dwords;
+};
+
+struct pvrgpu_pco_geometry_abi {
+   struct pvrgpu_pco_stage_abi stage;
+   struct pvrgpu_pco_geometry_layout input;
+   struct pvrgpu_pco_geometry_layout output;
+   /* Mesa primitive enums, not pipe primitive enums. */
+   uint32_t input_primitive;
+   uint32_t output_primitive;
+   uint32_t vertices_in;
+   uint32_t vertices_out;
+   uint32_t invocations;
+   uint32_t primitive_id_input;
+   uint32_t invocation_id_input;
+};
+
+struct pvrgpu_pco_geometry_binary {
+   struct pvrgpu_pco_owned_binary shader;
+   struct pvrgpu_pco_geometry_abi abi;
+};
+
+/* graphics.vertex is the original VS and writes geometry.abi.input;
+ * graphics.fragment consumes geometry.abi.output. All rasterizer-facing
+ * output ranges in graphics describe GS output, not VS output. */
+struct pvrgpu_pco_geometry_pipeline_binary {
+   struct pvrgpu_pco_graphics_binary graphics;
+   struct pvrgpu_pco_geometry_binary geometry;
+};
+
+bool pvrgpu_pco_compile_geometry(
+   struct pvrgpu_pco_compiler *compiler,
+   const struct nir_shader *geometry_nir,
+   const struct pvrgpu_pco_geometry_layout *input_layout,
+   const struct pvrgpu_pco_geometry_layout *output_layout,
+   unsigned uniform_dwords,
+   struct pvrgpu_pco_geometry_binary *out,
+   char *error, size_t error_size);
+
+bool pvrgpu_pco_compile_geometry_pipeline(
+   struct pvrgpu_pco_compiler *compiler,
+   const struct nir_shader *vertex_nir,
+   const struct nir_shader *geometry_nir,
+   const struct nir_shader *fragment_nir,
+   const enum pipe_format *attribute_formats,
+   unsigned render_target_count,
+   unsigned vertex_uniform_dwords,
+   unsigned geometry_uniform_dwords,
+   unsigned fragment_uniform_dwords,
+   unsigned attribute_count,
+   unsigned fragment_texture_count,
+   struct pvrgpu_pco_geometry_pipeline_binary *out,
+   char *error, size_t error_size);
+
+void pvrgpu_pco_geometry_binary_finish(struct pvrgpu_pco_geometry_binary *binary);
+void pvrgpu_pco_geometry_pipeline_binary_finish(
+   struct pvrgpu_pco_geometry_pipeline_binary *binary);
+
+/* Native TCS/TES ABI. The shader stages are preserved through PCO. TCS
+ * accesses patch storage with native LD/ST; TES reads the same storage and
+ * exports its evaluated vertex with UVSW. All quantities below are DWORDs.
+ * Patch storage starts with outer[4], inner[2], then patch varyings and AoS
+ * per-vertex outputs. Undefined/unwritten values are not fabricated exports.
+ * TCS runs <=32 invocations in one instruction-group-lockstep task. */
+#define PVRGPU_PCO_TESS_MAX_VERTICES 32u
+#define PVRGPU_PCO_TESS_PATCH_LOCATIONS 32u
+#define PVRGPU_PCO_TESS_MAX_PATCH_DWORDS 128u
+struct pvrgpu_pco_tessellation_layout {
+   struct pvrgpu_pco_geometry_layout vertex;
+   uint32_t patch_start[PVRGPU_PCO_TESS_PATCH_LOCATIONS];
+   uint32_t patch_count[PVRGPU_PCO_TESS_PATCH_LOCATIONS];
+   uint32_t per_vertex_offset_dwords;
+   uint32_t patch_stride_dwords;
+};
+struct pvrgpu_pco_tessellation_binary {
+   struct pvrgpu_pco_owned_binary shader;
+   uint32_t barrier_count;
+};
+struct pvrgpu_pco_tessellation_pipeline_binary {
+   struct pvrgpu_pco_graphics_binary graphics;
+   struct pvrgpu_pco_tessellation_binary control;
+   struct pvrgpu_pco_tessellation_binary evaluation;
+   struct pvrgpu_pco_geometry_layout input;
+   struct pvrgpu_pco_tessellation_layout patch;
+   struct pvrgpu_pco_geometry_layout output;
+   uint32_t output_vertices;
+   uint32_t primitive_mode; /* Mesa tess_primitive_mode. */
+   uint32_t spacing;        /* Mesa gl_tess_spacing. */
+   uint32_t ccw;
+   uint32_t point_mode;
+};
+bool pvrgpu_pco_compile_tessellation_pipeline(
+   struct pvrgpu_pco_compiler *compiler,
+   const struct nir_shader *vertex_nir,
+   const struct nir_shader *control_nir,
+   const struct nir_shader *evaluation_nir,
+   const struct nir_shader *fragment_nir,
+   const enum pipe_format *attribute_formats,
+   unsigned render_target_count,
+   unsigned vertex_uniform_dwords,
+   unsigned control_uniform_dwords,
+   unsigned evaluation_uniform_dwords,
+   unsigned fragment_uniform_dwords,
+   unsigned attribute_count,
+   unsigned fragment_texture_count,
+   struct pvrgpu_pco_tessellation_pipeline_binary *out,
+   char *error, size_t error_size);
+void pvrgpu_pco_tessellation_pipeline_binary_finish(
+   struct pvrgpu_pco_tessellation_pipeline_binary *binary);
+
 enum pvrgpu_pco_lit_mesh_profile {
    PVRGPU_PCO_LIT_MESH_BUILD,
    PVRGPU_PCO_LIT_MESH_BUMP,

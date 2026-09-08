@@ -236,6 +236,9 @@ std::uint64_t Fnv1a64(const std::vector<T> &payload) {
 
 bool RootPayloadIsEmpty(const DriverCommand &command) {
   return command.raw_vertex_data.empty() && command.vertex_pco.empty() &&
+         command.tessellation.control_pco.empty() && command.tessellation.evaluation_pco.empty() &&
+         command.tessellation.control_shared.empty() && command.tessellation.evaluation_shared.empty() &&
+         command.geometry_pco.empty() && command.geometry_shared.empty() &&
          command.fragment_pco.empty() && command.vertex_shared.empty() &&
          command.fragment_shared.empty() && command.sampled_textures.empty() &&
          command.sampled_texture_count == 0 &&
@@ -1201,7 +1204,8 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
     // position/colour one.  Sampled textures are carried by the sequence, and
     // each draw takes the slice its descriptor count names.
     const bool describes_attributes =
-        draw.vertex_attribute_count != 0 &&
+        (draw.vertex_attribute_count != 0 ||
+         ((!draw.geometry_pco.empty() || !draw.tessellation.control_pco.empty()) && draw.vertex_stride == 0 && draw.raw_vertex_data.empty())) &&
         draw.vertex_pco_abi.vertex_inputs ==
             draw.vertex_attribute_count * 4U;
     if ((!describes_attributes &&
@@ -1240,6 +1244,17 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
       default:
         topology_assembles = false;
         break;
+    }
+    if (!draw.geometry_pco.empty()) {
+      topology_assembles = (draw.primitive_mode <= 6 ||
+                           (draw.primitive_mode >= 10 && draw.primitive_mode <= 13)) &&
+                          draw.geometry_vertices_per_instance != 0 &&
+                          assembled % draw.geometry_vertices_per_instance == 0;
+    }
+    if (!draw.tessellation.control_pco.empty()) {
+      topology_assembles = draw.primitive_mode == 14 && draw.geometry_pco.empty() &&
+          draw.tessellation.vertices_per_instance != 0 &&
+          assembled % draw.tessellation.vertices_per_instance == 0;
     }
     const bool topology_expandable = draw.indexed <= 1U &&
                                      draw.first_vertex == 0 &&
@@ -1305,7 +1320,8 @@ bool DriverPcoSequenceSupported(const Options &options, std::string *error) {
   const DriverCommand &logical = options.driver_command;
   if (!logical.uniform_buffers.empty() ||
       logical.vertex_pco_abi.uniform_buffer_descriptor_count ||
-      logical.fragment_pco_abi.uniform_buffer_descriptor_count)
+      logical.fragment_pco_abi.uniform_buffer_descriptor_count ||
+      logical.geometry_pco_abi.uniform_buffer_descriptor_count)
     return Reject(error, "logical PCO sequence cannot carry uniform buffer payloads");
   for (const auto &draw : options.driver_commands) {
     if (!ValidateDriverUniformBuffers(draw, error))

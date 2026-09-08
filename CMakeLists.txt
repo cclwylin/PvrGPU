@@ -69,15 +69,39 @@ pvrgpu_target_warnings(pvrgpu-memory-core)
 # The archive is pulled only into executables that reference its symbols.
 link_libraries(pvrgpu-memory-core)
 
-set(PVRGPU_RESERVED_SHADER_STAGE_SOURCES
-    src/systemc/shader/geometry_shader.cpp
+add_library(pvrgpu-geometry-core STATIC src/systemc/common/geometry_emission.cpp)
+set_target_properties(pvrgpu-geometry-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(pvrgpu-geometry-core PUBLIC "${CMAKE_SOURCE_DIR}/src/systemc")
+pvrgpu_target_warnings(pvrgpu-geometry-core)
+link_libraries(pvrgpu-geometry-core)
+
+add_library(pvrgpu-tessellation-core STATIC
+    src/systemc/common/tessellation.cpp
+    src/systemc/common/tessellation_reference.cpp
+)
+set_target_properties(pvrgpu-tessellation-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(pvrgpu-tessellation-core PUBLIC "${CMAKE_SOURCE_DIR}/src/systemc")
+pvrgpu_target_warnings(pvrgpu-tessellation-core)
+link_libraries(pvrgpu-tessellation-core)
+
+add_library(pvrgpu-tessellation-iss-core STATIC src/systemc/shader/tessellation_iss.cpp)
+set_target_properties(pvrgpu-tessellation-iss-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(pvrgpu-tessellation-iss-core PUBLIC
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc")
+pvrgpu_target_warnings(pvrgpu-tessellation-iss-core)
+link_libraries(pvrgpu-tessellation-iss-core)
+
+set(PVRGPU_TESSELLATION_STAGE_SOURCES
     src/systemc/shader/tessellation_control_shader.cpp
     src/systemc/geometry/tessellator.cpp
     src/systemc/shader/tessellation_evaluation_shader.cpp
 )
 
 add_executable(pvrgpu-model-stub
-    ${PVRGPU_RESERVED_SHADER_STAGE_SOURCES}
+    ${PVRGPU_TESSELLATION_STAGE_SOURCES}
+    src/systemc/shader/geometry_shader.cpp
+    src/systemc/shader/geometry_iss.cpp
     model_stub/driver_command.cpp
     model_stub/json_reporter.cpp
     model_stub/memory_pool.cpp
@@ -142,7 +166,9 @@ target_link_libraries(pvrgpu-model-stub PRIVATE
 pvrgpu_target_warnings(pvrgpu-model-stub)
 
 add_library(pvrgpu-systemc-bridge SHARED
-    ${PVRGPU_RESERVED_SHADER_STAGE_SOURCES}
+    ${PVRGPU_TESSELLATION_STAGE_SOURCES}
+    src/systemc/shader/geometry_shader.cpp
+    src/systemc/shader/geometry_iss.cpp
     model_stub/driver_command.cpp
     model_stub/json_reporter.cpp
     model_stub/memory_pool.cpp
@@ -447,14 +473,48 @@ add_test(NAME systemc-compute-first-interleave-unit
 
 add_executable(shader-stage-placeholders-test
     tests/shader_stage_placeholders_test.cpp
-    ${PVRGPU_RESERVED_SHADER_STAGE_SOURCES}
 )
 target_include_directories(shader-stage-placeholders-test PRIVATE
     "${CMAKE_SOURCE_DIR}/src/systemc"
 )
-target_link_libraries(shader-stage-placeholders-test PRIVATE PkgConfig::SYSTEMC)
+target_link_libraries(shader-stage-placeholders-test PRIVATE pvrgpu-systemc-bridge PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(shader-stage-placeholders-test)
 add_test(NAME shader-stage-placeholders-unit COMMAND shader-stage-placeholders-test)
+
+add_executable(geometry-emission-test tests/geometry_emission_test.cpp)
+pvrgpu_target_warnings(geometry-emission-test)
+add_test(NAME geometry-emission-unit COMMAND geometry-emission-test)
+
+add_executable(tessellation-test tests/tessellation_test.cpp)
+pvrgpu_target_warnings(tessellation-test)
+add_test(NAME tessellation-unit COMMAND tessellation-test)
+
+foreach(tess_test IN ITEMS tessellation-iss tessellation-module tessellation-shader)
+    string(REPLACE "-" "_" tess_source "${tess_test}")
+    add_executable(${tess_test}-test tests/${tess_source}_test.cpp)
+    target_include_directories(${tess_test}-test PRIVATE
+        "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+        "${CMAKE_SOURCE_DIR}/src/systemc")
+    target_link_libraries(${tess_test}-test PRIVATE pvrgpu-systemc-bridge PkgConfig::SYSTEMC)
+    pvrgpu_target_warnings(${tess_test}-test)
+    add_test(NAME ${tess_test}-unit COMMAND ${tess_test}-test)
+endforeach()
+
+add_executable(geometry-shader-test tests/geometry_shader_test.cpp)
+target_include_directories(geometry-shader-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc")
+target_link_libraries(geometry-shader-test PRIVATE pvrgpu-systemc-bridge PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(geometry-shader-test)
+add_test(NAME geometry-shader-unit COMMAND geometry-shader-test)
+
+add_executable(geometry-frontend-test tests/geometry_frontend_test.cpp)
+target_include_directories(geometry-frontend-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc")
+target_link_libraries(geometry-frontend-test PRIVATE pvrgpu-systemc-bridge PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(geometry-frontend-test)
+add_test(NAME geometry-frontend-unit COMMAND geometry-frontend-test)
 
 add_executable(pco-systemc-api-bridge-test
     tests/pco_systemc_api_bridge_test.cpp
@@ -470,6 +530,66 @@ target_link_libraries(pco-systemc-api-bridge-test PRIVATE
 )
 pvrgpu_target_warnings(pco-systemc-api-bridge-test)
 add_test(NAME pco-systemc-api-bridge-unit COMMAND pco-systemc-api-bridge-test)
+
+add_executable(pco-geometry-api-bridge-test tests/pco_geometry_api_bridge_test.cpp)
+target_include_directories(pco-geometry-api-bridge-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu"
+)
+target_link_libraries(pco-geometry-api-bridge-test PRIVATE pvrgpu-systemc-bridge)
+pvrgpu_target_warnings(pco-geometry-api-bridge-test)
+add_test(NAME pco-geometry-api-bridge-unit COMMAND pco-geometry-api-bridge-test)
+
+add_executable(pco-tessellation-api-bridge-test tests/pco_tessellation_api_bridge_test.cpp)
+target_include_directories(pco-tessellation-api-bridge-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu")
+target_link_libraries(pco-tessellation-api-bridge-test PRIVATE pvrgpu-systemc-bridge)
+pvrgpu_target_warnings(pco-tessellation-api-bridge-test)
+add_test(NAME pco-tessellation-api-bridge-unit COMMAND pco-tessellation-api-bridge-test)
+add_test(NAME pco-tessellation-incomplete-patch-unit
+    COMMAND pco-tessellation-api-bridge-test cache incomplete)
+foreach(tess_mode IN ITEMS direct bypass)
+    add_test(NAME pco-tessellation-api-${tess_mode}-unit
+        COMMAND pco-tessellation-api-bridge-test ${tess_mode})
+endforeach()
+
+add_executable(pco-tessellation-api-boundary-test tests/pco_tessellation_api_boundary_test.cpp)
+target_include_directories(pco-tessellation-api-boundary-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu")
+target_link_libraries(pco-tessellation-api-boundary-test PRIVATE pvrgpu-systemc-bridge)
+pvrgpu_target_warnings(pco-tessellation-api-boundary-test)
+add_test(NAME pco-tessellation-api-boundary-unit COMMAND pco-tessellation-api-boundary-test)
+
+add_executable(pco-signed-metadata-test tests/pco_signed_metadata_test.cpp)
+target_include_directories(pco-signed-metadata-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc")
+target_link_libraries(pco-signed-metadata-test PRIVATE pvrgpu-systemc-bridge)
+pvrgpu_target_warnings(pco-signed-metadata-test)
+add_test(NAME pco-signed-metadata-unit COMMAND pco-signed-metadata-test)
+
+foreach(tess_reject RANGE 1 7)
+    add_test(NAME tessellation-module-reject-${tess_reject}
+        COMMAND tessellation-module-test ${tess_reject})
+endforeach()
+foreach(tess_shader_reject RANGE 1 8)
+    add_test(NAME tessellation-shader-reject-${tess_shader_reject}
+        COMMAND tessellation-shader-test ${tess_shader_reject})
+endforeach()
+
+add_executable(driver-front-face-test tests/driver_front_face_test.cpp)
+target_include_directories(driver-front-face-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc")
+target_link_libraries(driver-front-face-test PRIVATE pvrgpu-systemc-bridge PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(driver-front-face-test)
+add_test(NAME driver-front-face-unit COMMAND driver-front-face-test)
+
+add_executable(graphics-stats-test tests/graphics_stats_test.cpp)
+target_include_directories(graphics-stats-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/model_stub")
+pvrgpu_target_warnings(graphics-stats-test)
+add_test(NAME graphics-stats-unit COMMAND graphics-stats-test)
 
 add_executable(compute-systemc-api-test tests/compute_systemc_api_test.cpp)
 target_include_directories(compute-systemc-api-test PRIVATE

@@ -7,6 +7,8 @@
 #include "geometry/vdm.h"
 
 #include "common/functional_types.h"
+#include "common/geometry_emission.h"
+#include "common/tessellation_state.h"
 #include "memory/gpu_memory_system.h"
 
 #include <algorithm>
@@ -30,6 +32,74 @@ void ValidateDrawList(const MemoryPool &pool, PoolHandle handle) {
     throw std::runtime_error("VDM requires exactly DrawList 0");
 }
 
+GeometryInputTopology GeometryTopology(PrimitiveTopology topology) {
+  switch (topology) {
+    case PrimitiveTopology::kPoints: return GeometryInputTopology::kPoints;
+    case PrimitiveTopology::kLines: return GeometryInputTopology::kLines;
+    case PrimitiveTopology::kLineStrip: return GeometryInputTopology::kLineStrip;
+    case PrimitiveTopology::kLineLoop: return GeometryInputTopology::kLineLoop;
+    case PrimitiveTopology::kTriangleList: return GeometryInputTopology::kTriangles;
+    case PrimitiveTopology::kTriangleStrip: return GeometryInputTopology::kTriangleStrip;
+    case PrimitiveTopology::kTriangleFan: return GeometryInputTopology::kTriangleFan;
+    case PrimitiveTopology::kLinesAdjacency: return GeometryInputTopology::kLinesAdjacency;
+    case PrimitiveTopology::kLineStripAdjacency: return GeometryInputTopology::kLineStripAdjacency;
+    case PrimitiveTopology::kTrianglesAdjacency: return GeometryInputTopology::kTrianglesAdjacency;
+    case PrimitiveTopology::kTriangleStripAdjacency: return GeometryInputTopology::kTriangleStripAdjacency;
+    case PrimitiveTopology::kPatches: break;
+  }
+  throw std::runtime_error("VDM geometry input topology is invalid");
+}
+
+std::uint64_t ValidateGeometryInput(const MemoryPool &pool,
+                                    const PipelineState &state,
+                                    std::uint32_t occurrence_count) {
+  if (!HasPoolHandle(state.geometry_input_primitives))
+    throw std::runtime_error("VDM geometry_input_primitives is absent");
+  if (!state.geometry_vertices_per_instance ||
+      occurrence_count % state.geometry_vertices_per_instance)
+    throw std::runtime_error("VDM geometry_vertices_per_instance is invalid");
+  if (state.primitive_restart_enable)
+    throw std::runtime_error("VDM geometry primitive_restart is not transported");
+  const auto actual = LoadArray<GeometryInputPrimitive>(
+      pool, state.geometry_input_primitives);
+  if (actual.size() > occurrence_count)
+    throw std::runtime_error("VDM geometry primitive count exceeds occurrences");
+  const auto topology = GeometryTopology(state.draw.topology);
+  std::vector<std::uint32_t> occurrences(state.geometry_vertices_per_instance);
+  std::vector<GeometryInputPrimitive> expected(occurrences.size());
+  std::size_t cursor = 0;
+  for (std::uint32_t instance = 0;
+       instance < occurrence_count / state.geometry_vertices_per_instance;
+       ++instance) {
+    for (std::size_t i = 0; i < occurrences.size(); ++i)
+      occurrences[i] = instance * state.geometry_vertices_per_instance + i;
+    std::size_t count = 0;
+    const auto status = AssembleGeometryInputPrimitives(
+        topology, occurrences.data(), occurrences.size(), false, 0, instance,
+        expected.data(), expected.size(), count);
+    if (status != GeometryEmissionStatus::kSuccess)
+      throw std::runtime_error(std::string("VDM geometry input assembly: ") +
+                                GeometryEmissionStatusName(status));
+    if (count > actual.size() - cursor)
+      throw std::runtime_error("VDM geometry primitive metadata is incomplete");
+    for (std::size_t i = 0; i < count; ++i) {
+      const auto &a = actual[cursor + i];
+      const auto &e = expected[i];
+      if (a.primitive_id != e.primitive_id || a.instance_id != e.instance_id ||
+          a.vertex_count != e.vertex_count ||
+          a.vertex_count != state.geometry_input_primitive_vertices ||
+          !std::equal(std::begin(a.vertex_indices), std::end(a.vertex_indices),
+                        std::begin(e.vertex_indices)) ||
+          a.reserved[0] || a.reserved[1] || a.reserved[2])
+        throw std::runtime_error("VDM geometry input occurrence metadata mismatch");
+    }
+    cursor += count;
+  }
+  if (cursor != actual.size())
+    throw std::runtime_error("VDM geometry primitive metadata has extra entries");
+  return cursor;
+}
+
 std::uint64_t ValidateVertexInputState(const MemoryPool &pool,
                                        const PipelineState &state,
                                        const GpuMemorySystem *memory) {
@@ -42,6 +112,9 @@ std::uint64_t ValidateVertexInputState(const MemoryPool &pool,
   const std::vector<VertexAttributeBinding> bindings =
       LoadArray<VertexAttributeBinding>(pool,
                                         state.vertex_attribute_bindings);
+  if ((HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state)) && state.driver_describes_attributes &&
+      state.vertex_pco_abi.vertex_inputs == 0 && resources.empty() && bindings.empty())
+    return state.draw.vertex_count;
   if (resources.empty() || bindings.empty())
     throw std::runtime_error("VDM received an empty vertex input layout");
 
@@ -136,6 +209,10 @@ void Vdm::Run() {
 
     const bool driver_pco_triangles =
         IsDriverPcoTrianglesCase(state.functional_case);
+    const bool tessellation_enabled = HasPoolHandle(state.tessellation_state);
+    const bool geometry_enabled = HasPoolHandle(state.geometry_code) || tessellation_enabled;
+    if (geometry_enabled && !driver_pco_triangles)
+      throw std::runtime_error("VDM geometry_code requires a native driver draw");
     /*
      * A lowered draw that carries an index buffer belongs on the indexed path
      * below, which fetches the indices and assembles every GLES topology from
@@ -161,11 +238,12 @@ void Vdm::Run() {
       // no indication which pipeline feature it actually needs.
       const char *direct_reason = nullptr;
       if (driver_pco_triangles) {
-        if (state.draw.topology != PrimitiveTopology::kTriangleList)
+        if (!geometry_enabled &&
+            state.draw.topology != PrimitiveTopology::kTriangleList)
           direct_reason = "topology_not_triangle_list";
         else if (state.draw.vertex_count == 0)
           direct_reason = "empty_draw";
-        else if (state.draw.vertex_count % 3 != 0)
+        else if (!geometry_enabled && state.draw.vertex_count % 3 != 0)
           direct_reason = "vertex_count_not_a_triangle_multiple";
         else if (state.primitive_restart_enable != 0)
           direct_reason = "primitive_restart";
@@ -207,7 +285,8 @@ void Vdm::Run() {
         throw std::runtime_error("VDM direct vertex range exceeds its VBO");
       state.counters.ia_vertices = state.draw.vertex_count;
       state.counters.ia_primitives =
-          driver_pco_triangles ? state.draw.vertex_count / 3U : 2U;
+          tessellation_enabled ? 0U : geometry_enabled ? ValidateGeometryInput(pool_, state, state.draw.vertex_count)
+          : driver_pco_triangles ? state.draw.vertex_count / 3U : 2U;
     } else {
       if ((!IsIndexedTriangleRasterCase(state.functional_case) &&
            !driver_pco_indexed) ||
@@ -217,7 +296,13 @@ void Vdm::Run() {
            state.draw.topology != PrimitiveTopology::kLines &&
            state.draw.topology != PrimitiveTopology::kLineStrip &&
            state.draw.topology != PrimitiveTopology::kLineLoop &&
-           state.draw.topology != PrimitiveTopology::kTriangleFan) ||
+           state.draw.topology != PrimitiveTopology::kTriangleFan &&
+           !(tessellation_enabled && state.draw.topology == PrimitiveTopology::kPatches) &&
+           !(geometry_enabled &&
+             (state.draw.topology == PrimitiveTopology::kLinesAdjacency ||
+              state.draw.topology == PrimitiveTopology::kLineStripAdjacency ||
+              state.draw.topology == PrimitiveTopology::kTrianglesAdjacency ||
+              state.draw.topology == PrimitiveTopology::kTriangleStripAdjacency))) ||
           state.draw.first_vertex != 0 ||
           state.draw.index_format == IndexFormat::kNone ||
           state.draw.index_count == 0) {
@@ -319,8 +404,18 @@ void Vdm::Run() {
 
       state.counters.ia_vertices = ia_vertices;
       state.counters.ia_primitives = ia_primitives;
+      if (geometry_enabled && !tessellation_enabled)
+        state.counters.ia_primitives =
+            ValidateGeometryInput(pool_, state, state.draw.index_count);
     }
 
+    if (tessellation_enabled) {
+      const auto tess = LoadArray<TessellationState>(pool_, state.tessellation_state);
+      if (tess.size() != 1 || state.draw.topology != PrimitiveTopology::kPatches ||
+          state.primitive_restart_enable)
+        throw std::runtime_error("VDM tessellation patch contract is invalid");
+      state.counters.ia_primitives = LoadArray<TessellationPatch>(pool_, tess[0].patches).size();
+    }
     state.counters.drawlists = 1;
     state.stage = PipelineStage::kVdmComplete;
 

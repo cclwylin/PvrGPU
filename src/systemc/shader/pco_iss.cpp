@@ -31,6 +31,12 @@
 namespace pvrgpu::stub {
 namespace {
 
+bool IsNativeTaskStage(ShaderStage stage) {
+  return stage == ShaderStage::kCompute || stage == ShaderStage::kGeometry ||
+         stage == ShaderStage::kTessellationControl ||
+         stage == ShaderStage::kTessellationEvaluation;
+}
+
 /*
  * Mesa 26.2.1 commit da14d65e4499e66468094be52bff9ea0915a695e.
  * VS bytes are the public uscgen VS_PASSTHROUGH_COMMON binary after its
@@ -774,7 +780,9 @@ GroupHeader DecodeHeader(const std::vector<std::uint8_t> &binary,
   if (control) {
     header.control_misc = (byte2 >> 7U) & 1U;
     header.control_op = (byte2 >> 1U) & 0x0fU;
-    header.end = compute && header.control_op == 7 && header.control_misc;
+    // Native NOP carries END in the control group's misc bit for graphics
+    // as well as compute. Individual stage decoders still gate the opcode.
+    header.end = header.control_op == 7 && header.control_misc;
     header.repeat_count = 1;
   } else {
     header.end = (byte2 & 0x80U) != 0;
@@ -1783,7 +1791,7 @@ PcoInstruction DecodeGenericAdd64_32Group(
         DecodeError(cursor - 2, "ADD64_32 destination exceeds the temporary file");
       return PcoWriteTarget::kTemporary;
     }
-    if (stage == ShaderStage::kCompute &&
+    if (IsNativeTaskStage(stage) &&
         bank == static_cast<unsigned>(PcoRegisterBank::kVertexInput)) {
       if (index >= kPcoVertexInputCount)
         DecodeError(cursor - 2, "ADD64_32 destination exceeds the vertex-input file");
@@ -1819,7 +1827,8 @@ PcoInstruction DecodeGenericAdd64_32Group(
 PcoInstruction DecodeBufferLoadGroup(const std::vector<std::uint8_t> &binary,
                                      const GroupHeader &header,
                                      std::uint16_t group_index,
-                                     bool allow_bypass = false) {
+                                     bool allow_bypass = false,
+                                     bool allow_geometry_address = false) {
   if (header.control || header.bitwise || header.operation_origin != 2 ||
       header.write0_present || header.write1_present ||
       header.repeat_count != 1 || header.end)
@@ -1839,10 +1848,11 @@ PcoInstruction DecodeBufferLoadGroup(const std::vector<std::uint8_t> &binary,
       count > kPcoMaximumBufferLoadDwords)
     DecodeError(cursor - 2, "LD requires normal-cache s0 address and 1..16 DWORDs");
   const PcoRegisterRef address = DecodeOneLowerSource(binary, group_end, cursor);
-  if (address.bank != PcoRegisterBank::kTemporary ||
-      static_cast<std::size_t>(address.index) + 2 > kPcoTemporaryCount ||
-      group_end - cursor < 2)
-    DecodeError(cursor, "LD address is not a bounded TEMP pair");
+  const std::size_t address_limit = address.bank == PcoRegisterBank::kTemporary ? kPcoTemporaryCount :
+      allow_geometry_address && address.bank == PcoRegisterBank::kShared ? kPcoMaximumSharedCount :
+      allow_geometry_address && address.bank == PcoRegisterBank::kVertexInput ? kPcoVertexInputCount : 0;
+  if (static_cast<std::size_t>(address.index) + 2 > address_limit || group_end - cursor < 2)
+    DecodeError(cursor, "LD address is not a bounded allowed register pair");
   // I_ONE_UP_3B11I has the same source bank/index layout as the one-source
   // lower encoding with a zero selector. The shared parser also enforces
   // those selector/reserved bits, including the extended 3-byte form.
@@ -2170,12 +2180,12 @@ PcoInstruction DecodeGenericSimpleAluGroup(
     DecodeError(header.offset,
                 "output-load-check does not match the ALU destination");
   }
-  if ((stage == ShaderStage::kVertex || stage == ShaderStage::kCompute) &&
+  if ((stage == ShaderStage::kVertex || IsNativeTaskStage(stage)) &&
       destination.target != PcoWriteTarget::kTemporary &&
       destination.target != PcoWriteTarget::kVertexInput) {
     DecodeError(header.offset, "vertex/compute scalar ALU cannot write PIXOUT");
   }
-  if (stage != ShaderStage::kVertex && stage != ShaderStage::kCompute &&
+  if (stage != ShaderStage::kVertex && !IsNativeTaskStage(stage) &&
       destination.target == PcoWriteTarget::kVertexInput)
     DecodeError(header.offset, "only a vertex/compute ALU may write VTXIN");
   if (destination.target == PcoWriteTarget::kPixelOutput &&
@@ -3265,7 +3275,7 @@ PcoInstruction DecodeGenericImmediateGroup(
   const DecodedDestination destination =
       DecodeGenericDestination(binary, group_end, cursor);
   if (destination.target != PcoWriteTarget::kTemporary &&
-      (stage != ShaderStage::kCompute ||
+      (!IsNativeTaskStage(stage) ||
        destination.target != PcoWriteTarget::kVertexInput))
     DecodeError(header.offset, "unsupported bitwise immediate destination bank");
   ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
@@ -3351,7 +3361,7 @@ PcoInstruction DecodeGenericBitwiseOrGroup(
     ShaderStage stage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
   if ((stage != ShaderStage::kFragment && stage != ShaderStage::kVertex &&
-       stage != ShaderStage::kCompute) ||
+       !IsNativeTaskStage(stage)) ||
       !header.bitwise || header.control || header.da != 5 ||
       header.operation_origin != 3 ||
       header.output_load_check || !header.write0_present ||
@@ -3485,7 +3495,7 @@ PcoInstruction DecodeGenericBitfieldInsertGroup(
    * checked on its own so a refusal names the one that did not match
    * instead of reporting the header as a whole. */
   if (stage != ShaderStage::kFragment && stage != ShaderStage::kVertex &&
-      stage != ShaderStage::kCompute)
+      !IsNativeTaskStage(stage))
     DecodeError(header.offset, "BFI reached an unsupported shader stage");
   if (!header.bitwise || header.control)
     DecodeError(header.offset, "BFI group is not a bitwise phase");
@@ -3602,7 +3612,7 @@ PcoInstruction DecodeGenericBitwiseXnorGroup(
    * Retain a distinct opcode so the ISS and histogram do not mislabel XNOR
    * as AND/XOR, and accept no other logical phase operation. */
   if ((stage != ShaderStage::kFragment && stage != ShaderStage::kVertex &&
-       stage != ShaderStage::kCompute) ||
+       !IsNativeTaskStage(stage)) ||
       !header.bitwise || header.control || header.da != 5 ||
       header.operation_origin != 3 ||
       header.output_load_check || !header.write0_present ||
@@ -3674,7 +3684,7 @@ PcoInstruction DecodeGenericBitwiseXnorGroup(
  * into the shifter (BBYP0BM with both count and bitmask bypassed) and phase 2
  * shifts it right by the upper source. */
 PcoInstruction DecodeGenericShiftGroup(
-    ShaderStage, const std::vector<std::uint8_t> &binary,
+    ShaderStage stage, const std::vector<std::uint8_t> &binary,
     const GroupHeader &header, std::uint16_t group_index) {
   if (!header.bitwise || header.control || header.da != 5 ||
       header.operation_origin != 5 || header.output_load_check ||
@@ -3684,12 +3694,13 @@ PcoInstruction DecodeGenericShiftGroup(
   }
   const std::size_t group_end = header.offset + header.total_bytes;
   std::size_t cursor = header.offset + 3;
-  // F_SHIFT2_OP: lsl=0b000, shr=0b001.  Both are the same shifter datapath
+  // F_SHIFT2_OP: lsl=0b000, shr=0b001, asr_twb=0b100. These use one datapath
   // (BBYP0BM feed in phase 0, the shift in phase 2); only the direction and
   // the decoded opcode differ.  The array-index computation left-shifts.
   const std::uint8_t shift_op = binary[cursor++];
-  if (shift_op != 0x00U && shift_op != 0x01U)
-    DecodeError(header.offset + 3, "expected a phase-2 LSL or SHR operation");
+  if (shift_op != 0x00U && shift_op != 0x01U &&
+      !(IsNativeTaskStage(stage) && shift_op == 0x04U))
+    DecodeError(header.offset + 3, "expected a phase-2 LSL, SHR or native ASR_TWB operation");
   const PcoOpcode shift_opcode =
       shift_op == 0x00U ? PcoOpcode::kShiftLeft : PcoOpcode::kShiftRight;
   if (binary[cursor++] != 0x02U)
@@ -3725,6 +3736,7 @@ PcoInstruction DecodeGenericShiftGroup(
 
   PcoInstruction instruction;
   instruction.opcode = shift_opcode;
+  instruction.integer_signed = shift_op == 0x04U;
   instruction.target = destination.target;
   instruction.source = lower.source1;
   instruction.source1 = count;
@@ -3806,7 +3818,7 @@ PcoInstruction DecodeGenericMoveSpecialSourceGroup(
     DecodeError(header.offset + 3, "expected the phase-2 MOVS1 operation");
   const TwoLowerSources lower =
       DecodeTwoLowerSources(binary, group_end, cursor, true, false, nullptr,
-                            stage == ShaderStage::kCompute);
+                            IsNativeTaskStage(stage));
   if (lower.source0.bank != PcoRegisterBank::kSpecial ||
       lower.source0.index != kSpecialConstantZero) {
     DecodeError(header.offset, "MOVS1 unused s0 feed is not the canonical sc0");
@@ -3834,11 +3846,33 @@ PcoInstruction DecodeGenericMoveSpecialSourceGroup(
   return instruction;
 }
 
+PcoInstruction DecodeFragmentNopEndGroup(const std::vector<std::uint8_t> &binary,
+                                         const GroupHeader &header,
+                                         std::uint16_t group_index) {
+  if (!header.control || header.control_op != 7 || header.control_misc != 1 ||
+      !header.end || header.da || header.operation_origin ||
+      header.output_load_check || header.write0_present || header.write1_present ||
+      header.exec_cnd || header.repeat_count != 1 || header.total_bytes < 4 ||
+      binary[header.offset + 3] != 0)
+    DecodeError(header.offset, "fragment NOP.end requires canonical operand-free control");
+  ValidateAlignmentPadding(binary, header.offset, header.offset + 4,
+                           header.offset + header.total_bytes);
+  PcoInstruction instruction;
+  instruction.opcode = PcoOpcode::kNop;
+  instruction.source_count = 0;
+  instruction.binary_offset = CheckedU32(header.offset + 2, "fragment NOP offset");
+  instruction.group_index = group_index;
+  instruction.end_group = 1;
+  return instruction;
+}
+
 PcoInstruction DecodeFragmentGroup(const std::vector<std::uint8_t> &binary,
                                    const GroupHeader &header,
                                    std::uint16_t group_index) {
   if (header.control)
-    return DecodeWdfGroup(binary, header, group_index);
+    return header.control_op == 7
+        ? DecodeFragmentNopEndGroup(binary, header, group_index)
+        : DecodeWdfGroup(binary, header, group_index);
   if (header.bitwise) {
     if (header.operation_origin == 1)
       return DecodeGenericImmediateGroup(ShaderStage::kFragment, binary,
@@ -4383,7 +4417,8 @@ PcoInstruction DecodeComputeControl(const std::vector<std::uint8_t> &binary,
 
 PcoInstruction DecodeComputeStore(const std::vector<std::uint8_t> &binary,
                                   const GroupHeader &header,
-                                  std::uint16_t group_index) {
+                                  std::uint16_t group_index,
+                                  bool patch_address = false) {
   const std::size_t end = header.offset + header.total_bytes;
   std::size_t cursor = header.offset + 3;
   if (header.da != 6 || header.write0_present || header.write1_present ||
@@ -4398,10 +4433,12 @@ PcoInstruction DecodeComputeStore(const std::vector<std::uint8_t> &binary,
     DecodeError(cursor - 2, "compute ST32 requires non-tiled s3 address/s0 data");
   const auto data = DecodeOneLowerSource(binary, end, cursor);
   const auto addr = DecodeOneLowerSource(binary, end, cursor);
+  const bool shared_address = patch_address && addr.bank == PcoRegisterBank::kShared;
   if (data.bank != PcoRegisterBank::kTemporary ||
-      addr.bank != PcoRegisterBank::kTemporary ||
+      (addr.bank != PcoRegisterBank::kTemporary && !shared_address) ||
       static_cast<std::size_t>(data.index) + count > kPcoTemporaryCount ||
-      static_cast<std::size_t>(addr.index) + 2 > kPcoTemporaryCount ||
+      static_cast<std::size_t>(addr.index) + 2 >
+          (shared_address ? kPcoMaximumSharedCount : kPcoTemporaryCount) ||
       cursor >= end || binary[cursor++] != 0)
     DecodeError(cursor, "compute ST32 requires bounded TEMP data/address and null ISS");
   ValidateAlignmentPadding(binary, header.offset, cursor, end);
@@ -4540,9 +4577,12 @@ PcoInstruction DecodeComputeMultiplyHigh(const std::vector<std::uint8_t> &binary
                                          std::uint16_t group_index) {
   const std::size_t end = header.offset + header.total_bytes;
   std::size_t cursor = header.offset + 3;
-  if (header.da != 3 || header.write0_present || !header.write1_present ||
-      header.repeat_count != 1 || cursor >= end || binary[cursor++] != 0xe3)
-    DecodeError(header.offset, "compute IMADD64 high requires unsigned/no-modifier single-high destination");
+  if (header.da != 3 || header.output_load_check ||
+      header.write0_present || !header.write1_present ||
+      header.repeat_count != 1 || cursor >= end ||
+      (binary[cursor] & ~0x08U) != 0xe3)
+    DecodeError(header.offset, "native IMADD64 high requires no-modifier single-high destination");
+  const bool integer_signed = (binary[cursor++] & 0x08U) != 0;
   const auto lower = DecodeThreeLowerSources(binary, end, cursor);
   const auto high = DecodeOneLowerSource(binary, end, cursor);
   if (lower.input_selector != 1 || cursor >= end || binary[cursor++] != 0xc0)
@@ -4553,6 +4593,7 @@ PcoInstruction DecodeComputeMultiplyHigh(const std::vector<std::uint8_t> &binary
   ValidateAlignmentPadding(binary, header.offset, cursor, end);
   PcoInstruction out;
   out.opcode = PcoOpcode::kIntegerMultiplyAdd64High;
+  out.integer_signed = integer_signed;
   out.source = lower.source0;
   out.source1 = lower.source1;
   out.source2 = lower.source2;
@@ -4566,10 +4607,10 @@ PcoInstruction DecodeComputeMultiplyHigh(const std::vector<std::uint8_t> &binary
   return out;
 }
 
-PcoInstruction DecodeComputeGroup(const std::vector<std::uint8_t> &binary,
+PcoInstruction DecodeNativeTaskGroup(ShaderStage stage,
+                                  const std::vector<std::uint8_t> &binary,
                                   const GroupHeader &header,
                                   std::uint16_t group_index) {
-  constexpr auto stage = ShaderStage::kCompute;
   if (header.control) return DecodeComputeControl(binary, header, group_index);
   const auto op = binary[header.offset + 3];
   if (header.bitwise) {
@@ -4583,15 +4624,19 @@ PcoInstruction DecodeComputeGroup(const std::vector<std::uint8_t> &binary,
       case 0x68: return DecodeGenericBitfieldInsertGroup(stage, binary, header, group_index);
       }
     }
-    if (header.operation_origin == 5 && (op == 0 || op == 1))
+    if (header.operation_origin == 5 && (op == 0 || op == 1 || op == 4))
       return DecodeGenericShiftGroup(stage, binary, header, group_index);
     if (header.operation_origin == 7)
       return DecodeGenericBitfieldExtractUnsignedGroup(stage, binary, header, group_index);
     DecodeError(header.offset, "compute bitwise group is not implemented");
   }
   if (header.operation_origin == 2) {
-    if (op == 0xf1) return DecodeBufferLoadGroup(binary, header, group_index, true);
-    if (op == 0xf2) return DecodeComputeStore(binary, header, group_index);
+    if (op == 0xf1) return DecodeBufferLoadGroup(binary, header, group_index, true,
+                                                stage == ShaderStage::kGeometry ||
+                                                stage == ShaderStage::kTessellationControl ||
+                                                stage == ShaderStage::kTessellationEvaluation);
+    if (op == 0xf2) return DecodeComputeStore(binary, header, group_index,
+                                              stage == ShaderStage::kTessellationControl);
     if (op == 0xe0) return DecodeComputeIdf(binary, header, group_index);
     if (op == 0xe5) return DecodeComputeAtomic32(binary, header, group_index);
     DecodeError(header.offset, "compute backend operation is not implemented");
@@ -4599,7 +4644,7 @@ PcoInstruction DecodeComputeGroup(const std::vector<std::uint8_t> &binary,
   if (header.operation_origin == 0) {
     if (header.write1_present && (op & ~0x08U) == 0xe0)
       return DecodeGenericAdd64_32Group(stage, binary, header, group_index);
-    if (header.write1_present && op == 0xe3)
+    if (header.write1_present && (op & ~0x08U) == 0xe3)
       return DecodeComputeMultiplyHigh(binary, header, group_index);
     return DecodeGenericSimpleAluGroup(stage, binary, header, group_index);
   }
@@ -4614,6 +4659,50 @@ PcoInstruction DecodeComputeGroup(const std::vector<std::uint8_t> &binary,
   if (header.operation_origin == 1)
     return DecodeGenericPackGroup(stage, binary, header, group_index);
   DecodeError(header.offset, "compute ALU group is not implemented");
+}
+
+PcoInstruction DecodeNativeRasterTaskGroup(ShaderStage stage,
+                                   const std::vector<std::uint8_t> &binary,
+                                   const GroupHeader &header,
+                                   std::uint16_t group_index) {
+  const auto backend = binary[header.offset + 3];
+  if (header.control || header.bitwise || header.operation_origin != 2 ||
+      (backend >> 5U) != kBackendOpUvs)
+    return DecodeNativeTaskGroup(stage, binary, header,
+                                 group_index);
+  const unsigned operation = backend & 7U;
+  if (operation == kUvsOpWrite || operation == kUvsOpWriteEmitEndTask)
+    return DecodeVertexBackendGroup(binary, header, group_index);
+  // Mesa pco_isa.py I_UVSW_{EMIT,CUT,EMIT_CUT,ENDTASK,EMIT_ENDTASK}.
+  // Stream zero is the only raster stream; explicitly encoded nonzero
+  // streams are rejected, never silently merged into rasterization.
+  const bool stream = (backend & 8U) != 0;
+  const bool ends_task = operation == 4 || operation == 5;
+  if ((backend & 0x10U) || operation < 1 || operation > 5 ||
+      (stream && ends_task) || header.da != (stream ? 5 : 4) ||
+      header.repeat_count != 1 || header.output_load_check ||
+      header.write0_present || header.write1_present || header.end != ends_task)
+    DecodeError(header.offset, "invalid geometry UVSW control header");
+  std::size_t cursor = header.offset + 4;
+  const auto end = header.offset + header.total_bytes;
+  if (stream && (cursor >= end || binary[cursor++] != 0))
+    DecodeError(cursor - 1, "geometry UVSW nonzero/reserved stream field");
+  for (unsigned unused = 0; unused < 3; ++unused)
+    if (cursor >= end || binary[cursor++] != 0)
+      DecodeError(cursor - 1, "geometry UVSW has a nonzero unused source/ISS");
+  ValidateAlignmentPadding(binary, header.offset, cursor, end);
+  PcoInstruction instruction;
+  const std::array<PcoOpcode,5> operations{
+      PcoOpcode::kUvsEmit, PcoOpcode::kUvsCut, PcoOpcode::kUvsEmitCut,
+      PcoOpcode::kUvsEndTask, PcoOpcode::kUvsEmitEndTask};
+  instruction.opcode = operations[operation - 1];
+  instruction.target = PcoWriteTarget::kNone;
+  instruction.source_count = 0;
+  instruction.repeat_count = 1;
+  instruction.binary_offset = CheckedU32(header.offset + 3, "geometry UVSW offset");
+  instruction.group_index = group_index;
+  instruction.end_group = ends_task;
+  return instruction;
 }
 
 bool IsRegister(const PcoRegisterRef &reference, PcoRegisterBank bank,
@@ -4970,6 +5059,9 @@ void ValidateVertexTemporaryProgram(
   std::uint16_t pending_output = 0;
   std::uint8_t pending_components = 0;
   for (const PcoInstruction &instruction : instructions) {
+    if (instruction.integer_signed)
+      DecodeError(instruction.binary_offset,
+                  "vertex integer signedness flag is native-task-only");
     if (request_pending && instruction.opcode != PcoOpcode::kWaitDataFence) {
       DecodeError(instruction.binary_offset,
                   "vertex SMP must be followed by its DRC0 WDF");
@@ -5269,6 +5361,9 @@ void ValidateFragmentProgram(
   std::uint16_t pending_output = 0;
   std::uint8_t pending_components = 0;
   for (const PcoInstruction &instruction : instructions) {
+    if (instruction.integer_signed)
+      DecodeError(instruction.binary_offset,
+                  "fragment integer signedness flag is native-task-only");
     const auto require_source = [&](const PcoRegisterRef &source) {
       if (source.bank == PcoRegisterBank::kSpecial) {
         if (!IsSupportedSpecialConstant(source.index) &&
@@ -5300,6 +5395,22 @@ void ValidateFragmentProgram(
                   "generic fragment source bank is unsupported");
     };
 
+    if (instruction.opcode == PcoOpcode::kNop) {
+      if (request_pending || instruction.target != PcoWriteTarget::kNone ||
+          instruction.source_count != 0 || instruction.repeat_count != 1 ||
+          instruction.output_index || instruction.output_index1 ||
+          instruction.end_group != 1 || instruction.immediate ||
+          instruction.exec_cnd || instruction.writes_predicate ||
+          instruction.control_operation || instruction.control_condition ||
+          instruction.branch_condition || instruction.memory_cache_mode ||
+          instruction.output_target1 != PcoWriteTarget::kTemporary ||
+          instruction.phase_composed || instruction.address_offset_signed ||
+          !HasCanonicalGenericNonFitrpFields(instruction) ||
+          !HasCanonicalUnusedSources(instruction) ||
+          !HasDefaultControlFields(instruction))
+        DecodeError(instruction.binary_offset, "invalid operand-free fragment NOP.end");
+      continue;
+    }
     if (instruction.opcode == PcoOpcode::kFloatInterpolatePerspective) {
       if (request_pending || instruction.target != PcoWriteTarget::kTemporary ||
           instruction.source_count != 2 || instruction.repeat_count != 1 ||
@@ -6795,6 +6906,8 @@ void ValidateExecutionEnvelope(const PcoProgramSummary &summary,
   }
   for (std::size_t index = 0; index < instructions.size(); ++index) {
     const PcoInstruction &instruction = instructions[index];
+    if (instruction.integer_signed)
+      ExecuteError("integer signedness flag is native-task-only");
     if (instruction.group_index != index)
       ExecuteError("decoded groups are not contiguous and ordered");
     if (instruction.binary_offset >= summary.binary_size ||
@@ -7053,6 +7166,10 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
     case PcoOpcode::kUvsWrite:
     case PcoOpcode::kUvsWriteEmitEndTask:
     case PcoOpcode::kUvsEmitEndTask:
+    case PcoOpcode::kUvsEmit:
+    case PcoOpcode::kUvsCut:
+    case PcoOpcode::kUvsEmitCut:
+    case PcoOpcode::kUvsEndTask:
     case PcoOpcode::kBufferLoad:
     case PcoOpcode::kBufferStore:
     case PcoOpcode::kDiscard:
@@ -7139,6 +7256,8 @@ std::uint32_t EvaluatePcoAluInstruction(const PcoInstruction &i,
     const std::array<std::uint32_t, 4> &s, std::uint8_t repeat,
     const std::array<std::uint32_t, 3> &p0,
     const std::array<std::uint32_t, 3> &p1) {
+  if (!HasCanonicalNativeIntegerSignedness(i))
+    ExecuteError("integer signedness flag is not canonical for the native opcode");
   const auto a = ComputeAluSource(i, s[0], 0);
   const auto b = ComputeAluSource(i, s[1], 1);
   const auto c = ComputeAluSource(i, s[2], 2);
@@ -7153,15 +7272,32 @@ std::uint32_t EvaluatePcoAluInstruction(const PcoInstruction &i,
     return IntegerSourceModifier(s[0], i.source0_integer_absolute, i.source0_integer_negate) *
            IntegerSourceModifier(s[1], i.source1_integer_absolute, i.source1_integer_negate) +
            IntegerSourceModifier(s[2], i.source2_integer_absolute, false);
-  case PcoOpcode::kIntegerMultiplyAdd64High:
-    return static_cast<std::uint32_t>((static_cast<std::uint64_t>(s[0]) * s[1] +
-        s[2] + (static_cast<std::uint64_t>(s[3]) << 32)) >> 32);
+  case PcoOpcode::kIntegerMultiplyAdd64High: {
+    // Signed 32x32 multiplication differs from the unsigned bit-product by
+    // one high-word correction per negative input. Do the full multiply-add
+    // modulo 2^64, including the explicit s3:s2 addend, without signed C++
+    // overflow or implementation-defined unsigned-to-signed conversions.
+    std::uint64_t product = static_cast<std::uint64_t>(s[0]) * s[1];
+    if (i.integer_signed) {
+      if (s[0] & UINT32_C(0x80000000))
+        product -= static_cast<std::uint64_t>(s[1]) << 32;
+      if (s[1] & UINT32_C(0x80000000))
+        product -= static_cast<std::uint64_t>(s[0]) << 32;
+    }
+    return static_cast<std::uint32_t>((product + s[2] +
+        (static_cast<std::uint64_t>(s[3]) << 32)) >> 32);
+  }
   case PcoOpcode::kBitwiseAnd: return s[0] & s[1];
   case PcoOpcode::kBitwiseOr: return s[0] | s[1];
   case PcoOpcode::kBitwiseXor: return s[0] ^ s[1];
   case PcoOpcode::kBitwiseXnor: return ~(s[0] ^ s[1]);
   case PcoOpcode::kShiftLeft: return s[0] << (s[1] & 31);
-  case PcoOpcode::kShiftRight: return s[0] >> (s[1] & 31);
+  case PcoOpcode::kShiftRight: {
+    const unsigned count = s[1] & 31U;
+    const std::uint32_t shifted = s[0] >> count;
+    return i.integer_signed && count && (s[0] & UINT32_C(0x80000000))
+        ? shifted | (UINT32_MAX << (32U - count)) : shifted;
+  }
   case PcoOpcode::kBitfieldExtractUnsigned:
     return (s[0] >> (s[1] & 31)) & ((UINT32_C(1) << (s[2] & 31)) - 1);
   case PcoOpcode::kBitfieldExtractSigned:
@@ -7236,7 +7372,7 @@ PcoDecodedProgram DecodeComputePcoProgram(const std::vector<std::uint8_t> &binar
     if (out.summary.ends_task) DecodeError(offset, "bytes follow compute END");
     if (out.instructions.size() > UINT16_MAX) DecodeError(offset, "too many compute groups");
     const auto header = DecodeHeader(binary, offset, true);
-    auto instruction = DecodeComputeGroup(binary, header,
+    auto instruction = DecodeNativeTaskGroup(ShaderStage::kCompute, binary, header,
                             static_cast<std::uint16_t>(out.instructions.size()));
     instruction.exec_cnd = header.exec_cnd;
     instruction.end_group = header.end;
@@ -7269,9 +7405,126 @@ PcoDecodedProgram DecodeComputePcoProgram(const std::vector<std::uint8_t> &binar
   return out;
 }
 
+PcoDecodedProgram DecodeGeometryPcoProgram(const std::vector<std::uint8_t> &binary) {
+  if (binary.empty()) DecodeError(0, "empty geometry binary");
+  PcoDecodedProgram out;
+  out.summary.stage = ShaderStage::kGeometry;
+  out.summary.binary_size = CheckedU32(binary.size(), "geometry binary size");
+  std::vector<std::size_t> offsets;
+  for (std::size_t offset = 0; offset < binary.size();) {
+    if (out.summary.ends_task) DecodeError(offset, "bytes follow geometry ENDTASK");
+    if (out.instructions.size() > UINT16_MAX)
+      DecodeError(offset, "too many geometry instruction groups");
+    const auto header = DecodeHeader(binary, offset, true);
+    auto instruction = DecodeNativeRasterTaskGroup(ShaderStage::kGeometry, binary, header,
+        static_cast<std::uint16_t>(out.instructions.size()));
+    instruction.exec_cnd = header.exec_cnd;
+    instruction.end_group = header.end;
+    if (instruction.target == PcoWriteTarget::kPixelOutput)
+      DecodeError(offset, "geometry program writes fragment PIXOUT");
+    if (instruction.target == PcoWriteTarget::kVertexOutput) {
+      for (unsigned i = 0; i < instruction.repeat_count; ++i)
+        out.summary.vertex_output_mask |= UINT64_C(1) << (instruction.output_index + i);
+    }
+    if (header.end) {
+      if (instruction.opcode != PcoOpcode::kUvsEndTask &&
+          instruction.opcode != PcoOpcode::kUvsEmitEndTask &&
+          instruction.opcode != PcoOpcode::kUvsWriteEmitEndTask)
+        DecodeError(offset, "geometry END is not native UVSW ENDTASK");
+      out.summary.ends_task = 1;
+    }
+    offsets.push_back(offset);
+    out.instructions.push_back(instruction);
+    offset += header.total_bytes;
+  }
+  if (!out.summary.ends_task) DecodeError(binary.size(), "geometry has no native ENDTASK");
+  for (std::size_t index = 0; index < out.instructions.size(); ++index) {
+    auto &instruction = out.instructions[index];
+    if (instruction.opcode != PcoOpcode::kBranch) continue;
+    std::int32_t relative;
+    std::memcpy(&relative, &instruction.immediate, sizeof(relative));
+    const auto target = static_cast<std::int64_t>(offsets[index]) + relative;
+    if (target < 0 || static_cast<std::uint64_t>(target) >= binary.size())
+      DecodeError(offsets[index], "geometry branch leaves binary");
+    const auto found = std::lower_bound(offsets.begin(), offsets.end(),
+                                        static_cast<std::size_t>(target));
+    if (found == offsets.end() || *found != static_cast<std::size_t>(target))
+      DecodeError(offsets[index], "geometry branch does not name a group boundary");
+    instruction.branch_target_index = static_cast<std::uint16_t>(found - offsets.begin());
+  }
+  out.summary.group_count = CheckedU32(out.instructions.size(), "geometry group count");
+  out.summary.instruction_count = out.summary.group_count;
+  return out;
+}
+
+PcoDecodedProgram DecodeTessellationPcoProgram(
+    ShaderStage stage, const std::vector<std::uint8_t> &binary) {
+  const bool control = stage == ShaderStage::kTessellationControl;
+  if (!control && stage != ShaderStage::kTessellationEvaluation)
+    DecodeError(0, "tessellation decoder requires a real TCS or TES stage");
+  if (binary.empty()) DecodeError(0, "empty tessellation binary");
+  PcoDecodedProgram out;
+  out.summary.stage = stage;
+  out.summary.binary_size = CheckedU32(binary.size(), "tessellation binary size");
+  std::vector<std::size_t> offsets;
+  for (std::size_t offset = 0; offset < binary.size();) {
+    if (out.summary.ends_task) DecodeError(offset, "bytes follow tessellation END");
+    if (out.instructions.size() > UINT16_MAX)
+      DecodeError(offset, "too many tessellation instruction groups");
+    const auto header = DecodeHeader(binary, offset, true);
+    const auto index = static_cast<std::uint16_t>(out.instructions.size());
+    auto instruction = control ? DecodeNativeTaskGroup(stage, binary, header, index) :
+        DecodeNativeRasterTaskGroup(stage, binary, header, index);
+    instruction.exec_cnd = header.exec_cnd;
+    instruction.end_group = header.end;
+    if (instruction.target == PcoWriteTarget::kPixelOutput ||
+        (control && instruction.target == PcoWriteTarget::kVertexOutput))
+      DecodeError(offset, "tessellation stage writes an invalid graphics target");
+    if (instruction.target == PcoWriteTarget::kVertexOutput)
+      for (unsigned component = 0; component < instruction.repeat_count; ++component) {
+        const auto output = instruction.output_index + component;
+        if (output >= kPcoVertexOutputCount)
+          DecodeError(offset, "TES UVSW exceeds its output file");
+        out.summary.vertex_output_mask |= UINT64_C(1) << output;
+      }
+    if (header.end) {
+      if ((control && instruction.opcode != PcoOpcode::kNop) ||
+          (!control && instruction.opcode != PcoOpcode::kUvsEmitEndTask &&
+           instruction.opcode != PcoOpcode::kUvsWriteEmitEndTask))
+        DecodeError(offset, "TCS requires NOP.end; TES requires native UVSW emit/endtask");
+      out.summary.ends_task = 1;
+    }
+    offsets.push_back(offset);
+    out.instructions.push_back(instruction);
+    offset += header.total_bytes;
+  }
+  if (!out.summary.ends_task) DecodeError(binary.size(), "tessellation has no native END");
+  for (std::size_t index = 0; index < out.instructions.size(); ++index) {
+    auto &instruction = out.instructions[index];
+    if (instruction.opcode != PcoOpcode::kBranch) continue;
+    std::int32_t relative;
+    std::memcpy(&relative, &instruction.immediate, sizeof(relative));
+    const auto target = static_cast<std::int64_t>(offsets[index]) + relative;
+    if (target < 0 || static_cast<std::uint64_t>(target) >= binary.size())
+      DecodeError(offsets[index], "tessellation branch leaves binary");
+    const auto found = std::lower_bound(offsets.begin(), offsets.end(),
+                                        static_cast<std::size_t>(target));
+    if (found == offsets.end() || *found != static_cast<std::size_t>(target))
+      DecodeError(offsets[index], "tessellation branch is not a group boundary");
+    instruction.branch_target_index = static_cast<std::uint16_t>(found - offsets.begin());
+  }
+  out.summary.group_count = CheckedU32(out.instructions.size(), "tessellation group count");
+  out.summary.instruction_count = out.summary.group_count;
+  return out;
+}
+
 PcoDecodedProgram DecodePcoProgram(ShaderStage stage,
                                    const std::vector<std::uint8_t> &binary) {
   if (stage == ShaderStage::kCompute) return DecodeComputePcoProgram(binary);
+  if (stage == ShaderStage::kGeometry) return DecodeGeometryPcoProgram(binary);
+  if (stage == ShaderStage::kTessellationControl ||
+      stage == ShaderStage::kTessellationEvaluation)
+    return DecodeTessellationPcoProgram(stage, binary);
   if (stage != ShaderStage::kVertex && stage != ShaderStage::kFragment)
     DecodeError(0, "invalid shader stage");
   if (binary.empty())
@@ -8642,6 +8895,13 @@ PcoFragmentExecution ExecuteFragmentPco(
       ExecuteError("fragment dynamic instruction count overflow");
     }
     ++result.executed_instruction_count;
+
+    if (instruction.opcode == PcoOpcode::kNop) {
+      // Validation guarantees an operand-free final native control group.
+      // It ends execution without synthesizing color, depth, or a discard.
+      ++pc;
+      continue;
+    }
 
     /* Only MOVI carries an encoded immediate.  Executing an instruction whose
      * metadata contradicts its opcode would silently compute something the

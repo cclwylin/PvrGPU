@@ -48,11 +48,13 @@ static_assert(kFillTexNearestSharedDwordCount ==
  * render target declared.  Every target takes its own run of four outputs --
  * the first at pixout0, the second at pixout4 -- so a shader writing two vec3
  * attachments is expected to write 0x77, not 0x07.  Four lanes is the default
- * only when nothing was declared at all; requiring PIXOUT0..3 outright
- * rejected every shader whose output is narrower than a vec4.
+ * only for legacy callers when nothing was declared at all. GS-linked
+ * pipelines describe their actual outputs explicitly, including none.
+ * Requiring PIXOUT0..3 outright rejected narrower or empty exports.
  */
 inline std::uint32_t ExpectedPixelOutputMask(
-    const std::array<std::uint32_t, 8> &declared_by_target) {
+    const std::array<std::uint32_t, 8> &declared_by_target,
+    bool allow_empty = false) {
   std::uint32_t expected = 0;
   for (std::size_t target = 0;
        target < declared_by_target.size() &&
@@ -60,7 +62,7 @@ inline std::uint32_t ExpectedPixelOutputMask(
        ++target) {
     expected |= declared_by_target[target] << (4U * target);
   }
-  return expected != 0 ? expected : 0x0fU;
+  return expected != 0 || allow_empty ? expected : 0x0fU;
 }
 
 struct PipelineState {
@@ -89,6 +91,30 @@ struct PipelineState {
   PoolHandle vertex_indices;
   PoolHandle vertex_lanes;
   PoolHandle vertex_lane_refs;
+  // GS inputs retain complete API primitives (including adjacency). Native
+  // emission produces new lanes and explicit primitive identities; neither
+  // is inferred from a VS lane's single emitted flag.
+  PoolHandle geometry_input_primitives;
+  PoolHandle geometry_primitives;
+  PoolHandle geometry_code;
+  PoolHandle geometry_instructions;
+  PoolHandle geometry_shared_registers;
+  PoolHandle geometry_uniform_buffer_resources;
+  PoolHandle tessellation_state;
+  std::uint32_t tessellation_output_dwords = 0;
+  DriverPcoStageAbi geometry_pco_abi;
+  PcoProgramSummary geometry_program_summary;
+  std::uint64_t geometry_input_buffer_gpu_address = 0;
+  std::uint32_t geometry_input_primitive_vertices = 0;
+  PrimitiveTopology geometry_output_topology = PrimitiveTopology::kPoints;
+  std::uint32_t geometry_max_vertices = 0;
+  std::uint32_t geometry_invocations = 0;
+  std::uint32_t geometry_input_stride_dwords = 0;
+  std::uint32_t geometry_vertices_per_instance = 0;
+  std::uint32_t geometry_layer_output_start = 0;
+  std::uint32_t geometry_layer_output_count = 0;
+  std::uint32_t geometry_primitive_id_output_start = 0;
+  std::uint32_t geometry_primitive_id_output_count = 0;
   // One source vertex index per entry in the expanded vertex buffer, set when
   // the submitter expanded a strip, fan, line or point topology into a
   // triangle list. Vertex fetch reuses a single shading lane per distinct

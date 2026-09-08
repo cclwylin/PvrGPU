@@ -9,8 +9,8 @@
 extern "C" {
 #endif
 
-/* API-v22 transports per-draw multisample alpha operations. */
-#define PVRGPU_SYSTEMC_API_VERSION 23u
+/* API-v25 adds independent native TCS/fixed tessellator/TES transport. */
+#define PVRGPU_SYSTEMC_API_VERSION 25u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE 15u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES (64u * 1024u)
 /*
@@ -70,6 +70,42 @@ enum pvrgpu_systemc_pco_texture_source {
 enum pvrgpu_systemc_pco_shader_stage {
    PVRGPU_SYSTEMC_PCO_SHADER_STAGE_VERTEX = 0,
    PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT = 1,
+   PVRGPU_SYSTEMC_PCO_SHADER_STAGE_GEOMETRY = 2,
+   PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_CONTROL = 3,
+   PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION = 4,
+};
+
+/* Immutable patch pipeline. Domain: triangles=0, quads=1, isolines=2;
+ * spacing: equal=0, fractional_even=1, fractional_odd=2.
+ * Native TCS SH0..3=input descriptor, SH4..7=output descriptor; TES SH0..3
+ * reads that output. UBO descriptors follow; addresses are model-relocated.
+ * Output patch storage begins with outer[4], inner[2] then patch varyings,
+ * followed by output_vertices AoS records. No tessellation result is input. */
+#define PVRGPU_SYSTEMC_MAX_TESSELLATION_PATCHES 4096u
+#define PVRGPU_SYSTEMC_MAX_TESSELLATION_INPUT_VERTICES (4096u * 32u)
+struct pvrgpu_systemc_tessellation {
+   const uint8_t *control_pco;
+   size_t control_pco_size;
+   const uint32_t *control_shared;
+   uint32_t control_shared_count;
+   struct pvrgpu_systemc_pco_stage_abi control_abi;
+   const uint8_t *evaluation_pco;
+   size_t evaluation_pco_size;
+   const uint32_t *evaluation_shared;
+   uint32_t evaluation_shared_count;
+   struct pvrgpu_systemc_pco_stage_abi evaluation_abi;
+   uint32_t input_vertices;
+   uint32_t output_vertices;
+   uint32_t vertices_per_instance;
+   uint32_t input_stride_dwords;
+   uint32_t output_vertex_stride_dwords;
+   uint32_t per_vertex_offset_dwords;
+   uint32_t patch_stride_dwords;
+   uint32_t control_barrier_count;
+   uint32_t domain;
+   uint32_t spacing;
+   uint32_t clockwise;
+   uint32_t point_mode;
 };
 
 /* Immutable snapshot of the bound range, not the whole Gallium buffer.
@@ -422,6 +458,27 @@ struct pvrgpu_systemc_driver_command {
    uint32_t alpha_to_coverage;
    uint32_t alpha_to_coverage_dither;
    uint32_t alpha_to_one;
+   /* API-v24: optional immutable GS executable and stage-local SHARED bank.
+    * SHARED0..3 is the primitive-input descriptor, relocated by the GS module.
+    * Output primitive uses Gallium topology values: points=0, line_strip=3,
+    * triangle_strip=5. Inputs are not expanded into triangles before GS. */
+   const uint8_t *geometry_pco;
+   size_t geometry_pco_size;
+   const uint32_t *geometry_shared;
+   uint32_t geometry_shared_count;
+   struct pvrgpu_systemc_pco_stage_abi geometry_pco_abi;
+   uint32_t geometry_input_primitive_vertices;
+   uint32_t geometry_output_primitive;
+   uint32_t geometry_max_vertices;
+   uint32_t geometry_invocations;
+   uint32_t geometry_input_stride_dwords;
+   uint32_t geometry_vertices_per_instance;
+   uint32_t geometry_layer_output_start;
+   uint32_t geometry_layer_output_count;
+   uint32_t geometry_primitive_id_output_start;
+   uint32_t geometry_primitive_id_output_count;
+   /* API-v25: null means no patch pipeline; payload is deep-copied. */
+   const struct pvrgpu_systemc_tessellation *tessellation;
 };
 
 struct pvrgpu_systemc_submit_info {
@@ -431,6 +488,8 @@ struct pvrgpu_systemc_submit_info {
    const char *stderr_path;
    const char *outdir;
    const char *memory_mode;
+   /* Driver ownership token, not a primitive count or expected result. */
+   uint64_t submission_generation;
 };
 
 typedef int (*pvrgpu_systemc_submit_driver_command_fn)(
@@ -487,6 +546,27 @@ typedef int (*pvrgpu_systemc_flush_readback_fn)(
    struct pvrgpu_systemc_readback_info *readback,
    char *error,
    size_t error_size);
+
+/* Flush only the requested submission and return its actual physical stage
+ * counters. Repeated reads are idempotent; a different generation is an error,
+ * so one context cannot consume another context's last completed draw. */
+struct pvrgpu_systemc_graphics_stats {
+   uint32_t version;
+   uint64_t submission_generation;
+   uint64_t physical_submissions;
+   uint64_t primitives_generated;
+   uint64_t ia_primitives;
+   uint64_t gs_primitives;
+   uint64_t gs_invocations;
+};
+
+typedef int (*pvrgpu_systemc_flush_graphics_stats_fn)(
+   struct pvrgpu_systemc_graphics_stats *stats,
+   char *error, size_t error_size);
+
+int pvrgpu_systemc_flush_graphics_stats(
+   struct pvrgpu_systemc_graphics_stats *stats,
+   char *error, size_t error_size);
 
 /*
  * Ask the model whether it can execute a compiled PCO binary.

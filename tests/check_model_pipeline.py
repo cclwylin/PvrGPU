@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -24,6 +25,25 @@ SLC_LINE_BYTES = 128
 # fragment group because primitive interpolation state differs.
 USC_GROUP_COUNT = 1 + 323
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def verify_tessellation_stage_connections() -> None:
+    """Structural wiring is checked separately from runtime image evidence."""
+    source = (Path(__file__).resolve().parents[1] / "model_stub" / "pvrgpu_model_stub.cpp").read_text()
+    stages = ("vertex_cluster", "tessellation_control_shader", "tessellator",
+              "tessellation_evaluation_shader", "geometry_shader", "clip_cull")
+    channels = []
+    for producer, consumer in zip(stages, stages[1:]):
+        output = re.search(rf"\b{producer}\.output\((\w+)\);", source)
+        input_ = re.search(rf"\b{consumer}\.input\((\w+)\);", source)
+        assert output and input_, f"missing native stage connection {producer} -> {consumer}"
+        assert output.group(1) == input_.group(1), f"disconnected native stages {producer} -> {consumer}"
+        channel = output.group(1)
+        assert re.search(rf"sc_core::sc_fifo<PipelineTxn>\s+{channel}\s*\{{[^}}]*ModelFifoDepth\(\)", source), (
+            f"{producer} -> {consumer} must use a profile-bounded handle FIFO"
+        )
+        channels.append(channel)
+    assert len(set(channels)) == len(channels), "native stages cannot alias their upstream/downstream FIFO"
 
 STAGE_COUNTERS = (
     "vdm_cycles",
@@ -4093,6 +4113,28 @@ def verify_fill_tex_trilinear_linear_04_or_05(
         assert values.get(field) == expected, (
             f"{case_name}: {field}={values.get(field)!r}, expected {expected}"
         )
+    expected_values.update({field: 0 for field in (
+        "gs_alu_instructions", "gs_memory_instructions", "gs_load_instructions",
+        "gs_emitted_vertices", "gs_input_write_bytes", "gs_input_read_bytes",
+        "tcs_invocations",
+        "tcs_alu_instructions",
+        "tcs_memory_instructions",
+        "tcs_load_instructions",
+        "tcs_store_instructions",
+        "tcs_input_write_bytes",
+        "tcs_input_read_bytes",
+        "tcs_output_write_bytes",
+        "tcs_output_read_bytes",
+        "tes_alu_instructions",
+        "tes_memory_instructions",
+        "tes_load_instructions",
+        "tes_patch_read_bytes",
+        "tessellation_patches",
+        "tessellation_primitives",
+        "tessellation_domain_write_bytes",
+        "tessellation_domain_read_bytes",
+        "tessellation_level_read_bytes",
+    )})
     assert set(values) == set(expected_values), (
         f"{case_name}: counter fields={sorted(values)}, "
         f"expected {sorted(expected_values)}"
@@ -4196,6 +4238,7 @@ def verify_cache_bypass_options(executable: Path) -> None:
 
 
 def main() -> int:
+    verify_tessellation_stage_connections()
     if len(sys.argv) != 2:
         print(f"Usage: {sys.argv[0]} PVRGPU_MODEL", file=sys.stderr)
         return 2

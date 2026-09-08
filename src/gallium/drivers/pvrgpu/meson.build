@@ -33,6 +33,28 @@ driver_pvrgpu = declare_dependency(
 
 if with_tests
   test(
+    'pvrgpu_pco_geometry',
+    executable(
+      'pvrgpu_pco_geometry_test',
+      files('tests/pvrgpu_pco_geometry_test.c'),
+      include_directories : [inc_gallium_aux, inc_gallium, inc_imagination, inc_include, inc_src],
+      link_with : [libpvrgpu, libpowervr_compiler, libpowervr_common],
+      dependencies : [idep_nir, idep_mesautil],
+    ),
+    suite : ['compiler', 'pvrgpu'],
+  )
+  test(
+    'pvrgpu_pco_tessellation',
+    executable(
+      'pvrgpu_pco_tessellation_test',
+      files('tests/pvrgpu_pco_tessellation_test.c'),
+      include_directories : [inc_gallium_aux, inc_gallium, inc_imagination, inc_include, inc_src],
+      link_with : [libpvrgpu, libpowervr_compiler, libpowervr_common],
+      dependencies : [idep_nir, idep_mesautil],
+    ),
+    suite : ['compiler', 'pvrgpu'],
+  )
+  test(
     'pvrgpu_pco_lowering',
     executable(
       'pvrgpu_pco_lowering_test',

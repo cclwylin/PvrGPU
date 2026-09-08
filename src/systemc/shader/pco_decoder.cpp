@@ -152,7 +152,12 @@ void PcoDecoder::Run() {
 
     if (stage_ == ShaderStage::kVertex) {
       std::uint32_t expected_output_count = 4;
-      if (driver_pco_triangles) {
+      if (driver_pco_triangles && HasPoolHandle(state.tessellation_state)) {
+        expected_output_count = state.vertex_pco_abi.vertex_outputs;
+      } else if (driver_pco_triangles && HasPoolHandle(state.geometry_code)) {
+        // The VS links to the GS primitive-input buffer, not directly to FS.
+        expected_output_count = state.geometry_input_stride_dwords;
+      } else if (driver_pco_triangles) {
         /*
          * gl_PointSize occupies the outputs between the position and the
          * varyings, so the varyings start after both.  Requiring them to
@@ -198,13 +203,14 @@ void PcoDecoder::Run() {
       } else if (varying_case) {
         expected_output_count = VaryingVertexOutputDwordCount(state);
       }
-      if (expected_output_count == 0 || expected_output_count >= 64)
+      if (expected_output_count == 0 || expected_output_count > 64)
         throw std::runtime_error(
             "vertex PCO expected VTXOUT range is invalid");
       const std::uint64_t expected_output_mask =
-          (UINT64_C(1) << expected_output_count) - 1;
+          expected_output_count == 64 ? UINT64_MAX
+                                     : (UINT64_C(1) << expected_output_count) - 1;
       const std::uint64_t required_position_mask =
-          driver_pco_triangles
+          (HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state)) ? 0 : driver_pco_triangles
               ? (UINT64_C(1) << state.position_output_count) - 1
               : expected_output_mask;
       if ((decoded.summary.vertex_output_mask & required_position_mask) !=
@@ -238,7 +244,8 @@ void PcoDecoder::Run() {
        * every shader whose output is narrower than a vec4.
        */
       const std::uint32_t expected_pixel_output_mask =
-          ExpectedPixelOutputMask(state.fragment_output_mask);
+          ExpectedPixelOutputMask(state.fragment_output_mask,
+              HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state));
       if (decoded.summary.pixel_output_mask != expected_pixel_output_mask) {
         throw std::runtime_error(
             "fragment PCO pixel output mask does not match the attachment: "

@@ -4021,6 +4021,7 @@ static bool pvrgpu_color_primitive_allowed_intrinsic(nir_intrinsic_op op)
  */
 static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                                                 mesa_shader_stage expected_stage,
+                                                bool outputs_optional,
                                                 unsigned render_target_count,
                                                 uint64_t vertex_input_mask,
                                                 uint64_t varying_mask,
@@ -4051,7 +4052,8 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
          varying_slots | (nir->info.inputs_read & BITFIELD64_BIT(VARYING_SLOT_POS));
    const uint64_t expected_outputs =
       expected_stage == MESA_SHADER_VERTEX
-         ? (BITFIELD64_BIT(VARYING_SLOT_POS) | varying_slots |
+         ? (((!outputs_optional || (nir->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_POS))) ?
+             BITFIELD64_BIT(VARYING_SLOT_POS) : 0) | varying_slots |
             (writes_point_size ? BITFIELD64_BIT(VARYING_SLOT_PSIZ) : 0))
          : 0;
 
@@ -4076,7 +4078,7 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                                     BITFIELD64_BIT(FRAG_RESULT_DEPTH);
       for (unsigned target = 0; target < render_target_count; ++target)
          allowed_fs_outputs |= BITFIELD64_BIT(FRAG_RESULT_DATA0 + target);
-      if (nir->info.outputs_written == 0 ||
+      if ((!outputs_optional && nir->info.outputs_written == 0) ||
           (nir->info.outputs_written & ~allowed_fs_outputs) != 0) {
          return pvrgpu_pco_fail(error,
                                 error_size,
@@ -5063,6 +5065,1172 @@ fail:
    return false;
 }
 
+struct pvrgpu_geometry_uniform_lowering {
+   unsigned dwords;
+   char *error;
+   size_t error_size;
+   bool failed;
+};
+
+static bool
+pvrgpu_lower_geometry_dynamic_uniform(nir_builder *b,
+                                      nir_intrinsic_instr *intr, void *cb_data)
+{
+   struct pvrgpu_geometry_uniform_lowering *state = cb_data;
+   if (state->failed || intr->intrinsic != nir_intrinsic_load_uniform)
+      return false;
+   const unsigned components = intr->def.num_components;
+   const uint64_t base = nir_intrinsic_base(intr);
+   const uint64_t range = nir_intrinsic_range(intr);
+   if (intr->def.bit_size != 32 || !components || components > 4 ||
+       intr->src[0].ssa->bit_size != 32 || intr->src[0].ssa->num_components != 1) {
+      state->failed = true;
+      pvrgpu_pco_fail(state->error, state->error_size,
+                     "Geometry pipeline CB0 requires scalar 32-bit slot indices and 32-bit vec4 loads");
+      return false;
+   }
+   const bool direct = nir_src_is_const(intr->src[0]);
+   const uint64_t last_slot = direct ? base + nir_src_as_uint(intr->src[0]) :
+                                     base + (range ? range - 1 : 0);
+   if ((!direct && !range) || last_slot * 4 + components > state->dwords) {
+      state->failed = true;
+      pvrgpu_pco_fail(state->error, state->error_size,
+                     "Geometry pipeline CB0 base/range exceeds the captured DWORD span");
+      return false;
+   }
+   if (direct) return false;
+   /* Gallium non-packed uniforms use vec4 slot units for base, range and
+    * offset (nir_lower_uniforms_to_ubo uses the same 16-byte multiplier).
+    * The public PCO push-constant path requires a static shared-register
+    * index. Form a bounded native SSA selection of those actual SHARED
+    * loads instead of evaluating the shader or indexing memory on the host.
+    * OOB GLSL array access is undefined; select zero without touching any
+    * register outside the captured range. At most 64 candidate slots fit
+    * in the existing 256-DWORD CB0 ABI. All scalar/vector bits are preserved.
+    */
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *index = intr->src[0].ssa;
+   nir_def *selected = nir_imm_zero(b, components, 32);
+   for (unsigned slot = 0; slot < range; ++slot) {
+      nir_def *candidate = nir_load_uniform(b, components, 32,
+         nir_imm_int(b, slot), .base = base, .range = range,
+         .access = nir_intrinsic_access(intr),
+         .dest_type = nir_intrinsic_dest_type(intr));
+      selected = nir_bcsel(b, nir_ieq_imm(b, index, slot), candidate, selected);
+   }
+   nir_def_replace(&intr->def, selected);
+   return true;
+}
+
+static bool
+pvrgpu_lower_geometry_dynamic_uniforms(nir_shader *nir, unsigned dwords,
+                                      char *error, size_t error_size)
+{
+   struct pvrgpu_geometry_uniform_lowering state = {
+      .dwords = dwords, .error = error, .error_size = error_size,
+   };
+   nir_shader_intrinsics_pass(nir, pvrgpu_lower_geometry_dynamic_uniform,
+                             nir_metadata_control_flow, &state);
+   return !state.failed;
+}
+
+static bool
+pvrgpu_geometry_layout_valid(const struct pvrgpu_pco_geometry_layout *layout,
+                             const char *kind, char *error, size_t error_size)
+{
+   if (!layout || !layout->stride_dwords ||
+       layout->stride_dwords > PVRGPU_PCO_GEOMETRY_MAX_DWORDS)
+      return pvrgpu_pco_fail(error, error_size, "geometry %s stride exceeds 64 DWORDs", kind);
+   uint64_t used = 0;
+   for (unsigned location = 0; location < PVRGPU_PCO_GEOMETRY_LOCATIONS; ++location) {
+      const unsigned count = layout->count[location];
+      const unsigned start = layout->start[location];
+      if (!count) continue;
+      if (count > 4 || start >= layout->stride_dwords ||
+          count > layout->stride_dwords - start)
+         return pvrgpu_pco_fail(error, error_size,
+                               "geometry %s location %u has invalid component range", kind, location);
+      const uint64_t mask = BITFIELD64_MASK(count) << start;
+      if (used & mask)
+         return pvrgpu_pco_fail(error, error_size,
+                               "geometry %s location %u overlaps another location", kind, location);
+      used |= mask;
+   }
+   return true;
+}
+
+static bool
+pvrgpu_validate_geometry_nir(const nir_shader *nir, char *error, size_t error_size)
+{
+   if (!nir || nir->info.stage != MESA_SHADER_GEOMETRY)
+      return pvrgpu_pco_fail(error, error_size, "geometry requires a genuine GS NIR stage");
+   if (nir->info.gs.vertices_out > 256 ||
+       !nir->info.gs.invocations || nir->info.gs.invocations > 32 ||
+       !nir->info.gs.vertices_in || nir->info.gs.vertices_in > 6)
+      return pvrgpu_pco_fail(error, error_size, "geometry vertex/invocation limits are unsupported");
+   if (nir->info.gs.output_primitive != MESA_PRIM_POINTS &&
+       nir->info.gs.output_primitive != MESA_PRIM_LINE_STRIP &&
+       nir->info.gs.output_primitive != MESA_PRIM_TRIANGLE_STRIP)
+      return pvrgpu_pco_fail(error, error_size, "geometry output primitive is unsupported");
+   if (nir->info.gs.active_stream_mask & ~1u)
+      return pvrgpu_pco_fail(error, error_size, "geometry only supports vertex stream zero");
+   if (nir->info.num_textures || nir->info.num_images || nir->info.num_ssbos ||
+       nir->info.shared_size || nir->scratch_size || nir->info.num_ubos > 15)
+      return pvrgpu_pco_fail(error, error_size,
+         "geometry texture/image/SSBO/shared/scratch resources are not implemented");
+   unsigned functions = 0;
+   nir_foreach_function_impl(impl, (nir_shader *)nir) {
+      if (!impl->function->is_entrypoint || ++functions != 1)
+         return pvrgpu_pco_fail(error, error_size, "geometry requires one lowered entrypoint");
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            switch (instr->type) {
+            case nir_instr_type_alu:
+            case nir_instr_type_deref:
+            case nir_instr_type_load_const:
+            case nir_instr_type_undef:
+            case nir_instr_type_phi:
+            case nir_instr_type_jump:
+               break;
+            case nir_instr_type_intrinsic: {
+               const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               switch (intr->intrinsic) {
+               case nir_intrinsic_load_deref:
+               case nir_intrinsic_store_deref:
+               case nir_intrinsic_copy_deref:
+               case nir_intrinsic_load_per_vertex_input:
+               case nir_intrinsic_store_output:
+               case nir_intrinsic_load_uniform:
+               case nir_intrinsic_load_ubo:
+               case nir_intrinsic_get_ubo_size:
+               case nir_intrinsic_load_primitive_id:
+               case nir_intrinsic_load_invocation_id:
+                  break;
+               case nir_intrinsic_emit_vertex:
+               case nir_intrinsic_end_primitive:
+                  if (!nir_intrinsic_stream_id(intr)) break;
+                  return pvrgpu_pco_fail(error, error_size, "geometry emits a nonzero vertex stream");
+               default:
+                  return pvrgpu_pco_fail(error, error_size,
+                     "geometry NIR intrinsic is not implemented: %s",
+                     nir_intrinsic_infos[intr->intrinsic].name);
+               }
+               break;
+            }
+            default:
+               return pvrgpu_pco_fail(error, error_size,
+                  "geometry NIR instruction type %u is not implemented", instr->type);
+            }
+         }
+      }
+   }
+   return functions == 1 || pvrgpu_pco_fail(error, error_size, "geometry has no entrypoint");
+}
+
+struct pvrgpu_geometry_io_lowering {
+   const struct pvrgpu_pco_geometry_layout *input;
+   const struct pvrgpu_pco_geometry_layout *output;
+   char *error;
+   size_t error_size;
+   bool failed;
+};
+
+static unsigned
+pvrgpu_geometry_io_type_size(const struct glsl_type *type, bool bindless)
+{
+   (void)bindless;
+   return glsl_count_attribute_slots(type, false);
+}
+
+static bool
+pvrgpu_lower_geometry_io(nir_builder *b, nir_intrinsic_instr *intr, void *cb_data)
+{
+   struct pvrgpu_geometry_io_lowering *state = cb_data;
+   if (state->failed) return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   if (intr->intrinsic == nir_intrinsic_load_primitive_id ||
+       intr->intrinsic == nir_intrinsic_load_invocation_id) {
+      const unsigned slot = intr->intrinsic == nir_intrinsic_load_primitive_id
+                               ? PVRGPU_PCO_GEOMETRY_PRIMITIVE_ID_INPUT
+                               : PVRGPU_PCO_GEOMETRY_INVOCATION_ID_INPUT;
+      nir_def_replace(&intr->def, nir_load_vtxin_pco(b, 1, nir_imm_int(b, slot)));
+      return true;
+   }
+   const bool load = intr->intrinsic == nir_intrinsic_load_per_vertex_input;
+   if (!load && intr->intrinsic != nir_intrinsic_store_output) return false;
+   const struct pvrgpu_pco_geometry_layout *layout = load ? state->input : state->output;
+   const unsigned component = nir_intrinsic_component(intr);
+   const nir_def *value = load ? &intr->def : intr->src[0].ssa;
+   const unsigned location = nir_intrinsic_io_semantics(intr).location;
+   /* Location offsets remaining after indirect-IO legalization are vec4
+    * slots, while components within the mapped slot are DWORDs. */
+   if (!nir_src_is_const(intr->src[1]) || value->bit_size != 32 ||
+       !value->num_components || value->num_components > 4) {
+      state->failed = true;
+      pvrgpu_pco_fail(state->error, state->error_size,
+                     "geometry IO requires static locations and 32-bit vec4 components");
+      return false;
+   }
+   const uint64_t slot64 = (uint64_t)location + nir_src_as_uint(intr->src[1]);
+   if (slot64 >= PVRGPU_PCO_GEOMETRY_LOCATIONS ||
+       component >= layout->count[slot64] ||
+       value->num_components > layout->count[slot64] - component) {
+      state->failed = true;
+      pvrgpu_pco_fail(state->error, state->error_size,
+                     "geometry %s location %llu component %u has no linked range",
+                     load ? "input" : "output", (unsigned long long)slot64, component);
+      return false;
+   }
+   const unsigned start = layout->start[slot64] + component;
+   if (!load) {
+      const unsigned mask = nir_intrinsic_write_mask(intr);
+      for (unsigned c = 0; c < value->num_components; ++c) {
+         if (mask & (1u << c))
+            nir_uvsw_write_pco(b, nir_imm_int(b, start + c),
+                               nir_channel(b, intr->src[0].ssa, c));
+      }
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+   nir_def *vertex = intr->src[0].ssa;
+   if (vertex->num_components != 1 || vertex->bit_size != 32) {
+      state->failed = true;
+      pvrgpu_pco_fail(state->error, state->error_size, "geometry input vertex index is not scalar uint32");
+      return false;
+   }
+   nir_def *base = nir_load_preamble(b, 2, 32, .base = 0);
+   nir_def *offset = nir_iadd_imm(b, nir_imul_imm(b, vertex, layout->stride_dwords * 4), start * 4);
+   nir_def *lo = nir_iadd(b, nir_channel(b, base, 0), offset);
+   nir_def *carry = nir_b2i32(b, nir_ult(b, lo, nir_channel(b, base, 0)));
+   nir_def *hi = nir_iadd(b, nir_channel(b, base, 1), carry);
+   /* Out-of-range shader indices are undefined in GL. Keep memory accesses
+    * bounded anyway; both the guard and address arithmetic execute natively. */
+   nir_if *nif = nir_push_if(b, nir_ult_imm(b, vertex, b->shader->info.gs.vertices_in));
+   nir_def *loaded = nir_load_global_2x32(b, value->num_components, 32,
+      nir_vec2(b, lo, hi), .align_mul = 4, .align_offset = 0,
+      .access = ACCESS_NON_WRITEABLE);
+   nir_push_else(b, nif);
+   nir_def *zero = nir_imm_zero(b, value->num_components, 32);
+   nir_pop_if(b, nif);
+   nir_def_replace(&intr->def, nir_if_phi(b, loaded, zero));
+   return true;
+}
+
+void
+pvrgpu_pco_geometry_binary_finish(struct pvrgpu_pco_geometry_binary *binary)
+{
+   if (!binary) return;
+   free(binary->shader.data);
+   memset(binary, 0, sizeof(*binary));
+}
+
+void
+pvrgpu_pco_geometry_pipeline_binary_finish(struct pvrgpu_pco_geometry_pipeline_binary *binary)
+{
+   if (!binary) return;
+   pvrgpu_pco_graphics_binary_finish(&binary->graphics);
+   pvrgpu_pco_geometry_binary_finish(&binary->geometry);
+   memset(binary, 0, sizeof(*binary));
+}
+
+bool
+pvrgpu_pco_compile_geometry(struct pvrgpu_pco_compiler *compiler,
+                           const struct nir_shader *geometry_nir,
+                           const struct pvrgpu_pco_geometry_layout *input_layout,
+                           const struct pvrgpu_pco_geometry_layout *output_layout,
+                           unsigned uniform_dwords,
+                           struct pvrgpu_pco_geometry_binary *out,
+                           char *error, size_t error_size)
+{
+   if (error && error_size) error[0] = '\0';
+   if (!out) return pvrgpu_pco_fail(error, error_size, "missing geometry binary output");
+   memset(out, 0, sizeof(*out));
+#ifndef PCO_HAS_GEOMETRY_SHADER
+   return pvrgpu_pco_fail(error, error_size, "PCO requires the native Geometry stage patch");
+#else
+   if (!compiler || !compiler->pco || uniform_dwords > 256 ||
+       !pvrgpu_validate_geometry_nir(geometry_nir, error, error_size) ||
+       !pvrgpu_geometry_layout_valid(input_layout, "input", error, error_size) ||
+       !pvrgpu_geometry_layout_valid(output_layout, "output", error, error_size))
+      return false;
+   void *mem = ralloc_context(compiler->mem_ctx);
+   nir_shader *nir = mem ? nir_shader_clone(mem, geometry_nir) : NULL;
+   if (!nir) {
+      ralloc_free(mem);
+      return pvrgpu_pco_fail(error, error_size, "allocating Geometry NIR clone");
+   }
+   nir->options = &compiler->nir_options;
+   nir->info.internal = false;
+   /* Legalize the real per-vertex array before the generic PCO IO-to-temp
+    * pass. Otherwise that pass first copies the complete primitive array
+    * into function temporaries and its 8-byte scratch threshold spills a
+    * dynamically indexed gl_in, despite the source already living in a
+    * read-only primitive buffer. No Geometry scratch backing is assumed. */
+   NIR_PASS(_, nir, nir_lower_system_values);
+   NIR_PASS(_, nir, nir_split_var_copies);
+   NIR_PASS(_, nir, nir_lower_var_copies);
+   NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
+            pvrgpu_geometry_io_type_size, nir_lower_io_lower_64bit_to_32);
+   struct pvrgpu_geometry_io_lowering io = {
+      .input = input_layout, .output = output_layout,
+      .error = error, .error_size = error_size,
+   };
+   nir_shader_intrinsics_pass(nir, pvrgpu_lower_geometry_io, nir_metadata_none, &io);
+   if (io.failed) goto fail;
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_in | nir_var_shader_out, NULL);
+   pvrgpu_pco_preprocess_nir(compiler, nir);
+   if (nir->scratch_size || nir->info.shared_size) {
+      pvrgpu_pco_fail(error, error_size, "geometry preprocessing requires unimplemented scratch/shared memory");
+      goto fail;
+   }
+   if (!pvrgpu_lower_geometry_dynamic_uniforms(nir, uniform_dwords, error, error_size))
+      goto fail;
+   const unsigned uniform_loads = pvrgpu_count_uniform_loads(nir);
+   if (uniform_loads && !pvrgpu_lower_uniform_slots_to_push_constants(
+          nir, uniform_dwords, uniform_loads, "geometry", error, error_size)) goto fail;
+   pco_data data = {0};
+   data.common.shareds = 4;
+   data.common.vtxins = 2;
+   if (!pvrgpu_lower_generic_uniform_buffers(nir, &data, 4, mem, error, error_size)) goto fail;
+   const unsigned prefix = 4 + 4 * nir->info.num_ubos;
+   if (prefix + (uniform_loads ? uniform_dwords : 0) > 256) {
+      pvrgpu_pco_fail(error, error_size, "geometry descriptors and CB0 exceed 256 shared DWORDs");
+      goto fail;
+   }
+   if (getenv("PVRGPU_DEBUG_PCO_NIR")) {
+      fprintf(stderr, "=== pvrgpu: genuine Geometry NIR before native lowering ===\n");
+      nir_print_shader(nir, stderr);
+   }
+   pco_lower_nir(compiler->pco, nir, &data);
+   pco_postprocess_nir(compiler->pco, nir, &data);
+   data.common.push_consts.range = (pco_range){
+      .start = prefix, .count = uniform_loads ? uniform_dwords : 0,
+   };
+   data.common.shareds = prefix + data.common.push_consts.range.count;
+   if (nir->info.stage != MESA_SHADER_GEOMETRY || nir->scratch_size ||
+       data.common.scratch || data.common.push_consts.used > data.common.push_consts.range.count) {
+      pvrgpu_pco_fail(error, error_size, "geometry lowering exceeded its native stage/memory/CB0 ABI");
+      goto fail;
+   }
+   pco_shader *shader = pco_trans_nir(compiler->pco, nir, &data, mem);
+   if (!shader) {
+      pvrgpu_pco_fail(error, error_size, "PCO failed to translate Geometry NIR");
+      goto fail;
+   }
+   pco_process_ir(compiler->pco, shader);
+   pco_encode_ir(compiler->pco, shader);
+   const pco_data *compiled = pco_shader_data(shader);
+   if (compiled->common.temps > 256 || compiled->common.spilled_temps ||
+       compiled->common.scratch || compiled->common.shareds > 256) {
+      pvrgpu_pco_fail(error, error_size, "geometry register allocation exceeds the native ABI");
+      goto fail;
+   }
+   if (getenv("PVRGPU_DEBUG_PCO_NIR")) pco_print_shader(shader, stderr, "native Geometry");
+   if (!pvrgpu_copy_pco_stage(shader, false, &out->shader, error, error_size)) goto fail;
+   out->shader.abi.vertex_outputs = output_layout->stride_dwords;
+   out->shader.abi.uniform_buffer_descriptor_start = 4;
+   out->shader.abi.uniform_buffer_descriptor_count = geometry_nir->info.num_ubos;
+   out->abi.stage = out->shader.abi;
+   out->abi.input = *input_layout;
+   out->abi.output = *output_layout;
+   out->abi.input_primitive = geometry_nir->info.gs.input_primitive;
+   out->abi.output_primitive = geometry_nir->info.gs.output_primitive;
+   out->abi.vertices_in = geometry_nir->info.gs.vertices_in;
+   out->abi.vertices_out = geometry_nir->info.gs.vertices_out;
+   out->abi.invocations = geometry_nir->info.gs.invocations;
+   out->abi.primitive_id_input = PVRGPU_PCO_GEOMETRY_PRIMITIVE_ID_INPUT;
+   out->abi.invocation_id_input = PVRGPU_PCO_GEOMETRY_INVOCATION_ID_INPUT;
+   ralloc_free(mem);
+   return true;
+fail:
+   pvrgpu_pco_geometry_binary_finish(out);
+   ralloc_free(mem);
+   return false;
+#endif
+}
+
+static bool
+pvrgpu_geometry_type_components(const struct glsl_type *type, unsigned location,
+                                unsigned component, uint32_t counts[64],
+                                char *error, size_t error_size)
+{
+   if (location >= 64 || component > 3)
+      return pvrgpu_pco_fail(error, error_size, "geometry interface location is outside the ABI");
+   if (glsl_type_is_vector_or_scalar(type)) {
+      const unsigned count = glsl_get_components(type);
+      if (glsl_get_bit_size(type) != 32 || !count || count + component > 4)
+         return pvrgpu_pco_fail(error, error_size, "geometry interface requires 32-bit vec4 slots");
+      counts[location] = MAX2(counts[location], count + component);
+      return true;
+   }
+   if (component)
+      return pvrgpu_pco_fail(error, error_size, "geometry aggregate interface has a component offset");
+   if (glsl_type_is_matrix(type)) {
+      const unsigned columns = glsl_get_matrix_columns(type);
+      const struct glsl_type *column = glsl_get_column_type(type);
+      for (unsigned i = 0; i < columns; ++i)
+         if (!pvrgpu_geometry_type_components(column, location + i, 0, counts, error, error_size)) return false;
+      return true;
+   }
+   if (glsl_type_is_array(type)) {
+      const struct glsl_type *element = glsl_get_array_element(type);
+      const unsigned slots = glsl_count_attribute_slots(element, false);
+      const unsigned length = glsl_get_length(type);
+      if (!length || !slots || length > (64 - location) / slots)
+         return pvrgpu_pco_fail(error, error_size, "geometry array interface exceeds the location ABI");
+      for (unsigned i = 0; i < length; ++i)
+         if (!pvrgpu_geometry_type_components(element, location + i * slots, 0, counts, error, error_size)) return false;
+      return true;
+   }
+   return pvrgpu_pco_fail(error, error_size, "geometry interface aggregate type is not implemented");
+}
+
+static bool
+pvrgpu_geometry_allocate_layout(nir_shader *producer,
+                                struct pvrgpu_pco_geometry_layout *layout,
+                                char *error, size_t error_size)
+{
+   memset(layout, 0, sizeof(*layout));
+   nir_foreach_shader_out_variable(var, producer) {
+      if (!pvrgpu_geometry_type_components(var->type, var->data.location,
+            var->data.location_frac, layout->count, error, error_size)) return false;
+   }
+   bool emits_vertices = false;
+   nir_foreach_function_impl(impl, producer) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_emit_vertex)
+               emits_vertices = true;
+         }
+      }
+   }
+   /* Position need not be written by a VS feeding a GS: the GS can generate
+    * its own position. A GS with no EmitVertex likewise still executes its
+    * native task and ENDTASK after DCE removes unused output variables.
+    * Reserve the ordinary ABI without adding any store or fabricated vertex.
+    * A subsequent read of an unwritten VS position remains GLSL undefined. */
+   if ((producer->info.stage == MESA_SHADER_VERTEX || !emits_vertices) &&
+       !layout->count[VARYING_SLOT_POS])
+      layout->count[VARYING_SLOT_POS] = 4;
+   if (layout->count[VARYING_SLOT_POS] != 4)
+      return pvrgpu_pco_fail(error, error_size, "geometry producer must declare gl_Position vec4");
+   const unsigned first[] = {VARYING_SLOT_POS, VARYING_SLOT_PSIZ};
+   unsigned next = 0;
+   for (unsigned i = 0; i < ARRAY_SIZE(first); ++i) {
+      layout->start[first[i]] = next;
+      next += layout->count[first[i]];
+   }
+   for (unsigned location = VARYING_SLOT_VAR0; location < 64; ++location) {
+      layout->start[location] = next;
+      next += layout->count[location];
+   }
+   const unsigned last[] = {VARYING_SLOT_PRIMITIVE_ID, VARYING_SLOT_LAYER};
+   for (unsigned i = 0; i < ARRAY_SIZE(last); ++i) {
+      if (layout->count[last[i]] > 1)
+         return pvrgpu_pco_fail(error, error_size, "geometry scalar built-in output has multiple components");
+      layout->start[last[i]] = next;
+      next += layout->count[last[i]];
+   }
+   for (unsigned location = 0; location < VARYING_SLOT_VAR0; ++location) {
+      if (location != VARYING_SLOT_POS && location != VARYING_SLOT_PSIZ &&
+          location != VARYING_SLOT_PRIMITIVE_ID && location != VARYING_SLOT_LAYER &&
+          layout->count[location])
+         return pvrgpu_pco_fail(error, error_size, "geometry built-in output location %u is not implemented", location);
+   }
+   layout->stride_dwords = next;
+   return pvrgpu_geometry_layout_valid(layout, "linked", error, error_size);
+}
+
+static bool
+pvrgpu_validate_tessellation_nir(const nir_shader *nir, mesa_shader_stage stage,
+                                 char *error, size_t error_size)
+{
+   if (!nir || nir->info.stage != stage ||
+       (stage != MESA_SHADER_TESS_CTRL && stage != MESA_SHADER_TESS_EVAL))
+      return pvrgpu_pco_fail(error, error_size, "tessellation requires genuine TCS/TES stages");
+   if ((stage == MESA_SHADER_TESS_CTRL && (!nir->info.tess.tcs_vertices_out ||
+          nir->info.tess.tcs_vertices_out > PVRGPU_PCO_TESS_MAX_VERTICES)) ||
+       nir->info.num_textures || nir->info.num_images || nir->info.num_ssbos ||
+       nir->info.shared_size || nir->scratch_size || nir->info.num_ubos > 15)
+      return pvrgpu_pco_fail(error, error_size, "tessellation vertex/resource limits are unsupported");
+   if (stage == MESA_SHADER_TESS_EVAL &&
+       (nir->info.tess._primitive_mode < TESS_PRIMITIVE_TRIANGLES ||
+        nir->info.tess._primitive_mode > TESS_PRIMITIVE_ISOLINES ||
+        nir->info.tess.spacing < TESS_SPACING_EQUAL ||
+        nir->info.tess.spacing > TESS_SPACING_FRACTIONAL_EVEN))
+      return pvrgpu_pco_fail(error, error_size, "tessellation domain/spacing is unspecified or unsupported");
+   unsigned functions = 0;
+   nir_foreach_function_impl(impl, (nir_shader *)nir) {
+      if (!impl->function->is_entrypoint || ++functions != 1)
+         return pvrgpu_pco_fail(error, error_size, "tessellation requires one lowered entrypoint");
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            switch (instr->type) {
+            case nir_instr_type_alu: case nir_instr_type_deref:
+            case nir_instr_type_load_const: case nir_instr_type_undef:
+            case nir_instr_type_phi: case nir_instr_type_jump:
+               break;
+            case nir_instr_type_intrinsic: {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               switch (intr->intrinsic) {
+               case nir_intrinsic_load_deref: case nir_intrinsic_store_deref:
+               case nir_intrinsic_copy_deref: case nir_intrinsic_load_per_vertex_input:
+               case nir_intrinsic_load_per_vertex_output:
+               case nir_intrinsic_store_per_vertex_output:
+               case nir_intrinsic_load_input: case nir_intrinsic_load_output:
+               case nir_intrinsic_store_output: case nir_intrinsic_load_uniform:
+               case nir_intrinsic_load_ubo: case nir_intrinsic_get_ubo_size:
+               case nir_intrinsic_load_primitive_id: case nir_intrinsic_load_invocation_id:
+               case nir_intrinsic_load_patch_vertices_in: case nir_intrinsic_load_tess_coord:
+               case nir_intrinsic_load_tess_level_outer: case nir_intrinsic_load_tess_level_inner:
+                  break;
+               case nir_intrinsic_barrier:
+                  if (stage == MESA_SHADER_TESS_CTRL &&
+                      nir_intrinsic_execution_scope(intr) <= SCOPE_WORKGROUP &&
+                      !(nir_intrinsic_memory_modes(intr) & ~nir_var_shader_out)) break;
+                  return pvrgpu_pco_fail(error, error_size, "tessellation barrier scope/memory modes are unsupported");
+               default:
+                  return pvrgpu_pco_fail(error, error_size, "tessellation NIR intrinsic is unsupported: %s",
+                     nir_intrinsic_infos[intr->intrinsic].name);
+               }
+               break;
+            }
+            default:
+               return pvrgpu_pco_fail(error, error_size, "tessellation instruction type %u is unsupported", instr->type);
+            }
+         }
+      }
+   }
+   return functions == 1 || pvrgpu_pco_fail(error, error_size, "tessellation has no entrypoint");
+}
+
+static bool
+pvrgpu_tessellation_allocate_patch(nir_shader *tcs,
+                                   struct pvrgpu_pco_tessellation_layout *layout,
+                                   char *error, size_t error_size)
+{
+   memset(layout, 0, sizeof(*layout));
+   uint32_t patch_counts[64] = {0};
+   nir_foreach_shader_out_variable(var, tcs) {
+      if (var->data.location == VARYING_SLOT_TESS_LEVEL_OUTER ||
+          var->data.location == VARYING_SLOT_TESS_LEVEL_INNER) continue;
+      const struct glsl_type *type = var->type;
+      unsigned location = var->data.location;
+      uint32_t *counts = layout->vertex.count;
+      if (var->data.patch) {
+         if (location < VARYING_SLOT_PATCH0 || location >= VARYING_SLOT_PATCH0 + 32)
+            return pvrgpu_pco_fail(error, error_size, "tessellation patch location is unsupported");
+         location -= VARYING_SLOT_PATCH0;
+         counts = patch_counts;
+      } else {
+         if (!glsl_type_is_array(type))
+            return pvrgpu_pco_fail(error, error_size, "TCS output must have a per-vertex array");
+         type = glsl_get_array_element(type);
+      }
+      if (!pvrgpu_geometry_type_components(type, location, var->data.location_frac,
+                                            counts, error, error_size)) return false;
+   }
+   unsigned next = 6;
+   for (unsigned i = 0; i < 32; ++i) {
+      layout->patch_start[i] = next;
+      layout->patch_count[i] = patch_counts[i];
+      next += patch_counts[i];
+   }
+   for (unsigned i = 32; i < 64; ++i)
+      if (patch_counts[i]) return pvrgpu_pco_fail(error, error_size, "tessellation patch outputs exceed 32 locations");
+   layout->per_vertex_offset_dwords = next;
+   /* Keep a bounded four-DWORD position allocation even if TCS writes no
+    * per-vertex outputs. This reserves storage, not a synthetic shader store. */
+   if (!layout->vertex.count[VARYING_SLOT_POS]) layout->vertex.count[VARYING_SLOT_POS] = 4;
+   next = 0;
+   const unsigned first[] = { VARYING_SLOT_POS, VARYING_SLOT_PSIZ };
+   for (unsigned i = 0; i < ARRAY_SIZE(first); ++i) {
+      layout->vertex.start[first[i]] = next;
+      next += layout->vertex.count[first[i]];
+   }
+   for (unsigned i = VARYING_SLOT_VAR0; i < 64; ++i) {
+      layout->vertex.start[i] = next;
+      next += layout->vertex.count[i];
+   }
+   for (unsigned i = 0; i < VARYING_SLOT_VAR0; ++i)
+      if (i != VARYING_SLOT_POS && i != VARYING_SLOT_PSIZ && layout->vertex.count[i])
+         return pvrgpu_pco_fail(error, error_size, "tessellation per-vertex built-in %u is unsupported", i);
+   layout->vertex.stride_dwords = next;
+   layout->patch_stride_dwords = layout->per_vertex_offset_dwords + next * tcs->info.tess.tcs_vertices_out;
+   return pvrgpu_geometry_layout_valid(&layout->vertex, "TCS output", error, error_size);
+}
+
+struct pvrgpu_tessellation_io_lowering {
+   const struct pvrgpu_pco_geometry_layout *input;
+   const struct pvrgpu_pco_tessellation_layout *patch;
+   const struct pvrgpu_pco_geometry_layout *output;
+   unsigned vertices_out;
+   unsigned barriers;
+   char *error;
+   size_t error_size;
+   bool failed;
+};
+
+static nir_def *
+pvrgpu_tessellation_address(nir_builder *b, unsigned descriptor, nir_def *offset)
+{
+   nir_def *base = nir_load_preamble(b, 2, 32, .base = descriptor);
+   nir_def *lo = nir_iadd(b, nir_channel(b, base, 0), offset);
+   nir_def *carry = nir_b2i32(b, nir_ult(b, lo, nir_channel(b, base, 0)));
+   return nir_vec2(b, lo, nir_iadd(b, nir_channel(b, base, 1), carry));
+}
+
+static bool
+pvrgpu_lower_tessellation_io(nir_builder *b, nir_intrinsic_instr *intr, void *cb_data)
+{
+   struct pvrgpu_tessellation_io_lowering *state = cb_data;
+   if (state->failed) return false;
+   const bool control = b->shader->info.stage == MESA_SHADER_TESS_CTRL;
+   b->cursor = nir_before_instr(&intr->instr);
+   unsigned sys_slot = ~0u;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_primitive_id: sys_slot = control ? 0 : 3; break;
+   case nir_intrinsic_load_invocation_id: if (control) sys_slot = 1; break;
+   case nir_intrinsic_load_patch_vertices_in: sys_slot = control ? 2 : 4; break;
+   case nir_intrinsic_load_tess_coord:
+      if (!control) sys_slot = 0;
+      break;
+   case nir_intrinsic_barrier:
+      ++state->barriers;
+      /* PCO's <=32-lane rule eliminates the execution rendezvous. Native
+       * patch LD/ST are volatile/coherent so optimizations cannot move them
+       * across the task's instruction-group-lockstep memory ordering. */
+      return false;
+   case nir_intrinsic_load_tess_level_outer:
+   case nir_intrinsic_load_tess_level_inner: {
+      unsigned offset = intr->intrinsic == nir_intrinsic_load_tess_level_inner ? 16 : 0;
+      nir_def *address = pvrgpu_tessellation_address(b, control ? 4 : 0, nir_imm_int(b, offset));
+      nir_def_replace(&intr->def, nir_load_global_2x32(b, intr->def.num_components, 32,
+         address, .align_mul = 4, .align_offset = 0,
+         .access = ACCESS_COHERENT | ACCESS_VOLATILE));
+      return true;
+   }
+   default: break;
+   }
+   if (sys_slot != ~0u) {
+      nir_def_replace(&intr->def, nir_load_vtxin_pco(b, intr->def.num_components,
+                                                     nir_imm_int(b, sys_slot)));
+      return true;
+   }
+   const bool load = intr->intrinsic == nir_intrinsic_load_input ||
+                     intr->intrinsic == nir_intrinsic_load_output ||
+                     intr->intrinsic == nir_intrinsic_load_per_vertex_input ||
+                     intr->intrinsic == nir_intrinsic_load_per_vertex_output;
+   const bool store = intr->intrinsic == nir_intrinsic_store_output ||
+                      intr->intrinsic == nir_intrinsic_store_per_vertex_output;
+   if (!load && !store) return false;
+   const bool vertex = intr->intrinsic == nir_intrinsic_load_per_vertex_input ||
+                       intr->intrinsic == nir_intrinsic_load_per_vertex_output ||
+                       intr->intrinsic == nir_intrinsic_store_per_vertex_output;
+   const bool input = intr->intrinsic == nir_intrinsic_load_input ||
+                      intr->intrinsic == nir_intrinsic_load_per_vertex_input;
+   const unsigned offset_src = (store ? 1 : 0) + (vertex ? 1 : 0);
+   nir_def *offset = intr->src[offset_src].ssa;
+   nir_def *index = vertex ? intr->src[store ? 1 : 0].ssa : nir_imm_int(b, 0);
+   nir_def *value = store ? intr->src[0].ssa : &intr->def;
+   const unsigned components = value->num_components;
+   const unsigned accessed_components = store ? util_last_bit(nir_intrinsic_write_mask(intr)) : components;
+   const unsigned component = nir_intrinsic_component(intr);
+   const unsigned location = nir_intrinsic_io_semantics(intr).location;
+   if (value->bit_size != 32 || !components || components > 4 || component + components > 4 ||
+       offset->bit_size != 32 || offset->num_components != 1) goto unsupported;
+   if (!control && store) {
+      if (vertex || !nir_src_is_const(intr->src[offset_src])) goto unsupported;
+      const uint64_t loc = (uint64_t)location + nir_src_as_uint(intr->src[offset_src]);
+      if (loc >= 64 || component + accessed_components > state->output->count[loc]) goto unsupported;
+      for (unsigned c = 0; c < components; ++c)
+         if (nir_intrinsic_write_mask(intr) & (1u << c))
+            nir_uvsw_write_pco(b, nir_imm_int(b, state->output->start[loc] + component + c),
+                                nir_channel(b, value, c));
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+   /* Runtime location and vertex indexing are native address arithmetic,
+    * bounded by the actual linked component ranges. Never index host NIR. */
+   nir_def *byte_offset = nir_imm_int(b, 0);
+   nir_def *valid = nir_imm_false(b);
+   const bool from_vs = control && input;
+   unsigned descriptor = control && !input ? 4 : 0;
+   if (vertex) {
+      const struct pvrgpu_pco_geometry_layout *layout = from_vs ? state->input : &state->patch->vertex;
+      for (unsigned loc = location; loc < 64; ++loc) {
+         if (component + accessed_components > layout->count[loc]) continue;
+         nir_def *match = nir_ieq_imm(b, offset, loc - location);
+         byte_offset = nir_bcsel(b, match, nir_imm_int(b, 4 * (layout->start[loc] + component)), byte_offset);
+         valid = nir_ior(b, valid, match);
+      }
+      byte_offset = nir_iadd(b, byte_offset, nir_imul_imm(b, index, 4 * layout->stride_dwords));
+      if (!from_vs) byte_offset = nir_iadd_imm(b, byte_offset, 4 * state->patch->per_vertex_offset_dwords);
+      nir_def *count = from_vs ? nir_load_vtxin_pco(b, 1, nir_imm_int(b, 2)) : nir_imm_int(b, state->vertices_out);
+      valid = nir_iand(b, valid, nir_ult(b, index, count));
+   } else if (location == VARYING_SLOT_TESS_LEVEL_OUTER || location == VARYING_SLOT_TESS_LEVEL_INNER) {
+      const unsigned count = location == VARYING_SLOT_TESS_LEVEL_OUTER ? 4 : 2;
+      const unsigned start = location == VARYING_SLOT_TESS_LEVEL_OUTER ? 0 : 4;
+      /* The level arrays are canonicalized to vec4/vec2 before linking;
+       * their scalar array accesses now use component and a zero slot. */
+      byte_offset = nir_imul_imm(b, nir_iadd_imm(b, offset, start + component), 4);
+      valid = component + accessed_components <= count ? nir_ieq_imm(b, offset, 0) : nir_imm_false(b);
+   } else if (location >= VARYING_SLOT_PATCH0 && location < VARYING_SLOT_PATCH0 + 32) {
+      for (unsigned loc = location - VARYING_SLOT_PATCH0; loc < 32; ++loc) {
+         if (component + accessed_components > state->patch->patch_count[loc]) continue;
+         nir_def *match = nir_ieq_imm(b, offset, loc + VARYING_SLOT_PATCH0 - location);
+         byte_offset = nir_bcsel(b, match, nir_imm_int(b, 4 * (state->patch->patch_start[loc] + component)), byte_offset);
+         valid = nir_ior(b, valid, match);
+      }
+   } else goto unsupported;
+   nir_def *address = pvrgpu_tessellation_address(b, descriptor, byte_offset);
+   nir_if *guard = nir_push_if(b, valid);
+   if (load) {
+      nir_def *loaded = nir_load_global_2x32(b, components, 32, address,
+         .align_mul = 4, .align_offset = 0,
+         .access = from_vs ? ACCESS_NON_WRITEABLE : ACCESS_COHERENT | ACCESS_VOLATILE);
+      nir_push_else(b, guard);
+      nir_def *zero = nir_imm_zero(b, components, 32);
+      nir_pop_if(b, guard);
+      nir_def_replace(&intr->def, nir_if_phi(b, loaded, zero));
+   } else {
+      for (unsigned c = 0; c < components; ++c) {
+         if (!(nir_intrinsic_write_mask(intr) & (1u << c))) continue;
+         nir_def *scalar_address = pvrgpu_tessellation_address(b, descriptor, nir_iadd_imm(b, byte_offset, c * 4));
+         nir_store_global_2x32(b, nir_channel(b, value, c), scalar_address,
+            .write_mask = 1, .align_mul = 4, .align_offset = 0,
+            .access = ACCESS_COHERENT | ACCESS_VOLATILE);
+      }
+      nir_pop_if(b, guard);
+      nir_instr_remove(&intr->instr);
+   }
+   return true;
+unsupported:
+   state->failed = true;
+   pvrgpu_pco_fail(state->error, state->error_size,
+      "tessellation IO %s location %u component %u is unsupported",
+      nir_intrinsic_infos[intr->intrinsic].name, location, component);
+   return false;
+}
+
+static bool
+pvrgpu_compile_tessellation_stage(struct pvrgpu_pco_compiler *compiler,
+                                  const nir_shader *source, unsigned uniform_dwords,
+                                  const struct pvrgpu_pco_tessellation_pipeline_binary *pipeline,
+                                  struct pvrgpu_pco_tessellation_binary *out,
+                                  char *error, size_t error_size)
+{
+#ifndef PCO_HAS_TESSELLATION_SHADERS
+   return pvrgpu_pco_fail(error, error_size, "PCO requires the native tessellation stage patch");
+#else
+   void *mem = ralloc_context(compiler->mem_ctx);
+   nir_shader *nir = mem ? nir_shader_clone(mem, source) : NULL;
+   if (!nir) { ralloc_free(mem); return pvrgpu_pco_fail(error, error_size, "allocating tessellation NIR"); }
+   const bool control = source->info.stage == MESA_SHADER_TESS_CTRL;
+   nir->options = &compiler->nir_options;
+   nir->info.internal = false;
+   NIR_PASS(_, nir, nir_lower_system_values);
+   NIR_PASS(_, nir, nir_split_var_copies);
+   NIR_PASS(_, nir, nir_lower_var_copies);
+   NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
+            pvrgpu_geometry_io_type_size, nir_lower_io_lower_64bit_to_32);
+   struct pvrgpu_tessellation_io_lowering io = {
+      .input = &pipeline->input, .patch = &pipeline->patch, .output = &pipeline->output,
+      .vertices_out = pipeline->output_vertices, .error = error, .error_size = error_size,
+   };
+   if (getenv("PVRGPU_DEBUG_PCO_NIR")) {
+      fprintf(stderr, "=== tessellation before native IO lowering ===\n");
+      nir_print_shader(nir, stderr);
+   }
+   nir_shader_intrinsics_pass(nir, pvrgpu_lower_tessellation_io, nir_metadata_none, &io);
+   if (io.failed) goto fail;
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_in | nir_var_shader_out, NULL);
+   pvrgpu_pco_preprocess_nir(compiler, nir);
+   if (nir->scratch_size || nir->info.shared_size ||
+       !pvrgpu_lower_geometry_dynamic_uniforms(nir, uniform_dwords, error, error_size)) goto fail;
+   const unsigned uniforms = pvrgpu_count_uniform_loads(nir);
+   if (uniforms && !pvrgpu_lower_uniform_slots_to_push_constants(nir, uniform_dwords,
+          uniforms, "tessellation", error, error_size)) goto fail;
+   const unsigned descriptors = control ? 8 : 4;
+   pco_data data = {0};
+   data.common.shareds = descriptors;
+   data.common.vtxins = control ? 3 : 5;
+   if (!pvrgpu_lower_generic_uniform_buffers(nir, &data, descriptors, mem, error, error_size)) goto fail;
+   const unsigned prefix = descriptors + 4 * nir->info.num_ubos;
+   if (prefix + (uniforms ? uniform_dwords : 0) > 256) {
+      pvrgpu_pco_fail(error, error_size, "tessellation descriptors and CB0 exceed 256 DWORDs");
+      goto fail;
+   }
+   if (getenv("PVRGPU_DEBUG_PCO_NIR")) nir_print_shader(nir, stderr);
+   pco_lower_nir(compiler->pco, nir, &data);
+   pco_postprocess_nir(compiler->pco, nir, &data);
+   data.common.push_consts.range = (pco_range){.start = prefix, .count = uniforms ? uniform_dwords : 0};
+   data.common.shareds = prefix + data.common.push_consts.range.count;
+   if (nir->info.stage != source->info.stage || nir->scratch_size || data.common.scratch ||
+       data.common.push_consts.used > data.common.push_consts.range.count) {
+      pvrgpu_pco_fail(error, error_size, "tessellation lowering exceeded native stage/memory/CB0 ABI");
+      goto fail;
+   }
+   pco_shader *shader = pco_trans_nir(compiler->pco, nir, &data, mem);
+   if (!shader) goto fail;
+   pco_process_ir(compiler->pco, shader);
+   pco_encode_ir(compiler->pco, shader);
+   const pco_data *compiled = pco_shader_data(shader);
+   if (compiled->common.temps > 256 || compiled->common.spilled_temps || compiled->common.scratch) {
+      pvrgpu_pco_fail(error, error_size, "tessellation register allocation requires unsupported spills");
+      goto fail;
+   }
+   if (getenv("PVRGPU_DEBUG_PCO_NIR")) pco_print_shader(shader, stderr, control ? "native TCS" : "native TES");
+   if (!pvrgpu_copy_pco_stage(shader, false, &out->shader, error, error_size)) goto fail;
+   out->shader.abi.vertex_outputs = control ? 0 : pipeline->output.stride_dwords;
+   out->shader.abi.uniform_buffer_descriptor_start = descriptors;
+   out->shader.abi.uniform_buffer_descriptor_count = source->info.num_ubos;
+   out->barrier_count = io.barriers;
+   ralloc_free(mem);
+   return true;
+fail:
+   ralloc_free(mem);
+   return false;
+#endif
+}
+
+static bool
+pvrgpu_compile_extended_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
+                                    const struct nir_shader *vertex_nir,
+                                    const struct nir_shader *geometry_nir,
+                                    const struct nir_shader *fragment_nir,
+                                    const enum pipe_format *attribute_formats,
+                                    unsigned render_target_count,
+                                    unsigned vertex_uniform_dwords,
+                                    unsigned geometry_uniform_dwords,
+                                    unsigned fragment_uniform_dwords,
+                                    unsigned attribute_count,
+                                    unsigned fragment_texture_count,
+                                    struct pvrgpu_pco_geometry_pipeline_binary *out,
+                                    char *error, size_t error_size,
+                                    const nir_shader *control_nir,
+                                    unsigned control_uniform_dwords,
+                                    struct pvrgpu_pco_tessellation_pipeline_binary *tess)
+{
+   if (error && error_size) error[0] = '\0';
+   if (!out) return pvrgpu_pco_fail(error, error_size, "missing geometry pipeline output");
+   memset(out, 0, sizeof(*out));
+#ifndef PCO_HAS_GEOMETRY_SHADER
+   return pvrgpu_pco_fail(error, error_size, "PCO requires the native Geometry stage patch");
+#else
+   if (!compiler || !compiler->pco || !vertex_nir || !fragment_nir ||
+       vertex_nir->info.stage != MESA_SHADER_VERTEX || fragment_nir->info.stage != MESA_SHADER_FRAGMENT ||
+       (attribute_count && !attribute_formats) || attribute_count > PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES ||
+       !render_target_count || render_target_count > 8 ||
+       fragment_texture_count > PVRGPU_PCO_MAX_TEXTURES ||
+       vertex_uniform_dwords > 256 || geometry_uniform_dwords > 256 || fragment_uniform_dwords > 256)
+      return pvrgpu_pco_fail(error, error_size, "invalid Geometry pipeline stage/binding/count input");
+   if (tess ? (!pvrgpu_validate_tessellation_nir(control_nir, MESA_SHADER_TESS_CTRL, error, error_size) ||
+               !pvrgpu_validate_tessellation_nir(geometry_nir, MESA_SHADER_TESS_EVAL, error, error_size)) :
+              !pvrgpu_validate_geometry_nir(geometry_nir, error, error_size)) return false;
+   void *mem = ralloc_context(compiler->mem_ctx);
+   nir_shader *vs = mem ? nir_shader_clone(mem, vertex_nir) : NULL;
+   nir_shader *gs = mem ? nir_shader_clone(mem, geometry_nir) : NULL;
+   nir_shader *fs = mem ? nir_shader_clone(mem, fragment_nir) : NULL;
+   nir_shader *tcs = tess && mem ? nir_shader_clone(mem, control_nir) : NULL;
+   if (!vs || !gs || !fs || (tess && !tcs)) {
+      ralloc_free(mem);
+      return pvrgpu_pco_fail(error, error_size, "allocating Geometry pipeline NIR clones");
+   }
+   vs->options = gs->options = fs->options = &compiler->nir_options;
+   vs->info.internal = fs->info.internal = true;
+   gs->info.internal = false;
+   nir_lower_fragcolor(fs, 1);
+   pvrgpu_pco_preprocess_nir(compiler, vs);
+   /* Preserve Geometry's per-vertex input array until its native-memory IO
+    * legalization. The complete PCO preprocessing runs in compile_geometry
+    * after linking and explicit LD legalization, not on a copied gl_in. */
+   NIR_PASS(_, gs, nir_lower_system_values);
+   NIR_PASS(_, gs, nir_lower_returns);
+   NIR_PASS(_, gs, nir_lower_global_vars_to_local);
+   NIR_PASS(_, gs, nir_split_var_copies);
+   NIR_PASS(_, gs, nir_lower_var_copies);
+   if (tcs) {
+      tcs->options = &compiler->nir_options;
+      tcs->info.internal = false;
+      NIR_PASS(_, tcs, nir_lower_system_values);
+      NIR_PASS(_, tcs, nir_lower_returns);
+      NIR_PASS(_, tcs, nir_lower_global_vars_to_local);
+      NIR_PASS(_, tcs, nir_split_var_copies);
+      NIR_PASS(_, tcs, nir_lower_var_copies);
+      NIR_PASS(_, tcs, nir_lower_tess_level_array_vars_to_vec);
+      NIR_PASS(_, gs, nir_lower_tess_level_array_vars_to_vec);
+   }
+   pvrgpu_pco_preprocess_nir(compiler, fs);
+   pco_data vd = {0}, gd = {0}, fd = {0};
+   /* Link real adjacent stages independently. In particular, VS outputs must
+    * not be linked directly to FS across a Geometry stage. */
+   pco_link_nir(compiler->pco, gs, fs, &gd, &fd);
+   pco_rev_link_nir(compiler->pco, gs, fs);
+   if (tcs) {
+      pco_data cd = {0};
+      pco_link_nir(compiler->pco, tcs, gs, &cd, &gd);
+      pco_rev_link_nir(compiler->pco, tcs, gs);
+      pco_link_nir(compiler->pco, vs, tcs, &vd, &cd);
+      pco_rev_link_nir(compiler->pco, vs, tcs);
+      nir_shader_gather_info(tcs, nir_shader_get_entrypoint(tcs));
+   } else {
+      pco_link_nir(compiler->pco, vs, gs, &vd, &gd);
+      pco_rev_link_nir(compiler->pco, vs, gs);
+   }
+   nir_shader_gather_info(vs, nir_shader_get_entrypoint(vs));
+   nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
+   nir_shader_gather_info(fs, nir_shader_get_entrypoint(fs));
+   struct pvrgpu_pco_geometry_layout input, output;
+   if (!pvrgpu_geometry_allocate_layout(vs, &input, error, error_size) ||
+       !pvrgpu_geometry_allocate_layout(gs, &output, error, error_size)) goto fail;
+   if (((tcs ? tcs : gs)->info.inputs_read & ~(vs->info.outputs_written | BITFIELD64_BIT(VARYING_SLOT_POS))) ||
+       (fs->info.inputs_read & ~(gs->info.outputs_written | BITFIELD64_BIT(VARYING_SLOT_POS)))) {
+      pvrgpu_pco_fail(error, error_size, "Geometry pipeline consumer reads an unwritten interface location");
+      goto fail;
+   }
+   if (tess) {
+      tess->input = input;
+      tess->output = output;
+      tess->output_vertices = tcs->info.tess.tcs_vertices_out;
+      tess->primitive_mode = gs->info.tess._primitive_mode;
+      tess->spacing = gs->info.tess.spacing;
+      tess->ccw = gs->info.tess.ccw;
+      tess->point_mode = gs->info.tess.point_mode;
+      if (!pvrgpu_tessellation_allocate_patch(tcs, &tess->patch, error, error_size)) goto fail;
+   }
+   unsigned attribute_components[PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES] = {0};
+   unsigned attribute_locations[PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES] = {0};
+   const char *attribute_reason = NULL;
+   if (!attribute_count && (vs->info.inputs_read ||
+       BITSET_TEST(vs->info.system_values_read, SYSTEM_VALUE_INSTANCE_ID))) {
+      pvrgpu_pco_fail(error, error_size, "Geometry zero-attribute VS reads an unbound vertex input");
+      goto fail;
+   }
+   if (attribute_count && !pvrgpu_pco_vertex_attribute_components(vs, attribute_count,
+          attribute_components, attribute_locations, &attribute_reason)) {
+      pvrgpu_pco_fail(error, error_size, "Geometry pipeline vertex attributes are unsupported: %s",
+                      attribute_reason ? attribute_reason : "unknown layout");
+      goto fail;
+   }
+   uint64_t vertex_inputs = 0;
+   for (unsigned i = 0; i < attribute_count; ++i) {
+      const unsigned location = VERT_ATTRIB_GENERIC0 + attribute_locations[i];
+      if (attribute_formats[i] == PIPE_FORMAT_NONE) {
+         pvrgpu_pco_fail(error, error_size, "Geometry pipeline vertex attribute %u has no format", i);
+         goto fail;
+      }
+      vertex_inputs |= BITFIELD64_BIT(location);
+      vd.vs.attrib_formats[location] = attribute_formats[i];
+      vd.vs.attribs[location] = (pco_range){.start = i * 4, .count = 4};
+   }
+   vd.common.vtxins = attribute_count * 4;
+   if (BITSET_TEST(vs->info.system_values_read, SYSTEM_VALUE_INSTANCE_ID)) {
+      vd.common.sys_vals[SYSTEM_VALUE_INSTANCE_ID] = (pco_range){.start = vd.common.vtxins, .count = 1};
+      vd.common.vtxins += 4;
+   }
+   const uint64_t vs_varyings = vs->info.outputs_written &
+      ~(BITFIELD64_BIT(VARYING_SLOT_POS) | BITFIELD64_BIT(VARYING_SLOT_PSIZ));
+   if (!pvrgpu_validate_color_primitive_nir(vs, MESA_SHADER_VERTEX, true, render_target_count,
+          vertex_inputs, vs_varyings, input.count[VARYING_SLOT_PSIZ] != 0, 0, error, error_size) ||
+       !pvrgpu_validate_color_primitive_nir(fs, MESA_SHADER_FRAGMENT, true, render_target_count,
+          0, fs->info.inputs_read, false, fragment_texture_count, error, error_size)) goto fail;
+   for (unsigned location = 0; location < 64; ++location) {
+      vd.vs.varyings[location] = (pco_range){.start = input.start[location], .count = input.count[location]};
+   }
+   vd.vs.vtxouts = input.stride_dwords;
+   fd.fs.varyings[VARYING_SLOT_POS] = (pco_range){.start = 0, .count = 4};
+   fd.fs.uses.w = true;
+   unsigned next_coefficient = 4;
+   unsigned varying_count = 0;
+   unsigned varying_slots = 0;
+   out->graphics.varying_flat_mask = 0;
+   for (unsigned i = 0; i < 33; ++i) {
+      const unsigned location = i == 32 ? VARYING_SLOT_PRIMITIVE_ID : VARYING_SLOT_VAR0 + i;
+      if (location >= 64 || !output.count[location]) continue;
+      const bool read = (fs->info.inputs_read & BITFIELD64_BIT(location)) != 0;
+      if (location == VARYING_SLOT_PRIMITIVE_ID && !read) continue;
+      if (varying_slots >= PVRGPU_PCO_MAX_VARYINGS) {
+         pvrgpu_pco_fail(error, error_size, "Geometry output exceeds the linked varying slot ABI");
+         goto fail;
+      }
+      bool flat = location == VARYING_SLOT_PRIMITIVE_ID;
+      nir_foreach_shader_in_variable(var, fs) {
+         if (var->data.location == (int)location) flat |= var->data.interpolation == INTERP_MODE_FLAT;
+      }
+      if (flat) out->graphics.varying_flat_mask |= 1u << varying_slots;
+      ++varying_slots;
+      /* Keep unconsumed varying slots in the contiguous output layout. The
+       * coefficients are real interpolants, not copies of expected values. */
+      fd.fs.varyings[location] = (pco_range){.start = next_coefficient, .count = output.count[location] * 4};
+      next_coefficient += output.count[location] * 4;
+      varying_count += output.count[location];
+   }
+   fd.common.coeffs = next_coefficient;
+   if (!pvrgpu_lower_geometry_dynamic_uniforms(vs, vertex_uniform_dwords, error, error_size) ||
+       !pvrgpu_lower_geometry_dynamic_uniforms(fs, fragment_uniform_dwords, error, error_size))
+      goto fail;
+   const unsigned vs_uniforms = pvrgpu_count_uniform_loads(vs);
+   const unsigned fs_uniforms = pvrgpu_count_uniform_loads(fs);
+   if ((vs_uniforms && !pvrgpu_lower_uniform_slots_to_push_constants(vs,
+          vertex_uniform_dwords, vs_uniforms, "Geometry pipeline VS", error, error_size)) ||
+       (fs_uniforms && !pvrgpu_lower_uniform_slots_to_push_constants(fs,
+          fragment_uniform_dwords, fs_uniforms, "Geometry pipeline FS", error, error_size))) goto fail;
+   for (unsigned texture = 0; texture < fragment_texture_count; ++texture) {
+      pco_descriptor_set_data *set = &fd.common.desc_sets[texture];
+      set->binding_count = 1;
+      set->bindings = rzalloc_array(mem, pco_binding_data, 1);
+      if (!set->bindings) goto fail;
+      set->range = (pco_range){.start = texture * 20, .count = 20};
+      set->used = true;
+      set->bindings[0].range = (pco_range){.start = texture * 20, .count = 20, .stride = 20};
+      set->bindings[0].used = set->bindings[0].is_img_smp = true;
+   }
+   const unsigned texture_dwords = fragment_texture_count * 20;
+   fd.common.shareds = texture_dwords;
+   const unsigned vs_ubos = vs->info.num_ubos, fs_ubos = fs->info.num_ubos;
+   if (!pvrgpu_lower_generic_uniform_buffers(vs, &vd, 0, mem, error, error_size) ||
+       !pvrgpu_lower_generic_uniform_buffers(fs, &fd, texture_dwords, mem, error, error_size)) goto fail;
+   fd.fs.z_replicate = ~0u;
+   fd.fs.rasterization_samples = 1;
+   static const enum pipe_format formats[] = {
+      PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32_FLOAT,
+      PIPE_FORMAT_R32G32_FLOAT, PIPE_FORMAT_R32G32B32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+   };
+   for (unsigned target = 0; target < render_target_count; ++target) {
+      const uint64_t written = BITFIELD64_BIT(FRAG_RESULT_DATA0 + target) |
+         (target == 0 ? BITFIELD64_BIT(FRAG_RESULT_COLOR) : 0);
+      /* An output-less FS is a real native program, including when a GS
+       * emits fragments. Do not invent a color store or turn missing output
+       * metadata into an RGBA write: PBE must keep its color mask empty. */
+      if (!(fs->info.outputs_written & written))
+         continue;
+      unsigned components = 4;
+      nir_foreach_shader_out_variable(var, fs) {
+         if (var->data.location == (int)(FRAG_RESULT_DATA0 + target) && glsl_type_is_vector_or_scalar(var->type))
+            components = glsl_get_components(var->type);
+      }
+      if (!components || components > 4) components = 4;
+      fd.fs.outputs[FRAG_RESULT_DATA0 + target] = (pco_range){.start = target * 4, .count = 4};
+      fd.fs.output_formats[FRAG_RESULT_DATA0 + target] = formats[components];
+      out->graphics.fragment_output_mask[target] = BITFIELD_MASK(components);
+   }
+   if (render_target_count == 1 &&
+       (fs->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_COLOR))) {
+      fd.fs.outputs[FRAG_RESULT_COLOR] = (pco_range){.start = 0, .count = 4};
+      fd.fs.output_formats[FRAG_RESULT_COLOR] = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   }
+   bool depth_feedback = false;
+   nir_shader_intrinsics_pass(fs, pvrgpu_lower_fragment_depth_feedback,
+                               nir_metadata_control_flow, &depth_feedback);
+   fd.fs.uses.depth_feedback = depth_feedback;
+   pco_lower_nir(compiler->pco, vs, &vd);
+   pco_lower_nir(compiler->pco, fs, &fd);
+   pco_postprocess_nir(compiler->pco, vs, &vd);
+   pco_postprocess_nir(compiler->pco, fs, &fd);
+   if ((vs_uniforms && !pvrgpu_allocate_generic_push_constants_after(&vd, 4 * vs_ubos,
+          vertex_uniform_dwords, "Geometry VS", error, error_size)) ||
+       (fs_uniforms && !pvrgpu_allocate_generic_push_constants_after(&fd, texture_dwords + 4 * fs_ubos,
+          fragment_uniform_dwords, "Geometry FS", error, error_size))) goto fail;
+   if (!vd.common.push_consts.range.count) vd.common.push_consts.range.start = 4 * vs_ubos;
+   if (!fd.common.push_consts.range.count) fd.common.push_consts.range.start = texture_dwords + 4 * fs_ubos;
+   if (depth_feedback)
+      nir_shader_intrinsics_pass(fs, pvrgpu_restore_depth_feedback_no_discard, nir_metadata_control_flow, NULL);
+   if (vd.common.shareds > 96 || fd.common.shareds > 256 || vd.common.scratch || fd.common.scratch) {
+      pvrgpu_pco_fail(error, error_size, "Geometry VS/FS exceed the native memory/shared ABI");
+      goto fail;
+   }
+   pco_shader *vertex = pco_trans_nir(compiler->pco, vs, &vd, mem);
+   pco_shader *fragment = pco_trans_nir(compiler->pco, fs, &fd, mem);
+   if (!vertex || !fragment) {
+      pvrgpu_pco_fail(error, error_size, "PCO failed to translate Geometry VS/FS");
+      goto fail;
+   }
+   pco_process_ir(compiler->pco, vertex);
+   pco_process_ir(compiler->pco, fragment);
+   pco_encode_ir(compiler->pco, vertex);
+   pco_encode_ir(compiler->pco, fragment);
+   if (!pvrgpu_copy_pco_stage(vertex, true, &out->graphics.vertex, error, error_size) ||
+       !pvrgpu_copy_pco_stage(fragment, false, &out->graphics.fragment, error, error_size)) goto fail;
+   if (tess) {
+      if (!pvrgpu_compile_tessellation_stage(compiler, tcs, control_uniform_dwords,
+             tess, &tess->control, error, error_size) ||
+          !pvrgpu_compile_tessellation_stage(compiler, gs, geometry_uniform_dwords,
+             tess, &tess->evaluation, error, error_size)) goto fail;
+   } else if (!pvrgpu_pco_compile_geometry(compiler, gs, &input, &output,
+                 geometry_uniform_dwords, &out->geometry, error, error_size)) goto fail;
+   out->graphics.vertex.abi.uniform_buffer_descriptor_start = 0;
+   out->graphics.vertex.abi.uniform_buffer_descriptor_count = vs_ubos;
+   out->graphics.fragment.abi.uniform_buffer_descriptor_start = fs_ubos ? texture_dwords : 0;
+   out->graphics.fragment.abi.uniform_buffer_descriptor_count = fs_ubos;
+   out->graphics.position_output_start = 0;
+   out->graphics.position_output_count = 4;
+   out->graphics.point_size_output_count = output.count[VARYING_SLOT_PSIZ];
+   out->graphics.point_size_output_start = out->graphics.point_size_output_count ?
+      output.start[VARYING_SLOT_PSIZ] : 0;
+   out->graphics.fragment_position_start = 0;
+   out->graphics.fragment_position_count = 4;
+   out->graphics.varying_output_start = 4 + output.count[VARYING_SLOT_PSIZ];
+   out->graphics.varying_output_count = varying_count;
+   out->graphics.fragment_varying_start = 4;
+   out->graphics.fragment_varying_count = varying_count * 4;
+   out->graphics.fragment_texture_descriptor_count = fragment_texture_count;
+   out->graphics.fragment_texture_descriptor_stride = 20;
+   ralloc_free(mem);
+   return true;
+fail:
+   pvrgpu_pco_geometry_pipeline_binary_finish(out);
+   ralloc_free(mem);
+   return false;
+#endif
+}
+
+bool
+pvrgpu_pco_compile_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
+   const nir_shader *vs, const nir_shader *gs, const nir_shader *fs,
+   const enum pipe_format *formats, unsigned targets, unsigned vs_uniforms,
+   unsigned gs_uniforms, unsigned fs_uniforms, unsigned attributes, unsigned textures,
+   struct pvrgpu_pco_geometry_pipeline_binary *out, char *error, size_t error_size)
+{
+   return pvrgpu_compile_extended_geometry_pipeline(compiler, vs, gs, fs, formats,
+      targets, vs_uniforms, gs_uniforms, fs_uniforms, attributes, textures, out,
+      error, error_size, NULL, 0, NULL);
+}
+
+void
+pvrgpu_pco_tessellation_pipeline_binary_finish(struct pvrgpu_pco_tessellation_pipeline_binary *out)
+{
+   if (!out) return;
+   pvrgpu_pco_graphics_binary_finish(&out->graphics);
+   free(out->control.shader.data);
+   free(out->evaluation.shader.data);
+   memset(out, 0, sizeof(*out));
+}
+
+bool
+pvrgpu_pco_compile_tessellation_pipeline(struct pvrgpu_pco_compiler *compiler,
+   const nir_shader *vs, const nir_shader *tcs, const nir_shader *tes, const nir_shader *fs,
+   const enum pipe_format *formats, unsigned targets, unsigned vs_uniforms,
+   unsigned tcs_uniforms, unsigned tes_uniforms, unsigned fs_uniforms,
+   unsigned attributes, unsigned textures,
+   struct pvrgpu_pco_tessellation_pipeline_binary *out, char *error, size_t error_size)
+{
+   if (!out) return pvrgpu_pco_fail(error, error_size, "missing tessellation pipeline output");
+   memset(out, 0, sizeof(*out));
+   if (!tcs || !tes || tcs_uniforms > 256 || tes_uniforms > 256)
+      return pvrgpu_pco_fail(error, error_size, "tessellation requires TCS/TES with bounded CB0");
+   struct pvrgpu_pco_geometry_pipeline_binary adjacent = {0};
+   if (!pvrgpu_compile_extended_geometry_pipeline(compiler, vs, tes, fs, formats,
+          targets, vs_uniforms, tes_uniforms, fs_uniforms, attributes, textures,
+          &adjacent, error, error_size, tcs, tcs_uniforms, out)) {
+      pvrgpu_pco_tessellation_pipeline_binary_finish(out);
+      return false;
+   }
+   out->graphics = adjacent.graphics;
+   return true;
+}
+
 bool pvrgpu_pco_compile_color_triangle(
    struct pvrgpu_pco_compiler *compiler,
    const struct nir_shader *vertex_nir,
@@ -5187,7 +6355,8 @@ bool pvrgpu_pco_compile_color_triangle(
       topology_uses_point_size &&
       (vs->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_PSIZ)) != 0;
    if (!pvrgpu_validate_color_primitive_nir(vs,
-                                            MESA_SHADER_VERTEX,
+                                           MESA_SHADER_VERTEX,
+                                           false,
                                             render_target_count,
                                             vertex_input_mask,
                                             probe_varying_mask,
@@ -5196,7 +6365,8 @@ bool pvrgpu_pco_compile_color_triangle(
                                             error,
                                             error_size) ||
        !pvrgpu_validate_color_primitive_nir(fs,
-                                            MESA_SHADER_FRAGMENT,
+                                           MESA_SHADER_FRAGMENT,
+                                           false,
                                             render_target_count,
                                             0,
                                             fs->info.inputs_read,

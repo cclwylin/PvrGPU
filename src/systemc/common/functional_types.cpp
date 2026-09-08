@@ -5,11 +5,13 @@
 #include "common/functional_types.h"
 
 #include "common/pipeline_state.h"
+#include "common/tessellation_state.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <sstream>
+#include <utility>
 
 namespace pvrgpu::stub {
 
@@ -537,6 +539,22 @@ std::uint32_t ActiveVertexOutputDwordCount(const PipelineState &state) {
     dwords = std::max(dwords, state.raster_state.point_size_output_start +
                                   state.raster_state.point_size_output_count);
   }
+  if (HasPoolHandle(state.geometry_code)) {
+    // GS keeps PrimitiveID/Layer after its packed user varyings. These raw
+    // outputs still need transport when the fragment shader does not read
+    // them as varyings; the raster boundary consumes their declared slots.
+    for (const auto &range : {
+             std::pair{state.geometry_primitive_id_output_start,
+                        state.geometry_primitive_id_output_count},
+             std::pair{state.geometry_layer_output_start,
+                        state.geometry_layer_output_count}}) {
+      if (!range.second) continue;
+      if (range.first > kPcoVertexOutputRegisterCount ||
+          range.second > kPcoVertexOutputRegisterCount - range.first)
+        return kPcoVertexOutputRegisterCount + 1;
+      dwords = std::max(dwords, range.first + range.second);
+    }
+  }
   return dwords;
 }
 
@@ -612,7 +630,10 @@ bool IsExactVaryingBinding(const PipelineState &state,
   else if (state.fragment_varying_count !=
            components * kCoefficientSetDwordCount)
     refusal = "fragment_varying_count";
-  else if (state.vertex_pco_abi.vertex_outputs !=
+  else if ((HasPoolHandle(state.tessellation_state)
+                ? state.tessellation_output_dwords : HasPoolHandle(state.geometry_code)
+                ? state.geometry_pco_abi.vertex_outputs
+                : state.vertex_pco_abi.vertex_outputs) !=
            ActiveVertexOutputDwordCount(state))
     refusal = "vertex_outputs";
   else if (state.fragment_pco_abi.coefficients !=
@@ -775,6 +796,18 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
       release_unique(resource.data);
   }
 
+  if (HasPoolHandle(state.tessellation_state)) {
+    const auto tess = LoadArray<TessellationState>(pool, state.tessellation_state);
+    if (tess.size() != 1)
+      throw std::runtime_error("Tessellation state ownership extent is invalid");
+    for (const auto handle : {tess[0].control_code, tess[0].control_instructions,
+         tess[0].control_shared, tess[0].control_uniform_buffers,
+         tess[0].evaluation_code, tess[0].evaluation_instructions,
+         tess[0].evaluation_shared, tess[0].evaluation_uniform_buffers,
+         tess[0].patches, tess[0].domain_points, tess[0].domain_indices})
+      release_unique(handle);
+    release_unique(state.tessellation_state);
+  }
   const PoolHandle handles[] = {
       state.drawlist_stats,
       state.vertex_buffer_resources,
@@ -782,6 +815,12 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
       state.vertex_indices,
       state.vertex_lanes,
       state.vertex_lane_refs,
+      state.geometry_input_primitives,
+      state.geometry_primitives,
+      state.geometry_code,
+      state.geometry_instructions,
+      state.geometry_shared_registers,
+      state.geometry_uniform_buffer_resources,
       state.expanded_source_vertices,
       state.vertex_shared_registers,
       state.vertex_uniform_buffer_resources,

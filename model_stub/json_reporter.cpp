@@ -183,6 +183,7 @@ struct VertexPcoEvidence {
 struct FragmentPcoEvidence {
   std::uint64_t binary_fnv1a64 = UINT64_C(14695981039346656037);
   std::uint64_t binary_bytes = 0;
+  std::uint64_t nop = 0;
   std::uint64_t fitrp = 0;
   std::uint64_t depthf = 0;
   std::uint64_t ld = 0;
@@ -473,6 +474,9 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
       continue;
     }
     switch (instruction.opcode) {
+    case PcoOpcode::kNop:
+      ++evidence.nop;
+      break;
     case PcoOpcode::kInternal:
       ++evidence.internal;
       break;
@@ -622,7 +626,7 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
           std::to_string(static_cast<unsigned>(instruction.opcode)));
     }
   }
-  if (evidence.fitrp + evidence.depthf + evidence.ld + evidence.wdf + evidence.fadd + evidence.fmul +
+  if (evidence.nop + evidence.fitrp + evidence.depthf + evidence.ld + evidence.wdf + evidence.fadd + evidence.fmul +
           evidence.mbyp + evidence.smp + evidence.internal + evidence.fneg +
           evidence.fabs +
           evidence.movi + evidence.pck_cov + evidence.shr +
@@ -729,6 +733,7 @@ void AppendFragmentPcoEvidence(const MemoryPool &pool,
 #define PVRGPU_ADD_FRAGMENT_EVIDENCE(field)                                  \
   AddEvidenceCounter(&aggregate->field, evidence.field)
   PVRGPU_ADD_FRAGMENT_EVIDENCE(binary_bytes);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(nop);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(fitrp);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(depthf);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(ld);
@@ -1054,11 +1059,35 @@ void AccumulatePhysicalCounters(CounterTxn *aggregate,
   PVRGPU_ADD_COUNTER(vs_invocations);
   PVRGPU_ADD_COUNTER(gs_invocations);
   PVRGPU_ADD_COUNTER(gs_primitives);
+  PVRGPU_ADD_COUNTER(gs_alu_instructions);
+  PVRGPU_ADD_COUNTER(gs_memory_instructions);
+  PVRGPU_ADD_COUNTER(gs_load_instructions);
+  PVRGPU_ADD_COUNTER(gs_emitted_vertices);
+  PVRGPU_ADD_COUNTER(gs_input_write_bytes);
+  PVRGPU_ADD_COUNTER(gs_input_read_bytes);
   PVRGPU_ADD_COUNTER(c_invocations);
   PVRGPU_ADD_COUNTER(c_primitives);
   PVRGPU_ADD_COUNTER(ps_invocations);
   PVRGPU_ADD_COUNTER(hs_invocations);
   PVRGPU_ADD_COUNTER(ds_invocations);
+  PVRGPU_ADD_COUNTER(tcs_invocations);
+  PVRGPU_ADD_COUNTER(tcs_alu_instructions);
+  PVRGPU_ADD_COUNTER(tcs_memory_instructions);
+  PVRGPU_ADD_COUNTER(tcs_load_instructions);
+  PVRGPU_ADD_COUNTER(tcs_store_instructions);
+  PVRGPU_ADD_COUNTER(tcs_input_write_bytes);
+  PVRGPU_ADD_COUNTER(tcs_input_read_bytes);
+  PVRGPU_ADD_COUNTER(tcs_output_write_bytes);
+  PVRGPU_ADD_COUNTER(tcs_output_read_bytes);
+  PVRGPU_ADD_COUNTER(tes_alu_instructions);
+  PVRGPU_ADD_COUNTER(tes_memory_instructions);
+  PVRGPU_ADD_COUNTER(tes_load_instructions);
+  PVRGPU_ADD_COUNTER(tes_patch_read_bytes);
+  PVRGPU_ADD_COUNTER(tessellation_patches);
+  PVRGPU_ADD_COUNTER(tessellation_primitives);
+  PVRGPU_ADD_COUNTER(tessellation_domain_write_bytes);
+  PVRGPU_ADD_COUNTER(tessellation_domain_read_bytes);
+  PVRGPU_ADD_COUNTER(tessellation_level_read_bytes);
   PVRGPU_ADD_COUNTER(drawlists);
   PVRGPU_ADD_COUNTER(setup_triangles);
   PVRGPU_ADD_COUNTER(texel_fetches);
@@ -1165,6 +1194,11 @@ void ValidateDrawListStats(const CounterTxn &counters,
   std::uint64_t vs_alu = 0;
   std::uint64_t vs_tex = 0;
   std::uint64_t vs_memory = 0;
+  std::uint64_t gs_invocations = 0;
+  std::uint64_t gs_alu = 0;
+  std::uint64_t gs_memory = 0;
+  std::uint64_t tcs_invocations = 0, tcs_alu = 0, tcs_memory = 0;
+  std::uint64_t tes_invocations = 0, tes_alu = 0, tes_memory = 0;
   std::uint64_t fs_alu = 0;
   std::uint64_t fs_tex = 0;
   std::uint64_t fs_memory = 0;
@@ -1182,6 +1216,39 @@ void ValidateDrawListStats(const CounterTxn &counters,
     AddDrawListCounter(vs_alu, drawlist.vertex.executed_alu_instructions);
     AddDrawListCounter(vs_tex, drawlist.vertex.executed_tex_instructions);
     AddDrawListCounter(vs_memory, drawlist.vertex.executed_memory_instructions);
+    const DrawListShaderStats &gs = drawlist.geometry;
+    if (gs.program_recorded != gs.executions_recorded ||
+        gs.program_recorded > 1 || gs.executed_tex_instructions != 0 ||
+        (gs.program_recorded == 0 &&
+         (gs.invocations != 0 || gs.executed_alu_instructions != 0 ||
+          gs.executed_memory_instructions != 0))) {
+      throw std::runtime_error(
+          "JsonReporter received incomplete geometry DrawList statistics");
+    }
+    AddDrawListCounter(gs_invocations, gs.invocations);
+    AddDrawListCounter(gs_alu, gs.executed_alu_instructions);
+    AddDrawListCounter(gs_memory, gs.executed_memory_instructions);
+    for (const auto *shader : {&drawlist.tessellation_control,
+                              &drawlist.tessellation_evaluation}) {
+      if (shader->program_recorded != shader->executions_recorded ||
+          shader->program_recorded > 1 || shader->program_tex_instructions ||
+          shader->executed_tex_instructions ||
+          (!shader->program_recorded &&
+           (shader->invocations || shader->program_groups ||
+            shader->program_instructions || shader->program_alu_instructions ||
+            shader->program_memory_instructions ||
+            shader->executed_alu_instructions || shader->executed_memory_instructions)))
+        throw std::runtime_error("JsonReporter received incomplete tessellation DrawList statistics");
+    }
+    if (drawlist.tessellation_control.program_recorded !=
+        drawlist.tessellation_evaluation.program_recorded)
+      throw std::runtime_error("JsonReporter tessellation DrawList stage pair is incomplete");
+    AddDrawListCounter(tcs_invocations, drawlist.tessellation_control.invocations);
+    AddDrawListCounter(tcs_alu, drawlist.tessellation_control.executed_alu_instructions);
+    AddDrawListCounter(tcs_memory, drawlist.tessellation_control.executed_memory_instructions);
+    AddDrawListCounter(tes_invocations, drawlist.tessellation_evaluation.invocations);
+    AddDrawListCounter(tes_alu, drawlist.tessellation_evaluation.executed_alu_instructions);
+    AddDrawListCounter(tes_memory, drawlist.tessellation_evaluation.executed_memory_instructions);
     AddDrawListCounter(fs_alu, drawlist.fragment.executed_alu_instructions);
     AddDrawListCounter(fs_tex, drawlist.fragment.executed_tex_instructions);
     AddDrawListCounter(fs_memory,
@@ -1190,6 +1257,16 @@ void ValidateDrawListStats(const CounterTxn &counters,
   if (vs_alu != counters.vs_alu_instructions ||
       vs_tex != counters.vs_tex_instructions ||
       vs_memory != counters.vs_memory_instructions ||
+      gs_invocations != counters.gs_invocations ||
+      gs_alu != counters.gs_alu_instructions ||
+      gs_memory != counters.gs_memory_instructions ||
+      tcs_invocations != counters.tcs_invocations ||
+      tcs_alu != counters.tcs_alu_instructions ||
+      tcs_memory != counters.tcs_memory_instructions ||
+      tes_invocations != counters.ds_invocations ||
+      tes_alu != counters.tes_alu_instructions ||
+      tes_memory != counters.tes_memory_instructions ||
+      counters.hs_invocations != counters.tessellation_patches ||
       fs_alu != counters.fs_alu_instructions ||
       fs_tex != counters.fs_tex_instructions ||
       fs_memory != counters.fs_memory_instructions) {
@@ -1386,11 +1463,17 @@ void NormalizeDriverPcoTrianglesApiCounters(const Options &options,
   const DriverCommand &command = options.driver_command;
   if (!options.driver_commands.empty()) {
     const bool generic_sequence = command.command == "draw_pco_sequence";
+    const bool geometry_sequence = std::any_of(options.driver_commands.begin(),
+        options.driver_commands.end(), [](const DriverCommand &draw) {
+          return !draw.geometry_pco.empty() || !draw.tessellation.evaluation_pco.empty();
+        });
     const bool has_captured_totals =
         (generic_sequence ||
          command.draw_count == options.driver_commands.size()) &&
         command.draw_count != 0 && command.ia_vertices != 0 &&
-        command.ia_primitives != 0 && command.clip_invocations != 0;
+        (command.ia_primitives != 0 ||
+         (geometry_sequence && counters.ia_primitives == 0)) &&
+        (geometry_sequence || command.clip_invocations != 0);
     if (!has_captured_totals) {
       throw std::runtime_error(
           "ordered PCO sequence has no complete API counter metadata");
@@ -1400,7 +1483,8 @@ void NormalizeDriverPcoTrianglesApiCounters(const Options &options,
     // the submitted geometry, not about what the hardware did with it.
     counters.ia_vertices = command.ia_vertices;
     counters.ia_primitives = command.ia_primitives;
-    counters.c_invocations = command.clip_invocations;
+    if (!geometry_sequence)
+      counters.c_invocations = command.clip_invocations;
     counters.drawlists = command.draw_count;
 
     // Everything from vertex shading onwards is what the pipeline actually
@@ -1607,6 +1691,15 @@ void ExpandGenericPcoSequenceDrawLists(
     PartitionShaderExecution(physical[physical_index].fragment,
                              bucket_sizes[physical_index], partition,
                              &stats.fragment);
+    PartitionShaderExecution(physical[physical_index].geometry,
+                             bucket_sizes[physical_index], partition,
+                             &stats.geometry);
+    PartitionShaderExecution(physical[physical_index].tessellation_control,
+                             bucket_sizes[physical_index], partition,
+                             &stats.tessellation_control);
+    PartitionShaderExecution(physical[physical_index].tessellation_evaluation,
+                             bucket_sizes[physical_index], partition,
+                             &stats.tessellation_evaluation);
     drawlists->push_back(stats);
   }
 }
@@ -1827,6 +1920,8 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"imin_s32\":" << fragment_pco.imin_s32;
   if (fragment_pco.f2i != 0)
     std::cout << ",\"f2i\":" << fragment_pco.f2i;
+  if (fragment_pco.nop != 0)
+    std::cout << ",\"nop\":" << fragment_pco.nop;
   if (fragment_pco.csel != 0)
     std::cout << ",\"csel\":" << fragment_pco.csel;
   if (fragment_pco.pck_f16 != 0)
@@ -1856,11 +1951,35 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
       << ",\"vs_invocations\":" << counters.vs_invocations
       << ",\"gs_invocations\":" << counters.gs_invocations
       << ",\"gs_primitives\":" << counters.gs_primitives
+      << ",\"gs_alu_instructions\":" << counters.gs_alu_instructions
+      << ",\"gs_memory_instructions\":" << counters.gs_memory_instructions
+      << ",\"gs_load_instructions\":" << counters.gs_load_instructions
+      << ",\"gs_emitted_vertices\":" << counters.gs_emitted_vertices
+      << ",\"gs_input_write_bytes\":" << counters.gs_input_write_bytes
+      << ",\"gs_input_read_bytes\":" << counters.gs_input_read_bytes
       << ",\"c_invocations\":" << counters.c_invocations
       << ",\"c_primitives\":" << counters.c_primitives
       << ",\"ps_invocations\":" << counters.ps_invocations
       << ",\"hs_invocations\":" << counters.hs_invocations
       << ",\"ds_invocations\":" << counters.ds_invocations
+      << ",\"tcs_invocations\":" << counters.tcs_invocations
+      << ",\"tcs_alu_instructions\":" << counters.tcs_alu_instructions
+      << ",\"tcs_memory_instructions\":" << counters.tcs_memory_instructions
+      << ",\"tcs_load_instructions\":" << counters.tcs_load_instructions
+      << ",\"tcs_store_instructions\":" << counters.tcs_store_instructions
+      << ",\"tcs_input_write_bytes\":" << counters.tcs_input_write_bytes
+      << ",\"tcs_input_read_bytes\":" << counters.tcs_input_read_bytes
+      << ",\"tcs_output_write_bytes\":" << counters.tcs_output_write_bytes
+      << ",\"tcs_output_read_bytes\":" << counters.tcs_output_read_bytes
+      << ",\"tes_alu_instructions\":" << counters.tes_alu_instructions
+      << ",\"tes_memory_instructions\":" << counters.tes_memory_instructions
+      << ",\"tes_load_instructions\":" << counters.tes_load_instructions
+      << ",\"tes_patch_read_bytes\":" << counters.tes_patch_read_bytes
+      << ",\"tessellation_patches\":" << counters.tessellation_patches
+      << ",\"tessellation_primitives\":" << counters.tessellation_primitives
+      << ",\"tessellation_domain_write_bytes\":" << counters.tessellation_domain_write_bytes
+      << ",\"tessellation_domain_read_bytes\":" << counters.tessellation_domain_read_bytes
+      << ",\"tessellation_level_read_bytes\":" << counters.tessellation_level_read_bytes
       << ",\"cs_invocations\":" << cs_invocations
       << ",\"ts_invocations\":0"
       << ",\"ms_invocations\":0,\"ms_primitives\":0"
@@ -1969,6 +2088,18 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     EmitShaderStats(drawlist.vertex);
     std::cout << ",\"fs\":";
     EmitShaderStats(drawlist.fragment);
+    if (drawlist.geometry.program_recorded) {
+      std::cout << ",\"gs\":";
+      EmitShaderStats(drawlist.geometry);
+    }
+    if (drawlist.tessellation_control.program_recorded) {
+      std::cout << ",\"tcs\":";
+      EmitShaderStats(drawlist.tessellation_control);
+    }
+    if (drawlist.tessellation_evaluation.program_recorded) {
+      std::cout << ",\"tes\":";
+      EmitShaderStats(drawlist.tessellation_evaluation);
+    }
     std::cout << '}';
   }
   std::cout << "]}\n";
@@ -2199,6 +2330,14 @@ void JsonReporter::RunJob() {
         AppendVertexPcoEvidence(pool_, state, &vertex_pco);
         AppendFragmentPcoEvidence(pool_, state, &fragment_pco);
         AccumulatePhysicalCounters(&aggregate, state.counters);
+        if (job_) {
+          // Read physical stage counters before JSON/API normalization. A GS
+          // that emits zero complete primitives must contribute zero, not IA.
+          job_->graphics_stats.Add(HasPoolHandle(state.geometry_code),
+              state.counters.ia_primitives, state.counters.gs_primitives,
+              state.counters.gs_invocations, HasPoolHandle(state.tessellation_state),
+              state.counters.tessellation_primitives);
+        }
         for (DrawListStats &drawlist : drawlists) {
           drawlist.drawlist_index =
               static_cast<std::uint32_t>(aggregate_drawlists.size());
@@ -2418,6 +2557,13 @@ void JsonReporter::RunJob() {
           ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
                                        state.color_attachment_float32));
       if (job_) {
+        // Clear-only jobs may use internal drawing machinery, but do not
+        // generate application primitives. Never count that implementation.
+        if (!IsDriverClearColorApiCounterView(options_))
+          job_->graphics_stats.Add(HasPoolHandle(state.geometry_code),
+              state.counters.ia_primitives, state.counters.gs_primitives,
+              state.counters.gs_invocations, HasPoolHandle(state.tessellation_state),
+              state.counters.tessellation_primitives);
         job_->PublishFramebuffer(framebuffer, state.width, state.height,
                                  frame_bytes_per_pixel,
                                  std::move(extra_framebuffers),

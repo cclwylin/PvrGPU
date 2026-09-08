@@ -440,10 +440,10 @@ flowchart TB
 | Pixel Data Master | `PixelDataMaster` | `ACTIVE-FUNCTIONAL` subset | 驗證 PBE RGBA store、指定 framebuffer GPU address，經 `MemoryTxn` FIFO 送往 SLC |
 | Compute Data Master | `ComputeDataMaster` | `COMPUTE-SLICE` | 獨立 dispatch/workgroup process 與 LD/ST/整數 atomic32 memory-service process，後者經真實共享 `GpuMemorySystem` 存取；DMA RMW 是單一不可交錯的請求。CAS 執行真實 PCO MUTEX/SR51/逐 instance LD/ST，mutex owner 為 dispatch + task PoolHandle，錯誤時清理 |
 | Compute Shader | `ComputeShader` + non-module `compute_iss` | `COMPUTE-SLICE` | 自有 `.h/.cpp`、`SC_THREAD`、task/lane/mask 狀態；不得呼叫 VS/FS executor 代替 CS。FIFO 只傳小型 POD/PoolHandle，task 逐 native instruction group 鎖步執行 |
-| Geometry Shader 邏輯階段 | `GeometryShader` | `EMPTY-PLACEHOLDER` | 獨立 `.h/.cpp` 與頂層實例；尚無 GS 執行或輸出 primitive 行為，不是 VS/FS/CS 的別名 |
-| Tessellation Control Shader 邏輯階段 | `TessellationControlShader` | `EMPTY-PLACEHOLDER` | 獨立 TCS module；尚無 shader 執行、patch/task 或同步協定 |
-| 固定功能 Tessellation 邏輯階段 | `Tessellator` | `EMPTY-PLACEHOLDER` | 與 TCS/TES 分離，屬固定功能而非 shader；尚無細分與 primitive 產生行為 |
-| Tessellation Evaluation Shader 邏輯階段 | `TessellationEvaluationShader` | `EMPTY-PLACEHOLDER` | 獨立 TES module；尚無 shader 執行，既有 `DomainDataMaster` 不可代替 TCS/TES |
+| Geometry Shader 邏輯階段 | `GeometryShader` + non-module `geometry_iss` | `GEOMETRY-SLICE` | 獨立 `.h/.cpp`、event-driven `SC_THREAD` 與 bounded FIFO；真實 PCO LD/WDF、UVSW WRITE/EMIT/CUT/ENDTASK；primitive input 經 modeled GPU memory，strip output 留在 pool；不是 VS/FS/CS 的別名，尚非完整 GS conformance |
+| Tessellation Control Shader 邏輯階段 | `TessellationControlShader` + non-module `tessellation_iss` | `TESSELLATION-SLICE` | 獨立 event-driven module；每 patch 的真實 PCO task 執行 LD/ST，input、patch output 與 tess levels 經 modeled GPU memory，完成後才發往固定功能階段 |
+| 固定功能 Tessellation 邏輯階段 | `Tessellator` + non-module `tessellation` | `TESSELLATION-SLICE` | 獨立固定功能 module；triangle/quad/isoline、equal/fractional spacing、winding/point mode，演算法移植同 pinned llvmpipe 使用的 MIT tessellator；不呼叫 LLVM/JIT |
+| Tessellation Evaluation Shader 邏輯階段 | `TessellationEvaluationShader` + non-module `tessellation_iss` | `TESSELLATION-SLICE` | 獨立 task/lane module；真實 PCO 讀取 patch/domain memory 並 UVSW 輸出 vertices，接回 raster pipeline；Transform Feedback 與 GS+Tess 尚未支援，既有 `DomainDataMaster` 不代替 TES |
 | Domain Data Master | `DomainDataMaster` | `EMPTY-PLACEHOLDER` | 名稱來自 DXTP attachment；domain protocol/semantics 尚未公開驗證 |
 | 2D Data Master | `TwoDDataMaster` | `EMPTY-PLACEHOLDER` | 尚無 blit/2D render-packet ingest |
 | Programmable Data Sequencer | `PdsEngine` | `EMPTY-PLACEHOLDER` | 沒有 PDS decode/execute/task generation；USC `PcoDecoder` 不能代替 PDS |
@@ -478,7 +478,7 @@ flowchart TB
 
 上述 Fill.Solid/cache baseline 的 layout checker 為 **PASS（33 個 SystemC module class）**：16 個 active GPU functional class、3 個 implemented-idle cache class、2 個 harness class、12 個空 placeholder class。當時 VS/FS 各自實例化 `PcoDecoder`、`UscSlot`、`UscCluster`，top-level 共有 21 個 executable-chain instance、3 個 implemented-idle cache instance 與 12 個 placeholder instance。後續 Compute 與其他階段擴充的即時總數以 `tests/check_systemc_module_layout.py` 為準；所有具體 module 仍遵守一個 class 對一組唯一同 stem `.h/.cpp`。
 
-GS / TCS / Tessellator / TES 是額外預留的四個獨立邏輯 module，不代表已證實硬體中有四組專用執行核心。每個都有自己的 `.h/.cpp`，並納入 model executable、SystemC bridge 與 `ModelSession` 的初始 elaboration；目前完全沒有 ports、process、timing 或工作接收入口，不插入既有 graphics / compute 執行鏈，也不開啟 driver capability 或 public API。未來實作時才加入真正的原生執行與 bounded POD/PoolHandle FIFO，不允許以空 process、forwarding 或 VS/FS/CS 執行器冒充支援。
+GS / TCS / Tessellator / TES 是四個獨立邏輯 module，不代表已證實硬體中有四組專用執行核心。每個都有自己的 `.h/.cpp`、event-driven process 與 bounded POD/PoolHandle FIFO，納入 model executable、SystemC bridge 與 `ModelSession` 的初始 elaboration。GS 由 API24 引入，TCS/固定功能/TES 由 API25 引入；enabled stage 執行真實 native PCO 或固定功能細分，只有 absent stage 才原樣傳遞 transaction。完整支援邊界與實測結果見 `docs/GEOMETRY_SHADER_VALIDATION.md`、`docs/TESSELLATION_VALIDATION.md`；不得以 forwarding、host shader evaluator 或 VS/FS/CS 執行器冒充支援。
 
 Compute atomic32 的功能語義參照同一 pinned Mesa 的 llvmpipe
 `lp_bld_nir_soa.c`，但不呼叫其 LLVM/JIT：有效 lane 的整數 RMW 回傳舊值，
@@ -505,6 +505,9 @@ component mask 的 SSBO store 目前明確拒絕，不會當成完整 burst 誤�
 Submitter                                      [HARNESS]
   → Vdm → VertexFetch
   → PcoDecoder(VS) → UscSlot(VS) → UscCluster(VS)
+  → TessellationControlShader → Tessellator → TessellationEvaluationShader
+                                               [native Tess / no-Tess bypass]
+  → GeometryShader                             [native GS / no-GS bypass]
   → ClipCull → Tiler → ParameterBuffer
   → PcoDecoder(FS) → TileScheduler → Isp → FragmentFrontend
   → UscSlot(FS) → UscCluster(FS)
@@ -516,7 +519,7 @@ Submitter                                      [HARNESS]
   → JsonReporter                               [HARNESS]
 ```
 
-這是 20 條 depth=4 的 active bounded FIFO：geometry/fragment 及 PBE/DRAM completion 使用 `sc_fifo<PipelineTxn>`；PixelDataMaster→SLC→DramModel 使用 `sc_fifo<MemoryTxn>`，只帶 state/payload handle、address、bytes、operation/client/format。raw PCO、decoded instruction、vertex、primitive、tile list、fragment candidate/output 與 framebuffer bulk data 都留在 pool。執行採 `SC_THREAD` + timed/event wait，沒有 `sc_clock`、`SC_CTHREAD` 或逐 cycle polling。
+這條 graphics chain 使用 active bounded FIFO（預設 depth=4，可設定）：geometry/fragment 及 PBE/DRAM completion 使用 `sc_fifo<PipelineTxn>`；PixelDataMaster→SLC→DramModel 使用 `sc_fifo<MemoryTxn>`，只帶 state/payload handle、address、bytes、operation/client/format。raw PCO、decoded instruction、vertex、primitive、tile list、fragment candidate/output 與 framebuffer bulk data 都留在 pool。執行採 `SC_THREAD` + timed/event wait，沒有 `sc_clock`、`SC_CTHREAD` 或逐 cycle polling。TCS、固定功能 tessellator、TES 與 GS 分別具有獨立 FIFO boundary；absent stage 直接傳遞原 transaction。TCS input/output、tess levels 與 domain UV 經 `GpuMemorySystem` 實際讀寫與計時，pool transport 不取代 GPU memory traffic；目前 GS 與 Tess 同時 enabled 明確拒絕。
 
 `TextureUnit` 在 chain 中真的會 active，但三個現行 case只驗證 zero-request bypass。PBE建立 `pbe_framebuffer`，PixelDataMaster發出 framebuffer store，SLC active模式把 128-byte dirty line序列化後寫入 DramModel backing；bypass模式則送 linear payload。DramModel在 write completion後發出獨立 bulk read request，從自己的 backing建立全新 `dram_framebuffer`。`JsonReporter`要求 `framebuffer_from_dram=1`，並拒絕仍有 PBE/SLC source handle的 transaction；因此最終 PNG具有可執行的 DRAM provenance。
 

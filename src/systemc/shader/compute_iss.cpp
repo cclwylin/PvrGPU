@@ -260,6 +260,8 @@ void ValidateComputeProgram(const PcoDecodedProgram &program,
   bool pending = false;
   bool end = false;
   for (const auto &instruction : program.instructions) {
+    if (!HasCanonicalNativeIntegerSignedness(instruction))
+      Fail("integer signedness flag is not canonical for the native opcode");
     if (!instruction.repeat_count || instruction.repeat_count > 16 ||
         instruction.source_count > 4 || instruction.exec_cnd > 3 ||
         instruction.writes_predicate > 1)
@@ -401,10 +403,12 @@ void StepComputeTask(const PcoDecodedProgram &program, const ComputePcoAbi &abi,
   if (task.ended || !task.lane_count || task.lane_count > kComputeTaskWidth ||
       task.instruction_index >= program.instructions.size())
     Fail("task stepped outside its native program");
+  const auto &instruction = program.instructions[task.instruction_index];
+  if (!HasCanonicalNativeIntegerSignedness(instruction))
+    Fail("integer signedness flag is not canonical for the native opcode");
   // Finite watchdog bounds runaway native control flow; it never substitutes
   // a shader result or silently declares an unfinished invocation complete.
   if (++task.steps > UINT64_C(10000000)) Fail("native task instruction limit");
-  const auto &instruction = program.instructions[task.instruction_index];
   std::uint32_t next = task.instruction_index + 1;
   if (instruction.opcode == PcoOpcode::kWaitDataFence) {
     // pco_cf.c can predicate an LD/ST but deliberately never its WDF. DRC

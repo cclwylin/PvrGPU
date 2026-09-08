@@ -20,6 +20,11 @@ bool pvrgpu_submit_compute_command(
    struct pvrgpu_systemc_compute_stats *stats,
    char *error, size_t error_size);
 
+bool pvrgpu_read_graphics_stats(
+   uint64_t submission_generation,
+   struct pvrgpu_systemc_graphics_stats *stats,
+   char *error, size_t error_size);
+
 #define PVRGPU_DRIVER_COMMAND_SCHEMA "pvrgpu.driver-command.v1"
 #define PVRGPU_DRIVER_COMMAND_PRODUCER "pvrgpu-gallium-driver"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8 "PIPE_FORMAT_R8G8B8A8_UNORM"
@@ -233,6 +238,22 @@ struct pvrgpu_draw_pco_triangles_command {
 
    struct pvrgpu_draw_pco_stage_abi vertex_pco_abi;
    struct pvrgpu_draw_pco_stage_abi fragment_pco_abi;
+   const uint8_t *geometry_pco;
+   size_t geometry_pco_size;
+   const uint32_t *geometry_shared;
+   uint32_t geometry_shared_count;
+   struct pvrgpu_draw_pco_stage_abi geometry_pco_abi;
+   uint32_t geometry_input_primitive_vertices;
+   uint32_t geometry_output_primitive;
+   uint32_t geometry_max_vertices;
+   uint32_t geometry_invocations;
+   uint32_t geometry_input_stride_dwords;
+   uint32_t geometry_vertices_per_instance;
+   uint32_t geometry_layer_output_start;
+   uint32_t geometry_layer_output_count;
+   uint32_t geometry_primitive_id_output_start;
+   uint32_t geometry_primitive_id_output_count;
+   const struct pvrgpu_systemc_tessellation *tessellation;
    uint32_t position_output_start;
    uint32_t position_output_count;
    uint32_t fragment_position_start;

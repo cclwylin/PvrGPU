@@ -253,6 +253,11 @@ enum class PcoOpcode : std::uint8_t {
   kAtomicOr32,
   kAtomicXor32,
   kMutex,
+  // Native geometry UVSW operations; appended to preserve existing ordinals.
+  kUvsEmit,
+  kUvsCut,
+  kUvsEmitCut,
+  kUvsEndTask,
 };
 
 inline bool IsPcoAtomic32(PcoOpcode opcode) {
@@ -367,6 +372,10 @@ struct PcoInstruction {
   PcoWriteTarget output_target1 = PcoWriteTarget::kTemporary;
   // ADD64_32 sign-extends its 32-bit offset when the ISA S bit is set.
   std::uint8_t address_offset_signed = 0;
+  // IMADD64's S bit selects a signed product; ASR_TWB sign-extends SHR.
+  // Keep the native signedness instead of treating signed lowering as an
+  // unsigned multiply/shift that only happens to work for small positive IDs.
+  std::uint8_t integer_signed = 0;
   std::uint16_t branch_target_index = 0;
   std::uint32_t loop_count = 0;
   // Raw binary32/integer payload for compiler-emitted immediate groups.
@@ -477,6 +486,16 @@ struct PcoInstruction {
   // Native LD: normal=0/bypass=1; ST: through=0/back=1/lazy=2.
   std::uint8_t memory_cache_mode = 0;
 };
+
+// The standalone signed flag belongs only to native task IMADD64High and
+// SHR/ASR_TWB. Other signed integer ALU forms carry their existing, distinct
+// phase metadata. Validate before opcode-specific early-return branches.
+inline bool HasCanonicalNativeIntegerSignedness(const PcoInstruction &i) {
+  return i.integer_signed == 0 ||
+      (i.integer_signed == 1 &&
+       (i.opcode == PcoOpcode::kIntegerMultiplyAdd64High ||
+        i.opcode == PcoOpcode::kShiftRight));
+}
 
 /* Stored directly in PipelineState; no owning container appears here. */
 struct PcoProgramSummary {
@@ -687,6 +706,9 @@ PcoDecodedProgram DecodePcoProgram(ShaderStage stage,
  * construct a graphics context or call a VS/FS executor. Phase operands are
  * separately supplied because a composed group can read more than 4 regs. */
 PcoDecodedProgram DecodeComputePcoProgram(const std::vector<std::uint8_t> &binary);
+PcoDecodedProgram DecodeGeometryPcoProgram(const std::vector<std::uint8_t> &binary);
+PcoDecodedProgram DecodeTessellationPcoProgram(
+    ShaderStage stage, const std::vector<std::uint8_t> &binary);
 bool PcoSpecialConstantBits(std::uint16_t index, std::uint32_t *bits);
 std::uint32_t EvaluatePcoAluInstruction(
     const PcoInstruction &instruction,

@@ -3,6 +3,7 @@
 #include "pvrgpu_state.h"
 
 #include "pvrgpu_context.h"
+#include "pvrgpu_cmd.h"
 #include "pvrgpu_counter.h"
 #include "pvrgpu_resource.h"
 
@@ -34,6 +35,11 @@ struct pvrgpu_query {
    unsigned type;
    unsigned index;
    bool active;
+   bool ready;
+   uint64_t begin_primitives;
+   uint64_t begin_statistics_failures;
+   unsigned begin_unsupported_draws;
+   uint64_t result;
 };
 
 static const char *
@@ -996,6 +1002,60 @@ pvrgpu_set_vertex_buffers(struct pipe_context *pipe,
    }
 }
 
+bool
+pvrgpu_query_collect_completed(struct pvrgpu_context *ctx)
+{
+   if (!ctx)
+      return false;
+   const uint64_t generation = ctx->color_readback_generation;
+   if (!generation || generation == ctx->query_collected_generation)
+      return true;
+   /* Existing driver-only diagnostic use has no native statistics source.
+    * Do not turn an ordinary non-query flush into a new model requirement. */
+   const char *library = getenv("PVRGPU_SYSTEMC_API_LIB");
+   if ((!library || !library[0]) &&
+       !ctx->active_primitives_generated_queries)
+      return true;
+   struct pvrgpu_systemc_graphics_stats stats = {0};
+   char error[512] = {0};
+   if (!pvrgpu_read_graphics_stats(generation, &stats, error, sizeof(error)) ||
+       (!ctx->query_state_disabled &&
+        stats.primitives_generated > UINT64_MAX - ctx->query_primitives_generated)) {
+      ++ctx->query_statistics_failures;
+      pvrgpu_counter_eventf("query_statistics_error",
+         "generation=%llu reason=%s",
+         (unsigned long long)generation,
+         error[0] ? error : "primitive counter overflow");
+      return false;
+   }
+   if (!ctx->query_state_disabled)
+      ctx->query_primitives_generated += stats.primitives_generated;
+   ctx->query_collected_generation = generation;
+   pvrgpu_counter_eventf("query_statistics_completed",
+      "generation=%llu physical_submissions=%llu primitives_generated=%llu "
+      "ia_primitives=%llu gs_primitives=%llu gs_invocations=%llu enabled=%u",
+      (unsigned long long)generation,
+      (unsigned long long)stats.physical_submissions,
+      (unsigned long long)stats.primitives_generated,
+      (unsigned long long)stats.ia_primitives,
+      (unsigned long long)stats.gs_primitives,
+      (unsigned long long)stats.gs_invocations,
+      ctx->query_state_disabled ? 0u : 1u);
+   return true;
+}
+
+static bool
+pvrgpu_query_materialize(struct pipe_context *pipe)
+{
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   if (pvrgpu_context_has_incomplete_replay(ctx)) {
+      pvrgpu_counter_event("query_statistics_error", "reason=incomplete_replay");
+      return false;
+   }
+   pvrgpu_flush_current_color_attachments(pipe);
+   return pvrgpu_query_collect_completed(ctx);
+}
+
 static struct pipe_query *
 pvrgpu_create_query(struct pipe_context *pipe,
                     unsigned query_type,
@@ -1018,9 +1078,12 @@ pvrgpu_create_query(struct pipe_context *pipe,
 static void
 pvrgpu_destroy_query(struct pipe_context *pipe, struct pipe_query *query)
 {
-   (void)pipe;
    if (!query)
       return;
+   const struct pvrgpu_query *q = (const struct pvrgpu_query *)query;
+   if (q->type == PIPE_QUERY_PRIMITIVES_GENERATED && q->active &&
+       pvrgpu_context(pipe)->active_primitives_generated_queries)
+      --pvrgpu_context(pipe)->active_primitives_generated_queries;
    pvrgpu_counter_eventf("destroy_query", "");
    FREE(query);
 }
@@ -1028,10 +1091,23 @@ pvrgpu_destroy_query(struct pipe_context *pipe, struct pipe_query *query)
 static bool
 pvrgpu_begin_query(struct pipe_context *pipe, struct pipe_query *query)
 {
-   (void)pipe;
    struct pvrgpu_query *pvrgpu_query = (struct pvrgpu_query *)query;
    if (!pvrgpu_query)
       return false;
+
+   if (pvrgpu_query->type == PIPE_QUERY_PRIMITIVES_GENERATED) {
+      struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+      // Only stream zero is implemented by the native GS emission module.
+      if (pvrgpu_query->index || pvrgpu_query->active ||
+          !pvrgpu_query_materialize(pipe))
+         return false;
+      pvrgpu_query->begin_primitives = ctx->query_primitives_generated;
+      pvrgpu_query->begin_statistics_failures = ctx->query_statistics_failures;
+      pvrgpu_query->begin_unsupported_draws = ctx->unsupported_draws;
+      pvrgpu_query->ready = false;
+      pvrgpu_query->result = 0;
+      ++ctx->active_primitives_generated_queries;
+   }
 
    pvrgpu_query->active = true;
    pvrgpu_counter_eventf("begin_query",
@@ -1044,10 +1120,27 @@ pvrgpu_begin_query(struct pipe_context *pipe, struct pipe_query *query)
 static bool
 pvrgpu_end_query(struct pipe_context *pipe, struct pipe_query *query)
 {
-   (void)pipe;
    struct pvrgpu_query *pvrgpu_query = (struct pvrgpu_query *)query;
    if (!pvrgpu_query)
       return false;
+
+   if (pvrgpu_query->type == PIPE_QUERY_PRIMITIVES_GENERATED) {
+      struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+      if (!pvrgpu_query->active)
+         return false;
+      const bool completed = pvrgpu_query_materialize(pipe);
+      pvrgpu_query->active = false;
+      if (ctx->active_primitives_generated_queries)
+         --ctx->active_primitives_generated_queries;
+      if (!completed ||
+          ctx->query_statistics_failures != pvrgpu_query->begin_statistics_failures ||
+          ctx->unsupported_draws != pvrgpu_query->begin_unsupported_draws ||
+          ctx->query_primitives_generated < pvrgpu_query->begin_primitives)
+         return false;
+      pvrgpu_query->result =
+         ctx->query_primitives_generated - pvrgpu_query->begin_primitives;
+      pvrgpu_query->ready = true;
+   }
 
    pvrgpu_query->active = false;
    pvrgpu_counter_eventf("end_query",
@@ -1070,6 +1163,14 @@ pvrgpu_get_query_result(struct pipe_context *pipe,
 
    memset(result, 0, sizeof(*result));
    switch (pvrgpu_query->type) {
+   case PIPE_QUERY_PRIMITIVES_GENERATED:
+      if (pvrgpu_query->active || !pvrgpu_query->ready)
+         return false;
+      result->u64 = pvrgpu_query->result;
+      pvrgpu_counter_eventf("query_primitives_generated_result",
+         "value=%llu source=systemc-physical-stage-counters",
+         (unsigned long long)result->u64);
+      break;
    case PIPE_QUERY_GPU_FINISHED:
       result->b = true;
       break;
@@ -1096,7 +1197,15 @@ pvrgpu_get_query_result(struct pipe_context *pipe,
 static void
 pvrgpu_set_active_query_state(struct pipe_context *pipe, bool enable)
 {
-   (void)pipe;
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   if (ctx->query_state_disabled == enable) {
+      // Gallium disables application queries around internal meta draws.
+      // Close the previous accounting interval before changing its state.
+      if (ctx->active_primitives_generated_queries &&
+          !pvrgpu_query_materialize(pipe))
+         ++ctx->query_statistics_failures;
+      ctx->query_state_disabled = !enable;
+   }
    pvrgpu_counter_eventf("set_active_query_state",
                          "enable=%u",
                          enable ? 1 : 0);

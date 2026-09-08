@@ -79,6 +79,9 @@ enum class DriverPcoTextureSource : std::uint8_t {
 enum class DriverPcoShaderStage : std::uint8_t {
   kVertex = 0,
   kFragment = 1,
+  kGeometry = 2,
+  kTessellationControl = 3,
+  kTessellationEvaluation = 4,
 };
 
 inline constexpr std::size_t kMaximumUniformBuffersPerStage = 15;
@@ -274,6 +277,27 @@ constexpr bool DriverPcoStageAbiMatches(const DriverPcoStageAbi &actual,
          actual.uniform_buffer_descriptor_count == expected.uniform_buffer_descriptor_count;
 }
 
+struct DriverTessellation {
+  std::vector<std::uint8_t> control_pco;
+  std::vector<std::uint8_t> evaluation_pco;
+  std::vector<std::uint32_t> control_shared;
+  std::vector<std::uint32_t> evaluation_shared;
+  DriverPcoStageAbi control_abi;
+  DriverPcoStageAbi evaluation_abi;
+  std::uint32_t input_vertices = 0;
+  std::uint32_t output_vertices = 0;
+  std::uint32_t vertices_per_instance = 0;
+  std::uint32_t input_stride_dwords = 0;
+  std::uint32_t output_vertex_stride_dwords = 0;
+  std::uint32_t per_vertex_offset_dwords = 0;
+  std::uint32_t patch_stride_dwords = 0;
+  std::uint32_t control_barrier_count = 0;
+  std::uint32_t domain = 0;
+  std::uint32_t spacing = 0;
+  std::uint32_t clockwise = 0;
+  std::uint32_t point_mode = 0;
+};
+
 struct DriverCommand {
   bool enabled = false;
   std::string schema;
@@ -300,8 +324,13 @@ struct DriverCommand {
   std::vector<std::uint8_t> raw_vertex_data;
   std::vector<std::uint8_t> vertex_pco;
   std::vector<std::uint8_t> fragment_pco;
+  // API-v24: a genuine, separately executed geometry program. Empty means
+  // the VS remains the final pre-raster stage.
+  std::vector<std::uint8_t> geometry_pco;
   std::vector<std::uint32_t> vertex_shared;
   std::vector<std::uint32_t> fragment_shared;
+  std::vector<std::uint32_t> geometry_shared;
+  DriverTessellation tessellation;
   std::vector<DriverPcoUniformBuffer> uniform_buffers;
   std::uint32_t sampled_texture_count = 0;
   std::vector<std::uint8_t> sampled_texture_bytes;
@@ -341,6 +370,17 @@ struct DriverCommand {
   std::int32_t base_vertex = 0;
   DriverPcoStageAbi vertex_pco_abi;
   DriverPcoStageAbi fragment_pco_abi;
+  DriverPcoStageAbi geometry_pco_abi;
+  std::uint32_t geometry_input_primitive_vertices = 0;
+  std::uint32_t geometry_output_primitive = 0;
+  std::uint32_t geometry_max_vertices = 0;
+  std::uint32_t geometry_invocations = 0;
+  std::uint32_t geometry_input_stride_dwords = 0;
+  std::uint32_t geometry_vertices_per_instance = 0;
+  std::uint32_t geometry_layer_output_start = 0;
+  std::uint32_t geometry_layer_output_count = 0;
+  std::uint32_t geometry_primitive_id_output_start = 0;
+  std::uint32_t geometry_primitive_id_output_count = 0;
   std::uint32_t position_output_start = 0;
   std::uint32_t position_output_count = 0;
   std::uint32_t fragment_position_start = 0;
@@ -564,6 +604,10 @@ enum class MemoryClient : std::uint8_t {
   kUniformBuffer = 11,
   kComputeShader = 12,
   kComputeReadback = 13,
+  kGeometryShader = 14,
+  kTessellationControl = 15,
+  kTessellator = 16,
+  kTessellationEvaluation = 17,
 };
 
 enum class MemoryPayloadFormat : std::uint8_t {
@@ -601,6 +645,26 @@ struct CounterTxn {
   std::uint64_t ps_invocations = 0;
   std::uint64_t hs_invocations = 0;
   std::uint64_t ds_invocations = 0;
+  // Hull statistics count patches, as Gallium does. Actual TCS lane work is
+  // measured separately; domain shader invocations count generated points.
+  std::uint64_t tcs_invocations = 0;
+  std::uint64_t tcs_alu_instructions = 0;
+  std::uint64_t tcs_memory_instructions = 0;
+  std::uint64_t tcs_load_instructions = 0;
+  std::uint64_t tcs_store_instructions = 0;
+  std::uint64_t tcs_input_write_bytes = 0;
+  std::uint64_t tcs_input_read_bytes = 0;
+  std::uint64_t tcs_output_write_bytes = 0;
+  std::uint64_t tcs_output_read_bytes = 0;
+  std::uint64_t tes_alu_instructions = 0;
+  std::uint64_t tes_memory_instructions = 0;
+  std::uint64_t tes_load_instructions = 0;
+  std::uint64_t tes_patch_read_bytes = 0;
+  std::uint64_t tessellation_patches = 0;
+  std::uint64_t tessellation_primitives = 0;
+  std::uint64_t tessellation_domain_write_bytes = 0;
+  std::uint64_t tessellation_domain_read_bytes = 0;
+  std::uint64_t tessellation_level_read_bytes = 0;
   std::uint64_t drawlists = 0;
   std::uint64_t setup_triangles = 0;
   std::uint64_t texel_fetches = 0;
@@ -683,6 +747,12 @@ struct CounterTxn {
   std::uint64_t pbe_fragment_writes = 0;
   std::uint64_t pbe_pixels_written = 0;
   std::uint32_t functional_frame = 0;
+  std::uint64_t gs_alu_instructions = 0;
+  std::uint64_t gs_memory_instructions = 0;
+  std::uint64_t gs_load_instructions = 0;
+  std::uint64_t gs_emitted_vertices = 0;
+  std::uint64_t gs_input_write_bytes = 0;
+  std::uint64_t gs_input_read_bytes = 0;
 };
 
 std::ostream &operator<<(std::ostream &stream, const CounterTxn &txn);

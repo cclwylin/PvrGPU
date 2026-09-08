@@ -5,6 +5,7 @@
 #pragma once
 
 #include "model_types.h"
+#include "graphics_stats.h"
 
 #include <systemc>
 
@@ -43,6 +44,7 @@ struct ModelJob {
   bool complete = false;
   bool failed = false;
   std::string error;
+  ModelGraphicsStats graphics_stats;
 
   // The job's last physical DRAM readback.  This is what a `glReadPixels` on a
   // colour attachment ends up copying.  It is RGBA8 only while the attachment
@@ -67,6 +69,7 @@ struct ModelJob {
     complete = false;
     failed = false;
     error.clear();
+    graphics_stats = {};
     framebuffer.clear();
     extra_framebuffers.clear();
     framebuffer_width = 0;

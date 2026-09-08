@@ -13,6 +13,8 @@
 // PipelineTxn handle 與 frame/sequence metadata。
 #include "submitter.h"
 #include "uniform_buffers.h"
+#include "common/geometry_emission.h"
+#include "common/tessellation_state.h"
 
 #include "common/functional_types.h"
 #include "common/glbench_triangle_fixture.h"
@@ -81,6 +83,14 @@ inline constexpr std::uint64_t kBuiltinTexcoordBufferGpuAddress =
 // all three large vertex/index/UV regions, not inside texture/attachment space.
 inline constexpr std::uint64_t kUniformBufferGpuAddressBase =
     kBuiltinTexcoordBufferGpuAddress + kDriverSequenceAddressRegionBytes;
+inline constexpr std::uint64_t kGeometryPrimitiveGpuAddressBase =
+    kUniformBufferGpuAddressBase +
+    kDriverSequenceAddressSlots * 5U * kMaximumUniformBuffersPerStage *
+        kMaximumUniformBufferBytes;
+inline constexpr std::uint64_t kGeometryPrimitiveGpuAddressStride = 4096;
+inline constexpr std::uint64_t kTessellationGpuAddressBase =
+    kGeometryPrimitiveGpuAddressBase +
+    kDriverSequenceAddressSlots * kGeometryPrimitiveGpuAddressStride;
 // 以全部合法 slots 驗證區域，而非只以本輪實際 draw 數推測不會相撞。
 static_assert(kDriverPcoMrtColorAddressBase +
                   kDriverSequenceAddressSlots * kMaxRenderTargets *
@@ -89,19 +99,18 @@ static_assert(kDriverPcoMrtColorAddressBase +
               "MRT attachments overlap external textures");
 static_assert(kDriverPcoSequenceExternalAddressEnd <= kBuiltinVertexBufferGpuAddress,
               "external textures overlap vertex buffers");
-static_assert(kUniformBufferGpuAddressBase +
-                  kDriverSequenceAddressSlots * 2U * kMaximumUniformBuffersPerStage *
-                      kMaximumUniformBufferBytes <= kParameterTrianglesGpuAddress,
+static_assert(kTessellationGpuAddressBase +
+                  kDriverSequenceAddressSlots * kTessellationDrawAddressStride <= kParameterTrianglesGpuAddress,
               "driver buffers overlap parameter memory");
 
 std::uint64_t SequenceUniformBufferAddress(
     std::size_t submission, DriverPcoShaderStage stage, std::uint32_t block) {
   const auto stage_index = static_cast<unsigned>(stage);
-  if (submission >= kDriverSequenceAddressSlots || stage_index > 1 ||
+  if (submission >= kDriverSequenceAddressSlots || stage_index > 4 ||
       block >= kMaximumUniformBuffersPerStage)
     throw std::runtime_error("Submitter uniform buffer address slot is invalid");
   const std::uint64_t slot =
-      (static_cast<std::uint64_t>(submission) * 2U + stage_index) *
+      (static_cast<std::uint64_t>(submission) * 5U + stage_index) *
           kMaximumUniformBuffersPerStage + block;
   if (slot > (std::numeric_limits<std::uint64_t>::max() -
               kUniformBufferGpuAddressBase) / kMaximumUniformBufferBytes)
@@ -1133,9 +1142,59 @@ PrimitiveTopology DriverPcoTopologyFor(std::uint32_t primitive_mode) {
       return PrimitiveTopology::kTriangleStrip;
     case kPipePrimTriangleFan:
       return PrimitiveTopology::kTriangleFan;
+    case 10: return PrimitiveTopology::kLinesAdjacency;
+    case 11: return PrimitiveTopology::kLineStripAdjacency;
+    case 12: return PrimitiveTopology::kTrianglesAdjacency;
+    case 13: return PrimitiveTopology::kTriangleStripAdjacency;
+    case 14: return PrimitiveTopology::kPatches;
     default:
       throw std::runtime_error("Submitter driver PCO topology is unsupported");
   }
+}
+
+GeometryInputTopology GeometryInputTopologyFor(std::uint32_t mode) {
+  switch (mode) {
+    case 0: return GeometryInputTopology::kPoints;
+    case 1: return GeometryInputTopology::kLines;
+    case 2: return GeometryInputTopology::kLineLoop;
+    case 3: return GeometryInputTopology::kLineStrip;
+    case 4: return GeometryInputTopology::kTriangles;
+    case 5: return GeometryInputTopology::kTriangleStrip;
+    case 6: return GeometryInputTopology::kTriangleFan;
+    case 10: return GeometryInputTopology::kLinesAdjacency;
+    case 11: return GeometryInputTopology::kLineStripAdjacency;
+    case 12: return GeometryInputTopology::kTrianglesAdjacency;
+    case 13: return GeometryInputTopology::kTriangleStripAdjacency;
+    default: throw std::runtime_error("Submitter invalid GS input topology");
+  }
+}
+
+std::vector<GeometryInputPrimitive> GeometryInputsFor(const DriverCommand &command) {
+  const std::uint32_t count = command.indexed ? command.index_count : command.vertex_count;
+  const std::uint32_t per_instance = command.geometry_vertices_per_instance;
+  if (!per_instance || count % per_instance || command.first_index)
+    throw std::runtime_error("Submitter invalid GS input instance range");
+  std::vector<GeometryInputPrimitive> result(count);
+  std::vector<std::uint32_t> occurrences(per_instance);
+  std::size_t total = 0;
+  for (std::uint32_t instance = 0; instance < count / per_instance; ++instance) {
+    for (std::uint32_t i = 0; i < per_instance; ++i)
+      occurrences[i] = instance * per_instance + i;
+    std::size_t written = 0;
+    const auto status = AssembleGeometryInputPrimitives(
+        GeometryInputTopologyFor(command.primitive_mode), occurrences.data(),
+        occurrences.size(), false, UINT32_MAX, instance,
+        result.data() + total, result.size() - total, written);
+    if (status != GeometryEmissionStatus::kSuccess)
+      throw std::runtime_error(std::string("Submitter GS input assembly: ") +
+                               GeometryEmissionStatusName(status));
+    total += written;
+  }
+  result.resize(total);
+  for (const auto &primitive : result)
+    if (primitive.vertex_count != command.geometry_input_primitive_vertices)
+      throw std::runtime_error("Submitter GS input shader/topology mismatch");
+  return result;
 }
 
 IndexFormat DriverPcoIndexFormatFor(std::uint32_t index_size) {
@@ -1661,6 +1720,73 @@ void Submitter::RunJob() {
     if (driver_pco_triangles_command) {
       state.vertex_pco_abi = command.vertex_pco_abi;
       state.fragment_pco_abi = command.fragment_pco_abi;
+      if (!command.tessellation.control_pco.empty()) {
+        const auto &source = command.tessellation;
+        const auto count = command.indexed ? command.index_count : command.vertex_count;
+        if (!memory_ || !command.geometry_pco.empty() || command.primitive_mode != 14 ||
+            !source.input_vertices || source.input_vertices > kTessellationTaskWidth ||
+            !source.vertices_per_instance || count % source.vertices_per_instance ||
+            count > kTessellationMaxPatches * kTessellationTaskWidth)
+          throw std::runtime_error("Submitter tessellation patch input contract is invalid");
+        const auto patches_per_instance = source.vertices_per_instance / source.input_vertices;
+        const std::uint64_t patch_count = std::uint64_t(patches_per_instance) *
+            (count / source.vertices_per_instance);
+        if (patch_count > kTessellationMaxPatches)
+          throw std::runtime_error("Submitter tessellation patch count exceeds storage bound");
+        TessellationState tess;
+        tess.control_code = StoreNewArray(pool_, source.control_pco);
+        tess.evaluation_code = StoreNewArray(pool_, source.evaluation_pco);
+        tess.control_abi = source.control_abi;
+        tess.evaluation_abi = source.evaluation_abi;
+        state.tessellation_output_dwords = source.evaluation_abi.vertex_outputs;
+        tess.input_vertices = source.input_vertices;
+        tess.output_vertices = source.output_vertices;
+        tess.vertices_per_instance = source.vertices_per_instance;
+        tess.input_stride_dwords = source.input_stride_dwords;
+        tess.output_vertex_stride_dwords = source.output_vertex_stride_dwords;
+        tess.per_vertex_offset_dwords = source.per_vertex_offset_dwords;
+        tess.patch_stride_dwords = source.patch_stride_dwords;
+        tess.control_barrier_count = source.control_barrier_count;
+        tess.domain = static_cast<TessellationDomain>(source.domain);
+        tess.spacing = static_cast<TessellationSpacing>(source.spacing);
+        tess.clockwise = source.clockwise;
+        tess.point_mode = source.point_mode;
+        tess.input_address = kTessellationGpuAddressBase + submission * kTessellationDrawAddressStride;
+        tess.output_address = tess.input_address + kTessellationPatchAddressStride;
+        tess.domain_address = tess.output_address + UINT64_C(0x4000000);
+        std::vector<TessellationPatch> patches;
+        patches.reserve(patch_count);
+        for (std::uint32_t instance = 0; instance < count / source.vertices_per_instance; ++instance) {
+          for (std::uint32_t primitive = 0; primitive < patches_per_instance; ++primitive) {
+            TessellationPatch patch;
+            patch.primitive_id = primitive;
+            patch.instance_id = instance;
+            patch.first_occurrence = instance * source.vertices_per_instance + primitive * source.input_vertices;
+            patch.input_vertices = source.input_vertices;
+            patch.output_address = tess.output_address + patches.size() * kTessellationPatchAddressStride;
+            patches.push_back(patch);
+          }
+        }
+        tess.patches = StoreNewArray(pool_, patches);
+        state.tessellation_state = StoreNewArray(pool_, std::vector<TessellationState>{tess});
+      }
+      if (!command.geometry_pco.empty()) {
+        state.geometry_code = StoreNewArray(pool_, command.geometry_pco);
+        state.geometry_pco_abi = command.geometry_pco_abi;
+        state.geometry_input_primitive_vertices = command.geometry_input_primitive_vertices;
+        state.geometry_output_topology = DriverPcoTopologyFor(command.geometry_output_primitive);
+        state.geometry_max_vertices = command.geometry_max_vertices;
+        state.geometry_invocations = command.geometry_invocations;
+        state.geometry_input_stride_dwords = command.geometry_input_stride_dwords;
+        state.geometry_vertices_per_instance = command.geometry_vertices_per_instance;
+        state.geometry_input_buffer_gpu_address = kGeometryPrimitiveGpuAddressBase +
+            submission * kGeometryPrimitiveGpuAddressStride;
+        state.geometry_layer_output_start = command.geometry_layer_output_start;
+        state.geometry_layer_output_count = command.geometry_layer_output_count;
+        state.geometry_primitive_id_output_start = command.geometry_primitive_id_output_start;
+        state.geometry_primitive_id_output_count = command.geometry_primitive_id_output_count;
+        state.geometry_input_primitives = StoreNewArray(pool_, GeometryInputsFor(command));
+      }
       state.position_output_start =
           command.position_output_start;
       state.position_output_count =
@@ -1898,11 +2024,12 @@ void Submitter::RunJob() {
                             : MakeGlbenchFillTextureFixture(functional_case);
     }
     const DriverPcoTopologyExpansion expanded_pco =
-        driver_pco_triangles
+        driver_pco_triangles && command.geometry_pco.empty() && command.tessellation.control_pco.empty()
             ? ExpandDriverPcoTopology(command)
             : DriverPcoTopologyExpansion{};
     const std::vector<std::uint8_t> &expanded_pco_vertices =
-        expanded_pco.vertices;
+        command.geometry_pco.empty() && command.tessellation.control_pco.empty()
+            ? expanded_pco.vertices : command.raw_vertex_data;
     if (driver_triangle) {
       vertex_buffer = DriverTriangleFloat2Vertices(command);
       const std::vector<std::uint16_t> indices = {0, 1, 2};
@@ -1976,10 +2103,12 @@ void Submitter::RunJob() {
                                     kBuiltinIndexBufferGpuAddress,
                                     submission, "index"));
     } else if (driver_pco_triangles) {
-      state.draw.topology = PrimitiveTopology::kTriangleList;
+      state.draw.topology = command.geometry_pco.empty() && command.tessellation.control_pco.empty()
+          ? PrimitiveTopology::kTriangleList : DriverPcoTopologyFor(command.primitive_mode);
       state.draw.first_vertex = 0;
-      state.draw.vertex_count = static_cast<std::uint32_t>(
-          expanded_pco_vertices.size() / command.vertex_stride);
+      state.draw.vertex_count = command.geometry_pco.empty() && command.tessellation.control_pco.empty()
+          ? static_cast<std::uint32_t>(expanded_pco_vertices.size() / command.vertex_stride)
+          : command.vertex_count;
       state.draw.index_format = IndexFormat::kNone;
       if (!expanded_pco.source_vertices.empty()) {
         if (expanded_pco.source_vertices.size() != state.draw.vertex_count)
@@ -2012,7 +2141,13 @@ void Submitter::RunJob() {
       state.draw.first_vertex = 0;
       state.draw.vertex_count = 4;
     }
-    const VertexBufferResource vertex_resource =
+    const bool empty_geometry_attributes = driver_pco_triangles &&
+        (!command.geometry_pco.empty() || !command.tessellation.control_pco.empty()) && command.vertex_attribute_count == 0 &&
+        command.vertex_pco_abi.vertex_inputs == 0 && command.vertex_stride == 0 &&
+        expanded_pco_vertices.empty();
+    std::vector<VertexBufferResource> vertex_resources;
+    if (!empty_geometry_attributes) {
+      const VertexBufferResource vertex_resource =
         driver_pco_triangles
             ? StoreRawVertexBuffer(pool_, expanded_pco_vertices,
                                    SequenceBufferAddress(
@@ -2021,7 +2156,8 @@ void Submitter::RunJob() {
                                    memory_)
             : StoreFloat2VertexBuffer(pool_, vertex_buffer,
                                       kBuiltinVertexBufferGpuAddress, memory_);
-    std::vector<VertexBufferResource> vertex_resources{vertex_resource};
+      vertex_resources.push_back(vertex_resource);
+    }
     if (texture_case) {
       vertex_resources.push_back(StoreFloat2VertexBuffer(
           pool_, texture_fixture.texture_coordinates,
@@ -2060,7 +2196,10 @@ void Submitter::RunJob() {
         const bool terrain_main_layout =
             command.vertex_stride == 11U * sizeof(float) &&
             command.vertex_pco_abi.vertex_inputs == 16;
-        if (command.vertex_attribute_count != 0) {
+        if (empty_geometry_attributes) {
+          // No fabricated VBO or attribute: the shader has no VTXIN reads.
+          state.driver_describes_attributes = 1;
+        } else if (command.vertex_attribute_count != 0) {
           // The capsule states each attribute's width, so build the bindings
           // it describes rather than inferring a layout from the stride.
           state.driver_describes_attributes = 1;
@@ -2243,6 +2382,11 @@ void Submitter::RunJob() {
     } else if (driver_pco_triangles) {
       std::vector<std::uint32_t> vertex_shared_words = command.vertex_shared;
       std::vector<std::uint32_t> fragment_shared = command.fragment_shared;
+      std::vector<std::uint32_t> geometry_shared = command.geometry_shared;
+      std::vector<std::uint32_t> control_shared = command.tessellation.control_shared;
+      std::vector<std::uint32_t> evaluation_shared = command.tessellation.evaluation_shared;
+      std::vector<UniformBufferResource> control_uniform_buffers;
+      std::vector<UniformBufferResource> evaluation_uniform_buffers;
       std::string uniform_error;
       if (!ValidateDriverUniformBuffers(command, &uniform_error))
         throw std::runtime_error(uniform_error);
@@ -2251,11 +2395,20 @@ void Submitter::RunJob() {
           throw std::runtime_error("Submitter uniform buffers require sequence GPU memory");
         std::vector<UniformBufferResource> vertex_uniform_buffers;
         std::vector<UniformBufferResource> fragment_uniform_buffers;
+        std::vector<UniformBufferResource> geometry_uniform_buffers;
         for (const auto &buffer : command.uniform_buffers) {
           const bool vertex_stage = buffer.stage == DriverPcoShaderStage::kVertex;
-          const auto &abi = vertex_stage ? command.vertex_pco_abi
+          const bool geometry_stage = buffer.stage == DriverPcoShaderStage::kGeometry;
+          const bool control_stage = buffer.stage == DriverPcoShaderStage::kTessellationControl;
+          const bool evaluation_stage = buffer.stage == DriverPcoShaderStage::kTessellationEvaluation;
+          const auto &abi = control_stage ? command.tessellation.control_abi
+                           : evaluation_stage ? command.tessellation.evaluation_abi
+                           : geometry_stage ? command.geometry_pco_abi
+                           : vertex_stage ? command.vertex_pco_abi
                                          : command.fragment_pco_abi;
-          auto &shared = vertex_stage ? vertex_shared_words : fragment_shared;
+          auto &shared = control_stage ? control_shared : evaluation_stage ? evaluation_shared
+                         : geometry_stage ? geometry_shared
+                         : vertex_stage ? vertex_shared_words : fragment_shared;
           UniformBufferResource resource;
           resource.gpu_address = SequenceUniformBufferAddress(
               submission, buffer.stage, buffer.block_index);
@@ -2268,13 +2421,29 @@ void Submitter::RunJob() {
           shared[word] = static_cast<std::uint32_t>(resource.gpu_address);
           shared[word + 1] = static_cast<std::uint32_t>(resource.gpu_address >> 32U);
           // Size and zero dynamic offset were validated against the snapshot.
-          (vertex_stage ? vertex_uniform_buffers : fragment_uniform_buffers)
+          (control_stage ? control_uniform_buffers : evaluation_stage ? evaluation_uniform_buffers
+           : geometry_stage ? geometry_uniform_buffers
+           : vertex_stage ? vertex_uniform_buffers : fragment_uniform_buffers)
               .push_back(resource);
         }
         if (!vertex_uniform_buffers.empty())
           state.vertex_uniform_buffer_resources = StoreNewArray(pool_, vertex_uniform_buffers);
         if (!fragment_uniform_buffers.empty())
           state.fragment_uniform_buffer_resources = StoreNewArray(pool_, fragment_uniform_buffers);
+        if (!geometry_uniform_buffers.empty())
+          state.geometry_uniform_buffer_resources = StoreNewArray(pool_, geometry_uniform_buffers);
+      }
+      if (!geometry_shared.empty())
+        state.geometry_shared_registers = StoreNewArray(pool_, geometry_shared);
+      if (HasPoolHandle(state.tessellation_state)) {
+        auto tess = LoadArray<TessellationState>(pool_, state.tessellation_state);
+        tess[0].control_shared = StoreNewArray(pool_, control_shared);
+        tess[0].evaluation_shared = StoreNewArray(pool_, evaluation_shared);
+        if (!control_uniform_buffers.empty())
+          tess[0].control_uniform_buffers = StoreNewArray(pool_, control_uniform_buffers);
+        if (!evaluation_uniform_buffers.empty())
+          tess[0].evaluation_uniform_buffers = StoreNewArray(pool_, evaluation_uniform_buffers);
+        StoreArray(pool_, state.tessellation_state, tess);
       }
       if (!command.sampled_textures.empty()) {
         if (!driver_pco_sequence_command || !memory_ ||

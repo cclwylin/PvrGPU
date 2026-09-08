@@ -6,6 +6,9 @@ enum class ShaderStage {
   kVertex,
   kFragment,
   kCompute,
+  kGeometry,
+  kTessellationControl,
+  kTessellationEvaluation,
 };
 
 }  // namespace pvrgpu::stub

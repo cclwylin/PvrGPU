@@ -2240,7 +2240,7 @@ void TextureUnit::Run() {
     // pixel-output file.  This is the same quantity the decoder checks the
     // shader summary against, so both read it from one place.
     const std::uint32_t expected_pixel_output_mask =
-        ExpectedPixelOutputMask(state.fragment_output_mask);
+        ExpectedPixelOutputMask(state.fragment_output_mask, HasPoolHandle(state.geometry_code));
     if (!HasPoolHandle(state.fragment_outputs) ||
         state.fragment_program_summary.pixel_output_mask !=
             expected_pixel_output_mask) {

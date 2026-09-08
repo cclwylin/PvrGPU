@@ -16,30 +16,39 @@ inline bool ValidateDriverUniformBuffers(const DriverCommand &command,
       *error = std::string("PCO uniform buffer ") + message;
     return false;
   };
-  if (command.uniform_buffers.size() > 2U * kMaximumUniformBuffersPerStage)
+  if (command.uniform_buffers.size() > 5U * kMaximumUniformBuffersPerStage)
     return reject("payload count exceeds the stage limits");
   std::array<std::array<const DriverPcoUniformBuffer *,
-                        kMaximumUniformBuffersPerStage>, 2> payloads{};
+                        kMaximumUniformBuffersPerStage>, 5> payloads{};
   for (const auto &buffer : command.uniform_buffers) {
     const auto stage = static_cast<unsigned>(buffer.stage);
-    if (stage > 1 || buffer.block_index >= kMaximumUniformBuffersPerStage ||
+    if (stage > 4 || buffer.block_index >= kMaximumUniformBuffersPerStage ||
         buffer.bytes.empty() || buffer.bytes.size() > kMaximumUniformBufferBytes)
       return reject("payload stage/index/size is invalid");
     if (payloads[stage][buffer.block_index])
       return reject("stage/block index is duplicated");
     payloads[stage][buffer.block_index] = &buffer;
   }
-  for (unsigned stage = 0; stage < 2; ++stage) {
-    const auto &abi = stage ? command.fragment_pco_abi : command.vertex_pco_abi;
-    const auto &shared = stage ? command.fragment_shared : command.vertex_shared;
+  for (unsigned stage = 0; stage < 5; ++stage) {
+    const auto &abi = stage == 4 ? command.tessellation.evaluation_abi
+                     : stage == 3 ? command.tessellation.control_abi
+                     : stage == 2 ? command.geometry_pco_abi
+                     : stage ? command.fragment_pco_abi : command.vertex_pco_abi;
+    const auto &shared = stage == 4 ? command.tessellation.evaluation_shared
+                        : stage == 3 ? command.tessellation.control_shared
+                        : stage == 2 ? command.geometry_shared
+                        : stage ? command.fragment_shared : command.vertex_shared;
     const std::size_t count = abi.uniform_buffer_descriptor_count;
     const std::size_t start = abi.uniform_buffer_descriptor_start;
-    if (count > kMaximumUniformBuffersPerStage || (count == 0 && start != 0))
+    const std::size_t native_base = stage >= 3 && !command.tessellation.evaluation_pco.empty()
+        ? (stage == 3 ? 8U : 4U) : stage == 2 && !command.geometry_pco.empty() ? 4U : 0U;
+    if (count > kMaximumUniformBuffersPerStage ||
+        (count == 0 && start != native_base))
       return reject("descriptor range is invalid");
     if (count != 0) {
       const std::size_t textures = stage ? command.fragment_sampled_texture_count
                                         : command.vertex_sampled_texture_count;
-      if (start != textures * 20U || start > shared.size() ||
+      if (start != (stage >= 2 ? native_base : textures * 20U) || start > shared.size() ||
           count * kUniformBufferDescriptorDwordCount > shared.size() - start ||
           shared.size() != abi.shareds ||
           abi.push_constant_start != start + count * kUniformBufferDescriptorDwordCount ||

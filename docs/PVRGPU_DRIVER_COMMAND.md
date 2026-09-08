@@ -8,7 +8,113 @@ bring-up seam: small enough to debug quickly, strict enough to prevent fake
 passes, and close enough to Gallium state that the driver can grow phase by
 phase.
 
-## Multisample sampled images (SystemC API v23)
+## Native tessellation stages (introduced in SystemC API v25)
+
+Graphics API 25 appends an optional `pvrgpu_systemc_tessellation` pointer to a
+nested draw. Top-level and nested version checks happen before reading the new
+tail. The bridge deep-copies both binaries, both shared-register snapshots and
+stage-local UBO ranges before returning. Compute API remains independently at 2.
+TCS/TES graphics API stage IDs are 3/4, distinct from the internal shader enum.
+
+The executable chain is VS → independent `TessellationControlShader` → fixed
+`Tessellator` → independent `TessellationEvaluationShader` → GeometryShader
+(bypass when absent) → ClipCull. Every edge is a bounded handle FIFO. TCS/TES
+retain `MESA_SHADER_TESS_CTRL`/`MESA_SHADER_TESS_EVAL`; no VS/CS stage alias,
+host NIR interpreter, expected tessellation coordinates or shader results are
+submitted. Apply `mesa-26.2.1-pco-tessellation-stage.patch` after the GS patch.
+
+TCS VI0/1/2 are PrimitiveID, InvocationID and input PatchVerticesIn. SH0..3
+describe input VS AoS storage; SH4..7 describe writable output patch storage;
+UBO descriptors begin at SH8. TES VI0..2 are the raw float TessCoord values,
+VI3 is PrimitiveID, and VI4 is output PatchVerticesIn. TES SH0..3 describe the
+TCS output patch, with UBO descriptors at SH4. In both stages CB0 follows the
+UBO descriptors. Input descriptors must be all-zero until model relocation.
+
+The TCS output buffer stores outer[4], inner[2], patch varyings, then output
+vertex AoS records. TCS executes one bounded task (up to 32 invocations) in
+instruction-group lockstep; native stores become visible before the next
+group's loads, preserving the compiler's single-task barrier contract. TCS
+terminates with native NOP.end; TES emits one actual UVSW vertex per lane.
+VS input occurrences are retained before primitive expansion and grouped into
+patches independently per instance. Incomplete trailing patches produce no
+shader invocations or primitives.
+
+The fixed helper follows pinned llvmpipe's tessellator, including equal,
+fractional-even/odd spacing, all domains, winding, point mode, level clamping
+and discard rules. It reads actual TCS level stores and writes UV coordinates
+through `GpuMemorySystem`; TES reads them through its own memory client. The
+third triangle coordinate is evaluated as `(1.0f-u)-v`, as in llvmpipe. Generated
+topology indices remain bounded pool-owned fixed-function metadata.
+
+Transport bounds: 32 input/output vertices per patch, 4096 patches and 131072
+input occurrences per draw, 64 DWORDs per vertex output, 256 TEMP/SHARED
+registers, 15 UBOs per stage, and 64 KiB per UBO range. Fixed per-patch storage
+is bounded to 4225 points and 24576 indices; per-draw totals are capped at
+1048576 points and 6291456 indices. Output patch address slots are 16 KiB;
+input, output and UV storage are disjoint within each 128 MiB draw region.
+Extent overflow is rejected before copying/allocating input buffers.
+
+`hs_invocations` counts control patches, `tcs_invocations` counts actual TCS
+lanes, and `ds_invocations` counts evaluated domain points. Fixed generated
+primitives, native instructions and each stage's memory bytes are distinct
+counters. Primitive-generated queries select actual TES output rather than
+input patches, and never report that work as GS execution. TF primitives-written
+is a separate, not-yet-implemented capability; no generated-count substitute
+is used for TF. See [validation and limitations](TESSELLATION_VALIDATION.md).
+
+## Native geometry stage (introduced in SystemC API v24)
+
+Graphics API 24 appends a separately owned GS binary, shared-register payload,
+stage ABI, input/output topology, invocation/output bounds and built-in output
+locations to each nested draw. Old command versions are rejected before the
+new tail is read. Compute API 2 is independent and unchanged. The GS stage is
+not encoded as VS or CS; Mesa retains `MESA_SHADER_GEOMETRY` through native
+PCO lowering and exposes it as graphics API shader stage 2.
+
+The executable chain is VS → independent `GeometryShader` SystemC module →
+ClipCull. Its event-driven process receives bounded FIFO transactions carrying
+pool handles. Real native LD/WDF instructions read assembled VS outputs from
+modeled GPU memory. UVSW WRITE/EMIT/CUT/ENDTASK produce raw vertex snapshots
+and strips; no host shader interpretation or expected pixels are supplied.
+The compiler patch is `third_party/mesa-26.2.1-pco-geometry-stage.patch`.
+
+GS SH0/1 hold the primitive input address, SH2 its byte extent and SH3 is zero.
+UBO descriptors start at SH4, including when no UBO is bound. CB0 push constants
+follow the four-DWORD descriptors. VI0/VI1 carry integer PrimitiveIDIn and
+InvocationID. Inputs use the actual VS AoS output stride, not the GS output
+layout. GS outputs pack position, optional PointSize, linked varyings, then
+optional PrimitiveID and Layer. The ABI is bounded to 64 output DWORDs,
+256 emitted vertices and 32 invocations. `max_vertices=0` executes the task
+without emitting vertices; ENDTASK does not imply a fabricated emission.
+
+Input assembly and output strip decomposition follow the pinned Mesa/llvmpipe
+semantics, including adjacency ordering, strip parity, the last provoking
+vertex, and discarded incomplete strips. Flat outputs preserve raw DWORDs
+through clipping. Geometry instruction, invocation, emission and modeled input
+memory counters are measured separately and aggregated from DrawLists.
+
+No-attribute VS invocations own empty input tables, not fabricated VBOs; a VS
+without Position writes remains legal before a GS. A genuinely empty FS uses
+native NOP.end and zero output masks. For a single attachment, PBE preserves
+the imported color storage when no color is exported. All GS MRT draws are
+rejected until independent per-target LOAD is available: even a shader that
+declares every target can emit no vertices or leave pixels untouched.
+
+Primitive-generated queries materialize their actual submissions and snapshot
+SystemC physical GS output primitive counters, TES output with tessellation,
+or IA primitives with neither stage.
+The versioned statistics API carries a submission generation: wrong-owner
+requests fail, repeated reads do not add counts, and zero-emission GS does not
+fall back to the input primitive count. Driver Begin/End query intervals use
+context-owned cumulative results; no prepared query result is substituted.
+
+This is an initial native slice, not complete geometry-shading conformance.
+GS sampling, nonzero layered attachment addressing, driver restart transport
+and indirect submission remain outside this slice. Pure assembly helper
+restart coverage does not establish live driver restart support. QPA Pass
+with a refused draw is not native execution evidence.
+
+## Multisample sampled images (introduced in SystemC API v23)
 
 The sampled-texture payload appends `sample_count` (zero is the canonical
 single-sample default). Graphics API 23 rejects older top-level and nested

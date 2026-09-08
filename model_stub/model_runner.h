@@ -1,6 +1,7 @@
 #pragma once
 
 #include "model_types.h"
+#include "graphics_stats.h"
 
 #include <cstdint>
 #include <string>
@@ -21,6 +22,7 @@ bool ConfigureDriverCommandOptions(Options *options, std::string *error);
  * came back the driver could only ever hand out its own CPU clear.
  */
 struct ModelFramebuffer {
+  ModelGraphicsStats graphics_stats;
   std::vector<std::uint8_t> pixels;
   // Colour attachments past the first, in target order.  Each is the same
   // width, height and pixel width as `pixels`.

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "shader/pco_iss.h"
 #include "pco_compute_fixtures.h"
+#include "pco_geometry_fixtures.h"
 #include "compute_atomic_reference.h"
 #include <iostream>
 #include <stdexcept>
@@ -52,7 +53,26 @@ int main() {
             "native compute instruction classes");
       CountPcoInstructions(d.instructions, true);
       Reject([&] { DecodePcoProgram(ShaderStage::kVertex, ComputePcoFixture(kind)); });
-      Reject([&] { DecodePcoProgram(ShaderStage::kFragment, ComputePcoFixture(kind)); });
+      if (kind == 0) {
+        // The actual compute and fragment compilers emit identical native
+        // NOP.end bytes for empty shaders. Stage ownership is in the ABI,
+        // not an invented tag in this operand-free ISA instruction.
+        Check(ComputePcoFixture(kind) == GeometryEmptyFragmentFixture(),
+              "independently compiled empty CS/FS must share exact NOP.end bytes");
+        const auto fragment = DecodePcoProgram(ShaderStage::kFragment, ComputePcoFixture(kind));
+        Check(fragment.summary.stage == ShaderStage::kFragment &&
+              fragment.instructions.size() == 1 &&
+              fragment.instructions[0].opcode == PcoOpcode::kNop &&
+              fragment.instructions[0].end_group &&
+              !fragment.summary.pixel_output_mask && !fragment.summary.vertex_output_mask,
+              "shared empty instruction retains fragment stage and no fabricated outputs");
+        const auto executed = ExecuteFragmentPco(fragment.summary, fragment.instructions, {});
+        Check(executed.executed_instruction_count == 1 && !executed.written_mask &&
+              !executed.depth_written && !executed.discarded && !executed.suspended,
+              "empty fragment instruction has no compute or color side effects");
+      } else {
+        Reject([&] { DecodePcoProgram(ShaderStage::kFragment, ComputePcoFixture(kind)); });
+      }
       std::cout << "compute fixture " << kind << ": " << d.instructions.size() << " groups PASS\n";
     }
     const auto cas = DecodeComputePcoProgram(ComputePcoFixture(21));

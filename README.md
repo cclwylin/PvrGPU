@@ -32,14 +32,14 @@ So behaviour comes from one place only:
   `ComputeDataMaster` and `ComputeShader` SystemC modules, with native task
   state and bounded memory request/completion FIFOs.
 
-Geometry and tessellation reserve separate `GeometryShader`,
+Geometry and tessellation execute in separate `GeometryShader`,
 `TessellationControlShader`, `Tessellator` (fixed function) and
 `TessellationEvaluationShader` SystemC modules. Each has its own `.h/.cpp`
-and top-level instance. These are structural placeholders only: no ports,
-processes, execution, timing or additional advertised shader capabilities.
-They are not aliases for VS/FS/CS, and `DomainDataMaster` does not replace the
-tessellation shader stages. Future connections must use bounded POD/PoolHandle
-FIFOs under the same module and memory-ownership rules as compute.
+and top-level instance, with event-driven processes and bounded POD/PoolHandle
+FIFOs. They are not aliases for VS/FS/CS, and `DomainDataMaster` does not replace
+the tessellation stages. Absent stages forward only the original transaction;
+enabled stages execute native programs and modeled memory operations. Combined
+Tessellation+GS and Transform Feedback remain explicitly unsupported.
 
 ### Forbidden
 
@@ -114,6 +114,23 @@ Detail per component: [PvrGPU.md §3.5](PvrGPU.md), the
 
 ## Current Status
 
+- Graphics API v25 adds independent native TCS and TES execution around a
+  fixed-function tessellator ported from the pinned Mesa/llvmpipe helper.
+  Triangle/quad/isoline domains, all three spacing modes, winding and point
+  mode have bit-exact helper differential coverage. Live tessellation dEQP
+  is 89 Pass / 311 Fail / 6 NotSupported across 406 cases; the 47 non-TF
+  render cases all pass. Transform Feedback remains unimplemented, so this
+  is not all-pass or llvmpipe parity. See the
+  [tessellation validation](docs/TESSELLATION_VALIDATION.md).
+- Graphics API v24 adds a real native Geometry Shader path through its own
+  event-driven SystemC module between VS and ClipCull. Native LD/WDF and
+  UVSW WRITE/EMIT/CUT/ENDTASK execute with bounded pool-backed export storage.
+  Tessellation now has its own native stages; GS is not a VS/CS alias.
+  Live geometry-shading dEQP is 168 Pass / 29 Fail / 10 NotSupported across
+  207 cases (llvmpipe: 206 Pass / 1 NotSupported), not all-pass. Only 83 Pass
+  cases establish actual native GS execution; two indirect TF Pass cases
+  still refuse their draws. See the [validation](docs/GEOMETRY_SHADER_VALIDATION.md)
+  and [geometry contract](docs/PVRGPU_DRIVER_COMMAND.md).
 - Graphics API v23 adds native multisample texture fetch transport: real
   SMP.NNCOORDS.SNO selects one of 1/2/4/8 pixel-interleaved samples, including
   integer/float/depth views and single-level 2D arrays. Size/sample queries

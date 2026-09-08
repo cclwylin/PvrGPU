@@ -10,6 +10,7 @@
 #include "memory/gpu_memory_system.h"
 
 #include "common/functional_types.h"
+#include "common/tessellation_state.h"
 
 #include <algorithm>
 #include <array>
@@ -52,6 +53,9 @@ VertexInputState LoadVertexInputState(const MemoryPool &pool,
       pool, state.vertex_buffer_resources);
   input.bindings = LoadArray<VertexAttributeBinding>(
       pool, state.vertex_attribute_bindings);
+  if ((HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state)) && state.driver_describes_attributes &&
+      state.vertex_pco_abi.vertex_inputs == 0 && input.resources.empty() && input.bindings.empty())
+    return input;
   if (input.resources.empty() || input.bindings.empty())
     throw std::runtime_error("VertexFetch received an empty input layout");
 
@@ -144,12 +148,13 @@ float ReadComponentAsFloat(const std::vector<std::uint8_t>& buffer, std::size_t 
 std::uint32_t ReadComponentAsInteger(const std::vector<std::uint8_t>& buffer, std::size_t offset, VertexComponentType type);
 
 VertexLane MakeLane(std::uint32_t vertex_index,
-                    const VertexInputState &input) {
+                    const VertexInputState &input,
+                    std::uint32_t instance_id = 0) {
   VertexLane lane;
   for (const VertexAttributeBinding &binding : input.bindings) {
     std::uint32_t active_index = vertex_index;
     if (binding.instance_divisor != 0) {
-      active_index = 0;
+      active_index = instance_id / binding.instance_divisor;
     }
     const std::uint64_t stride_offset =
         static_cast<std::uint64_t>(active_index) * binding.stride_bytes;
@@ -415,7 +420,74 @@ void VertexFetch::Run() {
     const bool driver_pco_indexed =
         driver_pco_triangles &&
         state.draw.index_format != IndexFormat::kNone;
-    if (IsFillSolidFamily(state.functional_case) ||
+    const bool geometry_enabled = HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state);
+    const std::uint32_t vertices_per_instance = HasPoolHandle(state.tessellation_state)
+        ? LoadArray<TessellationState>(pool_, state.tessellation_state).at(0).vertices_per_instance
+        : state.geometry_vertices_per_instance;
+    if (geometry_enabled) {
+      if (!driver_pco_triangles || state.primitive_restart_enable ||
+          HasPoolHandle(state.expanded_source_vertices) ||
+          !vertices_per_instance ||
+          !kReferenceUarch.post_transform_cache_slots)
+        throw std::runtime_error("VertexFetch geometry source contract is invalid");
+      const std::uint32_t occurrence_count = driver_pco_indexed
+          ? state.draw.index_count : state.draw.vertex_count;
+      if (!occurrence_count ||
+          occurrence_count % vertices_per_instance)
+        throw std::runtime_error("VertexFetch geometry instance range is invalid");
+      std::vector<std::uint32_t> indices;
+      if (driver_pco_indexed) {
+        if (!HasPoolHandle(state.vertex_indices))
+          throw std::runtime_error("VertexFetch geometry index payload is absent");
+        if (state.draw.index_format == IndexFormat::kUint8) {
+          const auto raw = LoadArray<std::uint8_t>(pool_, state.vertex_indices);
+          indices.assign(raw.begin(), raw.end());
+        } else if (state.draw.index_format == IndexFormat::kUint16) {
+          const auto raw = LoadArray<std::uint16_t>(pool_, state.vertex_indices);
+          indices.assign(raw.begin(), raw.end());
+        } else if (state.draw.index_format == IndexFormat::kUint32) {
+          indices = LoadArray<std::uint32_t>(pool_, state.vertex_indices);
+        } else {
+          throw std::runtime_error("VertexFetch geometry index format is invalid");
+        }
+        if (std::uint64_t{state.draw.first_index} + occurrence_count > indices.size())
+          throw std::runtime_error("VertexFetch geometry index range exceeds payload");
+      } else if (state.draw.first_index || state.draw.index_count ||
+                 state.draw.base_vertex || HasPoolHandle(state.vertex_indices) ||
+                 state.index_buffer_gpu_address || state.index_buffer_bytes) {
+        throw std::runtime_error("VertexFetch geometry direct index state is invalid");
+      }
+      // GS receives full primitive inputs before raster topology expansion.
+      // Keep exactly one reference for each original occurrence, including
+      // adjacency vertices and incomplete trailing primitives. Native VS lanes
+      // may be reused only within one draw instance's post-transform cache.
+      std::vector<VertexLaneRef> refs;
+      refs.reserve(occurrence_count);
+      lanes.reserve(occurrence_count);
+      std::vector<CacheEntry> cache(kReferenceUarch.post_transform_cache_slots);
+      for (std::uint32_t occurrence = 0; occurrence < occurrence_count;
+           ++occurrence) {
+        if (occurrence % vertices_per_instance == 0)
+          std::fill(cache.begin(), cache.end(), CacheEntry{});
+        const std::uint32_t instance = occurrence / vertices_per_instance;
+        const std::int64_t resolved = driver_pco_indexed
+            ? std::int64_t{indices[state.draw.first_index + occurrence]} +
+                  state.draw.base_vertex
+            : std::int64_t{state.draw.first_vertex} + occurrence;
+        if (resolved < 0 || std::uint64_t(resolved) > UINT32_MAX)
+          throw std::runtime_error("VertexFetch geometry resolved vertex is invalid");
+        const auto index = static_cast<std::uint32_t>(resolved);
+        auto &entry = cache[index % cache.size()];
+        if (!entry.valid || entry.vertex_index != index) {
+          if (lanes.size() >= UINT32_MAX)
+            throw std::overflow_error("VertexFetch geometry lane count exceeds uint32");
+          entry = {index, static_cast<std::uint32_t>(lanes.size()), true};
+          lanes.push_back(MakeLane(index, vertex_input, instance));
+        }
+        refs.push_back({entry.lane_index, index});
+      }
+      state.vertex_lane_refs = StoreNewArray(pool_, refs);
+    } else if (IsFillSolidFamily(state.functional_case) ||
         IsTextureFamily(state.functional_case) ||
         (driver_pco_triangles && !driver_pco_indexed)) {
       const std::uint32_t expected_vertex_count =

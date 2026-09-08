@@ -688,15 +688,15 @@ private:
   TwoDDataMaster two_d_data_master{"two_d_data_master"};
   ImageCompression image_compression{"image_compression"};
 
-  // Separate future shader/fixed-function boundaries, not USC aliases.
-  // They elaborate before sc_start but have no executable ingress or process.
-  // DomainDataMaster is a data-master reservation, not a TCS/TES executor.
-  GeometryShader geometry_shader{"geometry_shader"};
+  // Geometry executes native PCO through its own event-driven FIFO module.
+  GeometryShader geometry_shader{"geometry_shader", pool, &memory};
+  // Native TCS, fixed tessellation and native TES each own an event-driven
+  // FIFO stage. DomainDataMaster is not a TCS/TES executor.
   TessellationControlShader tessellation_control_shader{
-      "tessellation_control_shader"};
-  Tessellator tessellator{"tessellator"};
+      "tessellation_control_shader", pool, &memory};
+  Tessellator tessellator{"tessellator", pool, &memory};
   TessellationEvaluationShader tessellation_evaluation_shader{
-      "tessellation_evaluation_shader"};
+      "tessellation_evaluation_shader", pool, &memory};
 
   // Compute has an independent event-driven execution and completion path.
   // All modules exist before the first sc_start, even in graphics-only runs.
@@ -744,6 +744,10 @@ private:
       "texture_samples_to_vertex_cluster", ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> vertex_cluster_to_clip{"vertex_cluster_to_clip",
                                                        ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> geometry_to_clip{"geometry_to_clip", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> control_to_tessellator{"control_to_tessellator", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> tessellator_to_evaluation{"tessellator_to_evaluation", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> evaluation_to_geometry{"evaluation_to_geometry", ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> clip_to_tiler{"clip_to_tiler",
                                               ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> tiler_to_parameter_buffer{
@@ -854,7 +858,15 @@ ModelSession::ModelSession(MemoryMode memory_mode, bool cache_bypass)
   vertex_cluster.texture_request_output(vertex_cluster_to_texture_samples);
   vertex_cluster.texture_response_input(texture_samples_to_vertex_cluster);
   vertex_cluster.output(vertex_cluster_to_clip);
-  clip_cull.input(vertex_cluster_to_clip);
+  tessellation_control_shader.input(vertex_cluster_to_clip);
+  tessellation_control_shader.output(control_to_tessellator);
+  tessellator.input(control_to_tessellator);
+  tessellator.output(tessellator_to_evaluation);
+  tessellation_evaluation_shader.input(tessellator_to_evaluation);
+  tessellation_evaluation_shader.output(evaluation_to_geometry);
+  geometry_shader.input(evaluation_to_geometry);
+  geometry_shader.output(geometry_to_clip);
+  clip_cull.input(geometry_to_clip);
   clip_cull.output(clip_to_tiler);
   tiler.input(clip_to_tiler);
   tiler.output(tiler_to_parameter_buffer);
@@ -939,6 +951,7 @@ int ModelSession::Run(const Options &options, ModelFramebuffer *framebuffer,
     return fail("SystemC model flush leaked MemoryPool payloads");
   }
   if (framebuffer) {
+    framebuffer->graphics_stats = job.graphics_stats;
     framebuffer->pixels = job.framebuffer;
     framebuffer->extra = job.extra_framebuffers;
     framebuffer->width = job.framebuffer_width;

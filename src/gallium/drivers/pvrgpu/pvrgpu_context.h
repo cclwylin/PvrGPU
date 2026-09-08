@@ -99,6 +99,13 @@ struct pvrgpu_context {
    unsigned flushes;
    unsigned unsupported_draws;
    unsigned observed_draws;
+   /* Owned, completed SystemC statistics only; never guessed from draw args.
+    * The generation prevents repeated attachment readbacks counting twice. */
+   uint64_t query_collected_generation;
+   uint64_t query_primitives_generated;
+   uint64_t query_statistics_failures;
+   unsigned active_primitives_generated_queries;
+   bool query_state_disabled;
    unsigned unsupported_resource_ops;
    unsigned indexed_quad_draws;
    struct pipe_resource *full_depth_clear_resource;
@@ -216,6 +223,10 @@ pvrgpu_context_has_incomplete_replay(const struct pvrgpu_context *ctx);
  */
 void
 pvrgpu_context_end_frame_at_readback(struct pvrgpu_context *ctx);
+
+/* Materialize and claim this context's last submitted native statistics.
+ * Returns false on model/ownership failure and never consumes another context. */
+bool pvrgpu_query_collect_completed(struct pvrgpu_context *ctx);
 
 void
 pvrgpu_array_primitive_sequence_reset(struct pvrgpu_context *ctx);

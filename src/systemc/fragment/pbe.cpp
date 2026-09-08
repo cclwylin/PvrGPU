@@ -359,7 +359,9 @@ void Pbe::Run() {
         state.render_target_count == 0 ? 1U : state.render_target_count;
     if (render_target_count > kMaxRenderTargets)
       throw std::runtime_error("PBE render target count is unsupported");
-
+    if ((HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state)) && render_target_count > 1)
+      throw std::runtime_error(
+          "PBE geometry MRT requires independent attachment LOAD");
     // Attachment 0 honours the API-v7 LOAD payload; the remaining attachments
     // of a multiple-render-target pass start from the clear colour.
     std::vector<std::vector<std::uint8_t>> framebuffers(render_target_count);
@@ -449,7 +451,7 @@ void Pbe::Run() {
                 ? state.fragment_output_mask[target]
                 : 0U;
         const std::uint32_t expected_pixel_output_mask =
-            declared != 0 ? declared : 0x0fU;
+            declared != 0 || HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state) ? declared : 0x0fU;
         if (output.written_mask[target] != expected_pixel_output_mask) {
           throw std::runtime_error(
               "PBE fragment did not write every expected PIXOUT lane of "
@@ -507,6 +509,10 @@ void Pbe::Run() {
       last_submit_ordinal[stored_index] = output.submit_ordinal;
       const std::size_t byte_offset = stored_index * bytes_per_pixel;
       for (std::uint32_t target = 0; target < render_target_count; ++target) {
+      // A GS-linked FS may genuinely have no output for this attachment.
+      // Preserve its pixels; no default color export or blend is fabricated.
+      if ((HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state)) && state.fragment_output_mask[target] == 0)
+        continue;
       std::vector<std::uint8_t> &framebuffer = framebuffers[target];
       if (state.color_attachment_float32) {
         std::array<float, 4> source{};
@@ -693,8 +699,14 @@ void Pbe::Run() {
     // attachment has an independent destination. Count the work performed
     // above, including overdraw, separately from full-surface serialization.
     std::uint64_t sample_colors = 0;
+    std::uint32_t color_output_targets = render_target_count;
+    if (HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state)) {
+      color_output_targets = 0;
+      for (std::uint32_t target = 0; target < render_target_count; ++target)
+        color_output_targets += state.fragment_output_mask[target] != 0;
+    }
     for (const std::uint32_t writes : written_map)
-      sample_colors += static_cast<std::uint64_t>(writes) * render_target_count;
+      sample_colors += static_cast<std::uint64_t>(writes) * color_output_targets;
     const std::uint32_t stored_channel_mask =
         state.color_attachment_raw_dwords != 0
             ? (1U << state.color_attachment_raw_dwords) - 1U : 0x0fU;

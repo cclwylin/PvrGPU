@@ -3,6 +3,7 @@
 #include "pvrgpu_cmd.h"
 #include "pvrgpu_counter.h"
 #include "pvrgpu_systemc_api.h"
+#include "pvrgpu_tessellation.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -359,6 +360,55 @@ pvrgpu_systemc_submit_info_init(
    info->stderr_path = pvrgpu_nonempty_env("PVRGPU_SYSTEMC_STDERR_OUT");
    info->outdir = pvrgpu_nonempty_env("PVRGPU_SYSTEMC_OUTDIR");
    info->memory_mode = pvrgpu_nonempty_env("PVRGPU_MODEL_MEMORY_MODE");
+   info->submission_generation = pvrgpu_global_submission_generation;
+}
+
+bool
+pvrgpu_read_graphics_stats(uint64_t submission_generation,
+                            struct pvrgpu_systemc_graphics_stats *stats,
+                            char *error, size_t error_size)
+{
+   const char *library_path = pvrgpu_nonempty_env("PVRGPU_SYSTEMC_API_LIB");
+   if (!stats || !submission_generation || !library_path) {
+      pvrgpu_cmd_error(error, error_size,
+                       "native graphics statistics require a model submission");
+      return false;
+   }
+   static void *stats_handle;
+   static pvrgpu_systemc_flush_graphics_stats_fn flush_stats;
+   static const char *stats_library_path;
+   if (!stats_handle || stats_library_path != library_path) {
+      dlerror();
+      stats_handle = dlopen(library_path, RTLD_NOW | RTLD_GLOBAL);
+      if (!stats_handle) {
+         pvrgpu_cmd_error(error, error_size,
+                          "cannot load native graphics statistics library");
+         return false;
+      }
+      stats_library_path = library_path;
+      dlerror();
+      flush_stats = (pvrgpu_systemc_flush_graphics_stats_fn)
+         dlsym(stats_handle, "pvrgpu_systemc_flush_graphics_stats");
+      if (dlerror())
+         flush_stats = NULL;
+   }
+   if (!flush_stats) {
+      pvrgpu_cmd_error(error, error_size,
+                       "native graphics statistics entry point is unavailable");
+      return false;
+   }
+   struct pvrgpu_systemc_graphics_stats result = {0};
+   result.version = PVRGPU_SYSTEMC_API_VERSION;
+   result.submission_generation = submission_generation;
+   if (flush_stats(&result, error, error_size) != 0)
+      return false;
+   if (result.submission_generation != submission_generation) {
+      pvrgpu_cmd_error(error, error_size,
+                       "native graphics statistics generation mismatch");
+      return false;
+   }
+   *stats = result;
+   return true;
 }
 
 /*
@@ -917,16 +967,24 @@ pvrgpu_cmd_validate_uniform_buffers(
    char *error, size_t error_size)
 {
    if (cmd->uniform_buffer_count >
-          2 * PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
+          5 * PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
        (cmd->uniform_buffer_count && !cmd->uniform_buffers))
       goto invalid;
-   for (uint32_t stage = 0; stage < 2; ++stage) {
-      const struct pvrgpu_systemc_pco_stage_abi *abi = stage == 0
-         ? &cmd->vertex_pco_abi : &cmd->fragment_pco_abi;
-      const uint32_t *shared = stage == 0
-         ? cmd->vertex_shared : cmd->fragment_shared;
-      const size_t shared_count = stage == 0
-         ? cmd->vertex_shared_count : cmd->fragment_shared_count;
+   const struct pvrgpu_systemc_pco_stage_abi empty = {0};
+   const struct pvrgpu_systemc_tessellation *t = cmd->tessellation;
+   const struct pvrgpu_systemc_pco_stage_abi *abis[5] = {
+      &cmd->vertex_pco_abi, &cmd->fragment_pco_abi, &cmd->geometry_pco_abi,
+      t ? &t->control_abi : &empty, t ? &t->evaluation_abi : &empty};
+   const uint32_t *banks[5] = {cmd->vertex_shared, cmd->fragment_shared, cmd->geometry_shared,
+      t ? t->control_shared : NULL, t ? t->evaluation_shared : NULL};
+   const uint32_t sizes[5] = {cmd->vertex_shared_count, cmd->fragment_shared_count,
+      cmd->geometry_shared_count, t ? t->control_shared_count : 0, t ? t->evaluation_shared_count : 0};
+   for (uint32_t stage = 0; stage < 5; ++stage) {
+      const struct pvrgpu_systemc_pco_stage_abi *abi = abis[stage];
+      const uint32_t *shared = banks[stage];
+      const size_t shared_count = sizes[stage];
+      const uint32_t native_base = stage >= 3 && t ? (stage == 3 ? 8u : 4u)
+         : stage == 2 && cmd->geometry_pco_size ? 4u : 0u;
       const uint32_t blocks = abi->uniform_buffer_descriptor_count;
       const uint64_t end = (uint64_t)abi->uniform_buffer_descriptor_start +
                            4u * blocks;
@@ -934,7 +992,8 @@ pvrgpu_cmd_validate_uniform_buffers(
           shared_count != abi->shareds || shared_count > (stage == 0 ? 96 : 256) ||
           (shared_count && !shared) || end > shared_count ||
           (abi->uniform_buffer_descriptor_start & 3u) ||
-          (!blocks && abi->uniform_buffer_descriptor_start) ||
+          (!blocks && abi->uniform_buffer_descriptor_start !=
+              native_base) ||
           (blocks && abi->push_constant_count &&
            end > abi->push_constant_start))
          goto invalid;
@@ -962,10 +1021,8 @@ pvrgpu_cmd_validate_uniform_buffers(
    for (uint32_t i = 0; i < cmd->uniform_buffer_count; ++i) {
       const struct pvrgpu_systemc_pco_uniform_buffer *entry =
          &cmd->uniform_buffers[i];
-      if (entry->stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT ||
-          entry->block_index >= (entry->stage == 0
-             ? cmd->vertex_pco_abi.uniform_buffer_descriptor_count
-             : cmd->fragment_pco_abi.uniform_buffer_descriptor_count))
+      if (entry->stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION ||
+          entry->block_index >= abis[entry->stage]->uniform_buffer_descriptor_count)
          goto invalid;
    }
    return true;
@@ -1072,7 +1129,11 @@ pvrgpu_cmd_validate_draw_pco_triangles(
     * stride the conditionals capture claims.  `color_layout` below already
     * makes this distinction; every profile needs it.
     */
-   const bool states_own_attributes = cmd->vertex_attribute_count != 0;
+   const bool empty_geometry_attributes = (cmd->geometry_pco_size != 0 || cmd->tessellation) &&
+      cmd->vertex_attribute_count == 0 && cmd->vertex_pco_abi.vertex_inputs == 0 &&
+      cmd->vertex_stride == 0 && !cmd->raw_vertex_data && cmd->raw_vertex_data_size == 0;
+   const bool states_own_attributes = cmd->vertex_attribute_count != 0 ||
+                                      empty_geometry_attributes;
    const bool conditionals_layout =
       !states_own_attributes &&
       cmd->vertex_stride == 12 && cmd->vertex_pco_abi.vertex_inputs == 4;
@@ -1128,7 +1189,52 @@ pvrgpu_cmd_validate_draw_pco_triangles(
    const bool ordinary_topology =
       pvrgpu_array_topology_expandable(cmd->primitive_mode,
                                        cmd->indexed != 0 ? cmd->index_count
-                                                         : cmd->vertex_count);
+                                                         : cmd->vertex_count) ||
+      (cmd->geometry_pco_size && cmd->primitive_mode >= 10 && cmd->primitive_mode <= 13) ||
+      (cmd->tessellation && cmd->primitive_mode == 14);
+   const bool geometry = cmd->geometry_pco_size != 0;
+   struct pvrgpu_draw_pco_stage_abi tess_raster_abi = {0};
+   if (cmd->tessellation) {
+      const char *reason = pvrgpu_tessellation_payload_error(cmd->tessellation);
+      if (reason || geometry || cmd->primitive_mode != 14 ||
+          cmd->tessellation->input_stride_dwords != cmd->vertex_pco_abi.vertex_outputs ||
+          (cmd->indexed ? cmd->index_count : cmd->vertex_count) % cmd->tessellation->vertices_per_instance) {
+         pvrgpu_cmd_error(error, error_size, reason ? reason : "tessellation stage/topology/input linkage");
+         return false;
+      }
+      memcpy(&tess_raster_abi, &cmd->tessellation->evaluation_abi, sizeof(tess_raster_abi));
+      reason = pvrgpu_tessellation_draw_extent_error(cmd->tessellation,
+          cmd->indexed ? cmd->index_count : cmd->vertex_count);
+      if (reason) {
+         pvrgpu_cmd_error(error, error_size, reason);
+         return false;
+      }
+   }
+   const struct pvrgpu_draw_pco_stage_abi *raster_abi = geometry
+      ? &cmd->geometry_pco_abi : cmd->tessellation ? &tess_raster_abi : &cmd->vertex_pco_abi;
+   if (geometry && (!cmd->geometry_pco || !cmd->geometry_shared ||
+       cmd->geometry_pco_size > UINT32_MAX ||
+       cmd->geometry_shared_count != cmd->geometry_pco_abi.shareds ||
+       cmd->geometry_shared_count < 4 || cmd->geometry_shared_count > 256 ||
+       cmd->geometry_pco_abi.temps > 256 || cmd->geometry_pco_abi.vertex_inputs != 2 ||
+       cmd->geometry_pco_abi.coefficients || cmd->geometry_pco_abi.entry_offset ||
+       cmd->geometry_pco_abi.uniform_buffer_descriptor_start != 4 ||
+       cmd->geometry_pco_abi.push_constant_start !=
+          4u + 4u * cmd->geometry_pco_abi.uniform_buffer_descriptor_count ||
+       (uint64_t)cmd->geometry_pco_abi.push_constant_start +
+          cmd->geometry_pco_abi.push_constant_count != cmd->geometry_pco_abi.shareds ||
+       cmd->geometry_pco_abi.vertex_outputs < 4 || cmd->geometry_pco_abi.vertex_outputs > 64 ||
+       (cmd->geometry_input_primitive_vertices != 1 && cmd->geometry_input_primitive_vertices != 2 &&
+        cmd->geometry_input_primitive_vertices != 3 && cmd->geometry_input_primitive_vertices != 4 &&
+        cmd->geometry_input_primitive_vertices != 6) ||
+       cmd->geometry_input_stride_dwords != cmd->vertex_pco_abi.vertex_outputs ||
+       cmd->geometry_max_vertices > 256 || !cmd->geometry_invocations || cmd->geometry_invocations > 32 ||
+       !cmd->geometry_vertices_per_instance ||
+       (cmd->geometry_output_primitive != 0 && cmd->geometry_output_primitive != 3 &&
+        cmd->geometry_output_primitive != 5))) {
+      pvrgpu_cmd_error(error, error_size, "invalid independent geometry program ABI");
+      return false;
+   }
    /*
     * A command may describe its own attribute layout.  The pinned capture
     * profiles do not, and are matched on their stride instead; when the
@@ -1173,6 +1279,12 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       return false;
    }
 
+   if ((geometry || cmd->tessellation) && cmd->render_target_count > 1) {
+      pvrgpu_cmd_error(error, error_size,
+         "geometry MRT requires independent attachment LOAD");
+      return false;
+   }
+
    /*
     * A non-indexed draw must carry no index payload; an indexed one needs a
     * whole number of 8/16/32-bit indices covering first_index + index_count.
@@ -1193,20 +1305,20 @@ pvrgpu_cmd_validate_draw_pco_triangles(
            cmd->index_size != 4) ||
           !cmd->raw_index_data || cmd->index_count == 0 ||
           index_end * cmd->index_size != (uint64_t)cmd->raw_index_data_size ||
-          !pvrgpu_array_topology_expandable(cmd->primitive_mode,
-                                            cmd->index_count)) {
+          (!geometry && !cmd->tessellation && !pvrgpu_array_topology_expandable(cmd->primitive_mode,
+                                            cmd->index_count))) {
          pvrgpu_cmd_error(error, error_size,
                           "draw PCO triangles has a malformed index payload");
          return false;
       }
    }
 
-   if (!cmd->raw_vertex_data || cmd->vertex_count == 0 ||
+   if ((!cmd->raw_vertex_data && !empty_geometry_attributes) || cmd->vertex_count == 0 ||
        (!ideas_layout && !ordinary_topology) ||
        (ideas_layout && !ideas_topology) ||
        (!conditionals_layout && !lit_mesh_layout && !texture_layout &&
         !ideas_layout && !color_layout) ||
-       expected_vertex_bytes == 0 || expected_vertex_bytes > SIZE_MAX ||
+       (expected_vertex_bytes == 0 && !empty_geometry_attributes) || expected_vertex_bytes > SIZE_MAX ||
        cmd->raw_vertex_data_size != (size_t)expected_vertex_bytes ||
        cmd->first_vertex != 0 || cmd->instance_count != 1) {
       pvrgpu_cmd_error(error, error_size,
@@ -1365,9 +1477,10 @@ pvrgpu_cmd_validate_draw_pco_triangles(
    const bool stage_linkage_invalid =
       cmd->position_output_start != 0 ||
       cmd->position_output_count != 4 ||
-      cmd->vertex_pco_abi.vertex_outputs !=
+      (!geometry && raster_abi->vertex_outputs !=
          cmd->position_output_count + cmd->point_size_output_count +
-            cmd->varying_output_count ||
+            cmd->varying_output_count) ||
+      (geometry && raster_abi->vertex_outputs < cmd->varying_output_start + cmd->varying_output_count) ||
       (cmd->varying_output_count != 0 &&
        cmd->varying_output_start !=
           cmd->position_output_count + cmd->point_size_output_count) ||
@@ -1394,11 +1507,11 @@ pvrgpu_cmd_validate_draw_pco_triangles(
     * builds rather than one it failed to.
     */
    const bool color_layout_invalid =
-      (color_layout && cmd->vertex_attribute_count != 0 &&
+      (color_layout && states_own_attributes &&
        (cmd->fragment_position_count != 4 ||
         cmd->fragment_varying_count > cmd->varying_output_count * 4u ||
         (cmd->fragment_varying_count & 3u) != 0)) ||
-      (color_layout && cmd->vertex_attribute_count == 0 &&
+      (color_layout && !states_own_attributes &&
        (cmd->varying_output_count != 4 ||
         cmd->fragment_position_count != 4 ||
         cmd->fragment_varying_count != 16));
@@ -1615,7 +1728,7 @@ pvrgpu_cmd_validate_draw_pco_triangles(
        (cmd->point_size_output_count != 0 &&
         (cmd->point_size_output_start < cmd->position_output_count ||
          cmd->point_size_output_start + cmd->point_size_output_count >
-            cmd->vertex_pco_abi.vertex_outputs))) {
+            raster_abi->vertex_outputs))) {
       pvrgpu_cmd_error(error, error_size,
                        "draw PCO triangles point size output is not inside "
                        "the vertex output span");
@@ -1990,6 +2103,23 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->vertex_pco_size = cmd->vertex_pco_size;
    out->fragment_pco = cmd->fragment_pco;
    out->fragment_pco_size = cmd->fragment_pco_size;
+   out->geometry_pco = cmd->geometry_pco;
+   out->tessellation = cmd->tessellation;
+   out->geometry_pco_size = cmd->geometry_pco_size;
+   out->geometry_shared = cmd->geometry_shared;
+   out->geometry_shared_count = cmd->geometry_shared_count;
+   out->geometry_input_primitive_vertices = cmd->geometry_input_primitive_vertices;
+   out->geometry_output_primitive = cmd->geometry_output_primitive;
+   out->geometry_max_vertices = cmd->geometry_max_vertices;
+   out->geometry_invocations = cmd->geometry_invocations;
+   out->geometry_input_stride_dwords = cmd->geometry_input_stride_dwords;
+   out->geometry_vertices_per_instance = cmd->geometry_vertices_per_instance;
+   out->geometry_layer_output_start = cmd->geometry_layer_output_start;
+   out->geometry_layer_output_count = cmd->geometry_layer_output_count;
+   out->geometry_primitive_id_output_start = cmd->geometry_primitive_id_output_start;
+   out->geometry_primitive_id_output_count = cmd->geometry_primitive_id_output_count;
+   pvrgpu_systemc_copy_pco_stage_abi(&out->geometry_pco_abi,
+                                  &cmd->geometry_pco_abi);
    out->vertex_shared = cmd->vertex_shared;
    out->vertex_shared_count = cmd->vertex_shared_count;
    out->fragment_shared = cmd->fragment_shared;

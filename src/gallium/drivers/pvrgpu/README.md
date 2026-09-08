@@ -54,6 +54,16 @@ Listed so they are removed rather than copied:
 
 Current status:
 
+- Graphics API v25 carries separately compiled VS/TCS/TES/FS binaries, patch
+  layout and immutable TCS/TES shared-register/UBO snapshots. Each shader stage
+  retains its Mesa stage identity. PATCHES execute through independent
+  SystemC TCS, fixed Tessellator and TES modules. TF, TCS/TES textures and
+  combined GS+Tessellation remain named refusals. See the
+  [validation](../../../../docs/TESSELLATION_VALIDATION.md).
+- Graphics API v24 supplies separately compiled VS/GS/FS binaries and a
+  stage-local GS input/UBO/output ABI. The independent GeometryShader SystemC
+  module executes native PCO emission and modeled memory reads. This is an
+  initial geometry slice with live dEQP debug in progress, not conformance.
 - The generic native PCO path now supplies typed integer/float texture and
   framebuffer transport, attachment continuity, per-sample MSAA and late
   shader-depth tests through SystemC. Typed CPU clears/blits preserve native

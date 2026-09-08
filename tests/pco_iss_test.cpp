@@ -7208,6 +7208,136 @@ void TestTemporaryFile256() {
   }
 }
 
+template <typename Run>
+unsigned RejectGraphicsIntegerSignedness(
+    const pvrgpu::stub::PcoDecodedProgram &program, Run run,
+    std::array<bool, 7> &covered, const std::string &entry) {
+  unsigned rejected = 0;
+  for (std::size_t index = 0; index < program.instructions.size(); ++index) {
+    const auto &instruction = program.instructions[index];
+    Check(instruction.integer_signed == 0,
+          "real VS/FS compiler instructions have no native-task signedness flag");
+    switch (instruction.opcode) {
+    case PcoOpcode::kMoveBypass: case PcoOpcode::kMoveImmediate: covered[0] = true; break;
+    case PcoOpcode::kFloatInterpolatePerspective: covered[1] = true; break;
+    case PcoOpcode::kBufferLoad: covered[2] = true; break;
+    case PcoOpcode::kWaitDataFence: covered[3] = true; break;
+    case PcoOpcode::kNop: covered[4] = true; break;
+    case PcoOpcode::kUvsWrite: case PcoOpcode::kUvsWriteEmitEndTask:
+    case PcoOpcode::kUvsEmitEndTask: covered[5] = true; break;
+    case PcoOpcode::kTextureSample: covered[6] = true; break;
+    default: break;
+    }
+    for (const std::uint8_t flag : {1, 2, 255}) {
+      auto instructions = program.instructions;
+      instructions[index].integer_signed = flag;
+      const auto label = entry + " instruction=" + std::to_string(index) +
+          " integer_signed=" + std::to_string(flag);
+      bool failed = false;
+      try {
+        run(instructions);
+      } catch (const std::exception &error) {
+        Check(std::string(error.what()).find("integer signedness") != std::string::npos,
+              label + " must fail at signedness gate, not an unrelated context error: " + error.what());
+        failed = true;
+      }
+      Check(failed, label + " must reject decoded signedness before executing any special branch");
+      ++rejected;
+    }
+  }
+  return rejected;
+}
+
+void TestGraphicsIntegerSignednessFailsClosed() {
+  using namespace pvrgpu::stub;
+  std::array<bool, 7> covered{};
+  unsigned rejected = 0;
+  unsigned reads = 0;
+  const auto read = +[](void *opaque, std::uint64_t address,
+                        std::uint32_t count, std::uint32_t *words) {
+    Check(address == UINT64_C(0x100002000) && count == 1,
+          "signedness baseline uses the actual native UBO address and burst");
+    ++*static_cast<unsigned *>(opaque);
+    words[0] = UINT32_C(0x3f000000);
+  };
+  const auto sample = BytesFromHex(
+      "57 a0 00 f4 4c 94 60 80 1c 88 80 a0 00 ff 02 80 6a ff");
+  const std::array<std::uint32_t, 4> response{FloatBits(.1F),FloatBits(.2F),FloatBits(.3F),FloatBits(1.F)};
+  for (const bool vertex : {true, false}) {
+    // Reuse the genuine high-TEMP UBO fixture plus the exact native Terrain
+    // SMP/WDF pair used by TestTemporaryFile256. This gives real MOV/LD/WDF/
+    // SMP/export special branches and a valid continuation, without inventing
+    // a decoded instruction or accepting an unrelated missing-memory failure.
+    auto binary = test::TemporaryFileUniformBufferFixture(vertex, 64, 1);
+    binary.insert(binary.begin() + 64, sample.begin(), sample.end());
+    const auto program = Decode(vertex ? ShaderStage::kVertex : ShaderStage::kFragment, binary);
+    PcoVertexExecutionContext vs;
+    PcoFragmentExecutionContext fs;
+    vs.shared_count = fs.shared_count = 40;
+    vs.shared_registers[0] = fs.shared_registers[0] = 0x2000;
+    vs.shared_registers[1] = fs.shared_registers[1] = 1;
+    vs.shared_registers[2] = fs.shared_registers[2] = 65536;
+    vs.memory_read = fs.memory_read = read;
+    vs.memory_user_data = fs.memory_user_data = &reads;
+    reads = 0;
+    if (vertex) {
+      const auto first = ExecuteVertex(program.summary, program.instructions, {}, vs);
+      Check(first.suspended && first.continuation.valid && reads == 1,
+            "unmodified VS signedness baseline reaches real SMP suspension");
+      const auto done = ResumeVertex(program.summary, program.instructions, first.continuation, response);
+      Check(!done.suspended && done.ended_task && done.outputs[3] == UINT32_C(0x3f000000),
+            "unmodified VS continuation completes with actual prior UBO output");
+      reads = 0;
+      rejected += RejectGraphicsIntegerSignedness(program, [&](const auto &instructions) {
+        (void)ExecuteVertex(program.summary, instructions, {}, vs);
+      }, covered, "ExecuteVertex");
+      rejected += RejectGraphicsIntegerSignedness(program, [&](const auto &instructions) {
+        (void)ResumeVertex(program.summary, instructions, first.continuation, response);
+      }, covered, "ResumeVertex");
+    } else {
+      const auto first = ExecuteFragment(program.summary, program.instructions, fs);
+      Check(first.suspended && first.continuation.valid && reads == 1,
+            "unmodified FS signedness baseline reaches real SMP suspension");
+      const auto done = ResumeFragment(program.summary, program.instructions, first.continuation, response);
+      Check(!done.suspended && done.written_mask == 15 && done.pixel_outputs[3] == UINT32_C(0x3f000000),
+            "unmodified FS continuation completes with actual prior UBO output");
+      reads = 0;
+      rejected += RejectGraphicsIntegerSignedness(program, [&](const auto &instructions) {
+        (void)ExecuteFragment(program.summary, instructions, fs);
+      }, covered, "ExecuteFragment UBO");
+      rejected += RejectGraphicsIntegerSignedness(program, [&](const auto &instructions) {
+        (void)ResumeFragment(program.summary, instructions, first.continuation, response);
+      }, covered, "ResumeFragment UBO");
+    }
+    Check(reads == 0, "malformed signedness anywhere in a program is rejected before any native memory request");
+  }
+  const auto textured = Decode(ShaderStage::kFragment, FillTexNearestFragmentPcoBinary());
+  const auto context = MakeFillTexNearestContext();
+  const auto first = ExecuteFragment(textured.summary, textured.instructions, context);
+  Check(first.suspended && first.continuation.valid, "valid FITRP baseline reaches SMP");
+  const auto done = ResumeFragment(textured.summary, textured.instructions, first.continuation, response);
+  Check(!done.suspended && done.written_mask == 15, "valid FITRP baseline resumes successfully");
+  rejected += RejectGraphicsIntegerSignedness(textured, [&](const auto &instructions) {
+    (void)ExecuteFragment(textured.summary, instructions, context);
+  }, covered, "ExecuteFragment FITRP");
+  rejected += RejectGraphicsIntegerSignedness(textured, [&](const auto &instructions) {
+    (void)ResumeFragment(textured.summary, instructions, first.continuation, response);
+  }, covered, "ResumeFragment FITRP");
+
+  // Exact compiler-generated empty FS, generate_geometry.c KIND 18/19;
+  // SHA256 dff39978acdf8eabfc205b7780491eac1bd1087af555cbe9bc73d71f328d4d61.
+  const auto empty = Decode(ShaderStage::kFragment, BytesFromHex("04 80 ee 00 f2 ff ff ff"));
+  const auto empty_result = ExecuteFragment(empty.summary, empty.instructions);
+  Check(!empty_result.suspended && !empty_result.written_mask,
+        "real NOP.end baseline succeeds without fabricating fragment output");
+  rejected += RejectGraphicsIntegerSignedness(empty, [&](const auto &instructions) {
+    (void)ExecuteFragment(empty.summary, instructions);
+  }, covered, "ExecuteFragment NOP.end");
+  Check(std::all_of(covered.begin(), covered.end(), [](bool value) { return value; }),
+        "signedness mutation coverage includes MOV, FITRP, LD, WDF, NOP, UVSW and SMP");
+  std::cout << "graphics integer signedness: " << rejected << " strict diagnostic rejections PASS\n";
+}
+
 int main() {
   try {
     TestEmbeddedBinaries();
@@ -7227,6 +7357,7 @@ int main() {
     TestDepthFeedback();
     TestUniformBufferLoads();
     TestTemporaryFile256();
+    TestGraphicsIntegerSignednessFailsClosed();
     TestDecodeAndExecuteHalfAlphaFragments();
     TestDecodeAndExecuteTriangleSetupOrange();
     TestDecodeAndExecuteTriangleSetupHalfCulledCyan();

@@ -5,6 +5,7 @@
 #include "texture/texture_unit.h"
 #include "pco_sequence_profiles.h"
 #include "pvrgpu_systemc_api.h"
+#include "pvrgpu_tessellation.h"
 #include "pvrgpu_systemc_compute_api.h"
 #include "shader/pco_iss.h"
 
@@ -37,6 +38,7 @@ struct PendingSubmit {
   std::string stderr_path;
   bool valid = false;
   bool executed = false;
+  std::uint64_t submission_generation = 0;
 };
 
 PendingSubmit g_pending_submit;
@@ -466,9 +468,13 @@ bool PcoViewportScaleMatches(const std::array<std::uint32_t, 3> &expected,
 void CopyPcoPayloadFields(
     const pvrgpu_systemc_driver_command &source,
     pvrgpu::stub::DriverCommand *destination) {
-  destination->raw_vertex_data.assign(
-      source.raw_vertex_data,
-      source.raw_vertex_data + source.raw_vertex_data_size);
+  if (source.raw_vertex_data_size != 0) {
+    destination->raw_vertex_data.assign(
+        source.raw_vertex_data,
+        source.raw_vertex_data + source.raw_vertex_data_size);
+  } else {
+    destination->raw_vertex_data.clear();
+  }
   if (source.raw_index_data && source.raw_index_data_size != 0) {
     destination->raw_index_data.assign(
         source.raw_index_data,
@@ -497,6 +503,59 @@ void CopyPcoPayloadFields(
   destination->fragment_pco.assign(
       source.fragment_pco,
       source.fragment_pco + source.fragment_pco_size);
+  destination->geometry_pco.clear();
+  destination->geometry_shared.clear();
+  destination->tessellation = {};
+  if (source.tessellation) {
+    const auto &t = *source.tessellation;
+    auto &owned = destination->tessellation;
+    owned.control_pco.assign(t.control_pco, t.control_pco + t.control_pco_size);
+    owned.evaluation_pco.assign(t.evaluation_pco, t.evaluation_pco + t.evaluation_pco_size);
+    owned.control_shared.assign(t.control_shared, t.control_shared + t.control_shared_count);
+    owned.evaluation_shared.assign(t.evaluation_shared, t.evaluation_shared + t.evaluation_shared_count);
+    const auto copy_abi = [](const pvrgpu_systemc_pco_stage_abi &a) {
+      return pvrgpu::stub::DriverPcoStageAbi{a.temps, a.vertex_inputs, a.vertex_outputs,
+          a.coefficients, a.shareds, a.push_constant_start, a.push_constant_count,
+          a.entry_offset, a.uniform_buffer_descriptor_start, a.uniform_buffer_descriptor_count};
+    };
+    owned.control_abi = copy_abi(t.control_abi);
+    owned.evaluation_abi = copy_abi(t.evaluation_abi);
+#define COPY_TESS(field) owned.field = t.field
+    COPY_TESS(input_vertices); COPY_TESS(output_vertices); COPY_TESS(vertices_per_instance);
+    COPY_TESS(input_stride_dwords); COPY_TESS(output_vertex_stride_dwords);
+    COPY_TESS(per_vertex_offset_dwords); COPY_TESS(patch_stride_dwords);
+    COPY_TESS(control_barrier_count); COPY_TESS(domain); COPY_TESS(spacing);
+    COPY_TESS(clockwise); COPY_TESS(point_mode);
+#undef COPY_TESS
+  }
+  if (source.geometry_pco_size != 0) {
+    destination->geometry_pco.assign(source.geometry_pco,
+                                    source.geometry_pco + source.geometry_pco_size);
+    destination->geometry_shared.assign(
+        source.geometry_shared, source.geometry_shared + source.geometry_shared_count);
+  }
+  destination->geometry_pco_abi = {
+      source.geometry_pco_abi.temps,
+      source.geometry_pco_abi.vertex_inputs,
+      source.geometry_pco_abi.vertex_outputs,
+      source.geometry_pco_abi.coefficients,
+      source.geometry_pco_abi.shareds,
+      source.geometry_pco_abi.push_constant_start,
+      source.geometry_pco_abi.push_constant_count,
+      source.geometry_pco_abi.entry_offset,
+      source.geometry_pco_abi.uniform_buffer_descriptor_start,
+      source.geometry_pco_abi.uniform_buffer_descriptor_count,
+  };
+  destination->geometry_input_primitive_vertices = source.geometry_input_primitive_vertices;
+  destination->geometry_output_primitive = source.geometry_output_primitive;
+  destination->geometry_max_vertices = source.geometry_max_vertices;
+  destination->geometry_invocations = source.geometry_invocations;
+  destination->geometry_input_stride_dwords = source.geometry_input_stride_dwords;
+  destination->geometry_vertices_per_instance = source.geometry_vertices_per_instance;
+  destination->geometry_layer_output_start = source.geometry_layer_output_start;
+  destination->geometry_layer_output_count = source.geometry_layer_output_count;
+  destination->geometry_primitive_id_output_start = source.geometry_primitive_id_output_start;
+  destination->geometry_primitive_id_output_count = source.geometry_primitive_id_output_count;
   destination->vertex_shared.clear();
   if (source.vertex_shared_count != 0) {
     destination->vertex_shared.assign(
@@ -823,6 +882,11 @@ bool CopyPcoTrianglePayload(
     pvrgpu::stub::DriverCommand *destination, std::string *error) {
   if (!destination || !error)
     return false;
+  if (source.geometry_pco || source.geometry_pco_size || source.geometry_shared ||
+      source.geometry_shared_count || source.geometry_invocations || source.tessellation) {
+    *error = "independent Geometry stage requires the native sequence transport";
+    return false;
+  }
   if (!PcoSingleDrawResolutionSupported(
           source.framebuffer_width, source.framebuffer_height,
           source.width, source.height)) {
@@ -1216,7 +1280,7 @@ bool CopyPcoSequenceDraw(
                   " expected=" + std::to_string(PVRGPU_SYSTEMC_API_VERSION));
   }
   if (source.uniform_buffer_count >
-          2U * PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
+          5U * PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
       ((source.uniform_buffer_count != 0) != (source.uniform_buffers != nullptr))) {
     *error = "SystemC API uniform buffer payload list is invalid";
     return false;
@@ -1252,6 +1316,53 @@ bool CopyPcoSequenceDraw(
   const bool strip_or_fan =
       source.primitive_mode == 5 || source.primitive_mode == 6;
   const bool line_or_point = source.primitive_mode <= 3;
+  const bool geometry = source.geometry_pco_size != 0;
+  const bool tessellation = source.tessellation != nullptr;
+  if (tessellation) {
+    if (const char *reason = pvrgpu_tessellation_payload_error(source.tessellation))
+      return refuse(reason);
+    if (geometry || source.primitive_mode != 14 ||
+        source.tessellation->input_stride_dwords != source.vertex_pco_abi.vertex_outputs ||
+        (source.indexed ? source.index_count : source.vertex_count) % source.tessellation->vertices_per_instance)
+      return refuse("tessellation stage/topology/input linkage");
+    if (const char *reason = pvrgpu_tessellation_draw_extent_error(source.tessellation,
+          source.indexed ? source.index_count : source.vertex_count))
+      return refuse(reason);
+  }
+  const auto &raster_abi = geometry ? source.geometry_pco_abi
+      : tessellation ? source.tessellation->evaluation_abi : source.vertex_pco_abi;
+  if (geometry) {
+    const auto &gs = source.geometry_pco_abi;
+    const uint32_t inputs = source.geometry_input_primitive_vertices;
+    if (!source.geometry_pco || !source.geometry_shared ||
+        source.geometry_pco_size > pvrgpu::stub::kDriverPcoMaximumBinaryBytes ||
+        !PcoStageAbiIsBounded(gs, true, true) || gs.coefficients != 0 ||
+        gs.vertex_inputs != 2 || gs.vertex_outputs < 4 ||
+        gs.uniform_buffer_descriptor_start != 4 ||
+        gs.push_constant_start != 4U + 4U * gs.uniform_buffer_descriptor_count ||
+        uint64_t(gs.push_constant_start) + gs.push_constant_count != gs.shareds ||
+        source.geometry_shared_count != gs.shareds || gs.shareds < 4 ||
+        (inputs != 1 && inputs != 2 && inputs != 3 && inputs != 4 && inputs != 6) ||
+        source.geometry_input_stride_dwords != source.vertex_pco_abi.vertex_outputs ||
+        source.geometry_input_stride_dwords < 4 ||
+        source.geometry_input_stride_dwords > 64 ||
+        source.geometry_max_vertices > 256 || source.geometry_invocations == 0 ||
+        source.geometry_invocations > 32 ||
+        (source.geometry_output_primitive != 0 && source.geometry_output_primitive != 3 &&
+         source.geometry_output_primitive != 5) ||
+        source.geometry_vertices_per_instance == 0 ||
+        (source.indexed ? source.index_count : source.vertex_count) %
+            source.geometry_vertices_per_instance != 0 ||
+        source.geometry_layer_output_count > 1 || source.geometry_primitive_id_output_count > 1 ||
+        uint64_t(source.geometry_layer_output_start) + source.geometry_layer_output_count > gs.vertex_outputs ||
+        uint64_t(source.geometry_primitive_id_output_start) + source.geometry_primitive_id_output_count > gs.vertex_outputs ||
+        source.geometry_shared[0] || source.geometry_shared[1] ||
+        source.geometry_shared[2] || source.geometry_shared[3])
+      return refuse("geometry ABI, topology or unrelocated input descriptor");
+  } else if (source.geometry_pco || source.geometry_shared || source.geometry_shared_count ||
+             source.geometry_invocations || source.geometry_input_primitive_vertices) {
+    return refuse("geometry payload without executable");
+  }
   /*
    * One named check per condition.  As a single bundled boolean this said only
    * that something about the vertex buffer or the topology was wrong, and each
@@ -1273,7 +1384,10 @@ bool CopyPcoSequenceDraw(
      * expands.  Requiring two floats assumed every attribute arrived already
      * unpacked to one word per component.
      */
-    if (source.vertex_stride < sizeof(std::uint32_t))
+    const bool empty_geometry_attributes = (geometry || tessellation) &&
+        source.vertex_attribute_count == 0 && source.vertex_pco_abi.vertex_inputs == 0 &&
+        source.vertex_stride == 0 && !source.raw_vertex_data && source.raw_vertex_data_size == 0;
+    if (!empty_geometry_attributes && source.vertex_stride < sizeof(std::uint32_t))
       return "vertex stride is below one register word";
     if (source.vertex_stride > 256)
       return "vertex stride is beyond the model's limit";
@@ -1285,10 +1399,12 @@ bool CopyPcoSequenceDraw(
       return "first vertex is not zero";
     if (source.instance_count != 1)
       return "instance count is not one";
-    if (!triangles && !strip_or_fan && !line_or_point)
+    if (!triangles && !strip_or_fan && !line_or_point &&
+        !(geometry && source.primitive_mode >= 10 && source.primitive_mode <= 13) &&
+        !(tessellation && source.primitive_mode == 14))
       return "primitive mode is outside the supported topologies";
     // An indexed draw assembles primitives from its indices.
-    if (!DriverPcoArrayTopologyIsExpandable(source.primitive_mode,
+    if (!geometry && !tessellation && !DriverPcoArrayTopologyIsExpandable(source.primitive_mode,
                                             source.indexed != 0
                                                 ? source.index_count
                                                 : source.vertex_count)) {
@@ -1298,17 +1414,20 @@ bool CopyPcoSequenceDraw(
       return "index payload is invalid";
     if (!DriverPcoRenderTargetCountIsValid(source.render_target_count))
       return "render target count is invalid";
+    if ((geometry || tessellation) && source.render_target_count > 1)
+      return "geometry MRT requires independent attachment LOAD";
     if (end_vertex == 0 ||
         end_vertex > std::numeric_limits<std::uint32_t>::max() ||
-        end_vertex > std::numeric_limits<std::uint64_t>::max() /
-                         source.vertex_stride) {
+        (source.vertex_stride != 0 &&
+         end_vertex > std::numeric_limits<std::uint64_t>::max() /
+                         source.vertex_stride)) {
       return "vertex range overflows";
     }
-    if (!source.raw_vertex_data)
+    if (!source.raw_vertex_data && !empty_geometry_attributes)
       return "vertex data is absent";
     if (source.raw_vertex_data_size != end_vertex * source.vertex_stride)
       return "vertex data size does not match the range and stride";
-    if (!RawFloatVerticesAreFinite(source.raw_vertex_data, end_vertex,
+    if (!empty_geometry_attributes && !RawFloatVerticesAreFinite(source.raw_vertex_data, end_vertex,
                                    source.vertex_stride,
                                    source.vertex_stride /
                                        sizeof(std::uint32_t),
@@ -1341,9 +1460,11 @@ bool CopyPcoSequenceDraw(
       source.position_output_start != 0 ||
       source.position_output_count != 4 ||
       // Position, then gl_PointSize when the shader writes it, then varyings.
-      source.vertex_pco_abi.vertex_outputs !=
+      (!geometry && raster_abi.vertex_outputs !=
           source.position_output_count + source.point_size_output_count +
-              source.varying_output_count ||
+              source.varying_output_count) ||
+      (geometry && raster_abi.vertex_outputs <
+          source.varying_output_start + source.varying_output_count) ||
       source.varying_output_start !=
           source.position_output_count + source.point_size_output_count ||
       // A shape shaded from a uniform passes no varyings; position still
@@ -1533,7 +1654,7 @@ bool CopyPcoSequenceDraw(
   CopyPcoPayloadFields(source, &command);
   for (std::uint32_t index = 0; index < source.uniform_buffer_count; ++index) {
     const auto &buffer = source.uniform_buffers[index];
-    if (buffer.stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT ||
+    if (buffer.stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION ||
         buffer.block_index >= PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
         !buffer.bytes || buffer.bytes_size == 0 ||
         buffer.bytes_size > PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES) {
@@ -1679,7 +1800,8 @@ std::uint64_t CommandOwnedPayloadBytes(
     const pvrgpu::stub::DriverCommand &command) {
   std::uint64_t byte_vectors =
       static_cast<std::uint64_t>(command.raw_vertex_data.size()) +
-      command.vertex_pco.size() + command.fragment_pco.size() +
+      command.vertex_pco.size() + command.fragment_pco.size() + command.geometry_pco.size() +
+      command.tessellation.control_pco.size() + command.tessellation.evaluation_pco.size() +
       command.sampled_texture_bytes.size() + command.texture_rgba8_bytes.size() +
       command.initial_color_attachment_bytes.size() +
       command.initial_depth_attachment_bytes.size();
@@ -1699,7 +1821,8 @@ std::uint64_t CommandOwnedPayloadBytes(
   }
   const std::uint64_t dword_count =
       static_cast<std::uint64_t>(command.vertex_shared.size()) +
-      command.fragment_shared.size();
+      command.fragment_shared.size() + command.geometry_shared.size() +
+      command.tessellation.control_shared.size() + command.tessellation.evaluation_shared.size();
   if (dword_count >
       (std::numeric_limits<std::uint64_t>::max() - byte_vectors) /
           sizeof(std::uint32_t)) {
@@ -2379,7 +2502,16 @@ int RunModelToFiles(const pvrgpu::stub::Options &options,
   std::streambuf *old_stdout = std::cout.rdbuf(jsonl.rdbuf());
   std::streambuf *old_stderr =
       stderr_file ? std::cerr.rdbuf(stderr_file.rdbuf()) : nullptr;
-  const int result = pvrgpu::stub::RunConfiguredModel(options, framebuffer);
+  int result = 0;
+  try {
+    result = pvrgpu::stub::RunConfiguredModel(options, framebuffer);
+  } catch (...) {
+    // A rejected native instruction/state can throw out of SystemC. Restore
+    // both buffers before local streams die so the caller retains diagnostics.
+    std::cout.rdbuf(old_stdout);
+    if (old_stderr) std::cerr.rdbuf(old_stderr);
+    throw;
+  }
   std::cout.rdbuf(old_stdout);
   if (old_stderr)
     std::cerr.rdbuf(old_stderr);
@@ -2409,11 +2541,20 @@ void DeriveSequenceInputAssembly(pvrgpu::stub::Options *options) {
   std::uint64_t vertices = 0;
   std::uint64_t primitives = 0;
   bool any_indexed = false;
+  bool any_geometry = false;
   for (const pvrgpu::stub::DriverCommand &draw : options->driver_commands) {
+    const bool geometry = !draw.geometry_pco.empty();
+    const bool tessellation = !draw.tessellation.control_pco.empty();
+    any_geometry = any_geometry || geometry || tessellation;
+    const std::uint64_t total_occurrences = draw.indexed ? draw.index_count : draw.vertex_count;
+    if (geometry && (!draw.geometry_vertices_per_instance ||
+                     total_occurrences % draw.geometry_vertices_per_instance))
+      throw std::runtime_error("invalid GS instance assembly extent");
     const std::uint64_t assembled =
-        draw.indexed != 0 ? draw.index_count : draw.vertex_count;
+        tessellation ? draw.tessellation.vertices_per_instance
+        : geometry ? draw.geometry_vertices_per_instance : total_occurrences;
     const std::uint64_t instances =
-        draw.instance_count != 0 ? draw.instance_count : 1U;
+        (geometry || tessellation) ? total_occurrences / assembled : draw.instance_count != 0 ? draw.instance_count : 1U;
     any_indexed = any_indexed || draw.indexed != 0;
     vertices += assembled * instances;
     switch (draw.primitive_mode) {
@@ -2428,6 +2569,11 @@ void DeriveSequenceInputAssembly(pvrgpu::stub::Options *options) {
       case 6U:
         primitives += (assembled >= 3U ? assembled - 2U : 0U) * instances;
         break;
+      case 10U: primitives += (assembled / 4U) * instances; break;
+      case 11U: primitives += (assembled >= 4U ? assembled - 3U : 0U) * instances; break;
+      case 12U: primitives += (assembled / 6U) * instances; break;
+      case 13U: primitives += (assembled >= 6U ? (assembled - 4U) / 2U : 0U) * instances; break;
+      case 14U: primitives += (assembled / draw.tessellation.input_vertices) * instances; break;
       default:
         return;  // An unknown topology is rejected by the profile checks.
     }
@@ -2437,7 +2583,7 @@ void DeriveSequenceInputAssembly(pvrgpu::stub::Options *options) {
       static_cast<std::uint32_t>(options->driver_commands.size());
   logical.ia_vertices = static_cast<std::uint32_t>(vertices);
   logical.ia_primitives = static_cast<std::uint32_t>(primitives);
-  logical.clip_invocations = static_cast<std::uint32_t>(primitives);
+  logical.clip_invocations = any_geometry ? 0U : static_cast<std::uint32_t>(primitives);
   // Vertex shading follows the vertex count exactly unless post-transform
   // reuse decides it, which only an indexed draw can do.
   logical.vs_invocations =
@@ -2451,6 +2597,8 @@ void DeriveSequenceInputAssembly(pvrgpu::stub::Options *options) {
  * are held here until the next submission runs and replaces them.
  */
 pvrgpu::stub::ModelFramebuffer g_last_framebuffer;
+pvrgpu::stub::ModelGraphicsStats g_last_graphics_stats;
+std::uint64_t g_last_graphics_generation = 0;
 
 int FlushPendingSubmitLocked(pvrgpu::stub::ModelFramebuffer *framebuffer,
                              std::string *error) {
@@ -2473,6 +2621,8 @@ int FlushPendingSubmitLocked(pvrgpu::stub::ModelFramebuffer *framebuffer,
       RunModelToFiles(g_pending_submit.options, g_pending_submit.jsonl_path,
                       g_pending_submit.stderr_path, &produced, error);
   if (status == 0) {
+    g_last_graphics_stats = produced.graphics_stats;
+    g_last_graphics_generation = g_pending_submit.submission_generation;
     g_last_framebuffer = std::move(produced);
     if (framebuffer)
       *framebuffer = g_last_framebuffer;
@@ -2576,13 +2726,26 @@ extern "C" int pvrgpu_systemc_can_execute_pco_binary(std::uint32_t stage,
     CopyError(error, error_size, "empty PCO binary");
     return 2;
   }
-  const pvrgpu::stub::ShaderStage shader_stage =
-      stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_VERTEX
-          ? pvrgpu::stub::ShaderStage::kVertex
-          : pvrgpu::stub::ShaderStage::kFragment;
+  if (stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION) {
+    CopyError(error, error_size, "invalid graphics shader stage");
+    return 2;
+  }
   try {
     const std::vector<std::uint8_t> bytes(binary, binary + binary_size);
-    (void)pvrgpu::stub::DecodePcoProgram(shader_stage, bytes);
+    if (stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_CONTROL ||
+        stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION) {
+      (void)pvrgpu::stub::DecodeTessellationPcoProgram(
+          stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_CONTROL
+              ? pvrgpu::stub::ShaderStage::kTessellationControl
+              : pvrgpu::stub::ShaderStage::kTessellationEvaluation, bytes);
+    } else if (stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_GEOMETRY) {
+      (void)pvrgpu::stub::DecodeGeometryPcoProgram(bytes);
+    } else {
+      (void)pvrgpu::stub::DecodePcoProgram(
+          stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_VERTEX
+              ? pvrgpu::stub::ShaderStage::kVertex : pvrgpu::stub::ShaderStage::kFragment,
+          bytes);
+    }
   } catch (const std::exception &failure) {
     CopyError(error, error_size, failure.what());
     return 2;
@@ -2730,11 +2893,13 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
       commands.push_back(std::move(options.driver_command));
       AdoptCapturedCounterMetadata(
           commands.back(), &g_pending_submit.options.driver_command);
+      g_pending_submit.submission_generation = info->submission_generation;
       return 0;
     }
   }
 
   PendingSubmit pending;
+  pending.submission_generation = info->submission_generation;
   pending.options = std::move(options);
   pending.jsonl_path = info->jsonl_path;
   if (info->stderr_path && info->stderr_path[0])
@@ -2755,6 +2920,43 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
    * the new flush happens to run. */
   g_last_framebuffer = {};
   g_pending_submit = std::move(pending);
+  return 0;
+}
+
+extern "C" int pvrgpu_systemc_flush_graphics_stats(
+    pvrgpu_systemc_graphics_stats *stats, char *error,
+    std::size_t error_size) {
+  std::lock_guard<std::mutex> lock(g_bridge_mutex);
+  if (!stats || stats->version != PVRGPU_SYSTEMC_API_VERSION ||
+      stats->submission_generation == 0) {
+    CopyError(error, error_size, "invalid SystemC graphics statistics request");
+    return 2;
+  }
+  const std::uint64_t requested = stats->submission_generation;
+  if (requested != g_last_graphics_generation) {
+    if (!g_pending_submit.valid || g_pending_submit.executed ||
+        g_pending_submit.submission_generation != requested) {
+      CopyError(error, error_size,
+                "SystemC graphics statistics submission ownership mismatch");
+      return 2;
+    }
+    std::string message;
+    const int status = FlushPendingSubmitLocked(nullptr, &message);
+    if (status != 0) {
+      CopyError(error, error_size,
+                message.empty() ? "SystemC graphics statistics flush failed" : message);
+      return status;
+    }
+  }
+  if (requested != g_last_graphics_generation) {
+    CopyError(error, error_size, "SystemC graphics statistics were not published");
+    return 2;
+  }
+  stats->physical_submissions = g_last_graphics_stats.physical_submissions;
+  stats->primitives_generated = g_last_graphics_stats.primitives_generated;
+  stats->ia_primitives = g_last_graphics_stats.ia_primitives;
+  stats->gs_primitives = g_last_graphics_stats.gs_primitives;
+  stats->gs_invocations = g_last_graphics_stats.gs_invocations;
   return 0;
 }
 

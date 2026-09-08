@@ -159,6 +159,58 @@ void TestFramebufferReadback() {
         "readback leaves authoritative backing populated");
 }
 
+void TestFreshPartialStores(MemoryMode mode) {
+  constexpr std::uint64_t kAddress = UINT64_C(0x800010000);
+  GpuMemorySystem memory(mode);
+  std::vector<std::uint8_t> expected(256, 0);
+  auto store = [&](std::size_t offset, std::size_t bytes, std::uint8_t seed,
+                   MemoryClient client) {
+    const auto replacement = Pattern(bytes, seed);
+    const auto stats = memory.Write(kAddress + offset, replacement.data(),
+                                    replacement.size(), client);
+    std::copy(replacement.begin(), replacement.end(), expected.begin() + offset);
+    if (mode == MemoryMode::kCache) {
+      Check(stats.dram_read_transactions == 0 &&
+                stats.dram_write_transactions == 0 &&
+                !memory.backing().Contains(kAddress, expected.size()),
+            "fresh dirty-line partial updates do not read or initialize DRAM");
+    }
+  };
+  // No HostWrite: fresh output storage begins with a full dirty line, then
+  // another client overwrites only an interior span of that resident line.
+  store(0, 128, 0x15, MemoryClient::kTessellationControl);
+  store(37, 19, 0xb7, MemoryClient::kTessellator);
+  auto read = memory.Read(kAddress, 128, MemoryClient::kTessellationEvaluation);
+  Check(std::equal(read.data.begin(), read.data.end(), expected.begin()),
+        "partial store preserves untouched bytes in fresh full dirty line");
+  if (mode == MemoryMode::kCache)
+    Check(read.stats.slc.hits == 1 && read.stats.dram_read_transactions == 0,
+          "fresh dirty line is shared across all tessellation clients");
+
+  // Two tightly packed patch outputs can share a line. The second line has
+  // only partial stores and is still absent from backing when overwritten.
+  store(120, 40, 0x6a, MemoryClient::kTessellator);
+  store(145, 31, 0xce, MemoryClient::kTessellationControl);
+  store(200, 4, 0x28, MemoryClient::kGeometryShader);
+  read = memory.Read(kAddress, expected.size(), MemoryClient::kTessellationEvaluation);
+  Check(read.data == expected,
+        "cross-line and disjoint partial stores preserve every other byte");
+  if (mode == MemoryMode::kCache)
+    Check(read.stats.slc.hits == 2 && read.stats.dram_read_transactions == 0,
+          "both fresh partial output lines remain resident and coherent");
+  const auto final = memory.Readback(kAddress, expected.size(), MemoryClient::kFramebufferReadback);
+  Check(final.data == expected && memory.backing().Read(kAddress, expected.size()) == expected,
+        "partial-store merge survives flush and authoritative readback");
+  if (mode == MemoryMode::kCache)
+    Check(final.stats.slc.writebacks == 2 && final.stats.dram_write_transactions == 2,
+          "fresh partial stores retire as exactly two dirty line writebacks");
+
+  bool rejected = false;
+  try { (void)memory.Read(kAddress + 0x10000, 4, MemoryClient::kVertexFetch); }
+  catch (const std::runtime_error &) { rejected = true; }
+  Check(rejected, "partial-store initialization does not legalize uninitialized reads");
+}
+
 }  // namespace
 
 int main() {
@@ -167,6 +219,9 @@ int main() {
     TestBypass();
     TestCacheAndFlush();
     TestFramebufferReadback();
+    TestFreshPartialStores(MemoryMode::kDirect);
+    TestFreshPartialStores(MemoryMode::kBypass);
+    TestFreshPartialStores(MemoryMode::kCache);
     std::cout << "gpu_memory_system_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {
