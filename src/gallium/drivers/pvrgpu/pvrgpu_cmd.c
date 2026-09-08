@@ -364,6 +364,42 @@ pvrgpu_systemc_submit_info_init(
 }
 
 bool
+pvrgpu_read_stream_output(
+   struct pvrgpu_systemc_stream_output_readback *readback,
+   char *error, size_t error_size)
+{
+   const char *library_path = pvrgpu_nonempty_env("PVRGPU_SYSTEMC_API_LIB");
+   if (!library_path || !readback || !readback->submission_generation) {
+      pvrgpu_cmd_error(error, error_size, "stream output requires a model submission");
+      return false;
+   }
+   static void *handle;
+   static pvrgpu_systemc_flush_stream_output_fn flush_stream_output;
+   if (!handle) {
+      handle = dlopen(library_path, RTLD_NOW | RTLD_GLOBAL);
+      if (handle)
+         flush_stream_output = (pvrgpu_systemc_flush_stream_output_fn)
+            dlsym(handle, "pvrgpu_systemc_flush_stream_output");
+   }
+   if (!flush_stream_output) {
+      pvrgpu_cmd_error(error, error_size, "stream output readback entry point is unavailable");
+      return false;
+   }
+   const uint64_t generation = readback->submission_generation;
+   const uint64_t resource_token = readback->resource_token;
+   const uint64_t target_token = readback->target_token;
+   readback->version = PVRGPU_SYSTEMC_API_VERSION;
+   if (flush_stream_output(readback, error, error_size) != 0)
+      return false;
+   if (!readback->data_written || readback->submission_generation != generation ||
+       readback->resource_token != resource_token || readback->target_token != target_token) {
+      pvrgpu_cmd_error(error, error_size, "stream output readback identity mismatch");
+      return false;
+   }
+   return true;
+}
+
+bool
 pvrgpu_read_graphics_stats(uint64_t submission_generation,
                             struct pvrgpu_systemc_graphics_stats *stats,
                             char *error, size_t error_size)

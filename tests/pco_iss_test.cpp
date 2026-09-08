@@ -2341,6 +2341,20 @@ void TestDecodeAndExecuteVaryingsOne() {
         "perspective interpolation computes B = (1/8)/0.5");
   Check(fragment_result.pixel_outputs[3] == UINT32_C(0x3f800000),
         "perspective interpolation computes A = 0.5/0.5");
+  auto centroid_binary = VaryingsOneFragmentPcoBinary();
+  centroid_binary[fitrp.binary_offset] |= 2U;
+  const auto centroid = Decode(ShaderStage::kFragment, centroid_binary);
+  Check(centroid.instructions[0].iteration_mode == PcoIterationMode::kCentroid,
+        "public FITRP centroid encoding remains distinct from pixel");
+  const auto centroid_result = ExecuteFragment(centroid.summary, centroid.instructions,
+                                                MakeVaryingsOneContext());
+  Check(centroid_result.pixel_outputs == fragment_result.pixel_outputs &&
+            centroid_result.written_mask == fragment_result.written_mask,
+        "single-sample centroid executes the same coefficient location as pixel");
+  auto msaa_context = MakeVaryingsOneContext();
+  msaa_context.raster_sample_count = 4;
+  ExpectFailure([&] { (void)ExecuteFragment(centroid.summary, centroid.instructions, msaa_context); },
+                "multisample centroid cannot silently use pixel coordinates");
 }
 
 void TestDecodeAndExecuteVaryingsTwo() {

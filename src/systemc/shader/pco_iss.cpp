@@ -8963,7 +8963,9 @@ PcoFragmentExecution ExecuteFragmentPco(
                   instruction.component_count >
               kPcoTemporaryCount ||
           instruction.data_request != 0 ||
-          instruction.iteration_mode != PcoIterationMode::kPixel ||
+          (instruction.iteration_mode != PcoIterationMode::kPixel &&
+           !(instruction.iteration_mode == PcoIterationMode::kCentroid &&
+             context.raster_sample_count == 1)) ||
           instruction.perspective != 1 || instruction.saturate != 0 ||
           instruction.source.bank != PcoRegisterBank::kCoefficient ||
           instruction.source.index < 4 ||
@@ -8972,7 +8974,7 @@ PcoFragmentExecution ExecuteFragmentPco(
                   instruction.component_count * 4U >
               context.coefficient_count ||
           !IsRegister(instruction.source1, PcoRegisterBank::kCoefficient, 0)) {
-        ExecuteError("invalid FITRP.PIXEL semantic instruction");
+        ExecuteError("invalid FITRP iteration semantics (CENTROID requires single-sample raster)");
       }
       const std::uint32_t reciprocal_w = EvaluateCoefficientPlane(context, 0);
       /* llvmpipe lowers perspective interpolation as two independently

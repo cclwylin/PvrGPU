@@ -12,6 +12,7 @@
 
 #include <systemc>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -101,18 +102,24 @@ PipelineState SourceState(MemoryPool &pool, bool indexed) {
   return state;
 }
 
-PipelineState RasterStateFor(MemoryPool &pool, unsigned shape, bool clipped) {
+PipelineState RasterStateFor(MemoryPool &pool, unsigned shape, bool clipped,
+                             bool geometry = true, bool smooth_nan = false,
+                             bool reverse_winding = false) {
   auto state = Base(pool);
+  if (!geometry) {
+    pool.Release(state.geometry_code);
+    state.geometry_code = {};
+  }
   state.stage = PipelineStage::kVertexShaded;
   state.draw.topology = PrimitiveTopology::kTriangleList;
   state.source_topology = shape == 1 ? PrimitiveTopology::kPoints :
       shape == 2 ? PrimitiveTopology::kLineStrip : PrimitiveTopology::kTriangleStrip;
   state.geometry_output_topology = state.source_topology;
   state.draw.vertex_count = shape ? 3 : 0;
-  state.geometry_pco_abi.vertex_outputs = 7;
+  state.geometry_pco_abi.vertex_outputs = geometry ? 7 : 0;
   // Deliberately different VS and GS output spans: raster linkage belongs to
   // the final programmable stage, not to the upstream vertex shader.
-  state.vertex_pco_abi.vertex_outputs = 4;
+  state.vertex_pco_abi.vertex_outputs = geometry ? 4 : 5;
   state.varying_output_start = 4;
   state.varying_output_count = 1;
   state.fragment_position_start = 0;
@@ -121,25 +128,27 @@ PipelineState RasterStateFor(MemoryPool &pool, unsigned shape, bool clipped) {
   state.fragment_varying_count = 4;
   state.fragment_pco_abi.coefficients = 8;
   state.geometry_primitive_id_output_start = 5;
-  state.geometry_primitive_id_output_count = 1;
+  state.geometry_primitive_id_output_count = geometry ? 1 : 0;
   state.geometry_layer_output_start = 6;
-  state.geometry_layer_output_count = 1;
+  state.geometry_layer_output_count = geometry ? 1 : 0;
   ShaderVaryingBinding binding;
   binding.vertex_output_base = 4;
   binding.coefficient_set_base = 1;
   binding.w_coefficient_set = 0;
   binding.component_count = 1;
-  binding.interpolation = InterpolationMode::kFlat;
+  binding.interpolation = smooth_nan ? InterpolationMode::kSmooth :
+                                      InterpolationMode::kFlat;
   state.shader_varying_bindings = StoreNewArray(pool,
       std::vector<ShaderVaryingBinding>{binding});
   std::vector<VertexLane> lanes(shape);
   const float xy[3][2] = {{-0.5f, -0.5f}, {0.5f, -0.5f}, {0.0f, 0.5f}};
   for (unsigned i = 0; i < shape; ++i) {
-    lanes[i].vertex_output[0] = Bits(xy[i][0]);
-    lanes[i].vertex_output[1] = Bits(clipped && i == 2 ? 2.0f : xy[i][1]);
+    lanes[i].vertex_output[0] = Bits(reverse_winding ? -xy[i][0] : xy[i][0]);
+    lanes[i].vertex_output[1] = Bits(clipped && i == shape - 1 ? 2.0f : xy[i][1]);
     lanes[i].vertex_output[2] = Bits(0);
     lanes[i].vertex_output[3] = Bits(1);
-    lanes[i].vertex_output[4] = UINT32_C(0xffa01230) + i;
+    lanes[i].vertex_output[4] = smooth_nan ? UINT32_C(0x7fc12345) :
+                                          UINT32_C(0xffa01230) + i;
     lanes[i].vertex_output[5] = UINT32_C(0xffffff80) + i;
     lanes[i].vertex_output[6] = 0;
     lanes[i].emitted = lanes[i].ended = 1;
@@ -155,11 +164,15 @@ PipelineState RasterStateFor(MemoryPool &pool, unsigned shape, bool clipped) {
     p.instance_id = 3;
     p.invocation_id = 2;
     primitives.push_back(p);
-    for (const auto index : p.refs.vertex_indices) refs.push_back({index, index});
+    for (unsigned occurrence = 0; occurrence < 3; ++occurrence) {
+      const auto index = p.refs.vertex_indices[occurrence];
+      refs.push_back({index, geometry ? index : occurrence});
+    }
   }
   state.vertex_lanes = StoreNewArray(pool, lanes);
   state.vertex_lane_refs = StoreNewArray(pool, refs);
-  state.geometry_primitives = StoreNewArray(pool, primitives);
+  if (geometry)
+    state.geometry_primitives = StoreNewArray(pool, primitives);
   return state;
 }
 }  // namespace
@@ -184,6 +197,10 @@ int sc_main(int, char **) {
     clip.input(raster_in); clip.output(clip_out);
     tiler.input(clip_out); tiler.output(tile_out);
     parameter.input(tile_out); parameter.output(raster_out);
+    sc_core::sc_fifo<PipelineTxn> clip_only_in("clip_only_in", 1);
+    sc_core::sc_fifo<PipelineTxn> clip_only_out("clip_only_out", 1);
+    ClipCull clip_only("clip_only", pool);
+    clip_only.input(clip_only_in); clip_only.output(clip_only_out);
 
     for (bool indexed : {false, true}) {
       const auto initial = SourceState(pool, indexed);
@@ -243,6 +260,68 @@ int sc_main(int, char **) {
                 "flat coefficient preserves exact raw signed/NaN payload");
         Retire(pool, state_handle);
       }
+    }
+    // GLES3 VS outputs use the same flat/raw contract as GS outputs. The
+    // original last vertex must survive clipping it away, widening lines or
+    // points, fan triangulation and either input winding.
+    for (unsigned shape : {1U, 2U, 3U}) {
+      for (bool clipped : {false, true}) {
+        if (clipped && shape == 1) continue;
+        for (bool reverse_winding : {false, true}) {
+          const auto state_handle = Publish(pool, RasterStateFor(
+              pool, shape, clipped, false, false, reverse_winding));
+          raster_in.write({state_handle, 1, 1});
+          sc_core::sc_start(sc_core::sc_time(10, sc_core::SC_US));
+          PipelineTxn completion;
+          Check(raster_out.nb_read(completion), "VS flat raster FIFO completion");
+          const auto state = LoadPipelineState(pool, completion.state);
+          const auto triangles = LoadArray<RasterTriangle>(pool, state.raster_triangles);
+          const auto words = LoadArray<std::uint32_t>(pool, state.raster_vertex_outputs);
+          const auto coefficients = LoadArray<ParameterCoefficientSet>(pool,
+              state.parameter_coefficients);
+          Check(!triangles.empty(), "VS flat primitive retains actual coverage");
+          for (const auto &triangle : triangles)
+            for (unsigned i = 0; i < 3; ++i)
+              Check(words[triangle.first_vertex_output_dword +
+                          i * triangle.vertex_output_stride_dwords + 4] ==
+                        UINT32_C(0xffa01230) + shape - 1,
+                    "VS original provoking raw DWORD survives clipping and winding");
+          for (std::size_t i = 1; i < coefficients.size(); i += 2)
+            Check(coefficients[i].a == 0 && coefficients[i].b == 0 &&
+                      coefficients[i].c == UINT32_C(0xffa01230) + shape - 1,
+                  "VS flat coefficient retains exact raw signed/NaN payload");
+          Retire(pool, state_handle);
+        }
+      }
+    }
+    // Smooth floating outputs may also be NaN. Their propagation is distinct
+    // from flat raw transport; only the four clip-position words must remain
+    // finite. Check the clipping boundary directly.
+    for (bool geometry : {false, true}) {
+      const auto state_handle = Publish(pool, RasterStateFor(
+          pool, 3, true, geometry, true));
+      clip_only_in.write({state_handle, 1, 1});
+      sc_core::sc_start(sc_core::sc_time(10, sc_core::SC_US));
+      PipelineTxn completion;
+      Check(clip_only_out.nb_read(completion), "smooth NaN clip FIFO completion");
+      const auto state = LoadPipelineState(pool, completion.state);
+      const auto triangles = LoadArray<RasterTriangle>(pool, state.raster_triangles);
+      const auto words = LoadArray<std::uint32_t>(pool, state.raster_vertex_outputs);
+      Check(triangles.size() > 1, "smooth NaN test generates clip intersections");
+      for (const auto &triangle : triangles)
+        for (unsigned i = 0; i < 3; ++i) {
+          const auto offset = triangle.first_vertex_output_dword +
+                              i * triangle.vertex_output_stride_dwords;
+          for (unsigned component = 0; component < 4; ++component) {
+            float value;
+            std::memcpy(&value, &words[offset + component], sizeof(value));
+            Check(std::isfinite(value), "clip positions remain finite");
+          }
+          float varying;
+          std::memcpy(&varying, &words[offset + 4], sizeof(varying));
+          Check(std::isnan(varying), "legal smooth NaN varying survives clipping");
+        }
+      Retire(pool, state_handle);
     }
     Check(pool.allocations() == pool.releases(), "all GS boundary pool handles retired");
     std::cout << "geometry-frontend-test: " << checks << " checks PASS\n";

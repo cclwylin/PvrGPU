@@ -465,6 +465,63 @@ bool PcoViewportScaleMatches(const std::array<std::uint32_t, 3> &expected,
          actual[2] == expected[2];
 }
 
+bool ValidateStreamOutput(const pvrgpu_systemc_stream_output *so,
+                         std::uint32_t output_dwords, std::string *error) {
+  if (!so)
+    return true;
+  const auto refuse = [&](const char *reason) {
+    *error = std::string("SystemC API stream output ") + reason;
+    return false;
+  };
+  if (!so->bindings || !so->binding_count ||
+      so->binding_count > PVRGPU_SYSTEMC_MAX_STREAM_OUTPUT_BINDINGS ||
+      so->target_count > PVRGPU_SYSTEMC_MAX_STREAM_OUTPUT_BUFFERS ||
+      ((so->target_count != 0) != (so->targets != nullptr)))
+    return refuse("binding/target list is invalid");
+  std::array<const pvrgpu_systemc_stream_output_target *,
+             PVRGPU_SYSTEMC_MAX_STREAM_OUTPUT_BUFFERS> targets{};
+  for (std::uint32_t i = 0; i < so->target_count; ++i) {
+    const auto &t = so->targets[i];
+    if (t.output_buffer >= targets.size() || targets[t.output_buffer] ||
+        !t.resource_token || !t.target_token || !t.bytes || !t.bytes_size ||
+        t.bytes_size > PVRGPU_SYSTEMC_MAX_STREAM_OUTPUT_RESOURCE_BYTES ||
+        t.buffer_offset > t.bytes_size || t.buffer_size > t.bytes_size - t.buffer_offset ||
+        t.internal_offset > t.buffer_size ||
+        (t.buffer_offset % 4) || (t.internal_offset % 4) ||
+        !t.stride_dwords || t.stride_dwords > 64)
+      return refuse("target identity/range/stride is invalid");
+    for (std::uint32_t j = 0; j < i; ++j) {
+      const auto &prior = so->targets[j];
+      if (t.target_token == prior.target_token)
+        return refuse("target token is duplicated");
+      if (t.resource_token == prior.resource_token &&
+          (t.bytes_size != prior.bytes_size ||
+           std::memcmp(t.bytes, prior.bytes, t.bytes_size) != 0))
+        return refuse("aliased resource snapshots disagree");
+    }
+    targets[t.output_buffer] = &t;
+  }
+  for (std::uint32_t i = 0; i < so->binding_count; ++i) {
+    const auto &b = so->bindings[i];
+    if (b.stream || b.output_buffer >= targets.size() ||
+        !b.num_components || b.num_components > 4 ||
+        b.output_dword >= output_dwords || b.num_components > output_dwords - b.output_dword ||
+        b.dst_offset_dwords > 64 || b.num_components > 64 - b.dst_offset_dwords)
+      return refuse("binding output range/stream is invalid");
+    const auto *target = targets[b.output_buffer];
+    if (target && b.dst_offset_dwords + b.num_components > target->stride_dwords)
+      return refuse("binding exceeds target stride");
+    for (std::uint32_t j = 0; j < i; ++j) {
+      const auto &prior = so->bindings[j];
+      if (b.output_buffer == prior.output_buffer &&
+          b.dst_offset_dwords < prior.dst_offset_dwords + prior.num_components &&
+          prior.dst_offset_dwords < b.dst_offset_dwords + b.num_components)
+        return refuse("binding destination ranges overlap");
+    }
+  }
+  return true;
+}
+
 void CopyPcoPayloadFields(
     const pvrgpu_systemc_driver_command &source,
     pvrgpu::stub::DriverCommand *destination) {
@@ -505,6 +562,35 @@ void CopyPcoPayloadFields(
       source.fragment_pco + source.fragment_pco_size);
   destination->geometry_pco.clear();
   destination->geometry_shared.clear();
+  destination->stream_output = {};
+  destination->explicit_varying_bindings = source.varying_bindings != nullptr;
+  destination->varying_bindings.clear();
+  for (std::uint32_t i = 0; i < source.varying_binding_count; ++i) {
+    const auto &binding = source.varying_bindings[i];
+    destination->varying_bindings.push_back({binding.output_dword, binding.num_components,
+                                            binding.coefficient_dword, binding.flat});
+  }
+  if (source.stream_output) {
+    const auto &so = *source.stream_output;
+    for (std::uint32_t i = 0; i < so.binding_count; ++i) {
+      const auto &b = so.bindings[i];
+      destination->stream_output.bindings.push_back(
+          {b.output_dword, b.num_components, b.output_buffer, b.dst_offset_dwords, b.stream});
+    }
+    for (std::uint32_t i = 0; i < so.target_count; ++i) {
+      const auto &t = so.targets[i];
+      pvrgpu::stub::DriverStreamOutputTarget owned;
+      owned.output_buffer = t.output_buffer;
+      owned.resource_token = t.resource_token;
+      owned.target_token = t.target_token;
+      owned.bytes.assign(t.bytes, t.bytes + t.bytes_size);
+      owned.buffer_offset = t.buffer_offset;
+      owned.buffer_size = t.buffer_size;
+      owned.internal_offset = t.internal_offset;
+      owned.stride_dwords = t.stride_dwords;
+      destination->stream_output.targets.push_back(std::move(owned));
+    }
+  }
   destination->tessellation = {};
   if (source.tessellation) {
     const auto &t = *source.tessellation;
@@ -1331,6 +1417,30 @@ bool CopyPcoSequenceDraw(
   }
   const auto &raster_abi = geometry ? source.geometry_pco_abi
       : tessellation ? source.tessellation->evaluation_abi : source.vertex_pco_abi;
+  if (source.stream_output && (geometry || tessellation))
+    return refuse("stream output currently requires a vertex-only pipeline");
+  if (!ValidateStreamOutput(source.stream_output, raster_abi.vertex_outputs, error))
+    return false;
+  if (source.varying_binding_count > PVRGPU_SYSTEMC_MAX_VARYING_BINDINGS ||
+      (!source.varying_bindings && source.varying_binding_count))
+    return refuse("explicit varying binding list is invalid");
+  if (source.varying_bindings) {
+    if (geometry || tessellation)
+      return refuse("explicit varying bindings require a vertex-only pipeline");
+    std::uint32_t next_coefficient = 4;
+    for (std::uint32_t i = 0; i < source.varying_binding_count; ++i) {
+      const auto &b = source.varying_bindings[i];
+      if (!b.num_components || b.num_components > 4 || b.flat > 1 ||
+          b.output_dword < source.varying_output_start ||
+          b.output_dword > raster_abi.vertex_outputs ||
+          b.num_components > raster_abi.vertex_outputs - b.output_dword ||
+          b.coefficient_dword != next_coefficient)
+        return refuse("explicit varying binding output/coefficient range is invalid");
+      next_coefficient += b.num_components * 4;
+    }
+    if (next_coefficient != source.fragment_pco_abi.coefficients)
+      return refuse("explicit varying bindings do not cover fragment coefficients");
+  }
   if (geometry) {
     const auto &gs = source.geometry_pco_abi;
     const uint32_t inputs = source.geometry_input_primitive_vertices;
@@ -1706,6 +1816,10 @@ bool CopyCommand(const pvrgpu_systemc_driver_command &source,
     *error = "SystemC API uniform buffers require a nested PCO draw";
     return false;
   }
+  if (source.stream_output || source.varying_bindings || source.varying_binding_count) {
+    *error = "SystemC API stream output/explicit varying bindings require a nested PCO draw";
+    return false;
+  }
   if (!source.command || !source.command[0]) {
     *error = "missing SystemC API command";
     return false;
@@ -1818,6 +1932,11 @@ std::uint64_t CommandOwnedPayloadBytes(
         std::numeric_limits<std::uint64_t>::max() - byte_vectors)
       throw std::overflow_error("SystemC API uniform buffer payload size overflow");
     byte_vectors += buffer.bytes.size();
+  }
+  for (const auto &target : command.stream_output.targets) {
+    if (target.bytes.size() > std::numeric_limits<std::uint64_t>::max() - byte_vectors)
+      throw std::overflow_error("SystemC API stream output payload size overflow");
+    byte_vectors += target.bytes.size();
   }
   const std::uint64_t dword_count =
       static_cast<std::uint64_t>(command.vertex_shared.size()) +
@@ -2226,12 +2345,20 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
   commands.reserve(source.pco_sequence_command_count);
   std::size_t texture_offset = 0;
   std::uint64_t payload_bytes = 0;
+  bool saw_stream_output = false;
   for (std::size_t ordinal = 0;
        ordinal < source.pco_sequence_command_count; ++ordinal) {
     pvrgpu::stub::DriverCommand command;
     if (!CopyPcoSequenceDraw(source.pco_sequence_commands[ordinal], ordinal,
                              &command, error)) {
       return false;
+    }
+    if (!command.stream_output.bindings.empty()) {
+      if (saw_stream_output) {
+        *error = "SystemC API sequence requires a completion between stream output draws";
+        return false;
+      }
+      saw_stream_output = true;
     }
     const auto attachment_matches = [&](std::uint32_t source_ordinal,
                                         bool depth) {
@@ -2957,7 +3084,55 @@ extern "C" int pvrgpu_systemc_flush_graphics_stats(
   stats->ia_primitives = g_last_graphics_stats.ia_primitives;
   stats->gs_primitives = g_last_graphics_stats.gs_primitives;
   stats->gs_invocations = g_last_graphics_stats.gs_invocations;
+  stats->stream_output_primitives_written = g_last_graphics_stats.stream_output_primitives_written;
+  stats->stream_output_primitives_storage_needed =
+      g_last_graphics_stats.stream_output_primitives_storage_needed;
   return 0;
+}
+
+extern "C" int pvrgpu_systemc_flush_stream_output(
+    pvrgpu_systemc_stream_output_readback *readback, char *error,
+    std::size_t error_size) {
+  std::lock_guard<std::mutex> lock(g_bridge_mutex);
+  if (!readback || readback->version != PVRGPU_SYSTEMC_API_VERSION) {
+    CopyError(error, error_size, "unsupported SystemC stream output readback version");
+    return 2;
+  }
+  readback->data_written = 0;
+  if (!readback->submission_generation || !readback->resource_token ||
+      !readback->target_token || !readback->bytes || !readback->bytes_size) {
+    CopyError(error, error_size, "invalid SystemC stream output readback request");
+    return 2;
+  }
+  if (readback->submission_generation != g_last_graphics_generation) {
+    if (!g_pending_submit.valid || g_pending_submit.executed ||
+        readback->submission_generation != g_pending_submit.submission_generation) {
+      CopyError(error, error_size, "SystemC stream output submission ownership mismatch");
+      return 2;
+    }
+    std::string message;
+    const int status = FlushPendingSubmitLocked(nullptr, &message);
+    if (status) {
+      CopyError(error, error_size, message);
+      return status;
+    }
+  }
+  for (const auto &source : g_last_framebuffer.stream_outputs) {
+    if (source.resource_token != readback->resource_token ||
+        source.target_token != readback->target_token)
+      continue;
+    if (source.bytes.size() != readback->bytes_size) {
+      CopyError(error, error_size, "SystemC stream output readback extent mismatch");
+      return 2;
+    }
+    std::memcpy(readback->bytes, source.bytes.data(), source.bytes.size());
+    readback->internal_offset = source.internal_offset;
+    readback->data_written = 1;
+    CopyError(error, error_size, "");
+    return 0;
+  }
+  CopyError(error, error_size, "SystemC stream output target ownership mismatch");
+  return 2;
 }
 
 extern "C" int pvrgpu_systemc_flush_readback(

@@ -654,6 +654,8 @@ struct PcoFragmentExecutionContext {
   std::uint32_t sample_x = 0;
   std::uint32_t sample_y = 0;
   std::uint32_t special_coordinate_offset = 0;
+  // CENTROID equals PIXEL only for a single-sample raster surface.
+  std::uint32_t raster_sample_count = 1;
   std::array<std::uint32_t, kPcoMaximumSharedCount> shared_registers{};
   std::array<std::uint32_t, kPcoTextureResponseCount> texture_response{};
   PcoFragmentContinuation continuation{};

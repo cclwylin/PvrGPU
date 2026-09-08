@@ -5,6 +5,7 @@
 #include "common/functional_types.h"
 
 #include "common/pipeline_state.h"
+#include "common/stream_output_types.h"
 #include "common/tessellation_state.h"
 
 #include <algorithm>
@@ -463,6 +464,8 @@ std::uint32_t VaryingVectorCount(const PipelineState &state) {
     return VaryingVectorCount(state.functional_case);
   if (!UsesShaderVaryings(state))
     return 0;
+  if (state.driver_varying_bindings_explicit)
+    return state.driver_varying_binding_count;
   return (state.varying_output_count +
           kVaryingVectorComponentCount - 1U) /
          kVaryingVectorComponentCount;
@@ -594,6 +597,21 @@ bool IsExactVaryingBinding(const PipelineState &state,
   }
   const std::uint32_t components = state.varying_output_count;
   const std::uint32_t binding_count = VaryingVectorCount(state);
+  if (state.driver_varying_bindings_explicit) {
+    const auto coefficient_count = state.fragment_pco_abi.coefficients / 4;
+    const bool valid = binding_index < binding_count && binding_count <= 64 &&
+        binding.component_count >= 1 && binding.component_count <= 4 &&
+        binding.vertex_output_base >= state.varying_output_start &&
+        binding.vertex_output_base <= state.vertex_pco_abi.vertex_outputs &&
+        binding.component_count <= state.vertex_pco_abi.vertex_outputs - binding.vertex_output_base &&
+        binding.coefficient_set_base >= 1 && binding.coefficient_set_base <= coefficient_count &&
+        binding.component_count <= coefficient_count - binding.coefficient_set_base &&
+        binding.w_coefficient_set == 0 &&
+        (binding.interpolation == InterpolationMode::kSmooth || binding.interpolation == InterpolationMode::kFlat) &&
+        !binding.reserved[0] && !binding.reserved[1];
+    if (!valid && out_refusal) *out_refusal = "explicit_varying_binding";
+    return valid;
+  }
   if (components == 0 || binding_count == 0 ||
       binding_index >= binding_count ||
       components > kDriverPcoMaximumVaryingComponents) {
@@ -808,6 +826,10 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
       release_unique(handle);
     release_unique(state.tessellation_state);
   }
+  if (HasPoolHandle(state.stream_output_targets)) {
+    for (const auto &target : LoadArray<StreamOutputTarget>(pool, state.stream_output_targets))
+      release_unique(target.readback);
+  }
   const PoolHandle handles[] = {
       state.drawlist_stats,
       state.vertex_buffer_resources,
@@ -815,6 +837,8 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
       state.vertex_indices,
       state.vertex_lanes,
       state.vertex_lane_refs,
+      state.stream_output_bindings,
+      state.stream_output_targets,
       state.geometry_input_primitives,
       state.geometry_primitives,
       state.geometry_code,

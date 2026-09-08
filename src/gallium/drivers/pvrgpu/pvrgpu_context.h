@@ -39,6 +39,13 @@ struct pvrgpu_refract_pco_observation;
 struct pvrgpu_shadow_pco_observation;
 struct pvrgpu_terrain_pco_observation;
 
+/* Materialize only topology indices; shader inputs/outputs remain native.
+ * Each instance owns an independent strip/fan/loop and a VBO slice. */
+bool pvrgpu_expand_instanced_connected_indices(
+   enum mesa_prim mode, const void *source_indices, unsigned source_index_size,
+   unsigned element_count, unsigned vertices_per_instance, unsigned instances,
+   uint32_t **out_indices, unsigned *out_index_count, enum mesa_prim *out_mode);
+
 /*
  * Scissored depth/stencil clears one draw may inherit.  dEQP's stencil.* paint
  * a grid of 36 rectangles before their first draw; the bound is generous enough
@@ -103,6 +110,8 @@ struct pvrgpu_context {
     * The generation prevents repeated attachment readbacks counting twice. */
    uint64_t query_collected_generation;
    uint64_t query_primitives_generated;
+   uint64_t query_primitives_written;
+   uint64_t query_primitives_storage_needed;
    uint64_t query_statistics_failures;
    unsigned active_primitives_generated_queries;
    bool query_state_disabled;

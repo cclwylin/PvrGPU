@@ -4459,6 +4459,11 @@ bool pvrgpu_pco_vertex_attribute_components(const struct nir_shader *vertex_nir,
  * the scissor and fragment-op groups draw -- is a valid layout rather than an
  * unsupported one.  Position still occupies the first four outputs.
  */
+static bool
+pvrgpu_geometry_type_components(const struct glsl_type *type, unsigned location,
+                                unsigned component, uint32_t counts[64],
+                                char *error, size_t error_size);
+
 static bool pvrgpu_color_primitive_varyings(const nir_shader *vs,
                                             const nir_shader *fs,
                                             unsigned *components,
@@ -4495,6 +4500,24 @@ static bool pvrgpu_color_primitive_varyings(const nir_shader *vs,
    if (vs_varyings == 0)
       return true;
 
+   uint32_t vertex_components[64] = {0};
+   uint32_t fragment_components[64] = {0};
+   bool fragment_flat[64] = {false};
+   nir_foreach_shader_out_variable(var, vs) {
+      if (!pvrgpu_geometry_type_components(var->type, var->data.location,
+             var->data.location_frac, vertex_components, NULL, 0))
+         return false;
+   }
+   nir_foreach_shader_in_variable(var, fs) {
+      if (!pvrgpu_geometry_type_components(var->type, var->data.location,
+             var->data.location_frac, fragment_components, NULL, 0))
+         return false;
+      const unsigned slots = glsl_count_attribute_slots(var->type, false);
+      for (unsigned slot = 0; slot < slots && var->data.location + slot < 64; ++slot)
+         fragment_flat[var->data.location + slot] =
+            var->data.interpolation == INTERP_MODE_FLAT;
+   }
+
    /*
     * Slots are packed in ascending order rather than required to start at
     * VAR0 and run consecutively.  Which registers a varying occupies is this
@@ -4511,31 +4534,8 @@ static bool pvrgpu_color_primitive_varyings(const nir_shader *vs,
          continue;
       if (slots >= PVRGPU_PCO_MAX_VARYINGS)
          return false;
-      components[slots] = 0;
-      flat[slots] = false;
-      nir_foreach_variable_with_modes (var, fs, nir_var_shader_in) {
-         if (var->data.location != (int)location)
-            continue;
-         if (!glsl_type_is_vector_or_scalar(var->type))
-            return false;
-         components[slots] = glsl_get_components(var->type);
-         flat[slots] = var->data.interpolation == INTERP_MODE_FLAT;
-      }
-      if (components[slots] == 0) {
-         /*
-          * The fragment stage does not read this one.  It still occupies a
-          * vertex output, because the vertex shader writes it; give it the
-          * width the vertex stage declares so the layout stays consistent,
-          * and no fragment coefficients below.
-          */
-         nir_foreach_variable_with_modes (var, vs, nir_var_shader_out) {
-            if (var->data.location != (int)location)
-               continue;
-            if (!glsl_type_is_vector_or_scalar(var->type))
-               return false;
-            components[slots] = glsl_get_components(var->type);
-         }
-      }
+      components[slots] = MAX2(vertex_components[location], fragment_components[location]);
+      flat[slots] = fragment_flat[location];
       if (components[slots] == 0 || components[slots] > 4)
          return false;
       read_by_fragment[slots] =
@@ -6528,10 +6528,22 @@ bool pvrgpu_pco_compile_color_triangle(
          .start = fragment_coefficient,
          .count = varying_components[slot] * 4,
       };
+      out->varying_bindings[out->varying_binding_count++] =
+         (struct pvrgpu_pco_varying_binding){
+            .output_dword = vertex_data.vs.varyings[location].start,
+            .num_components = varying_components[slot],
+            .coefficient_dword = fragment_coefficient,
+            .flat = varying_flat[slot],
+         };
       fragment_coefficient += varying_components[slot] * 4;
       fragment_varying_total += varying_components[slot];
    }
    vertex_data.vs.vtxouts = vertex_output;
+   out->explicit_varying_bindings = true;
+   for (unsigned location = 0; location < 64; ++location) {
+      out->vertex_output_start[location] = vertex_data.vs.varyings[location].start;
+      out->vertex_output_count[location] = vertex_data.vs.varyings[location].count;
+   }
    /* Smooth interpolation is a fragment-stage property. */
    vertex_data.vs.f32_smooth = fragment_varying_total;
 
@@ -6649,8 +6661,11 @@ bool pvrgpu_pco_compile_color_triangle(
    pvrgpu_pco_preprocess_nir(compiler, vs);
    pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=preprocess_fs");
    pvrgpu_pco_preprocess_nir(compiler, fs);
-   pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=link");
-   pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
+   /* Gallium already linked these stages and assigned the locations used by
+    * pipe_stream_output_info. PCO's additional link compacts/reorders those
+    * locations after the physical ABI above has been assigned, invalidating
+    * both raster linkage and transform-feedback register identity. Preserve
+    * the linked IO contract through native lowering, as the GS path does. */
    pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=rev_link");
    pco_rev_link_nir(compiler->pco, vs, fs);
    pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=lower_vs");

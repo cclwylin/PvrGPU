@@ -27,6 +27,7 @@
 #include "fragment/tile_scheduler.h"
 #include "geometry/clip_cull.h"
 #include "geometry/parameter_buffer.h"
+#include "geometry/stream_output.h"
 #include "geometry/tessellator.h"
 #include "geometry/tiler.h"
 #include "geometry/vdm.h"
@@ -690,6 +691,7 @@ private:
 
   // Geometry executes native PCO through its own event-driven FIFO module.
   GeometryShader geometry_shader{"geometry_shader", pool, &memory};
+  StreamOutput stream_output{"stream_output", pool, &memory};
   // Native TCS, fixed tessellation and native TES each own an event-driven
   // FIFO stage. DomainDataMaster is not a TCS/TES executor.
   TessellationControlShader tessellation_control_shader{
@@ -745,6 +747,7 @@ private:
   sc_core::sc_fifo<PipelineTxn> vertex_cluster_to_clip{"vertex_cluster_to_clip",
                                                        ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> geometry_to_clip{"geometry_to_clip", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> geometry_to_stream_output{"geometry_to_stream_output", ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> control_to_tessellator{"control_to_tessellator", ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> tessellator_to_evaluation{"tessellator_to_evaluation", ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> evaluation_to_geometry{"evaluation_to_geometry", ModelFifoDepth()};
@@ -865,7 +868,9 @@ ModelSession::ModelSession(MemoryMode memory_mode, bool cache_bypass)
   tessellation_evaluation_shader.input(tessellator_to_evaluation);
   tessellation_evaluation_shader.output(evaluation_to_geometry);
   geometry_shader.input(evaluation_to_geometry);
-  geometry_shader.output(geometry_to_clip);
+  geometry_shader.output(geometry_to_stream_output);
+  stream_output.input(geometry_to_stream_output);
+  stream_output.output(geometry_to_clip);
   clip_cull.input(geometry_to_clip);
   clip_cull.output(clip_to_tiler);
   tiler.input(clip_to_tiler);
@@ -952,6 +957,7 @@ int ModelSession::Run(const Options &options, ModelFramebuffer *framebuffer,
   }
   if (framebuffer) {
     framebuffer->graphics_stats = job.graphics_stats;
+    framebuffer->stream_outputs = job.stream_outputs;
     framebuffer->pixels = job.framebuffer;
     framebuffer->extra = job.extra_framebuffers;
     framebuffer->width = job.framebuffer_width;

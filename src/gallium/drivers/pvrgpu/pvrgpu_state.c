@@ -26,20 +26,17 @@ struct pvrgpu_state_object {
    unsigned placeholder;
 };
 
-struct pvrgpu_stream_output_target {
-   struct pipe_stream_output_target base;
-   uint32_t internal_offset;
-};
-
 struct pvrgpu_query {
    unsigned type;
    unsigned index;
    bool active;
    bool ready;
    uint64_t begin_primitives;
+   uint64_t begin_storage_needed;
    uint64_t begin_statistics_failures;
    unsigned begin_unsupported_draws;
    uint64_t result;
+   uint64_t storage_needed_result;
 };
 
 static const char *
@@ -1020,7 +1017,9 @@ pvrgpu_query_collect_completed(struct pvrgpu_context *ctx)
    char error[512] = {0};
    if (!pvrgpu_read_graphics_stats(generation, &stats, error, sizeof(error)) ||
        (!ctx->query_state_disabled &&
-        stats.primitives_generated > UINT64_MAX - ctx->query_primitives_generated)) {
+        (stats.primitives_generated > UINT64_MAX - ctx->query_primitives_generated ||
+         stats.stream_output_primitives_written > UINT64_MAX - ctx->query_primitives_written ||
+         stats.stream_output_primitives_storage_needed > UINT64_MAX - ctx->query_primitives_storage_needed))) {
       ++ctx->query_statistics_failures;
       pvrgpu_counter_eventf("query_statistics_error",
          "generation=%llu reason=%s",
@@ -1028,8 +1027,11 @@ pvrgpu_query_collect_completed(struct pvrgpu_context *ctx)
          error[0] ? error : "primitive counter overflow");
       return false;
    }
-   if (!ctx->query_state_disabled)
+   if (!ctx->query_state_disabled) {
       ctx->query_primitives_generated += stats.primitives_generated;
+      ctx->query_primitives_written += stats.stream_output_primitives_written;
+      ctx->query_primitives_storage_needed += stats.stream_output_primitives_storage_needed;
+   }
    ctx->query_collected_generation = generation;
    pvrgpu_counter_eventf("query_statistics_completed",
       "generation=%llu physical_submissions=%llu primitives_generated=%llu "
@@ -1075,13 +1077,20 @@ pvrgpu_create_query(struct pipe_context *pipe,
    return (struct pipe_query *)query;
 }
 
+static bool
+pvrgpu_query_uses_native_counters(unsigned type)
+{
+   return type == PIPE_QUERY_PRIMITIVES_GENERATED ||
+          type == PIPE_QUERY_PRIMITIVES_EMITTED || type == PIPE_QUERY_SO_STATISTICS;
+}
+
 static void
 pvrgpu_destroy_query(struct pipe_context *pipe, struct pipe_query *query)
 {
    if (!query)
       return;
    const struct pvrgpu_query *q = (const struct pvrgpu_query *)query;
-   if (q->type == PIPE_QUERY_PRIMITIVES_GENERATED && q->active &&
+   if (pvrgpu_query_uses_native_counters(q->type) && q->active &&
        pvrgpu_context(pipe)->active_primitives_generated_queries)
       --pvrgpu_context(pipe)->active_primitives_generated_queries;
    pvrgpu_counter_eventf("destroy_query", "");
@@ -1095,13 +1104,16 @@ pvrgpu_begin_query(struct pipe_context *pipe, struct pipe_query *query)
    if (!pvrgpu_query)
       return false;
 
-   if (pvrgpu_query->type == PIPE_QUERY_PRIMITIVES_GENERATED) {
+   if (pvrgpu_query_uses_native_counters(pvrgpu_query->type)) {
       struct pvrgpu_context *ctx = pvrgpu_context(pipe);
       // Only stream zero is implemented by the native GS emission module.
       if (pvrgpu_query->index || pvrgpu_query->active ||
           !pvrgpu_query_materialize(pipe))
          return false;
-      pvrgpu_query->begin_primitives = ctx->query_primitives_generated;
+      pvrgpu_query->begin_primitives =
+         pvrgpu_query->type == PIPE_QUERY_PRIMITIVES_GENERATED ?
+            ctx->query_primitives_generated : ctx->query_primitives_written;
+      pvrgpu_query->begin_storage_needed = ctx->query_primitives_storage_needed;
       pvrgpu_query->begin_statistics_failures = ctx->query_statistics_failures;
       pvrgpu_query->begin_unsupported_draws = ctx->unsupported_draws;
       pvrgpu_query->ready = false;
@@ -1124,7 +1136,7 @@ pvrgpu_end_query(struct pipe_context *pipe, struct pipe_query *query)
    if (!pvrgpu_query)
       return false;
 
-   if (pvrgpu_query->type == PIPE_QUERY_PRIMITIVES_GENERATED) {
+   if (pvrgpu_query_uses_native_counters(pvrgpu_query->type)) {
       struct pvrgpu_context *ctx = pvrgpu_context(pipe);
       if (!pvrgpu_query->active)
          return false;
@@ -1132,13 +1144,18 @@ pvrgpu_end_query(struct pipe_context *pipe, struct pipe_query *query)
       pvrgpu_query->active = false;
       if (ctx->active_primitives_generated_queries)
          --ctx->active_primitives_generated_queries;
+      const uint64_t primitives = pvrgpu_query->type == PIPE_QUERY_PRIMITIVES_GENERATED ?
+         ctx->query_primitives_generated : ctx->query_primitives_written;
       if (!completed ||
           ctx->query_statistics_failures != pvrgpu_query->begin_statistics_failures ||
           ctx->unsupported_draws != pvrgpu_query->begin_unsupported_draws ||
-          ctx->query_primitives_generated < pvrgpu_query->begin_primitives)
+          primitives < pvrgpu_query->begin_primitives ||
+          ctx->query_primitives_storage_needed < pvrgpu_query->begin_storage_needed)
          return false;
       pvrgpu_query->result =
-         ctx->query_primitives_generated - pvrgpu_query->begin_primitives;
+         primitives - pvrgpu_query->begin_primitives;
+      pvrgpu_query->storage_needed_result =
+         ctx->query_primitives_storage_needed - pvrgpu_query->begin_storage_needed;
       pvrgpu_query->ready = true;
    }
 
@@ -1164,10 +1181,12 @@ pvrgpu_get_query_result(struct pipe_context *pipe,
    memset(result, 0, sizeof(*result));
    switch (pvrgpu_query->type) {
    case PIPE_QUERY_PRIMITIVES_GENERATED:
+   case PIPE_QUERY_PRIMITIVES_EMITTED:
       if (pvrgpu_query->active || !pvrgpu_query->ready)
          return false;
       result->u64 = pvrgpu_query->result;
-      pvrgpu_counter_eventf("query_primitives_generated_result",
+      pvrgpu_counter_eventf(pvrgpu_query->type == PIPE_QUERY_PRIMITIVES_GENERATED ?
+            "query_primitives_generated_result" : "query_primitives_emitted_result",
          "value=%llu source=systemc-physical-stage-counters",
          (unsigned long long)result->u64);
       break;
@@ -1179,8 +1198,10 @@ pvrgpu_get_query_result(struct pipe_context *pipe,
       result->timestamp_disjoint.disjoint = false;
       break;
    case PIPE_QUERY_SO_STATISTICS:
-      result->so_statistics.num_primitives_written = 0;
-      result->so_statistics.primitives_storage_needed = 0;
+      if (pvrgpu_query->active || !pvrgpu_query->ready)
+         return false;
+      result->so_statistics.num_primitives_written = pvrgpu_query->result;
+      result->so_statistics.primitives_storage_needed = pvrgpu_query->storage_needed_result;
       break;
    default:
       break;

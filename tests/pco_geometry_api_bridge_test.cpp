@@ -140,7 +140,7 @@ void VerifyBinaryStages() {
 }
 
 void VerifyPreviousVersionGuard(Submission &submit) {
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 25);
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 26);
   constexpr auto previous_size = offsetof(pvrgpu_systemc_driver_command, geometry_pco);
   static_assert(previous_size % alignof(pvrgpu_systemc_driver_command) == 0);
 #if defined(_WIN32)
@@ -167,7 +167,7 @@ void VerifyPreviousVersionGuard(Submission &submit) {
   Check(pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) == 2 &&
             std::string(error.data()).find("command version") != std::string::npos,
         "top-level API23 short command is rejected before API24 tail access");
-  submit.Rejected(old_command, "version=23 expected=25", "nested guarded API23 command");
+  submit.Rejected(old_command, "version=23 expected=26", "nested guarded API23 command");
 #if defined(_WIN32)
   Check(VirtualFree(pages, 0, MEM_RELEASE) != 0, "release API23 guard");
 #else

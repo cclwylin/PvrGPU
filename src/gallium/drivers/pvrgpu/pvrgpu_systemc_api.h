@@ -9,8 +9,8 @@
 extern "C" {
 #endif
 
-/* API-v25 adds independent native TCS/fixed tessellator/TES transport. */
-#define PVRGPU_SYSTEMC_API_VERSION 25u
+/* API-v26 adds independent native transform-feedback transport/readback. */
+#define PVRGPU_SYSTEMC_API_VERSION 26u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE 15u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES (64u * 1024u)
 /*
@@ -106,6 +106,51 @@ struct pvrgpu_systemc_tessellation {
    uint32_t spacing;
    uint32_t clockwise;
    uint32_t point_mode;
+};
+
+/*
+ * Native transform feedback consumes the final pre-raster shader's raw
+ * VTXOUT DWORDs.  Bindings name those physical DWORDs after compiler layout;
+ * targets retain the Gallium byte range and append cursor.  The complete
+ * resource snapshot is input storage only: StreamOutput writes it through
+ * modeled GPU memory and readback returns that modeled result.
+ */
+#define PVRGPU_SYSTEMC_MAX_STREAM_OUTPUT_BUFFERS 4u
+#define PVRGPU_SYSTEMC_MAX_STREAM_OUTPUT_BINDINGS 64u
+#define PVRGPU_SYSTEMC_MAX_STREAM_OUTPUT_RESOURCE_BYTES (256u * 1024u * 1024u)
+struct pvrgpu_systemc_stream_output_binding {
+   uint32_t output_dword;
+   uint32_t num_components;
+   uint32_t output_buffer;
+   uint32_t dst_offset_dwords;
+   uint32_t stream;
+};
+
+struct pvrgpu_systemc_stream_output_target {
+   uint32_t output_buffer;
+   uint64_t resource_token;
+   uint64_t target_token;
+   const uint8_t *bytes;
+   size_t bytes_size;
+   uint32_t buffer_offset;
+   uint32_t buffer_size;
+   uint32_t internal_offset;
+   uint32_t stride_dwords;
+};
+
+struct pvrgpu_systemc_stream_output {
+   const struct pvrgpu_systemc_stream_output_binding *bindings;
+   uint32_t binding_count;
+   const struct pvrgpu_systemc_stream_output_target *targets;
+   uint32_t target_count;
+};
+
+#define PVRGPU_SYSTEMC_MAX_VARYING_BINDINGS 64u
+struct pvrgpu_systemc_varying_binding {
+   uint32_t output_dword;
+   uint32_t num_components;
+   uint32_t coefficient_dword;
+   uint32_t flat;
 };
 
 /* Immutable snapshot of the bound range, not the whole Gallium buffer.
@@ -479,6 +524,11 @@ struct pvrgpu_systemc_driver_command {
    uint32_t geometry_primitive_id_output_count;
    /* API-v25: null means no patch pipeline; payload is deep-copied. */
    const struct pvrgpu_systemc_tessellation *tessellation;
+   /* API-v26: null means no transform feedback; payload is deep-copied. */
+   const struct pvrgpu_systemc_stream_output *stream_output;
+   /* Non-null with count zero explicitly means no FS varying linkage. */
+   const struct pvrgpu_systemc_varying_binding *varying_bindings;
+   uint32_t varying_binding_count;
 };
 
 struct pvrgpu_systemc_submit_info {
@@ -558,6 +608,8 @@ struct pvrgpu_systemc_graphics_stats {
    uint64_t ia_primitives;
    uint64_t gs_primitives;
    uint64_t gs_invocations;
+   uint64_t stream_output_primitives_written;
+   uint64_t stream_output_primitives_storage_needed;
 };
 
 typedef int (*pvrgpu_systemc_flush_graphics_stats_fn)(
@@ -566,6 +618,26 @@ typedef int (*pvrgpu_systemc_flush_graphics_stats_fn)(
 
 int pvrgpu_systemc_flush_graphics_stats(
    struct pvrgpu_systemc_graphics_stats *stats,
+   char *error, size_t error_size);
+
+/* Generation-qualified readback of one transform-feedback resource. */
+struct pvrgpu_systemc_stream_output_readback {
+   uint32_t version;
+   uint64_t submission_generation;
+   uint64_t resource_token;
+   uint64_t target_token;
+   uint8_t *bytes;
+   size_t bytes_size;
+   uint32_t data_written;
+   uint32_t internal_offset;
+};
+
+typedef int (*pvrgpu_systemc_flush_stream_output_fn)(
+   struct pvrgpu_systemc_stream_output_readback *readback,
+   char *error, size_t error_size);
+
+int pvrgpu_systemc_flush_stream_output(
+   struct pvrgpu_systemc_stream_output_readback *readback,
    char *error, size_t error_size);
 
 /*

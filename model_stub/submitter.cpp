@@ -15,6 +15,7 @@
 #include "uniform_buffers.h"
 #include "common/geometry_emission.h"
 #include "common/tessellation_state.h"
+#include "common/stream_output_types.h"
 
 #include "common/functional_types.h"
 #include "common/glbench_triangle_fixture.h"
@@ -91,6 +92,12 @@ inline constexpr std::uint64_t kGeometryPrimitiveGpuAddressStride = 4096;
 inline constexpr std::uint64_t kTessellationGpuAddressBase =
     kGeometryPrimitiveGpuAddressBase +
     kDriverSequenceAddressSlots * kGeometryPrimitiveGpuAddressStride;
+inline constexpr std::uint64_t kStreamOutputResourceAddressStride = UINT64_C(0x10000000);
+inline constexpr std::uint64_t kStreamOutputGpuAddressBase =
+    kParameterCoefficientsGpuAddress + kParameterRegionBytes;
+static_assert(kStreamOutputGpuAddressBase <= UINT64_MAX -
+                  kDriverSequenceAddressSlots * 4U * kStreamOutputResourceAddressStride,
+              "stream output address region wraps");
 // 以全部合法 slots 驗證區域，而非只以本輪實際 draw 數推測不會相撞。
 static_assert(kDriverPcoMrtColorAddressBase +
                   kDriverSequenceAddressSlots * kMaxRenderTargets *
@@ -1720,6 +1727,43 @@ void Submitter::RunJob() {
     if (driver_pco_triangles_command) {
       state.vertex_pco_abi = command.vertex_pco_abi;
       state.fragment_pco_abi = command.fragment_pco_abi;
+      if (!command.stream_output.bindings.empty()) {
+        if (!memory_ || submission >= kDriverSequenceAddressSlots ||
+            command.stream_output.bindings.size() > 64 ||
+            command.stream_output.targets.size() > 4)
+          throw std::runtime_error("Submitter stream output contract is invalid");
+        std::vector<StreamOutputBinding> bindings;
+        for (const auto &b : command.stream_output.bindings)
+          bindings.push_back({b.output_dword, b.num_components, b.output_buffer,
+                              b.dst_offset_dwords, b.stream});
+        std::vector<StreamOutputTarget> targets;
+        for (const auto &source : command.stream_output.targets) {
+          if (source.bytes.empty() || source.bytes.size() > kStreamOutputResourceAddressStride)
+            throw std::runtime_error("Submitter stream output resource extent is invalid");
+          StreamOutputTarget target;
+          target.output_buffer = source.output_buffer;
+          target.resource_token = source.resource_token;
+          target.target_token = source.target_token;
+          target.bytes_size = source.bytes.size();
+          target.buffer_offset = source.buffer_offset;
+          target.buffer_size = source.buffer_size;
+          target.internal_offset = source.internal_offset;
+          target.stride_dwords = source.stride_dwords;
+          const auto alias = std::find_if(targets.begin(), targets.end(), [&](const auto &prior) {
+            return prior.resource_token == target.resource_token;
+          });
+          if (alias != targets.end()) {
+            target.gpu_address = alias->gpu_address;
+          } else {
+            target.gpu_address = kStreamOutputGpuAddressBase +
+                (submission * 4U + targets.size()) * kStreamOutputResourceAddressStride;
+            memory_->HostWrite(target.gpu_address, source.bytes.data(), source.bytes.size());
+          }
+          targets.push_back(target);
+        }
+        state.stream_output_bindings = StoreNewArray(pool_, bindings);
+        state.stream_output_targets = StoreNewArray(pool_, targets);
+      }
       if (!command.tessellation.control_pco.empty()) {
         const auto &source = command.tessellation;
         const auto count = command.indexed ? command.index_count : command.vertex_count;
@@ -1803,6 +1847,8 @@ void Submitter::RunJob() {
           command.fragment_varying_start;
       state.fragment_varying_count =
           command.fragment_varying_count;
+      state.driver_varying_bindings_explicit = command.explicit_varying_bindings;
+      state.driver_varying_binding_count = command.varying_bindings.size();
       for (std::size_t target = 0;
            target < state.fragment_output_mask.size(); ++target) {
         state.fragment_output_mask[target] =
@@ -2313,7 +2359,13 @@ void Submitter::RunJob() {
       linkages.reserve(varying_count);
       for (std::uint32_t varying = 0; varying < varying_count; ++varying) {
         ShaderVaryingBinding linkage;
-        if (driver_pco_triangles) {
+        if (driver_pco_triangles && command.explicit_varying_bindings) {
+          const auto &b = command.varying_bindings.at(varying);
+          linkage.vertex_output_base = static_cast<std::uint16_t>(b.output_dword);
+          linkage.coefficient_set_base = static_cast<std::uint16_t>(b.coefficient_dword / 4);
+          linkage.w_coefficient_set = 0;
+          linkage.component_count = static_cast<std::uint8_t>(b.num_components);
+        } else if (driver_pco_triangles) {
           const std::uint32_t component_offset =
               varying * kVaryingVectorComponentCount;
           const std::uint32_t component_count = std::min(
@@ -2343,8 +2395,10 @@ void Submitter::RunJob() {
         // provoking vertex's value.  The capsule states which are flat because
         // the model cannot tell from the linkage alone, and assuming smooth
         // made a flat integer read back as the plane's first term.
-        linkage.interpolation =
-            (command.varying_flat_mask & (1U << varying)) != 0
+        const bool flat = command.explicit_varying_bindings
+            ? command.varying_bindings.at(varying).flat != 0
+            : (command.varying_flat_mask & (1U << varying)) != 0;
+        linkage.interpolation = flat
                 ? InterpolationMode::kFlat
                 : InterpolationMode::kSmooth;
         const char *linkage_refusal = nullptr;

@@ -25,6 +25,10 @@ bool pvrgpu_read_graphics_stats(
    struct pvrgpu_systemc_graphics_stats *stats,
    char *error, size_t error_size);
 
+bool pvrgpu_read_stream_output(
+   struct pvrgpu_systemc_stream_output_readback *readback,
+   char *error, size_t error_size);
+
 #define PVRGPU_DRIVER_COMMAND_SCHEMA "pvrgpu.driver-command.v1"
 #define PVRGPU_DRIVER_COMMAND_PRODUCER "pvrgpu-gallium-driver"
 #define PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8 "PIPE_FORMAT_R8G8B8A8_UNORM"

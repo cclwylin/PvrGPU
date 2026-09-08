@@ -54,11 +54,10 @@ struct ClipVertex {
   // vertices.  draw_pipe_clip.c recomputes window coordinates for generated
   // intersections with three separate CPU operations instead.
   bool generated_intersection = false;
-  // GS flat/special outputs carry raw integer bits, not numbers to lerp.
-  // Ordinary GS float varyings may also be non-finite; only clip position
-  // must be finite. These flags are local clipping state, not an ABI change.
+  // Flat/special outputs carry raw integer bits, not numbers to lerp.
+  // Ordinary float varyings may also be non-finite; only clip position must
+  // be finite. This mask is local clipping state, not an ABI change.
   std::uint64_t non_interpolated_mask = 0;
-  bool geometry_output = false;
 };
 
 float StrictMultiply(float left, float right) {
@@ -160,9 +159,7 @@ ClipVertex Interpolate(float t, const ClipVertex &outside,
   result.output_count = outside.output_count;
   result.generated_intersection = true;
   result.non_interpolated_mask = outside.non_interpolated_mask;
-  result.geometry_output = outside.geometry_output;
-  if (outside.non_interpolated_mask != inside.non_interpolated_mask ||
-      outside.geometry_output != inside.geometry_output)
+  if (outside.non_interpolated_mask != inside.non_interpolated_mask)
     throw std::runtime_error("ClipCull interpolation stage metadata mismatch");
   for (std::size_t component = 0; component < result.output_count;
        ++component) {
@@ -173,8 +170,7 @@ ClipVertex Interpolate(float t, const ClipVertex &outside,
           outside.output[component] +
           t * (inside.output[component] - outside.output[component]);
     }
-    if ((!result.geometry_output || component < 4) &&
-        !std::isfinite(result.output[component]))
+    if (component < 4 && !std::isfinite(result.output[component]))
       throw std::runtime_error("ClipCull intersection is non-finite");
   }
   return result;
@@ -657,7 +653,7 @@ void ClipCull::Run() {
       throw std::runtime_error("ClipCull received no shaded vertices");
     const std::vector<VertexLane> lanes =
         LoadArray<VertexLane>(pool_, state.vertex_lanes);
-    std::vector<ShaderVaryingBinding> geometry_flat_bindings;
+    std::vector<ShaderVaryingBinding> flat_bindings;
     std::uint16_t active_vertex_output_dwords = 4;
     if (UsesShaderVaryings(state)) {
       if (!HasPoolHandle(state.shader_varying_bindings)) {
@@ -680,9 +676,8 @@ void ClipCull::Run() {
           throw std::runtime_error(
               "ClipCull varying linkage is not exact");
         }
-        if (geometry_enabled &&
-            bindings[index].interpolation == InterpolationMode::kFlat)
-          geometry_flat_bindings.push_back(bindings[index]);
+        if (bindings[index].interpolation == InterpolationMode::kFlat)
+          flat_bindings.push_back(bindings[index]);
       }
       active_vertex_output_dwords = static_cast<std::uint16_t>(
           VaryingVertexOutputDwordCount(state));
@@ -998,12 +993,18 @@ void ClipCull::Run() {
             vertices[vertex] = ReadClipVertex(
                 lanes[ref.lane_index], active_vertex_output_dwords);
           }
-          const VertexLane *geometry_provoking = nullptr;
+          // Gallium's expanded point/line occurrences duplicate the final
+          // vertex through slot 2, and triangle strips preserve their last
+          // vertex while swapping only their first two vertices for parity.
+          // Preserve that original provoking output before any clipping or
+          // line/point widening can remove or synthesize vertices.
+          const VertexLane *provoking =
+              &lanes[lane_refs[occurrence + 2].lane_index];
           std::uint32_t raster_primitive_id = static_cast<std::uint32_t>(primitive);
           std::uint32_t raster_instance_id = 0;
           std::uint16_t raster_layer = 0;
           if (geometry_primitive) {
-            geometry_provoking = &lanes[geometry_primitive->refs.vertex_indices[
+            provoking = &lanes[geometry_primitive->refs.vertex_indices[
                 geometry_primitive->refs.provoking_vertex]];
             raster_primitive_id = geometry_primitive->input_primitive_id;
             raster_instance_id = geometry_primitive->instance_id;
@@ -1012,10 +1013,10 @@ void ClipCull::Run() {
             // GeometryRasterPrimitive. With no declared GS output, the value
             // is provenance only, not a defined GLSL fragment PrimitiveID.
             if (state.geometry_primitive_id_output_count)
-              raster_primitive_id = geometry_provoking->vertex_output[
+              raster_primitive_id = provoking->vertex_output[
                   state.geometry_primitive_id_output_start];
             if (state.geometry_layer_output_count) {
-              const std::uint32_t layer = geometry_provoking->vertex_output[
+              const std::uint32_t layer = provoking->vertex_output[
                   state.geometry_layer_output_start];
               // Layered attachment addressing is a separate capability. Do
               // not silently send a computed nonzero layer to attachment 0.
@@ -1023,25 +1024,26 @@ void ClipCull::Run() {
                 throw std::runtime_error("ClipCull GS nonzero_layer is unsupported");
               raster_layer = static_cast<std::uint16_t>(layer);
             }
-            std::uint64_t flat_mask = 0;
-            for (const auto &binding : geometry_flat_bindings) {
-              for (std::uint8_t component = 0;
-                   component < binding.component_count; ++component)
-                flat_mask |= UINT64_C(1) << (binding.vertex_output_base + component);
-            }
+          }
+          std::uint64_t flat_mask = 0;
+          for (const auto &binding : flat_bindings) {
+            for (std::uint8_t component = 0;
+                 component < binding.component_count; ++component)
+              flat_mask |= UINT64_C(1) << (binding.vertex_output_base + component);
+          }
+          if (geometry_primitive) {
             if (state.geometry_primitive_id_output_count)
               flat_mask |= UINT64_C(1) << state.geometry_primitive_id_output_start;
             if (state.geometry_layer_output_count)
               flat_mask |= UINT64_C(1) << state.geometry_layer_output_start;
-            for (auto &vertex : vertices) {
-              vertex.geometry_output = true;
-              vertex.non_interpolated_mask = flat_mask;
-              for (std::size_t component = 4;
-                   component < active_vertex_output_dwords; ++component) {
-                if (flat_mask & (UINT64_C(1) << component))
-                  vertex.output[component] = BitsFloat(
-                      geometry_provoking->vertex_output[component]);
-              }
+          }
+          for (auto &vertex : vertices) {
+            vertex.non_interpolated_mask = flat_mask;
+            for (std::size_t component = 4;
+                 component < active_vertex_output_dwords; ++component) {
+              if (flat_mask & (UINT64_C(1) << component))
+                vertex.output[component] = BitsFloat(
+                    provoking->vertex_output[component]);
             }
           }
           const bool source_is_point =
@@ -1138,18 +1140,18 @@ void ClipCull::Run() {
               triangle.key.instance_id = raster_instance_id;
               triangle.key.layer = raster_layer;
               triangle.key.clip_piece = static_cast<std::uint16_t>(fan - 2);
-              if (geometry_provoking) {
+              if (!flat_bindings.empty()) {
                 // Flat values belong to the original provoking vertex even
                 // when clipping removes it or setup normalizes winding. Copy
                 // raw bits after clip interpolation to retain integer/NaN
                 // payloads without interpreting them as floating arithmetic.
-                for (const auto &binding : geometry_flat_bindings) {
+                for (const auto &binding : flat_bindings) {
                   for (std::size_t v = 0; v < 3; ++v) {
                     for (std::size_t c = 0; c < binding.component_count; ++c) {
                       const std::size_t reg = binding.vertex_output_base + c;
                       raster_vertex_outputs[triangle.first_vertex_output_dword +
                           v * triangle.vertex_output_stride_dwords + reg] =
-                          geometry_provoking->vertex_output[reg];
+                          provoking->vertex_output[reg];
                     }
                   }
                 }

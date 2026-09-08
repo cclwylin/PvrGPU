@@ -9,6 +9,11 @@
 
 struct nir_shader;
 
+struct pvrgpu_stream_output_target {
+   struct pipe_stream_output_target base;
+   uint32_t internal_offset;
+};
+
 struct pvrgpu_shader_state {
    mesa_shader_stage stage;
    enum pipe_shader_ir type;

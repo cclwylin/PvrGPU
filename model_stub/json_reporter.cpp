@@ -8,6 +8,7 @@
 #include "json_reporter.h"
 
 #include "common/functional_types.h"
+#include "common/stream_output_types.h"
 #include "shader/pco_iss.h"
 #include "support/png_writer.h"
 
@@ -2106,6 +2107,24 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
   std::cout.flush();
 }
 
+void PublishStreamOutputs(ModelJob &job, const MemoryPool &pool, const PipelineState &state) {
+  if (!HasPoolHandle(state.stream_output_targets))
+    return;
+  const auto targets = LoadArray<StreamOutputTarget>(pool, state.stream_output_targets);
+  for (const auto &target : targets) {
+    if (!HasPoolHandle(target.readback))
+      throw std::runtime_error("JsonReporter stream output has no modeled readback");
+    ModelStreamOutputReadback result;
+    result.resource_token = target.resource_token;
+    result.target_token = target.target_token;
+    result.internal_offset = target.internal_offset;
+    result.bytes = LoadArray<std::uint8_t>(pool, target.readback);
+    if (result.bytes.size() != target.bytes_size)
+      throw std::runtime_error("JsonReporter stream output readback extent mismatch");
+    job.stream_outputs.push_back(std::move(result));
+  }
+}
+
 void EmitError(std::uint32_t frame, const std::string &message) {
   std::cout << "{\"protocol\":\"pvrgpu-jsonl\",\"version\":1"
             << ",\"schema\":\"" << kSchema << "\",\"type\":\"error\""
@@ -2336,7 +2355,10 @@ void JsonReporter::RunJob() {
           job_->graphics_stats.Add(HasPoolHandle(state.geometry_code),
               state.counters.ia_primitives, state.counters.gs_primitives,
               state.counters.gs_invocations, HasPoolHandle(state.tessellation_state),
-              state.counters.tessellation_primitives);
+              state.counters.tessellation_primitives,
+              state.stream_output_primitives_written,
+              state.stream_output_primitives_storage_needed);
+          PublishStreamOutputs(*job_, pool_, state);
         }
         for (DrawListStats &drawlist : drawlists) {
           drawlist.drawlist_index =
@@ -2563,7 +2585,10 @@ void JsonReporter::RunJob() {
           job_->graphics_stats.Add(HasPoolHandle(state.geometry_code),
               state.counters.ia_primitives, state.counters.gs_primitives,
               state.counters.gs_invocations, HasPoolHandle(state.tessellation_state),
-              state.counters.tessellation_primitives);
+              state.counters.tessellation_primitives,
+              state.stream_output_primitives_written,
+              state.stream_output_primitives_storage_needed);
+        PublishStreamOutputs(*job_, pool_, state);
         job_->PublishFramebuffer(framebuffer, state.width, state.height,
                                  frame_bytes_per_pixel,
                                  std::move(extra_framebuffers),

@@ -171,8 +171,9 @@ void PcoDecoder::Run() {
             state.position_output_count >= 64 ||
             (state.varying_output_count != 0 &&
              (state.varying_output_start != expected_varying_start ||
-              state.varying_output_count >=
-                  64 - state.varying_output_start))) {
+              state.varying_output_start > kPcoVertexOutputCount ||
+              state.varying_output_count >
+                  kPcoVertexOutputCount - state.varying_output_start))) {
           throw std::runtime_error(
               "driver PCO vertex-output linkage is invalid: position=" +
               std::to_string(state.position_output_start) + "+" +

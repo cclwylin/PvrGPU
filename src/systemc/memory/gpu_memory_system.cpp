@@ -101,6 +101,7 @@ void GpuMemorySystem::ValidateClient(MemoryClient client) {
   case MemoryClient::kTessellationControl:
   case MemoryClient::kTessellator:
   case MemoryClient::kTessellationEvaluation:
+  case MemoryClient::kStreamOutput:
     return;
   case MemoryClient::kMixedCache:
   case MemoryClient::kUscL2:

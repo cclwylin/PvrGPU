@@ -4198,6 +4198,101 @@ test_terrain_blur_compile(struct pvrgpu_pco_compiler *compiler)
    }
 }
 
+static void
+test_stream_output_vertex_layout(struct pvrgpu_pco_compiler *compiler)
+{
+   nir_builder vb = nir_builder_init_simple_shader(MESA_SHADER_VERTEX,
+      pco_nir_options(), "stream_output_sparse_array_vs");
+   nir_variable *input = nir_variable_create(vb.shader, nir_var_shader_in,
+      glsl_vec4_type(), "position");
+   input->data.location = VERT_ATTRIB_GENERIC0;
+   nir_variable *position = nir_variable_create(vb.shader, nir_var_shader_out,
+      glsl_vec4_type(), "gl_Position");
+   position->data.location = VARYING_SLOT_POS;
+   nir_store_var(&vb, position, nir_load_var(&vb, input), 15);
+   nir_variable *point_size = nir_variable_create(vb.shader, nir_var_shader_out,
+      glsl_float_type(), "gl_PointSize");
+   point_size->data.location = VARYING_SLOT_PSIZ;
+   nir_store_var(&vb, point_size, nir_imm_float(&vb, 2.0f), 1);
+   nir_variable *array = nir_variable_create(vb.shader, nir_var_shader_out,
+      glsl_array_type(glsl_vector_type(GLSL_TYPE_INT, 2), 2, 0), "feedback_array");
+   array->data.location = VARYING_SLOT_VAR3;
+   for (unsigned element = 0; element < 2; ++element)
+      nir_store_deref(&vb, nir_build_deref_array_imm(&vb, nir_build_deref_var(&vb, array), element),
+         nir_imm_ivec2(&vb, 0x7fffffff - element, -1), 3);
+   nir_variable *scalar = nir_variable_create(vb.shader, nir_var_shader_out,
+      glsl_float_type(), "feedback_scalar");
+   scalar->data.location = VARYING_SLOT_VAR8;
+   nir_store_var(&vb, scalar, nir_channel(&vb, nir_load_var(&vb, input), 2), 1);
+   nir_shader_gather_info(vb.shader, nir_shader_get_entrypoint(vb.shader));
+
+   nir_builder fb = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+      pco_nir_options(), "stream_output_unused_fs");
+   nir_variable *color = nir_variable_create(fb.shader, nir_var_shader_out,
+      glsl_vec4_type(), "color");
+   color->data.location = FRAG_RESULT_DATA0;
+   nir_store_var(&fb, color, nir_imm_vec4(&fb, 0, 0, 0, 1), 15);
+   nir_shader_gather_info(fb.shader, nir_shader_get_entrypoint(fb.shader));
+   const enum pipe_format format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   struct pvrgpu_pco_graphics_binary binary = {0};
+   char error[512] = {0};
+   if (!pvrgpu_pco_compile_color_triangle(compiler, vb.shader, fb.shader,
+         &format, true, 1, 0, 0, 1, 0, &binary, error, sizeof(error)))
+      fail(error);
+   if (!binary.vertex.size || binary.vertex.abi.vertex_outputs != 10 ||
+       binary.vertex_output_start[VARYING_SLOT_POS] != 0 ||
+       binary.vertex_output_count[VARYING_SLOT_POS] != 4 ||
+       binary.vertex_output_start[VARYING_SLOT_PSIZ] != 4 ||
+       binary.vertex_output_count[VARYING_SLOT_PSIZ] != 1 ||
+       binary.vertex_output_start[VARYING_SLOT_VAR3] != 5 ||
+       binary.vertex_output_count[VARYING_SLOT_VAR3] != 2 ||
+       binary.vertex_output_start[VARYING_SLOT_VAR4] != 7 ||
+       binary.vertex_output_count[VARYING_SLOT_VAR4] != 2 ||
+       binary.vertex_output_start[VARYING_SLOT_VAR8] != 9 ||
+       binary.vertex_output_count[VARYING_SLOT_VAR8] != 1 ||
+       binary.fragment_varying_count != 0 || !binary.explicit_varying_bindings ||
+       binary.varying_binding_count != 0)
+      fail("stream output lost sparse array/point-size raw VS output layout");
+   pvrgpu_pco_graphics_binary_finish(&binary);
+   ralloc_free(fb.shader);
+   fb = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+      pco_nir_options(), "stream_output_mixed_width_fs");
+   nir_variable *array_in = nir_variable_create(fb.shader, nir_var_shader_in,
+      array->type, "feedback_array");
+   array_in->data.location = VARYING_SLOT_VAR3;
+   array_in->data.interpolation = INTERP_MODE_FLAT;
+   nir_variable *scalar_in = nir_variable_create(fb.shader, nir_var_shader_in,
+      glsl_float_type(), "feedback_scalar");
+   scalar_in->data.location = VARYING_SLOT_VAR8;
+   scalar_in->data.interpolation = INTERP_MODE_SMOOTH;
+   color = nir_variable_create(fb.shader, nir_var_shader_out, glsl_vec4_type(), "color");
+   color->data.location = FRAG_RESULT_DATA0;
+   nir_def *sum = nir_iadd(&fb,
+      nir_load_deref(&fb, nir_build_deref_array_imm(&fb, nir_build_deref_var(&fb, array_in), 0)),
+      nir_load_deref(&fb, nir_build_deref_array_imm(&fb, nir_build_deref_var(&fb, array_in), 1)));
+   nir_def *value = nir_i2f32(&fb, sum);
+   nir_store_var(&fb, color, nir_vec4(&fb, nir_channel(&fb, value, 0),
+      nir_channel(&fb, value, 1), nir_load_var(&fb, scalar_in), nir_imm_float(&fb, 1)), 15);
+   nir_shader_gather_info(fb.shader, nir_shader_get_entrypoint(fb.shader));
+   if (!pvrgpu_pco_compile_color_triangle(compiler, vb.shader, fb.shader,
+         &format, true, 1, 0, 0, 1, 0, &binary, error, sizeof(error)))
+      fail(error);
+   if (!binary.explicit_varying_bindings || binary.varying_binding_count != 3 ||
+       binary.varying_bindings[0].output_dword != 5 ||
+       binary.varying_bindings[0].coefficient_dword != 4 ||
+       binary.varying_bindings[0].num_components != 2 || !binary.varying_bindings[0].flat ||
+       binary.varying_bindings[1].output_dword != 7 ||
+       binary.varying_bindings[1].coefficient_dword != 12 ||
+       binary.varying_bindings[1].num_components != 2 || !binary.varying_bindings[1].flat ||
+       binary.varying_bindings[2].output_dword != 9 ||
+       binary.varying_bindings[2].coefficient_dword != 20 ||
+       binary.varying_bindings[2].num_components != 1 || binary.varying_bindings[2].flat)
+      fail("mixed-width flat and smooth varying bindings changed");
+   pvrgpu_pco_graphics_binary_finish(&binary);
+   ralloc_free(vb.shader);
+   ralloc_free(fb.shader);
+}
+
 int main(void)
 {
    test_refract_fragment_descriptors();
@@ -4224,6 +4319,7 @@ int main(void)
       fail(error[0] ? error : "failed to create compiler");
    test_float_sign_lowering(compiler);
    test_multisample_texture_lowering(compiler);
+   test_stream_output_vertex_layout(compiler);
 
    struct pvrgpu_pco_graphics_binary binary;
    if (!pvrgpu_pco_compile_conditionals(compiler,

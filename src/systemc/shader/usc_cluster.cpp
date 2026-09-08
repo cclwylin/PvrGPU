@@ -655,6 +655,7 @@ void UscCluster::Run() {
         if (IsDriverPcoTrianglesCase(state.functional_case)) {
           if (context)
             raster_context = *context;
+          raster_context.raster_sample_count = state.raster_state.sample_count;
           raster_context.sample_x = FloatBits(static_cast<float>(invocation.x));
           raster_context.sample_y = FloatBits(static_cast<float>(invocation.y));
           // Driver commands require half_pixel_center=1. Keep the integer
@@ -1004,6 +1005,7 @@ void UscCluster::Run() {
                 "texture fragment USC received an invalid quad mask");
           }
           PcoFragmentExecutionContext context;
+          context.raster_sample_count = state.raster_state.sample_count;
           context.memory_read = UscUniformBufferMemory::Read;
           context.memory_user_data = &uniform_memory;
           if (driver_pco_texture || state.functional_case ==
@@ -1279,6 +1281,7 @@ void UscCluster::Run() {
         for (std::size_t index = 0; index < invocations.size(); ++index) {
           const FragmentInvocation &invocation = invocations[index];
           PcoFragmentExecutionContext context;
+          context.raster_sample_count = state.raster_state.sample_count;
           context.memory_read = UscUniformBufferMemory::Read;
           context.memory_user_data = &uniform_memory;
           context.sample_x =
@@ -1356,6 +1359,7 @@ void UscCluster::Run() {
                 "varying fragment USC received an invalid quad lane mask");
           }
           PcoFragmentExecutionContext context;
+          context.raster_sample_count = state.raster_state.sample_count;
           context.memory_read = UscUniformBufferMemory::Read;
           context.memory_user_data = &uniform_memory;
           if (task.coefficient_dword_count > context.coefficients.size() ||

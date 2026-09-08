@@ -38,8 +38,11 @@ Geometry and tessellation execute in separate `GeometryShader`,
 and top-level instance, with event-driven processes and bounded POD/PoolHandle
 FIFOs. They are not aliases for VS/FS/CS, and `DomainDataMaster` does not replace
 the tessellation stages. Absent stages forward only the original transaction;
-enabled stages execute native programs and modeled memory operations. Combined
-Tessellation+GS and Transform Feedback remain explicitly unsupported.
+enabled stages execute native programs and modeled memory operations. Vertex
+Transform Feedback uses a separate event-driven `StreamOutput` module before
+clipping and writes raw shader output through the modeled memory hierarchy.
+Combined Tessellation+GS and GS/TES Transform Feedback remain explicitly
+unsupported.
 
 ### Forbidden
 
@@ -114,13 +117,24 @@ Detail per component: [PvrGPU.md §3.5](PvrGPU.md), the
 
 ## Current Status
 
+- Graphics API v26 adds native vertex Transform Feedback through the independent
+  event-driven `StreamOutput` module. Raw PCO exports are written to modeled GPU
+  memory before clipping, with whole-primitive capacity checks, generation-owned
+  readback, append cursors and real written/storage-needed queries. Explicit
+  VS-to-FS linkage preserves TF-only and packed scalar/vector outputs. The full
+  stock GLES3 Transform Feedback group is 1212 Pass / 108 NotSupported / 0 Fail
+  across 1320 cases, with exact per-case status parity against llvmpipe and no
+  unsupported draws or model errors in Pass cases. GS/TES feedback remains
+  gated and is validated separately. See the
+  [Transform Feedback validation](docs/TRANSFORM_FEEDBACK_VALIDATION.md).
 - Graphics API v25 adds independent native TCS and TES execution around a
   fixed-function tessellator ported from the pinned Mesa/llvmpipe helper.
   Triangle/quad/isoline domains, all three spacing modes, winding and point
   mode have bit-exact helper differential coverage. Live tessellation dEQP
   is 89 Pass / 311 Fail / 6 NotSupported across 406 cases; the 47 non-TF
-  render cases all pass. Transform Feedback remains unimplemented, so this
-  is not all-pass or llvmpipe parity. See the
+  render cases all pass. TES Transform Feedback remains unimplemented, so this
+  is not all-pass or llvmpipe parity. These tessellation results predate the
+  independent GLES3 vertex Transform Feedback implementation. See the
   [tessellation validation](docs/TESSELLATION_VALIDATION.md).
 - Graphics API v24 adds a real native Geometry Shader path through its own
   event-driven SystemC module between VS and ClipCull. Native LD/WDF and

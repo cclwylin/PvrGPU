@@ -97,9 +97,24 @@ bool pvrgpu_pco_compile_compute(
 
 void pvrgpu_pco_compute_binary_finish(struct pvrgpu_pco_compute_binary *binary);
 
+struct pvrgpu_pco_varying_binding {
+   uint32_t output_dword;
+   uint32_t num_components;
+   uint32_t coefficient_dword;
+   uint32_t flat;
+};
+
 struct pvrgpu_pco_graphics_binary {
    struct pvrgpu_pco_owned_binary vertex;
    struct pvrgpu_pco_owned_binary fragment;
+   /* Actual final VS output placement, keyed by NIR varying location.
+    * Gallium stream-output register indices are ordinals in outputs_written,
+    * not physical VTXOUT indices. */
+   uint32_t vertex_output_start[64];
+   uint32_t vertex_output_count[64];
+   struct pvrgpu_pco_varying_binding varying_bindings[16];
+   uint32_t varying_binding_count;
+   bool explicit_varying_bindings;
    /* Vertex output holding gl_PointSize, when the shader writes one. */
    uint32_t point_size_output_start;
    uint32_t point_size_output_count;

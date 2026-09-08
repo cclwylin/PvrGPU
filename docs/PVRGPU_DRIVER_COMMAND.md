@@ -8,6 +8,47 @@ bring-up seam: small enough to debug quickly, strict enough to prevent fake
 passes, and close enough to Gallium state that the driver can grow phase by
 phase.
 
+## Native vertex Transform Feedback (introduced in SystemC API v26)
+
+API 26 adds `stream_output` to nested VS draws. The bridge owns a deep copy of
+the raw VTXOUT binding table, target ranges/cursors, native binaries, and initial
+resource bytes before submission returns. API 25 and older callers are rejected
+before reading the new tail; Compute API remains at version 2.
+
+`StreamOutput` is an independent event-driven SystemC module between
+`GeometryShader` and `ClipCull`, connected through bounded PoolHandle FIFOs. The
+current enabled path captures ordinary VS output; GS and TES feedback remain
+explicitly rejected. The module consumes the actual shaded lane references and
+pre-clipping VTXOUT DWORDs. Points and lines discard the triangle-adapter padding;
+triangle strip/fan/loop decomposition follows the input assembler's occurrence
+order. It preflights every used target for each complete primitive, then writes
+the selected raw components through `GpuMemorySystem` client 18. Missing targets
+and insufficient space increment storage-needed without writing or advancing any
+cursor for that primitive. Floating-point, integer, NaN and signed-zero outputs
+all use the same raw byte transport.
+
+Targets carry a `resource_token` for shared modeled storage and a `target_token`
+for independent append cursors. Targets sharing a resource must have identical
+initial snapshots; they share one GPU address. All writes finish before any
+target's full-resource readback is published. The driver materializes each TF
+draw before recording the next, so append, pause/resume and buffer rebinding use
+the completed backing bytes and cursor. One sequence may contain at most one TF
+draw. Bounds are 4 buffers, 64 bindings, 64 DWORD stride and 256 MiB per resource.
+
+`pvrgpu_systemc_flush_stream_output` requires an exact submission generation,
+resource token, target token and resource size. It returns modeled bytes and the
+completed cursor. Separate `stream_output_primitives_written` and
+`stream_output_primitives_storage_needed` statistics drive emitted/SO queries;
+generated primitives remain independently measured. No framebuffer readback or
+generated-count substitution supplies TF data.
+
+API 26 also carries optional explicit VS-to-FS varying bindings. Each entry
+identifies the physical VTXOUT DWORD, 1–4 components, coefficient DWORD and flat
+interpolation bit. Coefficients densely cover the actual FS inputs, while output
+indices may skip TF-only exports. A non-null table with zero entries explicitly
+means no FS varyings. This preserves mixed scalar/vector integer qualifiers and
+array-layout gaps that cannot be represented by the legacy per-vec4 flat mask.
+
 ## Native tessellation stages (introduced in SystemC API v25)
 
 Graphics API 25 appends an optional `pvrgpu_systemc_tessellation` pointer to a
@@ -59,8 +100,8 @@ lanes, and `ds_invocations` counts evaluated domain points. Fixed generated
 primitives, native instructions and each stage's memory bytes are distinct
 counters. Primitive-generated queries select actual TES output rather than
 input patches, and never report that work as GS execution. TF primitives-written
-is a separate, not-yet-implemented capability; no generated-count substitute
-is used for TF. See [validation and limitations](TESSELLATION_VALIDATION.md).
+is a separate capability; the API26 VS feedback implementation does not yet
+enable TES feedback. See [validation and limitations](TESSELLATION_VALIDATION.md).
 
 ## Native geometry stage (introduced in SystemC API v24)
 

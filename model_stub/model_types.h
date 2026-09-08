@@ -298,6 +298,44 @@ struct DriverTessellation {
   std::uint32_t point_mode = 0;
 };
 
+struct DriverStreamOutputBinding {
+  std::uint32_t output_dword = 0;
+  std::uint32_t num_components = 0;
+  std::uint32_t output_buffer = 0;
+  std::uint32_t dst_offset_dwords = 0;
+  std::uint32_t stream = 0;
+};
+
+struct DriverVaryingBinding {
+  std::uint32_t output_dword = 0;
+  std::uint32_t num_components = 0;
+  std::uint32_t coefficient_dword = 0;
+  std::uint32_t flat = 0;
+};
+
+struct DriverStreamOutputTarget {
+  std::uint32_t output_buffer = 0;
+  std::uint64_t resource_token = 0;
+  std::uint64_t target_token = 0;
+  std::vector<std::uint8_t> bytes;
+  std::uint32_t buffer_offset = 0;
+  std::uint32_t buffer_size = 0;
+  std::uint32_t internal_offset = 0;
+  std::uint32_t stride_dwords = 0;
+};
+
+struct DriverStreamOutput {
+  std::vector<DriverStreamOutputBinding> bindings;
+  std::vector<DriverStreamOutputTarget> targets;
+};
+
+struct ModelStreamOutputReadback {
+  std::uint64_t resource_token = 0;
+  std::uint64_t target_token = 0;
+  std::vector<std::uint8_t> bytes;
+  std::uint32_t internal_offset = 0;
+};
+
 struct DriverCommand {
   bool enabled = false;
   std::string schema;
@@ -331,6 +369,9 @@ struct DriverCommand {
   std::vector<std::uint32_t> fragment_shared;
   std::vector<std::uint32_t> geometry_shared;
   DriverTessellation tessellation;
+  DriverStreamOutput stream_output;
+  bool explicit_varying_bindings = false;
+  std::vector<DriverVaryingBinding> varying_bindings;
   std::vector<DriverPcoUniformBuffer> uniform_buffers;
   std::uint32_t sampled_texture_count = 0;
   std::vector<std::uint8_t> sampled_texture_bytes;
@@ -608,6 +649,7 @@ enum class MemoryClient : std::uint8_t {
   kTessellationControl = 15,
   kTessellator = 16,
   kTessellationEvaluation = 17,
+  kStreamOutput = 18,
 };
 
 enum class MemoryPayloadFormat : std::uint8_t {

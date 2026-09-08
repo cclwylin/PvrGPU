@@ -6,6 +6,7 @@
 | `deqp_dynamic_ui.py` | PySide6 桌面前端：預設選單 → 即時 run status → 最後的 dashboard |
 | `deqp_4level_ui.py` | 同一個引擎的四層回歸前端：L1–L4 × 30 組目錄、等距取樣、分片、合併與分組統計（見 [docs/dEQP_4level.md](../docs/dEQP_4level.md)）|
 | `run_deqp_group_sample.sh` | 取 `tools/deqp_groups.py` 其中一組的樣本跑，列出 tally 與每個失敗的 QPA 理由（`--list` 列出 24 組）|
+| `run_deqp_transform_feedback.py` | 精確執行 stock GLES3 Transform Feedback 1320 案例，保存 runtime 雜湊並核對 llvmpipe 逐案狀態及原生模型記錄（見 [驗證報告](../docs/TRANSFORM_FEEDBACK_VALIDATION.md)）|
 
 **dEQP 一律走這條路。** `script/run_regression.sh` 不跑 dEQP：`2.dEQP` 的 RDC
 capture 已經退役（見 `tools/run_rdc_regression.py` 的 `RETIRED_SUITES`）。那

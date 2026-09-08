@@ -33,6 +33,17 @@ driver_pvrgpu = declare_dependency(
 
 if with_tests
   test(
+    'pvrgpu_stream_output_query',
+    executable(
+      'pvrgpu_stream_output_query_test',
+      files('tests/pvrgpu_stream_output_query_test.c'),
+      include_directories : [inc_gallium_aux, inc_gallium, inc_imagination, inc_include, inc_src],
+      link_with : [libpvrgpu, libpowervr_compiler, libpowervr_common, libgallium],
+      dependencies : [idep_nir, idep_mesautil],
+    ),
+    suite : ['pvrgpu'],
+  )
+  test(
     'pvrgpu_pco_geometry',
     executable(
       'pvrgpu_pco_geometry_test',

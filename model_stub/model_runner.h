@@ -23,6 +23,7 @@ bool ConfigureDriverCommandOptions(Options *options, std::string *error);
  */
 struct ModelFramebuffer {
   ModelGraphicsStats graphics_stats;
+  std::vector<ModelStreamOutputReadback> stream_outputs;
   std::vector<std::uint8_t> pixels;
   // Colour attachments past the first, in target order.  Each is the same
   // width, height and pixel width as `pixels`.

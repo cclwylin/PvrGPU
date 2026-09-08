@@ -31,7 +31,7 @@ def verify_tessellation_stage_connections() -> None:
     """Structural wiring is checked separately from runtime image evidence."""
     source = (Path(__file__).resolve().parents[1] / "model_stub" / "pvrgpu_model_stub.cpp").read_text()
     stages = ("vertex_cluster", "tessellation_control_shader", "tessellator",
-              "tessellation_evaluation_shader", "geometry_shader", "clip_cull")
+              "tessellation_evaluation_shader", "geometry_shader", "stream_output", "clip_cull")
     channels = []
     for producer, consumer in zip(stages, stages[1:]):
         output = re.search(rf"\b{producer}\.output\((\w+)\);", source)

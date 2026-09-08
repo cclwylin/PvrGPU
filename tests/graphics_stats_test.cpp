@@ -55,8 +55,30 @@ int main() {
       return a.physical_submissions == b.physical_submissions &&
              a.primitives_generated == b.primitives_generated &&
              a.ia_primitives == b.ia_primitives && a.gs_primitives == b.gs_primitives &&
-             a.gs_invocations == b.gs_invocations;
+             a.gs_invocations == b.gs_invocations &&
+             a.stream_output_primitives_written == b.stream_output_primitives_written &&
+             a.stream_output_primitives_storage_needed == b.stream_output_primitives_storage_needed;
     };
+    // Feedback counts successful complete primitives separately from storage
+    // demand. Overflowed or missing targets do not become emitted primitives.
+    auto feedback = pvrgpu::stub::ModelGraphicsStats{};
+    feedback.Add(false, 5, 0, 0, false, 0, 2, 5);
+    feedback.Add(false, 3, 0, 0, false, 0, 0, 3);
+    check(feedback.primitives_generated == 8 &&
+          feedback.stream_output_primitives_written == 2 &&
+          feedback.stream_output_primitives_storage_needed == 8);
+    for (auto field : {&pvrgpu::stub::ModelGraphicsStats::stream_output_primitives_written,
+                       &pvrgpu::stub::ModelGraphicsStats::stream_output_primitives_storage_needed}) {
+      auto overflowing = feedback;
+      overflowing.*field = UINT64_MAX;
+      const auto before = overflowing;
+      for (unsigned retry = 0; retry < 3; ++retry) {
+        bool rejected = false;
+        try { overflowing.Add(false, 1, 0, 0, false, 0, 1, 1); }
+        catch (const std::overflow_error &) { rejected = true; }
+        check(rejected && same(overflowing, before));
+      }
+    }
     auto tess_overflow = pvrgpu::stub::ModelGraphicsStats{};
     tess_overflow.Add(false, 1, 0, 0, true, UINT64_MAX);
     const auto tess_before = tess_overflow;

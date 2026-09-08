@@ -214,7 +214,7 @@ class GuardedBytes {
 };
 
 void VerifyVersions(Submission &submit) {
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 25);
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 26);
   constexpr auto previous_size = offsetof(pvrgpu_systemc_driver_command, tessellation);
   static_assert(previous_size % alignof(pvrgpu_systemc_driver_command) == 0);
   GuardedBytes previous(previous_size);
@@ -223,13 +223,20 @@ void VerifyVersions(Submission &submit) {
   const auto &old = *reinterpret_cast<const pvrgpu_systemc_driver_command *>(previous.data());
   auto info = submit.info; info.command = &old;
   submit.Call(info, "command version", "API24 short top-level command before API25 tail");
-  submit.Reject(old, "version=24 expected=25", "API24 short nested command before API25 tail");
+  submit.Reject(old, "version=24 expected=26", "API24 short nested command before API25 tail");
+  GuardedBytes api25(offsetof(pvrgpu_systemc_driver_command, stream_output));
+  const std::uint32_t api25_version = 25;
+  std::memcpy(api25.data(), &api25_version, sizeof(api25_version));
+  const auto &old25 = *reinterpret_cast<const pvrgpu_systemc_driver_command *>(api25.data());
+  info.command = &old25;
+  submit.Call(info, "command version", "API25 short command before API26 stream output tail");
+  submit.Reject(old25, "version=25 expected=26", "API25 short nested command before API26 tail");
   Fixture fixture;
   auto full = fixture.draw; full.version = 24;
-  submit.Reject(full, "version=24 expected=25", "full allocation with old nested version");
+  submit.Reject(full, "version=24 expected=26", "full allocation with old nested version");
   info.command = &full;
   submit.Call(info, "command version", "full allocation with old top-level version");
-  for (auto version : {0u,24u,26u,UINT32_MAX}) {
+  for (auto version : {0u,24u,25u,27u,UINT32_MAX}) {
     info = submit.info; info.version = version;
     submit.Call(info, "submit version", "invalid submit-info version " + std::to_string(version));
     full.version = version;

@@ -91,6 +91,13 @@ struct PipelineState {
   PoolHandle vertex_indices;
   PoolHandle vertex_lanes;
   PoolHandle vertex_lane_refs;
+  // Pre-clipping raw native exports. Each target owns a completed whole-
+  // resource readback; same-resource targets retain independent cursors.
+  PoolHandle stream_output_bindings;
+  PoolHandle stream_output_targets;
+  std::uint64_t stream_output_primitives_written = 0;
+  std::uint64_t stream_output_primitives_storage_needed = 0;
+  std::uint32_t stream_output_complete = 0;
   // GS inputs retain complete API primitives (including adjacency). Native
   // emission produces new lanes and explicit primitive identities; neither
   // is inferred from a VS lane's single emitted flag.
@@ -124,6 +131,8 @@ struct PipelineState {
   PoolHandle vertex_uniform_buffer_resources;
   PoolHandle fragment_uniform_buffer_resources;
   PoolHandle shader_varying_bindings;
+  std::uint32_t driver_varying_bindings_explicit = 0;
+  std::uint32_t driver_varying_binding_count = 0;
   PoolHandle vertex_texture_resources;
   PoolHandle vertex_sampler_states;
   PoolHandle texture_resources;

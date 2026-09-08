@@ -429,11 +429,22 @@ void ParameterBuffer::Run() {
               coefficients[coefficient_base + binding.coefficient_set_base +
                            component] = coefficient;
             } else {
-              coefficients[coefficient_base + binding.coefficient_set_base +
-                           component] =
-                  llvmpipe_driver_plane
-                      ? BuildLlvmPipeDriverPlane(triangle, numerator)
-                      : BuildPlane(triangle, numerator);
+              try {
+                coefficients[coefficient_base + binding.coefficient_set_base +
+                             component] =
+                    llvmpipe_driver_plane
+                        ? BuildLlvmPipeDriverPlane(triangle, numerator)
+                        : BuildPlane(triangle, numerator);
+              } catch (const std::runtime_error &error) {
+                throw std::runtime_error(std::string(error.what()) +
+                    " varying_output=" +
+                    std::to_string(binding.vertex_output_base + component) +
+                    " interpolation=" +
+                    std::to_string(static_cast<unsigned>(binding.interpolation)) +
+                    " numerator_bits=" + std::to_string(FloatBits(numerator[0])) +
+                    "," + std::to_string(FloatBits(numerator[1])) +
+                    "," + std::to_string(FloatBits(numerator[2])));
+              }
             }
           }
         }

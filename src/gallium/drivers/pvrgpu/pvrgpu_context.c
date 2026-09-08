@@ -9495,6 +9495,69 @@ pvrgpu_array_assembled_vertex_count(unsigned mode, unsigned count)
    }
 }
 
+bool
+pvrgpu_expand_instanced_connected_indices(
+   enum mesa_prim mode, const void *source_indices, unsigned source_index_size,
+   unsigned element_count, unsigned vertices_per_instance, unsigned instances,
+   uint32_t **out_indices, unsigned *out_index_count, enum mesa_prim *out_mode)
+{
+   if (!out_indices || !out_index_count || !out_mode || !instances ||
+       !vertices_per_instance || vertices_per_instance > UINT32_MAX / instances ||
+       (source_indices ? (source_index_size != 1 && source_index_size != 2 && source_index_size != 4)
+                       : (source_index_size != 0 || element_count > vertices_per_instance)))
+      return false;
+   const bool lines = mode == MESA_PRIM_LINE_STRIP || mode == MESA_PRIM_LINE_LOOP;
+   if (!lines && mode != MESA_PRIM_TRIANGLE_STRIP && mode != MESA_PRIM_TRIANGLE_FAN)
+      return false;
+   const unsigned width = lines ? 2u : 3u;
+   const unsigned primitives = pvrgpu_array_primitive_count(mode, element_count);
+   const uint64_t per_instance = (uint64_t)primitives * width;
+   if (per_instance > UINT32_MAX / instances)
+      return false;
+   const uint64_t count = per_instance * instances;
+   if (!count || count > UINT32_MAX || count > SIZE_MAX / sizeof(uint32_t))
+      return false;
+   uint32_t *indices = malloc((size_t)count * sizeof(*indices));
+   if (!indices)
+      return false;
+   unsigned destination = 0;
+   for (unsigned instance = 0; instance < instances; ++instance) {
+      for (unsigned primitive = 0; primitive < primitives; ++primitive) {
+         unsigned elements[3] = {primitive, primitive + 1, primitive + 2};
+         if (mode == MESA_PRIM_LINE_LOOP)
+            elements[1] %= element_count;
+         else if (mode == MESA_PRIM_TRIANGLE_FAN)
+            elements[0] = 0;
+         else if (mode == MESA_PRIM_TRIANGLE_STRIP && (primitive & 1)) {
+            elements[0] = primitive + 1;
+            elements[1] = primitive;
+         }
+         for (unsigned component = 0; component < width; ++component) {
+            uint32_t vertex = elements[component];
+            if (source_indices) {
+               const uint8_t *source = (const uint8_t *)source_indices +
+                  (size_t)vertex * source_index_size;
+               if (source_index_size == 1) vertex = *source;
+               else if (source_index_size == 2) {
+                  uint16_t value;
+                  memcpy(&value, source, sizeof(value));
+                  vertex = value;
+               } else memcpy(&vertex, source, sizeof(vertex));
+            }
+            if (vertex >= vertices_per_instance) {
+               free(indices);
+               return false;
+            }
+            indices[destination++] = instance * vertices_per_instance + vertex;
+         }
+      }
+   }
+   *out_indices = indices;
+   *out_index_count = (unsigned)count;
+   *out_mode = lines ? MESA_PRIM_LINES : MESA_PRIM_TRIANGLES;
+   return true;
+}
+
 /*
  * Copy one vertex attribute into the register words it occupies.
  *
@@ -10075,6 +10138,14 @@ struct pvrgpu_array_primitive_draw {
    struct pvrgpu_pco_geometry_binary geometry;
    struct pvrgpu_pco_tessellation_pipeline_binary tessellation_binary;
    struct pvrgpu_systemc_tessellation tessellation;
+   struct pvrgpu_systemc_stream_output stream_output;
+   struct pvrgpu_systemc_stream_output_binding
+      stream_output_bindings[PVRGPU_SYSTEMC_MAX_STREAM_OUTPUT_BINDINGS];
+   struct pvrgpu_systemc_stream_output_target
+      stream_output_payloads[PIPE_MAX_SO_BUFFERS];
+   struct pipe_stream_output_target *stream_output_targets[PIPE_MAX_SO_BUFFERS];
+   uint8_t *stream_output_bytes[PIPE_MAX_SO_BUFFERS];
+   struct pvrgpu_systemc_varying_binding varying_bindings[16];
 };
 
 static void
@@ -10095,8 +10166,91 @@ pvrgpu_array_primitive_draw_destroy(struct pvrgpu_array_primitive_draw **slot)
                                          &draw->uniform_buffer_count);
    for (unsigned texture = 0; texture < PVRGPU_PCO_MAX_TEXTURES; ++texture)
       free(draw->texture_bytes[texture]);
+   for (unsigned buffer = 0; buffer < PIPE_MAX_SO_BUFFERS; ++buffer) {
+      free(draw->stream_output_bytes[buffer]);
+      pipe_so_target_reference(&draw->stream_output_targets[buffer], NULL);
+   }
    FREE(draw);
    *slot = NULL;
+}
+
+static bool
+pvrgpu_capture_stream_output(const struct pvrgpu_context *ctx,
+                              struct pvrgpu_array_primitive_draw *recorded)
+{
+   if (!ctx->num_stream_output_targets)
+      return true;
+   /* VS capture is independent of the later tessellation/geometry work. */
+   if (ctx->gs || ctx->tcs || ctx->tes || !ctx->vs || !ctx->vs->nir)
+      return false;
+   const struct pipe_stream_output_info *info = &ctx->vs->stream_output;
+   if (!info->num_outputs || info->num_outputs > PVRGPU_SYSTEMC_MAX_STREAM_OUTPUT_BINDINGS)
+      return false;
+   unsigned used_buffers = 0;
+   for (unsigned output = 0; output < info->num_outputs; ++output) {
+      unsigned ordinal = 0, location = 0;
+      const unsigned register_index = info->output[output].register_index;
+      for (; location < 64; ++location) {
+         if (!(ctx->vs->nir->info.outputs_written & BITFIELD64_BIT(location)))
+            continue;
+         if (ordinal++ == register_index)
+            break;
+      }
+      const unsigned first = info->output[output].start_component;
+      const unsigned count = info->output[output].num_components;
+      const unsigned buffer = info->output[output].output_buffer;
+      if (location == 64 || !count || count > 4 || buffer >= PIPE_MAX_SO_BUFFERS ||
+          info->output[output].stream ||
+          first + count > recorded->binary.vertex_output_count[location] ||
+          info->output[output].dst_offset + count > info->stride[buffer])
+         return false;
+      recorded->stream_output_bindings[output] =
+         (struct pvrgpu_systemc_stream_output_binding){
+            .output_dword = recorded->binary.vertex_output_start[location] + first,
+            .num_components = count,
+            .output_buffer = buffer,
+            .dst_offset_dwords = info->output[output].dst_offset,
+            .stream = info->output[output].stream,
+         };
+      used_buffers |= 1u << buffer;
+   }
+   recorded->stream_output.bindings = recorded->stream_output_bindings;
+   recorded->stream_output.binding_count = info->num_outputs;
+   for (unsigned buffer = 0; buffer < ctx->num_stream_output_targets; ++buffer) {
+      struct pipe_stream_output_target *base = ctx->stream_output_targets[buffer];
+      if (!base || !(used_buffers & (1u << buffer)))
+         continue;
+      struct pvrgpu_stream_output_target *target = (struct pvrgpu_stream_output_target *)base;
+      struct pvrgpu_resource *resource = pvrgpu_resource(base->buffer);
+      if (base->context != &ctx->base || !resource->data || !resource->size ||
+          resource->size > PVRGPU_SYSTEMC_MAX_STREAM_OUTPUT_RESOURCE_BYTES ||
+          base->buffer_offset > resource->size ||
+          base->buffer_size > resource->size - base->buffer_offset)
+         return false;
+      const unsigned slot = recorded->stream_output.target_count++;
+      uint8_t *bytes = malloc(resource->size);
+      recorded->stream_output_bytes[slot] = bytes;
+      if (!bytes)
+         return false;
+      memcpy(bytes, resource->data, resource->size);
+      pipe_so_target_reference(&recorded->stream_output_targets[slot], base);
+      recorded->stream_output_payloads[slot] =
+         (struct pvrgpu_systemc_stream_output_target){
+            .output_buffer = buffer,
+            .resource_token = (uintptr_t)base->buffer,
+            .target_token = (uintptr_t)base,
+            .bytes = bytes,
+            .bytes_size = resource->size,
+            .buffer_offset = base->buffer_offset,
+            .buffer_size = base->buffer_size,
+            .internal_offset = target->internal_offset,
+            .stride_dwords = info->stride[buffer],
+         };
+   }
+   recorded->stream_output.targets = recorded->stream_output.target_count ?
+      recorded->stream_output_payloads : NULL;
+   recorded->command.stream_output = &recorded->stream_output;
+   return true;
 }
 
 /*
@@ -10292,6 +10446,11 @@ pvrgpu_context_end_frame_at_readback(struct pvrgpu_context *ctx)
    if (ctx->array_primitive_draw_count != 0) {
       const unsigned recorded = ctx->array_primitive_draw_count;
       const bool emitted = pvrgpu_emit_array_primitive_sequence_command(ctx);
+      /* An RDC sequence may already own a successful submission. Otherwise
+       * a rejected submission must invalidate queries spanning these draws,
+       * even when no new generation reached the model. */
+      if (!emitted && !ctx->array_primitive_sequence_owns_command)
+         ++ctx->query_statistics_failures;
       pvrgpu_counter_eventf("readback_sequence_flush",
                             "draws=%u emitted=%u replay=%u",
                             recorded,
@@ -10602,6 +10761,38 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
    ctx->array_primitive_sequence_owns_command = true;
    pvrgpu_note_driver_draw_command_emitted();
    pvrgpu_note_current_color_readback_pending(ctx);
+   /* Stream output completes while the recording still owns its target
+    * references. The following draw snapshots this actual modeled result,
+    * including the append cursor; application rebinding never invalidates
+    * an outstanding target identity. */
+   for (unsigned ordinal = 0; ordinal < ctx->array_primitive_draw_count; ++ordinal) {
+      struct pvrgpu_array_primitive_draw *recorded = ctx->array_primitive_draws[ordinal];
+      for (unsigned buffer = 0; buffer < recorded->stream_output.target_count; ++buffer) {
+         const struct pvrgpu_systemc_stream_output_target *payload =
+            &recorded->stream_output_payloads[buffer];
+         struct pvrgpu_stream_output_target *target =
+            (struct pvrgpu_stream_output_target *)recorded->stream_output_targets[buffer];
+         struct pvrgpu_resource *resource = pvrgpu_resource(target->base.buffer);
+         struct pvrgpu_systemc_stream_output_readback readback = {
+            .submission_generation = ctx->color_readback_generation,
+            .resource_token = payload->resource_token,
+            .target_token = payload->target_token,
+            .bytes = resource->data,
+            .bytes_size = resource->size,
+         };
+         if (!pvrgpu_read_stream_output(&readback, error, sizeof(error)) ||
+             readback.internal_offset > target->base.buffer_size) {
+            ++ctx->query_statistics_failures;
+            pvrgpu_counter_eventf("stream_output_readback_error", "reason=%s", error);
+            return false;
+         }
+         target->internal_offset = readback.internal_offset;
+         pvrgpu_counter_eventf("stream_output_readback",
+            "generation=%llu buffer=%u cursor=%u bytes=%zu",
+            (unsigned long long)readback.submission_generation,
+            payload->output_buffer, target->internal_offset, resource->size);
+      }
+   }
    /*
     * The sequence reproduces the whole frame in the model -- the clear it
     * starts from and every draw that followed.  A scissored or masked clear
@@ -10779,6 +10970,8 @@ pvrgpu_record_color_primitive_pco_draw(
       return false;
    }
    const bool has_tessellation = ctx->tcs && ctx->tes;
+   if (ctx->num_stream_output_targets && ctx->array_primitive_draw_count)
+      pvrgpu_flush_current_color_attachments(&ctx->base);
    if (ctx->driver_draw_command_emitted ||
        pvrgpu_driver_draw_command_has_been_emitted()) {
       pvrgpu_counter_eventf("draw_array_primitive_record_error",
@@ -11016,7 +11209,24 @@ pvrgpu_record_color_primitive_pco_draw(
     * leave the source index type's range, so the expansion is always 32-bit.
     */
    unsigned command_index_size = info->index_size;
-   if (info->index_size != 0 && instance_count > 1) {
+   enum mesa_prim command_primitive_mode = info->mode;
+   unsigned command_index_count = info->index_size ? assembled_count : 0;
+   const bool expand_instance_boundaries = instance_count > 1 && !ctx->gs && !has_tessellation &&
+      (info->mode == MESA_PRIM_LINE_STRIP || info->mode == MESA_PRIM_LINE_LOOP ||
+       info->mode == MESA_PRIM_TRIANGLE_STRIP || info->mode == MESA_PRIM_TRIANGLE_FAN);
+   if (expand_instance_boundaries) {
+      uint32_t *expanded = NULL;
+      if (!pvrgpu_expand_instanced_connected_indices(info->mode, index_data, info->index_size,
+             assembled_count, vertex_count, instance_count, &expanded,
+             &command_index_count, &command_primitive_mode)) {
+         free(index_data);
+         return false;
+      }
+      free(index_data);
+      index_data = (uint8_t *)expanded;
+      index_data_size = (size_t)command_index_count * sizeof(uint32_t);
+      command_index_size = 4;
+   } else if (info->index_size != 0 && instance_count > 1) {
       if (assembled_count > UINT_MAX / instance_count) {
          pvrgpu_counter_eventf("draw_array_primitive_record_error",
                                "stage=indices reason=instance_index_extent "
@@ -11057,6 +11267,7 @@ pvrgpu_record_color_primitive_pco_draw(
       index_data = (uint8_t *)expanded;
       index_data_size = (size_t)expanded_count * sizeof(uint32_t);
       command_index_size = 4;
+      command_index_count = expanded_count;
    }
    if ((packed_words == 0 && !ctx->gs && !has_tessellation) ||
        (packed_words != 0 &&
@@ -11186,10 +11397,10 @@ pvrgpu_record_color_primitive_pco_draw(
                                           ctx->vs->nir,
                                           ctx->fs->nir,
                                           attribute_formats,
-                                          info->mode == MESA_PRIM_POINTS &&
-                                             ctx->rasterizer &&
-                                             ctx->rasterizer->state
-                                                .point_size_per_vertex,
+                                          ctx->num_stream_output_targets ||
+                                             (info->mode == MESA_PRIM_POINTS &&
+                                              ctx->rasterizer &&
+                                              ctx->rasterizer->state.point_size_per_vertex),
                                           MAX2(1U, ctx->framebuffer.nr_cbufs),
                                           vertex_uniform_dwords,
                                           fragment_uniform_dwords,
@@ -11351,8 +11562,8 @@ pvrgpu_record_color_primitive_pco_draw(
    command.vertex_count = packed_vertex_count;
    command.first_vertex = 0;
    command.instance_count = 1;
-   command.primitive_mode = (uint32_t)info->mode;
-   command.indexed = info->index_size != 0 ? 1u : 0u;
+   command.primitive_mode = (uint32_t)command_primitive_mode;
+   command.indexed = command_index_size != 0 ? 1u : 0u;
    /* The model retains one inactive color slot for a depth-only pass,
     * matching the existing depth prepass transport. No GL color resource is
     * fabricated or written: color_mask=0 and only Z/S is read back. */
@@ -11360,8 +11571,7 @@ pvrgpu_record_color_primitive_pco_draw(
    command.raw_index_data = index_data;
    command.raw_index_data_size = index_data_size;
    command.index_size = command_index_size;
-   command.index_count =
-      info->index_size != 0 ? assembled_count * instance_count : 0u;
+   command.index_count = command_index_count;
    command.first_index = 0;
    command.base_vertex = 0;
    command.vertex_pco = binary.vertex.data;
@@ -11797,6 +12007,28 @@ pvrgpu_record_color_primitive_pco_draw(
       fragment_shared_count ? recorded->fragment_shared_words : NULL;
    pvrgpu_pco_triangles_command_to_systemc(&command, &recorded->command);
    recorded->command.raster_samples = MAX2(1, ctx->framebuffer.samples);
+   if (recorded->binary.explicit_varying_bindings) {
+      recorded->command.varying_bindings = recorded->varying_bindings;
+      recorded->command.varying_binding_count = recorded->binary.varying_binding_count;
+      for (unsigned varying = 0; varying < recorded->binary.varying_binding_count; ++varying) {
+         const struct pvrgpu_pco_varying_binding *binding = &recorded->binary.varying_bindings[varying];
+         recorded->varying_bindings[varying] = (struct pvrgpu_systemc_varying_binding){
+            .output_dword = binding->output_dword,
+            .num_components = binding->num_components,
+            .coefficient_dword = binding->coefficient_dword,
+            .flat = binding->flat,
+         };
+         pvrgpu_counter_eventf("pco_varying_linkage",
+            "varying=%u output=%u components=%u coefficient=%u flat=%u",
+            varying, binding->output_dword, binding->num_components,
+            binding->coefficient_dword, binding->flat);
+      }
+   }
+   if (!pvrgpu_capture_stream_output(ctx, recorded)) {
+      pvrgpu_counter_eventf("draw_array_primitive_record_error", "stage=stream_output reason=capture");
+      pvrgpu_array_primitive_draw_destroy(&recorded);
+      return false;
+   }
 
    if (ctx->array_primitive_draw_count == 0 &&
        (!pvrgpu_capture_initial_color_attachment(ctx, recorded) ||
@@ -11935,6 +12167,12 @@ pvrgpu_record_color_primitive_pco_draw(
                          command.stencil_ref[0],
                          command.cull_face,
                          command.front_ccw);
+   if (recorded->command.stream_output) {
+      const uint64_t failures = ctx->query_statistics_failures;
+      pvrgpu_flush_current_color_attachments(&ctx->base);
+      if (ctx->query_statistics_failures != failures)
+         return false;
+   }
    return true;
 }
 

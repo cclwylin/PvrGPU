@@ -99,6 +99,7 @@ set(PVRGPU_TESSELLATION_STAGE_SOURCES
 )
 
 add_executable(pvrgpu-model-stub
+    src/systemc/geometry/stream_output.cpp
     ${PVRGPU_TESSELLATION_STAGE_SOURCES}
     src/systemc/shader/geometry_shader.cpp
     src/systemc/shader/geometry_iss.cpp
@@ -166,6 +167,7 @@ target_link_libraries(pvrgpu-model-stub PRIVATE
 pvrgpu_target_warnings(pvrgpu-model-stub)
 
 add_library(pvrgpu-systemc-bridge SHARED
+    src/systemc/geometry/stream_output.cpp
     ${PVRGPU_TESSELLATION_STAGE_SOURCES}
     src/systemc/shader/geometry_shader.cpp
     src/systemc/shader/geometry_iss.cpp
@@ -507,6 +509,39 @@ target_include_directories(geometry-shader-test PRIVATE
 target_link_libraries(geometry-shader-test PRIVATE pvrgpu-systemc-bridge PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(geometry-shader-test)
 add_test(NAME geometry-shader-unit COMMAND geometry-shader-test)
+
+add_executable(stream-output-test tests/stream_output_test.cpp)
+target_include_directories(stream-output-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc" "${CMAKE_SOURCE_DIR}/tests")
+target_link_libraries(stream-output-test PRIVATE pvrgpu-systemc-bridge PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(stream-output-test)
+foreach(stream_output_mode IN ITEMS direct bypass cache)
+    add_test(NAME stream-output-${stream_output_mode}-unit
+        COMMAND stream-output-test ${stream_output_mode})
+endforeach()
+
+add_executable(stream-output-api-test tests/stream_output_api_test.cpp)
+target_include_directories(stream-output-api-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc" "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu")
+target_link_libraries(stream-output-api-test PRIVATE pvrgpu-systemc-bridge PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(stream-output-api-test)
+foreach(stream_output_mode IN ITEMS direct bypass cache)
+    add_test(NAME stream-output-api-${stream_output_mode}-unit
+        COMMAND stream-output-api-test ${stream_output_mode})
+endforeach()
+
+add_executable(pco-decoder-boundary-test tests/pco_decoder_boundary_test.cpp)
+target_include_directories(pco-decoder-boundary-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc")
+target_link_libraries(pco-decoder-boundary-test PRIVATE pvrgpu-systemc-bridge PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(pco-decoder-boundary-test)
+foreach(pco_decoder_boundary IN ITEMS valid reject65 reject65-point-size)
+    add_test(NAME pco-decoder-boundary-${pco_decoder_boundary}
+        COMMAND pco-decoder-boundary-test ${pco_decoder_boundary})
+endforeach()
 
 add_executable(geometry-frontend-test tests/geometry_frontend_test.cpp)
 target_include_directories(geometry-frontend-test PRIVATE
