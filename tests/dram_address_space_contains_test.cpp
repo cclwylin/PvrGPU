@@ -46,6 +46,22 @@ struct Reference {
     }
     return true;
   }
+  // Immediate pre-cache implementation: one seek followed by an explicit
+  // consecutive-page walk. The independent per-page find oracle above remains
+  // authoritative for all functional tests; this path is only a benchmark.
+  bool ContainsIterator(uint64_t address, size_t bytes) const noexcept {
+    if (bytes == 0 || bytes > kMaximum - address) return false;
+    const uint64_t end = address + bytes;
+    uint64_t page = address - address % kPage;
+    auto resident = pages.find(page);
+    while (page < end) {
+      if (resident == pages.end() || resident->first != page) return false;
+      if (kPage > kMaximum - page) return false;
+      page += kPage;
+      ++resident;
+    }
+    return true;
+  }
   void Write(uint64_t address, const uint8_t *source, size_t bytes) {
     if ((!source && bytes) || !bytes) throw std::invalid_argument("invalid write");
     if (bytes > kMaximum - address) throw std::overflow_error("wrapped write");
@@ -81,7 +97,7 @@ void Query(const DramAddressSpace &actual, const Reference &reference,
            uint64_t address, size_t bytes) {
   const auto resident = actual.resident_pages();
   Check(actual.Contains(address, bytes) == reference.Contains(address, bytes),
-        "iterator Contains differs from per-page find oracle");
+        "Contains differs from per-page find oracle");
   Check(actual.resident_pages() == resident && resident == reference.pages.size(),
         "Contains changed backing ownership/page count");
 }
@@ -195,22 +211,226 @@ void TestRandomWritesAndExtremes() {
     }
   Check(!actual.Contains(kMaximum - 127, 1), "page-advance overflow was silently accepted");
 }
+
+void TestPrimedProofSubrangesAndHoles() {
+  DramAddressSpace actual;
+  Reference reference;
+  constexpr uint64_t base = 0x10000;
+  constexpr size_t bytes = 8 * kPage;
+  const std::vector<uint8_t> initial(bytes, 41);
+  // Deliberately bypass the Write helper, whose differential Query would
+  // already prime an aligned proof before the unaligned first query below.
+  actual.Write(base, initial.data(), initial.size());
+  reference.Write(base, initial.data(), initial.size());
+  Check(actual.resident_pages() == reference.pages.size() &&
+            actual.resident_pages() == bytes / kPage,
+        "unaligned proof fixture has unexpected backing pages");
+  // Prime an unaligned query, then test prefix/interior/suffix ranges including
+  // bytes outside that first query but within the same resident backing pages.
+  Query(actual, reference, base + 17, bytes - 31);
+  for (unsigned repeat = 0; repeat < 3; ++repeat) {
+    Query(actual, reference, base, 17);
+    Query(actual, reference, base, 2 * kPage);
+    Query(actual, reference, base + kPage - 1, 3 * kPage + 2);
+    Query(actual, reference, base + 3 * kPage + 19, 2 * kPage - 37);
+    Query(actual, reference, base + bytes - 29, 29);
+    Query(actual, reference, base + bytes - kPage, kPage);
+    Query(actual, reference, base, bytes);
+    Query(actual, reference, base + bytes, 1);
+    Query(actual, reference, base - 1, bytes + 1);
+    Query(actual, reference, base, bytes + 1);
+    Query(actual, reference, base + 1, 0);
+  }
+
+  constexpr uint64_t hole_base = 0x30000;
+  Write(actual, reference, hole_base, 2 * kPage, 17);
+  Write(actual, reference, hole_base + 3 * kPage, 2 * kPage, 18);
+  for (unsigned repeat = 0; repeat < 3; ++repeat) {
+    Query(actual, reference, hole_base, 2 * kPage);
+    Query(actual, reference, hole_base + 3 * kPage, 2 * kPage);
+    Query(actual, reference, hole_base, 5 * kPage);
+    Query(actual, reference, hole_base + 2 * kPage - 1, kPage + 2);
+    Query(actual, reference, hole_base + 2 * kPage, 1);
+  }
+  Check(!actual.Contains(hole_base, 5 * kPage), "separate proofs bridged a missing page");
+  Write(actual, reference, hole_base + 2 * kPage, 1, 99);
+  Query(actual, reference, hole_base, 5 * kPage);
+  Check(actual.Contains(hole_base, 5 * kPage), "prior misses survived filling a hole");
+
+  // More distinct positive spans than the bounded cache can retain. Eviction
+  // must only change performance; it cannot join the intervening empty pages.
+  constexpr uint64_t sparse_base = 0x50000;
+  for (unsigned page = 0; page < 96; ++page)
+    Write(actual, reference, sparse_base + page * 2 * kPage, 1, page);
+  for (unsigned page = 0; page < 96; ++page)
+    Query(actual, reference, sparse_base + page * 2 * kPage, kPage);
+  for (unsigned page = 96; page-- > 0;) {
+    Query(actual, reference, sparse_base + page * 2 * kPage, kPage);
+    Query(actual, reference, sparse_base + page * 2 * kPage, kPage + 1);
+    Query(actual, reference, sparse_base + (page * 2 + 1) * kPage, 1);
+  }
+  Query(actual, reference, base, bytes);
+}
+
+void TestPrimedProofFailedTopPageWrite() {
+  DramAddressSpace actual;
+  Reference reference;
+  constexpr uint64_t penultimate_page = kMaximum - (2 * kPage - 1);
+  constexpr uint64_t final_page = kMaximum - (kPage - 1);
+  Write(actual, reference, penultimate_page, kPage, 73);
+  Query(actual, reference, penultimate_page, kPage);
+  Check(actual.resident_pages() == 1, "top-page fixture initially has unexpected pages");
+  // EnsureRange inserts the final backing page, then refuses page-advance
+  // overflow before copying any payload. Existing positive proofs remain true,
+  // but the newly inserted top page must never become a valid Contains proof.
+  Write(actual, reference, final_page - 8, 16, 91);
+  Check(actual.resident_pages() == 2, "failed top-page write lost its documented partial insertion");
+  for (unsigned repeat = 0; repeat < 3; ++repeat) {
+    Query(actual, reference, penultimate_page, kPage);
+    Query(actual, reference, penultimate_page + 7, kPage - 7);
+    Query(actual, reference, final_page - 1, 1);
+    Query(actual, reference, final_page - 1, 2);
+    Query(actual, reference, final_page, 1);
+    Query(actual, reference, final_page, kPage - 1);
+    Query(actual, reference, penultimate_page, 2 * kPage - 1);
+    Query(actual, reference, kMaximum - 1, 1);
+    Query(actual, reference, kMaximum, 1);
+  }
+  Read(actual, reference, final_page - 8, 16);
+  Check(!actual.Contains(final_page, 1), "partial failed write installed a false positive proof");
+}
+
+void CheckMovedFrom(const DramAddressSpace &actual, const Reference &reference,
+                    uint64_t old_base, size_t bytes) {
+  // Both objects were independently subjected to the same std::map move.
+  // Query before resetting: a stale positive cache cannot claim removed pages.
+  Check(actual.resident_pages() == reference.pages.size(), "moved-from backing differs from independent map move");
+  Query(actual, reference, old_base, bytes);
+  Query(actual, reference, old_base + 1, 1);
+  Query(actual, reference, old_base + bytes - 1, 1);
+  if (actual.resident_pages() == 0)
+    Check(!actual.Contains(old_base, bytes), "empty moved-from backing retained a positive proof");
+  Boundaries(actual, reference);
+}
+
+void TestPrimedProofCopyMoveAndReset() {
+  constexpr uint64_t a_base = 0x1000;
+  constexpr uint64_t b_base = 0x8000;
+  constexpr uint64_t c_base = 0x10000;
+  constexpr size_t bytes = 6 * kPage;
+  DramAddressSpace actual, other;
+  Reference reference, other_reference;
+  Write(actual, reference, a_base, bytes, 1);
+  Write(other, other_reference, b_base, bytes, 2);
+  Query(actual, reference, a_base, bytes);
+  Query(other, other_reference, b_base, bytes);
+  Check(actual.resident_pages() == other.resident_pages(), "equal-count copy fixture invalid");
+  actual = other;
+  reference = other_reference;
+  Query(actual, reference, a_base, bytes);
+  Query(actual, reference, b_base, bytes);
+  Check(!actual.Contains(a_base, 1), "copy assignment retained a disjoint old proof");
+
+  DramAddressSpace copied(actual);
+  Reference copied_reference(reference);
+  Query(copied, copied_reference, b_base, bytes);
+  Write(copied, copied_reference, c_base, kPage, 11);
+  Check(copied.Contains(c_base, kPage) && !actual.Contains(c_base, 1),
+        "primed copy does not own its pages independently");
+  Write(copied, copied_reference, b_base + 23, 17, 29);
+  Read(actual, reference, b_base, bytes);
+  Read(copied, copied_reference, b_base, bytes);
+
+  // Use aliases to exercise intentional self assignment without compiler
+  // self-assignment warnings. The explicit class contract preserves backing.
+  DramAddressSpace &self = actual;
+  actual = self;
+  Query(actual, reference, b_base, bytes);
+  actual = std::move(self);
+  Query(actual, reference, b_base, bytes);
+  Read(actual, reference, b_base, bytes);
+
+  DramAddressSpace moved(std::move(actual));
+  Reference moved_reference(std::move(reference));
+  Query(moved, moved_reference, b_base, bytes);
+  CheckMovedFrom(actual, reference, b_base, bytes);
+  Write(actual, reference, a_base, bytes, 37);
+  Query(actual, reference, a_base, bytes);
+  Check(actual.resident_pages() == moved.resident_pages(), "equal-count move fixture invalid");
+  actual = std::move(moved);
+  reference = std::move(moved_reference);
+  Query(actual, reference, a_base, bytes);
+  Query(actual, reference, b_base, bytes);
+  Check(!actual.Contains(a_base, 1), "move assignment retained a disjoint old proof");
+  CheckMovedFrom(moved, moved_reference, b_base, bytes);
+
+  Query(actual, reference, b_base, bytes);
+  actual = DramAddressSpace{};
+  reference = Reference{};
+  Query(actual, reference, b_base, bytes);
+  Check(actual.resident_pages() == 0 && !actual.Contains(b_base, 1),
+        "reset retained backing or a stale positive proof");
+  Write(actual, reference, c_base, bytes, 43);
+  Query(actual, reference, c_base, bytes);
+  Query(actual, reference, b_base, bytes);
+  Read(other, other_reference, b_base, bytes);
+}
+
+using BenchmarkQuery = bool (*)(const void *, uint64_t, size_t);
+bool BenchmarkFind(const void *object, uint64_t address, size_t bytes) {
+  return static_cast<const Reference *>(object)->Contains(address, bytes);
+}
+bool BenchmarkIterator(const void *object, uint64_t address, size_t bytes) {
+  return static_cast<const Reference *>(object)->ContainsIterator(address, bytes);
+}
+bool BenchmarkActual(const void *object, uint64_t address, size_t bytes) {
+  return static_cast<const DramAddressSpace *>(object)->Contains(address, bytes);
+}
+
 void Benchmark() {
   for (size_t bytes : {size_t(8) << 20, size_t(33) << 20}) {
     DramAddressSpace actual;
     Reference reference;
     Write(actual, reference, 0x200000, bytes, 29);
-    const auto run = [&](bool old) {
+    const auto run = [&](BenchmarkQuery function, const void *object,
+                         unsigned repetitions, bool exact) {
+      // Every candidate uses the same volatile indirect call and accumulator.
+      // This prevents hoisting the repeated pure oracle out of its timed loop.
+      BenchmarkQuery volatile query = function;
+      unsigned matches = 0;
       const auto start = std::chrono::steady_clock::now();
-      for (unsigned i = 0; i < 16; ++i)
-        Check(old ? reference.Contains(0x200000 + i, bytes - i)
-                  : actual.Contains(0x200000 + i, bytes - i), "benchmark lost backing pages");
-      return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      for (unsigned i = 0; i < repetitions; ++i) {
+        const auto offset = exact ? 0 : i;
+        matches += query(object, 0x200000 + offset, bytes - offset);
+      }
+      const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      Check(matches == repetitions, "benchmark lost backing pages");
+      return elapsed;
     };
-    const double old = run(true), optimized = run(false);
+    const double old = run(BenchmarkFind, &reference, 16, false);
+    const double optimized = run(BenchmarkActual, &actual, 16, false);
     std::cout << "informational host Contains bytes=" << bytes << " find_ms=" << old
-              << " iterator_ms=" << optimized << " ratio=" << old / optimized
+              << " optimized_ms=" << optimized << " ratio=" << old / optimized
               << " (not GPU work or timing assertion)\n";
+    // Prime both paths identically outside timing. They query the same address,
+    // byte count, resident pages, and repetition count in alternating order.
+    Check(reference.ContainsIterator(0x200000, bytes) && actual.Contains(0x200000, bytes),
+          "exact hot-range benchmark priming failed");
+    constexpr unsigned repetitions = 64;
+    double iterator_ms = 0, cached_ms = 0;
+    for (unsigned trial = 0; trial < 2; ++trial) {
+      if (trial == 0) {
+        iterator_ms += run(BenchmarkIterator, &reference, repetitions, true);
+        cached_ms += run(BenchmarkActual, &actual, repetitions, true);
+      } else {
+        cached_ms += run(BenchmarkActual, &actual, repetitions, true);
+        iterator_ms += run(BenchmarkIterator, &reference, repetitions, true);
+      }
+    }
+    std::cout << "informational exact repeated host Contains bytes=" << bytes
+              << " queries=" << 2 * repetitions << " iterator_ms=" << iterator_ms
+              << " cached_ms=" << cached_ms << " ratio=" << iterator_ms / cached_ms
+              << " (same repetitions; host query only, not frame speedup or timing assertion)\n";
   }
 }
 } // namespace
@@ -219,6 +439,9 @@ int main(int argc, char **argv) {
   try {
     TestOrdersHolesAndOwnership();
     TestRandomWritesAndExtremes();
+    TestPrimedProofSubrangesAndHoles();
+    TestPrimedProofFailedTopPageWrite();
+    TestPrimedProofCopyMoveAndReset();
     if (argc == 2 && std::string(argv[1]) == "--benchmark") Benchmark();
     std::cout << "DRAM Contains differential PASS checks=" << checks << '\n';
     return 0;

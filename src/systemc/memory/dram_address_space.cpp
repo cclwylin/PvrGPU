@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace pvrgpu::stub {
 namespace {
@@ -16,6 +17,39 @@ std::uint64_t CheckedEnd(std::uint64_t address, std::size_t bytes) {
 }
 
 }  // namespace
+
+DramAddressSpace::DramAddressSpace(const DramAddressSpace &other)
+    : pages_(other.pages_) {}
+
+DramAddressSpace &DramAddressSpace::operator=(const DramAddressSpace &other) {
+  if (this != &other) {
+    // Clear before assignment: a throwing map copy must not leave a proof for
+    // the old backing attached to partially replaced pages.
+    ClearValidatedRanges();
+    pages_ = other.pages_;
+  }
+  return *this;
+}
+
+DramAddressSpace::DramAddressSpace(DramAddressSpace &&other) noexcept
+    : pages_(std::move(other.pages_)) {
+  other.ClearValidatedRanges();
+}
+
+DramAddressSpace &DramAddressSpace::operator=(DramAddressSpace &&other) noexcept {
+  if (this != &other) {
+    ClearValidatedRanges();
+    other.ClearValidatedRanges();
+    pages_ = std::move(other.pages_);
+  }
+  return *this;
+}
+
+void DramAddressSpace::ClearValidatedRanges() noexcept {
+  validated_ranges_ = {};
+  most_recent_range_ = 0;
+  next_validated_range_ = 0;
+}
 
 void DramAddressSpace::EnsureRange(std::uint64_t address, std::size_t bytes) {
   const std::uint64_t end = CheckedEnd(address, bytes);
@@ -75,7 +109,20 @@ bool DramAddressSpace::Contains(std::uint64_t address,
   if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address)
     return false;
   const std::uint64_t end = address + bytes;
+  const auto covers = [address, end](const ValidatedRange &range) {
+    return address >= range.begin && end <= range.end;
+  };
+  if (covers(validated_ranges_[most_recent_range_]))
+    return true;
+  for (std::size_t index = 0; index < validated_ranges_.size(); ++index) {
+    if (covers(validated_ranges_[index])) {
+      most_recent_range_ = index;
+      return true;
+    }
+  }
+
   std::uint64_t page = address - address % kPageBytes;
+  const std::uint64_t first_page = page;
   auto resident = pages_.find(page);
   while (page < end) {
     // The map is ordered and remains const for this query. Seek only once,
@@ -87,6 +134,12 @@ bool DramAddressSpace::Contains(std::uint64_t address,
     page += kPageBytes;
     ++resident;
   }
+  // Only a completed authoritative scan establishes a proof. In particular,
+  // a failed Write may insert the final address-space page before its page
+  // advance overflows; the refusal above must never be bypassed or cached.
+  validated_ranges_[next_validated_range_] = {first_page, page};
+  most_recent_range_ = next_validated_range_;
+  next_validated_range_ = (next_validated_range_ + 1) % kValidatedRangeCount;
   return true;
 }
 
