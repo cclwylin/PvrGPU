@@ -9,6 +9,7 @@
 #include "shader/usc_cluster.h"
 
 #include "common/functional_types.h"
+#include "common/diagnostics.h"
 #include "common/centroid.h"
 #include "common/pipeline_state.h"
 #include "common/msaa.h"
@@ -92,7 +93,7 @@ void AddInstructionCounter(std::uint64_t &counter, std::uint64_t amount) {
 
 std::uint32_t DebugFragmentCoordinate(const char *name,
                                       std::uint32_t fallback) {
-  const char *value = std::getenv(name);
+  const char *value = DiagnosticEnvironment(name);
   if (value == nullptr || *value == '\0')
     return fallback;
   char *end = nullptr;
@@ -748,7 +749,7 @@ void UscCluster::Run() {
         AddInstructionCounter(fragment_dynamic.memory, execution.executed_instructions.memory);
       };
       const bool debug_fragment =
-          std::getenv("PVRGPU_SEQUENCE_DEBUG_FRAGMENT") != nullptr;
+          DiagnosticEnvironment("PVRGPU_SEQUENCE_DEBUG_FRAGMENT") != nullptr;
       const std::uint32_t debug_x =
           debug_fragment
               ? DebugFragmentCoordinate("PVRGPU_SEQUENCE_DEBUG_X", 37U)

@@ -12,6 +12,7 @@
 #include "texture/astc_decoder.h"
 
 #include "common/functional_types.h"
+#include "common/diagnostics.h"
 #include "common/pipeline_state.h"
 
 #include <algorithm>
@@ -172,7 +173,7 @@ namespace {
 
 std::uint32_t DebugFragmentCoordinate(const char *name,
                                       std::uint32_t fallback) {
-  const char *value = std::getenv(name);
+  const char *value = DiagnosticEnvironment(name);
   if (value == nullptr || *value == '\0')
     return fallback;
   char *end = nullptr;
@@ -1471,7 +1472,7 @@ void TextureUnit::SampleRunForStage(
     // TFRAC distributions; this deliberately observes the already-computed
     // datapath and cannot change sampling or descriptor semantics.
     if (fragment_stage &&
-        std::getenv("PVRGPU_SEQUENCE_DEBUG_LOD_HISTOGRAM") != nullptr) {
+        DiagnosticEnvironment("PVRGPU_SEQUENCE_DEBUG_LOD_HISTOGRAM") != nullptr) {
       std::array<std::array<std::uint64_t, kMaximumTextureMipLevels>,
                  kMaximumTextureMipLevels>
           level_pair_counts{};
@@ -1588,7 +1589,7 @@ void TextureUnit::SampleRunForStage(
     responses.reserve(requests.size());
     const bool debug_fragment =
         fragment_stage &&
-        std::getenv("PVRGPU_SEQUENCE_DEBUG_FRAGMENT") != nullptr;
+        DiagnosticEnvironment("PVRGPU_SEQUENCE_DEBUG_FRAGMENT") != nullptr;
     const std::uint32_t debug_x =
         debug_fragment
             ? DebugFragmentCoordinate("PVRGPU_SEQUENCE_DEBUG_X", 37U)
@@ -1618,7 +1619,7 @@ void TextureUnit::SampleRunForStage(
     std::size_t debug_target_index = 0;
     std::uint32_t debug_target_parameter = 0;
     std::uint32_t debug_target_quad = 0;
-    if (debug_lanes.size() == expected_lane_count) {
+    if (kDiagnosticsEnabled && debug_lanes.size() == expected_lane_count) {
       for (std::size_t index = 0; index < requests.size(); ++index) {
         if (requests[index].shader_lane_index >= debug_lanes.size())
           throw std::runtime_error("TextureUnit debug lane is out of range");
@@ -1732,7 +1733,7 @@ void TextureUnit::SampleRunForStage(
     for (std::size_t index = 0; index < requests.size(); ++index) {
       const TextureSampleRequest &request = requests[index];
       const bool debug_request =
-          debug_target_found &&
+          kDiagnosticsEnabled && debug_target_found &&
           debug_lanes[request.shader_lane_index].parameter_index == debug_target_parameter &&
           request.quad_id == debug_target_quad;
       const TextureImplicitLod &lod = implicit_lods[index];

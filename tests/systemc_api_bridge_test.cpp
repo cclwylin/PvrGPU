@@ -109,6 +109,106 @@ bool SubmitFailsWith(pvrgpu_systemc_submit_info *info,
                             std::string::npos;
 }
 
+void SetDisablePng(const char *value) {
+#if defined(_WIN32)
+  if (_putenv_s("PVRGPU_SYSTEMC_DISABLE_PNG", value ? value : "") != 0)
+#else
+  if ((value ? setenv("PVRGPU_SYSTEMC_DISABLE_PNG", value, 1)
+             : unsetenv("PVRGPU_SYSTEMC_DISABLE_PNG")) != 0)
+#endif
+    Fail("cannot configure PNG output fixture");
+}
+
+std::string CounterPayload(const std::string &report) {
+  const auto start = report.find("\"counters\":{");
+  const auto end = report.find('\n', start);
+  if (start == std::string::npos || end == std::string::npos)
+    Fail("missing complete counter and DrawList payload");
+  return report.substr(start, end - start);
+}
+
+void TestPngOutput(pvrgpu_systemc_submit_info info) {
+  std::array<std::uint8_t, 24> baseline{};
+  std::string baseline_counters;
+  for (unsigned mode = 0; mode < 3; ++mode) {
+    const auto folder = g_test_root / ("png-policy-" + std::to_string(mode));
+    std::filesystem::create_directory(folder);
+    const std::string jsonl = (folder / "model.jsonl").string();
+    const std::string stderr_path = (folder / "model.stderr.log").string();
+    const std::string outdir = folder.string();
+    info.jsonl_path = jsonl.c_str();
+    info.stderr_path = stderr_path.c_str();
+    info.outdir = outdir.c_str();
+    SetDisablePng(mode == 0 ? nullptr : mode == 1 ? "0" : "1");
+    std::array<char, 512> error{};
+    if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) != 0)
+      Fail("PNG policy submission failed: " + std::string(error.data()));
+    if (mode == 2) {
+      // Rejected options must neither replace nor execute this pending draw.
+      for (const char *invalid : {"true", "false", "on", "off", "-1", "2", "01", " 1", "1 "}) {
+        SetDisablePng(invalid);
+        if (!SubmitFailsWith(&info, "invalid PVRGPU_SYSTEMC_DISABLE_PNG"))
+          Fail("non-boolean PNG policy was accepted");
+      }
+#if !defined(_WIN32)
+      // Windows _putenv_s removes a variable when passed an empty value.
+      SetDisablePng("");
+      if (!SubmitFailsWith(&info, "invalid PVRGPU_SYSTEMC_DISABLE_PNG"))
+        Fail("empty PNG policy was accepted");
+#endif
+      SetDisablePng("1");
+      info.outdir = "";
+      if (!SubmitFailsWith(&info, "missing SystemC API outdir"))
+        Fail("PNG suppression bypassed the required output directory");
+      info.outdir = outdir.c_str();
+    }
+    // A deferred submit owns its policy, independent of later environment.
+    SetDisablePng(mode == 2 ? "0" : "1");
+    std::array<std::uint8_t, 24> pixels{};
+    pixels.fill(UINT8_C(0xa5));
+    pvrgpu_systemc_readback_info readback{};
+    readback.version = PVRGPU_SYSTEMC_API_VERSION;
+    readback.width = 3;
+    readback.height = 2;
+    readback.bytes_per_pixel = 4;
+    readback.pixels = pixels.data();
+    readback.pixels_size = pixels.size();
+    if (pvrgpu_systemc_flush_readback(&readback, error.data(), error.size()) != 0 ||
+        readback.pixels_written != 1)
+      Fail("PNG policy raw readback failed: " + std::string(error.data()));
+    const auto report = ReadText(jsonl);
+    if (report.find("\"type\":\"done\"") == std::string::npos ||
+        report.find("\"type\":\"error\"") != std::string::npos ||
+        report.find("\"ps_invocations\":6") == std::string::npos ||
+        report.find("\"framebuffer_dram_readback_bytes\":24") == std::string::npos)
+      Fail("PNG policy omitted actual drawing/readback/completion evidence");
+    if (mode == 0) {
+      baseline = pixels;
+      baseline_counters = CounterPayload(report);
+      if (pixels[3] != 255 || (pixels[4] != 30 && pixels[4] != 40))
+        Fail("PNG policy baseline did not render the real texture");
+    } else if (pixels != baseline || CounterPayload(report) != baseline_counters) {
+      Fail("PNG policy changed native pixels or dynamic counters");
+    }
+    const auto png = folder / "driver_textured_triangles_sample_000001.png";
+    if (mode == 2) {
+      if (std::filesystem::exists(png) || report.find("\"artifact_png\"") != std::string::npos ||
+          report.find("@CAPTURE:") != std::string::npos)
+        Fail("disabled PNG still created or advertised an artifact");
+      for (const auto &entry : std::filesystem::directory_iterator(folder))
+        if (entry.path().extension() == ".png")
+          Fail("disabled PNG created an unexpected PNG artifact");
+    } else {
+      png_uint_32 width = 0, height = 0;
+      const auto decoded = ReadPngRgba(png, &width, &height);
+      if (width != 3 || height != 2 || decoded.size() != pixels.size() ||
+          report.find("\"artifact_png\"") == std::string::npos)
+        Fail("default/zero PNG policy did not publish a valid artifact");
+    }
+  }
+  SetDisablePng(nullptr);
+}
+
 void TestPackedClearReadback() {
   for (const bool bgr : {false, true}) {
     const auto folder = g_test_root / (bgr ? "packed-clear-bgr" : "packed-clear-rgb");
@@ -180,6 +280,7 @@ void TestPackedClearReadback() {
 }  // namespace
 
 int main() {
+  SetDisablePng(nullptr);
   const auto nonce = std::chrono::high_resolution_clock::now()
                          .time_since_epoch()
                          .count();
@@ -275,6 +376,7 @@ int main() {
 
   // Register the verifier before the bridge's first submit registers its
   // deferred flusher; preserve the original atexit ordering contract below.
+  TestPngOutput(info);
   TestPackedClearReadback();
 
   std::array<char, 256> error{};

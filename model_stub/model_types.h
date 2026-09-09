@@ -569,6 +569,9 @@ struct Options {
   unsigned height = 512;
   std::string test_case = "fill_solid";
   std::string output_dir;
+  // Human-facing artifact only. Native attachment publication and all model
+  // counters/validation remain enabled when this is false.
+  bool emit_png = true;
   MemoryMode memory_mode = MemoryMode::kCache;
   // Legacy compatibility mirror for --cache-bypass and existing reports.
   // It is true only for kBypass; kDirect is identified by memory_mode.

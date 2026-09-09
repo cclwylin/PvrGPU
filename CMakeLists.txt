@@ -5,6 +5,10 @@ project(PvrGPUControlPlane VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+option(PVRGPU_ENABLE_DIAGNOSTICS
+    "Compile optional model traces and diagnostic dumps (not correctness checks)" ON)
+add_compile_definitions(
+    PVRGPU_ENABLE_DIAGNOSTICS=$<BOOL:${PVRGPU_ENABLE_DIAGNOSTICS}>)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 foreach(build_config IN ITEMS Debug Release RelWithDebInfo MinSizeRel)
@@ -26,6 +30,13 @@ function(pvrgpu_target_warnings target)
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 endfunction()
+
+if(UNIX)
+    add_executable(model-diagnostics-test tests/model_diagnostics_test.cpp)
+    target_include_directories(model-diagnostics-test PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/systemc")
+    pvrgpu_target_warnings(model-diagnostics-test)
+endif()
 
 add_library(pvrgpu-rdc-runner-support STATIC
     src/rdc_runner/native_report.cpp
@@ -370,6 +381,9 @@ if(PVRGPU_ENABLE_LIVE_DEQP)
 endif()
 
 enable_testing()
+if(UNIX)
+    add_test(NAME model-diagnostics-unit COMMAND model-diagnostics-test)
+endif()
 add_executable(rdc-native-report-test tests/rdc_native_report_test.cpp)
 target_link_libraries(rdc-native-report-test PRIVATE pvrgpu-rdc-runner-support)
 pvrgpu_target_warnings(rdc-native-report-test)

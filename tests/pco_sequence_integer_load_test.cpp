@@ -6,6 +6,7 @@
 
 #include "pvrgpu_systemc_api.h"
 #include "shader/pco_iss.h"
+#include "../model_stub/model_types.h"
 
 #include <array>
 #include <chrono>
@@ -143,9 +144,16 @@ pvrgpu_systemc_driver_command MakeDraw(
   return draw;
 }
 
-void SubmitAndFlushWideIntegerSequence(
+struct SequenceResult {
+  std::vector<std::uint8_t> pixels;
+  std::vector<std::uint8_t> depth;
+  std::string counters;
+};
+
+SequenceResult SubmitAndFlushSequence(
     const std::filesystem::path &root, const char *case_name,
-    const char *format, std::uint32_t channels) {
+    const char *format, std::uint32_t channels,
+    bool rgba8 = false, bool expect_png = false) {
   const std::vector<std::uint8_t> fullscreen = VertexBytes({
       {-1.0F, -1.0F, 0.0F, 1.0F},
       {1.0F, -1.0F, 0.0F, 1.0F},
@@ -169,6 +177,16 @@ void SubmitAndFlushWideIntegerSequence(
       MakeDraw(case_name, format, lower_left, vertex_pco, fragment_pco,
                channels, 0),
   };
+  if (rgba8) {
+    for (unsigned i = 0; i < draws.size(); ++i) {
+      draws[i].depth_format = pvrgpu::stub::kDriverPcoDepthFormatZ24X8Unorm;
+      draws[i].depth_enable = 1;
+      draws[i].depth_write = 1;
+      draws[i].depth_func = 3; // LEQUAL: both actual draws pass at z = 0.5.
+      draws[i].depth_clear_bits = kFloatOne;
+      draws[i].depth_attachment_source_command_index = i == 0 ? kNewAttachment : 0;
+    }
+  }
 
   pvrgpu_systemc_driver_command sequence{};
   sequence.version = PVRGPU_SYSTEMC_API_VERSION;
@@ -208,7 +226,7 @@ void SubmitAndFlushWideIntegerSequence(
     Fail(std::string(case_name) + " submit failed: " + error.data());
   }
 
-  const std::uint32_t bytes_per_pixel = channels * sizeof(std::uint32_t);
+  const std::uint32_t bytes_per_pixel = rgba8 ? 4U : channels * sizeof(std::uint32_t);
   std::vector<std::uint8_t> pixels(kWidth * kHeight * bytes_per_pixel,
                                    UINT8_C(0xa5));
   pvrgpu_systemc_readback_info readback{};
@@ -243,6 +261,16 @@ void SubmitAndFlushWideIntegerSequence(
         static_cast<float>(2 * static_cast<int>(y) + 1 -
                            static_cast<int>(kHeight)) /
         static_cast<float>(kHeight);
+    if (rgba8) {
+      // The real varyings shader emits x,y,z,w. These sample centers quantize
+      // to exact UNORM8 codes without an external image or production packer.
+      const std::array<std::uint8_t, 4> codes{0, 0, 64, 191};
+      if (pixels[pixel * 4] != codes[x] ||
+          pixels[pixel * 4 + 1] != codes[y] ||
+          pixels[pixel * 4 + 2] != 0 || pixels[pixel * 4 + 3] != 255)
+        Fail(std::string(case_name) + " RGBA8 sequence pixel mismatch");
+      continue;
+    }
     if (words[0] != FloatBits(expected_x) ||
         words[1] != FloatBits(expected_y)) {
       Fail(std::string(case_name) +
@@ -260,6 +288,43 @@ void SubmitAndFlushWideIntegerSequence(
       report.find("\"type\":\"done\"") == std::string::npos) {
     Fail(std::string(case_name) + " did not complete a two-draw sequence");
   }
+  const auto counters_begin = report.find("\"counters\":{");
+  const auto counters_end = report.find('\n', counters_begin);
+  if (counters_begin == std::string::npos || counters_end == std::string::npos)
+    Fail("sequence did not publish complete counters");
+  SequenceResult result{pixels, {}, report.substr(counters_begin, counters_end - counters_begin)};
+  if (rgba8) {
+    result.depth.assign(kWidth * kHeight * 4, UINT8_C(0xa5));
+    readback.attachment = UINT32_MAX;
+    readback.depth_format = pvrgpu::stub::kDriverPcoDepthFormatZ24X8Unorm;
+    readback.pixels = result.depth.data();
+    readback.pixels_size = result.depth.size();
+    readback.pixels_written = 0;
+    if (pvrgpu_systemc_flush_readback(&readback, error.data(), error.size()) != 0 ||
+        readback.pixels_written != 1 ||
+        result.depth == std::vector<std::uint8_t>(result.depth.size(), UINT8_C(0xa5)))
+      Fail("RGBA8 sequence did not publish actual depth readback: " + std::string(error.data()));
+    if (report.find("\"ps_invocations\":0,") != std::string::npos ||
+        report.find("\"type\":\"error\"") != std::string::npos)
+      Fail("RGBA8 sequence omitted native fragment work or reported an error");
+    const auto png = run_root / "out" / "driver_pco_triangles_sample_000001.png";
+    if (std::filesystem::exists(png) != expect_png ||
+        (report.find("\"artifact_png\"") != std::string::npos) != expect_png)
+      Fail("sequence PNG output did not follow the requested policy");
+    if (expect_png && std::filesystem::file_size(png) < 8)
+      Fail("default sequence PNG is empty");
+  }
+  return result;
+}
+
+void SetDisablePng(const char *value) {
+#if defined(_WIN32)
+  if (_putenv_s("PVRGPU_SYSTEMC_DISABLE_PNG", value ? value : "") != 0)
+#else
+  if ((value ? setenv("PVRGPU_SYSTEMC_DISABLE_PNG", value, 1)
+             : unsetenv("PVRGPU_SYSTEMC_DISABLE_PNG")) != 0)
+#endif
+    Fail("cannot configure sequence PNG output");
 }
 
 }  // namespace
@@ -272,10 +337,20 @@ int main() {
       ("pvrgpu-pco-sequence-integer-load-test-" + std::to_string(nonce));
   std::filesystem::create_directories(root);
 
-  SubmitAndFlushWideIntegerSequence(root, "sequence-rg32ui-load",
+  SetDisablePng(nullptr);
+  SubmitAndFlushSequence(root, "sequence-rg32ui-load",
                                     "PIPE_FORMAT_R32G32_UINT", 2);
-  SubmitAndFlushWideIntegerSequence(root, "sequence-rgba32ui-load",
+  SubmitAndFlushSequence(root, "sequence-rgba32ui-load",
                                     "PIPE_FORMAT_R32G32B32A32_UINT", 4);
+  const auto with_png = SubmitAndFlushSequence(root, "sequence-rgba8-png",
+      "PIPE_FORMAT_R8G8B8A8_UNORM", 4, true, true);
+  SetDisablePng("1");
+  const auto no_png = SubmitAndFlushSequence(root, "sequence-rgba8-no-png",
+      "PIPE_FORMAT_R8G8B8A8_UNORM", 4, true, false);
+  SetDisablePng(nullptr);
+  if (with_png.pixels != no_png.pixels || with_png.depth != no_png.depth ||
+      with_png.counters != no_png.counters)
+    Fail("PNG suppression changed actual sequence color/depth/counters");
 
   std::error_code error;
   std::filesystem::remove_all(root, error);

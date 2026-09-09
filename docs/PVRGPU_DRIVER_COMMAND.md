@@ -772,6 +772,27 @@ build/bin/pvrgpu-model-stub \
 The model validates every required field before execution. A malformed,
 unknown, or unsupported command fails before counters are emitted.
 
+Native in-process bridge submissions also accept
+`PVRGPU_SYSTEMC_DISABLE_PNG=1` to suppress the bridge's intermediate PNG
+artifacts. Unset or `0` preserves the default PNG output; every other value
+(including empty strings) is rejected at submission. The setting is captured
+with the submitted command, including deferred execution. It does not remove
+the required output directory, native color/depth readback, modeled memory
+traffic, dynamic counters, errors, or validation. No `artifact_png` reference
+is emitted for a suppressed artifact. A replay client can still read the
+actual final attachment and encode its own final PNG. This option is specific
+to bridge submissions, not the standalone model command-line interface.
+
+For an optimized model build, use CMake `Release` together with
+`-DPVRGPU_ENABLE_DIAGNOSTICS=OFF` in a separate build directory. Diagnostics
+default to `ON`; disabling them compiles out optional shader/texture traces
+and sequence debug hashes/dumps, not modeled work, counters, synchronization,
+or correctness checks. This compile-time setting is independent of PNG
+suppression. A final-frame timing should retain native counter output and
+final framebuffer readback, then compare the completed counters and pixels
+with the diagnostic baseline outside the timed process. Disabling diagnostic
+output alone is not evidence of correct or faster execution.
+
 ## Format
 
 The command file is UTF-8 text with one strict `key=value` field per line.

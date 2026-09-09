@@ -12,6 +12,7 @@
 // 大型 vertex/index/pipeline payload 留在 MemoryPool，output FIFO 只傳
 // PipelineTxn handle 與 frame/sequence metadata。
 #include "submitter.h"
+#include "common/diagnostics.h"
 #include "uniform_buffers.h"
 #include "shader_images.h"
 #include "common/geometry_emission.h"
@@ -668,7 +669,7 @@ std::uint64_t Fnv1a64(const Container &values) {
 void DebugSequenceResourceHashes(
     const GpuMemorySystem &memory, std::size_t consumer_ordinal,
     const DriverPcoSampledTexture &texture, std::uint64_t gpu_address) {
-  const char *enabled = std::getenv("PVRGPU_SEQUENCE_DEBUG_HASHES");
+  const char *enabled = DiagnosticEnvironment("PVRGPU_SEQUENCE_DEBUG_HASHES");
   if (!enabled || std::string_view(enabled) != "1")
     return;
   for (std::size_t level = 0; level < texture.mip_count; ++level) {
@@ -685,7 +686,7 @@ void DebugSequenceResourceHashes(
               << std::setw(16) << std::setfill('0') << Fnv1a64(payload)
               << std::dec << std::setfill(' ') << '\n';
     const char *dump_dir =
-        std::getenv("PVRGPU_SEQUENCE_DEBUG_DUMP_DIR");
+        DiagnosticEnvironment("PVRGPU_SEQUENCE_DEBUG_DUMP_DIR");
     if (dump_dir && dump_dir[0]) {
       const std::string path =
           std::string(dump_dir) + "/consumer" +

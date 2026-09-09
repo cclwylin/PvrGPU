@@ -1035,6 +1035,21 @@ bool SetMemoryMode(const char *text, pvrgpu::stub::Options *options,
   return false;
 }
 
+bool SetPngOutputFromEnvironment(pvrgpu::stub::Options *options,
+                                std::string *error) {
+  const char *value = std::getenv("PVRGPU_SYSTEMC_DISABLE_PNG");
+  if (!value || std::string_view(value) == "0") {
+    options->emit_png = true;
+    return true;
+  }
+  if (std::string_view(value) == "1") {
+    options->emit_png = false;
+    return true;
+  }
+  *error = "invalid PVRGPU_SYSTEMC_DISABLE_PNG (expected 0 or 1, or unset)";
+  return false;
+}
+
 bool CopyTextureSidecarBytes(
     const pvrgpu_systemc_driver_command &source,
     std::vector<std::uint8_t> *destination, std::string *error) {
@@ -3137,6 +3152,12 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
 
   pvrgpu::stub::Options options;
   options.output_dir = info->outdir;
+  // Capture the output policy with the owned command; changing the process
+  // environment after submission must not change a deferred job's output.
+  if (!SetPngOutputFromEnvironment(&options, &message)) {
+    CopyError(error, error_size, message);
+    return 2;
+  }
   if (!SetMemoryMode(info->memory_mode, &options, &message)) {
     CopyError(error, error_size, message);
     return 2;
@@ -3180,6 +3201,7 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
         g_pending_submit.jsonl_path == info->jsonl_path &&
         g_pending_submit.stderr_path == stderr_path &&
         g_pending_submit.options.output_dir == info->outdir &&
+        g_pending_submit.options.emit_png == options.emit_png &&
         g_pending_submit.options.memory_mode == options.memory_mode &&
         CommandsShareSequenceTarget(g_pending_submit.options.driver_command,
                                     options.driver_command);

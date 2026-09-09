@@ -11,6 +11,7 @@
 #include "common/stream_output_types.h"
 #include "shader/pco_iss.h"
 #include "support/png_writer.h"
+#include "common/diagnostics.h"
 
 #include <array>
 #include <cstdio>
@@ -886,7 +887,7 @@ void DebugSequenceAttachments(const MemoryPool &pool,
                               const DriverCommand &command,
                               std::size_t ordinal) {
   const char *enabled =
-      std::getenv("PVRGPU_SEQUENCE_DEBUG_ATTACHMENTS");
+      DiagnosticEnvironment("PVRGPU_SEQUENCE_DEBUG_ATTACHMENTS");
   if (!enabled || std::string_view(enabled) != "1")
     return;
   if (!HasPoolHandle(state.dram_framebuffer))
@@ -991,7 +992,7 @@ void DebugSequenceAttachments(const MemoryPool &pool,
                      state.depth_attachment_bytes);
   std::cerr << '\n';
 
-  const char *dump_dir = std::getenv("PVRGPU_SEQUENCE_DEBUG_DUMP_DIR");
+  const char *dump_dir = DiagnosticEnvironment("PVRGPU_SEQUENCE_DEBUG_DUMP_DIR");
   if (!dump_dir || !dump_dir[0])
     return;
   const auto write_dump = [&](const char *suffix, const void *data,
@@ -1025,7 +1026,7 @@ void DebugSequenceVertexOutputs(const MemoryPool &pool,
                                 const PipelineState &state,
                                 const DriverCommand &command,
                                 std::size_t ordinal) {
-  const char *enabled = std::getenv("PVRGPU_SEQUENCE_DEBUG_HASHES");
+  const char *enabled = DiagnosticEnvironment("PVRGPU_SEQUENCE_DEBUG_HASHES");
   if (!enabled || std::string_view(enabled) != "1" ||
       !HasPoolHandle(state.vertex_lanes)) {
     return;
@@ -1070,7 +1071,7 @@ void DebugSequenceVertexOutputs(const MemoryPool &pool,
   print_hash("position", positions);
   print_hash("varying", varyings);
 
-  const char *dump_dir = std::getenv("PVRGPU_SEQUENCE_DEBUG_DUMP_DIR");
+  const char *dump_dir = DiagnosticEnvironment("PVRGPU_SEQUENCE_DEBUG_DUMP_DIR");
   if (dump_dir && dump_dir[0]) {
     const auto write_dump = [&](const char *suffix, const void *data,
                                 std::size_t size) {
@@ -2630,7 +2631,7 @@ void JsonReporter::RunJob() {
       // An integer attachment's pixel is not an RGBA8 colour, so there is no
       // PNG to write for one.  The readback above still carries its real
       // bytes; only the human-facing artifact is skipped.
-      if (!options_.output_dir.empty() && final_bytes_per_pixel == 4U &&
+      if (options_.emit_png && !options_.output_dir.empty() && final_bytes_per_pixel == 4U &&
           final_sample_count == 1U && final_layer_count == 1U) {
         artifact_path = FramePath(options_, 1);
         // Ordered native PCO sequences publish only the final physical DRAM
@@ -2767,7 +2768,7 @@ void JsonReporter::RunJob() {
       std::filesystem::path artifact_path;
       // As above: an integer attachment has no RGBA8 rendering, so it gets no
       // PNG.  The pixels the driver reads back are unaffected.
-      if (!options_.output_dir.empty() && frame_bytes_per_pixel == 4U &&
+      if (options_.emit_png && !options_.output_dir.empty() && frame_bytes_per_pixel == 4U &&
           state.raster_state.sample_count == 1U && state.attachment_layers == 1U) {
         artifact_path = FramePath(options_, state.counters.frame);
         std::vector<std::uint8_t> artifact_framebuffer = PackedUnormDisplayBytes(

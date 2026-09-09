@@ -16,6 +16,7 @@
  * "PowerVR-like" opcode format or shader-name shortcut exists.
  */
 #include "pco_iss.h"
+#include "common/diagnostics.h"
 #include "common/msaa.h"
 
 #include <algorithm>
@@ -2565,7 +2566,7 @@ PcoInstruction DecodeGenericPackGroup(
     opcode = round_to_zero ? PcoOpcode::kFloatToInt32Rtz
                            : PcoOpcode::kFloatToInt32Rtne;
   else {
-    if (std::getenv("PVRGPU_PCO_DECODE_DUMP")) {
+    if (DiagnosticEnvironment("PVRGPU_PCO_DECODE_DUMP")) {
       std::cerr << "PCO_DECODE_DUMP PCK modifiers=0x" << std::hex
                 << static_cast<unsigned>(modifiers) << " at offset "
                 << std::dec << (header.offset + 4) << " total_bytes="
@@ -8008,7 +8009,7 @@ PcoDecodedProgram DecodePcoProgram(ShaderStage stage,
   PcoDecodedProgram decoded;
   decoded.summary.stage = stage;
   decoded.summary.binary_size = static_cast<std::uint32_t>(binary.size());
-  if (std::getenv("PVRGPU_PCO_DECODE_DUMP")) {
+  if (DiagnosticEnvironment("PVRGPU_PCO_DECODE_DUMP")) {
     std::cerr << "PCO_DECODE_BINARY stage="
               << (stage == ShaderStage::kFragment ? "fragment" : "vertex")
               << " size=" << binary.size() << " bytes=";
@@ -9292,7 +9293,7 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
    * exact sample coordinates so a replay does not emit every fragment. */
   const auto trace_coordinate = [](const char *name,
                                    std::uint32_t fallback) {
-    const char *text = std::getenv(name);
+    const char *text = DiagnosticEnvironment(name);
     if (text == nullptr || *text == '\0')
       return fallback;
     char *end = nullptr;
@@ -9307,14 +9308,15 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
     std::memcpy(&bits, &value, sizeof(bits));
     return bits;
   };
-  const char *trace_flag = std::getenv("PVRGPU_PCO_TRACE_FRAGMENT");
+  const char *trace_flag = DiagnosticEnvironment("PVRGPU_PCO_TRACE_FRAGMENT");
   const std::uint32_t trace_binary = trace_coordinate(
       "PVRGPU_PCO_TRACE_BINARY_SIZE", summary.binary_size);
   const std::uint32_t trace_x =
       trace_coordinate("PVRGPU_PCO_TRACE_X", UINT32_MAX);
   const std::uint32_t trace_y =
       trace_coordinate("PVRGPU_PCO_TRACE_Y", UINT32_MAX);
-  const bool trace = trace_flag != nullptr && *trace_flag != '\0' &&
+  const bool trace = kDiagnosticsEnabled &&
+                     trace_flag != nullptr && *trace_flag != '\0' &&
                      summary.binary_size == trace_binary &&
                      context.sample_x == float_bits(static_cast<float>(trace_x)) &&
                      context.sample_y == float_bits(static_cast<float>(trace_y));
