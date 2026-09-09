@@ -38,6 +38,7 @@ const std::set<std::string> &KnownFields() {
       "schema", "producer", "command", "case", "frame",
       "raw_index_data_size", "index_size", "first_index", "base_vertex",
       "render_target_count", "vertex_attribute_count",
+      "color_attachment_format_count", "color_attachment_formats",
       "framebuffer_width", "framebuffer_height", "width",
       "height", "format", "clear_color_bits", "fragment_color_bits",
       "vertex0_bits", "vertex1_bits", "vertex2_bits",
@@ -340,6 +341,8 @@ bool RequireExactFields(const std::map<std::string, std::string> &fields,
     const bool optional_pco_render_targets =
         command == kDrawPcoTrianglesCommand &&
         (entry.first == "render_target_count" ||
+         entry.first == "color_attachment_format_count" ||
+         entry.first == "color_attachment_formats" ||
          entry.first == "vertex_attribute_count");
     const bool optional_pco_index =
         command == kDrawPcoTrianglesCommand &&
@@ -707,6 +710,26 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
       return false;
     }
     const auto varying = fields.find("varying_linkage");
+    const auto format_count = fields.find("color_attachment_format_count");
+    const auto formats = fields.find("color_attachment_formats");
+    if (format_count != fields.end() || formats != fields.end()) {
+      std::uint32_t count = 0;
+      if (format_count == fields.end() || formats == fields.end() ||
+          !ParseU32(format_count->second, &count) || count == 0 || count > 4 ||
+          formats->second.empty() || formats->second.back() == ',') {
+        *error = "driver command explicit color attachment formats require a complete nonempty count/list";
+        return false;
+      }
+      std::istringstream list(formats->second);
+      std::string format;
+      while (std::getline(list, format, ','))
+        parsed.color_attachment_formats.push_back(format);
+      if (parsed.color_attachment_formats.size() != count ||
+          !DriverColorAttachmentFormatsAreValid(parsed)) {
+        *error = "driver command color attachment formats are invalid";
+        return false;
+      }
+    }
     if (varying != fields.end() &&
         !ParseU32List(varying->second, &varying_linkage)) {
       *error = "draw_pco_triangles varying_linkage must contain four uint32 "

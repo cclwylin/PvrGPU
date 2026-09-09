@@ -8,6 +8,7 @@
 #include "json_reporter.h"
 
 #include "common/functional_types.h"
+#include "common/color_attachment_formats.h"
 #include "common/stream_output_types.h"
 #include "shader/pco_iss.h"
 #include "support/png_writer.h"
@@ -207,6 +208,7 @@ struct FragmentPcoEvidence {
   std::uint64_t pck_cov = 0;
   std::uint64_t savmsk_vm = 0;
   std::uint64_t shr = 0;
+  std::uint64_t ftb = 0;
   std::uint64_t tstz = 0;
   std::uint64_t ffloor = 0;
   std::uint64_t fsub = 0;
@@ -492,6 +494,9 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kNop:
       ++evidence.nop;
       break;
+    case PcoOpcode::kFindTopBit:
+      ++evidence.ftb;
+      break;
     case PcoOpcode::kInternal:
       ++evidence.internal;
       break;
@@ -680,7 +685,7 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
   if (evidence.nop + evidence.fitrp + evidence.fitr + evidence.depthf + evidence.alphaf + evidence.atomic32 + evidence.branch + evidence.cnd + evidence.ld + evidence.wdf + evidence.fadd + evidence.fmul +
           evidence.mbyp + evidence.smp + evidence.internal + evidence.fneg +
           evidence.fabs +
-          evidence.movi + evidence.pck_cov + evidence.savmsk_vm + evidence.shr +
+          evidence.movi + evidence.pck_cov + evidence.savmsk_vm + evidence.shr + evidence.ftb +
           evidence.tstz + evidence.ffloor +
           evidence.fsub + evidence.fge + evidence.feq + evidence.flt +
       evidence.bcmp +
@@ -806,6 +811,7 @@ void AppendFragmentPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_FRAGMENT_EVIDENCE(pck_cov);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(savmsk_vm);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(shr);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(ftb);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(tstz);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(ffloor);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(fsub);
@@ -1159,6 +1165,7 @@ void AccumulatePhysicalCounters(CounterTxn *aggregate,
   PVRGPU_ADD_COUNTER(ds_invocations);
   PVRGPU_ADD_COUNTER(tcs_invocations);
   PVRGPU_ADD_COUNTER(tcs_alu_instructions);
+  PVRGPU_ADD_COUNTER(tcs_tex_instructions);
   PVRGPU_ADD_COUNTER(tcs_memory_instructions);
   PVRGPU_ADD_COUNTER(tcs_load_instructions);
   PVRGPU_ADD_COUNTER(tcs_store_instructions);
@@ -1167,6 +1174,7 @@ void AccumulatePhysicalCounters(CounterTxn *aggregate,
   PVRGPU_ADD_COUNTER(tcs_output_write_bytes);
   PVRGPU_ADD_COUNTER(tcs_output_read_bytes);
   PVRGPU_ADD_COUNTER(tes_alu_instructions);
+  PVRGPU_ADD_COUNTER(tes_tex_instructions);
   PVRGPU_ADD_COUNTER(tes_memory_instructions);
   PVRGPU_ADD_COUNTER(tes_load_instructions);
   PVRGPU_ADD_COUNTER(tes_patch_read_bytes);
@@ -1285,8 +1293,8 @@ void ValidateDrawListStats(const CounterTxn &counters,
   std::uint64_t gs_alu = 0;
   std::uint64_t gs_tex = 0;
   std::uint64_t gs_memory = 0;
-  std::uint64_t tcs_invocations = 0, tcs_alu = 0, tcs_memory = 0;
-  std::uint64_t tes_invocations = 0, tes_alu = 0, tes_memory = 0;
+  std::uint64_t tcs_invocations = 0, tcs_alu = 0, tcs_tex = 0, tcs_memory = 0;
+  std::uint64_t tes_invocations = 0, tes_alu = 0, tes_tex = 0, tes_memory = 0;
   std::uint64_t fs_alu = 0;
   std::uint64_t fs_tex = 0;
   std::uint64_t fs_memory = 0;
@@ -1323,12 +1331,12 @@ void ValidateDrawListStats(const CounterTxn &counters,
     for (const auto *shader : {&drawlist.tessellation_control,
                               &drawlist.tessellation_evaluation}) {
       if (shader->program_recorded != shader->executions_recorded ||
-          shader->program_recorded > 1 || shader->program_tex_instructions ||
-          shader->executed_tex_instructions ||
+          shader->program_recorded > 1 ||
           (!shader->program_recorded &&
            (shader->invocations || shader->program_groups ||
             shader->program_instructions || shader->program_alu_instructions ||
-            shader->program_memory_instructions ||
+            shader->program_memory_instructions || shader->program_tex_instructions ||
+            shader->executed_tex_instructions ||
             shader->executed_alu_instructions || shader->executed_memory_instructions)))
         throw std::runtime_error("JsonReporter received incomplete tessellation DrawList statistics");
     }
@@ -1337,9 +1345,11 @@ void ValidateDrawListStats(const CounterTxn &counters,
       throw std::runtime_error("JsonReporter tessellation DrawList stage pair is incomplete");
     AddDrawListCounter(tcs_invocations, drawlist.tessellation_control.invocations);
     AddDrawListCounter(tcs_alu, drawlist.tessellation_control.executed_alu_instructions);
+    AddDrawListCounter(tcs_tex, drawlist.tessellation_control.executed_tex_instructions);
     AddDrawListCounter(tcs_memory, drawlist.tessellation_control.executed_memory_instructions);
     AddDrawListCounter(tes_invocations, drawlist.tessellation_evaluation.invocations);
     AddDrawListCounter(tes_alu, drawlist.tessellation_evaluation.executed_alu_instructions);
+    AddDrawListCounter(tes_tex, drawlist.tessellation_evaluation.executed_tex_instructions);
     AddDrawListCounter(tes_memory, drawlist.tessellation_evaluation.executed_memory_instructions);
     AddDrawListCounter(fs_alu, drawlist.fragment.executed_alu_instructions);
     AddDrawListCounter(fs_tex, drawlist.fragment.executed_tex_instructions);
@@ -1355,9 +1365,11 @@ void ValidateDrawListStats(const CounterTxn &counters,
       gs_memory != counters.gs_memory_instructions ||
       tcs_invocations != counters.tcs_invocations ||
       tcs_alu != counters.tcs_alu_instructions ||
+      tcs_tex != counters.tcs_tex_instructions ||
       tcs_memory != counters.tcs_memory_instructions ||
       tes_invocations != counters.ds_invocations ||
       tes_alu != counters.tes_alu_instructions ||
+      tes_tex != counters.tes_tex_instructions ||
       tes_memory != counters.tes_memory_instructions ||
       counters.hs_invocations != counters.tessellation_patches ||
       fs_alu != counters.fs_alu_instructions ||
@@ -1831,6 +1843,17 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
               << command.framebuffer_width
               << ",\"driver_command_framebuffer_height\":"
               << command.framebuffer_height;
+    if (!command.color_attachment_formats.empty()) {
+      std::cout << ",\"driver_command_color_attachment_format_count\":"
+                << command.color_attachment_formats.size()
+                << ",\"driver_command_color_attachment_formats\":[";
+      for (std::size_t target = 0; target < command.color_attachment_formats.size(); ++target) {
+        if (target)
+          std::cout << ',';
+        std::cout << '"' << JsonEscape(command.color_attachment_formats[target]) << '"';
+      }
+      std::cout << ']';
+    }
     if (!options.driver_commands.empty()) {
       std::cout << ",\"driver_command_sequence_length\":"
                 << options.driver_commands.size();
@@ -1979,6 +2002,8 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"savmsk_vm\":" << fragment_pco.savmsk_vm;
   if (fragment_pco.shr != 0)
     std::cout << ",\"shr\":" << fragment_pco.shr;
+  if (fragment_pco.ftb != 0)
+    std::cout << ",\"ftb\":" << fragment_pco.ftb;
   if (fragment_pco.tstz != 0)
     std::cout << ",\"tstz\":" << fragment_pco.tstz;
   if (fragment_pco.ffloor != 0)
@@ -2080,6 +2105,7 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
       << ",\"ds_invocations\":" << counters.ds_invocations
       << ",\"tcs_invocations\":" << counters.tcs_invocations
       << ",\"tcs_alu_instructions\":" << counters.tcs_alu_instructions
+      << ",\"tcs_tex_instructions\":" << counters.tcs_tex_instructions
       << ",\"tcs_memory_instructions\":" << counters.tcs_memory_instructions
       << ",\"tcs_load_instructions\":" << counters.tcs_load_instructions
       << ",\"tcs_store_instructions\":" << counters.tcs_store_instructions
@@ -2088,6 +2114,7 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
       << ",\"tcs_output_write_bytes\":" << counters.tcs_output_write_bytes
       << ",\"tcs_output_read_bytes\":" << counters.tcs_output_read_bytes
       << ",\"tes_alu_instructions\":" << counters.tes_alu_instructions
+      << ",\"tes_tex_instructions\":" << counters.tes_tex_instructions
       << ",\"tes_memory_instructions\":" << counters.tes_memory_instructions
       << ",\"tes_load_instructions\":" << counters.tes_load_instructions
       << ",\"tes_patch_read_bytes\":" << counters.tes_patch_read_bytes
@@ -2340,6 +2367,24 @@ void JsonReporter::Run() {
   }
 }
 
+static std::vector<std::string> ReportedColorAttachmentFormats(
+    const DriverCommand &command, const PipelineState &state) {
+  const auto targets = ValidateColorAttachmentFormats(state);
+  // Built-in fixtures have no driver format strings; retain their legacy
+  // publication contract rather than inventing a transport identity.
+  if (!command.enabled)
+    return {};
+  if (!DriverColorAttachmentFormatsAreValid(command) ||
+      state.color_attachment_format_count != command.color_attachment_formats.size() ||
+      targets != (command.render_target_count ? command.render_target_count : 1U))
+    throw std::runtime_error("JsonReporter color attachment format ownership mismatch");
+  const auto formats = EffectiveDriverColorAttachmentFormats(command);
+  for (std::uint32_t target = 0; target < targets; ++target)
+    if (ColorAttachmentPackedUnorm(state, target) != PackedUnormFormatFromName(formats[target]))
+      throw std::runtime_error("JsonReporter color attachment codec mismatch");
+  return formats;
+}
+
 void JsonReporter::RunJob() {
   if (!options_.driver_commands.empty()) {
     const bool generic_sequence =
@@ -2358,6 +2403,8 @@ void JsonReporter::RunJob() {
      * is published from.  A shader returning more than one result writes one
      * per target and the driver reads back each in turn. */
     std::vector<std::vector<std::uint8_t>> final_extra_framebuffers;
+    std::vector<std::string> final_color_formats;
+    bool final_color_formats_explicit = false;
     std::uint32_t final_bytes_per_pixel = 4;
     PackedUnormFormat final_packed_unorm = PackedUnormFormat::kNone;
     std::uint32_t final_sample_count = 1;
@@ -2392,6 +2439,7 @@ void JsonReporter::RunJob() {
             static_cast<std::uint32_t>(completed + 1U);
         const DriverCommand &physical_command =
             options_.driver_commands[completed];
+        const auto color_formats = ReportedColorAttachmentFormats(physical_command, state);
         const std::uint32_t expected_width =
             generic_sequence ? physical_command.framebuffer_width
                              : options_.width;
@@ -2535,6 +2583,8 @@ void JsonReporter::RunJob() {
           aggregate_drawlists.push_back(drawlist);
         }
         final_framebuffer = framebuffer;
+        final_color_formats = color_formats;
+        final_color_formats_explicit = !physical_command.color_attachment_formats.empty();
         final_extra_framebuffers.clear();
         for (std::uint64_t target = 1; target < submission_render_target_count;
              ++target) {
@@ -2623,7 +2673,8 @@ void JsonReporter::RunJob() {
         job_->PublishFramebuffer(final_framebuffer, final_width, final_height,
                                  final_bytes_per_pixel,
                                  std::move(final_extra_framebuffers),
-                                 final_sample_count, final_layer_count);
+                                 final_sample_count, final_layer_count,
+                                 std::move(final_color_formats), final_color_formats_explicit);
         job_->depth_framebuffer = std::move(final_depth_framebuffer);
         job_->depth_format = final_depth_format;
       }
@@ -2749,6 +2800,7 @@ void JsonReporter::RunJob() {
       const std::uint32_t frame_bytes_per_pixel = static_cast<std::uint32_t>(
           ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
                                        state.color_attachment_float32));
+      const auto color_formats = ReportedColorAttachmentFormats(options_.driver_command, state);
       if (job_) {
         // Clear-only jobs may use internal drawing machinery, but do not
         // generate application primitives. Never count that implementation.
@@ -2763,7 +2815,9 @@ void JsonReporter::RunJob() {
         job_->PublishFramebuffer(framebuffer, state.width, state.height,
                                  frame_bytes_per_pixel,
                                  std::move(extra_framebuffers),
-                                 state.raster_state.sample_count, state.attachment_layers);
+                                 state.raster_state.sample_count, state.attachment_layers,
+                                 color_formats,
+                                 !options_.driver_command.color_attachment_formats.empty());
       }
       std::filesystem::path artifact_path;
       // As above: an integer attachment has no RGBA8 rendering, so it gets no

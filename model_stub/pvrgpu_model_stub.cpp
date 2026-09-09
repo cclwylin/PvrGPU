@@ -750,6 +750,10 @@ private:
       "geometry_to_texture_samples", ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> texture_samples_to_geometry{
       "texture_samples_to_geometry", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> control_to_texture_samples{"control_to_texture_samples", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> texture_samples_to_control{"texture_samples_to_control", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> evaluation_to_texture_samples{"evaluation_to_texture_samples", ModelFifoDepth()};
+  sc_core::sc_fifo<PipelineTxn> texture_samples_to_evaluation{"texture_samples_to_evaluation", ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> vertex_cluster_to_clip{"vertex_cluster_to_clip",
                                                        ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> geometry_to_clip{"geometry_to_clip", ModelFifoDepth()};
@@ -881,6 +885,10 @@ ModelSession::ModelSession(MemoryMode memory_mode, bool cache_bypass)
   geometry_shader.output(geometry_to_stream_output);
   geometry_shader.texture_request_output(geometry_to_texture_samples);
   geometry_shader.texture_response_input(texture_samples_to_geometry);
+  tessellation_control_shader.texture_request_output(control_to_texture_samples);
+  tessellation_control_shader.texture_response_input(texture_samples_to_control);
+  tessellation_evaluation_shader.texture_request_output(evaluation_to_texture_samples);
+  tessellation_evaluation_shader.texture_response_input(texture_samples_to_evaluation);
   stream_output.input(geometry_to_stream_output);
   stream_output.output(geometry_to_clip);
   clip_cull.input(geometry_to_clip);
@@ -913,6 +921,10 @@ ModelSession::ModelSession(MemoryMode memory_mode, bool cache_bypass)
   texture_unit.vertex_sample_output(texture_samples_to_vertex_cluster);
   texture_unit.geometry_sample_input(geometry_to_texture_samples);
   texture_unit.geometry_sample_output(texture_samples_to_geometry);
+  texture_unit.tessellation_control_sample_input(control_to_texture_samples);
+  texture_unit.tessellation_control_sample_output(texture_samples_to_control);
+  texture_unit.tessellation_evaluation_sample_input(evaluation_to_texture_samples);
+  texture_unit.tessellation_evaluation_sample_output(texture_samples_to_evaluation);
   texture_unit.input(fragment_cluster_to_texture);
   texture_unit.output(texture_to_pbe);
   pbe.input(texture_to_pbe);
@@ -975,6 +987,8 @@ int ModelSession::Run(const Options &options, ModelFramebuffer *framebuffer,
     framebuffer->shader_images = job.shader_images;
     framebuffer->pixels = job.framebuffer;
     framebuffer->extra = job.extra_framebuffers;
+    framebuffer->color_formats = job.framebuffer_color_formats;
+    framebuffer->color_formats_explicit = job.framebuffer_color_formats_explicit;
     framebuffer->width = job.framebuffer_width;
     framebuffer->height = job.framebuffer_height;
     framebuffer->bytes_per_pixel = job.framebuffer_bytes_per_pixel;

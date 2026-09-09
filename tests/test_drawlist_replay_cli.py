@@ -298,6 +298,55 @@ class DrawListReplayCliTest(unittest.TestCase):
             artifact.write_bytes(before)
         self.assertEqual(len(self.calls()), 2)
 
+    def test_gles_version_is_explicit_and_pinned_across_resume(self) -> None:
+        dirty = dict(os.environ, MESA_GLES_VERSION_OVERRIDE="9.9")
+        for backend in ("pvrgpu", "llvmpipe"):
+            with self.subTest(backend=backend):
+                snapshot, manifest = self.save(backend=backend, env=dirty,
+                                               extra=("--gles-version", "3.2"))
+                self.assertEqual(manifest["runtime"]["gles_version_override"], "3.2")
+                self.assertEqual(self.calls()[-1]["env"]["MESA_GLES_VERSION_OVERRIDE"], "3.2")
+                calls_before = len(self.calls())
+                extra = ("--allow-model-change",) if backend == "pvrgpu" else ()
+                result, out = self.run_cli(148, resume=snapshot, backend=backend, extra=extra)
+                self.failed(result, out, "runtime changed: GLES version")
+                self.assertEqual(len(self.calls()), calls_before)
+                self.save(148, resume=snapshot, backend=backend, extra=("--gles-version", "3.2"))
+        _, default = self.save(env=dirty)
+        self.assertEqual(default["runtime"]["gles_version_override"], "3.1")
+        self.assertEqual(self.calls()[-1]["env"]["MESA_GLES_VERSION_OVERRIDE"], "3.1")
+
+    def test_legacy_runtime_is_only_compatible_with_gles31(self) -> None:
+        snapshot, manifest = self.save()
+        manifest["runtime"]["schema"] = MODULE.LEGACY_RUNTIME_SCHEMA
+        manifest["runtime"].pop("gles_version_override")
+        (snapshot / "manifest.json").write_text(json.dumps(manifest))
+        _, resumed = self.save(148, resume=snapshot)
+        self.assertEqual(resumed["runtime"]["schema"], MODULE.RUNTIME_SCHEMA)
+        self.assertEqual(resumed["runtime"]["gles_version_override"], "3.1")
+        result, out = self.run_cli(148, resume=snapshot, extra=("--gles-version", "3.2",
+                                                              "--allow-model-change"))
+        self.failed(result, out, "runtime changed: GLES version")
+        manifest["runtime"]["gles_version_override"] = "3.2"
+        (snapshot / "manifest.json").write_text(json.dumps(manifest))
+        result, out = self.run_cli(148, resume=snapshot, extra=("--gles-version", "3.2"))
+        self.failed(result, out, "legacy runtime must use its fixed GLES 3.1 contract")
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_new_runtime_requires_a_valid_gles_version_before_child(self) -> None:
+        snapshot, manifest = self.save()
+        for value in (None, "", "3.0", "3.20", 3.1, True, {}, []):
+            with self.subTest(value=value):
+                manifest["runtime"]["gles_version_override"] = value
+                (snapshot / "manifest.json").write_text(json.dumps(manifest))
+                result, out = self.run_cli(148, resume=snapshot)
+                self.failed(result, out, "invalid snapshot GLES version")
+        manifest["runtime"].pop("gles_version_override")
+        (snapshot / "manifest.json").write_text(json.dumps(manifest))
+        result, out = self.run_cli(148, resume=snapshot)
+        self.failed(result, out, "invalid snapshot GLES version")
+        self.assertEqual(len(self.calls()), 1)
+
     def test_actual_gallium_and_separate_dri_loader_are_both_pinned(self) -> None:
         dri = self.mesa / "lib" / "dri"; dri.mkdir()
         loader = dri / "libdril_dri.dylib"; loader.write_bytes(b"small standalone DRI shim")
@@ -406,7 +455,8 @@ class DrawListReplayCliTest(unittest.TestCase):
         self.failed(result, out, "resume state changed")
 
     def test_invalid_options_missing_runtime_and_ambiguous_gallium(self) -> None:
-        for extra in (("--timeout", "nan"), ("--timeout", "0"), ("--allow-model-change",)):
+        for extra in (("--timeout", "nan"), ("--timeout", "0"), ("--allow-model-change",),
+                      ("--gles-version", "3.0"), ("--gles-version", "9.9")):
             result, out = self.run_cli(extra=extra)
             self.failed(result, out)
         result, out = self.run_cli(-1)

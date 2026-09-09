@@ -23,7 +23,8 @@ from typing import Any
 
 SNAPSHOT_SCHEMA = "pvrgpu.drawlist-snapshot.v1"
 REPLAY_SCHEMA = "pvrgpu.drawlist-replay.v1"
-RUNTIME_SCHEMA = "pvrgpu.drawlist-runtime.v1"
+RUNTIME_SCHEMA = "pvrgpu.drawlist-runtime.v2"
+LEGACY_RUNTIME_SCHEMA = "pvrgpu.drawlist-runtime.v1"
 API_VERSION = 1
 SEMANTICS = "functional-state-cold-cache; prefix timing/counters not restored"
 RUNTIME_FILES = ("player", "renderdoc", "gallium", "dri_loader", "egl", "gles", "bridge")
@@ -160,6 +161,7 @@ def runtime(args: argparse.Namespace) -> dict[str, Any]:
             "--allow-model-change is only valid with pvrgpu")
     return {
         "schema": RUNTIME_SCHEMA,
+        "gles_version_override": args.gles_version,
         "mesa_prefix": str(prefix),
         "player": file_identity(player),
         "renderdoc": file_identity(safe_path(args.renderdoc_lib, symlinks=True)),
@@ -278,8 +280,19 @@ def load_resume(args: argparse.Namespace, capture: dict[str, Any], current: dict
             state.get("sha256") == actual_state["sha256"], "snapshot state hash/size mismatch")
     saved_runtime = manifest.get("runtime")
     require(isinstance(saved_runtime, dict), "missing snapshot runtime")
-    require(saved_runtime.get("schema") == RUNTIME_SCHEMA,
+    require(saved_runtime.get("schema") in (RUNTIME_SCHEMA, LEGACY_RUNTIME_SCHEMA),
             "unsupported snapshot runtime identity schema; both Gallium and DRI loader must be pinned")
+    if saved_runtime["schema"] == LEGACY_RUNTIME_SCHEMA:
+        # V1 always forced 3.1. Do not let a new optional field silently
+        # reinterpret an old checkpoint as having been created under 3.2.
+        require("gles_version_override" not in saved_runtime,
+                "legacy runtime must use its fixed GLES 3.1 contract")
+        saved_gles = "3.1"
+    else:
+        saved_gles = saved_runtime.get("gles_version_override")
+        require(saved_gles in ("3.1", "3.2"), "missing or invalid snapshot GLES version")
+    require(saved_gles == current["gles_version_override"],
+            "snapshot runtime changed: GLES version; recreate the checkpoint")
     changed_bridge = False
     for key in RUNTIME_FILES:
         saved = saved_runtime.get(key)
@@ -320,7 +333,8 @@ def child_environment(args: argparse.Namespace, current: dict[str, Any], out: Pa
     env.update({
         "LC_ALL": "C", "EGL_PLATFORM": "surfaceless", "LIBGL_ALWAYS_SOFTWARE": "1",
         "GALLIUM_DRIVER": args.backend, "MESA_LOADER_DRIVER_OVERRIDE": "swrast",
-        "MESA_SHADER_CACHE_DISABLE": "true", "MESA_GLES_VERSION_OVERRIDE": "3.1",
+        "MESA_SHADER_CACHE_DISABLE": "true",
+        "MESA_GLES_VERSION_OVERRIDE": current["gles_version_override"],
         "DYLD_LIBRARY_PATH": str(prefix / "lib"), "LD_LIBRARY_PATH": str(prefix / "lib"),
         "LIBGL_DRIVERS_PATH": str(out / "dri"), "TMPDIR": str(out / "tmp"),
         "XDG_CACHE_HOME": str(out / "cache"),
@@ -437,6 +451,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--renderdoc-lib", required=True, help="exact snapshot-extension RenderDoc library")
     parser.add_argument("--mesa-prefix", required=True)
     parser.add_argument("--backend", required=True, choices=("pvrgpu", "llvmpipe"))
+    parser.add_argument("--gles-version", choices=("3.1", "3.2"), default="3.1",
+                        help="Mesa GLES override matching the capture (default: 3.1); pinned on resume")
     parser.add_argument("--bridge", help="required real PvrGPU bridge file; forbidden for llvmpipe")
     parser.add_argument("--through-draw", required=True, type=int, metavar="N", help="inclusive zero-based DrawList")
     parser.add_argument("--resume", metavar="SNAPSHOT_DIR", help="directory containing manifest.json and state.bin")

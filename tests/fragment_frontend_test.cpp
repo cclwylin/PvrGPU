@@ -9,6 +9,7 @@
 #include <systemc>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
@@ -19,6 +20,10 @@ namespace {
 
 using namespace pvrgpu::stub;
 
+static_assert(sizeof(FragmentShaderLane) == 64);
+static_assert(offsetof(FragmentShaderLane, front_facing) == 41);
+static_assert(offsetof(FragmentShaderLane, depth) == 44);
+
 void Check(bool condition, const std::string &message) {
   if (!condition)
     throw std::runtime_error("FragmentFrontend test failed: " + message);
@@ -28,6 +33,35 @@ void Check(bool condition, const std::string &message) {
 
 int sc_main(int, char **) {
   try {
+    // Genuine generic driver FS ABI always reserves CF0..3 for position,
+    // even with no user varying. Derivative-only quads need that existing
+    // ParameterBuffer/PDS route just as texture-only quads do.
+    PipelineState derivative_layout;
+    derivative_layout.functional_case = FunctionalCase::kDriverPcoTriangles;
+    derivative_layout.position_output_count = 4;
+    derivative_layout.fragment_position_count = 4;
+    derivative_layout.fragment_varying_start = 4;
+    derivative_layout.fragment_pco_abi.coefficients = 4;
+    Check(!UsesShaderVaryings(derivative_layout) &&
+              !UsesFragmentQuadLanes(derivative_layout) &&
+              VaryingCoefficientDwordCount(derivative_layout) == 0,
+          "legacy no-texture/no-derivative route changed");
+    derivative_layout.fragment_program_summary.uses_derivatives = 1;
+    Check(UsesShaderVaryings(derivative_layout) &&
+              UsesFragmentQuadLanes(derivative_layout) &&
+              VaryingVectorCount(derivative_layout) == 0 &&
+              VaryingCoefficientSetCount(derivative_layout) == 1 &&
+              VaryingCoefficientDwordCount(derivative_layout) == 4,
+          "derivative-only shader lost its declared position plane");
+    for (unsigned mutation = 0; mutation < 4; ++mutation) {
+      auto invalid = derivative_layout;
+      if (mutation == 0) invalid.fragment_position_start = 1;
+      if (mutation == 1) invalid.fragment_position_count = 0;
+      if (mutation == 2) invalid.fragment_position_count = 8;
+      if (mutation == 3) invalid.fragment_varying_start = 0;
+      Check(VaryingCoefficientDwordCount(invalid) == 0,
+            "derivative-only route accepted malformed position layout");
+    }
     MemoryPool pool;
     PipelineState state;
     state.width = 4;
@@ -104,6 +138,7 @@ int sc_main(int, char **) {
     std::vector<ParameterTriangle> parameters(2, parameter);
     parameters[1].key.api_primitive_id = 8;
     parameters[1].key.submit_ordinal = 2;
+    parameters[1].front_facing = 1;
     std::vector<FragmentCandidate> visible(2, rejected);
     for (std::uint32_t primitive = 0; primitive < 2; ++primitive) {
       visible[primitive].primitive_id = parameters[primitive].key.api_primitive_id;
@@ -133,6 +168,9 @@ int sc_main(int, char **) {
       Check(msaa_invocations[primitive].sample_mask == visible[primitive].sample_mask &&
                 msaa_lanes[primitive].sample_mask == visible[primitive].sample_mask,
             "MSAA frontend lost 16-bit sample coverage");
+      Check(msaa_invocations[primitive].front_facing == parameters[primitive].front_facing &&
+                msaa_lanes[primitive].front_facing == parameters[primitive].front_facing,
+            "front/back multisample primitives retain distinct normalized facing");
     }
     ReleaseFunctionalPayloads(pool, msaa_result);
     pool.Release(msaa_handle);
@@ -148,6 +186,7 @@ int sc_main(int, char **) {
         sampled.fragment_program_summary.uses_derivatives = helpers;
         sampled.active_fragment_invocations = 1;
         auto p = parameter; p.depth_plane_valid = 1;
+        p.front_facing = samples & 1U;
         auto candidate = rejected;
         candidate.visibility = FragmentVisibility::kVisible;
         candidate.sample_mask = (1U << samples) - 1U;
@@ -190,6 +229,8 @@ int sc_main(int, char **) {
               Check(work.sample_id == quad.sample_id && work.quad_lane == lane &&
                         work.sample_mask == (work.helper ? 0U : 1U << quad.sample_id),
                     "helper quad mixed sample IDs or invented covered helper samples");
+              Check(work.front_facing == p.front_facing,
+                    "covered and uncovered helper lanes inherit their actual primitive facing");
             }
           }
         }

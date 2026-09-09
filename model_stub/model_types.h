@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <iosfwd>
 #include <string>
+#include <string_view>
 #include <vector>
 #include "../src/gallium/drivers/pvrgpu/pvrgpu_systemc_limits.h"
 
@@ -129,7 +130,7 @@ struct DriverPcoSampledTexture {
   std::uint32_t normalized_coordinates = 0;
   std::uint32_t min_lod_u4_6 = 0;
   std::uint32_t max_lod_u4_6 = 0;
-  // 0 = plain 2D, 1 = 2D array.  A 2D array holds `layers` images per level.
+  // 0=2D, 1=2DArray, 2=3D, 3=Cube, 4=CubeArray. CubeArray layers=6*cubes.
   std::uint32_t texture_kind = 0;
   std::uint32_t layers = 1;
   // 每個 pixel 內依 sample 順序交錯；舊單 sample payload 保持原樣。
@@ -162,7 +163,7 @@ inline constexpr std::size_t kDriverPcoMaximumSequenceCommands = 4096;
  */
 inline constexpr std::size_t kDriverPcoMaximumNestedSequenceCommands = 256;
 inline constexpr std::size_t kDriverPcoMaximumSequenceTextures =
-    kDriverPcoMaximumNestedSequenceCommands * 3U * 8U;
+    kDriverPcoMaximumNestedSequenceCommands * 5U * PVRGPU_SYSTEMC_MAX_PCO_TEXTURES_PER_STAGE;
 inline constexpr std::uint64_t kDriverPcoMaximumSequencePayloadBytes =
     PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_PAYLOAD_BYTES;
 inline constexpr std::uint32_t kDriverPcoTextureWidth = 512;
@@ -417,6 +418,8 @@ struct DriverCommand {
   std::uint32_t vertex_sampled_texture_count = 0;
   std::uint32_t fragment_sampled_texture_count = 0;
   std::uint32_t geometry_sampled_texture_count = 0;
+  std::uint32_t tessellation_control_sampled_texture_count = 0;
+  std::uint32_t tessellation_evaluation_sampled_texture_count = 0;
   std::uint64_t declared_raw_vertex_data_size = 0;
   std::uint64_t declared_vertex_pco_size = 0;
   std::uint64_t declared_fragment_pco_size = 0;
@@ -428,6 +431,10 @@ struct DriverCommand {
   std::uint32_t indexed = 0;
   // Colour attachments this draw writes; one for an ordinary draw.
   std::uint32_t render_target_count = 1;
+  // API31: owned explicit normalized four-byte transport for each target.
+  // Empty retains the homogeneous legacy `format`; explicit vectors cover
+  // every effective target and agree with `format` at target zero.
+  std::vector<std::string> color_attachment_formats;
   // Packed vertex attribute widths; attribute N lands in VTXIN 4 * N.
   std::uint32_t vertex_attribute_count = 0;
   std::array<std::uint32_t, 16> vertex_attribute_components{};
@@ -585,6 +592,57 @@ struct Options {
   std::vector<DriverCommand> driver_commands;
 };
 
+inline bool IsNormalizedFourByteColorFormat(std::string_view format) {
+  return format == "PIPE_FORMAT_R8G8B8A8_UNORM" ||
+         format == "PIPE_FORMAT_R10G10B10A2_UNORM" ||
+         format == "PIPE_FORMAT_B10G10R10A2_UNORM";
+}
+
+inline bool DriverColorAttachmentFormatsAreValid(const DriverCommand &command) {
+  const auto targets = command.render_target_count ? command.render_target_count : 1U;
+  if (targets > 4U)
+    return false;
+  if (command.color_attachment_formats.empty())
+    return true;
+  if (command.color_attachment_formats.size() != targets ||
+      command.color_attachment_formats[0] != command.format)
+    return false;
+  for (const auto &format : command.color_attachment_formats)
+    if (!IsNormalizedFourByteColorFormat(format))
+      return false;
+  return true;
+}
+
+inline bool DriverColorAttachmentFormatsMatch(const DriverCommand &left,
+                                             const DriverCommand &right) {
+  if (!DriverColorAttachmentFormatsAreValid(left) ||
+      !DriverColorAttachmentFormatsAreValid(right))
+    return false;
+  const auto targets = left.render_target_count ? left.render_target_count : 1U;
+  if (targets != (right.render_target_count ? right.render_target_count : 1U))
+    return false;
+  for (std::uint32_t target = 0; target < targets; ++target) {
+    const auto &a = left.color_attachment_formats.empty() ? left.format
+                         : left.color_attachment_formats[target];
+    const auto &b = right.color_attachment_formats.empty() ? right.format
+                         : right.color_attachment_formats[target];
+    if (a != b)
+      return false;
+  }
+  return true;
+}
+
+// Only call after DriverColorAttachmentFormatsAreValid. This is the exact
+// target identity published with readback, including homogeneous legacy runs.
+inline std::vector<std::string> EffectiveDriverColorAttachmentFormats(
+    const DriverCommand &command) {
+  if (!command.color_attachment_formats.empty())
+    return command.color_attachment_formats;
+  return std::vector<std::string>(command.render_target_count ?
+                                     command.render_target_count : 1U,
+                                 command.format);
+}
+
 /*
  * DRAM addresses a PCO sequence's attachments occupy.
  *
@@ -609,6 +667,8 @@ inline bool ResolveSequenceAttachmentAddresses(
   std::size_t next_depth_slot = 0;
   for (std::size_t ordinal = 0; ordinal < draws.size(); ++ordinal) {
     const DriverCommand &draw = draws[ordinal];
+    if (!DriverColorAttachmentFormatsAreValid(draw))
+      return false;
     if (draw.color_attachment_source_command_index == kDriverPcoNewAttachment) {
       if (next_color_slot >= kDriverPcoSequenceAttachmentSlots)
         return false;
@@ -617,7 +677,7 @@ inline bool ResolveSequenceAttachmentAddresses(
                                         kDriverPcoSequenceAttachmentStride;
     } else if (draw.color_attachment_source_command_index < ordinal) {
       const DriverCommand &producer = draws[draw.color_attachment_source_command_index];
-      if (draw.format != producer.format ||
+      if (!DriverColorAttachmentFormatsMatch(draw, producer) ||
           draw.framebuffer_width != producer.framebuffer_width ||
           draw.framebuffer_height != producer.framebuffer_height ||
           (draw.render_target_count ? draw.render_target_count : 1U) !=
@@ -739,6 +799,7 @@ struct CounterTxn {
   // measured separately; domain shader invocations count generated points.
   std::uint64_t tcs_invocations = 0;
   std::uint64_t tcs_alu_instructions = 0;
+  std::uint64_t tcs_tex_instructions = 0;
   std::uint64_t tcs_memory_instructions = 0;
   std::uint64_t tcs_load_instructions = 0;
   std::uint64_t tcs_store_instructions = 0;
@@ -747,6 +808,7 @@ struct CounterTxn {
   std::uint64_t tcs_output_write_bytes = 0;
   std::uint64_t tcs_output_read_bytes = 0;
   std::uint64_t tes_alu_instructions = 0;
+  std::uint64_t tes_tex_instructions = 0;
   std::uint64_t tes_memory_instructions = 0;
   std::uint64_t tes_load_instructions = 0;
   std::uint64_t tes_patch_read_bytes = 0;

@@ -81,7 +81,7 @@ struct Fixture {
 
 int main(int argc, char **argv) {
   try {
-    static_assert(PVRGPU_SYSTEMC_API_VERSION == 30);
+    static_assert(PVRGPU_SYSTEMC_API_VERSION == 32);
     const bool incomplete_patch = argc > 2 && std::string(argv[2]) == "incomplete";
     const auto nonce = std::chrono::high_resolution_clock::now().time_since_epoch().count();
     const auto root = std::filesystem::temp_directory_path() / ("pvrgpu-tess-api25-" + std::to_string(nonce));
@@ -202,6 +202,7 @@ int main(int argc, char **argv) {
       for (const char *evidence : {incomplete_patch ? "\"hs_invocations\":0" : "\"hs_invocations\":1",
            incomplete_patch ? "\"tcs_invocations\":0" : "\"tcs_invocations\":1",
            incomplete_patch ? "\"tcs_output_write_bytes\":0" : "\"tcs_output_write_bytes\":24", "\"vertex_attribute_bytes\":0",
+           "\"tcs_tex_instructions\":0", "\"tes_tex_instructions\":0",
            "\"pool_bytes_in_flight\":0", "\"pool_leaks\":0"})
         Check(json.find(evidence) != std::string::npos, std::string("native/pool evidence: ") + evidence);
       std::cout << "native Tessellation API25 " << mode << " PASS, primitives=" << stats.primitives_generated << '\n';

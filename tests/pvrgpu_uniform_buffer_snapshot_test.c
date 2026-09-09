@@ -167,8 +167,20 @@ test_ranges_limits_and_raw_bytes(void)
    cmd.fragment_pco_abi.push_constant_start = 79;
    CHECK(!pvrgpu_cmd_validate_uniform_buffers(&cmd, error, sizeof(error)));
    cmd.fragment_pco_abi.push_constant_start = 80;
+   /* Five graphics stages are now admitted. Exceed the actual global cap;
+    * count31 is legal at the pointer/count boundary and would overread our
+    * 30-entry allocation before a later semantic rejection. */
+   cmd.uniform_buffer_count = 5 * PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE + 1;
+   CHECK(!pvrgpu_cmd_validate_uniform_buffers(&cmd, error, sizeof(error)));
+   /* A count within the global cap must have real backing storage even for
+    * a deliberately invalid entry. Reject its stage without an OOB read. */
+   struct pvrgpu_systemc_pco_uniform_buffer invalid_entries[31] = {0};
+   memcpy(invalid_entries, entries, sizeof(entries));
+   invalid_entries[30].stage = PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION + 1;
+   cmd.uniform_buffers = invalid_entries;
    cmd.uniform_buffer_count = 31;
    CHECK(!pvrgpu_cmd_validate_uniform_buffers(&cmd, error, sizeof(error)));
+   cmd.uniform_buffers = entries;
    cmd.uniform_buffer_count = 30;
    entries[29].bytes_size = 0;
    CHECK(!pvrgpu_cmd_validate_uniform_buffers(&cmd, error, sizeof(error)));
@@ -230,11 +242,114 @@ test_geometry_sampler_descriptor_prefix(void)
    CHECK(strstr(error,"independent geometry program ABI")!=NULL);
 }
 
+static void
+test_tessellation_sampler_descriptor_prefix(void)
+{
+   /* Structural envelopes only, not placeholder-code execution. The live
+    * tessellation texture test separately exercises actual compiler bytes. */
+   const uint8_t code = 1;
+   uint32_t banks[2][256] = {{0}};
+   struct pvrgpu_systemc_tessellation tess = {0};
+   tess.control_pco = tess.evaluation_pco = &code;
+   tess.control_pco_size = tess.evaluation_pco_size = 1;
+   tess.control_shared = banks[0]; tess.evaluation_shared = banks[1];
+   tess.input_vertices = tess.output_vertices = tess.vertices_per_instance = 3;
+   tess.input_stride_dwords = tess.output_vertex_stride_dwords = 4;
+   tess.per_vertex_offset_dwords = 6; tess.patch_stride_dwords = 18;
+   tess.control_abi.vertex_inputs = 3;
+   tess.evaluation_abi.vertex_inputs = 5; tess.evaluation_abi.vertex_outputs = 4;
+   struct pvrgpu_systemc_driver_command api = {0};
+   api.tessellation = &tess;
+   char error[256];
+   for (unsigned textures = 0; textures <= 8; ++textures) {
+      for (unsigned ubos = 0; ubos <= 15; ++ubos) {
+         for (unsigned stage = 0; stage < 2; ++stage) {
+            struct pvrgpu_systemc_pco_stage_abi *abi = stage ?
+               &tess.evaluation_abi : &tess.control_abi;
+            const unsigned prefix = stage ? 4 : 8;
+            abi->uniform_buffer_descriptor_start = prefix + 20 * textures;
+            abi->uniform_buffer_descriptor_count = ubos;
+            abi->push_constant_start = abi->uniform_buffer_descriptor_start + 4 * ubos;
+            abi->push_constant_count = 4;
+            abi->shareds = abi->push_constant_start + 4;
+            if (stage) tess.evaluation_shared_count = abi->shareds;
+            else tess.control_shared_count = abi->shareds;
+         }
+         CHECK(pvrgpu_tessellation_payload_error(&tess) == NULL);
+         CHECK(pvrgpu_cmd_validate_uniform_buffers(&api, error, sizeof(error)));
+         for (unsigned stage = 0; stage < 2; ++stage) {
+            struct pvrgpu_systemc_pco_stage_abi *abi = stage ?
+               &tess.evaluation_abi : &tess.control_abi;
+            const unsigned prefix = stage ? 4 : 8;
+            const unsigned valid_start = abi->uniform_buffer_descriptor_start;
+            const unsigned invalid[] = {0, prefix - 1, prefix + 4,
+               prefix + 19, prefix + 161, prefix + 180, UINT32_MAX};
+            for (unsigned i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+               abi->uniform_buffer_descriptor_start = invalid[i];
+               CHECK(pvrgpu_tessellation_payload_error(&tess) != NULL);
+               CHECK(!pvrgpu_cmd_validate_uniform_buffers(&api, error, sizeof(error)));
+            }
+            abi->uniform_buffer_descriptor_start = valid_start;
+            banks[stage][prefix - 1] = 1;
+            CHECK(pvrgpu_tessellation_payload_error(&tess) != NULL);
+            banks[stage][prefix - 1] = 0;
+            abi->push_constant_start += 4;
+            CHECK(pvrgpu_tessellation_payload_error(&tess) != NULL);
+            abi->push_constant_start -= 4;
+         }
+      }
+   }
+}
+
+static void
+test_compiled_ubo_prefix(void)
+{
+   for (unsigned declared = 0; declared <= 17; ++declared) {
+      for (unsigned compiled = 0; compiled <= 17; ++compiled) {
+         CHECK(pvrgpu_uniform_buffer_prefix_count_valid(declared, compiled, false) ==
+                  (declared <= 15 && compiled == declared));
+         CHECK(pvrgpu_uniform_buffer_prefix_count_valid(declared, compiled, true) ==
+                  (declared <= 15 && compiled <= declared));
+      }
+   }
+   CHECK(!pvrgpu_uniform_buffer_prefix_count_valid(UINT32_MAX, 0, true));
+   CHECK(!pvrgpu_uniform_buffer_prefix_count_valid(1, UINT32_MAX, true));
+   /* An unused suffix is not read or copied, even if stale higher bindings
+    * name invalid storage. Original block0 still comes from CB1. */
+   uint32_t data[] = {0xdeadbeef, 0x7fc12345, 0x80000000, 0x12345678};
+   struct pipe_constant_buffer bindings[16] = {0};
+   bindings[1].user_buffer = data;
+   bindings[1].buffer_size = sizeof(data);
+   struct pvrgpu_resource invalid = {0};
+   invalid.base.target = PIPE_TEXTURE_2D;
+   bindings[2].buffer = &invalid.base;
+   bindings[2].buffer_size = 4;
+   uint32_t words[12];
+   for (unsigned i = 0; i < 12; ++i) words[i] = 0xbabef00d;
+   struct pvrgpu_systemc_pco_uniform_buffer entries[15] = {0};
+   unsigned count = 0;
+   CHECK(pvrgpu_snapshot_stage_uniform_buffers(bindings, 0, 0, 0, words, 12,
+                                                entries, &count, 15));
+   CHECK(count == 0);
+   for (unsigned i = 0; i < 12; ++i) CHECK(words[i] == 0xbabef00d);
+   CHECK(pvrgpu_snapshot_stage_uniform_buffers(bindings, 0, 1, 0, words, 12,
+                                                entries, &count, 15));
+   CHECK(count == 1 && entries[0].block_index == 0 && entries[0].stage == 0);
+   CHECK(entries[0].bytes_size == sizeof(data));
+   CHECK(memcmp(entries[0].bytes, data, sizeof(data)) == 0);
+   CHECK(words[0] == 0 && words[1] == 0 && words[2] == sizeof(data) && words[3] == 0);
+   for (unsigned i = 4; i < 12; ++i) CHECK(words[i] == 0xbabef00d);
+   pvrgpu_finish_uniform_buffer_snapshots(entries, &count);
+   CHECK(count == 0);
+}
+
 int main(void)
 {
+   test_compiled_ubo_prefix();
    test_draw_snapshot_lifetime();
    test_ranges_limits_and_raw_bytes();
    test_geometry_sampler_descriptor_prefix();
+   test_tessellation_sampler_descriptor_prefix();
    printf("UBO snapshot/descriptor tests: %u checks, %u failures\n", checks, failures);
    return failures != 0;
 }

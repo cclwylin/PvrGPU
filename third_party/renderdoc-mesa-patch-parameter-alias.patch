@@ -1,0 +1,28 @@
+From: PvrGPU replay diagnostics
+Subject: [PATCH] GL: replay EXT/OES patch-parameter aliases as patch parameters
+
+glPatchParameteriEXT and glPatchParameteriOES are aliases of glPatchParameteri,
+not glPointParameteri. Dispatching their captured chunks to the point-state
+serializer issues an invalid desktop-only call on GLES and leaves the patch
+vertex count unchanged. Preserve the captured pname/value and route both aliases
+through the same serializer as the core tessellation entry point. No calls or
+errors are suppressed, and this is independent of the capture or shader name.
+
+diff --git a/renderdoc/driver/gl/gl_driver.cpp b/renderdoc/driver/gl/gl_driver.cpp
+--- a/renderdoc/driver/gl/gl_driver.cpp
++++ b/renderdoc/driver/gl/gl_driver.cpp
+@@ -4395,12 +4395,12 @@ bool WrappedOpenGL::ContextProcessChunk(ReadSerialiser &ser, GLChunk chunk)
+     case GLChunk::glMinSampleShadingOES:
+     case GLChunk::glMinSampleShading: return Serialise_glMinSampleShading(ser, 0);
+     case GLChunk::glRasterSamplesEXT: return Serialise_glRasterSamplesEXT(ser, 0, 0);
++    case GLChunk::glPatchParameteriEXT:
++    case GLChunk::glPatchParameteriOES:
+     case GLChunk::glPatchParameteri: return Serialise_glPatchParameteri(ser, eGL_NONE, 0);
+     case GLChunk::glPatchParameterfv: return Serialise_glPatchParameterfv(ser, eGL_NONE, 0);
+     case GLChunk::glLineWidth: return Serialise_glLineWidth(ser, 0);
+     case GLChunk::glPointSize: return Serialise_glPointSize(ser, 0);
+-    case GLChunk::glPatchParameteriEXT:
+-    case GLChunk::glPatchParameteriOES:
+     case GLChunk::glPointParameteri: return Serialise_glPointParameteri(ser, eGL_NONE, 0);
+     case GLChunk::glPointParameteriv: return Serialise_glPointParameteriv(ser, eGL_NONE, 0);
+     case GLChunk::glPointParameterfARB:

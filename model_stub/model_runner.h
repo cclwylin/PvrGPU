@@ -29,6 +29,10 @@ struct ModelFramebuffer {
   // Colour attachments past the first, in target order.  Each is the same
   // width, height and pixel width as `pixels`.
   std::vector<std::vector<std::uint8_t>> extra;
+  // Actual transport identities in target order; bytes-per-pixel alone
+  // cannot distinguish RGBA8 from either packed 10/10/10/2 layout.
+  std::vector<std::string> color_formats;
+  bool color_formats_explicit = false;
   std::uint32_t width = 0;
   std::uint32_t height = 0;
   // Four while the attachment packs UNORM8 channels; an integer attachment
@@ -48,6 +52,24 @@ struct ModelFramebuffer {
            static_cast<std::uint64_t>(pixels.size()) ==
                static_cast<std::uint64_t>(width) * height * bytes_per_pixel *
                    sample_count * layer_count;
+  }
+
+  bool ColorFormatMatches(std::uint32_t target, const char *requested) const {
+    if (target > extra.size() ||
+        (!color_formats.empty() && color_formats.size() != extra.size() + 1U) ||
+        (color_formats_explicit && color_formats.size() != extra.size() + 1U))
+      return false;
+    if (color_formats_explicit) {
+      if (color_formats.size() > 4U || bytes_per_pixel != 4U)
+        return false;
+      for (const auto &format : color_formats)
+        if (!IsNormalizedFourByteColorFormat(format))
+          return false;
+    }
+    if (!requested)
+      return !color_formats_explicit;
+    return requested[0] && target < color_formats.size() &&
+           color_formats[target] == requested;
   }
 };
 

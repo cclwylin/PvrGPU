@@ -142,6 +142,14 @@ void SetFragmentSampleContext(PcoFragmentExecutionContext &context,
   context.sample_position_valid = 1;
 }
 
+void SetFragmentFacingContext(PcoFragmentExecutionContext &context,
+                              std::uint8_t front_facing) {
+  if (front_facing > 1)
+    throw std::runtime_error("fragment USC raster facing is not canonical");
+  context.front_facing = front_facing;
+  context.front_facing_valid = 1;
+}
+
 bool SameTextureSampleRequest(const TextureSampleRequest &left,
                               const TextureSampleRequest &right) {
   return left.shader_lane_index == right.shader_lane_index &&
@@ -172,10 +180,11 @@ bool SameTextureSampleRequest(const TextureSampleRequest &left,
          left.explicit_lod_present == right.explicit_lod_present &&
          left.lod_bias == right.lod_bias &&
          left.lod_bias_present == right.lod_bias_present &&
+         left.gather == right.gather &&
          left.data_request == right.data_request &&
          left.quad_lane == right.quad_lane &&
-         left.shader_stage == right.shader_stage && left.reserved[0] == 0 &&
-         right.reserved[0] == 0;
+         left.shader_stage == right.shader_stage && left.gather <= 1 &&
+         right.gather <= 1;
 }
 
 bool SameVertexContinuation(const PcoVertexContinuation &left,
@@ -499,6 +508,8 @@ void UscCluster::Run() {
               request.explicit_lod_present = issued.explicit_lod_present;
               if (issued.lod_bias_present || issued.lod_bias)
                 throw std::runtime_error("vertex SMP shader LOD bias is unsupported");
+              if (issued.gather)
+                throw std::runtime_error("vertex SMP raw gather is unsupported");
               request.data_request = issued.data_request;
               request.texture_address_lo = issued.texture_address_lo;
               request.texture_address_hi = issued.texture_address_hi;
@@ -768,9 +779,11 @@ void UscCluster::Run() {
         }
         const FragmentInvocation &invocation = invocations[invocation_index];
         PcoFragmentExecutionContext raster_context;
+        if (context)
+          raster_context = *context;
+        SetFragmentFacingContext(raster_context, invocation.front_facing);
+        context = &raster_context;
         if (IsDriverPcoTrianglesCase(state.functional_case)) {
-          if (context)
-            raster_context = *context;
           raster_context.raster_sample_count = state.raster_state.sample_count;
           raster_context.memory_atomic32 = UscShaderImageMemory::Atomic32;
           raster_context.image_memory_user_data = &image_memory;
@@ -786,7 +799,6 @@ void UscCluster::Run() {
           SetFragmentSampleContext(raster_context, invocation.sample_id,
                                     invocation.sample_mask,
                                     state.raster_state.sample_frequency != 0);
-          context = &raster_context;
         }
         const PcoFragmentExecution execution =
             context ? ExecuteFragmentPco(fragment_program, *context)
@@ -1136,6 +1148,8 @@ void UscCluster::Run() {
             }
             const FragmentInvocation &invocation =
                 invocations[invocation_index];
+            if (invocation.front_facing != shader_lane.front_facing)
+              throw std::runtime_error("texture fragment USC visible facing identity mismatch");
             FragmentOutput fragment_output;
             fragment_output.x = invocation.x;
             fragment_output.y = invocation.y;
@@ -1234,6 +1248,7 @@ void UscCluster::Run() {
                 execution.texture_request.explicit_lod_present;
             request.lod_bias = execution.texture_request.lod_bias;
             request.lod_bias_present = execution.texture_request.lod_bias_present;
+            request.gather = execution.texture_request.gather;
             request.data_request = execution.texture_request.data_request;
             request.texture_address_lo =
                 execution.texture_request.texture_address_lo;
@@ -1326,6 +1341,8 @@ void UscCluster::Run() {
             for (std::size_t dword = 0; dword < shared_registers.size();
                  ++dword)
               context.shared_registers[dword] = shared_registers[dword];
+            bool quad_facing_set = false;
+            std::uint8_t quad_front_facing = 0;
             for (std::uint8_t lane = 0; lane < 4U; ++lane) {
               if ((active_mask & (1U << lane)) == 0)
                 continue;
@@ -1341,10 +1358,21 @@ void UscCluster::Run() {
                   shader_lane.quad_lane != lane ||
                   shader_lane.parameter_index != quad.parameter_index ||
                   shader_lane.submit_ordinal != quad.submit_ordinal ||
+                  shader_lane.front_facing > 1 ||
+                  shader_lane.helper !=
+                      static_cast<std::uint8_t>((quad.helper_mask >> lane) & 1U) ||
+                  (quad_facing_set && shader_lane.front_facing != quad_front_facing) ||
                   lane_context_initialized[shader_lane_index] != 0) {
                 throw std::runtime_error(
                     "texture fragment USC lost shader-lane identity");
               }
+              quad_facing_set = true;
+              quad_front_facing = shader_lane.front_facing;
+              if (!shader_lane.helper &&
+                  (shader_lane.visible_invocation_index >= invocations.size() ||
+                   invocations[shader_lane.visible_invocation_index].front_facing !=
+                       shader_lane.front_facing))
+                throw std::runtime_error("texture fragment USC visible facing identity mismatch");
               // The strict driver profile carries llvmpipe's coefficients,
               // whose origin already includes its half-pixel setup offset.
               const float interpolation_offset =
@@ -1367,6 +1395,7 @@ void UscCluster::Run() {
               context.memory_atomic32 = UscShaderImageMemory::Atomic32;
               context.image_memory_user_data = &image_memory;
               context.memory_side_effects_enabled = shader_lane.helper ? 0 : 1;
+              SetFragmentFacingContext(context, shader_lane.front_facing);
               lane_contexts[shader_lane_index] = context;
               lane_context_initialized[shader_lane_index] = 1;
               if (debug_fragment && shader_lane.x == debug_x &&
@@ -1438,7 +1467,8 @@ void UscCluster::Run() {
                   request.shader_lane_index !=
                       global_lane_indices[lane_index] ||
                   request.request_id != lane_index ||
-                  request.reserved[0] != 0 ||
+                  request.gather > 1 ||
+                  request.gather != pending_requests[first].gather ||
                   request.descriptor_set != descriptor_set ||
                   request.data_request !=
                       pending_continuations[lane_index].data_request ||
@@ -1545,6 +1575,8 @@ void UscCluster::Run() {
                   saved.discarded != expected_continuation.discarded ||
                   saved.execution_predicate !=
                       expected_continuation.execution_predicate ||
+                  saved.front_facing != expected_continuation.front_facing ||
+                  saved.front_facing_valid != expected_continuation.front_facing_valid ||
                   saved.native_steps != expected_continuation.native_steps ||
                   saved.executed_instructions.alu !=
                       expected_continuation.executed_instructions.alu ||

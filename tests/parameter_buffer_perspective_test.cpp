@@ -17,7 +17,9 @@
 
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -52,10 +54,299 @@ void CheckPlane(const ParameterCoefficientSet &plane, std::uint32_t a,
         description);
 }
 
+float BitsFloat(std::uint32_t bits) {
+  float value = 0.0f;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+// Each failure fixture is a separate process: a SystemC process which throws
+// must not be resumed to test another transaction. These are native module
+// tests, not replay shortcuts or capture-specific exception rules.
+void RunNonFiniteFixture(const std::string &mode) {
+  MemoryPool pool;
+  PipelineState state;
+  state.width = state.height = 128;
+  state.functional_case = FunctionalCase::kDriverPcoTriangles;
+  state.stage = PipelineStage::kTiled;
+  state.position_output_count = state.varying_output_start = 4;
+  state.varying_output_count = 4;
+  state.fragment_position_count = state.fragment_varying_start = 4;
+  state.fragment_varying_count = 16;
+  state.vertex_pco_abi.vertex_outputs = 8;
+  state.fragment_pco_abi.coefficients = 20;
+  ShaderVaryingBinding binding;
+  binding.vertex_output_base = 4;
+  binding.coefficient_set_base = 1;
+  binding.w_coefficient_set = 0;
+  binding.component_count = 4;
+  binding.interpolation = InterpolationMode::kSmooth;
+
+  // Independently synthesized collinear-in-binary32 setup. Fixed area is
+  // 6009; exactly one pixel center (27,32) is covered. Of the 16x positions,
+  // only sample 13 at (25,30) is covered. This is a visible negative control
+  // against treating every collapsed floating-point area as invisible.
+  RasterTriangle triangle;
+  triangle.x[0] = BitsFloat(0x40db440a);
+  triangle.y[0] = BitsFloat(0x4030b4ba);
+  triangle.x[1] = BitsFloat(0x41c0d6d7);
+  triangle.y[1] = BitsFloat(0x41dce174);
+  triangle.x[2] = BitsFloat(0x42453c2a);
+  triangle.y[2] = BitsFloat(0x427fa4bc);
+  bool varyings_fail = false;
+  bool reciprocal_fails = false;
+  bool regular_edges = false;
+  bool rollback = false;
+  std::string expected_error;
+  const std::string plane_error = "non-finite llvmpipe driver plane";
+  const auto scissor = [&](std::uint32_t x0, std::uint32_t y0, std::uint32_t x1,
+                           std::uint32_t y1) {
+    state.raster_state.scissor = {1, x0, y0, x1, y1};
+  };
+  if (mode == "empty-depth" || mode == "empty-varying" ||
+      mode == "empty-reciprocal" || mode == "rollback" ||
+      mode == "invalid-reciprocal" || mode == "invalid-layout" ||
+      mode == "invalid-setup") {
+    // Recorded screen coordinates uniquely identify their binary32 values
+    // at this magnitude. Depth/varying values below are intentionally
+    // synthetic: the diagnostic's six decimal depth digits were not exact.
+    triangle.x[0] = 478.912903f;
+    triangle.y[0] = 499.939392f;
+    triangle.x[1] = 478.919250f;
+    triangle.y[1] = 499.949097f;
+    triangle.x[2] = 478.906555f;
+    triangle.y[2] = 499.929688f;
+    state.width = state.height = 960;
+    varyings_fail = mode == "empty-varying" || mode == "rollback";
+    reciprocal_fails = mode == "empty-reciprocal";
+    rollback = mode == "rollback";
+    if (mode == "invalid-reciprocal")
+      expected_error = "invalid reciprocal W";
+    if (mode == "invalid-layout")
+      expected_error = "invalid RasterTriangle metadata";
+    if (mode == "invalid-setup")
+      expected_error = "invalid Mesa setup vertex order";
+    if (!expected_error.empty())
+      state.raster_state.sample_mask = 0;
+  } else if (mode == "covered") {
+    expected_error = plane_error;
+  } else if (mode == "zero-mask") {
+    state.raster_state.sample_mask = 0;
+  } else if (mode == "scissor-empty") {
+    scissor(0, 0, 1, 1);
+  } else if (mode == "scissor-boundary") {
+    scissor(28, 32, 29, 33);
+  } else if (mode == "framebuffer-clipped") {
+    state.width = 20;
+  } else if (mode == "msaa-covered" || mode == "msaa-masked" ||
+             mode == "msaa-disabled-covered" || mode == "msaa-disabled-empty" ||
+             mode == "msaa-enabled-scissored") {
+    state.raster_state.sample_count = 16;
+    state.raster_state.sample_mask = 1U << 13;
+    if (mode == "msaa-masked")
+      state.raster_state.sample_mask = ~(1U << 13);
+    if (mode == "msaa-disabled-covered" || mode == "msaa-disabled-empty")
+      state.raster_state.multisample_enable = 0;
+    if (mode == "msaa-disabled-empty" || mode == "msaa-enabled-scissored")
+      scissor(25, 30, 26, 31);
+    if (mode == "msaa-covered" || mode == "msaa-disabled-covered" ||
+        mode == "msaa-enabled-scissored")
+      expected_error = plane_error;
+  } else if (mode == "msaa-2-empty" || mode == "msaa-4-empty" ||
+             mode == "msaa-8-empty") {
+    state.raster_state.sample_count = static_cast<unsigned>(mode[5] - '0');
+  } else if (mode == "invalid-samples") {
+    state.raster_state.sample_count = 3;
+    state.raster_state.sample_mask = 0;
+    expected_error = "unsupported raster sample_count";
+  } else if (mode == "invalid-multisample") {
+    state.raster_state.multisample_enable = 2;
+    state.raster_state.sample_mask = 0;
+    expected_error = "multisample flag is invalid";
+  } else if (mode == "top-left-covered" || mode == "bottom-left-empty") {
+    regular_edges = varyings_fail = true;
+    triangle.x[0] = .5f;
+    triangle.y[0] = .5f;
+    triangle.x[1] = 2.5f;
+    triangle.y[1] = .5f;
+    triangle.x[2] = .5f;
+    triangle.y[2] = 2.5f;
+    scissor(1, 0, 2, 1); // The only sample lies exactly on the horizontal edge.
+    state.raster_state.bottom_edge_rule = mode == "bottom-left-empty";
+    if (mode == "top-left-covered")
+      expected_error = plane_error + ":";
+  } else {
+    throw std::runtime_error("unknown non-finite fixture: " + mode);
+  }
+
+  if (!regular_edges) {
+    const float dx01 = triangle.x[0] - triangle.x[1];
+    const float dy01 = triangle.y[0] - triangle.y[1];
+    const float dx20 = triangle.x[2] - triangle.x[0];
+    const float dy20 = triangle.y[2] - triangle.y[0];
+    const volatile float e = dx01 * dy20;
+    const volatile float f = dy01 * dx20;
+    Check(e - f == 0.f, "fixture has singular binary32 setup area");
+  }
+  const auto fixed_area = (QuantizeRasterSubpixel(triangle.x[1]) -
+                           QuantizeRasterSubpixel(triangle.x[0])) *
+                              (QuantizeRasterSubpixel(triangle.y[2]) -
+                               QuantizeRasterSubpixel(triangle.y[0])) -
+                          (QuantizeRasterSubpixel(triangle.y[1]) -
+                           QuantizeRasterSubpixel(triangle.y[0])) *
+                              (QuantizeRasterSubpixel(triangle.x[2]) -
+                               QuantizeRasterSubpixel(triangle.x[0]));
+  Check(fixed_area != 0, "fixture has nonzero fixed-point area");
+  if (fixed_area < 0) {
+    std::swap(triangle.x[1], triangle.x[2]);
+    std::swap(triangle.y[1], triangle.y[2]);
+  }
+  triangle.rasterizable = triangle.front_facing = 1;
+  triangle.vertex_output_stride_dwords = mode == "invalid-layout" ? 7 : 8;
+  triangle.setup_vertex_order[0] = 0;
+  triangle.setup_vertex_order[1] = 1;
+  triangle.setup_vertex_order[2] = mode == "invalid-setup" ? 1 : 2;
+  for (unsigned vertex = 0; vertex != 3; ++vertex) {
+    triangle.window_z[vertex] =
+        varyings_fail || reciprocal_fails ? .5f : .25f * (vertex + 1);
+    triangle.reciprocal_w[vertex] = reciprocal_fails ? 1.f / (vertex + 1) : 1.f;
+  }
+  if (mode == "invalid-reciprocal")
+    triangle.reciprocal_w[0] = 0.f;
+
+  std::vector<RasterTriangle> triangles{triangle};
+  if (rollback) {
+    RasterTriangle finite = triangle;
+    finite.x[0] = 0.f;
+    finite.y[0] = 0.f;
+    finite.x[1] = 2.f;
+    finite.y[1] = 0.f;
+    finite.x[2] = 0.f;
+    finite.y[2] = 2.f;
+    triangles = {finite, triangle, finite};
+  }
+  std::vector<std::uint32_t> outputs(triangles.size() * 24, FloatBits(1.f));
+  for (std::size_t index = 0; index < triangles.size(); ++index) {
+    triangles[index].first_vertex_output_dword =
+        static_cast<std::uint32_t>(index * 24);
+    triangles[index].key.submit_ordinal = 100 + index;
+    triangles[index].key.draw_id = 31;
+    triangles[index].key.api_primitive_id = 17 + index;
+    triangles[index].key.instance_id = 9;
+    triangles[index].key.clip_piece = 2;
+    if (varyings_fail && (!rollback || index == 1)) {
+      for (unsigned vertex = 0; vertex != 3; ++vertex) {
+        // A later component fails after W and previous components were
+        // written, exercising rollback of a genuinely partial allocation.
+        const float value =
+            regular_edges ? (vertex == 1 ? -std::numeric_limits<float>::max()
+                                         : std::numeric_limits<float>::max())
+                          : float(vertex + 1);
+        outputs[index * 24 + vertex * 8 + 6] = FloatBits(value);
+      }
+    }
+  }
+  state.counters.c_primitives = state.counters.setup_triangles =
+      triangles.size();
+  state.raster_triangles = StoreNewArray(pool, triangles);
+  state.raster_vertex_outputs = StoreNewArray(pool, outputs);
+  state.shader_varying_bindings =
+      StoreNewArray(pool, std::vector<ShaderVaryingBinding>{binding});
+  const PoolHandle handle = pool.Allocate(sizeof(PipelineState));
+  StorePipelineState(pool, handle, state);
+  sc_core::sc_fifo<PipelineTxn> input("input", 1), output("output", 1);
+  ParameterBuffer parameter_buffer("parameter_buffer", pool);
+  parameter_buffer.input(input);
+  parameter_buffer.output(output);
+  input.write({handle, 1, 1});
+  try {
+    sc_core::sc_start(sc_core::sc_time(100, sc_core::SC_NS));
+  } catch (const sc_core::sc_report &error) {
+    const std::string message = error.what();
+    Check(!expected_error.empty() &&
+              message.find(expected_error) != std::string::npos,
+          "unexpected failure in " + mode + ": " + message);
+    if (regular_edges)
+      Check(message.find("varying_output=6") != std::string::npos,
+            "typed numerical exception retains varying context");
+    PipelineTxn unexpected;
+    Check(!output.nb_read(unexpected) &&
+              LoadPipelineState(pool, handle).stage == PipelineStage::kTiled,
+          "failure cannot publish a completed parameter buffer");
+    ReleaseFunctionalPayloads(pool, state);
+    pool.Release(handle);
+    Check(pool.bytes_in_flight() == 0, "negative fixture pool balance");
+    return;
+  }
+  Check(expected_error.empty(), mode + " must retain its original failure");
+  PipelineTxn completed;
+  Check(output.nb_read(completed), "empty triangle FIFO completion");
+  const PipelineState result = LoadPipelineState(pool, handle);
+  const auto parameters =
+      LoadArray<ParameterTriangle>(pool, result.parameter_triangles);
+  const auto coefficients =
+      LoadArray<ParameterCoefficientSet>(pool, result.parameter_coefficients);
+  Check(result.stage == PipelineStage::kParameterBufferReady &&
+            parameters.size() == triangles.size() &&
+            result.counters.c_primitives == triangles.size() &&
+            result.counters.setup_triangles == triangles.size(),
+        "empty setup preserves parameter indices and setup counters");
+  const std::size_t skipped_index = rollback ? 1 : 0;
+  const ParameterTriangle &skipped = parameters[skipped_index];
+  Check(skipped.key.submit_ordinal == 100 + skipped_index &&
+            skipped.key.api_primitive_id == 17 + skipped_index &&
+            skipped.key.draw_id == 31 && skipped.key.instance_id == 9 &&
+            skipped.key.clip_piece == 2 && skipped.front_facing == 1 &&
+            skipped.face_culled == 0,
+        "inactive placeholder retains primitive identity");
+  Check(skipped.rasterizable == 0 && skipped.signed_area == 0 &&
+            skipped.coefficient_set_count == 0 &&
+            skipped.depth_plane_valid == 0 &&
+            HasCanonicalDepthPlaneMetadata(result.functional_case, skipped),
+        "inactive placeholder has canonical zero plane metadata");
+  Check(skipped.min_x == 0 && skipped.min_y == 0 && skipped.max_x == 0 &&
+            skipped.max_y == 0,
+        "stale tiler references see empty half-open ISP bounds");
+  // ISP intersects every stale tile/scissor reference with these clamped
+  // half-open bounds. Even a tile at the origin cannot enter either loop.
+  Check(!(std::max(0, skipped.min_x) < std::max(0, skipped.max_x)) &&
+            !(std::max(0, skipped.min_y) < std::max(0, skipped.max_y)),
+        "ISP's clamped half-open loops cannot interpolate the placeholder");
+  const unsigned expected_sets = rollback ? 10 : 0;
+  Check(coefficients.size() == expected_sets &&
+            result.counters.parameter_coefficient_sets == expected_sets &&
+            result.counters.parameter_write_bytes ==
+                expected_sets * sizeof(ParameterCoefficientSet),
+        "partial coefficients are rolled back, with exact payload counters");
+  if (rollback) {
+    Check(parameters[0].first_coefficient_set == 0 &&
+              parameters[0].coefficient_set_count == 5 &&
+              skipped.first_coefficient_set == 5 &&
+              parameters[2].first_coefficient_set == 5 &&
+              parameters[2].coefficient_set_count == 5 &&
+              parameters[0].rasterizable && parameters[2].rasterizable,
+          "surrounding finite triangles keep contiguous coefficient ownership");
+    for (const auto &coefficient : coefficients)
+      CheckPlane(coefficient, 0, 0, FloatBits(1.f),
+                 "surrounding finite planes unchanged");
+  }
+  ReleaseFunctionalPayloads(pool, result);
+  pool.Release(handle);
+  Check(pool.bytes_in_flight() == 0 && pool.allocations() == pool.releases(),
+        "non-finite fixture MemoryPool balance");
+}
+
 } // namespace
 
-int sc_main(int, char **) {
+int sc_main(int argc, char **argv) {
   try {
+    if (argc == 2) {
+      RunNonFiniteFixture(argv[1]);
+      std::cout << "parameter_buffer_perspective_test: " << argv[1]
+                << ": PASS\n";
+      return 0;
+    }
+    Check(argc == 1, "expected zero or one fixture argument");
     MemoryPool pool;
     PipelineState state;
     state.width = 2;
@@ -72,8 +363,8 @@ int sc_main(int, char **) {
     binding.w_coefficient_set = 0;
     binding.component_count = 4;
     binding.interpolation = InterpolationMode::kSmooth;
-    state.shader_varying_bindings = StoreNewArray(
-        pool, std::vector<ShaderVaryingBinding>{binding});
+    state.shader_varying_bindings =
+        StoreNewArray(pool, std::vector<ShaderVaryingBinding>{binding});
 
     RasterTriangle triangle;
     triangle.x[0] = 0.0F;

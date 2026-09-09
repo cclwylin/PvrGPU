@@ -21,6 +21,12 @@ struct ControlMemory {
   CounterTxn &counters;
   std::uint64_t input_address,input_bytes,output_address,output_bytes;
   std::uint32_t level_written_mask=0;
+  std::function<void(const PcoTextureRequest &, std::uint32_t *)> sample{};
+  static void Sample(void *opaque, const PcoTextureRequest &request, std::uint32_t *response) {
+    auto &self = *static_cast<ControlMemory *>(opaque);
+    if (!self.sample) throw std::runtime_error("TCS has no texture route");
+    self.sample(request, response);
+  }
   static void Read(void *opaque,std::uint64_t address,std::uint32_t count,std::uint32_t *destination) {
     auto &self=*static_cast<ControlMemory*>(opaque);
     if(!destination || !count || count>16 || address%4)
@@ -59,12 +65,15 @@ TessellationControlShader::TessellationControlShader(sc_core::sc_module_name nam
     MemoryPool &pool,GpuMemorySystem *memory)
     : sc_module(name),pool_(pool),memory_(memory) { SC_THREAD(Run); }
 
-void TessellationControlShader::Execute(PipelineState &state) {
+void TessellationControlShader::Execute(PipelineState &state, const PipelineTxn &txn) {
   auto records=LoadArray<TessellationState>(pool_,state.tessellation_state);
   if(records.size()!=1 || state.stage!=PipelineStage::kVertexShaded || !memory_ ||
      memory_->mode()!=state.memory_mode)
     throw std::runtime_error("TCS pipeline/state/memory contract is invalid");
   auto &t=records[0];
+  if (state.tessellation_control_sampled_texture_count > kPcoMaximumTextureDescriptorSets ||
+      t.control_abi.uniform_buffer_descriptor_start != 8U + 20U * state.tessellation_control_sampled_texture_count)
+    throw std::runtime_error("TCS texture count/descriptor prefix mismatch");
   if(t.phase!=TessellationPhase::kSubmitted || !t.input_address || t.input_address%4 ||
      !t.output_address || t.output_address%4 || !t.input_vertices || t.input_vertices>32 ||
      !t.output_vertices || t.output_vertices>32 || !t.input_stride_dwords ||
@@ -125,7 +134,11 @@ void TessellationControlShader::Execute(PipelineState &state) {
       task=MakeTessellationControlTask(t.control_abi,shared,patch.primitive_id,patch.input_vertices,t.output_vertices);
       ControlMemory context{*memory_,uniforms,state.counters,t.input_address,input_words*4,
                              patch.output_address,t.patch_stride_dwords*4};
-      const TessellationMemoryCallbacks callbacks{&context,ControlMemory::Read,ControlMemory::Write};
+      context.sample = [this, &state, &txn](const PcoTextureRequest &request, std::uint32_t *response) {
+        SampleTessellationTexture(pool_, state, txn, ShaderStage::kTessellationControl, request,
+                                  response, texture_request_output, texture_response_input);
+      };
+      const TessellationMemoryCallbacks callbacks{&context,ControlMemory::Read,ControlMemory::Write,ControlMemory::Sample};
       while(!task.ended)StepTessellationTask(program,t.control_abi,task,callbacks,execution);
       const auto required=t.domain==TessellationDomain::kQuads?63U:
                           t.domain==TessellationDomain::kTriangles?23U:3U;
@@ -143,6 +156,7 @@ void TessellationControlShader::Execute(PipelineState &state) {
   state.counters.usc_groups+=execution.groups;
   state.counters.usc_cluster_cycles+=execution.groups;
   state.counters.tcs_alu_instructions+=execution.alu_instructions;
+  state.counters.tcs_tex_instructions+=execution.texture_instructions;
   state.counters.tcs_memory_instructions+=execution.memory_instructions;
   state.counters.tcs_load_instructions+=execution.load_instructions;
   state.counters.tcs_store_instructions+=execution.store_instructions;
@@ -154,6 +168,7 @@ void TessellationControlShader::Execute(PipelineState &state) {
     s.invocations=state.counters.tcs_invocations;
     s.program_groups=program.summary.group_count;s.program_instructions=program.summary.instruction_count;
     s.program_alu_instructions=composition.alu;s.program_memory_instructions=composition.memory;
+    s.program_tex_instructions=composition.texture;s.executed_tex_instructions=execution.texture_instructions;
     s.executed_alu_instructions=execution.alu_instructions;s.executed_memory_instructions=execution.memory_instructions;
     s.program_recorded=s.executions_recorded=1;
     StoreArray(pool_,state.drawlist_stats,stats);
@@ -169,7 +184,7 @@ void TessellationControlShader::Run() {
     while(!input.nb_read(transaction))wait(input.data_written_event());
     auto state=LoadPipelineState(pool_,transaction.state);
     if(HasPoolHandle(state.tessellation_state)) {
-      try { Execute(state); }
+      try { Execute(state, transaction); }
       catch(...) { StorePipelineState(pool_,transaction.state,state);throw; }
       StorePipelineState(pool_,transaction.state,state);
     }

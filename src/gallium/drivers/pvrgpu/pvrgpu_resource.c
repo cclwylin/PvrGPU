@@ -1371,9 +1371,14 @@ pvrgpu_resource_read_back_color_surface(struct pipe_context *pipe,
 
    bool written = false;
    char error[512] = { 0 };
+   const char *color_format =
+      surface->format == PIPE_FORMAT_R8G8B8A8_UNORM ||
+      surface->format == PIPE_FORMAT_R10G10B10A2_UNORM ||
+      surface->format == PIPE_FORMAT_B10G10R10A2_UNORM
+         ? util_format_name(surface->format) : NULL;
    const bool flushed =
       pvrgpu_systemc_flush_readback_pixels(width, height, bytes_per_pixel,
-                                           (uint32_t)attachment, samples, 0, layer_count, pixels,
+                                           (uint32_t)attachment, samples, 0, layer_count, color_format, pixels,
                                            pixels_size, &written,
                                            error, sizeof(error));
    if (!flushed || !written) {
@@ -1451,7 +1456,7 @@ pvrgpu_resource_read_back_depth_surface(struct pipe_context *pipe)
    char error[512] = {0};
    bool written = false;
    const bool flushed = pvrgpu_systemc_flush_readback_pixels(width, height, bpp, UINT32_MAX,
-         samples, surface->format, layer_count, pixels, size, &written, error, sizeof(error));
+         samples, surface->format, layer_count, NULL, pixels, size, &written, error, sizeof(error));
    if (flushed && written) {
       uint8_t *destination = resource->data + destination_offset;
       for (unsigned layer = 0; layer < layer_count; ++layer)

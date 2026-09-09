@@ -40,10 +40,14 @@ struct TessellationState {
   PoolHandle control_instructions;
   PoolHandle control_shared;
   PoolHandle control_uniform_buffers;
+  PoolHandle control_texture_resources;
+  PoolHandle control_sampler_states;
   PoolHandle evaluation_code;
   PoolHandle evaluation_instructions;
   PoolHandle evaluation_shared;
   PoolHandle evaluation_uniform_buffers;
+  PoolHandle evaluation_texture_resources;
+  PoolHandle evaluation_sampler_states;
   PoolHandle patches;
   // Indices use patch-local point indices; point_start locates each patch's
   // domain values in the GPU address region. No bulk data crosses a FIFO.

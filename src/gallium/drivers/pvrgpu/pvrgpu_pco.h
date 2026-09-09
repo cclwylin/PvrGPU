@@ -3,6 +3,7 @@
 #define PVRGPU_PCO_H
 
 #include "util/format/u_formats.h"
+#include "pvrgpu_systemc_limits.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -15,6 +16,17 @@ struct pvrgpu_pco_compiler;
  * instruction sequence before public PCO instruction selection. */
 bool pvrgpu_lower_float_builtins_nir(struct nir_shader *nir);
 bool pvrgpu_lower_uniform_fragment_texture_selects(struct nir_shader *nir);
+
+/* Read-only sampler-capture proof: at least one bounded red shadow gather
+ * uses this exact FS slot and every sample involving the slot is the same
+ * supported 2D/2D-array shadow-gather shape. Queries do not count as samples;
+ * any unresolved descriptor addressing makes the whole proof fail closed. */
+bool pvrgpu_pco_fragment_shadow_gather_only(const struct nir_shader *nir,
+                                         unsigned slot, bool array);
+/* Conservative routing predicate: unresolved FS shadow gathers may alias any
+ * slot and must reach the strict proof above, not a nearest-shadow fallback. */
+bool pvrgpu_pco_fragment_has_shadow_gather(const struct nir_shader *nir,
+                                        unsigned slot);
 
 /* Run the common PCO preprocessing pipeline with the compiler-owned NIR
  * options, including the builtin lowerings above. */
@@ -48,10 +60,23 @@ struct pvrgpu_pco_stage_abi {
    uint32_t uniform_buffer_descriptor_count;
 };
 
+/* Driver-only CB0 packing plan, never part of the stable model ABI. count=0
+ * is the unchanged identity-copy path (all remaining fields are zero).
+ * Otherwise count equals the compiled push_constant_count, source_dwords is
+ * the original bound CB0 extent, and source_words[0..count) is strictly
+ * increasing and in range. Unused entries are zero. The driver copies raw
+ * source DWORDs into the already allocated flat push-constant suffix. */
+struct pvrgpu_pco_uniform_word_map {
+   uint32_t count;
+   uint32_t source_dwords;
+   uint32_t source_words[256];
+};
+
 struct pvrgpu_pco_owned_binary {
    uint8_t *data;
    size_t size;
    struct pvrgpu_pco_stage_abi abi;
+   struct pvrgpu_pco_uniform_word_map cb0_word_map;
 };
 
 /* Compute has its own transport contract; it is never a graphics stage.
@@ -361,7 +386,7 @@ bool pvrgpu_pco_compile_conditionals(struct pvrgpu_pco_compiler *compiler,
 #define PVRGPU_PCO_MAX_VARYINGS 16u
 
 /* Combined image/sampler descriptors one generically lowered draw can bind. */
-#define PVRGPU_PCO_MAX_TEXTURES 8u
+#define PVRGPU_PCO_MAX_TEXTURES PVRGPU_SYSTEMC_MAX_PCO_TEXTURES_PER_STAGE
 
 /*
  * Reports, for each bound vertex element, the component width the vertex
@@ -522,6 +547,13 @@ bool pvrgpu_pco_build_terrain_texture_descriptor(
  * extent and stride remain logical texels; storage is pixel-interleaved. */
 bool pvrgpu_pco_set_texture_sample_count(
    uint32_t out[PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS], unsigned sample_count);
+
+/* Convert a fresh address-zero physical-face array descriptor to CubeArray.
+ * WORD1.depth becomes cube_count-1; word4 becomes one base-level face's byte
+ * stride for PCO's layer*6 address override. On refusal out is unchanged. */
+bool pvrgpu_pco_set_cube_array_texture_layout(
+   uint32_t out[PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS],
+   enum pipe_format format, unsigned physical_faces);
 
 /* Compile one of the four shader pairs used by the 180-draw GLMark2 ideas
  * capture.  The simple profiles consume one float4 attribute and 32 VS

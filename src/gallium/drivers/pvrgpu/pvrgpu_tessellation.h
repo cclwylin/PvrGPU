@@ -29,6 +29,7 @@ pvrgpu_tessellation_payload_error(const struct pvrgpu_systemc_tessellation *t)
       const uint32_t *shared = stage ? t->evaluation_shared : t->control_shared;
       const uint32_t count = stage ? t->evaluation_shared_count : t->control_shared_count;
       const uint32_t descriptors = stage ? 4u : 8u;
+      const uint32_t ubo_start = a->uniform_buffer_descriptor_start;
       /* PCO may use aligned spare VTXIN words as writable registers. Only
        * the fixed 3/5-word system-input prefix is initialized by the task. */
       if (a->temps > 256 || a->vertex_inputs < (stage ? 5u : 3u) ||
@@ -37,8 +38,9 @@ pvrgpu_tessellation_payload_error(const struct pvrgpu_systemc_tessellation *t)
           a->coefficients || a->entry_offset || !shared || count != a->shareds ||
           count < descriptors || count > 256 ||
           a->uniform_buffer_descriptor_count > 15 ||
-          a->uniform_buffer_descriptor_start != descriptors ||
-          a->push_constant_start != descriptors + 4u * a->uniform_buffer_descriptor_count ||
+          ubo_start < descriptors || ubo_start > descriptors + 8u * 20u ||
+          (ubo_start - descriptors) % 20u ||
+          a->push_constant_start != ubo_start + 4u * a->uniform_buffer_descriptor_count ||
           (uint64_t)a->push_constant_start + a->push_constant_count != count)
          return "tessellation native stage register/descriptor ABI";
       for (unsigned word = 0; word < descriptors; ++word)

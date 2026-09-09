@@ -31,6 +31,13 @@ namespace pvrgpu::stub {
 // packed to the taps a particular sample happens to issue.
 inline constexpr std::uint64_t kTextureSampleTapRequestStride = 16;
 
+// Raw gather's binary32 coordinate datapath: round s*extent and independently
+// round +/-0.5 before truncation and clamp-to-edge. Do not derive the upper
+// neighbor from the lower-clamped index, or replace finite-precision addressing
+// with an ideal double floor; both differ at observable half-texel boundaries.
+std::array<std::uint32_t, 2> ComputeTextureGatherClampToEdge(
+    float coordinate, std::uint32_t extent);
+
 // Validates a declared tightly packed RGBA8 texture view of an actual earlier
 // sequence color attachment in unified GPU memory. A one-level view aliases
 // the producer bytes without rewriting them; a multi-level view derives and
@@ -68,6 +75,12 @@ bool ComputeTextureTexelOffset(
 void ValidateTextureSingleLevelDimensions(
     const std::array<std::uint32_t, 4> &words,
     const TextureResource &resource);
+// Explicit whole-cube, uncompressed, single-sample layout. TAO must name an
+// exact shader-produced cube base, never a face or an approximate byte offset.
+void ValidateTextureCubeArrayLayout(const TextureResource &resource);
+std::uint32_t TextureCubeArrayBaseFace(const TextureResource &resource,
+                                      std::uint64_t image_address,
+                                      std::uint64_t sample_address);
 // What driver-PCO sampling can serve: a format the unit decodes, address
 // modes the wrap arithmetic implements, a LOD window that runs forwards.
 // Level selection is not a constraint -- see texture_filter.h.
@@ -122,6 +135,14 @@ class TextureUnit final : public sc_core::sc_module {
                    sc_core::SC_ZERO_OR_MORE_BOUND>
       geometry_sample_output{"geometry_sample_output"};
   sc_core::sc_port<sc_core::sc_fifo_in_if<PipelineTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND> tessellation_control_sample_input{"tessellation_control_sample_input"};
+  sc_core::sc_port<sc_core::sc_fifo_out_if<PipelineTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND> tessellation_control_sample_output{"tessellation_control_sample_output"};
+  sc_core::sc_port<sc_core::sc_fifo_in_if<PipelineTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND> tessellation_evaluation_sample_input{"tessellation_evaluation_sample_input"};
+  sc_core::sc_port<sc_core::sc_fifo_out_if<PipelineTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND> tessellation_evaluation_sample_output{"tessellation_evaluation_sample_output"};
+  sc_core::sc_port<sc_core::sc_fifo_in_if<PipelineTxn>, 0,
                    sc_core::SC_ZERO_OR_MORE_BOUND> compute_sample_input{"compute_sample_input"};
   sc_core::sc_port<sc_core::sc_fifo_out_if<PipelineTxn>, 0,
                    sc_core::SC_ZERO_OR_MORE_BOUND> compute_sample_output{"compute_sample_output"};
@@ -146,6 +167,8 @@ class TextureUnit final : public sc_core::sc_module {
   void SampleRun();
   void VertexSampleRun();
   void GeometrySampleRun();
+  void TessellationControlSampleRun();
+  void TessellationEvaluationSampleRun();
   void ComputeSampleRun();
   void SampleRunForStage(
       ShaderStage stage,
@@ -156,16 +179,16 @@ class TextureUnit final : public sc_core::sc_module {
 
   MemoryPool& pool_;
   GpuMemorySystem *memory_;
-  // VS, FS and GS descriptor-set namespaces are independent. Residency is kept
+  // All six shader-stage descriptor-set namespaces are independent. Residency is kept
   // within one PipelineState (including all of its SMP continuation rounds)
   // and reset when the next physical draw receives a new state handle.
-  std::array<std::array<bool, kPcoMaximumTextureDescriptorSets>, 4>
+  std::array<std::array<bool, kPcoMaximumTextureDescriptorSets>, 6>
       texture_preloaded_{};
-  std::array<std::array<std::uint64_t, kPcoMaximumTextureDescriptorSets>, 4>
+  std::array<std::array<std::uint64_t, kPcoMaximumTextureDescriptorSets>, 6>
       preloaded_address_{};
-  std::array<std::array<std::uint64_t, kPcoMaximumTextureDescriptorSets>, 4>
+  std::array<std::array<std::uint64_t, kPcoMaximumTextureDescriptorSets>, 6>
       preloaded_bytes_{};
-  std::array<PoolHandle, 4> residency_state_{};
+  std::array<PoolHandle, 6> residency_state_{};
 };
 
 }  // namespace pvrgpu::stub

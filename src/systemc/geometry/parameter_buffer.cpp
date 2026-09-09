@@ -9,6 +9,7 @@
 #include "geometry/parameter_buffer.h"
 
 #include "common/functional_types.h"
+#include "common/msaa.h"
 
 #include <algorithm>
 #include <array>
@@ -21,9 +22,23 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
+
+class NonFiniteDriverPlane : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
+std::int64_t CheckedAdd(std::int64_t lhs, std::int64_t rhs,
+                        const char *description) {
+  std::int64_t result = 0;
+  if (__builtin_add_overflow(lhs, rhs, &result))
+    throw std::overflow_error(description);
+  return result;
+}
 
 std::int64_t CheckedSub(std::int64_t lhs, std::int64_t rhs,
                         const char *description) {
@@ -58,6 +73,72 @@ float BitsFloat(std::uint32_t bits) {
   static_assert(sizeof(value) == sizeof(bits));
   std::memcpy(&value, &bits, sizeof(value));
   return value;
+}
+
+// This is deliberately a conservative proof using the ISP's exact coverage
+// domain, not a tolerance on the floating-point plane determinant. No depth,
+// alpha, line or shader rejection is used to declare a primitive invisible.
+// It runs only after numerical plane setup has failed. Arithmetic overflow or
+// invalid sample state must remain errors rather than evidence of no coverage.
+bool HasEnabledRasterSample(const pvrgpu::stub::PipelineState &state,
+                            const pvrgpu::stub::ParameterTriangle &triangle) {
+  using namespace pvrgpu::stub;
+  const RasterState &raster = state.raster_state;
+  if (raster.multisample_enable > 1)
+    throw std::runtime_error("ParameterBuffer multisample flag is invalid");
+  const std::uint32_t enabled =
+      RasterSampleMask(raster.sample_count) & raster.sample_mask;
+  if (enabled == 0)
+    return false;
+  const bool multisample =
+      raster.sample_count > 1 && raster.multisample_enable != 0;
+  const ScissorState &scissor = raster.scissor;
+  const std::uint32_t x_begin = std::max(
+      scissor.enable ? scissor.x0 : 0U,
+      static_cast<std::uint32_t>(std::max(0, triangle.min_x)));
+  const std::uint32_t y_begin = std::max(
+      scissor.enable ? scissor.y0 : 0U,
+      static_cast<std::uint32_t>(std::max(0, triangle.min_y)));
+  const std::uint32_t x_end = std::min({
+      state.width, scissor.enable ? scissor.x1 : state.width,
+      static_cast<std::uint32_t>(std::max(0, triangle.max_x))});
+  const std::uint32_t y_end = std::min({
+      state.height, scissor.enable ? scissor.y1 : state.height,
+      static_cast<std::uint32_t>(std::max(0, triangle.max_y))});
+  for (std::uint32_t y = y_begin; y < y_end; ++y) {
+    for (std::uint32_t x = x_begin; x < x_end; ++x) {
+      for (std::uint32_t sample = 0; sample < raster.sample_count; ++sample) {
+        if ((enabled & (1U << sample)) == 0)
+          continue;
+        const auto position = multisample
+            ? RasterSamplePosition(raster.sample_count, sample)
+            : RasterSamplePosition(1, 0);
+        const std::int64_t sample_x =
+            static_cast<std::int64_t>(x) * kSubpixelScale +
+            position[0] * (kSubpixelScale / 16);
+        const std::int64_t sample_y =
+            static_cast<std::int64_t>(y) * kSubpixelScale +
+            position[1] * (kSubpixelScale / 16);
+        bool covered = true;
+        for (const EdgeEquation &edge : triangle.edge) {
+          const std::int64_t ax = CheckedMul(
+              edge.a, sample_x, "ParameterBuffer sample edge product overflow");
+          const std::int64_t by = CheckedMul(
+              edge.b, sample_y, "ParameterBuffer sample edge product overflow");
+          const std::int64_t value = CheckedAdd(
+              CheckedAdd(ax, by, "ParameterBuffer sample edge sum overflow"),
+              edge.c, "ParameterBuffer sample edge sum overflow");
+          if (value < 0 || (value == 0 && edge.inclusive == 0)) {
+            covered = false;
+            break;
+          }
+        }
+        if (covered)
+          return true;
+      }
+    }
+  }
+  return false;
 }
 
 std::uint32_t FloatBits(float value) {
@@ -172,7 +253,7 @@ BuildLlvmPipeDriverPlane(const pvrgpu::stub::RasterTriangle &triangle,
   const float attr0 = value[i0] - origin;
   if (!std::isfinite(dadx) || !std::isfinite(dady) ||
       !std::isfinite(attr0)) {
-    throw std::runtime_error(
+    throw NonFiniteDriverPlane(
         "ParameterBuffer produced a non-finite llvmpipe driver plane: "
         "xy=(" + std::to_string(triangle.x[i0]) + "," + std::to_string(triangle.y[i0]) +
         "),(" + std::to_string(triangle.x[i1]) + "," + std::to_string(triangle.y[i1]) +
@@ -374,29 +455,19 @@ void ParameterBuffer::Run() {
       parameter.max_x = ClampCeil(x_bounds.second, state.width);
       parameter.max_y = ClampCeil(y_bounds.second, state.height);
 
-      if (IsDriverPcoTrianglesCase(state.functional_case)) {
-        const ParameterCoefficientSet depth_plane =
-            BuildLlvmPipeDriverPlane(triangle, triangle.window_z);
-        parameter.depth_plane[0] = depth_plane.a;
-        parameter.depth_plane[1] = depth_plane.b;
-        parameter.depth_plane[2] = depth_plane.c;
-        parameter.depth_plane[3] = depth_plane.pad;
-        parameter.depth_plane_valid = 1;
-      }
-
+      // Validate all non-numerical varying inputs before depth setup can
+      // fail. An invisible primitive must not hide an invalid payload.
+      float reciprocal_w[3]{};
+      const std::size_t coefficient_base = coefficients.size();
       if (UsesShaderVaryings(state)) {
         parameter.coefficient_set_count = static_cast<std::uint16_t>(
             VaryingCoefficientSetCount(state));
-        const std::size_t coefficient_base = coefficients.size();
         if (coefficient_base >
             std::numeric_limits<std::uint32_t>::max() -
                 parameter.coefficient_set_count) {
           throw std::overflow_error(
               "ParameterBuffer coefficient-set range overflow");
         }
-        coefficients.resize(coefficient_base + parameter.coefficient_set_count);
-
-        float reciprocal_w[3]{};
         for (std::size_t vertex = 0; vertex < 3; ++vertex) {
           reciprocal_w[vertex] = triangle.reciprocal_w[vertex];
           if (!(reciprocal_w[vertex] > 0.0F) ||
@@ -405,67 +476,109 @@ void ParameterBuffer::Run() {
                 "ParameterBuffer received invalid reciprocal W");
           }
         }
-        const bool llvmpipe_driver_plane =
-            state.functional_case == FunctionalCase::kDriverTexturedTriangles ||
-            IsDriverPcoTrianglesCase(state.functional_case);
-        coefficients[coefficient_base] =
-            llvmpipe_driver_plane
-                ? BuildLlvmPipeDriverPlane(triangle, reciprocal_w)
-                : BuildPlane(triangle, reciprocal_w);
+      }
 
-        for (const ShaderVaryingBinding &binding : varying_bindings) {
-          for (std::uint8_t component = 0;
-               component < binding.component_count; ++component) {
-            float numerator[3]{};
-            for (std::size_t vertex = 0; vertex < 3; ++vertex) {
-              const std::size_t output_index =
-                  triangle.first_vertex_output_dword +
-                  vertex * triangle.vertex_output_stride_dwords +
-                  binding.vertex_output_base + component;
-              /* A varying is a shader result, and GLSL lets a shader compute
-               * a NaN or an infinity and write one out.  This stage only fits
-               * a plane through the three values it is given, so a non-finite
-               * varying is carried into the coefficients and reaches the
-               * fragment shader as the non-finite value it is, exactly as the
-               * finite ones are interpolated. */
-              const float varying =
-                  BitsFloat(raster_vertex_outputs[output_index]);
-              if (binding.interpolation == InterpolationMode::kFlat) {
-                numerator[vertex] = varying;
-              } else if (binding.interpolation == InterpolationMode::kNoPerspective) {
-                numerator[vertex] = varying;
-              } else {
-                numerator[vertex] = varying * reciprocal_w[vertex];
+      try {
+        if (IsDriverPcoTrianglesCase(state.functional_case)) {
+          const ParameterCoefficientSet depth_plane =
+              BuildLlvmPipeDriverPlane(triangle, triangle.window_z);
+          parameter.depth_plane[0] = depth_plane.a;
+          parameter.depth_plane[1] = depth_plane.b;
+          parameter.depth_plane[2] = depth_plane.c;
+          parameter.depth_plane[3] = depth_plane.pad;
+          parameter.depth_plane_valid = 1;
+        }
+
+        if (UsesShaderVaryings(state)) {
+          coefficients.resize(coefficient_base +
+                              parameter.coefficient_set_count);
+
+          const bool llvmpipe_driver_plane =
+              state.functional_case ==
+                  FunctionalCase::kDriverTexturedTriangles ||
+              IsDriverPcoTrianglesCase(state.functional_case);
+          coefficients[coefficient_base] =
+              llvmpipe_driver_plane
+                  ? BuildLlvmPipeDriverPlane(triangle, reciprocal_w)
+                  : BuildPlane(triangle, reciprocal_w);
+
+          for (const ShaderVaryingBinding &binding : varying_bindings) {
+            for (std::uint8_t component = 0;
+                 component < binding.component_count; ++component) {
+              float numerator[3]{};
+              for (std::size_t vertex = 0; vertex < 3; ++vertex) {
+                const std::size_t output_index =
+                    triangle.first_vertex_output_dword +
+                    vertex * triangle.vertex_output_stride_dwords +
+                    binding.vertex_output_base + component;
+                /* A varying is a shader result, and GLSL lets a shader compute
+                 * a NaN or an infinity and write one out.  This stage only fits
+                 * a plane through the three values it is given, so a non-finite
+                 * varying is carried into the coefficients and reaches the
+                 * fragment shader as the non-finite value it is, exactly as the
+                 * finite ones are interpolated. */
+                const float varying =
+                    BitsFloat(raster_vertex_outputs[output_index]);
+                if (binding.interpolation == InterpolationMode::kFlat) {
+                  numerator[vertex] = varying;
+                } else if (binding.interpolation ==
+                           InterpolationMode::kNoPerspective) {
+                  numerator[vertex] = varying;
+                } else {
+                  numerator[vertex] = varying * reciprocal_w[vertex];
+                }
               }
-            }
-            if (binding.interpolation == InterpolationMode::kFlat) {
-              pvrgpu::stub::ParameterCoefficientSet coefficient;
-              coefficient.a = 0;
-              coefficient.b = 0;
-              coefficient.c = FloatBits(numerator[2]); // Provoking vertex (default is vertex 2)
-              coefficient.pad = 0;
-              coefficients[coefficient_base + binding.coefficient_set_base +
-                           component] = coefficient;
-            } else {
-              try {
+              if (binding.interpolation == InterpolationMode::kFlat) {
+                pvrgpu::stub::ParameterCoefficientSet coefficient;
+                coefficient.a = 0;
+                coefficient.b = 0;
+                coefficient.c = FloatBits(
+                    numerator[2]); // Provoking vertex (default is vertex 2)
+                coefficient.pad = 0;
                 coefficients[coefficient_base + binding.coefficient_set_base +
-                             component] =
-                    llvmpipe_driver_plane
-                        ? BuildLlvmPipeDriverPlane(triangle, numerator)
-                        : BuildPlane(triangle, numerator);
-              } catch (const std::runtime_error &error) {
-                throw std::runtime_error(std::string(error.what()) +
-                    " varying_output=" +
-                    std::to_string(binding.vertex_output_base + component) +
-                    " interpolation=" +
-                    std::to_string(static_cast<unsigned>(binding.interpolation)) +
-                    " numerator_bits=" + std::to_string(FloatBits(numerator[0])) +
-                    "," + std::to_string(FloatBits(numerator[1])) +
-                    "," + std::to_string(FloatBits(numerator[2])));
+                             component] = coefficient;
+              } else {
+                try {
+                  coefficients[coefficient_base + binding.coefficient_set_base +
+                               component] =
+                      llvmpipe_driver_plane
+                          ? BuildLlvmPipeDriverPlane(triangle, numerator)
+                          : BuildPlane(triangle, numerator);
+                } catch (const std::runtime_error &error) {
+                  const std::string description =
+                      std::string(error.what()) + " varying_output=" +
+                      std::to_string(binding.vertex_output_base + component) +
+                      " interpolation=" +
+                      std::to_string(
+                          static_cast<unsigned>(binding.interpolation)) +
+                      " numerator_bits=" +
+                      std::to_string(FloatBits(numerator[0])) + "," +
+                      std::to_string(FloatBits(numerator[1])) + "," +
+                      std::to_string(FloatBits(numerator[2]));
+                  if (dynamic_cast<const NonFiniteDriverPlane *>(&error))
+                    throw NonFiniteDriverPlane(description);
+                  throw std::runtime_error(description);
+                }
               }
             }
           }
         }
+      } catch (const NonFiniteDriverPlane &) {
+        if (HasEnabledRasterSample(state, parameter))
+          throw;
+        // Tiler references already name this identity, so keep its slot and
+        // setup accounting. A canonical inactive payload and empty bounds
+        // ensure those references cannot reach interpolation in the ISP.
+        ParameterTriangle inactive;
+        inactive.key = parameter.key;
+        inactive.front_facing = parameter.front_facing;
+        inactive.face_culled = parameter.face_culled;
+        inactive.line = parameter.line;
+        inactive.first_coefficient_set = parameter.first_coefficient_set;
+        std::copy(std::begin(parameter.window_z), std::end(parameter.window_z),
+                  std::begin(inactive.window_z));
+        parameter = inactive;
+        coefficients.resize(coefficient_base);
       }
       if (triangle_index == debug_parameter_index) {
         std::cerr << "parameter-debug index=" << triangle_index

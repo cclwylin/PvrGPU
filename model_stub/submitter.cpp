@@ -14,6 +14,7 @@
 #include "submitter.h"
 #include "common/diagnostics.h"
 #include "uniform_buffers.h"
+#include "texture_stages.h"
 #include "shader_images.h"
 #include "common/geometry_emission.h"
 #include "common/tessellation_state.h"
@@ -23,6 +24,7 @@
 #include "common/glbench_triangle_fixture.h"
 #include "common/glbench_texture_fixture.h"
 #include "common/pipeline_state.h"
+#include "common/color_attachment_formats.h"
 #include "memory/gpu_memory_system.h"
 #include "pco_sequence_profiles.h"
 #include "shader/pco_iss.h"
@@ -173,7 +175,9 @@ std::uint64_t SequenceExternalTextureAddress(
   if (submission >= kDriverPcoMaximumNestedSequenceCommands ||
       (stage != DriverPcoShaderStage::kVertex &&
        stage != DriverPcoShaderStage::kFragment &&
-       stage != DriverPcoShaderStage::kGeometry) ||
+       stage != DriverPcoShaderStage::kGeometry &&
+       stage != DriverPcoShaderStage::kTessellationControl &&
+       stage != DriverPcoShaderStage::kTessellationEvaluation) ||
       descriptor_set >= kPcoMaximumTextureDescriptorSets) {
     throw std::runtime_error(
         "Submitter sequence external texture slot is out of bounds");
@@ -1543,17 +1547,21 @@ void Submitter::RunJob() {
       for (const DriverPcoSampledTexture &texture :
            command.sampled_textures) {
         const std::uint32_t samples = texture.sample_count ? texture.sample_count : 1U;
-        const auto &shared = texture.stage == DriverPcoShaderStage::kVertex
-                                 ? command.vertex_shared
-                                 : texture.stage == DriverPcoShaderStage::kGeometry
-                                     ? command.geometry_shared : command.fragment_shared;
+        const auto &shared = DriverTextureShared(command, texture.stage);
         const std::size_t descriptor_end =
             (static_cast<std::size_t>(texture.descriptor_set) + 1U) *
                 kPcoTextureDescriptorDwordCount +
-                (texture.stage == DriverPcoShaderStage::kGeometry ? 4U : 0U);
+                DriverTextureDescriptorStart(texture.stage);
+        if (texture.texture_kind > 4U ||
+            (texture.texture_kind == 4U &&
+             (texture.stage != DriverPcoShaderStage::kFragment ||
+              texture.source != DriverPcoTextureSource::kExternalPayload)))
+          throw std::runtime_error("Submitter cube array requires external fragment storage");
         if ((texture.stage != DriverPcoShaderStage::kVertex &&
              texture.stage != DriverPcoShaderStage::kFragment &&
-             texture.stage != DriverPcoShaderStage::kGeometry) ||
+             texture.stage != DriverPcoShaderStage::kGeometry &&
+             texture.stage != DriverPcoShaderStage::kTessellationControl &&
+             texture.stage != DriverPcoShaderStage::kTessellationEvaluation) ||
             (samples != 1U && samples != 2U && samples != 4U && samples != 8U) ||
             descriptor_end > shared.size() ||
             (1U << (shared[descriptor_end - kPcoTextureDescriptorDwordCount + 1U] >> 30U)) != samples ||
@@ -1636,6 +1644,14 @@ void Submitter::RunJob() {
         command.render_target_count == 0 ? 1U : command.render_target_count;
     if (state.render_target_count > kMaxRenderTargets)
       throw std::runtime_error("Submitter render target count is unsupported");
+    if (!DriverColorAttachmentFormatsAreValid(command))
+      throw std::runtime_error("Submitter color attachment formats are invalid");
+    state.color_attachment_format_count =
+        static_cast<std::uint32_t>(command.color_attachment_formats.size());
+    for (std::uint32_t target = 0; target < state.color_attachment_format_count; ++target)
+      state.color_attachment_packed_unorms[target] =
+          PackedUnormFormatFromName(command.color_attachment_formats[target]);
+    ValidateColorAttachmentFormats(state);
     for (std::uint32_t target = 1; target < state.render_target_count;
          ++target) {
       const std::uint64_t color_owner = driver_pco_sequence_command ?
@@ -1761,6 +1777,14 @@ void Submitter::RunJob() {
     if (driver_pco_triangles_command) {
       state.vertex_pco_abi = command.vertex_pco_abi;
       state.fragment_pco_abi = command.fragment_pco_abi;
+      // ParameterBuffer precedes the modeled fragment decoder, but must
+      // already know whether a position-only FS needs quad coefficients.
+      // Derive only this planning bit from the owned native bytes. Do not
+      // prepopulate instruction payloads, execution statistics or timing;
+      // PcoDecoder still fetches/validates the real code and checks this bit.
+      state.fragment_program_summary.uses_derivatives =
+          DecodePcoProgram(ShaderStage::kFragment, command.fragment_pco)
+              .summary.uses_derivatives;
       if (!command.stream_output.bindings.empty()) {
         if (!memory_ || submission >= kDriverSequenceAddressSlots ||
             command.stream_output.bindings.size() > 64 ||
@@ -1907,6 +1931,8 @@ void Submitter::RunJob() {
       state.vertex_sampled_texture_count =
           command.vertex_sampled_texture_count;
       state.geometry_sampled_texture_count = command.geometry_sampled_texture_count;
+      state.tessellation_control_sampled_texture_count = command.tessellation_control_sampled_texture_count;
+      state.tessellation_evaluation_sampled_texture_count = command.tessellation_evaluation_sampled_texture_count;
       state.sampled_texture_count =
           command.fragment_sampled_texture_count != 0 ||
                   !command.sampled_textures.empty()
@@ -2563,22 +2589,15 @@ void Submitter::RunJob() {
         if (!geometry_uniform_buffers.empty())
           state.geometry_uniform_buffer_resources = StoreNewArray(pool_, geometry_uniform_buffers);
       }
-      if (HasPoolHandle(state.tessellation_state)) {
-        auto tess = LoadArray<TessellationState>(pool_, state.tessellation_state);
-        tess[0].control_shared = StoreNewArray(pool_, control_shared);
-        tess[0].evaluation_shared = StoreNewArray(pool_, evaluation_shared);
-        if (!control_uniform_buffers.empty())
-          tess[0].control_uniform_buffers = StoreNewArray(pool_, control_uniform_buffers);
-        if (!evaluation_uniform_buffers.empty())
-          tess[0].evaluation_uniform_buffers = StoreNewArray(pool_, evaluation_uniform_buffers);
-        StoreArray(pool_, state.tessellation_state, tess);
-      }
+      std::array<std::vector<TextureResource>, 2> tessellation_resources;
+      std::array<std::vector<SamplerState>, 2> tessellation_samplers;
       if (!command.sampled_textures.empty()) {
         if (!driver_pco_sequence_command || !memory_ ||
             command.sampled_textures.size() !=
                 command.sampled_texture_count ||
             command.vertex_sampled_texture_count +
-                    command.fragment_sampled_texture_count + command.geometry_sampled_texture_count !=
+                    command.fragment_sampled_texture_count + command.geometry_sampled_texture_count +
+                    command.tessellation_control_sampled_texture_count + command.tessellation_evaluation_sampled_texture_count !=
                 command.sampled_texture_count) {
           throw std::runtime_error(
               "Submitter PCO sequence texture state is inconsistent");
@@ -2594,6 +2613,14 @@ void Submitter::RunJob() {
         std::vector<TextureResource> geometry_resources(command.geometry_sampled_texture_count);
         std::vector<SamplerState> geometry_samplers(command.geometry_sampled_texture_count);
         std::vector<bool> geometry_present(command.geometry_sampled_texture_count, false);
+        const std::array<std::uint32_t, 2> tessellation_counts{
+            command.tessellation_control_sampled_texture_count, command.tessellation_evaluation_sampled_texture_count};
+        std::array<std::vector<bool>, 2> tessellation_present;
+        for (unsigned stage = 0; stage < 2; ++stage) {
+          tessellation_resources[stage].resize(tessellation_counts[stage]);
+          tessellation_samplers[stage].resize(tessellation_counts[stage]);
+          tessellation_present[stage].resize(tessellation_counts[stage], false);
+        }
         std::vector<bool> vertex_present(command.vertex_sampled_texture_count,
                                          false);
         std::vector<bool> fragment_present(
@@ -2603,11 +2630,18 @@ void Submitter::RunJob() {
           const bool vertex_stage =
               texture.stage == DriverPcoShaderStage::kVertex;
           const bool geometry_stage = texture.stage == DriverPcoShaderStage::kGeometry;
+          const bool control_stage = texture.stage == DriverPcoShaderStage::kTessellationControl;
+          const bool evaluation_stage = texture.stage == DriverPcoShaderStage::kTessellationEvaluation;
+          const bool tessellation_stage = control_stage || evaluation_stage;
+          const unsigned tessellation_index = evaluation_stage ? 1U : 0U;
           auto &resources =
+              tessellation_stage ? tessellation_resources[tessellation_index] :
               vertex_stage ? vertex_resources : geometry_stage ? geometry_resources : fragment_resources;
           auto &samplers =
+              tessellation_stage ? tessellation_samplers[tessellation_index] :
               vertex_stage ? vertex_samplers : geometry_stage ? geometry_samplers : fragment_samplers;
           auto &present =
+              tessellation_stage ? tessellation_present[tessellation_index] :
               vertex_stage ? vertex_present : geometry_stage ? geometry_present : fragment_present;
           if (texture.declared_bytes_size == 0 ||
               texture.declared_bytes_size >
@@ -2659,8 +2693,9 @@ void Submitter::RunJob() {
                 "Submitter PCO sequence resource is absent from DRAM");
           }
           PatchPcoDescriptorAddress(
+              control_stage ? &control_shared : evaluation_stage ? &evaluation_shared :
               vertex_stage ? &vertex_shared_words : geometry_stage ? &geometry_shared : &fragment_shared,
-              texture.descriptor_set, gpu_address, geometry_stage ? 4U : 0U);
+              texture.descriptor_set, gpu_address, DriverTextureDescriptorStart(texture.stage));
 
           TextureResource resource;
           resource.gpu_address = gpu_address;
@@ -2679,6 +2714,8 @@ void Submitter::RunJob() {
                   ? TextureDimensionType::k3D
               : texture.texture_kind == 3U
                   ? TextureDimensionType::kCube
+              : texture.texture_kind == 4U
+                  ? TextureDimensionType::kCubeArray
                   : TextureDimensionType::k2D;
           resource.format =
               texture.format == "PIPE_FORMAT_R32G32B32A32_UINT"
@@ -2799,6 +2836,20 @@ void Submitter::RunJob() {
                 texture.mip[level].offset_bytes,
             };
           }
+          if (resource.dimension_type == TextureDimensionType::kCubeArray) {
+            if (texture.layers > UINT16_MAX || !texture.layers)
+              throw std::runtime_error("Submitter cube array face count is invalid");
+            ValidateTextureCubeArrayLayout(resource);
+            const auto &words = DriverTextureShared(command, texture.stage);
+            const std::size_t base = texture.descriptor_set * kPcoTextureDescriptorDwordCount;
+            std::array<std::uint32_t, 4> image_words{};
+            std::copy_n(words.begin() + base, 4, image_words.begin());
+            ValidateTextureSingleLevelDimensions(image_words, resource);
+            if (words.at(base + 4U) !=
+                  static_cast<std::uint64_t>(resource.mip[0].row_pitch_bytes) * resource.mip[0].height ||
+                words.at(base + 7U) || words.at(base + 12U))
+              throw std::runtime_error("Submitter cube array descriptor face stride/mode mismatch");
+          }
           if (resource.sample_count > 1U) {
             if (resource.block_width != 1U || resource.block_height != 1U ||
                 resource.format == TextureFormat::kAstcLdr ||
@@ -2851,6 +2902,9 @@ void Submitter::RunJob() {
         }
         if (std::find(vertex_present.begin(), vertex_present.end(), false) !=
                 vertex_present.end() ||
+            std::any_of(tessellation_present.begin(), tessellation_present.end(), [](const auto &present) {
+              return std::find(present.begin(), present.end(), false) != present.end();
+            }) ||
             std::find(geometry_present.begin(), geometry_present.end(), false) != geometry_present.end() ||
             std::find(fragment_present.begin(), fragment_present.end(),
                       false) != fragment_present.end()) {
@@ -2905,6 +2959,26 @@ void Submitter::RunJob() {
             pool_, std::vector<SamplerState>{sampler});
       }
       std::vector<ShaderSharedRegister> vertex_shared;
+      if (HasPoolHandle(state.tessellation_state)) {
+        auto tess = LoadArray<TessellationState>(pool_, state.tessellation_state);
+        if (tess.size() != 1) throw std::runtime_error("Submitter tessellation state count mismatch");
+        // Publish after both UBO and texture relocation, never the address-zero source words.
+        tess[0].control_shared = StoreNewArray(pool_, control_shared);
+        tess[0].evaluation_shared = StoreNewArray(pool_, evaluation_shared);
+        if (!control_uniform_buffers.empty())
+          tess[0].control_uniform_buffers = StoreNewArray(pool_, control_uniform_buffers);
+        if (!evaluation_uniform_buffers.empty())
+          tess[0].evaluation_uniform_buffers = StoreNewArray(pool_, evaluation_uniform_buffers);
+        if (!tessellation_resources[0].empty()) {
+          tess[0].control_texture_resources = StoreNewArray(pool_, tessellation_resources[0]);
+          tess[0].control_sampler_states = StoreNewArray(pool_, tessellation_samplers[0]);
+        }
+        if (!tessellation_resources[1].empty()) {
+          tess[0].evaluation_texture_resources = StoreNewArray(pool_, tessellation_resources[1]);
+          tess[0].evaluation_sampler_states = StoreNewArray(pool_, tessellation_samplers[1]);
+        }
+        StoreArray(pool_, state.tessellation_state, tess);
+      }
       if (!geometry_shared.empty())
         state.geometry_shared_registers = StoreNewArray(pool_, geometry_shared);
       vertex_shared.reserve(vertex_shared_words.size());

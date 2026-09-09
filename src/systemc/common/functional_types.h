@@ -158,6 +158,10 @@ enum class PipelineStage : std::uint32_t {
   kGeometryTextureSamplesReady,
   kComputeTexturePending,
   kComputeTextureSamplesReady,
+  kTessellationControlTexturePending,
+  kTessellationControlTextureSamplesReady,
+  kTessellationEvaluationTexturePending,
+  kTessellationEvaluationTextureSamplesReady,
 };
 
 enum class PrimitiveTopology : std::uint32_t {
@@ -659,6 +663,8 @@ enum class TextureDimensionType : std::uint8_t {
   k2DArray = 1,
   k3D = 2,
   kCube = 3,
+  // Physical layers are complete six-face cubes; native TAO selects the cube.
+  kCubeArray = 4,
 };
 
 enum class TextureFilter : std::uint8_t {
@@ -943,7 +949,10 @@ struct FragmentShaderLane {
   std::uint8_t sample_id = 0;
   std::uint32_t sample_mask = 0;
   std::uint8_t helper = 0;
-  std::uint8_t reserved = 0;
+  // Reuses the reserved byte. Helpers inherit their original primitive's
+  // normalized facing just like covered invocations; they do not guess from
+  // coverage or the coefficient-plane orientation.
+  std::uint8_t front_facing = 1;
   float depth = 0.0f;
   float barycentric[3]{};
 };
@@ -1012,7 +1021,8 @@ struct TextureSampleRequest {
   // independently overrides coordinate normalization for this instruction.
   std::uint8_t sample_index = 0;
   std::uint8_t sample_index_present = 0;
-  std::uint8_t reserved[1]{};
+  // Raw component-zero gather returns four unfiltered texels, not RGBA.
+  std::uint8_t gather = 0;
   // Native SMP REPLACE float word. NNCOORDS distinguishes texelFetch from
   // normalized textureLod; neither consumes implicit quad derivatives.
   std::uint32_t explicit_lod = 0;

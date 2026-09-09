@@ -309,6 +309,7 @@ void FragmentFrontend::Run() {
               shader_lane.quad_lane = lane;
               shader_lane.sample_id = sample_id;
               shader_lane.sample_mask = 0;
+              shader_lane.front_facing = parameter.front_facing;
               const auto visible = visible_invocations.find(
                   PixelKey{parameter_index, x, y, sample_id});
               const std::uint8_t lane_bit =

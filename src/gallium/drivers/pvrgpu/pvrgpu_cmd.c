@@ -4,6 +4,7 @@
 #include "pvrgpu_counter.h"
 #include "pvrgpu_systemc_api.h"
 #include "pvrgpu_tessellation.h"
+#include "pvrgpu_color_formats.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -703,6 +704,7 @@ pvrgpu_systemc_flush_readback_pixels(uint32_t width,
                                      uint32_t sample_count,
                                      uint32_t depth_format,
                                      uint32_t layer_count,
+                                     const char *color_format,
                                      uint8_t *pixels,
                                      size_t pixels_size,
                                      bool *out_written,
@@ -750,6 +752,7 @@ pvrgpu_systemc_flush_readback_pixels(uint32_t width,
    readback.sample_count = sample_count;
    readback.depth_format = depth_format;
    readback.layer_count = layer_count;
+   readback.color_format = color_format;
    readback.pixels = pixels;
    readback.pixels_size = pixels_size;
 
@@ -1080,9 +1083,11 @@ pvrgpu_cmd_validate_uniform_buffers(
       const size_t shared_count = sizes[stage];
       uint32_t native_base = stage >= 3 && t ? (stage == 3 ? 8u : 4u)
          : stage == 2 && cmd->geometry_pco_size ? 4u : 0u;
-      if (stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_GEOMETRY && cmd->geometry_pco_size) {
+      if ((stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_GEOMETRY && cmd->geometry_pco_size) ||
+          (stage >= PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_CONTROL && t)) {
          const uint32_t start = abi->uniform_buffer_descriptor_start;
-         if (start < 4 || start > 4 + 8 * 20 || (start - 4) % 20)
+         if (start < native_base || start > native_base + 8 * 20 ||
+             (start - native_base) % 20)
             goto invalid;
          native_base = start;
       }
@@ -1378,7 +1383,7 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       }
    }
 
-   /* One to four colour attachments, all sharing the command's format. */
+   /* One to four attachments, with an optional explicit normalized codec. */
    if (cmd->render_target_count == 0 || cmd->render_target_count > 4) {
       pvrgpu_cmd_error(error, error_size,
                        "draw PCO triangles render target count is "
@@ -1386,7 +1391,16 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       return false;
    }
 
-   if ((geometry || cmd->tessellation) && cmd->render_target_count > 1) {
+   const char *color_error = pvrgpu_color_formats_error(cmd->format,
+      cmd->render_target_count, cmd->color_attachment_format_count,
+      cmd->color_attachment_formats);
+   if (color_error) {
+      pvrgpu_cmd_error(error, error_size, color_error);
+      return false;
+   }
+
+   if ((geometry || cmd->tessellation) && cmd->render_target_count > 1 &&
+       cmd->color_attachment_format_count == 0) {
       pvrgpu_cmd_error(error, error_size,
          "geometry MRT requires independent attachment LOAD");
       return false;
@@ -2180,6 +2194,9 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->primitive_mode = cmd->primitive_mode;
    out->indexed = cmd->indexed;
    out->render_target_count = cmd->render_target_count;
+   out->color_attachment_format_count = cmd->color_attachment_format_count;
+   memcpy(out->color_attachment_formats, cmd->color_attachment_formats,
+          sizeof(out->color_attachment_formats));
    out->vertex_attribute_count = cmd->vertex_attribute_count;
    for (uint32_t attribute = 0;
         attribute < PVRGPU_ARRAY_SIZE(cmd->vertex_attribute_components);
@@ -2312,6 +2329,21 @@ pvrgpu_pco_triangles_command_to_systemc(
    }
    out->attachment_clears = cmd->attachment_clears;
    out->attachment_clear_count = cmd->attachment_clear_count;
+}
+
+static int
+pvrgpu_write_color_formats(FILE *file, const char *prefix, uint32_t count,
+                           const char *const formats[4])
+{
+   if (!count)
+      return 0;
+   if (fprintf(file, "\n%scolor_attachment_format_count=%u\n%scolor_attachment_formats=",
+               prefix, count, prefix) < 0)
+      return -1;
+   for (uint32_t target = 0; target < count; ++target)
+      if (fprintf(file, "%s%s", target ? "," : "", formats[target]) < 0)
+         return -1;
+   return fprintf(file, "\n");
 }
 
 bool
@@ -2553,6 +2585,9 @@ pvrgpu_write_draw_pco_triangles_command(
       cmd->depth_clear_bits,
       cmd->depth_format);
    }
+   if (written >= 0)
+      written = pvrgpu_write_color_formats(file, "", cmd->color_attachment_format_count,
+                                            cmd->color_attachment_formats);
    const int close_status = fclose(file);
    if (written < 0 || close_status != 0) {
       if (error && error_size != 0) {
@@ -2601,6 +2636,13 @@ pvrgpu_write_draw_pco_sequence_command(
 
    bool has_initial_color_attachment = false;
    bool has_uniform_buffers = false;
+   const char *color_error = pvrgpu_color_formats_error(cmd->format,
+      cmd->render_target_count, cmd->color_attachment_format_count,
+      cmd->color_attachment_formats);
+   if (color_error) {
+      pvrgpu_cmd_error(error, error_size, color_error);
+      return false;
+   }
    for (uint32_t ordinal = 0;
         ordinal < cmd->pco_sequence_command_count;
         ++ordinal) {
@@ -2616,6 +2658,13 @@ pvrgpu_write_draw_pco_sequence_command(
           nested->pco_sequence_textures) {
          pvrgpu_cmd_error(error, error_size,
                           "invalid nested API-v6 PCO sequence draw");
+         return false;
+      }
+      color_error = pvrgpu_color_formats_error(nested->format,
+         nested->render_target_count, nested->color_attachment_format_count,
+         nested->color_attachment_formats);
+      if (color_error) {
+         pvrgpu_cmd_error(error, error_size, color_error);
          return false;
       }
       if (!pvrgpu_cmd_validate_uniform_buffers(nested, error, error_size))
@@ -2639,7 +2688,7 @@ pvrgpu_write_draw_pco_sequence_command(
       }
       return false;
    }
-   const int written = fprintf(
+   int written = fprintf(
       file,
       "%s"
       "%s"
@@ -2696,6 +2745,16 @@ pvrgpu_write_draw_pco_sequence_command(
       cmd->semantic_texel_fetches,
       cmd->pco_sequence_command_count,
       cmd->pco_sequence_texture_count);
+   if (written >= 0)
+      written = pvrgpu_write_color_formats(file, "", cmd->color_attachment_format_count,
+                                            cmd->color_attachment_formats);
+   for (uint32_t ordinal = 0; written >= 0 && ordinal < cmd->pco_sequence_command_count; ++ordinal) {
+      char prefix[32];
+      snprintf(prefix, sizeof(prefix), "draw%u_", ordinal);
+      const struct pvrgpu_systemc_driver_command *draw = &cmd->pco_sequence_commands[ordinal];
+      written = pvrgpu_write_color_formats(file, prefix, draw->color_attachment_format_count,
+                                            draw->color_attachment_formats);
+   }
    const int close_status = fclose(file);
    if (written < 0 || close_status != 0) {
       if (error && error_size != 0) {

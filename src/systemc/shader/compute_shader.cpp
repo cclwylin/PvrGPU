@@ -45,6 +45,8 @@ void ComputeShader::SampleTexture(void *context, const PcoTextureRequest &issued
   const auto dispatch = ReadPod<ComputeDispatchState>(self.pool_, self.current_dispatch_);
   if (issued.lod_bias_present || issued.lod_bias)
     throw std::runtime_error("compute SMP shader LOD bias is unsupported");
+  if (issued.gather)
+    throw std::runtime_error("compute SMP raw gather is unsupported");
   if (!response || !self.texture_request_output.size() || !self.texture_response_input.size() ||
       !HasPoolHandle(dispatch.texture_state))
     throw std::runtime_error("compute SMP FIFO/state is unbound");
@@ -93,7 +95,7 @@ void ComputeShader::SampleTexture(void *context, const PcoTextureRequest &issued
       requests[0].texture_address_hi != request.texture_address_hi ||
       requests[0].explicit_lod != request.explicit_lod ||
       requests[0].explicit_lod_present != request.explicit_lod_present ||
-      requests[0].lod_bias_present || requests[0].lod_bias ||
+      requests[0].lod_bias_present || requests[0].lod_bias || requests[0].gather ||
       requests[0].dimension != request.dimension || requests[0].normalized != request.normalized ||
       requests[0].fcnorm != request.fcnorm || requests[0].coordinate_count != request.coordinate_count ||
       requests[0].component_count != request.component_count || requests[0].data_request != request.data_request ||

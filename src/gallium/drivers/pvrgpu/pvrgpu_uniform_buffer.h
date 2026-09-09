@@ -9,6 +9,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Generic VS/FS compilation may prove an unused UBO suffix under register
+ * pressure. Its ABI retains the original indices of every remaining block.
+ * Other compilation paths still require the complete declared inventory. */
+static inline bool
+pvrgpu_uniform_buffer_prefix_count_valid(unsigned declared_blocks,
+                                          unsigned compiled_blocks,
+                                          bool allow_unused_suffix)
+{
+   return declared_blocks <= PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE &&
+      compiled_blocks <= declared_blocks &&
+      (allow_unused_suffix || compiled_blocks == declared_blocks);
+}
+
 /* Snapshot one already-selected Gallium constant-buffer range. The stage's
  * NIR block i is bound at CB[i+1]; CB0 remains the default uniform block.
  * This copies inputs, never evaluates shader instructions or repacks layout.

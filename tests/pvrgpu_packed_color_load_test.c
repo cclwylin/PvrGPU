@@ -17,9 +17,10 @@ static uint32_t word(unsigned target, unsigned layer, unsigned y, unsigned x,
    return (bgr ? b : r) | (g << 10) | ((bgr ? r : b) << 20) | (a << 30);
 }
 
-static void run(enum pipe_format format, unsigned samples)
+static void run(enum pipe_format format, unsigned samples, bool mixed)
 {
-   const bool bgr = format == PIPE_FORMAT_B10G10R10A2_UNORM;
+   const enum pipe_format mixed_formats[] = {PIPE_FORMAT_R8G8B8A8_UNORM,
+      PIPE_FORMAT_R10G10B10A2_UNORM, PIPE_FORMAT_B10G10R10A2_UNORM, PIPE_FORMAT_R8G8B8A8_UNORM};
    const unsigned width = 5, height = 3, layers = 2;
    const size_t row_bytes = width * samples * 4;
    const size_t target_bytes = row_bytes * height * layers;
@@ -33,9 +34,11 @@ static void run(enum pipe_format format, unsigned samples)
    recorded.command.raster_samples = samples;
    recorded.command.framebuffer_layers = layers;
    for (unsigned target = 0; target < 4; ++target) {
+      const enum pipe_format target_format = mixed ? mixed_formats[target] : format;
+      const bool bgr = target_format == PIPE_FORMAT_B10G10R10A2_UNORM;
       struct pvrgpu_resource *r = &resources[target];
       r->base.target = PIPE_TEXTURE_2D_ARRAY;
-      r->base.format = format;
+      r->base.format = target_format;
       r->base.width0 = width * 2;
       r->base.height0 = height * 2;
       r->base.depth0 = 1;
@@ -58,16 +61,31 @@ static void run(enum pipe_format format, unsigned samples)
                 y * r->level_strides[1] + x * 4, &packed, sizeof(packed));
       }
       ctx.framebuffer.cbufs[target] = (struct pipe_surface){
-         .texture = &r->base, .format = format, .level = 1,
+         .texture = &r->base, .format = target_format, .level = 1,
          .first_layer = 1, .last_layer = 2};
    }
-   const char *expected_format = bgr ? PVRGPU_DRIVER_COMMAND_FORMAT_BGRA10_A2 :
+   const char *expected_format = mixed ? PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8 :
+      format == PIPE_FORMAT_B10G10R10A2_UNORM ? PVRGPU_DRIVER_COMMAND_FORMAT_BGRA10_A2 :
                                      PVRGPU_DRIVER_COMMAND_FORMAT_RGB10_A2;
+   recorded.command.format = expected_format;
+   if (mixed) {
+      recorded.command.color_attachment_format_count = 4;
+      for (unsigned target = 0; target < 4; ++target)
+         recorded.command.color_attachment_formats[target] = util_format_name(mixed_formats[target]);
+      /* A same-size codec swap must fail before publishing any LOAD bytes. */
+      const char *correct = recorded.command.color_attachment_formats[1];
+      recorded.command.color_attachment_formats[1] = expected_format;
+      CHECK(!pvrgpu_capture_initial_color_attachment(&ctx, &recorded));
+      CHECK(recorded.initial_color_attachment_bytes == NULL);
+      CHECK(recorded.command.initial_color_attachment_bytes_size == 0);
+      recorded.command.color_attachment_formats[1] = correct;
+   }
    CHECK(!strcmp(pvrgpu_command_format_for_framebuffer(&ctx), expected_format));
    CHECK(pvrgpu_capture_initial_color_attachment(&ctx, &recorded));
    CHECK(recorded.command.initial_color_attachment_bytes_size == target_bytes * 4);
    CHECK(recorded.command.initial_color_attachment_bytes == recorded.initial_color_attachment_bytes);
    for (unsigned target = 0; target < 4; ++target) {
+      const bool bgr = (mixed ? mixed_formats[target] : format) == PIPE_FORMAT_B10G10R10A2_UNORM;
       /* Owned snapshots cannot refer to source pixels which may later change. */
       memset(resources[target].data, 0xa7, resources[target].size);
       for (unsigned layer = 0; layer < layers; ++layer)
@@ -94,8 +112,9 @@ static void run(enum pipe_format format, unsigned samples)
 int main(void)
 {
    for (unsigned samples = 1; samples <= 16; samples *= 2) {
-      run(PIPE_FORMAT_R10G10B10A2_UNORM, samples);
-      run(PIPE_FORMAT_B10G10R10A2_UNORM, samples);
+      run(PIPE_FORMAT_R10G10B10A2_UNORM, samples, false);
+      run(PIPE_FORMAT_B10G10R10A2_UNORM, samples, false);
+      run(PIPE_FORMAT_R8G8B8A8_UNORM, samples, true);
    }
    printf("packed color LOAD: PASS (%u checks)\n", checks);
    return 0;

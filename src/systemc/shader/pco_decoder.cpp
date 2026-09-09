@@ -246,13 +246,19 @@ void PcoDecoder::Run() {
        */
       const std::uint32_t expected_pixel_output_mask =
           ExpectedPixelOutputMask(state.fragment_output_mask,
-              HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state));
+                                  HasExplicitFragmentOutputMasks(state));
       if (decoded.summary.pixel_output_mask != expected_pixel_output_mask) {
         throw std::runtime_error(
             "fragment PCO pixel output mask does not match the attachment: "
             "decoded=" +
             std::to_string(decoded.summary.pixel_output_mask) + " expected=" +
             std::to_string(expected_pixel_output_mask));
+      }
+      if (driver_pco_triangles &&
+          state.fragment_program_summary.uses_derivatives !=
+              decoded.summary.uses_derivatives) {
+        throw std::runtime_error(
+            "fragment PCO derivative classification changed after submit");
       }
       state.fragment_program_summary = decoded.summary;
       state.fragment_instructions = StoreNewArray(pool_, decoded.instructions);

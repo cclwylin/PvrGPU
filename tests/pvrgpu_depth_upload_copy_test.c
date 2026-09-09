@@ -41,11 +41,12 @@ bool pvrgpu_is_supported_color_format(enum pipe_format format)
 bool pvrgpu_systemc_flush_readback_pixels(
    uint32_t width, uint32_t height, uint32_t bpp, uint32_t attachment,
    uint32_t samples, uint32_t depth_format, uint32_t layers,
+   const char *color_format,
    uint8_t *pixels, size_t bytes, bool *written, char *error, size_t error_size)
 {
    (void)width; (void)height; (void)bpp; (void)attachment; (void)samples;
    (void)depth_format; (void)layers; (void)pixels; (void)bytes; (void)written;
-   (void)error; (void)error_size;
+   (void)error; (void)error_size; (void)color_format;
    CHECK(false); return false;
 }
 

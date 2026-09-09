@@ -3,6 +3,7 @@
 #include "pvrgpu_context.h"
 #include "pvrgpu_compute_snapshot.h"
 #include "pvrgpu_cmd.h"
+#include "pvrgpu_color_formats.h"
 #include "pvrgpu_counter.h"
 #include "pvrgpu_indirect_draw.h"
 #include "pvrgpu_index_fetch.h"
@@ -15,6 +16,7 @@
 #include "pvrgpu_systemc_api.h"
 #include "pvrgpu_tessellation.h"
 #include "pvrgpu_uniform_buffer.h"
+#include "pvrgpu_push_constants.h"
 #include "pvrgpu_vertex_fetch.h"
 
 #include "pipe/p_defines.h"
@@ -793,12 +795,8 @@ pvrgpu_read_draw_index(const struct pipe_draw_info *info,
 }
 
 static const char *
-pvrgpu_command_format_for_framebuffer(const struct pvrgpu_context *ctx)
+pvrgpu_command_format_for_surface(enum pipe_format format)
 {
-   if (!ctx || ctx->framebuffer.nr_cbufs == 0)
-      return PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8;
-
-   const enum pipe_format format = ctx->framebuffer.cbufs[0].format;
    switch (format) {
    case PIPE_FORMAT_R8G8B8A8_SRGB:
       return PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8_SRGB;
@@ -842,6 +840,37 @@ pvrgpu_command_format_for_framebuffer(const struct pvrgpu_context *ctx)
 
    /* Remaining normalized targets retain the logical RGBA8 transport. */
    return PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8;
+}
+
+static const char *
+pvrgpu_command_format_for_framebuffer(const struct pvrgpu_context *ctx)
+{
+   return !ctx || !ctx->framebuffer.nr_cbufs ? PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8 :
+      pvrgpu_command_format_for_surface(ctx->framebuffer.cbufs[0].format);
+}
+
+static bool
+pvrgpu_framebuffer_has_mixed_color_formats(const struct pvrgpu_context *ctx)
+{
+   for (unsigned target = 1; target < ctx->framebuffer.nr_cbufs; ++target)
+      if (ctx->framebuffer.cbufs[target].format != ctx->framebuffer.cbufs[0].format)
+         return true;
+   return false;
+}
+
+static bool
+pvrgpu_framebuffer_color_transport_is_bounded(const struct pvrgpu_context *ctx)
+{
+   if (!ctx || ctx->framebuffer.nr_cbufs > PVRGPU_MAX_RENDER_TARGETS)
+      return false;
+   const bool mixed = pvrgpu_framebuffer_has_mixed_color_formats(ctx);
+   for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target) {
+      const struct pipe_surface *surface = &ctx->framebuffer.cbufs[target];
+      if (!surface->texture ||
+          (mixed && !pvrgpu_is_explicit_color_format(util_format_name(surface->format))))
+         return false;
+   }
+   return true;
 }
 
 static bool
@@ -6705,6 +6734,12 @@ pvrgpu_systemc_shader_stage_from_mesa(mesa_shader_stage source,
    case MESA_SHADER_GEOMETRY:
       *destination = PVRGPU_SYSTEMC_PCO_SHADER_STAGE_GEOMETRY;
       return true;
+   case MESA_SHADER_TESS_CTRL:
+      *destination = PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_CONTROL;
+      return true;
+   case MESA_SHADER_TESS_EVAL:
+      *destination = PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION;
+      return true;
    case MESA_SHADER_COMPUTE:
       *destination = PVRGPU_SYSTEMC_PCO_SHADER_STAGE_COMPUTE;
       return true;
@@ -9819,6 +9854,38 @@ pvrgpu_set_generic_texture_compare_metadata(const struct pipe_sampler_view *view
 }
 
 static bool
+pvrgpu_shadow_gather_sampler_supported(const struct pvrgpu_context *ctx,
+                                      mesa_shader_stage stage, unsigned slot,
+                                      const struct pipe_sampler_view *view,
+                                      const struct pipe_sampler_state *sampler)
+{
+   /* Gather returns four unfiltered depths; native shader ALU compares each
+    * tap. Linear image filtering therefore needs no PCF implementation here.
+    * Prove that this slot has no ordinary shadow samples before relaxing the
+    * nearest-only rule. The exposed image is rebased by the existing snapshot
+    * code, so a single exposed mip also has model base level zero. */
+   return ctx && stage == MESA_SHADER_FRAGMENT && ctx->fs &&
+      view && view->texture && sampler &&
+      (view->target == PIPE_TEXTURE_2D ||
+       view->target == PIPE_TEXTURE_2D_ARRAY) &&
+      view->texture->nr_samples == 0 &&
+      view->texture->nr_storage_samples <= 1 &&
+      view->u.tex.first_level == view->u.tex.last_level &&
+      util_format_has_depth(util_format_description(view->format)) &&
+      view->swizzle_r == PIPE_SWIZZLE_X &&
+      sampler->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE &&
+      sampler->compare_func <= PIPE_FUNC_ALWAYS &&
+      sampler->min_img_filter <= PIPE_TEX_FILTER_LINEAR &&
+      sampler->mag_img_filter <= PIPE_TEX_FILTER_LINEAR &&
+      sampler->min_mip_filter <= PIPE_TEX_MIPFILTER_NONE &&
+      sampler->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE &&
+      sampler->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_EDGE &&
+      !sampler->unnormalized_coords && sampler->max_anisotropy <= 1 &&
+      pvrgpu_pco_fragment_shadow_gather_only(ctx->fs->nir, slot,
+         view->target == PIPE_TEXTURE_2D_ARRAY);
+}
+
+static bool
 pvrgpu_capture_generic_sequence_texture(
    const struct pvrgpu_context *ctx,
    mesa_shader_stage stage,
@@ -9849,7 +9916,8 @@ pvrgpu_capture_generic_sequence_texture(
    if (view->target != PIPE_TEXTURE_2D &&
        view->target != PIPE_TEXTURE_2D_ARRAY &&
        view->target != PIPE_TEXTURE_3D &&
-       view->target != PIPE_TEXTURE_CUBE) {
+       view->target != PIPE_TEXTURE_CUBE &&
+       view->target != PIPE_TEXTURE_CUBE_ARRAY) {
       *reason = "view_target";
       return false;
    }
@@ -9860,6 +9928,8 @@ pvrgpu_capture_generic_sequence_texture(
     * halve.  Plain 2D is one layer.
     */
    const bool array_view = view->target == PIPE_TEXTURE_2D_ARRAY;
+   const bool cube_array_view = view->target == PIPE_TEXTURE_CUBE_ARRAY;
+   const bool layered_view = array_view || cube_array_view;
    /*
     * A 3D image stores `depth` complete 2D slices per mip level, slice-minor
     * like an array's layers -- but unlike an array the slice count halves with
@@ -9878,25 +9948,25 @@ pvrgpu_capture_generic_sequence_texture(
    const unsigned sample_count = MAX2(1U, view->texture->nr_samples);
    const bool multisample_view = view->texture->nr_samples != 0;
    if (sample_count > 8U || (sample_count & (sample_count - 1U)) != 0 ||
-       (multisample_view && (volume_view || cube_view ||
+       (multisample_view && (volume_view || cube_view || cube_array_view ||
                             view->texture->last_level != 0))) {
       *reason = "sample_layout";
       return false;
    }
-   const unsigned resource_layers = array_view ? view->texture->array_size
+   const unsigned resource_layers = layered_view ? view->texture->array_size
       : volume_view ? view->texture->depth0 : cube_view ? 6U : 1U;
    const unsigned first_level = view->u.tex.first_level;
    const unsigned last_level = view->u.tex.last_level;
-   const unsigned first_layer = array_view ? view->u.tex.first_layer : 0U;
+   const unsigned first_layer = layered_view ? view->u.tex.first_layer : 0U;
    if (first_level > last_level || last_level > view->texture->last_level ||
        first_level >= PIPE_MAX_TEXTURE_LEVELS ||
-       (array_view && (first_layer > view->u.tex.last_layer ||
+       (layered_view && (first_layer > view->u.tex.last_layer ||
                       view->u.tex.last_layer >= resource_layers))) {
       *reason = "view_range";
       return false;
    }
    const unsigned layers = volume_view ? u_minify(resource_layers, first_level)
-      : array_view ? view->u.tex.last_layer - first_layer + 1U : resource_layers;
+      : layered_view ? view->u.tex.last_layer - first_layer + 1U : resource_layers;
    /* The MS snapshot currently transports a whole image.  Do not silently
     * interpret a restricted array view relative to the backing image. */
    if (multisample_view && array_view &&
@@ -9905,12 +9975,31 @@ pvrgpu_capture_generic_sequence_texture(
       *reason = "sample_layer_view";
       return false;
    }
-   if (layers == 0U || layers > 4096U || (array_view && layers > 2048U)) {
+   if (layers == 0U || layers > 4096U || (layered_view && layers > 2048U)) {
       *reason = "layers";
       return false;
    }
 
    const enum pipe_format format = pvrgpu_effective_sampled_format(view);
+   const bool cube_array_depth_view = cube_array_view &&
+      util_format_has_depth(util_format_description(format));
+   /* Cube-array addressing uses complete six-face cubes, rebased at the
+    * first exposed cube and mip. Non-comparison depth views use the existing
+    * exact depth unpack and view-swizzle path below, producing ordinary
+    * RGBA32F storage. Stencil-only, shadow and compressed views stay gated. */
+   if (cube_array_view &&
+       (stage != MESA_SHADER_FRAGMENT ||
+        view->texture->target != PIPE_TEXTURE_CUBE_ARRAY ||
+        view->texture->width0 != view->texture->height0 ||
+        view->texture->nr_samples != 0 || view->texture->nr_storage_samples > 1 ||
+        resource_layers % 6U != 0 || first_layer % 6U != 0 || layers % 6U != 0 ||
+        (util_format_is_depth_or_stencil(format) && !cube_array_depth_view) ||
+        util_format_get_blockwidth(format) != 1 ||
+        util_format_get_blockheight(format) != 1 ||
+        sampler->state.compare_mode != PIPE_TEX_COMPARE_NONE)) {
+      *reason = "cube_array_layout_or_sampler";
+      return false;
+   }
    const bool integer_view = util_format_is_pure_integer(format) &&
                              !util_format_is_depth_or_stencil(format);
    /*
@@ -9950,7 +10039,7 @@ pvrgpu_capture_generic_sequence_texture(
     * datapath, including Z16 and packed depth-only formats. No depth compare
     * is performed while taking this immutable resource snapshot. */
    const bool float_depth_view = util_format_has_depth(format_desc) &&
-                                 format != PIPE_FORMAT_Z24_UNORM_S8_UINT;
+      (format != PIPE_FORMAT_Z24_UNORM_S8_UINT || cube_array_depth_view);
    const bool canonical_float_view = float_depth_view || (!integer_view &&
       (!packed_colour_view || util_format_is_float(format)) &&
       format_desc->colorspace != UTIL_FORMAT_COLORSPACE_ZS &&
@@ -10050,11 +10139,21 @@ pvrgpu_capture_generic_sequence_texture(
    }
 
    const struct pipe_sampler_state *state = &sampler->state;
-   if (!multisample_view && state->compare_mode != PIPE_TEX_COMPARE_NONE &&
-       !pvrgpu_stage_texture_query_only(ctx, stage, slot) &&
-       (!(stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_FRAGMENT) ||
-        !pvrgpu_nearest_shadow_sampler_supported(view, state))) {
-      *reason = "shadow_sampler_state_requires_nearest_2d";
+   const bool shadow_gather = stage == MESA_SHADER_FRAGMENT && ctx->fs &&
+      pvrgpu_pco_fragment_has_shadow_gather(ctx->fs->nir, slot);
+   /* A shadow gather must never fall through the legacy nearest/query
+    * exceptions, even for a disabled comparison or multisample binding. In
+    * particular, canonicalizing a constant red swizzle before shader compare
+    * is not the API's gather-constant swizzle after comparison. */
+   if ((shadow_gather &&
+        !pvrgpu_shadow_gather_sampler_supported(ctx, stage, slot, view, state)) ||
+       (!shadow_gather && !multisample_view &&
+        state->compare_mode != PIPE_TEX_COMPARE_NONE &&
+        !pvrgpu_stage_texture_query_only(ctx, stage, slot) &&
+        (!(stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_FRAGMENT) ||
+         !pvrgpu_nearest_shadow_sampler_supported(view, state)))) {
+      *reason = shadow_gather ? "shadow_gather_sampler_state" :
+                               "shadow_sampler_state_requires_nearest_2d";
       return false;
    }
    if (!multisample_view &&
@@ -10188,7 +10287,7 @@ pvrgpu_capture_generic_sequence_texture(
    }
    destination->normalized_coordinates = 1;
    destination->texture_kind =
-      cube_view ? 3U : volume_view ? 2U : array_view ? 1U : 0U;
+      cube_array_view ? 4U : cube_view ? 3U : volume_view ? 2U : array_view ? 1U : 0U;
    destination->layers = layers;
    destination->sample_count = sample_count;
    destination->min_lod_u4_6 = 0;
@@ -10254,8 +10353,8 @@ struct pvrgpu_array_primitive_draw {
     * copy until the whole sequence is submitted.
     */
    struct pvrgpu_systemc_pco_sequence_texture
-      textures[3 * PVRGPU_PCO_MAX_TEXTURES];
-   uint8_t *texture_bytes[3 * PVRGPU_PCO_MAX_TEXTURES];
+      textures[5 * PVRGPU_PCO_MAX_TEXTURES];
+   uint8_t *texture_bytes[5 * PVRGPU_PCO_MAX_TEXTURES];
    unsigned texture_count;
    struct pvrgpu_pco_graphics_binary binary;
    struct pvrgpu_pco_geometry_binary geometry;
@@ -10479,6 +10578,15 @@ pvrgpu_capture_initial_color_target(
    const unsigned width = framebuffer_width * MAX2(1, recorded->command.raster_samples);
    const unsigned height = ctx->framebuffer.height;
    const unsigned capture_layers = MAX2(1, recorded->command.framebuffer_layers);
+   if (pvrgpu_color_formats_error(recorded->command.format,
+          recorded->command.render_target_count,
+          recorded->command.color_attachment_format_count,
+          recorded->command.color_attachment_formats) ||
+       strcmp(pvrgpu_color_format_at(recorded->command.format,
+          recorded->command.color_attachment_format_count,
+          recorded->command.color_attachment_formats, target),
+          pvrgpu_command_format_for_surface(surface->format)))
+      return false;
    if (!texture || !resource->data || width == 0 || height == 0 ||
        surface->level >= resource->level_count ||
        surface->level >= PIPE_MAX_TEXTURE_LEVELS ||
@@ -10851,6 +10959,21 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
          free(draws);
          return false;
       }
+      for (unsigned target = 0; target < first->render_target_count; ++target) {
+         if (strcmp(pvrgpu_color_format_at(recorded->command.format,
+                       recorded->command.color_attachment_format_count,
+                       recorded->command.color_attachment_formats, target),
+                    pvrgpu_color_format_at(first->format,
+                       first->color_attachment_format_count,
+                       first->color_attachment_formats, target))) {
+            pvrgpu_counter_eventf("draw_array_primitive_sequence_error",
+               "stage=assemble ordinal=%u reason=attachment_format_mismatch target=%u",
+               ordinal, target);
+            free(sequence_textures);
+            free(draws);
+            return false;
+         }
+      }
       draws[ordinal] = recorded->command;
       if (draws[ordinal].blend_enable == 0) {
          /* Disabled blending still has to carry its canonical ONE/ZERO ABI. */
@@ -10983,6 +11106,9 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
       if (draws[ordinal].geometry_pco_size)
          command.clip_invocations = 0; /* native GS emission decides clip work */
    command.render_target_count = first->render_target_count;
+   command.color_attachment_format_count = first->color_attachment_format_count;
+   memcpy(command.color_attachment_formats, first->color_attachment_formats,
+          sizeof(command.color_attachment_formats));
    command.pco_sequence_command_count = ctx->array_primitive_draw_count;
    command.pco_sequence_commands = draws;
    command.pco_sequence_texture_count = sequence_texture_count;
@@ -11187,6 +11313,7 @@ static bool
 pvrgpu_copy_stage_uniform_words(const struct pvrgpu_context *ctx,
                                 mesa_shader_stage stage,
                                 const struct pvrgpu_pco_stage_abi *abi,
+                                const struct pvrgpu_pco_uniform_word_map *map,
                                 uint32_t *words)
 {
    /*
@@ -11198,38 +11325,28 @@ pvrgpu_copy_stage_uniform_words(const struct pvrgpu_context *ctx,
     */
    if (!abi || !words)
       return false;
-   if (abi->push_constant_count == 0)
-      return true;
-   if ((uint64_t)abi->push_constant_start + abi->push_constant_count >
-       abi->shareds)
-      return false;
-
    size_t available = 0;
-   const uint8_t *bytes =
-      pvrgpu_constant_buffer_bytes(ctx, stage, 0, &available);
-   if (!bytes)
-      return false;
-   for (unsigned word = 0; word < abi->push_constant_count; ++word) {
-      const size_t offset = (size_t)word * sizeof(uint32_t);
-      uint32_t value = 0;
-      if (offset + sizeof(uint32_t) <= available)
-         memcpy(&value, bytes + offset, sizeof(value));
-      words[abi->push_constant_start + word] = value;
-   }
-   return true;
+   const uint8_t *bytes = abi->push_constant_count
+      ? pvrgpu_constant_buffer_bytes(ctx, stage, 0, &available) : NULL;
+   return pvrgpu_copy_push_constant_words(abi, map, bytes, available, words,
+                                          PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS);
 }
 
 static bool
 pvrgpu_capture_stage_uniform_buffers(
    const struct pvrgpu_context *ctx, mesa_shader_stage stage,
-   unsigned active_blocks, const struct pvrgpu_pco_stage_abi *abi,
+   unsigned declared_blocks, bool allow_unused_suffix,
+   const struct pvrgpu_pco_stage_abi *abi,
    struct pvrgpu_array_primitive_draw *recorded, uint32_t *shared)
 {
-   if ((stage != MESA_SHADER_VERTEX && stage != MESA_SHADER_FRAGMENT &&
+   const unsigned active_blocks = abi ? abi->uniform_buffer_descriptor_count : 0;
+   if (!abi || (stage != MESA_SHADER_VERTEX && stage != MESA_SHADER_FRAGMENT &&
         stage != MESA_SHADER_GEOMETRY && stage != MESA_SHADER_TESS_CTRL &&
         stage != MESA_SHADER_TESS_EVAL) ||
-       active_blocks > PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
-       active_blocks != abi->uniform_buffer_descriptor_count ||
+       (allow_unused_suffix && stage != MESA_SHADER_VERTEX &&
+          stage != MESA_SHADER_FRAGMENT) ||
+       !pvrgpu_uniform_buffer_prefix_count_valid(declared_blocks, active_blocks,
+                                                  allow_unused_suffix) ||
        (uint64_t)abi->uniform_buffer_descriptor_start + 4u * active_blocks >
           abi->shareds || abi->shareds > PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS)
       return false;
@@ -11262,6 +11379,13 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    if (!path || !ctx || !info || !draw) {
       pvrgpu_counter_eventf("draw_array_primitive_record_error",
                             "stage=entry reason=no_output_path");
+      return false;
+   }
+   /* Every caller, including observable-draw fallbacks, must satisfy the
+    * fixed four-target capsule before allocation, compilation or writes. */
+   if (!pvrgpu_framebuffer_color_transport_is_bounded(ctx)) {
+      pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                            "stage=entry reason=color_transport_bounds");
       return false;
    }
    const bool has_tessellation = ctx->tcs && ctx->tes;
@@ -11342,14 +11466,11 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
       return false;
    }
 
-   /*
-    * A draw needs somewhere to read positions from, but nothing more: a shape
-    * shaded from a uniform has a single position attribute, and requiring two
-    * left every such draw unlowerable.
-    */
+   /* A VS can generate positions from system values/uniforms without a real
+    * attribute. Only nonempty layouts need vertex buffers; the NIR input
+    * mask and the packed system-value ABI are validated below. */
    if (!ctx->vertex_elements ||
-       (((!ctx->gs && !has_tessellation) || ctx->vertex_elements->num_elements != 0) &&
-        (ctx->vertex_elements->num_elements == 0 || ctx->num_vertex_buffers == 0)) ||
+       (ctx->vertex_elements->num_elements != 0 && ctx->num_vertex_buffers == 0) ||
        !ctx->vs || !ctx->fs ||
        !ctx->vs->nir || !ctx->fs->nir) {
       pvrgpu_counter_eventf("draw_array_primitive_record_error",
@@ -11418,11 +11539,9 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
          return true;
       }
       index_data_size = (size_t)assembled_count * info->index_size;
-      /* The native VS compiler still rejects load_vertex_id and related
-       * system values. Do not make a rebased index visible as gl_VertexID if
-       * a future compiler enables them without an original-ID input ABI. */
-      if (BITSET_TEST(ctx->vs->nir->info.system_values_read, SYSTEM_VALUE_VERTEX_ID) ||
-          BITSET_TEST(ctx->vs->nir->info.system_values_read, SYSTEM_VALUE_VERTEX_ID_ZERO_BASE) ||
+      /* gl_VertexID is transported separately from the rebased fetch index
+       * below. Related system values still have no input transport. */
+      if (BITSET_TEST(ctx->vs->nir->info.system_values_read, SYSTEM_VALUE_VERTEX_ID_ZERO_BASE) ||
           BITSET_TEST(ctx->vs->nir->info.system_values_read, SYSTEM_VALUE_BASE_VERTEX) ||
           !pvrgpu_rebase_vertex_indices(index_data, index_data_size,
                                         info->index_size, assembled_count,
@@ -11446,8 +11565,7 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    unsigned attribute_components[PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES] = {0};
    unsigned attribute_locations[PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES] = {0};
    const char *attribute_reason = NULL;
-   if (!((ctx->gs || has_tessellation) && attribute_count == 0 && ctx->vs->nir->info.inputs_read == 0) &&
-       !pvrgpu_pco_vertex_attribute_components(ctx->vs->nir,
+   if (!pvrgpu_pco_vertex_attribute_components(ctx->vs->nir,
                                                attribute_count,
                                                attribute_components,
                                                attribute_locations,
@@ -11471,8 +11589,9 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
          ctx->vertex_elements->elements[attribute].src_format;
    }
    /*
-    * A shader reading gl_InstanceID takes it from a VTXIN register, so it is
-    * packed as one more attribute after the real ones.  Instancing itself is
+    * Vertex system values use separate raw-integer VTXIN slots after the
+    * real attributes, in the compiler's order: InstanceID, then VertexID.
+    * Instancing itself is
     * resolved here: the capsule describes a flat vertex stream, and the draw
     * expands `instance_count` copies of it with each attribute already read at
     * the index its divisor selects.  That is the same work this path already
@@ -11483,19 +11602,28 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
       ctx->vs->nir != NULL &&
       BITSET_TEST(ctx->vs->nir->info.system_values_read,
                   SYSTEM_VALUE_INSTANCE_ID);
+   const bool reads_vertex_id =
+      BITSET_TEST(ctx->vs->nir->info.system_values_read,
+                  SYSTEM_VALUE_VERTEX_ID);
+   const unsigned instance_id_attribute = attribute_count;
+   const unsigned vertex_id_attribute = attribute_count + (reads_instance_id ? 1u : 0u);
    const unsigned packed_attribute_count =
-      attribute_count + (reads_instance_id ? 1u : 0u);
+      vertex_id_attribute + (reads_vertex_id ? 1u : 0u);
    if (packed_attribute_count > PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES) {
       pvrgpu_counter_eventf("draw_array_primitive_record_error",
-                            "stage=attributes reason=instance_id_slot "
+                            "stage=attributes reason=vertex_system_value_slots "
                             "attributes=%u",
                             attribute_count);
       free(index_data);
       return false;
    }
    if (reads_instance_id) {
-      attribute_components[attribute_count] = 1;
-      attribute_formats[attribute_count] = PIPE_FORMAT_R32_UINT;
+      attribute_components[instance_id_attribute] = 1;
+      attribute_formats[instance_id_attribute] = PIPE_FORMAT_R32_UINT;
+   }
+   if (reads_vertex_id) {
+      attribute_components[vertex_id_attribute] = 1;
+      attribute_formats[vertex_id_attribute] = PIPE_FORMAT_R32_UINT;
    }
    const unsigned instance_count =
       info->instance_count != 0 ? info->instance_count : 1u;
@@ -11698,8 +11826,16 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
              * register, so the integer is stored verbatim rather than
              * converted to float and back.
              */
-            interleaved[packed_base + attribute_offsets[attribute_count]] =
+            interleaved[packed_base + attribute_offsets[instance_id_attribute]] =
                instance;
+         }
+         if (reads_vertex_id) {
+            /* Preserve the API-visible ID, not the compacted index or the
+             * instance-expanded stream offset. For indexed draws v_idx
+             * already includes signed baseVertex; for arrays it includes
+             * first. Repeated indices reuse this same original ID. */
+            interleaved[packed_base + attribute_offsets[vertex_id_attribute]] =
+               v_idx;
          }
       }
    }
@@ -11713,6 +11849,8 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    const unsigned fragment_texture_count = ctx->fs->nir->info.num_textures;
    const unsigned geometry_texture_count = ctx->gs ? ctx->gs->nir->info.num_textures : 0;
    const unsigned vertex_texture_count = ctx->vs->nir->info.num_textures;
+   const unsigned control_texture_count = has_tessellation ? ctx->tcs->nir->info.num_textures : 0;
+   const unsigned evaluation_texture_count = has_tessellation ? ctx->tes->nir->info.num_textures : 0;
 
    char error[512] = {0};
    if (!ctx->pco_compiler) {
@@ -11942,6 +12080,12 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
     * matching the existing depth prepass transport. No GL color resource is
     * fabricated or written: color_mask=0 and only Z/S is read back. */
    command.render_target_count = MAX2(1U, ctx->framebuffer.nr_cbufs);
+   if (pvrgpu_framebuffer_has_mixed_color_formats(ctx)) {
+      command.color_attachment_format_count = command.render_target_count;
+      for (unsigned target = 0; target < command.render_target_count; ++target)
+         command.color_attachment_formats[target] =
+            pvrgpu_command_format_for_surface(ctx->framebuffer.cbufs[target].format);
+   }
    command.raw_index_data = index_data;
    command.raw_index_data_size = index_data_size;
    command.index_size = command_index_size;
@@ -11963,8 +12107,8 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
       const struct pvrgpu_pco_owned_binary *evaluation = &tessellation.evaluation.shader;
       if (control->abi.shareds > PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS ||
           evaluation->abi.shareds > PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS ||
-          !pvrgpu_copy_stage_uniform_words(ctx, MESA_SHADER_TESS_CTRL, &control->abi, control_uniform_words) ||
-          !pvrgpu_copy_stage_uniform_words(ctx, MESA_SHADER_TESS_EVAL, &evaluation->abi, evaluation_uniform_words)) {
+          !pvrgpu_copy_stage_uniform_words(ctx, MESA_SHADER_TESS_CTRL, &control->abi, &control->cb0_word_map, control_uniform_words) ||
+          !pvrgpu_copy_stage_uniform_words(ctx, MESA_SHADER_TESS_EVAL, &evaluation->abi, &evaluation->cb0_word_map, evaluation_uniform_words)) {
          pvrgpu_pco_tessellation_pipeline_binary_finish(&tessellation);
          pvrgpu_pco_geometry_binary_finish(&geometry);
          pvrgpu_pco_graphics_binary_finish(&binary);
@@ -12012,7 +12156,7 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    if (ctx->gs) {
       if (geometry.shader.abi.shareds > PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS ||
           !pvrgpu_copy_stage_uniform_words(ctx, MESA_SHADER_GEOMETRY,
-                                          &geometry.shader.abi, geometry_uniform_words)) {
+                                          &geometry.shader.abi, &geometry.shader.cb0_word_map, geometry_uniform_words)) {
          pvrgpu_pco_tessellation_pipeline_binary_finish(&tessellation);
          pvrgpu_pco_geometry_binary_finish(&geometry);
          pvrgpu_pco_graphics_binary_finish(&binary);
@@ -12045,10 +12189,12 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
        !pvrgpu_copy_stage_uniform_words(ctx,
                                         MESA_SHADER_VERTEX,
                                         &binary.vertex.abi,
+                                        &binary.vertex.cb0_word_map,
                                         vertex_uniform_words) ||
        !pvrgpu_copy_stage_uniform_words(ctx,
                                         MESA_SHADER_FRAGMENT,
                                         &binary.fragment.abi,
+                                        &binary.fragment.cb0_word_map,
                                         fragment_uniform_words)) {
       pvrgpu_counter_eventf("draw_array_primitive_record_error",
                             "stage=uniforms reason=shared_transport "
@@ -12068,6 +12214,34 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    command.fragment_shared =
       fragment_shared_count ? fragment_uniform_words : NULL;
    command.fragment_shared_count = fragment_shared_count;
+   /* Record the new driver-private mapping only when packing was required.
+    * These are hashes of already validated/copied CPU words, not new GPU
+    * reads or proof that this draw has completed. Legacy records are unchanged. */
+   const struct pvrgpu_pco_owned_binary *mapped_stages[] = {
+      &binary.vertex, &binary.fragment,
+   };
+   const uint32_t *mapped_shared[] = {vertex_uniform_words, fragment_uniform_words};
+   for (unsigned stage = 0; stage < ARRAY_SIZE(mapped_stages); ++stage) {
+      const struct pvrgpu_pco_owned_binary *compiled = mapped_stages[stage];
+      const struct pvrgpu_pco_uniform_word_map *map = &compiled->cb0_word_map;
+      if (!map->count)
+         continue;
+      uint64_t map_hash = UINT64_C(14695981039346656037);
+      for (unsigned word = 0; word < map->count; ++word)
+         for (unsigned byte = 0; byte < 4; ++byte) {
+            map_hash ^= (map->source_words[word] >> (byte * 8)) & 255U;
+            map_hash *= UINT64_C(1099511628211);
+         }
+      pvrgpu_counter_eventf("draw_array_primitive_uniform_word_map",
+         "stage=%u source_dwords=%u count=%u shared_start=%u shareds=%u "
+         "map_fnv1a64=%016llx packed_fnv1a64=%016llx",
+         stage ? MESA_SHADER_FRAGMENT : MESA_SHADER_VERTEX,
+         map->source_dwords, map->count, compiled->abi.push_constant_start,
+         compiled->abi.shareds, (unsigned long long)map_hash,
+         (unsigned long long)pvrgpu_pco_binary_fnv1a64(
+            (const uint8_t *)(mapped_shared[stage] + compiled->abi.push_constant_start),
+            map->count * sizeof(uint32_t)));
+   }
    pvrgpu_copy_pco_stage_abi_to_command(&command.vertex_pco_abi,
                                         &binary.vertex.abi);
    pvrgpu_copy_pco_stage_abi_to_command(&command.fragment_pco_abi,
@@ -12254,20 +12428,26 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    recorded->binary = binary;
    recorded->geometry = geometry;
    recorded->tessellation_binary = tessellation;
+   /* Only the ordinary VS/FS compiler currently proves unused descriptor
+    * suffixes. Snapshot its compiled prefix, never compact block indices or
+    * read a declared-but-unused binding back into the CB0 register window. */
+   const bool compiled_ubo_prefix = !ctx->gs && !has_tessellation;
    if (!pvrgpu_capture_stage_uniform_buffers(
           ctx, MESA_SHADER_VERTEX, ctx->vs->nir->info.num_ubos,
+          compiled_ubo_prefix,
           &binary.vertex.abi, recorded, vertex_uniform_words) ||
        !pvrgpu_capture_stage_uniform_buffers(
           ctx, MESA_SHADER_FRAGMENT, ctx->fs->nir->info.num_ubos,
+          compiled_ubo_prefix,
           &binary.fragment.abi, recorded, fragment_uniform_words) ||
        (ctx->gs && !pvrgpu_capture_stage_uniform_buffers(
-          ctx, MESA_SHADER_GEOMETRY, ctx->gs->nir->info.num_ubos,
+          ctx, MESA_SHADER_GEOMETRY, ctx->gs->nir->info.num_ubos, false,
           &geometry.shader.abi, recorded, geometry_uniform_words)) ||
        (has_tessellation && (!pvrgpu_capture_stage_uniform_buffers(
-          ctx, MESA_SHADER_TESS_CTRL, ctx->tcs->nir->info.num_ubos,
+          ctx, MESA_SHADER_TESS_CTRL, ctx->tcs->nir->info.num_ubos, false,
           &tessellation.control.shader.abi, recorded, control_uniform_words) ||
           !pvrgpu_capture_stage_uniform_buffers(
-          ctx, MESA_SHADER_TESS_EVAL, ctx->tes->nir->info.num_ubos,
+          ctx, MESA_SHADER_TESS_EVAL, ctx->tes->nir->info.num_ubos, false,
           &tessellation.evaluation.shader.abi, recorded, evaluation_uniform_words)))) {
       pvrgpu_counter_eventf("draw_array_primitive_record_error",
                             "stage=uniform_buffers reason=bound_range_or_descriptor");
@@ -12277,18 +12457,26 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    command.uniform_buffers = recorded->uniform_buffer_count
       ? recorded->uniform_buffers : NULL;
    command.uniform_buffer_count = recorded->uniform_buffer_count;
-   for (unsigned captured_index = 0;
-        captured_index < fragment_texture_count + geometry_texture_count + vertex_texture_count; ++captured_index) {
-      const bool vertex_texture = captured_index >= fragment_texture_count + geometry_texture_count;
-      const bool geometry_texture = !vertex_texture && captured_index >= fragment_texture_count;
-      const mesa_shader_stage stage = vertex_texture ? MESA_SHADER_VERTEX :
-         geometry_texture ? MESA_SHADER_GEOMETRY : MESA_SHADER_FRAGMENT;
-      const unsigned texture = vertex_texture ? captured_index - fragment_texture_count - geometry_texture_count :
-         geometry_texture ? captured_index - fragment_texture_count : captured_index;
-      uint32_t *shared_words = vertex_texture ? vertex_uniform_words :
-         geometry_texture ? geometry_uniform_words : fragment_uniform_words;
-      const unsigned shared_count = vertex_texture ? vertex_shared_count :
-         geometry_texture ? geometry.shader.abi.shareds : fragment_shared_count;
+   const struct {
+      mesa_shader_stage stage;
+      unsigned count;
+      uint32_t *shared;
+      unsigned shared_count;
+      unsigned descriptor_start;
+   } texture_stages[] = {
+      {MESA_SHADER_VERTEX, vertex_texture_count, vertex_uniform_words, vertex_shared_count, 0},
+      {MESA_SHADER_FRAGMENT, fragment_texture_count, fragment_uniform_words, fragment_shared_count, 0},
+      {MESA_SHADER_GEOMETRY, geometry_texture_count, geometry_uniform_words, geometry.shader.abi.shareds,
+       PVRGPU_PCO_GEOMETRY_UBO_DESCRIPTOR_START},
+      {MESA_SHADER_TESS_CTRL, control_texture_count, control_uniform_words, tessellation.control.shader.abi.shareds, 8},
+      {MESA_SHADER_TESS_EVAL, evaluation_texture_count, evaluation_uniform_words, tessellation.evaluation.shader.abi.shareds, 4},
+   };
+   for (unsigned stage_index = 0; stage_index < ARRAY_SIZE(texture_stages); ++stage_index) {
+    for (unsigned texture = 0; texture < texture_stages[stage_index].count; ++texture) {
+      const unsigned captured_index = recorded->texture_count;
+      const mesa_shader_stage stage = texture_stages[stage_index].stage;
+      uint32_t *shared_words = texture_stages[stage_index].shared;
+      const unsigned shared_count = texture_stages[stage_index].shared_count;
       const char *texture_reason = NULL;
       if (!pvrgpu_capture_generic_sequence_texture(
              ctx,
@@ -12308,14 +12496,14 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
       /*
        * PCO lays each sampled image's descriptor at
        * texture * PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS in the stage's shared
-       * file (after GS's four primitive-input words) and reads constants after them, so the
+       * file after the stage's system-input descriptors, then constants, so the
        * uniform copy above left these words zero.  Fill them here: without a
        * descriptor the model has no image state at all and rejects the draw.
        */
       const struct pvrgpu_systemc_pco_sequence_texture *captured =
          &recorded->textures[captured_index];
       const unsigned descriptor_start =
-         (geometry_texture ? PVRGPU_PCO_GEOMETRY_UBO_DESCRIPTOR_START : 0) +
+         texture_stages[stage_index].descriptor_start +
          texture * PVRGPU_PCO_TEXTURE_DESCRIPTOR_DWORDS;
       enum pipe_format descriptor_format = pvrgpu_effective_sampled_format(
          ctx->sampler_views[stage][texture]);
@@ -12365,10 +12553,38 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
          descriptor[3] = 0;
          descriptor[4] = captured->mip[0].row_pitch * captured->mip[0].height;
       }
+      if (captured->texture_kind == 4U &&
+          !pvrgpu_pco_set_cube_array_texture_layout(
+             &shared_words[descriptor_start], descriptor_format, captured->layers)) {
+         pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                               "stage=textures reason=cube_array_descriptor slot=%u",
+                               texture);
+         pvrgpu_array_primitive_draw_destroy(&recorded);
+         return false;
+      }
+      if (captured->texture_kind == 4U) {
+         const struct pipe_sampler_view *view = ctx->sampler_views[stage][texture];
+         pvrgpu_counter_eventf("draw_array_primitive_texture_snapshot",
+            "stage=%u slot=%u view=%p texture_res=%p kind=4 format=%s "
+            "width=%u height=%u faces=%u mips=%u first_layer=%u first_level=%u bytes=%zu",
+            (unsigned)stage, texture, (const void *)view, (const void *)view->texture,
+            captured->format, captured->mip[0].width, captured->mip[0].height,
+            captured->layers, captured->mip_count,
+            view->u.tex.first_layer, view->u.tex.first_level, captured->bytes_size);
+         if (util_format_has_depth(util_format_description(view->format)))
+            pvrgpu_counter_eventf("draw_array_primitive_cube_array_depth_view",
+               "stage=%u slot=%u view=%p texture_res=%p source_format=%s "
+               "storage_format=%s swizzle=%u,%u,%u,%u compare_mode=%u",
+               (unsigned)stage, texture, (const void *)view, (const void *)view->texture,
+               util_format_name(view->format), captured->format,
+               view->swizzle_r, view->swizzle_g, view->swizzle_b, view->swizzle_a,
+               ctx->samplers[stage][texture]->state.compare_mode);
+      }
       pvrgpu_set_generic_texture_compare_metadata(
          ctx->sampler_views[stage][texture], &ctx->samplers[stage][texture]->state,
          &shared_words[descriptor_start]);
       ++recorded->texture_count;
+    }
    }
    command.sampled_texture_count = recorded->texture_count;
    /*
@@ -13488,18 +13704,13 @@ pvrgpu_draw_is_lowerable_array_primitive(
          *reason = "tessellation_with_geometry";
          return false;
       }
-      if (ctx->tcs->nir->info.num_textures || ctx->tes->nir->info.num_textures) {
-         *reason = "tessellation_texture";
-         return false;
-      }
    }
    if (ctx->gs && !ctx->gs->nir) {
       *reason = "geometry_missing_nir";
       return false;
    }
    if (!ctx->vertex_elements ||
-       (((!ctx->gs && !(ctx->tcs && ctx->tes)) || ctx->vertex_elements->num_elements != 0) &&
-        (ctx->vertex_elements->num_elements == 0 || ctx->num_vertex_buffers == 0))) {
+       (ctx->vertex_elements->num_elements != 0 && ctx->num_vertex_buffers == 0)) {
       *reason = "no_vertex_layout";
       return false;
    }
@@ -13526,9 +13737,13 @@ pvrgpu_draw_is_lowerable_array_primitive(
    }
    const unsigned fragment_texture_count = ctx->fs->nir->info.num_textures;
    const unsigned geometry_texture_count = ctx->gs ? ctx->gs->nir->info.num_textures : 0;
+   const unsigned control_texture_count = ctx->tcs ? ctx->tcs->nir->info.num_textures : 0;
+   const unsigned evaluation_texture_count = ctx->tes ? ctx->tes->nir->info.num_textures : 0;
    if (fragment_texture_count > PVRGPU_PCO_MAX_TEXTURES ||
        geometry_texture_count > PVRGPU_PCO_MAX_TEXTURES ||
-       vertex_texture_count > PVRGPU_PCO_MAX_TEXTURES) {
+       vertex_texture_count > PVRGPU_PCO_MAX_TEXTURES ||
+       control_texture_count > PVRGPU_PCO_MAX_TEXTURES ||
+       evaluation_texture_count > PVRGPU_PCO_MAX_TEXTURES) {
       *reason = "too_many_textures";
       if (detail && detail_size) {
          snprintf(detail, detail_size, "fragment_textures=%u geometry_textures=%u limit=%u",
@@ -13537,13 +13752,13 @@ pvrgpu_draw_is_lowerable_array_primitive(
       }
       return false;
    }
-   for (unsigned texture_index = 0;
-        texture_index < fragment_texture_count + geometry_texture_count + vertex_texture_count; ++texture_index) {
-      const bool vertex_texture = texture_index >= fragment_texture_count + geometry_texture_count;
-      const mesa_shader_stage stage = vertex_texture ? MESA_SHADER_VERTEX :
-         texture_index < fragment_texture_count ? MESA_SHADER_FRAGMENT : MESA_SHADER_GEOMETRY;
-      const unsigned texture = vertex_texture ? texture_index - fragment_texture_count - geometry_texture_count :
-         texture_index < fragment_texture_count ? texture_index : texture_index - fragment_texture_count;
+   const mesa_shader_stage texture_stages[] = {MESA_SHADER_FRAGMENT, MESA_SHADER_GEOMETRY,
+      MESA_SHADER_VERTEX, MESA_SHADER_TESS_CTRL, MESA_SHADER_TESS_EVAL};
+   const unsigned texture_counts[] = {fragment_texture_count, geometry_texture_count,
+      vertex_texture_count, control_texture_count, evaluation_texture_count};
+   for (unsigned stage_index = 0; stage_index < ARRAY_SIZE(texture_stages); ++stage_index) {
+    for (unsigned texture = 0; texture < texture_counts[stage_index]; ++texture) {
+      const mesa_shader_stage stage = texture_stages[stage_index];
       const struct pipe_sampler_view *view =
          ctx->sampler_views[stage][texture];
       if (!view || !view->texture) {
@@ -13563,7 +13778,10 @@ pvrgpu_draw_is_lowerable_array_primitive(
       if (view->texture->target != PIPE_TEXTURE_2D &&
           view->texture->target != PIPE_TEXTURE_2D_ARRAY &&
           view->texture->target != PIPE_TEXTURE_3D &&
-          view->texture->target != PIPE_TEXTURE_CUBE) {
+          view->texture->target != PIPE_TEXTURE_CUBE &&
+          !(stage == MESA_SHADER_FRAGMENT &&
+            view->texture->target == PIPE_TEXTURE_CUBE_ARRAY &&
+            view->target == PIPE_TEXTURE_CUBE_ARRAY)) {
          *reason = "texture_target";
          if (detail && detail_size) {
             const char *name =
@@ -13597,6 +13815,14 @@ pvrgpu_draw_is_lowerable_array_primitive(
             snprintf(detail, detail_size, "slot=%u", texture);
          return false;
       }
+      if ((stage == MESA_SHADER_TESS_CTRL || stage == MESA_SHADER_TESS_EVAL) &&
+          (view->target != PIPE_TEXTURE_2D || view->texture->target != PIPE_TEXTURE_2D ||
+           view->texture->nr_samples > 1 ||
+           ctx->samplers[stage][texture]->state.compare_mode != PIPE_TEX_COMPARE_NONE)) {
+         *reason = "tessellation_texture_requires_single_sample_nonshadow_2d";
+         return false;
+      }
+    }
    }
    /*
     * One to four colour attachments, every one present and sharing the
@@ -13617,8 +13843,8 @@ pvrgpu_draw_is_lowerable_array_primitive(
    }
    for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target) {
       if (!ctx->framebuffer.cbufs[target].texture ||
-          ctx->framebuffer.cbufs[target].format !=
-             ctx->framebuffer.cbufs[0].format) {
+          (pvrgpu_framebuffer_has_mixed_color_formats(ctx) &&
+           !pvrgpu_is_explicit_color_format(util_format_name(ctx->framebuffer.cbufs[target].format)))) {
          *reason = "mixed_render_targets";
          return false;
       }
@@ -15261,6 +15487,15 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
                "before this one");
    }
 
+   /* Preserve the original gate/record refusal before a shape-specific
+    * fallback can return. The native CPU-present guard must still refuse
+    * substitution, but its safety reason alone does not explain why native
+    * lowering was unavailable (for example, descriptor capacity or target). */
+   pvrgpu_counter_eventf("draw_array_primitive_gate_declined",
+                         "reason=%s detail=[%s]",
+                         lowering_reason ? lowering_reason : "unknown",
+                         lowering_detail);
+
    /* Preserve preceding generic draws before a different lowering path
     * submits this draw.  Otherwise that command claims the shared output
     * slot and prevents the recorded sequence from ever executing. */
@@ -15786,7 +16021,7 @@ pvrgpu_launch_grid(struct pipe_context *pipe,
    uint32_t shared[PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS] = {0};
    reason = "compute_push_constants";
    if (!pvrgpu_copy_stage_uniform_words(ctx, MESA_SHADER_COMPUTE,
-                                        &abi->stage, shared))
+                                        &abi->stage, NULL, shared))
       goto fail;
    for (unsigned slot = 0; slot < abi->sampled_texture_count; ++slot) {
       reason = "compute_texture_snapshot";

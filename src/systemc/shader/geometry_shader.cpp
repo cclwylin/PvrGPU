@@ -54,7 +54,7 @@ bool SameSample(const TextureSampleRequest &a, const TextureSampleRequest &b) {
       a.sample_index == b.sample_index && a.sample_index_present == b.sample_index_present &&
       a.explicit_lod == b.explicit_lod && a.explicit_lod_present == b.explicit_lod_present &&
       !a.lod_bias && !b.lod_bias && !a.lod_bias_present && !b.lod_bias_present &&
-      a.reserved[0] == b.reserved[0];
+      a.gather == 0 && b.gather == 0;
 }
 struct InvocationContext {
   GpuMemorySystem &memory;
@@ -124,6 +124,8 @@ void GeometryShader::Sample(PipelineState &state, const PipelineTxn &txn,
   request.explicit_lod_present = issued.explicit_lod_present;
   if (issued.lod_bias_present || issued.lod_bias)
     throw std::runtime_error("geometry SMP shader LOD bias is unsupported");
+  if (issued.gather)
+    throw std::runtime_error("geometry SMP raw gather is unsupported");
   state.texture_sample_requests = StoreNewArray(pool_, std::vector<TextureSampleRequest>{request});
   state.stage = PipelineStage::kGeometryTexturePending;
   StorePipelineState(pool_, txn.state, state);

@@ -1,0 +1,48 @@
+From: PvrGPU replay diagnostics
+Subject: [PATCH] GL: query discard multiview state from an attached texture
+
+The OVR view-count pname is only valid for a texture attachment. A depth-only
+framebuffer or a renderbuffer at color slot zero must not trigger that query on
+COLOR_ATTACHMENT0. Select an actual texture from the color/depth/stencil
+attachments; complete framebuffers require consistent attachment view counts.
+If no texture is attached, retain the existing single-view default. Preserve
+actual multiview counts and ordinary texture count zero (clamped by the existing
+program selection). No GL errors, captured calls, or discard work are suppressed.
+
+diff --git a/renderdoc/driver/gl/gl_debug.cpp b/renderdoc/driver/gl/gl_debug.cpp
+--- a/renderdoc/driver/gl/gl_debug.cpp
++++ b/renderdoc/driver/gl/gl_debug.cpp
+@@ -1595,10 +1595,30 @@ void GLReplay::FillWithDiscardPattern(DiscardType type, GLuint framebuffer, GLsizei numAttachments,
+   int numviews = 1;
+ 
+   if(IsGLES && HasExt[OVR_multiview])
+   {
+-    GL.glGetNamedFramebufferAttachmentParameterivEXT(
+-        framebuffer, eGL_COLOR_ATTACHMENT0, eGL_FRAMEBUFFER_ATTACHMENT_TEXTURE_NUM_VIEWS_OVR,
+-        &numviews);
++    // Complete framebuffers have consistent view counts across populated
++    // attachments. COLOR_ATTACHMENT0 can be absent or a renderbuffer, so find
++    // a real texture before issuing a texture-only attachment query.
++    GLint maxColorAttachments = 0;
++    GL.glGetIntegerv(eGL_MAX_COLOR_ATTACHMENTS, &maxColorAttachments);
++    for(GLint i = 0; i < maxColorAttachments + 2; i++)
++    {
++      GLenum attachment = GLenum(eGL_COLOR_ATTACHMENT0 + i);
++      if(i == maxColorAttachments)
++        attachment = eGL_DEPTH_ATTACHMENT;
++      else if(i == maxColorAttachments + 1)
++        attachment = eGL_STENCIL_ATTACHMENT;
++
++      GLint objectType = eGL_NONE;
++      GL.glGetNamedFramebufferAttachmentParameterivEXT(
++          framebuffer, attachment, eGL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &objectType);
++      if(objectType == eGL_TEXTURE)
++      {
++        GL.glGetNamedFramebufferAttachmentParameterivEXT(
++            framebuffer, attachment, eGL_FRAMEBUFFER_ATTACHMENT_TEXTURE_NUM_VIEWS_OVR, &numviews);
++        break;
++      }
++    }
+   }
+ 
+   drv.glBindBufferBase(eGL_UNIFORM_BUFFER, 0, DebugData.discardPatternBuffer);

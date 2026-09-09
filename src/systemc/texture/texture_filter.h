@@ -168,6 +168,15 @@ TextureLevelSelection SelectTextureLevels(
     const TextureLodSelection &lod,
     const RogueTextureSamplerDescriptor &sampler, std::uint32_t mip_count);
 
+// Whether an implicit footprint can change the actual level/filter selection.
+// Besides the original zero-window/single-level cases, only a nearest-mip
+// window strictly below half a level with equal image filters is proved
+// independent. The real selector verifies both endpoints under the current
+// host rounding mode; raw sampler state and texture coordinates are untouched.
+bool TextureImplicitLodAffectsSelection(
+    const RogueTextureImageDescriptor &image,
+    const RogueTextureSamplerDescriptor &sampler);
+
 // Texel fetches one sample with this selection issues.
 std::uint32_t TextureLevelTaps(const TextureLevelSelection &levels);
 

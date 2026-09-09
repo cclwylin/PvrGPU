@@ -176,7 +176,7 @@ void Run(const std::filesystem::path &root, const char *mode, unsigned layers, b
 }
 int main(int argc,char **argv) {
   try {
-    static_assert(PVRGPU_SYSTEMC_API_VERSION==30);
+    static_assert(PVRGPU_SYSTEMC_API_VERSION==32);
     const char *mode=argc>1?argv[1]:"direct";
     const auto root=std::filesystem::temp_directory_path()/("pvrgpu-layered-api-"+
         std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count()));

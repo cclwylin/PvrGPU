@@ -1,6 +1,7 @@
 #include "model_runner.h"
 #include "compute_types.h"
 #include "uniform_buffers.h"
+#include "texture_stages.h"
 #include "shader_images.h"
 #include "texture/astc_decoder.h"
 #include "texture/texture_unit.h"
@@ -622,6 +623,38 @@ bool ValidateStreamOutput(const pvrgpu_systemc_stream_output *so,
   return true;
 }
 
+bool ColorAttachmentFormatsAreValid(
+    const pvrgpu_systemc_driver_command &source, std::string *error) {
+  const auto refuse = [&](const char *reason) {
+    *error = std::string("SystemC API color attachment formats are invalid: ") + reason;
+    return false;
+  };
+  const std::uint32_t count = source.color_attachment_format_count;
+  const std::uint32_t targets = source.render_target_count ? source.render_target_count : 1U;
+  if (count > 4U || (count && count != targets))
+    return refuse("count does not cover every render target");
+  for (std::uint32_t target = 0; target < 4U; ++target) {
+    const char *format = source.color_attachment_formats[target];
+    if (target >= count) {
+      if (format)
+        return refuse("inactive entry must be null");
+    } else if (!format || !pvrgpu::stub::IsNormalizedFourByteColorFormat(format)) {
+      return refuse("explicit entry is not a supported normalized four-byte format");
+    }
+  }
+  if (count && (!source.format ||
+      std::string_view(source.color_attachment_formats[0]) != source.format))
+    return refuse("target zero disagrees with command format");
+  return true;
+}
+
+void CopyColorAttachmentFormats(const pvrgpu_systemc_driver_command &source,
+                               pvrgpu::stub::DriverCommand *destination) {
+  destination->color_attachment_formats.clear();
+  for (std::uint32_t target = 0; target < source.color_attachment_format_count; ++target)
+    destination->color_attachment_formats.emplace_back(source.color_attachment_formats[target]);
+}
+
 void CopyPcoPayloadFields(
     const pvrgpu_systemc_driver_command &source,
     pvrgpu::stub::DriverCommand *destination) {
@@ -641,6 +674,7 @@ void CopyPcoPayloadFields(
   }
   destination->render_target_count =
       source.render_target_count == 0 ? 1U : source.render_target_count;
+  CopyColorAttachmentFormats(source, destination);
   destination->vertex_attribute_count = source.vertex_attribute_count;
   for (std::size_t attribute = 0;
        attribute < destination->vertex_attribute_components.size();
@@ -938,6 +972,8 @@ void CopyPcoPayloadFields(
 
 bool InitialColorAttachmentIsValid(
     const pvrgpu_systemc_driver_command &source, std::string *error) {
+  if (!ColorAttachmentFormatsAreValid(source, error))
+    return false;
   const auto reject = [&](const char *reason) {
     *error = std::string("SystemC API initial color attachment is invalid: ") +
              reason;
@@ -1511,6 +1547,8 @@ bool CopyPcoSequenceDraw(
     return refuse("version=" + std::to_string(source.version) +
                   " expected=" + std::to_string(PVRGPU_SYSTEMC_API_VERSION));
   }
+  if (!ColorAttachmentFormatsAreValid(source, error))
+    return false;
   if (source.uniform_buffer_count >
           5U * PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
       ((source.uniform_buffer_count != 0) != (source.uniform_buffers != nullptr))) {
@@ -1686,7 +1724,11 @@ bool CopyPcoSequenceDraw(
       return "index payload is invalid";
     if (!DriverPcoRenderTargetCountIsValid(source.render_target_count))
       return "render target count is invalid";
-    if ((geometry || tessellation) && source.render_target_count > 1)
+    // The complete explicit vector was validated before this lambda. Only
+    // that bounded four-byte LOAD contract admits stage pipelines with MRT;
+    // the homogeneous legacy path retains its previous refusal.
+    if ((geometry || tessellation) && source.render_target_count > 1 &&
+        source.color_attachment_format_count == 0)
       return "geometry MRT requires independent attachment LOAD";
     if (end_vertex == 0 ||
         end_vertex > std::numeric_limits<std::uint32_t>::max() ||
@@ -1827,7 +1869,7 @@ bool CopyPcoSequenceDraw(
   // capture actually needs.
   const char *nested_reason = nullptr;
   if (source.sampled_texture_count >
-      3U * pvrgpu::stub::kPcoMaximumTextureDescriptorSets)
+      5U * pvrgpu::stub::kPcoMaximumTextureDescriptorSets)
     nested_reason = "sampled_texture_count";
   else if (source.sampled_texture_bytes ||
            source.sampled_texture_bytes_size != 0 ||
@@ -2020,6 +2062,14 @@ bool CopyCommand(const pvrgpu_systemc_driver_command &source,
     *error = "missing SystemC API format";
     return false;
   }
+  if (!ColorAttachmentFormatsAreValid(source, error))
+    return false;
+  if (source.color_attachment_format_count &&
+      std::string_view(source.command) != "draw_pco_triangles" &&
+      std::string_view(source.command) != "draw_pco_sequence") {
+    *error = "SystemC API explicit color attachment formats require a PCO command";
+    return false;
+  }
   if (source.initial_color_attachment_bytes ||
       source.initial_color_attachment_bytes_size != 0 ||
       source.initial_depth_attachment_bytes ||
@@ -2048,6 +2098,8 @@ bool CopyCommand(const pvrgpu_systemc_driver_command &source,
   command.width = source.width;
   command.height = source.height;
   command.format = source.format;
+  command.render_target_count = source.render_target_count ? source.render_target_count : 1U;
+  CopyColorAttachmentFormats(source, &command);
   command.clear_color_bits = {source.clear_color_bits[0],
                               source.clear_color_bits[1],
                               source.clear_color_bits[2],
@@ -2289,7 +2341,7 @@ bool CopyPcoSequenceTexture(
   if (source.source > PVRGPU_SYSTEMC_PCO_TEXTURE_PREVIOUS_DEPTH_ATTACHMENT)
     return reject("source");
   if (compute_resource ? source.stage != PVRGPU_SYSTEMC_PCO_SHADER_STAGE_COMPUTE
-                       : source.stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_GEOMETRY)
+                       : source.stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION)
     return reject("stage");
   if (source.descriptor_set >=
       pvrgpu::stub::kPcoMaximumTextureDescriptorSets)
@@ -2308,9 +2360,15 @@ bool CopyPcoSequenceTexture(
   const std::uint32_t samples = source.sample_count ? source.sample_count : 1U;
   if (samples != 1U && samples != 2U && samples != 4U && samples != 8U)
     return reject("sample count");
-  if (source.texture_kind > 3U || source.layers > UINT16_MAX ||
+  if (source.texture_kind > 4U || source.layers > UINT16_MAX ||
       (source.texture_kind == 0U && source.layers > 1U))
     return reject("dimension/layer count");
+  if (source.texture_kind == 4U &&
+      (source.stage != PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT ||
+       source.source != PVRGPU_SYSTEMC_PCO_TEXTURE_EXTERNAL_PAYLOAD ||
+       !source.layers || source.layers % 6U || source.layers / 6U > 2048U ||
+       samples != 1U || block_width != 1U || block_height != 1U))
+    return reject("whole-cube uncompressed single-sample fragment array");
   if (samples > 1U &&
       (source.source != PVRGPU_SYSTEMC_PCO_TEXTURE_EXTERNAL_PAYLOAD ||
        source.texture_kind > 1U || source.mip_count != 1U ||
@@ -2346,6 +2404,10 @@ bool CopyPcoSequenceTexture(
             ? ((base_slices >> level) == 0U ? 1U : (base_slices >> level))
             : base_slices;
     const std::uint64_t rows = blocks_for(mip.height, block_height);
+    if (source.texture_kind == 4U &&
+        (mip.width != mip.height || mip.row_pitch != tight_pitch ||
+         (level && mip.width != std::max(1U, source.mip[level - 1].width >> 1U))))
+      return reject("cube array square mip extent/pitch");
     if (rows && level_slices &&
         mip.row_pitch > source.declared_bytes_size / rows / level_slices)
       return reject("mip byte extent");
@@ -2584,7 +2646,7 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
              producer.raster_samples == command.raster_samples &&
              producer.framebuffer_layers == command.framebuffer_layers &&
              (depth ? producer.depth_format == command.depth_format
-                    : producer.format == command.format);
+                    : pvrgpu::stub::DriverColorAttachmentFormatsMatch(producer, command));
     };
     if (!attachment_matches(command.color_attachment_source_command_index,
                             false) ||
@@ -2592,6 +2654,11 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
                             true)) {
       *error =
           "SystemC API PCO sequence attachment alias format/extent mismatch";
+      return false;
+    }
+    if (ordinal == 0 && !options->driver_command.color_attachment_formats.empty() &&
+        !pvrgpu::stub::DriverColorAttachmentFormatsMatch(options->driver_command, command)) {
+      *error = "SystemC API PCO logical/physical color attachment formats mismatch";
       return false;
     }
     const std::size_t texture_count = command.sampled_texture_count;
@@ -2603,11 +2670,7 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
       return false;
     }
     command.sampled_textures.reserve(texture_count);
-    std::array<bool, pvrgpu::stub::kPcoMaximumTextureDescriptorSets>
-        vertex_sets{};
-    std::array<bool, pvrgpu::stub::kPcoMaximumTextureDescriptorSets>
-        fragment_sets{};
-    std::array<bool, pvrgpu::stub::kPcoMaximumTextureDescriptorSets> geometry_sets{};
+    std::array<std::array<bool, pvrgpu::stub::kPcoMaximumTextureDescriptorSets>, 5> stage_sets{};
     auto previous_stage = pvrgpu::stub::DriverPcoShaderStage::kVertex;
     for (std::size_t texture_index = 0; texture_index < texture_count;
          ++texture_index) {
@@ -2617,13 +2680,10 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
               ordinal, &texture, error)) {
         return false;
       }
-      auto &sets =
-          texture.stage == pvrgpu::stub::DriverPcoShaderStage::kVertex
-              ? vertex_sets
-              : texture.stage == pvrgpu::stub::DriverPcoShaderStage::kGeometry ? geometry_sets : fragment_sets;
+      auto &sets = stage_sets[pvrgpu::stub::DriverTextureStageIndex(texture.stage)];
       if (texture.stage < previous_stage) {
         *error =
-            "SystemC API PCO sequence texture stages are not VS-then-FS-then-GS";
+            "SystemC API PCO sequence texture stages are not VS-then-FS-then-GS-then-TCS-then-TES";
         return false;
       }
       previous_stage = texture.stage;
@@ -2632,12 +2692,7 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
         return false;
       }
       sets[texture.descriptor_set] = true;
-      if (texture.stage == pvrgpu::stub::DriverPcoShaderStage::kVertex)
-        ++command.vertex_sampled_texture_count;
-      else if (texture.stage == pvrgpu::stub::DriverPcoShaderStage::kGeometry)
-        ++command.geometry_sampled_texture_count;
-      else
-        ++command.fragment_sampled_texture_count;
+      ++pvrgpu::stub::DriverStageTextureCount(command, texture.stage);
       command.sampled_textures.push_back(std::move(texture));
     }
     const auto sets_are_dense = [](const auto &sets, std::size_t count) {
@@ -2646,14 +2701,12 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
              std::none_of(sets.begin() + count, sets.end(),
                           [](bool present) { return present; });
     };
-    if (!sets_are_dense(vertex_sets,
-                        command.vertex_sampled_texture_count) ||
-        !sets_are_dense(fragment_sets,
-                        command.fragment_sampled_texture_count) ||
-        !sets_are_dense(geometry_sets, command.geometry_sampled_texture_count)) {
-      *error =
-          "SystemC API PCO sequence descriptor sets are not stage-dense";
-      return false;
+    for (unsigned stage = 0; stage < stage_sets.size(); ++stage) {
+      if (!sets_are_dense(stage_sets[stage], pvrgpu::stub::DriverStageTextureCount(
+              command, static_cast<pvrgpu::stub::DriverPcoShaderStage>(stage)))) {
+        *error = "SystemC API PCO sequence descriptor sets are not stage-dense";
+        return false;
+      }
     }
     const std::size_t descriptor_dwords =
         pvrgpu::stub::kPcoTextureDescriptorDwordCount;
@@ -2670,6 +2723,21 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
           "SystemC API PCO sequence descriptor prefix exceeds stage shareds";
       return false;
     }
+    for (unsigned stage = 3; stage < 5; ++stage) {
+      const bool control = stage == 3;
+      const auto kind = static_cast<pvrgpu::stub::DriverPcoShaderStage>(stage);
+      const auto count = pvrgpu::stub::DriverStageTextureCount(command, kind);
+      const auto &binary = control ? command.tessellation.control_pco : command.tessellation.evaluation_pco;
+      const auto &abi = control ? command.tessellation.control_abi : command.tessellation.evaluation_abi;
+      const auto &shared = pvrgpu::stub::DriverTextureShared(command, kind);
+      const auto prefix = pvrgpu::stub::DriverTextureDescriptorStart(kind) + count * descriptor_dwords;
+      if ((count && binary.empty()) || (!binary.empty() &&
+          (shared.size() != abi.shareds || shared.size() < prefix ||
+           abi.uniform_buffer_descriptor_start != prefix))) {
+        *error = "SystemC API PCO sequence tessellation texture/UBO prefix mismatch";
+        return false;
+      }
+    }
     std::sort(command.sampled_textures.begin(),
               command.sampled_textures.end(),
               [](const auto &left, const auto &right) {
@@ -2678,18 +2746,35 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
                 return left.descriptor_set < right.descriptor_set;
               });
     for (const auto &texture : command.sampled_textures) {
-      const auto &shared = texture.stage == pvrgpu::stub::DriverPcoShaderStage::kVertex
-                               ? command.vertex_shared
-                               : texture.stage == pvrgpu::stub::DriverPcoShaderStage::kGeometry
-                                   ? command.geometry_shared : command.fragment_shared;
+      const auto &shared = pvrgpu::stub::DriverTextureShared(command, texture.stage);
       // Rogue TEXSTATE_IMAGE_WORD0[63:62] 保存 log2(samples)，與結構化
       // payload 必須一致，不能由 host metadata 蓋過 shader descriptor。
       const std::size_t image_word1 = texture.descriptor_set * descriptor_dwords + 1U +
-          (texture.stage == pvrgpu::stub::DriverPcoShaderStage::kGeometry ? 4U : 0U);
+          pvrgpu::stub::DriverTextureDescriptorStart(texture.stage);
+      const bool tessellation_texture = texture.stage == pvrgpu::stub::DriverPcoShaderStage::kTessellationControl ||
+          texture.stage == pvrgpu::stub::DriverPcoShaderStage::kTessellationEvaluation;
+      if (tessellation_texture && (texture.texture_kind != 0 || texture.layers != 1 ||
+          texture.sample_count != 1 || !texture.normalized_coordinates ||
+          shared.at(image_word1 + 11U) != 0)) {
+        *error = "SystemC API tessellation texture requires normalized nonshadow single-sample 2D";
+        return false;
+      }
       const std::uint32_t descriptor_samples = 1U << (shared.at(image_word1) >> 30U);
       if (descriptor_samples != texture.sample_count) {
         *error = "SystemC API PCO sequence texture descriptor/sample count mismatch";
         return false;
+      }
+      if (texture.texture_kind == 4U) {
+        const std::size_t base = image_word1 - 1U;
+        const std::uint64_t face_stride =
+            static_cast<std::uint64_t>(texture.mip[0].row_pitch_bytes) * texture.mip[0].height;
+        if ((shared.at(base) & 7U) != 1U ||
+            ((shared.at(base + 2U) >> 4U) & 2047U) + 1U != texture.layers / 6U ||
+            shared.at(base + 4U) != face_stride || shared.at(base + 7U) ||
+            shared.at(base + 12U)) {
+          *error = "SystemC API cube array descriptor cube count/face stride/mode mismatch";
+          return false;
+        }
       }
       if (texture.source ==
           pvrgpu::stub::DriverPcoTextureSource::kExternalPayload) {
@@ -3439,6 +3524,11 @@ extern "C" int pvrgpu_systemc_flush_readback(
     return 2;
   }
   readback->pixels_written = 0;
+  if (readback->attachment == UINT32_MAX && readback->color_format) {
+    CopyError(error, error_size,
+              "SystemC API depth readback requires a null color format");
+    return 2;
+  }
   const std::uint32_t samples = readback->sample_count ? readback->sample_count : 1;
   const std::uint32_t layers = readback->layer_count ? readback->layer_count : 1;
   if (layers > 256) {
@@ -3503,7 +3593,6 @@ extern "C" int pvrgpu_systemc_flush_readback(
   } else if (framebuffer.bytes_per_pixel != readback->bytes_per_pixel) {
     return 0;
   }
-
   /*
    * Attachment zero is the frame's own surface; the rest are the additional
    * colour targets the same pass wrote, in target order.  An attachment the
@@ -3519,6 +3608,11 @@ extern "C" int pvrgpu_systemc_flush_readback(
   }
   if (!source || source->size() != static_cast<std::size_t>(required))
     return 0;
+  if (!depth_readback && !framebuffer.ColorFormatMatches(readback->attachment,
+                                                        readback->color_format)) {
+    CopyError(error, error_size, "SystemC API color readback transport format mismatch or missing required format");
+    return 2;
+  }
 
   std::memcpy(readback->pixels, source->data(),
               static_cast<std::size_t>(required));

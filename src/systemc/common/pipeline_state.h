@@ -50,8 +50,8 @@ static_assert(kFillTexNearestSharedDwordCount ==
  * render target declared.  Every target takes its own run of four outputs --
  * the first at pixout0, the second at pixout4 -- so a shader writing two vec3
  * attachments is expected to write 0x77, not 0x07.  Four lanes is the default
- * only for legacy callers when nothing was declared at all. GS-linked
- * pipelines describe their actual outputs explicitly, including none.
+ * only for legacy callers when nothing was declared at all. Native fragment
+ * programs describe their actual outputs explicitly, including none.
  * Requiring PIXOUT0..3 outright rejected narrower or empty exports.
  */
 inline std::uint32_t ExpectedPixelOutputMask(
@@ -237,6 +237,11 @@ struct PipelineState {
   std::uint8_t color_attachment_float32 = 0;
   // Actual packed four-byte normalized storage, not RGBA8 or raw integers.
   PackedUnormFormat color_attachment_packed_unorm = PackedUnormFormat::kNone;
+  // Optional API-v31 normalized four-byte codec vector. Count zero preserves
+  // the homogeneous legacy codec above. Explicit kNone entries mean RGBA8;
+  // raw integer, float32 and sRGB mixtures are not represented by this ABI.
+  std::uint32_t color_attachment_format_count = 0;
+  std::array<PackedUnormFormat, kMaxRenderTargets> color_attachment_packed_unorms{};
   // The UNORM8 colour attachment stores sRGB-encoded bytes: the PBE encodes the
   // shader's linear PIXOUT on write and, when blending, decodes the stored
   // destination to linear, blends there and re-encodes.  Zero is a plain linear
@@ -247,6 +252,8 @@ struct PipelineState {
   // the correspondingly numbered owned resource and sampler.
   std::uint32_t vertex_sampled_texture_count = 0;
   std::uint32_t geometry_sampled_texture_count = 0;
+  std::uint32_t tessellation_control_sampled_texture_count = 0;
+  std::uint32_t tessellation_evaluation_sampled_texture_count = 0;
   std::uint32_t compute_sampled_texture_count = 0;
   std::uint64_t compute_texture_request_count = 0;
   std::uint64_t compute_texel_fetch_count = 0;
@@ -258,6 +265,10 @@ struct PipelineState {
   // to the other stage and that multi-round SMP continuations are not lost.
   std::uint64_t vertex_texture_request_count = 0;
   std::uint64_t geometry_texture_request_count = 0;
+  std::uint64_t tessellation_control_texture_request_count = 0;
+  std::uint64_t tessellation_evaluation_texture_request_count = 0;
+  std::uint64_t tessellation_control_texel_fetch_count = 0;
+  std::uint64_t tessellation_evaluation_texel_fetch_count = 0;
   std::uint64_t geometry_texture_instruction_count = 0;
   std::uint64_t fragment_texture_request_count = 0;
   std::uint64_t vertex_texel_fetch_count = 0;
@@ -308,6 +319,15 @@ struct PipelineState {
   std::uint64_t fragment_groups = 0;
   CounterTxn counters;
 };
+
+// Native code supplies an explicit output contract, including a zero color
+// mask for a depth-only program. Keep the same policy at decode, texture
+// bypass, and PBE; a legacy synthetic caller without code retains its default.
+inline bool HasExplicitFragmentOutputMasks(const PipelineState &state) {
+  return HasPoolHandle(state.fragment_code) ||
+         HasPoolHandle(state.geometry_code) ||
+         HasPoolHandle(state.tessellation_state);
+}
 
 PipelineState LoadPipelineState(const MemoryPool &pool, PoolHandle handle);
 void StorePipelineState(MemoryPool &pool, PoolHandle handle,

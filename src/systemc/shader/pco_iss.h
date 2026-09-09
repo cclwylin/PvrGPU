@@ -11,6 +11,7 @@
 #pragma once
 
 #include "common/shader_stage.h"
+#include "../../gallium/drivers/pvrgpu/pvrgpu_systemc_limits.h"
 
 #include <array>
 #include <cstddef>
@@ -45,6 +46,9 @@ inline constexpr std::size_t kPcoTemporaryCount = 256;
 // Public PCO_SR_INST_NUM. This is a runtime compute system register, never a
 // constant-table entry; its value is the physical instance within a 32-lane task.
 inline constexpr std::uint16_t kPcoSpecialInstanceNumber = 51;
+/* Public FACE_ORIENT/BACK_FACE. The driver lowers the winding operation to
+ * NOP because rasterization already supplies normalized API front-facing. */
+inline constexpr std::uint16_t kPcoSpecialFragmentBackFace = 44;
 
 /* Lane/continuation ownership covers the full TEMP file, without shifting a
  * 64-bit integer by a register index >=64. Keep this payload trivially
@@ -82,12 +86,13 @@ static_assert(std::is_trivially_copyable_v<PcoTemporaryMask>);
  * shared-register slot.  Descriptor count, sequential SMP count, and the
  * transported shared-register span are independent bounds.  The captured
  * terrain main draw transports 56 VS push DWORDs plus two descriptors (96
- * total), and 64 FS push DWORDs plus five descriptors (164 total).  GFXBench
- * Manhattan samples six textures in one fragment stage, so the descriptor
- * bound is eight and the fragment transport 256 DWORDs.  These are current
+ * total), and 64 FS push DWORDs plus five descriptors (164 total). The
+ * descriptor bound is derived from the fragment transport's 256 DWORDs.
+ * Stage-specific prefixes and shared budgets still apply. These are current
  * public workload/transport gates, not Rogue hardware-file limits. */
 inline constexpr std::size_t kPcoTextureDescriptorDwordCount = 20;
-inline constexpr std::size_t kPcoMaximumTextureDescriptorSets = 8;
+inline constexpr std::size_t kPcoMaximumTextureDescriptorSets =
+    PVRGPU_SYSTEMC_MAX_PCO_TEXTURES_PER_STAGE;
 /* The vertex continuation path validates a bounded straight-line SMP
  * sequence. Fragment programs instead support control flow and reuse one
  * continuation per resident lane: their static SMP count is not continuation
@@ -97,6 +102,8 @@ inline constexpr std::size_t kPcoMaximumVertexSharedCount = 96;
 inline constexpr std::size_t kPcoMaximumFragmentSharedCount = 256;
 inline constexpr std::size_t kPcoMaximumSharedCount =
     kPcoMaximumFragmentSharedCount;
+static_assert(kPcoMaximumTextureDescriptorSets ==
+              kPcoMaximumFragmentSharedCount / kPcoTextureDescriptorDwordCount);
 inline constexpr std::size_t kPcoConditionalsVertexSharedCount = 16;
 inline constexpr std::size_t kPcoConditionalsFragmentSharedCount = 4;
 inline constexpr std::size_t kPcoFillTexNearestCoefficientCount = 12;
@@ -264,6 +271,9 @@ enum class PcoOpcode : std::uint8_t {
   kAlphaFeedback,
   // Native FITR evaluates a coefficient plane without a perspective-W source.
   kFloatInterpolate,
+  // Native bitwise phase0 FTB: unsigned highest set-bit index, or -1 for zero.
+  // Appended to preserve all existing decoded opcode ordinals.
+  kFindTopBit,
 };
 
 inline bool IsPcoAtomic32(PcoOpcode opcode) {
@@ -417,6 +427,8 @@ struct PcoInstruction {
   // Fragment SMP BIAS/PPLOD: a raw float bias follows the coordinates.
   // The existing TAO zero-bias padding remains a distinct, bounded path.
   std::uint8_t texture_lod_bias = 0;
+  // SMP CHAN1/RAWDATA: four component-0 taps, not a filtered RGBA texel.
+  std::uint8_t texture_gather = 0;
   std::uint8_t data_request = 0;
   PcoIterationMode iteration_mode = PcoIterationMode::kPixel;
   std::uint8_t perspective = 0;
@@ -514,8 +526,17 @@ inline bool HasCanonicalNativeIntegerSignedness(const PcoInstruction &i) {
        (i.opcode == PcoOpcode::kIntegerMultiplyAdd64High ||
         i.opcode == PcoOpcode::kShiftRight));
 }
-inline bool HasCanonicalTextureLodMode(const PcoInstruction &i) {
-  return (i.texture_lod_replace == 0 ||
+// Task/geometry executors use the default fail-closed gather policy.
+inline bool HasCanonicalTextureLodMode(const PcoInstruction &i,
+                                      bool allow_fragment_gather = false) {
+  return (i.texture_gather == 0 ||
+          (allow_fragment_gather && i.texture_gather == 1 &&
+           i.opcode == PcoOpcode::kTextureSample &&
+           i.texture_dimension == 2 && i.texture_fcnorm == 1 &&
+           i.texture_lod_replace == 1 && !i.texture_lod_bias &&
+           i.texture_address_offset <= 1 && !i.texture_non_normalized_coords &&
+           !i.texture_sample_index_present && !i.texture_spatial_offset_present)) &&
+         (i.texture_lod_replace == 0 ||
           (i.texture_lod_replace == 1 && i.opcode == PcoOpcode::kTextureSample)) &&
          (i.texture_lod_bias == 0 ||
           (i.texture_lod_bias == 1 && i.opcode == PcoOpcode::kTextureSample &&
@@ -581,6 +602,7 @@ struct PcoTextureRequest {
   std::uint8_t explicit_lod_present = 0;
   std::uint32_t lod_bias = 0;
   std::uint8_t lod_bias_present = 0;
+  std::uint8_t gather = 0;
 };
 
 /* Complete lane-local vertex state captured immediately after an SMP request.
@@ -677,6 +699,9 @@ struct PcoFragmentContinuation {
   std::array<LoopState, 32> loops{};
   std::uint8_t loop_depth = 0;
   std::uint8_t execution_predicate = 1;
+  // Immutable raster input, retained even when FACE is first read after WDF.
+  std::uint8_t front_facing = 0;
+  std::uint8_t front_facing_valid = 0;
   std::uint64_t native_steps = 0;
   PcoInstructionCounts executed_instructions{};
 };
@@ -725,6 +750,11 @@ struct PcoFragmentExecutionContext {
   std::uint8_t sample_position_valid = 0;
   std::uint32_t sample_id = 0;
   std::uint32_t coverage_mask = 1;
+  // Presence is explicit: a default context must not fabricate a front face.
+  // Normalized API facing comes from the original raster primitive, including
+  // helper lanes and raster winding/reflection state already applied upstream.
+  std::uint8_t front_facing = 0;
+  std::uint8_t front_facing_valid = 0;
   std::uint32_t special_coordinate_offset = 0;
   // CENTROID has a separate, coverage-selected position on MSAA surfaces.
   std::uint32_t raster_sample_count = 1;
@@ -849,6 +879,11 @@ PcoFragmentExecution ResumeFragmentPco(
 // decoded program; no public API accepts a caller-provided trusted signature.
 // Per-lane context, continuation and sampler/derivative response checks still
 // execute on every invocation. The vector-based API retains full revalidation.
+struct PcoFragmentTemporaryRequirements {
+  PcoTemporaryMask written{};
+  bool reachable = false;
+};
+
 class PcoPreparedFragmentProgram final {
  public:
   PcoPreparedFragmentProgram(const PcoProgramSummary &summary,
@@ -862,7 +897,11 @@ class PcoPreparedFragmentProgram final {
   const PcoProgramSummary summary_;
   const std::vector<PcoInstruction> instructions_;
   const bool texture_program_;
+  const bool front_facing_required_;
   const std::uint64_t program_signature_;
+  // Host-only CFG proof, computed once per immutable program, never a FIFO
+  // payload or caller-provided trust token. Entries precede the instruction.
+  const std::vector<PcoFragmentTemporaryRequirements> temporary_requirements_;
   friend PcoFragmentExecution ExecuteFragmentPco(
       const PcoPreparedFragmentProgram &, const PcoFragmentExecutionContext &);
 };

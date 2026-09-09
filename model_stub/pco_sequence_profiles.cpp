@@ -248,6 +248,8 @@ bool RootPayloadIsEmpty(const DriverCommand &command) {
          command.vertex_sampled_texture_count == 0 &&
          command.fragment_sampled_texture_count == 0 &&
          command.geometry_sampled_texture_count == 0 &&
+         command.tessellation_control_sampled_texture_count == 0 &&
+         command.tessellation_evaluation_sampled_texture_count == 0 &&
          command.initial_color_attachment_bytes.empty() &&
          command.sampled_texture_bytes.empty() &&
          command.declared_sampled_texture_bytes_size == 0 &&
@@ -1168,6 +1170,8 @@ bool DriverPcoTerrainFragmentBinaryHashMatches(
 // counters itself, so no profile constants are involved.
 bool GenericColorSequenceSupported(const Options &options, std::string *error) {
   const DriverCommand &logical = options.driver_command;
+  if (!DriverColorAttachmentFormatsAreValid(logical))
+    return Reject(error, "generic PCO logical color attachment formats are invalid");
   if (!logical.enabled || logical.schema != kDriverCommandSchema ||
       logical.producer != kDriverCommandProducer ||
       logical.command != kDrawPcoSequence || logical.frame != 1 ||
@@ -1186,6 +1190,9 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
   if (options.driver_commands.empty()) {
     return Reject(error, "generic PCO sequence has no physical draws");
   }
+  if (!logical.color_attachment_formats.empty() &&
+      !DriverColorAttachmentFormatsMatch(logical, options.driver_commands[0]))
+    return Reject(error, "generic PCO logical/physical color attachment formats mismatch");
 
   for (std::size_t ordinal = 0; ordinal < options.driver_commands.size();
        ++ordinal) {
@@ -1196,7 +1203,9 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
     // draw's width/height are independent of the logical command and attachment
     // -- SystemC positions geometry from the draw's viewport scale/translate,
     // then limits tile coverage to the attachment and the draw's scissor.
-    if (draw.command != kDrawPcoTriangles || draw.test_case != logical.test_case ||
+    if (!DriverColorAttachmentFormatsAreValid(draw) ||
+        (ordinal && !DriverColorAttachmentFormatsMatch(draw, options.driver_commands[ordinal - 1])) ||
+        draw.command != kDrawPcoTriangles || draw.test_case != logical.test_case ||
         !IsGenericDrawFormat(draw.format) || draw.frame != 1 ||
         draw.framebuffer_width != logical.framebuffer_width ||
         draw.framebuffer_height != logical.framebuffer_height ||
@@ -1230,7 +1239,7 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
           draw.vertex_pco_abi.vertex_inputs != 8)) ||
         draw.sampled_textures.size() != draw.sampled_texture_count ||
         draw.sampled_texture_count >
-            3U * pvrgpu::stub::kPcoMaximumTextureDescriptorSets) {
+            5U * pvrgpu::stub::kPcoMaximumTextureDescriptorSets) {
       return Reject(error, "generic PCO sequence draw is not the colour layout");
     }
     // Topologies the submitter expands for setup.  An indexed draw assembles

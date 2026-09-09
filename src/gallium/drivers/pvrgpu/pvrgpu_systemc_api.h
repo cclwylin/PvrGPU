@@ -10,8 +10,9 @@
 extern "C" {
 #endif
 
-/* API-v26 adds independent native transform-feedback transport/readback. */
-#define PVRGPU_SYSTEMC_API_VERSION 30u
+/* API-v32 adds explicit CubeArray semantics and twelve descriptor slots.
+ * Structure sizes are unchanged; old versioned consumers must not guess. */
+#define PVRGPU_SYSTEMC_API_VERSION 32u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE 15u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES (64u * 1024u)
 /*
@@ -21,10 +22,10 @@ extern "C" {
  */
 #define PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_COMMANDS 256u
 /* A sequence contains per-draw slices, not just one draw's descriptor set.
- * Each graphics stage (VS, FS, GS) can bind eight sampled textures. The
+ * Each graphics stage retains its own shared-register budget. The
  * independent payload-byte budget still bounds actual memory consumption. */
 #define PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_TEXTURES \
-   (PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_COMMANDS * 3u * 8u)
+   (PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_COMMANDS * 5u * PVRGPU_SYSTEMC_MAX_PCO_TEXTURES_PER_STAGE)
 #define PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS 15u
 #define PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR UINT32_MAX
 
@@ -280,10 +281,12 @@ struct pvrgpu_systemc_pco_sequence_texture {
    uint32_t min_lod_u4_6;
    uint32_t max_lod_u4_6;
    /*
-    * The sampled image's dimensionality: 0 = plain 2D, 1 = 2D array.  A 2D
-    * array stores `layers` complete 2D images per mip level, layer-minor
-    * inside each level, and the shader's third texture coordinate selects one.
-    * Plain 2D leaves layers at one.
+    * 0=2D, 1=2DArray, 2=3D, 3=Cube, 4=CubeArray. For CubeArray, layers is
+    * the physical face count 6*N (not N); every mip retains all square faces
+    * in cube-major, GL face order. Only whole-cube views, external block1x1
+    * single-sample fragment textures are supported. Native TAO selects a cube
+    * base and xyz selects its face. WORD1.depth stores N-1; metadata word4 is
+    * one base-level face's stride. Other kinds keep their existing contract.
     */
    uint32_t texture_kind;
    uint32_t layers;
@@ -576,6 +579,14 @@ struct pvrgpu_systemc_driver_command {
    uint32_t fragment_image_read_mask;
    uint32_t fragment_image_write_mask;
    uint32_t fragment_early_tests;
+   /* API-v31: optional independent normalized four-byte storage codecs.
+    * Zero count and four NULL entries preserve homogeneous `format`.
+    * Otherwise count equals effective render_target_count (at most four),
+    * target zero equals `format`, and each active entry is RGBA8, RGB10_A2
+    * or BGR10_A2 UNORM. Inactive entries must be NULL. Initial contents stay
+    * target-major native bytes; shared blend/color-mask state is unchanged. */
+   uint32_t color_attachment_format_count;
+   const char *color_attachment_formats[4];
 };
 
 struct pvrgpu_systemc_submit_info {
@@ -631,6 +642,11 @@ struct pvrgpu_systemc_readback_info {
    uint32_t depth_format;
    /* Zero means one; must match the complete rendered attachment extent. */
    uint32_t layer_count;
+   /* API-v31: required for explicitly formatted color attachments, optional
+    * but checked for homogeneous legacy commands. Never infer the codec
+    * from bytes_per_pixel: RGBA8 and RGB10_A2 have the same stored width.
+    * Depth/stencil readback requires NULL here and uses depth_format. */
+   const char *color_format;
 };
 
 /*

@@ -453,6 +453,79 @@ target_include_directories(pco-texture-sequence-test PRIVATE
 pvrgpu_target_warnings(pco-texture-sequence-test)
 add_test(NAME pco-texture-sequence-unit COMMAND pco-texture-sequence-test)
 
+add_executable(pco-texture-gather-test
+    tests/pco_texture_gather_test.cpp
+    src/systemc/shader/pco_iss.cpp
+)
+target_include_directories(pco-texture-gather-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(pco-texture-gather-test)
+add_test(NAME pco-texture-gather-unit COMMAND pco-texture-gather-test)
+
+add_executable(pco-array-shadow-gather-test
+    tests/pco_array_shadow_gather_test.cpp
+    src/systemc/shader/pco_iss.cpp
+)
+target_include_directories(pco-array-shadow-gather-test PRIVATE "${CMAKE_SOURCE_DIR}/src/systemc")
+pvrgpu_target_warnings(pco-array-shadow-gather-test)
+add_test(NAME pco-array-shadow-gather-unit COMMAND pco-array-shadow-gather-test)
+
+add_executable(pco-branch-continuation-test
+    tests/pco_branch_continuation_test.cpp
+    src/systemc/shader/pco_iss.cpp
+)
+target_include_directories(pco-branch-continuation-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(pco-branch-continuation-test)
+add_test(NAME pco-branch-continuation-unit COMMAND pco-branch-continuation-test)
+
+add_executable(pco-front-face-test
+    tests/pco_front_face_test.cpp
+    src/systemc/shader/pco_iss.cpp
+)
+target_include_directories(pco-front-face-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(pco-front-face-test)
+add_test(NAME pco-front-face-unit COMMAND pco-front-face-test)
+
+add_executable(pco-vertex-shift-test
+    tests/pco_vertex_shift_test.cpp
+    src/systemc/shader/pco_iss.cpp)
+target_include_directories(pco-vertex-shift-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/systemc")
+pvrgpu_target_warnings(pco-vertex-shift-test)
+add_test(NAME pco-vertex-shift-unit COMMAND pco-vertex-shift-test)
+
+add_executable(pco-find-top-bit-test
+    tests/pco_find_top_bit_test.cpp
+    src/systemc/shader/pco_iss.cpp)
+target_include_directories(pco-find-top-bit-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/systemc")
+pvrgpu_target_warnings(pco-find-top-bit-test)
+add_test(NAME pco-find-top-bit-unit COMMAND pco-find-top-bit-test)
+
+add_executable(fragment-output-mask-test tests/fragment_output_mask_test.cpp)
+target_include_directories(fragment-output-mask-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(fragment-output-mask-test)
+add_test(NAME fragment-output-mask-unit COMMAND fragment-output-mask-test)
+
+# This checker takes a directory of binaries from the real Mesa-side
+# pvrgpu_pco_fragment_output_test generator; it has no synthetic fallback.
+add_executable(pco-fragment-output-contract-test
+    tests/pco_fragment_output_contract_test.cpp
+    src/systemc/shader/pco_iss.cpp
+)
+target_include_directories(pco-fragment-output-contract-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(pco-fragment-output-contract-test)
+
 add_executable(pco-multisample-texture-test
     tests/pco_multisample_texture_test.cpp
     src/systemc/shader/pco_iss.cpp
@@ -542,7 +615,7 @@ add_executable(tessellation-test tests/tessellation_test.cpp)
 pvrgpu_target_warnings(tessellation-test)
 add_test(NAME tessellation-unit COMMAND tessellation-test)
 
-foreach(tess_test IN ITEMS tessellation-iss tessellation-module tessellation-shader)
+foreach(tess_test IN ITEMS tessellation-iss tessellation-module tessellation-shader tessellation-texture-iss)
     string(REPLACE "-" "_" tess_source "${tess_test}")
     add_executable(${tess_test}-test tests/${tess_source}_test.cpp)
     target_include_directories(${tess_test}-test PRIVATE
@@ -552,6 +625,19 @@ foreach(tess_test IN ITEMS tessellation-iss tessellation-module tessellation-sha
     pvrgpu_target_warnings(${tess_test}-test)
     add_test(NAME ${tess_test}-unit COMMAND ${tess_test}-test)
 endforeach()
+
+add_executable(tessellation-texture-test tests/tessellation_texture_test.cpp)
+target_include_directories(tessellation-texture-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc")
+target_link_libraries(tessellation-texture-test PRIVATE pvrgpu-systemc-bridge PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(tessellation-texture-test)
+foreach(tess_texture_mode IN ITEMS cache direct bypass reject-count reject-descriptor
+        reject-stage reject-gather reject-shadow reject-dimension reject-identity)
+    add_test(NAME tessellation-texture-${tess_texture_mode}
+        COMMAND tessellation-texture-test ${tess_texture_mode})
+endforeach()
+add_test(NAME tessellation-shader-textures-unit COMMAND tessellation-shader-test textures)
 
 add_executable(geometry-shader-test tests/geometry_shader_test.cpp)
 target_include_directories(geometry-shader-test PRIVATE
@@ -647,6 +733,43 @@ target_link_libraries(pco-systemc-api-bridge-test PRIVATE
 )
 pvrgpu_target_warnings(pco-systemc-api-bridge-test)
 add_test(NAME pco-systemc-api-bridge-unit COMMAND pco-systemc-api-bridge-test)
+
+add_executable(color-attachment-format-contract-test tests/color_attachment_format_contract_test.cpp)
+target_include_directories(color-attachment-format-contract-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu"
+)
+pvrgpu_target_warnings(color-attachment-format-contract-test)
+add_test(NAME color-attachment-format-contract-unit COMMAND color-attachment-format-contract-test)
+
+add_executable(color-attachment-format-parser-test
+    tests/color_attachment_format_parser_test.cpp
+    model_stub/driver_command.cpp
+)
+target_include_directories(color-attachment-format-parser-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu"
+)
+pvrgpu_target_warnings(color-attachment-format-parser-test)
+add_test(NAME color-attachment-format-parser-unit COMMAND color-attachment-format-parser-test)
+
+add_executable(pco-color-attachment-format-api-test tests/pco_color_attachment_format_api_test.cpp)
+target_include_directories(pco-color-attachment-format-api-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu"
+)
+target_link_libraries(pco-color-attachment-format-api-test PRIVATE pvrgpu-systemc-bridge PkgConfig::LIBPNG)
+pvrgpu_target_warnings(pco-color-attachment-format-api-test)
+add_test(NAME pco-color-attachment-format-api-unit COMMAND pco-color-attachment-format-api-test)
+
+add_executable(pco-cube-array-api-test tests/pco_cube_array_api_test.cpp)
+target_include_directories(pco-cube-array-api-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/systemc" "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu")
+target_link_libraries(pco-cube-array-api-test PRIVATE pvrgpu-systemc-bridge PkgConfig::LIBPNG)
+pvrgpu_target_warnings(pco-cube-array-api-test)
+add_test(NAME pco-cube-array-api-unit COMMAND pco-cube-array-api-test)
 
 add_executable(pco-geometry-api-bridge-test tests/pco_geometry_api_bridge_test.cpp)
 target_include_directories(pco-geometry-api-bridge-test PRIVATE
@@ -977,6 +1100,48 @@ target_link_libraries(texture-unit-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(texture-unit-test)
 add_test(NAME texture-unit-unit COMMAND texture-unit-test)
 
+add_executable(texture-gather-test
+    tests/texture_gather_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/texture/astc_decoder.cpp
+    src/systemc/texture/texture_filter.cpp
+    src/systemc/texture/texture_unit.cpp
+)
+target_include_directories(texture-gather-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(texture-gather-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(texture-gather-test)
+foreach(gather_case IN ITEMS
+        default 1x1 odd linear lod-window
+        rgba-default rgba-1x1 rgba-odd rgba-linear rgba-min-linear
+        rgba-mag-linear rgba-lod-window rgba-direct rgba-bypass
+        reject-flag reject-implicit reject-lod reject-negative-zero-lod
+        reject-normalized reject-fcnorm reject-component reject-coordinate-count
+        reject-coordinate-z reject-offset reject-address reject-sno reject-bias
+        reject-stage reject-nan reject-infinity reject-sampler-offset
+        reject-repeat reject-compare reject-base reject-layers reject-dimension
+        reject-format reject-red-swizzle reject-gather-descriptor
+        reject-gather-word1 reject-image-state reject-mixed-batch
+        reject-rgba-red-swizzle
+        array-default array-1x1 array-odd array-linear array-direct array-bypass
+        array-rgba-default array-rgba-1x1 array-rgba-odd array-rgba-linear
+        array-rgba-direct array-rgba-bypass
+        compare-0 compare-1 compare-2 compare-3 compare-4 compare-5 compare-6 compare-7
+        array-compare-0 array-compare-1 array-compare-2 array-compare-3
+        array-compare-4 array-compare-5 array-compare-6 array-compare-7
+        reject-array-stride reject-array-depth reject-array-unaligned
+        reject-array-below-base reject-array-past-last reject-array-missing-address
+        reject-array-msaa reject-array-mips)
+    add_test(NAME texture-gather-${gather_case}
+             COMMAND texture-gather-test ${gather_case})
+endforeach()
+
 add_executable(texture-multisample-test
     tests/texture_multisample_test.cpp
     model_stub/memory_pool.cpp
@@ -1014,6 +1179,26 @@ target_include_directories(texture-cube-nonfinite-test PRIVATE
 target_link_libraries(texture-cube-nonfinite-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(texture-cube-nonfinite-test)
 add_test(NAME texture-cube-nonfinite-unit COMMAND texture-cube-nonfinite-test)
+
+add_executable(pco-cube-array-test tests/pco_cube_array_test.cpp src/systemc/shader/pco_iss.cpp)
+target_include_directories(pco-cube-array-test PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/systemc")
+pvrgpu_target_warnings(pco-cube-array-test)
+add_test(NAME pco-cube-array-unit COMMAND pco-cube-array-test)
+
+add_executable(texture-cube-array-test
+    tests/texture_cube_array_test.cpp
+    model_stub/memory_pool.cpp model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp src/systemc/common/pipeline_state.cpp
+    src/systemc/texture/astc_decoder.cpp src/systemc/texture/texture_filter.cpp
+    src/systemc/texture/texture_unit.cpp)
+target_include_directories(texture-cube-array-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/systemc")
+target_link_libraries(texture-cube-array-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(texture-cube-array-test)
+add_test(NAME texture-cube-array-unit COMMAND texture-cube-array-test)
+foreach(refusal offset gather bias face-address low-address end-address word4 raw-depth shadow)
+  add_test(NAME texture-cube-array-reject-${refusal} COMMAND texture-cube-array-test ${refusal})
+endforeach()
 
 # Native Mesa-emitted BIAS/PPLOD, real USC/TextureUnit FIFOs, and mip data.
 # The private Mesa producer script also runs this fixture on freshly compiled
@@ -1078,6 +1263,29 @@ target_include_directories(texture-filter-test PRIVATE
 target_link_libraries(texture-filter-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(texture-filter-test)
 add_test(NAME texture-filter-unit COMMAND texture-filter-test)
+
+add_executable(texture-lod-invariance-test tests/texture_lod_invariance_test.cpp
+    model_stub/memory_pool.cpp src/systemc/common/functional_types.cpp
+    src/systemc/texture/texture_filter.cpp)
+target_include_directories(texture-lod-invariance-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src/systemc")
+pvrgpu_target_warnings(texture-lod-invariance-test)
+add_test(NAME texture-lod-invariance-unit COMMAND texture-lod-invariance-test)
+
+add_executable(texture-lod-independent-test tests/texture_lod_independent_test.cpp
+    model_stub/memory_pool.cpp model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp src/systemc/common/pipeline_state.cpp
+    src/systemc/texture/astc_decoder.cpp src/systemc/texture/texture_filter.cpp
+    src/systemc/texture/texture_unit.cpp)
+target_include_directories(texture-lod-independent-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/systemc")
+target_link_libraries(texture-lod-independent-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(texture-lod-independent-test)
+add_test(NAME texture-lod-independent-unit COMMAND texture-lod-independent-test)
+foreach(lod_case IN ITEMS half next wide filters miplinear)
+  add_test(NAME texture-lod-dependent-reject-${lod_case}
+      COMMAND texture-lod-independent-test ${lod_case})
+endforeach()
 
 add_executable(usc-uniform-buffer-memory-test
     tests/usc_uniform_buffer_memory_test.cpp
@@ -1173,6 +1381,8 @@ foreach(residency_invalid_state
         lane-out-of-range task-out-of-range overlapping-mask
         high-coverage-mask high-helper-mask high-write-mask empty-mask
         partial-derivative-quad coefficient-offset coefficient-span output-collision
+        facing-noncanonical helper-facing-mismatch visible-facing-mismatch
+        continuation-facing continuation-facing-valid
         program-stage program-bytes program-groups program-instructions
         program-vertex-input program-vertex-output program-pixel-output
         program-early-hsr program-depth program-derivatives program-ends-task
@@ -1222,6 +1432,14 @@ add_test(NAME pbe-packed-unorm-unit COMMAND pbe-packed-unorm-test)
 foreach(pbe_packed_invalid_state IN ITEMS float integer srgb format load-size)
     add_test(NAME pbe-packed-unorm-reject-${pbe_packed_invalid_state}
         COMMAND pbe-packed-unorm-test ${pbe_packed_invalid_state})
+endforeach()
+
+add_test(NAME pbe-packed-unorm-mixed COMMAND pbe-packed-unorm-test mixed)
+foreach(pbe_mixed_invalid_state IN ITEMS mixed-count mixed-count-overflow mixed-target0
+        mixed-inactive mixed-enum mixed-legacy mixed-float mixed-integer mixed-srgb
+        legacy-geometry legacy-tessellation)
+    add_test(NAME pbe-packed-unorm-reject-${pbe_mixed_invalid_state}
+        COMMAND pbe-packed-unorm-test ${pbe_mixed_invalid_state})
 endforeach()
 
 add_executable(pbe-nonfinite-output-test
@@ -1574,6 +1792,26 @@ add_test(
     COMMAND varyings-shader-one-pipeline-test
 )
 
+# Exercise the same complete production module chain with native derivative
+# bytes and no user varyings/texture. Keep module coverage in step with the
+# existing full-pipeline target above, without linking another test main.
+get_target_property(pvrgpu_derivative_pipeline_sources
+    varyings-shader-one-pipeline-test SOURCES)
+list(REMOVE_ITEM pvrgpu_derivative_pipeline_sources
+    tests/varyings_shader_one_pipeline_test.cpp)
+add_executable(pco-derivative-pipeline-test
+    tests/pco_derivative_pipeline_test.cpp
+    ${pvrgpu_derivative_pipeline_sources})
+target_include_directories(pco-derivative-pipeline-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc")
+target_link_libraries(pco-derivative-pipeline-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(pco-derivative-pipeline-test)
+foreach(mode IN ITEMS front back changed-classification)
+    add_test(NAME pco-derivative-pipeline-${mode}
+        COMMAND pco-derivative-pipeline-test ${mode})
+endforeach()
+
 add_executable(varyings-shader-two-pipeline-test
     tests/varyings_shader_two_pipeline_test.cpp
     model_stub/memory_pool.cpp
@@ -1809,6 +2047,18 @@ add_test(
     NAME parameter-buffer-perspective-unit
     COMMAND parameter-buffer-perspective-test
 )
+foreach(plane_case IN ITEMS
+        empty-depth empty-varying empty-reciprocal rollback covered zero-mask
+        scissor-empty scissor-boundary framebuffer-clipped
+        msaa-covered msaa-masked msaa-disabled-covered msaa-disabled-empty
+        msaa-enabled-scissored msaa-2-empty msaa-4-empty msaa-8-empty
+        invalid-reciprocal invalid-layout invalid-setup invalid-samples
+        invalid-multisample top-left-covered bottom-left-empty)
+    add_test(
+        NAME parameter-buffer-plane-${plane_case}
+        COMMAND parameter-buffer-perspective-test ${plane_case}
+    )
+endforeach()
 
 add_test(
     NAME pvrgpu-model-stub-smoke

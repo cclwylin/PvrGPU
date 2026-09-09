@@ -325,6 +325,8 @@ struct pvrgpu_draw_pco_triangles_command {
    /* Scissored depth/stencil clears issued since the previous draw. */
    const struct pvrgpu_systemc_attachment_clear *attachment_clears;
    uint32_t attachment_clear_count;
+   uint32_t color_attachment_format_count;
+   const char *color_attachment_formats[4];
 };
 
 struct pvrgpu_systemc_driver_command;
@@ -415,6 +417,7 @@ pvrgpu_systemc_flush_readback_pixels(uint32_t width,
                                      uint32_t sample_count,
                                      uint32_t depth_format,
                                      uint32_t layer_count,
+                                     const char *color_format,
                                      uint8_t *pixels,
                                      size_t pixels_size,
                                      bool *out_written,

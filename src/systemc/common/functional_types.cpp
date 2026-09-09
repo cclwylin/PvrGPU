@@ -411,6 +411,8 @@ bool UsesTextureSampling(const PipelineState &state) {
   return UsesTextureSampling(state, ShaderStage::kCompute) ||
          UsesTextureSampling(state, ShaderStage::kVertex) ||
          UsesTextureSampling(state, ShaderStage::kGeometry) ||
+         UsesTextureSampling(state, ShaderStage::kTessellationControl) ||
+         UsesTextureSampling(state, ShaderStage::kTessellationEvaluation) ||
          UsesTextureSampling(state, ShaderStage::kFragment);
 }
 
@@ -424,6 +426,8 @@ bool UsesTextureSampling(const PipelineState &state, ShaderStage stage) {
   switch (stage) {
     case ShaderStage::kVertex: return state.vertex_sampled_texture_count != 0;
     case ShaderStage::kGeometry: return state.geometry_sampled_texture_count != 0;
+    case ShaderStage::kTessellationControl: return state.tessellation_control_sampled_texture_count != 0;
+    case ShaderStage::kTessellationEvaluation: return state.tessellation_evaluation_sampled_texture_count != 0;
     case ShaderStage::kFragment: return state.sampled_texture_count != 0;
     default: return false;
   }
@@ -441,12 +445,13 @@ bool UsesFragmentQuadLanes(const PipelineState &state) {
 bool UsesShaderVaryings(const PipelineState &state) {
   if (!IsDriverPcoTrianglesCase(state.functional_case))
     return UsesShaderVaryings(state.functional_case);
-  // A texture shader can address texels from gl_FragCoord or constants with
-  // no user varying. Its declared position coefficient set still traverses
+  // Texture and derivative shaders can use gl_FragCoord or constants with
+  // no user varying. Their declared position coefficient set still traverses
   // ParameterBuffer/PDS; an empty linkage is not an absent position plane.
   return state.varying_output_count != 0 ||
          state.fragment_varying_count != 0 ||
-         UsesTextureSampling(state, ShaderStage::kFragment);
+         UsesTextureSampling(state, ShaderStage::kFragment) ||
+         state.fragment_program_summary.uses_derivatives != 0;
 }
 
 std::uint32_t VaryingVectorCount(FunctionalCase functional_case) {
@@ -761,6 +766,14 @@ const char *PipelineStageName(PipelineStage stage) {
     return "geometry-texture-pending";
   case PipelineStage::kGeometryTextureSamplesReady:
     return "geometry-texture-samples-ready";
+  case PipelineStage::kTessellationControlTexturePending:
+    return "tessellation-control-texture-pending";
+  case PipelineStage::kTessellationControlTextureSamplesReady:
+    return "tessellation-control-texture-samples-ready";
+  case PipelineStage::kTessellationEvaluationTexturePending:
+    return "tessellation-evaluation-texture-pending";
+  case PipelineStage::kTessellationEvaluationTextureSamplesReady:
+    return "tessellation-evaluation-texture-samples-ready";
   case PipelineStage::kComputeTexturePending:
     return "compute-texture-pending";
   case PipelineStage::kComputeTextureSamplesReady:
@@ -861,10 +874,16 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
     const auto tess = LoadArray<TessellationState>(pool, state.tessellation_state);
     if (tess.size() != 1)
       throw std::runtime_error("Tessellation state ownership extent is invalid");
+    for (const auto resources : {tess[0].control_texture_resources, tess[0].evaluation_texture_resources})
+      if (HasPoolHandle(resources))
+        for (const auto &resource : LoadArray<TextureResource>(pool, resources))
+          release_unique(resource.data);
     for (const auto handle : {tess[0].control_code, tess[0].control_instructions,
          tess[0].control_shared, tess[0].control_uniform_buffers,
+         tess[0].control_texture_resources, tess[0].control_sampler_states,
          tess[0].evaluation_code, tess[0].evaluation_instructions,
          tess[0].evaluation_shared, tess[0].evaluation_uniform_buffers,
+         tess[0].evaluation_texture_resources, tess[0].evaluation_sampler_states,
          tess[0].patches, tess[0].domain_points, tess[0].domain_indices})
       release_unique(handle);
     release_unique(state.tessellation_state);

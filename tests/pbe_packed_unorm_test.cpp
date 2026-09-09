@@ -3,6 +3,7 @@
 // codes. No production pack/unpack helper is used as the test oracle.
 #include "common/functional_types.h"
 #include "common/pipeline_state.h"
+#include "common/tessellation_state.h"
 #include "fragment/pbe.h"
 
 #include <systemc>
@@ -41,6 +42,11 @@ std::uint32_t Bits(float value) {
 
 // Fixed storage definitions, independent of PackedUnormShift/PackUnormColor.
 std::uint32_t Word(const Codes &codes, PackedUnormFormat format) {
+  if (format == PackedUnormFormat::kNone) {
+    Check(std::all_of(codes.begin(), codes.end(), [](auto code) { return code < 256; }),
+          "RGBA8 oracle channel range");
+    return codes[0] | (codes[1] << 8) | (codes[2] << 16) | (codes[3] << 24);
+  }
   Check(codes[0] < 1024 && codes[1] < 1024 && codes[2] < 1024 && codes[3] < 4,
         "oracle channel range");
   const auto red = format == PackedUnormFormat::kBgr10A2 ? codes[2] : codes[0];
@@ -48,7 +54,9 @@ std::uint32_t Word(const Codes &codes, PackedUnormFormat format) {
   return red | (codes[1] << 10) | (blue << 20) | (codes[3] << 30);
 }
 
-Color Normalized(const Codes &codes) {
+Color Normalized(const Codes &codes, PackedUnormFormat format = PackedUnormFormat::kRgb10A2) {
+  if (format == PackedUnormFormat::kNone)
+    return {codes[0] / 255.0F, codes[1] / 255.0F, codes[2] / 255.0F, codes[3] / 255.0F};
   return {codes[0] / 1023.0F, codes[1] / 1023.0F,
           codes[2] / 1023.0F, codes[3] / 3.0F};
 }
@@ -56,7 +64,7 @@ Color Normalized(const Codes &codes) {
 std::uint32_t ChannelMask(std::uint8_t logical, PackedUnormFormat format) {
   Codes mask{};
   for (unsigned c = 0; c < 4; ++c)
-    mask[c] = (logical & (1U << c)) ? (c == 3 ? 3 : 1023) : 0;
+    mask[c] = (logical & (1U << c)) ? (format == PackedUnormFormat::kNone ? 255 : c == 3 ? 3 : 1023) : 0;
   return Word(mask, format);
 }
 
@@ -110,6 +118,41 @@ Scenario NewScenario(PackedUnormFormat format, const std::string &name,
   return scenario;
 }
 
+Codes ReadCodes(std::uint32_t word, PackedUnormFormat format) {
+  if (format == PackedUnormFormat::kNone)
+    return {word & 255U, (word >> 8) & 255U, (word >> 16) & 255U, word >> 24};
+  Codes codes{word & 1023U, (word >> 10) & 1023U, (word >> 20) & 1023U, word >> 30};
+  if (format == PackedUnormFormat::kBgr10A2) std::swap(codes[0], codes[2]);
+  return codes;
+}
+
+Scenario NewMixedScenario(unsigned rotation = 0, bool load = true,
+                          unsigned samples = 4, unsigned layers = 2) {
+  auto scenario = NewScenario(PackedUnormFormat::kRgb10A2, "mixed normalized4B", 2, 2, layers, samples, 4);
+  auto &state = scenario.state;
+  const std::array<PackedUnormFormat, 4> formats{PackedUnormFormat::kNone,
+      PackedUnormFormat::kRgb10A2, PackedUnormFormat::kBgr10A2, PackedUnormFormat::kNone};
+  state.color_attachment_format_count = 4;
+  for (unsigned target = 0; target < 4; ++target)
+    state.color_attachment_packed_unorms[target] = formats[(target + rotation) % 4];
+  state.color_attachment_packed_unorm = state.color_attachment_packed_unorms[0];
+  const Color clear{0, 0.25F, 0.5F, 1};
+  std::memcpy(state.raster_state.clear_color, clear.data(), sizeof(clear));
+  for (unsigned target = 0; target < 4; ++target) {
+    const auto format = state.color_attachment_packed_unorms[target];
+    for (std::size_t sample = 0; sample < scenario.TargetWords(); ++sample) {
+      const auto i = static_cast<unsigned>(target * scenario.TargetWords() + sample);
+      const Codes initial = format == PackedUnormFormat::kNone
+          ? Codes{(1 + i * 3) % 256, (2 + i * 7) % 256, (3 + i * 11) % 256, i % 256}
+          : Codes{(1 + i * 3) % 1024, (257 + i * 7) % 1024, (769 + i * 11) % 1024, i % 4};
+      const Codes cleared = format == PackedUnormFormat::kNone ? Codes{0,64,128,255} : Codes{0,256,512,3};
+      scenario.expected[i] = Word(load ? initial : cleared, format);
+    }
+  }
+  scenario.initial = load ? scenario.expected : std::vector<std::uint32_t>{};
+  return scenario;
+}
+
 void AddFragment(Scenario &scenario, const std::vector<Color> &colors,
                  const std::vector<Codes> &result_codes, unsigned x = 0,
                  unsigned y = 0, unsigned layer = 0, unsigned coverage = 1) {
@@ -132,9 +175,14 @@ void AddFragment(Scenario &scenario, const std::vector<Color> &colors,
   output.parameter_index = invocation.parameter_index;
   output.submit_ordinal = invocation.submit_ordinal;
   output.render_target_count = static_cast<std::uint8_t>(state.render_target_count);
-  const auto mask = ChannelMask(state.raster_state.color_mask,
-                                state.color_attachment_packed_unorm);
+  const bool explicit_outputs = std::any_of(state.fragment_output_mask.begin(), state.fragment_output_mask.end(),
+                                            [](auto mask) { return mask != 0; });
   for (unsigned target = 0; target < state.render_target_count; ++target) {
+    if (explicit_outputs && state.fragment_output_mask[target] == 0)
+      continue;
+    const auto format = state.color_attachment_format_count ? state.color_attachment_packed_unorms[target]
+                                                           : state.color_attachment_packed_unorm;
+    const auto mask = ChannelMask(state.raster_state.color_mask, format);
     output.written_mask[target] = 15;
     for (unsigned c = 0; c < 4; ++c)
       output.pixel_output[target * 4 + c] = Bits(colors[target][c]);
@@ -144,7 +192,7 @@ void AddFragment(Scenario &scenario, const std::vector<Color> &colors,
       const auto index = target * scenario.TargetWords() +
           ((layer * state.height + y) * state.width + x) *
               state.raster_state.sample_count + sample;
-      const auto word = Word(result_codes[target], state.color_attachment_packed_unorm);
+      const auto word = Word(result_codes[target], format);
       scenario.expected[index] = (scenario.expected[index] & ~mask) | (word & mask);
       ++scenario.covered_colors;
     }
@@ -163,6 +211,12 @@ void Run(MemoryPool &pool, sc_core::sc_fifo<PipelineTxn> &input,
   state.counters.ps_invocations = scenario.invocations.size();
   state.fragment_invocations = StoreNewArray(pool, scenario.invocations);
   state.fragment_outputs = StoreNewArray(pool, scenario.outputs);
+  if (std::any_of(state.fragment_output_mask.begin(), state.fragment_output_mask.end(),
+                  [](auto mask) { return mask != 0; })) {
+    // PBE-only fixture: the handle marks the explicit PIXOUT contract; these
+    // are synthetic fragment records, not a native shader-execution claim.
+    state.fragment_code = StoreNewArray(pool, std::vector<std::uint8_t>{0});
+  }
   if (!scenario.initial.empty()) {
     state.color_attachment_load = StoreNewArray(pool, scenario.initial);
     state.color_attachment_load_enable = 1;
@@ -173,14 +227,34 @@ void Run(MemoryPool &pool, sc_core::sc_fifo<PipelineTxn> &input,
   if (failure == "srgb") state.color_is_srgb = 1;
   if (failure == "format") state.color_attachment_packed_unorm = static_cast<PackedUnormFormat>(255);
   if (failure == "load-size") --state.color_attachment_load_bytes;
+  if (failure == "mixed-count") state.color_attachment_format_count = 3;
+  if (failure == "mixed-count-overflow") state.color_attachment_format_count = 5;
+  if (failure == "mixed-target0") state.color_attachment_packed_unorms[0] = PackedUnormFormat::kBgr10A2;
+  if (failure == "mixed-inactive") { state.render_target_count = state.color_attachment_format_count = 2; state.color_attachment_packed_unorms[3] = PackedUnormFormat::kRgb10A2; }
+  if (failure == "mixed-enum") state.color_attachment_packed_unorms[1] = static_cast<PackedUnormFormat>(255);
+  if (failure == "mixed-legacy") state.color_attachment_format_count = 0;
+  if (failure == "mixed-float") state.color_attachment_float32 = 1;
+  if (failure == "mixed-integer") state.color_attachment_raw_dwords = 1;
+  if (failure == "mixed-srgb") state.color_is_srgb = 1;
+  if (failure == "legacy-geometry" || failure == "legacy-tessellation") {
+    state.color_attachment_format_count = 0;
+    state.color_attachment_packed_unorms = {};
+    if (failure == "legacy-geometry")
+      state.geometry_code = StoreNewArray(pool, std::vector<std::uint8_t>{0});
+    else
+      state.tessellation_state = StoreNewArray(pool, std::vector<TessellationState>{TessellationState{}});
+  }
   const auto handle = pool.Allocate(sizeof(PipelineState));
   StorePipelineState(pool, handle, state);
   input.write({handle, cases, cases});
+  const auto allocations_before = pool.allocations();
   try {
     sc_core::sc_start(sc_core::sc_time(10000, sc_core::SC_NS));
   } catch (const sc_core::sc_report &error) {
     const std::string message = error.what();
-    const std::string reason = failure == "format" ? "invalid packed UNORM format"
+    const std::string reason = failure.rfind("legacy-", 0) == 0 ? "geometry MRT requires independent attachment LOAD"
+        : failure.rfind("mixed-", 0) == 0 ? "per-target color attachment"
+        : failure == "format" ? "invalid packed UNORM format"
         : failure == "load-size" ? "LOAD byte count"
         : "packed UNORM attachment state is invalid";
     Check(!failure.empty() && message.find(reason) != std::string::npos,
@@ -189,6 +263,7 @@ void Run(MemoryPool &pool, sc_core::sc_fifo<PipelineTxn> &input,
     Check(!output.nb_read(unexpected) &&
               LoadPipelineState(pool, handle).stage == PipelineStage::kTextureComplete,
           "invalid state published completed output");
+    Check(pool.allocations() == allocations_before, "invalid metadata allocated attachment output");
     ReleaseFunctionalPayloads(pool, state);
     pool.Release(handle);
     return;
@@ -220,6 +295,86 @@ void Run(MemoryPool &pool, sc_core::sc_fifo<PipelineTxn> &input,
     pool.Release(state.extra_pbe_framebuffer[target - 1]);
   ReleaseFunctionalPayloads(pool, state);
   pool.Release(handle);
+}
+
+void RunMixed(MemoryPool &pool, sc_core::sc_fifo<PipelineTxn> &input,
+              sc_core::sc_fifo<PipelineTxn> &output) {
+  // The same shared mask/blend state is applied independently in each
+  // attachment's integer code domain. Two ordered fragments prove that the
+  // second blend sees the first format-specific quantized result.
+  for (unsigned rotation = 0; rotation < 3; ++rotation)
+    for (bool load : {false, true}) for (bool blend : {false, true})
+      for (unsigned mask = 0; mask < 16; ++mask) {
+        auto scenario = NewMixedScenario(rotation, load);
+        auto &state = scenario.state;
+        state.raster_state.color_mask = mask;
+        state.raster_state.blend.enable = blend;
+        for (unsigned fragment = 0; fragment < 2; ++fragment) {
+          std::vector<Codes> result;
+          std::vector<Color> colors;
+          for (unsigned target = 0; target < 4; ++target) {
+            const auto format = state.color_attachment_packed_unorms[target];
+            const Codes source{1U + target + fragment, 2U + target + fragment,
+                               3U + target + fragment, format == PackedUnormFormat::kNone ? 15U : 1U};
+            colors.push_back(Normalized(source, format));
+            Codes codes = source;
+            if (blend) {
+              // All covered samples are initialized independently. For this
+              // one-pixel RMW check, cover one selected sample only.
+              const auto index = target * scenario.TargetWords() +
+                  ((state.attachment_layers - 1) * state.height * state.width + 3) * state.raster_state.sample_count + 2;
+              const Codes destination = ReadCodes(scenario.expected[index], format);
+              for (unsigned c = 0; c < 4; ++c)
+                codes[c] = std::min(destination[c] + source[c], format == PackedUnormFormat::kNone ? 255U : c == 3 ? 3U : 1023U);
+            }
+            result.push_back(codes);
+          }
+          AddFragment(scenario, colors, result, 1, 1, state.attachment_layers - 1, 4);
+        }
+        Run(pool, input, output, scenario);
+      }
+  // Partial sample coverage and entirely absent attachment exports preserve
+  // independently supplied LOAD bits (including packed RGB low bits).
+  for (unsigned absent = 0; absent < 4; ++absent) {
+    auto scenario = NewMixedScenario();
+    scenario.state.fragment_output_mask = {15,15,15,15};
+    scenario.state.fragment_output_mask[absent] = 0;
+    std::vector<Color> colors;
+    std::vector<Codes> codes;
+    for (unsigned target = 0; target < 4; ++target) {
+      const auto format = scenario.state.color_attachment_packed_unorms[target];
+      codes.push_back(format == PackedUnormFormat::kNone ? Codes{1,2,3,255} : Codes{1,257,769,2});
+      colors.push_back(Normalized(codes.back(), format));
+    }
+    AddFragment(scenario, colors, codes, 1, 0, 1, 5);
+    Run(pool, input, output, scenario);
+  }
+  // One source value simultaneously exercises different codec tie rules:
+  // RGBA8 rounds half upward; packed10/2 uses nearest-even.
+  auto boundary = NewMixedScenario(0, true, 1, 1);
+  const Color values{0.5F, 0.5F / 1023, 1.5F / 1023, 0.5F};
+  AddFragment(boundary, std::vector<Color>(4, values),
+      {{128,0,0,128}, {512,0,2,2}, {512,0,2,2}, {128,0,0,128}});
+  Run(pool, input, output, boundary);
+  for (unsigned targets = 1; targets < 4; ++targets) {
+    auto bounded = NewMixedScenario(0, true, 1, 1);
+    bounded.state.render_target_count = bounded.state.color_attachment_format_count = targets;
+    for (unsigned target = targets; target < 4; ++target)
+      bounded.state.color_attachment_packed_unorms[target] = PackedUnormFormat::kNone;
+    bounded.initial.resize(targets * bounded.TargetWords());
+    bounded.expected = bounded.initial;
+    std::vector<Color> colors;
+    std::vector<Codes> codes;
+    for (unsigned target = 0; target < targets; ++target) {
+      const auto format = bounded.state.color_attachment_packed_unorms[target];
+      codes.push_back(format == PackedUnormFormat::kNone ? Codes{1,2,3,255} : Codes{1,257,769,2});
+      colors.push_back(Normalized(codes.back(), format));
+    }
+    AddFragment(bounded, colors, codes);
+    Run(pool, input, output, bounded);
+  }
+  Check(pool.bytes_in_flight() == 0 && pool.allocations() == pool.releases(),
+        "mixed format output and LOAD ownership balanced");
 }
 
 using PreciseColor = std::array<long double, 4>;
@@ -391,9 +546,16 @@ int sc_main(int argc, char **argv) {
     Pbe pbe("pbe", pool);
     pbe.input(input);
     pbe.output(output);
+    if (argc == 2 && std::string(argv[1]) == "mixed") {
+      RunMixed(pool, input, output);
+      std::cout << "PBE mixed normalized4B PASS cases=" << cases << " checks=" << checks << '\n';
+      return 0;
+    }
     if (argc == 2) {
-      auto scenario = NewScenario(PackedUnormFormat::kRgb10A2, "reject");
-      AddFragment(scenario, {{0.5F, 0.25F, 0.75F, 1.0F}}, {{512, 256, 767, 3}});
+      const bool mixed = std::string(argv[1]).rfind("mixed-", 0) == 0 ||
+                         std::string(argv[1]).rfind("legacy-", 0) == 0;
+      auto scenario = mixed ? NewMixedScenario() : NewScenario(PackedUnormFormat::kRgb10A2, "reject");
+      if (!mixed) AddFragment(scenario, {{0.5F, 0.25F, 0.75F, 1.0F}}, {{512, 256, 767, 3}});
       Run(pool, input, output, scenario, argv[1]);
       std::cout << "PBE packed UNORM reject " << argv[1] << " PASS checks=" << checks << '\n';
       return 0;

@@ -17,16 +17,19 @@ void ValidateAbi(ShaderStage stage, const DriverPcoStageAbi &abi) {
   const bool control = stage == ShaderStage::kTessellationControl;
   if (!control && stage != ShaderStage::kTessellationEvaluation)
     Fail("stage is neither TCS nor TES");
-  const auto descriptors = control ? 8U : 4U;
+  const auto system_shared = control ? 8U : 4U;
+  const auto descriptors = abi.uniform_buffer_descriptor_start;
   // Reserved system-input prefix plus PCO's aligned writable VTXIN scratch.
   // MakeTask initializes only the prefix, so spare words still require a
   // native write before any read and every access stays within this ABI.
   if (abi.temps > kPcoTemporaryCount || abi.vertex_inputs < (control ? 3U : 5U) ||
       abi.vertex_inputs > kPcoVertexInputCount ||
       (control ? abi.vertex_outputs != 0 : abi.vertex_outputs < 4 || abi.vertex_outputs > 64) ||
-      abi.coefficients || abi.entry_offset || abi.shareds < descriptors ||
+      abi.coefficients || abi.entry_offset || abi.shareds < system_shared ||
       abi.shareds > kPcoMaximumSharedCount || abi.uniform_buffer_descriptor_count > 15 ||
-      abi.uniform_buffer_descriptor_start != descriptors ||
+      descriptors < system_shared ||
+      (descriptors - system_shared) % kPcoTextureDescriptorDwordCount ||
+      (descriptors - system_shared) / kPcoTextureDescriptorDwordCount > kPcoMaximumTextureDescriptorSets ||
       abi.push_constant_start != descriptors + abi.uniform_buffer_descriptor_count * 4 ||
       !Fits(abi.push_constant_start, abi.push_constant_count, abi.shareds) ||
       std::uint64_t{abi.push_constant_start} + abi.push_constant_count != abi.shareds)
@@ -136,6 +139,55 @@ bool Condition(unsigned condition, const TessellationLaneState &lane) {
   default: Fail("invalid execution-mask condition");
   }
 }
+void ValidateSample(const PcoInstruction &i, ShaderStage stage,
+                    const DriverPcoStageAbi &abi) {
+  ValidateAbi(stage, abi);
+  const auto first_descriptor = stage == ShaderStage::kTessellationControl ? 8U : 4U;
+  // TCS/TES system memory descriptors precede the same 20-DWORD combined
+  // image/sampler sets used by other stages. This initial task-stage contract
+  // is normalized 2D ordinary/explicit-LOD sampling, not derivatives or TAO.
+  const auto payload_count = 2U + i.texture_lod_replace;
+  if (i.opcode != PcoOpcode::kTextureSample || i.repeat_count != 1 ||
+      i.source_count != 3 || i.data_request || i.component_count != kPcoTextureResponseCount ||
+      i.end_group || i.target != PcoWriteTarget::kTemporary ||
+      !HasCanonicalTextureLodMode(i) || i.texture_lod_bias || i.texture_gather ||
+      i.texture_dimension != 2 || i.texture_fcnorm != 1 ||
+      i.texture_address_offset || i.texture_non_normalized_coords ||
+      i.texture_sample_index_present || i.texture_spatial_offset_present ||
+      i.source.bank != PcoRegisterBank::kTemporary ||
+      !Fits(i.source.index, payload_count, abi.temps) ||
+      !Fits(i.output_index, kPcoTextureResponseCount, abi.temps) ||
+      i.source1.bank != PcoRegisterBank::kShared || i.source1.index < first_descriptor ||
+      (i.source1.index - first_descriptor) % kPcoTextureDescriptorDwordCount ||
+      !Fits(i.source1.index, kPcoTextureDescriptorDwordCount, abi.uniform_buffer_descriptor_start) ||
+      i.source2.bank != PcoRegisterBank::kShared || i.source2.index != i.source1.index + 8)
+    Fail("native SMP source/response/descriptor layout is invalid");
+}
+PcoTextureRequest SampleRequest(const PcoInstruction &i,
+                               const DriverPcoStageAbi &abi,
+                               const TessellationTaskState &task,
+                               unsigned lane_index) {
+  ValidateSample(i, task.stage, abi);
+  PcoTextureRequest request;
+  for (unsigned component = 0; component < 2; ++component)
+    request.coordinates[component] = Read(i.source, component, abi, task, lane_index);
+  request.explicit_lod_present = i.texture_lod_replace;
+  if (i.texture_lod_replace)
+    request.explicit_lod = Read(i.source, 2, abi, task, lane_index);
+  for (unsigned word = 0; word < 4; ++word) {
+    request.texture_state[word] = task.shared[i.source1.index + word];
+    request.sampler_state[word] = task.shared[i.source2.index + word];
+  }
+  const auto first_descriptor = task.stage == ShaderStage::kTessellationControl ? 8U : 4U;
+  request.descriptor_set = static_cast<std::uint8_t>(
+      (i.source1.index - first_descriptor) / kPcoTextureDescriptorDwordCount);
+  request.component_count = kPcoTextureResponseCount;
+  request.coordinate_count = request.dimension = 2;
+  request.normalized = 1;
+  request.fcnorm = i.texture_fcnorm;
+  request.data_request = i.data_request;
+  return request;
+}
 TessellationTaskState MakeTask(ShaderStage stage, const DriverPcoStageAbi &abi,
     const std::vector<std::uint32_t> &shared, std::uint32_t count) {
   ValidateAbi(stage, abi);
@@ -162,7 +214,8 @@ void ValidateTessellationProgram(const PcoDecodedProgram &program,
   bool pending = false, ended = false;
   for (const auto &i : program.instructions) {
     if (!HasCanonicalDerivativeMode(i)) Fail("derivative mode is not canonical for opcode");
-    if (!HasCanonicalTextureLodMode(i)) Fail("texture LOD replacement flag is not canonical for opcode");
+    if (!HasCanonicalTextureLodMode(i) || i.texture_lod_bias)
+      Fail("tessellation texture LOD mode is unsupported");
     if (!HasCanonicalNativeIntegerSignedness(i))
       Fail("integer signedness flag is not canonical for the native opcode");
     if (ended || !i.repeat_count || i.repeat_count > 16 || i.source_count > 4 ||
@@ -170,22 +223,26 @@ void ValidateTessellationProgram(const PcoDecodedProgram &program,
       Fail("invalid native instruction metadata or bytes after END");
     const bool load = i.opcode == PcoOpcode::kBufferLoad;
     const bool store = i.opcode == PcoOpcode::kBufferStore;
+    const bool sample = i.opcode == PcoOpcode::kTextureSample;
     const bool wdf = i.opcode == PcoOpcode::kWaitDataFence;
     const bool mask = i.opcode == PcoOpcode::kConditionalMask;
     const bool branch = i.opcode == PcoOpcode::kBranch;
     const bool export_vertex = IsWrite(i.opcode) || IsEmit(i.opcode);
-    if (!IsAlu(i.opcode) && !load && !store && !wdf && !mask && !branch &&
+    if (!IsAlu(i.opcode) && !load && !store && !sample && !wdf && !mask && !branch &&
         !export_vertex && i.opcode != PcoOpcode::kNop)
       Fail("opcode requires unimplemented tessellation functionality");
     if ((control && export_vertex) || (!control && store))
       Fail("TCS UVSW or TES store is outside this stage contract");
-    if (pending && !wdf) Fail("native LD/ST is not followed by WDF");
+    if (pending && !wdf) Fail("native LD/ST/SMP is not followed by WDF");
     if (load || store) {
       if (i.repeat_count != 1 || i.source_count != (load ? 2 : 3) ||
           i.data_request || !i.component_count || i.component_count > 16 ||
           i.memory_cache_mode > (load ? 1U : 2U) || i.end_group ||
           i.target != (load ? PcoWriteTarget::kTemporary : PcoWriteTarget::kNone))
         Fail("invalid native LD/ST metadata");
+      pending = true;
+    } else if (sample) {
+      ValidateSample(i, program.summary.stage, abi);
       pending = true;
     } else if (wdf) {
       if (!pending || i.exec_cnd || i.data_request || i.end_group)
@@ -215,7 +272,7 @@ void ValidateTessellationProgram(const PcoDecodedProgram &program,
     if (i.target == PcoWriteTarget::kPixelOutput ||
         (i.target == PcoWriteTarget::kVertexOutput && !IsWrite(i.opcode)))
       Fail("tessellation has an invalid export destination");
-    const auto count = load ? i.component_count : i.repeat_count;
+    const auto count = (load || sample) ? i.component_count : i.repeat_count;
     if ((i.target == PcoWriteTarget::kTemporary && !Fits(i.output_index,count,abi.temps)) ||
         (i.target == PcoWriteTarget::kVertexInput && !Fits(i.output_index,count,abi.vertex_inputs)) ||
         (i.target == PcoWriteTarget::kVertexOutput && !Fits(i.output_index,count,abi.vertex_outputs)))
@@ -279,8 +336,15 @@ void StepTessellationTask(const PcoDecodedProgram &program,
       task.lane_count > 32 || task.instruction_index >= program.instructions.size())
     Fail("task stepped outside its native stage program");
   const auto &i = program.instructions[task.instruction_index];
+  for (unsigned index = 0; index < task.lane_count; ++index) {
+    const auto pending = task.lanes[index].pending_operation;
+    if (pending > 3) Fail("unknown pending memory operation");
+    if (pending == 3 && i.opcode != PcoOpcode::kWaitDataFence)
+      Fail("native SMP response requires its immediate WDF");
+  }
   if (!HasCanonicalDerivativeMode(i)) Fail("derivative mode is not canonical for opcode");
-  if (!HasCanonicalTextureLodMode(i)) Fail("texture LOD replacement flag is not canonical for opcode");
+  if (!HasCanonicalTextureLodMode(i) || i.texture_lod_bias)
+    Fail("tessellation texture LOD mode is unsupported");
   if (!HasCanonicalNativeIntegerSignedness(i))
     Fail("integer signedness flag is not canonical for the native opcode");
   if (++task.steps > UINT64_C(10000000)) Fail("native instruction watchdog");
@@ -289,8 +353,18 @@ void StepTessellationTask(const PcoDecodedProgram &program,
   if (i.opcode == PcoOpcode::kWaitDataFence) {
     for (unsigned index = 0; index < task.lane_count; ++index) {
       auto &lane = task.lanes[index];
+      if (lane.pending_operation == 3) {
+        if (!task.instruction_index ||
+            program.instructions[task.instruction_index - 1].opcode != PcoOpcode::kTextureSample)
+          Fail("native SMP response has no matching request before WDF");
+        const auto &sample = program.instructions[task.instruction_index - 1];
+        ValidateSample(sample, task.stage, abi);
+        if (lane.pending_count != kPcoTextureResponseCount || lane.pending_output != sample.output_index ||
+            !Fits(lane.pending_output, kPcoTextureResponseCount, abi.temps))
+          Fail("native SMP pending response span is invalid");
+      }
       if (lane.pending_operation || Selected(i,lane)) ++stats.instructions;
-      if (lane.pending_operation == 1)
+      if (lane.pending_operation == 1 || lane.pending_operation == 3)
         for (unsigned c = 0; c < lane.pending_count; ++c)
           Write(PcoWriteTarget::kTemporary,lane.pending_output+c,lane.pending_words[c],abi,lane);
       lane.pending_operation = lane.pending_count = 0;
@@ -371,6 +445,16 @@ void StepTessellationTask(const PcoDecodedProgram &program,
         lane.pending_operation = 2; ++stats.store_instructions;
       }
       ++stats.memory_instructions;
+      continue;
+    }
+    if (i.opcode == PcoOpcode::kTextureSample) {
+      if (!memory.sample) Fail("native SMP has no TextureUnit request callback");
+      const auto request = SampleRequest(i, abi, task, index);
+      memory.sample(memory.user_data, request, lane.pending_words.data());
+      lane.pending_output = i.output_index;
+      lane.pending_count = kPcoTextureResponseCount;
+      lane.pending_operation = 3;
+      ++stats.texture_instructions;
       continue;
     }
     if (IsWrite(i.opcode) || IsEmit(i.opcode)) {

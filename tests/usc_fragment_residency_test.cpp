@@ -39,6 +39,12 @@ constexpr std::array<const char *, 13> kProgramMutations{
 };
 
 const char *ExpectedFailure(const std::string &mode) {
+  if (mode == "facing-noncanonical" || mode == "helper-facing-mismatch")
+    return "texture fragment USC lost shader-lane identity";
+  if (mode == "visible-facing-mismatch")
+    return "texture fragment USC visible facing identity mismatch";
+  if (mode == "continuation-facing" || mode == "continuation-facing-valid")
+    return "texture fragment USC response ordering is invalid";
   if (mode == "duplicate-task" || mode == "task-out-of-range")
     return "fragment residency repeats or loses a quad";
   if (mode == "duplicate-lane" || mode == "lane-out-of-range")
@@ -220,6 +226,7 @@ public:
         shader.parameter_index = q; shader.submit_ordinal = quad.submit_ordinal;
         shader.quad_id = quad.quad_id; shader.quad_lane = lane;
         shader.helper = lane == 1 || lane == 2; shader.sample_mask = shader.helper ? 0 : 1;
+        shader.front_facing = q & 1U;
         if (!shader.helper) {
           const auto visible = 2 * (quad_count - 1 - q) + (lane == 3 ? 1 : 0);
           shader.visible_invocation_index = visible;
@@ -227,6 +234,7 @@ public:
           inv.primitive_id = shader.primitive_id; inv.parameter_index = shader.parameter_index;
           inv.submit_ordinal = shader.submit_ordinal; inv.quad_id = shader.quad_id;
           inv.quad_lane = shader.quad_lane; inv.sample_mask = 1;
+          inv.front_facing = shader.front_facing;
         }
       }
     }
@@ -239,6 +247,10 @@ public:
       // Completed earlier work must never turn this malformed transaction into
       // a successful final output. The orphan tests cover global completeness.
       const auto last = quad_count - 1;
+      if (failure_mode == "facing-noncanonical") lanes[last * 4 + 1].front_facing = 2;
+      if (failure_mode == "helper-facing-mismatch") lanes[last * 4 + 1].front_facing ^= 1;
+      if (failure_mode == "visible-facing-mismatch")
+        invocations[lanes[last * 4].visible_invocation_index].front_facing ^= 1;
       if (failure_mode == "duplicate-task") tasks[last].fragment_quad_index = 0;
       if (failure_mode == "duplicate-lane") quads[last].invocation_indices[0] = 0;
       if (failure_mode == "missing-lane") lanes.push_back(lanes.back());
@@ -436,12 +448,23 @@ private:
               request.descriptor_set == requests_per_lane_[lane] &&
               continuations[i].resume_instruction_index == continuations[0].resume_instruction_index,
               "request IDs are dense but shader/quad IDs remain original across resident batches");
+        Check(continuations[i].front_facing_valid == 1 &&
+                  continuations[i].front_facing == ((lane / 4) & 1U),
+              "covered/helper raster facing survives derivatives and both texture fences across residency batches");
         ++requests_per_lane_[lane];
       }
       texture_requests_.write(txn);
       const auto done = texture_responses_.read();
       Check(done.state.slot == txn.state.slot && done.state.generation == txn.state.generation,
             "actual TextureUnit response retains transaction ownership");
+      if (fifo_batches_ == 3 &&
+          (failure_mode_ == "continuation-facing" || failure_mode_ == "continuation-facing-valid")) {
+        auto changed = LoadArray<PcoFragmentContinuation>(pool_, state.fragment_continuations);
+        Check(!changed.empty(), "facing response corruption requires a real checkpoint");
+        if (failure_mode_ == "continuation-facing") changed[0].front_facing ^= 1;
+        else changed[0].front_facing_valid = 0;
+        StoreArray(pool_, state.fragment_continuations, changed);
+      }
       if (fifo_batches_ == 3 &&
           std::find(kProgramMutations.begin(), kProgramMutations.end(), failure_mode_) != kProgramMutations.end()) {
         auto changed = LoadPipelineState(pool_, txn.state);

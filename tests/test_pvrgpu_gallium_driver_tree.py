@@ -33,6 +33,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             "pvrgpu_clear.c",
             "pvrgpu_cmd.c",
             "pvrgpu_cmd.h",
+            "pvrgpu_color_formats.h",
             "pvrgpu_compute_snapshot.h",
             "pvrgpu_context.c",
             "pvrgpu_context.h",
@@ -41,6 +42,8 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             "pvrgpu_msaa.h",
             "pvrgpu_pco.c",
             "pvrgpu_pco.h",
+            "pvrgpu_push_constants.h",
+            "pvrgpu_payload_budget.h",
             "pvrgpu_point_restart.h",
             "pvrgpu_indirect_draw.h",
             "pvrgpu_index_fetch.h",
@@ -53,6 +56,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             "pvrgpu_state.c",
             "pvrgpu_state.h",
             "pvrgpu_systemc_api.h",
+            "pvrgpu_systemc_limits.h",
             "pvrgpu_systemc_compute_api.h",
             "pvrgpu_uniform_buffer.h",
             "pvrgpu_tessellation.h",
@@ -251,7 +255,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("full_depth_clear_resource", context_header)
         self.assertIn("pvrgpu_note_full_depth_clear_one", clear)
         self.assertIn("pvrgpu_invalidate_full_depth_clear_for_resource", resource)
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 30u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 32u", systemc_api)
         for field in (
             "const uint8_t *raw_vertex_data;",
             "size_t raw_vertex_data_size;",
@@ -418,7 +422,8 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("uint8_t stencil_clear_mask", clear)
         self.assertIn("pvrgpu_clear_depth_stencil", clear)
         self.assertIn("clear_depth_stencil", context)
-        self.assertIn("fb->cbufs[0].texture", clear)
+        self.assertIn("ctx->framebuffer.cbufs[0].texture", clear)
+        self.assertIn("ctx->framebuffer.cbufs[target]", clear)
         self.assertIn("pvrgpu_can_lower_clear_color_format", clear)
         self.assertIn("pvrgpu_fill_surface_rect_with_clear_color", clear)
         self.assertIn("pvrgpu_apply_zero_draw_output_extent", clear)
@@ -796,7 +801,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 30u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 32u", systemc_api)
         for field in (
             "uint32_t vertex_stride;",
             "uint32_t position_output_start;",
@@ -932,7 +937,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 30u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 32u", systemc_api)
         self.assertIn("command=draw_pco_triangles", command)
         self.assertIn("pvrgpu_write_draw_pco_triangles_command", command_header)
         self.assertIn("PVRGPU_DRAW_PCO_TRIANGLES_VERTEX_COUNT 6144u", command_header)

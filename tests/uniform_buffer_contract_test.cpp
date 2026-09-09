@@ -106,6 +106,24 @@ int main() {
         {static_cast<DriverPcoShaderStage>(stage), 0, {3, 5, 7, 9}});
   }
   Accept(tessellation_stages);
+  for (unsigned stage : {3U, 4U}) for (unsigned textures : {1U, 8U}) {
+    auto sampled = tessellation_stages;
+    auto &abi = stage == 3 ? sampled.tessellation.control_abi : sampled.tessellation.evaluation_abi;
+    auto &shared = stage == 3 ? sampled.tessellation.control_shared : sampled.tessellation.evaluation_shared;
+    (stage == 3 ? sampled.tessellation_control_sampled_texture_count : sampled.tessellation_evaluation_sampled_texture_count) = textures;
+    const auto prefix = (stage == 3 ? 8U : 4U) + 20U * textures;
+    abi.uniform_buffer_descriptor_start = prefix;
+    abi.push_constant_start = prefix + 4;
+    abi.push_constant_count = 1; abi.shareds = prefix + 5;
+    shared.assign(abi.shareds, 0); shared[prefix + 2] = 4; shared[prefix + 4] = 0x12345678;
+    Accept(sampled);
+    for (unsigned bad_start : {0U, prefix - 1U, prefix + 1U}) {
+      auto bad = sampled;
+      (stage == 3 ? bad.tessellation.control_abi : bad.tessellation.evaluation_abi).uniform_buffer_descriptor_start = bad_start;
+      std::string error;
+      if (ValidateDriverUniformBuffers(bad, &error)) Fail("tessellation texture/UBO overlap accepted");
+    }
+  }
   auto maximum = Fixture();
   maximum.uniform_buffers[0].bytes.resize(kMaximumUniformBufferBytes);
   maximum.vertex_shared[6] = kMaximumUniformBufferBytes;

@@ -45,6 +45,46 @@ static unsigned checks;
 
 int main(void)
 {
+   const char *formats[4] = {0};
+   CHECK(pvrgpu_color_formats_error(PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8, 4, 0, formats) == NULL);
+   formats[0] = PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8;
+   formats[1] = PVRGPU_DRIVER_COMMAND_FORMAT_RGB10_A2;
+   formats[2] = PVRGPU_DRIVER_COMMAND_FORMAT_BGRA10_A2;
+   formats[3] = PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8;
+   CHECK(pvrgpu_color_formats_error(formats[0], 4, 4, formats) == NULL);
+   CHECK(pvrgpu_color_formats_error(formats[0], 3, 4, formats) != NULL);
+   CHECK(pvrgpu_color_formats_error(formats[0], 5, 5, formats) != NULL);
+   CHECK(pvrgpu_color_formats_error(formats[0], 4, 0, formats) != NULL);
+   CHECK(pvrgpu_color_formats_error(formats[1], 4, 4, formats) != NULL);
+   const char *bad_formats[] = {NULL, "", "PIPE_FORMAT_R8G8B8A8_SRGB",
+      "PIPE_FORMAT_R32G32B32A32_FLOAT", "PIPE_FORMAT_R32G32B32A32_UINT",
+      "PIPE_FORMAT_R8_UNORM", "unknown"};
+   for (unsigned target = 0; target < 4; ++target) {
+      const char *saved = formats[target];
+      for (unsigned bad = 0; bad < sizeof(bad_formats) / sizeof(bad_formats[0]); ++bad) {
+         formats[target] = bad_formats[bad];
+         CHECK(pvrgpu_color_formats_error(PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8, 4, 4, formats) != NULL);
+      }
+      formats[target] = saved;
+   }
+   struct pvrgpu_draw_pco_triangles_command projection = {0};
+   projection.format = formats[0]; projection.render_target_count = 4;
+   projection.color_attachment_format_count = 4;
+   memcpy(projection.color_attachment_formats, formats, sizeof(formats));
+   struct pvrgpu_systemc_driver_command projected;
+   pvrgpu_pco_triangles_command_to_systemc(&projection, &projected);
+   CHECK(projected.version == PVRGPU_SYSTEMC_API_VERSION && projected.color_attachment_format_count == 4);
+   for (unsigned target = 0; target < 4; ++target)
+      CHECK(!strcmp(projected.color_attachment_formats[target], formats[target]));
+   FILE *format_file = tmpfile();
+   CHECK(format_file != NULL);
+   CHECK(pvrgpu_write_color_formats(format_file, "", 4, formats) > 0);
+   rewind(format_file);
+   char format_text[512] = {0};
+   CHECK(fread(format_text, 1, sizeof(format_text) - 1, format_file) > 0);
+   CHECK(strstr(format_text, "color_attachment_format_count=4\n") != NULL);
+   CHECK(strstr(format_text, "color_attachment_formats=PIPE_FORMAT_R8G8B8A8_UNORM,PIPE_FORMAT_R10G10B10A2_UNORM,PIPE_FORMAT_B10G10R10A2_UNORM,PIPE_FORMAT_R8G8B8A8_UNORM\n") != NULL);
+   CHECK(fclose(format_file) == 0);
    /* Change only the target format of an otherwise identical incomplete
     * command: packed targets must reach exactly the RGBA8 payload gate,
     * while a format lacking native PBE support must fail at the format gate. */

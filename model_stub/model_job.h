@@ -57,6 +57,8 @@ struct ModelJob {
   // size as the first.  A shader returning more than one result writes one
   // per target, and the driver reads back whichever it maps.
   std::vector<std::vector<std::uint8_t>> extra_framebuffers;
+  std::vector<std::string> framebuffer_color_formats;
+  bool framebuffer_color_formats_explicit = false;
   std::uint32_t framebuffer_width = 0;
   std::uint32_t framebuffer_height = 0;
   std::uint32_t framebuffer_bytes_per_pixel = 4;
@@ -77,6 +79,8 @@ struct ModelJob {
     shader_images.clear();
     framebuffer.clear();
     extra_framebuffers.clear();
+    framebuffer_color_formats.clear();
+    framebuffer_color_formats_explicit = false;
     framebuffer_width = 0;
     framebuffer_height = 0;
     framebuffer_bytes_per_pixel = 4;
@@ -100,9 +104,14 @@ struct ModelJob {
                           std::uint32_t bytes_per_pixel,
                           std::vector<std::vector<std::uint8_t>> extra = {},
                           std::uint32_t sample_count = 1,
-                          std::uint32_t layer_count = 1) {
+                          std::uint32_t layer_count = 1,
+                          std::vector<std::string> color_formats = {},
+                          bool color_formats_explicit = false) {
     if (!width || !height || width > 4096 || height > 4096 ||
         bytes_per_pixel > 16 || sample_count > 16 || layer_count > 256)
+      return;
+    if ((!color_formats.empty() || color_formats_explicit) &&
+        color_formats.size() != extra.size() + 1U)
       return;
     const std::uint64_t expected =
         static_cast<std::uint64_t>(width) * height * bytes_per_pixel * sample_count * layer_count;
@@ -116,6 +125,8 @@ struct ModelJob {
     }
     framebuffer = pixels;
     extra_framebuffers = std::move(extra);
+    framebuffer_color_formats = std::move(color_formats);
+    framebuffer_color_formats_explicit = color_formats_explicit;
     framebuffer_width = width;
     framebuffer_height = height;
     framebuffer_bytes_per_pixel = bytes_per_pixel;

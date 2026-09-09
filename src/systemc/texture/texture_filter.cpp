@@ -216,6 +216,41 @@ TextureLevelSelection SelectTextureLevels(
   return result;
 }
 
+bool TextureImplicitLodAffectsSelection(
+    const RogueTextureImageDescriptor &image,
+    const RogueTextureSamplerDescriptor &sampler) {
+  if (image.mip_count == 0 || image.mip_count > kMaximumTextureMipLevels ||
+      sampler.min_lod_u4_6 > sampler.max_lod_u4_6)
+    throw std::runtime_error("TextureUnit implicit LOD dependency state is invalid");
+  if (sampler.max_lod_u4_6 == 0)
+    return false;
+  if (sampler.min_filter != sampler.mag_filter)
+    return true;
+  if (image.mip_count == 1)
+    return false;
+  if (sampler.mip_filter != TextureFilter::kNearest ||
+      sampler.max_lod_u4_6 >= 32U)
+    return true;
+
+  // With >=2 levels and a [min,max] window below 0.5, the existing selector
+  // always has clamp_active. Nearest level selection is monotone nearbyint;
+  // equal endpoint selections prove every possible clamped lambda selects
+  // base0. In particular FE_UPWARD must not be mistaken for round-nearest.
+  // minified may differ inside the window, but the image filters are equal.
+  for (const auto endpoint : {sampler.min_lod_u4_6, sampler.max_lod_u4_6}) {
+    TextureLodSelection lod;
+    lod.lambda = static_cast<float>(endpoint) / 64.0F;
+    lod.minified = lod.lambda > 0.0F;
+    lod.clamp_active = true;
+    const auto levels = SelectTextureLevels(lod, sampler, image.mip_count);
+    if (levels.level0 != 0 || levels.level1 != 0 ||
+        levels.image_filter != sampler.min_filter ||
+        levels.mip_mode == TextureMipMode::kLinear)
+      return true;
+  }
+  return false;
+}
+
 std::uint32_t TextureLevelTaps(const TextureLevelSelection &levels) {
   const std::uint32_t image_taps =
       levels.image_filter == TextureFilter::kLinear ? 4U : 1U;

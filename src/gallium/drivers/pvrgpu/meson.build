@@ -33,6 +33,75 @@ driver_pvrgpu = declare_dependency(
 
 if with_tests
   test(
+    'pvrgpu_pco_packed_uniforms',
+    executable(
+      'pvrgpu_pco_packed_uniforms_test',
+      files('tests/pvrgpu_pco_packed_uniforms_test.c'),
+      include_directories : [inc_gallium_aux, inc_gallium, inc_imagination, inc_include, inc_src],
+      link_with : [libpvrgpu, libpowervr_compiler, libpowervr_common],
+      dependencies : [idep_nir, idep_mesautil],
+    ),
+    suite : ['compiler', 'pvrgpu'],
+  )
+  test(
+    'pvrgpu_pco_many_textures',
+    executable(
+      'pvrgpu_pco_many_textures_test',
+      files('tests/pvrgpu_pco_many_textures_test.c'),
+      c_args : ['-DPVRGPU_MANY_TEXTURES_DIRECT_HELPER'],
+      include_directories : [inc_gallium_aux, inc_gallium, inc_imagination, inc_include, inc_src],
+      link_with : [libpvrgpu, libpowervr_compiler, libpowervr_common],
+      dependencies : [idep_nir, idep_mesautil],
+    ),
+    suite : ['compiler', 'pvrgpu'],
+  )
+  test(
+    'pvrgpu_pco_shadow_gather',
+    executable(
+      'pvrgpu_pco_shadow_gather_test',
+      files('tests/pvrgpu_pco_shadow_gather_test.c'),
+      include_directories : [inc_gallium_aux, inc_gallium, inc_imagination, inc_include, inc_src],
+      link_with : [libpvrgpu, libpowervr_compiler, libpowervr_common],
+      dependencies : [idep_nir, idep_mesautil],
+    ),
+    suite : ['compiler', 'pvrgpu'],
+  )
+  test(
+    'pvrgpu_pco_front_face',
+    executable(
+      'pvrgpu_pco_front_face_test',
+      files('tests/pvrgpu_pco_front_face_test.c'),
+      c_args : ['-DPVRGPU_FRONT_FACE_DIRECT_HELPER'],
+      include_directories : [inc_gallium_aux, inc_gallium, inc_imagination, inc_include, inc_src],
+      link_with : [libpvrgpu, libpowervr_compiler, libpowervr_common],
+      dependencies : [idep_nir, idep_mesautil],
+    ),
+    suite : ['compiler', 'pvrgpu'],
+  )
+  test(
+    'pvrgpu_pco_wide_ubo',
+    executable(
+      'pvrgpu_pco_wide_ubo_test',
+      files('tests/pvrgpu_pco_wide_ubo_test.c'),
+      c_args : ['-DPVRGPU_WIDE_UBO_DIRECT_HELPER'],
+      include_directories : [inc_gallium_aux, inc_gallium, inc_imagination, inc_include, inc_src],
+      link_with : [libpvrgpu, libpowervr_compiler, libpowervr_common],
+      dependencies : [idep_nir, idep_mesautil],
+    ),
+    suite : ['compiler', 'pvrgpu'],
+  )
+  test(
+    'pvrgpu_pco_shared_budget',
+    executable(
+      'pvrgpu_pco_shared_budget_test',
+      files('tests/pvrgpu_pco_shared_budget_test.c'),
+      include_directories : [inc_gallium_aux, inc_gallium, inc_imagination, inc_include, inc_src],
+      link_with : [libpvrgpu, libpowervr_compiler, libpowervr_common],
+      dependencies : [idep_nir, idep_mesautil],
+    ),
+    suite : ['compiler', 'pvrgpu'],
+  )
+  test(
     'pvrgpu_stream_output_query',
     executable(
       'pvrgpu_stream_output_query_test',

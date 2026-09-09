@@ -210,6 +210,7 @@ void PdsEngine::Run() {
       }
       const ParameterTriangle &parameter = parameters[quad.parameter_index];
       if (!parameter.rasterizable || parameter.face_culled ||
+          parameter.front_facing > 1 ||
           parameter.key.submit_ordinal != quad.submit_ordinal) {
         throw std::runtime_error("PDS FragmentQuad lost primitive identity");
       }
@@ -232,6 +233,7 @@ void PdsEngine::Run() {
               shader_lane.quad_id != quad.quad_id ||
               shader_lane.submit_ordinal != quad.submit_ordinal ||
               shader_lane.quad_lane != lane ||
+              shader_lane.front_facing != parameter.front_facing ||
               shader_lane.helper != static_cast<std::uint8_t>(!covered) ||
               (covered && shader_lane.visible_invocation_index >=
                               invocations.size()) ||
@@ -239,6 +241,9 @@ void PdsEngine::Run() {
                                kInvalidFragmentInvocationIndex)) {
             throw std::runtime_error("PDS quad/shader-lane identity mismatch");
           }
+          if (covered && invocations[shader_lane.visible_invocation_index].front_facing !=
+                             shader_lane.front_facing)
+            throw std::runtime_error("PDS shader/visible facing identity mismatch");
         } else {
           if (invocation_index >= invocations.size())
             throw std::runtime_error("PDS invocation index is out of bounds");
@@ -246,6 +251,7 @@ void PdsEngine::Run() {
           if (invocation.parameter_index != quad.parameter_index ||
               invocation.quad_id != quad.quad_id ||
               invocation.submit_ordinal != quad.submit_ordinal ||
+              invocation.front_facing != parameter.front_facing ||
               invocation.quad_lane != lane) {
             throw std::runtime_error("PDS quad/invocation identity mismatch");
           }

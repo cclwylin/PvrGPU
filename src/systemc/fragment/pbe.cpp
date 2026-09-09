@@ -7,6 +7,7 @@
 #include "fragment/pbe.h"
 
 #include "common/functional_types.h"
+#include "common/color_attachment_formats.h"
 #include "common/msaa.h"
 
 #include <algorithm>
@@ -350,14 +351,13 @@ void Pbe::Run() {
     if (state.color_attachment_float32 &&
         (state.color_attachment_raw_dwords != 0 || state.color_is_srgb))
       throw std::runtime_error("PBE floating-point attachment state is invalid");
-    const bool packed_unorm =
-        state.color_attachment_packed_unorm != PackedUnormFormat::kNone;
-    if (packed_unorm) {
+    if (state.color_attachment_packed_unorm != PackedUnormFormat::kNone) {
       (void)PackedUnormShift(state.color_attachment_packed_unorm, 0);
       if (state.color_attachment_raw_dwords || state.color_attachment_float32 ||
           state.color_is_srgb)
         throw std::runtime_error("PBE packed UNORM attachment state is invalid");
     }
+    const std::uint32_t render_target_count = ValidateColorAttachmentFormats(state);
     if (stored_samples > std::numeric_limits<std::size_t>::max() / bytes_per_pixel)
       throw std::overflow_error("PBE framebuffer size overflow");
     const std::vector<FragmentInvocation> invocations =
@@ -377,13 +377,11 @@ void Pbe::Run() {
          state.color_attachment_load_bytes != 0)) {
       throw std::runtime_error("PBE color attachment LOAD state is invalid");
     }
-    const std::uint32_t render_target_count =
-        state.render_target_count == 0 ? 1U : state.render_target_count;
-    if (render_target_count > kMaxRenderTargets)
-      throw std::runtime_error("PBE render target count is unsupported");
-    const bool explicit_output_masks = HasPoolHandle(state.fragment_code) ||
-        HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state);
-    if ((HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state)) && render_target_count > 1)
+    const bool explicit_output_masks = HasExplicitFragmentOutputMasks(state);
+    // The explicit normalized4B vector is the new per-target storage
+    // contract. Legacy GS/TES MRT still lacks that proof and stays refused.
+    if ((HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state)) &&
+        render_target_count > 1 && state.color_attachment_format_count == 0)
       throw std::runtime_error(
           "PBE geometry MRT requires independent attachment LOAD");
     // API-v30 LOAD is target-major. Each target retains its independent
@@ -397,6 +395,7 @@ void Pbe::Run() {
     }
     std::vector<std::vector<std::uint8_t>> framebuffers(render_target_count);
     for (std::uint32_t target = 0; target < render_target_count; ++target) {
+      const auto packed_format = ColorAttachmentPackedUnorm(state, target);
       std::vector<std::uint8_t> &attachment = framebuffers[target];
       if (state.color_attachment_load_enable != 0) {
         attachment.assign(initial_colors.begin() + target * framebuffer_bytes,
@@ -404,11 +403,11 @@ void Pbe::Run() {
         continue;
       }
       attachment.assign(static_cast<std::size_t>(framebuffer_bytes), 0);
-      if (packed_unorm) {
+      if (packed_format != PackedUnormFormat::kNone) {
         std::array<float, 4> clear{};
         std::copy_n(state.raster_state.clear_color, 4, clear.begin());
         const std::uint32_t word =
-            PackUnormColor(clear, state.color_attachment_packed_unorm);
+            PackUnormColor(clear, packed_format);
         for (std::size_t pixel = 0; pixel < stored_samples; ++pixel)
           std::memcpy(attachment.data() + pixel * 4U, &word, sizeof(word));
       } else if (state.color_attachment_float32) {
@@ -559,6 +558,8 @@ void Pbe::Run() {
       // Preserve its pixels; no default color export or blend is fabricated.
       if (explicit_output_masks && state.fragment_output_mask[target] == 0)
         continue;
+      const auto packed_format = ColorAttachmentPackedUnorm(state, target);
+      const bool packed_unorm = packed_format != PackedUnormFormat::kNone;
       std::vector<std::uint8_t> &framebuffer = framebuffers[target];
       if (state.color_attachment_float32 || packed_unorm) {
         std::array<float, 4> source{};
@@ -570,8 +571,7 @@ void Pbe::Run() {
           for (float &component : source)
             component = ClampShaderUnorm(component);
           std::memcpy(&packed_destination, framebuffer.data() + byte_offset, 4);
-          destination = UnpackUnormColor(packed_destination,
-                                         state.color_attachment_packed_unorm);
+          destination = UnpackUnormColor(packed_destination, packed_format);
         } else {
           std::memcpy(destination.data(), framebuffer.data() + byte_offset,
                       sizeof(destination));
@@ -602,7 +602,7 @@ void Pbe::Run() {
           // Quantize after every fragment, before any later destination LOAD.
           // Masked channels retain their original packed bits, not a recode.
           const std::uint32_t word = PackUnormColor(result,
-              state.color_attachment_packed_unorm, packed_destination,
+              packed_format, packed_destination,
               state.raster_state.color_mask);
           std::memcpy(framebuffer.data() + byte_offset, &word, sizeof(word));
           continue;

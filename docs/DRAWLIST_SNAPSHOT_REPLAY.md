@@ -91,6 +91,13 @@ python3 script/run_drawlist_replay.py "$CAPTURE" \
 
 `--outdir` 必須尚不存在；重新測試要換新目錄。`--help` 不啟動 build 或 GL replay。
 
+`--gles-version` 預設為 `3.1`；保存及接續必須使用相同、已實際驗證的版本。
+不要僅依 capture header 強制提高版本：Car Chase 目前驗證的是 GLES3.1＋
+所需 extensions，強制3.2會啟用 driver 尚未支援的 indexed blend-state 查詢。
+此選項只設定 replay context 的版本，不會補上功能，也不能代替 RenderDoc
+的 API alias 修正。Car Chase 另需相容的 D16 renderbuffer snapshot codec；
+既有 V1 尚不支援，不能直接把上述 Manhattan checkpoint 流程視為已可用。
+
 ## Artifact 與相容性
 
 每個成功輸出含：
@@ -110,6 +117,9 @@ Snapshot 目錄可以搬移，manifest 中的舊絕對路徑只作 provenance。
 
 預設要求相同 backend、player、RenderDoc、Mesa／EGL／GLES 和 bridge binary。
 Mesa 的 DRI loader 與實際 libgallium 實作分別記錄，不得只核對 loader shim。
+Runtime identity v2 另外固定 GLES override；改版本必須重建 checkpoint，
+`--allow-model-change` 不放寬這項限制。舊 runtime identity v1 的版本固定為 3.1，
+只可在 3.1 下接續，不能把舊 manifest 補上 3.2 就當成相容。
 只有修正 model bridge 時，才可明確使用 `--allow-model-change`；它只允許 bridge 改變，
 不放寬其他 runtime identity。使用者必須確認保存的 prefix 功能結果在修正後仍然有效。
 若修正會影響 prefix，必須從 capture 初始狀態重新建立 checkpoint。

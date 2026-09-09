@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build focused resource/clear tests with an existing Mesa build's actual
 # compiler configuration. Generated executables stay outside the source tree.
-# Usage: bash script/run_mesa_resource_unit.sh [all|blit|clear|ubo|compute|surface|vertex|command|texture|boundary|flush|depth-upload|payload-budget|native-present|packed-load|packed-store|packed-descriptor]
+# Usage: bash script/run_mesa_resource_unit.sh [all|blit|clear|ubo|push-map|compute|surface|vertex|command|texture|boundary|flush|depth-upload|payload-budget|native-present|packed-load|packed-store|packed-descriptor]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,11 +24,12 @@ abort 'Mesa test build/output must be outside the source tree' if
   [build, output].any? { |path| path == repo || path.start_with?(repo + '/') }
 database = JSON.parse(File.read(File.join(build, 'compile_commands.json')))
 selected = ARGV.fetch(0)
-abort 'usage: run_mesa_resource_unit.sh [all|blit|clear|ubo|compute|surface|vertex|command|texture|boundary|flush|depth-upload|payload-budget|native-present|packed-load|packed-store|packed-descriptor]' unless
-  %w[all blit clear ubo compute surface vertex command texture boundary flush depth-upload payload-budget native-present packed-load packed-store packed-descriptor].include?(selected)
+abort 'usage: run_mesa_resource_unit.sh [all|blit|clear|ubo|push-map|compute|surface|vertex|command|texture|boundary|flush|depth-upload|payload-budget|native-present|packed-load|packed-store|packed-descriptor]' unless
+  %w[all blit clear ubo push-map compute surface vertex command texture boundary flush depth-upload payload-budget native-present packed-load packed-store packed-descriptor].include?(selected)
 tests = { 'blit' => ['pvrgpu_resource.c', 'pvrgpu_msaa_blit_test.c'],
           'clear' => ['pvrgpu_clear.c', 'pvrgpu_clear_storage_test.c'],
           'ubo' => ['pvrgpu_context.c', 'pvrgpu_uniform_buffer_snapshot_test.c'],
+          'push-map' => ['pvrgpu_context.c', 'pvrgpu_push_constant_map_test.c'],
           'compute' => ['pvrgpu_context.c', 'pvrgpu_compute_snapshot_test.c'],
           'surface' => ['pvrgpu_resource.c', 'pvrgpu_surface_span_test.c'],
           'boundary' => ['pvrgpu_resource.c', 'pvrgpu_framebuffer_boundary_test.c'],
@@ -66,7 +67,34 @@ tests.each do |name, (driver, source)|
   else
     args.concat(%w[-ffunction-sections -fdata-sections -Wl,--gc-sections])
   end
-  args << 'src/compiler/nir/libnir.a' if name == 'texture'
+  if name == 'texture'
+    # Snapshot admission calls the actual compiler's read-only sampler-use
+    # proof. Compile the current implementation privately rather than linking
+    # a possibly stale installed driver or replacing the proof with a stub.
+    pco_entry = database.find { |item| File.basename(item.fetch('file')) == 'pvrgpu_pco.c' }
+    abort 'Mesa compile command missing for pvrgpu_pco.c' unless pco_entry
+    pco_command = pco_entry['arguments']&.dup || Shellwords.split(pco_entry.fetch('command'))
+    pco_args = []
+    until pco_command.empty?
+      argument = pco_command.shift
+      if %w[-o -MF -MQ -MT].include?(argument)
+        pco_command.shift
+      elsif %w[-MD -MMD].include?(argument)
+        next
+      elsif File.basename(argument) == 'pvrgpu_pco.c'
+        pco_args << File.join(repo, 'src/gallium/drivers/pvrgpu/pvrgpu_pco.c')
+      else
+        pco_args << argument
+      end
+    end
+    pco_object = File.join(output, 'pvrgpu_pco.o')
+    pco_args.concat(['-ffunction-sections', '-fdata-sections', '-o', pco_object])
+    abort 'texture compiler proof compilation failed' unless
+      system(*pco_args, chdir: pco_entry.fetch('directory'))
+    args.concat([pco_object, 'src/compiler/nir/libnir.a',
+                 'src/compiler/libcompiler.a',
+                 RUBY_PLATFORM.include?('darwin') ? '-lc++' : '-lstdc++'])
+  end
   if name == 'depth-upload'
     pack = database.find { |item| item.fetch('file').end_with?('/main/pack.c') }
     abort 'Mesa compile command missing for main/pack.c' unless pack
