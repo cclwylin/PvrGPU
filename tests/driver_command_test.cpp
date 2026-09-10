@@ -177,6 +177,7 @@ int main() {
   textured_text +=
       "texture_width=800\n"
       "texture_height=600\n"
+      "depth_state=1,1,3,1065353216,276\n"
       "texture_rgba8_path=" +
       texture_sidecar.string() + "\n";
   WriteText(textured, textured_text);
@@ -191,6 +192,8 @@ int main() {
               command.vertex_bits[5][0] == UINT32_C(3212836864) &&
               command.texcoord_bits[5][1] == UINT32_C(1065353216) &&
               command.texture_width == 800 && command.texture_height == 600 &&
+              command.depth_enable == 1 && command.depth_write == 1 &&
+              command.depth_func == 3 && command.depth_format == 276 &&
               command.texture_rgba8_path == texture_sidecar.string(),
           "wrong textured triangle command payload"))
     return failed;

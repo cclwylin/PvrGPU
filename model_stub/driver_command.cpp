@@ -358,10 +358,13 @@ bool RequireExactFields(const std::map<std::string, std::string> &fields,
         entry.first == "sample_frequency";
     const bool optional_polygon_offset = command == kDrawPcoTrianglesCommand &&
         entry.first == "polygon_offset_state";
+    const bool optional_textured_depth =
+        command == kDrawTexturedTrianglesCommand &&
+        entry.first == "depth_state";
     if (!required.count(entry.first) && !optional_pco_counter && !optional_sample_frequency &&
         !optional_pco_texture && !optional_pco_linkage &&
         !optional_pco_index && !optional_pco_render_targets && !optional_pco_alpha &&
-        !optional_polygon_offset) {
+        !optional_polygon_offset && !optional_textured_depth) {
       *error = "field is not valid for " + command +
                " driver command: " + entry.first;
       return false;
@@ -613,6 +616,33 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     }
   }
   if (parsed.command == kDrawTexturedTrianglesCommand) {
+    const auto depth = fields.find("depth_state");
+    if (depth != fields.end()) {
+      std::array<std::uint32_t, 5> depth_state{};
+      if (!ParseU32List(depth->second, &depth_state)) {
+        *error = "draw_textured_triangles depth_state is invalid";
+        return false;
+      }
+      const bool no_depth = std::all_of(depth_state.begin(),
+                                        depth_state.end(),
+                                        [](std::uint32_t value) {
+                                          return value == 0;
+                                        });
+      const bool effect_depth =
+          depth_state[0] == 1 && depth_state[1] == 1 &&
+          depth_state[2] == 3 &&
+          depth_state[3] == UINT32_C(0x3f800000) &&
+          depth_state[4] != 0;
+      if (!no_depth && !effect_depth) {
+        *error = "draw_textured_triangles depth_state is invalid";
+        return false;
+      }
+      parsed.depth_enable = depth_state[0];
+      parsed.depth_write = depth_state[1];
+      parsed.depth_func = depth_state[2];
+      parsed.depth_clear_bits = depth_state[3];
+      parsed.depth_format = depth_state[4];
+    }
     for (std::size_t vertex = 0; vertex < parsed.vertex_bits.size(); ++vertex) {
       const std::string suffix = std::to_string(vertex) + "_bits";
       if (!ParseU32List(fields["vertex" + suffix],

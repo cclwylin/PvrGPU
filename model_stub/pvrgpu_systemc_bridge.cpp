@@ -2155,6 +2155,26 @@ bool CopyCommand(const pvrgpu_systemc_driver_command &source,
       !CopyTextureSidecarBytes(source, &command.texture_rgba8_bytes, error)) {
     return false;
   }
+  if (command.command == "draw_textured_triangles") {
+    const bool no_depth = source.depth_enable == 0 &&
+                          source.depth_write == 0 && source.depth_func == 0 &&
+                          source.depth_clear_bits == 0 &&
+                          source.depth_format == 0;
+    const bool effect_depth =
+        source.depth_enable == 1 && source.depth_write == 1 &&
+        source.depth_func == 3 &&
+        source.depth_clear_bits == UINT32_C(0x3f800000) &&
+        source.depth_format != 0;
+    if (!no_depth && !effect_depth) {
+      *error = "SystemC API textured-triangle depth metadata mismatch";
+      return false;
+    }
+    command.depth_enable = source.depth_enable;
+    command.depth_write = source.depth_write;
+    command.depth_func = source.depth_func;
+    command.depth_clear_bits = source.depth_clear_bits;
+    command.depth_format = source.depth_format;
+  }
   if (command.command == "draw_pco_triangles" &&
       !CopyPcoTrianglePayload(source, &command, error)) {
     return false;

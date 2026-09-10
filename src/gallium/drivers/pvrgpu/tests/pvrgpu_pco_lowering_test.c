@@ -4507,6 +4507,12 @@ int main(void)
    if (binary.fragment_position_start != 0 ||
        binary.fragment_position_count != 0)
       fail("fragment gl_FragCoord must not consume a varying linkage");
+   if (binary.fragment_output_mask[0] != 0xfu)
+      fail("conditionals fragment output mask is not RGBA target zero");
+   for (unsigned target = 1; target < 8; ++target) {
+      if (binary.fragment_output_mask[target] != 0)
+         fail("conditionals fragment output mask names an extra target");
+   }
 
    /* The compile API promises clone-before-lower ownership semantics. */
    if (count_intrinsic(vs, nir_intrinsic_load_uniform) != 4 ||
@@ -4621,6 +4627,12 @@ int main(void)
        binary.fragment_texture_descriptor_count != 20 ||
        binary.fragment_texture_descriptor_stride != 20) {
       fail("texture PCO linkage or descriptor ABI changed");
+   }
+   if (binary.fragment_output_mask[0] != 0xfu)
+      fail("texture fragment output mask is not RGBA target zero");
+   for (unsigned target = 1; target < 8; ++target) {
+      if (binary.fragment_output_mask[target] != 0)
+         fail("texture fragment output mask names an extra target");
    }
 
    /* Compile must lower only its private clones.  The source graph retains

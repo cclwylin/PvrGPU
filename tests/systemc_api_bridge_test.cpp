@@ -332,6 +332,11 @@ int main() {
   command.texture_width = 2;
   command.texture_height = 2;
   command.texture_rgba8_path = sidecar_text.c_str();
+  command.depth_enable = 1;
+  command.depth_write = 1;
+  command.depth_func = 3;
+  command.depth_clear_bits = UINT32_C(0x3f800000);
+  command.depth_format = 276;
 
   pvrgpu_systemc_submit_info info{};
   info.version = PVRGPU_SYSTEMC_API_VERSION;

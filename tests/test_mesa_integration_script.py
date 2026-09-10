@@ -159,6 +159,8 @@ class NativeMesaIntegrationTests(unittest.TestCase):
             'environment["PVRGPU_SYSTEMC_JSONL_OUT"] = PathToUtf8(model_stdout)',
             'environment["PVRGPU_SYSTEMC_STDERR_OUT"] = PathToUtf8(model_stderr)',
             'environment["PVRGPU_SYSTEMC_OUTDIR"] = PathToUtf8(model_png_dir)',
+            'environment["PVRGPU_RDC_OUTPUT_WIDTH"] = std::to_string(options.width)',
+            'environment["PVRGPU_RDC_OUTPUT_HEIGHT"] = std::to_string(options.height)',
         ):
             with self.subTest(contract=contract):
                 self.assertIn(contract, runner)
@@ -177,9 +179,11 @@ class NativeMesaIntegrationTests(unittest.TestCase):
         self.assertIn("pvrgpu.rdc-native-runner.v2", runner)
         self.assertIn("ParseNativeReport(model_text, driver_text", runner)
         self.assertNotIn("probe_request", runner)
-        for metadata_only in ("PVRGPU_RDC_TRACE_DRAW_ACTIONS", "PVRGPU_RDC_OUTPUT_WIDTH", "PVRGPU_RDC_OUTPUT_HEIGHT"):
+        for metadata_only in ("PVRGPU_RDC_TRACE_DRAW_ACTIONS",):
             self.assertNotIn(f'environment["{metadata_only}"]', runner)
             self.assertIn(f'"{metadata_only}"', runner)
+        for isolated_extent in ("PVRGPU_RDC_OUTPUT_WIDTH", "PVRGPU_RDC_OUTPUT_HEIGHT"):
+            self.assertIn(f'"{isolated_extent}"', runner)
 
     def test_cmake_uses_compiler_appropriate_flags_and_exports_windows_bridge(
         self,

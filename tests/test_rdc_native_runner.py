@@ -24,8 +24,14 @@ p = pathlib.Path
 mode = os.environ['PVRGPU_TEST_MODE']
 calls = p(os.environ['PVRGPU_TEST_CALLS'])
 with calls.open('a') as stream: stream.write('player\n')
-for name in ('PVRGPU_RDC_TRACE_DRAW_ACTIONS', 'PVRGPU_RDC_OUTPUT_WIDTH', 'PVRGPU_RDC_OUTPUT_HEIGHT'):
-    assert name not in os.environ, name
+assert 'PVRGPU_RDC_TRACE_DRAW_ACTIONS' not in os.environ
+expected_extent = os.environ.get('PVRGPU_TEST_EXPECT_EXTENT')
+if expected_extent:
+    assert (os.environ.get('PVRGPU_RDC_OUTPUT_WIDTH') + 'x' +
+            os.environ.get('PVRGPU_RDC_OUTPUT_HEIGHT')) == expected_extent
+else:
+    assert 'PVRGPU_RDC_OUTPUT_WIDTH' not in os.environ
+    assert 'PVRGPU_RDC_OUTPUT_HEIGHT' not in os.environ
 if mode == 'stale': sys.exit(0)
 out = p(sys.argv[2]); out.parent.mkdir(parents=True, exist_ok=True)
 def png(width, height, color):
@@ -90,6 +96,13 @@ class NativeRunnerProcessTests(unittest.TestCase):
             player.chmod(0o755)
             rdc = root / "capture with spaces.rdc"
             rdc.write_bytes(b"process-contract-fixture-not-a-real-capture")
+            digest = hashlib.sha256(rdc.read_bytes()).hexdigest()
+            config = root / "config"
+            config.mkdir()
+            (config / "rdc-glmark2-800x600-v1.tsv").write_text(
+                "rdc_sha256\tcase\twidth\theight\n"
+                f"{digest}\tfixture.capture.1\t2\t3\n"
+            )
             for mode in ("pass", "no_color", "compute_only", "missing_receipt", "wrong_png", "wrong_rdc",
                          "unfinished", "api_error", "png_extent", "missing_compute_done", "driver_failure",
                          "truncated_model", "stale", "missing_init_audit", "failed_init_copy",
@@ -104,6 +117,7 @@ class NativeRunnerProcessTests(unittest.TestCase):
                     (output / "player-final-output.json.initial-copy-driver-counter.txt").write_text("stale")
                     calls = root / (mode + "-calls")
                     env = dict(os.environ, PVRGPU_TEST_MODE=mode, PVRGPU_TEST_CALLS=str(calls),
+                               PVRGPU_TEST_EXPECT_EXTENT="2x3",
                                PVRGPU_SYSTEMC_API_LIB=str(bridge), PVRGPU_RDC_TRACE_DRAW_ACTIONS="999999",
                                PVRGPU_RDC_OUTPUT_WIDTH="800", PVRGPU_RDC_OUTPUT_HEIGHT="600")
                     run = subprocess.run([str(binary), str(rdc), "--outdir", str(output),
@@ -116,7 +130,7 @@ class NativeRunnerProcessTests(unittest.TestCase):
                         self.assertEqual(run.returncode, 0, run.stderr)
                         self.assertEqual(result["status"], "PASS")
                         report = output / "capture-report.jsonl"
-                        counters = counters_from_pvrgpu_jsonl(report, expected_rdc_sha256=hashlib.sha256(rdc.read_bytes()).hexdigest())
+                        counters = counters_from_pvrgpu_jsonl(report, expected_rdc_sha256=digest)
                         self.assertEqual(counters["cs_invocations"], 37)
                         self.assertEqual(counters["texel_fetches"], 17 if mode == "compute_only" else 24)
                         self.assertEqual(counters["drawlists"], 0 if mode == "compute_only" else 7)
@@ -134,6 +148,22 @@ class NativeRunnerProcessTests(unittest.TestCase):
                         self.assertEqual(result["status"], "FAIL")
                         self.assertFalse((output / "capture-report.jsonl").exists())
                         self.assertFalse((output / "frame.png").exists())
+
+            # Without explicit or manifest metadata, stale parent dimensions
+            # must be removed instead of silently becoming replay selection.
+            (config / "rdc-glmark2-800x600-v1.tsv").unlink()
+            output = root / "no-manifest"
+            output.mkdir()
+            calls = root / "no-manifest-calls"
+            env = dict(os.environ, PVRGPU_TEST_MODE="pass", PVRGPU_TEST_CALLS=str(calls),
+                       PVRGPU_SYSTEMC_API_LIB=str(bridge),
+                       PVRGPU_RDC_OUTPUT_WIDTH="800", PVRGPU_RDC_OUTPUT_HEIGHT="600")
+            run = subprocess.run([str(binary), str(rdc), "--outdir", str(output),
+                                  "--project-root", str(root), "--mesa-prefix", str(mesa),
+                                  "--player", str(player)],
+                                 capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(calls.read_text().splitlines(), ["player"])
 
 
 if __name__ == "__main__":

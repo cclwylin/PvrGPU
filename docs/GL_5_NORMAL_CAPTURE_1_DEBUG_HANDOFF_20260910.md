@@ -745,3 +745,42 @@ tile list，可能到累積完後的 Phase 2 才顯示錯誤，且後續 draw �
 - 不得以 hash／capture 名稱／draw index 選擇渲染答案。
 - 不得因為 dEQP 的品質警告而讓 model 偏離 llvmpipe 實際執行的運算；capture replay
   的 oracle 是 llvmpipe。
+
+## 2026-09-11 glmark2 WIP 修復與回歸
+
+這一輪把 glmark2 WIP 收斂完成，沒有重新啟用 formal player 明確清除的
+`PVRGPU_RDC_CASE_NAME` 捷徑。修正內容如下：
+
+- `conditionals`、`lit_mesh`、`texture` 三個專用 PCO compiler 明確宣告
+  `fragment_output_mask[0] = 0xf`，emit command 時完整傳輸八個 render-target
+  mask。不要在 generic color compiler 裡重跑 `nir_shader_gather_info()`；那會把
+  dEQP multisample texture query 人工建立的 `num_textures` metadata 清成零。
+- `draw_textured_triangles` 命令新增 canonical `depth_state`，driver、文字 parser、
+  SystemC API deep-copy、submitter capture 與 reporter publish 全部接通。這是
+  effect2d 的真實修正：model 現在回傳 framebuffer boundary 所要求的 depth plane，
+  沒有略過 boundary 或降低驗證強度。
+- 合法 Mesa depth format 的 single-draw PCO 同樣 materialize/publish depth plane，
+  修復 build、bump、conditionals、shading、texture 的 boundary failure。
+- runner 先清除父程序遺留的 output width/height，再只在 explicit/manifest extent
+  存在時注入正式 replay；process test 同時覆蓋有 manifest 與無 manifest 的污染環境。
+
+最終正式回歸（2 workers、cache mode、每案 timeout 900 秒）為 **10/10 PASS**：
+
+```text
+/Users/linwanyi/Downloads/_Codex/Working/PvrGPU/out/runs/rdc_regression/glmark2_final_10of10_20260911/
+total=10 passed=10 failed=0 timeout=0 total_time=578.32s
+terrain=483.95s
+```
+
+terrain 在 300 秒會 timeout，但單獨與完整 2-worker 回歸都在約 481–484 秒 PASS。
+原因是 formal player 會清除 case name，八個 terrain draw 走通用 native PCO/USC ISS，
+而不是 capture-name 專用的八-draw sequence。這符合目前「不用 case 名稱選答案」的
+規則，但成本高：最終 run 的最大 model pool high-water 為
+`1,055,172,624` bytes（約 1006 MiB），觀察到 player RSS 約 1.61 GiB。後續若要降
+terrain 時間／記憶體，應優化通用 texture/fragment payload，而不是恢復 case-name
+捷徑。
+
+驗證通過：Mesa `pvrgpu_pco_lowering`、`fragment-output-mask-unit`、
+`driver-command-unit`、`systemc-api-bridge-unit`、`pco-systemc-api-bridge-unit`、
+`rdc-native-runner-process-test`，以及 9 個 runner 靜態契約 unittest。最後沒有殘留
+`pvrgpu` 或 `pvrgpu-rdc-player` 程序。

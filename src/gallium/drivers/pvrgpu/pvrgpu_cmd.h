@@ -130,6 +130,11 @@ struct pvrgpu_draw_textured_triangles_command {
    uint32_t texture_width;
    uint32_t texture_height;
    const char *texture_rgba8_path;
+   uint32_t depth_enable;
+   uint32_t depth_write;
+   uint32_t depth_func;
+   uint32_t depth_clear_bits;
+   uint32_t depth_format;
 };
 
 #define PVRGPU_DRAW_PCO_TRIANGLES_VERTEX_COUNT 6144u

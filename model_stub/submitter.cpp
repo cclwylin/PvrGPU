@@ -760,6 +760,15 @@ void PatchPcoDescriptorAddress(std::vector<std::uint32_t> *shared,
   (*shared)[base + 3U] = static_cast<std::uint32_t>(word1 >> 32U);
 }
 
+bool DriverDepthAttachmentFormatSupported(std::uint32_t format) {
+  return format == kDriverPcoDepthFormatZ16Unorm ||
+         format == kDriverPcoDepthFormatZ24X8Unorm ||
+         format == kDriverPcoDepthFormatZ24UnormS8Uint ||
+         format == kDriverPcoDepthFormatZ32Unorm ||
+         format == kDriverPcoDepthFormatZ32Float ||
+         format == kDriverPcoDepthFormatZ32FloatS8X24Uint;
+}
+
 bool DriverTexturedTrianglesCommandSupported(const DriverCommand &command) {
   if (command.framebuffer_width == 0 || command.framebuffer_height == 0 ||
       command.width == 0 || command.height == 0 ||
@@ -768,6 +777,13 @@ bool DriverTexturedTrianglesCommandSupported(const DriverCommand &command) {
       command.texture_width == 0 || command.texture_width > 16384U ||
       command.texture_height == 0 || command.texture_height > 16384U ||
       command.texture_rgba8_path.empty()) {
+    return false;
+  }
+  if (command.depth_format != 0 &&
+      (command.depth_enable != 1 || command.depth_write != 1 ||
+       command.depth_func != 3 ||
+       command.depth_clear_bits != UINT32_C(0x3f800000) ||
+       !DriverDepthAttachmentFormatSupported(command.depth_format))) {
     return false;
   }
   for (const auto &vertex : command.vertex_bits) {
@@ -1774,6 +1790,45 @@ void Submitter::RunJob() {
       state.counters.renderer_cycles += dependency_cycles;
       WaitForCycles(dependency_cycles);
     }
+    if (driver_textured_triangles_command && command.depth_format != 0 &&
+        memory_ != nullptr) {
+      const std::size_t depth_bytes_per_pixel =
+          DepthAttachmentBytesPerPixel(command.depth_format);
+      const std::uint64_t depth_bytes =
+          static_cast<std::uint64_t>(state.width) * state.height *
+          depth_bytes_per_pixel * state.raster_state.sample_count *
+          state.attachment_layers;
+      if (depth_bytes == 0 ||
+          depth_bytes > kDriverPcoSequenceAttachmentStride ||
+          depth_bytes > std::numeric_limits<std::size_t>::max()) {
+        throw std::runtime_error(
+            "Submitter textured depth attachment byte size is invalid");
+      }
+      state.depth_attachment_format = command.depth_format;
+      state.depth_attachment_gpu_address = kDriverPcoSequenceDepthAddressBase;
+      state.capture_depth_attachment = 1;
+    }
+    /* Single-draw PCO profiles such as glmark2 build/bump/conditionals also
+     * own the framebuffer depth plane, so publish it just like a sequence. */
+    if (driver_pco_triangles_command && !driver_pco_sequence_command &&
+        command.depth_format != 0 &&
+        memory_ != nullptr) {
+      const std::size_t depth_bytes_per_pixel =
+          DepthAttachmentBytesPerPixel(command.depth_format);
+      const std::uint64_t depth_bytes =
+          static_cast<std::uint64_t>(state.width) * state.height *
+          depth_bytes_per_pixel * state.raster_state.sample_count *
+          state.attachment_layers;
+      if (depth_bytes == 0 ||
+          depth_bytes > kDriverPcoSequenceAttachmentStride ||
+          depth_bytes > std::numeric_limits<std::size_t>::max()) {
+        throw std::runtime_error(
+            "Submitter PCO depth attachment byte size is invalid");
+      }
+      state.depth_attachment_format = command.depth_format;
+      state.depth_attachment_gpu_address = kDriverPcoSequenceDepthAddressBase;
+      state.capture_depth_attachment = 1;
+    }
     if (driver_pco_triangles_command) {
       state.vertex_pco_abi = command.vertex_pco_abi;
       state.fragment_pco_abi = command.fragment_pco_abi;
@@ -1979,6 +2034,9 @@ void Submitter::RunJob() {
             ? DepthCompareOp::kNever
             : driver_textured_triangles ? DepthCompareOp::kLessOrEqual
                                         : DepthCompareOp::kNotEqual;
+    if (driver_textured_triangles && command.depth_format != 0)
+      state.raster_state.depth.clear_depth =
+          FloatFromBits(command.depth_clear_bits);
     if (functional_case == FunctionalCase::kFillSolidBlended) {
       state.raster_state.blend.enable = 1;
       state.raster_state.blend.rgb_equation = BlendEquation::kAdd;

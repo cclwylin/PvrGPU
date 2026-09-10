@@ -1051,6 +1051,19 @@ pvrgpu_cmd_validate_draw_textured_triangles(
                        "positive");
       return false;
    }
+   const bool no_depth = cmd->depth_enable == 0 && cmd->depth_write == 0 &&
+                         cmd->depth_func == 0 &&
+                         cmd->depth_clear_bits == 0 && cmd->depth_format == 0;
+   const bool effect_depth =
+      cmd->depth_enable == 1 && cmd->depth_write == 1 &&
+      cmd->depth_func == 3 &&
+      cmd->depth_clear_bits == UINT32_C(0x3f800000) &&
+      cmd->depth_format != 0;
+   if (!no_depth && !effect_depth) {
+      pvrgpu_cmd_error(error, error_size,
+                       "draw textured triangles depth state is invalid");
+      return false;
+   }
    return pvrgpu_cmd_texture_sidecar_size_matches(path,
                                                    cmd,
                                                    error,
@@ -2137,10 +2150,16 @@ pvrgpu_write_draw_textured_triangles_command(
       written = fprintf(file,
                         "texture_width=%u\n"
                         "texture_height=%u\n"
-                        "texture_rgba8_path=%s\n",
+                        "texture_rgba8_path=%s\n"
+                        "depth_state=%u,%u,%u,%u,%u\n",
                         cmd->texture_width,
                         cmd->texture_height,
-                        cmd->texture_rgba8_path);
+                        cmd->texture_rgba8_path,
+                        cmd->depth_enable,
+                        cmd->depth_write,
+                        cmd->depth_func,
+                        cmd->depth_clear_bits,
+                        cmd->depth_format);
    }
    const int close_status = fclose(file);
    if (written < 0 || close_status != 0) {
@@ -2173,6 +2192,11 @@ pvrgpu_write_draw_textured_triangles_command(
    api_command.texture_width = cmd->texture_width;
    api_command.texture_height = cmd->texture_height;
    api_command.texture_rgba8_path = cmd->texture_rgba8_path;
+   api_command.depth_enable = cmd->depth_enable;
+   api_command.depth_write = cmd->depth_write;
+   api_command.depth_func = cmd->depth_func;
+   api_command.depth_clear_bits = cmd->depth_clear_bits;
+   api_command.depth_format = cmd->depth_format;
    return pvrgpu_submit_systemc_api(&api_command, error, error_size);
 }
 

@@ -4097,6 +4097,16 @@ bool pvrgpu_pco_compile_conditionals(struct pvrgpu_pco_compiler *compiler,
       return false;
    }
 
+   /*
+    * pvrgpu_canonicalize_fragment_output() accepted this program, so its
+    * colour contract is exactly one four-component FRAG_RESULT_DATA0 store
+    * expanded to PIXOUT0..3 on target 0.  Declare that mask: the model reads
+    * a native fragment program's mask as an explicit contract, so leaving it
+    * zero states a depth-only draw and the decoder then rejects the shader's
+    * own 0xf pixel-output mask.
+    */
+   out->fragment_output_mask[0] = 0xfu;
+
    out->position_output_start = vertex_data.vs.varyings[VARYING_SLOT_POS].start;
    out->position_output_count = vertex_data.vs.varyings[VARYING_SLOT_POS].count;
    out->fragment_position_start =
@@ -12058,6 +12068,16 @@ bool pvrgpu_pco_compile_lit_mesh(
       return false;
    }
 
+   /*
+    * pvrgpu_canonicalize_fragment_output() accepted this program, so its
+    * colour contract is exactly one four-component FRAG_RESULT_DATA0 store
+    * expanded to PIXOUT0..3 on target 0.  Declare that mask: the model reads
+    * a native fragment program's mask as an explicit contract, so leaving it
+    * zero states a depth-only draw and the decoder then rejects the shader's
+    * own 0xf pixel-output mask.
+    */
+   out->fragment_output_mask[0] = 0xfu;
+
    out->position_output_start =
       vertex_data.vs.varyings[VARYING_SLOT_POS].start;
    out->position_output_count =
@@ -12236,6 +12256,16 @@ bool pvrgpu_pco_compile_texture(
       ralloc_free(compile_mem_ctx);
       return false;
    }
+
+   /*
+    * pvrgpu_canonicalize_fragment_output() accepted this program, so its
+    * colour contract is exactly one four-component FRAG_RESULT_DATA0 store
+    * expanded to PIXOUT0..3 on target 0.  Declare that mask: the model reads
+    * a native fragment program's mask as an explicit contract, so leaving it
+    * zero states a depth-only draw and the decoder then rejects the shader's
+    * own 0xf pixel-output mask.
+    */
+   out->fragment_output_mask[0] = 0xfu;
 
    out->position_output_start =
       vertex_data.vs.varyings[VARYING_SLOT_POS].start;

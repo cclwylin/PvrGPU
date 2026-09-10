@@ -2818,6 +2818,18 @@ void JsonReporter::RunJob() {
                                  state.raster_state.sample_count, state.attachment_layers,
                                  color_formats,
                                  !options_.driver_command.color_attachment_formats.empty());
+        /*
+         * A lone native command publishes its depth plane the same way the
+         * sequence path does.  The driver's framebuffer-boundary readback
+         * asks for depth whenever the pass has a zsbuf, and without this the
+         * bridge held no depth plane and answered with zero pixels.
+         */
+        if (state.depth_attachment_ready) {
+          if (!HasPoolHandle(state.depth_attachment))
+            throw std::runtime_error("JsonReporter depth readback has no storage");
+          job_->depth_framebuffer = LoadArray<std::uint8_t>(pool_, state.depth_attachment);
+          job_->depth_format = state.depth_attachment_format;
+        }
       }
       std::filesystem::path artifact_path;
       // As above: an integer attachment has no RGBA8 rendering, so it gets no

@@ -927,6 +927,16 @@ RunOutcome RunPvrgpu(const Options &options, const RuntimeConfig &config,
   environment["PVRGPU_SYSTEMC_STDERR_OUT"] = PathToUtf8(model_stderr);
   environment["PVRGPU_SYSTEMC_OUTDIR"] = PathToUtf8(model_png_dir);
   environment["PVRGPU_RDC_FINAL_OUTPUT_RECEIPT"] = PathToUtf8(receipt_path);
+  const bool extent_enforced = options.width_explicit || options.height_explicit ||
+                               options.extent_from_manifest;
+  if (extent_enforced) {
+    // Unlike the draw-action count, the requested extent is not permission to
+    // stop replay work. The driver uses it to identify the final capture FBO
+    // and to reject helper/probe framebuffers, so the one-process native path
+    // must preserve the manifest-owned extent for the formal replay.
+    environment["PVRGPU_RDC_OUTPUT_WIDTH"] = std::to_string(options.width);
+    environment["PVRGPU_RDC_OUTPUT_HEIGHT"] = std::to_string(options.height);
+  }
 
   outcome.stage = "player";
   ProcessRequest player_request;
@@ -1026,8 +1036,6 @@ RunOutcome RunPvrgpu(const Options &options, const RuntimeConfig &config,
       outcome.reason = "Final replay PNG extent does not match its attachment receipt";
       return outcome;
     }
-    const bool extent_enforced = options.width_explicit || options.height_explicit ||
-                                 options.extent_from_manifest;
     if (extent_enforced && (frame_width != options.width || frame_height != options.height)) {
       outcome.reason = "PvrGPU model framebuffer extent mismatch: requested=" +
           std::to_string(options.width) + "x" + std::to_string(options.height) +

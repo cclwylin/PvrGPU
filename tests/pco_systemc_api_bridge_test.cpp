@@ -532,7 +532,7 @@ int main() {
   command.depth_write = 1;
   command.depth_func = 3;
   command.depth_clear_bits = UINT32_C(0x3f800000);
-  command.depth_format = 1;
+  command.depth_format = kDriverPcoDepthFormatZ24X8Unorm;
   const auto set_pco_resolution = [&](std::uint32_t width,
                                       std::uint32_t height) {
     command.framebuffer_width = width;

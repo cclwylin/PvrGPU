@@ -9246,6 +9246,12 @@ pvrgpu_emit_draw_pco_triangles_command(
    command.position_output_count = binary.position_output_count;
    command.fragment_position_start = binary.fragment_position_start;
    command.fragment_position_count = binary.fragment_position_count;
+   /* The compiled program states which PIXOUT lanes each attachment expects.
+    * The model reads a native fragment program's mask as an explicit
+    * contract, so a command that leaves it zero states a depth-only draw and
+    * the decoder rejects the shader's own colour mask. */
+   for (unsigned target = 0; target < 8; ++target)
+      command.fragment_output_mask[target] = binary.fragment_output_mask[target];
    for (unsigned component = 0; component < 3; ++component) {
       command.viewport_scale_bits[component] =
          pvrgpu_float_bits(ctx->viewport.scale[component]);
@@ -9418,6 +9424,12 @@ pvrgpu_emit_lit_mesh_command(
    command.varying_output_count = binary.varying_output_count;
    command.fragment_varying_start = binary.fragment_varying_start;
    command.fragment_varying_count = binary.fragment_varying_count;
+   /* The compiled program states which PIXOUT lanes each attachment expects.
+    * The model reads a native fragment program's mask as an explicit
+    * contract, so a command that leaves it zero states a depth-only draw and
+    * the decoder rejects the shader's own colour mask. */
+   for (unsigned target = 0; target < 8; ++target)
+      command.fragment_output_mask[target] = binary.fragment_output_mask[target];
    for (unsigned component = 0; component < 3; ++component) {
       command.viewport_scale_bits[component] =
          pvrgpu_float_bits(ctx->viewport.scale[component]);
@@ -13146,6 +13158,12 @@ pvrgpu_emit_texture_pco_command(
    command.varying_output_count = binary.varying_output_count;
    command.fragment_varying_start = binary.fragment_varying_start;
    command.fragment_varying_count = binary.fragment_varying_count;
+   /* The compiled program states which PIXOUT lanes each attachment expects.
+    * The model reads a native fragment program's mask as an explicit
+    * contract, so a command that leaves it zero states a depth-only draw and
+    * the decoder rejects the shader's own colour mask. */
+   for (unsigned target = 0; target < 8; ++target)
+      command.fragment_output_mask[target] = binary.fragment_output_mask[target];
    for (unsigned component = 0; component < 3; ++component) {
       command.viewport_scale_bits[component] =
          pvrgpu_float_bits(ctx->viewport.scale[component]);
@@ -13565,6 +13583,14 @@ pvrgpu_emit_draw_textured_triangles_command(
    command.texture_width = observation->texture_width;
    command.texture_height = observation->texture_height;
    command.texture_rgba8_path = sidecar_path;
+   /* The matched effect2d profile owns a real depth attachment.  Carry that
+    * attachment through the legacy textured command so the model can publish
+    * the depth plane requested by the framebuffer-boundary readback. */
+   command.depth_enable = ctx->dsa->state.depth_enabled;
+   command.depth_write = ctx->dsa->state.depth_writemask;
+   command.depth_func = ctx->dsa->state.depth_func;
+   command.depth_clear_bits = UINT32_C(0x3f800000);
+   command.depth_format = ctx->framebuffer.zsbuf.format;
 
    char error[256];
    if (!pvrgpu_write_draw_textured_triangles_command(path,
@@ -13585,14 +13611,15 @@ pvrgpu_emit_draw_textured_triangles_command(
    pvrgpu_note_driver_draw_command_emitted();
    pvrgpu_counter_eventf("draw_textured_triangles_command",
                          "framebuffer=%ux%u viewport=%ux%u texture=%ux%u "
-                         "texture_path=%s",
+                         "texture_path=%s depth_format=%s",
                          command.framebuffer_width,
                          command.framebuffer_height,
                          command.width,
                          command.height,
                          command.texture_width,
                          command.texture_height,
-                         command.texture_rgba8_path);
+                         command.texture_rgba8_path,
+                         util_format_name(command.depth_format));
    return true;
 }
 
