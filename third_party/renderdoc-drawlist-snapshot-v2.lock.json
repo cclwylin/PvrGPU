@@ -1,0 +1,76 @@
+{
+  "schema": "pvrgpu.renderdoc-snapshot-source-lock.v2",
+  "source_git_head": "2fc0bc04cb95499635f63986a55bc6f67849dd9f",
+  "baseline_tracked_tree_sha256": "9ff036ab97e9ea1cf0be69b619b987466baf760718c6a5a5a2ed006dd795db04",
+  "patch_sha256": "ac97c7ddb057c7811448737e0945106264258cf2240e350caaaadcc6b195495d",
+  "files": {
+    "renderdoc/driver/gl/gl_driver.cpp": {
+      "base_sha256": "3dbf0eddeec4b4c10a13a90e5cd608889c0953d4256a3c17e6a627b6bb8f43e0",
+      "patched_sha256": "d9e0f37651f903a9e0c3bdbd4bd0c2e10b9be504e385b522954b23a575d0bbf7"
+    },
+    "renderdoc/driver/gl/gl_driver.h": {
+      "base_sha256": "20a50f311e41ed1a0f2d9abca3bff96319bc71cb020981adafb39ce6b49db899",
+      "patched_sha256": "819128fb52697e2b8370c4bbecff7c38851030c044ba009fb7363732b78f8d5c"
+    },
+    "renderdoc/driver/gl/gl_initstate.cpp": {
+      "base_sha256": "e7c7a3d29e868b951e84b765dc8b92075505935c807e56696a7539f48b99e96e",
+      "patched_sha256": "10154650b7af5efddcc883c381806a4608bb97e961a14d8b9b6c6b3b49be3ae1"
+    },
+    "renderdoc/driver/gl/gl_manager.h": {
+      "base_sha256": "5171d4484aa3f92ed2ba3c02dfb204b3e97155729b67976fd4a16b8fba604920",
+      "patched_sha256": "fa58f75be411629545044921af06fedd762c0996d7f795737ed2573d4db8a012"
+    },
+    "renderdoc/driver/gl/gl_replay.cpp": {
+      "base_sha256": "f82ea952bb680544a6f1151a9f16b411ed58e1ee9af56045d6afaf6d2c865a3d",
+      "patched_sha256": "1e321df954fcf5657ebff30f108308ad26ec501d11d070d6ebac34e3048902fa"
+    },
+    "renderdoc/driver/gl/gl_replay.h": {
+      "base_sha256": "1d63f8f1149dbd9ece91717d350385099bf4c00539e406ddb37aa3f53987945c",
+      "patched_sha256": "e34893188302d392ce4a34c4622f6659a606e5eba0a6606b6e70b8b07411a2c1"
+    },
+    "renderdoc/driver/gl/gl_replay_snapshot.inl": {
+      "base_sha256": null,
+      "patched_sha256": "dd6d6f6c5dd21c66de5da8e0705777e42c2b8fe9d8b190d2446e0f59cb089936"
+    },
+    "renderdoc/driver/gl/gl_resources.cpp": {
+      "base_sha256": "d65874d178321a6c3ea603402fa18c3091d5f8b0a3b94fa5028ab9e7dd9addb0",
+      "patched_sha256": "b3c8c99f26355b0365d91648bd102a6d932346b1d3fa3766f021967fb8f81dad"
+    },
+    "renderdoc/driver/gl/gl_snapshot_codec_safety.inl": {
+      "base_sha256": null,
+      "patched_sha256": "afbc2f719cad2025c086a068bed9dcc0d0ab558f530e58e9c3c0e136bfd76eba"
+    },
+    "renderdoc/replay/replay_controller.cpp": {
+      "base_sha256": "32664e3266044cd387db6225f7a2f835320ec61c9430887518c6d063e6a306f5",
+      "patched_sha256": "221912fd806b8e59e2ba72992443564c102e45ca509c5aadf88687957df3390f"
+    },
+    "renderdoc/replay/replay_controller.h": {
+      "base_sha256": "d20b45d52ca767f9645155215ff346cc21f51e339d30ee782dae0390b06441fd",
+      "patched_sha256": "6775566a4020218e40199c385b6f3d071acd70bdbae282ca1d9f661a474e073a"
+    },
+    "renderdoc/replay/replay_snapshot.h": {
+      "base_sha256": null,
+      "patched_sha256": "3c5faacc76c12aec234a3a12c0e9868ea6da1e431d6c1bbd0400677f00196d1f"
+    },
+    "renderdoc/replay/replay_snapshot_api.inl": {
+      "base_sha256": null,
+      "patched_sha256": "4e4d7a2615d889d52a629e0c52b55954b790a3da0496e6da704989c7b34bfeb9"
+    },
+    "renderdoc/driver/gl/gl_debug.cpp": {
+      "base_sha256": "d98b1c9a9c91b3148445230183463d8739f8745c1fa68951ea49054cbabc0e02",
+      "patched_sha256": "f3484b19f77fc0ff81b3747801b4023a3a552138c90bb099ed1871ac1cd62c14"
+    },
+    "renderdoc/driver/gl/gl_common.cpp": {
+      "base_sha256": "e8c5eb848c94f0e491ac4dd78c5f51fa631ca7836173474bf22826179e782363",
+      "patched_sha256": "0023eea5491573b672e7f71a75a800cbca5f674bc7e21a7b48eb9e18d4428f59"
+    },
+    "renderdoc/driver/gl/gl_renderstate.cpp": {
+      "base_sha256": "e8e379d3302f88707c45abb6dbb793e699f4bf1c6fa7947bb3ebb495bbeb87b1",
+      "patched_sha256": "2d70d9bb2d1300b0b137314208b369cbd950072df4ef83595f4fb194c5717c03"
+    },
+    "renderdoc/driver/gl/gl_renderstate.h": {
+      "base_sha256": "9e1f27fdada7dccc0d8613cb36ebe848cb67f48d1e17518c59cf4a19ccbde236",
+      "patched_sha256": "b4940431903d52c77658cbd3224beda2177f6d104000a20747d9e7fc1f574a60"
+    }
+  }
+}

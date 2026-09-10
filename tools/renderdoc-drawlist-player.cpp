@@ -148,6 +148,7 @@ struct SnapshotApi
   using Save = int (*)(IReplayController *, uint32_t, const char *, const char *, char *, size_t);
   using Load = int (*)(IReplayController *, const char *, const char *, uint32_t *, char *, size_t);
   void *library = nullptr;
+  uint32_t version = 0;
   Save save = nullptr;
   Load load = nullptr;
   fs::path path;
@@ -170,7 +171,8 @@ struct SnapshotApi
             "Player is linked to a different RenderDoc library; rebuild it for --renderdoc-lib");
     library = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     require(library != nullptr, "Cannot load selected RenderDoc library");
-    require(symbol<Version>("RENDERDOC_GetReplaySnapshotVersion")() == 1, "Unsupported RenderDoc snapshot ABI");
+    version = symbol<Version>("RENDERDOC_GetReplaySnapshotVersion")();
+    require(version == 1 || version == 2, "Unsupported RenderDoc snapshot ABI");
     save = symbol<Save>("RENDERDOC_SaveReplaySnapshot");
     load = symbol<Load>("RENDERDOC_LoadReplaySnapshot");
   }
@@ -446,7 +448,8 @@ int main(int argc, char **argv)
             << ",\"capture_last_event\":" << lastEvent << ",\"trace_draw_actions\":" << draws.size()
             << ",\"resumed_from_event\":" << (args.resume ? std::to_string(resumed) : "null")
             << ",\"native_prefix_replayed\":false,\"snapshot_state_sha256\":" << quote(hashFile(args.output))
-            << ",\"snapshot_api_version\":1,\"context_finished\":true,\"api_errors\":0"
+            << ",\"snapshot_api_version\":" << snapshot.version
+            << ",\"context_finished\":true,\"api_errors\":0"
             << ",\"snapshot_restore_verified\":" << (args.resume ? "true" : "false")
             << ",\"cold_cache\":true,\"color_output\":" << colorJson << "}\n";
     exclusiveWrite(args.receipt, receipt.str());

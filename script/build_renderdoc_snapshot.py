@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build five locked RenderDoc snapshot TUs in a fresh private source overlay.
+"""Build version-locked RenderDoc snapshot TUs in a fresh private source overlay.
 
 SOURCE BUILD_BASE OUTDIR must identify an exact locked Mesa/vendor source tree,
 an existing compatible Ninja build, and a new directory outside either tree and
@@ -25,8 +25,11 @@ from run_drawlist_replay import (ReplayError, atomic_json, digest_string,
 
 REPO = Path(__file__).resolve().parents[1]
 LOCK_SCHEMA = "pvrgpu.renderdoc-snapshot-source-lock.v1"
-DEFAULT_LOCK = REPO / "third_party/renderdoc-drawlist-snapshot-v1.lock.json"
+V2_LOCK_SCHEMA = "pvrgpu.renderdoc-snapshot-source-lock.v2"
+DEFAULT_LOCK = REPO / "third_party/renderdoc-drawlist-snapshot-v2.lock.json"
 DEFAULT_PATCH = REPO / "third_party/renderdoc-drawlist-snapshot.patch"
+LEGACY_LOCK = REPO / "third_party/renderdoc-drawlist-snapshot-v1.lock.json"
+LEGACY_PATCH = REPO / "third_party/renderdoc-drawlist-snapshot-v1.patch"
 TARGETS = {
     **{f"renderdoc/driver/gl/{name}.cpp": f"renderdoc/driver/gl/CMakeFiles/rdoc_gl.dir/{name}.cpp.o"
        for name in ("gl_driver", "gl_replay", "gl_resources", "gl_initstate")},
@@ -36,8 +39,23 @@ CHANGED_EXISTING = set(TARGETS) | {
     "renderdoc/driver/gl/gl_driver.h", "renderdoc/driver/gl/gl_replay.h",
     "renderdoc/driver/gl/gl_manager.h", "renderdoc/replay/replay_controller.h",
 }
+V2_TARGETS = dict(TARGETS, **{
+    f"renderdoc/driver/gl/{name}.cpp": f"renderdoc/driver/gl/CMakeFiles/rdoc_gl.dir/{name}.cpp.o"
+    for name in ("gl_debug", "gl_common", "gl_renderstate")
+})
+V2_CHANGED_EXISTING = CHANGED_EXISTING | set(V2_TARGETS) | {"renderdoc/driver/gl/gl_renderstate.h"}
 ADDED = {"renderdoc/replay/replay_snapshot.h", "renderdoc/replay/replay_snapshot_api.inl",
          "renderdoc/driver/gl/gl_replay_snapshot.inl", "renderdoc/driver/gl/gl_snapshot_codec_safety.inl"}
+
+
+def targets_for(lock: dict) -> dict[str, str]:
+    require(lock.get("schema") in (LOCK_SCHEMA, V2_LOCK_SCHEMA), "unsupported snapshot source-lock schema")
+    return V2_TARGETS if lock["schema"] == V2_LOCK_SCHEMA else TARGETS
+
+
+def existing_for(lock: dict) -> set[str]:
+    targets_for(lock)
+    return V2_CHANGED_EXISTING if lock["schema"] == V2_LOCK_SCHEMA else CHANGED_EXISTING
 
 
 def command_output(args: list[str], cwd: Path | None = None) -> str:
@@ -81,15 +99,15 @@ def source_hash(path: Path) -> str:
 
 def load_lock(path: Path, patch: Path) -> dict:
     lock = read_json(path)
-    require(lock.get("schema") == LOCK_SCHEMA, "unsupported snapshot source-lock schema")
+    existing = existing_for(lock)
     head = lock.get("source_git_head")
     require(isinstance(head, str) and len(head) == 40 and all(c in "0123456789abcdef" for c in head),
             "invalid locked Git HEAD")
     digest_string(lock.get("baseline_tracked_tree_sha256"), "baseline source tree SHA-256")
     require(file_identity(patch)["sha256"] == lock.get("patch_sha256"), "snapshot patch hash mismatch")
     files = lock.get("files")
-    require(isinstance(files, dict) and set(files) == CHANGED_EXISTING | ADDED,
-            "lock must describe exactly the nine existing and four new snapshot files")
+    require(isinstance(files, dict) and set(files) == existing | ADDED,
+            "lock must describe exactly its version's existing and four new snapshot files")
     for name, entry in files.items():
         relative_name(name)
         require(isinstance(entry, dict), f"invalid lock entry: {name}")
@@ -101,24 +119,32 @@ def load_lock(path: Path, patch: Path) -> dict:
     return lock
 
 
-def inspect_source(source: Path, lock: dict, git: str) -> tuple[list[str], dict[str, str]]:
+def inspect_source(source: Path, lock: dict, git: str, legacy: dict | None = None
+                   ) -> tuple[list[str], dict[str, str]]:
     require(command_output([git, "-C", str(source), "rev-parse", "HEAD"]).strip() == lock["source_git_head"],
             "RenderDoc source Git HEAD does not match lock")
     names, others = source_names(source, git)
-    require(CHANGED_EXISTING <= set(names), "baseline tracked source is incomplete")
+    existing = existing_for(lock)
+    require(existing <= set(names), "baseline tracked source is incomplete")
     require(not (set(names) & ADDED), "snapshot additions unexpectedly tracked in baseline tree")
     require(others <= ADDED, "unknown untracked RenderDoc source files: " + ", ".join(sorted(others - ADDED)))
     hashes = {name: source_hash(source / name) for name in names}
     normalized = dict(hashes)
-    for name in CHANGED_EXISTING:
+    for name in existing:
         entry = lock["files"][name]
-        require(hashes[name] in (entry["base_sha256"], entry["patched_sha256"]), f"unrecognized source bytes: {name}")
+        recognized = {entry["base_sha256"], entry["patched_sha256"]}
+        if legacy and name in legacy["files"]:
+            recognized.add(legacy["files"][name]["patched_sha256"])
+        require(hashes[name] in recognized, f"unrecognized source bytes: {name}")
         normalized[name] = entry["base_sha256"]
     for name in ADDED:
         path = source / name
         if path.exists() or path.is_symlink():
             hashes[name] = source_hash(path)
-            require(hashes[name] == lock["files"][name]["patched_sha256"], f"unrecognized added source bytes: {name}")
+            recognized = {lock["files"][name]["patched_sha256"]}
+            if legacy:
+                recognized.add(legacy["files"][name]["patched_sha256"])
+            require(hashes[name] in recognized, f"unrecognized added source bytes: {name}")
     require(tree_digest(normalized) == lock["baseline_tracked_tree_sha256"],
             "normalized tracked source differs from pinned Mesa/vendor baseline")
     return names, hashes
@@ -141,7 +167,8 @@ def patch_names(patch: Path, git: str) -> set[str]:
 
 
 def prepare_overlay(source: Path, overlay: Path, names: list[str], hashes: dict[str, str],
-                    lock: dict, patch: Path, git: str) -> None:
+                    lock: dict, patch: Path, git: str,
+                    legacy: tuple[dict, Path] | None = None) -> None:
     require(patch_names(patch, git) == set(lock["files"]), "patch file set differs from lock")
     overlay.mkdir()
     # Ensure Git never discovers an unrelated ancestor worktree and applies a
@@ -152,12 +179,17 @@ def prepare_overlay(source: Path, overlay: Path, names: list[str], hashes: dict[
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source / name, destination, follow_symlinks=False)
         require(source_hash(destination) == hashes[name], f"source changed during overlay copy: {name}")
-    # Both clean-baseline and already-patched source trees are supported. Mixed
-    # exact files also normalize independently; arbitrary partial edits refuse.
+    # Normalize exact current/legacy patched files with THEIR matching patch,
+    # exclusively in this new overlay. Never reverse a v1 file with a v2 diff.
+    # Arbitrary partial edits or unrecognized combinations still refuse.
     for name in sorted(lock["files"]):
-        entry = lock["files"][name]
-        if hashes.get(name) == entry["patched_sha256"]:
-            command_output([git, "apply", "--reverse", "--include=" + name, str(patch)], cwd=overlay)
+        variants = [(lock, patch)] + ([legacy] if legacy else [])
+        for variant, variant_patch in variants:
+            entry = variant["files"].get(name)
+            if entry and hashes.get(name) == entry["patched_sha256"]:
+                command_output([git, "apply", "--reverse", "--include=" + name,
+                                str(variant_patch)], cwd=overlay)
+                break
     normalized = {name: source_hash(overlay / name) for name in names}
     require(tree_digest(normalized) == lock["baseline_tracked_tree_sha256"], "private reverse patch did not restore baseline")
     require(not any((overlay / name).exists() for name in ADDED), "private reverse patch retained added files")
@@ -262,6 +294,24 @@ def build(args: argparse.Namespace) -> Path:
     lock_path, patch = safe_path(args.lock), safe_path(args.patch)
     lock_identity, patch_identity = file_identity(lock_path), file_identity(patch)
     lock = load_lock(lock_path, patch)
+    targets = targets_for(lock)
+    legacy = None
+    legacy_identities = []
+    if lock["schema"] == V2_LOCK_SCHEMA:
+        legacy_paths = (safe_path(args.legacy_lock), safe_path(args.legacy_patch))
+        legacy_identities = [file_identity(path) for path in legacy_paths]
+        legacy_lock = load_lock(*legacy_paths)
+        require(legacy_lock["schema"] == LOCK_SCHEMA and
+                legacy_lock["source_git_head"] == lock["source_git_head"] and
+                legacy_lock["baseline_tracked_tree_sha256"] == lock["baseline_tracked_tree_sha256"],
+                "legacy normalization lock must describe the same v1 baseline")
+        require(all(legacy_lock["files"][name]["base_sha256"] == lock["files"][name]["base_sha256"]
+                    for name in legacy_lock["files"]), "legacy normalization baseline file mismatch")
+        require(patch_names(legacy_paths[1], args.git) == set(legacy_lock["files"]),
+                "legacy normalization patch file set differs from lock")
+        require([file_identity(path) for path in legacy_paths] == legacy_identities,
+                "legacy normalization inputs changed during preflight")
+        legacy = (legacy_lock, legacy_paths[1])
     require(file_identity(lock_path) == lock_identity and file_identity(patch) == patch_identity,
             "snapshot patch/lock changed during preflight")
     git = executable_identity(args.git)
@@ -270,13 +320,13 @@ def build(args: argparse.Namespace) -> Path:
     values = [line.split("=", 1)[1] for line in cache.read_text().splitlines()
               if line.startswith("CMAKE_HOME_DIRECTORY:INTERNAL=")]
     require(len(values) == 1 and safe_path(values[0]) == source, "Ninja build was configured for a different source")
-    names, source_before = inspect_source(source, lock, git["path"])
+    names, source_before = inspect_source(source, lock, git["path"], legacy[0] if legacy else None)
     libraries = [p for p in (base / "lib/librenderdoc.dylib", base / "lib/librenderdoc.so") if p.is_file()]
     require(len(libraries) == 1, "expected one existing base RenderDoc shared library")
     original_library = libraries[0]
     library_target = original_library.relative_to(base).as_posix()
     commands, raw_queries = {}, {}
-    for name, target in TARGETS.items():
+    for name, target in targets.items():
         commands[name], raw_queries[target] = query_command(ninja["path"], base, target)
         original = commands[name]
         require((base / original[option(original, "-c")]).resolve() == source / name,
@@ -294,7 +344,7 @@ def build(args: argparse.Namespace) -> Path:
             protected.add(base / name)
     for command in [*commands.values(), link]:
         protected.update(protected_inputs(command, base))
-    protected.update(base / target for target in TARGETS.values())
+    protected.update(base / target for target in targets.values())
     before = {str(path): source_hash(path) for path in sorted(protected)}
     out.mkdir(mode=0o700)
     for name in ("objects", "lib", "logs"):
@@ -306,20 +356,28 @@ def build(args: argparse.Namespace) -> Path:
                                             (patch, private_patch, patch_identity)):
         shutil.copy2(original, destination, follow_symlinks=False)
         require(source_hash(destination) == identity["sha256"], "patch/lock changed during private copy")
+    private_legacy_identities = []
+    if legacy:
+        for identity, filename in zip(legacy_identities, ("legacy-source-lock.json", "legacy-source.patch")):
+            destination = out / filename
+            shutil.copy2(identity["path"], destination, follow_symlinks=False)
+            require(source_hash(destination) == identity["sha256"], "legacy patch/lock changed during private copy")
+            private_legacy_identities.append(file_identity(destination))
+        legacy = (legacy[0], out / "legacy-source.patch")
     overlay = out / "source"
-    prepare_overlay(source, overlay, names, source_before, lock, private_patch, git["path"])
+    prepare_overlay(source, overlay, names, source_before, lock, private_patch, git["path"], legacy)
     library = out / "lib" / ("librenderdoc-drawlist-snapshot" + original_library.suffix)
     private_commands = {}
     replacements = {}
     for name, original in commands.items():
         command = [relocate_source_argument(arg, source, overlay, base) for arg in original]
-        target = out / "objects" / Path(TARGETS[name]).name
+        target = out / "objects" / Path(targets[name]).name
         command[option(command, "-o")] = str(target)
         command[option(command, "-MF")] = str(target) + ".d"
         command[option(command, "-MT")] = str(target)
         require(str(source) not in "\n".join(command), "compiler still references mutable source tree")
         private_commands[name] = command
-        replacements[(base / TARGETS[name]).resolve()] = target
+        replacements[(base / targets[name]).resolve()] = target
     private_link = [relocate_source_argument(arg, source, overlay, base) for arg in link]
     private_link[option(private_link, "-o")] = str(library)
     if original_library.suffix == ".dylib":
@@ -333,12 +391,13 @@ def build(args: argparse.Namespace) -> Path:
         resolved = (base / arg).resolve()
         if resolved in replacements:
             private_link[i] = str(replacements[resolved]); replaced.add(resolved)
-    require(replaced == set(replacements), "shared library does not directly link all five changed objects")
+    require(replaced == set(replacements), "shared library does not directly link all changed objects")
     receipt = {"schema": "pvrgpu.renderdoc-snapshot-build.v1", "status": "started",
         "source": str(source), "source_git_head": lock["source_git_head"], "base_build": str(base),
         "overlay": str(overlay), "baseline_tracked_tree_sha256": lock["baseline_tracked_tree_sha256"],
         "source_input_tree_sha256": tree_digest(source_before), "source_file_sha256": source_before,
         "lock": lock_identity, "patch": patch_identity,
+        "legacy_inputs": legacy_identities, "private_legacy_inputs": private_legacy_identities,
         "private_lock": file_identity(private_lock), "private_patch": file_identity(private_patch),
         "builder_sources": [file_identity(REPO / name) for name in
                             ("script/build_renderdoc_snapshot.py", "script/build_renderdoc_snapshot.sh",
@@ -367,7 +426,7 @@ def build(args: argparse.Namespace) -> Path:
     except Exception as error:
         failure = str(error)
     # Even compilation failure retains the no-shared-mutation evidence.
-    _, source_after = inspect_source(source, lock, git["path"])
+    _, source_after = inspect_source(source, lock, git["path"], legacy[0] if legacy else None)
     after = {str(path): source_hash(path) for path in sorted(protected)}
     require(source_after == source_before, "source changed while private snapshot build was running")
     require(after == before, "shared build input/output changed while private build was running")
@@ -377,6 +436,8 @@ def build(args: argparse.Namespace) -> Path:
             "snapshot patch/lock changed during compilation")
     for identity in [receipt["private_lock"], receipt["private_patch"], *receipt["builder_sources"]]:
         require(file_identity(Path(identity["path"])) == identity, "private provenance/builder source changed during compilation")
+    for identity in legacy_identities + private_legacy_identities:
+        require(file_identity(Path(identity["path"])) == identity, "legacy normalization input changed during compilation")
     receipt.update(status="FAIL" if failure else "PASS", source_unchanged=True, shared_outputs_unchanged=True)
     if failure:
         receipt["error"] = failure
@@ -395,6 +456,10 @@ def main() -> int:
     parser.add_argument("outdir", metavar="OUTDIR")
     parser.add_argument("--lock", default=str(DEFAULT_LOCK))
     parser.add_argument("--patch", default=str(DEFAULT_PATCH))
+    parser.add_argument("--legacy-lock", default=str(LEGACY_LOCK),
+                        help="exact v1 lock used only to normalize v1-patched input for a v2 build")
+    parser.add_argument("--legacy-patch", default=str(LEGACY_PATCH),
+                        help="matching v1 patch; reversed only in the new private overlay")
     parser.add_argument("--jobs", type=int, default=2, choices=(1, 2))
     parser.add_argument("--ninja", default="ninja")
     parser.add_argument("--git", default="git")

@@ -2317,6 +2317,63 @@ pvrgpu_emit_unsupported_blit(struct pipe_context *pipe,
 }
 
 static bool
+pvrgpu_format_is_32bit_texture_view_class(enum pipe_format format)
+{
+   /*
+    * GL_{EXT,OES}_texture_view's VIEW_CLASS_32_BITS table.  These formats
+    * have identical one-texel/one-dword storage even though their component
+    * interpretations differ.  glCopyImageSubData validates view-class
+    * compatibility before Gallium reaches resource_copy_region, so retaining
+    * the explicit class here lets the driver perform the required raw-bit
+    * copy without accidentally enabling arbitrary same-sized conversions.
+    */
+   switch (format) {
+   case PIPE_FORMAT_R16G16_FLOAT:
+   case PIPE_FORMAT_R11G11B10_FLOAT:
+   case PIPE_FORMAT_R32_FLOAT:
+   case PIPE_FORMAT_R10G10B10A2_UINT:
+   case PIPE_FORMAT_R8G8B8A8_UINT:
+   case PIPE_FORMAT_R16G16_UINT:
+   case PIPE_FORMAT_R32_UINT:
+   case PIPE_FORMAT_R8G8B8A8_SINT:
+   case PIPE_FORMAT_R16G16_SINT:
+   case PIPE_FORMAT_R32_SINT:
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R16G16_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_SNORM:
+   case PIPE_FORMAT_R16G16_SNORM:
+   case PIPE_FORMAT_R8G8B8A8_SRGB:
+   case PIPE_FORMAT_R9G9B9E5_FLOAT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+pvrgpu_texture_copy_formats_are_raw_compatible(enum pipe_format dst,
+                                                enum pipe_format src)
+{
+   if (dst == src)
+      return true;
+
+   const struct util_format_description *dst_desc =
+      util_format_description(dst);
+   const struct util_format_description *src_desc =
+      util_format_description(src);
+   return pvrgpu_format_is_32bit_texture_view_class(dst) &&
+          pvrgpu_format_is_32bit_texture_view_class(src) &&
+          dst_desc && src_desc &&
+          dst_desc->block.width == 1 && dst_desc->block.height == 1 &&
+          dst_desc->block.depth == 1 && dst_desc->block.bits == 32 &&
+          src_desc->block.width == dst_desc->block.width &&
+          src_desc->block.height == dst_desc->block.height &&
+          src_desc->block.depth == dst_desc->block.depth &&
+          src_desc->block.bits == dst_desc->block.bits;
+}
+
+static bool
 pvrgpu_can_copy_texture_region(struct pipe_resource *dst,
                                unsigned dst_level,
                                unsigned dstx,
@@ -2332,7 +2389,8 @@ pvrgpu_can_copy_texture_region(struct pipe_resource *dst,
       return false;
    if (dst->target != src->target)
       return false;
-   if (dst->format != src->format)
+   if (!pvrgpu_texture_copy_formats_are_raw_compatible(dst->format,
+                                                       src->format))
       return false;
    if (pvrgpu_resource_storage_sample_count(dst) !=
        pvrgpu_resource_storage_sample_count(src) ||
@@ -2514,7 +2572,7 @@ pvrgpu_resource_copy_region(struct pipe_context *pipe,
                                        src, src_level, src_box)) {
       pvrgpu_emit_unsupported_resource_copy_region(
          pipe,
-         "buffer-or-2d-level0-same-format-only",
+         "buffer-or-texture-raw-compatible-only",
          dst,
          dst_level,
          dstx,

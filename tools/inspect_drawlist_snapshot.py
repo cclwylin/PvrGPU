@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only inventory/digest inspector for RDGLSN01 functional checkpoints.
+"""Read-only inventory/digest inspector for RDGLSN01/RDGLSN02 checkpoints.
 
 This validates the outer envelope, not the GL codec's semantic compatibility.
 Only the snapshot extension's bounded preflight and complete live read-back
@@ -57,7 +57,8 @@ def inspect(path: Path) -> dict:
         raw = stream.read(info.st_size + 1)
         if len(raw) != info.st_size:
             raise ValueError("snapshot size changed while reading")
-    if raw[:8] != b"RDGLSN01":
+    versions = {b"RDGLSN01": 1, b"RDGLSN02": 2}
+    if raw[:8] not in versions:
         raise ValueError("snapshot magic/version mismatch")
     payload = memoryview(raw)[48:]
     if struct.unpack_from("<Q", raw, 8)[0] != len(payload):
@@ -69,10 +70,13 @@ def inspect(path: Path) -> dict:
     if len(capture) != 64 or any(c not in "0123456789abcdef" for c in capture):
         raise ValueError("invalid capture SHA-256")
     result = {"schema": "pvrgpu.drawlist-snapshot-inventory.v1", "capture_sha256": capture,
+              "snapshot_api_version": versions[raw[:8]],
               "section_version": reader.u64(), "event": reader.u64(),
               "next_chunk_offset": reader.u64(), "vendor": reader.text(),
               "renderer": reader.text(), "version": reader.text()}
-    context = reader.blob(65536)
+    # V2 wraps the same bounded native GL state in 48 bytes of typed context
+    # metadata (renderbuffer selector and optional pack-direction state).
+    context = reader.blob(65536 + (48 if result["snapshot_api_version"] == 2 else 0))
     result["context_state_sha256"] = digest(context)
     result["pack"] = [reader.u64() for _ in range(12)]
     result["unpack"] = [reader.u64() for _ in range(12)]

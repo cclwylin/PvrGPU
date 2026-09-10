@@ -25,7 +25,8 @@ SNAPSHOT_SCHEMA = "pvrgpu.drawlist-snapshot.v1"
 REPLAY_SCHEMA = "pvrgpu.drawlist-replay.v1"
 RUNTIME_SCHEMA = "pvrgpu.drawlist-runtime.v2"
 LEGACY_RUNTIME_SCHEMA = "pvrgpu.drawlist-runtime.v1"
-API_VERSION = 1
+SUPPORTED_API_VERSIONS = (1, 2)
+ARCHIVE_VERSIONS = {b"RDGLSN01": 1, b"RDGLSN02": 2}
 SEMANTICS = "functional-state-cold-cache; prefix timing/counters not restored"
 RUNTIME_FILES = ("player", "renderdoc", "gallium", "dri_loader", "egl", "gles", "bridge")
 
@@ -91,6 +92,17 @@ def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         require(key not in result, f"duplicate JSON field: {key}")
         result[key] = value
     return result
+
+
+def archive_api_version(path: Path) -> int:
+    # Only identify the envelope version here, not its codec correctness. The
+    # selected engine still preflights every blob and verifies the live restore.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    with os.fdopen(os.open(safe_path(path), flags), "rb") as stream:
+        require(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), "snapshot state must be regular")
+        magic = stream.read(8)
+    require(magic in ARCHIVE_VERSIONS, "unsupported snapshot archive magic/version")
+    return ARCHIVE_VERSIONS[magic]
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -192,7 +204,8 @@ def validate_boundary(value: Any) -> dict[str, Any]:
 
 def validate_receipt(receipt: Any, *, backend: str, capture: dict[str, Any],
                      state: dict[str, Any], draw: int, resume_event: int | None,
-                     resume_boundary: dict[str, Any] | None = None) -> dict[str, Any]:
+                     resume_boundary: dict[str, Any] | None = None,
+                     api_version: int | None = None) -> dict[str, Any]:
     require(isinstance(receipt, dict), "missing engine receipt")
     expected = {
         "schema": REPLAY_SCHEMA, "status": "snapshot_saved", "backend": backend,
@@ -203,8 +216,10 @@ def validate_receipt(receipt: Any, *, backend: str, capture: dict[str, Any],
     for key, value in expected.items():
         require(receipt.get(key) == value, f"engine receipt mismatch: {key}")
     require(type(receipt.get("snapshot_api_version")) is int and
-            receipt["snapshot_api_version"] == API_VERSION,
-            "unsupported snapshot library/API version (required version 1)")
+            receipt["snapshot_api_version"] in SUPPORTED_API_VERSIONS,
+            "unsupported snapshot library/API version (required version 1 or 2)")
+    require(api_version is None or receipt["snapshot_api_version"] == api_version,
+            "snapshot ABI changed across manifest/receipt or resume; recreate the checkpoint")
     for key, value in (("context_finished", True), ("cold_cache", True),
                        ("native_prefix_replayed", False),
                        ("snapshot_restore_verified", resume_event is not None)):
@@ -260,7 +275,8 @@ def load_resume(args: argparse.Namespace, capture: dict[str, Any], current: dict
     manifest = read_json(directory / "manifest.json")
     require(manifest.get("schema") == SNAPSHOT_SCHEMA, "unsupported snapshot manifest schema")
     require(type(manifest.get("snapshot_api_version")) is int and
-            manifest["snapshot_api_version"] == API_VERSION, "unsupported snapshot manifest ABI")
+            manifest["snapshot_api_version"] in SUPPORTED_API_VERSIONS,
+            "unsupported snapshot manifest ABI")
     require(manifest.get("backend") == args.backend, "snapshot backend mismatch")
     require(manifest.get("cold_cache") is True and manifest.get("semantics") == SEMANTICS and
             manifest.get("native_prefix_replayed") is False, "unsupported snapshot execution semantics")
@@ -278,6 +294,8 @@ def load_resume(args: argparse.Namespace, capture: dict[str, Any], current: dict
     actual_state = file_identity(directory / "state.bin", single_link=True)
     require(type(state.get("size_bytes")) is int and state["size_bytes"] == actual_state["size_bytes"] and
             state.get("sha256") == actual_state["sha256"], "snapshot state hash/size mismatch")
+    require(archive_api_version(directory / "state.bin") == manifest["snapshot_api_version"],
+            "snapshot archive/manifest ABI mismatch; recreate the checkpoint")
     saved_runtime = manifest.get("runtime")
     require(isinstance(saved_runtime, dict), "missing snapshot runtime")
     require(saved_runtime.get("schema") in (RUNTIME_SCHEMA, LEGACY_RUNTIME_SCHEMA),
@@ -313,7 +331,8 @@ def load_resume(args: argparse.Namespace, capture: dict[str, Any], current: dict
     identity_shape(receipt_state, "original state")
     verified = validate_receipt(receipt, backend=args.backend, capture=source,
                                 state=receipt_state, draw=boundary["after_draw"],
-                                resume_event=manifest.get("resumed_from_event"))
+                                resume_event=manifest.get("resumed_from_event"),
+                                api_version=manifest["snapshot_api_version"])
     require(verified == boundary, "manifest boundary does not match saved engine receipt")
     digest_string(manifest.get("engine_receipt_sha256"), "engine receipt sha256")
     require(hashlib.sha256(json_bytes(receipt)).hexdigest() == manifest["engine_receipt_sha256"],
@@ -376,7 +395,7 @@ def run_child(command: list[str], env: dict[str, str], out: Path, timeout: float
                     process.kill()
                 process.wait()
             raise ReplayError("player timed out/interrupted; no snapshot committed") from error
-    require(code == 0, f"player exited {code}; inspect {out / 'stderr.log'} (unsupported snapshot library must fail)")
+    require(code == 0, f"player exited {code}; inspect {out / 'stderr.log'}")
 
 
 def execute(args: argparse.Namespace) -> Path:
@@ -422,10 +441,14 @@ def execute(args: argparse.Namespace) -> Path:
     receipt = read_json(receipt_path)
     boundary = validate_receipt(receipt, backend=args.backend, capture=capture, state=state,
                                 draw=args.through_draw, resume_event=resume_event,
-                                resume_boundary=previous["boundary"] if previous else None)
+                                resume_boundary=previous["boundary"] if previous else None,
+                                api_version=previous["snapshot_api_version"] if previous else None)
+    require(archive_api_version(state_path) == receipt["snapshot_api_version"],
+            "snapshot archive/receipt ABI mismatch; no snapshot committed")
     color = verify_color(receipt, out / "color.rgba") if args.verify_color else None
     manifest = {
-        "schema": SNAPSHOT_SCHEMA, "snapshot_api_version": API_VERSION, "backend": args.backend,
+        "schema": SNAPSHOT_SCHEMA, "snapshot_api_version": receipt["snapshot_api_version"],
+        "backend": args.backend,
         "source_capture": capture, "runtime": current, "boundary": boundary,
         "state": dict(state, path="state.bin"), "resumed_from_event": resume_event,
         "cold_cache": True, "semantics": SEMANTICS, "native_prefix_replayed": False,

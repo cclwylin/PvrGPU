@@ -2096,6 +2096,10 @@ if(Python3_Interpreter_FOUND)
         COMMAND "${CMAKE_COMMAND}" -E env
                 "PYTHONDONTWRITEBYTECODE=1"
                 "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_inspect_drawlist_snapshot.py")
+    add_test(NAME drawlist-snapshot-rejection-test
+        COMMAND "${CMAKE_COMMAND}" -E env
+                "PYTHONDONTWRITEBYTECODE=1"
+                "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_drawlist_snapshot_rejection.py")
     add_test(NAME rdc-native-runner-process-test
         COMMAND "${CMAKE_COMMAND}" -E env
                 "PYTHONDONTWRITEBYTECODE=1"

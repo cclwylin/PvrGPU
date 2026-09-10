@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build focused resource/clear tests with an existing Mesa build's actual
 # compiler configuration. Generated executables stay outside the source tree.
-# Usage: bash script/run_mesa_resource_unit.sh [all|blit|clear|ubo|push-map|compute|surface|vertex|command|texture|boundary|flush|depth-upload|payload-budget|native-present|packed-load|packed-store|packed-descriptor]
+# Usage: bash script/run_mesa_resource_unit.sh [all|blit|clear|ubo|push-map|compute|surface|vertex|command|texture|boundary|flush|depth-upload|view-copy|payload-budget|native-present|packed-load|packed-store|packed-descriptor]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,8 +24,8 @@ abort 'Mesa test build/output must be outside the source tree' if
   [build, output].any? { |path| path == repo || path.start_with?(repo + '/') }
 database = JSON.parse(File.read(File.join(build, 'compile_commands.json')))
 selected = ARGV.fetch(0)
-abort 'usage: run_mesa_resource_unit.sh [all|blit|clear|ubo|push-map|compute|surface|vertex|command|texture|boundary|flush|depth-upload|payload-budget|native-present|packed-load|packed-store|packed-descriptor]' unless
-  %w[all blit clear ubo push-map compute surface vertex command texture boundary flush depth-upload payload-budget native-present packed-load packed-store packed-descriptor].include?(selected)
+abort 'usage: run_mesa_resource_unit.sh [all|blit|clear|ubo|push-map|compute|surface|vertex|command|texture|boundary|flush|depth-upload|view-copy|payload-budget|native-present|packed-load|packed-store|packed-descriptor]' unless
+  %w[all blit clear ubo push-map compute surface vertex command texture boundary flush depth-upload view-copy payload-budget native-present packed-load packed-store packed-descriptor].include?(selected)
 tests = { 'blit' => ['pvrgpu_resource.c', 'pvrgpu_msaa_blit_test.c'],
           'clear' => ['pvrgpu_clear.c', 'pvrgpu_clear_storage_test.c'],
           'ubo' => ['pvrgpu_context.c', 'pvrgpu_uniform_buffer_snapshot_test.c'],
@@ -39,6 +39,7 @@ tests = { 'blit' => ['pvrgpu_resource.c', 'pvrgpu_msaa_blit_test.c'],
           'packed-store' => ['pvrgpu_resource.c', 'pvrgpu_packed_color_store_test.c'],
           'packed-descriptor' => ['pvrgpu_pco.c', 'pvrgpu_packed_color_descriptor_test.c'],
           'depth-upload' => ['pvrgpu_resource.c', 'pvrgpu_depth_upload_copy_test.c'],
+          'view-copy' => ['pvrgpu_resource.c', 'pvrgpu_texture_view_raw_copy_test.c'],
           'payload-budget' => ['pvrgpu_context.c', 'pvrgpu_payload_budget_test.c'],
           'vertex' => ['pvrgpu_context.c', 'pvrgpu_vertex_attribute_fetch_test.c'],
           'texture' => ['pvrgpu_context.c', 'pvrgpu_texture_view_snapshot_test.c'],

@@ -21,14 +21,15 @@ def blob(value):
     return u64(len(value)) + value
 
 
-def archive(records=None):
+def archive(records=None, version=1, context=b"opaque-context"):
     records = [(9, 2)] if records is None else records
     payload = blob(b"a" * 64) + u64(36) + u64(12) + u64(256)
-    payload += b"".join(blob(text) for text in (b"vendor", b"renderer", b"version", b"opaque-context"))
+    payload += b"".join(blob(text) for text in (b"vendor", b"renderer", b"version", context))
     payload += u64(0) * 25 + u64(len(records))
     for identity, namespace in records:
         payload += u64(identity) + u64(namespace) + blob(b"signature") + u64(0) + blob(b"opaque-resource")
-    return b"RDGLSN01" + u64(len(payload)) + hashlib.sha256(payload).digest() + payload
+    magic = {1: b"RDGLSN01", 2: b"RDGLSN02"}[version]
+    return magic + u64(len(payload)) + hashlib.sha256(payload).digest() + payload
 
 
 class SnapshotInspectorTests(unittest.TestCase):
@@ -50,7 +51,30 @@ class SnapshotInspectorTests(unittest.TestCase):
         self.assertEqual(result["archive_sha256"], hashlib.sha256(data).hexdigest())
         self.assertEqual(result["resource_count"], 1)
         self.assertEqual(result["resources"][0]["id"], 9)
+        self.assertEqual(result["snapshot_api_version"], 1)
         self.assertIn("not a restoration receipt", result["verification"])
+
+    def test_v2_keeps_distinct_archive_version_and_outer_only_contract(self):
+        result = self.inspect(archive(version=2))
+        self.assertEqual(result["snapshot_api_version"], 2)
+        self.assertEqual(result["resource_count"], 1)
+        self.assertIn("not a restoration receipt", result["verification"])
+
+    def test_unknown_archive_version_is_refused(self):
+        data = bytearray(archive())
+        data[7] = ord("3")
+        with self.assertRaisesRegex(ValueError, "magic/version"):
+            self.inspect(data)
+
+    def test_versioned_outer_context_limit(self):
+        for version, limit in ((1, 65536), (2, 65536 + 48)):
+            with self.subTest(version=version):
+                self.assertEqual(self.inspect(archive(version=version, context=b"x" * limit))
+                                 ["snapshot_api_version"], version)
+                with self.assertRaisesRegex(ValueError, "exceeds limit"):
+                    self.inspect(archive(version=version, context=b"x" * (limit + 1)))
+        with self.assertRaisesRegex(ValueError, "exceeds limit"):
+            self.inspect(archive(version=1, context=b"x" * (65536 + 48)))
 
     def test_truncated_outer_envelope(self):
         for count in (0, 7, 20, 47, 48, 100):

@@ -53,7 +53,9 @@ capture = p(v.capture)
 state = p(v.state_out)
 receipt_path = p(v.receipt_out)
 previous = p(v.state_in).read_bytes() if v.state_in else b'initial'
-payload = b'fake opaque full-state test data\0' + previous + str(v.stop_after_draw).encode()
+version = mode.get('state_api_version', mode.get('receipt', {}).get('snapshot_api_version', 1))
+magic = {1: b'RDGLSN01', 2: b'RDGLSN02'}.get(version, b'RDGLSN99')
+payload = magic + b'fake opaque full-state test data\0' + previous + str(v.stop_after_draw).encode()
 if mode.get('state_symlink'):
     state.symlink_to(capture)
 elif mode.get('state_hardlink'):
@@ -226,7 +228,7 @@ class DrawListReplayCliTest(unittest.TestCase):
             "schema": "pvrgpu.drawlist-replay.v99", "status": "PASS", "backend": "llvmpipe",
             "capture_path": "/other.rdc", "state_path": "/outside/state.bin",
             "source_capture_sha256": "0" * 64, "snapshot_state_sha256": "0" * 64,
-            "snapshot_api_version": 2, "after_draw": 148, "after_event": -1,
+            "snapshot_api_version": 3, "after_draw": 148, "after_event": -1,
             "next_event": None, "capture_last_event": 1, "trace_draw_actions": 1,
             "resumed_from_event": 10, "native_prefix_replayed": True,
             "context_finished": False, "api_errors": 1, "snapshot_restore_verified": True,
@@ -297,6 +299,58 @@ class DrawListReplayCliTest(unittest.TestCase):
             self.failed(result, out, "runtime changed:")
             artifact.write_bytes(before)
         self.assertEqual(len(self.calls()), 2)
+
+    def test_v2_abi_is_preserved_through_fresh_process_chain(self) -> None:
+        self.control({"receipt": {"snapshot_api_version": 2}})
+        first, a = self.save()
+        second, b = self.save(148, resume=first)
+        _, c = self.save(149, resume=second)
+        for manifest in (a, b, c):
+            self.assertEqual(manifest["snapshot_api_version"], 2)
+            self.assertEqual(manifest["engine_receipt"]["snapshot_api_version"], 2)
+        self.assertEqual(c["resumed_from_event"], b["boundary"]["after_event"])
+
+    def test_resume_cannot_switch_codec_abi_even_with_bridge_acknowledgement(self) -> None:
+        for saved, changed in ((1, 2), (2, 1)):
+            with self.subTest(saved=saved, changed=changed):
+                self.control({"receipt": {"snapshot_api_version": saved}})
+                first, _ = self.save()
+                self.control({"receipt": {"snapshot_api_version": changed}})
+                result, out = self.run_cli(148, resume=first,
+                                          extra=("--allow-model-change",))
+                self.failed(result, out, "snapshot ABI changed")
+                self.assertFalse((out / "snapshot" / "manifest.json").exists())
+
+    def test_manifest_cannot_relabel_legacy_receipt_as_v2(self) -> None:
+        first, manifest = self.save()
+        manifest["snapshot_api_version"] = 2
+        (first / "manifest.json").write_text(json.dumps(manifest))
+        result, out = self.run_cli(148, resume=first)
+        self.failed(result, out, "archive/manifest ABI mismatch")
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_archive_magic_must_match_reported_abi(self) -> None:
+        for reported, actual in ((1, 2), (2, 1)):
+            with self.subTest(reported=reported, actual=actual):
+                self.control({"receipt": {"snapshot_api_version": reported},
+                              "state_api_version": actual})
+                result, out = self.run_cli()
+                self.failed(result, out, "archive/receipt ABI mismatch")
+                self.assertFalse((out / "snapshot" / "manifest.json").exists())
+
+    def test_matching_manifest_magic_cannot_disguise_legacy_engine_receipt(self) -> None:
+        first, manifest = self.save()
+        state = b"RDGLSN02" + (first / "state.bin").read_bytes()[8:]
+        (first / "state.bin").write_bytes(state)
+        manifest["snapshot_api_version"] = 2
+        manifest["state"]["sha256"] = hashlib.sha256(state).hexdigest()
+        manifest["engine_receipt"]["snapshot_state_sha256"] = manifest["state"]["sha256"]
+        manifest["engine_receipt_sha256"] = hashlib.sha256(
+            MODULE.json_bytes(manifest["engine_receipt"])).hexdigest()
+        (first / "manifest.json").write_text(json.dumps(manifest))
+        result, out = self.run_cli(148, resume=first)
+        self.failed(result, out, "snapshot ABI changed")
+        self.assertEqual(len(self.calls()), 1)
 
     def test_gles_version_is_explicit_and_pinned_across_resume(self) -> None:
         dirty = dict(os.environ, MESA_GLES_VERSION_OVERRIDE="9.9")
