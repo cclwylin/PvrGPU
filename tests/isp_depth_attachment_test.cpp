@@ -35,6 +35,13 @@ std::uint32_t FloatBits(float value) {
   return bits;
 }
 
+float BitsFloat(std::uint32_t bits) {
+  float value = 0.0F;
+  static_assert(sizeof(value) == sizeof(bits));
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
 struct CasePayload {
   PoolHandle state;
   PipelineTxn txn;
@@ -430,6 +437,29 @@ void CheckFloatDepthCodecs() {
         "float-stencil reads exact planes and ignores undefined X24 padding");
 }
 
+void CheckD24DepthCodecRounding() {
+  // These values make the binary32 product land exactly on adjacent .5
+  // boundaries. The first one distinguishes llvmpipe's rounded float
+  // multiply from a higher-precision multiply followed by integer rounding;
+  // the pair also verifies round-to-nearest-even in both directions.
+  const float even_tie = BitsFloat(UINT32_C(0x3e800002));
+  const float odd_tie = BitsFloat(UINT32_C(0x3e800004));
+  for (const auto format : {kDriverPcoDepthFormatZ24X8Unorm,
+                            kDriverPcoDepthFormatZ24UnormS8Uint}) {
+    Check(EncodeDepthAttachmentUnorm(even_tie, format) == UINT32_C(0x400000),
+          "D24 rounds an even binary32 half tie downward");
+    Check(EncodeDepthAttachmentUnorm(odd_tie, format) == UINT32_C(0x400002),
+          "D24 rounds an odd binary32 half tie upward");
+  }
+  Check(EncodeDepthAttachmentUnorm(even_tie,
+                                   kDriverPcoDepthFormatZ16Unorm) ==
+                UINT32_C(0x4000) &&
+            EncodeDepthAttachmentUnorm(even_tie,
+                                       kDriverPcoDepthFormatZ32Unorm) ==
+                UINT32_C(0x40000100),
+        "D24 binary32 scaling does not change Z16 or Z32 conversion");
+}
+
 void CheckFloatDepthCompareCase(MemoryPool &pool, const CasePayload &payload) {
   const PipelineState state = LoadPipelineState(pool, payload.state);
   Check(LoadArray<std::uint32_t>(pool, state.isp_depth_attachment) ==
@@ -449,6 +479,7 @@ void CheckFloatDepthCompareCase(MemoryPool &pool, const CasePayload &payload) {
 int sc_main(int, char **) {
   try {
     CheckFloatDepthCodecs();
+    CheckD24DepthCodecRounding();
     MemoryPool pool;
     sc_core::sc_fifo<PipelineTxn> input("input", 8);
     sc_core::sc_fifo<PipelineTxn> output("output", 8);

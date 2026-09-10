@@ -331,8 +331,8 @@ int sc_main(int, char **) {
       }
     }
     // Smooth floating outputs may also be NaN. Their propagation is distinct
-    // from flat raw transport; only the four clip-position words must remain
-    // finite. Check the clipping boundary directly.
+    // from flat raw transport; the positions in this fixture remain finite.
+    // Check the clipping boundary directly.
     for (bool geometry : {false, true}) {
       const auto state_handle = Publish(pool, RasterStateFor(
           pool, 3, true, geometry, true));
@@ -357,6 +357,193 @@ int sc_main(int, char **) {
           std::memcpy(&varying, &words[offset + 4], sizeof(varying));
           Check(std::isnan(varying), "legal smooth NaN varying survives clipping");
         }
+      Retire(pool, state_handle);
+    }
+    // Mesa's clip test maps unordered comparisons to clip bits, then the
+    // generic clipper drops only the primitive whose selected plane distance
+    // is NaN or infinity.  Preserve the original shader DWORDs while proving
+    // that neither a non-finite position nor a user clip distance aborts the
+    // surrounding submission.  The finite raster cases above are controls.
+    struct NonFiniteClipCase {
+      unsigned component;
+      std::uint32_t bits;
+    };
+    const std::array<NonFiniteClipCase, 6> nonfinite_positions = {{
+        {0, UINT32_C(0xffc00000)},
+        {1, UINT32_C(0x7fc12345)},
+        {2, UINT32_C(0x7f800000)},
+        {2, UINT32_C(0xff800000)},
+        {3, UINT32_C(0xffc00000)},
+        {3, UINT32_C(0xff800000)},
+    }};
+    for (bool geometry : {false, true}) {
+      for (const auto &fixture : nonfinite_positions) {
+        auto initial = RasterStateFor(pool, 3, false, geometry);
+        auto original_lanes = LoadArray<VertexLane>(pool, initial.vertex_lanes);
+        original_lanes[2].vertex_output[fixture.component] = fixture.bits;
+        pool.Release(initial.vertex_lanes);
+        initial.vertex_lanes = StoreNewArray(pool, original_lanes);
+        const auto state_handle = Publish(pool, initial);
+        clip_only_in.write({state_handle, 1, 1});
+        sc_core::sc_start(sc_core::sc_time(10, sc_core::SC_US));
+        PipelineTxn completion;
+        Check(clip_only_out.nb_read(completion),
+              "non-finite clip position completes");
+        const auto state = LoadPipelineState(pool, completion.state);
+        const auto triangles = LoadArray<RasterTriangle>(
+            pool, state.raster_triangles);
+        const auto output_lanes = LoadArray<VertexLane>(pool, state.vertex_lanes);
+        Check(state.stage == PipelineStage::kClipCullComplete,
+              "non-finite position reaches clip completion");
+        Check(state.counters.c_invocations == 1 &&
+                  state.counters.c_primitives == 0 && triangles.empty(),
+              "non-finite position discards only its primitive");
+        Check(output_lanes.size() == original_lanes.size() &&
+                  std::memcmp(output_lanes.data(), original_lanes.data(),
+                              original_lanes.size() * sizeof(VertexLane)) == 0,
+              "non-finite position preserves original VTXOUT bits");
+        Retire(pool, state_handle);
+      }
+
+      // A clean +Inf W is inside every hard plane in Mesa and reaches the
+      // viewport with reciprocal W = +0.  If another vertex selects a hard
+      // plane, however, Mesa's four-term dot sees that infinity and drops the
+      // primitive from the generic clipper.
+      for (const bool select_hard_plane : {false, true}) {
+        auto initial = RasterStateFor(pool, 3, false, geometry);
+        auto original_lanes = LoadArray<VertexLane>(pool, initial.vertex_lanes);
+        original_lanes[2].vertex_output[3] = UINT32_C(0x7f800000);
+        if (select_hard_plane)
+          original_lanes[1].vertex_output[0] = Bits(2.0F);
+        pool.Release(initial.vertex_lanes);
+        initial.vertex_lanes = StoreNewArray(pool, original_lanes);
+        const auto state_handle = Publish(pool, initial);
+        clip_only_in.write({state_handle, 1, 1});
+        sc_core::sc_start(sc_core::sc_time(10, sc_core::SC_US));
+        PipelineTxn completion;
+        Check(clip_only_out.nb_read(completion),
+              "+Inf W clip transaction completes");
+        const auto state = LoadPipelineState(pool, completion.state);
+        const auto triangles = LoadArray<RasterTriangle>(
+            pool, state.raster_triangles);
+        Check(state.counters.c_invocations == 1,
+              "+Inf W retains its clip invocation");
+        if (select_hard_plane) {
+          Check(state.counters.c_primitives == 0 && triangles.empty(),
+                "+Inf W on a selected hard plane discards its primitive");
+        } else {
+          Check(state.counters.c_primitives == 1 && triangles.size() == 1,
+                "clean +Inf W reaches fixed setup");
+          bool found_zero_reciprocal = false;
+          for (const auto &triangle : triangles) {
+            for (unsigned i = 0; i < 3; ++i) {
+              found_zero_reciprocal |= triangle.reciprocal_w[i] == 0.0F;
+              Check(std::isfinite(triangle.x[i]) &&
+                        std::isfinite(triangle.y[i]) &&
+                        std::isfinite(triangle.window_z[i]) &&
+                        std::isfinite(triangle.reciprocal_w[i]),
+                    "clean +Inf W has a finite viewport result");
+            }
+          }
+          Check(found_zero_reciprocal,
+                "clean +Inf W produces zero reciprocal W");
+        }
+        Retire(pool, state_handle);
+      }
+
+      for (const std::uint32_t bits : {UINT32_C(0x7fc45678),
+                                       UINT32_C(0x7f800000),
+                                       UINT32_C(0xff800000)}) {
+        auto initial = RasterStateFor(pool, 3, false, geometry, true);
+        auto original_lanes = LoadArray<VertexLane>(pool, initial.vertex_lanes);
+        for (auto &lane : original_lanes)
+          lane.vertex_output[4] = Bits(1.0F);
+        original_lanes[1].vertex_output[4] = bits;
+        pool.Release(initial.vertex_lanes);
+        initial.vertex_lanes = StoreNewArray(pool, original_lanes);
+        initial.clip_distance_mask = 1;
+        initial.clip_distance_register = 4;
+        const auto state_handle = Publish(pool, initial);
+        clip_only_in.write({state_handle, 1, 1});
+        sc_core::sc_start(sc_core::sc_time(10, sc_core::SC_US));
+        PipelineTxn completion;
+        Check(clip_only_out.nb_read(completion),
+              "non-finite user clip distance completes");
+        const auto state = LoadPipelineState(pool, completion.state);
+        const auto triangles = LoadArray<RasterTriangle>(
+            pool, state.raster_triangles);
+        const auto output_lanes =
+            LoadArray<VertexLane>(pool, state.vertex_lanes);
+        Check(state.stage == PipelineStage::kClipCullComplete,
+              "non-finite user clip distance reaches clip completion");
+        Check(state.counters.c_invocations == 1,
+              "non-finite user clip distance retains its invocation");
+        Check(state.counters.c_primitives == 0 && triangles.empty(),
+              "non-finite user clip distance discards only its primitive");
+        Check(output_lanes.size() == original_lanes.size() &&
+                  std::memcmp(output_lanes.data(), original_lanes.data(),
+                              original_lanes.size() * sizeof(VertexLane)) == 0,
+              "non-finite user clip distance preserves original VTXOUT bits");
+        Retire(pool, state_handle);
+      }
+
+      auto initial = RasterStateFor(pool, 3, false, geometry, true);
+      auto original_lanes = LoadArray<VertexLane>(pool, initial.vertex_lanes);
+      original_lanes[1].vertex_output[4] = UINT32_C(0x7f800000);
+      pool.Release(initial.vertex_lanes);
+      initial.vertex_lanes = StoreNewArray(pool, original_lanes);
+      initial.clip_distance_mask = 0;
+      initial.clip_distance_register = 4;
+      const auto state_handle = Publish(pool, initial);
+      clip_only_in.write({state_handle, 1, 1});
+      sc_core::sc_start(sc_core::sc_time(10, sc_core::SC_US));
+      PipelineTxn completion;
+      Check(clip_only_out.nb_read(completion),
+            "disabled non-finite user clip distance completes");
+      const auto state = LoadPipelineState(pool, completion.state);
+      const auto triangles = LoadArray<RasterTriangle>(
+          pool, state.raster_triangles);
+      Check(state.counters.c_invocations == 1 &&
+                state.counters.c_primitives == 1 && triangles.size() == 1,
+            "disabled non-finite user clip distance does not clip");
+      Retire(pool, state_handle);
+    }
+
+    // The captured failure has invalid and ordinary triangles in one draw.
+    // Keep both in one occurrence segment so this distinguishes per-primitive
+    // discard from either aborting or dropping the complete submission.
+    {
+      auto initial = RasterStateFor(pool, 3, false, false);
+      auto original_lanes = LoadArray<VertexLane>(pool, initial.vertex_lanes);
+      const auto finite_lanes = original_lanes;
+      original_lanes.insert(original_lanes.end(), finite_lanes.begin(),
+                            finite_lanes.end());
+      original_lanes[2].vertex_output[0] = UINT32_C(0xffc00000);
+      pool.Release(initial.vertex_lanes);
+      initial.vertex_lanes = StoreNewArray(pool, original_lanes);
+      pool.Release(initial.vertex_lane_refs);
+      std::vector<VertexLaneRef> refs;
+      for (std::uint32_t i = 0; i < original_lanes.size(); ++i)
+        refs.push_back({i, i});
+      initial.vertex_lane_refs = StoreNewArray(pool, refs);
+      initial.draw.vertex_count = 6;
+      const auto state_handle = Publish(pool, initial);
+      clip_only_in.write({state_handle, 1, 1});
+      sc_core::sc_start(sc_core::sc_time(10, sc_core::SC_US));
+      PipelineTxn completion;
+      Check(clip_only_out.nb_read(completion),
+            "mixed finite/non-finite submission completes");
+      const auto state = LoadPipelineState(pool, completion.state);
+      const auto triangles = LoadArray<RasterTriangle>(
+          pool, state.raster_triangles);
+      const auto output_lanes = LoadArray<VertexLane>(pool, state.vertex_lanes);
+      Check(state.counters.c_invocations == 2 &&
+                state.counters.c_primitives == 1 && triangles.size() == 1,
+            "mixed submission drops only the non-finite primitive");
+      Check(output_lanes.size() == original_lanes.size() &&
+                std::memcmp(output_lanes.data(), original_lanes.data(),
+                            original_lanes.size() * sizeof(VertexLane)) == 0,
+            "mixed submission preserves every original VTXOUT DWORD");
       Retire(pool, state_handle);
     }
     // A finite homogeneous position is legal even at/behind the eye. The

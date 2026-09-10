@@ -407,9 +407,11 @@ void CheckDescriptorAndArithmetic() {
       "Terrain D3 non-finite implicit derivative remains fail-closed");
 
   // One screen-pixel derivative across the 64x64 Gate 18 quad after its
-  // float32 0.933 vertex scale.  The LODM=NORMAL datapath must expose mip
-  // levels 3/4 and architectural TFRAC=25; the float datapath's weight is the
-  // unquantized fraction TFRAC was truncated from.
+  // float32 0.933 vertex scale: rho^2 = 73.52193, llvmpipe's
+  // 0.5 * fast_log2 = 0.5 * (6 + 73.52193/64 - 1) = 3.0743902 (an exact log2
+  // would give 3.1000514 and TFRAC 25).  The LODM=NORMAL datapath must expose
+  // mip levels 3/4 and architectural TFRAC=19; the float datapath's weight is
+  // the unquantized fraction TFRAC was truncated from.
   const float gate18_scale = BitsFloat(trilinear.vertex_scale_bits);
   const float gate18_derivative = 1.0F / (64.0F * gate18_scale);
   constexpr float kGate18U = 0.25F;
@@ -423,15 +425,16 @@ void CheckDescriptorAndArithmetic() {
   const TextureImplicitLod gate18_lod = ComputeTextureImplicitLod(
       gate18_coordinates, trilinear_image, trilinear_sampler);
   Check(gate18_lod.level0 == 3 && gate18_lod.level1 == 4 &&
-            gate18_lod.mip_weight_u8 == 25 &&
-            gate18_lod.mip_weight >= 25.0F / 256.0F &&
-            gate18_lod.mip_weight < 26.0F / 256.0F &&
-            gate18_lod.lambda >= 3.0F && gate18_lod.lambda < 4.0F,
+            gate18_lod.mip_weight_u8 == 19 &&
+            gate18_lod.mip_weight >= 19.0F / 256.0F &&
+            gate18_lod.mip_weight < 20.0F / 256.0F &&
+            FloatBits(gate18_lod.lambda) == UINT32_C(0x4044c2cf),
         "Gate 18 implicit LOD levels and TFRAC");
 
   // Gate 19 keeps the descriptor and shaders byte-identical while changing
-  // only live SH0 to 0.758f.  Its larger implicit derivative remains between
-  // mip levels 3/4 but quantizes to architectural TFRAC=102.
+  // only live SH0 to 0.758f.  Its larger implicit derivative (rho^2 =
+  // 111.38887, 0.5 * fast_log2 = 3.3702254) remains between mip levels 3/4
+  // but quantizes to architectural TFRAC=94 (exact log2: 3.3997307, 102).
   const RogueTextureImageDescriptor trilinear04_image =
       DecodeRogueTextureImageDescriptor(DescriptorDwords(trilinear04, 0));
   const RogueTextureSamplerDescriptor trilinear04_sampler =
@@ -447,17 +450,17 @@ void CheckDescriptorAndArithmetic() {
   const TextureImplicitLod gate19_lod = ComputeTextureImplicitLod(
       gate19_coordinates, trilinear04_image, trilinear04_sampler);
   Check(gate19_lod.level0 == 3 && gate19_lod.level1 == 4 &&
-            gate19_lod.mip_weight_u8 == 102 &&
-            gate19_lod.mip_weight >= 102.0F / 256.0F &&
-            gate19_lod.mip_weight < 103.0F / 256.0F &&
-            gate19_lod.lambda >= 3.0F && gate19_lod.lambda < 4.0F,
+            gate19_lod.mip_weight_u8 == 94 &&
+            gate19_lod.mip_weight >= 94.0F / 256.0F &&
+            gate19_lod.mip_weight < 95.0F / 256.0F &&
+            FloatBits(gate19_lod.lambda) == UINT32_C(0x4057b1c6),
         "Gate 19 implicit LOD levels and TFRAC");
 
   // Gate 20's exact 0.7071f scale reaches the mip half-way boundary.  Pin the
   // ideal float32 derivative, the lambda after storing coordinates at the
-  // chosen base point, and the architectural U8 TFRAC=0x80 -- the one gate
-  // whose TFRAC an exact LOD leaves where the piecewise-linear one had it,
-  // because half way is a value both resolve exactly.
+  // chosen base point (rho^2 = 128.00235, 0.5 * fast_log2 = 3.5000091), and
+  // the architectural U8 TFRAC=0x80 -- half way is a value the piecewise-
+  // linear log2 and an exact one both resolve to the same TFRAC.
   const RogueTextureImageDescriptor trilinear05_image =
       DecodeRogueTextureImageDescriptor(DescriptorDwords(trilinear05, 0));
   const RogueTextureSamplerDescriptor trilinear05_sampler =
@@ -477,7 +480,7 @@ void CheckDescriptorAndArithmetic() {
             gate20_lod.mip_weight_u8 == 128 &&
             gate20_lod.mip_weight >= static_cast<float>(gate20_lod.mip_weight_u8) / 256.0F &&
             gate20_lod.mip_weight < static_cast<float>(gate20_lod.mip_weight_u8 + 1U) / 256.0F &&
-            FloatBits(gate20_lod.lambda) == UINT32_C(0x40600038),
+            FloatBits(gate20_lod.lambda) == UINT32_C(0x40600026),
         "Gate 20 implicit LOD levels, approximate lambda, and TFRAC");
   const std::array<std::array<float, 2>, 4> gate20_edge_coordinates = {{
       {{0.5013811588287354F, 0.9764730930328369F}},
@@ -495,7 +498,10 @@ void CheckDescriptorAndArithmetic() {
 
   // Two exact f16->f32 Refract composite quads formerly rounded upward by a
   // near-integer epsilon. Gallivm uses fptosi(fpart * 256), so 10.99939 and
-  // 230.98755 must remain 10 and 230 respectively.
+  // 230.98755 must remain 10 and 230 respectively.  Both fractions come from
+  // lp_build_fast_log2(rho^2) * 0.5 (the llvmpipe reference's LOD); an exact
+  // log2 would move them to 15.22 and 237.02 and change the blended alpha of
+  // trilinear-minified, alpha-tested textures (GL5 Draw 185).
   RogueTextureImageDescriptor refract_image = trilinear_image;
   refract_image.width = 160;
   refract_image.height = 120;
@@ -516,13 +522,13 @@ void CheckDescriptorAndArithmetic() {
   Check(FloatBits(refract_coordinates_a[0][0]) == UINT32_C(0x3c8c0000) &&
             FloatBits(refract_coordinates_a[1][0]) ==
                 UINT32_C(0x3edcc000) &&
-            FloatBits(refract_lod_a.lambda) == UINT32_C(0x40c1e728) &&
-            refract_scaled_a > 15.22F && refract_scaled_a < 15.23F &&
+            FloatBits(refract_lod_a.lambda) == UINT32_C(0x40c15ffb) &&
+            refract_scaled_a > 10.99F && refract_scaled_a < 11.0F &&
             refract_lod_a.level0 == 6 && refract_lod_a.level1 == 7 &&
-            refract_lod_a.mip_weight_u8 == 15 &&
+            refract_lod_a.mip_weight_u8 == 10 &&
             refract_lod_a.mip_weight >= static_cast<float>(refract_lod_a.mip_weight_u8) / 256.0F &&
             refract_lod_a.mip_weight < static_cast<float>(refract_lod_a.mip_weight_u8 + 1U) / 256.0F,
-        "Refract lane 37,45 derives lambda 6.0594673 and TFRAC 15");
+        "Refract lane 37,45 derives lambda 6.0429664 and TFRAC 10");
 
   const std::array<std::array<float, 2>, 4> refract_coordinates_b = {{
       {{0.466552734375F, 0.19873046875F}},
@@ -537,13 +543,13 @@ void CheckDescriptorAndArithmetic() {
   Check(FloatBits(refract_coordinates_b[0][0]) == UINT32_C(0x3eeee000) &&
             FloatBits(refract_coordinates_b[3][1]) ==
                 UINT32_C(0x3e6ec000) &&
-            FloatBits(refract_lod_b.lambda) == UINT32_C(0x3ff681c8) &&
-            refract_scaled_b > 237.01F && refract_scaled_b < 237.02F &&
+            FloatBits(refract_lod_b.lambda) == UINT32_C(0x3ff37e68) &&
+            refract_scaled_b > 230.98F && refract_scaled_b < 230.99F &&
             refract_lod_b.level0 == 1 && refract_lod_b.level1 == 2 &&
-            refract_lod_b.mip_weight_u8 == 237 &&
+            refract_lod_b.mip_weight_u8 == 230 &&
             refract_lod_b.mip_weight >= static_cast<float>(refract_lod_b.mip_weight_u8) / 256.0F &&
             refract_lod_b.mip_weight < static_cast<float>(refract_lod_b.mip_weight_u8 + 1U) / 256.0F,
-        "Refract lane 38,17 derives lambda 1.9258356 and TFRAC 237");
+        "Refract lane 38,17 derives lambda 1.9022951 and TFRAC 230");
 
   /* Golden Gallivm target primitive/quad for the final Refract mismatch:
    * internal lane (57,16), parameter 10301, quad 348:1.  Keep all four
@@ -563,11 +569,12 @@ void CheckDescriptorAndArithmetic() {
             FloatBits(refract_target_lod.dtdy) == FloatBits(-7.32421875F) &&
             FloatBits(refract_target_lod.rho_squared) ==
                 FloatBits(1744.224609375F) &&
-            FloatBits(refract_target_lod.lambda) == UINT32_C(0x40ac4b3e) &&
+            FloatBits(refract_target_lod.lambda) == UINT32_C(0x40ab40e6) &&
             refract_target_lod.level0 == 5 &&
             refract_target_lod.level1 == 6 &&
-            refract_target_lod.mip_weight_u8 == 98,
-        "Refract target primitive quad derives golden rho/lambda/TFRAC98");
+            refract_target_lod.mip_weight_u8 == 90,
+        "Refract target primitive quad derives golden rho/lambda/TFRAC90 "
+        "(0.5 * fast_log2(1744.2246) = 5.3516722)");
 
   /*
    * A non-zero max LOD is a valid encoding; whether it can be sampled depends
@@ -1510,11 +1517,17 @@ void CheckEventPaths(pvrgpu::stub::MemoryMode memory_mode) {
   const std::vector<TextureSampleResponse> gate_responses =
       LoadArray<TextureSampleResponse>(
           gate_pool, gate_final_state.texture_sample_responses);
+  // Per-lane U8 bilinear taps from the fixture pattern: mip3 (0,124,124),
+  // (0,60,60), (0,124,124), (0,68,68) and mip4 (120,0,120), (56,0,56),
+  // (120,0,120), (65,0,65), blended by llvmpipe's lerp_round_half_even with
+  // the Gate 18 TFRAC of 19/256 (0.5 * fast_log2(73.52193) = 3.0743902).
+  // An exact-log2 LOD (TFRAC 25) blended them to (12,112,124), (5,54,60),
+  // (12,112,124), (6,61,68).
   constexpr std::array<Rgba8, 4> kGateExpected = {{
-      {{12, 112, 124, 255}},
-      {{5, 54, 60, 255}},
-      {{12, 112, 124, 255}},
-      {{6, 61, 68, 255}},
+      {{9, 115, 124, 255}},
+      {{4, 56, 60, 255}},
+      {{9, 115, 124, 255}},
+      {{5, 63, 68, 255}},
   }};
   Check(gate_responses.size() == kGateExpected.size(),
         "Gate 18 returns one response per quad lane");

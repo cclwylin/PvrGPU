@@ -97,6 +97,67 @@ static void test_configuration(const char *api, const char *bridge,
    CHECK(!pvrgpu_refuse_native_cpu_present(NULL, &info, NULL, &draw, 1));
 }
 
+static void test_unsupported_format_conversion_is_rejected(void)
+{
+   uint8_t source[16] = {0}, target[16], before[16];
+   memset(target, 0xa5, sizeof(target));
+   memcpy(before, target, sizeof(target));
+   struct pvrgpu_resource src = {0}, dst = {0};
+   src.base.target = dst.base.target = PIPE_TEXTURE_2D;
+   src.base.format = PIPE_FORMAT_ASTC_4x4;
+   dst.base.format = PIPE_FORMAT_R8G8B8A8_UNORM;
+   src.base.width0 = dst.base.width0 = 1;
+   src.base.height0 = dst.base.height0 = 1;
+   src.base.depth0 = dst.base.depth0 = 1;
+   src.base.array_size = dst.base.array_size = 1;
+   src.data = source;
+   dst.data = target;
+   src.size = sizeof(source);
+   dst.size = sizeof(target);
+   src.level_count = dst.level_count = 1;
+   src.level_strides[0] = sizeof(source);
+   dst.level_strides[0] = sizeof(target);
+   src.level_layer_strides[0] = sizeof(source);
+   dst.level_layer_strides[0] = sizeof(target);
+
+   struct pipe_sampler_view view = {0};
+   view.texture = &src.base;
+   view.format = PIPE_FORMAT_ASTC_4x4;
+   view.swizzle_r = PIPE_SWIZZLE_X;
+   view.swizzle_g = PIPE_SWIZZLE_Y;
+   view.swizzle_b = PIPE_SWIZZLE_Z;
+   view.swizzle_a = PIPE_SWIZZLE_W;
+   struct pvrgpu_sampler_state sampler = {0};
+   struct pvrgpu_context ctx = {0};
+   ctx.framebuffer.width = ctx.framebuffer.height = 1;
+   ctx.framebuffer.nr_cbufs = 1;
+   ctx.framebuffer.cbufs[0] = (struct pipe_surface){
+      .texture = &dst.base, .format = PIPE_FORMAT_R8G8B8A8_UNORM};
+   ctx.num_sampler_views[MESA_SHADER_FRAGMENT] = 1;
+   ctx.num_samplers[MESA_SHADER_FRAGMENT] = 1;
+   ctx.sampler_views[MESA_SHADER_FRAGMENT][0] = &view;
+   ctx.samplers[MESA_SHADER_FRAGMENT][0] = &sampler;
+   struct pipe_draw_info info = {.mode = MESA_PRIM_TRIANGLE_STRIP};
+   struct pipe_draw_start_count_bias draw = {.count = 4};
+
+   CHECK(strcmp(pvrgpu_cpu_present_textured_quad_skip_reason(
+                   &ctx, &info, NULL, &draw, 1),
+                "unsupported_source_format_unpack") == 0);
+   CHECK(!pvrgpu_can_cpu_present_textured_quad(&ctx, &info, NULL, &draw, 1));
+   CHECK(!pvrgpu_cpu_present_textured_quad(&ctx, &info, NULL, &draw, 1));
+   CHECK(memcmp(target, before, sizeof(target)) == 0);
+
+   src.base.format = view.format = PIPE_FORMAT_R8G8B8A8_UNORM;
+   ctx.framebuffer.cbufs[0].format = PIPE_FORMAT_ASTC_4x4;
+   dst.base.format = PIPE_FORMAT_ASTC_4x4;
+   CHECK(strcmp(pvrgpu_cpu_present_textured_quad_skip_reason(
+                   &ctx, &info, NULL, &draw, 1),
+                "unsupported_destination_format_pack") == 0);
+   CHECK(!pvrgpu_can_cpu_present_textured_quad(&ctx, &info, NULL, &draw, 1));
+   CHECK(!pvrgpu_cpu_present_textured_quad(&ctx, &info, NULL, &draw, 1));
+   CHECK(memcmp(target, before, sizeof(target)) == 0);
+}
+
 int main(void)
 {
    unsetenv("PVRGPU_DRIVER_COMMAND_OUT");
@@ -108,6 +169,7 @@ int main(void)
          for (unsigned previous = 0; previous < 2; ++previous)
             test_configuration(values[a], values[b], a == 2 || b == 2,
                                previous != 0);
+   test_unsupported_format_conversion_is_rejected();
    puts("native CPU-present guard: PASS");
    printf("%u checks; diagnostic-only CPU copy control, no native work claimed\n", checks);
    return 0;

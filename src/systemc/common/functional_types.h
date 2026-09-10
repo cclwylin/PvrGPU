@@ -466,6 +466,12 @@ struct RasterState {
   // means unstated, and the full surface is used.
   float viewport_scale[3] = {0.0f, 0.0f, 0.0f};
   float viewport_translate[3] = {0.0f, 0.0f, 0.0f};
+  // Effective filled-polygon depth bias for this draw.  The Parameter Buffer
+  // turns these values into one llvmpipe-compatible binary32 offset per
+  // primitive; the ISP adds that value after evaluating the position-Z plane.
+  float polygon_offset_factor = 0.0f;
+  float polygon_offset_units = 0.0f;
+  float polygon_offset_clamp = 0.0f;
   float clear_color[4] = {0.0F, 0.0F, 0.0F, 1.0F};
   std::uint32_t sample_count = 1;
   std::uint32_t sample_mask = UINT32_MAX;
@@ -488,6 +494,8 @@ struct RasterState {
   // before shader side effects; shader depth exports cannot replace it.
   std::uint8_t shader_early_tests = 0;
   std::uint8_t depth_clamp_enable = 0;
+  std::uint8_t polygon_offset_enable = 0;
+  std::uint8_t polygon_offset_units_unscaled = 0;
   std::uint8_t color_mask = 0x0f;
   // Fill convention for pixels exactly on an edge.  0 is Gallium's top-left
   // rule; 1 is the bottom-left rule Mesa states for a y-flipped (window
@@ -850,6 +858,10 @@ struct ParameterTriangle {
   // the plane evaluated as fma(B, y, fma(A, x, C)); PAD is kept explicit so
   // the serialized payload has the same fail-closed shape as varying planes.
   std::uint32_t depth_plane[4]{};
+  // Raw binary32 result of llvmpipe's per-primitive polygon-offset setup.  It
+  // remains separate from C so the ISP performs the observable final FADD
+  // after its two ordered depth-plane FMAs.
+  std::uint32_t depth_offset = 0;
   std::uint8_t depth_plane_valid = 0;
   std::uint8_t depth_plane_reserved[3]{};
   // Contiguous A/B/C/PAD sets in parameter_coefficients. A non-rasterizable
@@ -876,13 +888,17 @@ inline bool HasCanonicalDepthPlaneMetadata(
   }
   if (!expected) {
     return triangle.depth_plane[0] == 0 && triangle.depth_plane[1] == 0 &&
-           triangle.depth_plane[2] == 0;
+           triangle.depth_plane[2] == 0 && triangle.depth_offset == 0;
   }
   for (std::size_t component = 0; component < 3; ++component) {
     if ((triangle.depth_plane[component] & UINT32_C(0x7f800000)) ==
         UINT32_C(0x7f800000)) {
       return false;
     }
+  }
+  if ((triangle.depth_offset & UINT32_C(0x7f800000)) ==
+      UINT32_C(0x7f800000)) {
+    return false;
   }
   return true;
 }

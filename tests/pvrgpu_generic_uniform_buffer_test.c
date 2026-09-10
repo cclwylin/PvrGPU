@@ -166,15 +166,15 @@ static void test_shared_register_limits(struct pvrgpu_pco_compiler *compiler)
    const enum pipe_format format = PIPE_FORMAT_R32G32B32A32_FLOAT;
    const struct {
       unsigned vs_words, fs_words, vs_blocks, fs_blocks, textures;
-      bool accepted;
+      unsigned vs_shared, fs_shared, vs_map, fs_map;
    } cases[] = {
-      {4, 100, 0, 0, 1, true},
-      {80, 4, 4, 0, 1, true},
-      {84, 4, 4, 0, 1, false},
-      {4, 224, 0, 3, 1, true},
-      {4, 228, 0, 3, 1, false},
-      {4, 96, 0, 0, 8, true},
-      {4, 100, 0, 0, 8, false},
+      {4, 100, 0, 0, 1, 4, 120, 0, 0},
+      {80, 4, 4, 0, 1, 96, 24, 0, 0},
+      {84, 4, 4, 0, 1, 20, 24, 0, 0},
+      {4, 224, 0, 3, 1, 4, 256, 0, 0},
+      {4, 228, 0, 3, 1, 4, 36, 0, 0},
+      {4, 96, 0, 0, 8, 4, 256, 0, 0},
+      {4, 100, 0, 0, 8, 4, 164, 0, 0},
    };
    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
       nir_shader *vs = shader(true, cases[i].vs_blocks, true);
@@ -185,17 +185,14 @@ static void test_shared_register_limits(struct pvrgpu_pco_compiler *compiler)
       const bool accepted = pvrgpu_pco_compile_color_triangle(compiler, vs, fs,
          &format, false, false, 1, cases[i].vs_words, cases[i].fs_words,
          1, cases[i].textures, &binary, error, sizeof(error));
-      check(accepted == cases[i].accepted,
-            "shared register limit does not include stage-local descriptor and CB0 words");
-      if (accepted) {
-         check(binary.vertex.abi.shareds == cases[i].vs_words + cases[i].vs_blocks * 4 &&
-               binary.fragment.abi.shareds == cases[i].textures * 20 +
-                  cases[i].fs_blocks * 4 + cases[i].fs_words,
-               "accepted stage does not preserve its complete CB0 suffix");
-      } else {
-         check(!binary.vertex.data && !binary.fragment.data,
-               "out-of-budget program retained executable bytes");
-      }
+      check(accepted,
+            "shared register pressure rejected a valid full or packed CB0 program");
+      check(binary.vertex.abi.shareds == cases[i].vs_shared &&
+            binary.fragment.abi.shareds == cases[i].fs_shared,
+            "accepted stage has an incorrect full/packed shared span");
+      check(binary.vertex.cb0_word_map.count == cases[i].vs_map &&
+            binary.fragment.cb0_word_map.count == cases[i].fs_map,
+            "shared pressure selected the wrong CB0 word map");
       pvrgpu_pco_graphics_binary_finish(&binary);
       ralloc_free(vs);
       ralloc_free(fs);

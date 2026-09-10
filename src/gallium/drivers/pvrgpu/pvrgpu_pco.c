@@ -4981,7 +4981,7 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                   nir_tex_instr_src_index(tex, nir_tex_src_bias);
                const bool biased_sample = tex->op == nir_texop_txb &&
                   expected_stage == MESA_SHADER_FRAGMENT &&
-                  !tex->is_shadow && !tex->is_array && !tex->is_sparse &&
+                  !tex->is_sparse &&
                   bias_src >= 0 &&
                   tex->src[bias_src].src.ssa->num_components == 1 &&
                   tex->src[bias_src].src.ssa->bit_size == 32;
@@ -5005,7 +5005,10 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                   tex, expected_stage, texture_count);
                if (texture_count == 0 || (!ordinary_sample && !multisample && !texel_fetch && !size_query && !gather) ||
                    (tex->is_shadow && !size_query && !gather &&
-                    !(ordinary_sample && tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array)) ||
+                    !(ordinary_sample &&
+                      (tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
+                       (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE &&
+                        !tex->is_array)))) ||
                    (ordinary_sample && tex->texture_index != tex->sampler_index) ||
                    tex->texture_index >= texture_count) {
                   const char *op_name = pvrgpu_nir_texop_name(tex->op);
@@ -5034,7 +5037,7 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                      "color primitive contains an unsupported texture "
                      "operation (op=%s dim=%s array=%u shadow=%u "
                      "texture_index=%u sampler_index=%u bound_textures=%u); "
-                     "the lowering covers non-shadow tex/txl/txd and size queries on 2D/3D/cube, fragment-only non-array txb with scalar f32 bias on 2D/3D/cube, nearest-only 2D shadow sampling, txf on 2D/3D, or "
+                     "the lowering covers non-shadow tex/txl/txd and size queries on 2D/3D/cube, fragment-only txb with scalar f32 bias on 2D/3D/cube (including nearest shadow), nearest-only 2D/2D-array/cube shadow sampling, txf on 2D/3D, or "
                      "txf_ms/txs/texture_samples on MS, or fragment 2D f32 component0 tg4 without offsets at base LOD with a bound texture",
                      op_name,
                      dim_name,
@@ -6683,9 +6686,12 @@ static bool pvrgpu_lower_geometry_dynamic_uniforms(nir_shader *nir,
    unsigned dwords, char *error, size_t error_size);
 
 static bool
-pvrgpu_lower_compute_large_cb0(nir_shader *nir, unsigned dwords, unsigned slot,
-                               char *error, size_t error_size)
+pvrgpu_lower_large_cb0(nir_shader *nir, unsigned dwords, unsigned slot,
+                       const char *profile, char *error, size_t error_size)
 {
+   if (!nir || !profile || !dwords || dwords > 16384 || slot >= 15)
+      return pvrgpu_pco_fail(error, error_size,
+                             "invalid %s CB0 DMA descriptor input", profile);
    nir_foreach_function_impl(impl, nir) {
       nir_builder b = nir_builder_create(impl);
       nir_foreach_block(block, impl) {
@@ -6693,20 +6699,48 @@ pvrgpu_lower_compute_large_cb0(nir_shader *nir, unsigned dwords, unsigned slot,
             if (instr->type != nir_instr_type_intrinsic) continue;
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
             if (intr->intrinsic != nir_intrinsic_load_uniform) continue;
-            const uint64_t base = nir_intrinsic_base(intr);
-            const uint64_t range = nir_intrinsic_range(intr);
-            const bool direct = nir_src_is_const(intr->src[0]);
-            const uint64_t last = base + (direct ? nir_src_as_uint(intr->src[0]) : range ? range - 1 : 0);
             if (intr->def.bit_size != 32 || !intr->def.num_components ||
                 intr->def.num_components > 4 || intr->src[0].ssa->bit_size != 32 ||
-                intr->src[0].ssa->num_components != 1 || (!direct && !range) ||
-                last * 4 + intr->def.num_components > dwords)
-               return pvrgpu_pco_fail(error, error_size, "compute CB0 DMA load exceeds captured vec4-slot span");
+                intr->src[0].ssa->num_components != 1)
+               return pvrgpu_pco_fail(error, error_size,
+                  "%s CB0 DMA load requires a scalar 32-bit slot index and a 32-bit vec4 value",
+                  profile);
+            /* NIR BASE is a signed int while RANGE and a 32-bit source offset
+             * are unsigned.  Every caller must see the same proof here, not
+             * only the graphics prefix pass: widening a negative base first
+             * would let base -1 plus offset 1 wrap the byte address to zero. */
+            const int signed_base = nir_intrinsic_base(intr);
+            if (signed_base < 0)
+               return pvrgpu_pco_fail(error, error_size,
+                  "%s CB0 DMA base is negative", profile);
+            const uint64_t base = (unsigned)signed_base;
+            const uint64_t range = nir_intrinsic_range(intr);
+            const bool direct = nir_src_is_const(intr->src[0]);
+            if (!direct && !range)
+               return pvrgpu_pco_fail(error, error_size,
+                  "%s CB0 DMA indirect range is unknown", profile);
+            const uint64_t extent = direct ? nir_src_as_uint(intr->src[0]) : range - 1;
+            /* Checked arithmetic for the last vec4 slot, its DWORD span and
+             * the static byte address (base * 16 and last * 16 must both fit
+             * an unsigned NIR range_base / 32-bit UBO offset). */
+            if (extent > UINT64_MAX - base)
+               return pvrgpu_pco_fail(error, error_size,
+                  "%s CB0 DMA base/offset addition overflows", profile);
+            const uint64_t last = base + extent;
+            if (last > UINT32_MAX / 16U)
+               return pvrgpu_pco_fail(error, error_size,
+                  "%s CB0 DMA byte address exceeds 32 bits", profile);
+            if (last * 4 + intr->def.num_components > dwords)
+               return pvrgpu_pco_fail(error, error_size,
+                  "%s CB0 DMA load exceeds captured vec4-slot span", profile);
+            /* base <= last, so base * 16 fits 32 bits and dwords > base * 4. */
+            const unsigned base_bytes = (unsigned)(base * 16);
+            const unsigned span_bytes = (unsigned)((dwords - base * 4) * 4);
             b.cursor = nir_before_instr(instr);
-            nir_def *offset = nir_iadd_imm(&b, nir_imul_imm(&b, intr->src[0].ssa, 16), base * 16);
+            nir_def *offset = nir_iadd_imm(&b, nir_imul_imm(&b, intr->src[0].ssa, 16), base_bytes);
             nir_def *value = nir_load_ubo(&b, intr->def.num_components, 32,
                nir_imm_int(&b, slot), offset, .align_mul = 16,
-               .range_base = base * 16, .range = (dwords - base * 4) * 4);
+               .range_base = base_bytes, .range = span_bytes);
             nir_def_rewrite_uses(&intr->def, value);
             nir_instr_remove(instr);
          }
@@ -6822,8 +6856,8 @@ pvrgpu_pco_compile_compute(struct pvrgpu_pco_compiler *compiler,
       goto fail;
    const unsigned cb0_slot = uniform_dwords > 256 ? nir->info.num_ubos + 1 : 0;
    if (cb0_slot && (cb0_slot > 15 ||
-       !pvrgpu_lower_compute_large_cb0(nir, uniform_dwords, cb0_slot - 1,
-                                       error, error_size)))
+       !pvrgpu_lower_large_cb0(nir, uniform_dwords, cb0_slot - 1,
+                               "compute", error, error_size)))
       goto fail;
    pvrgpu_pco_preprocess_nir(compiler, nir);
    memset(&abi, 0, sizeof(abi));
@@ -7097,13 +7131,15 @@ static bool
 pvrgpu_color_uniform_word_map(nir_shader *nir, unsigned bound_dwords,
                               unsigned available,
                               struct pvrgpu_pco_uniform_word_map *out,
+                              bool *exceeds_budget,
                               char *error, size_t error_size)
 {
    struct pvrgpu_pco_uniform_word_map map = {0};
    unsigned required;
-   if (!out || available > ARRAY_SIZE(map.source_words) ||
+   if (!out || !exceeds_budget || available > ARRAY_SIZE(map.source_words) ||
        !pvrgpu_color_uniform_prefix(nir, bound_dwords, &required, error, error_size))
       return false;
+   *exceeds_budget = false;
    /* The prefix proof above validates signed bases, index types, overflow,
     * and every candidate of an indirect range before collecting any word.
     * Keep the union of all possible loads, never an observed index or value.
@@ -7120,9 +7156,10 @@ pvrgpu_color_uniform_word_map(nir_shader *nir, unsigned bound_dwords,
             const unsigned components = intr->def.num_components;
             const bool direct = nir_src_is_const(intr->src[0]);
             const unsigned count = direct ? 1 : nir_intrinsic_range(intr);
-            if (count > available / components)
-               return pvrgpu_pco_fail(error, error_size,
-                  "color primitive live CB0 words exceed the native shared register budget");
+            if (count > available / components) {
+               *exceeds_budget = true;
+               return false;
+            }
             const uint64_t first = (uint64_t)nir_intrinsic_base(intr) +
                (direct ? nir_src_as_uint(intr->src[0]) : 0);
             for (unsigned slot = 0; slot < count; ++slot) {
@@ -7133,9 +7170,10 @@ pvrgpu_color_uniform_word_map(nir_shader *nir, unsigned bound_dwords,
                      ++i;
                   if (i < map.count && map.source_words[i] == word)
                      continue;
-                  if (map.count == available)
-                     return pvrgpu_pco_fail(error, error_size,
-                        "color primitive live CB0 words exceed the native shared register budget");
+                  if (map.count == available) {
+                     *exceeds_budget = true;
+                     return false;
+                  }
                   memmove(&map.source_words[i + 1], &map.source_words[i],
                           (map.count - i) * sizeof(map.source_words[0]));
                   map.source_words[i] = word;
@@ -7210,11 +7248,19 @@ pvrgpu_fit_color_shared_budget(nir_shader *nir, unsigned fixed_prefix,
                                unsigned limit, bool trim_ubos,
                                unsigned *bound_dwords,
                                struct pvrgpu_pco_uniform_word_map *map,
+                               uint32_t *cb0_uniform_buffer_slot,
                                char *error, size_t error_size)
 {
    unsigned required;
-   if (!pvrgpu_color_uniform_prefix(nir, *bound_dwords, &required, error, error_size))
+   if (!nir || !bound_dwords || !map || !cb0_uniform_buffer_slot ||
+       nir->info.num_ubos > 15 || fixed_prefix > limit)
+      return pvrgpu_pco_fail(error, error_size,
+         "color primitive descriptor inventory exceeds the native shared register budget");
+   if (
+       !pvrgpu_color_uniform_prefix(nir, *bound_dwords, &required,
+                                    error, error_size))
       return false;
+   *cb0_uniform_buffer_slot = 0;
    unsigned prefix = fixed_prefix + nir->info.num_ubos * 4;
    /* Keep all previously fitting binaries and their driver ABI unchanged. */
    if (prefix <= limit && (!required || *bound_dwords <= limit - prefix))
@@ -7225,9 +7271,23 @@ pvrgpu_fit_color_shared_budget(nir_shader *nir, unsigned fixed_prefix,
       return pvrgpu_pco_fail(error, error_size,
          "color primitive descriptors and CB0 exceed the native VS/FS shared register budget");
    if (required && required > limit - prefix) {
+      bool exceeds_budget = false;
       if (!pvrgpu_color_uniform_word_map(nir, *bound_dwords, limit - prefix,
-                                         map, error, error_size))
-         return false;
+                                         map, &exceeds_budget,
+                                         error, error_size)) {
+         if (!exceeds_budget)
+            return false;
+         /* Preserve every statically provable packed-CB0 program above.  A
+          * genuinely large live set instead consumes one ordinary read-only
+          * UBO descriptor.  The one-based driver mapping is appended after
+          * the retained Gallium UBO prefix, so no public binding moves. */
+         if (ubos >= 15 || prefix + 4 > limit)
+            return pvrgpu_pco_fail(error, error_size,
+               "color primitive large CB0 has no native UBO descriptor slot");
+         nir->info.num_ubos = ubos;
+         *cb0_uniform_buffer_slot = ubos + 1;
+         return true;
+      }
       /* The source bound must remain unchanged until indirect selection has
        * been lowered; only the physical push suffix uses map->count. */
       nir->info.num_ubos = ubos;
@@ -8503,7 +8563,16 @@ bool pvrgpu_pco_compile_color_triangle(
 
    vs->info.internal = true;
    fs->info.internal = true;
-   vs->options = &compiler->nir_options;
+   /* Gallium preserves ordinary GLSL matrix multiply/add boundaries in the
+    * linked vertex NIR.  Do not contract those operations into FMAD here:
+    * the extra rounding is observable in clip-space position, triangle
+    * clipping and depth.  Explicit nir_ffma remains an ffma; prefers_split
+    * only keeps separately authored fmul/fadd operations separate. */
+   nir_shader_compiler_options vertex_options = compiler->nir_options;
+   vertex_options.float_mul_add32 &= ~nir_float_muladd_support_fuse;
+   vertex_options.float_mul_add32 |=
+      nir_float_muladd_support_prefers_split;
+   vs->options = &vertex_options;
    fs->options = &compiler->nir_options;
 
    if (!pvrgpu_prune_unbound_fragment_outputs(fs, render_target_count, error, error_size)) {
@@ -8577,6 +8646,41 @@ bool pvrgpu_pco_compile_color_triangle(
    const bool probe_writes_point_size =
       topology_uses_point_size &&
       (vs->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_PSIZ)) != 0;
+   if (vs->info.num_ubos > 15 || fs->info.num_ubos > 15 ||
+       fs->info.num_images > 32) {
+      ralloc_free(compile_mem_ctx);
+      return pvrgpu_pco_fail(error, error_size,
+         "color primitive UBO/image descriptor inventory is unsupported");
+   }
+   /* Fit CB0 before fragment images become fixed SH preamble loads.  When a
+    * large default-uniform array needs the DMA path, appending its UBO slot
+    * here also moves the following image descriptor window without rewriting
+    * already lowered image addresses. */
+   struct pvrgpu_pco_uniform_word_map vertex_word_map = {0};
+   struct pvrgpu_pco_uniform_word_map fragment_word_map = {0};
+   uint32_t vertex_cb0_uniform_buffer_slot = 0;
+   uint32_t fragment_cb0_uniform_buffer_slot = 0;
+   if (!pvrgpu_fit_color_shared_budget(vs,
+          expected_stage_textures_vs * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+          96, true, &vertex_uniform_dwords, &vertex_word_map,
+          &vertex_cb0_uniform_buffer_slot, error, error_size) ||
+       !pvrgpu_fit_color_shared_budget(fs,
+          texture_count * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS +
+             fs->info.num_images * 8,
+          256, fs->info.num_images == 0,
+          &fragment_uniform_dwords, &fragment_word_map,
+          &fragment_cb0_uniform_buffer_slot, error, error_size) ||
+       (vertex_cb0_uniform_buffer_slot &&
+        !pvrgpu_lower_large_cb0(vs, vertex_uniform_dwords,
+           vertex_cb0_uniform_buffer_slot - 1, "color primitive vertex",
+           error, error_size)) ||
+       (fragment_cb0_uniform_buffer_slot &&
+        !pvrgpu_lower_large_cb0(fs, fragment_uniform_dwords,
+           fragment_cb0_uniform_buffer_slot - 1, "color primitive fragment",
+           error, error_size))) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
    if (!pvrgpu_lower_fragment_images(fs, texture_count, out, error, error_size)) {
       ralloc_free(compile_mem_ctx);
       return false;
@@ -8593,7 +8697,7 @@ bool pvrgpu_pco_compile_color_triangle(
                                             error_size) ||
        !pvrgpu_validate_color_primitive_nir(fs,
                                            MESA_SHADER_FRAGMENT,
-                                           false,
+                                           true,
                                             render_target_count,
                                             0,
                                             fs->info.inputs_read,
@@ -8613,25 +8717,8 @@ bool pvrgpu_pco_compile_color_triangle(
     * constant buffer, so rewrite them onto push constants sized by the buffer
     * the driver bound for that stage.
     */
-   /* Check the physical stage budget before expanding any runtime uniform
-    * index. Descriptors and CB0 share the same register bank; CB0 alone has
-    * no 64-DWORD architectural limit. An unreferenced CB0 needs no suffix.
-    * Under budget pressure only, retain the proven CB0/UBO prefixes. Fragment
-    * image lowering has already pinned offsets after its UBO inventory, so
-    * never trim that inventory when images are present. */
-   struct pvrgpu_pco_uniform_word_map vertex_word_map = {0};
-   struct pvrgpu_pco_uniform_word_map fragment_word_map = {0};
-   if (!pvrgpu_fit_color_shared_budget(vs,
-          expected_stage_textures_vs * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
-          96, true, &vertex_uniform_dwords, &vertex_word_map, error, error_size) ||
-       !pvrgpu_fit_color_shared_budget(fs,
-          texture_count * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS +
-             out->fragment_image_descriptor_count * 8,
-          256, out->fragment_image_descriptor_count == 0,
-          &fragment_uniform_dwords, &fragment_word_map, error, error_size)) {
-      ralloc_free(compile_mem_ctx);
-      return false;
-   }
+   /* Remaining CB0 loads fit the shared file (possibly through a proven word
+    * map).  DMA-backed stages have no load_uniform instructions left here. */
    if (!pvrgpu_lower_geometry_dynamic_uniforms(vs, vertex_uniform_dwords,
                                                error, error_size) ||
        !pvrgpu_lower_geometry_dynamic_uniforms(fs, fragment_uniform_dwords,
@@ -9008,6 +9095,8 @@ bool pvrgpu_pco_compile_color_triangle(
 
    out->vertex.cb0_word_map = vertex_word_map;
    out->fragment.cb0_word_map = fragment_word_map;
+   out->vertex.cb0_uniform_buffer_slot = vertex_cb0_uniform_buffer_slot;
+   out->fragment.cb0_uniform_buffer_slot = fragment_cb0_uniform_buffer_slot;
 
    /* Position, then gl_PointSize when the shader writes it, then varyings. */
    out->vertex.abi.uniform_buffer_descriptor_start = vertex_ubo_count ? vertex_texture_dwords : 0;

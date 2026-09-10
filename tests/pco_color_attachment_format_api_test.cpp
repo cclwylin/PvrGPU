@@ -78,7 +78,7 @@ void Reject(const std::filesystem::path &root,Fixture &f,const char *name,const 
 }
 void VerifyOldSize(const std::filesystem::path &root) {
 #if !defined(_WIN32)
-  static_assert(PVRGPU_SYSTEMC_API_VERSION==32);
+  static_assert(PVRGPU_SYSTEMC_API_VERSION==33);
   const auto page=static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
   // API30 ends immediately before the new count, rounded to the old struct
   // alignment. Only the version may be read before refusing this command.

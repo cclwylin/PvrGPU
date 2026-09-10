@@ -341,6 +341,27 @@ test_compiled_ubo_prefix(void)
    for (unsigned i = 4; i < 12; ++i) CHECK(words[i] == 0xbabef00d);
    pvrgpu_finish_uniform_buffer_snapshots(entries, &count);
    CHECK(count == 0);
+
+   /* The compiler may append CB0 after the retained real-UBO prefix.  Native
+    * block0 still snapshots Gallium CB1; native block1 deliberately aliases
+    * Gallium CB0, and both payloads keep their native descriptor indices. */
+   uint32_t cb0[] = {0x10203040, 0x7fc00001, 0x80000000, 0xffffffff};
+   bindings[0].user_buffer = cb0;
+   bindings[0].buffer_size = sizeof(cb0) - 3;
+   for (unsigned i = 0; i < 12; ++i) words[i] = 0xbabef00d;
+   CHECK(pvrgpu_snapshot_stage_uniform_buffers_mapped(
+      bindings, 0, 2, 0, 2, 4, words, 12, entries, &count, 15));
+   CHECK(count == 2);
+   CHECK(entries[0].block_index == 0 && entries[0].bytes_size == sizeof(data));
+   CHECK(entries[1].block_index == 1 && entries[1].bytes_size == sizeof(cb0));
+   CHECK(memcmp(entries[0].bytes, data, sizeof(data)) == 0);
+   CHECK(memcmp(entries[1].bytes, cb0, 3 * sizeof(uint32_t)) == 0);
+   CHECK(((const uint32_t *)entries[1].bytes)[3] == 0);
+   CHECK(words[2] == sizeof(data) && words[6] == sizeof(cb0));
+   CHECK(!pvrgpu_snapshot_stage_uniform_buffers_mapped(
+      bindings, 0, 2, 0, 1, 4, words, 12, entries, &count, 15));
+   pvrgpu_finish_uniform_buffer_snapshots(entries, &count);
+   CHECK(count == 0);
 }
 
 int main(void)

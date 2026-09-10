@@ -105,19 +105,24 @@ TextureLodSelection SelectTextureLod(
   TextureLodSelection result;
   result.rho_squared = rho_squared;
   // Public SMP LODM=NORMAL derives one isotropic LOD for a 2x2 quad from
-  // rho^2 = max(|d/dx|^2, |d/dy|^2) (lp_build_rho without the rho_opt
-  // shortcut).  log2(rho) is half of log2(rho^2), so the log2 is taken once
-  // on the square and halved.  The LOD is an exact log2 rather than
-  // llvmpipe's piecewise-linear fast_log2: GL requires the LOD accurate to a
-  // few fractional bits (dEQP checks six), and fast_log2's mid-octave error
-  // (~0.086, e.g. log2(3) as 1.5 not 1.585) shows up directly as the mip
-  // blend weight of a trilinear filter -- a low-quality result the hardware's
-  // LOD unit does not produce.  Level selection still rounds this LOD, so the
-  // mip-nearest and magnification decisions are unchanged at every boundary
-  // fast_log2 already resolved exactly (the powers of two).
+  // rho^2 = max(|d/dx|^2, |d/dy|^2) (lp_build_rho with no_rho_approx, which
+  // is llvmpipe's default: GALLIVM_PERF_RHO_APPROX and _BRILINEAR are
+  // opt-in).  log2(rho) is half of log2(rho^2), so the log2 is taken once on
+  // the square and halved, exactly as lp_build_lod_selector's general path
+  // does: lod = fast_log2(rho^2) * 0.5.  That log2 is llvmpipe's
+  // piecewise-linear lp_build_fast_log2 (exponent field plus mantissa), not
+  // an exact log2.  Its mid-octave error (~0.086, e.g. log2(3) as 1.5) is
+  // the reference's actual trilinear blend weight and is observable: the
+  // GL5 foliage shadow draws alpha-test a minified trilinear ASTC texture,
+  // and an exact log2 shifts the blended alpha across the 0.021 threshold on
+  // ~1.6% of the covered pixels (Draw 185 first mismatch).  An exact log2
+  // only silences dEQP's mipmap_linear QualityWarning; the llvmpipe reference
+  // remains the byte-exact oracle for capture replay.  Level selection still
+  // rounds this LOD, so the mip-nearest and magnification decisions are
+  // unchanged at the powers of two both log2 variants resolve exactly.
   float lambda = min_lod;
   if (rho_squared > 0.0F)
-    lambda = std::clamp(std::log2(rho_squared) * 0.5F, min_lod, max_lod);
+    lambda = std::clamp(TextureFastLog2(rho_squared) * 0.5F, min_lod, max_lod);
   result.lambda = lambda;
   result.minified = lambda > 0.0F;
   const std::uint32_t last_level_u4_6 = (mip_count - 1U) * 64U;
@@ -141,8 +146,10 @@ TextureLodSelection SelectTextureBiasedLod(
     // This is not a rewrite of shader registers or fabricated texture data.
     lambda = bias > 0.0F ? max_lod : min_lod;
   } else {
+    // lp_build_lod_selector: lod = fast_log2(rho^2) * 0.5, then the shader
+    // bias is a separate FAdd before the sampler LOD clamps.
     lambda = rho_squared == 0.0F ? min_lod :
-        std::clamp(std::log2(rho_squared) * 0.5F + bias, min_lod, max_lod);
+        std::clamp(TextureFastLog2(rho_squared) * 0.5F + bias, min_lod, max_lod);
   }
   result.lambda = lambda;
   result.minified = lambda > 0.0F;
@@ -507,7 +514,14 @@ TextureFloatAxis ComputeTextureFloatLinear(float coordinate,
 }
 
 float LerpTextureFloat(float first, float second, float weight) {
-  return first + weight * (second - first);
+  // lp_build_lerp_simple takes the floating-point branch for every datapath
+  // that is not 8-bit unorm, and that branch is lp_build_mad(x, v1 - v0, v0)
+  // -> lp_build_fmuladd, a single llvm.fmuladd that this host fuses (the ISP
+  // depth plane already relies on the same fusion).  Evaluating the multiply
+  // and the add separately rounds twice and shows up as a 1-ULP difference in
+  // the RGBA16F bloom chain, where the float datapath filters half-float
+  // texels (GL5 Draws 196-199).
+  return std::fma(weight, second - first, first);
 }
 
 namespace {

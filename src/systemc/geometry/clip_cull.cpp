@@ -55,8 +55,9 @@ struct ClipVertex {
   // intersections with three separate CPU operations instead.
   bool generated_intersection = false;
   // Flat/special outputs carry raw integer bits, not numbers to lerp.
-  // Ordinary float varyings may also be non-finite; only clip position must
-  // be finite. This mask is local clipping state, not an ABI change.
+  // Ordinary float varyings and shader clip positions may be non-finite; the
+  // selected-plane policy below decides whether a primitive survives. This
+  // mask is local clipping state, not an ABI change.
   std::uint64_t non_interpolated_mask = 0;
 };
 
@@ -84,21 +85,13 @@ ClipVertex ReadClipVertex(const VertexLane &vertex,
     throw std::runtime_error(
         "ClipCull received a vertex without UVSW emit/end-task");
   }
-  /* Only the clip position drives the clipping arithmetic.  The registers
-   * above it -- gl_PointSize and then the varyings -- are shader results the
-   * clipper merely carries and interpolates, and GLSL places no finiteness
-   * requirement on them: a shader may legitimately compute a NaN or an
-   * infinity and write it to a varying.  Checking those here rejected valid
-   * shader output, so the check is scoped to the four components whose value
-   * this stage actually reasons about. */
-  for (std::size_t component = 0; component < 4; ++component) {
-    if (!std::isfinite(result.output[component])) {
-      throw std::runtime_error(
-          "ClipCull received a non-finite clip position: component " +
-          std::to_string(component) + " of " + std::to_string(output_count) +
-          " bits=" + std::to_string(vertex.vertex_output[component]));
-    }
-  }
+  /* Preserve every raw shader result here, including non-finite clip
+   * positions.  Mesa's clip test deliberately marks unordered plane
+   * comparisons as outside, then its generic clipper discards only the
+   * affected primitive when a selected plane distance is NaN or infinity.
+   * Rejecting the vertex here instead aborts unrelated primitives and the
+   * whole ordered submission.  ClipTriangle applies that fail-closed policy
+   * at the same per-primitive boundary below. */
   return result;
 }
 
@@ -139,7 +132,12 @@ std::uint32_t ClipMask(const ClipVertex &vertex, bool depth_clamp, std::uint8_t 
   if (clip_dist_mask != 0) {
     for (std::uint32_t i = 0; i < 8; ++i) {
       if ((clip_dist_mask & (1U << i)) != 0) {
-        if (!(PlaneDistance(vertex, 6 + i, clip_dist_reg) >= 0.0F)) {
+        // Shader-provided gl_ClipDistance has stricter Mesa semantics than
+        // a homogeneous/user-plane dot product: either sign of infinity, as
+        // well as NaN and ordinary negative values, is outside.
+        const float distance =
+            PlaneDistance(vertex, 6 + i, clip_dist_reg);
+        if (distance < 0.0F || !std::isfinite(distance)) {
           mask |= 1U << (6 + i);
         }
       }
@@ -197,15 +195,33 @@ ClipTriangle(const std::array<ClipVertex, 3> &input, bool depth_clamp, std::uint
 
     if ((union_mask & (1U << plane)) == 0)
       continue;
+    if (plane < 6 && std::any_of(
+            polygon.begin(), polygon.end(), [](const ClipVertex &vertex) {
+              return std::any_of(vertex.output, vertex.output + 4,
+                                 [](float component) {
+                                   return !std::isfinite(component);
+                                 });
+            })) {
+      /* Mesa evaluates a selected hard plane as a four-term dot product.
+       * IEEE zero-times-NaN/Inf is still NaN, so a non-finite component that
+       * the simplified PlaneDistance expression does not mention must also
+       * discard this primitive.  A clean w=+Inf primitive selects no plane
+       * and intentionally bypasses this generic-clip rule. */
+      return {};
+    }
     if (polygon.size() > 15)
       throw std::runtime_error("ClipCull polygon exceeds six-plane bound");
     std::vector<ClipVertex> output;
     output.reserve(polygon.size() + 1);
     ClipVertex previous = polygon.front();
     float previous_distance = PlaneDistance(previous, plane, clip_dist_reg);
+    if (!std::isfinite(previous_distance))
+      return {};
     for (std::size_t edge = 1; edge <= polygon.size(); ++edge) {
       const ClipVertex current = polygon[edge % polygon.size()];
       const float distance = PlaneDistance(current, plane, clip_dist_reg);
+      if (!std::isfinite(distance))
+        return {};
       bool different_sign = false;
       if (previous_distance >= 0.0F) {
         output.push_back(previous);
@@ -512,7 +528,7 @@ RasterTriangle BuildRasterTriangle(const std::array<ClipVertex, 3> &vertices,
     if (vertices[index].output_count != output_count)
       throw std::runtime_error("ClipCull triangle VTXOUT strides disagree");
     const float clip_w = vertices[index].output[3];
-    if (!(clip_w > 0.0F) || !std::isfinite(clip_w))
+    if (!(clip_w > 0.0F))
       throw std::runtime_error("ClipCull post-clip W is not positive");
     triangle.reciprocal_w[index] = 1.0F / clip_w;
     const float ndc_x =
@@ -560,6 +576,15 @@ RasterTriangle BuildRasterTriangle(const std::array<ClipVertex, 3> &vertices,
   }
 
   std::int64_t area = QuantizedArea(triangle);
+  // llvmpipe's lp_setup_tri.c computes the same 24.8 fixed-point area on its
+  // own input order (dx01 * dy20 - dx20 * dy01), which is the negation of
+  // QuantizedArea's (x1 - x0)(y2 - y0) - (y1 - y0)(x2 - x0).  A clipper fan
+  // piece {fan-1, fan, 0} is a cyclic rotation of this model's {0, fan-1,
+  // fan}, so the sign relation holds for both emission orders.  Only a
+  // negative llvmpipe area sign makes triangle_cw/triangle_both exchange v0
+  // and v1 (rotate_fixed_position_01); a positive sign keeps the input order
+  // (triangle_ccw/triangle_both) and a zero area draws nothing.
+  const bool mesa_exchanges_first_two = area > 0;
   if (area < 0) {
     std::swap(triangle.x[1], triangle.x[2]);
     std::swap(triangle.y[1], triangle.y[2]);
@@ -574,15 +599,23 @@ RasterTriangle BuildRasterTriangle(const std::array<ClipVertex, 3> &vertices,
 
   // The GL driver command uses last-vertex provoking semantics.  Clean
   // primitives enter llvmpipe setup in application order; the generic Mesa
-  // clip stage fan-emits them as {fan-1, fan, 0}.  llvmpipe then exchanges
-  // its first two vertices while normalizing the validated CW command for
-  // setup, yielding {1,0,2} and {2,1,0}, respectively.  Translate that input
-  // order through this model's independent raster-winding normalization.
+  // clip stage fan-emits them as {fan-1, fan, 0}.  When llvmpipe's fixed-point
+  // area sign is negative it exchanges its first two setup vertices, yielding
+  // {1,0,2} and {2,1,0}; a positive sign (only reachable when face culling
+  // does not reject that winding, e.g. GL5's double-sided foliage shadow
+  // draws) keeps {0,1,2} and {1,2,0}.  The choice is observable: the setup
+  // coefficient subtraction sequence and the polygon-offset slope are
+  // anchored at the first setup vertex.  Translate that input order through
+  // this model's independent raster-winding normalization.
   const std::array<std::size_t, 3> setup_input_order =
       mesa_viewport_order
           ? (mesa_clipper_emit_order
-                 ? std::array<std::size_t, 3>{2, 1, 0}
-                 : std::array<std::size_t, 3>{1, 0, 2})
+                 ? (mesa_exchanges_first_two
+                        ? std::array<std::size_t, 3>{2, 1, 0}
+                        : std::array<std::size_t, 3>{1, 2, 0})
+                 : (mesa_exchanges_first_two
+                        ? std::array<std::size_t, 3>{1, 0, 2}
+                        : std::array<std::size_t, 3>{0, 1, 2}))
           : std::array<std::size_t, 3>{0, 1, 2};
   for (std::size_t setup_index = 0; setup_index < setup_input_order.size();
        ++setup_index) {
@@ -1207,7 +1240,9 @@ void ClipCull::Run() {
             const bool preclip_ndc_defined = std::all_of(
                 vertices.begin(), vertices.end(),
                 [](const ClipVertex &vertex) {
-                  return vertex.output[3] > 0.0F;
+                  return vertex.output[3] > 0.0F &&
+                         std::isfinite(vertex.output[0]) &&
+                         std::isfinite(vertex.output[1]);
                 });
             if (preclip_ndc_defined) {
               (void)ClassifyFrontFacing(

@@ -135,7 +135,7 @@ void RejectUnsupportedMetadata(const Program &p) {
     auto &i=changed[index];
     if(malformed==0) i.texture_lod_bias=2;
     if(malformed==1) i.texture_lod_replace=1;
-    if(malformed==2) i.texture_address_offset=1;
+    if(malformed==2) i.texture_gather=1;
     if(malformed==3) i.texture_non_normalized_coords=1;
     if(malformed==4) i.texture_sample_index_present=1;
     if(malformed==5) i.opcode=PcoOpcode::kNop;

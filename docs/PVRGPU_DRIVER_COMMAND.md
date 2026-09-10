@@ -8,7 +8,7 @@ bring-up seam: small enough to debug quickly, strict enough to prevent fake
 passes, and close enough to Gallium state that the driver can grow phase by
 phase.
 
-## Current contracts: graphics API 30 and compute API 6
+## Current contracts: graphics API 33 and compute API 6
 
 Native fragment control flow supports relative group-boundary branches and
 ST/EF/SM/LT/END execution masks. The compiler admits fragment `break`, including
@@ -29,7 +29,7 @@ control-only. Static binary opcode histograms are separately reported and are
 not multiplied to manufacture loop execution counts.
 
 The numbered sections below describe the features at their introduction.
-Current callers must use graphics version **30** and independent compute
+Current callers must use graphics version **33** and independent compute
 version **6**; both entry points reject older versions before reading new
 tails. They must be rebuilt with the matching headers and runtime together.
 
@@ -72,6 +72,17 @@ target and PBE loads each target independently. This also preserves untouched
 pixels/channels across flush/readback boundaries. Older runtimes are rejected
 even though no struct fields were added. Explicit RDC frame-length ownership
 remains unchanged.
+
+Graphics API 33 appends the effective polygon-offset state to every physical
+draw: an enable, exact binary32 factor/units/clamp values, and Gallium's
+`offset_units_unscaled` selector. Disabled state is canonical and carries a
+zero tail; booleans outside 0/1, non-finite values, or enabled state without a
+depth format are rejected before work is queued. The parameter buffer computes
+one offset per primitive using llvmpipe's ordered binary32 setup operations,
+including its half-unit rounding adjustment for UNORM depth. The ISP performs a
+separate final add after the two position-Z FMAs and clamps the resulting
+window depth. Folding the bias into the plane constant is not equivalent at
+Z16/Z24/Z32 quantization boundaries.
 
 Graphics API 27 adds `framebuffer_layers` to physical nested PCO draws: zero
 means a non-layered attachment, otherwise 1–256 layer-major images. The model
@@ -547,7 +558,7 @@ Each physical draw snapshots three boolean fields: `alpha_to_coverage`,
 them and copy them into the draw's `RasterState`; they are not context-global
 values read after a deferred draw. Both top-level and nested old-version
 commands are rejected before accessing their new tail. Current callers use
-graphics API 30 and the independent compute API 6, as described above.
+graphics API 33 and the independent compute API 6, as described above.
 
 The model adapts Mesa 26.2.1 llvmpipe's pixel-frequency alpha-to-coverage
 algorithm: sample s survives when the original DATA0 alpha is greater than
@@ -606,19 +617,23 @@ ownership masks retain all 256 bits across texture continuations.
 
 Every physical nested PCO draw may carry `uniform_buffers` and
 `uniform_buffer_count`. Each entry states a VS/FS `stage`, zero-based
-`block_index`, `bytes` and `bytes_size`. The driver snapshots only the bound
-Gallium constant-buffer range at index `block_index + 1`; CB0 remains the
-ordinary uniform/push-constant source. Both the deferred driver draw and the
-bridge own deep copies, so rebinding or updating a buffer cannot modify an
-earlier draw. There are at most 15 blocks per stage and 64 KiB per bound range.
+native descriptor `block_index`, `bytes` and `bytes_size`. Ordinary block N
+snapshots Gallium constant-buffer N+1. When a dynamically indexed CB0 live set
+cannot fit the shared bank, the compiler may append one driver-private final
+block containing the complete, vec4-padded CB0 range. Both the deferred driver
+draw and the bridge own deep copies, so rebinding or updating a buffer cannot
+modify an earlier draw. There are at most 15 total blocks per stage and 64 KiB
+per bound range.
 
 The stage ABI exposes `uniform_buffer_descriptor_start` (DWORD index) and
 `uniform_buffer_descriptor_count` (slot extent). Each native descriptor is
 four DWORDs: 64-bit base address, byte size, and dynamic byte offset. Texture
 descriptors retain their existing 20-DWORD prefix; UBO descriptors follow,
-then CB0 push constants. When CB0 is empty, its start still equals the
-descriptor-prefix end. The compiler maps UBO block N to set 0/binding N+1;
-texture unit N remains set N/binding 0. Unbound holes contain four zeros.
+then fragment image descriptors and CB0 push constants. When CB0 is empty, its
+start still equals the descriptor-prefix end. The compiler maps native UBO
+block N to set 0/binding N+1; texture unit N remains set N/binding 0. Unbound
+ordinary UBO holes contain four zeros; a live driver-private CB0 block cannot
+be a hole.
 Captured descriptors contain `[0, 0, bytes_size, 0]`, because the payload is
 already sliced to the binding range. Submitter assigns a disjoint address to
 each draw/stage/block, imports its bytes into DRAM and relocates the address.

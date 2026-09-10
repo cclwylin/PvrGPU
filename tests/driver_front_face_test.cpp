@@ -124,6 +124,43 @@ void Verify(MemoryPool &pool, const PipelineState &state, bool front,
   const auto raster = LoadArray<RasterTriangle>(pool, state.raster_triangles);
   const auto parameters = LoadArray<ParameterTriangle>(pool, state.parameter_triangles);
   Check(raster.size() == 1 && parameters.size() == 1, "one interior triangle");
+  if (!culled) {
+    // llvmpipe's lp_setup_tri.c evaluates the 24.8 fixed-point area
+    // dx01 * dy20 - dx20 * dy01 on its setup input order and exchanges v0/v1
+    // only when that sign is negative, so every triangle it rasterizes has a
+    // positive area in that convention once the exchange has been applied.
+    // With face culling disabled both application windings reach setup, and
+    // the exchange therefore differs per triangle; the recorded Mesa setup
+    // order must reproduce that, because the coefficient subtraction
+    // sequence and the polygon-offset slope are anchored at setup v0 and
+    // are observable in D24 depth.
+    const auto &t = raster[0];
+    const std::size_t s0 = t.setup_vertex_order[0];
+    const std::size_t s1 = t.setup_vertex_order[1];
+    const std::size_t s2 = t.setup_vertex_order[2];
+    Check(s0 < 3 && s1 < 3 && s2 < 3 && s0 != s1 && s1 != s2 && s0 != s2,
+          "Mesa setup order is a vertex permutation");
+    const std::int64_t x0 = QuantizeRasterSubpixel(t.x[s0]);
+    const std::int64_t y0 = QuantizeRasterSubpixel(t.y[s0]);
+    const std::int64_t x1 = QuantizeRasterSubpixel(t.x[s1]);
+    const std::int64_t y1 = QuantizeRasterSubpixel(t.y[s1]);
+    const std::int64_t x2 = QuantizeRasterSubpixel(t.x[s2]);
+    const std::int64_t y2 = QuantizeRasterSubpixel(t.y[s2]);
+    const std::int64_t llvmpipe_area =
+        (x0 - x1) * (y2 - y0) - (x2 - x0) * (y0 - y1);
+    Check(llvmpipe_area > 0,
+          "Mesa setup order has llvmpipe's positive fixed-point area after "
+          "its conditional v0/v1 exchange");
+    // The exchange never moves llvmpipe's third setup vertex: it is always
+    // the last application vertex, which this fixture places at window
+    // y = kExtent/2 + 0.75 * viewport_scale[1] (lane 2) or at the mirrored
+    // -0.75 row (lane 1), never at the first lane's corner.
+    const float third_y = t.y[s2];
+    const float first_lane_y =
+        kExtent * 0.5F + -0.75F * state.raster_state.viewport_scale[1];
+    Check(third_y != first_lane_y || t.x[s2] != kExtent * 0.5F - 0.75F * (kExtent * 0.5F),
+          "third Mesa setup vertex is never the first application vertex");
+  }
   Check(raster[0].front_facing == front, "ClipCull original front_facing");
   Check(raster[0].face_culled == culled, "ClipCull face_culled");
   Check(raster[0].rasterizable == !culled, "ClipCull rasterizable");

@@ -1795,6 +1795,8 @@ PcoInstruction DecodeTextureSampleGroup(
                     channel_encoding != 0 || !fcnorm || dimension != 2 ||
                     (extension != 0x90U && extension != 0x91U) || !lod_replace)) ||
         pplod != (address_offset || lod_replace || lod_mode == 1U) ||
+        /* A 2D multisample array still has a 2D TPU request: Mesa lowers the
+         * array layer into the TAO address pair rather than a third coordinate. */
         (sample_index_present && (!non_normalized_coords || lod_replace || dimension != 2)) ||
         (non_normalized_coords && !sample_index_present && !lod_replace) ||
         (!address_offset && !sample_index_present && !lod_replace &&
@@ -1805,7 +1807,15 @@ PcoInstruction DecodeTextureSampleGroup(
     DecodeError(header.offset + 4, "SMP channel count disagrees with sample-buffer mode");
   if (descriptor_start != 0 && spatial_offset_present)
     DecodeError(header.offset, "SMP spatial offset transport is not enabled for task-stage textures");
-  const bool lod_bias = lod_mode == 1U && !address_offset;
+  /* LODM=BIAS is overloaded by Mesa's public encoding when TAO is present.
+   * Fragment txb uses the PPLOD word as its real bias (including BIAS+TAO),
+   * while an address override without an explicit LOD carries the compiler's
+   * required zero PPLOD padding before the shader-computed layer address.
+   * The fragment stage alone cannot distinguish those forms: txf_ms array
+   * fetches are fragment instructions too. SNO identifies that fetch and its
+   * PPLOD word as padding, never as an implicit-derivative bias. */
+  const bool lod_bias = lod_mode == 1U &&
+      (!address_offset || (fragment_bias && !sample_index_present));
   if (lod_bias && !fragment_bias)
     DecodeError(header.offset + 4, "SMP shader LOD bias is fragment-only");
   if (((lod_replace || lod_bias) && !exta) ||
@@ -1985,6 +1995,87 @@ PcoInstruction DecodeGenericAdd64_32Group(
   instruction.source_count = 3;
   instruction.repeat_count = 1;
   instruction.end_group = 0;
+  return instruction;
+}
+
+/* MBYP2: phase 0 and phase 1 each move one independent source to one
+ * independent destination. Mesa uses this dual-phase group for register
+ * shuffles around 3D texture-coordinate lowering. Both sources are sampled
+ * before either destination is written by the executor, matching the two
+ * phases in one instruction group. */
+PcoInstruction DecodeGenericMoveBypass2Group(
+    const std::vector<std::uint8_t> &binary, const GroupHeader &header,
+    std::uint16_t group_index) {
+  if (header.control || header.bitwise || header.da != 3 ||
+      header.operation_origin != 3 || header.output_load_check ||
+      !header.write0_present || !header.write1_present ||
+      header.repeat_count != 1) {
+    DecodeError(header.offset, "unsupported MBYP2 instruction-group header");
+  }
+  const std::size_t group_end = header.offset + header.total_bytes;
+  std::size_t cursor = header.offset + 3;
+  if (group_end - cursor < 2 || binary[cursor++] != 0x87U ||
+      binary[cursor++] != 0x87U) {
+    DecodeError(header.offset + 3, "expected phase-0/phase-1 MBYP operations");
+  }
+
+  const PcoRegisterRef source0 =
+      DecodeOneLowerSource(binary, group_end, cursor);
+  const PcoRegisterRef source1 =
+      DecodeOneLowerSource(binary, group_end, cursor);
+  if (cursor >= group_end || binary[cursor++] != 0x40U)
+    DecodeError(cursor - 1, "MBYP2 requires is4=ft0 and is5=ft1");
+
+  /* Mesa I_TWO_1B7I_1B6I, I_TWO_3B8I_3B8I and
+   * I_TWO_3B11I_3B11I share this prefix/extension layout. */
+  if (group_end - cursor < 2)
+    DecodeError(cursor, "truncated MBYP2 dual destination");
+  const std::uint8_t dst0_byte = binary[cursor++];
+  const std::uint8_t dst1_byte = binary[cursor++];
+  unsigned bank0 = (dst0_byte >> 7U) & 1U;
+  unsigned bank1 = (dst1_byte >> 6U) & 1U;
+  std::uint16_t output0 = dst0_byte & 0x7fU;
+  std::uint16_t output1 = dst1_byte & 0x3fU;
+  if ((dst1_byte & 0x80U) != 0) {
+    if (cursor >= group_end)
+      DecodeError(cursor, "truncated MBYP2 extended dual destination");
+    const std::uint8_t extension = binary[cursor++];
+    bank0 |= ((extension >> 1U) & 3U) << 1U;
+    bank1 |= ((extension >> 5U) & 3U) << 1U;
+    output0 |= (extension & 1U) << 7U;
+    output1 |= ((extension >> 3U) & 3U) << 6U;
+    if ((extension & 0x80U) != 0) {
+      if (cursor >= group_end)
+        DecodeError(cursor, "truncated MBYP2 long dual destination");
+      const std::uint8_t high = binary[cursor++];
+      if ((high & 0xc0U) != 0)
+        DecodeError(cursor - 1,
+                    "MBYP2 dual destination reserved bits are nonzero");
+      output0 |= (high & 7U) << 8U;
+      output1 |= ((high >> 3U) & 7U) << 8U;
+    }
+  }
+  if (bank0 != static_cast<unsigned>(PcoRegisterBank::kTemporary) ||
+      bank1 != static_cast<unsigned>(PcoRegisterBank::kTemporary) ||
+      output0 >= kPcoTemporaryCount || output1 >= kPcoTemporaryCount) {
+    DecodeError(cursor - 2,
+                "fragment MBYP2 destinations must be modeled temporaries");
+  }
+  ValidateAlignmentPadding(binary, header.offset, cursor, group_end);
+
+  PcoInstruction instruction;
+  instruction.opcode = PcoOpcode::kMoveBypass;
+  instruction.target = PcoWriteTarget::kTemporary;
+  instruction.output_target1 = PcoWriteTarget::kTemporary;
+  instruction.source = source0;
+  instruction.source1 = source1;
+  instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
+  instruction.group_index = group_index;
+  instruction.output_index = output0;
+  instruction.output_index1 = output1;
+  instruction.source_count = 2;
+  instruction.repeat_count = 1;
+  instruction.end_group = header.end ? 1U : 0U;
   return instruction;
 }
 
@@ -4239,6 +4330,8 @@ PcoInstruction DecodeFragmentGroup(const std::vector<std::uint8_t> &binary,
       return DecodeFragmentFitrGroup(binary, header, group_index);
     return DecodeFragmentFitrpGroup(binary, header, group_index);
   }
+  if (header.operation_origin == 3)
+    return DecodeGenericMoveBypass2Group(binary, header, group_index);
   if (header.operation_origin == 0) {
     if (header.write1_present &&
         (binary[header.offset + 3] & ~0x08U) == 0xe3U)
@@ -5258,6 +5351,8 @@ bool HasCanonicalTextureFields(const PcoInstruction &instruction) {
          HasCanonicalTextureLodMode(instruction, true) &&
          (!instruction.texture_non_normalized_coords ||
           instruction.texture_sample_index_present || instruction.texture_lod_replace) &&
+         /* sampler2DMSArray keeps dimension=2; its layer is already folded
+          * into the TAO base address, so this gate intentionally accepts it. */
          (!instruction.texture_sample_index_present ||
           (instruction.texture_non_normalized_coords && !instruction.texture_lod_replace &&
            instruction.texture_dimension == 2));
@@ -5296,9 +5391,9 @@ void SetTextureRequestData(
   if (instruction.texture_lod_bias)
     request.lod_bias = temporaries[tail++];
   if (instruction.texture_address_offset) {
-    // pco_emit_nir_smp injects a zero bias before the address pair. A nonzero
-    // BIAS needs its own LOD datapath; never silently discard it here.
-    if (!instruction.texture_lod_replace &&
+    // AUTO+TAO injects a zero PPLOD word before the address pair. BIAS+TAO
+    // uses that same slot as its real bias and consumed it immediately above.
+    if (!instruction.texture_lod_replace && !instruction.texture_lod_bias &&
         (temporaries[tail++] & UINT32_C(0x7fffffff)) != 0)
       ExecuteError("SMP TAO requires the supported zero LOD bias");
     request.texture_address_lo = temporaries[tail++];
@@ -6065,6 +6160,13 @@ void ValidateFragmentProgram(
                          instruction.source_count == 0;
       break;
     case PcoOpcode::kMoveBypass:
+      if (instruction.source_count == 2) {
+        writes_temporary =
+            instruction.target == PcoWriteTarget::kTemporary &&
+            instruction.output_target1 == PcoWriteTarget::kTemporary &&
+            instruction.output_index1 < kPcoTemporaryCount;
+        break;
+      }
       if (instruction.target == PcoWriteTarget::kPixelOutput) {
         if (instruction.source_count != 1 || instruction.repeat_count != 1 ||
             instruction.output_index >= kPcoPixelOutputCount)
@@ -6146,7 +6248,9 @@ void ValidateFragmentProgram(
       DecodeError(instruction.binary_offset,
                   "invalid generic fragment ALU destination");
     written_mask.set(instruction.output_index);
-    if (instruction.opcode == PcoOpcode::kIntegerAdd64_32) {
+    if (instruction.opcode == PcoOpcode::kIntegerAdd64_32 ||
+        (instruction.opcode == PcoOpcode::kMoveBypass &&
+         instruction.source_count == 2)) {
       if (instruction.output_index1 >= kPcoTemporaryCount)
         DecodeError(instruction.binary_offset,
                     "invalid generic fragment ALU high destination");
@@ -7147,6 +7251,89 @@ std::uint32_t ReciprocalSquareRootBits(std::uint32_t val_bits) {
   return result_bits;
 }
 
+/* The reference USC transcendental unit is llvmpipe's, not libm's.  gallivm
+ * evaluates flog2/fexp2 (and therefore fpow, which it lowers to
+ * exp2(y * log2(x))) with minimax polynomials in lp_bld_arit.c, so an exact
+ * log2f()/exp2f() here is a different function by roughly one ULP.  GL5's
+ * Draws 197-199 run a fragment shader whose only special-function work is
+ * three pow() evaluations (ps_sfu=6, ps_tex=0), and that ULP is visible in
+ * the RGBA16F attachment.  Mirror gallivm exactly, including its evaluation
+ * order: lp_build_polynomial splits the series into even and odd halves in
+ * x^2 and folds each with a fused multiply-add, rather than using Horner. */
+constexpr double kLlvmpipeExp2Polynomial[] = {
+    1.000000000000000000000,   0.693153073200168932794,
+    0.240153617044375388211,   0.0558263180532956664775,
+    0.00898934009049466391101, 0.00187757667519147912699,
+};
+constexpr double kLlvmpipeLog2Polynomial[] = {
+    2.88539009343309178325,  0.961791550404184197881,
+    0.577440339438736392009, 0.403343858251329912514,
+    0.406718052498846252698,
+};
+
+float LlvmpipePolynomial(float x, const double *coefficients,
+                         std::size_t count) {
+  if (count < 2)
+    throw std::runtime_error("USC transcendental polynomial is too short");
+  const float squared = x * x;
+  bool have_even = false;
+  bool have_odd = false;
+  float even = 0.0F;
+  float odd = 0.0F;
+  for (std::size_t index = count; index-- > 0;) {
+    /* gallivm declares the fits in double but materializes them into an f32
+     * vector, so each coefficient is rounded to binary32 exactly once. */
+    const float coefficient = static_cast<float>(coefficients[index]);
+    if (index % 2 == 0) {
+      even = have_even ? std::fma(squared, even, coefficient) : coefficient;
+      have_even = true;
+    } else {
+      odd = have_odd ? std::fma(squared, odd, coefficient) : coefficient;
+      have_odd = true;
+    }
+  }
+  return have_odd ? std::fma(odd, x, even) : even;
+}
+
+/* lp_build_exp2: clamp into the representable exponent range, split into
+ * integer and fractional parts, build 2**ipart by constructing the exponent
+ * field and 2**fpart from the minimax fit, then multiply. */
+float LlvmpipeExp2(float value) {
+  value = value > 128.0F ? 128.0F : value;
+  value = value < -126.99999F ? -126.99999F : value;
+  const float integral = std::floor(value);
+  const float fractional = value - integral;
+  const std::uint32_t exponent_bits =
+      static_cast<std::uint32_t>(static_cast<std::int32_t>(integral) + 127)
+      << 23U;
+  float exp_integral = 0.0F;
+  std::memcpy(&exp_integral, &exponent_bits, sizeof(exp_integral));
+  return exp_integral *
+         LlvmpipePolynomial(fractional, kLlvmpipeExp2Polynomial,
+                            std::size(kLlvmpipeExp2Polynomial));
+}
+
+/* lp_build_log2_approx: take the exponent field as the integer part and fit
+ * the mantissa through y = (m - 1) / (m + 1), whose odd series in y^2 is the
+ * polynomial above.  Edge cases stay with the callers below, which already
+ * implement NIR flog2's reference behaviour. */
+float LlvmpipeLog2(float value) {
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const std::int32_t biased =
+      static_cast<std::int32_t>((bits & UINT32_C(0x7f800000)) >> 23U);
+  const float log_exponent = static_cast<float>(biased - 127);
+  const std::uint32_t mantissa_bits =
+      (bits & UINT32_C(0x007fffff)) | UINT32_C(0x3f800000);
+  float mantissa = 0.0F;
+  std::memcpy(&mantissa, &mantissa_bits, sizeof(mantissa));
+  const float y = (mantissa - 1.0F) / (mantissa + 1.0F);
+  return std::fma(y,
+                  LlvmpipePolynomial(y * y, kLlvmpipeLog2Polynomial,
+                                     std::size(kLlvmpipeLog2Polynomial)),
+                  log_exponent);
+}
+
 std::uint32_t FloatLog2Bits(std::uint32_t val_bits) {
   constexpr std::uint32_t kPositiveInfinity = UINT32_C(0x7f800000);
   constexpr std::uint32_t kNegativeInfinity = UINT32_C(0xff800000);
@@ -7178,7 +7365,7 @@ std::uint32_t FloatLog2Bits(std::uint32_t val_bits) {
 
   float val = 0.0f;
   std::memcpy(&val, &val_bits, sizeof(val));
-  const float result_val = std::log2(val);
+  const float result_val = LlvmpipeLog2(val);
   std::uint32_t result_bits = 0;
   std::memcpy(&result_bits, &result_val, sizeof(result_bits));
   return result_bits;
@@ -7198,7 +7385,7 @@ std::uint32_t FloatExp2Bits(std::uint32_t val_bits) {
   }
   float val = 0.0f;
   std::memcpy(&val, &val_bits, sizeof(val));
-  float result_val = std::exp2(val);
+  float result_val = LlvmpipeExp2(val);
   std::uint32_t result_bits = 0;
   std::memcpy(&result_bits, &result_val, sizeof(result_bits));
   return result_bits;
@@ -10277,6 +10464,30 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
       if (trace) {
         std::cerr << "pco-fragment-trace pc=" << pc << " off="
                   << instruction.binary_offset << " op=ADD64_32 dst=t"
+                  << instruction.output_index << ",t"
+                  << instruction.output_index1 << '\n';
+      }
+      ++pc;
+      continue;
+    }
+
+    if (instruction.opcode == PcoOpcode::kMoveBypass &&
+        instruction.source_count == 2) {
+      if (instruction.target != PcoWriteTarget::kTemporary ||
+          instruction.output_target1 != PcoWriteTarget::kTemporary ||
+          instruction.repeat_count != 1 ||
+          instruction.output_index >= temporaries.size() ||
+          instruction.output_index1 >= temporaries.size())
+        ExecuteError("invalid dual MBYP target in fragment shader");
+      const std::uint32_t value0 = read_fragment_source(instruction.source);
+      const std::uint32_t value1 = read_fragment_source(instruction.source1);
+      temporaries[instruction.output_index] = value0;
+      temporaries[instruction.output_index1] = value1;
+      temporary_written_mask.set(instruction.output_index);
+      temporary_written_mask.set(instruction.output_index1);
+      if (trace) {
+        std::cerr << "pco-fragment-trace pc=" << pc << " off="
+                  << instruction.binary_offset << " op=MBYP2 dst=t"
                   << instruction.output_index << ",t"
                   << instruction.output_index1 << '\n';
       }

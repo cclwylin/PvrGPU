@@ -4293,6 +4293,133 @@ test_stream_output_vertex_layout(struct pvrgpu_pco_compiler *compiler)
    ralloc_free(fb.shader);
 }
 
+static nir_shader *
+build_generic_mul_add_vertex_shader(bool fused)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX,
+      pco_nir_options(),
+      fused ? "generic_explicit_ffma_vs" : "generic_split_mul_add_vs");
+   nir_variable *input = nir_variable_create(b.shader,
+                                             nir_var_shader_in,
+                                             glsl_vec4_type(),
+                                             "position");
+   input->data.location = VERT_ATTRIB_GENERIC0;
+   nir_variable *output = nir_variable_create(b.shader,
+                                              nir_var_shader_out,
+                                              glsl_vec4_type(),
+                                              "gl_Position");
+   output->data.location = VARYING_SLOT_POS;
+
+   nir_def *position = nir_load_var(&b, input);
+   nir_def *x = nir_channel(&b, position, 0);
+   nir_def *y = nir_channel(&b, position, 1);
+   nir_def *z = nir_channel(&b, position, 2);
+   nir_def *result = fused ? nir_ffma(&b, x, y, z) :
+                             nir_fadd(&b, nir_fmul(&b, x, y), z);
+   nir_store_var(&b,
+                 output,
+                 nir_vec4(&b, result, y, z, nir_channel(&b, position, 3)),
+                 0xf);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   return b.shader;
+}
+
+static nir_shader *
+build_generic_mul_add_fragment_shader(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                  pco_nir_options(),
+                                                  "generic_mul_add_fs");
+   nir_variable *output = nir_variable_create(b.shader,
+                                              nir_var_shader_out,
+                                              glsl_vec4_type(),
+                                              "color");
+   output->data.location = FRAG_RESULT_DATA0;
+   nir_store_var(&b, output, nir_imm_vec4(&b, 0, 0, 0, 1), 0xf);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   return b.shader;
+}
+
+static void
+test_generic_vertex_mul_add_boundaries(struct pvrgpu_pco_compiler *compiler)
+{
+   nir_shader *vs[2] = {
+      build_generic_mul_add_vertex_shader(false),
+      build_generic_mul_add_vertex_shader(true),
+   };
+   nir_shader *fs = build_generic_mul_add_fragment_shader();
+   struct pvrgpu_pco_graphics_binary binary[2] = {{0}};
+   const enum pipe_format format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   uint64_t hash[2] = {0};
+   char error[512] = {0};
+
+   if (count_alu(vs[0], nir_op_fmul) != 1 ||
+       count_alu(vs[0], nir_op_fadd) != 1 ||
+       count_alu(vs[0], nir_op_ffma) != 0 ||
+       count_alu(vs[1], nir_op_fmul) != 0 ||
+       count_alu(vs[1], nir_op_fadd) != 0 ||
+       count_alu(vs[1], nir_op_ffma) != 1) {
+      fail("generic mul-add test did not start with distinct split/fused NIR");
+   }
+
+   for (unsigned fused = 0; fused < 2; ++fused) {
+      if (!pvrgpu_pco_compile_color_triangle(compiler,
+                                             vs[fused],
+                                             fs,
+                                             &format,
+                                             false,
+                                             false,
+                                             1,
+                                             0,
+                                             0,
+                                             1,
+                                             0,
+                                             &binary[fused],
+                                             error,
+                                             sizeof(error))) {
+         fail(error[0] ? error : "generic mul-add compile failed");
+      }
+      hash[fused] = fnv1a64(binary[fused].vertex.data,
+                            binary[fused].vertex.size);
+   }
+
+   if (binary[0].vertex.size != 72 ||
+       hash[0] != UINT64_C(0x4022256db500976b) ||
+       binary[1].vertex.size != 64 ||
+       hash[1] != UINT64_C(0x7f210be8dcd7ead1)) {
+      fprintf(stderr,
+              "generic mul-add PCO got split=%zu/%016llx fused=%zu/%016llx\n",
+              binary[0].vertex.size,
+              (unsigned long long)hash[0],
+              binary[1].vertex.size,
+              (unsigned long long)hash[1]);
+      fail("generic mul-add PCO fixtures changed");
+   }
+   if (binary[0].vertex.size == binary[1].vertex.size &&
+       memcmp(binary[0].vertex.data,
+              binary[1].vertex.data,
+              binary[0].vertex.size) == 0) {
+      fail("generic split fmul/fadd was contracted into explicit ffma");
+   }
+
+   /* The public compiler API clones before preprocessing both forms. */
+   if (count_alu(vs[0], nir_op_fmul) != 1 ||
+       count_alu(vs[0], nir_op_fadd) != 1 ||
+       count_alu(vs[0], nir_op_ffma) != 0 ||
+       count_alu(vs[1], nir_op_fmul) != 0 ||
+       count_alu(vs[1], nir_op_fadd) != 0 ||
+       count_alu(vs[1], nir_op_ffma) != 1) {
+      fail("generic mul-add compile modified caller-owned NIR");
+   }
+
+   pvrgpu_pco_graphics_binary_finish(&binary[0]);
+   pvrgpu_pco_graphics_binary_finish(&binary[1]);
+   ralloc_free(vs[0]);
+   ralloc_free(vs[1]);
+   ralloc_free(fs);
+}
+
 int main(void)
 {
    test_refract_fragment_descriptors();
@@ -4320,6 +4447,7 @@ int main(void)
    test_float_sign_lowering(compiler);
    test_multisample_texture_lowering(compiler);
    test_stream_output_vertex_layout(compiler);
+   test_generic_vertex_mul_add_boundaries(compiler);
 
    struct pvrgpu_pco_graphics_binary binary;
    if (!pvrgpu_pco_compile_conditionals(compiler,

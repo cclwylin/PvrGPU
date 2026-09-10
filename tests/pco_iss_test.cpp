@@ -6960,6 +6960,110 @@ void TestFragmentRepeatedTemporaryMove() {
         "both repeated fragment MBYP destinations survive SMP resume");
 }
 
+void TestFragmentDualTemporaryMove() {
+  // Two immediate definitions, a real Mesa O_MBYP2 register swap, and four
+  // exports. The two moves are phases of one group, so both read the old
+  // register values before either result becomes visible.
+  const auto binary = BytesFromHex(R"hex(
+86 92 40 13 11 11 11 11 00 00 40 ff
+86 92 40 13 22 22 22 22 00 00 41 ff
+35 b6 00 87 87 41 40 40 80 41
+34 8a 00 87 40 00 00 20
+34 8a 00 87 41 00 00 21
+34 8a 00 87 00 00 00 22
+35 8a 80 87 80 01 00 00 00 23
+)hex");
+  const auto decoded = Decode(ShaderStage::kFragment, binary);
+  const auto &move = decoded.instructions[2];
+  Check(move.opcode == PcoOpcode::kMoveBypass && move.source_count == 2 &&
+            move.source.bank == PcoRegisterBank::kTemporary &&
+            move.source.index == 1 &&
+            move.source1.bank == PcoRegisterBank::kTemporary &&
+            move.source1.index == 0 && move.output_index == 0 &&
+            move.output_index1 == 1,
+        "fragment MBYP2 decodes both independent TEMP moves");
+  const auto result = ExecuteFragment(decoded.summary, decoded.instructions);
+  Check(result.pixel_outputs[0] == UINT32_C(0x22222222) &&
+            result.pixel_outputs[1] == UINT32_C(0x11111111),
+        "fragment MBYP2 executes both phases from the pre-group register state");
+
+  for (unsigned mutation = 0; mutation < 5; ++mutation) {
+    auto malformed = binary;
+    if (mutation == 0) malformed[27] = 0x86; // Phase 0 is not MBYP.
+    if (mutation == 1) malformed[28] = 0x86; // Phase 1 is not MBYP.
+    if (mutation == 2) malformed[31] = 0x00; // Wrong ISS routing.
+    if (mutation == 3) malformed[32] = 0x00; // Destination 0 is special.
+    if (mutation == 4) malformed[33] = 0x01; // Destination 1 is special.
+    ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, malformed); },
+                  "malformed fragment MBYP2 fails closed");
+  }
+}
+
+void TestFragmentArrayTextureBiasRequest() {
+  std::vector<PcoInstruction> instructions(11);
+  for (std::size_t index = 0; index < instructions.size(); ++index) {
+    instructions[index].binary_offset =
+        static_cast<std::uint32_t>(index * 8U);
+    instructions[index].group_index = static_cast<std::uint16_t>(index);
+  }
+  const std::uint32_t payload[] = {
+      FloatBits(0.25F), FloatBits(0.75F), FloatBits(1.5F),
+      UINT32_C(0x12345678), UINT32_C(0x9abcdef0),
+  };
+  for (std::size_t index = 0; index < std::size(payload); ++index) {
+    auto &move = instructions[index];
+    move.opcode = PcoOpcode::kMoveImmediate;
+    move.target = PcoWriteTarget::kTemporary;
+    move.source_count = 0;
+    move.output_index = static_cast<std::uint16_t>(index);
+    move.immediate = payload[index];
+  }
+  auto &sample = instructions[5];
+  sample.opcode = PcoOpcode::kTextureSample;
+  sample.target = PcoWriteTarget::kTemporary;
+  sample.source = {PcoRegisterBank::kTemporary, 0};
+  sample.source1 = {PcoRegisterBank::kShared, 0};
+  sample.source2 = {PcoRegisterBank::kShared, 8};
+  sample.source_count = 3;
+  sample.component_count = 4;
+  sample.output_index = 8;
+  sample.texture_dimension = 2;
+  sample.texture_fcnorm = 1;
+  sample.texture_address_offset = 1;
+  sample.texture_lod_bias = 1;
+  instructions[6].opcode = PcoOpcode::kWaitDataFence;
+  instructions[6].target = PcoWriteTarget::kNone;
+  instructions[6].source_count = 0;
+  for (std::size_t component = 0; component < 4; ++component) {
+    auto &move = instructions[7 + component];
+    move.opcode = PcoOpcode::kMoveBypass;
+    move.target = PcoWriteTarget::kPixelOutput;
+    move.source = {PcoRegisterBank::kTemporary,
+                   static_cast<std::uint16_t>(8 + component)};
+    move.output_index = static_cast<std::uint16_t>(component);
+  }
+  instructions.back().end_group = 1;
+
+  PcoProgramSummary summary;
+  summary.stage = ShaderStage::kFragment;
+  summary.binary_size = 88;
+  summary.group_count = static_cast<std::uint32_t>(instructions.size());
+  summary.instruction_count = summary.group_count;
+  summary.pixel_output_mask = 0x0f;
+  summary.early_hsr_safe = 1;
+  PcoFragmentExecutionContext context;
+  context.shared_count = 20;
+  const auto result = ExecuteFragment(summary, instructions, context);
+  Check(result.suspended && result.texture_request_valid &&
+            result.texture_request.coordinates[0] == payload[0] &&
+            result.texture_request.coordinates[1] == payload[1] &&
+            result.texture_request.lod_bias_present == 1 &&
+            result.texture_request.lod_bias == payload[2] &&
+            result.texture_request.texture_address_lo == payload[3] &&
+            result.texture_request.texture_address_hi == payload[4],
+        "fragment array BIAS preserves PPLOD and TAO as independent payloads");
+}
+
 void TestExecuteThreeTextureContinuations() {
   std::vector<PcoInstruction> instructions(12);
   for (std::size_t index = 0; index < instructions.size(); ++index) {
@@ -8039,6 +8143,8 @@ void TestNativeNonperspectiveInterpolation() {
 
 int main() {
   try {
+    TestFragmentDualTemporaryMove();
+    TestFragmentArrayTextureBiasRequest();
     TestEmbeddedBinaries();
     TestNativeNonperspectiveInterpolation();
     TestDecodeAndExecuteVertex();

@@ -1531,8 +1531,7 @@ void TextureUnit::SampleRunForStage(
           request.explicit_lod_present != (explicit_lod ? 1U : 0U) ||
           request.lod_bias_present != (biased_lod ? 1U : 0U) ||
           (!biased_lod && request.lod_bias != 0) ||
-          (biased_lod && (!fragment_stage || direct_fetch || explicit_lod ||
-                         resource.dimension_type == TextureDimensionType::k2DArray)) ||
+          (biased_lod && (!fragment_stage || direct_fetch || explicit_lod)) ||
           (!explicit_lod && request.explicit_lod != 0) ||
           (multisample_fetch && explicit_lod) || (texel_fetch && !explicit_lod) ||
           (multisample_fetch &&

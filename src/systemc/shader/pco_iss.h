@@ -540,7 +540,7 @@ inline bool HasCanonicalTextureLodMode(const PcoInstruction &i,
           (i.texture_lod_replace == 1 && i.opcode == PcoOpcode::kTextureSample)) &&
          (i.texture_lod_bias == 0 ||
           (i.texture_lod_bias == 1 && i.opcode == PcoOpcode::kTextureSample &&
-           !i.texture_lod_replace && !i.texture_address_offset &&
+           !i.texture_lod_replace &&
            !i.texture_non_normalized_coords && !i.texture_sample_index_present)) &&
          (i.texture_spatial_offset_present == 0 ||
           (i.texture_spatial_offset_present == 1 && i.opcode == PcoOpcode::kTextureSample));

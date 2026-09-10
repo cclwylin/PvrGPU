@@ -10,9 +10,9 @@
 extern "C" {
 #endif
 
-/* API-v32 adds explicit CubeArray semantics and twelve descriptor slots.
- * Structure sizes are unchanged; old versioned consumers must not guess. */
-#define PVRGPU_SYSTEMC_API_VERSION 32u
+/* API-v33 appends explicit polygon-offset raster state to each physical draw.
+ * Old versioned consumers must not guess at the longer command envelope. */
+#define PVRGPU_SYSTEMC_API_VERSION 33u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE 15u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES (64u * 1024u)
 /*
@@ -187,8 +187,10 @@ struct pvrgpu_systemc_varying_binding {
 };
 
 /* Immutable snapshot of the bound range, not the whole Gallium buffer.
- * block_index is stage-local NIR UBO index (Gallium constant buffer index - 1).
- * Descriptor words are [0, 0, bytes_size, 0] before model relocation. */
+ * block_index is the stage-local native descriptor index. Ordinary block i
+ * maps to Gallium constant buffer i+1; the driver may append one private final
+ * block containing a large CB0. Descriptor words are [0, 0, bytes_size, 0]
+ * before model relocation. */
 struct pvrgpu_systemc_pco_uniform_buffer {
    uint32_t stage;
    uint32_t block_index;
@@ -587,6 +589,13 @@ struct pvrgpu_systemc_driver_command {
     * target-major native bytes; shared blend/color-mask state is unchanged. */
    uint32_t color_attachment_format_count;
    const char *color_attachment_formats[4];
+   /* API-v33 polygon offset. Float values are carried as exact IEEE-754 bits.
+    * Disabled state is canonical: all four remaining fields are zero. */
+   uint32_t polygon_offset_enable;
+   uint32_t polygon_offset_factor_bits;
+   uint32_t polygon_offset_units_bits;
+   uint32_t polygon_offset_clamp_bits;
+   uint32_t polygon_offset_units_unscaled;
 };
 
 struct pvrgpu_systemc_submit_info {

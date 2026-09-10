@@ -77,6 +77,11 @@ struct pvrgpu_pco_owned_binary {
    size_t size;
    struct pvrgpu_pco_stage_abi abi;
    struct pvrgpu_pco_uniform_word_map cb0_word_map;
+   /* Driver-only mapping: nonzero is (native UBO slot + 1) containing CB0.
+    * A large dynamically indexed default-uniform array is read through the
+    * ordinary read-only DMA descriptor path instead of the shared register
+    * file.  The slot is always appended after the shader's real UBOs. */
+   uint32_t cb0_uniform_buffer_slot;
 };
 
 /* Compute has its own transport contract; it is never a graphics stage.

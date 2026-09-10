@@ -5,11 +5,12 @@
 
 時間預算來自 456 個既有 run、6,349 條案例的實測耗時，不是估計值：
 平均 0.66 秒、中位數 0.38 秒、p90 1.46 秒。8 分片實測加速 6.2 倍。
+表內 CPU／wall 時間沿用原量測作上限參考；新的 L4-only 規則會縮短
+L1/L2/L3，待完成一輪新版實測後再更新時間欄。
 
-**實作狀態**：本文件的分層與 30 組目錄是計畫，尚未寫進 `tools/deqp_groups.py`
-（目前是 24 組）。文件中標示「可直接執行」的指令**現在就能跑**，因為它們直接
-從 discovery 檔案 grep 出 caselist，不經過 group 目錄。標示「待實作」的
-`run_deqp_tier.sh` 尚未存在。
+**實作狀態**：`script/deqp_4level_ui.py` 已實作本文件的分層、30 組目錄、
+長測項隔離與分片。`tools/deqp_groups.py` 仍是舊的 24 組目錄；文件中標示
+「可直接執行」的指令仍可從 discovery 檔案產生相同 caselist。
 
 ---
 
@@ -17,18 +18,18 @@
 
 | 層 | 名稱 | 案例 | CPU 時間 | 8 分片 wall | 預算 | 用途 |
 |---|---|---|---|---|---|---|
-| L1 | Very Fast Regression | 2,534 | 20 min | 2.7 min | 5 min | 每次 commit 前 |
-| L2 | Fast Regression | 7,904 | 54 min | 8.6 min | 15 min | 修完一個 subsystem |
-| L3 | Detail Regression | 30,491 | 4.0 h | 40 min | 1 h | milestone、過夜 |
+| L1 | Very Fast Regression | 2,474 | 20 min | 2.7 min | 5 min | 每次 commit 前 |
+| L2 | Fast Regression | 7,750 | 54 min | 8.6 min | 15 min | 修完一個 subsystem |
+| L3 | Detail Regression | 30,224 | 4.0 h | 40 min | 1 h | milestone、過夜 |
 | L4 | Full Regression | 90,360 | 12.5 h | 見下 | 25 h | 版本釋出、認證前 |
 
 ### 分層規則
 
 | 層 | 每組取樣規則 |
 |---|---|
-| L1 | 每組 `min(N, 100)` 條，等距取樣。第 11 組 compressed 蓋在 30 |
-| L2 | 每組 `min(N, 400)` 條，等距取樣。第 11 組 compressed 蓋在 120 |
-| L3 | 30 組目錄全跑 |
+| L1 | 先移除 L4-only 長測項，再每組 `min(N, 100)` 條等距取樣；第 11 組 compressed 蓋在 30 |
+| L2 | 先移除 L4-only 長測項，再每組 `min(N, 400)` 條等距取樣；第 11 組 compressed 蓋在 120 |
+| L3 | 30 組目錄扣除 L4-only 長測項後全跑 |
 | L4 | 四個 module 列舉出的全部案例，單行程、開啟存圖 |
 
 L1 到 L3 必須分片才進得了預算。**L4 刻意不分片**：25 小時是單行程加存圖的數字，
@@ -37,19 +38,37 @@ L1 到 L3 必須分片才進得了預算。**L4 刻意不分片**：25 小時是
 第 11 組 compressed 被蓋住是因為它每條 2.78 秒，是所有組裡最貴的，
 滿額會吃掉 L1 四分之一的預算。
 
+### L4-only 長測項
+
+L1、L2、L3 一律先排除下列 267 條；L4 仍完整執行，單案例與自訂 caselist
+除錯也不套用此過濾。這是固定的 case-prefix 規則，不會因上一次執行速度而
+悄悄改變下一次 caselist。
+
+| 組 | L4-only family | 案例 |
+|---|---|---:|
+| 18 | `stress.long_shaders.*`、`stress.long_running_shaders.*` | 40 |
+| 20 | `functional.draw_indirect.compute_interop.large.*`、`stress.draw_indirect.{drawarrays,drawelements}.data_over_bounds_with_primcount` | 66 |
+| 22 | `functional.multisample.default_framebuffer.constancy_*`、`functional.texture.multisample.samples_8.sample_mask_*` | 9 |
+| 28 | `functional.image_load_store.{2d_array,3d,cube}.atomic.*` | 102 |
+| 29 | `functional.synchronization.inter_call.with_memory_barrier.*`、`without_memory_barrier.{image_atomic_dispatch_100_calls_128x128_invocations,ssbo_atomic_dispatch_100_calls_32k_invocations}` | 30 |
+| 30 | `functional.multisample.{default_framebuffer,fbo_4_samples,fbo_8_samples,fbo_max_samples}.constancy_*` | 20 |
+
+這些 family 包含無界 shader loop，或在 PvrGPU SystemC 實測會反覆耗用數分鐘；
+移出快速層不代表 Pass、Skip 或刪除，只是改由 L4／單獨長測批次執行。
+
 ### 每層涵蓋幾組
 
-**四層都涵蓋全部 30 組。** 差別在每組取幾條，不在取幾組。
-這是刻意的設計：任何子系統壞掉，L1 就會看到，不用等到 L2。
+L1 到 L3 涵蓋 29 個一般組；第 18 組的 40 條全是長測項，只在 L4。
+其餘五組仍保留一般案例，只有上表的長 family 移到 L4。
 
 | 層 | 涵蓋組數 | 該層已 100% 覆蓋 | 仍在取樣 | 案例 |
 |---|---|---|---|---|
-| L1 | 30 | 8 組 | 22 組 | 2,534 |
-| L2 | 30 | 13 組 | 17 組 | 7,904 |
-| L3 | 30 | 30 組 | 0 | 30,491 |
+| L1 | 29 | 7 組 | 22 組 | 2,474 |
+| L2 | 29 | 13 組 | 16 組 | 7,750 |
+| L3 | 29 | 29 組 | 0 | 30,224 |
 | L4 | 全部四個 module | — | — | 90,360 |
 
-**L1 已 100% 覆蓋的 8 組**（案例數不足 100，全取）：
+**L1 已 100% 覆蓋一般案例的 7 組**（案例數不足 100，全取）：
 
 | # | 組名 | 案例 |
 |---|---|---|
@@ -59,28 +78,26 @@ L1 到 L3 必須分片才進得了預算。**L4 刻意不分片**：25 小時是
 | 7 | Instancing | 45 |
 | 16 | Stress draw | 74 |
 | 17 | Stress memory | 80 |
-| 18 | Stress shaders | 40 |
-| 30 | Basic MSAA | 64 |
+| 30 | Basic MSAA（扣除 20 條 L4-only） | 44 |
 
-**L2 再多 5 組**（合計 13 組已 100% 覆蓋）：
+**L2 再多 6 組**（合計 13 組已 100% 覆蓋一般案例）：
 
 | # | 組名 | 案例 |
 |---|---|---|
 | 2 | EGL Image | 226 |
 | 8 | Rasterization | 108 |
 | 19 | Compute | 195 |
-| 20 | Draw indirect | 244 |
+| 20 | Draw indirect（扣除 66 條 L4-only） | 178 |
 | 23 | Geometry shading | 207 |
+| 29 | Sync + atomic counter（扣除 30 條 L4-only） | 372 |
 
-對這 13 組而言 **L2 和 L3 是同一件事**，所以要完整驗證 compute 或
-draw indirect，跑 L2 就夠，不必等 L3。
+對這 13 組的一般案例而言 **L2 和 L3 是同一件事**。長 family 仍須跑 L4。
 
-**只有 L3 才跑得完的 16 組**是第 5、6、9、10、12、13、14、15、21、22、
-24、25、26、27、28、29 組。其中第 25 組 shader operator 6,478 條差距最大，L2 只看得到 6%。
+**只有 L3 才跑得完一般案例的 15 組**是第 5、6、9、10、12、13、14、15、21、22、
+24、25、26、27、28 組。其中第 25 組 shader operator 6,478 條差距最大，L2 只看得到 6%。
 第 11 組 compressed 兩層都被蓋住，要全跑只有 L3。
 
-L1 剩下 22 組的分配是 21 組各取 100 條，加第 11 組取 30 條。
-L2 剩下 17 組的分配是 16 組各取 400 條，加第 11 組取 120 條。
+各層配額皆套在排除 L4-only 後的 pool；若剩餘案例少於配額（例如第 20、29、30 組），就全取一般案例。
 
 ---
 
@@ -124,9 +141,9 @@ script/run_deqp_dynamic.sh --module gles31 --discover --caselist-out "$DISC/gles
 | 15 | Vertex arrays | GLES3 | `functional.vertex_arrays.` | 1005 | 100 | 400 |
 | 16 | Stress draw | GLES3 | `stress.draw.` | 74 | 74 | 74 |
 | 17 | Stress memory | GLES3 | `stress.memory.` | 80 | 80 | 80 |
-| 18 | Stress shaders | GLES3 | `stress.long_shaders.`<br>`stress.long_running_shaders.` | 40 | 40 | 40 |
+| 18 | Stress shaders | GLES3 | `stress.long_shaders.`<br>`stress.long_running_shaders.` | 40 | 0 | 0 |
 | 19 | Compute | GLES31 | `functional.compute.` | 195 | 100 | 195 |
-| 20 | Draw indirect | GLES31 | `functional.draw_indirect.`<br>`stress.draw_indirect.` | 244 | 100 | 244 |
+| 20 | Draw indirect | GLES31 | `functional.draw_indirect.`<br>`stress.draw_indirect.` | 244 | 100 | 178 |
 | 21 | SSBO | GLES31 | `functional.ssbo.` | 2061 | 100 | 400 |
 | 22 | Multisample | GLES31 | `functional.texture.multisample.`<br>`functional.shaders.sample_variables.`<br>`functional.shaders.multisample_interpolation.`<br>`functional.sample_shading.`<br>`functional.multisample.` | 595 | 100 | 400 |
 | 23 | Geometry shading | GLES31 | `functional.geometry_shading.` | 207 | 100 | 207 |
@@ -135,8 +152,8 @@ script/run_deqp_dynamic.sh --module gles31 --discover --caselist-out "$DISC/gles
 | 26 | Shader matrix | GLES3 | `functional.shaders.matrix.` | 2646 | 100 | 400 |
 | 27 | Texture wrap | GLES3 | `functional.texture.wrap.` | 1440 | 100 | 400 |
 | 28 | Image load/store | GLES31 | `functional.image_load_store.` | 747 | 100 | 400 |
-| 29 | Sync + atomic counter | GLES31 | `functional.synchronization.`<br>`functional.atomic_counter.` | 402 | 100 | 400 |
-| 30 | Basic MSAA | GLES3 | `functional.multisample.` | 64 | 64 | 64 |
+| 29 | Sync + atomic counter | GLES31 | `functional.synchronization.`<br>`functional.atomic_counter.` | 402 | 100 | 372 |
+| 30 | Basic MSAA | GLES3 | `functional.multisample.` | 64 | 44 | 44 |
 
 本表只記結構，不記通過率。各組當下的狀態看該次 run 的 `summary.tsv`
 （統計指令見 4.5），不在本文件維護。
@@ -171,6 +188,10 @@ python3 -c "import sys;c=[l.strip() for l in open(sys.argv[1]) if l.strip()];n=m
 上面的等距取法給出 basic 22、shared_var 69、indirect_dispatch 9，與母體比例一致。
 受影響的是 N 介於配額與兩倍配額之間的組：L1 配額 100 時是第 2、8、19、23 組，
 L2 配額 400 時是第 22、24、28 組。
+
+取樣前要先排除上節的 L4-only family；UI 產生的 `commands.sh` 會自動加入
+同一組 `grep -vE` 規則。手動產生整層 caselist 時也必須先過濾，不能在取樣後
+才刪除，否則取樣分布與 UI 不一致。
 
 ### 4.3 單一案例除錯（可直接執行）
 
@@ -231,11 +252,39 @@ script/run_deqp_group_sample.sh 19 100 g19_L1
 這個腳本內部用的是整數 stride（`matched[::step]`），有 4.2 說的退化問題，
 要求的條數超過該組案例數一半時會變成取前 N 條。改用 4.1 加 4.2 的手動流程可以避開。
 
-### 4.7 跑整層（待實作）
+### 4.7 跑整層
 
 ```bash
-script/run_deqp_tier.sh 3 --shards 8
+script/run_deqp_level.sh       # 預設 Level 1
+script/run_deqp_level.sh --1
+script/run_deqp_level.sh --2
+script/run_deqp_level.sh --3
+script/run_deqp_level.sh --4
 ```
+
+腳本自動載入 `config/local.env`，命令列參數優先於環境變數與設定檔。
+使用一般 `python3`，不需要 PySide6；可用 `PVRGPU_DEQP_LEVEL_PYTHON` 指定 Python。
+UI 與命令列共用 `script/deqp_4level_catalog.py` 的目錄、長測項過濾、等距取樣與 ms4 例外。
+
+L1–L3 預設最多 8 個 worker；`--shards 4` 可調整。L4 固定單一 worker，依序執行
+四個 module 的完整列舉清單，開啟存圖。所有層都由 `run_deqp_dynamic.sh` 逐案例啟動新程序。
+單案例預設不限時；可加 `--timeout 900` 設定 900 秒上限。
+
+```bash
+script/run_deqp_level.sh --dry-run                # 僅用快取產生 L1 計畫，不執行測試
+script/run_deqp_level.sh --2 --shards 4 --timeout 900
+script/run_deqp_level.sh --3 --refresh-discovery   # 重列舉後執行 L3
+```
+
+列舉快取預設在 `$PVRGPU_OUTPUT_ROOT/deqp_groups/discovery`；缺少 module 快取時自動列舉。
+`--dry-run` 需要已存在的快取。可用 `--discovery-dir` 指定另一份快取。
+每輪建立新的 `$PVRGPU_OUTPUT_ROOT/deqp_4level/<時間>_L<層>_<識別碼>` 目錄；
+`--output-dir` 可指定尚未存在的結果目錄。
+
+結果含 `plan.json`、`caselists/all.txt`、每片 caselist／log、合併的 `summary.tsv` 與 `result.json`。
+Fail、程序非零退出、缺少結果或分片失敗都回傳非零；NotSupported 與 Warning 保留原始狀態。
+Ctrl-C 會停止 runner 與其 dEQP 子程序，保留已完成結果。
+此腳本負責 L4 的 dEQP 部分；發版要求的 `ctest` 與 RDC 回歸仍另外執行。
 
 ---
 
@@ -255,7 +304,7 @@ script/run_deqp_tier.sh 3 --shards 8
 grep -E '^dEQP-GLES3\.functional\.multisample\.default_framebuffer\.' "$DISC/gles3.txt" > /tmp/g30_df.txt && script/run_deqp_dynamic.sh --caselist /tmp/g30_df.txt --keep-going --gl-config rgba8888d24s8ms4 --output-dir "$PVRGPU_OUTPUT_ROOT/deqp_groups/g30_df"
 ```
 
-`run_deqp_tier.sh` 因此需要支援逐組覆寫 gl-config，不能整份 caselist 共用一個。
+`run_deqp_level.sh` 會依 module 與 gl-config 分桶，每桶使用各自的 caselist 與結果目錄。
 
 ---
 
@@ -288,14 +337,15 @@ grep -E '^dEQP-GLES31\.functional\.(texture\.multisample|shaders\.sample_variabl
 先跑第 30 組（基本 MSAA 光柵化）再跑這組，依賴順序是
 基本 MSAA → sample 內建變數 → multisample texture。
 
-### 第 20 組 Draw indirect（L3 全跑，244 條）
+### 第 20 組 Draw indirect（L2/L3 一般案例全跑，178 條）
 
 ```bash
-grep -E '^dEQP-GLES31\.(functional|stress)\.draw_indirect\.' "$DISC/gles31.txt" > /tmp/g20.txt && script/run_deqp_dynamic.sh --caselist /tmp/g20.txt --keep-going --output-dir "$PVRGPU_OUTPUT_ROOT/deqp_groups/g20"
+grep -E '^dEQP-GLES31\.(functional|stress)\.draw_indirect\.' "$DISC/gles31.txt" | grep -vE '^dEQP-GLES31\.(functional\.draw_indirect\.compute_interop\.large\.|stress\.draw_indirect\.(drawarrays|drawelements)\.data_over_bounds_with_primcount$)' > /tmp/g20.txt && script/run_deqp_dynamic.sh --caselist /tmp/g20.txt --keep-going --output-dir "$PVRGPU_OUTPUT_ROOT/deqp_groups/g20"
 ```
 
 221 條 functional 裡有 79 條 `compute_interop` 綁在第 19 組上，
-其餘 142 條只需要 driver 從緩衝區讀 draw 參數，不需要 compute。
+其中 64 條 `compute_interop.large` 只在 L4；其餘 142 條只需要 driver 從緩衝區
+讀 draw 參數，不需要 compute。
 
 ### 第 5 組 FBO（L2 配額 400 條）
 
@@ -336,10 +386,9 @@ grep -E '^dEQP-GLES3\.functional\.fragment_ops\.' "$DISC/gles3.txt" > /tmp/g6.tx
 | 項目 | 內容 |
 |---|---|
 | `tools/deqp_groups.py` | 24 組擴成 30 組；放寬第 8、19、20、22 組 selector；第 9 組換掉重複的 scissor；第 23、24 組移除 blocked 旗標 |
-| `tools/deqp_tiers.py` | 四層的 per-group 配額表與 caselist 生成器 |
 | `tests/deqp/caselists/L*.txt` | 生成後的 caselist 進版控。dEQP 一旦重建，列舉順序會變，stride 取到的就是另一批案例，回歸比對失效 |
 | `tests/deqp/baselines/L*.tsv` | case 對 expected status。現在只有案例數漂移檢查，沒有結果比對 |
-| `script/run_deqp_tier.sh` | 分片、執行、合併、對 baseline diff、有新 Fail 就非零退出；支援逐組 gl-config 覆寫 |
+| `script/run_deqp_level.sh` baseline 比對 | 分片、執行、合併、失敗非零退出與 gl-config 分桶已完成；尚待加入逐案例 baseline diff |
 | 層級包含關係 | L2 要定義成 L1 加 stride 偏移的補集，否則「L2 掛了但 L1 過」沒有意義 |
 | `tests/test_deqp_live_ui_source.py`<br>`tests/deqp_live_ui_smoke.py` | 兩處對 24 的斷言 |
 | `docs/dEQP_GLES_Test_Execution_Matrix.xlsx` | 6 個不存在的 pattern（見第九節） |

@@ -271,6 +271,35 @@ int main() {
     std::memcpy(&bits, &value, sizeof(bits));
     return bits;
   };
+  const auto polygon_offset_path = TempFile("polygon-offset.txt");
+  WriteText(polygon_offset_path,
+            pco_large_text + "polygon_offset_state=1," +
+                std::to_string(float_bits(1.0F)) + "," +
+                std::to_string(float_bits(200.0F)) + "," +
+                std::to_string(float_bits(-0.1F)) + ",0\n");
+  error.clear();
+  if (int failed = Expect(
+          LoadDriverCommand(polygon_offset_path.string(), &command, &error) &&
+              command.polygon_offset_enable == 1 &&
+              command.polygon_offset_factor_bits == float_bits(1.0F) &&
+              command.polygon_offset_units_bits == float_bits(200.0F) &&
+              command.polygon_offset_clamp_bits == float_bits(-0.1F) &&
+              command.polygon_offset_units_unscaled == 0,
+          "polygon-offset audit metadata was not preserved: " + error))
+    return failed;
+  const std::string invalid_polygon_offset[] = {
+      "2,0,0,0,0", "0,1065353216,0,0,0", "1,2139095040,0,0,0",
+      "1,0,0,0,2", "1,0,0,0", "1,0,0,0,0,0"};
+  for (const std::string &state : invalid_polygon_offset) {
+    WriteText(polygon_offset_path,
+              pco_large_text + "polygon_offset_state=" + state + "\n");
+    error.clear();
+    if (int failed = Expect(
+            !LoadDriverCommand(polygon_offset_path.string(), &command, &error),
+            "invalid polygon-offset audit metadata was accepted: " + state))
+      return failed;
+  }
+  std::filesystem::remove(polygon_offset_path);
   const struct { float scale, translate; bool valid; } depth_viewports[] = {
       {.5F, .5F, true}, {-.5F, .5F, true}, {.25F, .5F, true},
       {-.25F, .5F, true}, {0, 0, true}, {0, .375F, true}, {0, 1, true},

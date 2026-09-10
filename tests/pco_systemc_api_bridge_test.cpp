@@ -44,7 +44,7 @@ void VerifyGuardedPreviousVersionCommand(
   // API-v22 added alpha-to-sample state after the uniform-buffer list.
   // Reconstruct the aligned API-v21 byte extent, not a zeroed
   // current-size command whose readable tail would hide the invalid access.
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 32U,
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 33U,
                 "update the frozen API-v21 guard-page fixture on ABI changes");
   constexpr std::size_t kApi21Tail =
       offsetof(pvrgpu_systemc_driver_command, uniform_buffer_count) +
@@ -395,8 +395,8 @@ void VerifySequenceExternalTextureAllocation() {
 
 int main() {
   using namespace pvrgpu::stub;
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 32U,
-                "native sequence bridge test requires API-v32");
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 33U,
+                "native sequence bridge test requires API-v33");
   static_assert(PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS == 15U);
   static_assert(kDriverPcoMaximumTextureMipLevels == 15U);
   static_assert(kMaximumTextureMipLevels == 15U);
@@ -728,6 +728,55 @@ int main() {
         make_sequence_draw(), make_sequence_draw()};
     draws[0].*field = 2;
     expect_sequence_rejected(draws, "alpha_to_", "non-boolean alpha-to-sample state");
+  }
+  for (const auto field : {
+           &pvrgpu_systemc_driver_command::polygon_offset_enable,
+           &pvrgpu_systemc_driver_command::polygon_offset_units_unscaled}) {
+    std::array<pvrgpu_systemc_driver_command, 2> draws = {
+        make_sequence_draw(), make_sequence_draw()};
+    draws[0].*field = 2;
+    expect_sequence_rejected(draws, "polygon_offset",
+                             "non-boolean polygon-offset state");
+  }
+  for (const auto field : {
+           &pvrgpu_systemc_driver_command::polygon_offset_factor_bits,
+           &pvrgpu_systemc_driver_command::polygon_offset_units_bits,
+           &pvrgpu_systemc_driver_command::polygon_offset_clamp_bits}) {
+    std::array<pvrgpu_systemc_driver_command, 2> draws = {
+        make_sequence_draw(), make_sequence_draw()};
+    draws[0].polygon_offset_enable = 1;
+    draws[0].*field = UINT32_C(0x7f800000);
+    expect_sequence_rejected(draws, "polygon_offset",
+                             "non-finite polygon-offset value");
+  }
+  {
+    std::array<pvrgpu_systemc_driver_command, 2> draws = {
+        make_sequence_draw(), make_sequence_draw()};
+    draws[0].polygon_offset_factor_bits = UINT32_C(0x3f800000);
+    expect_sequence_rejected(draws, "polygon_offset",
+                             "noncanonical disabled polygon offset");
+  }
+  {
+    std::array<pvrgpu_systemc_driver_command, 2> draws = {
+        make_sequence_draw(), make_sequence_draw()};
+    draws[0].polygon_offset_enable = 1;
+    draws[0].depth_enable = draws[0].depth_write = 0;
+    draws[0].depth_format = 0;
+    expect_sequence_rejected(draws, "polygon_offset",
+                             "polygon offset without a depth format");
+  }
+  {
+    // A legal enabled state must reach the independent second-draw blend
+    // sentinel, proving the v33 tail passes validation and scalar cloning.
+    std::array<pvrgpu_systemc_driver_command, 2> draws = {
+        make_sequence_draw(), make_sequence_draw()};
+    draws[0].polygon_offset_enable = 1;
+    draws[0].polygon_offset_factor_bits = UINT32_C(0x3f800000);
+    draws[0].polygon_offset_units_bits = UINT32_C(0x43480000);
+    draws[0].polygon_offset_units_unscaled = 1;
+    draws[1].blend_source_rgb_factor = PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ZERO;
+    expect_sequence_rejected(draws, "unsupported: blend",
+                             "finite enabled polygon-offset state");
   }
   {
     std::array<pvrgpu_systemc_driver_command, 2> draws = {

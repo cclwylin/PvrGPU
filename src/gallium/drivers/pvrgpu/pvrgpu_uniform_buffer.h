@@ -77,8 +77,91 @@ pvrgpu_snapshot_uniform_buffer(const struct pipe_constant_buffer *binding,
    return true;
 }
 
-/* The active shader extent selects CB[1..active_blocks], not the context's
- * highest ever bound slot. Preserve holes so block indices remain stable. */
+/* CB0's push-constant contract discards an incomplete trailing DWORD and
+ * zero-pads complete words to a vec4.  Preserve those exact bytes when a
+ * large CB0 is represented by a UBO descriptor; ordinary UBO snapshots above
+ * continue to expose their exact bound range without padding. */
+static inline bool
+pvrgpu_snapshot_cb0_uniform_buffer(
+   const struct pipe_constant_buffer *binding, uint32_t stage,
+   uint32_t block_index, uint32_t uniform_dwords,
+   struct pvrgpu_systemc_pco_uniform_buffer *entry, uint32_t descriptor[4])
+{
+   struct pvrgpu_systemc_pco_uniform_buffer source;
+   uint32_t source_descriptor[4];
+   if (!uniform_dwords ||
+       uniform_dwords > PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES / 4u ||
+       !pvrgpu_snapshot_uniform_buffer(binding, stage, block_index,
+                                       &source, source_descriptor) ||
+       !source.bytes)
+      return false;
+   const size_t bytes_size = (size_t)uniform_dwords * sizeof(uint32_t);
+   uint8_t *bytes = calloc(1, bytes_size);
+   if (!bytes) {
+      free((void *)source.bytes);
+      return false;
+   }
+   const size_t complete_source_bytes =
+      source.bytes_size / sizeof(uint32_t) * sizeof(uint32_t);
+   const size_t copied = complete_source_bytes < bytes_size
+      ? complete_source_bytes : bytes_size;
+   memcpy(bytes, source.bytes, copied);
+   free((void *)source.bytes);
+   *entry = (struct pvrgpu_systemc_pco_uniform_buffer){
+      .stage = stage,
+      .block_index = block_index,
+      .bytes = bytes,
+      .bytes_size = bytes_size,
+   };
+   memset(descriptor, 0, 4 * sizeof(*descriptor));
+   descriptor[2] = (uint32_t)bytes_size;
+   return true;
+}
+
+/* The active native extent normally selects CB[1..active_blocks], not the
+ * context's highest ever bound slot. Preserve holes so block indices remain
+ * stable. A nonzero mapping replaces only the final native slot with CB0. */
+static inline bool
+pvrgpu_snapshot_stage_uniform_buffers_mapped(
+   const struct pipe_constant_buffer *bindings, uint32_t stage,
+   uint32_t active_blocks, uint32_t descriptor_start,
+   uint32_t cb0_uniform_buffer_slot,
+   uint32_t cb0_uniform_dwords,
+   uint32_t *shared, size_t shared_count,
+   struct pvrgpu_systemc_pco_uniform_buffer *entries,
+   unsigned *entry_count, unsigned entry_capacity)
+{
+   if (!bindings || !entries || !entry_count ||
+       stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION ||
+       active_blocks > PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
+       (cb0_uniform_buffer_slot &&
+        cb0_uniform_buffer_slot != active_blocks) ||
+       (!!cb0_uniform_buffer_slot != !!cb0_uniform_dwords) ||
+       (uint64_t)descriptor_start + 4u * active_blocks > shared_count ||
+       (shared_count && !shared) || *entry_count > entry_capacity ||
+       active_blocks > entry_capacity - *entry_count)
+      return false;
+   for (unsigned block = 0; block < active_blocks; ++block) {
+      struct pvrgpu_systemc_pco_uniform_buffer snapshot;
+      /* Native UBO slots normally mirror Gallium CB[1..].  A large CB0 is
+       * appended as the final native descriptor, preserving every public UBO
+       * index while reusing the same owned per-draw byte snapshot contract. */
+      const unsigned gallium_slot =
+         cb0_uniform_buffer_slot == block + 1 ? 0 : block + 1;
+      const bool captured = gallium_slot == 0
+         ? pvrgpu_snapshot_cb0_uniform_buffer(&bindings[0], stage, block,
+              cb0_uniform_dwords, &snapshot,
+              shared + descriptor_start + 4u * block)
+         : pvrgpu_snapshot_uniform_buffer(&bindings[gallium_slot], stage, block,
+              &snapshot, shared + descriptor_start + 4u * block);
+      if (!captured)
+         return false;
+      if (snapshot.bytes)
+         entries[(*entry_count)++] = snapshot;
+   }
+   return true;
+}
+
 static inline bool
 pvrgpu_snapshot_stage_uniform_buffers(
    const struct pipe_constant_buffer *bindings, uint32_t stage,
@@ -87,22 +170,9 @@ pvrgpu_snapshot_stage_uniform_buffers(
    struct pvrgpu_systemc_pco_uniform_buffer *entries,
    unsigned *entry_count, unsigned entry_capacity)
 {
-   if (!bindings || !entries || !entry_count ||
-       stage > PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION ||
-       active_blocks > PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
-       (uint64_t)descriptor_start + 4u * active_blocks > shared_count ||
-       (shared_count && !shared) || *entry_count > entry_capacity ||
-       active_blocks > entry_capacity - *entry_count)
-      return false;
-   for (unsigned block = 0; block < active_blocks; ++block) {
-      struct pvrgpu_systemc_pco_uniform_buffer snapshot;
-      if (!pvrgpu_snapshot_uniform_buffer(&bindings[block + 1], stage, block,
-             &snapshot, shared + descriptor_start + 4u * block))
-         return false;
-      if (snapshot.bytes)
-         entries[(*entry_count)++] = snapshot;
-   }
-   return true;
+   return pvrgpu_snapshot_stage_uniform_buffers_mapped(
+      bindings, stage, active_blocks, descriptor_start, 0, 0,
+      shared, shared_count, entries, entry_count, entry_capacity);
 }
 
 static inline void

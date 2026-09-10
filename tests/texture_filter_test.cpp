@@ -152,15 +152,22 @@ void CheckLevelSelection() {
   const RogueTextureSamplerDescriptor trilinear =
       Sampler(TextureFilter::kLinear, TextureFilter::kLinear,
               TextureFilter::kLinear, 9 * 64);
-  // rho^2 = 12: log2 12 = 3.5849625, lambda 1.7924813.  The fraction is
-  // 202.875/256, so TFRAC also shows that the quantization truncates -- a
-  // rounding datapath would report 203.
+  // rho^2 = 12: llvmpipe's fast_log2(12) = floor(log2 12) - 1 + 12/8 = 3.5
+  // (an exact log2 would give 3.5849625), lambda 1.75 and TFRAC 192/256.
   const TextureLevelSelection blend = SelectTextureLevels(
       SelectTextureLod(12.0F, trilinear, 10), trilinear, 10);
   Check(blend.mip_mode == TextureMipMode::kLinear && blend.level0 == 1 &&
-            blend.level1 == 2 && blend.mip_weight_u8 == 202 &&
-            Near(blend.mip_weight, 0.7924813F) && TextureLevelTaps(blend) == 8,
-        "mip linear: floor(lambda) and the next level, fraction 202/256");
+            blend.level1 == 2 && blend.mip_weight_u8 == 192 &&
+            blend.mip_weight == 0.75F && TextureLevelTaps(blend) == 8,
+        "mip linear: floor(lambda) and the next level, fraction 192/256");
+  // rho^2 = 12.5: fast_log2 is 3 + 12.5/8 - 1 = 3.5625, lambda 1.78125 and
+  // the fraction 200/256 exactly, so TFRAC also shows that the quantization
+  // truncates the strict positive product rather than rounding it.
+  const TextureLevelSelection blend_mid = SelectTextureLevels(
+      SelectTextureLod(12.5F, trilinear, 10), trilinear, 10);
+  Check(blend_mid.level0 == 1 && blend_mid.level1 == 2 &&
+            blend_mid.mip_weight_u8 == 200 && blend_mid.mip_weight == 0.78125F,
+        "mip linear: piece-wise linear fraction 200/256");
   const TextureLevelSelection blend_mag = SelectTextureLevels(
       SelectTextureLod(0.5F, trilinear, 10), trilinear, 10);
   Check(blend_mag.level0 == 0 && blend_mag.level1 == 1 &&

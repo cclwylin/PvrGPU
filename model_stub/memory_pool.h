@@ -19,6 +19,7 @@ class MemoryPool {
   std::uint64_t high_water_bytes() const { return high_water_bytes_; }
   std::uint64_t allocations() const { return allocations_; }
   std::uint64_t releases() const { return releases_; }
+  std::uint64_t capacity_bytes() const;
 
  private:
   struct Entry {

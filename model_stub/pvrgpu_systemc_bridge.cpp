@@ -922,6 +922,12 @@ void CopyPcoPayloadFields(
   destination->depth_func = source.depth_func;
   destination->depth_clear_bits = source.depth_clear_bits;
   destination->depth_format = source.depth_format;
+  destination->polygon_offset_enable = source.polygon_offset_enable;
+  destination->polygon_offset_factor_bits = source.polygon_offset_factor_bits;
+  destination->polygon_offset_units_bits = source.polygon_offset_units_bits;
+  destination->polygon_offset_clamp_bits = source.polygon_offset_clamp_bits;
+  destination->polygon_offset_units_unscaled =
+      source.polygon_offset_units_unscaled;
   destination->raster_samples = source.raster_samples ? source.raster_samples : 1;
   destination->framebuffer_layers = source.framebuffer_layers;
   destination->stencil_enable = source.stencil_enable;
@@ -1143,6 +1149,30 @@ bool ViewportOffsetIsInside(const std::uint32_t offset_bits[3],
          offset[1] - half_height >= -0.5F &&
          offset[0] + half_width <= static_cast<float>(framebuffer_width) + 0.5F &&
          offset[1] + half_height <= static_cast<float>(framebuffer_height) + 0.5F;
+}
+
+bool PolygonOffsetStateIsValid(
+    const pvrgpu_systemc_driver_command &source) {
+  float values[3];
+  const std::uint32_t bits[3] = {
+      source.polygon_offset_factor_bits,
+      source.polygon_offset_units_bits,
+      source.polygon_offset_clamp_bits,
+  };
+  static_assert(sizeof(values) == sizeof(bits));
+  std::memcpy(values, bits, sizeof(values));
+  if (source.polygon_offset_enable > 1U ||
+      source.polygon_offset_units_unscaled > 1U ||
+      !std::isfinite(values[0]) || !std::isfinite(values[1]) ||
+      !std::isfinite(values[2]) ||
+      (source.polygon_offset_enable != 0U && source.depth_format == 0U)) {
+    return false;
+  }
+  return source.polygon_offset_enable != 0U ||
+         (source.polygon_offset_factor_bits == 0U &&
+          source.polygon_offset_units_bits == 0U &&
+          source.polygon_offset_clamp_bits == 0U &&
+          source.polygon_offset_units_unscaled == 0U);
 }
 
 bool CopyPcoTrianglePayload(
@@ -1456,6 +1486,7 @@ bool CopyPcoTrianglePayload(
   }
   const bool common_raster_invalid =
       source.fill_front != 0 || source.fill_back != 0 ||
+      !PolygonOffsetStateIsValid(source) ||
       source.rasterizer_discard != 0 ||
       // GL_MULTISAMPLE on a single-sample attachment rasterizes as
       // single-sample; a multi-sampled attachment never reaches here.
@@ -1885,6 +1916,8 @@ bool CopyPcoSequenceDraw(
     nested_reason = "cull_face";
   else if (source.fill_front != 0 || source.fill_back != 0)
     nested_reason = "polygon_fill_mode";
+  else if (!PolygonOffsetStateIsValid(source))
+    nested_reason = "polygon_offset";
   else if (source.rasterizer_discard != 0)
     nested_reason = "rasterizer_discard";
   else if (source.multisample > 1)

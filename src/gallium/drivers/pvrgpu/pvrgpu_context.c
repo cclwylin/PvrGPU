@@ -1752,6 +1752,15 @@ pvrgpu_cpu_present_textured_quad_skip_reason(
    if (!pvrgpu_resource((struct pipe_resource *)src)->data ||
        !pvrgpu_resource((struct pipe_resource *)dst)->data)
       return "missing_cpu_storage";
+   const struct util_format_unpack_description *src_unpack =
+      util_format_unpack_description(view->format);
+   if (!src_unpack || (!src_unpack->unpack_rgba_8unorm &&
+                       !src_unpack->unpack_rgba_8unorm_rect))
+      return "unsupported_source_format_unpack";
+   const struct util_format_pack_description *dst_pack =
+      util_format_pack_description(ctx->framebuffer.cbufs[0].format);
+   if (!dst_pack || !dst_pack->pack_rgba_8unorm)
+      return "unsupported_destination_format_pack";
    if (util_format_get_blocksize(view->format) == 0 ||
        util_format_get_blocksize(ctx->framebuffer.cbufs[0].format) == 0)
       return "unsupported_format_blocksize";
@@ -9824,7 +9833,10 @@ pvrgpu_nearest_shadow_sampler_supported(const struct pipe_sampler_view *view,
    /* A scalar native sample followed by a shader compare is precisely a
     * nearest shadow lookup. Linear PCF needs comparison of individual taps,
     * not comparison of interpolated depths; keep that unsupported explicitly. */
-   return view && sampler && view->target == PIPE_TEXTURE_2D &&
+   return view && sampler &&
+      (view->target == PIPE_TEXTURE_2D ||
+       view->target == PIPE_TEXTURE_2D_ARRAY ||
+       view->target == PIPE_TEXTURE_CUBE) &&
       view->texture && view->texture->nr_samples <= 1 &&
       view->texture->nr_storage_samples <= 1 &&
       util_format_has_depth(util_format_description(view->format)) &&
@@ -11337,27 +11349,37 @@ pvrgpu_capture_stage_uniform_buffers(
    const struct pvrgpu_context *ctx, mesa_shader_stage stage,
    unsigned declared_blocks, bool allow_unused_suffix,
    const struct pvrgpu_pco_stage_abi *abi,
+   uint32_t cb0_uniform_buffer_slot,
    struct pvrgpu_array_primitive_draw *recorded, uint32_t *shared)
 {
    const unsigned active_blocks = abi ? abi->uniform_buffer_descriptor_count : 0;
+   const unsigned compiled_blocks =
+      active_blocks >= (cb0_uniform_buffer_slot ? 1u : 0u)
+         ? active_blocks - (cb0_uniform_buffer_slot ? 1u : 0u) : UINT_MAX;
+   const unsigned cb0_uniform_dwords = cb0_uniform_buffer_slot
+      ? pvrgpu_stage_uniform_dwords(ctx, stage) : 0;
    if (!abi || (stage != MESA_SHADER_VERTEX && stage != MESA_SHADER_FRAGMENT &&
         stage != MESA_SHADER_GEOMETRY && stage != MESA_SHADER_TESS_CTRL &&
         stage != MESA_SHADER_TESS_EVAL) ||
        (allow_unused_suffix && stage != MESA_SHADER_VERTEX &&
           stage != MESA_SHADER_FRAGMENT) ||
-       !pvrgpu_uniform_buffer_prefix_count_valid(declared_blocks, active_blocks,
+       (cb0_uniform_buffer_slot &&
+        (cb0_uniform_buffer_slot != active_blocks || active_blocks == 0)) ||
+       !pvrgpu_uniform_buffer_prefix_count_valid(declared_blocks, compiled_blocks,
                                                   allow_unused_suffix) ||
        (uint64_t)abi->uniform_buffer_descriptor_start + 4u * active_blocks >
           abi->shareds || abi->shareds > PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS)
       return false;
-   return pvrgpu_snapshot_stage_uniform_buffers(
+   return pvrgpu_snapshot_stage_uniform_buffers_mapped(
       ctx->constant_buffers[stage],
       stage == MESA_SHADER_VERTEX ? PVRGPU_SYSTEMC_PCO_SHADER_STAGE_VERTEX
       : stage == MESA_SHADER_GEOMETRY ? PVRGPU_SYSTEMC_PCO_SHADER_STAGE_GEOMETRY
       : stage == MESA_SHADER_TESS_CTRL ? PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_CONTROL
       : stage == MESA_SHADER_TESS_EVAL ? PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION
                                      : PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT,
-      active_blocks, abi->uniform_buffer_descriptor_start, shared, abi->shareds,
+      active_blocks, abi->uniform_buffer_descriptor_start,
+      cb0_uniform_buffer_slot, cb0_uniform_dwords,
+      shared, abi->shareds,
       recorded->uniform_buffers, &recorded->uniform_buffer_count,
       ARRAY_SIZE(recorded->uniform_buffers));
 }
@@ -12184,8 +12206,21 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    }
    const unsigned vertex_shared_count = binary.vertex.abi.shareds;
    const unsigned fragment_shared_count = binary.fragment.abi.shareds;
+   const bool vertex_cb0_dma_valid = !binary.vertex.cb0_uniform_buffer_slot ||
+      (binary.vertex.cb0_uniform_buffer_slot ==
+          binary.vertex.abi.uniform_buffer_descriptor_count &&
+       binary.vertex.abi.push_constant_count == 0 &&
+       binary.vertex.cb0_word_map.count == 0 &&
+       binary.vertex.cb0_word_map.source_dwords == 0);
+   const bool fragment_cb0_dma_valid = !binary.fragment.cb0_uniform_buffer_slot ||
+      (binary.fragment.cb0_uniform_buffer_slot ==
+          binary.fragment.abi.uniform_buffer_descriptor_count &&
+       binary.fragment.abi.push_constant_count == 0 &&
+       binary.fragment.cb0_word_map.count == 0 &&
+       binary.fragment.cb0_word_map.source_dwords == 0);
    if (vertex_shared_count > PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS ||
        fragment_shared_count > PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS ||
+       !vertex_cb0_dma_valid || !fragment_cb0_dma_valid ||
        !pvrgpu_copy_stage_uniform_words(ctx,
                                         MESA_SHADER_VERTEX,
                                         &binary.vertex.abi,
@@ -12221,9 +12256,19 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
       &binary.vertex, &binary.fragment,
    };
    const uint32_t *mapped_shared[] = {vertex_uniform_words, fragment_uniform_words};
+   const unsigned mapped_source_dwords[] = {
+      vertex_uniform_dwords, fragment_uniform_dwords,
+   };
    for (unsigned stage = 0; stage < ARRAY_SIZE(mapped_stages); ++stage) {
       const struct pvrgpu_pco_owned_binary *compiled = mapped_stages[stage];
       const struct pvrgpu_pco_uniform_word_map *map = &compiled->cb0_word_map;
+      if (compiled->cb0_uniform_buffer_slot)
+         pvrgpu_counter_eventf("draw_array_primitive_cb0_dma",
+            "stage=%u source_dwords=%u native_ubo_slot=%u descriptor_start=%u shareds=%u",
+            stage ? MESA_SHADER_FRAGMENT : MESA_SHADER_VERTEX,
+            mapped_source_dwords[stage], compiled->cb0_uniform_buffer_slot - 1,
+            compiled->abi.uniform_buffer_descriptor_start,
+            compiled->abi.shareds);
       if (!map->count)
          continue;
       uint64_t map_hash = UINT64_C(14695981039346656037);
@@ -12349,6 +12394,60 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
       ctx->rasterizer ? ctx->rasterizer->state.depth_clip_far : 1;
    command.depth_clamp =
       ctx->rasterizer ? ctx->rasterizer->state.depth_clamp : 0;
+   if (ctx->rasterizer) {
+      /*
+       * Gallium keeps one offset enable for each rasterized primitive class.
+       * Select the class after the last pre-raster shader: a GS can turn a
+       * triangle input into points or lines, and TES point/isolines modes do
+       * the same.  Disabled state remains all-zero so the v33 capsule has one
+       * canonical representation and no stale glPolygonOffset values leak in.
+       */
+      bool offset_enabled = false;
+      if (ctx->gs) {
+         if (geometry.abi.output_primitive == MESA_PRIM_POINTS)
+            offset_enabled = ctx->rasterizer->state.offset_point;
+         else if (geometry.abi.output_primitive == MESA_PRIM_LINE_STRIP)
+            offset_enabled = ctx->rasterizer->state.offset_line;
+         else if (geometry.abi.output_primitive == MESA_PRIM_TRIANGLE_STRIP)
+            offset_enabled = ctx->rasterizer->state.offset_tri;
+      } else if (has_tessellation) {
+         if (tessellation.point_mode)
+            offset_enabled = ctx->rasterizer->state.offset_point;
+         else if (tessellation.primitive_mode == TESS_PRIMITIVE_ISOLINES)
+            offset_enabled = ctx->rasterizer->state.offset_line;
+         else
+            offset_enabled = ctx->rasterizer->state.offset_tri;
+      } else {
+         switch (command_primitive_mode) {
+         case MESA_PRIM_POINTS:
+            offset_enabled = ctx->rasterizer->state.offset_point;
+            break;
+         case MESA_PRIM_LINES:
+         case MESA_PRIM_LINE_LOOP:
+         case MESA_PRIM_LINE_STRIP:
+            offset_enabled = ctx->rasterizer->state.offset_line;
+            break;
+         case MESA_PRIM_TRIANGLES:
+         case MESA_PRIM_TRIANGLE_STRIP:
+         case MESA_PRIM_TRIANGLE_FAN:
+            offset_enabled = ctx->rasterizer->state.offset_tri;
+            break;
+         default:
+            break;
+         }
+      }
+      if (offset_enabled) {
+         command.polygon_offset_enable = 1;
+         command.polygon_offset_factor_bits =
+            pvrgpu_float_bits(ctx->rasterizer->state.offset_scale);
+         command.polygon_offset_units_bits =
+            pvrgpu_float_bits(ctx->rasterizer->state.offset_units);
+         command.polygon_offset_clamp_bits =
+            pvrgpu_float_bits(ctx->rasterizer->state.offset_clamp);
+         command.polygon_offset_units_unscaled =
+            ctx->rasterizer->state.offset_units_unscaled;
+      }
+   }
    command.sample_mask = ctx->sample_mask;
    command.color_mask = ctx->framebuffer.nr_cbufs ? pvrgpu_rt_colormask(ctx, 0) : 0;
    command.blend_enable =
@@ -12435,20 +12534,24 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    if (!pvrgpu_capture_stage_uniform_buffers(
           ctx, MESA_SHADER_VERTEX, ctx->vs->nir->info.num_ubos,
           compiled_ubo_prefix,
-          &binary.vertex.abi, recorded, vertex_uniform_words) ||
+          &binary.vertex.abi, binary.vertex.cb0_uniform_buffer_slot,
+          recorded, vertex_uniform_words) ||
        !pvrgpu_capture_stage_uniform_buffers(
           ctx, MESA_SHADER_FRAGMENT, ctx->fs->nir->info.num_ubos,
           compiled_ubo_prefix,
-          &binary.fragment.abi, recorded, fragment_uniform_words) ||
+          &binary.fragment.abi, binary.fragment.cb0_uniform_buffer_slot,
+          recorded, fragment_uniform_words) ||
        (ctx->gs && !pvrgpu_capture_stage_uniform_buffers(
           ctx, MESA_SHADER_GEOMETRY, ctx->gs->nir->info.num_ubos, false,
-          &geometry.shader.abi, recorded, geometry_uniform_words)) ||
+          &geometry.shader.abi, 0, recorded, geometry_uniform_words)) ||
        (has_tessellation && (!pvrgpu_capture_stage_uniform_buffers(
           ctx, MESA_SHADER_TESS_CTRL, ctx->tcs->nir->info.num_ubos, false,
-          &tessellation.control.shader.abi, recorded, control_uniform_words) ||
+          &tessellation.control.shader.abi, 0,
+          recorded, control_uniform_words) ||
           !pvrgpu_capture_stage_uniform_buffers(
           ctx, MESA_SHADER_TESS_EVAL, ctx->tes->nir->info.num_ubos, false,
-          &tessellation.evaluation.shader.abi, recorded, evaluation_uniform_words)))) {
+          &tessellation.evaluation.shader.abi, 0,
+          recorded, evaluation_uniform_words)))) {
       pvrgpu_counter_eventf("draw_array_primitive_record_error",
                             "stage=uniform_buffers reason=bound_range_or_descriptor");
       pvrgpu_array_primitive_draw_destroy(&recorded);
@@ -12813,6 +12916,7 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
                          "vs_bytes=%zu fs_bytes=%zu fill=%u,%u scissor=%u "
                          "discard=%u multisample=%u halfpixel=%u "
                          "bottomedge=%u halfz=%u clip=%u,%u clamp=%u "
+                         "polygonoffset=%u,0x%08x,0x%08x,0x%08x,%u "
                          "samplemask=0x%x colormask=0x%x blend=%u dither=%u "
                          "depth=%u,%u,%u,%u stencil=%u,%u,%u,%u,%u,%u,%u "
                          "cull=%u ccw=%u",
@@ -12834,6 +12938,11 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
                          command.depth_clip_near,
                          command.depth_clip_far,
                          command.depth_clamp,
+                         command.polygon_offset_enable,
+                         command.polygon_offset_factor_bits,
+                         command.polygon_offset_units_bits,
+                         command.polygon_offset_clamp_bits,
+                         command.polygon_offset_units_unscaled,
                          command.sample_mask,
                          command.color_mask,
                          command.blend_enable,

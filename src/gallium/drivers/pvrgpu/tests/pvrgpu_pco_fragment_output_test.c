@@ -75,13 +75,6 @@ int main(int argc, char **argv)
       const bool compiled = pvrgpu_pco_compile_color_triangle(compiler, vs, fs, &format,
             false, false, kind == 6 ? 4 : 1, 0, 0, 1, 0,
             &binary, error, sizeof(error));
-      if (kind == 0) {
-         ++checks;
-         if (compiled) { fprintf(stderr, "empty FS unexpectedly admitted\n"); return 1; }
-         printf("kind=0 empty-FS refusal retained: %s\n", error);
-         ralloc_free(vs); ralloc_free(fs);
-         continue;
-      }
       if (!compiled) {
          fprintf(stderr, "kind=%u compile failure: %s\n", kind, error);
          return 1;

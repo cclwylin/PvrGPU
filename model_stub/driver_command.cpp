@@ -53,7 +53,8 @@ const std::set<std::string> &KnownFields() {
       "fragment_shared_words", "vertex_pco_abi", "fragment_pco_abi",
       "position_linkage", "varying_linkage", "viewport_scale_bits",
       "viewport_translate_bits", "raster_state", "scissor_rect",
-      "primitive_width", "point_size_output", "sample_mask", "sample_frequency",
+      "primitive_width", "point_size_output", "polygon_offset_state",
+      "sample_mask", "sample_frequency",
       "color_state", "depth_state",
       "alpha_to_coverage", "alpha_to_coverage_dither", "alpha_to_one",
       "sampled_texture_count", "sampled_texture_bytes_size",
@@ -355,9 +356,12 @@ bool RequireExactFields(const std::map<std::string, std::string> &fields,
          entry.first == "alpha_to_coverage_dither" || entry.first == "alpha_to_one");
     const bool optional_sample_frequency = command == kDrawPcoTrianglesCommand &&
         entry.first == "sample_frequency";
+    const bool optional_polygon_offset = command == kDrawPcoTrianglesCommand &&
+        entry.first == "polygon_offset_state";
     if (!required.count(entry.first) && !optional_pco_counter && !optional_sample_frequency &&
         !optional_pco_texture && !optional_pco_linkage &&
-        !optional_pco_index && !optional_pco_render_targets && !optional_pco_alpha) {
+        !optional_pco_index && !optional_pco_render_targets && !optional_pco_alpha &&
+        !optional_polygon_offset) {
       *error = "field is not valid for " + command +
                " driver command: " + entry.first;
       return false;
@@ -646,6 +650,7 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     std::array<std::uint32_t, 4> scissor_rect{};
     std::array<std::uint32_t, 2> primitive_width{};
     std::array<std::uint32_t, 2> point_size_output{};
+    std::array<std::uint32_t, 5> polygon_offset_state{};
     std::array<std::uint32_t, 3> color_state{};
     std::array<std::uint32_t, 5> depth_state{};
     if (!ParseU64(fields["raw_vertex_data_size"],
@@ -707,6 +712,13 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         !ParseU32List(fields["depth_state"], &depth_state)) {
       *error = "draw_pco_triangles metadata is malformed or outside the "
                "bounded native PCO profile";
+      return false;
+    }
+    const auto polygon_offset = fields.find("polygon_offset_state");
+    if (polygon_offset != fields.end() &&
+        !ParseU32List(polygon_offset->second, &polygon_offset_state)) {
+      *error = "draw_pco_triangles polygon_offset_state must contain five "
+               "uint32 values";
       return false;
     }
     const auto varying = fields.find("varying_linkage");
@@ -810,6 +822,30 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     parsed.depth_clip_near = raster_state[10];
     parsed.depth_clip_far = raster_state[11];
     parsed.depth_clamp = raster_state[12];
+    parsed.polygon_offset_enable = polygon_offset_state[0];
+    parsed.polygon_offset_factor_bits = polygon_offset_state[1];
+    parsed.polygon_offset_units_bits = polygon_offset_state[2];
+    parsed.polygon_offset_clamp_bits = polygon_offset_state[3];
+    parsed.polygon_offset_units_unscaled = polygon_offset_state[4];
+    float polygon_offset_values[3]{};
+    static_assert(sizeof(polygon_offset_values) ==
+                  sizeof(std::uint32_t) * 3);
+    std::memcpy(&polygon_offset_values[0], &parsed.polygon_offset_factor_bits,
+                sizeof(float));
+    std::memcpy(&polygon_offset_values[1], &parsed.polygon_offset_units_bits,
+                sizeof(float));
+    std::memcpy(&polygon_offset_values[2], &parsed.polygon_offset_clamp_bits,
+                sizeof(float));
+    const bool polygon_offset_finite =
+        std::isfinite(polygon_offset_values[0]) &&
+        std::isfinite(polygon_offset_values[1]) &&
+        std::isfinite(polygon_offset_values[2]);
+    const bool polygon_offset_disabled_is_canonical =
+        parsed.polygon_offset_enable != 0 ||
+        (parsed.polygon_offset_factor_bits == 0 &&
+         parsed.polygon_offset_units_bits == 0 &&
+         parsed.polygon_offset_clamp_bits == 0 &&
+         parsed.polygon_offset_units_unscaled == 0);
     parsed.color_mask = color_state[0];
     parsed.blend_enable = color_state[1];
     parsed.dither = color_state[2];
@@ -912,6 +948,9 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         parsed.bottom_edge_rule != 0 || parsed.clip_halfz != 0 ||
         parsed.depth_clip_near != 1 || parsed.depth_clip_far != 1 ||
         parsed.depth_clamp != 0 || parsed.sample_mask != UINT32_MAX ||
+        parsed.polygon_offset_enable > 1 ||
+        parsed.polygon_offset_units_unscaled > 1 ||
+        !polygon_offset_finite || !polygon_offset_disabled_is_canonical ||
         parsed.alpha_to_coverage != 0 || parsed.alpha_to_one != 0 ||
         parsed.color_mask > 0x0f || parsed.blend_enable > 1 ||
         parsed.dither != 1 || parsed.depth_enable > 1 ||
@@ -941,7 +980,8 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
           parsed.viewport_translate_bits != expected_viewport ||
           parsed.cull_face != 2 || parsed.depth_enable != 1 ||
           parsed.depth_write != 1 || parsed.depth_func != 3 ||
-          parsed.depth_clear_bits != UINT32_C(0x3f800000)) {
+          parsed.depth_clear_bits != UINT32_C(0x3f800000) ||
+          parsed.polygon_offset_enable != 0) {
         *error = "draw_pco_triangles ABI/raster metadata does not match the "
                  "strict supported-resolution conditionals profile "
                  "(80x60 or 800x600)";

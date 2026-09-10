@@ -1788,6 +1788,24 @@ pvrgpu_cmd_validate_draw_pco_triangles(
     * (front_ccw=1, scale_y<0) is the same GL state as the (0, >0) the
     * pinned captures use.
     */
+   float polygon_offset_factor = 0.0f;
+   float polygon_offset_units = 0.0f;
+   float polygon_offset_clamp = 0.0f;
+   memcpy(&polygon_offset_factor, &cmd->polygon_offset_factor_bits,
+          sizeof(polygon_offset_factor));
+   memcpy(&polygon_offset_units, &cmd->polygon_offset_units_bits,
+          sizeof(polygon_offset_units));
+   memcpy(&polygon_offset_clamp, &cmd->polygon_offset_clamp_bits,
+          sizeof(polygon_offset_clamp));
+   const bool polygon_offset_values_finite =
+      isfinite(polygon_offset_factor) && isfinite(polygon_offset_units) &&
+      isfinite(polygon_offset_clamp);
+   const bool polygon_offset_disabled_is_canonical =
+      cmd->polygon_offset_enable != 0 ||
+      (cmd->polygon_offset_factor_bits == 0 &&
+       cmd->polygon_offset_units_bits == 0 &&
+       cmd->polygon_offset_clamp_bits == 0 &&
+       cmd->polygon_offset_units_unscaled == 0);
    const char *raster_reason = NULL;
    if (cmd->front_ccw > 1)
       raster_reason = "front_ccw";
@@ -1813,6 +1831,15 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       raster_reason = "depth_clip";
    else if (cmd->depth_clamp != 0)
       raster_reason = "depth_clamp";
+   else if (cmd->polygon_offset_enable > 1 ||
+            cmd->polygon_offset_units_unscaled > 1)
+      raster_reason = "polygon_offset_boolean";
+   else if (!polygon_offset_values_finite)
+      raster_reason = "polygon_offset_non_finite";
+   else if (!polygon_offset_disabled_is_canonical)
+      raster_reason = "polygon_offset_disabled_payload";
+   else if (cmd->polygon_offset_enable != 0 && cmd->depth_format == 0)
+      raster_reason = "polygon_offset_without_depth_format";
    else if (!color_layout && cmd->sample_mask != UINT32_MAX)
       raster_reason = "sample_mask";
    else if (cmd->alpha_to_coverage > 1 ||
@@ -2303,6 +2330,12 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->depth_clip_near = cmd->depth_clip_near;
    out->depth_clip_far = cmd->depth_clip_far;
    out->depth_clamp = cmd->depth_clamp;
+   out->polygon_offset_enable = cmd->polygon_offset_enable;
+   out->polygon_offset_factor_bits = cmd->polygon_offset_factor_bits;
+   out->polygon_offset_units_bits = cmd->polygon_offset_units_bits;
+   out->polygon_offset_clamp_bits = cmd->polygon_offset_clamp_bits;
+   out->polygon_offset_units_unscaled =
+      cmd->polygon_offset_units_unscaled;
    out->sample_mask = cmd->sample_mask;
    out->sample_frequency = cmd->sample_frequency;
    out->alpha_to_coverage = cmd->alpha_to_coverage;
@@ -2513,6 +2546,7 @@ pvrgpu_write_draw_pco_triangles_command(
       "scissor_rect=%u,%u,%u,%u\n"
       "primitive_width=%u,%u\n"
       "point_size_output=%u,%u\n"
+      "polygon_offset_state=%u,%u,%u,%u,%u\n"
       "sample_mask=%u\n"
       "sample_frequency=%u\n"
       "alpha_to_coverage=%u\n"
@@ -2571,6 +2605,11 @@ pvrgpu_write_draw_pco_triangles_command(
       cmd->point_size_bits,
       cmd->point_size_output_start,
       cmd->point_size_output_count,
+      cmd->polygon_offset_enable,
+      cmd->polygon_offset_factor_bits,
+      cmd->polygon_offset_units_bits,
+      cmd->polygon_offset_clamp_bits,
+      cmd->polygon_offset_units_unscaled,
       cmd->sample_mask,
       cmd->sample_frequency,
       cmd->alpha_to_coverage,

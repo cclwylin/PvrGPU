@@ -70,10 +70,20 @@ int main(void)
    struct pvrgpu_draw_pco_triangles_command projection = {0};
    projection.format = formats[0]; projection.render_target_count = 4;
    projection.color_attachment_format_count = 4;
+   projection.polygon_offset_enable = 1;
+   projection.polygon_offset_factor_bits = UINT32_C(0x3f800000);
+   projection.polygon_offset_units_bits = UINT32_C(0x43480000);
+   projection.polygon_offset_clamp_bits = UINT32_C(0xbdcccccd);
+   projection.polygon_offset_units_unscaled = 1;
    memcpy(projection.color_attachment_formats, formats, sizeof(formats));
    struct pvrgpu_systemc_driver_command projected;
    pvrgpu_pco_triangles_command_to_systemc(&projection, &projected);
    CHECK(projected.version == PVRGPU_SYSTEMC_API_VERSION && projected.color_attachment_format_count == 4);
+   CHECK(projected.polygon_offset_enable == 1 &&
+         projected.polygon_offset_factor_bits == UINT32_C(0x3f800000) &&
+         projected.polygon_offset_units_bits == UINT32_C(0x43480000) &&
+         projected.polygon_offset_clamp_bits == UINT32_C(0xbdcccccd) &&
+         projected.polygon_offset_units_unscaled == 1);
    for (unsigned target = 0; target < 4; ++target)
       CHECK(!strcmp(projected.color_attachment_formats[target], formats[target]));
    FILE *format_file = tmpfile();

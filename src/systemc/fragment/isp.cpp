@@ -99,6 +99,11 @@ float BitsFloat(std::uint32_t bits) {
   return value;
 }
 
+float StrictAdd(float lhs, float rhs) {
+  const volatile float result = lhs + rhs;
+  return result;
+}
+
 float InterpolateDepth(const ParameterTriangle &triangle,
                        const std::int64_t edge_values[3], float x,
                        float y, bool llvmpipe_driver_plane,
@@ -121,11 +126,23 @@ float InterpolateDepth(const ParameterTriangle &triangle,
     const float c = BitsFloat(triangle.depth_plane[2]);
     if (!std::isfinite(a) || !std::isfinite(b) || !std::isfinite(c))
       throw std::runtime_error("ISP driver depth plane is non-finite");
+    const float offset = BitsFloat(triangle.depth_offset);
+    if (!std::isfinite(offset))
+      throw std::runtime_error("ISP driver polygon offset is non-finite");
     // llvmpipe's FS evaluates its internal position-Z slot with these two
-    // ordered llvm.fmuladd operations.  The order is observable after Z32
-    // quantization and later binary16 texture sampling.
-    return std::fma(b, static_cast<float>(y),
-                    std::fma(a, static_cast<float>(x), c));
+    // ordered llvm.fmuladd operations, then performs a distinct FADD with the
+    // per-primitive polygon offset held in position coefficient A0.x. Folding
+    // the offset into C changes the rounded result at D24/D32 boundaries.
+    const float interpolated =
+        std::fma(b, static_cast<float>(y),
+                 std::fma(a, static_cast<float>(x), c));
+    const float biased = StrictAdd(interpolated, offset);
+    if (!std::isfinite(biased))
+      throw std::runtime_error("ISP biased driver depth is non-finite");
+    // GLES restricts fragment depth to the viewport depth range.  Polygon
+    // offset is applied before this clamp, just as in llvmpipe's early/late
+    // depth paths.
+    return std::clamp(biased, 0.0F, 1.0F);
   }
   return barycentric[0] * triangle.window_z[0] +
          barycentric[1] * triangle.window_z[1] +

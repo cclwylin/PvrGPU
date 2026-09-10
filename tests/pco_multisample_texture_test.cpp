@@ -241,7 +241,8 @@ void TestNativeSampling() {
       const auto smp = SampleInstruction(program);
       Check(program.instructions[smp].texture_non_normalized_coords == 1 &&
                 program.instructions[smp].texture_sample_index_present == 1 &&
-                program.instructions[smp].texture_address_offset == unsigned(kind >= 3),
+                program.instructions[smp].texture_address_offset == unsigned(kind >= 3) &&
+                program.instructions[smp].texture_lod_bias == 0,
             "decoder lost native multisample flags");
       for (unsigned samples : {1U, 2U, 4U, 8U}) {
         for (unsigned sample = 0; sample < samples; ++sample) {

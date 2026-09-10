@@ -13,7 +13,7 @@ int main(int argc, char **argv) {
   try {
     const unsigned masks[] = {0,0,1,3,7,15,0x703,15,7};
     unsigned checks = 0;
-    for (unsigned kind = 1; kind < 9; ++kind) {
+    for (unsigned kind = 0; kind < 9; ++kind) {
       std::ifstream stream(std::string(argv[1]) + "/output-" + std::to_string(kind) + ".bin", std::ios::binary);
       if (!stream) throw std::runtime_error("missing actual compiler binary");
       const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(stream), {}};

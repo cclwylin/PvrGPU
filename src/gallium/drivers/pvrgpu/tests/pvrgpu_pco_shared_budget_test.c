@@ -109,12 +109,13 @@ int main(int argc, char **argv)
    const struct stage_case empty = {.no_uniform = true, .bits = 32, .index_bits = 32};
    const struct stage_case full = {.bound = 96, .base = 23, .range = 1,
       .components = 4, .bits = 32, .index_bits = 32, .ubos = 1};
-   enum { CASE_COUNT = 32 };
+   enum { CASE_COUNT = 38 };
    for (unsigned i = 0; i < CASE_COUNT; ++i) {
       struct stage_case v = full, f = empty;
       bool success = true, rescued = false;
       unsigned expected_ubos = 0, expected_count = 96, expected_start = 0;
-      bool fragment = false, packed = false;
+      bool fragment = false, packed = false, dma = false;
+      unsigned expected_cb0_slot = 0, expected_image_start = 4;
       switch (i) {
       case 0: current = "full96-dead-ubo"; rescued = true; break;
       case 1: current = "full96-live-ubo-packed"; v.load_ubo = true; packed = true;
@@ -166,6 +167,32 @@ int main(int argc, char **argv)
          fragment = true; expected_ubos = 1; expected_count = 244; expected_start = 12; rescued = true; break;
       case 31: current = "fragment-image-already-fitting-unchanged"; f = full; f.bound = 244; f.base = 60; f.image = true; v = empty;
          fragment = true; expected_ubos = 1; expected_count = 244; expected_start = 12; break;
+      case 32: current = "d176-large-dynamic-vertex-cb0-dma";
+         v.bound = 400; v.base = 4; v.range = 96; v.indirect = true; v.ubos = 0;
+         expected_ubos = 1; expected_count = 0; expected_start = 4;
+         expected_cb0_slot = 1; dma = true; rescued = true; break;
+      case 33: current = "large-dynamic-vertex-after-live-ubo-prefix";
+         v.bound = 400; v.base = 4; v.range = 96; v.indirect = true;
+         v.ubos = 3; v.block = 1; v.load_ubo = true;
+         expected_ubos = 3; expected_count = 0; expected_start = 12;
+         expected_cb0_slot = 3; dma = true; rescued = true; break;
+      case 34: current = "large-dynamic-fragment-cb0-dma";
+         f = full; f.bound = 400; f.base = 4; f.range = 96;
+         f.indirect = true; f.ubos = 0; v = empty; fragment = true;
+         expected_ubos = 1; expected_count = 0; expected_start = 4;
+         expected_cb0_slot = 1; dma = true; rescued = true; break;
+      case 35: current = "fragment-image-after-large-cb0-dma";
+         f = full; f.bound = 400; f.base = 4; f.range = 96;
+         f.indirect = true; f.image = true; v = empty; fragment = true;
+         expected_ubos = 2; expected_count = 0; expected_start = 16;
+         expected_cb0_slot = 2; expected_image_start = 8;
+         dma = true; rescued = true; break;
+      case 36: current = "large-cb0-after-fifteen-ubos-refused";
+         v.bound = 400; v.base = 4; v.range = 96; v.indirect = true;
+         v.ubos = 15; v.block = 14; v.load_ubo = true; success = false; break;
+      case 37: current = "large-cb0-over-64k-refused";
+         v.bound = 16388; v.base = 0; v.range = 4097; v.indirect = true;
+         v.ubos = 0; success = false; break;
       }
       nir_shader *vs = make_shader(MESA_SHADER_VERTEX, v);
       nir_shader *fs = make_shader(MESA_SHADER_FRAGMENT, f);
@@ -182,11 +209,17 @@ int main(int argc, char **argv)
          require(abi->push_constant_count == expected_count, "exact CB0 prefix length");
          require(abi->shareds == expected_start + expected_count, "physical shared allocation");
          const struct pvrgpu_pco_uniform_word_map *map = fragment ? &result.fragment.cb0_word_map : &result.vertex.cb0_word_map;
+         const struct pvrgpu_pco_owned_binary *owned =
+            fragment ? &result.fragment : &result.vertex;
          require(map->count == (packed ? expected_count : 0), "packing only formerly rejected cases");
          require(map->source_dwords == (packed ? (fragment ? f.bound : v.bound) : 0), "original source bound retained");
+         require(owned->cb0_uniform_buffer_slot == expected_cb0_slot,
+                 "large CB0 uses only its appended native UBO slot");
+         require(dma == (expected_cb0_slot != 0), "DMA case expectation is coherent");
          require(result.vertex.data && result.vertex.size && result.fragment.data && result.fragment.size, "real compiler bytes");
          if (f.image) {
-            require(result.fragment_image_descriptor_start == 4, "image descriptor address remains pinned after UBO");
+            require(result.fragment_image_descriptor_start == expected_image_start,
+                    "image descriptor address follows the final UBO inventory");
             require(result.fragment_image_descriptor_count == 1 &&
                result.fragment_image_read_mask == 1 && result.fragment_image_write_mask == 1,
                "real image atomic descriptor identity");

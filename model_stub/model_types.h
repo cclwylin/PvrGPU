@@ -519,6 +519,11 @@ struct DriverCommand {
   std::uint32_t depth_func = 0;
   std::uint32_t depth_clear_bits = 0;
   std::uint32_t depth_format = 0;
+  std::uint32_t polygon_offset_enable = 0;
+  std::uint32_t polygon_offset_factor_bits = 0;
+  std::uint32_t polygon_offset_units_bits = 0;
+  std::uint32_t polygon_offset_clamp_bits = 0;
+  std::uint32_t polygon_offset_units_unscaled = 0;
   // Mirrors the API's stencil block; index 0 is the front face, 1 the back.
   std::uint32_t stencil_enable = 0;
   std::uint32_t stencil_clear = 0;

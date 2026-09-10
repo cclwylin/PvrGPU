@@ -93,7 +93,18 @@ std::uint32_t EncodeDepthAttachmentUnorm(float depth,
                       ? UINT64_C(0xffffffff)
                       : throw std::runtime_error(
                             "unsupported native depth attachment format");
-  const long double scaled = static_cast<long double>(depth) * maximum;
+  long double scaled = 0.0L;
+  if (format == kDriverPcoDepthFormatZ24X8Unorm ||
+      format == kDriverPcoDepthFormatZ24UnormS8Uint) {
+    // llvmpipe's float32-to-D24 conversion first emits an LLVM float
+    // multiply by 0xffffff, then rounds that binary32 product to the nearest
+    // integer. Preserve the intermediate rounding instead of evaluating the
+    // product at long-double precision.
+    const volatile float binary32_scaled = depth * 16777215.0F;
+    scaled = binary32_scaled;
+  } else {
+    scaled = static_cast<long double>(depth) * maximum;
+  }
   const long double integral = std::floor(scaled);
   std::uint64_t encoded = static_cast<std::uint64_t>(integral);
   const long double fraction = scaled - integral;

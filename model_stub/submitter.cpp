@@ -2104,6 +2104,16 @@ void Submitter::RunJob() {
           command.point_size_output_start;
       state.raster_state.point_size_output_count =
           command.point_size_output_count;
+      state.raster_state.polygon_offset_enable =
+          static_cast<std::uint8_t>(command.polygon_offset_enable);
+      state.raster_state.polygon_offset_factor =
+          FloatFromBits(command.polygon_offset_factor_bits);
+      state.raster_state.polygon_offset_units =
+          FloatFromBits(command.polygon_offset_units_bits);
+      state.raster_state.polygon_offset_clamp =
+          FloatFromBits(command.polygon_offset_clamp_bits);
+      state.raster_state.polygon_offset_units_unscaled =
+          static_cast<std::uint8_t>(command.polygon_offset_units_unscaled);
       // The viewport transform the draw states.  Clip/cull falls back to the
       // whole attachment when the scale is unstated.
       for (std::size_t axis = 0; axis < 3; ++axis) {
@@ -3042,6 +3052,15 @@ void Submitter::RunJob() {
     state.counters.fifo_stall_events = fifo_stalls_;
     StorePipelineState(pool_, handle, state);
     output.write({handle, frame, frame});
+
+    // TODO(pvrgpu-tbdr): This is the draw-serialized compatibility path, not
+    // a hardware-faithful render-pass-wide TBDR schedule.  A real two-phase
+    // implementation must first bin every draw in one compatible render pass
+    // into shared per-tile lists, then cross a pass-wide barrier and render
+    // each tile once (preserving draw order).  Keep this wait until that shared
+    // render-pass state and the required hazard/pass-boundary splitting exist.
+    // Retain this serialized path as a selectable debug/reference mode after
+    // the hardware-faithful path is added; it is needed for per-draw bisection.
     if (!options_.driver_commands.empty() && sequence_completion_ &&
         submission + 1U < submission_count)
       wait(*sequence_completion_);

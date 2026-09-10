@@ -148,6 +148,146 @@ std::uint32_t FloatBits(float value) {
   return bits;
 }
 
+// Keep llvmpipe setup's individual LLVM FMul/FSub/FAdd/FDiv instructions
+// individually rounded.  In particular, the offset slope is formed from a
+// cross product before multiplying by reciprocal area; deriving it from the
+// already-serialized depth plane would change the rounding order.
+float StrictMultiply(float lhs, float rhs) {
+  const volatile float result = lhs * rhs;
+  return result;
+}
+
+float StrictSubtract(float lhs, float rhs) {
+  const volatile float result = lhs - rhs;
+  return result;
+}
+
+float StrictAdd(float lhs, float rhs) {
+  const volatile float result = lhs + rhs;
+  return result;
+}
+
+float StrictDivide(float lhs, float rhs) {
+  const volatile float result = lhs / rhs;
+  return result;
+}
+
+float RoundToFloat(double value) {
+  const volatile float result = static_cast<float>(value);
+  return result;
+}
+
+bool IsFloatingPointDepthFormat(std::uint32_t format) {
+  using namespace pvrgpu::stub;
+  return format == kDriverPcoDepthFormatZ32Float ||
+         format == kDriverPcoDepthFormatZ32FloatS8X24Uint;
+}
+
+double UnormDepthMrd(std::uint32_t format) {
+  using namespace pvrgpu::stub;
+  std::uint64_t maximum = UINT64_C(0xffffff);
+  if (format == 0 || format == kDriverPcoDepthFormatZ24X8Unorm ||
+      format == kDriverPcoDepthFormatZ24UnormS8Uint) {
+    maximum = UINT64_C(0xffffff);
+  } else if (format == kDriverPcoDepthFormatZ16Unorm) {
+    maximum = UINT64_C(0xffff);
+  } else if (format == kDriverPcoDepthFormatZ32Unorm) {
+    maximum = UINT64_C(0xffffffff);
+  } else {
+    throw std::runtime_error(
+        "ParameterBuffer polygon offset has an unsupported depth format");
+  }
+  return 1.0 / static_cast<double>(maximum);
+}
+
+float BuildLlvmPipePolygonOffset(
+    const pvrgpu::stub::RasterTriangle &triangle,
+    const pvrgpu::stub::RasterState &raster, std::uint32_t depth_format) {
+  using namespace pvrgpu::stub;
+  if (raster.polygon_offset_enable == 0)
+    return 0.0F;
+
+  const bool floating_depth = IsFloatingPointDepthFormat(depth_format);
+  float units = raster.polygon_offset_units;
+  if (!raster.polygon_offset_units_unscaled && !floating_depth &&
+      units != 0.0F) {
+    // lp_make_setup_variant_key performs this calculation on the host before
+    // emitting the setup JIT.  The half-unit adjustment is deliberately made
+    // in binary32, then the product with its double-precision MRD is rounded
+    // back to the binary32 value embedded in the setup key.
+    const float adjustment = units > 0.0F ? 0.5F : -0.5F;
+    const float adjusted_units = StrictAdd(units, adjustment);
+    units = RoundToFloat(static_cast<double>(adjusted_units) *
+                         UnormDepthMrd(depth_format));
+  }
+
+  // llvmpipe skips the whole calculation when both setup-key inputs compare
+  // equal to zero.  A nonzero clamp alone therefore cannot create an offset.
+  if (raster.polygon_offset_factor == 0.0F && units == 0.0F)
+    return 0.0F;
+
+  const std::size_t i0 = triangle.setup_vertex_order[0];
+  const std::size_t i1 = triangle.setup_vertex_order[1];
+  const std::size_t i2 = triangle.setup_vertex_order[2];
+  const float dx01 = StrictSubtract(triangle.x[i0], triangle.x[i1]);
+  const float dy01 = StrictSubtract(triangle.y[i0], triangle.y[i1]);
+  const float dx20 = StrictSubtract(triangle.x[i2], triangle.x[i0]);
+  const float dy20 = StrictSubtract(triangle.y[i2], triangle.y[i0]);
+  const float dz01 =
+      StrictSubtract(triangle.window_z[i0], triangle.window_z[i1]);
+  const float dz20 =
+      StrictSubtract(triangle.window_z[i2], triangle.window_z[i0]);
+  const float determinant = StrictSubtract(StrictMultiply(dx01, dy20),
+                                           StrictMultiply(dy01, dx20));
+  const float reciprocal_area = StrictDivide(1.0F, determinant);
+
+  // lp_do_offset_tri computes cross(e,f).xy, then multiplies each component
+  // by inv_det and takes its absolute value.  These products/subtractions are
+  // intentionally not replaced with fabs(depth_plane.{a,b}).
+  const float slope_x = std::fabs(StrictMultiply(
+      StrictSubtract(StrictMultiply(dz20, dy01),
+                     StrictMultiply(dy20, dz01)),
+      reciprocal_area));
+  const float slope_y = std::fabs(StrictMultiply(
+      StrictSubtract(StrictMultiply(dx20, dz01),
+                     StrictMultiply(dz20, dx01)),
+      reciprocal_area));
+  const float maximum_slope = slope_x > slope_y ? slope_x : slope_y;
+  const float slope_offset =
+      StrictMultiply(maximum_slope, raster.polygon_offset_factor);
+
+  float unit_offset = units;
+  if (floating_depth && !raster.polygon_offset_units_unscaled) {
+    const float z01_max =
+        std::fabs(triangle.window_z[i0]) > std::fabs(triangle.window_z[i1])
+            ? std::fabs(triangle.window_z[i0])
+            : std::fabs(triangle.window_z[i1]);
+    const float maximum_z = std::fabs(triangle.window_z[i2]) > z01_max
+                                ? std::fabs(triangle.window_z[i2])
+                                : z01_max;
+    const std::uint32_t exponent =
+        FloatBits(maximum_z) & UINT32_C(0x7f800000);
+    constexpr std::uint32_t kMantissaShift = 23U << 23U;
+    const std::uint32_t mrd_bits =
+        exponent > kMantissaShift ? exponent - kMantissaShift : 0U;
+    unit_offset = StrictMultiply(BitsFloat(mrd_bits), units);
+  }
+
+  float offset = StrictAdd(unit_offset, slope_offset);
+  if (raster.polygon_offset_clamp > 0.0F &&
+      offset > raster.polygon_offset_clamp) {
+    offset = raster.polygon_offset_clamp;
+  } else if (raster.polygon_offset_clamp < 0.0F &&
+             offset < raster.polygon_offset_clamp) {
+    offset = raster.polygon_offset_clamp;
+  }
+  if (!std::isfinite(offset)) {
+    throw NonFiniteDriverPlane(
+        "ParameterBuffer produced a non-finite llvmpipe polygon offset");
+  }
+  return offset;
+}
+
 std::size_t DebugParameterIndex() {
   const char *text = std::getenv("PVRGPU_PARAMETER_DEBUG_INDEX");
   if (!text)
@@ -292,6 +432,24 @@ void ParameterBuffer::Run() {
     RequireStage(state.stage, PipelineStage::kTiled, name());
     if (memory_ && state.memory_mode != memory_->mode())
       throw std::runtime_error("ParameterBuffer memory mode mismatch");
+    const RasterState &raster = state.raster_state;
+    if (raster.polygon_offset_enable > 1 ||
+        raster.polygon_offset_units_unscaled > 1) {
+      throw std::runtime_error(
+          "ParameterBuffer polygon offset control flag is invalid");
+    }
+    if (raster.polygon_offset_enable != 0) {
+      if (!IsDriverPcoTrianglesCase(state.functional_case)) {
+        throw std::runtime_error(
+            "ParameterBuffer polygon offset requires a driver depth plane");
+      }
+      if (!std::isfinite(raster.polygon_offset_factor) ||
+          !std::isfinite(raster.polygon_offset_units) ||
+          !std::isfinite(raster.polygon_offset_clamp)) {
+        throw std::runtime_error(
+            "ParameterBuffer polygon offset state is non-finite");
+      }
+    }
     if (!HasPoolHandle(state.raster_triangles))
       throw std::runtime_error("ParameterBuffer received no raster triangles");
     const std::vector<RasterTriangle> triangles =
@@ -480,6 +638,8 @@ void ParameterBuffer::Run() {
 
       try {
         if (IsDriverPcoTrianglesCase(state.functional_case)) {
+          parameter.depth_offset = FloatBits(BuildLlvmPipePolygonOffset(
+              triangle, state.raster_state, state.depth_attachment_format));
           const ParameterCoefficientSet depth_plane =
               BuildLlvmPipeDriverPlane(triangle, triangle.window_z);
           parameter.depth_plane[0] = depth_plane.a;

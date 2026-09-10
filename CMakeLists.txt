@@ -384,6 +384,15 @@ enable_testing()
 if(UNIX)
     add_test(NAME model-diagnostics-unit COMMAND model-diagnostics-test)
 endif()
+add_executable(memory-pool-test
+    tests/memory_pool_test.cpp
+    model_stub/memory_pool.cpp
+)
+target_include_directories(memory-pool-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+)
+pvrgpu_target_warnings(memory-pool-test)
+add_test(NAME memory-pool-unit COMMAND memory-pool-test)
 add_executable(rdc-native-report-test tests/rdc_native_report_test.cpp)
 target_link_libraries(rdc-native-report-test PRIVATE pvrgpu-rdc-runner-support)
 pvrgpu_target_warnings(rdc-native-report-test)
@@ -1526,6 +1535,24 @@ target_include_directories(isp-depth-attachment-test PRIVATE
 target_link_libraries(isp-depth-attachment-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(isp-depth-attachment-test)
 add_test(NAME isp-depth-attachment-unit COMMAND isp-depth-attachment-test)
+
+add_executable(polygon-offset-test
+    tests/polygon_offset_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/geometry/parameter_buffer.cpp
+    src/systemc/fragment/isp.cpp
+)
+target_include_directories(polygon-offset-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(polygon-offset-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(polygon-offset-test)
+add_test(NAME polygon-offset-unit COMMAND polygon-offset-test)
 
 add_executable(fragment-frontend-test
     tests/fragment_frontend_test.cpp

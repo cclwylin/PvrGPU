@@ -81,7 +81,7 @@ struct Fixture {
 
 int main(int argc, char **argv) {
   try {
-    static_assert(PVRGPU_SYSTEMC_API_VERSION == 32);
+    static_assert(PVRGPU_SYSTEMC_API_VERSION == 33);
     const bool incomplete_patch = argc > 2 && std::string(argv[2]) == "incomplete";
     const auto nonce = std::chrono::high_resolution_clock::now().time_since_epoch().count();
     const auto root = std::filesystem::temp_directory_path() / ("pvrgpu-tess-api25-" + std::to_string(nonce));

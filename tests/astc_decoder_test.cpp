@@ -139,8 +139,9 @@ int main() {
     }
   }
 
-  // UNORM16 到 UNORM8 是取最近值，不是截斷：0xffff 必須是 255，而
-  // 0x0080 不能掉成 0 以外的值。
+  // UNORM16 到 UNORM8 取高 8 位元（截斷），與 Mesa util/texcompress_astc.cpp
+  // 的 output_unorm8 路徑（llvmpipe 取樣的 CPU decode）一致：0xffff 必須是
+  // 255，0x00ff 是 0 而不是四捨五入成 1。
   {
     const auto block = MakeVoidExtentBlock(0x0080, 0x00ff, 0x0100, 0x7fff);
     AstcDecodedBlock decoded;
@@ -149,10 +150,22 @@ int main() {
                           &decoded, &refusal),
           "12x12 void extent decodes");
     Check(decoded.footprint.texel_count() == 144, "12x12 covers 144 texels");
-    Check(decoded.texels[143][0] == 0, "0x0080 rounds to 0");
-    Check(decoded.texels[143][1] == 1, "0x00ff rounds to 1");
-    Check(decoded.texels[143][2] == 1, "0x0100 rounds to 1");
-    Check(decoded.texels[143][3] == 127, "0x7fff rounds to 127");
+    Check(decoded.texels[143][0] == 0, "0x0080 truncates to 0");
+    Check(decoded.texels[143][1] == 0, "0x00ff truncates to 0, not 1");
+    Check(decoded.texels[143][2] == 1, "0x0100 truncates to 1");
+    Check(decoded.texels[143][3] == 127, "0x7fff truncates to 127");
+  }
+  {
+    const auto block = MakeVoidExtentBlock(0xffff, 0x01ff, 0x0000, 0xfeff);
+    AstcDecodedBlock decoded;
+    const char *refusal = nullptr;
+    Check(DecodeAstcBlock(block.data(), AstcBlockFootprint{4, 4}, false,
+                          &decoded, &refusal),
+          "4x4 void extent decodes (truncation extremes)");
+    Check(decoded.texels[15][0] == 255, "0xffff is 255");
+    Check(decoded.texels[15][1] == 1, "0x01ff truncates to 1 (rounding gave 2)");
+    Check(decoded.texels[15][2] == 0, "0x0000 is 0");
+    Check(decoded.texels[15][3] == 254, "0xfeff truncates to 254 (rounding gave 255)");
   }
 
   // sRGB 的 void extent 取 UNORM16 的高 8 位元。

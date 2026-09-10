@@ -214,7 +214,7 @@ class GuardedBytes {
 };
 
 void VerifyVersions(Submission &submit) {
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 32);
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 33);
   constexpr auto previous_size = offsetof(pvrgpu_systemc_driver_command, tessellation);
   static_assert(previous_size % alignof(pvrgpu_systemc_driver_command) == 0);
   GuardedBytes previous(previous_size);
@@ -249,10 +249,24 @@ void VerifyVersions(Submission &submit) {
     full.version = version;
     submit.Reject(full, "version=", "invalid nested version " + std::to_string(version));
   }
+  GuardedBytes api32(offsetof(pvrgpu_systemc_driver_command,
+                              polygon_offset_enable));
+  const std::uint32_t api32_version = 32;
+  std::memcpy(api32.data(), &api32_version, sizeof(api32_version));
+  const auto &old32 =
+      *reinterpret_cast<const pvrgpu_systemc_driver_command *>(api32.data());
+  info = submit.info;
+  info.command = &old32;
+  submit.Call(info, "command version",
+              "API32 short command before API33 polygon-offset tail");
+  submit.Reject(old32,
+                "version=32 expected=" +
+                    std::to_string(PVRGPU_SYSTEMC_API_VERSION),
+                "API32 short nested command before API33 tail");
   GuardedBytes complete(sizeof(pvrgpu_systemc_driver_command));
   std::memcpy(complete.data(), &fixture.draw, sizeof(fixture.draw));
   submit.Reject(*reinterpret_cast<const pvrgpu_systemc_driver_command *>(complete.data()),
-                kLateGate, "full API25 command reads no byte beyond its tail");
+                kLateGate, "full API33 command reads no byte beyond its tail");
   GuardedBytes payload(sizeof(pvrgpu_systemc_tessellation));
   std::memcpy(payload.data(), &fixture.tess, sizeof(fixture.tess));
   full = fixture.draw;

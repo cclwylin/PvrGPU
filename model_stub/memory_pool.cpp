@@ -5,6 +5,17 @@
 
 namespace pvrgpu::stub {
 
+namespace {
+
+// Keep the allocator fast for the small control payloads that are recycled on
+// almost every pipeline stage, but do not pin old full-frame/candidate buffers
+// in every free slot.  Manhattan changes the allocation shape between native
+// sequences, so clear() alone can otherwise retain several gigabytes even
+// when bytes_in_flight() has returned to zero.
+constexpr std::size_t kMaximumRetainedPayloadCapacity = 64U * 1024U;
+
+}  // namespace
+
 PoolHandle MemoryPool::Allocate(std::size_t bytes) {
   std::size_t slot = 0;
   for (; slot < entries_.size(); ++slot) {
@@ -38,9 +49,20 @@ void MemoryPool::Release(PoolHandle handle) {
   if (--entry.ref_count != 0)
     return;
   bytes_in_flight_ -= entry.bytes.size();
-  entry.bytes.clear();
+  if (entry.bytes.capacity() > kMaximumRetainedPayloadCapacity) {
+    std::vector<std::uint8_t>().swap(entry.bytes);
+  } else {
+    entry.bytes.clear();
+  }
   entry.live = false;
   releases_++;
+}
+
+std::uint64_t MemoryPool::capacity_bytes() const {
+  std::uint64_t total = 0;
+  for (const Entry& entry : entries_)
+    total += entry.bytes.capacity();
+  return total;
 }
 
 MemoryPool::Entry& MemoryPool::Checked(PoolHandle handle) {

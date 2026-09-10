@@ -299,6 +299,12 @@ struct pvrgpu_draw_pco_triangles_command {
    uint32_t depth_clip_near;
    uint32_t depth_clip_far;
    uint32_t depth_clamp;
+   /* Gallium polygon offset, transported as exact IEEE-754 bit patterns. */
+   uint32_t polygon_offset_enable;
+   uint32_t polygon_offset_factor_bits;
+   uint32_t polygon_offset_units_bits;
+   uint32_t polygon_offset_clamp_bits;
+   uint32_t polygon_offset_units_unscaled;
    uint32_t sample_mask;
    uint32_t sample_frequency;
    uint32_t alpha_to_coverage;

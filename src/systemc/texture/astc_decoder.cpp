@@ -943,14 +943,20 @@ void FillErrorColour(AstcDecodedBlock *out) {
  * The 16-bit interpolation result as an eight-bit texel.
  *
  * The LDR decode defines the linear result as a value in [0,1]: 0xffff is
- * 1.0 and everything else is c/65536.  Rounding that to eight bits is this
- * expression.  sRGB takes the top eight bits instead, because its endpoints
- * were expanded with 0x80 in the low byte precisely so that they would.
+ * 1.0 and everything else is c/65536.  An eight-bit output takes the top
+ * eight bits of that result, for linear and sRGB alike: this is what Mesa's
+ * CPU decoder (util/texcompress_astc.cpp Block::write_decoded, output_unorm8)
+ * stores, and llvmpipe samples that decode because it advertises no ASTC
+ * support.  Rounding ((c * 255 + 32768) >> 16) instead is one-sided in the
+ * low range -- for texels Mesa stores as <= 8 it is +1 in half of the
+ * interpolated cases and never lower -- and flips alpha tests against the
+ * llvmpipe reference at soft leaf edges (GL5 Draw 185).  0xffff still maps
+ * to 0xff, and the sRGB endpoints were expanded with 0x80 in the low byte
+ * precisely so that their top byte is the encoded value.
  */
 std::uint8_t ResultToUnorm8(std::uint32_t value, bool srgb) {
-  if (srgb)
-    return static_cast<std::uint8_t>((value & 0xff00U) >> 8U);
-  return static_cast<std::uint8_t>((value * 255U + 32768U) >> 16U);
+  (void)srgb;
+  return static_cast<std::uint8_t>((value & 0xff00U) >> 8U);
 }
 
 bool DecodeVoidExtent(const std::uint8_t block[16], bool srgb,

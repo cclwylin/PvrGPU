@@ -460,6 +460,35 @@ int main(int argc, char **argv)
             "large dynamic CB0 out-of-range extent remains fail-closed");
       ralloc_free(b.shader);
    }
+   /* Compute has no graphics-style CB0 prefix proof before the shared large
+    * CB0 DMA lowering, so that helper must reject a signed negative base and
+    * every unchecked base/offset/range sum itself.  Base -1 with direct
+    * offset 1 previously widened to UINT64_MAX and wrapped the last slot to
+    * zero, passing the span check with a negative byte address. */
+   for (unsigned bad = 0; bad < 3; ++bad) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+         pco_nir_options(), "native_large_cb0_dma_invalid");
+      b.shader->info.workgroup_size[0] = 128;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      nir_def *id = nir_load_local_invocation_index(&b);
+      nir_def *index = bad == 2 ? nir_umod_imm(&b, id, 121)
+                     : nir_imm_int(&b, bad == 0 ? 1 : UINT32_MAX);
+      const int base = bad == 0 ? -1 : bad == 1 ? 1 : INT32_MAX;
+      nir_def *value = nir_load_uniform(&b, 4, 32, index,
+         .base = base, .range = bad == 2 ? 121 : 1, .dest_type = nir_type_uint32);
+      nir_store_ssbo(&b, value, nir_imm_int(&b, 0), nir_imul_imm(&b, id, 16),
+         .write_mask = 15, .align_mul = 16);
+      nir_shader_gather_info(b.shader, b.impl);
+      b.shader->info.num_ssbos = 1;
+      b.shader->info.num_ubos = 0;
+      error[0] = '\0';
+      check(!pvrgpu_pco_compile_compute(compiler, b.shader, 484, &binary, error, sizeof(error)) &&
+               !binary.data && !binary.size && strstr(error, "CB0 DMA") != NULL,
+            bad == 0 ? "large CB0 DMA negative base is rejected by the shared helper"
+            : bad == 1 ? "large CB0 DMA direct offset past the 32-bit byte address is rejected"
+                       : "large CB0 DMA indirect base/range sum past the span is rejected");
+      ralloc_free(b.shader);
+   }
    for (unsigned bad = 0; bad < 2; ++bad) {
       nir_shader *nir = make_shader(10);
       if (bad == 0) {
