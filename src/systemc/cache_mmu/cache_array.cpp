@@ -6,6 +6,7 @@
 #include "cache_mmu/cache_array.h"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -281,6 +282,33 @@ CacheLineAccess CacheArray::ReadLine(std::uint64_t line_address,
                                      const CacheLineWrite &lower_write) {
   return AccessLine(line_address, false, nullptr, lower_read, lower_write,
                     true);
+}
+
+CacheLineAccess CacheArray::ReadLineInto(std::uint64_t line_address,
+                                         std::size_t offset,
+                                         void *destination, std::size_t bytes,
+                                         const CacheLineRead &lower_read,
+                                         const CacheLineWrite &lower_write) {
+  if (!destination)
+    throw std::invalid_argument("CacheArray read destination is null");
+  if (bytes == 0 || offset > config_.line_size_bytes ||
+      bytes > config_.line_size_bytes - offset)
+    throw std::invalid_argument("CacheArray read span exceeds cache line");
+
+  // Keep the original access path's lookup, lower callbacks, victim choice,
+  // LRU updates and failure ordering. Bypass still needs the owned lower
+  // response; a resident line can be copied immediately without exposing a
+  // pointer whose lifetime could cross another access or a SystemC wait.
+  CacheLineAccess access = AccessLine(line_address, false, nullptr, lower_read,
+                                      lower_write, bypass_);
+  if (access.bypassed) {
+    std::memcpy(destination, access.data.data() + offset, bytes);
+    access.data.clear();
+  } else {
+    const auto &line = sets_[access.bank * sets_per_bank_ + access.set][access.way];
+    std::memcpy(destination, line.data.data() + offset, bytes);
+  }
+  return access;
 }
 
 CacheLineAccess CacheArray::WriteLine(std::uint64_t line_address,

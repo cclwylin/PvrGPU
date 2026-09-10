@@ -100,6 +100,15 @@ public:
   CacheLineAccess ReadLine(std::uint64_t line_address,
                            const CacheLineRead &lower_read = {},
                            const CacheLineWrite &lower_write = {});
+  // The same one-line read and metadata, but copy only the requested span
+  // into caller-owned storage. The returned data vector is empty. A hit
+  // neither allocates nor copies an owned full-line response. The nonempty
+  // destination span must fit the line and must not alias cache storage.
+  CacheLineAccess ReadLineInto(std::uint64_t line_address,
+                               std::size_t offset, void *destination,
+                               std::size_t bytes,
+                               const CacheLineRead &lower_read = {},
+                               const CacheLineWrite &lower_write = {});
   CacheLineAccess WriteLine(std::uint64_t line_address,
                             const CacheLineData &data,
                             const CacheLineRead &lower_read = {},

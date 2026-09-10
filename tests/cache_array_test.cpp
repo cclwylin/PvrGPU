@@ -5,12 +5,16 @@
  */
 #include "cache_mmu/cache_array.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <exception>
 #include <iostream>
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -19,6 +23,8 @@ namespace {
 using pvrgpu::stub::CacheArray;
 using pvrgpu::stub::CacheArrayConfig;
 using pvrgpu::stub::CacheLineData;
+using pvrgpu::stub::CacheStats;
+using pvrgpu::stub::CacheLineAccess;
 using pvrgpu::stub::McuCacheConfig;
 using pvrgpu::stub::SlcCacheConfig;
 using pvrgpu::stub::TcuCacheConfig;
@@ -41,6 +47,19 @@ void ExpectFailure(Function &&function, const std::string &description) {
 
 CacheLineData Pattern(std::size_t size, std::uint8_t value) {
   return CacheLineData(size, value);
+}
+
+auto Stats(const CacheStats &s) {
+  return std::make_tuple(s.line_accesses, s.read_accesses, s.write_accesses,
+      s.hits, s.misses, s.evictions, s.writebacks, s.bypassed);
+}
+
+void SameAccess(const CacheLineAccess &old, const CacheLineAccess &fresh) {
+  Check(std::tie(old.line_address, old.bank, old.set, old.way, old.hit, old.bypassed) ==
+            std::tie(fresh.line_address, fresh.bank, fresh.set, fresh.way,
+                     fresh.hit, fresh.bypassed) && Stats(old.delta) == Stats(fresh.delta),
+        "range read preserves all access metadata and counters");
+  Check(fresh.data.empty(), "range read has no owned response payload");
 }
 
 void TestReferenceProfiles() {
@@ -212,6 +231,128 @@ void TestLineValidationAndResetStats() {
   Check(cache.ReadLine(0).hit, "ResetStats preserves resident lines");
 }
 
+void TestReadLineInto(bool bypass) {
+  CacheArray legacy({"into", 64, 16, 2, 1}, bypass);
+  CacheArray into({"into", 64, 16, 2, 1}, bypass);
+  using Store = std::map<std::uint64_t, CacheLineData>;
+  Store old_memory, new_memory;
+  using Events = std::vector<std::pair<char, std::uint64_t>>;
+  Events old_events, new_events;
+  for (std::uint64_t address = 0; address < 160; address += 16) {
+    CacheLineData line(16);
+    for (std::size_t i = 0; i < line.size(); ++i)
+      line[i] = static_cast<std::uint8_t>(address + 3 * i);
+    old_memory[address] = new_memory[address] = line;
+  }
+  const auto old_read = [&](std::uint64_t a, std::size_t n) {
+    Check(n == 16, "legacy lower size");
+    old_events.emplace_back('R', a); return old_memory.at(a);
+  };
+  const auto new_read = [&](std::uint64_t a, std::size_t n) {
+    Check(n == 16, "range lower size");
+    new_events.emplace_back('R', a); return new_memory.at(a);
+  };
+  const auto old_write = [&](std::uint64_t a, const CacheLineData &d) {
+    old_events.emplace_back('W', a); old_memory[a] = d;
+  };
+  const auto new_write = [&](std::uint64_t a, const CacheLineData &d) {
+    new_events.emplace_back('W', a); new_memory[a] = d;
+  };
+  const auto read = [&](std::uint64_t address, std::size_t offset,
+                        std::size_t bytes) {
+    std::array<std::uint8_t, 32> guarded;
+    guarded.fill(0x9b);
+    const auto old = legacy.ReadLine(address, old_read, old_write);
+    const auto fresh = into.ReadLineInto(address, offset, guarded.data() + 8,
+                                         bytes, new_read, new_write);
+    SameAccess(old, fresh);
+    Check(std::equal(old.data.begin() + offset, old.data.begin() + offset + bytes,
+                     guarded.begin() + 8), "range data equals legacy slice");
+    Check(std::all_of(guarded.begin(), guarded.begin() + 8,
+                     [](auto v) { return v == 0x9b; }) &&
+              std::all_of(guarded.begin() + 8 + bytes, guarded.end(),
+                          [](auto v) { return v == 0x9b; }),
+          "range copy respects exact caller span");
+    Check(old_events == new_events && old_memory == new_memory &&
+              Stats(legacy.stats()) == Stats(into.stats()),
+          "range read preserves lower callback sequence, bytes and lifetime stats");
+  };
+  for (std::size_t offset = 0; offset < 16; ++offset)
+    for (std::size_t bytes = 1; bytes <= 16 - offset; ++bytes) {
+      read((offset % 5) * 32, offset, bytes);
+      read((offset % 5) * 32, offset, bytes);
+    }
+  for (const std::uint64_t address : {0U, 32U, 64U, 0U, 96U, 128U}) {
+    const auto data = Pattern(16, static_cast<std::uint8_t>(address + 97));
+    const auto a = legacy.WriteLine(address, data, old_read, old_write, false);
+    const auto b = into.WriteLine(address, data, new_read, new_write, false);
+    SameAccess(a, b);
+    read(address, 3, 9);
+    read((address + 32) % 160, 1, 15);
+  }
+  Check(legacy.Flush(old_write) == into.Flush(new_write) &&
+            old_events == new_events && old_memory == new_memory &&
+            Stats(legacy.stats()) == Stats(into.stats()),
+        "range read preserves dirty flush and LRU-induced writebacks");
+  Check(legacy.InvalidateRange(0, 80, old_write) ==
+            into.InvalidateRange(0, 80, new_write), "range invalidation matches");
+  old_memory[0] = new_memory[0] = Pattern(16, 0xe3);
+  read(0, 0, 16);
+  Check(legacy.SetBypass(!bypass, old_write) == into.SetBypass(!bypass, new_write),
+        "range cache bypass transition matches");
+  read(32, 15, 1);
+}
+
+void TestReadLineIntoFailures() {
+  CacheArray legacy({"failure", 16, 16, 1, 1});
+  CacheArray into({"failure", 16, 16, 1, 1});
+  std::array<std::uint8_t, 16> destination;
+  destination.fill(0x63);
+  const auto original = destination;
+  const auto failure = [](const auto &call) {
+    try { call(); }
+    catch (const std::exception &error) {
+      return std::string(typeid(error).name()) + ':' + error.what();
+    }
+    throw std::runtime_error("expected cache read failure");
+  };
+  const auto compare = [&](std::uint64_t address,
+                           const pvrgpu::stub::CacheLineRead &read,
+                           const pvrgpu::stub::CacheLineWrite &write) {
+    const auto a = failure([&] { (void)legacy.ReadLine(address, read, write); });
+    const auto b = failure([&] {
+      (void)into.ReadLineInto(address, 5, destination.data(), 4, read, write);
+    });
+    Check(a == b && Stats(legacy.stats()) == Stats(into.stats()),
+          "range read matches lower failure type, message and counters");
+    Check(destination == original, "failed single-line read leaves destination unchanged");
+  };
+  compare(1, {}, {});
+  compare(0, [](std::uint64_t, std::size_t) { return Pattern(15, 0); }, {});
+  compare(0, [](std::uint64_t, std::size_t) -> CacheLineData {
+    throw std::runtime_error("lower read sentinel");
+  }, {});
+  (void)legacy.WriteLine(0, Pattern(16, 0x75));
+  (void)into.WriteLine(0, Pattern(16, 0x75));
+  compare(16, {}, [](std::uint64_t, const CacheLineData &) {
+    throw std::runtime_error("dirty writeback sentinel");
+  });
+  const auto old = legacy.ReadLine(0);
+  const auto fresh = into.ReadLineInto(0, 0, destination.data(), 16);
+  SameAccess(old, fresh);
+  Check(std::equal(destination.begin(), destination.end(), old.data.begin()) && fresh.hit,
+        "failed dirty eviction preserves old resident line");
+
+  const auto before = Stats(into.stats());
+  ExpectFailure([&] { (void)into.ReadLineInto(0, 0, nullptr, 1); }, "null destination");
+  ExpectFailure([&] { (void)into.ReadLineInto(0, 0, destination.data(), 0); }, "zero span");
+  ExpectFailure([&] { (void)into.ReadLineInto(0, 16, destination.data(), 1); }, "past line");
+  ExpectFailure([&] { (void)into.ReadLineInto(0, 15, destination.data(), 2); }, "cross-line span");
+  ExpectFailure([&] { (void)into.ReadLineInto(0, SIZE_MAX, destination.data(), 1); }, "huge offset");
+  ExpectFailure([&] { (void)into.ReadLineInto(0, 1, destination.data(), SIZE_MAX); }, "huge span");
+  Check(before == Stats(into.stats()), "invalid destination/span causes no cache accesses");
+}
+
 } // namespace
 
 int main() {
@@ -223,6 +364,9 @@ int main() {
     TestWriteAllocateEvictionAndFlush();
     TestBypass();
     TestLineValidationAndResetStats();
+    TestReadLineInto(false);
+    TestReadLineInto(true);
+    TestReadLineIntoFailures();
     std::cout << "cache_array_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

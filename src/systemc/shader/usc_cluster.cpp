@@ -26,6 +26,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace pvrgpu::stub {
@@ -67,6 +68,23 @@ bool DriverPcoTextureSharedLayoutSupported(
 }
 
 namespace {
+
+// Same owned snapshot and validation contract as LoadArray, but retain host
+// capacity between texture rounds. No reference into MemoryPool survives this
+// function, a FIFO wait, or a later pool allocation/release. resize reuses
+// existing elements when the batch size is unchanged; memcpy still replaces
+// every payload byte before any response/continuation validation reads it.
+template <typename T>
+void LoadFragmentScratchArray(const MemoryPool &pool, PoolHandle handle,
+                              std::vector<T> &values) {
+  static_assert(std::is_trivially_copyable_v<T>);
+  const auto &source = pool.Read(handle);
+  if (source.size() % sizeof(T) != 0)
+    throw std::runtime_error("MemoryPool array has an invalid byte size");
+  values.resize(source.size() / sizeof(T));
+  if (!source.empty())
+    std::memcpy(values.data(), source.data(), source.size());
+}
 
 std::uint32_t FloatBits(float value) {
   std::uint32_t bits = 0;
@@ -1437,6 +1455,20 @@ void UscCluster::Run() {
                 "texture fragment USC did not initialize every shader lane");
           }
 
+          // A resident chunk owns these buffers across all of its texture
+          // FIFO rounds. clear/resize preserve host capacity, while the pool
+          // payloads remain separate owned copies with the original lifetime.
+          // The next-pending buffers are still full transactional snapshots:
+          // do not mutate current pending state while validating a response.
+          std::vector<std::size_t> batch_lanes;
+          std::vector<TextureSampleRequest> batch_requests;
+          std::vector<PcoFragmentContinuation> batch_continuations;
+          std::vector<TextureSampleRequest> carried_requests;
+          std::vector<TextureSampleResponse> responses;
+          std::vector<PcoFragmentContinuation> saved_continuations;
+          std::vector<TextureSampleRequest> next_requests;
+          std::vector<PcoFragmentContinuation> next_continuations;
+          std::vector<std::uint8_t> next_queued;
           while (std::any_of(pending_queued.begin(), pending_queued.end(),
                              [](std::uint8_t value) { return value != 0; })) {
             // Native branches may finish lanes or reach different SMPs. Send
@@ -1449,9 +1481,15 @@ void UscCluster::Run() {
                 pending_requests[first].descriptor_set;
             const auto resume_pc =
                 pending_continuations[first].resume_instruction_index;
-            std::vector<std::size_t> batch_lanes;
-            std::vector<TextureSampleRequest> batch_requests;
-            std::vector<PcoFragmentContinuation> batch_continuations;
+            batch_lanes.clear();
+            batch_requests.clear();
+            batch_continuations.clear();
+            // Reserve only after a real suspension exists. The resident lane
+            // bound covers every possible compact batch, including divergent
+            // rounds whose sizes shrink and later grow again.
+            batch_lanes.reserve(pending_lane_count);
+            batch_requests.reserve(pending_lane_count);
+            batch_continuations.reserve(pending_lane_count);
             for (std::size_t lane_index = 0;
                  lane_index < pending_requests.size(); ++lane_index) {
               if (!pending_queued[lane_index] ||
@@ -1511,15 +1549,12 @@ void UscCluster::Run() {
               throw std::runtime_error(
                   "texture fragment USC received no response/continuation");
             }
-            const std::vector<TextureSampleRequest> carried_requests =
-                LoadArray<TextureSampleRequest>(pool_,
-                                                state.texture_sample_requests);
-            const std::vector<TextureSampleResponse> responses =
-                LoadArray<TextureSampleResponse>(
-                    pool_, state.texture_sample_responses);
-            const std::vector<PcoFragmentContinuation> saved_continuations =
-                LoadArray<PcoFragmentContinuation>(
-                    pool_, state.fragment_continuations);
+            LoadFragmentScratchArray(pool_, state.texture_sample_requests,
+                                     carried_requests);
+            LoadFragmentScratchArray(pool_, state.texture_sample_responses,
+                                     responses);
+            LoadFragmentScratchArray(pool_, state.fragment_continuations,
+                                     saved_continuations);
             if (carried_requests.size() != batch_lanes.size() ||
                 responses.size() != batch_lanes.size() ||
                 saved_continuations.size() != batch_lanes.size()) {
@@ -1527,9 +1562,9 @@ void UscCluster::Run() {
                   "texture fragment USC response lane count mismatch");
             }
 
-            auto next_requests = pending_requests;
-            auto next_continuations = pending_continuations;
-            auto next_queued = pending_queued;
+            next_requests = pending_requests;
+            next_continuations = pending_continuations;
+            next_queued = pending_queued;
             for (std::size_t batch_index = 0; batch_index < batch_lanes.size();
                  ++batch_index) {
               const auto lane_index = batch_lanes[batch_index];
@@ -1646,9 +1681,11 @@ void UscCluster::Run() {
             // of leaving already-released handles in its last response copy.
             StorePipelineState(pool_, txn.state, state);
 
-            pending_requests = std::move(next_requests);
-            pending_continuations = std::move(next_continuations);
-            pending_queued = std::move(next_queued);
+            // Both sides retain capacity for the next round. Publication and
+            // pool cleanup above must succeed before replacing pending state.
+            pending_requests.swap(next_requests);
+            pending_continuations.swap(next_continuations);
+            pending_queued.swap(next_queued);
           }
           if (std::any_of(lane_completed.begin(), lane_completed.end(),
                           [](std::uint8_t value) { return value != 1; })) {

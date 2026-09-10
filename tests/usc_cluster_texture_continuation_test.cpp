@@ -337,7 +337,26 @@ private:
             "response handle starts empty");
       state.texture_sample_responses =
           StoreNewArray(pool_, std::vector<TextureSampleResponse>{response});
-      if (!corrupt_continuation_.empty()) {
+      if (corrupt_continuation_.rfind("scratch-", 0) == 0 && round == 1) {
+        // Corrupt only after one complete round has populated the retained
+        // scratch arrays. A malformed replacement must not reuse stale values.
+        pvrgpu::stub::PoolHandle *target = nullptr;
+        if (corrupt_continuation_ == "scratch-request-bytes")
+          target = &state.texture_sample_requests;
+        else if (corrupt_continuation_ == "scratch-response-bytes" ||
+                 corrupt_continuation_ == "scratch-response-count")
+          target = &state.texture_sample_responses;
+        else if (corrupt_continuation_ == "scratch-continuation-bytes")
+          target = &state.fragment_continuations;
+        else throw std::runtime_error("unknown scratch payload mutation");
+        auto bytes = pool_.Read(*target);
+        Check(!bytes.empty(), "warm scratch mutation requires a real payload");
+        if (corrupt_continuation_ == "scratch-response-count") bytes.clear();
+        else bytes.pop_back();
+        pool_.Release(*target);
+        *target = StoreNewArray(pool_, bytes);
+      } else if (!corrupt_continuation_.empty() &&
+                 corrupt_continuation_.rfind("scratch-", 0) != 0) {
         auto saved = LoadArray<pvrgpu::stub::PcoFragmentContinuation>(pool_, state.fragment_continuations);
         Check(saved.size() == 1, "malformed continuation target must be one native lane");
         if (corrupt_continuation_ == "count") ++saved[0].executed_instructions.alu;
@@ -910,6 +929,7 @@ enum class TextureControlFlowCase {
   kMixedSkipAll,
   kDiscardThenMixed,
   kDivergentSites,
+  kShrinkThenRegrow,
 };
 
 // Execute real native TST/P0, BR, ALPHAF, SMP and WDF semantics through the
@@ -933,7 +953,8 @@ public:
     }
     auto half = straight[0];
     half.output_index = 2;
-    half.immediate = UINT32_C(0xbf000000);
+    half.immediate = mode_ == TextureControlFlowCase::kShrinkThenRegrow
+        ? UINT32_C(0xbfc00000) : UINT32_C(0xbf000000);
     program.push_back(half);
     PcoInstruction subtract;
     subtract.opcode = PcoOpcode::kFloatAdd;
@@ -947,7 +968,9 @@ public:
     predicate.opcode = PcoOpcode::kBooleanCompare;
     predicate.source = {PcoRegisterBank::kTemporary, 3};
     predicate.writes_predicate = 1;
-    program.push_back(predicate); // P0 = (pixel center X - 0.5 == 0).
+    // Normally P0 selects left lanes; the scratch-reuse case selects right
+    // lanes so the first pending lane executes the extra middle SMP first.
+    program.push_back(predicate);
     if (mode_ == TextureControlFlowCase::kDiscardThenMixed) {
       PcoInstruction feedback;
       feedback.opcode = PcoOpcode::kAlphaFeedback;
@@ -963,7 +986,8 @@ public:
     const bool post_branch = mode_ == TextureControlFlowCase::kMixedSkipRemaining ||
         mode_ == TextureControlFlowCase::kAllSkipRemaining ||
         mode_ == TextureControlFlowCase::kDiscardThenMixed ||
-        mode_ == TextureControlFlowCase::kDivergentSites;
+        mode_ == TextureControlFlowCase::kDivergentSites ||
+        mode_ == TextureControlFlowCase::kShrinkThenRegrow;
     PcoInstruction branch;
     branch.opcode = PcoOpcode::kBranch;
     branch.source_count = 0;
@@ -983,6 +1007,15 @@ public:
     sample.output_index = 4; // Both paths write the same final color registers.
     program.push_back(sample);
     program.push_back(straight[5]);
+    const auto common_sample = program.size();
+    if (mode_ == TextureControlFlowCase::kShrinkThenRegrow) {
+      // Four lanes -> two left lanes -> four lanes. The last native SMP is
+      // reached after reconvergence; each actual response uses new raw bits.
+      auto final_sample = straight[2];
+      final_sample.output_index = 4;
+      program.push_back(final_sample);
+      program.push_back(straight[3]);
+    }
     const auto output_index = program.size();
     for (unsigned component = 0; component < 4; ++component) {
       auto output = straight[6 + component];
@@ -993,7 +1026,9 @@ public:
       program[pre_index].branch_target_index =
           mode_ == TextureControlFlowCase::kDivergentSites ? second_sample : output_index;
     if (post_branch)
-      program[post_index].branch_target_index = output_index;
+      program[post_index].branch_target_index =
+          mode_ == TextureControlFlowCase::kShrinkThenRegrow
+              ? common_sample : output_index;
     for (std::size_t pc = 0; pc < program.size(); ++pc) {
       program[pc].binary_offset = 1 + pc * 8;
       program[pc].group_index = pc;
@@ -1063,6 +1098,9 @@ public:
               requests_.num_available() == 0 && responses_.num_available() == 0,
           "native branch completion retires every sparse response payload");
     unsigned total = 0;
+    if (mode_ == TextureControlFlowCase::kShrinkThenRegrow)
+      Check(batch_sizes_ == std::vector<std::size_t>{4, 2, 4},
+            "scratch reuse sees real shrinking and regrowing FIFO payloads");
     for (unsigned lane = 0; lane < 4; ++lane) {
       const auto expected = ExpectedSets(lane);
       Check(issued_[lane] == expected, "only the lane's reached SMP sites request samples");
@@ -1081,7 +1119,9 @@ public:
     Check(outputs.size() == 2, "geometric helpers publish no fragment outputs");
     for (unsigned lane = 0; lane < outputs.size(); ++lane) {
       const auto sets = ExpectedSets(lane);
-      const auto expected = sets.empty() ? Fallback() : ResponseForRound(lane * 2 + sets.back());
+      const auto expected = sets.empty() ? Fallback() : ResponseForRound(
+          mode_ == TextureControlFlowCase::kShrinkThenRegrow
+              ? lane * 4 + sets.size() - 1 : lane * 2 + sets.back());
       Check(outputs[lane].written_mask[0] == 0x0f &&
                 std::equal(expected.begin(), expected.end(), outputs[lane].pixel_output) &&
                 outputs[lane].discarded ==
@@ -1109,6 +1149,9 @@ private:
       return left ? std::vector<std::uint8_t>{} : std::vector<std::uint8_t>{0, 1};
     case TextureControlFlowCase::kDivergentSites:
       return {static_cast<std::uint8_t>(left ? 1 : 0)};
+    case TextureControlFlowCase::kShrinkThenRegrow:
+      return left ? std::vector<std::uint8_t>{0, 1, 0}
+                  : std::vector<std::uint8_t>{0, 0};
     default:
       return left ? std::vector<std::uint8_t>{0} : std::vector<std::uint8_t>{0, 1};
     }
@@ -1123,6 +1166,7 @@ private:
       Check(state.stage == PipelineStage::kFragmentTexturePending &&
                 !requests.empty() && requests.size() <= 4 && saved.size() == requests.size(),
             "only nonempty native SMP batches cross the FIFO");
+      batch_sizes_.push_back(requests.size());
       std::vector<TextureSampleResponse> replies;
       for (std::size_t index = 0; index < requests.size(); ++index) {
         const auto &request = requests[index];
@@ -1142,7 +1186,10 @@ private:
         response.shader_lane_index = lane;
         response.shader_stage = ShaderStage::kFragment;
         response.request_id = request.request_id;
-        const auto rgba = ResponseForRound(lane * 2 + request.descriptor_set);
+        const auto rgba = ResponseForRound(
+            mode_ == TextureControlFlowCase::kShrinkThenRegrow
+                ? lane * 4 + issued_[lane].size() - 1
+                : lane * 2 + request.descriptor_set);
         std::copy(rgba.begin(), rgba.end(), response.rgba);
         replies.push_back(response);
       }
@@ -1159,6 +1206,7 @@ private:
   CasePayload payload_;
   std::array<std::vector<std::uint8_t>, 4> issued_;
   std::array<unsigned, 4> discarded_requests_{};
+  std::vector<std::size_t> batch_sizes_;
   sc_core::sc_fifo<PipelineTxn> input_{"input", 1}, output_{"output", 1},
       requests_{"requests", 1}, responses_{"responses", 1};
   UscCluster cluster_;
@@ -1232,15 +1280,28 @@ public:
     pool_.Release(state.fragment_shared_registers);
     state.fragment_shared_registers = {};
     state.fragment_pco_abi.shareds = 0;
-    state.fragment_pco_abi.coefficients = 0;
-    state.fragment_position_count = 0;
-    state.fragment_varying_start = 0;
-    auto tasks = LoadArray<UscFragmentTask>(pool_, state.usc_fragment_tasks);
-    tasks[0].coefficient_dword_count = 0;
-    pvrgpu::stub::StoreArray(pool_, state.usc_fragment_tasks, tasks);
-    pool_.Release(state.usc_coefficient_banks);
-    state.usc_coefficient_banks = StoreNewArray(pool_, std::vector<std::uint32_t>{});
     state.sampled_texture_count = 0;
+    // Derivative-only driver fragments retain the same position-CF4 contract
+    // as texture fragments, even when these instructions only read specials.
+    // Keep MakeCase's valid position ABI/task/bank instead of fabricating CF0.
+    const auto tasks = LoadArray<UscFragmentTask>(pool_, state.usc_fragment_tasks);
+    const auto coefficients = LoadArray<std::uint32_t>(pool_, state.usc_coefficient_banks);
+    Check(pvrgpu::stub::UsesShaderVaryings(state) &&
+              pvrgpu::stub::VaryingVectorCount(state) == 0 &&
+              pvrgpu::stub::VaryingCoefficientDwordCount(state) == 4 &&
+              state.fragment_pco_abi.coefficients == 4 &&
+              state.fragment_position_start == 0 &&
+              state.fragment_position_count == 4 &&
+              state.fragment_varying_start == 4 &&
+              state.fragment_varying_count == 0 &&
+              tasks.size() == 1 && tasks[0].first_coefficient_dword == 0 &&
+              tasks[0].coefficient_dword_count == 4 && coefficients.size() == 4,
+          "derivative-only fixture preserves its declared position-CF4 payload");
+    // This unit enters after PDS: carry the counters for the one already
+    // supplied task and its actual four-word coefficient bank into UscSlot.
+    state.counters.pds_coefficient_tasks = tasks.size();
+    state.counters.pds_douti_issues = tasks.size() * 2;
+    state.counters.usc_coefficient_load_bytes = coefficients.size() * sizeof(std::uint32_t);
     state.fragment_shader_lane_count = 4;
     state.stage = PipelineStage::kPdsReady;
     state.counters.ps_invocations = 1;
@@ -1260,6 +1321,9 @@ public:
               outputs[0].pixel_output[1] == 0 && outputs[0].pixel_output[2] == 0x3f800000U &&
               outputs[0].pixel_output[3] == 0x3f800000U &&
               state.counters.fs_tex_instructions == 0 &&
+              state.counters.pds_coefficient_tasks == 1 &&
+              state.counters.pds_douti_issues == 2 &&
+              state.counters.usc_coefficient_load_bytes == 16 &&
               requests_.num_available() == 0 && responses_.num_available() == 0,
           "helper lanes supply native fine derivatives without texture traffic or helper writes");
     ReleaseFunctionalPayloads(pool_, state);
@@ -1470,7 +1534,8 @@ int RunQuadSequence(unsigned samples, bool loop, bool expect_failure = false) {
 
 int RunExpectedFailure(std::string corrupt_continuation = {}) {
   MemoryPool pool;
-  const std::size_t sample_count = 1U;
+  const bool warm_scratch = corrupt_continuation.rfind("scratch-", 0) == 0;
+  const std::size_t sample_count = warm_scratch ? 3U : 1U;
   const std::size_t descriptor_count = 1U;
   const CasePayload payload =
       MakeCase(pool, sample_count, 99, descriptor_count);
@@ -1494,11 +1559,25 @@ int RunExpectedFailure(std::string corrupt_continuation = {}) {
     sc_core::sc_start(sc_core::sc_time(1, sc_core::SC_US));
   } catch (const std::exception &error) {
     const std::string message = error.what();
-    const std::string expected = "response ordering is invalid";
+    const std::string expected = !warm_scratch ? "response ordering is invalid" :
+        corrupt_continuation == "scratch-response-count"
+            ? "texture fragment USC response lane count mismatch"
+            : "MemoryPool array has an invalid byte size";
     Check(message.find(expected) != std::string::npos,
           "unexpected fail-closed diagnostic: " + message);
+    Check(output.num_available() == 0, "malformed response cannot publish success");
+    const auto failed = LoadPipelineState(pool, payload.state);
+    Check(!HasPoolHandle(failed.fragment_outputs),
+          "malformed response cannot publish stale fragment outputs");
+    if (warm_scratch)
+      Check(responder.descriptor_sets().size() == 2,
+            "scratch rejection follows one complete unchanged texture round");
+    ReleaseFunctionalPayloads(pool, failed);
+    pool.Release(payload.state);
+    Check(pool.bytes_in_flight() == 0 && pool.allocations() == pool.releases(),
+          "rejected response leaves recoverable ownership and no pool leaks");
     std::cout << "usc_cluster_texture_continuation_test: expected failure "
-              << "response-order"
+              << (corrupt_continuation.empty() ? "response-order" : corrupt_continuation)
               << " PASS\n";
     return 0;
   }
@@ -1525,6 +1604,12 @@ int sc_main(int argc, char **argv) {
       return RunExpectedFailure("steps");
     if (argc == 2 && std::string(argv[1]) == "continuation-mask")
       return RunExpectedFailure("mask");
+    if (argc == 2 &&
+        (std::string(argv[1]) == "scratch-request-bytes" ||
+         std::string(argv[1]) == "scratch-response-bytes" ||
+         std::string(argv[1]) == "scratch-continuation-bytes" ||
+         std::string(argv[1]) == "scratch-response-count"))
+      return RunExpectedFailure(argv[1]);
     Check(argc == 1, "unknown test mode");
 
     DriverPcoStageAbi terrain_d4_fragment_abi;
@@ -1602,7 +1687,8 @@ int sc_main(int argc, char **argv) {
                       TextureControlFlowCase::kAllSkipAll,
                       TextureControlFlowCase::kMixedSkipAll,
                       TextureControlFlowCase::kDiscardThenMixed,
-                      TextureControlFlowCase::kDivergentSites}) {
+                      TextureControlFlowCase::kDivergentSites,
+                      TextureControlFlowCase::kShrinkThenRegrow}) {
       control_flow_cases.emplace_back(new TextureControlFlowHarness(
           sc_core::sc_gen_unique_name("texture_control_flow"), mode));
     }

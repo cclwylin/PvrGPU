@@ -977,7 +977,7 @@ void CheckCubeNonfiniteLod() {
                 "nonfinite direction cannot bypass invalid image metadata");
 }
 
-void CheckEventPaths() {
+void CheckEventPaths(pvrgpu::stub::MemoryMode memory_mode) {
   MemoryPool pool;
   GlbenchFillTextureFixture fixture =
       MakeGlbenchFillTextureFixture(TextureFilter::kLinear);
@@ -1345,7 +1345,7 @@ void CheckEventPaths() {
   // Their values cannot be represented exactly as floats, so a floating
   // conversion or an eight-byte fetch is detected by the returned DWORDs.
   MemoryPool integer_pool;
-  GpuMemorySystem integer_memory(pvrgpu::stub::MemoryMode::kDirect);
+  GpuMemorySystem integer_memory(memory_mode);
   const std::array<std::array<std::uint32_t, 4>, 2> integer_texels = {{
       {{UINT32_C(0xffffffff), UINT32_C(0x80000000), UINT32_C(0x01000001), 1}},
       {{UINT32_C(0x76543210), UINT32_C(0xfedcba98), UINT32_C(0x7fffffff), 0}},
@@ -1389,7 +1389,7 @@ void CheckEventPaths() {
     std::copy_n(integer_shared.begin(), 4, request.texture_state);
   }
   PipelineState integer_state;
-  integer_state.memory_mode = pvrgpu::stub::MemoryMode::kDirect;
+  integer_state.memory_mode = memory_mode;
   integer_state.sequence = 5;
   integer_state.functional_case = FunctionalCase::kDriverPcoTriangles;
   integer_state.stage = PipelineStage::kFragmentTexturePending;
@@ -1418,7 +1418,7 @@ void CheckEventPaths() {
   // GS owns a third stage bank and reserves SH0..3 for primitive input.
   // A scalar request cannot accidentally enter the FS derivative/quad path.
   MemoryPool geometry_pool;
-  GpuMemorySystem geometry_memory(pvrgpu::stub::MemoryMode::kDirect);
+  GpuMemorySystem geometry_memory(memory_mode);
   geometry_memory.HostWrite(base, driver_fixture.texture_bytes.data(), driver_fixture.texture_bytes.size());
   geometry_memory.HostWrite(base, driver_texel.data(), driver_texel.size());
   auto geometry_resource = driver_fixture.resource;
@@ -1426,7 +1426,7 @@ void CheckEventPaths() {
   TextureSampleRequest geometry_request = driver_request;
   geometry_request.shader_stage = pvrgpu::stub::ShaderStage::kGeometry;
   PipelineState geometry_state;
-  geometry_state.memory_mode = pvrgpu::stub::MemoryMode::kDirect;
+  geometry_state.memory_mode = memory_mode;
   geometry_state.functional_case = FunctionalCase::kDriverPcoTriangles;
   geometry_state.stage = PipelineStage::kGeometryTexturePending;
   geometry_state.geometry_sampled_texture_count = 1;
@@ -1598,6 +1598,44 @@ void CheckEventPaths() {
   Check(integer_final_state.counters.texel_fetches == 2 &&
             integer_responses.size() == 2,
         "two integer requests execute two physical texel reads");
+  const auto check_tap_memory = [memory_mode](
+      const pvrgpu::stub::CounterTxn &counters, std::uint64_t taps,
+      std::uint64_t tap_bytes, std::uint64_t requests, bool tiler_stage) {
+    const bool cached = memory_mode == pvrgpu::stub::MemoryMode::kCache;
+    const bool direct = memory_mode == pvrgpu::stub::MemoryMode::kDirect;
+    const bool bypass = memory_mode == pvrgpu::stub::MemoryMode::kBypass;
+    // These taps occupy one cold 128-byte SLC line. The warm reads must
+    // remain modeled accesses, not memoized texture answers; direct and
+    // bypass retain their different traffic accounting.
+    Check(counters.slc_line_accesses == (cached ? taps : 0) &&
+              counters.slc_read_accesses == (cached ? taps : 0) &&
+              counters.slc_misses == (cached ? 1U : 0U) &&
+              counters.slc_hits == (cached ? taps - 1U : 0U) &&
+              counters.slc_bypassed == (bypass ? taps : 0) &&
+              counters.slc_cycles ==
+                  (cached ? taps * pvrgpu::stub::kMemorySlcLookupCycles : 0) &&
+              counters.dram_read_transactions ==
+                  (cached ? 1U : bypass ? taps : 0) &&
+              counters.dram_read_bytes ==
+                  (cached ? 128U : bypass ? taps * tap_bytes : 0) &&
+              counters.dram_cycles ==
+                  (cached ? 1U : bypass ? taps : 0) *
+                      pvrgpu::stub::kMemoryDramRequestCycles &&
+              counters.memory_direct_read_bytes ==
+                  (direct ? taps * tap_bytes : 0) &&
+              counters.slc_write_accesses == 0 &&
+              counters.slc_evictions == 0 && counters.slc_writebacks == 0 &&
+              counters.dram_write_transactions == 0 &&
+              counters.dram_write_bytes == 0,
+          "inline TPU reads preserve cold/warm/direct/bypass tap accounting");
+    const auto cycles = requests * pvrgpu::stub::kReferenceUarch.texture_bypass_cycles +
+                        counters.slc_cycles + counters.dram_cycles;
+    Check(counters.texture_cycles == cycles &&
+              counters.tiler_cycles == (tiler_stage ? cycles : 0) &&
+              counters.renderer_cycles == (tiler_stage ? 0 : cycles),
+          "inline reads retain modeled delay and texture cycle stage routing");
+  };
+  check_tap_memory(integer_final_state.counters, 2, 16, 2, false);
   for (std::size_t lane = 0; lane < integer_responses.size(); ++lane) {
     Check(std::equal(integer_texels[lane].begin(), integer_texels[lane].end(),
                      std::begin(integer_responses[lane].rgba)),
@@ -1622,6 +1660,7 @@ void CheckEventPaths() {
         geometry_responses[0].rgba[3] == FloatBits(1.0F),
         "GS raw SH4 descriptor samples modeled memory without FS derivatives or stage leakage");
   ReleaseFunctionalPayloads(geometry_pool, geometry_final_state);
+  check_tap_memory(geometry_final_state.counters, 1, 4, 1, true);
   geometry_pool.Release(geometry_state_handle);
   Check(!geometry_pool.bytes_in_flight() && geometry_pool.allocations() == geometry_pool.releases(),
         "GS texture nested resource ownership is balanced");
@@ -1660,7 +1699,7 @@ void CheckEventPaths() {
   std::copy_n(integer_shared.begin(), 4, float_request.texture_state);
   std::copy_n(integer_shared.begin() + 8, 4, float_request.sampler_state);
   PipelineState float_state;
-  float_state.memory_mode = pvrgpu::stub::MemoryMode::kDirect;
+  float_state.memory_mode = memory_mode;
   float_state.sequence = 6;
   float_state.functional_case = FunctionalCase::kDriverPcoTriangles;
   float_state.stage = PipelineStage::kFragmentTexturePending;
@@ -1686,6 +1725,9 @@ void CheckEventPaths() {
   const std::array<float, 4> expected_float = {{2.0F, 0.5F, 1536.5F, 0.5F}};
   Check(float_final_state.counters.texel_fetches == 4 && float_responses.size() == 1,
         "float32 bilinear sample executes four physical sixteen-byte reads");
+  // HostWrite above replaced the previous integer contents at the same
+  // address. The cache must refill once and return the new float bits.
+  check_tap_memory(float_final_state.counters, 4, 16, 1, false);
   for (std::size_t channel = 0; channel < 4; ++channel) {
     Check(float_responses[0].rgba[channel] == FloatBits(expected_float[channel]),
           "float32 bilinear filter preserves negative, high-range and alpha channels");
@@ -1719,13 +1761,20 @@ void CheckEventPaths() {
 
 } // namespace
 
-int sc_main(int, char **) {
+int sc_main(int argc, char **argv) {
   try {
+    pvrgpu::stub::MemoryMode memory_mode = pvrgpu::stub::MemoryMode::kDirect;
+    if (argc == 2 && std::string(argv[1]) == "cache")
+      memory_mode = pvrgpu::stub::MemoryMode::kCache;
+    else if (argc == 2 && std::string(argv[1]) == "bypass")
+      memory_mode = pvrgpu::stub::MemoryMode::kBypass;
+    else if (argc != 1)
+      throw std::runtime_error("usage: texture-unit-test [cache|bypass]");
     CheckDescriptorAndArithmetic();
     CheckIntegerImageDescriptors();
     CheckSequenceColorMipMaterialization();
     CheckCubeNonfiniteLod();
-    CheckEventPaths();
+    CheckEventPaths(memory_mode);
     std::cout << "texture_unit_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

@@ -1099,6 +1099,8 @@ target_include_directories(texture-unit-test PRIVATE
 target_link_libraries(texture-unit-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(texture-unit-test)
 add_test(NAME texture-unit-unit COMMAND texture-unit-test)
+add_test(NAME texture-unit-cache-readinto-unit COMMAND texture-unit-test cache)
+add_test(NAME texture-unit-bypass-readinto-unit COMMAND texture-unit-test bypass)
 
 add_executable(texture-gather-test
     tests/texture_gather_test.cpp
@@ -1353,6 +1355,13 @@ foreach(field count steps mask)
     add_test(
         NAME usc-cluster-texture-continuation-${field}-fail-closed
         COMMAND usc-cluster-texture-continuation-test continuation-${field}
+    )
+endforeach()
+
+foreach(scratch_failure request-bytes response-bytes continuation-bytes response-count)
+    add_test(
+        NAME usc-cluster-texture-scratch-${scratch_failure}-fail-closed
+        COMMAND usc-cluster-texture-continuation-test scratch-${scratch_failure}
     )
 endforeach()
 

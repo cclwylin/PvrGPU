@@ -58,6 +58,13 @@ class GpuMemorySystem final {
 
   MemoryReadResult Read(std::uint64_t address, std::size_t bytes,
                         MemoryClient client);
+  // Read the same GPU transactions into nonaliasing caller-owned storage.
+  // The caller supplies at least bytes writable bytes. Like a multi-line
+  // access, failure may leave earlier successful lines copied and resident;
+  // the destination is unspecified on failure. Cache hits allocate no read
+  // payload. Direct/bypass and cold fills retain the backing's owned Read.
+  MemoryAccessStats ReadInto(std::uint64_t address, void *destination,
+                             std::size_t bytes, MemoryClient client);
   MemoryAccessStats Write(std::uint64_t address, const void *source,
                           std::size_t bytes, MemoryClient client);
   MemoryReadResult Readback(std::uint64_t address, std::size_t bytes,

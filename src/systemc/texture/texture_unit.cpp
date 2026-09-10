@@ -2065,6 +2065,8 @@ void TextureUnit::SampleRunForStage(
                                               resource.block_height};
       const std::uint32_t fetch_bytes =
           astc_image ? 16U : TextureBytesPerTexel(image.format);
+      if (fetch_bytes > 16U)
+        throw std::runtime_error("TextureUnit texel exceeds inline read capacity");
       std::uint64_t multisample_offset = 0;
       const bool direct_in_bounds = multisample_fetch ?
           ComputeTextureMultisampleTexelOffset(resource, request, selected_layer, &multisample_offset) :
@@ -2102,12 +2104,19 @@ void TextureUnit::SampleRunForStage(
               "TextureUnit texel address is out of range");
         }
         const std::uint64_t texel_address = image.gpu_address + texel_offset;
-        std::vector<std::uint8_t> payload;
+        // Each modeled tap still executes a memory transaction. Keep only
+        // its small host result inline: a cache hit need not allocate a
+        // vector or copy an entire cache line to obtain at most 16 bytes.
+        std::array<std::uint8_t, 16> inline_payload{};
+        std::vector<std::uint8_t> fifo_payload;
+        const std::uint8_t *payload = nullptr;
+        std::size_t payload_size = 0;
         if (memory_) {
-          MemoryReadResult read = memory_->Read(
-              texel_address, fetch_bytes, MemoryClient::kTextureCache);
-          payload = std::move(read.data);
-          memory_stats += read.stats;
+          memory_stats += memory_->ReadInto(
+              texel_address, inline_payload.data(), fetch_bytes,
+              MemoryClient::kTextureCache);
+          payload = inline_payload.data();
+          payload_size = fetch_bytes;
         } else {
           MemoryTxn memory_request;
           memory_request.pipeline = txn;
@@ -2137,11 +2146,13 @@ void TextureUnit::SampleRunForStage(
               !HasPoolHandle(memory_response.payload)) {
             throw std::runtime_error("TextureUnit TCU response mismatch");
           }
-          payload =
+          fifo_payload =
               LoadArray<std::uint8_t>(pool_, memory_response.payload);
           pool_.Release(memory_response.payload);
+          payload = fifo_payload.data();
+          payload_size = fifo_payload.size();
         }
-        if (payload.size() != fetch_bytes)
+        if (payload_size != fetch_bytes)
           throw std::runtime_error("TextureUnit TCU texel size mismatch");
         if (texel_fetch_count == std::numeric_limits<std::uint64_t>::max())
           throw std::overflow_error("TextureUnit texel fetch overflow");
@@ -2149,16 +2160,16 @@ void TextureUnit::SampleRunForStage(
         std::array<std::uint8_t, 16> texel{};
         if (astc_image) {
           if (!astc_block_decoded ||
-              !std::equal(payload.begin(), payload.end(),
+              !std::equal(payload, payload + payload_size,
                           astc_block_bytes.begin())) {
             const char *refusal = nullptr;
-            if (!DecodeAstcBlock(payload.data(), astc_footprint, astc_srgb,
+            if (!DecodeAstcBlock(payload, astc_footprint, astc_srgb,
                                  &astc_block, &refusal)) {
               throw std::runtime_error(
                   std::string("TextureUnit cannot decode this ASTC block: ") +
                   (refusal != nullptr ? refusal : "unstated"));
             }
-            std::copy(payload.begin(), payload.end(),
+            std::copy(payload, payload + payload_size,
                       astc_block_bytes.begin());
             astc_block_decoded = true;
           }
@@ -2168,7 +2179,7 @@ void TextureUnit::SampleRunForStage(
               astc_block.texels[inside_y * astc_footprint.width + inside_x];
           std::copy(decoded.begin(), decoded.end(), texel.begin());
         } else {
-          std::copy(payload.begin(), payload.end(), texel.begin());
+          std::copy(payload, payload + payload_size, texel.begin());
         }
         // B8G8R8A8 storage arrives B,G,R,A; the descriptor's swizzle presents
         // it as RGBA, which the unit realises by swapping red and blue here so

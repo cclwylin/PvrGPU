@@ -207,6 +207,58 @@ MemoryReadResult GpuMemorySystem::Read(std::uint64_t address,
   return result;
 }
 
+MemoryAccessStats GpuMemorySystem::ReadInto(std::uint64_t address,
+                                           void *destination,
+                                           std::size_t bytes,
+                                           MemoryClient client) {
+  ValidateClient(client);
+  if (bytes == 0)
+    throw std::invalid_argument("GpuMemorySystem read is empty");
+  if (!destination)
+    throw std::invalid_argument("GpuMemorySystem read destination is null");
+  MemoryAccessStats result;
+  if (mode_ == MemoryMode::kDirect || mode_ == MemoryMode::kBypass) {
+    const auto data = backing_.Read(address, bytes);
+    std::memcpy(destination, data.data(), bytes);
+    if (mode_ == MemoryMode::kDirect) {
+      result.direct_read_bytes = bytes;
+    } else {
+      result.slc.bypassed = 1;
+      AddDramRead(result, bytes);
+    }
+    return result;
+  }
+
+  auto *output = static_cast<std::uint8_t *>(destination);
+  const std::size_t line_bytes = slc_.config().line_size_bytes;
+  std::size_t copied = 0;
+  while (copied < bytes) {
+    const std::uint64_t current = address + copied;
+    const std::uint64_t line_address = current - current % line_bytes;
+    const std::size_t line_offset =
+        static_cast<std::size_t>(current - line_address);
+    const std::size_t chunk = std::min(bytes - copied, line_bytes - line_offset);
+    MemoryAccessStats lower;
+    const CacheLineRead read_lower = [&](std::uint64_t lower_address,
+                                         std::size_t lower_bytes) {
+      AddDramRead(lower, lower_bytes);
+      return backing_.Read(lower_address, lower_bytes);
+    };
+    const CacheLineWrite write_lower = [&](std::uint64_t lower_address,
+                                           const CacheLineData &data) {
+      backing_.Write(lower_address, data.data(), data.size());
+      AddDramWrite(lower, data.size());
+    };
+    const CacheLineAccess access = slc_.ReadLineInto(
+        line_address, line_offset, output + copied, chunk, read_lower, write_lower);
+    result.slc += access.delta;
+    result += lower;
+    copied += chunk;
+  }
+  result.slc_cycles = result.slc.line_accesses * kMemorySlcLookupCycles;
+  return result;
+}
+
 MemoryAccessStats GpuMemorySystem::Write(std::uint64_t address,
                                          const void *source,
                                          std::size_t bytes,
