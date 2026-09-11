@@ -1568,6 +1568,46 @@ void ReportAdoptedCounterDrift(const Options &options,
   }
 }
 
+/* Samples that passed the early depth test -- the point Mesa's PS_INVOCATIONS
+ * query observes, before PowerVR HSR collapses opaque owners to the final
+ * visible one.  A depth-writing draw records every passing sample as a write.
+ * A test-only draw (depth test on, depth writes masked) writes nothing, so its
+ * passing count is the tested samples the test did not reject.  GLES allows
+ * that state and dEQP's FBO depth and MSAA cases use it; treating it as an
+ * inconsistent counter view dropped the whole frame. */
+std::uint64_t EarlyDepthPassedFragments(const DriverCommand &command,
+                                        const CounterTxn &counters,
+                                        const char *inconsistent) {
+  const auto fail = [&]() {
+    throw std::runtime_error(
+        std::string(inconsistent) +
+        " [depth_enable=" + std::to_string(command.depth_enable) +
+        " depth_write=" + std::to_string(command.depth_write) +
+        " tested=" + std::to_string(counters.depth_tested_fragments) +
+        " rejected=" + std::to_string(counters.depth_rejected_fragments) +
+        " written=" + std::to_string(counters.depth_written_fragments) +
+        " pbe_writes=" + std::to_string(counters.pbe_fragment_writes) +
+        " render_targets=" + std::to_string(command.render_target_count) + "]");
+  };
+  if (command.depth_enable != 1 || command.depth_write > 1 ||
+      counters.depth_written_fragments > counters.depth_tested_fragments ||
+      counters.depth_rejected_fragments > counters.depth_tested_fragments)
+    fail();
+  const std::uint64_t passed =
+      command.depth_write == 1
+          ? counters.depth_written_fragments
+          : counters.depth_tested_fragments - counters.depth_rejected_fragments;
+  /* The PBE counts one write per colour attachment a passing sample updates
+   * (pbe.cpp multiplies by the colour output targets), so a four-target
+   * G-buffer pass reports four writes per sample.  Compare in the same unit:
+   * writes can never exceed the passing samples times the attachments. */
+  const std::uint64_t targets =
+      command.render_target_count ? command.render_target_count : 1U;
+  if ((counters.pbe_fragment_writes + targets - 1U) / targets > passed)
+    fail();
+  return passed;
+}
+
 void NormalizeDriverPcoTrianglesApiCounters(const Options &options,
                                             CounterTxn &counters) {
   const DriverCommand &command = options.driver_command;
@@ -1616,18 +1656,12 @@ void NormalizeDriverPcoTrianglesApiCounters(const Options &options,
     counters.ps_invocations = counters.pbe_fragment_writes;
     return;
   }
-  if (command.depth_enable != 1 || command.depth_write != 1 ||
-      counters.depth_written_fragments > counters.depth_tested_fragments ||
-      counters.depth_written_fragments < counters.pbe_fragment_writes) {
-    throw std::runtime_error(
-        "driver PCO early-depth counter view is inconsistent");
-  }
-
   /* Mesa's PS_INVOCATIONS query counts samples that pass early depth before
    * PowerVR HSR collapses several opaque owners to the final visible owner.
    * Keep DrawList execution statistics as the actual ISS lanes, but expose
    * the API counter at the same observation point as the llvmpipe golden. */
-  counters.ps_invocations = counters.depth_written_fragments;
+  counters.ps_invocations = EarlyDepthPassedFragments(
+      command, counters, "driver PCO early-depth counter view is inconsistent");
 }
 
 std::uint64_t CheckedMul(std::uint64_t left, std::uint64_t right,
@@ -1653,13 +1687,9 @@ void NormalizeSequenceDrawApiCounters(const DriverCommand &command,
   if (command.depth_enable == 0) {
     counters->ps_invocations = counters->pbe_fragment_writes;
   } else {
-    if (command.depth_enable != 1 || command.depth_write != 1 ||
-        counters->depth_written_fragments > counters->depth_tested_fragments ||
-        counters->depth_written_fragments < counters->pbe_fragment_writes) {
-      throw std::runtime_error(
-          "sequence PCO early-depth counter view is inconsistent");
-    }
-    counters->ps_invocations = counters->depth_written_fragments;
+    counters->ps_invocations = EarlyDepthPassedFragments(
+        command, *counters,
+        "sequence PCO early-depth counter view is inconsistent");
 
     /* The model did not issue texture work for fragments removed by HSR.
      * When every executed invocation has the same fetch cost, reconstruct the
