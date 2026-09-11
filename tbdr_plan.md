@@ -174,6 +174,50 @@ serialized fallback；只要仍走 pass-wide Phase 1/2，該 run 仍是合法 TB
 blend、MRT masked output、sample mask 和 shader side-effect cases 必須分別覆蓋，HSR
 rejection 與各類 conservative-disable counter 分開報告。
 
+### 3.2 32×32 tile fragment lifecycle 與 tile-local framebuffer（未來工作）
+
+現況只有前半段 tile 化：Tiler 已建立 row-major 32×32 `TileRecord` 與 ordered primitive
+refs，ISP 也以 `for (tile) for (primitive ref)` 走訪；但 `TileScheduler` 仍只為整個 draw
+送出一個 pipeline token，ISP 最後把所有 tile 的 candidates flatten 成 draw-wide payload，
+FragmentFrontend／PDS／USC 再以整個 draw 的 invocation／2×2 quad arrays 執行。另一方面，
+ISP 的 depth/stencil/coverage 與 PBE 的 color working surface 都仍按完整
+`width × height × layers × samples` 配置，PbeWriteBack 也以整張 attachment 寫回。因此目前
+不能把「32×32 binning／tile-major ISP」稱為「32×32 fragment lifecycle」或「32×32
+framebuffer」。
+
+正式 `render-pass-tbdr` 必須補齊下列兩個彼此相連、但分階段落地的契約：
+
+1. **32×32 tile-bounded fragment lifecycle。** Phase 1 barrier 後，由 coordinator 或等價
+   排程狀態以有上限的 tile work descriptor 驅動 fragment path。descriptor 至少帶
+   pass/generation/tile ID、global tile rect、primitive-ref range，以及 immutable draw-state
+   reference。FragmentFrontend、PDS、USC、TextureUnit 與 PBE 必須能讓一個 tile 的
+   candidates、2×2 quads、shader lanes、continuations 和 outputs 在該 tile 完成後釋放，
+   不得以 pass/draw-wide flat arrays 掩蓋無上限的 transient working set。2×2 quad 與
+   4×2 half-stamp 必須保留 global framebuffer coordinates、helper-lane/derivative 語意；
+   tile 內仍依原始 draw/primitive order 執行。實作不得為 1080p 直接複製約 60×34 份完整
+   `PipelineState`；共享 state 的 ownership、in-flight tile 上限與 completion aggregation
+   必須 first-class。
+2. **32×32 tile-local framebuffer。** 每個 tile 的 color/depth/stencil/coverage working set
+   依有效 tile rect、layers、samples、MRT 數和各 attachment bytes-per-pixel 配置；右／下
+   邊界 tile 的有效範圍必須顯式記錄。tile 開始時對每個 attachment 做一次所需的
+   LOAD/CLEAR，該 tile 的所有 draw refs 完成後才由 PBE STORE/scatter 到完整 attachment 的
+   GPU address（正確處理 row pitch、layer、sample 與 MRT）。最終 Phase 4 TBDR path 不得再
+   配置 pass-owned full-frame color/depth/stencil staging surface；完整 framebuffer 只在
+   pass end 的 presentation、API readback 或 Capture/Play 明確要求時 materialize，不能在
+   每個 draw 後重建或 readback。
+
+落地順序固定為：Phase 3 先建立 tile work/range、真正的 tile-bounded shader lifecycle 與
+per-tile completion，允許暫時沿用 pass-owned full-frame attachment backing；Phase 4 再把
+attachment working storage 和 transport 改成 tile-local。不得以「把 draw-wide array 加上
+tile offset」作為最終完成狀態，也不得在 Phase 4 只切割 PBE write 而保留 full-frame ISP/PBE
+working surface。
+
+驗收至少覆蓋跨 `x=31/32`、`y=31/32` 的 primitive、空 tile、非 32 倍數的 framebuffer
+邊界、單 tile 大量 overdraw、MSAA/sample-frequency、derivative/helper lanes、MRT、layered
+attachment、blend、discard 與 late depth/stencil。兩種排程必須 bit-exact；report 必須能
+證明 fragment transient 與 attachment working-set high-water 受 in-flight tile budget 約束，
+且同一 compatible pass 沒有 per-draw full-frame LOAD/STORE/Readback。
+
 ## 4. 核心資料結構
 
 新增一個共享的 `RenderPassState`（名稱可依既有命名調整），至少包含：
@@ -343,6 +387,10 @@ handle，snapshot round-trip exact。
 ### Phase 3：Pass-wide barrier 與 tile-major Phase 2
 
 - 所有 Phase 1 工作完成後才開啟 Phase 2。
+- 依 §3.2 建立有上限的 tile work/range 與 completion aggregation；fragment candidates、
+  2×2 quads、PDS/USC tasks、texture continuations 和 outputs 必須具有真正的 per-tile
+  lifecycle。此階段可保留 full-frame attachment backing，但不能再把 draw/pass-wide flat
+  fragment arrays 當作 `render-pass-tbdr` 的最終實作。
 - 每個 tile 依原始 draw/primitive order 執行 ISP/fragment/depth/stencil/blend；此階段禁止
   跨 draw HSR，所有有 API 可觀察效果的工作都維持 in-order。
 - 允許先使用 pass-owned full-frame color/depth/stencil working surfaces，以降低第一次
@@ -368,6 +416,9 @@ logical LOAD/CLEAR 和 STORE；沒有 serialized fallback。達成後才可把 `
 
 - 把 ISP 的整張 surface plane（`isp.cpp:251` 的 encoded depth/depth/stencil/coverage）
   改為 tile working set；FragmentFrontend、PBE、PbeWriteBack 同步改為 tile-local。
+- 依 §3.2 實作真正的 32×32 color/depth/stencil/coverage backing：邊界 tile 記錄 valid
+  rect，PBE 以正確 row pitch/layer/sample/MRT 位址把 tile STORE/scatter 到完整 attachment；
+  只有 presentation、API readback 或 Capture/Play 可以在 pass end materialize 完整畫面。
 - 把 Phase 3 的 pass-level full-frame LOAD/STORE transport 改成 modeled per-tile LOAD/STORE；
   `submitter.cpp:1711` 的 per-draw 全畫面 `Readback` 不得重新出現。
 - 重新定義 reference uArch cycle model：現行 `WaitForCycles(kReferenceUarch...)` 的常數
