@@ -228,12 +228,11 @@ void FragmentFrontend::Run() {
       MaterializeDepthAttachment(pool_, memory_, &state);
     std::vector<FragmentShaderLane> shader_lanes;
     if (UsesFragmentQuadLanes(state)) {
-      // Walk touched 4x2 half-stamps, but issue only their nonempty 2x2 quads.
-      // Within each issued quad, uncovered lanes execute as helpers for
-      // derivatives and texture issue without writing. The adjacent quad is
-      // not part of that derivative group: if it has no visible invocation,
-      // it has no functional shader work (regardless of any physical dispatch
-      // padding). Selection derives solely from ISP visibility.
+      // A touched 4x2 half-stamp issues both of its 2x2 child quads.  This is
+      // the native fragment dispatch width: an otherwise empty child still
+      // executes four non-writing helper lanes, including texture operations.
+      // Completely rejected half-stamps remain absent because the stamp set
+      // below is seeded only by visible invocations.
       using PixelKey =
           std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>;
       std::map<PixelKey, std::uint32_t> visible_invocations;
@@ -287,10 +286,6 @@ void FragmentFrontend::Run() {
             quad.quad_id = (quad_y / 2U) * quads_x + quad_x / 2U;
             quad.sample_id = sample_id;
             quad.submit_ordinal = parameter.key.submit_ordinal;
-            if (quad_indices.find(std::make_tuple(parameter_index, quad.quad_id,
-                                                  std::uint32_t(sample_id))) ==
-                quad_indices.end())
-              continue;
             for (std::uint8_t lane = 0; lane < 4U; ++lane) {
               const std::uint32_t x = quad_x + lane % 2U;
               const std::uint32_t y = quad_y + lane / 2U;

@@ -1,6 +1,6 @@
-// Focused FragmentFrontend regression. A texture-sampling draw whose complete
-// 2x2 quad was rejected by ISP must not launch helper-only USC quads, even
-// when the adjacent child of its 4x2 half-stamp remains visible.
+// Focused FragmentFrontend regression. A completely rejected 4x2 half-stamp
+// launches no USC work, while either visible 2x2 child causes both children
+// to execute at the native half-stamp width.
 
 #include "common/functional_types.h"
 #include "common/pipeline_state.h"
@@ -207,7 +207,7 @@ int sc_main(int, char **) {
         const auto quads = LoadArray<FragmentQuad>(pool, done.fragment_quads);
         Check(invocations.size() == expected && done.active_fragment_invocations == expected &&
                   done.counters.ps_invocations == expected &&
-                  done.fragment_shader_lane_count == expected * (helpers ? 4U : 1U),
+                  done.fragment_shader_lane_count == expected * (helpers ? 8U : 1U),
               "sample-frequency shading did not create one native invocation per covered sample");
         std::uint32_t seen_samples = 0;
         for (const auto &invocation : invocations) {
@@ -259,7 +259,7 @@ int sc_main(int, char **) {
             "stage-local texture frontend did not complete");
       const auto done = LoadPipelineState(pool, handle);
       Check(done.active_fragment_invocations == 1 && done.counters.ps_invocations == 1 &&
-            done.fragment_shader_lane_count == (stage == 1 || stage == 3 ? 4U : 1U) &&
+            done.fragment_shader_lane_count == (stage == 1 || stage == 3 ? 8U : 1U) &&
             HasPoolHandle(done.fragment_shader_lanes) == (stage == 1 || stage == 3),
             "fragment SMP and derivatives need helper quads; VS/GS samplers remain independent");
       ReleaseFunctionalPayloads(pool, done); pool.Release(handle);
@@ -326,7 +326,7 @@ int sc_main(int, char **) {
                 done.fragment_groups == expected.size() &&
                 lanes.size() == 4 * expected.size() &&
                 done.fragment_shader_lane_count == lanes.size(),
-            name + ": only nonempty 2x2 quads may issue four shader lanes");
+            name + ": touched half-stamps must issue both 2x2 children");
       std::vector<bool> seen_lanes(lanes.size(), false);
       std::vector<bool> seen_invocations(invocations.size(), false);
       unsigned covered_count = 0;
@@ -337,7 +337,7 @@ int sc_main(int, char **) {
         });
         Check(it != quads.end(), name + ": missing primitive/quad/sample identity");
         const auto &quad = *it;
-        Check(wanted.coverage != 0 && quad.coverage_mask == wanted.coverage &&
+        Check(quad.coverage_mask == wanted.coverage &&
                   quad.write_mask == wanted.coverage &&
                   quad.helper_mask == (0xfU ^ wanted.coverage),
               name + ": visible coverage and required helper masks changed");
@@ -388,31 +388,38 @@ int sc_main(int, char **) {
       pool.Release(handle);
     };
     check_quad_fixture("left child only", 4, 2, 1, false,
-                       {candidate_at(0, 0, 0, 1)}, {{0, 0, 0, 0x1}});
+                       {candidate_at(0, 0, 0, 1)},
+                       {{0, 0, 0, 0x1}, {0, 1, 0, 0x0}});
     check_quad_fixture("right child only", 4, 2, 1, false,
-                       {candidate_at(3, 1, 0, 1)}, {{0, 1, 0, 0x8}});
+                       {candidate_at(3, 1, 0, 1)},
+                       {{0, 0, 0, 0x0}, {0, 1, 0, 0x8}});
     check_quad_fixture("both children", 4, 2, 1, false,
                        {candidate_at(0, 0, 0, 1), candidate_at(1, 1, 0, 1),
                         candidate_at(2, 0, 0, 1)},
                        {{0, 0, 0, 0x9}, {0, 1, 0, 0x1}});
     check_quad_fixture("children belong to different primitives", 4, 2, 1, false,
                        {candidate_at(0, 0, 0, 1), candidate_at(3, 1, 1, 1)},
-                       {{0, 0, 0, 0x1}, {1, 1, 0, 0x8}});
+                       {{0, 0, 0, 0x1}, {0, 1, 0, 0x0},
+                        {1, 0, 0, 0x0}, {1, 1, 0, 0x8}});
     check_quad_fixture("children belong to different samples", 4, 2, 4, true,
                        {candidate_at(0, 0, 0, 0x2), candidate_at(3, 1, 0, 0x8)},
-                       {{0, 0, 1, 0x1}, {0, 1, 3, 0x8}});
+                       {{0, 0, 1, 0x1}, {0, 1, 1, 0x0},
+                        {0, 0, 3, 0x0}, {0, 1, 3, 0x8}});
     check_quad_fixture("different primitive and sample identities", 4, 2, 4, true,
                        {candidate_at(0, 0, 0, 0x5), candidate_at(3, 1, 1, 0xa)},
-                       {{0, 0, 0, 0x1}, {0, 0, 2, 0x1},
-                        {1, 1, 1, 0x8}, {1, 1, 3, 0x8}});
+                       {{0, 0, 0, 0x1}, {0, 1, 0, 0x0},
+                        {0, 0, 2, 0x1}, {0, 1, 2, 0x0},
+                        {1, 0, 1, 0x0}, {1, 1, 1, 0x8},
+                        {1, 0, 3, 0x0}, {1, 1, 3, 0x8}});
     check_quad_fixture("odd viewport retains derivative helpers", 3, 3, 1, false,
-                       {candidate_at(2, 2, 0, 1)}, {{0, 3, 0, 0x1}});
+                       {candidate_at(2, 2, 0, 1)},
+                       {{0, 2, 0, 0x0}, {0, 3, 0, 0x1}});
     check_quad_fixture("ISP rejected adjacent child", 4, 2, 1, false,
                        {candidate_at(0, 0, 0, 1), candidate_at(2, 0, 0, 1, false)},
-                       {{0, 0, 0, 0x1}});
+                       {{0, 0, 0, 0x1}, {0, 1, 0, 0x0}});
     check_quad_fixture("ISP rejected entire primitive beside visible primitive", 4, 2, 1, false,
                        {candidate_at(0, 0, 0, 1, false), candidate_at(2, 0, 1, 1)},
-                       {{1, 1, 0, 0x1}});
+                       {{1, 0, 0, 0x0}, {1, 1, 0, 0x1}});
     check_quad_fixture("ISP rejected all samples in both children", 4, 2, 4, true,
                        {candidate_at(0, 0, 0, 0xf, false), candidate_at(2, 0, 1, 0xf, false)},
                        {});

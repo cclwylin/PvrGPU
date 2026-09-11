@@ -1340,6 +1340,40 @@ static const struct pvrgpu_terrain_pco_desc pvrgpu_terrain_profiles[] = {
    },
 };
 
+static bool
+pvrgpu_source_hash_matches(const nir_shader *shader,
+                           const uint32_t expected_words[8]);
+
+bool pvrgpu_pco_match_terrain_profile(
+   const nir_shader *vertex_nir,
+   const nir_shader *fragment_nir,
+   enum pvrgpu_pco_terrain_profile *profile)
+{
+   if (!vertex_nir || !fragment_nir || !profile ||
+       vertex_nir->info.stage != MESA_SHADER_VERTEX ||
+       fragment_nir->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+
+   for (unsigned candidate = PVRGPU_PCO_TERRAIN_D1;
+        candidate <= PVRGPU_PCO_TERRAIN_D8; ++candidate) {
+      const struct pvrgpu_terrain_pco_desc *desc =
+         &pvrgpu_terrain_profiles[candidate];
+      const bool fragment_matches =
+         pvrgpu_source_hash_matches(fragment_nir,
+                                    desc->fragment_source_hash) ||
+         (desc->fragment_source_hash_800x600[0] != 0U &&
+          pvrgpu_source_hash_matches(fragment_nir,
+                                     desc->fragment_source_hash_800x600));
+      if (pvrgpu_source_hash_matches(vertex_nir,
+                                     desc->vertex_source_hash) &&
+          fragment_matches) {
+         *profile = (enum pvrgpu_pco_terrain_profile)candidate;
+         return true;
+      }
+   }
+   return false;
+}
+
 struct pvrgpu_ideas_pco_desc {
    const char *name;
    uint32_t vertex_source_hash[8];
@@ -12496,6 +12530,11 @@ bool pvrgpu_pco_compile_refract(
    out->varying_output_count = desc->varying_components;
    out->fragment_varying_start = 4;
    out->fragment_varying_count = desc->varying_components * 4;
+   /* Both strict refract fragments export one complete RGBA render target.
+    * Generic draw transport consumes this metadata independently of the PCO
+    * decoder, so state the attachment lanes just like the other strict
+    * graphics profiles do. */
+   out->fragment_output_mask[0] = 0xfu;
    if (profile == PVRGPU_PCO_REFRACT_COMPOSITE) {
       out->fragment_texture_descriptor_start = 0;
       out->fragment_texture_descriptor_count =
@@ -16007,6 +16046,10 @@ bool pvrgpu_pco_compile_terrain(
    out->varying_output_count = desc->varying_components;
    out->fragment_varying_start = 4;
    out->fragment_varying_count = desc->varying_components * 4U;
+   /* Every terrain fragment profile stores one RGBA result.  The strict
+    * compiler predates generic sequence ABI validation, so make that PIXOUT
+    * contract explicit just as the refract/shadow profiles do. */
+   out->fragment_output_mask[0] = 0xfu;
    if (fragment_descriptor_dwords != 0) {
       out->fragment_texture_descriptor_start = 0;
       out->fragment_texture_descriptor_count = fragment_descriptor_dwords;

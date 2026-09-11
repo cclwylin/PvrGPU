@@ -31,6 +31,7 @@
 #define PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS 256u
 
 struct pvrgpu_array_primitive_draw;
+struct blitter_context;
 struct pvrgpu_compute_state;
 struct pvrgpu_deqp_primitive_sequence_profile;
 struct pvrgpu_pco_compiler;
@@ -56,6 +57,14 @@ bool pvrgpu_expand_instanced_connected_indices(
 
 struct pvrgpu_context {
    struct pipe_context base;
+   /* Mesa's shader blitter is used for operations which are GPU work on the
+    * reference driver, notably render-to-texture mipmap generation. */
+   struct blitter_context *blitter;
+   /* Non-zero only while util_blitter records an internal mipmap draw.  Mesa
+    * suspends application pipeline queries around that draw: the model still
+    * executes its geometry, but the API-visible texel count follows
+    * llvmpipe's 4x2 stamp coverage instead of exposing the helper geometry. */
+   uint64_t internal_blit_semantic_texel_fetches;
    struct pipe_framebuffer_state framebuffer;
    /* Targets still owned by one exact bridge submission for this framebuffer.
     * Materializing a target consumes its bit; rebinding invalidates the set. */

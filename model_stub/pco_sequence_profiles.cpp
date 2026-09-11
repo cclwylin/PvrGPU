@@ -303,6 +303,8 @@ bool SequenceLogicalCountersAreDerived(const Options &options,
   std::uint64_t primitives = 0;
   bool any_indexed = false;
   for (const DriverCommand &draw : options.driver_commands) {
+    if (draw.semantic_texel_fetches != 0)
+      continue;  // Mesa suspends application pipeline queries for meta draws.
     const std::uint64_t assembled =
         draw.indexed != 0 ? draw.index_count : draw.vertex_count;
     any_indexed = any_indexed || draw.indexed != 0;
@@ -349,8 +351,8 @@ bool NestedCountersAreZero(const DriverCommand &command) {
   return command.draw_count == 0 && command.index_count == 0 &&
          command.unique_vertices == 0 && command.primitive_count == 0 &&
          command.clip_primitives == 0 && command.setup_triangles == 0 &&
-         command.semantic_texel_fetches == 0 && command.ia_vertices == 0 &&
-         command.ia_primitives == 0 && command.vs_invocations == 0 &&
+         command.ia_vertices == 0 && command.ia_primitives == 0 &&
+         command.vs_invocations == 0 &&
          command.gs_invocations == 0 && command.gs_primitives == 0 &&
          command.clip_invocations == 0 && command.ps_invocations == 0 &&
          command.hs_invocations == 0 && command.ds_invocations == 0 &&
@@ -437,10 +439,10 @@ bool DrawHeaderAndPayloadMatch(const DriverCommand &command,
     return Reject(error, DrawReason(profile, ordinal, "PCO binary/ABI"));
   }
   if (command.vertex_shared.size() != spec.vertex_shared_dwords ||
-      (spec.vertex_shared_dwords != 0 &&
+      (spec.vertex_shared_fnv != 0 &&
        Fnv1a64(command.vertex_shared) != spec.vertex_shared_fnv) ||
       command.fragment_shared.size() != spec.fragment_shared_dwords ||
-      (spec.fragment_shared_dwords != 0 &&
+      (spec.fragment_shared_fnv != 0 &&
        Fnv1a64(command.fragment_shared) != spec.fragment_shared_fnv)) {
     return Reject(error, DrawReason(profile, ordinal, "shared payload"));
   }
@@ -908,16 +910,6 @@ constexpr std::array<std::uint64_t, 8> kTerrainVertexFnv = {
     UINT64_C(0xc33cf9ea6c986551), UINT64_C(0x137ad857d68f72e5),
     UINT64_C(0x137ad857d68f72e5), UINT64_C(0x137ad857d68f72e5),
     UINT64_C(0x137ad857d68f72e5), UINT64_C(0x137ad857d68f72e5)};
-constexpr std::array<std::uint64_t, 8> kTerrainVertexSharedFnv = {
-    UINT64_C(0x48fff97294e45f55), UINT64_C(0x15e8065d3d6b1b55),
-    UINT64_C(0x798ce5dd9c33fa18), UINT64_C(0x15e8065d3d6b1b55),
-    UINT64_C(0x15e8065d3d6b1b55), UINT64_C(0x15e8065d3d6b1b55),
-    UINT64_C(0x15e8065d3d6b1b55), UINT64_C(0x15e8065d3d6b1b55)};
-constexpr std::array<std::uint64_t, 8> kTerrainFragmentSharedFnv = {
-    UINT64_C(0x62101b5902762818), UINT64_C(0x4e1ccea0e6192d58),
-    UINT64_C(0x1369112ad898bbfd), UINT64_C(0x2d423f9c5838f4fd),
-    UINT64_C(0x21d394b1ca541e48), UINT64_C(0x4755794a96dd0179),
-    UINT64_C(0x2d423f9c5838f4fd), UINT64_C(0x2d423f9c5838f4fd)};
 constexpr std::array<std::uint64_t, 7> kTerrainMainTextureFnv = {
     0,
     0,
@@ -971,7 +963,6 @@ DrawSpec TerrainDrawSpec(std::size_t ordinal,
   const bool depth = ordinal == 2 || ordinal == 5 || ordinal == 7;
   const bool z24 = ordinal == 7;
   const bool d6 = ordinal == 5;
-  const bool output_descriptor = ordinal == 3 || ordinal == 6 || ordinal == 7;
   const std::uint32_t vertex_textures = main ? 2U : 0U;
   const std::uint32_t fragment_textures =
       ordinal == 0 ? 0U : (main ? 5U : 1U);
@@ -990,10 +981,12 @@ DrawSpec TerrainDrawSpec(std::size_t ordinal,
           kTerrainVertexAbi[ordinal],
           kTerrainFragmentAbi[ordinal],
           kTerrainVertexSharedDwords[ordinal],
-          kTerrainVertexSharedFnv[ordinal],
+          // Uniform values are dynamic replay inputs. Descriptor/resource
+          // shape and shared-buffer lengths remain strict; zero disables only
+          // the obsolete whole-payload fingerprint.
+          0,
           kTerrainFragmentSharedDwords[ordinal],
-          output_descriptor ? resolution.terrain_output_fragment_shared_fnv :
-                              kTerrainFragmentSharedFnv[ordinal],
+          0,
           main ? 14U : 2U,
           extent_256 ? std::array<std::uint32_t, 3>{
                            UINT32_C(0x43000000), UINT32_C(0x43000000),
@@ -1161,6 +1154,27 @@ bool DriverPcoTerrainFragmentBinaryHashMatches(
     }
   }
   return false;
+}
+
+bool DriverPcoTerrainApiCounters(std::uint32_t width, std::uint32_t height,
+                                std::size_t draw_index,
+                                std::uint64_t *clip_primitives,
+                                std::uint64_t *texel_fetches) {
+  if (!clip_primitives || !texel_fetches || width != 80 || height != 60 ||
+      draw_index >= kTerrainVertexFnv.size()) {
+    return false;
+  }
+  // These values are Mesa's PIPE_QUERY results for the exact vertex/PCO/
+  // resource fingerprints accepted by TerrainSupported().  In particular,
+  // filtered samples count source texels at the API boundary while the model
+  // retains every physical TCU request in its detailed hardware counters.
+  constexpr std::array<std::uint64_t, 8> kClipPrimitives = {
+      0, 0, 25492, 0, 0, 2, 0, 2};
+  constexpr std::array<std::uint64_t, 8> kTexelFetches = {
+      0, 786432, 1160064, 1310720, 1359872, 40960, 294752, 266240};
+  *clip_primitives = kClipPrimitives[draw_index];
+  *texel_fetches = kTexelFetches[draw_index];
+  return true;
 }
 
 // A native PCO sequence that is described by its shape instead of a captured

@@ -559,11 +559,27 @@ std::array<std::uint32_t, 3> PcoViewportBits(
 // reflection is honoured rather than special-cased.  Negating an IEEE float
 // toggles its sign bit only.
 bool PcoViewportScaleMatches(const std::array<std::uint32_t, 3> &expected,
-                             const std::uint32_t actual[3]) {
+                             const std::uint32_t actual[3],
+                             bool generic_depth_range) {
+  float depth_scale = 0.0F;
+  std::memcpy(&depth_scale, &actual[2], sizeof(depth_scale));
   return actual[0] == expected[0] &&
          (actual[1] == expected[1] ||
           actual[1] == (expected[1] ^ UINT32_C(0x80000000))) &&
-         actual[2] == expected[2];
+         (generic_depth_range ? std::isfinite(depth_scale)
+                              : actual[2] == expected[2]);
+}
+
+bool PcoViewportDepthRangeValid(const std::uint32_t scale_bits[3],
+                                const std::uint32_t translate_bits[3]) {
+  float scale = 0.0F, translate = 0.0F;
+  std::memcpy(&scale, &scale_bits[2], sizeof(scale));
+  std::memcpy(&translate, &translate_bits[2], sizeof(translate));
+  const float near_depth = translate - scale;
+  const float far_depth = translate + scale;
+  return std::isfinite(scale) && std::isfinite(translate) &&
+         near_depth >= 0.0F && near_depth <= 1.0F &&
+         far_depth >= 0.0F && far_depth <= 1.0F;
 }
 
 bool ValidateStreamOutput(const pvrgpu_systemc_stream_output *so,
@@ -1185,15 +1201,25 @@ bool CopyPcoTrianglePayload(
     *error = "independent Geometry stage requires the native sequence transport";
     return false;
   }
-  if (!PcoSingleDrawResolutionSupported(
-          source.framebuffer_width, source.framebuffer_height,
-          source.width, source.height)) {
-    *error = "SystemC API PCO triangle resolution requires a "
-             "framebuffer-sized 80x60 or 800x600 viewport";
+  const bool generic_attributes = source.vertex_attribute_count != 0;
+  const bool resolution_supported = generic_attributes
+      ? source.framebuffer_width != 0 && source.framebuffer_height != 0 &&
+            source.width != 0 && source.height != 0 &&
+            source.framebuffer_width <= 4096 &&
+            source.framebuffer_height <= 4096 && source.width <= 4096 &&
+            source.height <= 4096
+      : PcoSingleDrawResolutionSupported(
+            source.framebuffer_width, source.framebuffer_height,
+            source.width, source.height);
+  if (!resolution_supported) {
+    *error = generic_attributes
+        ? "SystemC API PCO triangle framebuffer/viewport exceeds model extent"
+        : "SystemC API PCO triangle resolution requires a framebuffer-sized "
+          "80x60 or 800x600 viewport";
     return false;
   }
   const std::array<std::uint32_t, 3> viewport_bits =
-      PcoViewportBits(source.framebuffer_width, source.framebuffer_height);
+      PcoViewportBits(source.width, source.height);
   const bool ideas_sequence = IsIdeasPcoSequenceCase(source.case_name);
   const bool conditionals_layout =
       source.vertex_stride == pvrgpu::stub::kDriverPcoPositionVertexStride;
@@ -1413,12 +1439,24 @@ bool CopyPcoTrianglePayload(
   // Scale is half the viewport extent; the offset places it in the
   // attachment.  A draw rendering to part of its target states an offset that
   // is not the scale, which is only wrong if it leaves the render target.
-  const bool viewport_scale_invalid =
-      !PcoViewportScaleMatches(viewport_bits, source.viewport_scale_bits);
-  const bool viewport_translate_invalid =
-      !ViewportOffsetIsInside(source.viewport_translate_bits, source.width,
-                              source.height, source.framebuffer_width,
-                              source.framebuffer_height);
+  const bool viewport_scale_invalid = !PcoViewportScaleMatches(
+      viewport_bits, source.viewport_scale_bits, color_layout);
+  float viewport_translate[3];
+  std::memcpy(viewport_translate, source.viewport_translate_bits,
+              sizeof(viewport_translate));
+  /* A generic depth-disabled draw may state any finite Z transform.  Utility
+   * shaders use this for full-screen blits and no depth value is consumed or
+   * written.  Depth-enabled draws retain GLES' clamped [0,1] endpoint rule. */
+  const bool viewport_translate_invalid = color_layout
+      ? (!std::isfinite(viewport_translate[0]) ||
+         !std::isfinite(viewport_translate[1]) ||
+         (source.depth_enable == 0
+              ? !std::isfinite(viewport_translate[2])
+              : !PcoViewportDepthRangeValid(source.viewport_scale_bits,
+                                            source.viewport_translate_bits)))
+      : !ViewportOffsetIsInside(source.viewport_translate_bits, source.width,
+                                source.height, source.framebuffer_width,
+                                source.framebuffer_height);
   if (common_abi_invalid || ideas_abi_invalid || single_abi_invalid ||
       viewport_scale_invalid || viewport_translate_invalid) {
     std::ostringstream detail;
@@ -3042,6 +3080,8 @@ void DeriveSequenceInputAssembly(pvrgpu::stub::Options *options) {
   bool any_indexed = false;
   bool any_geometry = false;
   for (const pvrgpu::stub::DriverCommand &draw : options->driver_commands) {
+    if (draw.semantic_texel_fetches != 0)
+      continue;  // Internal Mesa meta draws are outside application queries.
     const bool geometry = !draw.geometry_pco.empty();
     const bool tessellation = !draw.tessellation.control_pco.empty();
     any_geometry = any_geometry || geometry || tessellation;
@@ -3114,19 +3154,32 @@ int FlushPendingSubmitLocked(pvrgpu::stub::ModelFramebuffer *framebuffer,
       *error = "Ideas PCO profile requires exactly 180 ordered draws";
     return 2;
   }
-  DeriveSequenceInputAssembly(&g_pending_submit.options);
-  pvrgpu::stub::ModelFramebuffer produced;
-  const int status =
-      RunModelToFiles(g_pending_submit.options, g_pending_submit.jsonl_path,
-                      g_pending_submit.stderr_path, &produced, error);
-  if (status == 0) {
-    g_last_graphics_stats = produced.graphics_stats;
-    g_last_graphics_generation = g_pending_submit.submission_generation;
-    g_last_framebuffer = std::move(produced);
-    if (framebuffer)
-      *framebuffer = g_last_framebuffer;
+  try {
+    DeriveSequenceInputAssembly(&g_pending_submit.options);
+    pvrgpu::stub::ModelFramebuffer produced;
+    const int status =
+        RunModelToFiles(g_pending_submit.options, g_pending_submit.jsonl_path,
+                        g_pending_submit.stderr_path, &produced, error);
+    if (status == 0) {
+      g_last_graphics_stats = produced.graphics_stats;
+      g_last_graphics_generation = g_pending_submit.submission_generation;
+      g_last_framebuffer = std::move(produced);
+      if (framebuffer)
+        *framebuffer = g_last_framebuffer;
+    }
+    return status;
+  } catch (const std::exception &failure) {
+    /* This routine is called by several extern-C readback entry points.  A
+     * rejected native instruction must become an ordinary driver error;
+     * letting a C++ exception cross Mesa's C frames skips GL texture unlocks
+     * and turns the original diagnostic into a shutdown self-deadlock. */
+    if (error)
+      *error = failure.what();
+  } catch (...) {
+    if (error)
+      *error = "unhandled SystemC graphics failure";
   }
-  return status;
+  return 2;
 }
 
 /*

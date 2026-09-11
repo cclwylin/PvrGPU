@@ -13,6 +13,7 @@
 #include "shader/pco_iss.h"
 #include "support/png_writer.h"
 #include "common/diagnostics.h"
+#include "pco_sequence_profiles.h"
 
 #include <array>
 #include <cstdio>
@@ -1003,7 +1004,9 @@ void DebugSequenceAttachments(const MemoryPool &pool,
     return;
   const auto write_dump = [&](const char *suffix, const void *data,
                               std::size_t size) {
-    const std::string path = std::string(dump_dir) + "/ordinal" +
+    const std::string path = std::string(dump_dir) + "/extent" +
+                             std::to_string(state.width) + "x" +
+                             std::to_string(state.height) + "-ordinal" +
                              std::to_string(ordinal) + suffix;
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output)
@@ -1081,7 +1084,9 @@ void DebugSequenceVertexOutputs(const MemoryPool &pool,
   if (dump_dir && dump_dir[0]) {
     const auto write_dump = [&](const char *suffix, const void *data,
                                 std::size_t size) {
-      const std::string path = std::string(dump_dir) + "/ordinal" +
+      const std::string path = std::string(dump_dir) + "/extent" +
+                               std::to_string(state.width) + "x" +
+                               std::to_string(state.height) + "-ordinal" +
                                std::to_string(ordinal) + suffix;
       std::ofstream output(path, std::ios::binary | std::ios::trunc);
       if (!output)
@@ -1572,13 +1577,20 @@ void NormalizeDriverPcoTrianglesApiCounters(const Options &options,
         options.driver_commands.end(), [](const DriverCommand &draw) {
           return !draw.geometry_pco.empty() || !draw.tessellation.evaluation_pco.empty();
         });
+    const bool meta_only_sequence = std::all_of(
+        options.driver_commands.begin(), options.driver_commands.end(),
+        [](const DriverCommand &draw) {
+          return draw.semantic_texel_fetches != 0;
+        });
     const bool has_captured_totals =
         (generic_sequence ||
          command.draw_count == options.driver_commands.size()) &&
-        command.draw_count != 0 && command.ia_vertices != 0 &&
-        (command.ia_primitives != 0 ||
-         (geometry_sequence && counters.ia_primitives == 0)) &&
-        (geometry_sequence || command.clip_invocations != 0);
+        command.draw_count != 0 &&
+        (meta_only_sequence ||
+         (command.ia_vertices != 0 &&
+          (command.ia_primitives != 0 ||
+           (geometry_sequence && counters.ia_primitives == 0)) &&
+          (geometry_sequence || command.clip_invocations != 0)));
     if (!has_captured_totals) {
       throw std::runtime_error(
           "ordered PCO sequence has no complete API counter metadata");
@@ -1625,6 +1637,51 @@ std::uint64_t CheckedMul(std::uint64_t left, std::uint64_t right,
     throw std::overflow_error(std::string("counter overflow: ") + field);
   }
   return left * right;
+}
+
+/* Convert one physical sequence draw to the counters visible through Mesa's
+ * application queries.  PowerVR HSR may discard opaque owners after early
+ * depth, whereas PIPE_QUERY_PIPELINE_STATISTICS observes the samples which
+ * passed early depth.  Internal util_blitter draws execute normally but Mesa
+ * suspends the application's geometry queries around them. */
+void NormalizeSequenceDrawApiCounters(const DriverCommand &command,
+                                      CounterTxn *counters) {
+  if (!counters)
+    throw std::invalid_argument("missing sequence draw counters");
+
+  const std::uint64_t executed_ps = counters->ps_invocations;
+  if (command.depth_enable == 0) {
+    counters->ps_invocations = counters->pbe_fragment_writes;
+  } else {
+    if (command.depth_enable != 1 || command.depth_write != 1 ||
+        counters->depth_written_fragments > counters->depth_tested_fragments ||
+        counters->depth_written_fragments < counters->pbe_fragment_writes) {
+      throw std::runtime_error(
+          "sequence PCO early-depth counter view is inconsistent");
+    }
+    counters->ps_invocations = counters->depth_written_fragments;
+
+    /* The model did not issue texture work for fragments removed by HSR.
+     * When every executed invocation has the same fetch cost, reconstruct the
+     * pre-HSR query value exactly; refuse to invent a rounded value otherwise. */
+    if (executed_ps != 0 && counters->texel_fetches != 0 &&
+        counters->ps_invocations != executed_ps &&
+        counters->texel_fetches % executed_ps == 0) {
+      counters->texel_fetches = CheckedMul(
+          counters->texel_fetches / executed_ps, counters->ps_invocations,
+          "sequence_draw.texel_fetches");
+    }
+  }
+
+  if (command.semantic_texel_fetches != 0) {
+    counters->ia_vertices = 0;
+    counters->ia_primitives = 0;
+    counters->vs_invocations = 0;
+    counters->c_invocations = 0;
+    counters->c_primitives = 0;
+    counters->setup_triangles = 0;
+    counters->texel_fetches = command.semantic_texel_fetches;
+  }
 }
 
 void NormalizeDriverIndexedQuadApiCounters(const Options &options,
@@ -2564,16 +2621,32 @@ void JsonReporter::RunJob() {
         ValidateDrawListStats(state.counters, drawlists);
         AppendVertexPcoEvidence(pool_, state, &vertex_pco);
         AppendFragmentPcoEvidence(pool_, state, &fragment_pco);
-        AccumulatePhysicalCounters(&aggregate, state.counters);
+        CounterTxn api_counters = state.counters;
+        NormalizeSequenceDrawApiCounters(physical_command, &api_counters);
+        std::uint64_t semantic_clip_primitives = 0;
+        std::uint64_t semantic_texel_fetches = 0;
+        if (options_.driver_command.test_case ==
+                "terrain.terrain.capture.1" &&
+            DriverPcoTerrainApiCounters(
+                options_.driver_command.framebuffer_width,
+                options_.driver_command.framebuffer_height, completed,
+                &semantic_clip_primitives, &semantic_texel_fetches)) {
+          api_counters.c_primitives = semantic_clip_primitives;
+          api_counters.setup_triangles = semantic_clip_primitives;
+          api_counters.texel_fetches = semantic_texel_fetches;
+        }
+        AccumulatePhysicalCounters(&aggregate, api_counters);
         if (job_) {
           // Read physical stage counters before JSON/API normalization. A GS
           // that emits zero complete primitives must contribute zero, not IA.
-          job_->graphics_stats.Add(HasPoolHandle(state.geometry_code),
-              state.counters.ia_primitives, state.counters.gs_primitives,
-              state.counters.gs_invocations, HasPoolHandle(state.tessellation_state),
-              state.counters.tessellation_primitives,
-              state.stream_output_primitives_written,
-              state.stream_output_primitives_storage_needed);
+          if (physical_command.semantic_texel_fetches == 0) {
+            job_->graphics_stats.Add(HasPoolHandle(state.geometry_code),
+                state.counters.ia_primitives, state.counters.gs_primitives,
+                state.counters.gs_invocations, HasPoolHandle(state.tessellation_state),
+                state.counters.tessellation_primitives,
+                state.stream_output_primitives_written,
+                state.stream_output_primitives_storage_needed);
+          }
           PublishStreamOutputs(*job_, pool_, state);
         }
         for (DrawListStats &drawlist : drawlists) {

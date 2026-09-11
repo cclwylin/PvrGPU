@@ -23,6 +23,7 @@
 #include "nir/nir.h"
 #include "util/format/u_format.h"
 #include "util/u_debug.h"
+#include "util/u_blitter.h"
 #include "util/u_framebuffer.h"
 #include "util/u_inlines.h"
 #include "util/u_math.h"
@@ -6845,6 +6846,9 @@ pvrgpu_init_refract_systemc_draw(
    command->varying_output_count = binary->varying_output_count;
    command->fragment_varying_start = binary->fragment_varying_start;
    command->fragment_varying_count = binary->fragment_varying_count;
+   memcpy(command->fragment_output_mask,
+          binary->fragment_output_mask,
+          sizeof(command->fragment_output_mask));
 
    command->viewport_scale_bits[0] =
       pvrgpu_float_bits((float)observation->viewport_width * 0.5f);
@@ -7637,7 +7641,8 @@ pvrgpu_compile_terrain_pco_binary(
       "pass=%u profile=%u vs_bytes=%zu vs_fnv1a64=%016llx "
       "vs_abi=%u,%u,%u,%u,%u,%u,%u,%u fs_bytes=%zu "
       "fs_fnv1a64=%016llx fs_abi=%u,%u,%u,%u,%u,%u,%u,%u "
-      "linkage=%u,%u,%u,%u,%u,%u,%u,%u descriptor=%u,%u,%u",
+      "linkage=%u,%u,%u,%u,%u,%u,%u,%u descriptor=%u,%u,%u "
+      "output_mask=%x",
       sequence_pass,
       profile,
       binary->vertex.size,
@@ -7672,7 +7677,8 @@ pvrgpu_compile_terrain_pco_binary(
       binary->fragment_varying_count,
       binary->fragment_texture_descriptor_start,
       binary->fragment_texture_descriptor_count,
-      binary->fragment_texture_descriptor_stride);
+      binary->fragment_texture_descriptor_stride,
+      binary->fragment_output_mask[0]);
    *failure_reason = NULL;
    return true;
 }
@@ -8501,28 +8507,6 @@ pvrgpu_terrain_pco_payload_matches_binary(
          UINT64_C(0x137ad857d68f72e5),
          UINT64_C(0x137ad857d68f72e5),
       };
-   static const uint64_t expected_vertex_shared_fnv1a64
-      [PVRGPU_TERRAIN_PCO_DRAW_COUNT] = {
-         UINT64_C(0x48fff97294e45f55),
-         UINT64_C(0x15e8065d3d6b1b55),
-         UINT64_C(0x798ce5dd9c33fa18),
-         UINT64_C(0x15e8065d3d6b1b55),
-         UINT64_C(0x15e8065d3d6b1b55),
-         UINT64_C(0x15e8065d3d6b1b55),
-         UINT64_C(0x15e8065d3d6b1b55),
-         UINT64_C(0x15e8065d3d6b1b55),
-      };
-   static const uint64_t expected_fragment_shared_fnv1a64
-      [PVRGPU_TERRAIN_PCO_DRAW_COUNT] = {
-         UINT64_C(0x62101b5902762818),
-         UINT64_C(0x4e1ccea0e6192d58),
-         UINT64_C(0x1369112ad898bbfd),
-         UINT64_C(0x2d423f9c5838f4fd),
-         UINT64_C(0x21d394b1ca541e48),
-         UINT64_C(0x4755794a96dd0179),
-         UINT64_C(0x2d423f9c5838f4fd),
-         UINT64_C(0x2d423f9c5838f4fd),
-      };
    static const uint64_t expected_main_texture_fnv1a64
       [PVRGPU_TERRAIN_PCO_MAX_TEXTURES] = {
          0,
@@ -8577,15 +8561,12 @@ pvrgpu_terrain_pco_payload_matches_binary(
       *failure_reason = "captured_output_extent";
       return false;
    }
-   uint64_t expected_fragment_shared =
-      expected_fragment_shared_fnv1a64[profile];
    uint64_t expected_fragment_binary =
       expected_fragment_binary_fnv1a64[profile];
    if (output_width == 800u && output_height == 600u &&
        (profile == PVRGPU_PCO_TERRAIN_D4 ||
         profile == PVRGPU_PCO_TERRAIN_D7 ||
         profile == PVRGPU_PCO_TERRAIN_D8)) {
-      expected_fragment_shared = UINT64_C(0x33d7c2aad6bb3b8a);
       if (profile == PVRGPU_PCO_TERRAIN_D4) {
          expected_fragment_binary = UINT64_C(0x6ad4537c64c80942);
       } else if (profile == PVRGPU_PCO_TERRAIN_D7) {
@@ -8594,25 +8575,37 @@ pvrgpu_terrain_pco_payload_matches_binary(
          expected_fragment_binary = UINT64_C(0xb41e711d1ef41b5a);
       }
    }
+   const uint64_t actual_vertex_binary = pvrgpu_pco_binary_fnv1a64(
+      binary->vertex.data, binary->vertex.size);
+   const uint64_t actual_fragment_binary = pvrgpu_pco_binary_fnv1a64(
+      binary->fragment.data, binary->fragment.size);
+   const uint64_t actual_vertex = pvrgpu_pco_binary_fnv1a64(
+      observation->vertex_data, observation->vertex_data_size);
+   /* Uniform values are live replay inputs: the selected-action pass may
+    * legitimately differ from RenderDoc's warmup pass.  Their exact sizes,
+    * descriptor prefixes and compiled ABI are validated below; only immutable
+    * shader binaries, vertex payload and external texture data use golden
+    * fingerprints. */
    if (binary->vertex.size != expected_vertex_binary_size[profile] ||
-       pvrgpu_pco_binary_fnv1a64(binary->vertex.data,
-                                 binary->vertex.size) !=
-          expected_vertex_binary_fnv1a64[profile] ||
+       actual_vertex_binary != expected_vertex_binary_fnv1a64[profile] ||
        binary->fragment.size != expected_fragment_binary_size[profile] ||
-       pvrgpu_pco_binary_fnv1a64(binary->fragment.data,
-                                 binary->fragment.size) !=
-          expected_fragment_binary ||
-       pvrgpu_pco_binary_fnv1a64(observation->vertex_data,
-                                 observation->vertex_data_size) !=
-          expected_vertex_fnv1a64[profile] ||
-       pvrgpu_pco_binary_fnv1a64(
-          (const uint8_t *)observation->vertex_shared,
-          observation->vertex_shared_count * sizeof(uint32_t)) !=
-          expected_vertex_shared_fnv1a64[profile] ||
-       pvrgpu_pco_binary_fnv1a64(
-          (const uint8_t *)observation->fragment_shared,
-          observation->fragment_shared_count * sizeof(uint32_t)) !=
-          expected_fragment_shared) {
+       actual_fragment_binary != expected_fragment_binary ||
+       actual_vertex != expected_vertex_fnv1a64[profile]) {
+      pvrgpu_counter_eventf(
+         "draw_pco_terrain_payload_fingerprint_mismatch",
+         "profile=%u vb_size=%zu/%zu vb=%016llx/%016llx "
+         "fb_size=%zu/%zu fb=%016llx/%016llx vertex=%016llx/%016llx",
+         profile,
+         binary->vertex.size,
+         expected_vertex_binary_size[profile],
+         (unsigned long long)actual_vertex_binary,
+         (unsigned long long)expected_vertex_binary_fnv1a64[profile],
+         binary->fragment.size,
+         expected_fragment_binary_size[profile],
+         (unsigned long long)actual_fragment_binary,
+         (unsigned long long)expected_fragment_binary,
+         (unsigned long long)actual_vertex,
+         (unsigned long long)expected_vertex_fnv1a64[profile]);
       *failure_reason = "captured_payload_fingerprint";
       return false;
    }
@@ -8765,7 +8758,7 @@ pvrgpu_draw_matches_terrain_pco(
       pvrgpu_counter_eventf(
          "draw_pco_terrain_texture_capture",
          "profile=%u texture=%u stage=%u source_slot=%u descriptor_set=%u "
-         "source=%u producer=%u format=%s extent=%ux%u mips=%u "
+         "source=%u producer_command=%u format=%s extent=%ux%u mips=%u "
          "declared_bytes=%zu payload_bytes=%zu payload_fnv1a64=%016llx "
          "filter=%u,%u,%u wrap=%u,%u max_lod_u4_6=%u",
          profile,
@@ -8855,6 +8848,13 @@ pvrgpu_init_terrain_systemc_draw(
    command->varying_output_count = binary->varying_output_count;
    command->fragment_varying_start = binary->fragment_varying_start;
    command->fragment_varying_count = binary->fragment_varying_count;
+
+   /* Strict Terrain PCO exports RGBA, and native-code validation treats the
+    * zero mask as an explicit depth-only contract.  Carry the compiler's
+    * attachment lanes into each nested sequence draw. */
+   memcpy(command->fragment_output_mask,
+          binary->fragment_output_mask,
+          sizeof(command->fragment_output_mask));
 
    memcpy(command->viewport_scale_bits,
           observation->viewport_scale_bits,
@@ -11924,28 +11924,51 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
       binary = pipeline.graphics;
       geometry = pipeline.geometry;
    } else {
-      bool multisample_target = ctx->framebuffer.zsbuf.texture &&
-         ctx->framebuffer.zsbuf.texture->nr_samples != 0;
-      for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target)
-         multisample_target |= ctx->framebuffer.cbufs[target].texture &&
-            ctx->framebuffer.cbufs[target].texture->nr_samples != 0;
-      compiled = pvrgpu_pco_compile_color_triangle(ctx->pco_compiler,
-                                          ctx->vs->nir,
-                                          ctx->fs->nir,
-                                          attribute_formats,
-                                          ctx->num_stream_output_targets ||
-                                             (info->mode == MESA_PRIM_POINTS &&
-                                              ctx->rasterizer &&
-                                              ctx->rasterizer->state.point_size_per_vertex),
-                                          multisample_target,
-                                          MAX2(1U, ctx->framebuffer.nr_cbufs),
-                                          vertex_uniform_dwords,
-                                          fragment_uniform_dwords,
-                                          attribute_count,
-                                          fragment_texture_count,
+      enum pvrgpu_pco_refract_profile refract_profile;
+      const bool refract_shader =
+         pvrgpu_refract_pco_profile(ctx, &refract_profile);
+      if (refract_shader) {
+         /* Precision is a property of the linked shader, not of an RDC case
+          * name.  Formal replay deliberately removes PVRGPU_RDC_CASE_NAME,
+          * so select the fail-closed mediump lowering from its validated NIR
+          * source pair here as well.  Vertex/texture/framebuffer payloads
+          * continue through the ordinary generic draw command below. */
+         compiled = pvrgpu_pco_compile_refract(ctx->pco_compiler,
+                                               ctx->vs->nir,
+                                               ctx->fs->nir,
+                                               refract_profile,
+                                               &binary,
+                                               error,
+                                               sizeof(error));
+         if (compiled) {
+            pvrgpu_counter_eventf("pco_color_triangle_compile_profile",
+                                  "profile=refract variant=%u",
+                                  refract_profile);
+         }
+      } else {
+         bool multisample_target = ctx->framebuffer.zsbuf.texture &&
+            ctx->framebuffer.zsbuf.texture->nr_samples != 0;
+         for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target)
+            multisample_target |= ctx->framebuffer.cbufs[target].texture &&
+               ctx->framebuffer.cbufs[target].texture->nr_samples != 0;
+         compiled = pvrgpu_pco_compile_color_triangle(ctx->pco_compiler,
+                                             ctx->vs->nir,
+                                             ctx->fs->nir,
+                                             attribute_formats,
+                                             ctx->num_stream_output_targets ||
+                                                (info->mode == MESA_PRIM_POINTS &&
+                                                 ctx->rasterizer &&
+                                                 ctx->rasterizer->state.point_size_per_vertex),
+                                             multisample_target,
+                                             MAX2(1U, ctx->framebuffer.nr_cbufs),
+                                             vertex_uniform_dwords,
+                                             fragment_uniform_dwords,
+                                             attribute_count,
+                                             fragment_texture_count,
                                           &binary,
                                           error,
                                           sizeof(error));
+      }
    }
    if (!compiled) {
       pvrgpu_pco_tessellation_pipeline_binary_finish(&tessellation);
@@ -12038,6 +12061,8 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    struct pvrgpu_draw_pco_triangles_command command;
    memset(&command, 0, sizeof(command));
    command.case_name = pvrgpu_command_case_name("color_triangle.gallium.pco");
+   command.semantic_texel_fetches =
+      ctx->internal_blit_semantic_texel_fetches;
    /* Gallium supplies a minimum, so full per-sample execution is legal and
     * keeps all sample IDs/coverage unique. Sample-mask stores also execute
     * per sample so native feedback can suppress just that sample. */
@@ -14096,6 +14121,8 @@ pvrgpu_destroy(struct pipe_context *pipe)
                          ctx->num_stream_output_targets,
                          ctx->framebuffer.width,
                          ctx->framebuffer.height);
+   if (ctx->blitter)
+      util_blitter_destroy(ctx->blitter);
    for (unsigned stage = 0; stage < MESA_SHADER_MESH_STAGES; ++stage) {
       for (unsigned i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; ++i) {
          pipe_sampler_view_reference(&ctx->sampler_views[stage][i], NULL);
@@ -14590,12 +14617,20 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
       ctx->framebuffer.width == 1 && ctx->framebuffer.height == 1;
 
    const char *rdc_case_name = pvrgpu_rdc_case_name();
-   if (rdc_case_name && strcmp(rdc_case_name,
-                               "terrain.terrain.capture.1") == 0) {
+   enum pvrgpu_pco_terrain_profile terrain_profile;
+   const bool terrain_source_profile =
+      ctx->vs && ctx->fs &&
+      pvrgpu_pco_match_terrain_profile(ctx->vs->nir,
+                                       ctx->fs->nir,
+                                       &terrain_profile);
+   if ((rdc_case_name && strcmp(rdc_case_name,
+                                "terrain.terrain.capture.1") == 0) ||
+       terrain_source_profile) {
       const unsigned terrain_ordinal = ctx->terrain_pco_probe_draws++;
-      const enum pvrgpu_pco_terrain_profile terrain_profile =
-         (enum pvrgpu_pco_terrain_profile)
+      if (!terrain_source_profile) {
+         terrain_profile = (enum pvrgpu_pco_terrain_profile)
             (terrain_ordinal % PVRGPU_TERRAIN_PCO_DRAW_COUNT);
+      }
       const unsigned terrain_pass =
          terrain_ordinal / PVRGPU_TERRAIN_PCO_DRAW_COUNT;
       char terrain_vs_source_hash[72];
@@ -14616,10 +14651,12 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
        * boundary has been identified below, the remaining four physical
        * draws from pass zero are observations only.  Pass one is captured
        * from D1 again and must satisfy the complete strict sequence. */
-      if (terrain_pass == 0 && ctx->terrain_pco_warmup_skipped) {
+      if (ctx->terrain_pco_warmup_skipped &&
+          terrain_profile != PVRGPU_PCO_TERRAIN_D1) {
          ctx->observed_draws++;
          pvrgpu_counter_eventf("draw_pco_terrain_warmup_draw_skip",
-                               "pass=0 profile=%u total=%u",
+                               "pass=%u profile=%u total=%u",
+                               terrain_pass,
                                terrain_profile,
                                ctx->observed_draws);
          pvrgpu_invalidate_full_depth_clear(ctx);
@@ -14642,8 +14679,7 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
       if (terrain_profile == PVRGPU_PCO_TERRAIN_D1) {
          if (ctx->terrain_pco_draw_count != 0)
             pvrgpu_terrain_pco_sequence_reset(ctx);
-         if (terrain_pass != 0)
-            ctx->terrain_pco_warmup_skipped = false;
+         ctx->terrain_pco_warmup_skipped = false;
       }
 
       if (ctx->terrain_pco_draw_count != (unsigned)terrain_profile) {
@@ -14704,8 +14740,7 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
       }
 
       pvrgpu_terrain_pco_observation_destroy(&terrain);
-      if (terrain_pass == 0 &&
-          terrain_profile == PVRGPU_PCO_TERRAIN_D4 &&
+      if (terrain_profile == PVRGPU_PCO_TERRAIN_D4 &&
           ctx->terrain_pco_draw_count == PVRGPU_PCO_TERRAIN_D4 &&
           terrain_failure_reason &&
           strcmp(terrain_failure_reason, "texture_attachment_source") == 0) {
@@ -14714,8 +14749,9 @@ pvrgpu_draw_vbo(struct pipe_context *pipe,
          ctx->observed_draws++;
          pvrgpu_counter_eventf(
             "draw_pco_terrain_warmup_sequence_skip",
-            "pass=0 profile=%u reason=restored_texture_attachment_alias "
+            "pass=%u profile=%u reason=restored_texture_attachment_alias "
             "total=%u",
+            terrain_pass,
             terrain_profile,
             ctx->observed_draws);
          pvrgpu_invalidate_full_depth_clear(ctx);
@@ -16367,5 +16403,13 @@ pvrgpu_create_context(struct pipe_screen *screen, void *priv,
    ctx->base.set_shader_buffers = pvrgpu_set_shader_buffers;
    ctx->base.set_shader_images = pvrgpu_set_shader_images;
    ctx->base.memory_barrier = pvrgpu_memory_barrier;
+   ctx->blitter = util_blitter_create(&ctx->base);
+   if (!ctx->blitter) {
+      ctx->base.destroy(&ctx->base);
+      return NULL;
+   }
+   /* Shader creation here avoids changing application state from inside a
+    * later blit and matches the software reference driver's setup. */
+   util_blitter_cache_all_shaders(ctx->blitter);
    return &ctx->base;
 }

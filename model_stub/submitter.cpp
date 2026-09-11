@@ -200,11 +200,31 @@ float FloatFromBits(std::uint32_t bits) {
 // is y-flipped, so GL states scale_y = -h/2 there.  Negating an IEEE float
 // toggles only its sign bit.
 bool ViewportScaleMatches(const std::array<std::uint32_t, 3> &actual,
-                          const std::array<std::uint32_t, 3> &expected) {
+                          const std::array<std::uint32_t, 3> &expected,
+                          bool generic_depth_range = false) {
+  const float depth_scale = FloatFromBits(actual[2]);
   return actual[0] == expected[0] &&
          (actual[1] == expected[1] ||
           actual[1] == (expected[1] ^ UINT32_C(0x80000000))) &&
-         actual[2] == expected[2];
+         (generic_depth_range ? std::isfinite(depth_scale)
+                              : actual[2] == expected[2]);
+}
+
+bool GenericViewportTranslateValid(const DriverCommand &command) {
+  const float x = FloatFromBits(command.viewport_translate_bits[0]);
+  const float y = FloatFromBits(command.viewport_translate_bits[1]);
+  const float z = FloatFromBits(command.viewport_translate_bits[2]);
+  const float depth_scale = FloatFromBits(command.viewport_scale_bits[2]);
+  if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+      !std::isfinite(depth_scale)) {
+    return false;
+  }
+  if (command.depth_enable == 0)
+    return true;
+  const float near_depth = z - depth_scale;
+  const float far_depth = z + depth_scale;
+  return near_depth >= 0.0F && near_depth <= 1.0F && far_depth >= 0.0F &&
+         far_depth <= 1.0F;
 }
 
 // Mesa flips front_ccw together with the viewport Y sign
@@ -595,7 +615,9 @@ bool DriverPcoTrianglesCommandSupported(const DriverCommand &command) {
         command.fragment_position_count != 4 ||
         command.fragment_varying_start != 4 ||
         command.fragment_varying_count != 16)) ||
-      !ViewportScaleMatches(command.viewport_scale_bits, viewport_bits) ||
+      !ViewportScaleMatches(command.viewport_scale_bits, viewport_bits,
+                            color_layout) ||
+      (color_layout && !GenericViewportTranslateValid(command)) ||
       command.front_ccw > 1 ||
       (!color_layout && command.cull_face != 2) ||
       command.fill_front != 0 || command.fill_back != 0 ||

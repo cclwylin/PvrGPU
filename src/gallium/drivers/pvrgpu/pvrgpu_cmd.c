@@ -1514,9 +1514,11 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       cmd->clip_invocations == 0 && cmd->clip_primitives == 0 &&
       cmd->hs_invocations == 0 && cmd->ds_invocations == 0 &&
       cmd->cs_invocations == 0 && cmd->ps_invocations == 0 &&
-      cmd->setup_triangles == 0 && cmd->semantic_texel_fetches == 0;
+      cmd->setup_triangles == 0;
    /*
-    * A draw that is one member of a sequence states no counters of its own.
+    * A draw that is one member of a sequence states no pipeline counters of
+    * its own. semantic_texel_fetches is the exception: an internal Mesa blit
+    * uses it to describe the application-query view of real modeled work.
     * The totals belong to the sequence, and only once every member has been
     * submitted can they be summed -- which is why the ideas profile used to
     * carry a pinned set here instead.  The bridge derives them now.
@@ -1757,12 +1759,20 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       pvrgpu_cmd_viewport_scale_matches(cmd->viewport_scale_bits,
                                         cmd->width,
                                         cmd->height, color_layout);
-   float viewport_offset[3];
+   float viewport_scale[3], viewport_offset[3];
+   memcpy(viewport_scale, cmd->viewport_scale_bits, sizeof(viewport_scale));
    memcpy(viewport_offset, cmd->viewport_translate_bits, sizeof(viewport_offset));
+   /* Utility draws may use an unclamped Z viewport (for example scale=1,
+    * translate=0) when depth is disabled.  It still reaches the rasterizer
+    * verbatim, but cannot address or update a depth attachment, so only its
+    * finiteness is part of the command contract in that state. */
    const bool viewport_offset_ok = color_layout ?
       (isfinite(viewport_offset[0]) && isfinite(viewport_offset[1]) &&
-       pvrgpu_cmd_viewport_depth_range_valid(cmd->viewport_scale_bits,
-                                              cmd->viewport_translate_bits)) :
+       (cmd->depth_enable == 0
+           ? (isfinite(viewport_offset[2]) &&
+              isfinite(viewport_scale[2]))
+           : pvrgpu_cmd_viewport_depth_range_valid(
+                cmd->viewport_scale_bits, cmd->viewport_translate_bits))) :
       pvrgpu_cmd_viewport_offset_is_inside(cmd->viewport_translate_bits,
                                            cmd->width,
                                            cmd->height,

@@ -915,13 +915,16 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
       // Float reconstruction matches Gallium's stored half-sum/difference.
       const float near_depth = translate[2] - depth_scale;
       const float far_depth = translate[2] + depth_scale;
+      const bool depth_transform_valid = parsed.depth_enable == 0
+          ? std::isfinite(translate[2]) && std::isfinite(depth_scale)
+          : std::isfinite(translate[2]) && std::isfinite(depth_scale) &&
+                near_depth >= 0.0F && near_depth <= 1.0F &&
+                far_depth >= 0.0F && far_depth <= 1.0F;
       viewport_valid = parsed.viewport_scale_bits[0] == expected_viewport[0] &&
           (parsed.viewport_scale_bits[1] == expected_viewport[1] ||
            parsed.viewport_scale_bits[1] == (expected_viewport[1] ^ UINT32_C(0x80000000))) &&
           std::isfinite(translate[0]) && std::isfinite(translate[1]) &&
-          std::isfinite(translate[2]) && std::isfinite(depth_scale) &&
-          near_depth >= 0.0F && near_depth <= 1.0F &&
-          far_depth >= 0.0F && far_depth <= 1.0F;
+          depth_transform_valid;
     }
     const std::uint64_t end_vertex =
         static_cast<std::uint64_t>(parsed.first_vertex) +
@@ -985,7 +988,8 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         parsed.color_mask > 0x0f || parsed.blend_enable > 1 ||
         parsed.dither != 1 || parsed.depth_enable > 1 ||
         parsed.depth_write > 1 || parsed.depth_func > 7 ||
-        parsed.depth_format == 0 ||
+        (parsed.depth_write != 0 && parsed.depth_enable == 0) ||
+        (parsed.depth_enable != 0 && parsed.depth_format == 0) ||
         !viewport_valid) {
       *error = conditionals_geometry
                    ? "draw_pco_triangles metadata is malformed or outside "

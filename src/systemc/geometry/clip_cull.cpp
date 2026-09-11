@@ -33,6 +33,12 @@ using pvrgpu::stub::CullFaceMode;
 using pvrgpu::stub::FaceCullState;
 using pvrgpu::stub::FrontFaceWinding;
 
+/* draw_pt's LLVM middle end accepts 4096 vertices and trims a triangle-list
+ * batch to the last complete primitive.  Its post-VS clip decision is shared
+ * by that whole 4095-occurrence batch.  Indexed work retains the reference
+ * uArch's smaller cache/segment extent from VertexFetch. */
+constexpr std::size_t kMesaNonIndexedTriangleSegment = 4095;
+
 float BitsFloat(std::uint32_t bits) {
   float value = 0.0f;
   static_assert(sizeof(value) == sizeof(bits));
@@ -921,8 +927,11 @@ void ClipCull::Run() {
           !driver_pco_triangles ? state.raster_state.face_cull.front_face
           : state.raster_state.face_cull.front_face == FrontFaceWinding::kClockwise
               ? FrontFaceWinding::kCounterClockwise : FrontFaceWinding::kClockwise;
-      if (kReferenceUarch.index_segment_max_indices == 0 ||
-          kReferenceUarch.index_segment_max_indices % 3 != 0) {
+      const std::size_t clip_segment_max_indices =
+          driver_pco_indexed ? kReferenceUarch.index_segment_max_indices
+                             : kMesaNonIndexedTriangleSegment;
+      if (clip_segment_max_indices == 0 ||
+          clip_segment_max_indices % 3 != 0) {
         throw std::runtime_error(
             "ClipCull triangle segment configuration is invalid");
       }
@@ -931,8 +940,7 @@ void ClipCull::Run() {
       std::size_t segment_begin = 0;
       while (segment_begin < lane_refs.size()) {
         const std::size_t segment_count = std::min<std::size_t>(
-            kReferenceUarch.index_segment_max_indices,
-            lane_refs.size() - segment_begin);
+            clip_segment_max_indices, lane_refs.size() - segment_begin);
         if (segment_count == 0 || segment_count % 3 != 0)
           throw std::runtime_error(
               "ClipCull occurrence segment split a triangle");

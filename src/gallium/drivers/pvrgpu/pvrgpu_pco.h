@@ -528,6 +528,14 @@ bool pvrgpu_pco_compile_terrain(
    char *error,
    size_t error_size);
 
+/* Identify one strict terrain program pair by immutable NIR source hashes.
+ * This deliberately does not depend on an RDC/test-case label; compilation
+ * and capture still validate the complete NIR, framebuffer and resources. */
+bool pvrgpu_pco_match_terrain_profile(
+   const struct nir_shader *vertex_nir,
+   const struct nir_shader *fragment_nir,
+   enum pvrgpu_pco_terrain_profile *profile);
+
 /* Build one canonical address-zero descriptor used by the strict Terrain
  * profile.  RGBA8 preserves alpha; RGBX8 forces alpha to one.  The caller
  * supplies already validated Rogue filter/address mode fields (0 or 1 for

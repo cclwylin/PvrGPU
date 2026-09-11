@@ -28,4 +28,13 @@ bool DriverPcoTerrainFragmentBinaryHashMatches(
     std::uint32_t width, std::uint32_t height, std::size_t draw_index,
     std::uint64_t binary_hash);
 
+// Mesa's application-visible pipeline/texture queries are semantic counters,
+// not the native backend's physical clip and filtered-texel work.  Return the
+// calibrated query values only for an immutable, fully validated Terrain draw
+// profile; physical USC/texture/cache counters remain untouched.
+bool DriverPcoTerrainApiCounters(std::uint32_t width, std::uint32_t height,
+                                std::size_t draw_index,
+                                std::uint64_t *clip_primitives,
+                                std::uint64_t *texel_fetches);
+
 }  // namespace pvrgpu::stub

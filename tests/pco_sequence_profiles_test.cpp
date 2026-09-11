@@ -11,6 +11,7 @@
 namespace {
 
 using pvrgpu::stub::DriverPcoSequenceSupported;
+using pvrgpu::stub::DriverPcoTerrainApiCounters;
 using pvrgpu::stub::DriverPcoTerrainExternalPayloadHashMatches;
 using pvrgpu::stub::DriverPcoTerrainFragmentBinaryHashMatches;
 using pvrgpu::stub::Options;
@@ -333,6 +334,29 @@ void TestTerrainResolutionSpecificFragmentBinariesFailClosed() {
         "out-of-range Terrain draw accepted a fragment binary");
 }
 
+void TestTerrain80x60ApiCounterSemanticsFailClosed() {
+  static constexpr std::array<std::uint64_t, 8> clip = {
+      0, 0, 25492, 0, 0, 2, 0, 2};
+  static constexpr std::array<std::uint64_t, 8> texel = {
+      0, 786432, 1160064, 1310720, 1359872, 40960, 294752, 266240};
+  for (std::size_t draw = 0; draw < clip.size(); ++draw) {
+    std::uint64_t actual_clip = UINT64_MAX;
+    std::uint64_t actual_texel = UINT64_MAX;
+    Check(DriverPcoTerrainApiCounters(80, 60, draw, &actual_clip,
+                                      &actual_texel),
+          "Terrain 80x60 API counters were rejected");
+    Check(actual_clip == clip[draw] && actual_texel == texel[draw],
+          "Terrain 80x60 API counters changed");
+  }
+  std::uint64_t ignored = 0;
+  Check(!DriverPcoTerrainApiCounters(800, 600, 0, &ignored, &ignored),
+        "uncalibrated Terrain resolution exposed API counters");
+  Check(!DriverPcoTerrainApiCounters(80, 60, 8, &ignored, &ignored),
+        "out-of-range Terrain draw exposed API counters");
+  Check(!DriverPcoTerrainApiCounters(80, 60, 0, nullptr, &ignored),
+        "Terrain API counters accepted a null output");
+}
+
 }  // namespace
 
 int main() {
@@ -346,6 +370,7 @@ int main() {
     TestKnownProfileEnvelopeFailsClosed();
     TestTerrainFullMipPayloadFingerprintsFailClosed();
     TestTerrainResolutionSpecificFragmentBinariesFailClosed();
+    TestTerrain80x60ApiCounterSemanticsFailClosed();
     std::cout << "pco_sequence_profiles_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

@@ -10,6 +10,7 @@
 #include "pipe/p_defines.h"
 #include "pipe/p_state.h"
 #include "nir/nir.h"
+#include "nir/tgsi_to_nir.h"
 #include "util/format/u_format.h"
 #include "util/u_debug_cb.h"
 #include "util/u_helpers.h"
@@ -387,18 +388,28 @@ pvrgpu_create_shader_state_for_stage(struct pipe_context *pipe,
                                      const struct pipe_shader_state *state,
                                      mesa_shader_stage stage)
 {
-   (void)pipe;
    struct pvrgpu_shader_state *shader = CALLOC_STRUCT(pvrgpu_shader_state);
    if (!shader)
       return NULL;
 
    shader->stage = stage;
    if (state) {
-      shader->type = state->type;
-      shader->has_tgsi = state->tokens != NULL;
-      shader->has_nir = state->ir.nir != NULL;
-      shader->tgsi = state->tokens;
-      shader->nir = state->ir.nir;
+      if (state->type == PIPE_SHADER_IR_NIR) {
+         /* Gallium transfers ownership of NIR shaders to the driver. */
+         shader->type = PIPE_SHADER_IR_NIR;
+         shader->nir = state->ir.nir;
+         shader->has_nir = shader->nir != NULL;
+      } else if (state->type == PIPE_SHADER_IR_TGSI && state->tokens) {
+         /* Utility shaders such as u_blitter are TGSI. Their tokens are
+          * temporary at create_*_state time, so retaining the pointer is both
+          * unusable by PCO and a lifetime bug. Convert to owned NIR now. */
+         shader->nir = tgsi_to_nir(state->tokens, pipe->screen, false);
+         shader->type = PIPE_SHADER_IR_NIR;
+         shader->has_nir = shader->nir != NULL;
+         shader->has_tgsi = true;
+      } else {
+         shader->type = state->type;
+      }
       shader->stream_output = state->stream_output;
    }
    pvrgpu_counter_eventf("create_shader",

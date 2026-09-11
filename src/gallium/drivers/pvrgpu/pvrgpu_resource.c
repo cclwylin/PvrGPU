@@ -10,6 +10,7 @@
 #include "frontend/sw_winsys.h"
 #include "pipe/p_defines.h"
 #include "util/format/u_format.h"
+#include "util/u_blitter.h"
 #include "util/u_debug.h"
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
@@ -3842,9 +3843,76 @@ pvrgpu_emit_framebuffer_blit_command(struct pipe_context *pipe,
 }
 
 static void
+pvrgpu_shader_blit(struct pvrgpu_context *ctx,
+                   const struct pipe_blit_info *info)
+{
+   struct blitter_context *blitter = ctx->blitter;
+
+   util_blitter_save_vertex_buffers(blitter, ctx->vertex_buffers,
+                                    ctx->num_vertex_buffers);
+   util_blitter_save_vertex_elements(blitter, ctx->vertex_elements);
+   util_blitter_save_vertex_shader(blitter, ctx->vs);
+   util_blitter_save_geometry_shader(blitter, ctx->gs);
+   util_blitter_save_so_targets(blitter, ctx->num_stream_output_targets,
+                                ctx->stream_output_targets,
+                                ctx->stream_output_prim);
+   util_blitter_save_rasterizer(blitter, ctx->rasterizer);
+   util_blitter_save_viewport(blitter, &ctx->viewport);
+   util_blitter_save_scissor(blitter, &ctx->scissor);
+   util_blitter_save_fragment_shader(blitter, ctx->fs);
+   util_blitter_save_blend(blitter, ctx->blend);
+   util_blitter_save_tessctrl_shader(blitter, ctx->tcs);
+   util_blitter_save_tesseval_shader(blitter, ctx->tes);
+   util_blitter_save_depth_stencil_alpha(blitter, ctx->dsa);
+   util_blitter_save_stencil_ref(blitter, &ctx->stencil_ref);
+   util_blitter_save_sample_mask(blitter, ctx->sample_mask,
+                                 ctx->min_samples);
+   util_blitter_save_framebuffer(blitter, &ctx->framebuffer);
+   util_blitter_save_fragment_sampler_states(
+      blitter, ctx->num_samplers[MESA_SHADER_FRAGMENT],
+      (void **)ctx->samplers[MESA_SHADER_FRAGMENT]);
+   util_blitter_save_fragment_sampler_views(
+      blitter, ctx->num_sampler_views[MESA_SHADER_FRAGMENT],
+      ctx->sampler_views[MESA_SHADER_FRAGMENT]);
+   util_blitter_save_render_condition(blitter, NULL, false,
+                                      PIPE_RENDER_COND_WAIT);
+   util_blitter_blit(blitter, info, NULL);
+}
+
+static bool
+pvrgpu_is_full_level_mipmap_blit(const struct pipe_blit_info *info)
+{
+   if (!info || !info->src.resource || !info->dst.resource ||
+       info->src.resource != info->dst.resource ||
+       info->dst.level != info->src.level + 1 ||
+       info->src.level > info->src.resource->last_level ||
+       info->dst.level > info->dst.resource->last_level ||
+       info->filter != PIPE_TEX_FILTER_LINEAR ||
+       info->mask != PIPE_MASK_RGBA || info->scissor_enable ||
+       info->src.box.x != 0 || info->src.box.y != 0 ||
+       info->dst.box.x != 0 || info->dst.box.y != 0 ||
+       info->src.box.z != info->dst.box.z ||
+       info->src.box.depth != info->dst.box.depth ||
+       info->src.box.width != (int)u_minify(info->src.resource->width0,
+                                            info->src.level) ||
+       info->src.box.height != (int)u_minify(info->src.resource->height0,
+                                             info->src.level) ||
+       info->dst.box.width != (int)u_minify(info->dst.resource->width0,
+                                            info->dst.level) ||
+       info->dst.box.height != (int)u_minify(info->dst.resource->height0,
+                                             info->dst.level))
+      return false;
+
+   return util_format_is_plain(info->src.format) &&
+          !util_format_is_depth_or_stencil(info->src.format) &&
+          info->src.format == info->dst.format;
+}
+
+static void
 pvrgpu_blit(struct pipe_context *pipe,
             const struct pipe_blit_info *info)
 {
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
    const bool copy_2d = pvrgpu_can_blit_as_2d_copy(info);
    const bool texture_blit =
       !copy_2d && pvrgpu_can_blit_as_texture_region(info);
@@ -3858,6 +3926,28 @@ pvrgpu_blit(struct pipe_context *pipe,
     */
    if (copy_2d || texture_blit || depth_stencil_blit)
       pvrgpu_flush_current_color_attachments(pipe);
+
+   /* glGenerateMipmap is rendered as one shader draw per level by llvmpipe.
+    * Execute the same real GPU work here so generated levels, fragment/texel
+    * counts and drawlist boundaries all come from PCO/SystemC.  Other copies
+    * retain the exact CPU paths below. */
+   if (texture_blit && ctx->blitter &&
+       pvrgpu_is_full_level_mipmap_blit(info) &&
+       util_blitter_is_blit_supported(ctx->blitter, info)) {
+      pvrgpu_counter_eventf("blit_shader_mipmap",
+                            "src_level=%u dst_level=%u dst=%dx%d",
+                            info->src.level, info->dst.level,
+                            info->dst.box.width, info->dst.box.height);
+      const uint64_t stamp_width =
+         ((uint64_t)info->dst.box.width + UINT64_C(3)) & ~UINT64_C(3);
+      const uint64_t stamp_height =
+         ((uint64_t)info->dst.box.height + UINT64_C(1)) & ~UINT64_C(1);
+      ctx->internal_blit_semantic_texel_fetches =
+         stamp_width * stamp_height * UINT64_C(4);
+      pvrgpu_shader_blit(ctx, info);
+      ctx->internal_blit_semantic_texel_fetches = 0;
+      return;
+   }
 
    if (copy_2d) {
       pvrgpu_copy_texture_region_unchecked(info->dst.resource,
