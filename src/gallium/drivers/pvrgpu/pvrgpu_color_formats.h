@@ -8,8 +8,17 @@ static inline int
 pvrgpu_is_explicit_color_format(const char *format)
 {
    return format && (!strcmp(format, "PIPE_FORMAT_R8G8B8A8_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R8G8B8A8_SRGB") ||
+                     !strcmp(format, "PIPE_FORMAT_B8G8R8A8_SRGB") ||
                      !strcmp(format, "PIPE_FORMAT_R10G10B10A2_UNORM") ||
-                     !strcmp(format, "PIPE_FORMAT_B10G10R10A2_UNORM"));
+                     !strcmp(format, "PIPE_FORMAT_B10G10R10A2_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R32_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R32_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R32G32_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R32G32_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R32G32B32A32_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R32G32B32A32_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R32G32B32A32_FLOAT"));
 }
 
 static inline const char *

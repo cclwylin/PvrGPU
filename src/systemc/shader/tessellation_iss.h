@@ -30,6 +30,7 @@ struct TessellationTaskState {
   std::uint32_t instruction_index = 0;
   std::uint32_t ended = 0;
   std::uint64_t steps = 0;
+  DriverStorageBufferAbi storage_abi;
 };
 struct TessellationExecutionStats {
   std::uint64_t instructions = 0;
@@ -49,15 +50,18 @@ struct TessellationMemoryCallbacks {
 };
 
 void ValidateTessellationProgram(const PcoDecodedProgram &program,
-                                 const DriverPcoStageAbi &abi);
+                                 const DriverPcoStageAbi &abi,
+                                 const DriverStorageBufferAbi *storage = nullptr);
 TessellationTaskState MakeTessellationControlTask(
     const DriverPcoStageAbi &abi, const std::vector<std::uint32_t> &shared,
     std::uint32_t primitive_id, std::uint32_t patch_vertices,
-    std::uint32_t output_vertices);
+    std::uint32_t output_vertices,
+    const DriverStorageBufferAbi *storage = nullptr);
 TessellationTaskState MakeTessellationEvaluationTask(
     const DriverPcoStageAbi &abi, const std::vector<std::uint32_t> &shared,
     std::uint32_t primitive_id, std::uint32_t patch_vertices,
-    const std::array<std::uint32_t, 3> *coordinates, std::uint32_t count);
+    const std::array<std::uint32_t, 3> *coordinates, std::uint32_t count,
+    const DriverStorageBufferAbi *storage = nullptr);
 void StepTessellationTask(const PcoDecodedProgram &program,
     const DriverPcoStageAbi &abi, TessellationTaskState &task,
     const TessellationMemoryCallbacks &memory, TessellationExecutionStats &stats);

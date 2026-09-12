@@ -60,6 +60,10 @@ struct ClipVertex {
   // vertices.  draw_pipe_clip.c recomputes window coordinates for generated
   // intersections with three separate CPU operations instead.
   bool generated_intersection = false;
+  // Synthetic point/line quad corners can be extremely far outside the clip
+  // volume. Their intersections need a wider accumulator or the visible
+  // sub-pixel width is cancelled away before fixed setup.
+  bool wide_raster_primitive = false;
   // Flat/special outputs carry raw integer bits, not numbers to lerp.
   // Ordinary float varyings and shader clip positions may be non-finite; the
   // selected-plane policy below decides whether a primitive survives. This
@@ -152,7 +156,7 @@ std::uint32_t ClipMask(const ClipVertex &vertex, bool depth_clamp, std::uint8_t 
   return mask;
 }
 
-ClipVertex Interpolate(float t, const ClipVertex &outside,
+ClipVertex Interpolate(double t, const ClipVertex &outside,
                        const ClipVertex &inside) {
   if (outside.output_count != inside.output_count ||
       outside.output_count < 4 ||
@@ -170,9 +174,19 @@ ClipVertex Interpolate(float t, const ClipVertex &outside,
     if (result.non_interpolated_mask & (UINT64_C(1) << component)) {
       result.output[component] = outside.output[component];
     } else {
-      result.output[component] =
-          outside.output[component] +
-          t * (inside.output[component] - outside.output[component]);
+      if (outside.wide_raster_primitive || inside.wide_raster_primitive) {
+        result.output[component] = static_cast<float>(
+            static_cast<double>(outside.output[component]) +
+            static_cast<double>(t) *
+                (static_cast<double>(inside.output[component]) -
+                 static_cast<double>(outside.output[component])));
+      } else {
+        const float binary32_t = static_cast<float>(t);
+        result.output[component] =
+            outside.output[component] +
+            binary32_t *
+                (inside.output[component] - outside.output[component]);
+      }
     }
     if (component < 4 && !std::isfinite(result.output[component]))
       throw std::runtime_error("ClipCull intersection is non-finite");
@@ -245,18 +259,18 @@ ClipTriangle(const std::array<ClipVertex, 3> &input, bool depth_clamp, std::uint
         // clipper and choose the endpoint that minimizes interpolation error.
         if (distance < 0.0F) {
           if (-distance < previous_distance) {
-            intersection = Interpolate(distance / denominator, current,
+            intersection = Interpolate(static_cast<double>(distance) / denominator, current,
                                        previous);
           } else {
-            intersection = Interpolate(-previous_distance / denominator,
+            intersection = Interpolate(-static_cast<double>(previous_distance) / denominator,
                                        previous, current);
           }
         } else {
           if (-previous_distance < distance) {
-            intersection = Interpolate(-previous_distance / denominator,
+            intersection = Interpolate(-static_cast<double>(previous_distance) / denominator,
                                        previous, current);
           } else {
-            intersection = Interpolate(distance / denominator, current,
+            intersection = Interpolate(static_cast<double>(distance) / denominator, current,
                                        previous);
           }
         }
@@ -400,6 +414,7 @@ ClipVertex OffsetClipVertexScreenPixels(const ClipVertex &vertex,
                                         std::uint32_t width,
                                         std::uint32_t height) {
   ClipVertex result = vertex;
+  result.wide_raster_primitive = true;
   const float w = vertex.output[3];
   const float delta_ndc_x = delta_screen_x * 2.0F / static_cast<float>(width);
   const float delta_ndc_y = delta_screen_y * 2.0F / static_cast<float>(height);
@@ -1103,12 +1118,17 @@ void ClipCull::Run() {
           const bool width_expanded =
               (source_is_point &&
                BuildPointQuadCorners(vertices[0],
-                                     0.5F * PointSizeFor(state, vertices[0]),
+                                     0.5F * PointSizeFor(state, vertices[0]) +
+                                         1.0F / static_cast<float>(kSubpixelScale),
                                      state.width, state.height,
                                      quad_corners)) ||
               (source_is_line &&
                BuildLineQuadCorners(vertices[0], vertices[1],
-                                    0.5F * state.raster_state.line_width,
+                                    state.raster_state.line_width <= 1.0F &&
+                                            !(state.raster_state.sample_count > 1 &&
+                                              state.raster_state.multisample_enable)
+                                        ? 1.0F
+                                        : 0.5F * state.raster_state.line_width,
                                     state.width,
                                     state.height, quad_corners));
 
@@ -1123,6 +1143,7 @@ void ClipCull::Run() {
            * quad already describes it exactly.
            */
           LineSegment line_segment;
+          pvrgpu::stub::PointSprite point_sprite;
           if (source_is_line && width_expanded &&
               state.raster_state.line_width <= 1.0F) {
             const float wa = vertices[0].output[3];
@@ -1146,6 +1167,15 @@ void ClipCull::Run() {
               line_segment.y1 = to_screen_y(vertices[1], wb);
               line_segment.valid = 1;
             }
+          }
+          if (source_is_point && width_expanded && vertices[0].output[3] > 0.0F) {
+            const float w = vertices[0].output[3];
+            point_sprite.center_x =
+                vertices[0].output[0] / w * viewport.scale_x + viewport.offset_x;
+            point_sprite.center_y =
+                vertices[0].output[1] / w * viewport.scale_y + viewport.offset_y;
+            point_sprite.half_size = 0.5F * PointSizeFor(state, vertices[0]);
+            point_sprite.valid = 1;
           }
 
           const auto emit_triangle = [&](const std::array<ClipVertex, 3> &tri,
@@ -1220,6 +1250,7 @@ void ClipCull::Run() {
                 }
               }
               triangle.line = line_segment;
+              triangle.point = point_sprite;
               triangle.face_culled = face_culled ? 1U : 0U;
               if (face_culled)
                 triangle.rasterizable = 0;

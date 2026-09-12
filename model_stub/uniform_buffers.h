@@ -45,6 +45,14 @@ inline bool ValidateDriverUniformBuffers(const DriverCommand &command,
                       : 4U + 20U * command.tessellation_evaluation_sampled_texture_count)
         : stage == 2 && !command.geometry_pco.empty()
             ? 4U + 20U * command.geometry_sampled_texture_count : 0U;
+    const auto &storage = stage == 4 ? command.tessellation.evaluation_storage
+                          : command.tessellation.control_storage;
+    const std::size_t push_start = stage >= 3 && !command.tessellation.evaluation_pco.empty()
+        ? (storage.descriptor_count ? storage.descriptor_start
+                                    : start + count * kUniformBufferDescriptorDwordCount) +
+              4U * storage.descriptor_count
+        : start + count * kUniformBufferDescriptorDwordCount +
+              (stage == 1 ? command.fragment_image_descriptor_count * 8U : 0U);
     if (count > kMaximumUniformBuffersPerStage ||
         (count == 0 && start != native_base))
       return reject("descriptor range is invalid");
@@ -54,8 +62,7 @@ inline bool ValidateDriverUniformBuffers(const DriverCommand &command,
       if (start != (stage >= 2 ? native_base : textures * 20U) || start > shared.size() ||
           count * kUniformBufferDescriptorDwordCount > shared.size() - start ||
           shared.size() != abi.shareds ||
-          abi.push_constant_start != start + count * kUniformBufferDescriptorDwordCount +
-              (stage == 1 ? command.fragment_image_descriptor_count * 8U : 0U) ||
+          abi.push_constant_start != push_start ||
           abi.push_constant_count > shared.size() - abi.push_constant_start ||
           abi.push_constant_start + abi.push_constant_count != shared.size())
         return reject("descriptor/texture/push-constant layout is inconsistent");

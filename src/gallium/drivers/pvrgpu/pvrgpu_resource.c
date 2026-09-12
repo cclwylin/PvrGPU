@@ -1372,11 +1372,7 @@ pvrgpu_resource_read_back_color_surface(struct pipe_context *pipe,
 
    bool written = false;
    char error[512] = { 0 };
-   const char *color_format =
-      surface->format == PIPE_FORMAT_R8G8B8A8_UNORM ||
-      surface->format == PIPE_FORMAT_R10G10B10A2_UNORM ||
-      surface->format == PIPE_FORMAT_B10G10R10A2_UNORM
-         ? util_format_name(surface->format) : NULL;
+   const char *color_format = pvrgpu_command_format_for_surface(surface->format);
    const bool flushed =
       pvrgpu_systemc_flush_readback_pixels(width, height, bytes_per_pixel,
                                            (uint32_t)attachment, samples, 0, layer_count, color_format, pixels,

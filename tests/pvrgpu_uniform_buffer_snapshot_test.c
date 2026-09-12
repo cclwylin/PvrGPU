@@ -227,6 +227,23 @@ test_geometry_sampler_descriptor_prefix(void)
          CHECK(pvrgpu_cmd_validate_uniform_buffers(&api,error,sizeof(error)));
       }
    }
+   for (unsigned i = 0; i < 2; ++i) {
+      const unsigned vertex_inputs = i ? 64 : 3;
+      cmd.geometry_pco_abi.vertex_inputs = vertex_inputs;
+      CHECK(!pvrgpu_validate_draw_pco_triangles_command("unused", &cmd,
+                                                        error, sizeof(error)));
+      CHECK(strstr(error, "vertex attribute count") != NULL);
+   }
+   const unsigned invalid_vertex_inputs[] = {0, 1, 65, UINT32_MAX};
+   for (unsigned i = 0;
+        i < sizeof(invalid_vertex_inputs) / sizeof(invalid_vertex_inputs[0]);
+        ++i) {
+      cmd.geometry_pco_abi.vertex_inputs = invalid_vertex_inputs[i];
+      CHECK(!pvrgpu_validate_draw_pco_triangles_command("unused", &cmd,
+                                                        error, sizeof(error)));
+      CHECK(strstr(error, "independent geometry program ABI") != NULL);
+   }
+   cmd.geometry_pco_abi.vertex_inputs = 2;
    const unsigned invalid[]={0,3,5,23,25,165,184,UINT32_MAX};
    for(unsigned i=0;i<sizeof(invalid)/sizeof(invalid[0]);++i) {
       cmd.geometry_pco_abi.uniform_buffer_descriptor_start=invalid[i];

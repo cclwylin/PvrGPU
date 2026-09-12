@@ -3,6 +3,13 @@
 #include "../src/gallium/drivers/pvrgpu/pvrgpu_context.c"
 #include "compiler/nir/nir_builder.h"
 
+void
+pvrgpu_counter_eventf(const char *event, const char *format, ...)
+{
+   (void)event;
+   (void)format;
+}
+
 static unsigned snapshot_checks;
 #define CHECK(test) do { ++snapshot_checks; if (!(test)) { \
    fprintf(stderr, "%s:%u: %s\n", __FILE__, __LINE__, #test); exit(1); \
@@ -695,7 +702,7 @@ static void test_color_transport_bounds(void)
          ctx.framebuffer.cbufs[1].format = PIPE_FORMAT_B10G10R10A2_UNORM;
          CHECK(pvrgpu_framebuffer_color_transport_is_bounded(&ctx) == (count <= 4));
          ctx.framebuffer.cbufs[1].format = PIPE_FORMAT_R8_UNORM;
-         CHECK(!pvrgpu_framebuffer_color_transport_is_bounded(&ctx));
+         CHECK(pvrgpu_framebuffer_color_transport_is_bounded(&ctx) == (count <= 4));
       }
       if (count) {
          ctx.framebuffer.cbufs[count - 1].texture = NULL;

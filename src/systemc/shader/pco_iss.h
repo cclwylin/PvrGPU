@@ -277,7 +277,28 @@ enum class PcoOpcode : std::uint8_t {
   // Native bitwise phase0 FTB: unsigned highest set-bit index, or -1 for zero.
   // Appended to preserve all existing decoded opcode ordinals.
   kFindTopBit,
+  // Native bitwise phase0 CBS and REV. Keep these after FTB so adding the
+  // remaining operations from the same unary p0 family preserves ordinals.
+  kCountBitsSet,
+  kReverseBits,
+  // Mesa's O_UADD_CARRY/O_USUB_BORROW are one three-phase group with
+  // independently live W0 (low word) and W1 (carry/borrow) destinations.
+  // Append these semantic forms so existing serialized opcode ordinals stay
+  // stable.
+  kUnsignedAddCarry,
+  kUnsignedSubBorrow,
 };
+
+inline bool IsPcoUnaryBitwise(PcoOpcode opcode) {
+  return opcode == PcoOpcode::kCountBitsSet ||
+         opcode == PcoOpcode::kFindTopBit ||
+         opcode == PcoOpcode::kReverseBits;
+}
+
+inline bool IsPcoCarryBorrow(PcoOpcode opcode) {
+  return opcode == PcoOpcode::kUnsignedAddCarry ||
+         opcode == PcoOpcode::kUnsignedSubBorrow;
+}
 
 inline bool IsPcoAtomic32(PcoOpcode opcode) {
   switch (opcode) {
@@ -391,7 +412,8 @@ struct PcoInstruction {
   std::uint32_t binary_offset = 0;
   std::uint16_t group_index = 0;
   std::uint16_t output_index = 0;
-  // The high half's destination for a two-output op (add64_32).
+  // The second destination for dual-output operations (ADD64_32 and the W1
+  // carry/borrow flag of UADDC/USUBB).
   std::uint16_t output_index1 = 0;
   // Dual destinations encode independent banks. Keep the graphics TEMP default.
   PcoWriteTarget output_target1 = PcoWriteTarget::kTemporary;
@@ -536,6 +558,23 @@ inline bool HasCanonicalNativeIntegerSignedness(const PcoInstruction &i) {
       (i.integer_signed == 1 &&
        (i.opcode == PcoOpcode::kIntegerMultiplyAdd64High ||
         i.opcode == PcoOpcode::kShiftRight));
+}
+
+inline bool HasCanonicalCarryBorrowShape(const PcoInstruction &i,
+                                         bool allow_vertex_input) {
+  if (!IsPcoCarryBorrow(i.opcode) || i.source_count != 2 ||
+      i.repeat_count != 1 || i.end_group != 0)
+    return false;
+  const auto valid_target = [allow_vertex_input](PcoWriteTarget target) {
+    return target == PcoWriteTarget::kNone ||
+           target == PcoWriteTarget::kTemporary ||
+           (allow_vertex_input && target == PcoWriteTarget::kVertexInput);
+  };
+  return valid_target(i.target) && valid_target(i.output_target1) &&
+         (i.target != PcoWriteTarget::kNone ||
+          i.output_target1 != PcoWriteTarget::kNone) &&
+         (i.target != PcoWriteTarget::kNone || i.output_index == 0) &&
+         (i.output_target1 != PcoWriteTarget::kNone || i.output_index1 == 0);
 }
 // Task/geometry executors use the default fail-closed gather policy.
 inline bool HasCanonicalTextureLodMode(const PcoInstruction &i,
@@ -847,6 +886,13 @@ PcoDecodedProgram DecodeGeometryPcoProgram(const std::vector<std::uint8_t> &bina
 PcoDecodedProgram DecodeTessellationPcoProgram(
     ShaderStage stage, const std::vector<std::uint8_t> &binary);
 bool PcoSpecialConstantBits(std::uint16_t index, std::uint32_t *bits);
+struct PcoCarryBorrowResult {
+  std::uint32_t low = 0;
+  std::uint32_t flag = 0;
+};
+PcoCarryBorrowResult EvaluatePcoCarryBorrow(PcoOpcode opcode,
+                                             std::uint32_t source0,
+                                             std::uint32_t source1);
 std::uint32_t EvaluatePcoAluInstruction(
     const PcoInstruction &instruction,
     const std::array<std::uint32_t, 4> &sources,

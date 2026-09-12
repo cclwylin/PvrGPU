@@ -16,11 +16,13 @@ struct ModelGraphicsStats {
   std::uint64_t gs_invocations = 0;
   std::uint64_t stream_output_primitives_written = 0;
   std::uint64_t stream_output_primitives_storage_needed = 0;
+  std::uint64_t occlusion_samples_passed = 0;
 
   void Add(bool geometry_enabled, std::uint64_t input_primitives,
            std::uint64_t output_primitives, std::uint64_t invocations,
            bool tessellation_enabled = false, std::uint64_t tessellation_primitives = 0,
-           std::uint64_t stream_output_written = 0, std::uint64_t stream_output_needed = 0) {
+           std::uint64_t stream_output_written = 0, std::uint64_t stream_output_needed = 0,
+           std::uint64_t occlusion_samples = 0) {
     const auto checked = [](std::uint64_t a, std::uint64_t b) {
       if (b > std::numeric_limits<std::uint64_t>::max() - a)
         throw std::overflow_error("native graphics statistics overflow");
@@ -39,6 +41,8 @@ struct ModelGraphicsStats {
                                                     stream_output_written);
     next.stream_output_primitives_storage_needed = checked(stream_output_primitives_storage_needed,
                                                            stream_output_needed);
+    next.occlusion_samples_passed = checked(occlusion_samples_passed,
+                                            occlusion_samples);
     *this = next;
   }
 };

@@ -13,12 +13,22 @@ namespace {
 bool Fits(std::uint32_t start, std::uint32_t count, std::uint32_t limit) {
   return start <= limit && count <= limit - start;
 }
-void ValidateAbi(ShaderStage stage, const DriverPcoStageAbi &abi) {
+void ValidateAbi(ShaderStage stage, const DriverPcoStageAbi &abi,
+                 const DriverStorageBufferAbi *storage = nullptr) {
   const bool control = stage == ShaderStage::kTessellationControl;
   if (!control && stage != ShaderStage::kTessellationEvaluation)
     Fail("stage is neither TCS nor TES");
   const auto system_shared = control ? 8U : 4U;
   const auto descriptors = abi.uniform_buffer_descriptor_start;
+  const auto uniform_end = descriptors + abi.uniform_buffer_descriptor_count * 4U;
+  const auto storage_count = storage ? storage->descriptor_count : 0U;
+  const auto storage_start = storage && storage_count ? storage->descriptor_start
+                                                      : uniform_end;
+  const auto storage_mask = storage_count >= 32U
+                                ? UINT32_MAX
+                                : storage_count
+                                      ? (UINT32_C(1) << storage_count) - 1U
+                                      : 0U;
   // Reserved system-input prefix plus PCO's aligned writable VTXIN scratch.
   // MakeTask initializes only the prefix, so spare words still require a
   // native write before any read and every access stays within this ABI.
@@ -30,7 +40,14 @@ void ValidateAbi(ShaderStage stage, const DriverPcoStageAbi &abi) {
       descriptors < system_shared ||
       (descriptors - system_shared) % kPcoTextureDescriptorDwordCount ||
       (descriptors - system_shared) / kPcoTextureDescriptorDwordCount > kPcoMaximumTextureDescriptorSets ||
-      abi.push_constant_start != descriptors + abi.uniform_buffer_descriptor_count * 4 ||
+      (storage && (storage_count > 32U ||
+                   (storage->descriptor_start &&
+                    storage->descriptor_start != uniform_end) ||
+                   (storage_count && storage->descriptor_start != uniform_end) ||
+                   (storage->used_mask & ~storage_mask) ||
+                   ((storage->read_mask | storage->write_mask) &
+                    ~storage->used_mask))) ||
+      abi.push_constant_start != storage_start + storage_count * 4U ||
       !Fits(abi.push_constant_start, abi.push_constant_count, abi.shareds) ||
       std::uint64_t{abi.push_constant_start} + abi.push_constant_count != abi.shareds)
     Fail("register/descriptor/push ABI is invalid");
@@ -41,9 +58,12 @@ bool IsAlu(PcoOpcode op) {
   case PcoOpcode::kFloatNegate: case PcoOpcode::kFloatAbs:
   case PcoOpcode::kIntegerAdd: case PcoOpcode::kIntegerMultiplyAdd32:
   case PcoOpcode::kIntegerMultiplyAdd64High: case PcoOpcode::kIntegerAdd64_32:
+  case PcoOpcode::kUnsignedAddCarry: case PcoOpcode::kUnsignedSubBorrow:
   case PcoOpcode::kBitwiseAnd: case PcoOpcode::kBitwiseOr:
   case PcoOpcode::kBitwiseXor: case PcoOpcode::kBitwiseXnor:
   case PcoOpcode::kShiftLeft: case PcoOpcode::kShiftRight:
+  case PcoOpcode::kCountBitsSet: case PcoOpcode::kFindTopBit:
+  case PcoOpcode::kReverseBits:
   case PcoOpcode::kBitfieldExtractUnsigned: case PcoOpcode::kBitfieldExtractSigned:
   case PcoOpcode::kBitfieldInsert: case PcoOpcode::kBooleanCompare:
   case PcoOpcode::kFloatEqual: case PcoOpcode::kFloatLess:
@@ -140,8 +160,9 @@ bool Condition(unsigned condition, const TessellationLaneState &lane) {
   }
 }
 void ValidateSample(const PcoInstruction &i, ShaderStage stage,
-                    const DriverPcoStageAbi &abi) {
-  ValidateAbi(stage, abi);
+                    const DriverPcoStageAbi &abi,
+                    const DriverStorageBufferAbi *storage = nullptr) {
+  ValidateAbi(stage, abi, storage);
   const auto first_descriptor = stage == ShaderStage::kTessellationControl ? 8U : 4U;
   // TCS/TES system memory descriptors precede the same 20-DWORD combined
   // image/sampler sets used by other stages. This initial task-stage contract
@@ -189,22 +210,25 @@ PcoTextureRequest SampleRequest(const PcoInstruction &i,
   return request;
 }
 TessellationTaskState MakeTask(ShaderStage stage, const DriverPcoStageAbi &abi,
-    const std::vector<std::uint32_t> &shared, std::uint32_t count) {
-  ValidateAbi(stage, abi);
+    const std::vector<std::uint32_t> &shared, std::uint32_t count,
+    const DriverStorageBufferAbi *storage) {
+  ValidateAbi(stage, abi, storage);
   if (shared.size() != abi.shareds || shared[3] ||
       (stage == ShaderStage::kTessellationControl && shared[7]) ||
       !count || count > kTessellationTaskWidth)
     Fail("task width or immutable shared payload is invalid");
   TessellationTaskState task;
   task.stage = stage; task.lane_count = count;
+  if (storage) task.storage_abi = *storage;
   std::copy(shared.begin(), shared.end(), task.shared.begin());
   return task;
 }
 } // namespace
 
 void ValidateTessellationProgram(const PcoDecodedProgram &program,
-                                 const DriverPcoStageAbi &abi) {
-  ValidateAbi(program.summary.stage, abi);
+                                 const DriverPcoStageAbi &abi,
+                                 const DriverStorageBufferAbi *storage) {
+  ValidateAbi(program.summary.stage, abi, storage);
   const bool control = program.summary.stage == ShaderStage::kTessellationControl;
   if (program.instructions.empty() || !program.summary.ends_task ||
       program.summary.pixel_output_mask || program.summary.writes_depth ||
@@ -221,6 +245,11 @@ void ValidateTessellationProgram(const PcoDecodedProgram &program,
     if (ended || !i.repeat_count || i.repeat_count > 16 || i.source_count > 4 ||
         i.exec_cnd > 3 || i.writes_predicate > 1)
       Fail("invalid native instruction metadata or bytes after END");
+    if (IsPcoUnaryBitwise(i.opcode) &&
+        (i.repeat_count != 1 || i.source_count != 1 ||
+         (i.target != PcoWriteTarget::kTemporary &&
+          i.target != PcoWriteTarget::kVertexInput)))
+      Fail("invalid unary bitwise ALU metadata");
     const bool load = i.opcode == PcoOpcode::kBufferLoad;
     const bool store = i.opcode == PcoOpcode::kBufferStore;
     const bool sample = i.opcode == PcoOpcode::kTextureSample;
@@ -231,8 +260,8 @@ void ValidateTessellationProgram(const PcoDecodedProgram &program,
     if (!IsAlu(i.opcode) && !load && !store && !sample && !wdf && !mask && !branch &&
         !export_vertex && i.opcode != PcoOpcode::kNop)
       Fail("opcode requires unimplemented tessellation functionality");
-    if ((control && export_vertex) || (!control && store))
-      Fail("TCS UVSW or TES store is outside this stage contract");
+    if (control && export_vertex)
+      Fail("TCS UVSW is outside this stage contract");
     if (pending && !wdf) Fail("native LD/ST/SMP is not followed by WDF");
     if (load || store) {
       if (i.repeat_count != 1 || i.source_count != (load ? 2 : 3) ||
@@ -242,7 +271,7 @@ void ValidateTessellationProgram(const PcoDecodedProgram &program,
         Fail("invalid native LD/ST metadata");
       pending = true;
     } else if (sample) {
-      ValidateSample(i, program.summary.stage, abi);
+      ValidateSample(i, program.summary.stage, abi, storage);
       pending = true;
     } else if (wdf) {
       if (!pending || i.exec_cnd || i.data_request || i.end_group)
@@ -282,6 +311,17 @@ void ValidateTessellationProgram(const PcoDecodedProgram &program,
          (i.output_target1 == PcoWriteTarget::kTemporary ? !Fits(i.output_index1,1,abi.temps) :
           i.output_target1 == PcoWriteTarget::kVertexInput ? !Fits(i.output_index1,1,abi.vertex_inputs) : true)))
       Fail("ADD64 secondary destination is invalid");
+    if (IsPcoCarryBorrow(i.opcode) &&
+        (!HasCanonicalCarryBorrowShape(i, true) ||
+         (i.target == PcoWriteTarget::kTemporary &&
+          !Fits(i.output_index, 1, abi.temps)) ||
+         (i.target == PcoWriteTarget::kVertexInput &&
+          !Fits(i.output_index, 1, abi.vertex_inputs)) ||
+         (i.output_target1 == PcoWriteTarget::kTemporary &&
+          !Fits(i.output_index1, 1, abi.temps)) ||
+         (i.output_target1 == PcoWriteTarget::kVertexInput &&
+          !Fits(i.output_index1, 1, abi.vertex_inputs))))
+      Fail("UADDC/USUBB destination pair is invalid");
     const std::array<PcoRegisterRef,4> refs{i.source,i.source1,i.source2,i.source3};
     for (unsigned repeat = 0; repeat < i.repeat_count; ++repeat) {
       const auto sr = Packed(i.opcode) ? 0 : repeat;
@@ -303,9 +343,11 @@ void ValidateTessellationProgram(const PcoDecodedProgram &program,
 
 TessellationTaskState MakeTessellationControlTask(
     const DriverPcoStageAbi &abi, const std::vector<std::uint32_t> &shared,
-    std::uint32_t primitive_id, std::uint32_t patch_vertices, std::uint32_t output_vertices) {
+    std::uint32_t primitive_id, std::uint32_t patch_vertices,
+    std::uint32_t output_vertices, const DriverStorageBufferAbi *storage) {
   if (!patch_vertices || patch_vertices > 32) Fail("TCS input patch size is invalid");
-  auto task = MakeTask(ShaderStage::kTessellationControl,abi,shared,output_vertices);
+  auto task = MakeTask(ShaderStage::kTessellationControl,abi,shared,
+                       output_vertices,storage);
   for (unsigned lane = 0; lane < task.lane_count; ++lane) {
     task.lanes[lane].inputs[0] = primitive_id;
     task.lanes[lane].inputs[1] = lane;
@@ -317,9 +359,11 @@ TessellationTaskState MakeTessellationControlTask(
 TessellationTaskState MakeTessellationEvaluationTask(
     const DriverPcoStageAbi &abi, const std::vector<std::uint32_t> &shared,
     std::uint32_t primitive_id, std::uint32_t patch_vertices,
-    const std::array<std::uint32_t,3> *coordinates, std::uint32_t count) {
+    const std::array<std::uint32_t,3> *coordinates, std::uint32_t count,
+    const DriverStorageBufferAbi *storage) {
   if (!coordinates || !patch_vertices || patch_vertices > 32) Fail("TES input patch or coordinates are invalid");
-  auto task = MakeTask(ShaderStage::kTessellationEvaluation,abi,shared,count);
+  auto task = MakeTask(ShaderStage::kTessellationEvaluation,abi,shared,count,
+                       storage);
   for (unsigned lane = 0; lane < count; ++lane) {
     std::copy(coordinates[lane].begin(),coordinates[lane].end(),task.lanes[lane].inputs.begin());
     task.lanes[lane].inputs[3] = primitive_id;
@@ -358,7 +402,7 @@ void StepTessellationTask(const PcoDecodedProgram &program,
             program.instructions[task.instruction_index - 1].opcode != PcoOpcode::kTextureSample)
           Fail("native SMP response has no matching request before WDF");
         const auto &sample = program.instructions[task.instruction_index - 1];
-        ValidateSample(sample, task.stage, abi);
+        ValidateSample(sample, task.stage, abi, &task.storage_abi);
         if (lane.pending_count != kPcoTextureResponseCount || lane.pending_output != sample.output_index ||
             !Fits(lane.pending_output, kPcoTextureResponseCount, abi.temps))
           Fail("native SMP pending response span is invalid");
@@ -437,8 +481,8 @@ void StepTessellationTask(const PcoDecodedProgram &program,
         lane.pending_output = i.output_index; lane.pending_count = i.component_count;
         lane.pending_operation = 1; ++stats.load_instructions;
       } else {
-        if (task.stage != ShaderStage::kTessellationControl || !memory.write)
-          Fail("native ST has no TCS patch memory callback");
+        if (!memory.write)
+          Fail("native ST has no modeled memory callback");
         std::array<std::uint32_t,16> words{};
         for (unsigned c = 0; c < i.component_count; ++c) words[c] = Read(i.source2,c,abi,task,index);
         memory.write(memory.user_data,address,i.component_count,words.data());
@@ -489,6 +533,10 @@ void StepTessellationTask(const PcoDecodedProgram &program,
         const auto value = base+offset;
         Write(i.target,i.output_index,static_cast<std::uint32_t>(value),abi,lane);
         Write(i.output_target1,i.output_index1,static_cast<std::uint32_t>(value >> 32U),abi,lane);
+      } else if (IsPcoCarryBorrow(i.opcode)) {
+        const auto values=EvaluatePcoCarryBorrow(i.opcode,raw[0],raw[1]);
+        Write(i.target,i.output_index,values.low,abi,lane);
+        Write(i.output_target1,i.output_index1,values.flag,abi,lane);
       } else Write(i.target,i.output_index+repeat,EvaluatePcoAluInstruction(i,raw,repeat,p0,p1),abi,lane);
       if (i.writes_predicate) lane.predicate = EvaluatePcoPredicate(i,raw,p0,p1);
       ++stats.alu_instructions;

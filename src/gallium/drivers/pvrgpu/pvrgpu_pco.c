@@ -5946,6 +5946,70 @@ pvrgpu_lower_generic_uniform_buffers(nir_shader *nir, pco_data *data,
    return true;
 }
 
+/* Append stage-local SSBOs after the texture and UBO shared-register
+ * descriptors. Generic graphics stages reserve set-0/binding-0 for their
+ * sampler descriptor, so SSBO i follows UBOs at binding i + num_ubos + 1.
+ * This is descriptor metadata only: the driver/model still owns the backing
+ * bytes and relocates the base address before execution. */
+static bool
+pvrgpu_lower_generic_storage_buffers(nir_shader *nir, pco_data *data,
+                                     unsigned descriptor_count,
+                                     unsigned start, void *mem,
+                                     char *error, size_t error_size)
+{
+   if (!descriptor_count)
+      return true;
+   const unsigned first_binding = nir->info.num_ubos + 1;
+   pco_descriptor_set_data *set = &data->common.desc_sets[0];
+   pco_binding_data *bindings =
+      rzalloc_array(mem, pco_binding_data, first_binding + descriptor_count);
+   if (!bindings)
+      return pvrgpu_pco_fail(error, error_size,
+                             "allocating tessellation SSBO descriptor ABI");
+   if (set->binding_count)
+      memcpy(bindings, set->bindings,
+             MIN2(set->binding_count, first_binding) * sizeof(*bindings));
+   set->bindings = bindings;
+   set->binding_count = first_binding + descriptor_count;
+   set->used = true;
+   set->range = (pco_range){.start = 0, .count = start + descriptor_count * 4};
+   for (unsigned i = 0; i < descriptor_count; ++i) {
+      bindings[first_binding + i].used = true;
+      bindings[first_binding + i].range = (pco_range){
+         .start = start + i * 4, .count = 4, .stride = 4,
+      };
+   }
+   data->common.shareds = start + descriptor_count * 4;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            unsigned source;
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_ssbo:
+            case nir_intrinsic_get_ssbo_size:
+               source = 0;
+               break;
+            case nir_intrinsic_store_ssbo:
+               source = 1;
+               break;
+            default:
+               continue;
+            }
+            const unsigned slot = nir_src_as_uint(intr->src[source]);
+            b.cursor = nir_before_instr(instr);
+            nir_src_rewrite(&intr->src[source],
+               nir_imm_ivec2(&b, (first_binding + slot) << 16, 0));
+         }
+      }
+      nir_progress(true, impl, nir_metadata_control_flow);
+   }
+   return true;
+}
+
 static bool
 pvrgpu_compute_atomic_op_supported(nir_atomic_op op)
 {
@@ -6794,7 +6858,8 @@ pvrgpu_lower_large_cb0(nir_shader *nir, unsigned dwords, unsigned slot,
  * Full stores remain vectorizable, and PCO's vectorizer rejects positive holes
  * when it later combines adjacent scalar stores. */
 static bool
-pvrgpu_lower_compute_store_masks(nir_shader *nir, char *error, size_t error_size)
+pvrgpu_lower_ssbo_store_masks(nir_shader *nir, const char *stage,
+                              char *error, size_t error_size)
 {
    nir_foreach_function_impl(impl, nir) {
       nir_builder b = nir_builder_create(impl);
@@ -6822,7 +6887,8 @@ pvrgpu_lower_compute_store_masks(nir_shader *nir, char *error, size_t error_size
                 intr->src[2].ssa->bit_size != 32 ||
                 intr->src[2].ssa->num_components != 1)
                return pvrgpu_pco_fail(error, error_size,
-                  "compute SSBO masked store requires valid 32-bit components and byte offset");
+                  "%s SSBO masked store requires valid 32-bit components and byte offset",
+                  stage);
             if (mask == BITFIELD_MASK(components))
                continue;
 
@@ -6899,7 +6965,7 @@ pvrgpu_pco_compile_compute(struct pvrgpu_pco_compiler *compiler,
    pvrgpu_pco_preprocess_nir(compiler, nir);
    memset(&abi, 0, sizeof(abi));
    abi.cb0_uniform_buffer_slot = cb0_slot;
-   if (!pvrgpu_lower_compute_store_masks(nir, error, error_size) ||
+   if (!pvrgpu_lower_ssbo_store_masks(nir, "compute", error, error_size) ||
        !pvrgpu_validate_compute_nir(nir, &abi, true, error, error_size))
       goto fail;
 
@@ -7821,6 +7887,88 @@ unsupported:
       "tessellation texture source requires vec2 coordinates and optional scalar explicit LOD");
 }
 
+/* Validate the native buffer subset independently from shader IO. The first
+ * pass accepts a binding expression that preprocessing can fold; the second
+ * pass requires a static Gallium slot and records exactly which resources the
+ * draw must snapshot and write back. */
+static bool
+pvrgpu_validate_tessellation_buffers(
+   const nir_shader *nir, struct pvrgpu_pco_tessellation_binary *out,
+   bool validate_bindings, char *error, size_t error_size)
+{
+   if (out)
+      out->storage_buffer_descriptor_count = nir->info.num_ssbos;
+   nir_foreach_function_impl(impl, (nir_shader *)nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            bool read = false, write = false;
+            unsigned binding_source = 0, offset_source = 0;
+            const nir_def *value = NULL;
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_ssbo:
+               read = true;
+               offset_source = 1;
+               value = &intr->def;
+               break;
+            case nir_intrinsic_get_ssbo_size:
+               value = &intr->def;
+               break;
+            case nir_intrinsic_store_ssbo:
+               write = true;
+               binding_source = 1;
+               offset_source = 2;
+               value = intr->src[0].ssa;
+               break;
+            default:
+               continue;
+            }
+            if (!value || value->bit_size != 32 || !value->num_components ||
+                value->num_components > 16 ||
+                !nir_num_components_valid(value->num_components) ||
+                (intr->intrinsic == nir_intrinsic_get_ssbo_size &&
+                 value->num_components != 1))
+               return pvrgpu_pco_fail(error, error_size,
+                  "tessellation SSBO access requires a valid vector of up to 16 32-bit components");
+            if ((read || write) &&
+                (intr->src[offset_source].ssa->bit_size != 32 ||
+                 intr->src[offset_source].ssa->num_components != 1))
+               return pvrgpu_pco_fail(error, error_size,
+                  "tessellation SSBO byte offset must be scalar 32-bit");
+            if (write && validate_bindings &&
+                nir_intrinsic_write_mask(intr) !=
+                   BITFIELD_MASK(value->num_components))
+               return pvrgpu_pco_fail(error, error_size,
+                  "tessellation SSBO store requires a full component write mask");
+            const nir_src binding = intr->src[binding_source];
+            if (binding.ssa->bit_size != 32 ||
+                binding.ssa->num_components != 1)
+               return pvrgpu_pco_fail(error, error_size,
+                  "tessellation requires scalar 32-bit SSBO bindings");
+            if (!validate_bindings)
+               continue;
+            if (!nir_src_is_const(binding) || nir_src_as_uint(binding) >= 32)
+               return pvrgpu_pco_fail(error, error_size,
+                  "tessellation requires a static SSBO binding below 32");
+            const unsigned slot = nir_src_as_uint(binding);
+            const uint32_t bit = UINT32_C(1) << slot;
+            if (out) {
+               out->storage_buffer_descriptor_count =
+                  MAX2(out->storage_buffer_descriptor_count, slot + 1);
+               out->storage_buffer_used_mask |= bit;
+               if (read)
+                  out->storage_buffer_read_mask |= bit;
+               if (write)
+                  out->storage_buffer_write_mask |= bit;
+            }
+         }
+      }
+   }
+   return true;
+}
+
 static bool
 pvrgpu_validate_tessellation_nir(const nir_shader *nir, mesa_shader_stage stage,
                                  char *error, size_t error_size)
@@ -7830,9 +7978,13 @@ pvrgpu_validate_tessellation_nir(const nir_shader *nir, mesa_shader_stage stage,
       return pvrgpu_pco_fail(error, error_size, "tessellation requires genuine TCS/TES stages");
    if ((stage == MESA_SHADER_TESS_CTRL && (!nir->info.tess.tcs_vertices_out ||
           nir->info.tess.tcs_vertices_out > PVRGPU_PCO_TESS_MAX_VERTICES)) ||
-       BITSET_LAST_BIT(nir->info.textures_used) > PVRGPU_PCO_MAX_TEXTURES || nir->info.num_images || nir->info.num_ssbos ||
+       BITSET_LAST_BIT(nir->info.textures_used) > PVRGPU_PCO_MAX_TEXTURES ||
+       nir->info.num_images || nir->info.num_ssbos > 32 ||
        nir->info.shared_size || nir->scratch_size || nir->info.num_ubos > 15)
       return pvrgpu_pco_fail(error, error_size, "tessellation vertex/resource limits are unsupported");
+   if (!pvrgpu_validate_tessellation_buffers(nir, NULL, false,
+                                             error, error_size))
+      return false;
    if (stage == MESA_SHADER_TESS_EVAL &&
        (nir->info.tess._primitive_mode < TESS_PRIMITIVE_TRIANGLES ||
         nir->info.tess._primitive_mode > TESS_PRIMITIVE_ISOLINES ||
@@ -7864,6 +8016,8 @@ pvrgpu_validate_tessellation_nir(const nir_shader *nir, mesa_shader_stage stage,
                case nir_intrinsic_load_input: case nir_intrinsic_load_output:
                case nir_intrinsic_store_output: case nir_intrinsic_load_uniform:
                case nir_intrinsic_load_ubo: case nir_intrinsic_get_ubo_size:
+               case nir_intrinsic_load_ssbo: case nir_intrinsic_store_ssbo:
+               case nir_intrinsic_get_ssbo_size:
                case nir_intrinsic_load_primitive_id: case nir_intrinsic_load_invocation_id:
                case nir_intrinsic_load_patch_vertices_in: case nir_intrinsic_load_tess_coord:
                case nir_intrinsic_load_tess_level_outer: case nir_intrinsic_load_tess_level_inner:
@@ -7871,7 +8025,8 @@ pvrgpu_validate_tessellation_nir(const nir_shader *nir, mesa_shader_stage stage,
                case nir_intrinsic_barrier:
                   if (stage == MESA_SHADER_TESS_CTRL &&
                       nir_intrinsic_execution_scope(intr) <= SCOPE_WORKGROUP &&
-                      !(nir_intrinsic_memory_modes(intr) & ~nir_var_shader_out)) break;
+                      !(nir_intrinsic_memory_modes(intr) &
+                        ~(nir_var_shader_out | nir_var_mem_ssbo))) break;
                   return pvrgpu_pco_fail(error, error_size, "tessellation barrier scope/memory modes are unsupported");
                default:
                   return pvrgpu_pco_fail(error, error_size, "tessellation NIR intrinsic is unsupported: %s",
@@ -8133,7 +8288,10 @@ pvrgpu_compile_tessellation_stage(struct pvrgpu_pco_compiler *compiler,
    if (io.failed) goto fail;
    NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_in | nir_var_shader_out, NULL);
    pvrgpu_pco_preprocess_nir(compiler, nir);
-   if (nir->scratch_size || nir->info.shared_size ||
+   if (!pvrgpu_lower_ssbo_store_masks(nir, "tessellation", error, error_size) ||
+       !pvrgpu_validate_tessellation_buffers(nir, out, true,
+                                             error, error_size) ||
+       nir->scratch_size || nir->info.shared_size ||
        !pvrgpu_lower_geometry_dynamic_uniforms(nir, uniform_dwords, error, error_size)) goto fail;
    const unsigned uniforms = pvrgpu_count_uniform_loads(nir);
    if (uniforms && !pvrgpu_lower_uniform_slots_to_push_constants(nir, uniform_dwords,
@@ -8148,7 +8306,13 @@ pvrgpu_compile_tessellation_stage(struct pvrgpu_pco_compiler *compiler,
        !pvrgpu_pack_generic_texture_bindings(nir, texture_count, error, error_size)) goto fail;
    data.common.vtxins = control ? 3 : 5;
    if (!pvrgpu_lower_generic_uniform_buffers(nir, &data, ubo_start, mem, error, error_size)) goto fail;
-   const unsigned prefix = ubo_start + 4 * nir->info.num_ubos;
+   out->storage_buffer_descriptor_start = ubo_start + 4 * nir->info.num_ubos;
+   if (!pvrgpu_lower_generic_storage_buffers(
+          nir, &data, out->storage_buffer_descriptor_count,
+          out->storage_buffer_descriptor_start, mem, error, error_size))
+      goto fail;
+   const unsigned prefix = out->storage_buffer_descriptor_start +
+                           4 * out->storage_buffer_descriptor_count;
    if (prefix + (uniforms ? uniform_dwords : 0) >
        PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE) {
       pvrgpu_pco_fail(error, error_size,

@@ -899,6 +899,21 @@ target_link_libraries(pco-compute-add64-test PRIVATE pvrgpu-memory-core)
 pvrgpu_target_warnings(pco-compute-add64-test)
 add_test(NAME pco-compute-add64-unit COMMAND pco-compute-add64-test)
 
+add_executable(pco-carry-borrow-test
+    tests/pco_carry_borrow_test.cpp
+    src/systemc/shader/pco_iss.cpp
+    src/systemc/shader/compute_iss.cpp
+    src/systemc/shader/geometry_iss.cpp
+    src/systemc/shader/tessellation_iss.cpp
+)
+target_include_directories(pco-carry-borrow-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(pco-carry-borrow-test)
+add_test(NAME pco-carry-borrow-unit COMMAND pco-carry-borrow-test)
+
 add_executable(compute-shader-fifo-test
     tests/compute_shader_fifo_test.cpp
     model_stub/memory_pool.cpp

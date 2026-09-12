@@ -213,6 +213,8 @@ struct pvrgpu_draw_pco_triangles_command {
    uint32_t index_count;
    uint32_t first_index;
    int32_t base_vertex;
+   uint32_t primitive_restart_enable;
+   uint32_t primitive_restart_index;
 
    /* Optional whole-sequence API counter contract.  A multi-draw lowering
     * carries these totals on its first command only; single-draw profiles

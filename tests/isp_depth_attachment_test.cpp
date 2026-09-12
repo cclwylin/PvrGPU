@@ -144,6 +144,84 @@ CasePayload MakeDriverDepthPlaneCase(MemoryPool &pool,
   return payload;
 }
 
+CasePayload MakePointQuadDedupCase(MemoryPool &pool,
+                                   std::uint64_t sequence) {
+  PipelineState state;
+  state.width = state.height = 1;
+  state.sequence = sequence;
+  state.functional_case = FunctionalCase::kDriverPcoTriangles;
+  state.stage = PipelineStage::kTilesScheduled;
+  state.raster_state.sample_count = 1;
+  state.scheduled_tiles = 1;
+
+  ParameterTriangle triangle;
+  triangle.key.api_primitive_id = 7;
+  triangle.rasterizable = 1;
+  triangle.signed_area = 1;
+  triangle.max_x = triangle.max_y = 1;
+  triangle.point = {0.5F, 0.5F, 0.5F, 1, {}};
+  triangle.depth_plane[2] = FloatBits(0.5F);
+  triangle.depth_plane_valid = 1;
+  // A clipped point quad may need its direct square rule even when a fan
+  // triangle's three edges reject the sample. Both fan triangles describe
+  // the same source point and must still publish one owner, not two.
+  for (auto &edge : triangle.edge)
+    edge = {0, 0, -1, 0, {}};
+  std::vector<ParameterTriangle> triangles(2, triangle);
+  triangles[0].key.submit_ordinal = 10;
+  triangles[1].key.submit_ordinal = 11;
+  state.tile_records =
+      StoreNewArray(pool, std::vector<TileRecord>{{0, 0, 1, 1, 0, 2}});
+  state.tile_primitive_refs = StoreNewArray(
+      pool, std::vector<TilePrimitiveRef>{{0, 0, 10}, {1, 0, 11}});
+  state.parameter_triangles = StoreNewArray(pool, triangles);
+
+  CasePayload payload;
+  payload.state = pool.Allocate(sizeof(PipelineState));
+  StorePipelineState(pool, payload.state, state);
+  payload.txn = {payload.state, static_cast<std::uint32_t>(sequence), sequence};
+  return payload;
+}
+
+CasePayload MakeLineQuadDedupCase(MemoryPool &pool,
+                                  std::uint64_t sequence) {
+  PipelineState state;
+  state.width = state.height = 1;
+  state.sequence = sequence;
+  state.functional_case = FunctionalCase::kDriverPcoTriangles;
+  state.stage = PipelineStage::kTilesScheduled;
+  state.raster_state.sample_count = 1;
+  state.scheduled_tiles = 1;
+
+  ParameterTriangle triangle;
+  triangle.key.api_primitive_id = 8;
+  triangle.rasterizable = 1;
+  triangle.signed_area = 1;
+  triangle.max_x = triangle.max_y = 1;
+  // The segment lies exactly on an integer X diamond boundary. GL's
+  // deterministic perturbation selects one adjacent pixel; two expanded fan
+  // triangles still describe only one source-line sample.
+  triangle.line = {0.0F, -1.0F, 0.0F, 2.0F, 1, {}};
+  triangle.depth_plane[2] = FloatBits(0.5F);
+  triangle.depth_plane_valid = 1;
+  for (auto &edge : triangle.edge)
+    edge = {0, 0, -1, 0, {}};
+  std::vector<ParameterTriangle> triangles(2, triangle);
+  triangles[0].key.submit_ordinal = 12;
+  triangles[1].key.submit_ordinal = 13;
+  state.tile_records =
+      StoreNewArray(pool, std::vector<TileRecord>{{0, 0, 1, 1, 0, 2}});
+  state.tile_primitive_refs = StoreNewArray(
+      pool, std::vector<TilePrimitiveRef>{{0, 0, 12}, {1, 0, 13}});
+  state.parameter_triangles = StoreNewArray(pool, triangles);
+
+  CasePayload payload;
+  payload.state = pool.Allocate(sizeof(PipelineState));
+  StorePipelineState(pool, payload.state, state);
+  payload.txn = {payload.state, static_cast<std::uint32_t>(sequence), sequence};
+  return payload;
+}
+
 CasePayload MakeQuantizedDepthCompareCase(MemoryPool &pool,
                                           std::uint64_t sequence,
                                           bool float_depth = false) {
@@ -246,6 +324,20 @@ void CheckDriverDepthPlaneCase(MemoryPool &pool,
       LoadArray<FragmentCandidate>(pool, state.fragment_candidates);
   Check(candidates.size() == 1 && candidates[0].depth == 0.25F,
         "candidate carries the driver depth-plane result");
+  ReleaseFunctionalPayloads(pool, state);
+  pool.Release(payload.state);
+}
+
+void CheckShapeQuadDedupCase(MemoryPool &pool,
+                             const CasePayload &payload,
+                             const char *shape) {
+  const PipelineState state = LoadPipelineState(pool, payload.state);
+  const auto candidates =
+      LoadArray<FragmentCandidate>(pool, state.fragment_candidates);
+  Check(state.active_fragment_invocations == 1 && candidates.size() == 1 &&
+            candidates[0].sample_mask == 1,
+        std::string(shape) +
+            " quad fan triangles published duplicate sample ownership");
   ReleaseFunctionalPayloads(pool, state);
   pool.Release(payload.state);
 }
@@ -481,8 +573,8 @@ int sc_main(int, char **) {
     CheckFloatDepthCodecs();
     CheckD24DepthCodecRounding();
     MemoryPool pool;
-    sc_core::sc_fifo<PipelineTxn> input("input", 8);
-    sc_core::sc_fifo<PipelineTxn> output("output", 8);
+    sc_core::sc_fifo<PipelineTxn> input("input", 9);
+    sc_core::sc_fifo<PipelineTxn> output("output", 9);
     Isp isp("isp", pool);
     isp.input(input);
     isp.output(output);
@@ -502,6 +594,8 @@ int sc_main(int, char **) {
     const CasePayload z32fs8 = MakeCase(
         pool, 6, kDriverPcoDepthFormatZ32FloatS8X24Uint, 0x1p-100F, {});
     const CasePayload float_compare = MakeQuantizedDepthCompareCase(pool, 7, true);
+    const CasePayload point_quad_dedup = MakePointQuadDedupCase(pool, 8);
+    const CasePayload line_quad_dedup = MakeLineQuadDedupCase(pool, 9);
     input.write(z16.txn);
     input.write(z24.txn);
     input.write(depth_plane.txn);
@@ -509,6 +603,8 @@ int sc_main(int, char **) {
     input.write(z32f.txn);
     input.write(z32fs8.txn);
     input.write(float_compare.txn);
+    input.write(point_quad_dedup.txn);
+    input.write(line_quad_dedup.txn);
     sc_core::sc_start(sc_core::sc_time(100, sc_core::SC_NS));
     sc_core::sc_start(sc_core::SC_ZERO_TIME);
 
@@ -524,6 +620,10 @@ int sc_main(int, char **) {
     for (std::uint64_t sequence = 5; sequence <= 7; ++sequence)
       Check(output.nb_read(completed) && completed.sequence == sequence,
             "float depth FIFO order");
+    Check(output.nb_read(completed) && completed.sequence == 8,
+          "point quad dedup FIFO order");
+    Check(output.nb_read(completed) && completed.sequence == 9,
+          "line quad dedup FIFO order");
     CheckCase(pool, z16, z16_load);
     CheckCase(pool, z24, {0x800000U, 0x800000U, 0x800000U});
     CheckDriverDepthPlaneCase(pool, depth_plane);
@@ -531,6 +631,8 @@ int sc_main(int, char **) {
     CheckCase(pool, z32f, float_load);
     CheckCase(pool, z32fs8, {FloatBits(0x1p-100F), FloatBits(0x1p-100F), FloatBits(0x1p-100F)});
     CheckFloatDepthCompareCase(pool, float_compare);
+    CheckShapeQuadDedupCase(pool, point_quad_dedup, "point");
+    CheckShapeQuadDedupCase(pool, line_quad_dedup, "line");
     for (std::uint32_t samples : {1U, 2U, 4U, 8U, 16U}) {
       for (std::uint32_t mask : {UINT32_MAX, UINT32_C(0x5555)}) {
         for (const bool multisample_enable : {true, false}) {

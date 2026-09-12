@@ -25,6 +25,17 @@ inline std::vector<std::uint8_t> GeometryNativeLoadFixture() {
     0x00,0x00,0x00,0xff,0x44,0xa0,0x00,0x02,0x00,0x00,0x00,0xff,
     0x44,0xa0,0x80,0x04,0x00,0x00,0x00,0xff};
 }
+/* Reduced from group 25 of the dEQP GLES31 ivec3/uvec3 mulExtended geometry
+ * captures. The compiler writes the IMADD64 high word to VI2; the only
+ * signed/unsigned encoding difference is bit 3 of the phase operation. */
+inline std::vector<std::uint8_t> GeometryMultiplyHighVtxin2Fixture(
+    bool integer_signed) {
+  return {
+    0x36,0x84,0x00,integer_signed ? std::uint8_t{0xeb} : std::uint8_t{0xe3},
+    0xca,0x77,0x20,0x00,0x00,0xc0,0x82,0x04,
+    0x44,0xa0,0x80,0x04,0x00,0x00,0x00,0xff,
+  };
+}
 inline DriverPcoStageAbi GeometryNativeLoadAbi() {
   DriverPcoStageAbi abi;
   abi.temps=4; abi.vertex_inputs=2; abi.vertex_outputs=4;

@@ -123,6 +123,8 @@ void RunCase(MemoryPool &pool, sc_core::sc_fifo<PipelineTxn> &input,
         "PBE blend counters must count sample/attachment work and integer bypass");
   Check(state.counters.pbe_pixels_written == serialized,
         "PBE serialization includes untouched samples and every attachment");
+  Check(state.counters.occlusion_samples_passed == covered_samples,
+        "occlusion must count surviving samples once, independent of MRTs and color masks");
   Check(state.counters.pbe_cycles == expected_cycles &&
             state.counters.renderer_cycles == expected_cycles + 7,
         "PBE cycles must use actual blend and serialization sample colors");

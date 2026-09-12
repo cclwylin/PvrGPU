@@ -60,11 +60,16 @@ pvrgpu_pco_draw_payload_bytes(
       return false;
    if (draw->tessellation) {
       const struct pvrgpu_systemc_tessellation *t = draw->tessellation;
-      if (!pvrgpu_payload_add(&total, t->control_pco_size) ||
+      if (t->buffer_resource_count > PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_RESOURCES ||
+          (t->buffer_resource_count && !t->buffer_resources) ||
+          !pvrgpu_payload_add(&total, t->control_pco_size) ||
           !pvrgpu_payload_add(&total, t->evaluation_pco_size) ||
           !pvrgpu_payload_add_dwords(&total, t->control_shared_count) ||
           !pvrgpu_payload_add_dwords(&total, t->evaluation_shared_count))
          return false;
+      for (unsigned i = 0; i < t->buffer_resource_count; ++i)
+         if (!pvrgpu_payload_add(&total, t->buffer_resources[i].bytes_size))
+            return false;
    }
    for (unsigned i = 0; i < texture_count; ++i) {
       if (textures[i].source == PVRGPU_SYSTEMC_PCO_TEXTURE_EXTERNAL_PAYLOAD &&

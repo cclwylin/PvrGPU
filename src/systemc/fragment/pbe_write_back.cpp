@@ -5,6 +5,7 @@
 #include "fragment/pbe_write_back.h"
 
 #include "common/functional_types.h"
+#include "common/color_attachment_formats.h"
 #include "common/depth_attachment.h"
 #include "memory/gpu_memory_system.h"
 
@@ -55,11 +56,14 @@ void PbeWriteBack::Run() {
     // A pixel is four bytes only while the attachment packs UNORM8 channels.
     // An integer attachment stores a dword per channel, and the byte counts
     // this stage reports and moves have to follow it.
-    const std::uint64_t expected_bytes =
+    const std::uint64_t stored_pixels =
         static_cast<std::uint64_t>(state.width) * state.height *
-        state.raster_state.sample_count * state.attachment_layers *
-        ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
-                                     state.color_attachment_float32);
+        state.raster_state.sample_count * state.attachment_layers;
+    const std::uint32_t render_target_count = ValidateColorAttachmentFormats(state);
+    const auto attachment_bytes = [&](std::uint32_t target) {
+      return stored_pixels * ColorAttachmentBytesPerPixel(state, target);
+    };
+    const std::uint64_t expected_bytes = attachment_bytes(0);
     if (expected_bytes == 0 || state.framebuffer_bytes != expected_bytes ||
         pool_.Read(state.pbe_framebuffer).size() != expected_bytes) {
       throw std::runtime_error(
@@ -82,10 +86,7 @@ void PbeWriteBack::Run() {
             "PbeWriteBack sequence framebuffer address is invalid");
       }
     }
-    const std::uint32_t render_target_count =
-        state.render_target_count == 0 ? 1U : state.render_target_count;
-    if (render_target_count > kMaxRenderTargets)
-      throw std::runtime_error("PbeWriteBack render target count is invalid");
+    std::uint64_t total_attachment_bytes = expected_bytes;
     for (std::uint32_t target = 1; target < render_target_count; ++target) {
       /* Each condition names itself: a bundled sentence here leaves the
        * caller guessing between an attachment the PBE never published, one
@@ -100,17 +101,22 @@ void PbeWriteBack::Run() {
             "PbeWriteBack colour attachment " + std::to_string(target) +
             " has no GPU address");
       }
-      if (state.extra_framebuffer_bytes[target - 1] != expected_bytes) {
+      const auto expected_target_bytes = attachment_bytes(target);
+      if (state.extra_framebuffer_bytes[target - 1] != expected_target_bytes ||
+          pool_.Read(state.extra_pbe_framebuffer[target - 1]).size() !=
+              expected_target_bytes) {
         throw std::runtime_error(
             "PbeWriteBack colour attachment " + std::to_string(target) +
             " is " +
             std::to_string(state.extra_framebuffer_bytes[target - 1]) +
-            " bytes, expected " + std::to_string(expected_bytes));
+            " bytes, expected " + std::to_string(expected_target_bytes));
       }
+      total_attachment_bytes = CheckedAdd(total_attachment_bytes,
+                                          expected_target_bytes,
+                                          "attachment bytes");
     }
-    // Every attachment is a separate DRAM transaction of the same size.
     state.counters.pixel_data_master_transactions = render_target_count;
-    state.counters.pixel_data_master_bytes = expected_bytes * render_target_count;
+    state.counters.pixel_data_master_bytes = total_attachment_bytes;
     state.counters.pixel_data_master_cycles = kPbeWriteBackLatency;
     state.counters.renderer_cycles += kPbeWriteBackLatency;
     state.stage = PipelineStage::kPixelDataMasterComplete;
@@ -138,9 +144,10 @@ void PbeWriteBack::Run() {
       // attachment 0 is read back, because it is the one the frame is
       // published from.
       for (std::uint32_t target = 1; target < render_target_count; ++target) {
+        const auto expected_target_bytes = attachment_bytes(target);
         const std::vector<std::uint8_t> extra = LoadArray<std::uint8_t>(
             pool_, state.extra_pbe_framebuffer[target - 1]);
-        if (extra.size() != static_cast<std::size_t>(expected_bytes)) {
+        if (extra.size() != static_cast<std::size_t>(expected_target_bytes)) {
           throw std::runtime_error(
               "PbeWriteBack extra colour attachment size mismatch");
         }
@@ -162,17 +169,19 @@ void PbeWriteBack::Run() {
       PoolHandle extra_readback_handles[kMaxRenderTargets - 1]{};
       std::uint64_t extra_readback_bytes = 0;
       for (std::uint32_t target = 1; target < render_target_count; ++target) {
+        const auto expected_target_bytes = attachment_bytes(target);
         MemoryReadResult extra = memory_->Readback(
-            state.extra_framebuffer_gpu_address[target - 1], source.size(),
+            state.extra_framebuffer_gpu_address[target - 1],
+            static_cast<std::size_t>(expected_target_bytes),
             MemoryClient::kFramebufferReadback);
         memory_stats += extra.stats;
-        if (extra.data.size() != source.size()) {
+        if (extra.data.size() != expected_target_bytes) {
           throw std::runtime_error(
               "PbeWriteBack readback of colour attachment " +
               std::to_string(target) + " is the wrong size");
         }
         extra_readback_handles[target - 1] = StoreNewArray(pool_, extra.data);
-        extra_readback_bytes += expected_bytes;
+        extra_readback_bytes += expected_target_bytes;
       }
       if (SameHandle(readback_handle, state.pbe_framebuffer)) {
         pool_.Release(readback_handle);

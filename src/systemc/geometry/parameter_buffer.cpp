@@ -540,6 +540,7 @@ void ParameterBuffer::Run() {
       parameter.rasterizable = triangle.rasterizable;
       parameter.face_culled = triangle.face_culled;
       parameter.line = triangle.line;
+      parameter.point = triangle.point;
       if (coefficients.size() > std::numeric_limits<std::uint32_t>::max())
         throw std::overflow_error(
             "ParameterBuffer coefficient-set offset overflow");
@@ -760,6 +761,7 @@ void ParameterBuffer::Run() {
         inactive.front_facing = parameter.front_facing;
         inactive.face_culled = parameter.face_culled;
         inactive.line = parameter.line;
+        inactive.point = parameter.point;
         inactive.first_coefficient_set = parameter.first_coefficient_set;
         std::copy(std::begin(parameter.window_z), std::end(parameter.window_z),
                   std::begin(inactive.window_z));

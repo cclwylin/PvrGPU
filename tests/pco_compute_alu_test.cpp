@@ -115,7 +115,7 @@ void Bitfields() {
                                           0x12345678, 0xfedcba98}};
   PcoInstruction instruction;
   for (auto value : values) for (unsigned offset = 0; offset < 32; ++offset) {
-    for (unsigned width = 0; width <= 31 && width + offset <= 32; ++width) {
+    for (unsigned width = 0; width <= 32 && width + offset <= 32; ++width) {
       std::uint32_t field = 0;
       for (unsigned bit = 0; bit < width; ++bit)
         field |= ((value >> (offset + bit)) & 1U) << bit;
@@ -123,8 +123,9 @@ void Bitfields() {
       Check(EvaluatePcoAluInstruction(instruction, {value, offset, width, 0}) == field,
             "unsigned native bitfield extraction changed");
       instruction.opcode = PcoOpcode::kBitfieldExtractSigned;
-      const auto sign_extended = width && (field & (1U << (width - 1)))
-          ? field | (UINT32_MAX << width) : field;
+      const auto sign_extended =
+          width && width < 32 && (field & (1U << (width - 1)))
+              ? field | (UINT32_MAX << width) : field;
       Check(EvaluatePcoAluInstruction(instruction, {value, offset, width, 0}) ==
                 sign_extended, "signed native bitfield extraction changed");
       instruction.opcode = PcoOpcode::kBitfieldInsert;

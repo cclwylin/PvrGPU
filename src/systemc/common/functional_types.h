@@ -794,6 +794,17 @@ struct LineSegment {
   std::uint8_t reserved[3]{};
 };
 
+// Points are clipped through a conservative widened quad, but their exact
+// raster rule is a square centered on the original window coordinate. Keep
+// that identity so the ISP can reject the conservative fringe after clipping.
+struct PointSprite {
+  float center_x = 0.0F;
+  float center_y = 0.0F;
+  float half_size = 0.0F;
+  std::uint8_t valid = 0;
+  std::uint8_t reserved[3]{};
+};
+
 struct RasterTriangle {
   PrimitiveKey key;
   float x[3]{};
@@ -817,6 +828,7 @@ struct RasterTriangle {
   // entries are a permutation of the serialized raster vertices.
   std::uint8_t setup_vertex_order[3]{};
   LineSegment line;
+  PointSprite point;
 };
 
 // TileRecord owns a contiguous range in TilePrimitiveRef. This preserves
@@ -873,6 +885,7 @@ struct ParameterTriangle {
   std::uint8_t face_culled = 0;
   std::uint8_t reserved[3]{};
   LineSegment line;
+  PointSprite point;
 };
 
 inline bool HasCanonicalDepthPlaneMetadata(

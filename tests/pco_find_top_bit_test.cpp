@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "shader/pco_iss.h"
 #include "pco_find_top_bit_fixtures.h"
+#include "pco_geometry_fixtures.h"
+#include "pco_tessellation_patch_fixtures.h"
 #include "pco_texture_gather_fixtures.h"
 #include <algorithm>
 #include <array>
@@ -23,6 +25,73 @@ std::vector<uint32_t> Inputs(){
   uint32_t x=0x17a5826dU;
   for(unsigned n=0;n<1024;++n){x^=x<<13;x^=x>>17;x^=x<<5;out.push_back(x);}
   return out;
+}
+uint32_t CountOracle(uint32_t x){uint32_t out=0;for(unsigned b=0;b<32;++b)out+=(x>>b)&1U;return out;}
+uint32_t ReverseOracle(uint32_t x){uint32_t out=0;for(unsigned b=0;b<32;++b)out|=((x>>b)&1U)<<(31U-b);return out;}
+struct UnaryOperation { uint8_t phase; PcoOpcode opcode; };
+constexpr std::array<UnaryOperation,3> kUnaryOperations{{
+  {0x00U,PcoOpcode::kCountBitsSet},
+  {0x20U,PcoOpcode::kFindTopBit},
+  {0x4aU,PcoOpcode::kReverseBits},
+}};
+// Exact scalar W1 phase-0 group shape captured from the real compiler output.
+// CBS, FTB and REV differ only in the observed phase byte at offset three.
+std::vector<uint8_t> UnaryGroup(uint8_t phase){return {
+  0x47,0x94,0x40,phase,0x80,0x40,0x00,0x84,0x00,0x40,
+  0xf2,0xff,0xff,0xff};}
+std::vector<uint8_t> Prefix(std::vector<uint8_t> head,const std::vector<uint8_t>&tail){
+  head.insert(head.end(),tail.begin(),tail.end());return head;
+}
+void CheckNativeUnary(const PcoDecodedProgram&p,PcoOpcode opcode){
+  Check(!p.instructions.empty(),"unary program retained its compiler group");
+  const auto&i=p.instructions.front();
+  Check(i.opcode==opcode&&i.source_count==1&&i.repeat_count==1&&
+        i.source.bank==PcoRegisterBank::kVertexInput&&i.source.index==4&&
+        i.target==PcoWriteTarget::kTemporary&&!i.output_index,
+        "native unary p0 group semantic shape");
+  const auto counts=CountPcoInstructions({i},true);
+  Check(counts.alu==1&&!counts.texture&&!counts.memory,
+        "native unary p0 group is one ALU issue");
+}
+void TestUnaryFamilyStages(){
+  const std::vector<uint8_t> nop_end{
+      0x04,0x80,0xee,0x00,0xf2,0xff,0xff,0xff};
+  for(const auto operation:kUnaryOperations){
+    // Fragment uses the independently pinned real FTB program; replacing its
+    // one phase byte exercises the two other compiler-confirmed p0 encodings.
+    auto fragment_bytes=test::FindTopBitFixture(0);
+    fragment_bytes[13]=operation.phase;
+    const auto fragment=DecodePcoProgram(ShaderStage::kFragment,fragment_bytes);
+    Check(fragment.instructions[1].opcode==operation.opcode&&
+          fragment.instructions[1].source_count==1&&
+          fragment.instructions[1].target==PcoWriteTarget::kTemporary,
+          "fragment unary p0 phase decode");
+
+    CheckNativeUnary(DecodePcoProgram(
+        ShaderStage::kVertex,
+        Prefix(UnaryGroup(operation.phase),FillSolidVertexPcoBinary())),
+        operation.opcode);
+    CheckNativeUnary(DecodeComputePcoProgram(
+        Prefix(UnaryGroup(operation.phase),nop_end)),operation.opcode);
+    CheckNativeUnary(DecodeGeometryPcoProgram(
+        Prefix(UnaryGroup(operation.phase),GeometryNativeLoadFixture())),
+        operation.opcode);
+    CheckNativeUnary(DecodeTessellationPcoProgram(
+        ShaderStage::kTessellationControl,
+        Prefix(UnaryGroup(operation.phase),kTessPatchFiveToTenTcs)),
+        operation.opcode);
+    CheckNativeUnary(DecodeTessellationPcoProgram(
+        ShaderStage::kTessellationEvaluation,
+        Prefix(UnaryGroup(operation.phase),kTessPatchFiveToTenTes)),
+        operation.opcode);
+  }
+  for(uint32_t x:Inputs())for(const auto operation:kUnaryOperations){
+    PcoInstruction i;i.opcode=operation.opcode;
+    const auto expected=operation.opcode==PcoOpcode::kCountBitsSet?CountOracle(x):
+        operation.opcode==PcoOpcode::kFindTopBit?Oracle(x):ReverseOracle(x);
+    Check(EvaluatePcoAluInstruction(i,{x,0,0,0})==expected,
+          "unary p0 evaluator matches independent bit oracle");
+  }
 }
 void TestGenuine(){
   const auto values=Inputs();
@@ -51,6 +120,58 @@ void TestGenuine(){
       Check(EvaluatePcoAluInstruction(ftb_op,{x,0,0,0})==msb,"pure FTB semantics exact bits");
     }
   }
+}
+void TestSignedFindMsbXnorPrecursor(){
+  // Exact first group emitted for signed findMSB.  THREE_LO is four bytes:
+  // s0/s1=sc0 and the visible s2 is VTXIN4; s3 is the following sc0 byte.
+  const std::vector<uint8_t> group{
+      0x56,0xb2,0x40,0x46,0x02,0x80,0x40,0x00,0x84,0x00,0x40,0xff};
+  const auto p=DecodePcoProgram(
+      ShaderStage::kVertex,Prefix(group,FillSolidVertexPcoBinary()));
+  const auto&i=p.instructions.front();
+  Check(i.opcode==PcoOpcode::kBitwiseXnor&&i.source_count==2&&
+        i.source.bank==PcoRegisterBank::kVertexInput&&i.source.index==4&&
+        i.source1.bank==PcoRegisterBank::kSpecial&&!i.source1.index&&
+        i.target==PcoWriteTarget::kTemporary&&!i.output_index,
+        "signed findMSB XNOR precursor consumes full THREE_LO source block");
+}
+void TestRealBitCountVertexProgram(){
+  // Exact linked VS binary from the dEQP int_highp_fragment bitCount case.
+  // Reverse-linking hoists the builtin to this stage; its group at byte 58
+  // is the public CBS s2 encoding with phase byte 0x00.
+  const std::vector<uint8_t> bytes{
+      0x35,0x82,0x00,0x87,0x80,0x04,0x00,0x00,0x00,0x40,
+      0x35,0x82,0x00,0x87,0x81,0x04,0x00,0x00,0x00,0x41,
+      0x34,0x82,0x00,0x87,0x00,0x00,0x00,0x42,
+      0x35,0x82,0x00,0x87,0x80,0x01,0x00,0x00,0x00,0x43,
+      0x55,0xa0,0x06,0x08,0x00,0xc0,0x00,0x00,0x00,0x30,
+      0x55,0xa0,0x00,0x08,0x04,0x80,0x01,0x00,0x00,0x30,
+      0x47,0x94,0x40,0x00,0x80,0x40,0x00,0x84,0x00,0x40,
+      0xf2,0xff,0xff,0xff,
+      0x58,0xa0,0x80,0x0e,0x05,0xc0,0x00,0x00,0x00,0x30,
+      0xf3,0xff,0xff,0xff,0xff,0xff};
+  Check(bytes.size()==88,"real bitCount vertex binary size changed");
+  const auto p=DecodePcoProgram(ShaderStage::kVertex,bytes);
+  const auto cbs=std::find_if(p.instructions.begin(),p.instructions.end(),
+      [](const auto&i){return i.opcode==PcoOpcode::kCountBitsSet;});
+  Check(cbs!=p.instructions.end()&&cbs->binary_offset==61&&
+        cbs->source.bank==PcoRegisterBank::kVertexInput&&cbs->source.index==4&&
+        cbs->target==PcoWriteTarget::kTemporary&&!cbs->output_index,
+        "real bitCount vertex program decodes exact CBS group");
+
+  // Its paired FS contains no CBS: reverse-linking exported the result as
+  // varying coefficient 2, which this final group writes to pixel output 0.
+  const std::vector<uint8_t> fragment{
+      0x38,0x8a,0x80,0x87,0xc2,0x04,0x00,0x00,
+      0x00,0x20,0xf3,0xff,0xff,0xff,0xff,0xff};
+  const auto fp=DecodePcoProgram(ShaderStage::kFragment,fragment);
+  Check(fp.instructions.size()==1&&
+        fp.instructions.front().opcode==PcoOpcode::kMoveBypass&&
+        fp.instructions.front().source.bank==PcoRegisterBank::kCoefficient&&
+        fp.instructions.front().source.index==2&&
+        fp.instructions.front().target==PcoWriteTarget::kPixelOutput&&
+        !fp.instructions.front().output_index,
+        "real bitCount fragment program consumes the reverse-linked CBS result");
 }
 void Reindex(PcoDecodedProgram &p){
   for(size_t pc=0;pc<p.instructions.size();++pc){p.instructions[pc].binary_offset=pc*8+3;p.instructions[pc].group_index=pc;}
@@ -83,12 +204,9 @@ void TestContinuation(){
 }
 void TestGuards(){
   const auto original=test::FindTopBitFixture(0);
-  const std::vector<uint8_t> group(original.begin()+10,original.begin()+20);
-  for(auto stage:{ShaderStage::kVertex,ShaderStage::kCompute,ShaderStage::kGeometry,ShaderStage::kTessellationControl,ShaderStage::kTessellationEvaluation})
-    Reject([&]{if(stage==ShaderStage::kVertex)DecodePcoProgram(stage,group);else if(stage==ShaderStage::kCompute)DecodeComputePcoProgram(group);else if(stage==ShaderStage::kGeometry)DecodeGeometryPcoProgram(group);else DecodeTessellationPcoProgram(stage,group);},"unproven stage FTB admission");
   const std::array<std::pair<size_t,uint8_t>,17> changes{{
     {10,0x35},{11,0x92},{11,0x96},{11,0x9c},{12,0x42},{12,0x44},{12,0x46},
-    {13,0x00},{13,0x60},{13,0x21},{13,0x22},{13,0x24},{14,0x81},{15,0x41},
+    {13,0x06},{13,0x60},{13,0x21},{13,0x22},{13,0x24},{14,0x81},{15,0x41},
     {16,0x20},{18,1},{19,0x20}}};
   for(auto change:changes){auto b=original;b[change.first]=change.second;Reject([&]{DecodePcoProgram(ShaderStage::kFragment,b);},"noncanonical native FTB encoding");}
   for(size_t n=10;n<20;++n){auto b=original;b.resize(n);Reject([&]{DecodePcoProgram(ShaderStage::kFragment,b);},"truncated FTB binary");}
@@ -109,4 +227,4 @@ void TestGuards(){
   }
 }
 }
-int main(){try{TestGenuine();TestContinuation();TestGuards();std::cout<<"find top bit: "<<checks<<" checks PASS\n";return 0;}catch(const std::exception&e){std::cerr<<"find top bit after "<<checks<<" checks: "<<e.what()<<'\n';return 1;}}
+int main(){try{TestUnaryFamilyStages();TestGenuine();TestSignedFindMsbXnorPrecursor();TestRealBitCountVertexProgram();TestContinuation();TestGuards();std::cout<<"unary bitwise p0: "<<checks<<" checks PASS\n";return 0;}catch(const std::exception&e){std::cerr<<"unary bitwise p0 after "<<checks<<" checks: "<<e.what()<<'\n';return 1;}}

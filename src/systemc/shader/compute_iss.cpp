@@ -118,12 +118,17 @@ bool IsAlu(PcoOpcode opcode) {
   case PcoOpcode::kBitfieldExtractUnsigned:
   case PcoOpcode::kBitfieldExtractSigned:
   case PcoOpcode::kIntegerAdd64_32:
+  case PcoOpcode::kUnsignedAddCarry:
+  case PcoOpcode::kUnsignedSubBorrow:
   case PcoOpcode::kBitwiseAnd:
   case PcoOpcode::kBitwiseOr:
   case PcoOpcode::kBitwiseXor:
   case PcoOpcode::kBitwiseXnor:
   case PcoOpcode::kShiftRight:
   case PcoOpcode::kShiftLeft:
+  case PcoOpcode::kCountBitsSet:
+  case PcoOpcode::kFindTopBit:
+  case PcoOpcode::kReverseBits:
   case PcoOpcode::kTestZero:
   case PcoOpcode::kFloatSine:
   case PcoOpcode::kFloatCosine:
@@ -335,6 +340,11 @@ void ValidateComputeProgram(const PcoDecodedProgram &program,
         instruction.source_count > 4 || instruction.exec_cnd > 3 ||
         instruction.writes_predicate > 1)
       Fail("invalid instruction operand or repeat metadata");
+    if (IsPcoUnaryBitwise(instruction.opcode) &&
+        (instruction.repeat_count != 1 || instruction.source_count != 1 ||
+         (instruction.target != PcoWriteTarget::kTemporary &&
+          instruction.target != PcoWriteTarget::kVertexInput)))
+      Fail("invalid unary bitwise ALU metadata");
     if (pending && instruction.opcode != PcoOpcode::kWaitDataFence)
       Fail("native memory request is not followed by its WDF");
     const bool load = instruction.opcode == PcoOpcode::kBufferLoad;
@@ -411,6 +421,17 @@ void ValidateComputeProgram(const PcoDecodedProgram &program,
           instruction.output_target1 == PcoWriteTarget::kVertexInput ?
               !Fits(instruction.output_index1, 1, abi.stage.vertex_inputs) : true)))
       Fail("ADD64_32 destination pair exceeds its declared register spans");
+    if (IsPcoCarryBorrow(instruction.opcode) &&
+        (!HasCanonicalCarryBorrowShape(instruction, true) ||
+         (instruction.target == PcoWriteTarget::kTemporary &&
+          !Fits(instruction.output_index, 1, abi.stage.temps)) ||
+         (instruction.target == PcoWriteTarget::kVertexInput &&
+          !Fits(instruction.output_index, 1, abi.stage.vertex_inputs)) ||
+         (instruction.output_target1 == PcoWriteTarget::kTemporary &&
+          !Fits(instruction.output_index1, 1, abi.stage.temps)) ||
+         (instruction.output_target1 == PcoWriteTarget::kVertexInput &&
+          !Fits(instruction.output_index1, 1, abi.stage.vertex_inputs))))
+      Fail("UADDC/USUBB destinations exceed their declared register spans");
     const std::array<PcoRegisterRef,4> sources{
         instruction.source, instruction.source1, instruction.source2,
         instruction.source3};
@@ -699,6 +720,13 @@ void StepComputeTask(const PcoDecodedProgram &program, const ComputePcoAbi &abi,
                 static_cast<std::uint32_t>(value), abi, lane);
           Write(instruction.output_target1, instruction.output_index1,
                 static_cast<std::uint32_t>(value >> 32U), abi, lane);
+        } else if (IsPcoCarryBorrow(instruction.opcode)) {
+          const auto values = EvaluatePcoCarryBorrow(
+              instruction.opcode, raw[0], raw[1]);
+          Write(instruction.target, instruction.output_index,
+                values.low, abi, lane);
+          Write(instruction.output_target1, instruction.output_index1,
+                values.flag, abi, lane);
         } else {
           // The shared helper is a pure ALU operation, not a VS/FS executor.
           const auto value = EvaluatePcoAluInstruction(instruction, raw,

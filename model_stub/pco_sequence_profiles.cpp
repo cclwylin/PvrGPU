@@ -1261,8 +1261,10 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
     // the model widens them into real screen-space geometry.
     const std::uint32_t assembled =
         draw.indexed != 0 ? draw.index_count : draw.vertex_count;
-    bool topology_assembles = false;
-    switch (draw.primitive_mode) {
+    bool topology_assembles =
+        draw.indexed != 0 && draw.primitive_restart_enable != 0 &&
+        draw.primitive_mode <= 6U;
+    switch (topology_assembles ? UINT32_MAX : draw.primitive_mode) {
       case 0U:
         topology_assembles = assembled >= 1U;
         break;
@@ -1281,7 +1283,6 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
         topology_assembles = assembled >= 3U;
         break;
       default:
-        topology_assembles = false;
         break;
     }
     if (!draw.geometry_pco.empty()) {
@@ -1311,20 +1312,24 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
       return Reject(error, "generic PCO sequence colour attachment chain is invalid");
     }
     if (!draw.initial_color_attachment_bytes.empty()) {
-      const std::uint64_t bytes_per_pixel =
-          draw.format == kRgba32Ui || draw.format == kRgba32I ||
-              draw.format == kRgba32F
-              ? 16U
-              : draw.format == kRg32Ui || draw.format == kRg32I ? 8U : 4U;
-      const std::uint64_t expected_bytes =
+      const std::uint64_t stored_pixels =
           static_cast<std::uint64_t>(draw.framebuffer_width) *
-          draw.framebuffer_height * bytes_per_pixel *
+          draw.framebuffer_height *
           (draw.raster_samples == 0 ? 1U : draw.raster_samples) *
           (draw.framebuffer_layers ? draw.framebuffer_layers : 1);
       const unsigned targets = draw.render_target_count ? draw.render_target_count : 1U;
+      const auto formats = EffectiveDriverColorAttachmentFormats(draw);
+      std::uint64_t expected_bytes = 0;
+      bool target_too_large = false;
+      for (const auto &format : formats) {
+        const auto target_bytes =
+            stored_pixels * DriverColorAttachmentBytesPerPixel(format);
+        expected_bytes += target_bytes;
+        target_too_large |= target_bytes > kDriverPcoSequenceAttachmentStride;
+      }
       if (ordinal != 0 || targets > kMaxRenderTargets ||
-          draw.initial_color_attachment_bytes.size() != expected_bytes * targets ||
-          expected_bytes > kDriverPcoSequenceAttachmentStride) {
+          draw.initial_color_attachment_bytes.size() != expected_bytes ||
+          target_too_large) {
         return Reject(error, "generic PCO initial colour attachment is invalid");
       }
     }

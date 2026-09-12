@@ -342,24 +342,19 @@ void Pbe::Run() {
       throw std::runtime_error("PBE sample count or framebuffer size is invalid");
     const std::size_t stored_samples =
         static_cast<std::size_t>(pixel_count) * sample_count;
-    // An integer attachment stores one dword per channel, so a pixel is not
-    // always four bytes wide.  Everything below sizes and indexes through
-    // this rather than assuming.
-    const std::size_t bytes_per_pixel =
-        ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
-                                     state.color_attachment_float32);
-    if (state.color_attachment_float32 &&
-        (state.color_attachment_raw_dwords != 0 || state.color_is_srgb))
-      throw std::runtime_error("PBE floating-point attachment state is invalid");
-    if (state.color_attachment_packed_unorm != PackedUnormFormat::kNone) {
-      (void)PackedUnormShift(state.color_attachment_packed_unorm, 0);
-      if (state.color_attachment_raw_dwords || state.color_attachment_float32 ||
-          state.color_is_srgb)
-        throw std::runtime_error("PBE packed UNORM attachment state is invalid");
-    }
     const std::uint32_t render_target_count = ValidateColorAttachmentFormats(state);
-    if (stored_samples > std::numeric_limits<std::size_t>::max() / bytes_per_pixel)
-      throw std::overflow_error("PBE framebuffer size overflow");
+    std::array<std::size_t, kMaxRenderTargets> target_bytes{};
+    std::array<std::size_t, kMaxRenderTargets + 1> target_offsets{};
+    for (std::uint32_t target = 0; target < render_target_count; ++target) {
+      const auto bytes_per_pixel = ColorAttachmentBytesPerPixel(state, target);
+      if (stored_samples > std::numeric_limits<std::size_t>::max() / bytes_per_pixel)
+        throw std::overflow_error("PBE framebuffer size overflow");
+      target_bytes[target] = stored_samples * bytes_per_pixel;
+      if (target_bytes[target] > std::numeric_limits<std::size_t>::max() -
+                                     target_offsets[target])
+        throw std::overflow_error("PBE aggregate framebuffer size overflow");
+      target_offsets[target + 1] = target_offsets[target] + target_bytes[target];
+    }
     const std::vector<FragmentInvocation> invocations =
         LoadArray<FragmentInvocation>(pool_, state.fragment_invocations);
     const std::vector<FragmentOutput> outputs =
@@ -369,7 +364,6 @@ void Pbe::Run() {
       throw std::runtime_error("PBE fragment input/output count mismatch");
     }
 
-    const std::uint64_t framebuffer_bytes = stored_samples * bytes_per_pixel;
     if (state.color_attachment_load_enable > 1 ||
         (state.color_attachment_load_enable != 0) !=
             HasPoolHandle(state.color_attachment_load) ||
@@ -378,8 +372,8 @@ void Pbe::Run() {
       throw std::runtime_error("PBE color attachment LOAD state is invalid");
     }
     const bool explicit_output_masks = HasExplicitFragmentOutputMasks(state);
-    // The explicit normalized4B vector is the new per-target storage
-    // contract. Legacy GS/TES MRT still lacks that proof and stays refused.
+    // The explicit format vector is the per-target storage contract. Legacy
+    // GS/TES MRT still lacks that proof and stays refused.
     if ((HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state)) &&
         render_target_count > 1 && state.color_attachment_format_count == 0)
       throw std::runtime_error(
@@ -389,20 +383,23 @@ void Pbe::Run() {
     std::vector<std::uint8_t> initial_colors;
     if (state.color_attachment_load_enable) {
       initial_colors = LoadArray<std::uint8_t>(pool_, state.color_attachment_load);
-      if (state.color_attachment_load_bytes != framebuffer_bytes * render_target_count ||
+      if (state.color_attachment_load_bytes != target_offsets[render_target_count] ||
           initial_colors.size() != state.color_attachment_load_bytes)
         throw std::runtime_error("PBE color attachment LOAD byte count mismatch");
     }
     std::vector<std::vector<std::uint8_t>> framebuffers(render_target_count);
     for (std::uint32_t target = 0; target < render_target_count; ++target) {
       const auto packed_format = ColorAttachmentPackedUnorm(state, target);
+      const auto raw_dwords = ColorAttachmentRawDwords(state, target);
+      const bool float32 = ColorAttachmentFloat32(state, target) != 0;
+      const auto bytes_per_pixel = ColorAttachmentBytesPerPixel(state, target);
       std::vector<std::uint8_t> &attachment = framebuffers[target];
       if (state.color_attachment_load_enable != 0) {
-        attachment.assign(initial_colors.begin() + target * framebuffer_bytes,
-                          initial_colors.begin() + (target + 1) * framebuffer_bytes);
+        attachment.assign(initial_colors.begin() + target_offsets[target],
+                          initial_colors.begin() + target_offsets[target + 1]);
         continue;
       }
-      attachment.assign(static_cast<std::size_t>(framebuffer_bytes), 0);
+      attachment.assign(target_bytes[target], 0);
       if (packed_format != PackedUnormFormat::kNone) {
         std::array<float, 4> clear{};
         std::copy_n(state.raster_state.clear_color, 4, clear.begin());
@@ -410,15 +407,15 @@ void Pbe::Run() {
             PackUnormColor(clear, packed_format);
         for (std::size_t pixel = 0; pixel < stored_samples; ++pixel)
           std::memcpy(attachment.data() + pixel * 4U, &word, sizeof(word));
-      } else if (state.color_attachment_float32) {
+      } else if (float32) {
         for (std::size_t pixel = 0; pixel < stored_samples; ++pixel) {
           std::memcpy(attachment.data() + pixel * bytes_per_pixel,
                       state.raster_state.clear_color, bytes_per_pixel);
         }
-      } else if (state.color_attachment_raw_dwords != 0) {
+      } else if (raw_dwords != 0) {
         // An integer attachment clears to the raw value, not a colour, and to
         // one such value per channel it stores.
-        const std::size_t channels = state.color_attachment_raw_dwords;
+        const std::size_t channels = raw_dwords;
         std::array<std::uint32_t, 4> raw{};
         for (std::size_t channel = 0; channel < channels; ++channel) {
           std::memcpy(&raw[channel], &state.raster_state.clear_color[channel],
@@ -552,7 +549,6 @@ void Pbe::Run() {
       }
       ++written_map[stored_index];
       last_submit_ordinal[stored_index] = output.submit_ordinal;
-      const std::size_t byte_offset = stored_index * bytes_per_pixel;
       for (std::uint32_t target = 0; target < render_target_count; ++target) {
       // A native FS may genuinely have no output for this attachment.
       // Preserve its pixels; no default color export or blend is fabricated.
@@ -560,8 +556,13 @@ void Pbe::Run() {
         continue;
       const auto packed_format = ColorAttachmentPackedUnorm(state, target);
       const bool packed_unorm = packed_format != PackedUnormFormat::kNone;
+      const auto raw_dwords = ColorAttachmentRawDwords(state, target);
+      const bool float32 = ColorAttachmentFloat32(state, target) != 0;
+      const bool srgb = ColorAttachmentSrgb(state, target) != 0;
+      const auto bytes_per_pixel = ColorAttachmentBytesPerPixel(state, target);
+      const std::size_t byte_offset = stored_index * bytes_per_pixel;
       std::vector<std::uint8_t> &framebuffer = framebuffers[target];
-      if (state.color_attachment_float32 || packed_unorm) {
+      if (float32 || packed_unorm) {
         std::array<float, 4> source{};
         std::array<float, 4> destination{};
         std::memcpy(source.data(), &output.pixel_output[target * 4],
@@ -615,14 +616,14 @@ void Pbe::Run() {
         }
         continue;
       }
-      if (state.color_attachment_raw_dwords != 0) {
+      if (raw_dwords != 0) {
         /*
          * A 32-bit integer attachment stores the shader's PIXOUT lanes
          * verbatim, one dword per channel it holds.  UNORM8 conversion would
          * quantise a value that was never a colour, and GLES forbids blending
          * on an integer format, so this path writes and returns.
          */
-        const std::size_t channels = state.color_attachment_raw_dwords;
+        const std::size_t channels = raw_dwords;
         for (std::size_t channel = 0; channel < channels; ++channel) {
           if ((state.raster_state.color_mask & (1U << channel)) == 0)
             continue;
@@ -633,7 +634,7 @@ void Pbe::Run() {
         }
         continue;
       }
-      if (state.color_is_srgb) {
+      if (srgb) {
         /*
          * GLES blends an sRGB colour buffer in linear space with no toggle.
          * The shader source is already linear; decode the stored sRGB
@@ -764,29 +765,30 @@ void Pbe::Run() {
     // Pixel-frequency shader outputs can own several samples, and each
     // attachment has an independent destination. Count the work performed
     // above, including overdraw, separately from full-surface serialization.
-    std::uint64_t sample_colors = 0;
-    std::uint32_t color_output_targets = render_target_count;
-    if (explicit_output_masks) {
-      color_output_targets = 0;
-      for (std::uint32_t target = 0; target < render_target_count; ++target)
-        color_output_targets += state.fragment_output_mask[target] != 0;
-    }
+    std::uint64_t sample_owners = 0;
     for (const std::uint32_t writes : written_map)
-      sample_colors += static_cast<std::uint64_t>(writes) * color_output_targets;
-    const std::uint32_t stored_channel_mask =
-        state.color_attachment_raw_dwords != 0
-            ? (1U << state.color_attachment_raw_dwords) - 1U : 0x0fU;
+      sample_owners += writes;
+    state.counters.occlusion_samples_passed = sample_owners;
+    std::uint32_t writable_targets = 0;
+    std::uint32_t blendable_targets = 0;
+    for (std::uint32_t target = 0; target < render_target_count; ++target) {
+      if (explicit_output_masks && state.fragment_output_mask[target] == 0)
+        continue;
+      const auto raw_dwords = ColorAttachmentRawDwords(state, target);
+      const std::uint32_t stored_channel_mask =
+          raw_dwords != 0 ? (1U << raw_dwords) - 1U : 0x0fU;
+      writable_targets +=
+          (state.raster_state.color_mask & stored_channel_mask) != 0;
+      blendable_targets += raw_dwords == 0;
+    }
     state.counters.pbe_pixels_written = stored_samples * render_target_count;
-    state.counters.pbe_fragment_writes =
-        (state.raster_state.color_mask & stored_channel_mask) != 0
-            ? sample_colors : 0;
+    state.counters.pbe_fragment_writes = sample_owners * writable_targets;
     // Integer attachments bypass the blend equation even if API blend state
     // is enabled. A masked floating/UNORM output still runs that equation in
     // this model, but does not produce a color write when all lanes are off.
-    const std::uint64_t blended_colors =
-        state.raster_state.blend.enable &&
-                state.color_attachment_raw_dwords == 0
-            ? sample_colors : 0;
+    const std::uint64_t blended_colors = state.raster_state.blend.enable
+                                             ? sample_owners * blendable_targets
+                                             : 0;
     state.counters.pbe_color_reads = blended_colors;
     state.counters.pbe_blended_fragments = blended_colors;
     const std::uint64_t blend_cycles =

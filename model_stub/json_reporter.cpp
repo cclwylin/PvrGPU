@@ -10,6 +10,7 @@
 #include "common/functional_types.h"
 #include "common/color_attachment_formats.h"
 #include "common/stream_output_types.h"
+#include "common/tessellation_state.h"
 #include "shader/pco_iss.h"
 #include "support/png_writer.h"
 #include "common/diagnostics.h"
@@ -152,6 +153,11 @@ struct VertexPcoEvidence {
   std::uint64_t bitwise_or = 0;
   std::uint64_t bitwise_xor = 0;
   std::uint64_t bitwise_xnor = 0;
+  std::uint64_t cbs = 0;
+  std::uint64_t ftb = 0;
+  std::uint64_t rev = 0;
+  std::uint64_t uaddc = 0;
+  std::uint64_t usubb = 0;
   std::uint64_t shr = 0;
   std::uint64_t shl = 0;
   std::uint64_t bfi = 0;
@@ -216,6 +222,10 @@ struct FragmentPcoEvidence {
   std::uint64_t savmsk_vm = 0;
   std::uint64_t shr = 0;
   std::uint64_t ftb = 0;
+  std::uint64_t cbs = 0;
+  std::uint64_t rev = 0;
+  std::uint64_t uaddc = 0;
+  std::uint64_t usubb = 0;
   std::uint64_t tstz = 0;
   std::uint64_t ffloor = 0;
   std::uint64_t fsub = 0;
@@ -414,6 +424,21 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kBitwiseXnor:
       ++evidence.bitwise_xnor;
       break;
+    case PcoOpcode::kCountBitsSet:
+      ++evidence.cbs;
+      break;
+    case PcoOpcode::kFindTopBit:
+      ++evidence.ftb;
+      break;
+    case PcoOpcode::kReverseBits:
+      ++evidence.rev;
+      break;
+    case PcoOpcode::kUnsignedAddCarry:
+      ++evidence.uaddc;
+      break;
+    case PcoOpcode::kUnsignedSubBorrow:
+      ++evidence.usubb;
+      break;
     case PcoOpcode::kBitfieldInsert:
       ++evidence.bfi;
       break;
@@ -457,7 +482,9 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
       evidence.fsub + evidence.fge + evidence.feq + evidence.flt +
       evidence.bcmp +
       evidence.bitwise_and + evidence.bitwise_or + evidence.bitwise_xor +
-      evidence.bitwise_xnor + evidence.shr + evidence.shl + evidence.bfi +
+      evidence.bitwise_xnor + evidence.cbs + evidence.ftb + evidence.rev +
+      evidence.uaddc + evidence.usubb + evidence.shr + evidence.shl +
+      evidence.bfi +
       evidence.csel + evidence.fmad + evidence.fmin + evidence.fmax +
       evidence.frcp + evidence.frsq + evidence.flog2 + evidence.fexp2 +
       evidence.pck_f16 + evidence.unpck_f16 + evidence.unpck_int +
@@ -512,6 +539,18 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
       break;
     case PcoOpcode::kFindTopBit:
       ++evidence.ftb;
+      break;
+    case PcoOpcode::kCountBitsSet:
+      ++evidence.cbs;
+      break;
+    case PcoOpcode::kReverseBits:
+      ++evidence.rev;
+      break;
+    case PcoOpcode::kUnsignedAddCarry:
+      ++evidence.uaddc;
+      break;
+    case PcoOpcode::kUnsignedSubBorrow:
+      ++evidence.usubb;
       break;
     case PcoOpcode::kInternal:
       ++evidence.internal;
@@ -702,6 +741,7 @@ FragmentPcoEvidence BuildFragmentPcoEvidence(const MemoryPool &pool,
           evidence.mbyp + evidence.smp + evidence.internal + evidence.fneg +
           evidence.fabs +
           evidence.movi + evidence.pck_cov + evidence.savmsk_vm + evidence.shr + evidence.ftb +
+          evidence.cbs + evidence.rev + evidence.uaddc + evidence.usubb +
           evidence.tstz + evidence.ffloor +
           evidence.fsub + evidence.fge + evidence.feq + evidence.flt +
       evidence.bcmp +
@@ -761,6 +801,11 @@ void AppendVertexPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_VERTEX_EVIDENCE(bitwise_or);
   PVRGPU_ADD_VERTEX_EVIDENCE(bitwise_xor);
   PVRGPU_ADD_VERTEX_EVIDENCE(bitwise_xnor);
+  PVRGPU_ADD_VERTEX_EVIDENCE(cbs);
+  PVRGPU_ADD_VERTEX_EVIDENCE(ftb);
+  PVRGPU_ADD_VERTEX_EVIDENCE(rev);
+  PVRGPU_ADD_VERTEX_EVIDENCE(uaddc);
+  PVRGPU_ADD_VERTEX_EVIDENCE(usubb);
   PVRGPU_ADD_VERTEX_EVIDENCE(shr);
   PVRGPU_ADD_VERTEX_EVIDENCE(shl);
   PVRGPU_ADD_VERTEX_EVIDENCE(bfi);
@@ -831,6 +876,10 @@ void AppendFragmentPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_FRAGMENT_EVIDENCE(savmsk_vm);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(shr);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(ftb);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(cbs);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(rev);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(uaddc);
+  PVRGPU_ADD_FRAGMENT_EVIDENCE(usubb);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(tstz);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(ffloor);
   PVRGPU_ADD_FRAGMENT_EVIDENCE(fsub);
@@ -1289,6 +1338,7 @@ void AccumulatePhysicalCounters(CounterTxn *aggregate,
   PVRGPU_ADD_COUNTER(pbe_color_reads);
   PVRGPU_ADD_COUNTER(pbe_blended_fragments);
   PVRGPU_ADD_COUNTER(pbe_fragment_writes);
+  PVRGPU_ADD_COUNTER(occlusion_samples_passed);
   PVRGPU_ADD_COUNTER(pbe_pixels_written);
 #undef PVRGPU_ADD_COUNTER
 }
@@ -1413,6 +1463,15 @@ void ValidateMemoryPath(const Options &options, const PipelineState &state,
    * than reporting the memory path as a whole. */
   const std::uint64_t render_target_count =
       state.render_target_count == 0 ? 1U : state.render_target_count;
+  const std::uint64_t stored_pixels =
+      static_cast<std::uint64_t>(state.width) * state.height *
+      state.raster_state.sample_count * state.attachment_layers;
+  std::uint64_t expected_all_bytes = 0;
+  for (std::uint32_t target = 0; target < render_target_count; ++target)
+    expected_all_bytes +=
+        stored_pixels * ColorAttachmentBytesPerPixel(state, target);
+  if (expected_bytes != stored_pixels * ColorAttachmentBytesPerPixel(state, 0))
+    throw std::runtime_error("JsonReporter primary color byte count mismatch");
   if (state.memory_mode != options.memory_mode ||
       state.cache_bypass != static_cast<std::uint8_t>(options.cache_bypass)) {
     throw std::runtime_error("JsonReporter memory mode or cache bypass "
@@ -1425,22 +1484,20 @@ void ValidateMemoryPath(const Options &options, const PipelineState &state,
         " transactions, expected one per colour attachment (" +
         std::to_string(render_target_count) + ")");
   }
-  if (counters.pixel_data_master_bytes !=
-      expected_bytes * render_target_count) {
+  if (counters.pixel_data_master_bytes != expected_all_bytes) {
     throw std::runtime_error(
         "JsonReporter pixel data master moved " +
         std::to_string(counters.pixel_data_master_bytes) + " bytes, expected " +
-        std::to_string(expected_bytes * render_target_count));
+        std::to_string(expected_all_bytes));
   }
   if (counters.pixel_data_master_cycles == 0)
     throw std::runtime_error("JsonReporter pixel data master spent no cycles");
-  if (counters.framebuffer_dram_readback_bytes !=
-      expected_bytes * render_target_count) {
+  if (counters.framebuffer_dram_readback_bytes != expected_all_bytes) {
     throw std::runtime_error(
         "JsonReporter framebuffer read back " +
         std::to_string(counters.framebuffer_dram_readback_bytes) +
         " bytes, expected " +
-        std::to_string(expected_bytes * render_target_count));
+        std::to_string(expected_all_bytes));
   }
   if (counters.dram_cycles !=
       counters.dram_read_transactions + counters.dram_write_transactions) {
@@ -2057,6 +2114,16 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"bitwise_xor\":" << vertex_pco.bitwise_xor;
   if (vertex_pco.bitwise_xnor != 0)
     std::cout << ",\"bitwise_xnor\":" << vertex_pco.bitwise_xnor;
+  if (vertex_pco.cbs != 0)
+    std::cout << ",\"cbs\":" << vertex_pco.cbs;
+  if (vertex_pco.ftb != 0)
+    std::cout << ",\"ftb\":" << vertex_pco.ftb;
+  if (vertex_pco.rev != 0)
+    std::cout << ",\"rev\":" << vertex_pco.rev;
+  if (vertex_pco.uaddc != 0)
+    std::cout << ",\"uaddc\":" << vertex_pco.uaddc;
+  if (vertex_pco.usubb != 0)
+    std::cout << ",\"usubb\":" << vertex_pco.usubb;
   if (vertex_pco.shr != 0)
     std::cout << ",\"shr\":" << vertex_pco.shr;
   if (vertex_pco.shl != 0)
@@ -2117,6 +2184,14 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"shr\":" << fragment_pco.shr;
   if (fragment_pco.ftb != 0)
     std::cout << ",\"ftb\":" << fragment_pco.ftb;
+  if (fragment_pco.cbs != 0)
+    std::cout << ",\"cbs\":" << fragment_pco.cbs;
+  if (fragment_pco.rev != 0)
+    std::cout << ",\"rev\":" << fragment_pco.rev;
+  if (fragment_pco.uaddc != 0)
+    std::cout << ",\"uaddc\":" << fragment_pco.uaddc;
+  if (fragment_pco.usubb != 0)
+    std::cout << ",\"usubb\":" << fragment_pco.usubb;
   if (fragment_pco.tstz != 0)
     std::cout << ",\"tstz\":" << fragment_pco.tstz;
   if (fragment_pco.ffloor != 0)
@@ -2332,6 +2407,7 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
       << ",\"pbe_color_reads\":" << counters.pbe_color_reads
       << ",\"pbe_blended_fragments\":" << counters.pbe_blended_fragments
       << ",\"pbe_fragment_writes\":" << counters.pbe_fragment_writes
+      << ",\"occlusion_samples_passed\":" << counters.occlusion_samples_passed
       << ",\"pbe_pixels_written\":" << counters.pbe_pixels_written
       << ",\"functional_frame\":" << counters.functional_frame
       << "},\"drawlist_stats\":[";
@@ -2363,6 +2439,38 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
 }
 
 void PublishStreamOutputs(ModelJob &job, const MemoryPool &pool, const PipelineState &state) {
+  if (HasPoolHandle(state.tessellation_state)) {
+    const auto tess = LoadArray<TessellationState>(pool, state.tessellation_state);
+    if (tess.size() != 1)
+      throw std::runtime_error("JsonReporter tessellation state extent is invalid");
+    if (HasPoolHandle(tess[0].buffer_resources)) {
+      if (tess[0].phase != TessellationPhase::kEvaluationComplete)
+        throw std::runtime_error(
+            "JsonReporter tessellation storage-buffer readback is incomplete");
+      for (const auto &resource : LoadArray<TessellationBufferResource>(
+               pool, tess[0].buffer_resources)) {
+        if (!(resource.access & 2U)) continue;
+        if (!resource.resource_token || !HasPoolHandle(resource.readback))
+          throw std::runtime_error(
+              "JsonReporter tessellation storage buffer has no modeled readback");
+        ModelShaderImageReadback result;
+        result.resource_token = resource.resource_token;
+        result.bytes = LoadArray<std::uint8_t>(pool, resource.readback);
+        if (result.bytes.size() != resource.bytes)
+          throw std::runtime_error(
+              "JsonReporter tessellation storage-buffer readback extent mismatch");
+        const auto prior = std::find_if(
+            job.shader_images.begin(), job.shader_images.end(),
+            [&](const auto &entry) {
+              return entry.resource_token == result.resource_token;
+            });
+        if (prior == job.shader_images.end())
+          job.shader_images.push_back(std::move(result));
+        else
+          *prior = std::move(result);
+      }
+    }
+  }
   if (HasPoolHandle(state.fragment_image_resources)) {
     if (!state.fragment_images_complete)
       throw std::runtime_error("JsonReporter fragment image execution/readback is incomplete");
@@ -2519,6 +2627,7 @@ void JsonReporter::RunJob() {
     std::vector<std::string> final_color_formats;
     bool final_color_formats_explicit = false;
     std::uint32_t final_bytes_per_pixel = 4;
+    std::vector<std::uint32_t> final_bytes_per_pixel_per_target;
     PackedUnormFormat final_packed_unorm = PackedUnormFormat::kNone;
     std::uint32_t final_sample_count = 1;
     std::uint32_t final_layer_count = 1;
@@ -2601,11 +2710,9 @@ void JsonReporter::RunJob() {
               (physical_command.depth_attachment_source_command_index !=
                   kDriverPcoNewAttachment ||
                !physical_command.initial_depth_attachment_bytes.empty());
-          const std::uint64_t expected_color_bytes =
+          const std::uint64_t stored_pixels =
               static_cast<std::uint64_t>(state.width) * state.height *
-              state.raster_state.sample_count * state.attachment_layers *
-              ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
-                                           state.color_attachment_float32);
+              state.raster_state.sample_count * state.attachment_layers;
           const std::uint32_t targets = physical_command.render_target_count ?
               physical_command.render_target_count : 1U;
           const std::uint64_t color_owner =
@@ -2613,16 +2720,22 @@ void JsonReporter::RunJob() {
                   kDriverPcoSequenceAttachmentStride;
           if (state.render_target_count != targets)
             throw std::runtime_error("JsonReporter PCO sequence MRT count mismatch");
+          std::uint64_t expected_all_color_bytes = 0;
+          for (std::uint32_t target = 0; target < targets; ++target)
+            expected_all_color_bytes +=
+                stored_pixels * ColorAttachmentBytesPerPixel(state, target);
           for (std::uint32_t target = 1; target < targets; ++target) {
+            const auto expected_target_bytes =
+                stored_pixels * ColorAttachmentBytesPerPixel(state, target);
             const std::uint64_t expected_address = kDriverPcoMrtColorAddressBase +
                 (color_owner * kMaxRenderTargets + target) * kDriverPcoSequenceAttachmentStride;
             if (state.extra_framebuffer_gpu_address[target - 1] != expected_address ||
-                state.extra_framebuffer_bytes[target - 1] != expected_color_bytes)
+                state.extra_framebuffer_bytes[target - 1] != expected_target_bytes)
               throw std::runtime_error("JsonReporter PCO sequence MRT ownership mismatch");
           }
           if (state.color_attachment_load_enable != (color_load ? 1U : 0U) ||
               state.color_attachment_load_bytes !=
-                  (color_load ? expected_color_bytes * targets : 0U) ||
+                  (color_load ? expected_all_color_bytes : 0U) ||
               HasPoolHandle(state.color_attachment_load) != color_load ||
               state.depth_attachment_load_enable != (depth_load ? 1U : 0U) ||
               state.depth_attachment_load_bytes !=
@@ -2651,16 +2764,21 @@ void JsonReporter::RunJob() {
 
         const std::vector<std::uint8_t> framebuffer =
             LoadArray<std::uint8_t>(pool_, state.dram_framebuffer);
-        const std::uint64_t expected_framebuffer_bytes =
+        const std::uint64_t stored_pixels =
             static_cast<std::uint64_t>(state.width) * state.height *
-            state.raster_state.sample_count * state.attachment_layers *
-            ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
-                                         state.color_attachment_float32);
+            state.raster_state.sample_count * state.attachment_layers;
+        const std::uint64_t expected_framebuffer_bytes =
+            stored_pixels * ColorAttachmentBytesPerPixel(state, 0);
         const std::uint64_t submission_render_target_count =
             state.render_target_count == 0 ? 1U : state.render_target_count;
+        std::uint64_t expected_all_framebuffer_bytes = 0;
+        for (std::uint32_t target = 0;
+             target < submission_render_target_count; ++target)
+          expected_all_framebuffer_bytes +=
+              stored_pixels * ColorAttachmentBytesPerPixel(state, target);
         if (state.framebuffer_bytes != expected_framebuffer_bytes ||
             state.counters.framebuffer_dram_readback_bytes !=
-                expected_framebuffer_bytes * submission_render_target_count ||
+                expected_all_framebuffer_bytes ||
             framebuffer.size() != expected_framebuffer_bytes) {
           throw std::runtime_error(
               "JsonReporter PCO sequence DRAM byte count mismatch");
@@ -2701,7 +2819,8 @@ void JsonReporter::RunJob() {
                 state.counters.gs_invocations, HasPoolHandle(state.tessellation_state),
                 state.counters.tessellation_primitives,
                 state.stream_output_primitives_written,
-                state.stream_output_primitives_storage_needed);
+                state.stream_output_primitives_storage_needed,
+                state.counters.occlusion_samples_passed);
           }
           PublishStreamOutputs(*job_, pool_, state);
         }
@@ -2726,8 +2845,12 @@ void JsonReporter::RunJob() {
               pool_, state.extra_dram_framebuffer[target - 1]));
         }
         final_bytes_per_pixel = static_cast<std::uint32_t>(
-            ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
-                                         state.color_attachment_float32));
+            ColorAttachmentBytesPerPixel(state, 0));
+        final_bytes_per_pixel_per_target.clear();
+        for (std::uint32_t target = 0;
+             target < submission_render_target_count; ++target)
+          final_bytes_per_pixel_per_target.push_back(static_cast<std::uint32_t>(
+              ColorAttachmentBytesPerPixel(state, target)));
         final_sample_count = state.raster_state.sample_count;
         final_packed_unorm = state.color_attachment_packed_unorm;
         final_layer_count = state.attachment_layers;
@@ -2803,7 +2926,8 @@ void JsonReporter::RunJob() {
                                  final_bytes_per_pixel,
                                  std::move(final_extra_framebuffers),
                                  final_sample_count, final_layer_count,
-                                 std::move(final_color_formats), final_color_formats_explicit);
+                                 std::move(final_color_formats), final_color_formats_explicit,
+                                 std::move(final_bytes_per_pixel_per_target));
         job_->depth_framebuffer = std::move(final_depth_framebuffer);
         job_->depth_format = final_depth_format;
       }
@@ -2886,16 +3010,20 @@ void JsonReporter::RunJob() {
 
       const std::vector<std::uint8_t> framebuffer =
           LoadArray<std::uint8_t>(pool_, state.dram_framebuffer);
-      const std::uint64_t expected_framebuffer_bytes =
+      const std::uint64_t stored_pixels =
           static_cast<std::uint64_t>(state.width) * state.height *
-          state.raster_state.sample_count * state.attachment_layers *
-          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
-                                       state.color_attachment_float32);
+          state.raster_state.sample_count * state.attachment_layers;
+      const std::uint64_t expected_framebuffer_bytes =
+          stored_pixels * ColorAttachmentBytesPerPixel(state, 0);
       const std::uint64_t sequence_render_target_count =
           state.render_target_count == 0 ? 1U : state.render_target_count;
+      std::uint64_t expected_all_framebuffer_bytes = 0;
+      for (std::uint32_t target = 0; target < sequence_render_target_count; ++target)
+        expected_all_framebuffer_bytes +=
+            stored_pixels * ColorAttachmentBytesPerPixel(state, target);
       if (state.framebuffer_bytes != expected_framebuffer_bytes ||
           state.counters.framebuffer_dram_readback_bytes !=
-              expected_framebuffer_bytes * sequence_render_target_count ||
+              expected_all_framebuffer_bytes ||
           framebuffer.size() != expected_framebuffer_bytes) {
         throw std::runtime_error(
             "JsonReporter DRAM framebuffer byte count mismatch");
@@ -2903,6 +3031,10 @@ void JsonReporter::RunJob() {
       /* Attachments past the first, in target order, so a driver reading back
        * a second colour surface sees what the shader wrote to it. */
       std::vector<std::vector<std::uint8_t>> extra_framebuffers;
+      std::vector<std::uint32_t> bytes_per_pixel_per_target;
+      bytes_per_pixel_per_target.reserve(sequence_render_target_count);
+      bytes_per_pixel_per_target.push_back(static_cast<std::uint32_t>(
+          ColorAttachmentBytesPerPixel(state, 0)));
       for (std::uint64_t target = 1; target < sequence_render_target_count;
            ++target) {
         if (!HasPoolHandle(state.extra_dram_framebuffer[target - 1])) {
@@ -2912,6 +3044,8 @@ void JsonReporter::RunJob() {
         }
         extra_framebuffers.push_back(LoadArray<std::uint8_t>(
             pool_, state.extra_dram_framebuffer[target - 1]));
+        bytes_per_pixel_per_target.push_back(static_cast<std::uint32_t>(
+            ColorAttachmentBytesPerPixel(state, target)));
       }
       ValidateMemoryPath(options_, state, expected_framebuffer_bytes);
       if (!HasPoolHandle(state.drawlist_stats))
@@ -2927,8 +3061,7 @@ void JsonReporter::RunJob() {
       // What the driver reads back is the model's own DRAM contents, never the
       // command sidecar the artifact may be overlaid with below.
       const std::uint32_t frame_bytes_per_pixel = static_cast<std::uint32_t>(
-          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
-                                       state.color_attachment_float32));
+          ColorAttachmentBytesPerPixel(state, 0));
       const auto color_formats = ReportedColorAttachmentFormats(options_.driver_command, state);
       if (job_) {
         // Clear-only jobs may use internal drawing machinery, but do not
@@ -2939,14 +3072,16 @@ void JsonReporter::RunJob() {
               state.counters.gs_invocations, HasPoolHandle(state.tessellation_state),
               state.counters.tessellation_primitives,
               state.stream_output_primitives_written,
-              state.stream_output_primitives_storage_needed);
+              state.stream_output_primitives_storage_needed,
+              state.counters.occlusion_samples_passed);
         PublishStreamOutputs(*job_, pool_, state);
         job_->PublishFramebuffer(framebuffer, state.width, state.height,
                                  frame_bytes_per_pixel,
                                  std::move(extra_framebuffers),
                                  state.raster_state.sample_count, state.attachment_layers,
                                  color_formats,
-                                 !options_.driver_command.color_attachment_formats.empty());
+                                 !options_.driver_command.color_attachment_formats.empty(),
+                                 std::move(bytes_per_pixel_per_target));
         /*
          * A lone native command publishes its depth plane the same way the
          * sequence path does.  The driver's framebuffer-boundary readback

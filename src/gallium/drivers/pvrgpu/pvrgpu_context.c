@@ -795,7 +795,7 @@ pvrgpu_read_draw_index(const struct pipe_draw_info *info,
    }
 }
 
-static const char *
+const char *
 pvrgpu_command_format_for_surface(enum pipe_format format)
 {
    switch (format) {
@@ -864,11 +864,11 @@ pvrgpu_framebuffer_color_transport_is_bounded(const struct pvrgpu_context *ctx)
 {
    if (!ctx || ctx->framebuffer.nr_cbufs > PVRGPU_MAX_RENDER_TARGETS)
       return false;
-   const bool mixed = pvrgpu_framebuffer_has_mixed_color_formats(ctx);
    for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target) {
       const struct pipe_surface *surface = &ctx->framebuffer.cbufs[target];
       if (!surface->texture ||
-          (mixed && !pvrgpu_is_explicit_color_format(util_format_name(surface->format))))
+          !pvrgpu_is_explicit_color_format(
+             pvrgpu_command_format_for_surface(surface->format)))
          return false;
    }
    return true;
@@ -10461,6 +10461,13 @@ struct pvrgpu_array_primitive_draw {
    /* Snapshot utility only captures BO bytes/refs; execution is native FS USC. */
    struct pvrgpu_compute_snapshot fragment_image_snapshot;
    struct pvrgpu_systemc_shader_image fragment_images[PVRGPU_SYSTEMC_MAX_SHADER_IMAGES];
+   /* TCS/TES views share one owned backing snapshot so aliases remain
+    * coherent across both stages and writable ranges can be copied back. */
+   struct pvrgpu_compute_snapshot tessellation_buffer_snapshot;
+   struct pvrgpu_systemc_shader_buffer_resource
+      tessellation_buffer_resources[PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_RESOURCES];
+   struct pvrgpu_systemc_shader_buffer_binding
+      tessellation_buffer_bindings[PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BINDINGS];
 };
 
 static void
@@ -10480,6 +10487,7 @@ pvrgpu_array_primitive_draw_destroy(struct pvrgpu_array_primitive_draw **slot)
    pvrgpu_finish_uniform_buffer_snapshots(draw->uniform_buffers,
                                          &draw->uniform_buffer_count);
    pvrgpu_compute_snapshot_finish(&draw->fragment_image_snapshot);
+   pvrgpu_compute_snapshot_finish(&draw->tessellation_buffer_snapshot);
    for (unsigned texture = 0; texture < ARRAY_SIZE(draw->texture_bytes); ++texture)
       free(draw->texture_bytes[texture]);
    for (unsigned buffer = 0; buffer < PIPE_MAX_SO_BUFFERS; ++buffer) {
@@ -10488,6 +10496,109 @@ pvrgpu_array_primitive_draw_destroy(struct pvrgpu_array_primitive_draw **slot)
    }
    FREE(draw);
    *slot = NULL;
+}
+
+static bool
+pvrgpu_capture_tessellation_buffers(
+   const struct pvrgpu_context *ctx,
+   const struct pvrgpu_pco_tessellation_pipeline_binary *binary,
+   uint32_t *control_shared,
+   uint32_t *evaluation_shared,
+   struct pvrgpu_systemc_tessellation *payload,
+   struct pvrgpu_compute_snapshot *snapshot,
+   struct pvrgpu_systemc_shader_buffer_resource *resources,
+   struct pvrgpu_systemc_shader_buffer_binding *bindings)
+{
+   if (!ctx || !binary || !control_shared || !evaluation_shared || !payload ||
+       !snapshot || !resources || !bindings)
+      return false;
+   const struct {
+      mesa_shader_stage stage;
+      uint32_t public_stage;
+      const struct pvrgpu_pco_tessellation_binary *binary;
+      uint32_t *shared;
+      struct pvrgpu_systemc_storage_buffer_abi *abi;
+   } stages[] = {
+      {MESA_SHADER_TESS_CTRL, PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_CONTROL,
+       &binary->control, control_shared, &payload->control_storage},
+      {MESA_SHADER_TESS_EVAL, PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION,
+       &binary->evaluation, evaluation_shared, &payload->evaluation_storage},
+   };
+   for (unsigned stage_index = 0; stage_index < ARRAY_SIZE(stages); ++stage_index) {
+      const __typeof__(stages[0]) *stage = &stages[stage_index];
+      const struct pvrgpu_pco_tessellation_binary *compiled = stage->binary;
+      *stage->abi = (struct pvrgpu_systemc_storage_buffer_abi){
+         .descriptor_start = compiled->storage_buffer_descriptor_start,
+         .descriptor_count = compiled->storage_buffer_descriptor_count,
+         .used_mask = compiled->storage_buffer_used_mask,
+         .read_mask = compiled->storage_buffer_read_mask,
+         .write_mask = compiled->storage_buffer_write_mask,
+      };
+      if (compiled->storage_buffer_descriptor_count > PIPE_MAX_SHADER_BUFFERS ||
+          (uint64_t)compiled->storage_buffer_descriptor_start +
+             4u * compiled->storage_buffer_descriptor_count >
+                compiled->shader.abi.shareds)
+         return false;
+      for (unsigned slot = 0; slot < compiled->storage_buffer_descriptor_count; ++slot) {
+         const uint32_t bit = UINT32_C(1) << slot;
+         if (!(compiled->storage_buffer_used_mask & bit))
+            continue;
+         const struct pipe_shader_buffer *binding =
+            &ctx->shader_buffers[stage->stage][slot];
+         uint32_t access = 0;
+         if (compiled->storage_buffer_read_mask & bit)
+            access |= PVRGPU_SYSTEMC_SHADER_BUFFER_READ;
+         if (compiled->storage_buffer_write_mask & bit) {
+            if (!(ctx->shader_buffer_writable_mask[stage->stage] & bit))
+               return false;
+            access |= PVRGPU_SYSTEMC_SHADER_BUFFER_WRITE;
+         }
+         const char *reason = NULL;
+         if (!pvrgpu_compute_snapshot_add(snapshot,
+                PVRGPU_SYSTEMC_COMPUTE_STORAGE_BUFFER, slot, access,
+                binding->buffer, NULL, binding->buffer_offset,
+                binding->buffer_size, &reason))
+            return false;
+         const struct pvrgpu_systemc_compute_binding *captured =
+            &snapshot->bindings[snapshot->binding_count - 1];
+         if (snapshot->binding_count > PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BINDINGS)
+            return false;
+         bindings[snapshot->binding_count - 1] =
+            (struct pvrgpu_systemc_shader_buffer_binding){
+               .stage = stage->public_stage,
+               .slot = slot,
+               .resource_index = captured->resource_index,
+               .access = access,
+               .offset = captured->offset,
+               .bytes_size = captured->bytes_size,
+            };
+         uint32_t *descriptor = stage->shared +
+            compiled->storage_buffer_descriptor_start + 4u * slot;
+         descriptor[0] = descriptor[1] = descriptor[3] = 0;
+         descriptor[2] = captured->bytes_size;
+      }
+   }
+   uint64_t total = 0;
+   if (snapshot->resource_count > PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_RESOURCES)
+      return false;
+   for (unsigned index = 0; index < snapshot->resource_count; ++index) {
+      const struct pvrgpu_systemc_compute_resource *captured =
+         &snapshot->resources[index];
+      if (!snapshot->owners[index] || !captured->bytes || !captured->bytes_size ||
+          captured->bytes_size > PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BYTES - total)
+         return false;
+      total += captured->bytes_size;
+      resources[index] = (struct pvrgpu_systemc_shader_buffer_resource){
+         .resource_token = (uintptr_t)snapshot->owners[index],
+         .bytes = captured->bytes,
+         .bytes_size = captured->bytes_size,
+      };
+   }
+   payload->buffer_resources = snapshot->resource_count ? resources : NULL;
+   payload->buffer_resource_count = snapshot->resource_count;
+   payload->buffer_bindings = snapshot->binding_count ? bindings : NULL;
+   payload->buffer_binding_count = snapshot->binding_count;
+   return true;
 }
 
 static bool
@@ -10782,30 +10893,30 @@ pvrgpu_capture_initial_color_attachment(
    if (targets > 4 || targets != recorded->command.render_target_count)
       return false;
    uint8_t *all_pixels = NULL;
-   size_t target_bytes = 0;
+   size_t all_size = 0;
    for (unsigned target = 0; target < targets; ++target) {
       uint8_t *pixels = NULL;
       size_t size = 0;
       if (!pvrgpu_capture_initial_color_target(ctx, recorded, target, &pixels, &size) ||
-          (target && size != target_bytes) || size > SIZE_MAX / targets) {
+          size > SIZE_MAX - all_size) {
          free(pixels);
          free(all_pixels);
          return false;
       }
-      if (!target) {
-         target_bytes = size;
-         all_pixels = malloc(target_bytes * targets);
-         if (!all_pixels) {
-            free(pixels);
-            return false;
-         }
+      uint8_t *grown = realloc(all_pixels, all_size + size);
+      if (!grown) {
+         free(pixels);
+         free(all_pixels);
+         return false;
       }
-      memcpy(all_pixels + target * target_bytes, pixels, target_bytes);
+      all_pixels = grown;
+      memcpy(all_pixels + all_size, pixels, size);
+      all_size += size;
       free(pixels);
    }
    recorded->initial_color_attachment_bytes = all_pixels;
    recorded->command.initial_color_attachment_bytes = all_pixels;
-   recorded->command.initial_color_attachment_bytes_size = target_bytes * targets;
+   recorded->command.initial_color_attachment_bytes_size = all_size;
    return true;
 }
 
@@ -11265,6 +11376,38 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
        * bytes outside the native descriptor. Reused utility performs byte
        * transport only; these results were produced by the fragment USC. */
       pvrgpu_compute_snapshot_writeback(images);
+      struct pvrgpu_compute_snapshot *buffers =
+         &recorded->tessellation_buffer_snapshot;
+      for (unsigned resource_index = 0;
+           resource_index < buffers->resource_count; ++resource_index) {
+         bool writable = false;
+         for (unsigned binding = 0; binding < buffers->binding_count; ++binding)
+            if (buffers->bindings[binding].resource_index == resource_index &&
+                (buffers->bindings[binding].access &
+                 PVRGPU_SYSTEMC_COMPUTE_ACCESS_WRITE)) {
+               writable = true;
+               break;
+            }
+         if (!writable)
+            continue;
+         struct pvrgpu_systemc_shader_image_readback readback = {
+            .submission_generation = ctx->color_readback_generation,
+            .resource_token = (uintptr_t)buffers->owners[resource_index],
+            .bytes = buffers->resources[resource_index].bytes,
+            .bytes_size = buffers->resources[resource_index].bytes_size,
+         };
+         if (!pvrgpu_read_shader_image(&readback, error, sizeof(error))) {
+            ++ctx->query_statistics_failures;
+            pvrgpu_counter_eventf("tessellation_buffer_readback_error",
+                                  "reason=%s", error);
+            return false;
+         }
+         pvrgpu_counter_eventf("tessellation_buffer_readback",
+            "generation=%llu resource=%u bytes=%zu",
+            (unsigned long long)readback.submission_generation,
+            resource_index, readback.bytes_size);
+      }
+      pvrgpu_compute_snapshot_writeback(buffers);
       for (unsigned buffer = 0; buffer < recorded->stream_output.target_count; ++buffer) {
          const struct pvrgpu_systemc_stream_output_target *payload =
             &recorded->stream_output_payloads[buffer];
@@ -11335,8 +11478,7 @@ pvrgpu_copy_draw_indices(const struct pipe_draw_info *info,
    if (!info || !draw ||
        (info->index_size != 1 && info->index_size != 2 && info->index_size != 4) ||
        index_count == 0 || index_count > SIZE_MAX / info->index_size ||
-       !out_index_count || !out_max_index ||
-       (info->primitive_restart && info->mode != MESA_PRIM_POINTS))
+       !out_index_count || !out_max_index)
       return NULL;
 
    const size_t bytes = (size_t)index_count * info->index_size;
@@ -11351,7 +11493,8 @@ pvrgpu_copy_draw_indices(const struct pipe_draw_info *info,
          free(indices);
          return NULL;
       }
-      if (index > max_index)
+      if ((!info->primitive_restart || index != info->restart_index) &&
+          index > max_index)
          max_index = index;
       switch (info->index_size) {
       case 1:
@@ -11368,7 +11511,7 @@ pvrgpu_copy_draw_indices(const struct pipe_draw_info *info,
       }
    }
    unsigned retained_count = index_count;
-   if (info->primitive_restart &&
+   if (info->primitive_restart && info->mode == MESA_PRIM_POINTS &&
        !pvrgpu_compact_point_restart_indices(indices, bytes, info->index_size,
                                              index_count, info->restart_index,
                                              &retained_count, &max_index)) {
@@ -11493,7 +11636,14 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    const bool current_images = ctx->fs && ctx->fs->nir && ctx->fs->nir->info.num_images;
    const bool preceding_images = ctx->array_primitive_draw_count &&
       ctx->array_primitive_draws[ctx->array_primitive_draw_count - 1]->command.fragment_image_count;
-   if ((ctx->num_stream_output_targets || current_images || preceding_images) &&
+   const bool current_tessellation_buffers = has_tessellation &&
+      ((ctx->tcs->nir && ctx->tcs->nir->info.num_ssbos) ||
+       (ctx->tes->nir && ctx->tes->nir->info.num_ssbos));
+   const bool preceding_tessellation_buffers = ctx->array_primitive_draw_count &&
+      ctx->array_primitive_draws[ctx->array_primitive_draw_count - 1]
+         ->tessellation.buffer_resource_count;
+   if ((ctx->num_stream_output_targets || current_images || preceding_images ||
+        current_tessellation_buffers || preceding_tessellation_buffers) &&
        ctx->array_primitive_draw_count) {
       const uint64_t failures = ctx->query_statistics_failures;
       pvrgpu_flush_current_color_attachments(&ctx->base);
@@ -11613,10 +11763,15 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
     * the model.
     */
    unsigned assembled_count =
-      has_tessellation ? draw->count / patch_vertices * patch_vertices :
-                        pvrgpu_array_assembled_vertex_count(info->mode, draw->count);
+      (info->index_size != 0 && info->primitive_restart) ? draw->count :
+      (has_tessellation ? draw->count / patch_vertices * patch_vertices :
+                          pvrgpu_array_assembled_vertex_count(info->mode,
+                                                               draw->count));
    unsigned vertex_count = assembled_count;
    unsigned vertex_bias = 0;
+   const bool transport_primitive_restart =
+      info->index_size != 0 && info->primitive_restart &&
+      info->mode != MESA_PRIM_POINTS;
    if (info->index_size != 0) {
       uint32_t max_index = 0;
       index_data =
@@ -11640,20 +11795,52 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
          return true;
       }
       index_data_size = (size_t)assembled_count * info->index_size;
+      /* Canonicalize restart before rebasing. Keeping an application's
+       * narrow/custom marker through rebase is ambiguous: a real index can
+       * become numerically equal to that marker after subtracting the minimum.
+       * UINT32_MAX cannot collide with any rebased vertex in this capsule. */
+      unsigned rebase_index_size = info->index_size;
+      uint32_t rebase_restart_index = info->restart_index;
+      if (transport_primitive_restart) {
+         uint32_t *canonical =
+            malloc((size_t)assembled_count * sizeof(*canonical));
+         if (!canonical) {
+            free(index_data);
+            return false;
+         }
+         for (unsigned i = 0; i < assembled_count; ++i) {
+            const uint32_t index = pvrgpu_snapshot_index(
+               index_data + (size_t)i * info->index_size, info->index_size);
+            canonical[i] = index == info->restart_index ? UINT32_MAX : index;
+         }
+         free(index_data);
+         index_data = (uint8_t *)canonical;
+         index_data_size = (size_t)assembled_count * sizeof(*canonical);
+         rebase_index_size = 4;
+         rebase_restart_index = UINT32_MAX;
+      }
       /* gl_VertexID is transported separately from the rebased fetch index
        * below. Related system values still have no input transport. */
       if (BITSET_TEST(ctx->vs->nir->info.system_values_read, SYSTEM_VALUE_VERTEX_ID_ZERO_BASE) ||
           BITSET_TEST(ctx->vs->nir->info.system_values_read, SYSTEM_VALUE_BASE_VERTEX) ||
-          !pvrgpu_rebase_vertex_indices(index_data, index_data_size,
-                                        info->index_size, assembled_count,
-                                        draw->index_bias,
-                                        &vertex_bias, &vertex_count)) {
+          !pvrgpu_rebase_vertex_indices_with_restart(
+             index_data, index_data_size, rebase_index_size, assembled_count,
+             draw->index_bias, transport_primitive_restart,
+             rebase_restart_index,
+             &vertex_bias, &vertex_count)) {
          pvrgpu_counter_eventf("draw_array_primitive_record_error",
                                "stage=indices reason=vertex_rebase_or_system_value "
                                "base_vertex=%d max_index=%u",
                                draw->index_bias, max_index);
          free(index_data);
          return false;
+      }
+      if (vertex_count == 0) {
+         pvrgpu_counter_eventf("draw_array_primitive_empty",
+                               "mode=%u count=%u reason=restart_only",
+                               info->mode, draw->count);
+         free(index_data);
+         return true;
       }
    }
    /*
@@ -11794,13 +11981,52 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
     * instance's slice of the expanded vertex stream.  The shifted values can
     * leave the source index type's range, so the expansion is always 32-bit.
     */
-   unsigned command_index_size = info->index_size;
+   unsigned command_index_size = transport_primitive_restart ? 4u
+                                                              : info->index_size;
    enum mesa_prim command_primitive_mode = info->mode;
    unsigned command_index_count = info->index_size ? assembled_count : 0;
+   bool command_primitive_restart = transport_primitive_restart;
+   uint32_t command_restart_index =
+      transport_primitive_restart ? UINT32_MAX : 0;
    const bool expand_instance_boundaries = instance_count > 1 && !ctx->gs && !has_tessellation &&
+      !info->primitive_restart &&
       (info->mode == MESA_PRIM_LINE_STRIP || info->mode == MESA_PRIM_LINE_LOOP ||
        info->mode == MESA_PRIM_TRIANGLE_STRIP || info->mode == MESA_PRIM_TRIANGLE_FAN);
-   if (expand_instance_boundaries) {
+   if (info->index_size != 0 && transport_primitive_restart) {
+      /* The owned stream was canonicalized before rebase. A marker between
+       * expanded instances prevents an incomplete final segment from joining
+       * the next instance. */
+      const uint64_t expanded_count64 =
+         (uint64_t)assembled_count * instance_count + instance_count - 1u;
+      if (expanded_count64 > UINT_MAX ||
+          expanded_count64 > SIZE_MAX / sizeof(uint32_t)) {
+         free(index_data);
+         return false;
+      }
+      const unsigned expanded_count = (unsigned)expanded_count64;
+      uint32_t *expanded = malloc((size_t)expanded_count * sizeof(*expanded));
+      if (!expanded) {
+         free(index_data);
+         return false;
+      }
+      unsigned destination = 0;
+      for (unsigned instance = 0; instance < instance_count; ++instance) {
+         if (instance)
+            expanded[destination++] = UINT32_MAX;
+         for (unsigned i = 0; i < assembled_count; ++i) {
+            const uint32_t index = ((const uint32_t *)index_data)[i];
+            expanded[destination++] = index == UINT32_MAX
+               ? UINT32_MAX : index + instance * vertex_count;
+         }
+      }
+      free(index_data);
+      index_data = (uint8_t *)expanded;
+      index_data_size = (size_t)expanded_count * sizeof(*expanded);
+      command_index_size = 4;
+      command_index_count = expanded_count;
+      command_primitive_restart = true;
+      command_restart_index = UINT32_MAX;
+   } else if (expand_instance_boundaries) {
       uint32_t *expanded = NULL;
       if (!pvrgpu_expand_instanced_connected_indices(info->mode, index_data, info->index_size,
              assembled_count, vertex_count, instance_count, &expanded,
@@ -12211,7 +12437,14 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
     * matching the existing depth prepass transport. No GL color resource is
     * fabricated or written: color_mask=0 and only Z/S is read back. */
    command.render_target_count = MAX2(1U, ctx->framebuffer.nr_cbufs);
-   if (pvrgpu_framebuffer_has_mixed_color_formats(ctx)) {
+   /* Extended pre-raster stages require the explicit per-target contract for
+    * MRT even when every attachment happens to have the same format.  Their
+    * first recorded draw already captures a target-major LOAD for every
+    * attachment below; publishing the format vector proves how each slice is
+    * sized and keeps untouched targets independent in the PBE. */
+   if (pvrgpu_framebuffer_has_mixed_color_formats(ctx) ||
+       ((ctx->gs || has_tessellation) &&
+        ctx->framebuffer.nr_cbufs > 1)) {
       command.color_attachment_format_count = command.render_target_count;
       for (unsigned target = 0; target < command.render_target_count; ++target)
          command.color_attachment_formats[target] =
@@ -12223,6 +12456,8 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    command.index_count = command_index_count;
    command.first_index = 0;
    command.base_vertex = 0;
+   command.primitive_restart_enable = command_primitive_restart ? 1u : 0u;
+   command.primitive_restart_index = command_restart_index;
    command.vertex_pco = binary.vertex.data;
    command.vertex_pco_size = binary.vertex.size;
    command.fragment_pco = binary.fragment.data;
@@ -12233,6 +12468,11 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    uint32_t control_uniform_words[PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS] = {0};
    uint32_t evaluation_uniform_words[PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS] = {0};
    struct pvrgpu_systemc_tessellation tessellation_payload = {0};
+   struct pvrgpu_compute_snapshot tessellation_buffer_snapshot = {0};
+   struct pvrgpu_systemc_shader_buffer_resource
+      tessellation_buffer_resources[PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_RESOURCES] = {{0}};
+   struct pvrgpu_systemc_shader_buffer_binding
+      tessellation_buffer_bindings[PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BINDINGS] = {{0}};
    if (has_tessellation) {
       const struct pvrgpu_pco_owned_binary *control = &tessellation.control.shader;
       const struct pvrgpu_pco_owned_binary *evaluation = &tessellation.evaluation.shader;
@@ -12606,10 +12846,26 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
       }
    }
 
+   if (has_tessellation &&
+       !pvrgpu_capture_tessellation_buffers(
+          ctx, &tessellation, control_uniform_words, evaluation_uniform_words,
+          &tessellation_payload, &tessellation_buffer_snapshot,
+          tessellation_buffer_resources, tessellation_buffer_bindings)) {
+      pvrgpu_compute_snapshot_finish(&tessellation_buffer_snapshot);
+      pvrgpu_pco_tessellation_pipeline_binary_finish(&tessellation);
+      pvrgpu_pco_geometry_binary_finish(&geometry);
+      pvrgpu_pco_graphics_binary_finish(&binary);
+      free(interleaved);
+      free(index_data);
+      pvrgpu_counter_eventf("draw_array_primitive_record_error",
+                            "stage=tessellation_buffers reason=capture");
+      return false;
+   }
    if (!pvrgpu_validate_draw_pco_triangles_command(path,
                                                   &command,
                                                   error,
                                                   sizeof(error))) {
+      pvrgpu_compute_snapshot_finish(&tessellation_buffer_snapshot);
       pvrgpu_pco_tessellation_pipeline_binary_finish(&tessellation);
       pvrgpu_pco_geometry_binary_finish(&geometry);
       pvrgpu_pco_graphics_binary_finish(&binary);
@@ -12625,6 +12881,7 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    struct pvrgpu_array_primitive_draw *recorded =
       CALLOC_STRUCT(pvrgpu_array_primitive_draw);
    if (!recorded) {
+      pvrgpu_compute_snapshot_finish(&tessellation_buffer_snapshot);
       pvrgpu_pco_tessellation_pipeline_binary_finish(&tessellation);
       pvrgpu_pco_geometry_binary_finish(&geometry);
       pvrgpu_pco_graphics_binary_finish(&binary);
@@ -12638,6 +12895,12 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    recorded->binary = binary;
    recorded->geometry = geometry;
    recorded->tessellation_binary = tessellation;
+   recorded->tessellation_buffer_snapshot = tessellation_buffer_snapshot;
+   memset(&tessellation_buffer_snapshot, 0, sizeof(tessellation_buffer_snapshot));
+   memcpy(recorded->tessellation_buffer_resources, tessellation_buffer_resources,
+          sizeof(tessellation_buffer_resources));
+   memcpy(recorded->tessellation_buffer_bindings, tessellation_buffer_bindings,
+          sizeof(tessellation_buffer_bindings));
    /* Only the ordinary VS/FS compiler currently proves unused descriptor
     * suffixes. Snapshot its compiled prefix, never compact block indices or
     * read a declared-but-unused binding back into the CB0 register window. */
@@ -12822,6 +13085,12 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
       recorded->tessellation = tessellation_payload;
       recorded->tessellation.control_shared = recorded->control_shared_words;
       recorded->tessellation.evaluation_shared = recorded->evaluation_shared_words;
+      recorded->tessellation.buffer_resources =
+         recorded->tessellation.buffer_resource_count ?
+            recorded->tessellation_buffer_resources : NULL;
+      recorded->tessellation.buffer_bindings =
+         recorded->tessellation.buffer_binding_count ?
+            recorded->tessellation_buffer_bindings : NULL;
       command.tessellation = &recorded->tessellation;
    }
    command.vertex_shared =
@@ -13862,9 +14131,8 @@ pvrgpu_draw_is_lowerable_array_primitive(
       *reason = "index_size";
       return false;
    }
-   if (info->index_size != 0 && info->primitive_restart &&
-       info->mode != MESA_PRIM_POINTS) {
-      *reason = "primitive_restart";
+   if (info->primitive_restart && (ctx->gs || ctx->tcs || ctx->tes)) {
+      *reason = "primitive_restart_extended_pipeline";
       return false;
    }
    /*
@@ -14090,8 +14358,8 @@ pvrgpu_draw_is_lowerable_array_primitive(
    }
    for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target) {
       if (!ctx->framebuffer.cbufs[target].texture ||
-          (pvrgpu_framebuffer_has_mixed_color_formats(ctx) &&
-           !pvrgpu_is_explicit_color_format(util_format_name(ctx->framebuffer.cbufs[target].format)))) {
+          !pvrgpu_is_explicit_color_format(pvrgpu_command_format_for_surface(
+             ctx->framebuffer.cbufs[target].format))) {
          *reason = "mixed_render_targets";
          return false;
       }

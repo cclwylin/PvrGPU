@@ -15,10 +15,19 @@ namespace {
 bool Inside(std::uint64_t address,std::uint64_t bytes,std::uint64_t base,std::uint64_t size) {
   return address>=base && address-base<=size && bytes<=size-(address-base);
 }
+bool Permitted(const std::vector<TessellationBufferRange> &ranges,
+               std::uint64_t address, std::uint64_t bytes,
+               std::uint32_t access) {
+  return std::any_of(ranges.begin(), ranges.end(), [&](const auto &range) {
+    return (range.access & access) == access &&
+           Inside(address, bytes, range.gpu_address, range.bytes);
+  });
+}
 struct ControlMemory {
   GpuMemorySystem &memory;
   UscUniformBufferMemory &uniforms;
   CounterTxn &counters;
+  const std::vector<TessellationBufferRange> &buffers;
   std::uint64_t input_address,input_bytes,output_address,output_bytes;
   std::uint32_t level_written_mask=0;
   std::function<void(const PcoTextureRequest &, std::uint32_t *)> sample{};
@@ -34,7 +43,8 @@ struct ControlMemory {
     const auto bytes=count*sizeof(std::uint32_t);
     const bool input=Inside(address,bytes,self.input_address,self.input_bytes);
     const bool output=Inside(address,bytes,self.output_address,self.output_bytes);
-    if(!input && !output) {
+    const bool storage=Permitted(self.buffers,address,bytes,1U);
+    if(!input && !output && !storage) {
       UscUniformBufferMemory::Read(&self.uniforms,address,count,destination); return;
     }
     const auto read=self.memory.Read(address,bytes,MemoryClient::kTessellationControl);
@@ -42,20 +52,23 @@ struct ControlMemory {
     std::memcpy(destination,read.data.data(),bytes);
     ApplyMemoryAccessStats(self.counters,read.stats);
     if(input)self.counters.tcs_input_read_bytes+=bytes;
-    else self.counters.tcs_output_read_bytes+=bytes;
+    else if(output)self.counters.tcs_output_read_bytes+=bytes;
     WaitForCycles(MemoryAccessDelayCycles(read.stats));
   }
   static void Write(void *opaque,std::uint64_t address,std::uint32_t count,const std::uint32_t *source) {
     auto &self=*static_cast<ControlMemory*>(opaque);
     const auto bytes=count*sizeof(std::uint32_t);
-    if(!source || !count || count>16 || address%4 ||
-       !Inside(address,bytes,self.output_address,self.output_bytes))
-      throw std::runtime_error("TCS ST exceeds its exact output patch range");
+    const bool output=Inside(address,bytes,self.output_address,self.output_bytes);
+    const bool storage=Permitted(self.buffers,address,bytes,2U);
+    if(!source || !count || count>16 || address%4 || (!output && !storage))
+      throw std::runtime_error("TCS ST exceeds its output patch/storage-buffer ranges");
     const auto write=self.memory.Write(address,source,bytes,MemoryClient::kTessellationControl);
     ApplyMemoryAccessStats(self.counters,write);
-    self.counters.tcs_output_write_bytes+=bytes;
-    const auto first=(address-self.output_address)/4;
-    for(unsigned c=0;c<count && first+c<6;++c)self.level_written_mask|=1U<<(first+c);
+    if(output) {
+      self.counters.tcs_output_write_bytes+=bytes;
+      const auto first=(address-self.output_address)/4;
+      for(unsigned c=0;c<count && first+c<6;++c)self.level_written_mask|=1U<<(first+c);
+    }
     WaitForCycles(MemoryAccessDelayCycles(write));
   }
 };
@@ -87,7 +100,7 @@ void TessellationControlShader::Execute(PipelineState &state, const PipelineTxn 
     throw std::runtime_error("TCS phase/patch/address/layout contract is invalid");
   const auto program=DecodeTessellationPcoProgram(ShaderStage::kTessellationControl,
       LoadArray<std::uint8_t>(pool_,t.control_code));
-  ValidateTessellationProgram(program,t.control_abi);
+  ValidateTessellationProgram(program,t.control_abi,&t.control_storage);
   t.control_summary=program.summary;
   t.control_instructions=StoreNewArray(pool_,program.instructions);
   StoreArray(pool_,state.tessellation_state,records);
@@ -102,6 +115,9 @@ void TessellationControlShader::Execute(PipelineState &state, const PipelineTxn 
   UscUniformBufferMemory uniforms(memory_,state.memory_mode,
       HasPoolHandle(t.control_uniform_buffers)?LoadArray<UniformBufferResource>(pool_,t.control_uniform_buffers):
                                               std::vector<UniformBufferResource>{});
+  const auto storage_buffers = HasPoolHandle(t.control_buffer_ranges)
+      ? LoadArray<TessellationBufferRange>(pool_, t.control_buffer_ranges)
+      : std::vector<TessellationBufferRange>{};
   TessellationExecutionStats execution;
   const auto task_handle=pool_.Allocate(sizeof(TessellationTaskState));
   try {
@@ -131,8 +147,11 @@ void TessellationControlShader::Execute(PipelineState &state, const PipelineTxn 
       shared[4]=static_cast<std::uint32_t>(patch.output_address);
       shared[5]=static_cast<std::uint32_t>(patch.output_address>>32U);shared[6]=t.patch_stride_dwords*4;shared[7]=0;
       auto &task=*reinterpret_cast<TessellationTaskState*>(pool_.Write(task_handle).data());
-      task=MakeTessellationControlTask(t.control_abi,shared,patch.primitive_id,patch.input_vertices,t.output_vertices);
-      ControlMemory context{*memory_,uniforms,state.counters,t.input_address,input_words*4,
+      task=MakeTessellationControlTask(t.control_abi,shared,patch.primitive_id,
+                                       patch.input_vertices,t.output_vertices,
+                                       &t.control_storage);
+      ControlMemory context{*memory_,uniforms,state.counters,storage_buffers,
+                             t.input_address,input_words*4,
                              patch.output_address,t.patch_stride_dwords*4};
       context.sample = [this, &state, &txn](const PcoTextureRequest &request, std::uint32_t *response) {
         SampleTessellationTexture(pool_, state, txn, ShaderStage::kTessellationControl, request,

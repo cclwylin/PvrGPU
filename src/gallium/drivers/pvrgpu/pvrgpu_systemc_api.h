@@ -13,8 +13,11 @@ extern "C" {
 /* API-v33 appended explicit polygon-offset raster state to each physical draw.
  * API-v34 appends the exact Z/reciprocal-W position coefficient selection.
  * API-v35 raises the graphics texture/shared transport to the GLES3 minimum.
+ * API-v36 transports indexed primitive restart, per-target canonical colour
+ * formats/byte widths, and native occlusion sample statistics.
+ * API-v37 adds alias-preserving TCS/TES storage-buffer snapshots and bindings.
  * Old versioned consumers must not guess at the longer command envelope. */
-#define PVRGPU_SYSTEMC_API_VERSION 35u
+#define PVRGPU_SYSTEMC_API_VERSION 37u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE 15u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES (64u * 1024u)
 /*
@@ -85,6 +88,39 @@ enum pvrgpu_systemc_pco_shader_stage {
    PVRGPU_SYSTEMC_PCO_SHADER_STAGE_COMPUTE = 5,
 };
 
+#define PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_RESOURCES 64u
+#define PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BINDINGS 64u
+#define PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BYTES \
+   PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_PAYLOAD_BYTES
+#define PVRGPU_SYSTEMC_SHADER_BUFFER_READ 1u
+#define PVRGPU_SYSTEMC_SHADER_BUFFER_WRITE 2u
+
+/* Whole backing snapshots preserve aliases shared by TCS and TES. A binding
+ * names one stage-local descriptor/view; descriptor words are
+ * [0, 0, bytes_size, 0] before model relocation. */
+struct pvrgpu_systemc_shader_buffer_resource {
+   uint64_t resource_token;
+   const uint8_t *bytes;
+   size_t bytes_size;
+};
+
+struct pvrgpu_systemc_shader_buffer_binding {
+   uint32_t stage;
+   uint32_t slot;
+   uint32_t resource_index;
+   uint32_t access;
+   uint64_t offset;
+   uint64_t bytes_size;
+};
+
+struct pvrgpu_systemc_storage_buffer_abi {
+   uint32_t descriptor_start;
+   uint32_t descriptor_count;
+   uint32_t used_mask;
+   uint32_t read_mask;
+   uint32_t write_mask;
+};
+
 /* Immutable patch pipeline. Domain: triangles=0, quads=1, isolines=2;
  * spacing: equal=0, fractional_even=1, fractional_odd=2.
  * Native TCS SH0..3=input descriptor, SH4..7=output descriptor; TES SH0..3
@@ -116,6 +152,12 @@ struct pvrgpu_systemc_tessellation {
    uint32_t spacing;
    uint32_t clockwise;
    uint32_t point_mode;
+   struct pvrgpu_systemc_storage_buffer_abi control_storage;
+   struct pvrgpu_systemc_storage_buffer_abi evaluation_storage;
+   const struct pvrgpu_systemc_shader_buffer_resource *buffer_resources;
+   uint32_t buffer_resource_count;
+   const struct pvrgpu_systemc_shader_buffer_binding *buffer_bindings;
+   uint32_t buffer_binding_count;
 };
 
 /*
@@ -524,7 +566,8 @@ struct pvrgpu_systemc_driver_command {
     * the command format's model transport: RGBA8 is four bytes per pixel;
     * R32, RG32 and RGBA32 integer targets are four, eight and sixteen bytes.
     * Each target contains every layer, pixel and sample before the next
-    * target; all targets use the command's format and framebuffer extent.
+    * target. API-v36 lets the explicit format vector select each target's
+    * canonical 4/8/16-byte transport; all share the framebuffer extent.
     * Supply every target completely, or leave both fields zero.
     * Submission deep-copies these bytes.  The model imports them into DRAM
     * and performs a PBE LOAD before rasterizing the draw.
@@ -583,12 +626,13 @@ struct pvrgpu_systemc_driver_command {
    uint32_t fragment_image_read_mask;
    uint32_t fragment_image_write_mask;
    uint32_t fragment_early_tests;
-   /* API-v31: optional independent normalized four-byte storage codecs.
+   /* API-v31, extended by API-v36: optional independent storage codecs.
     * Zero count and four NULL entries preserve homogeneous `format`.
     * Otherwise count equals effective render_target_count (at most four),
-    * target zero equals `format`, and each active entry is RGBA8, RGB10_A2
-    * or BGR10_A2 UNORM. Inactive entries must be NULL. Initial contents stay
-    * target-major native bytes; shared blend/color-mask state is unchanged. */
+    * target zero equals `format`, and each active entry is a canonical RGBA8,
+    * sRGB, packed 10/10/10/2, R32/RG32/RGBA32 integer, or RGBA32F transport.
+    * Inactive entries must be NULL. Initial contents stay target-major native
+    * bytes; shared blend/color-mask state is unchanged. */
    uint32_t color_attachment_format_count;
    const char *color_attachment_formats[4];
    /* API-v33 polygon offset. Float values are carried as exact IEEE-754 bits.
@@ -602,6 +646,10 @@ struct pvrgpu_systemc_driver_command {
     * Z, when present, occupies the first set; reciprocal-W follows it. */
    uint32_t fragment_position_uses_z;
    uint32_t fragment_position_uses_w;
+   /* API-v36 append-only tail: restart compares the unsigned transported
+    * index before baseVertex. Disabled draws require both fields to be zero. */
+   uint32_t primitive_restart_enable;
+   uint32_t primitive_restart_index;
 };
 
 struct pvrgpu_systemc_submit_info {
@@ -690,6 +738,7 @@ struct pvrgpu_systemc_graphics_stats {
    uint64_t gs_invocations;
    uint64_t stream_output_primitives_written;
    uint64_t stream_output_primitives_storage_needed;
+   uint64_t occlusion_samples_passed;
 };
 
 typedef int (*pvrgpu_systemc_flush_graphics_stats_fn)(

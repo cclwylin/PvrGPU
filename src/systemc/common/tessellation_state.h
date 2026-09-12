@@ -35,6 +35,22 @@ struct TessellationPatch {
   std::uint32_t reserved = 0;
 };
 
+struct TessellationBufferResource {
+  std::uint64_t resource_token = 0;
+  std::uint64_t gpu_address = 0;
+  std::uint64_t bytes = 0;
+  std::uint32_t access = 0;
+  std::uint32_t reserved = 0;
+  PoolHandle readback;
+};
+
+struct TessellationBufferRange {
+  std::uint64_t gpu_address = 0;
+  std::uint64_t bytes = 0;
+  std::uint32_t access = 0;
+  std::uint32_t slot = 0;
+};
+
 struct TessellationState {
   PoolHandle control_code;
   PoolHandle control_instructions;
@@ -48,6 +64,9 @@ struct TessellationState {
   PoolHandle evaluation_uniform_buffers;
   PoolHandle evaluation_texture_resources;
   PoolHandle evaluation_sampler_states;
+  PoolHandle buffer_resources;
+  PoolHandle control_buffer_ranges;
+  PoolHandle evaluation_buffer_ranges;
   PoolHandle patches;
   // Indices use patch-local point indices; point_start locates each patch's
   // domain values in the GPU address region. No bulk data crosses a FIFO.
@@ -55,6 +74,8 @@ struct TessellationState {
   PoolHandle domain_indices;
   DriverPcoStageAbi control_abi;
   DriverPcoStageAbi evaluation_abi;
+  DriverStorageBufferAbi control_storage;
+  DriverStorageBufferAbi evaluation_storage;
   PcoProgramSummary control_summary;
   PcoProgramSummary evaluation_summary;
   TessellationPhase phase = TessellationPhase::kSubmitted;
@@ -76,6 +97,8 @@ struct TessellationState {
 };
 
 static_assert(std::is_trivially_copyable_v<TessellationPatch>);
+static_assert(std::is_trivially_copyable_v<TessellationBufferResource>);
+static_assert(std::is_trivially_copyable_v<TessellationBufferRange>);
 static_assert(std::is_trivially_copyable_v<TessellationState>);
 
 } // namespace pvrgpu::stub

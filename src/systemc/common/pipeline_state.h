@@ -239,11 +239,14 @@ struct PipelineState {
   std::uint8_t color_attachment_float32 = 0;
   // Actual packed four-byte normalized storage, not RGBA8 or raw integers.
   PackedUnormFormat color_attachment_packed_unorm = PackedUnormFormat::kNone;
-  // Optional API-v31 normalized four-byte codec vector. Count zero preserves
-  // the homogeneous legacy codec above. Explicit kNone entries mean RGBA8;
-  // raw integer, float32 and sRGB mixtures are not represented by this ABI.
+  // Optional per-target storage vector. Count zero preserves the homogeneous
+  // legacy fields above. API-v31 introduced packed UNORM codecs; the current
+  // command contract also carries canonical integer, float32 and sRGB names.
   std::uint32_t color_attachment_format_count = 0;
   std::array<PackedUnormFormat, kMaxRenderTargets> color_attachment_packed_unorms{};
+  std::array<std::uint8_t, kMaxRenderTargets> color_attachment_raw_dwords_per_target{};
+  std::array<std::uint8_t, kMaxRenderTargets> color_attachment_float32_per_target{};
+  std::array<std::uint8_t, kMaxRenderTargets> color_attachment_srgb_per_target{};
   // The UNORM8 colour attachment stores sRGB-encoded bytes: the PBE encodes the
   // shader's linear PIXOUT on write and, when blending, decodes the stored
   // destination to linear, blends there and re-encodes.  Zero is a plain linear

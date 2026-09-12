@@ -13,6 +13,17 @@
 
 namespace pvrgpu::stub {
 namespace {
+bool Inside(std::uint64_t address,std::uint64_t bytes,std::uint64_t base,std::uint64_t size) {
+  return address>=base && address-base<=size && bytes<=size-(address-base);
+}
+bool Permitted(const std::vector<TessellationBufferRange> &ranges,
+               std::uint64_t address, std::uint64_t bytes,
+               std::uint32_t access) {
+  return std::any_of(ranges.begin(), ranges.end(), [&](const auto &range) {
+    return (range.access & access) == access &&
+           Inside(address, bytes, range.gpu_address, range.bytes);
+  });
+}
 class OwnedPayload {
  public:
   OwnedPayload(MemoryPool &pool,std::size_t bytes):pool_(pool),handle_(pool.Allocate(bytes)) {}
@@ -29,6 +40,7 @@ struct EvaluationMemory {
   GpuMemorySystem &memory;
   UscUniformBufferMemory &uniforms;
   CounterTxn &counters;
+  const std::vector<TessellationBufferRange> &buffers;
   std::uint64_t patch_address,patch_bytes;
   std::function<void(const PcoTextureRequest &, std::uint32_t *)> sample{};
   static void Sample(void *opaque, const PcoTextureRequest &request, std::uint32_t *response) {
@@ -41,16 +53,29 @@ struct EvaluationMemory {
     if(!destination || !count || count>16 || address%4)
       throw std::runtime_error("TES LD destination/count/alignment is invalid");
     const auto bytes=count*sizeof(std::uint32_t);
-    if(address<self.patch_address || address-self.patch_address>self.patch_bytes ||
-       bytes>self.patch_bytes-(address-self.patch_address)) {
+    const bool patch=Inside(address,bytes,self.patch_address,self.patch_bytes);
+    const bool storage=Permitted(self.buffers,address,bytes,1U);
+    if(!patch && !storage) {
       UscUniformBufferMemory::Read(&self.uniforms,address,count,destination);return;
     }
     const auto read=self.memory.Read(address,bytes,MemoryClient::kTessellationEvaluation);
     if(read.data.size()!=bytes)throw std::runtime_error("TES patch LD completion size mismatch");
     std::memcpy(destination,read.data.data(),bytes);
     ApplyMemoryAccessStats(self.counters,read.stats);
-    self.counters.tes_patch_read_bytes+=bytes;
+    if(patch)self.counters.tes_patch_read_bytes+=bytes;
     WaitForCycles(MemoryAccessDelayCycles(read.stats));
+  }
+  static void Write(void *opaque,std::uint64_t address,std::uint32_t count,
+                    const std::uint32_t *source) {
+    auto &self=*static_cast<EvaluationMemory*>(opaque);
+    const auto bytes=count*sizeof(std::uint32_t);
+    if(!source || !count || count>16 || address%4 ||
+       !Permitted(self.buffers,address,bytes,2U))
+      throw std::runtime_error("TES ST exceeds its storage-buffer ranges");
+    const auto write=self.memory.Write(address,source,bytes,
+                                       MemoryClient::kTessellationEvaluation);
+    ApplyMemoryAccessStats(self.counters,write);
+    WaitForCycles(MemoryAccessDelayCycles(write));
   }
 };
 std::uint32_t Bits(float value){std::uint32_t bits;std::memcpy(&bits,&value,4);return bits;}
@@ -80,7 +105,7 @@ void TessellationEvaluationShader::Execute(PipelineState &state, const PipelineT
     throw std::runtime_error("TES phase/address/register/ownership contract is invalid");
   const auto program=DecodeTessellationPcoProgram(ShaderStage::kTessellationEvaluation,
       LoadArray<std::uint8_t>(pool_,t.evaluation_code));
-  ValidateTessellationProgram(program,t.evaluation_abi);
+  ValidateTessellationProgram(program,t.evaluation_abi,&t.evaluation_storage);
   t.evaluation_summary=program.summary;
   t.evaluation_instructions=StoreNewArray(pool_,program.instructions);
   StoreArray(pool_,state.tessellation_state,records);
@@ -100,6 +125,9 @@ void TessellationEvaluationShader::Execute(PipelineState &state, const PipelineT
   UscUniformBufferMemory uniforms(memory_,state.memory_mode,
       HasPoolHandle(t.evaluation_uniform_buffers)?LoadArray<UniformBufferResource>(pool_,t.evaluation_uniform_buffers):
                                                  std::vector<UniformBufferResource>{});
+  const auto storage_buffers = HasPoolHandle(t.evaluation_buffer_ranges)
+      ? LoadArray<TessellationBufferRange>(pool_, t.evaluation_buffer_ranges)
+      : std::vector<TessellationBufferRange>{};
   OwnedPayload task_payload(pool_,sizeof(TessellationTaskState));
   std::vector<VertexLane> lanes;
   std::vector<VertexLaneRef> refs;
@@ -121,12 +149,15 @@ void TessellationEvaluationShader::Execute(PipelineState &state, const PipelineT
     shared[0]=static_cast<std::uint32_t>(patch.output_address);
     shared[1]=static_cast<std::uint32_t>(patch.output_address>>32U);
     shared[2]=t.patch_stride_dwords*4;shared[3]=0;
-    EvaluationMemory context{*memory_,uniforms,state.counters,patch.output_address,t.patch_stride_dwords*4};
+    EvaluationMemory context{*memory_,uniforms,state.counters,storage_buffers,
+                             patch.output_address,t.patch_stride_dwords*4};
     context.sample = [this, &state, &txn](const PcoTextureRequest &request, std::uint32_t *response) {
       SampleTessellationTexture(pool_, state, txn, ShaderStage::kTessellationEvaluation, request,
                                 response, texture_request_output, texture_response_input);
     };
-    const TessellationMemoryCallbacks callbacks{&context,EvaluationMemory::Read,nullptr,EvaluationMemory::Sample};
+    const TessellationMemoryCallbacks callbacks{&context,EvaluationMemory::Read,
+                                                 EvaluationMemory::Write,
+                                                 EvaluationMemory::Sample};
     for(unsigned first=0;first<patch.point_count;first+=kTessellationTaskWidth) {
       const auto count=std::min(kTessellationTaskWidth,patch.point_count-first);
       const auto bytes=count*sizeof(TessellationDomainPoint);
@@ -143,8 +174,9 @@ void TessellationEvaluationShader::Execute(PipelineState &state, const PipelineT
         coordinates[lane]={Bits(point.u),Bits(point.v),Bits(TessellationCoordinateW(t.domain,point))};
       }
       auto &task=*task_payload.data<TessellationTaskState>();
-      task=MakeTessellationEvaluationTask(t.evaluation_abi,shared,patch.primitive_id,t.output_vertices,
-                                          coordinates.data(),count);
+      task=MakeTessellationEvaluationTask(t.evaluation_abi,shared,patch.primitive_id,
+                                          t.output_vertices,coordinates.data(),count,
+                                          &t.evaluation_storage);
       while(!task.ended)StepTessellationTask(program,t.evaluation_abi,task,callbacks,execution);
       for(unsigned index=0;index<count;++index) {
         const auto &result=task.lanes[index];
@@ -173,6 +205,23 @@ void TessellationEvaluationShader::Execute(PipelineState &state, const PipelineT
   }
   if(lanes.size()!=point_count || consumed_indices!=indices.size())
     throw std::runtime_error("TES patch descriptors do not own the entire domain storage");
+  if (HasPoolHandle(t.buffer_resources)) {
+    auto resources = LoadArray<TessellationBufferResource>(pool_, t.buffer_resources);
+    for (auto &resource : resources) {
+      if (!(resource.access & 2U)) continue;
+      if (!resource.resource_token || !resource.gpu_address || !resource.bytes ||
+          !HasPoolHandle(resource.readback))
+        throw std::runtime_error("TES writable storage buffer has no readback backing");
+      const auto read = memory_->Read(resource.gpu_address, resource.bytes,
+                                      MemoryClient::kTessellationEvaluation);
+      if (read.data.size() != resource.bytes)
+        throw std::runtime_error("TES storage buffer readback extent mismatch");
+      StoreArray(pool_, resource.readback, read.data);
+      ApplyMemoryAccessStats(state.counters, read.stats);
+      WaitForCycles(MemoryAccessDelayCycles(read.stats));
+    }
+    StoreArray(pool_, t.buffer_resources, resources);
+  }
   ApplyMemoryAccessStats(state.counters,uniforms.stats());
   WaitForCycles(MemoryAccessDelayCycles(uniforms.stats()));
   state.counters.pco_decode_cycles+=program.summary.group_count;

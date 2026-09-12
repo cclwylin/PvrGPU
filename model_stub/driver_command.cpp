@@ -37,6 +37,7 @@ const std::set<std::string> &KnownFields() {
   static const std::set<std::string> fields = {
       "schema", "producer", "command", "case", "frame",
       "raw_index_data_size", "index_size", "first_index", "base_vertex",
+      "primitive_restart_enable", "primitive_restart_index",
       "render_target_count", "vertex_attribute_count",
       "color_attachment_format_count", "color_attachment_formats",
       "framebuffer_width", "framebuffer_height", "width",
@@ -349,7 +350,9 @@ bool RequireExactFields(const std::map<std::string, std::string> &fields,
         command == kDrawPcoTrianglesCommand &&
         (entry.first == "raw_index_data_size" ||
          entry.first == "index_size" || entry.first == "index_count" ||
-         entry.first == "first_index" || entry.first == "base_vertex");
+         entry.first == "first_index" || entry.first == "base_vertex" ||
+         entry.first == "primitive_restart_enable" ||
+         entry.first == "primitive_restart_index");
     const bool optional_pco_alpha =
         command == kDrawPcoTrianglesCommand &&
         (entry.first == "alpha_to_coverage" ||
@@ -709,6 +712,13 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
         !ParseOptionalU32(fields, "index_count", &parsed.index_count) ||
         !ParseOptionalU32(fields, "first_index", &parsed.first_index) ||
         !ParseOptionalI32(fields, "base_vertex", &parsed.base_vertex) ||
+        !ParseOptionalU32(fields, "primitive_restart_enable",
+                          &parsed.primitive_restart_enable) ||
+        parsed.primitive_restart_enable > 1 ||
+        !ParseOptionalU32(fields, "primitive_restart_index",
+                          &parsed.primitive_restart_index) ||
+        (!parsed.primitive_restart_enable &&
+         parsed.primitive_restart_index != 0) ||
         !ParseU64(fields["vertex_pco_size"],
                   &parsed.declared_vertex_pco_size) ||
         parsed.declared_vertex_pco_size == 0 ||

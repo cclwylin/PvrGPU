@@ -281,6 +281,28 @@ constexpr bool DriverPcoStageAbiMatches(const DriverPcoStageAbi &actual,
          actual.uniform_buffer_descriptor_count == expected.uniform_buffer_descriptor_count;
 }
 
+struct DriverStorageBufferAbi {
+  std::uint32_t descriptor_start = 0;
+  std::uint32_t descriptor_count = 0;
+  std::uint32_t used_mask = 0;
+  std::uint32_t read_mask = 0;
+  std::uint32_t write_mask = 0;
+};
+
+struct DriverShaderBufferResource {
+  std::uint64_t resource_token = 0;
+  std::vector<std::uint8_t> bytes;
+};
+
+struct DriverShaderBufferBinding {
+  DriverPcoShaderStage stage = DriverPcoShaderStage::kTessellationControl;
+  std::uint32_t slot = 0;
+  std::uint32_t resource_index = 0;
+  std::uint32_t access = 0;
+  std::uint64_t offset = 0;
+  std::uint64_t bytes_size = 0;
+};
+
 struct DriverTessellation {
   std::vector<std::uint8_t> control_pco;
   std::vector<std::uint8_t> evaluation_pco;
@@ -288,6 +310,10 @@ struct DriverTessellation {
   std::vector<std::uint32_t> evaluation_shared;
   DriverPcoStageAbi control_abi;
   DriverPcoStageAbi evaluation_abi;
+  DriverStorageBufferAbi control_storage;
+  DriverStorageBufferAbi evaluation_storage;
+  std::vector<DriverShaderBufferResource> buffer_resources;
+  std::vector<DriverShaderBufferBinding> buffer_bindings;
   std::uint32_t input_vertices = 0;
   std::uint32_t output_vertices = 0;
   std::uint32_t vertices_per_instance = 0;
@@ -446,6 +472,8 @@ struct DriverCommand {
   std::uint32_t index_size = 0;
   std::uint32_t first_index = 0;
   std::int32_t base_vertex = 0;
+  std::uint32_t primitive_restart_enable = 0;
+  std::uint32_t primitive_restart_index = 0;
   DriverPcoStageAbi vertex_pco_abi;
   DriverPcoStageAbi fragment_pco_abi;
   DriverPcoStageAbi geometry_pco_abi;
@@ -608,6 +636,47 @@ inline bool IsNormalizedFourByteColorFormat(std::string_view format) {
          format == "PIPE_FORMAT_B10G10R10A2_UNORM";
 }
 
+inline bool IsColorAttachmentTransportFormat(std::string_view format) {
+  return IsNormalizedFourByteColorFormat(format) ||
+         format == "PIPE_FORMAT_R8G8B8A8_SRGB" ||
+         format == "PIPE_FORMAT_B8G8R8A8_SRGB" ||
+         format == "PIPE_FORMAT_R32_UINT" ||
+         format == "PIPE_FORMAT_R32_SINT" ||
+         format == "PIPE_FORMAT_R32G32_UINT" ||
+         format == "PIPE_FORMAT_R32G32_SINT" ||
+         format == "PIPE_FORMAT_R32G32B32A32_UINT" ||
+         format == "PIPE_FORMAT_R32G32B32A32_SINT" ||
+         format == "PIPE_FORMAT_R32G32B32A32_FLOAT";
+}
+
+inline std::uint8_t DriverColorAttachmentRawDwords(std::string_view format) {
+  if (format == "PIPE_FORMAT_R32_UINT" ||
+      format == "PIPE_FORMAT_R32_SINT")
+    return 1;
+  if (format == "PIPE_FORMAT_R32G32_UINT" ||
+      format == "PIPE_FORMAT_R32G32_SINT")
+    return 2;
+  if (format == "PIPE_FORMAT_R32G32B32A32_UINT" ||
+      format == "PIPE_FORMAT_R32G32B32A32_SINT")
+    return 4;
+  return 0;
+}
+
+inline bool DriverColorAttachmentIsFloat32(std::string_view format) {
+  return format == "PIPE_FORMAT_R32G32B32A32_FLOAT";
+}
+
+inline bool DriverColorAttachmentIsSrgb(std::string_view format) {
+  return format == "PIPE_FORMAT_R8G8B8A8_SRGB" ||
+         format == "PIPE_FORMAT_B8G8R8A8_SRGB";
+}
+
+inline std::uint32_t DriverColorAttachmentBytesPerPixel(
+    std::string_view format) {
+  const auto raw = DriverColorAttachmentRawDwords(format);
+  return raw ? 4U * raw : DriverColorAttachmentIsFloat32(format) ? 16U : 4U;
+}
+
 inline bool DriverColorAttachmentFormatsAreValid(const DriverCommand &command) {
   const auto targets = command.render_target_count ? command.render_target_count : 1U;
   if (targets > 4U)
@@ -618,7 +687,7 @@ inline bool DriverColorAttachmentFormatsAreValid(const DriverCommand &command) {
       command.color_attachment_formats[0] != command.format)
     return false;
   for (const auto &format : command.color_attachment_formats)
-    if (!IsNormalizedFourByteColorFormat(format))
+    if (!IsColorAttachmentTransportFormat(format))
       return false;
   return true;
 }
@@ -907,6 +976,9 @@ struct CounterTxn {
   std::uint64_t pbe_color_reads = 0;
   std::uint64_t pbe_blended_fragments = 0;
   std::uint64_t pbe_fragment_writes = 0;
+  // Samples that survived discard plus depth/stencil tests. Unlike colour
+  // writes this is independent of render-target count and colour masks.
+  std::uint64_t occlusion_samples_passed = 0;
   std::uint64_t pbe_pixels_written = 0;
   std::uint32_t functional_frame = 0;
   std::uint64_t gs_alu_instructions = 0;

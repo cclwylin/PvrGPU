@@ -11,6 +11,7 @@
 #include "common/msaa.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -29,6 +30,7 @@ using pvrgpu::stub::FragmentCandidate;
 using pvrgpu::stub::FragmentVisibility;
 using pvrgpu::stub::LineSegment;
 using pvrgpu::stub::ParameterTriangle;
+using pvrgpu::stub::PointSprite;
 
 bool CoversSample(const ParameterTriangle &triangle, std::int64_t sample_x,
                   std::int64_t sample_y, std::int64_t values[3]) {
@@ -74,22 +76,57 @@ bool DepthPass(DepthCompareOp compare_op, T incoming, T stored) {
  */
 bool LineCoversPixel(const LineSegment &line, std::uint32_t x,
                      std::uint32_t y) {
-  const float dx = line.x1 - line.x0;
-  const float dy = line.y1 - line.y0;
+  // In the u=x+y, v=x-y basis a pixel's open diamond is an axis-aligned
+  // square of half extent 0.5. Intersect the segment with both slabs and emit
+  // the pixel only when the segment exits its diamond before the final line
+  // endpoint. This is the GLES diamond-exit rule, including endpoint
+  // exclusion, rather than a center-step approximation.
+  // The GL rule conceptually perturbs exact boundary hits so a vertical or
+  // horizontal line on an integer coordinate belongs to one adjacent diamond
+  // instead of neither. Keep the perturbation well below fixed setup's
+  // 1/256-pixel grid, and make the axes unequal to break corner ties.
+  const double x0 = static_cast<double>(line.x0) + 1.0 / 1048576.0;
+  const double y0 = static_cast<double>(line.y0) + 1.0 / 4194304.0;
+  const double dx = static_cast<double>(line.x1) - x0;
+  const double dy = static_cast<double>(line.y1) - y0;
   if (!std::isfinite(dx) || !std::isfinite(dy))
     return false;
-  if (std::fabs(dx) >= std::fabs(dy)) {
-    if (dx == 0.0F)
-      return true;  // A point-length segment; the quad already bounds it.
-    const float centre = static_cast<float>(x) + 0.5F;
-    const float at = line.y0 + (centre - line.x0) * (dy / dx);
-    return static_cast<std::int64_t>(std::floor(at)) ==
-           static_cast<std::int64_t>(y);
-  }
-  const float centre = static_cast<float>(y) + 0.5F;
-  const float at = line.x0 + (centre - line.y0) * (dx / dy);
-  return static_cast<std::int64_t>(std::floor(at)) ==
-         static_cast<std::int64_t>(x);
+  if (dx == 0.0 && dy == 0.0)
+    return false;
+
+  double enter = 0.0;
+  double exit = 1.0;
+  const auto intersect_open_slab = [&](double origin, double delta,
+                                       double low, double high) {
+    if (delta == 0.0)
+      return origin > low && origin < high;
+    double first = (low - origin) / delta;
+    double last = (high - origin) / delta;
+    if (first > last)
+      std::swap(first, last);
+    enter = std::max(enter, first);
+    exit = std::min(exit, last);
+    return enter < exit;
+  };
+  const double center_x = static_cast<double>(x) + 0.5;
+  const double center_y = static_cast<double>(y) + 0.5;
+  if (!intersect_open_slab(x0 + y0, dx + dy,
+                           center_x + center_y - 0.5,
+                           center_x + center_y + 0.5) ||
+      !intersect_open_slab(x0 - y0, dx - dy,
+                           center_x - center_y - 0.5,
+                           center_x - center_y + 0.5))
+    return false;
+  return enter < exit && exit < 1.0;
+}
+
+bool PointCoversSample(const PointSprite &point, float sample_x,
+                       float sample_y) {
+  return point.valid != 0 && point.half_size > 0.0F &&
+         sample_x >= point.center_x - point.half_size &&
+         sample_x < point.center_x + point.half_size &&
+         sample_y >= point.center_y - point.half_size &&
+         sample_y < point.center_y + point.half_size;
 }
 
 float BitsFloat(std::uint32_t bits) {
@@ -370,6 +407,10 @@ void Isp::Run() {
         throw std::runtime_error("ISP tile primitive range is out of bounds");
       std::uint64_t previous_ordinal = 0;
       bool first_ref = true;
+      std::array<std::uint64_t, 2> active_shape_key{};
+      bool active_shape_key_valid = false;
+      std::vector<std::uint16_t> shape_sample_owners(
+          static_cast<std::size_t>(tile.x1 - tile.x0) * (tile.y1 - tile.y0), 0);
       for (std::uint32_t ref_offset = 0; ref_offset < tile.primitive_ref_count;
            ++ref_offset) {
         const TilePrimitiveRef &ref =
@@ -394,6 +435,26 @@ void Isp::Run() {
         if (!HasCanonicalDepthPlaneMetadata(state.functional_case,
                                             triangle)) {
           throw std::runtime_error("ISP depth plane metadata is invalid");
+        }
+
+        const bool direct_point = triangle.point.valid != 0;
+        const bool direct_line = !multisample_rasterization &&
+                                 triangle.line.valid != 0;
+        const bool direct_shape = direct_point || direct_line;
+        if (direct_shape) {
+          const std::array<std::uint64_t, 2> shape_key = {
+              (static_cast<std::uint64_t>(triangle.key.draw_id) << 32) |
+                  triangle.key.api_primitive_id,
+              (static_cast<std::uint64_t>(triangle.key.instance_id) << 32) |
+                  (static_cast<std::uint64_t>(direct_point) << 16) |
+                  triangle.key.layer};
+          if (!active_shape_key_valid || active_shape_key != shape_key) {
+            std::fill(shape_sample_owners.begin(), shape_sample_owners.end(), 0);
+            active_shape_key = shape_key;
+            active_shape_key_valid = true;
+          }
+        } else {
+          active_shape_key_valid = false;
         }
 
         // The scissor test rejects a fragment before any other per-fragment
@@ -446,8 +507,26 @@ void Isp::Run() {
               const std::int64_t sample_y =
                   static_cast<std::int64_t>(y) * kSubpixelScale +
                   position[1] * (kSubpixelScale / 16);
-              if (!CoversSample(triangle, sample_x, sample_y, edge_values))
+              const bool point_coverage = triangle.point.valid != 0 &&
+                  PointCoversSample(triangle.point,
+                      static_cast<float>(x) + position[0] / 16.0F,
+                      static_cast<float>(y) + position[1] / 16.0F);
+              const bool line_coverage = direct_line &&
+                  LineCoversPixel(triangle.line, x, y);
+              const bool triangle_coverage =
+                  CoversSample(triangle, sample_x, sample_y, edge_values);
+              if ((direct_point && !point_coverage) ||
+                  (direct_line && !line_coverage) ||
+                  (!direct_shape && !triangle_coverage))
                 continue;
+              if (direct_shape) {
+                const std::size_t shape_index =
+                    static_cast<std::size_t>(y - tile.y0) * (tile.x1 - tile.x0) +
+                    (x - tile.x0);
+                if (shape_sample_owners[shape_index] & sample_bit)
+                  continue;
+                shape_sample_owners[shape_index] |= sample_bit;
+              }
               float barycentric[3];
               sample_depth[sample] = InterpolateDepth(
                   triangle, edge_values,
@@ -468,10 +547,6 @@ void Isp::Run() {
              * exact; the fill rule already gives a shared edge to one of the
              * quad's two triangles, so no pixel is produced twice.
              */
-            if (!multisample_rasterization && triangle.line.valid != 0 &&
-                !LineCoversPixel(triangle.line, x, y))
-              continue;
-
             // Pixel-frequency shading still interpolates at the pixel center;
             // sample positions govern coverage and depth/stencil individually.
             // Evaluate every center edge even when the center is uncovered.

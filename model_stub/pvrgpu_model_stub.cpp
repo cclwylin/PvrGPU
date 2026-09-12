@@ -999,6 +999,8 @@ int ModelSession::Run(const Options &options, ModelFramebuffer *framebuffer,
     framebuffer->width = job.framebuffer_width;
     framebuffer->height = job.framebuffer_height;
     framebuffer->bytes_per_pixel = job.framebuffer_bytes_per_pixel;
+    framebuffer->bytes_per_pixel_per_target =
+        job.framebuffer_bytes_per_pixel_per_target;
     framebuffer->sample_count = job.framebuffer_sample_count;
     framebuffer->layer_count = job.framebuffer_layer_count;
     framebuffer->depth_pixels = job.depth_framebuffer;

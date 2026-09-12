@@ -906,12 +906,18 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
       if (HasPoolHandle(resources))
         for (const auto &resource : LoadArray<TextureResource>(pool, resources))
           release_unique(resource.data);
+    if (HasPoolHandle(tess[0].buffer_resources))
+      for (const auto &resource :
+           LoadArray<TessellationBufferResource>(pool, tess[0].buffer_resources))
+        release_unique(resource.readback);
     for (const auto handle : {tess[0].control_code, tess[0].control_instructions,
          tess[0].control_shared, tess[0].control_uniform_buffers,
          tess[0].control_texture_resources, tess[0].control_sampler_states,
          tess[0].evaluation_code, tess[0].evaluation_instructions,
          tess[0].evaluation_shared, tess[0].evaluation_uniform_buffers,
          tess[0].evaluation_texture_resources, tess[0].evaluation_sampler_states,
+         tess[0].buffer_resources, tess[0].control_buffer_ranges,
+         tess[0].evaluation_buffer_ranges,
          tess[0].patches, tess[0].domain_points, tess[0].domain_indices})
       release_unique(handle);
     release_unique(state.tessellation_state);

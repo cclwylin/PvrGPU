@@ -6693,6 +6693,15 @@ void TestBitfieldInsertFourSourceValidation() {
   Check(ExecuteFragment(summary, fragment, context).pixel_outputs[0] ==
             UINT32_C(0xffff0ab0),
         "fragment BFI validates and reads both extra shared operands");
+  auto full_width_fragment = fragment;
+  full_width_fragment.front().source = {PcoRegisterBank::kShared, 2};
+  full_width_fragment.front().source1 = {PcoRegisterBank::kSpecial, 0};
+  auto full_width_context = context;
+  full_width_context.shared_count = 3;
+  full_width_context.shared_registers[2] = 32;
+  Check(ExecuteFragment(summary, full_width_fragment, full_width_context)
+                .pixel_outputs[0] == inputs[0],
+        "fragment BFI treats width 32 as a full-word insert");
   for (bool base_operand : {false, true}) {
     for (const PcoRegisterBank bank : {PcoRegisterBank::kTemporary,
                                        PcoRegisterBank::kShared}) {
@@ -6730,6 +6739,23 @@ void TestBitfieldExtractExtendedRegisterEncoding() {
             program.instructions.front().source_count == 3 &&
             program.instructions.front().output_index == 0,
         "extended-register UBFE decodes from its encoded group length");
+
+  /* A vertex offset in VTXIN8 uses the extended I_TWO_UP form.  Phase 2 must
+   * decode the full source instead of treating its extension byte as the
+   * destination.  This group comes from GLES31 bitfieldExtract. */
+  auto vertex_binary = BytesFromHex(
+      "67 f2 40 01 68 03 8c 48 18 84 80 c8 08 40");
+  const auto &vertex_tail = FillSolidVertexPcoBinary();
+  vertex_binary.insert(vertex_binary.end(), vertex_tail.begin(),
+                       vertex_tail.end());
+  const auto vertex = Decode(ShaderStage::kVertex, vertex_binary);
+  Check(!vertex.instructions.empty() &&
+            vertex.instructions.front().opcode ==
+                PcoOpcode::kBitfieldExtractUnsigned &&
+            vertex.instructions.front().source1.bank ==
+                PcoRegisterBank::kVertexInput &&
+            vertex.instructions.front().source1.index == 8,
+        "vertex UBFE decodes its extended repeated-offset upper source");
 }
 
 void TestIndexedSharedRegisterRead() {

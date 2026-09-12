@@ -26,10 +26,15 @@ pvrgpu_tessellation_payload_error(const struct pvrgpu_systemc_tessellation *t)
       return "tessellation domain/spacing/winding/point mode";
    for (unsigned stage = 0; stage < 2; ++stage) {
       const struct pvrgpu_systemc_pco_stage_abi *a = stage ? &t->evaluation_abi : &t->control_abi;
+      const struct pvrgpu_systemc_storage_buffer_abi *storage =
+         stage ? &t->evaluation_storage : &t->control_storage;
       const uint32_t *shared = stage ? t->evaluation_shared : t->control_shared;
       const uint32_t count = stage ? t->evaluation_shared_count : t->control_shared_count;
       const uint32_t descriptors = stage ? 4u : 8u;
       const uint32_t ubo_start = a->uniform_buffer_descriptor_start;
+      const uint32_t ubo_end = ubo_start + 4u * a->uniform_buffer_descriptor_count;
+      const uint32_t storage_start = storage->descriptor_count ?
+         storage->descriptor_start : ubo_end;
       /* PCO may use aligned spare VTXIN words as writable registers. Only
        * the fixed 3/5-word system-input prefix is initialized by the task. */
       if (a->temps > 256 || a->vertex_inputs < (stage ? 5u : 3u) ||
@@ -41,12 +46,82 @@ pvrgpu_tessellation_payload_error(const struct pvrgpu_systemc_tessellation *t)
           a->uniform_buffer_descriptor_count > 15 ||
           ubo_start < descriptors || ubo_start > descriptors + 8u * 20u ||
           (ubo_start - descriptors) % 20u ||
-          a->push_constant_start != ubo_start + 4u * a->uniform_buffer_descriptor_count ||
+          storage->descriptor_count > 32 ||
+          (storage->descriptor_start && storage->descriptor_start != ubo_end) ||
+          (storage->descriptor_count && storage->descriptor_start != ubo_end) ||
+          (storage->descriptor_count < 32 &&
+           (storage->used_mask >> storage->descriptor_count)) ||
+          ((storage->read_mask | storage->write_mask) & ~storage->used_mask) ||
+          (uint64_t)storage_start + 4u * storage->descriptor_count > count ||
+          a->push_constant_start != storage_start +
+             4u * storage->descriptor_count ||
           (uint64_t)a->push_constant_start + a->push_constant_count != count)
          return "tessellation native stage register/descriptor ABI";
       for (unsigned word = 0; word < descriptors; ++word)
          if (shared[word])
             return "tessellation patch descriptor must be unrelocated";
+   }
+   if (t->buffer_resource_count > PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_RESOURCES ||
+       t->buffer_binding_count > PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BINDINGS ||
+       ((t->buffer_resource_count != 0) != (t->buffer_resources != NULL)) ||
+       ((t->buffer_binding_count != 0) != (t->buffer_bindings != NULL)))
+      return "tessellation storage buffer count/pointer";
+   uint64_t total_bytes = 0;
+   for (unsigned resource = 0; resource < t->buffer_resource_count; ++resource) {
+      const struct pvrgpu_systemc_shader_buffer_resource *r =
+         &t->buffer_resources[resource];
+      if (!r->resource_token || !r->bytes || !r->bytes_size ||
+          r->bytes_size > PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BYTES - total_bytes)
+         return "tessellation storage buffer backing resource";
+      total_bytes += r->bytes_size;
+      for (unsigned prior = 0; prior < resource; ++prior)
+         if (t->buffer_resources[prior].resource_token == r->resource_token)
+            return "tessellation storage buffer resource token is duplicated";
+   }
+   uint32_t present[2] = {0, 0};
+   for (unsigned index = 0; index < t->buffer_binding_count; ++index) {
+      const struct pvrgpu_systemc_shader_buffer_binding *b =
+         &t->buffer_bindings[index];
+      const unsigned stage = b->stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_CONTROL ? 0 :
+         b->stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION ? 1 : 2;
+      if (stage >= 2 || b->resource_index >= t->buffer_resource_count)
+         return "tessellation storage buffer binding stage/resource";
+      const struct pvrgpu_systemc_storage_buffer_abi *storage =
+         stage ? &t->evaluation_storage : &t->control_storage;
+      const struct pvrgpu_systemc_shader_buffer_resource *resource =
+         &t->buffer_resources[b->resource_index];
+      if (b->slot >= storage->descriptor_count || (b->access & ~3u) ||
+          (b->offset & 3u) || !b->bytes_size || b->bytes_size > UINT32_MAX ||
+          b->offset > resource->bytes_size ||
+          b->bytes_size > resource->bytes_size - b->offset)
+         return "tessellation storage buffer binding view";
+      const uint32_t bit = UINT32_C(1) << b->slot;
+      if (present[stage] & bit)
+         return "tessellation storage buffer binding slot is duplicated";
+      present[stage] |= bit;
+      const unsigned required = ((storage->read_mask & bit) ? 1u : 0u) |
+                                ((storage->write_mask & bit) ? 2u : 0u);
+      if ((b->access & required) != required)
+         return "tessellation storage buffer binding access";
+      const uint32_t *shared = stage ? t->evaluation_shared : t->control_shared;
+      const unsigned word = storage->descriptor_start + 4u * b->slot;
+      if (shared[word] || shared[word + 1] ||
+          shared[word + 2] != b->bytes_size || shared[word + 3])
+         return "tessellation storage buffer descriptor must be canonical";
+   }
+   for (unsigned stage = 0; stage < 2; ++stage) {
+      const struct pvrgpu_systemc_storage_buffer_abi *storage =
+         stage ? &t->evaluation_storage : &t->control_storage;
+      const uint32_t *shared = stage ? t->evaluation_shared : t->control_shared;
+      if (storage->used_mask & ~present[stage])
+         return "tessellation shader uses an unbound storage buffer";
+      for (unsigned slot = 0; slot < storage->descriptor_count; ++slot) {
+         if (present[stage] & (UINT32_C(1) << slot))
+            continue;
+         const unsigned word = storage->descriptor_start + 4u * slot;
+         if (shared[word] || shared[word + 1] || shared[word + 2] || shared[word + 3])
+            return "unused tessellation storage buffer descriptor must be zero";
+      }
    }
    return NULL;
 }

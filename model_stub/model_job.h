@@ -53,15 +53,15 @@ struct ModelJob {
   // packs UNORM8 channels: an integer attachment stores a dword per channel,
   // so the pixel width travels with the pixels.
   std::vector<std::uint8_t> framebuffer;
-  // Colour attachments past the first, in target order and each the same
-  // size as the first.  A shader returning more than one result writes one
-  // per target, and the driver reads back whichever it maps.
+  // Colour attachments past the first, in target order. Each carries its own
+  // canonical transport width through the companion vector below.
   std::vector<std::vector<std::uint8_t>> extra_framebuffers;
   std::vector<std::string> framebuffer_color_formats;
   bool framebuffer_color_formats_explicit = false;
   std::uint32_t framebuffer_width = 0;
   std::uint32_t framebuffer_height = 0;
   std::uint32_t framebuffer_bytes_per_pixel = 4;
+  std::vector<std::uint32_t> framebuffer_bytes_per_pixel_per_target;
   std::uint32_t framebuffer_sample_count = 1;
   std::uint32_t framebuffer_layer_count = 1;
   std::vector<std::uint8_t> depth_framebuffer;
@@ -84,6 +84,7 @@ struct ModelJob {
     framebuffer_width = 0;
     framebuffer_height = 0;
     framebuffer_bytes_per_pixel = 4;
+    framebuffer_bytes_per_pixel_per_target.clear();
     framebuffer_sample_count = 1;
     framebuffer_layer_count = 1;
     depth_framebuffer.clear();
@@ -106,12 +107,18 @@ struct ModelJob {
                           std::uint32_t sample_count = 1,
                           std::uint32_t layer_count = 1,
                           std::vector<std::string> color_formats = {},
-                          bool color_formats_explicit = false) {
+                          bool color_formats_explicit = false,
+                          std::vector<std::uint32_t> bytes_per_pixel_per_target = {}) {
     if (!width || !height || width > 4096 || height > 4096 ||
         bytes_per_pixel > 16 || sample_count > 16 || layer_count > 256)
       return;
     if ((!color_formats.empty() || color_formats_explicit) &&
         color_formats.size() != extra.size() + 1U)
+      return;
+    if (bytes_per_pixel_per_target.empty())
+      bytes_per_pixel_per_target.assign(extra.size() + 1U, bytes_per_pixel);
+    if (bytes_per_pixel_per_target.size() != extra.size() + 1U ||
+        bytes_per_pixel_per_target[0] != bytes_per_pixel)
       return;
     const std::uint64_t expected =
         static_cast<std::uint64_t>(width) * height * bytes_per_pixel * sample_count * layer_count;
@@ -119,8 +126,13 @@ struct ModelJob {
         static_cast<std::uint64_t>(pixels.size()) != expected) {
       return;
     }
-    for (const std::vector<std::uint8_t> &attachment : extra) {
-      if (static_cast<std::uint64_t>(attachment.size()) != expected)
+    for (std::size_t target = 1; target <= extra.size(); ++target) {
+      const auto target_bpp = bytes_per_pixel_per_target[target];
+      const std::uint64_t target_expected =
+          static_cast<std::uint64_t>(width) * height * target_bpp *
+          sample_count * layer_count;
+      if (target_bpp == 0 || target_bpp > 16 ||
+          static_cast<std::uint64_t>(extra[target - 1].size()) != target_expected)
         return;
     }
     framebuffer = pixels;
@@ -130,6 +142,7 @@ struct ModelJob {
     framebuffer_width = width;
     framebuffer_height = height;
     framebuffer_bytes_per_pixel = bytes_per_pixel;
+    framebuffer_bytes_per_pixel_per_target = std::move(bytes_per_pixel_per_target);
     framebuffer_sample_count = sample_count;
     framebuffer_layer_count = layer_count;
   }

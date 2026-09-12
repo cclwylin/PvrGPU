@@ -14,6 +14,8 @@ import unittest
 
 DRIVER = Path(__file__).resolve().parents[1] / "src/gallium/drivers/pvrgpu"
 SOURCE = DRIVER / "pvrgpu_context.c"
+FORMAT_BEGIN = "const char *\npvrgpu_command_format_for_surface("
+FORMAT_END = "static const char *\npvrgpu_command_format_for_framebuffer("
 HELPERS_BEGIN = "static bool\npvrgpu_framebuffer_has_mixed_color_formats("
 HELPERS_END = "static bool\npvrgpu_read_user_float2_vertex("
 ENTRY_BEGIN = "static bool\npvrgpu_record_color_primitive_pco_draw_attempt("
@@ -27,13 +29,14 @@ GUARD = """   if (!pvrgpu_framebuffer_color_transport_is_bounded(ctx)) {
 
 
 def extract(source):
-    for marker in (HELPERS_BEGIN, HELPERS_END, ENTRY_BEGIN):
+    for marker in (FORMAT_BEGIN, FORMAT_END, HELPERS_BEGIN, HELPERS_END, ENTRY_BEGIN):
         assert source.count(marker) == 1, "ambiguous or missing production function"
+    formats = FORMAT_BEGIN + source.split(FORMAT_BEGIN, 1)[1].split(FORMAT_END, 1)[0]
     helpers = HELPERS_BEGIN + source.split(HELPERS_BEGIN, 1)[1].split(HELPERS_END, 1)[0]
     rest = source.split(ENTRY_BEGIN, 1)[1]
     assert rest.count(ENTRY_END) == 1, "missing first post-entry operation"
     entry = ENTRY_BEGIN + rest.split(ENTRY_END, 1)[0]
-    return helpers, entry
+    return formats + helpers, entry
 
 
 MOCK = r"""
@@ -41,9 +44,15 @@ MOCK = r"""
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include "pvrgpu_cmd.h"
 #include "pvrgpu_color_formats.h"
 #define PVRGPU_MAX_RENDER_TARGETS 4u
-enum pipe_format {RGBA8, RGB10, BGR10, R16};
+enum pipe_format {RGBA8, RGB10, BGR10, R16, RGBA8_SRGB, BGRA8_SRGB};
+#define PIPE_FORMAT_R8G8B8A8_SRGB RGBA8_SRGB
+#define PIPE_FORMAT_B8G8R8A8_SRGB BGRA8_SRGB
+#define PIPE_FORMAT_R10G10B10A2_UNORM RGB10
+#define PIPE_FORMAT_B10G10R10A2_UNORM BGR10
 struct pipe_resource {int unused;};
 struct pipe_surface {struct pipe_resource *texture; enum pipe_format format;};
 struct pipe_framebuffer_state {unsigned nr_cbufs; struct pipe_surface cbufs[8];};
@@ -55,6 +64,10 @@ static const char *util_format_name(enum pipe_format format) {
     "PIPE_FORMAT_R10G10B10A2_UNORM", "PIPE_FORMAT_B10G10R10A2_UNORM", "PIPE_FORMAT_R16_UNORM"};
   return names[format];
 }
+static bool util_format_is_pure_uint(enum pipe_format format) {(void)format;return false;}
+static bool util_format_is_pure_sint(enum pipe_format format) {(void)format;return false;}
+static bool util_format_is_float(enum pipe_format format) {(void)format;return false;}
+static unsigned util_format_get_nr_components(enum pipe_format format) {(void)format;return 4;}
 static const char *pvrgpu_command_output_path(void) {return "unit-only-not-written";}
 static unsigned compiler_boundary, bounds_errors;
 static void pvrgpu_counter_eventf(const char *event, const char *format, ...) {
@@ -84,7 +97,9 @@ int main(int argc,char **argv) {
   if(mode==1) {ctx.framebuffer.cbufs[1].format=RGB10;ctx.framebuffer.cbufs[2].format=BGR10;}
   if(mode==2) ctx.framebuffer.cbufs[1].format=R16;
   if(mode==3 && count) ctx.framebuffer.cbufs[count-1].texture=NULL;
-  bool expected=count<=4 && !(mode==2 && count>=2) && !(mode==3 && count>0);
+  bool expected_mixed=count>1 && (mode==1 || mode==2);
+  if(pvrgpu_framebuffer_has_mixed_color_formats(&ctx)!=expected_mixed) return 2;
+  bool expected=count<=4 && !(mode==3 && count>0);
   const struct pvrgpu_context before=ctx;
   struct pipe_draw_info info={0};struct pipe_draw_start_count_bias draw={0};
   bool terminal=false;
@@ -164,11 +179,12 @@ class MixedMrtAdmission(unittest.TestCase):
         result = self.run_case(self.compile("eight-targets", bad), 8, 1)
         self.assertNotEqual(result.returncode, 0)
 
-    def test_quantizing_an_unsupported_mixed_format_is_detected(self):
-        bad = self.source.replace("(mixed && !pvrgpu_is_explicit_color_format(util_format_name(surface->format)))",
-                                  "(mixed && false)", 1)
-        result = self.run_case(self.compile("unsupported-mixed", bad), 4, 2)
+    def test_bypassing_canonical_transport_mapping_is_detected(self):
+        bad = self.source.replace("pvrgpu_command_format_for_surface(surface->format)",
+                                  "util_format_name(surface->format)", 1)
+        result = self.run_case(self.compile("uncanonical-mixed", bad), 4, 2)
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("accepted=0 expected=1", result.stderr)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,8 @@ bool Fits(std::uint32_t first, std::uint32_t count, std::uint32_t limit) {
 }
 void ValidateAbi(const DriverPcoStageAbi &abi) {
   const auto descriptors = abi.uniform_buffer_descriptor_start;
-  if (abi.temps > kPcoTemporaryCount || abi.vertex_inputs != 2 ||
+  if (abi.temps > kPcoTemporaryCount || abi.vertex_inputs < 2 ||
+      abi.vertex_inputs > kPcoVertexInputCount ||
       abi.vertex_outputs < 4 || abi.vertex_outputs > kPcoVertexOutputCount || abi.coefficients ||
       abi.shareds < 4 || abi.shareds > kPcoMaximumSharedCount || abi.entry_offset ||
       abi.uniform_buffer_descriptor_count > 15 ||
@@ -32,9 +33,12 @@ bool IsAlu(PcoOpcode opcode) {
   case PcoOpcode::kFloatNegate: case PcoOpcode::kFloatAbs:
   case PcoOpcode::kIntegerAdd: case PcoOpcode::kIntegerMultiplyAdd32:
   case PcoOpcode::kIntegerMultiplyAdd64High: case PcoOpcode::kIntegerAdd64_32:
+  case PcoOpcode::kUnsignedAddCarry: case PcoOpcode::kUnsignedSubBorrow:
   case PcoOpcode::kBitwiseAnd: case PcoOpcode::kBitwiseOr:
   case PcoOpcode::kBitwiseXor: case PcoOpcode::kBitwiseXnor:
   case PcoOpcode::kShiftLeft: case PcoOpcode::kShiftRight:
+  case PcoOpcode::kCountBitsSet: case PcoOpcode::kFindTopBit:
+  case PcoOpcode::kReverseBits:
   case PcoOpcode::kBitfieldExtractUnsigned: case PcoOpcode::kBitfieldExtractSigned:
   case PcoOpcode::kBitfieldInsert: case PcoOpcode::kBooleanCompare:
   case PcoOpcode::kFloatEqual: case PcoOpcode::kFloatLess:
@@ -227,6 +231,11 @@ void ValidateGeometryProgram(const PcoDecodedProgram &program,
     if (ended || !i.repeat_count || i.repeat_count > 16 || i.source_count > 4 ||
         i.exec_cnd > 3 || i.writes_predicate > 1)
       Fail("invalid instruction metadata or bytes following ENDTASK");
+    if (IsPcoUnaryBitwise(i.opcode) &&
+        (i.repeat_count != 1 || i.source_count != 1 ||
+         (i.target != PcoWriteTarget::kTemporary &&
+          i.target != PcoWriteTarget::kVertexInput)))
+      Fail("invalid unary bitwise ALU metadata");
     const bool load = i.opcode == PcoOpcode::kBufferLoad;
     const bool sample = i.opcode == PcoOpcode::kTextureSample;
     const bool wdf = i.opcode == PcoOpcode::kWaitDataFence;
@@ -279,6 +288,17 @@ void ValidateGeometryProgram(const PcoDecodedProgram &program,
          (i.output_target1 == PcoWriteTarget::kTemporary ? !Fits(i.output_index1, 1, abi.temps) :
           i.output_target1 == PcoWriteTarget::kVertexInput ? !Fits(i.output_index1, 1, abi.vertex_inputs) : true)))
       Fail("ADD64 secondary destination is invalid");
+    if (IsPcoCarryBorrow(i.opcode) &&
+        (!HasCanonicalCarryBorrowShape(i, true) ||
+         (i.target == PcoWriteTarget::kTemporary &&
+          !Fits(i.output_index, 1, abi.temps)) ||
+         (i.target == PcoWriteTarget::kVertexInput &&
+          !Fits(i.output_index, 1, abi.vertex_inputs)) ||
+         (i.output_target1 == PcoWriteTarget::kTemporary &&
+          !Fits(i.output_index1, 1, abi.temps)) ||
+         (i.output_target1 == PcoWriteTarget::kVertexInput &&
+          !Fits(i.output_index1, 1, abi.vertex_inputs))))
+      Fail("UADDC/USUBB destination pair is invalid");
     const std::array<PcoRegisterRef,4> refs{i.source, i.source1, i.source2, i.source3};
     for (unsigned repeat = 0; repeat < i.repeat_count; ++repeat) {
       const auto sr = Packed(i.opcode) ? 0 : repeat;
@@ -410,6 +430,10 @@ void StepGeometryTask(const PcoDecodedProgram &program,
           const auto value = base + offset;
           Write(i.target, i.output_index, static_cast<std::uint32_t>(value), abi, task);
           Write(i.output_target1, i.output_index1, static_cast<std::uint32_t>(value >> 32U), abi, task);
+        } else if (IsPcoCarryBorrow(i.opcode)) {
+          const auto values = EvaluatePcoCarryBorrow(i.opcode, raw[0], raw[1]);
+          Write(i.target, i.output_index, values.low, abi, task);
+          Write(i.output_target1, i.output_index1, values.flag, abi, task);
         } else Write(i.target, i.output_index + r, EvaluatePcoAluInstruction(i, raw, r, p0, p1), abi, task);
         if (i.writes_predicate) task.predicate = EvaluatePcoPredicate(i, raw, p0, p1);
         ++stats.alu_instructions;

@@ -16,6 +16,7 @@
 #include "uniform_buffers.h"
 #include "texture_stages.h"
 #include "shader_images.h"
+#include "tessellation_buffers.h"
 #include "common/geometry_emission.h"
 #include "common/tessellation_state.h"
 #include "common/stream_output_types.h"
@@ -107,6 +108,15 @@ inline constexpr std::uint64_t kShaderImageGpuAddressBase = kStreamOutputGpuAddr
 static_assert(kShaderImageGpuAddressBase <= UINT64_MAX -
     kDriverSequenceAddressSlots * kMaximumFragmentImages * kMaximumFragmentImageBytes,
     "fragment image address region wraps");
+inline constexpr std::uint64_t kTessellationBufferResourceAddressStride =
+    kMaximumTessellationBufferBytes;
+inline constexpr std::uint64_t kTessellationBufferGpuAddressBase =
+    kShaderImageGpuAddressBase +
+    kDriverSequenceAddressSlots * kMaximumFragmentImages * kMaximumFragmentImageBytes;
+static_assert(kTessellationBufferGpuAddressBase <= UINT64_MAX -
+    kDriverSequenceAddressSlots * kMaximumTessellationBufferResources *
+        kTessellationBufferResourceAddressStride,
+    "tessellation buffer address region wraps");
 // 以全部合法 slots 驗證區域，而非只以本輪實際 draw 數推測不會相撞。
 static_assert(kDriverPcoMrtColorAddressBase +
                   kDriverSequenceAddressSlots * kMaxRenderTargets *
@@ -323,6 +333,8 @@ inline constexpr std::uint32_t kPipePrimTriangleFan = 6;
 // vertices.
 bool DriverPcoArrayTopologyIsExpandable(const DriverCommand &command) {
   // An indexed draw assembles its primitives from the index buffer.
+  if (command.indexed != 0 && command.primitive_restart_enable != 0)
+    return command.primitive_mode <= kPipePrimTriangleFan;
   const std::uint32_t count =
       command.indexed != 0 ? command.index_count : command.vertex_count;
   switch (command.primitive_mode) {
@@ -1562,6 +1574,8 @@ void Submitter::RunJob() {
   std::vector<std::uint64_t> sequence_color_addresses(submission_count, 0);
   std::vector<std::uint64_t> sequence_depth_addresses(submission_count, 0);
   std::vector<std::pair<const DriverShaderImage *, std::uint64_t>> sequence_image_storage;
+  std::vector<std::pair<const DriverShaderBufferResource *, std::uint64_t>>
+      sequence_tessellation_buffer_storage;
   DriverPcoExternalTextureAllocation sequence_external_allocation;
   if (driver_pco_sequence_command &&
       !ResolveSequenceAttachmentAddresses(options_.driver_commands,
@@ -1671,6 +1685,7 @@ void Submitter::RunJob() {
           ColorAttachmentRawDwords(command.format);
       state.color_attachment_float32 =
           command.format == "PIPE_FORMAT_R32G32B32A32_FLOAT" ? 1U : 0U;
+      state.color_is_srgb = DriverColorAttachmentIsSrgb(command.format) ? 1U : 0U;
     }
     // Clear-only commands use the same physical packed storage as draws.
     state.color_attachment_packed_unorm = PackedUnormFormatFromName(command.format);
@@ -1686,10 +1701,24 @@ void Submitter::RunJob() {
       throw std::runtime_error("Submitter color attachment formats are invalid");
     state.color_attachment_format_count =
         static_cast<std::uint32_t>(command.color_attachment_formats.size());
-    for (std::uint32_t target = 0; target < state.color_attachment_format_count; ++target)
+    for (std::uint32_t target = 0; target < state.color_attachment_format_count; ++target) {
+      const auto &format = command.color_attachment_formats[target];
       state.color_attachment_packed_unorms[target] =
-          PackedUnormFormatFromName(command.color_attachment_formats[target]);
+          PackedUnormFormatFromName(format);
+      state.color_attachment_raw_dwords_per_target[target] =
+          DriverColorAttachmentRawDwords(format);
+      state.color_attachment_float32_per_target[target] =
+          DriverColorAttachmentIsFloat32(format) ? 1U : 0U;
+      state.color_attachment_srgb_per_target[target] =
+          DriverColorAttachmentIsSrgb(format) ? 1U : 0U;
+    }
     ValidateColorAttachmentFormats(state);
+    const std::uint64_t stored_pixels =
+        static_cast<std::uint64_t>(state.width) * state.height *
+        state.raster_state.sample_count * state.attachment_layers;
+    const auto color_bytes = [&](std::uint32_t target) {
+      return stored_pixels * ColorAttachmentBytesPerPixel(state, target);
+    };
     for (std::uint32_t target = 1; target < state.render_target_count;
          ++target) {
       const std::uint64_t color_owner = driver_pco_sequence_command ?
@@ -1699,21 +1728,15 @@ void Submitter::RunJob() {
           color_owner * kMaxRenderTargets + target;
       state.extra_framebuffer_gpu_address[target - 1] =
           kDriverPcoMrtColorAddressBase + slot * kDriverPcoSequenceAttachmentStride;
-      /* Every attachment of a pass stores the same pixel width. */
       state.extra_framebuffer_bytes[target - 1] =
-          static_cast<std::uint64_t>(state.width) * state.height *
-          state.raster_state.sample_count * state.attachment_layers *
-          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
-                                       state.color_attachment_float32);
+          color_bytes(target);
     }
     if (driver_pco_sequence_command) {
       state.framebuffer_gpu_address = sequence_color_addresses[submission];
-      const std::uint64_t color_bytes =
-          static_cast<std::uint64_t>(state.width) * state.height *
-          state.raster_state.sample_count * state.attachment_layers *
-          ColorAttachmentBytesPerPixel(state.color_attachment_raw_dwords,
-                                       state.color_attachment_float32);
-      const std::uint64_t all_color_bytes = color_bytes * state.render_target_count;
+      std::array<std::uint64_t, kMaxRenderTargets + 1> color_offsets{};
+      for (std::uint32_t target = 0; target < state.render_target_count; ++target)
+        color_offsets[target + 1] = color_offsets[target] + color_bytes(target);
+      const std::uint64_t all_color_bytes = color_offsets[state.render_target_count];
       const auto color_address = [&](unsigned target) {
         return target == 0 ? state.framebuffer_gpu_address :
                             state.extra_framebuffer_gpu_address[target - 1];
@@ -1721,38 +1744,43 @@ void Submitter::RunJob() {
       if (!command.initial_color_attachment_bytes.empty()) {
         if (command.color_attachment_source_command_index !=
                 kDriverPcoNewAttachment ||
-            command.initial_color_attachment_bytes.size() != all_color_bytes ||
-            color_bytes > kDriverPcoSequenceAttachmentStride) {
+            command.initial_color_attachment_bytes.size() != all_color_bytes) {
           throw std::runtime_error(
               "Submitter initial color attachment contract is invalid");
         }
         // A host snapshot establishes input storage only.  Reading it through
         // the memory system records the dependency and feeds the same PBE
         // LOAD path used by attachments produced by an earlier draw.
-        for (unsigned target = 0; target < state.render_target_count; ++target)
+        for (unsigned target = 0; target < state.render_target_count; ++target) {
+          const auto bytes = color_bytes(target);
+          if (bytes == 0 || bytes > kDriverPcoSequenceAttachmentStride)
+            throw std::runtime_error(
+                "Submitter initial color attachment byte size is invalid");
           memory_->HostWrite(color_address(target),
-              command.initial_color_attachment_bytes.data() + target * color_bytes,
-              static_cast<std::size_t>(color_bytes));
+              command.initial_color_attachment_bytes.data() + color_offsets[target],
+              static_cast<std::size_t>(bytes));
+        }
       }
       if (command.color_attachment_source_command_index !=
               kDriverPcoNewAttachment ||
           !command.initial_color_attachment_bytes.empty()) {
-        if (color_bytes == 0 || color_bytes > kDriverPcoSequenceAttachmentStride ||
-            all_color_bytes > std::numeric_limits<std::size_t>::max()) {
+        if (all_color_bytes > std::numeric_limits<std::size_t>::max()) {
           throw std::runtime_error(
               "Submitter aliased color attachment byte size is invalid");
         }
         std::vector<std::uint8_t> all_color_load(static_cast<std::size_t>(all_color_bytes));
         for (unsigned target = 0; target < state.render_target_count; ++target) {
-          if (!memory_->backing().Contains(color_address(target), static_cast<std::size_t>(color_bytes)))
+          const auto bytes = color_bytes(target);
+          if (bytes == 0 || bytes > kDriverPcoSequenceAttachmentStride ||
+              !memory_->backing().Contains(color_address(target), static_cast<std::size_t>(bytes)))
             throw std::runtime_error("Submitter aliased color attachment is absent from DRAM");
           MemoryReadResult color_load = memory_->Readback(color_address(target),
-              static_cast<std::size_t>(color_bytes), MemoryClient::kFramebufferReadback);
-          if (color_load.data.size() != color_bytes)
+              static_cast<std::size_t>(bytes), MemoryClient::kFramebufferReadback);
+          if (color_load.data.size() != bytes)
             throw std::runtime_error("Submitter aliased color attachment readback is truncated");
           sequence_dependency_stats += color_load.stats;
           std::copy(color_load.data.begin(), color_load.data.end(),
-                    all_color_load.begin() + target * color_bytes);
+                    all_color_load.begin() + color_offsets[target]);
         }
         state.color_attachment_load = StoreNewArray(pool_, all_color_load);
         state.color_attachment_load_enable = 1;
@@ -1917,6 +1945,8 @@ void Submitter::RunJob() {
         tess.evaluation_code = StoreNewArray(pool_, source.evaluation_pco);
         tess.control_abi = source.control_abi;
         tess.evaluation_abi = source.evaluation_abi;
+        tess.control_storage = source.control_storage;
+        tess.evaluation_storage = source.evaluation_storage;
         state.tessellation_output_dwords = source.evaluation_abi.vertex_outputs;
         tess.input_vertices = source.input_vertices;
         tess.output_vertices = source.output_vertices;
@@ -2297,6 +2327,8 @@ void Submitter::RunJob() {
       state.draw.index_count = command.index_count;
       state.draw.base_vertex = command.base_vertex;
       state.draw.index_format = DriverPcoIndexFormatFor(command.index_size);
+      state.primitive_restart_enable = command.primitive_restart_enable;
+      state.primitive_restart_index = command.primitive_restart_index;
       StoreDriverPcoIndexBuffer(pool_, memory_, command, &state,
                                 SequenceBufferAddress(
                                     kBuiltinIndexBufferGpuAddress,
@@ -2596,9 +2628,13 @@ void Submitter::RunJob() {
       std::vector<std::uint32_t> evaluation_shared = command.tessellation.evaluation_shared;
       std::vector<UniformBufferResource> control_uniform_buffers;
       std::vector<UniformBufferResource> evaluation_uniform_buffers;
+      std::vector<TessellationBufferResource> tessellation_buffer_resources;
+      std::array<std::vector<TessellationBufferRange>, 2>
+          tessellation_buffer_ranges;
       std::string uniform_error;
       if (!ValidateDriverUniformBuffers(command, &uniform_error) ||
-          !ValidateDriverShaderImages(command, &uniform_error))
+          !ValidateDriverShaderImages(command, &uniform_error) ||
+          !ValidateDriverTessellationBuffers(command, &uniform_error))
         throw std::runtime_error(uniform_error);
       state.fragment_image_descriptor_start = command.fragment_image_descriptor_start;
       state.fragment_image_descriptor_count = command.fragment_image_descriptor_count;
@@ -2682,6 +2718,68 @@ void Submitter::RunJob() {
           state.fragment_uniform_buffer_resources = StoreNewArray(pool_, fragment_uniform_buffers);
         if (!geometry_uniform_buffers.empty())
           state.geometry_uniform_buffer_resources = StoreNewArray(pool_, geometry_uniform_buffers);
+      }
+      if (!command.tessellation.buffer_resources.empty()) {
+        if (!driver_pco_sequence_command || !memory_ ||
+            !HasPoolHandle(state.tessellation_state))
+          throw std::runtime_error(
+              "Submitter tessellation storage buffers require sequence GPU memory");
+        tessellation_buffer_resources.resize(
+            command.tessellation.buffer_resources.size());
+        for (std::size_t index = 0;
+             index < command.tessellation.buffer_resources.size(); ++index) {
+          const auto &source = command.tessellation.buffer_resources[index];
+          auto &resource = tessellation_buffer_resources[index];
+          resource.resource_token = source.resource_token;
+          resource.bytes = source.bytes.size();
+          const auto image_alias = std::find_if(
+              sequence_image_storage.begin(), sequence_image_storage.end(),
+              [&](const auto &prior) {
+                return prior.first->resource_token == source.resource_token;
+              });
+          if (image_alias != sequence_image_storage.end())
+            throw std::runtime_error(
+                "Submitter tessellation buffer aliases a fragment image");
+          const auto alias = std::find_if(
+              sequence_tessellation_buffer_storage.begin(),
+              sequence_tessellation_buffer_storage.end(), [&](const auto &prior) {
+                return prior.first->resource_token == source.resource_token;
+              });
+          if (alias != sequence_tessellation_buffer_storage.end()) {
+            if (alias->first->bytes != source.bytes)
+              throw std::runtime_error(
+                  "Submitter tessellation buffer changed without a sequence boundary");
+            resource.gpu_address = alias->second;
+          } else {
+            if (sequence_tessellation_buffer_storage.size() >=
+                kDriverSequenceAddressSlots * kMaximumTessellationBufferResources)
+              throw std::runtime_error(
+                  "Submitter tessellation buffer address slots exhausted");
+            resource.gpu_address = kTessellationBufferGpuAddressBase +
+                sequence_tessellation_buffer_storage.size() *
+                    kTessellationBufferResourceAddressStride;
+            memory_->HostWrite(resource.gpu_address, source.bytes.data(),
+                               source.bytes.size());
+            sequence_tessellation_buffer_storage.emplace_back(&source,
+                                                                resource.gpu_address);
+          }
+          resource.readback = StoreNewArray(pool_, source.bytes);
+        }
+        for (const auto &binding : command.tessellation.buffer_bindings) {
+          const unsigned stage =
+              binding.stage == DriverPcoShaderStage::kTessellationControl ? 0U : 1U;
+          auto &resource = tessellation_buffer_resources.at(binding.resource_index);
+          const auto address = resource.gpu_address + binding.offset;
+          const auto &storage = stage ? command.tessellation.evaluation_storage
+                                      : command.tessellation.control_storage;
+          auto &shared = stage ? evaluation_shared : control_shared;
+          const auto word = storage.descriptor_start + 4U * binding.slot;
+          shared.at(word) = static_cast<std::uint32_t>(address);
+          shared.at(word + 1U) = static_cast<std::uint32_t>(address >> 32U);
+          resource.access |= binding.access;
+          tessellation_buffer_ranges[stage].push_back(
+              {address, binding.bytes_size, binding.access, binding.slot});
+        }
       }
       std::array<std::vector<TextureResource>, 2> tessellation_resources;
       std::array<std::vector<SamplerState>, 2> tessellation_samplers;
@@ -3063,6 +3161,15 @@ void Submitter::RunJob() {
           tess[0].control_uniform_buffers = StoreNewArray(pool_, control_uniform_buffers);
         if (!evaluation_uniform_buffers.empty())
           tess[0].evaluation_uniform_buffers = StoreNewArray(pool_, evaluation_uniform_buffers);
+        if (!tessellation_buffer_resources.empty())
+          tess[0].buffer_resources =
+              StoreNewArray(pool_, tessellation_buffer_resources);
+        if (!tessellation_buffer_ranges[0].empty())
+          tess[0].control_buffer_ranges =
+              StoreNewArray(pool_, tessellation_buffer_ranges[0]);
+        if (!tessellation_buffer_ranges[1].empty())
+          tess[0].evaluation_buffer_ranges =
+              StoreNewArray(pool_, tessellation_buffer_ranges[1]);
         if (!tessellation_resources[0].empty()) {
           tess[0].control_texture_resources = StoreNewArray(pool_, tessellation_resources[0]);
           tess[0].control_sampler_states = StoreNewArray(pool_, tessellation_samplers[0]);

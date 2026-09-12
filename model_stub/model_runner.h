@@ -38,6 +38,7 @@ struct ModelFramebuffer {
   // Four while the attachment packs UNORM8 channels; an integer attachment
   // stores one 32-bit channel per dword and is 8 or 16 bytes wide.
   std::uint32_t bytes_per_pixel = 4;
+  std::vector<std::uint32_t> bytes_per_pixel_per_target;
   // Samples are stored next to each other within each pixel, without resolve.
   std::uint32_t sample_count = 1;
   std::uint32_t layer_count = 1;
@@ -49,6 +50,9 @@ struct ModelFramebuffer {
            bytes_per_pixel != 0 && bytes_per_pixel <= 16 &&
            sample_count != 0 && sample_count <= 16 &&
            layer_count != 0 && layer_count <= 256 &&
+           (bytes_per_pixel_per_target.empty() ||
+            (bytes_per_pixel_per_target.size() == extra.size() + 1U &&
+             bytes_per_pixel_per_target[0] == bytes_per_pixel)) &&
            static_cast<std::uint64_t>(pixels.size()) ==
                static_cast<std::uint64_t>(width) * height * bytes_per_pixel *
                    sample_count * layer_count;
@@ -60,16 +64,27 @@ struct ModelFramebuffer {
         (color_formats_explicit && color_formats.size() != extra.size() + 1U))
       return false;
     if (color_formats_explicit) {
-      if (color_formats.size() > 4U || bytes_per_pixel != 4U)
+      if (color_formats.size() > 4U ||
+          bytes_per_pixel_per_target.size() != color_formats.size())
         return false;
-      for (const auto &format : color_formats)
-        if (!IsNormalizedFourByteColorFormat(format))
+      for (std::size_t index = 0; index < color_formats.size(); ++index)
+        if (!IsColorAttachmentTransportFormat(color_formats[index]) ||
+            bytes_per_pixel_per_target[index] !=
+                DriverColorAttachmentBytesPerPixel(color_formats[index]))
           return false;
     }
     if (!requested)
       return !color_formats_explicit;
     return requested[0] && target < color_formats.size() &&
            color_formats[target] == requested;
+  }
+
+  std::uint32_t BytesPerPixel(std::uint32_t target) const {
+    if (target > extra.size())
+      return 0;
+    return bytes_per_pixel_per_target.empty()
+               ? bytes_per_pixel
+               : bytes_per_pixel_per_target[target];
   }
 };
 

@@ -70,6 +70,7 @@ struct Fixture {
     d.geometry_input_stride_dwords = 4; d.geometry_vertices_per_instance = 3;
     d.position_output_count = d.varying_output_start = 4;
     d.fragment_position_count = d.fragment_varying_start = 4;
+    d.fragment_position_uses_w = 1;
     d.viewport_scale_bits[0] = d.viewport_scale_bits[1] = 0x41000000;
     d.viewport_scale_bits[2] = 0x3f000000;
     std::memcpy(d.viewport_translate_bits, d.viewport_scale_bits, sizeof(d.viewport_scale_bits));
@@ -141,7 +142,7 @@ void VerifyBinaryStages() {
 }
 
 void VerifyPreviousVersionGuard(Submission &submit) {
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 35);
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 37);
   constexpr auto previous_size = offsetof(pvrgpu_systemc_driver_command, geometry_pco);
   static_assert(previous_size % alignof(pvrgpu_systemc_driver_command) == 0);
 #if defined(_WIN32)
@@ -213,8 +214,8 @@ void VerifyGeometryPayload(Fixture &fixture, Submission &submit) {
     reject([&](auto &d) { d.geometry_output_primitive = topology; }, "invalid GS output topology");
   reject([](auto &d) { d.geometry_pco_abi.temps = 257; }, "TEMP overflow");
   reject([](auto &d) { d.geometry_pco_abi.coefficients = 1; }, "GS coefficient bank forbidden");
-  for (std::uint32_t count : {0U,1U,3U,64U})
-    reject([&](auto &d) { d.geometry_pco_abi.vertex_inputs = count; }, "GS needs exact two system-value inputs");
+  for (std::uint32_t count : {0U,1U,65U,UINT32_MAX})
+    reject([&](auto &d) { d.geometry_pco_abi.vertex_inputs = count; }, "GS input bank bounds");
   for (std::uint32_t count : {0U,3U,65U,UINT32_MAX})
     reject([&](auto &d) { d.geometry_pco_abi.vertex_outputs = count; }, "GS output bank bounds");
   for (std::uint32_t start : {0U,3U,5U,UINT32_MAX})
@@ -253,6 +254,10 @@ void VerifyGeometryPayload(Fixture &fixture, Submission &submit) {
   for (std::uint32_t temps : {0U,256U}) {
     auto draw = fixture.Draw(); draw.geometry_pco_abi.temps = temps;
     submit.Rejected(draw, "unsupported: blend", "legal GS TEMP envelope boundary");
+  }
+  for (std::uint32_t inputs : {2U,3U,64U}) {
+    auto draw = fixture.Draw(); draw.geometry_pco_abi.vertex_inputs = inputs;
+    submit.Rejected(draw, "unsupported: blend", "legal expanded GS VTXIN ABI");
   }
 }
 

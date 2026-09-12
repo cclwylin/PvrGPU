@@ -44,6 +44,7 @@ struct Fixture {
     d.vertex_pco_abi={4,4,8,0,0,0,0,0,0,0};d.fragment_pco_abi={4,0,0,20,0,0,0,0,0,0};
     d.position_output_count=4;d.varying_output_start=4;d.varying_output_count=4;
     d.fragment_position_count=4;d.fragment_varying_start=4;d.fragment_varying_count=16;
+    d.fragment_position_uses_z=1;
     d.fragment_output_mask[0]=15;
     const std::array<float,3> vp={2,2,.5f};
     std::memcpy(d.viewport_scale_bits,vp.data(),12);std::memcpy(d.viewport_translate_bits,vp.data(),12);
@@ -78,7 +79,7 @@ void Reject(const std::filesystem::path &root,Fixture &f,const char *name,const 
 }
 void VerifyOldSize(const std::filesystem::path &root) {
 #if !defined(_WIN32)
-  static_assert(PVRGPU_SYSTEMC_API_VERSION==35);
+  static_assert(PVRGPU_SYSTEMC_API_VERSION==37);
   const auto page=static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
   // API30 ends immediately before the new count, rounded to the old struct
   // alignment. Only the version may be read before refusing this command.
@@ -162,7 +163,7 @@ int main() {
     {Fixture f;f.draws[0].color_attachment_format_count=3;Reject(root,f,"count","color attachment formats");}
     {Fixture f;f.draws[0].color_attachment_formats[1]=nullptr;Reject(root,f,"null","color attachment formats");}
     {Fixture f;f.draws[0].color_attachment_formats[1]="";Reject(root,f,"empty","color attachment formats");}
-    {Fixture f;f.draws[0].color_attachment_formats[1]="PIPE_FORMAT_R32_UINT";Reject(root,f,"integer","color attachment formats");}
+    {Fixture f;f.draws[0].color_attachment_formats[1]="PIPE_FORMAT_R16_UINT";Reject(root,f,"unsupported","color attachment formats");}
     {Fixture f;f.draws[0].color_attachment_formats[0]=kFormats[1];Reject(root,f,"target0","color attachment formats");}
     {Fixture f;f.draws[0].color_attachment_format_count=0;Reject(root,f,"legacy-nonnull","inactive entry");}
     {Fixture f;f.draws[1].color_attachment_formats[1]=kFormats[0];Reject(root,f,"alias-format-swap","alias format/extent mismatch");}

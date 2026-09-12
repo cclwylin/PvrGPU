@@ -39,6 +39,7 @@ static nir_def *sample_texture(nir_builder *b, nir_def *coord, nir_def *lod)
       glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, false, GLSL_TYPE_FLOAT), "image");
    sampler->data.descriptor_set = sampler->data.binding = 0;
    b->shader->info.num_textures = 1;
+   BITSET_SET(b->shader->info.textures_used, 0);
    nir_tex_instr *tex = nir_tex_instr_create(b->shader, lod ? 2 : 1);
    tex->op = lod ? nir_texop_txl : nir_texop_tex;
    tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
@@ -160,6 +161,29 @@ static nir_shader *make_evaluation(unsigned kind)
    nir_shader_gather_info(b.shader, b.impl);
    return b.shader;
 }
+
+static nir_intrinsic_instr *add_storage_buffers(nir_shader *shader)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   nir_instr *return_instr = nir_block_last_instr(nir_impl_last_block(impl));
+   require(return_instr && return_instr->type == nir_instr_type_jump,
+           "SSBO fixture has a terminal return");
+   nir_builder b = nir_builder_at(nir_before_instr(return_instr));
+   nir_def *index = shader->info.stage == MESA_SHADER_TESS_CTRL ?
+      nir_load_invocation_id(&b) : nir_load_primitive_id(&b);
+   nir_def *offset = nir_imul_imm(&b, index, 16);
+   nir_def *size = nir_get_ssbo_size(&b, 32, nir_imm_int(&b, 0));
+   offset = nir_umin(&b, offset, nir_iadd_imm(&b, size, -16));
+   nir_def *value = nir_load_ssbo(&b, 4, 32, nir_imm_int(&b, 0), offset,
+                                  .align_mul = 4, .align_offset = 0);
+   nir_intrinsic_instr *store = nir_store_ssbo(
+      &b, value, nir_imm_int(&b, 1), offset,
+      .write_mask = 5, .align_mul = 4, .align_offset = 0);
+   nir_shader_gather_info(shader, impl);
+   shader->info.num_ssbos = 2;
+   return store;
+}
+
 static nir_shader *make_fragment(void)
 {
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, pco_nir_options(), "tess_fixture_fs");
@@ -169,6 +193,45 @@ static nir_shader *make_fragment(void)
    nir_jump(&b, nir_jump_return);
    nir_shader_gather_info(b.shader, b.impl);
    return b.shader;
+}
+
+static void test_storage_buffers(struct pvrgpu_pco_compiler *compiler)
+{
+   nir_shader *vs = make_vertex(false), *tcs = make_control(0);
+   nir_shader *tes = make_evaluation(0), *fs = make_fragment();
+   nir_intrinsic_instr *tcs_store = add_storage_buffers(tcs);
+   nir_intrinsic_instr *tes_store = add_storage_buffers(tes);
+   struct pvrgpu_pco_tessellation_pipeline_binary binary = {0};
+   char error[512] = {0};
+   require(pvrgpu_pco_compile_tessellation_pipeline(
+      compiler, vs, tcs, tes, fs, NULL, 1, 0, 0, 0, 0, 0, 0,
+      &binary, error, sizeof(error)), error);
+   const struct pvrgpu_pco_tessellation_binary *stages[] = {
+      &binary.control, &binary.evaluation,
+   };
+   for (unsigned stage = 0; stage < 2; ++stage) {
+      const struct pvrgpu_pco_tessellation_binary *compiled = stages[stage];
+      const unsigned start = stage ? 4 : 8;
+      require(compiled->storage_buffer_descriptor_start == start &&
+              compiled->storage_buffer_descriptor_count == 2,
+              "TCS/TES SSBO descriptors follow native system descriptors");
+      require(compiled->storage_buffer_used_mask == 3 &&
+              compiled->storage_buffer_read_mask == 1 &&
+              compiled->storage_buffer_write_mask == 2,
+              "TCS/TES SSBO resource access masks are exact");
+      require(compiled->shader.abi.push_constant_start == start + 8 &&
+              compiled->shader.abi.shareds == start + 8,
+              "TCS/TES SSBO descriptors precede the CB0 suffix");
+      require(compiled->shader.data && compiled->shader.size,
+              "TCS/TES SSBO operations encode native shader bytes");
+   }
+   require(nir_intrinsic_write_mask(tcs_store) == 5 &&
+           nir_intrinsic_write_mask(tes_store) == 5 &&
+           nir_src_as_uint(tcs_store->src[1]) == 1 &&
+           nir_src_as_uint(tes_store->src[1]) == 1,
+           "SSBO scalarization and descriptor packing do not mutate caller NIR");
+   pvrgpu_pco_tessellation_pipeline_binary_finish(&binary);
+   ralloc_free(vs); ralloc_free(tcs); ralloc_free(tes); ralloc_free(fs);
 }
 static void save_stage(unsigned kind, const char *name, const struct pvrgpu_pco_owned_binary *s)
 {
@@ -318,6 +381,7 @@ int main(void)
    struct pvrgpu_pco_compiler *compiler = pvrgpu_pco_compiler_create(error, sizeof(error));
    require(compiler != NULL, error);
    test_stream_output_layout(compiler);
+   test_storage_buffers(compiler);
    for (unsigned kind = 0; kind < 7; ++kind) {
       nir_shader *vs = make_vertex(kind != 0), *tcs = make_control(kind), *tes = make_evaluation(kind), *fs = make_fragment();
       struct pvrgpu_pco_tessellation_pipeline_binary binary = {0};
@@ -356,7 +420,10 @@ int main(void)
       if (invalid == 1) tes->info.stage = MESA_SHADER_VERTEX;
       if (invalid == 2) tcs->info.tess.tcs_vertices_out = 33;
       if (invalid == 3) tes->info.tess.spacing = TESS_SPACING_UNSPECIFIED;
-      if (invalid == 4) tes->info.num_textures = PVRGPU_PCO_MAX_TEXTURES + 1;
+      if (invalid == 4) {
+         tes->info.num_textures = PVRGPU_PCO_MAX_TEXTURES + 1;
+         BITSET_SET(tes->info.textures_used, PVRGPU_PCO_MAX_TEXTURES);
+      }
       if (invalid == 5) tcs->scratch_size = 16;
       if (invalid == 6) tes->info.tess._primitive_mode = TESS_PRIMITIVE_UNSPECIFIED;
       struct pvrgpu_pco_tessellation_pipeline_binary binary = {0};

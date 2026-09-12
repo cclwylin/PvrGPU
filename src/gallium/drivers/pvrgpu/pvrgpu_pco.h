@@ -289,6 +289,13 @@ struct pvrgpu_pco_tessellation_layout {
 struct pvrgpu_pco_tessellation_binary {
    struct pvrgpu_pco_owned_binary shader;
    uint32_t barrier_count;
+   /* Driver-only stage-local Gallium SSBO capture plan. Four shared DWORDs
+    * describe each block: base low/high, byte size and dynamic byte offset. */
+   uint32_t storage_buffer_descriptor_start;
+   uint32_t storage_buffer_descriptor_count;
+   uint32_t storage_buffer_used_mask;
+   uint32_t storage_buffer_read_mask;
+   uint32_t storage_buffer_write_mask;
 };
 struct pvrgpu_pco_tessellation_pipeline_binary {
    struct pvrgpu_pco_graphics_binary graphics;

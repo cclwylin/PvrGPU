@@ -258,6 +258,78 @@ void EmptyFragmentNative() {
   reject_instruction([](auto &i){i.phase_composed=1;});
   std::cout<<"geometry pipeline native empty fragment NOP.end PASS\n";
 }
+void MultiplyHighVertexInputNative() {
+  for (const bool integer_signed : {false, true}) {
+    const auto binary = GeometryMultiplyHighVtxin2Fixture(integer_signed);
+    const auto program = DecodeGeometryPcoProgram(binary);
+    Check(program.summary.stage == ShaderStage::kGeometry &&
+              program.summary.group_count == 2 &&
+              program.summary.instruction_count == 2 &&
+              program.summary.ends_task,
+          "captured mulExtended geometry fixture is a complete native task");
+    const auto &multiply = program.instructions[0];
+    Check(multiply.opcode == PcoOpcode::kIntegerMultiplyAdd64High &&
+              multiply.integer_signed == integer_signed &&
+              multiply.source_count == 4 &&
+              multiply.source.bank == PcoRegisterBank::kTemporary &&
+              multiply.source.index == 10 &&
+              multiply.source1.bank == PcoRegisterBank::kTemporary &&
+              multiply.source1.index == 23 &&
+              multiply.source2.bank == PcoRegisterBank::kSpecial &&
+              multiply.source2.index == 0 &&
+              multiply.source3.bank == PcoRegisterBank::kSpecial &&
+              multiply.source3.index == 0 &&
+              multiply.target == PcoWriteTarget::kVertexInput &&
+              multiply.output_index == 2,
+          "captured IMADD64 W1 destination and four sources decode exactly");
+
+    auto abi = GeometryNativeLoadAbi();
+    abi.temps = 24;
+    abi.vertex_inputs = 3;
+    ValidateGeometryProgram(program, abi);
+    auto task = MakeGeometryTask(abi, std::vector<std::uint32_t>(4), 19, 7);
+    Check(task.inputs_written == 3 && task.inputs[0] == 19 &&
+              task.inputs[1] == 7,
+          "ABI=3 initializes only the two geometry system-value inputs");
+    task.temporaries[10] = UINT32_C(0x80000000);
+    task.temporaries[23] = 2;
+    task.temporary_written.set(10);
+    task.temporary_written.set(23);
+    GeometryExecutionStats stats;
+    StepGeometryTask(program, abi, task, {}, stats);
+    Check((task.inputs_written & 4) &&
+              task.inputs[2] == (integer_signed ? UINT32_MAX : 1U) &&
+              stats.instructions == 1 && stats.alu_instructions == 1,
+          "captured signed/unsigned IMADD64 writes the exact high word to VI2");
+
+    auto read_before_write = program;
+    read_before_write.instructions[0].source =
+        {PcoRegisterBank::kVertexInput, 2};
+    ValidateGeometryProgram(read_before_write, abi);
+    auto unread_task =
+        MakeGeometryTask(abi, std::vector<std::uint32_t>(4), 19, 7);
+    GeometryExecutionStats unread_stats;
+    Reject([&] {
+      StepGeometryTask(read_before_write, abi, unread_task, {}, unread_stats);
+    });
+
+    auto too_small = abi;
+    too_small.vertex_inputs = 2;
+    Reject([&] { ValidateGeometryProgram(program, too_small); });
+
+    bool fragment_rejected_destination = false;
+    try {
+      DecodePcoProgram(ShaderStage::kFragment, binary);
+    } catch (const std::runtime_error &error) {
+      fragment_rejected_destination =
+          std::string(error.what()).find("invalid for this stage") !=
+          std::string::npos;
+    }
+    Check(fragment_rejected_destination,
+          "fragment IMADD64 remains TEMP-only at the destination decoder");
+  }
+  std::cout << "geometry captured IMADD64 VTXIN2 fixture PASS\n";
+}
 void PureNative() {
   auto binary=GeometryNativeLoadFixture();
   const auto program=DecodeGeometryPcoProgram(binary);
@@ -315,10 +387,17 @@ void PureNative() {
   Reject([&]{ValidateGeometryProgram(bad,abi);});
   auto badabi=abi; badabi.uniform_buffer_descriptor_start=0;
   Reject([&]{ValidateGeometryProgram(program,badabi);});
-  for (unsigned inputs : {0U,1U,3U,64U}) {
+  for (unsigned inputs : {0U,1U,65U,UINT32_MAX}) {
     badabi=abi; badabi.vertex_inputs=inputs;
     Reject([&]{ValidateGeometryProgram(program,badabi);});
     Reject([&]{MakeGeometryTask(badabi,{0x1000,0x80,16,0},0,0);});
+  }
+  for (unsigned inputs : {2U,3U,64U}) {
+    auto validabi=abi; validabi.vertex_inputs=inputs;
+    ValidateGeometryProgram(program,validabi);
+    const auto task=MakeGeometryTask(validabi,{0x1000,0x80,16,0},11,13);
+    Check(task.inputs_written==3&&task.inputs[0]==11&&task.inputs[1]==13,
+        "expanded GS VTXIN ABI initializes only VI0 and VI1");
   }
   for (unsigned outputs : {0U,3U,65U}) {
     badabi=abi; badabi.vertex_outputs=outputs;
@@ -570,6 +649,7 @@ void VerifyAndRelease(MemoryPool &pool,PipelineTxn txn,unsigned epoch,unsigned m
 int sc_main(int,char**) {
   try {
     PureNative();
+    MultiplyHighVertexInputNative();
     SampleExecution();
     RejectFragmentOnlyBias();
     CompilerNative();

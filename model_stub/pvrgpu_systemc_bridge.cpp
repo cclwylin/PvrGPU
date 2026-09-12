@@ -3,6 +3,7 @@
 #include "uniform_buffers.h"
 #include "texture_stages.h"
 #include "shader_images.h"
+#include "tessellation_buffers.h"
 #include "texture/astc_decoder.h"
 #include "texture/texture_unit.h"
 #include "pco_sequence_profiles.h"
@@ -499,12 +500,19 @@ bool DriverPcoIndexPayloadIsValid(
     return source.raw_index_data == nullptr &&
            source.raw_index_data_size == 0 && source.index_size == 0 &&
            source.index_count == 0 && source.first_index == 0 &&
-           source.base_vertex == 0;
+           source.base_vertex == 0 && source.primitive_restart_enable == 0 &&
+           source.primitive_restart_index == 0;
   }
   if (source.index_size != 1 && source.index_size != 2 &&
       source.index_size != 4)
     return false;
   if (!source.raw_index_data || source.index_count == 0)
+    return false;
+  if (source.primitive_restart_enable > 1 ||
+      (!source.primitive_restart_enable && source.primitive_restart_index) ||
+      (source.primitive_restart_enable &&
+       ((source.index_size == 1 && source.primitive_restart_index > UINT8_MAX) ||
+        (source.index_size == 2 && source.primitive_restart_index > UINT16_MAX))))
     return false;
   const std::uint64_t index_end =
       static_cast<std::uint64_t>(source.first_index) + source.index_count;
@@ -654,8 +662,8 @@ bool ColorAttachmentFormatsAreValid(
     if (target >= count) {
       if (format)
         return refuse("inactive entry must be null");
-    } else if (!format || !pvrgpu::stub::IsNormalizedFourByteColorFormat(format)) {
-      return refuse("explicit entry is not a supported normalized four-byte format");
+    } else if (!format || !pvrgpu::stub::IsColorAttachmentTransportFormat(format)) {
+      return refuse("explicit entry is not a supported color transport format");
     }
   }
   if (count && (!source.format ||
@@ -705,6 +713,8 @@ void CopyPcoPayloadFields(
   destination->index_count = source.index_count;
   destination->first_index = source.first_index;
   destination->base_vertex = source.base_vertex;
+  destination->primitive_restart_enable = source.primitive_restart_enable;
+  destination->primitive_restart_index = source.primitive_restart_index;
   destination->vertex_pco.assign(source.vertex_pco,
                                  source.vertex_pco + source.vertex_pco_size);
   destination->fragment_pco.assign(
@@ -778,6 +788,29 @@ void CopyPcoPayloadFields(
     };
     owned.control_abi = copy_abi(t.control_abi);
     owned.evaluation_abi = copy_abi(t.evaluation_abi);
+    const auto copy_storage = [](const pvrgpu_systemc_storage_buffer_abi &a) {
+      return pvrgpu::stub::DriverStorageBufferAbi{
+          a.descriptor_start, a.descriptor_count, a.used_mask, a.read_mask,
+          a.write_mask};
+    };
+    owned.control_storage = copy_storage(t.control_storage);
+    owned.evaluation_storage = copy_storage(t.evaluation_storage);
+    owned.buffer_resources.reserve(t.buffer_resource_count);
+    for (unsigned index = 0; index < t.buffer_resource_count; ++index) {
+      const auto &resource = t.buffer_resources[index];
+      pvrgpu::stub::DriverShaderBufferResource copy;
+      copy.resource_token = resource.resource_token;
+      copy.bytes.assign(resource.bytes, resource.bytes + resource.bytes_size);
+      owned.buffer_resources.push_back(std::move(copy));
+    }
+    owned.buffer_bindings.reserve(t.buffer_binding_count);
+    for (unsigned index = 0; index < t.buffer_binding_count; ++index) {
+      const auto &binding = t.buffer_bindings[index];
+      owned.buffer_bindings.push_back({
+          static_cast<pvrgpu::stub::DriverPcoShaderStage>(binding.stage),
+          binding.slot, binding.resource_index, binding.access, binding.offset,
+          binding.bytes_size});
+    }
 #define COPY_TESS(field) owned.field = t.field
     COPY_TESS(input_vertices); COPY_TESS(output_vertices); COPY_TESS(vertices_per_instance);
     COPY_TESS(input_stride_dwords); COPY_TESS(output_vertex_stride_dwords);
@@ -1015,35 +1048,34 @@ bool InitialColorAttachmentIsValid(
   const std::uint32_t targets = source.render_target_count ? source.render_target_count : 1U;
   if (targets > pvrgpu::stub::kMaxRenderTargets)
     return reject("color target count exceeds the native bound");
-  const std::string_view format = source.format ? source.format : "";
-  std::uint64_t bytes_per_pixel = 0;
-  if (format == "PIPE_FORMAT_R8G8B8A8_UNORM" ||
-      format == "PIPE_FORMAT_R10G10B10A2_UNORM" ||
-      format == "PIPE_FORMAT_B10G10R10A2_UNORM" ||
-      format == "PIPE_FORMAT_R8G8B8A8_SRGB" ||
-      format == "PIPE_FORMAT_B8G8R8A8_SRGB" ||
-      format == "PIPE_FORMAT_R32_UINT" || format == "PIPE_FORMAT_R32_SINT")
-    bytes_per_pixel = 4;
-  else if (format == "PIPE_FORMAT_R32G32_UINT" ||
-           format == "PIPE_FORMAT_R32G32_SINT")
-    bytes_per_pixel = 8;
-  else if (format == "PIPE_FORMAT_R32G32B32A32_UINT" ||
-           format == "PIPE_FORMAT_R32G32B32A32_SINT" ||
-           format == "PIPE_FORMAT_R32G32B32A32_FLOAT")
-    bytes_per_pixel = 16;
-  else
-    return reject("unsupported transport format");
+  const auto formats = pvrgpu::stub::EffectiveDriverColorAttachmentFormats(
+      [&]() {
+        pvrgpu::stub::DriverCommand command;
+        command.format = source.format ? source.format : "";
+        command.render_target_count = targets;
+        for (std::uint32_t target = 0;
+             target < source.color_attachment_format_count; ++target)
+          command.color_attachment_formats.emplace_back(
+              source.color_attachment_formats[target]);
+        return command;
+      }());
   if (source.framebuffer_width == 0 || source.framebuffer_height == 0 ||
       source.framebuffer_width > 4096 || source.framebuffer_height > 4096)
     return reject("unsupported framebuffer extent");
-  const std::uint64_t expected =
+  const std::uint64_t stored_pixels =
       static_cast<std::uint64_t>(source.framebuffer_width) *
-      source.framebuffer_height * bytes_per_pixel *
+      source.framebuffer_height *
       (source.raster_samples ? source.raster_samples : 1) *
       (source.framebuffer_layers ? source.framebuffer_layers : 1);
-  if (expected > pvrgpu::stub::kDriverPcoSequenceAttachmentStride)
-    return reject("transport exceeds attachment address slot");
-  if (expected * targets != source.initial_color_attachment_bytes_size)
+  std::uint64_t expected = 0;
+  for (const auto &format : formats) {
+    const auto target_bytes = stored_pixels *
+        pvrgpu::stub::DriverColorAttachmentBytesPerPixel(format);
+    if (target_bytes > pvrgpu::stub::kDriverPcoSequenceAttachmentStride)
+      return reject("transport exceeds attachment address slot");
+    expected += target_bytes;
+  }
+  if (expected != source.initial_color_attachment_bytes_size)
     return reject("byte count does not match framebuffer transport");
   return true;
 }
@@ -1292,6 +1324,7 @@ bool CopyPcoTrianglePayload(
        !ideas_layout && !color_layout) ||
       source.vertex_count == 0 ||
       (!ideas_sequence &&
+       !source.primitive_restart_enable &&
        !DriverPcoArrayTopologyIsExpandable(source.primitive_mode,
                                            source.indexed != 0
                                                ? source.index_count
@@ -1733,7 +1766,9 @@ bool CopyPcoSequenceDraw(
     if (!source.geometry_pco || !source.geometry_shared ||
         source.geometry_pco_size > pvrgpu::stub::kDriverPcoMaximumBinaryBytes ||
         !PcoStageAbiIsBounded(gs, true, true) || gs.coefficients != 0 ||
-        gs.vertex_inputs != 2 || gs.vertex_outputs < 4 ||
+        gs.vertex_inputs < 2 ||
+        gs.vertex_inputs > pvrgpu::stub::kPcoVertexInputCount ||
+        gs.vertex_outputs < 4 ||
         gs.uniform_buffer_descriptor_start < 4 ||
         (gs.uniform_buffer_descriptor_start - 4U) % pvrgpu::stub::kPcoTextureDescriptorDwordCount != 0 ||
         (gs.uniform_buffer_descriptor_start - 4U) / pvrgpu::stub::kPcoTextureDescriptorDwordCount >
@@ -1803,12 +1838,16 @@ bool CopyPcoSequenceDraw(
         !(tessellation && source.primitive_mode == 14))
       return "primitive mode is outside the supported topologies";
     // An indexed draw assembles primitives from its indices.
-    if (!geometry && !tessellation && !DriverPcoArrayTopologyIsExpandable(source.primitive_mode,
+    if (!geometry && !tessellation &&
+        !source.primitive_restart_enable &&
+        !DriverPcoArrayTopologyIsExpandable(source.primitive_mode,
                                             source.indexed != 0
                                                 ? source.index_count
                                                 : source.vertex_count)) {
       return "topology cannot be expanded from the element count";
     }
+    if ((geometry || tessellation) && source.primitive_restart_enable)
+      return "primitive restart is unsupported for extended pre-raster stages";
     if (!DriverPcoIndexPayloadIsValid(source))
       return "index payload is invalid";
     if (!DriverPcoRenderTargetCountIsValid(source.render_target_count))
@@ -2298,6 +2337,12 @@ std::uint64_t CommandOwnedPayloadBytes(
     if (image.bytes.size() > std::numeric_limits<std::uint64_t>::max() - byte_vectors)
       throw std::overflow_error("SystemC API fragment image payload size overflow");
     byte_vectors += image.bytes.size();
+  }
+  for (const auto &resource : command.tessellation.buffer_resources) {
+    if (resource.bytes.size() >
+        std::numeric_limits<std::uint64_t>::max() - byte_vectors)
+      throw std::overflow_error("SystemC API tessellation buffer payload size overflow");
+    byte_vectors += resource.bytes.size();
   }
   const std::uint64_t dword_count =
       static_cast<std::uint64_t>(command.vertex_shared.size()) +
@@ -2939,7 +2984,8 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
       }
     }
     if (!pvrgpu::stub::ValidateDriverUniformBuffers(command, error) ||
-        !pvrgpu::stub::ValidateDriverShaderImages(command, error))
+        !pvrgpu::stub::ValidateDriverShaderImages(command, error) ||
+        !pvrgpu::stub::ValidateDriverTessellationBuffers(command, error))
       return false;
     for (const auto &image : command.fragment_images) {
       const auto [entry, inserted] = image_snapshots.emplace(image.resource_token, &image);
@@ -3558,6 +3604,8 @@ extern "C" int pvrgpu_systemc_flush_graphics_stats(
   stats->stream_output_primitives_written = g_last_graphics_stats.stream_output_primitives_written;
   stats->stream_output_primitives_storage_needed =
       g_last_graphics_stats.stream_output_primitives_storage_needed;
+  stats->occlusion_samples_passed =
+      g_last_graphics_stats.occlusion_samples_passed;
   return 0;
 }
 
@@ -3727,7 +3775,8 @@ extern "C" int pvrgpu_systemc_flush_readback(
         pvrgpu::stub::DepthAttachmentBytesPerPixel(framebuffer.depth_format) !=
             readback->bytes_per_pixel)
       return 0;
-  } else if (framebuffer.bytes_per_pixel != readback->bytes_per_pixel) {
+  } else if (framebuffer.BytesPerPixel(readback->attachment) !=
+             readback->bytes_per_pixel) {
     return 0;
   }
   /*

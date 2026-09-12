@@ -123,8 +123,9 @@ struct pvrgpu_context {
    uint64_t query_primitives_generated;
    uint64_t query_primitives_written;
    uint64_t query_primitives_storage_needed;
+   uint64_t query_occlusion_samples;
    uint64_t query_statistics_failures;
-   unsigned active_primitives_generated_queries;
+   unsigned active_native_queries;
    bool query_state_disabled;
    unsigned unsupported_resource_ops;
    unsigned indexed_quad_draws;
@@ -230,6 +231,10 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx);
  */
 bool
 pvrgpu_context_has_recorded_geometry(const struct pvrgpu_context *ctx);
+
+/* Canonical SystemC transport used for a Gallium color surface. */
+const char *
+pvrgpu_command_format_for_surface(enum pipe_format format);
 
 /* Eager resource synchronization must not prematurely close an RDC frame. */
 bool

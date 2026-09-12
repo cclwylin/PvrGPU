@@ -91,6 +91,30 @@ int main() {
     for (unsigned i = 0; i < retained; ++i)
       Check(pvrgpu_snapshot_index(restart.data() + i * width, width) == 0,
             "all references preserve same vertex reuse");
+
+    // Connected topologies keep their canonical marker while real indices
+    // are rebased. The driver widens before this call so the marker cannot be
+    // created by subtracting the minimum from a real index.
+    std::array<uint32_t, 5> connected = {19, UINT32_MAX, 23, 19, UINT32_MAX};
+    source = count = 0;
+    Check(pvrgpu_rebase_vertex_indices_with_restart(
+              connected.data(), sizeof(connected), 4, connected.size(), -3,
+              true, UINT32_MAX, &source, &count),
+          "connected restart stream rebases around canonical markers");
+    Check(source == 16 && count == 5 && connected[0] == 0 &&
+              connected[1] == UINT32_MAX && connected[2] == 4 &&
+              connected[3] == 0 && connected[4] == UINT32_MAX,
+          "restart markers are excluded from range and preserved");
+
+    std::array<uint32_t, 3> restart_only = {
+        UINT32_MAX, UINT32_MAX, UINT32_MAX};
+    source = 123;
+    count = 456;
+    Check(pvrgpu_rebase_vertex_indices_with_restart(
+              restart_only.data(), sizeof(restart_only), 4,
+              restart_only.size(), 0, true, UINT32_MAX, &source, &count) &&
+              source == 0 && count == 0,
+          "all-restart connected stream is valid empty work");
   }
   Exercise(4, {0x80000000, 0x80000002, 0x80000001}, INT32_MIN);
   Exercise(4, {1000000000, 1000000007, 1000000000}, 1);
