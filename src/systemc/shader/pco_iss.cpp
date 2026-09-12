@@ -5222,7 +5222,7 @@ bool IsDescriptorMetadataSource(const PcoRegisterRef &reference,
  * compare-op==255 select behind each shadow SMP. It is a binary-level Dref
  * transport contract: recognize every operand relationship, then annotate
  * only the SMP. The ALU remains executable and passes the TPU's PCF result. */
-void AnnotateFragmentShadowSamples(std::vector<PcoInstruction> &instructions) {
+void AnnotateShadowSamples(std::vector<PcoInstruction> &instructions) {
   for (std::size_t index = 0; index + 9U < instructions.size(); ++index) {
     PcoInstruction &sample = instructions[index];
     if (sample.opcode != PcoOpcode::kTextureSample ||
@@ -5235,7 +5235,6 @@ void AnnotateFragmentShadowSamples(std::vector<PcoInstruction> &instructions) {
     const bool match =
         reference_copy.opcode == PcoOpcode::kFloatAdd &&
         reference_copy.target == PcoWriteTarget::kTemporary &&
-        reference_copy.source.bank == PcoRegisterBank::kTemporary &&
         IsRegister(reference_copy.source1, PcoRegisterBank::kSpecial, 0) &&
         marker.opcode == PcoOpcode::kMoveImmediate &&
         marker.target == PcoWriteTarget::kTemporary && marker.immediate == 255U &&
@@ -5246,14 +5245,20 @@ void AnnotateFragmentShadowSamples(std::vector<PcoInstruction> &instructions) {
                    marker.output_index) &&
         pass_select.opcode == PcoOpcode::kTestConditionalSelect &&
         pass_select.target == PcoWriteTarget::kTemporary &&
-        pass_select.output_index == sample.output_index &&
-        IsRegister(pass_select.source1, PcoRegisterBank::kTemporary,
-                   reference_copy.output_index) &&
+        /* The source selected by the impossible op==255 arm is the final
+         * Dref. For UNORM depth PCO inserts the required clamp between the
+         * transport copy and this select, while RA may also coalesce the copy.
+         * The marker comparison and the other arm's exact SMP destination
+         * make this a fail-closed identification of that transformed value. */
+        pass_select.source1.bank == PcoRegisterBank::kTemporary &&
         IsRegister(pass_select.source2, PcoRegisterBank::kTemporary,
                    sample.output_index);
     if (!match)
       continue;
     sample.texture_shadow_compare = 1;
+    /* This source is live when SMP issues. Any UNORM clamp materialized after
+     * WDF is mirrored by TextureUnit from descriptor bit 8; reading the
+     * select's later temporary here would capture an unrelated pre-SMP value. */
     sample.texture_shadow_reference = reference_copy.source;
   }
 }
@@ -5486,8 +5491,10 @@ bool HasCanonicalTextureFields(const PcoInstruction &instruction) {
          instruction.texture_lod_replace <= 1 &&
          instruction.texture_shadow_compare <= 1 &&
          (instruction.texture_shadow_compare
-              ? instruction.texture_shadow_reference.bank ==
-                    PcoRegisterBank::kTemporary
+              ? (instruction.texture_shadow_reference.bank ==
+                    PcoRegisterBank::kTemporary ||
+                 instruction.texture_shadow_reference.bank ==
+                    PcoRegisterBank::kVertexInput)
               : IsDefaultUnusedRegister(
                     instruction.texture_shadow_reference)) &&
          HasCanonicalTextureLodMode(instruction, true) &&
@@ -5850,6 +5857,9 @@ void ValidateVertexTemporaryProgram(
         written_mask.set(instruction.output_index + repeat);
       }
     }
+    if (instruction.target == PcoWriteTarget::kIndex0 ||
+        instruction.target == PcoWriteTarget::kIndex1)
+      uses_temporary_program = true;
     if (instruction.opcode == PcoOpcode::kIntegerAdd64_32) {
       const std::size_t high_limit = instruction.output_target1 == PcoWriteTarget::kTemporary
           ? kPcoTemporaryCount : instruction.output_target1 == PcoWriteTarget::kVertexInput
@@ -5871,6 +5881,7 @@ void ValidateVertexTemporaryProgram(
     return;
 
   std::size_t texture_sample_count = 0;
+  std::array<bool, 2> index_register_written{};
   for (const PcoInstruction &instruction : instructions) {
     if (instruction.opcode == PcoOpcode::kBranch ||
         instruction.opcode == PcoOpcode::kConditionalMask ||
@@ -5959,6 +5970,14 @@ void ValidateVertexTemporaryProgram(
             kPcoMaximumVertexSharedCount)
           DecodeError(instruction.binary_offset,
                       "generic vertex shared source is out of bounds");
+      } else if (source.bank == PcoRegisterBank::kIndex0 ||
+                 source.bank == PcoRegisterBank::kIndex1) {
+        const unsigned index_register =
+            source.bank == PcoRegisterBank::kIndex0 ? 0U : 1U;
+        if (count != 1 || (source.index & 7U) != 3U ||
+            !index_register_written[index_register])
+          DecodeError(instruction.binary_offset,
+                      "indexed vertex SH source has no address register");
       } else {
         DecodeError(instruction.binary_offset,
                     "generic vertex source bank is unsupported");
@@ -5973,15 +5992,35 @@ void ValidateVertexTemporaryProgram(
     if (instruction.source_count >= 4)
       require_source_range(instruction.source3, instruction.repeat_count);
 
+    if (instruction.target == PcoWriteTarget::kIndex0 ||
+        instruction.target == PcoWriteTarget::kIndex1) {
+      if (instruction.opcode != PcoOpcode::kMoveImmediate ||
+          instruction.source_count != 0 || instruction.repeat_count != 1 ||
+          instruction.output_index != 0 || instruction.exec_cnd != 0 ||
+          instruction.end_group)
+        DecodeError(instruction.binary_offset,
+                    "vertex index register requires an unconditional scalar MOVI");
+      index_register_written[instruction.target == PcoWriteTarget::kIndex0
+                                 ? 0U
+                                 : 1U] = true;
+      continue;
+    }
+
     const bool writes_alu_register =
         instruction.target == PcoWriteTarget::kTemporary ||
         instruction.target == PcoWriteTarget::kVertexInput;
     switch (instruction.opcode) {
     case PcoOpcode::kMoveImmediate:
       if (!writes_alu_register ||
-          instruction.source_count != 0 || instruction.repeat_count != 1)
-        DecodeError(instruction.binary_offset,
-                    "invalid generic vertex immediate move");
+          instruction.source_count != 0 || instruction.repeat_count != 1) {
+        DecodeError(
+            instruction.binary_offset,
+            "invalid generic vertex immediate move: target=" +
+                std::to_string(static_cast<unsigned>(instruction.target)) +
+                " sources=" + std::to_string(instruction.source_count) +
+                " repeat=" + std::to_string(instruction.repeat_count) +
+                " output=" + std::to_string(instruction.output_index));
+      }
       break;
     case PcoOpcode::kMoveBypass:
     case PcoOpcode::kFloatNegate:
@@ -8647,10 +8686,10 @@ PcoDecodedProgram DecodePcoProgram(ShaderStage stage,
       DecodeError(group_offsets[index], "fragment branch target is not a native group boundary");
     instruction.branch_target_index = static_cast<std::uint16_t>(found - group_offsets.begin());
   }
+  AnnotateShadowSamples(decoded.instructions);
   if (stage == ShaderStage::kVertex)
     ValidateVertexTemporaryProgram(decoded.instructions);
   else {
-    AnnotateFragmentShadowSamples(decoded.instructions);
     ValidateFragmentProgram(decoded.instructions);
   }
 
@@ -8740,6 +8779,8 @@ PcoVertexExecution ExecuteVertexPco(
   std::uint16_t effective_shared_count = 0;
   std::array<std::uint32_t, kPcoTemporaryCount> temporaries{};
   PcoTemporaryMask temporary_written_mask{};
+  std::array<std::uint32_t, 2> index_registers{};
+  std::array<bool, 2> index_register_valid{};
   std::uint64_t vertex_input_mask = 0;
   std::uint64_t rewritten_vertex_inputs = 0;
   std::uint64_t pending_vertex_inputs = 0;
@@ -8833,6 +8874,7 @@ PcoVertexExecution ExecuteVertexPco(
     std::uint8_t expected_pending_components = 0;
     std::uint8_t expected_emitted = 0;
     std::uint8_t expected_ended_task = 0;
+    std::uint8_t expected_index_register_valid_mask = 0;
     for (std::size_t index = 0;
          index + 1 < continuation.resume_instruction_index; ++index) {
       const PcoInstruction &prior = instructions[index];
@@ -8861,6 +8903,10 @@ PcoVertexExecution ExecuteVertexPco(
         for (std::uint8_t repeat = 0; repeat < prior.repeat_count; ++repeat)
           expected_temporary_mask.set(prior.output_index + repeat);
       }
+      if (prior.target == PcoWriteTarget::kIndex0 ||
+          prior.target == PcoWriteTarget::kIndex1)
+        expected_index_register_valid_mask |=
+            prior.target == PcoWriteTarget::kIndex0 ? 1U : 2U;
       if (prior.opcode == PcoOpcode::kIntegerAdd64_32 &&
           prior.output_target1 == PcoWriteTarget::kTemporary)
         expected_temporary_mask.set(prior.output_index1);
@@ -8878,6 +8924,8 @@ PcoVertexExecution ExecuteVertexPco(
     if (expected_request_pending ||
         continuation.temporary_written_mask != expected_temporary_mask ||
         continuation.output_written_mask != expected_output_mask ||
+        continuation.index_register_valid_mask !=
+            expected_index_register_valid_mask ||
         continuation.emitted != expected_emitted ||
         continuation.ended_task != expected_ended_task) {
       ExecuteError("texture vertex continuation masks are inconsistent");
@@ -8914,6 +8962,11 @@ PcoVertexExecution ExecuteVertexPco(
                 effective_shared.begin());
     temporaries = continuation.temporaries;
     temporary_written_mask = continuation.temporary_written_mask;
+    index_registers = continuation.index_registers;
+    index_register_valid[0] =
+        (continuation.index_register_valid_mask & 1U) != 0;
+    index_register_valid[1] =
+        (continuation.index_register_valid_mask & 2U) != 0;
     result.outputs = continuation.outputs;
     result.written_mask = continuation.output_written_mask;
     result.emitted = continuation.emitted;
@@ -8930,6 +8983,19 @@ PcoVertexExecution ExecuteVertexPco(
       if (source.index >= effective_shared_count)
         ExecuteError("vertex control-flow shared source is absent");
       return effective_shared[source.index];
+    }
+    if (source.bank == PcoRegisterBank::kIndex0 ||
+        source.bank == PcoRegisterBank::kIndex1) {
+      const unsigned index_register =
+          source.bank == PcoRegisterBank::kIndex0 ? 0U : 1U;
+      if (!index_register_valid[index_register] || (source.index & 7U) != 3U)
+        ExecuteError("indexed vertex SH source has no valid address register");
+      const std::uint64_t index =
+          static_cast<std::uint64_t>(index_registers[index_register]) +
+          (source.index >> 3U);
+      if (index >= effective_shared_count)
+        ExecuteError("indexed vertex SH source is outside the supplied span");
+      return effective_shared[index];
     }
     return ReadSource(source, effective_vertex_inputs, temporaries,
                       temporary_written_mask, 0, ShaderStage::kVertex);
@@ -9098,6 +9164,21 @@ PcoVertexExecution ExecuteVertexPco(
         result.texture_request.sampler_state[word] =
             effective_shared[instruction.source2.index + word];
       }
+      const bool descriptor_shadow =
+          (effective_shared[instruction.source1.index + 7U] &
+           UINT32_C(0x200)) != 0;
+      if (descriptor_shadow != (instruction.texture_shadow_compare != 0))
+        ExecuteError("vertex shadow descriptor and native Dref marker disagree");
+      if (descriptor_shadow) {
+        const std::uint32_t compare_op =
+            effective_shared[instruction.source1.index + 12U];
+        if (compare_op > 7U)
+          ExecuteError("vertex shadow descriptor compare operation is invalid");
+        result.texture_request.shadow_reference = ReadSource(
+            instruction.texture_shadow_reference, effective_vertex_inputs,
+            temporaries, temporary_written_mask, 0, ShaderStage::kVertex);
+        result.texture_request.shadow_compare = 1;
+      }
       result.texture_request.component_count = kPcoTextureResponseCount;
       result.texture_request.descriptor_set = static_cast<std::uint8_t>(
           instruction.source1.index / kPcoTextureDescriptorDwordCount);
@@ -9113,6 +9194,7 @@ PcoVertexExecution ExecuteVertexPco(
                   result.continuation.shared_registers.begin());
       result.continuation.temporaries = temporaries;
       result.continuation.outputs = result.outputs;
+      result.continuation.index_registers = index_registers;
       result.continuation.temporary_written_mask = temporary_written_mask;
       result.continuation.output_written_mask = result.written_mask;
       result.continuation.program_binary_size = summary.binary_size;
@@ -9129,6 +9211,9 @@ PcoVertexExecution ExecuteVertexPco(
       result.continuation.shared_count = effective_shared_count;
       result.continuation.emitted = result.emitted;
       result.continuation.ended_task = result.ended_task;
+      result.continuation.index_register_valid_mask =
+          (index_register_valid[0] ? 1U : 0U) |
+          (index_register_valid[1] ? 2U : 0U);
       result.continuation.valid = 1;
       result.suspended = 1;
       return result;
@@ -9234,11 +9319,17 @@ PcoVertexExecution ExecuteVertexPco(
     }
 
     if (instruction.target == PcoWriteTarget::kTemporary ||
-        instruction.target == PcoWriteTarget::kVertexInput) {
+        instruction.target == PcoWriteTarget::kVertexInput ||
+        instruction.target == PcoWriteTarget::kIndex0 ||
+        instruction.target == PcoWriteTarget::kIndex1) {
       const bool writes_vertex_input =
           instruction.target == PcoWriteTarget::kVertexInput;
-      const std::size_t destination_count = writes_vertex_input
-          ? effective_vertex_inputs.size() : temporaries.size();
+      const bool writes_index =
+          instruction.target == PcoWriteTarget::kIndex0 ||
+          instruction.target == PcoWriteTarget::kIndex1;
+      const std::size_t destination_count = writes_index ? 1U :
+          (writes_vertex_input ? effective_vertex_inputs.size()
+                               : temporaries.size());
       if (instruction.repeat_count == 0 ||
           static_cast<std::size_t>(instruction.output_index) +
                   instruction.repeat_count >
@@ -9269,6 +9360,20 @@ PcoVertexExecution ExecuteVertexPco(
           if (ref.index >= effective_shared_count)
             ExecuteError("generic vertex shared source is absent");
           return effective_shared[ref.index];
+        }
+        if (ref.bank == PcoRegisterBank::kIndex0 ||
+            ref.bank == PcoRegisterBank::kIndex1) {
+          const unsigned index_register =
+              ref.bank == PcoRegisterBank::kIndex0 ? 0U : 1U;
+          if (!index_register_valid[index_register] ||
+              (ref.index & 7U) != 3U)
+            ExecuteError("indexed vertex SH source has no valid address register");
+          const std::uint64_t index =
+              static_cast<std::uint64_t>(index_registers[index_register]) +
+              (ref.index >> 3U);
+          if (index >= effective_shared_count)
+            ExecuteError("indexed vertex SH source is outside the supplied span");
+          return effective_shared[index];
         }
         return ReadSource(ref, effective_vertex_inputs, temporaries,
                           temporary_written_mask, 0,
@@ -9592,7 +9697,12 @@ PcoVertexExecution ExecuteVertexPco(
       }
       const std::size_t destination =
           static_cast<std::size_t>(instruction.output_index) + repeat;
-      if (writes_vertex_input) {
+      if (writes_index) {
+        const unsigned index_register =
+            instruction.target == PcoWriteTarget::kIndex0 ? 0U : 1U;
+        index_registers[index_register] = value;
+        index_register_valid[index_register] = true;
+      } else if (writes_vertex_input) {
         // pco_ra.c allocates SSA results into VTXIN after their original
         // inputs die. Later reads and UVSW exports see this new value.
         effective_vertex_inputs[destination] = value;
@@ -10845,8 +10955,18 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
       }
       const bool descriptor_shadow =
           (context.shared_registers[texture_base + 7U] & UINT32_C(0x200)) != 0;
-      if (descriptor_shadow != (instruction.texture_shadow_compare != 0))
-        ExecuteError("shadow descriptor and native Dref marker disagree");
+      if (descriptor_shadow != (instruction.texture_shadow_compare != 0)) {
+        ExecuteError(
+            "shadow descriptor and native Dref marker disagree: descriptor=" +
+            std::to_string(descriptor_shadow ? 1U : 0U) +
+            " native=" +
+            std::to_string(instruction.texture_shadow_compare ? 1U : 0U) +
+            " word7=" +
+            std::to_string(context.shared_registers[texture_base + 7U]) +
+            " word12=" +
+            std::to_string(context.shared_registers[texture_base + 12U]) +
+            " base=" + std::to_string(texture_base));
+      }
       if (descriptor_shadow) {
         const std::uint32_t compare_op =
             context.shared_registers[texture_base + 12U];

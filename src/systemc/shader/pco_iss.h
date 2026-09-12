@@ -628,6 +628,7 @@ struct PcoVertexContinuation {
   std::array<std::uint32_t, kPcoMaximumVertexSharedCount> shared_registers{};
   std::array<std::uint32_t, kPcoTemporaryCount> temporaries{};
   std::array<std::uint32_t, kPcoVertexOutputCount> outputs{};
+  std::array<std::uint32_t, 2> index_registers{};
   PcoTemporaryMask temporary_written_mask{};
   std::uint64_t output_written_mask = 0;
   std::uint32_t program_binary_size = 0;
@@ -640,6 +641,7 @@ struct PcoVertexContinuation {
   std::uint16_t shared_count = 0;
   std::uint8_t emitted = 0;
   std::uint8_t ended_task = 0;
+  std::uint8_t index_register_valid_mask = 0;
   std::uint8_t valid = 0;
 };
 

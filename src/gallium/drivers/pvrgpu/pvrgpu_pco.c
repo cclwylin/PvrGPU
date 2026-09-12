@@ -7173,10 +7173,15 @@ pvrgpu_color_uniform_word_map(nir_shader *nir, unsigned bound_dwords,
 {
    struct pvrgpu_pco_uniform_word_map map = {0};
    unsigned required;
-   if (!out || !exceeds_budget || available > ARRAY_SIZE(map.source_words) ||
+   if (!out || !exceeds_budget ||
        !pvrgpu_color_uniform_prefix(nir, bound_dwords, &required, error, error_size))
       return false;
    *exceeds_budget = false;
+   /* The architectural shared bank is slightly wider than this optional
+    * sparse-map cache. If the live set crosses the cache capacity, select the
+    * ordinary CB0 UBO path below instead of rejecting an otherwise valid
+    * shader without a diagnostic. */
+   available = MIN2(available, ARRAY_SIZE(map.source_words));
    /* The prefix proof above validates signed bases, index types, overflow,
     * and every candidate of an indirect range before collecting any word.
     * Keep the union of all possible loads, never an observed index or value.
@@ -8712,26 +8717,37 @@ bool pvrgpu_pco_compile_color_triangle(
    struct pvrgpu_pco_uniform_word_map fragment_word_map = {0};
    uint32_t vertex_cb0_uniform_buffer_slot = 0;
    uint32_t fragment_cb0_uniform_buffer_slot = 0;
+   const char *shared_budget_stage = NULL;
    if (!pvrgpu_fit_color_shared_budget(vs,
           expected_stage_textures_vs * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
           PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE,
           true, &vertex_uniform_dwords, &vertex_word_map,
-          &vertex_cb0_uniform_buffer_slot, error, error_size) ||
-       !pvrgpu_fit_color_shared_budget(fs,
+          &vertex_cb0_uniform_buffer_slot, error, error_size)) {
+      shared_budget_stage = "fitting vertex CB0";
+   } else if (!pvrgpu_fit_color_shared_budget(fs,
           texture_count * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS +
              fs->info.num_images * 8,
           PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE,
           fs->info.num_images == 0,
           &fragment_uniform_dwords, &fragment_word_map,
-          &fragment_cb0_uniform_buffer_slot, error, error_size) ||
-       (vertex_cb0_uniform_buffer_slot &&
-        !pvrgpu_lower_large_cb0(vs, vertex_uniform_dwords,
-           vertex_cb0_uniform_buffer_slot - 1, "color primitive vertex",
-           error, error_size)) ||
-       (fragment_cb0_uniform_buffer_slot &&
-        !pvrgpu_lower_large_cb0(fs, fragment_uniform_dwords,
-           fragment_cb0_uniform_buffer_slot - 1, "color primitive fragment",
-           error, error_size))) {
+          &fragment_cb0_uniform_buffer_slot, error, error_size)) {
+      shared_budget_stage = "fitting fragment CB0";
+   } else if (vertex_cb0_uniform_buffer_slot &&
+              !pvrgpu_lower_large_cb0(vs, vertex_uniform_dwords,
+                 vertex_cb0_uniform_buffer_slot - 1,
+                 "color primitive vertex", error, error_size)) {
+      shared_budget_stage = "lowering vertex CB0 DMA";
+   } else if (fragment_cb0_uniform_buffer_slot &&
+              !pvrgpu_lower_large_cb0(fs, fragment_uniform_dwords,
+                 fragment_cb0_uniform_buffer_slot - 1,
+                 "color primitive fragment", error, error_size)) {
+      shared_budget_stage = "lowering fragment CB0 DMA";
+   }
+   if (shared_budget_stage) {
+      if (error && error_size && !error[0])
+         pvrgpu_pco_fail(error, error_size,
+                         "color primitive failed while %s",
+                         shared_budget_stage);
       ralloc_free(compile_mem_ctx);
       return false;
    }

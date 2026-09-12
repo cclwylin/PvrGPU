@@ -530,6 +530,8 @@ void UscCluster::Run() {
                 throw std::runtime_error("vertex SMP shader LOD bias is unsupported");
               if (issued.gather)
                 throw std::runtime_error("vertex SMP raw gather is unsupported");
+              request.shadow_reference = issued.shadow_reference;
+              request.shadow_compare = issued.shadow_compare;
               request.data_request = issued.data_request;
               request.texture_address_lo = issued.texture_address_lo;
               request.texture_address_hi = issued.texture_address_hi;

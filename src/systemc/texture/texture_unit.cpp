@@ -1608,7 +1608,7 @@ void TextureUnit::SampleRunForStage(
     const bool biased_lod = requests.front().lod_bias_present != 0;
     const bool direct_fetch = multisample_fetch || texel_fetch;
     if (shadow_compare &&
-        (!driver_pco || !fragment_stage || gather || direct_fetch ||
+        (!driver_pco || gather || direct_fetch ||
          (image.format != TextureFormat::kZ24UnormS8Uint &&
           image.format != TextureFormat::kZ32Unorm &&
           image.format != TextureFormat::kRgba32Float) ||
