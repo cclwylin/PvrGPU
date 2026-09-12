@@ -530,6 +530,12 @@ GL readback 確認輸出變化。控制 shader 的結果不是原 capture 的 PA
 只解釋已驗證的像素／quad；殘差要保留，並查相應 API 規範是否容許該精度選擇，
 不能為了模仿 llvmpipe 而改掉原本合法的模型算法。
 
+實作上要明確分流，不可臨時改 source：Capture/Play 的 `draw-serialized`
+比較設定 `PVRGPU_TEXTURE_LOD_MODE=llvmpipe`，保留 reference renderer 可觀測的
+fast-log2 mip weight；dEQP、未來真實硬體與 `render-pass-tbdr` performance mode
+設定 `PVRGPU_TEXTURE_LOD_MODE=exact`。這是 SystemC elaboration-time 模型選項，
+同一 process 內不得中途切換；結果報告必須記載所用模式。
+
 ### 7.6 Packed render target 精度
 
 先查當下 attachment 的實際 channel bit sizes。RGBA8 PNG／`GL_UNSIGNED_BYTE`

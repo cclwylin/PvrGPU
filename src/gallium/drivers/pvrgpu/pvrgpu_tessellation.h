@@ -36,7 +36,8 @@ pvrgpu_tessellation_payload_error(const struct pvrgpu_systemc_tessellation *t)
           a->vertex_inputs > 64 ||
           (stage ? (a->vertex_outputs < 4 || a->vertex_outputs > 64) : a->vertex_outputs != 0) ||
           a->coefficients || a->entry_offset || !shared || count != a->shareds ||
-          count < descriptors || count > 256 ||
+          count < descriptors ||
+          count > PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE ||
           a->uniform_buffer_descriptor_count > 15 ||
           ubo_start < descriptors || ubo_start > descriptors + 8u * 20u ||
           (ubo_start - descriptors) % 20u ||

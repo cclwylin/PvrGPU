@@ -216,6 +216,8 @@ struct PipelineState {
   std::uint32_t position_output_count = 0;
   std::uint32_t fragment_position_start = 0;
   std::uint32_t fragment_position_count = 0;
+  std::uint32_t fragment_position_uses_z = 0;
+  std::uint32_t fragment_position_uses_w = 0;
   std::uint32_t varying_output_start = 0;
   std::uint32_t varying_output_count = 0;
   std::uint32_t fragment_varying_start = 0;

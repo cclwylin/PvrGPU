@@ -255,7 +255,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("full_depth_clear_resource", context_header)
         self.assertIn("pvrgpu_note_full_depth_clear_one", clear)
         self.assertIn("pvrgpu_invalidate_full_depth_clear_for_resource", resource)
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 33u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 34u", systemc_api)
         for field in (
             "const uint8_t *raw_vertex_data;",
             "size_t raw_vertex_data_size;",
@@ -276,6 +276,8 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             "uint32_t polygon_offset_units_bits;",
             "uint32_t polygon_offset_clamp_bits;",
             "uint32_t polygon_offset_units_unscaled;",
+            "uint32_t fragment_position_uses_z;",
+            "uint32_t fragment_position_uses_w;",
         ):
             self.assertIn(field, systemc_api)
 
@@ -321,6 +323,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("caps->glsl_feature_level_compatibility = 400", screen)
         self.assertIn("caps->max_texture_3d_levels = 9", screen)
         self.assertIn("caps->max_texture_array_layers = 256", screen)
+        self.assertIn("caps->max_texture_lod_bias = 2.0f", screen)
         self.assertIn("caps->max_render_targets = 8", screen)
         self.assertIn("caps->max_viewports = PIPE_MAX_VIEWPORTS", screen)
         self.assertIn("caps->max_varyings = 32", screen)
@@ -806,7 +809,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 33u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 34u", systemc_api)
         for field in (
             "uint32_t vertex_stride;",
             "uint32_t position_output_start;",
@@ -817,6 +820,8 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             "uint32_t varying_output_count;",
             "uint32_t fragment_varying_start;",
             "uint32_t fragment_varying_count;",
+            "uint32_t fragment_position_uses_z;",
+            "uint32_t fragment_position_uses_w;",
         ):
             self.assertIn(field, systemc_api)
 
@@ -942,7 +947,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 33u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 34u", systemc_api)
         self.assertIn("command=draw_pco_triangles", command)
         self.assertIn("pvrgpu_write_draw_pco_triangles_command", command_header)
         self.assertIn("PVRGPU_DRAW_PCO_TRIANGLES_VERTEX_COUNT 6144u", command_header)

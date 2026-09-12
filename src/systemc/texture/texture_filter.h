@@ -143,18 +143,21 @@ struct TextureImplicitLod {
 float TextureFastLog2(float x);
 
 // lp_build_lod_selector for LODM=NORMAL: lambda from rho^2 through
-// TextureFastLog2, clamped to the sampler's U4.6 window, and the
-// minification decision.  rho_squared of zero is the degenerate quad and
-// selects the window's minimum.
+// llvmpipe-compatible TextureFastLog2 or exact log2, clamped to the sampler's
+// U4.6 window, and the minification decision. rho_squared of zero is the
+// degenerate quad and selects the window's minimum. Exact mode models the
+// conformance/hardware path; false preserves Capture/Play's llvmpipe oracle.
 TextureLodSelection SelectTextureLod(float rho_squared,
                                      const RogueTextureSamplerDescriptor &sampler,
-                                     std::uint32_t mip_count);
+                                     std::uint32_t mip_count,
+                                     bool exact_lod = false);
 // Fragment BIAS/PPLOD adds the shader's scalar to the *unclamped* implicit
 // lambda. NaN bias means zero bias; infinities select the corresponding LOD
 // bound. Raw shader bits remain in the request. Sampler DADJUST is separate.
 TextureLodSelection SelectTextureBiasedLod(float rho_squared, float bias,
                                           const RogueTextureSamplerDescriptor &sampler,
-                                          std::uint32_t mip_count);
+                                          std::uint32_t mip_count,
+                                          bool exact_lod = false);
 
 // lp_build_sample_general: a minified fragment takes the minification filter
 // and the sampler's mip filter, a magnified one the magnification filter on

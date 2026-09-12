@@ -180,6 +180,12 @@ struct VertexPcoEvidence {
   std::uint64_t ld = 0;
   std::uint64_t smp = 0;
   std::uint64_t wdf = 0;
+  // Vertex programs use the same native P0/CND/BR control-flow encoding as
+  // fragment programs.  Keep those groups in the evidence stream instead of
+  // treating a valid vertex loop as an unknown opcode.
+  std::uint64_t branch = 0;
+  std::uint64_t cnd = 0;
+  std::uint64_t tstz = 0;
   std::uint64_t uvsw_write = 0;
   std::uint64_t uvsw_write_emit_endtask = 0;
   std::uint64_t uvsw_emit_endtask = 0;
@@ -417,6 +423,15 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kBufferLoad:
       ++evidence.ld;
       break;
+    case PcoOpcode::kBranch:
+      ++evidence.branch;
+      break;
+    case PcoOpcode::kConditionalMask:
+      ++evidence.cnd;
+      break;
+    case PcoOpcode::kTestZero:
+      ++evidence.tstz;
+      break;
     case PcoOpcode::kUvsWrite:
       ++evidence.uvsw_write;
       break;
@@ -427,7 +442,6 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
       ++evidence.uvsw_emit_endtask;
       break;
     case PcoOpcode::kPackCoverageMask:
-    case PcoOpcode::kTestZero:
     case PcoOpcode::kFloatInterpolatePerspective:
     default:
       throw std::runtime_error(
@@ -448,7 +462,8 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
       evidence.frcp + evidence.frsq + evidence.flog2 + evidence.fexp2 +
       evidence.pck_f16 + evidence.unpck_f16 + evidence.unpck_int +
       evidence.f2i + evidence.imadd32 + evidence.imadd64_high + evidence.ubfe + evidence.smp +
-      evidence.wdf + evidence.add64_32 + evidence.ld;
+      evidence.wdf + evidence.add64_32 + evidence.ld + evidence.branch +
+      evidence.cnd + evidence.tstz;
   if (opcode_total != instructions.size()) {
     throw std::runtime_error(
         "JsonReporter vertex PCO opcode histogram mismatch");
@@ -770,6 +785,9 @@ void AppendVertexPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_VERTEX_EVIDENCE(ld);
   PVRGPU_ADD_VERTEX_EVIDENCE(smp);
   PVRGPU_ADD_VERTEX_EVIDENCE(wdf);
+  PVRGPU_ADD_VERTEX_EVIDENCE(branch);
+  PVRGPU_ADD_VERTEX_EVIDENCE(cnd);
+  PVRGPU_ADD_VERTEX_EVIDENCE(tstz);
   PVRGPU_ADD_VERTEX_EVIDENCE(uvsw_write);
   PVRGPU_ADD_VERTEX_EVIDENCE(uvsw_write_emit_endtask);
   PVRGPU_ADD_VERTEX_EVIDENCE(uvsw_emit_endtask);
@@ -1966,6 +1984,8 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
             << (options.cache_bypass ? "true" : "false")
             << ",\"memory_mode\":\""
             << MemoryModeName(options.memory_mode) << "\""
+            << ",\"texture_lod_mode\":\""
+            << (options.exact_texture_lod ? "exact" : "llvmpipe") << "\""
             << ",\"cache_simulated\":"
             << (options.memory_mode == MemoryMode::kCache ? "true" : "false")
             << ",\"framebuffer_source\":\"dram-readback\""
@@ -2047,6 +2067,12 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"csel\":" << vertex_pco.csel;
   if (vertex_pco.internal != 0)
     std::cout << ",\"internal\":" << vertex_pco.internal;
+  if (vertex_pco.branch != 0)
+    std::cout << ",\"branch\":" << vertex_pco.branch;
+  if (vertex_pco.cnd != 0)
+    std::cout << ",\"cnd\":" << vertex_pco.cnd;
+  if (vertex_pco.tstz != 0)
+    std::cout << ",\"tstz\":" << vertex_pco.tstz;
   std::cout << ",\"mbyp\":" << vertex_pco.mbyp
             << ",\"uvsw_write\":" << vertex_pco.uvsw_write
             << ",\"uvsw_write_emit_endtask\":"

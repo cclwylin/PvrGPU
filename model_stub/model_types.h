@@ -463,6 +463,8 @@ struct DriverCommand {
   std::uint32_t position_output_count = 0;
   std::uint32_t fragment_position_start = 0;
   std::uint32_t fragment_position_count = 0;
+  std::uint32_t fragment_position_uses_z = 0;
+  std::uint32_t fragment_position_uses_w = 0;
   // Generic smooth-varying linkage. The vertex range is expressed in VTXOUT
   // dwords; the fragment range is expressed in coefficient dwords. A zero
   // count on both sides is the legacy conditionals profile.
@@ -585,6 +587,9 @@ struct Options {
   // counters/validation remain enabled when this is false.
   bool emit_png = true;
   MemoryMode memory_mode = MemoryMode::kCache;
+  // Exact log2 is the conformance/hardware-mode LOD selector. Capture/Play
+  // leaves this false to reproduce llvmpipe's observable fast-log2 weights.
+  bool exact_texture_lod = false;
   // Legacy compatibility mirror for --cache-bypass and existing reports.
   // It is true only for kBypass; kDirect is identified by memory_mode.
   bool cache_bypass = false;

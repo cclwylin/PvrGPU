@@ -51,7 +51,7 @@ const std::set<std::string> &KnownFields() {
       "vertex_pco_size", "fragment_pco_size", "vertex_shared_count",
       "vertex_shared_words", "fragment_shared_count",
       "fragment_shared_words", "vertex_pco_abi", "fragment_pco_abi",
-      "position_linkage", "varying_linkage", "viewport_scale_bits",
+      "position_linkage", "fragment_position_components", "varying_linkage", "viewport_scale_bits",
       "viewport_translate_bits", "raster_state", "scissor_rect",
       "primitive_width", "point_size_output", "polygon_offset_state",
       "sample_mask", "sample_frequency",
@@ -675,6 +675,7 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     std::array<std::uint32_t, 8> vertex_abi{};
     std::array<std::uint32_t, 8> fragment_abi{};
     std::array<std::uint32_t, 4> position_linkage{};
+    std::array<std::uint32_t, 2> position_components{};
     std::array<std::uint32_t, 4> varying_linkage{};
     std::array<std::uint32_t, 13> raster_state{};
     std::array<std::uint32_t, 4> scissor_rect{};
@@ -788,6 +789,22 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     parsed.position_output_count = position_linkage[1];
     parsed.fragment_position_start = position_linkage[2];
     parsed.fragment_position_count = position_linkage[3];
+    const auto position_component_field =
+        fields.find("fragment_position_components");
+    if (position_component_field != fields.end()) {
+      if (!ParseU32List(position_component_field->second,
+                        &position_components) ||
+          position_components[0] > 1 || position_components[1] > 1) {
+        *error = "fragment_position_components must contain two Booleans";
+        return false;
+      }
+      parsed.fragment_position_uses_z = position_components[0];
+      parsed.fragment_position_uses_w = position_components[1];
+    } else {
+      /* Pre-v34 captures exposed one position set and documented it as W. */
+      parsed.fragment_position_uses_w =
+          parsed.fragment_position_count != 0 ? 1 : 0;
+    }
     parsed.varying_output_start = varying_linkage[0];
     parsed.varying_output_count = varying_linkage[1];
     parsed.fragment_varying_start = varying_linkage[2];

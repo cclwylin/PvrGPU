@@ -1047,6 +1047,9 @@ struct TextureSampleRequest {
   // sampler clamps. Preserve NaN/Inf bits until the fixed-function boundary.
   std::uint32_t lod_bias = 0;
   std::uint8_t lod_bias_present = 0;
+  // Per-lane depth reference for fixed-function compare-before-filter PCF.
+  std::uint32_t shadow_reference = 0;
+  std::uint8_t shadow_compare = 0;
 };
 
 struct TextureSampleResponse {

@@ -68,6 +68,10 @@ static nir_shader *fragment(unsigned mode, unsigned n, unsigned textures)
       value = nir_ixor(&b, value, sample(&b, i));
    nir_store_var(&b, out, value, 15);
    nir_jump(&b, nir_jump_return); nir_shader_gather_info(b.shader, b.impl);
+   /* The synthetic tex instructions use fixed indices without deref sources;
+    * mirror the stage resource bitmap carried by real Mesa NIR. */
+   for (unsigned i = 0; i < textures; ++i)
+      BITSET_SET(b.shader->info.textures_used, i);
    return b.shader;
 }
 static void save(unsigned id, const char *name, const void *data, size_t size)
@@ -97,8 +101,23 @@ static void compile_case(struct pvrgpu_pco_compiler *compiler, unsigned id,
    if (success) {
       const struct pvrgpu_pco_uniform_word_map *m = &binary.fragment.cb0_word_map;
       const struct pvrgpu_pco_stage_abi *a = &binary.fragment.abi;
-      check(a->shareds == textures * 20 + expected_count && a->shareds <= 256, "exact physical shared count");
-      check(a->push_constant_start == textures * 20 && a->push_constant_count == expected_count, "exact push suffix");
+      if (binary.fragment.cb0_uniform_buffer_slot) {
+         check(!packed && expected_count == 0, "CB0 UBO fallback has no packed push map");
+         check(a->shareds == textures * 20 + 4 &&
+               a->shareds <= PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE,
+               "CB0 UBO fallback reserves one descriptor");
+         check(a->uniform_buffer_descriptor_start == textures * 20 &&
+               a->uniform_buffer_descriptor_count == 1 &&
+               binary.fragment.cb0_uniform_buffer_slot == 1,
+               "CB0 UBO fallback descriptor ABI");
+         check(a->push_constant_start == a->shareds && a->push_constant_count == 0,
+               "CB0 UBO fallback has an empty push suffix");
+      } else {
+         check(a->shareds == textures * 20 + expected_count &&
+               a->shareds <= PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE,
+               "exact physical shared count");
+         check(a->push_constant_start == textures * 20 && a->push_constant_count == expected_count, "exact push suffix");
+      }
       check(m->count == (packed ? expected_count : 0) && m->source_dwords == (packed ? bound : 0), "map count/source extent");
       if (packed) {
          const unsigned dynamic_words[] = {0,40,41,42,43,80,84,88,92};
@@ -128,13 +147,25 @@ static void direct_preflight(void)
 {
    nir_shader *fs = fragment(1, 0, 12);
    struct pvrgpu_pco_uniform_word_map map = {0}; char error[512];
-   check(pvrgpu_color_uniform_word_map(fs, 128, 9, &map, error, sizeof(error)), "exact nine-word overlapping/dynamic proof");
+   bool exceeds_budget = true;
+   check(pvrgpu_color_uniform_word_map(fs, 128, 9, &map, &exceeds_budget,
+                                      error, sizeof(error)),
+         "exact nine-word overlapping/dynamic proof");
+   check(!exceeds_budget, "exact word map stays within budget");
    check(map.count == 9 && map.source_words[8] == 92, "every dynamic candidate retained");
    struct pvrgpu_pco_uniform_word_map sentinel; memset(&sentinel, 0x5a, sizeof(sentinel));
    const struct pvrgpu_pco_uniform_word_map original = sentinel;
-   check(!pvrgpu_color_uniform_word_map(fs, 128, 8, &sentinel, error, sizeof(error)), "one word over budget rejects");
+   exceeds_budget = false;
+   check(!pvrgpu_color_uniform_word_map(fs, 128, 8, &sentinel,
+                                       &exceeds_budget, error, sizeof(error)),
+         "one word over budget rejects");
+   check(exceeds_budget, "word-map overflow is classified as budget pressure");
    check(!memcmp(&sentinel, &original, sizeof(sentinel)), "failed collection publishes no partial map");
-   check(!pvrgpu_color_uniform_word_map(fs, 92, 256, &sentinel, error, sizeof(error)), "full indirect range bound checked");
+   exceeds_budget = false;
+   check(!pvrgpu_color_uniform_word_map(fs, 92, 256, &sentinel,
+                                       &exceeds_budget, error, sizeof(error)),
+         "full indirect range bound checked");
+   check(!exceeds_budget, "invalid source bounds are not budget pressure");
    check(!memcmp(&sentinel, &original, sizeof(sentinel)), "out of bound preflight is atomic");
    ralloc_free(fs);
 }
@@ -163,7 +194,8 @@ static void unsupported_ubo_dereference(struct pvrgpu_pco_compiler *compiler)
          struct pvrgpu_pco_graphics_binary result = {0};
          const enum pipe_format format = PIPE_FORMAT_R32G32B32A32_FLOAT;
          check(!pvrgpu_pco_compile_color_triangle(compiler, vs, fs, &format, false, false, 1,
-            pressure ? 96 : 4, pressure ? 128 : 4, 1, pressure ? 12 : 0, &result, error, sizeof(error)),
+            pressure ? 96 : 4, pressure ? 128 : 4, 1, pressure ? 12 : 0,
+            &result, error, sizeof(error)),
             "unlowered UBO rejected before PCO regardless of pressure");
          check(strstr(error, "requires lowered UBO accesses") != NULL, "specific unlowered UBO diagnostic");
          check(!result.vertex.data && !result.fragment.data && !result.vertex.cb0_word_map.count && !result.fragment.cb0_word_map.count,
@@ -178,13 +210,17 @@ int main(void)
    char error[1024];
    struct pvrgpu_pco_compiler *compiler = pvrgpu_pco_compiler_create(error, sizeof(error));
    check(compiler != NULL, error); direct_preflight(); unsupported_ubo_dereference(compiler);
-   compile_case(compiler, 900, 1, 0, 128, 12, 9, true, true);
-   compile_case(compiler, 901, 0, 15, 64, 12, 15, true, true); /* SH255 */
-   compile_case(compiler, 902, 0, 16, 64, 12, 16, true, true); /* SH256 */
-   compile_case(compiler, 903, 0, 17, 68, 12, 0, false, false); /* SH257 */
-   compile_case(compiler, 904, 0, 4, 16, 12, 16, false, true); /* legacy */
-   compile_case(compiler, 905, 2, 1, 512, 12, 1, true, true); /* high source extent */
-   compile_case(compiler, 906, 1, 0, 92, 12, 0, false, false); /* dynamic OOB */
+   /* Sixteen 20-DWORD descriptors leave a 64-DWORD suffix in the current
+    * graphics transport. Exercise packing plus the exact 383/384/385 edges,
+    * so this test follows the GLES-required texture inventory instead of the
+    * retired 256-DWORD/12-texture transport. */
+   compile_case(compiler, 900, 1, 0, 128, 16, 9, true, true);
+   compile_case(compiler, 901, 0, 63, 252, 16, 63, true, true); /* SH383 */
+   compile_case(compiler, 902, 0, 64, 256, 16, 64, true, true); /* SH384 */
+   compile_case(compiler, 903, 0, 65, 260, 16, 0, false, true); /* CB0 UBO fallback */
+   compile_case(compiler, 904, 0, 4, 64, 16, 64, false, true); /* legacy exact fit */
+   compile_case(compiler, 905, 2, 1, 512, 16, 1, true, true); /* high source extent */
+   compile_case(compiler, 906, 1, 0, 92, 16, 0, false, false); /* dynamic OOB */
    pvrgpu_pco_compiler_destroy(compiler);
    printf("packed_uniforms: PASS %u checks\n", checks);
    return 0;

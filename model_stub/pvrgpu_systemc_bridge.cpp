@@ -878,6 +878,8 @@ void CopyPcoPayloadFields(
   destination->position_output_count = source.position_output_count;
   destination->fragment_position_start = source.fragment_position_start;
   destination->fragment_position_count = source.fragment_position_count;
+  destination->fragment_position_uses_z = source.fragment_position_uses_z;
+  destination->fragment_position_uses_w = source.fragment_position_uses_w;
   destination->varying_output_start = source.varying_output_start;
   destination->varying_output_count = source.varying_output_count;
   destination->fragment_varying_start = source.fragment_varying_start;
@@ -1105,6 +1107,24 @@ bool SetPngOutputFromEnvironment(pvrgpu::stub::Options *options,
     return true;
   }
   *error = "invalid PVRGPU_SYSTEMC_DISABLE_PNG (expected 0 or 1, or unset)";
+  return false;
+}
+
+bool SetTextureLodModeFromEnvironment(pvrgpu::stub::Options *options,
+                                      std::string *error) {
+  if (!options || !error)
+    return false;
+  const char *value = std::getenv("PVRGPU_TEXTURE_LOD_MODE");
+  const std::string_view mode = value && value[0] ? value : "llvmpipe";
+  if (mode == "llvmpipe") {
+    options->exact_texture_lod = false;
+    return true;
+  }
+  if (mode == "exact") {
+    options->exact_texture_lod = true;
+    return true;
+  }
+  *error = "invalid PVRGPU_TEXTURE_LOD_MODE (expected llvmpipe or exact)";
   return false;
 }
 
@@ -1680,7 +1700,7 @@ bool CopyPcoSequenceDraw(
       (!source.varying_bindings && source.varying_binding_count))
     return refuse("explicit varying binding list is invalid");
   if (source.varying_bindings) {
-    std::uint32_t next_coefficient = 4;
+    std::uint32_t next_coefficient = source.fragment_position_count;
     for (std::uint32_t i = 0; i < source.varying_binding_count; ++i) {
       const auto &b = source.varying_bindings[i];
       if (!b.num_components || b.num_components > 4 || b.flat > 1 ||
@@ -1850,12 +1870,17 @@ bool CopyPcoSequenceDraw(
           source.varying_output_start + source.varying_output_count) ||
       source.varying_output_start !=
           source.position_output_count + source.point_size_output_count ||
-      // A shape shaded from a uniform passes no varyings; position still
-      // occupies the first four outputs and coefficients.
+      // A shape shaded from a uniform passes no user varyings. Position
+      // coefficients carry only the z and/or reciprocal-W planes named by
+      // the native fragment ABI.
       source.varying_output_count >
           pvrgpu::stub::kDriverPcoMaximumVaryingComponents ||
       source.fragment_position_start != 0 ||
-      source.fragment_position_count != 4 ||
+      source.fragment_position_uses_z > 1 ||
+      source.fragment_position_uses_w > 1 ||
+      source.fragment_position_count !=
+          4U * (source.fragment_position_uses_z +
+                source.fragment_position_uses_w) ||
       source.fragment_varying_start != source.fragment_position_count ||
       // The fragment stage interpolates the varyings it reads, which may be
       // fewer than the vertex stage writes.
@@ -3349,6 +3374,10 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
     CopyError(error, error_size, message);
     return 2;
   }
+  if (!SetTextureLodModeFromEnvironment(&options, &message)) {
+    CopyError(error, error_size, message);
+    return 2;
+  }
   if (!SetMemoryMode(info->memory_mode, &options, &message)) {
     CopyError(error, error_size, message);
     return 2;
@@ -3394,6 +3423,8 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
         g_pending_submit.options.output_dir == info->outdir &&
         g_pending_submit.options.emit_png == options.emit_png &&
         g_pending_submit.options.memory_mode == options.memory_mode &&
+        g_pending_submit.options.exact_texture_lod ==
+            options.exact_texture_lod &&
         CommandsShareSequenceTarget(g_pending_submit.options.driver_command,
                                     options.driver_command);
     if ((sequence_active || sequence_root) &&

@@ -6259,6 +6259,64 @@ void TestNativeFragmentVisibilityFeedback() {
         "post-feedback checkpoint cannot revive killed samples");
 }
 
+void TestInactiveFragmentFeedbackHasNoSideEffect() {
+  std::vector<PcoInstruction> instructions(6);
+
+  auto &predicate = instructions[0];
+  predicate.opcode = PcoOpcode::kBooleanCompare;
+  predicate.source = {PcoRegisterBank::kSpecial, 0};
+  predicate.target = PcoWriteTarget::kNone;
+  predicate.source_count = 1;
+  predicate.comparison_test_op = 1; // TST.F32.GZ on zero is false.
+  predicate.comparison_test_type = 0;
+  predicate.writes_predicate = 1;
+
+  auto &one = instructions[1];
+  one.opcode = PcoOpcode::kMoveImmediate;
+  one.target = PcoWriteTarget::kTemporary;
+  one.output_index = 0;
+  one.source_count = 0;
+  one.immediate = 1;
+
+  auto &mask = instructions[2];
+  mask.opcode = PcoOpcode::kConditionalMask;
+  mask.target = PcoWriteTarget::kTemporary;
+  mask.output_index = 0;
+  mask.source = {PcoRegisterBank::kTemporary, 0};
+  mask.source_count = 1;
+  mask.exec_cnd = 2;
+  mask.control_operation = 0;
+  mask.immediate = 1;
+
+  auto &feedback = instructions[3];
+  feedback.opcode = PcoOpcode::kAlphaFeedback;
+  feedback.source_count = 0;
+  feedback.exec_cnd = 1;
+
+  auto &fence = instructions[4];
+  fence.opcode = PcoOpcode::kWaitDataFence;
+  fence.source_count = 0;
+
+  auto &end = instructions[5];
+  end.opcode = PcoOpcode::kNop;
+  end.source_count = 0;
+  end.end_group = 1;
+
+  for (std::size_t index = 0; index < instructions.size(); ++index) {
+    instructions[index].group_index = static_cast<std::uint16_t>(index);
+    instructions[index].binary_offset = 1 + index * 8;
+  }
+  PcoProgramSummary summary;
+  summary.stage = ShaderStage::kFragment;
+  summary.binary_size = 64;
+  summary.group_count = summary.instruction_count = instructions.size();
+  summary.early_hsr_safe = 0;
+
+  const auto result = ExecuteFragment(summary, instructions);
+  Check(!result.discarded && result.written_mask == 0,
+        "ALPHAF reached under an inactive structured mask has no discard side effect");
+}
+
 void TestNativeDerivativeDecode() {
   for (unsigned operation = 0x88; operation <= 0x8b; ++operation) {
     for (unsigned modifier = 0; modifier <= 3; ++modifier) {
@@ -6653,6 +6711,62 @@ void TestBitfieldInsertFourSourceValidation() {
   ExpectFailure(
       [&] { (void)ExecuteFragment(summary, unused_fragment_source, context); },
       "non-BFI fragment instruction rejects a noncanonical fourth source");
+}
+
+void TestBitfieldExtractExtendedRegisterEncoding() {
+  /* Mesa emits the same UBFE group with a longer header when its lower
+   * sources or destination need extended register encodings.  This group is
+   * derived from GLES3 texture.units.8_units.only_2d_array.2 at byte 1230;
+   * its extended lower-source form makes a valid 16-byte group. */
+  auto binary = BytesFromHex(
+      "68 f2 40 01 68 03 90 50 80 00 00 80 90 40 f1 ff "
+      "34 8a 00 87 40 00 00 20 "
+      "34 8a 00 87 40 00 00 21 "
+      "34 8a 00 87 40 00 00 22 "
+      "34 8a 80 87 40 00 00 23");
+  const auto program = Decode(ShaderStage::kFragment, binary);
+  Check(program.instructions.front().opcode ==
+            PcoOpcode::kBitfieldExtractUnsigned &&
+            program.instructions.front().source_count == 3 &&
+            program.instructions.front().output_index == 0,
+        "extended-register UBFE decodes from its encoded group length");
+}
+
+void TestIndexedSharedRegisterRead() {
+  /* GLES3 texture.units shaders place descriptor/large-CB0 data above the
+   * directly encodable SH255 boundary.  Mesa loads the absolute SH address
+   * into IDX0, then names SH[idx0 + 0] as bank 6, raw index 3. */
+  const auto binary = BytesFromHex(R"hex(
+86 92 40 13 41 01 00 00 00 00 85 0c
+35 82 00 87 83 0c 00 00 00 42
+34 8a 00 87 42 00 00 20
+34 8a 00 87 42 00 00 21
+34 8a 00 87 42 00 00 22
+34 8a 80 87 42 00 00 23
+)hex");
+  const auto program = Decode(ShaderStage::kFragment, binary);
+  Check(program.instructions.size() == 6 &&
+            program.instructions[0].opcode == PcoOpcode::kMoveImmediate &&
+            program.instructions[0].target == PcoWriteTarget::kIndex0 &&
+            program.instructions[0].immediate == 321 &&
+            program.instructions[1].source.bank == PcoRegisterBank::kIndex0 &&
+            program.instructions[1].source.index == 3,
+        "IDX0 MOVI and indexed SH source preserve the native encoding");
+
+  PcoFragmentExecutionContext context;
+  context.shared_count = 322;
+  context.shared_registers[321] = UINT32_C(0x3f2468ac);
+  const auto result =
+      ExecuteFragment(program.summary, program.instructions, context);
+  Check(result.written_mask == 0x0f &&
+            result.pixel_outputs[0] == context.shared_registers[321] &&
+            result.pixel_outputs[3] == context.shared_registers[321],
+        "indexed SH above SH255 reaches fragment ALU and pixel outputs");
+
+  context.shared_count = 321;
+  ExpectFailure(
+      [&] { (void)ExecuteFragment(program.summary, program.instructions, context); },
+      "indexed SH rejects an address outside the supplied transport span");
 }
 
 void TestExecuteVertexTextureContinuations() {
@@ -8143,6 +8257,8 @@ void TestNativeNonperspectiveInterpolation() {
 
 int main() {
   try {
+    TestBitfieldExtractExtendedRegisterEncoding();
+    TestIndexedSharedRegisterRead();
     TestFragmentDualTemporaryMove();
     TestFragmentArrayTextureBiasRequest();
     TestEmbeddedBinaries();
@@ -8211,6 +8327,7 @@ int main() {
     TestGraphicsIntegerOpcodeParity();
     TestNativeFragmentSampleInputs();
     TestNativeFragmentVisibilityFeedback();
+    TestInactiveFragmentFeedbackHasNoSideEffect();
     TestNativeDerivativeDecode();
     TestNativeDerivativeExchange();
     TestVertexInputRegisterReuse();

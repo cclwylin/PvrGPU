@@ -50,6 +50,10 @@ void CheckPlane(const ParameterCoefficientSet &plane, std::uint32_t a,
                 std::uint32_t b, std::uint32_t c, const char *description) {
   const bool a_matches = IsZero(a) ? IsZero(plane.a) : plane.a == a;
   const bool b_matches = IsZero(b) ? IsZero(plane.b) : plane.b == b;
+  if (!(a_matches && b_matches && plane.c == c && plane.pad == 0))
+    std::fprintf(stderr,
+                 "%s actual=%08x,%08x,%08x,%08x expected=%08x,%08x,%08x,00000000\n",
+                 description, plane.a, plane.b, plane.c, plane.pad, a, b, c);
   Check(a_matches && b_matches && plane.c == c && plane.pad == 0,
         description);
 }

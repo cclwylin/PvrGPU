@@ -21,6 +21,7 @@ using pvrgpu::stub::LerpTextureUnorm8;
 using pvrgpu::stub::RogueTextureSamplerDescriptor;
 using pvrgpu::stub::SelectTextureFilterDatapath;
 using pvrgpu::stub::SelectTextureLevels;
+using pvrgpu::stub::SelectTextureBiasedLod;
 using pvrgpu::stub::SelectTextureLod;
 using pvrgpu::stub::TextureBytesPerTexel;
 using pvrgpu::stub::TextureFastLog2;
@@ -93,6 +94,16 @@ void CheckLog2AndLod() {
   const TextureLodSelection huge = SelectTextureLod(1.0e12F, open, 10);
   Check(Near(huge.lambda, 9.0F) && huge.minified,
         "lambda clamps to the window maximum");
+  const TextureLodSelection fast_mid = SelectTextureLod(12.0F, open, 10);
+  const TextureLodSelection exact_mid = SelectTextureLod(12.0F, open, 10, true);
+  Check(Near(fast_mid.lambda, 1.75F) &&
+            Near(exact_mid.lambda, std::log2(12.0F) * 0.5F) &&
+            exact_mid.lambda > fast_mid.lambda,
+        "exact conformance LOD is distinct from Capture/Play fast-log2");
+  const TextureLodSelection exact_biased =
+      SelectTextureBiasedLod(12.0F, 0.25F, open, 10, true);
+  Check(Near(exact_biased.lambda, std::log2(12.0F) * 0.5F + 0.25F),
+        "exact LOD mode also applies before shader bias");
 
   // The mip-NONE window: 0..0.25 keeps the minification decision.
   const RogueTextureSamplerDescriptor base_only =

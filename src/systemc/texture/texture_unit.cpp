@@ -905,11 +905,29 @@ float SampledDepth24ToFloat(std::uint32_t depth) {
                             static_cast<double>(kSampledDepth24Maximum));
 }
 
+float EvaluateShadowCompare(float reference, float depth,
+                            std::uint32_t operation) {
+  bool passes = false;
+  switch (operation) {
+  case 0: passes = false; break;
+  case 1: passes = reference < depth; break;
+  case 2: passes = reference == depth; break;
+  case 3: passes = reference <= depth; break;
+  case 4: passes = reference > depth; break;
+  case 5: passes = reference != depth; break;
+  case 6: passes = reference >= depth; break;
+  case 7: passes = true; break;
+  default:
+    throw std::runtime_error("TextureUnit shadow compare operation is invalid");
+  }
+  return passes ? 1.0F : 0.0F;
+}
+
 static TextureImplicitLod ComputeTextureImplicitLodImpl(
     const std::array<std::array<float, 2>, 4> &coordinates,
     const RogueTextureImageDescriptor &image,
     const RogueTextureSamplerDescriptor &sampler,
-    bool undefined_cube_input, std::size_t checked_lanes) {
+    bool undefined_cube_input, std::size_t checked_lanes, bool exact_lod) {
   if (image.width == 0 || image.height == 0 || image.mip_count == 0)
     throw std::runtime_error("TextureUnit implicit LOD state is invalid");
   for (std::size_t lane = 0; lane < checked_lanes; ++lane) {
@@ -946,7 +964,8 @@ static TextureImplicitLod ComputeTextureImplicitLodImpl(
   // descriptor-driven texel reads/filtering. This is a generic undefined-input
   // policy, not a claim about a physical Rogue or exact llvmpipe NaN pixels.
   const TextureLodSelection lod =
-      SelectTextureLod(nonfinite_rho ? 0.0F : rho_squared, sampler, image.mip_count);
+      SelectTextureLod(nonfinite_rho ? 0.0F : rho_squared, sampler,
+                       image.mip_count, exact_lod);
   const TextureLevelSelection levels =
       SelectTextureLevels(lod, sampler, image.mip_count);
 
@@ -970,33 +989,115 @@ static TextureImplicitLod ComputeTextureImplicitLodImpl(
 TextureImplicitLod ComputeTextureImplicitLod(
     const std::array<std::array<float, 2>, 4> &coordinates,
     const RogueTextureImageDescriptor &image,
-    const RogueTextureSamplerDescriptor &sampler) {
-  return ComputeTextureImplicitLodImpl(coordinates, image, sampler, false, 4);
+    const RogueTextureSamplerDescriptor &sampler, bool exact_lod) {
+  return ComputeTextureImplicitLodImpl(coordinates, image, sampler, false, 4,
+                                       exact_lod);
 }
 
 TextureImplicitLod ComputeTextureCubeImplicitLod(
     const std::array<std::array<float, 3>, 4> &directions,
     const RogueTextureImageDescriptor &image,
-    const RogueTextureSamplerDescriptor &sampler) {
-  const auto &first = directions[0];
-  const std::uint32_t face = ProjectCubeDirection(first[0], first[1], first[2]).face;
-  std::array<std::array<float, 2>, 4> projected{};
+    const RogueTextureSamplerDescriptor &sampler, bool exact_lod) {
+  if (image.width == 0 || image.height == 0 || image.mip_count == 0)
+    throw std::runtime_error("TextureUnit implicit LOD state is invalid");
+
   bool undefined_input = false;
-  for (std::size_t lane = 0; lane < directions.size(); ++lane) {
+  for (std::size_t lane = 0; lane < 3; ++lane) {
     const auto &direction = directions[lane];
-    if (lane < 3) {
-      // Only lanes 0/1/2 participate in this coarse derivative. A singular
-      // common-face projection of otherwise valid nonzero directions is not
-      // shader undefined input and must not be hidden by this policy.
-      undefined_input |= !std::isfinite(direction[0]) ||
-          !std::isfinite(direction[1]) || !std::isfinite(direction[2]) ||
-          (direction[0] == 0 && direction[1] == 0 && direction[2] == 0);
-    }
-    // Unlike address generation, retain the unmodified projection here so a
-    // NaN cannot turn into a fabricated finite derivative across a mixed quad.
-    projected[lane] = ProjectCubeToFace(face, direction[0], direction[1], direction[2]);
+    undefined_input |= !std::isfinite(direction[0]) ||
+        !std::isfinite(direction[1]) || !std::isfinite(direction[2]) ||
+        (direction[0] == 0 && direction[1] == 0 && direction[2] == 0);
   }
-  return ComputeTextureImplicitLodImpl(projected, image, sampler, undefined_input, 3);
+  if (undefined_input) {
+    const auto levels = SelectTextureLevels(
+        SelectTextureLod(0.0F, sampler, image.mip_count, exact_lod), sampler,
+        image.mip_count);
+    TextureImplicitLod result;
+    result.lambda = static_cast<float>(sampler.min_lod_u4_6) / 64.0F;
+    result.rho_squared = std::numeric_limits<float>::quiet_NaN();
+    result.dsdx = result.dtdx = result.dsdy = result.dtdy =
+        std::numeric_limits<float>::quiet_NaN();
+    result.minified = result.lambda > 0.0F;
+    result.image_filter = levels.image_filter;
+    result.mip_mode = levels.mip_mode;
+    result.level0 = levels.level0;
+    result.level1 = levels.level1;
+    result.mip_weight_u8 = levels.mip_weight_u8;
+    result.mip_weight = levels.mip_weight;
+    return result;
+  }
+
+  /* lp_build_cube_lookup differentiates sc/ma and tc/ma from the original
+   * direction vector.  Projecting the neighbouring lanes themselves onto
+   * lane zero's face is not equivalent: a perfectly valid quad crossing a
+   * 90-degree face boundary can then divide by zero. */
+  const auto &p = directions[0];
+  const std::array<float, 3> dx = {directions[1][0] - p[0],
+                                   directions[1][1] - p[1],
+                                   directions[1][2] - p[2]};
+  const std::array<float, 3> dy = {directions[2][0] - p[0],
+                                   directions[2][1] - p[1],
+                                   directions[2][2] - p[2]};
+  const float ax = std::fabs(p[0]);
+  const float ay = std::fabs(p[1]);
+  const float az = std::fabs(p[2]);
+  unsigned major = 2;
+  if (ax >= ay && ax >= az)
+    major = 0;
+  else if (ay >= az)
+    major = 1;
+
+  const float ma = p[major];
+  const float imahalf = 0.5F / ma;
+  float face_s = 0.0F, face_t = 0.0F;
+  float face_sdx = 0.0F, face_tdx = 0.0F;
+  float face_sdy = 0.0F, face_tdy = 0.0F;
+  if (major == 0) {
+    const float sign = std::signbit(ma) ? 1.0F : -1.0F;
+    face_s = sign * p[2]; face_t = -p[1];
+    face_sdx = sign * dx[2]; face_tdx = -dx[1];
+    face_sdy = sign * dy[2]; face_tdy = -dy[1];
+  } else if (major == 1) {
+    const float sign = std::signbit(ma) ? -1.0F : 1.0F;
+    face_s = p[0]; face_t = sign * p[2];
+    face_sdx = dx[0]; face_tdx = sign * dx[2];
+    face_sdy = dy[0]; face_tdy = sign * dy[2];
+  } else {
+    const float sign = std::signbit(ma) ? -1.0F : 1.0F;
+    face_s = sign * p[0]; face_t = -p[1];
+    face_sdx = sign * dx[0]; face_tdx = -dx[1];
+    face_sdy = sign * dy[0]; face_tdy = -dy[1];
+  }
+  const float madxdivma = dx[major] / ma;
+  const float madydivma = dy[major] / ma;
+  const float dsdx = (face_sdx - face_s * madxdivma) * imahalf * image.width;
+  const float dtdx = (face_tdx - face_t * madxdivma) * imahalf * image.height;
+  const float dsdy = (face_sdy - face_s * madydivma) * imahalf * image.width;
+  const float dtdy = (face_tdy - face_t * madydivma) * imahalf * image.height;
+  const float rho_x_squared = dsdx * dsdx + dtdx * dtdx;
+  const float rho_y_squared = dsdy * dsdy + dtdy * dtdy;
+  const float rho_squared = std::max(rho_x_squared, rho_y_squared);
+  if (!std::isfinite(rho_squared))
+    throw std::runtime_error("TextureUnit cube derivative rho is invalid");
+
+  const auto lod =
+      SelectTextureLod(rho_squared, sampler, image.mip_count, exact_lod);
+  const auto levels = SelectTextureLevels(lod, sampler, image.mip_count);
+  TextureImplicitLod result;
+  result.lambda = lod.lambda;
+  result.dsdx = dsdx;
+  result.dtdx = dtdx;
+  result.dsdy = dsdy;
+  result.dtdy = dtdy;
+  result.rho_squared = rho_squared;
+  result.minified = lod.minified;
+  result.image_filter = levels.image_filter;
+  result.mip_mode = levels.mip_mode;
+  result.level0 = levels.level0;
+  result.level1 = levels.level1;
+  result.mip_weight_u8 = levels.mip_weight_u8;
+  result.mip_weight = levels.mip_weight;
+  return result;
 }
 
 TextureImplicitLod ComputeTextureExplicitLod(
@@ -1045,7 +1146,7 @@ static void StoreLodSelection(TextureImplicitLod &result,
 TextureImplicitLod ComputeTexture3DImplicitLod(
     const std::array<std::array<float, 3>, 4> &coordinates,
     std::uint32_t depth, const RogueTextureImageDescriptor &image,
-    const RogueTextureSamplerDescriptor &sampler) {
+    const RogueTextureSamplerDescriptor &sampler, bool exact_lod) {
   if (!depth) throw std::runtime_error("TextureUnit 3D LOD depth is invalid");
   std::array<std::array<float, 2>, 4> xy{};
   for (std::size_t lane = 0; lane < 4; ++lane) {
@@ -1053,7 +1154,7 @@ TextureImplicitLod ComputeTexture3DImplicitLod(
     if (!std::isfinite(coordinates[lane][2]))
       throw std::runtime_error("TextureUnit 3D LOD coordinate is invalid");
   }
-  auto result = ComputeTextureImplicitLod(xy, image, sampler);
+  auto result = ComputeTextureImplicitLod(xy, image, sampler, exact_lod);
   const float drdx = (coordinates[1][2] - coordinates[0][2]) * depth;
   const float drdy = (coordinates[2][2] - coordinates[0][2]) * depth;
   const float rho_x = result.dsdx * result.dsdx + result.dtdx * result.dtdx + drdx * drdx;
@@ -1061,7 +1162,8 @@ TextureImplicitLod ComputeTexture3DImplicitLod(
   if (!std::isfinite(rho_x) || !std::isfinite(rho_y))
     throw std::runtime_error("TextureUnit 3D implicit derivative rho is invalid");
   result.rho_squared = std::max(rho_x, rho_y);
-  StoreLodSelection(result, SelectTextureLod(result.rho_squared, sampler, image.mip_count),
+  StoreLodSelection(result, SelectTextureLod(result.rho_squared, sampler,
+                                             image.mip_count, exact_lod),
                     sampler, image.mip_count);
   return result;
 }
@@ -1069,21 +1171,23 @@ TextureImplicitLod ComputeTexture3DImplicitLod(
 TextureImplicitLod ApplyTextureLodBias(
     const TextureImplicitLod &implicit, float bias,
     const RogueTextureImageDescriptor &image,
-    const RogueTextureSamplerDescriptor &sampler, bool undefined_cube_footprint) {
+    const RogueTextureSamplerDescriptor &sampler, bool undefined_cube_footprint,
+    bool exact_lod) {
   auto result = implicit;
   // Nonfinite rho can only survive the validated cube undefined-coordinate
   // path, whose defined selector input is zero; preserve its raw diagnostics.
   if (!std::isfinite(implicit.rho_squared) && !undefined_cube_footprint)
     throw std::runtime_error("TextureUnit biased derivative rho is invalid");
   const float rho = std::isfinite(implicit.rho_squared) ? implicit.rho_squared : 0.0F;
-  StoreLodSelection(result, SelectTextureBiasedLod(rho, bias, sampler, image.mip_count),
+  StoreLodSelection(result, SelectTextureBiasedLod(rho, bias, sampler,
+                                                   image.mip_count, exact_lod),
                     sampler, image.mip_count);
   return result;
 }
 
 TextureUnit::TextureUnit(sc_core::sc_module_name name, MemoryPool &pool,
-                         GpuMemorySystem *memory)
-    : sc_module(name), pool_(pool), memory_(memory) {
+                         GpuMemorySystem *memory, bool exact_lod)
+    : sc_module(name), pool_(pool), memory_(memory), exact_lod_(exact_lod) {
   SC_THREAD(Run);
   SC_THREAD(SampleRun);
   SC_THREAD(VertexSampleRun);
@@ -1329,6 +1433,11 @@ void TextureUnit::SampleRunForStage(
                              resource.format == TextureFormat::kAstcLdrSrgb);
     const RogueTextureSamplerDescriptor decoded_sampler =
         DecodeRogueTextureSamplerDescriptor(sampler_words);
+    const bool shadow_compare =
+        (shared[descriptor_base + 7U] & UINT32_C(0x200)) != 0;
+    const bool shadow_reference_unorm =
+        (shared[descriptor_base + 7U] & UINT32_C(0x100)) != 0;
+    const std::uint32_t shadow_compare_op = shared[descriptor_base + 12U];
 
     // Raw public descriptor fields drive execution.  Structured resource and
     // sampler objects own the MemoryPool allocation and provide a redundant
@@ -1386,9 +1495,9 @@ void TextureUnit::SampleRunForStage(
               ? "word4 is not the image layer size"
           : shared[descriptor_base + 5U] != 0   ? "word5 is not zero"
           : shared[descriptor_base + 6U] != 0   ? "word6 is not zero"
-          // Public PCO software metadata is consumed by native shader ALU:
-          // word7 bit8 clamps UNORM shadow references; word12 is compare op.
-          : (shared[descriptor_base + 7U] & ~UINT32_C(0x100)) != 0
+          // Public PCO software metadata: word7 bit8 clamps UNORM Dref and
+          // bit9 requests fixed-function PCF; word12 is the compare op.
+          : (shared[descriptor_base + 7U] & ~UINT32_C(0x300)) != 0
               ? "word7 has unsupported pack metadata"
           : shared[descriptor_base + 12U] > 7  ? "word12 compare operation is invalid"
           : shared[descriptor_base + 13U] != 0  ? "word13 is not zero"
@@ -1498,6 +1607,17 @@ void TextureUnit::SampleRunForStage(
     const bool explicit_lod = requests.front().explicit_lod_present != 0;
     const bool biased_lod = requests.front().lod_bias_present != 0;
     const bool direct_fetch = multisample_fetch || texel_fetch;
+    if (shadow_compare &&
+        (!driver_pco || !fragment_stage || gather || direct_fetch ||
+         (image.format != TextureFormat::kZ24UnormS8Uint &&
+          image.format != TextureFormat::kZ32Unorm &&
+          image.format != TextureFormat::kRgba32Float) ||
+         (resource.dimension_type != TextureDimensionType::k2D &&
+          resource.dimension_type != TextureDimensionType::k2DArray &&
+          resource.dimension_type != TextureDimensionType::kCube) ||
+         shadow_compare_op > 7U)) {
+      throw std::runtime_error("TextureUnit unsupported shadow compare state");
+    }
     if (gather &&
         (!driver_pco || !fragment_stage ||
          (image.format != TextureFormat::kZ24UnormS8Uint &&
@@ -1513,6 +1633,11 @@ void TextureUnit::SampleRunForStage(
       throw std::runtime_error("TextureUnit unsupported depth gather state");
     }
     for (const TextureSampleRequest &request : requests) {
+      if (request.shadow_compare != (shadow_compare ? 1U : 0U) ||
+          request.shadow_compare > 1U ||
+          (!request.shadow_compare && request.shadow_reference != 0U)) {
+        throw std::runtime_error("TextureUnit shadow request metadata mismatch");
+      }
       if (gather &&
           (request.normalized != 1U || request.fcnorm != 1U ||
            request.coordinate_count != 2U || request.component_count != 4U ||
@@ -1633,10 +1758,14 @@ void TextureUnit::SampleRunForStage(
         TextureImplicitLod lod;
         try {
           lod = cube_resource
-              ? ComputeTextureCubeImplicitLod(cube_directions, image, decoded_sampler)
+              ? ComputeTextureCubeImplicitLod(cube_directions, image,
+                                              decoded_sampler, exact_lod_)
               : resource.dimension_type == TextureDimensionType::k3D
-              ? ComputeTexture3DImplicitLod(cube_directions, resource.layer_count, image, decoded_sampler)
-              : ComputeTextureImplicitLod(coordinates, image, decoded_sampler);
+              ? ComputeTexture3DImplicitLod(cube_directions,
+                                            resource.layer_count, image,
+                                            decoded_sampler, exact_lod_)
+              : ComputeTextureImplicitLod(coordinates, image, decoded_sampler,
+                                          exact_lod_);
         } catch (const std::runtime_error &error) {
           // Retain the real failing inputs at this boundary. This does not
           // replace nonfinite shader values or invent helper coordinates.
@@ -1676,15 +1805,17 @@ void TextureUnit::SampleRunForStage(
       // Zero derivatives: the window's minimum LOD, the base level.
       const std::array<std::array<float, 2>, 4> degenerate_quad{};
       const TextureImplicitLod base_level =
-          ComputeTextureImplicitLod(degenerate_quad, image, decoded_sampler);
+          ComputeTextureImplicitLod(degenerate_quad, image, decoded_sampler,
+                                    exact_lod_);
       std::fill(implicit_lods.begin(), implicit_lods.end(), base_level);
     }
     if (biased_lod) {
       // PPLOD is per lane: the implicit derivatives belong to the quad, but
       // four different bias words can select four different mip pairs.
       for (std::size_t i = 0; i < requests.size(); ++i)
-        implicit_lods[i] = ApplyTextureLodBias(implicit_lods[i], BitsFloat(requests[i].lod_bias),
-            image, decoded_sampler, cube_resource);
+        implicit_lods[i] = ApplyTextureLodBias(
+            implicit_lods[i], BitsFloat(requests[i].lod_bias), image,
+            decoded_sampler, cube_resource, exact_lod_);
     }
 
     // Bounded, default-off evidence for diagnosing captured mip residency.
@@ -2508,7 +2639,111 @@ void TextureUnit::SampleRunForStage(
         return d == 0U ? 1U : d;
       };
 
-      if (integer_texture) {
+      if (shadow_compare) {
+        float reference = BitsFloat(request.shadow_reference);
+        if (shadow_reference_unorm)
+          reference = std::clamp(reference, 0.0F, 1.0F);
+        const auto depth_from_texel = [&](const std::array<std::uint8_t, 8> &texel) {
+          if (image.format == TextureFormat::kZ24UnormS8Uint)
+            return SampledDepth24ToFloat(SampledDepth24FromTexel(texel));
+          std::uint32_t encoded = 0;
+          std::memcpy(&encoded, texel.data(), sizeof(encoded));
+          if (image.format == TextureFormat::kRgba32Float) {
+            float depth = 0.0F;
+            std::memcpy(&depth, &encoded, sizeof(depth));
+            return depth;
+          }
+          return static_cast<float>(
+              static_cast<double>(encoded) /
+              static_cast<double>(std::numeric_limits<std::uint32_t>::max()));
+        };
+        const auto compare_texel = [&](const TextureMipLevel &mip,
+                                       std::uint32_t x, std::uint32_t y,
+                                       std::uint64_t rid) {
+          return EvaluateShadowCompare(
+              reference, depth_from_texel(read_texel(mip, x, y, rid)),
+              shadow_compare_op);
+        };
+        const auto shadow_plane = [&](const TextureMipLevel &mip,
+                                      std::uint64_t rid) {
+          if (!linear_filter) {
+            const std::uint32_t x = ComputeTextureFloatNearest(
+                plane_s, mip.width, decoded_sampler.wrap_u,
+                request.spatial_offsets[0]);
+            const std::uint32_t y = ComputeTextureFloatNearest(
+                plane_t, mip.height, decoded_sampler.wrap_v,
+                request.spatial_offsets[1]);
+            return compare_texel(mip, x, y, rid);
+          }
+          if (cube_texture) {
+            const std::int32_t size = static_cast<std::int32_t>(mip.width);
+            const float u = plane_s * static_cast<float>(size);
+            const float v = plane_t * static_cast<float>(size);
+            const std::int32_t x0 =
+                static_cast<std::int32_t>(std::floor(u - 0.5F));
+            const std::int32_t y0 =
+                static_cast<std::int32_t>(std::floor(v - 0.5F));
+            const std::int32_t tap_x[4] = {x0, x0 + 1, x0, x0 + 1};
+            const std::int32_t tap_y[4] = {y0, y0, y0 + 1, y0 + 1};
+            std::array<float, 4> comparisons{};
+            int corner = -1;
+            for (int tap = 0; tap < 4; ++tap) {
+              int face = 0, x = 0, y = 0;
+              if (RemapCubeEdgeCoords(static_cast<int>(cube_face), tap_x[tap],
+                                      tap_y[tap], size, &face, &x, &y)) {
+                selected_layer = cube_base_face +
+                    static_cast<std::uint32_t>(face);
+                comparisons[tap] = compare_texel(
+                    mip, static_cast<std::uint32_t>(x),
+                    static_cast<std::uint32_t>(y), rid + tap);
+              } else {
+                corner = tap;
+                selected_layer = cube_base_face + cube_face;
+                comparisons[tap] = compare_texel(
+                    mip,
+                    static_cast<std::uint32_t>(
+                        std::clamp(tap_x[tap], 0, size - 1)),
+                    static_cast<std::uint32_t>(
+                        std::clamp(tap_y[tap], 0, size - 1)),
+                    rid + tap);
+              }
+            }
+            if (corner >= 0) {
+              float average = 0.0F;
+              for (int tap = 0; tap < 4; ++tap)
+                if (tap != corner)
+                  average += comparisons[tap];
+              comparisons[corner] = average / 3.0F;
+            }
+            const float a = (u - 0.5F) - std::floor(u - 0.5F);
+            const float b = (v - 0.5F) - std::floor(v - 0.5F);
+            return comparisons[0] * (1.0F - a) * (1.0F - b) +
+                   comparisons[1] * a * (1.0F - b) +
+                   comparisons[2] * (1.0F - a) * b +
+                   comparisons[3] * a * b;
+          }
+          const TextureFloatAxis x = ComputeTextureFloatLinear(
+              plane_s, mip.width, decoded_sampler.wrap_u,
+              request.spatial_offsets[0]);
+          const TextureFloatAxis y = ComputeTextureFloatLinear(
+              plane_t, mip.height, decoded_sampler.wrap_v,
+              request.spatial_offsets[1]);
+          const float lower = LerpTextureFloat(
+              compare_texel(mip, x.lower, y.lower, rid + 0U),
+              compare_texel(mip, x.upper, y.lower, rid + 1U), x.weight);
+          const float upper = LerpTextureFloat(
+              compare_texel(mip, x.lower, y.upper, rid + 2U),
+              compare_texel(mip, x.upper, y.upper, rid + 3U), x.weight);
+          return LerpTextureFloat(lower, upper, y.weight);
+        };
+        float pcf = shadow_plane(level0, tap_request_base);
+        if (two_levels) {
+          pcf = LerpTextureFloat(
+              pcf, shadow_plane(level1, tap_request_base + 4U),
+              lod.mip_weight);
+        }
+        filtered = {pcf, 0.0F, 0.0F, 1.0F};
+      } else if (integer_texture) {
         if (linear_filter || two_levels)
           throw std::runtime_error("TextureUnit cannot linearly filter integer texels");
         if (volume_texture) {

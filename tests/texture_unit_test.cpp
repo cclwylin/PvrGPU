@@ -640,6 +640,19 @@ void CheckDescriptorAndArithmetic() {
   Check(negative.lower == 2 && negative.upper == 3 &&
             negative.weight == 128,
         "u=-0.25 negative repeat");
+  const TextureLinearAxis nonfinite_nan = ComputeTextureLinearRepeat(
+      std::numeric_limits<float>::quiet_NaN(), 512);
+  const TextureLinearAxis nonfinite_inf = ComputeTextureLinearRepeat(
+      std::numeric_limits<float>::infinity(), 512);
+  Check(nonfinite_nan.lower == zero.lower &&
+            nonfinite_nan.upper == zero.upper &&
+            nonfinite_nan.weight == zero.weight &&
+            nonfinite_inf.lower == zero.lower &&
+            nonfinite_inf.upper == zero.upper &&
+            nonfinite_inf.weight == zero.weight,
+        "undefined nonfinite coordinates stay bounded at texel-zero address");
+  ExpectFailure([&] { ComputeTextureLinearRepeat(0.0F, 0); },
+                "zero texture extent remains invalid");
   const TextureLinearAxis trilinear04_default =
       ComputeTextureLinearRepeat(0.921287477016449F, 256);
   const TextureLinearAxis trilinear04_snap = ComputeTextureLinearRepeat(
@@ -971,14 +984,17 @@ void CheckCubeNonfiniteLod() {
         "unused coarse-derivative corner cannot erase a valid footprint");
   auto singular_projection = finite;
   singular_projection[1] = {0, 1, 0};
-  ExpectFailure([&] {
-    ComputeTextureCubeImplicitLod(singular_projection, image, sampler);
-  }, "valid nonzero directions cannot hide an unmodeled common-face singularity");
+  const auto boundary_lod =
+      ComputeTextureCubeImplicitLod(singular_projection, image, sampler);
+  Check(std::isfinite(boundary_lod.rho_squared) &&
+            boundary_lod.rho_squared == 1024.0F && boundary_lod.lambda == 5.0F,
+        "cube quotient derivative stays finite across a 90-degree face boundary");
   auto overflowing_projection = finite;
   overflowing_projection[1] = {std::numeric_limits<float>::min(), 1, 1};
-  ExpectFailure([&] {
-    ComputeTextureCubeImplicitLod(overflowing_projection, image, sampler);
-  }, "finite nonzero direction cannot hide projection derivative overflow");
+  const auto finite_extreme_lod =
+      ComputeTextureCubeImplicitLod(overflowing_projection, image, sampler);
+  Check(std::isfinite(finite_extreme_lod.rho_squared),
+        "finite cube directions do not divide by a neighbouring major axis");
   image.width = 0;
   ExpectFailure([&] { ComputeTextureCubeImplicitLod(zero, image, sampler); },
                 "nonfinite direction cannot bypass invalid image metadata");

@@ -2987,8 +2987,11 @@ pvrgpu_can_blit_as_texture_region(const struct pipe_blit_info *info)
    if (info->dst.resource->target == PIPE_BUFFER ||
        info->src.resource->target == PIPE_BUFFER)
       return false;
-   if (info->dst.resource->target != info->src.resource->target)
-      return false;
+   /* A framebuffer-to-texture copy commonly crosses target classes (for
+    * example PIPE_TEXTURE_2D into one cube face).  The storage path below is
+    * layer based, so target equality is not a semantic requirement; the
+    * per-level box/layer validation later in this predicate is the real
+    * safety boundary. */
    if (!(info->mask & PIPE_MASK_RGBA) || (info->mask & ~PIPE_MASK_RGBA))
       return false;
    if (info->dst.box.width <= 0 || info->dst.box.height <= 0 ||

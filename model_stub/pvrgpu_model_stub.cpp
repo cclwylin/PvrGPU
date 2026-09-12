@@ -460,6 +460,8 @@ int AnnounceModelConfiguration(pvrgpu::stub::Options &options) {
             << (options.cache_bypass ? "true" : "false")
             << ",\"memory_mode\":\""
             << pvrgpu::stub::MemoryModeName(options.memory_mode) << "\""
+            << ",\"texture_lod_mode\":\""
+            << (options.exact_texture_lod ? "exact" : "llvmpipe") << "\""
             << ",\"cache_simulated\":"
             << (options.memory_mode == pvrgpu::stub::MemoryMode::kCache
                     ? "true"
@@ -646,9 +648,11 @@ int ModelFifoDepth() {
  */
 class ModelSession {
 public:
-  explicit ModelSession(MemoryMode memory_mode, bool cache_bypass);
+  explicit ModelSession(MemoryMode memory_mode, bool cache_bypass,
+                        bool exact_texture_lod);
 
   MemoryMode memory_mode() const { return memory_mode_; }
+  bool exact_texture_lod() const { return exact_texture_lod_; }
 
   // Runs one flush.  Returns 0 when the reporter published the job's records
   // and the MemoryPool balanced, and non-zero otherwise, with `error` set.
@@ -669,6 +673,7 @@ public:
 private:
   MemoryMode memory_mode_;
   bool cache_bypass_;
+  bool exact_texture_lod_;
   bool started_ = false;
   bool stopped_ = false;
   bool poisoned_ = false;
@@ -829,16 +834,18 @@ private:
   UscSlot fragment_slot{"fragment_usc_slot", pool, ShaderStage::kFragment};
   UscCluster fragment_cluster{"fragment_usc_cluster", pool,
                               ShaderStage::kFragment, &memory};
-  TextureUnit texture_unit{"texture_unit", pool, &memory};
+  TextureUnit texture_unit;
   Pbe pbe{"pbe", pool};
   PbeWriteBack pbe_write_back{"pbe_write_back", pool, &memory};
   JsonReporter reporter{"json_reporter", elaboration_options_, pool,
                         &sequence_completion, &job};
 };
 
-ModelSession::ModelSession(MemoryMode memory_mode, bool cache_bypass)
+ModelSession::ModelSession(MemoryMode memory_mode, bool cache_bypass,
+                           bool exact_texture_lod)
     : memory_mode_(memory_mode), cache_bypass_(cache_bypass),
-      memory(memory_mode) {
+      exact_texture_lod_(exact_texture_lod), memory(memory_mode),
+      texture_unit("texture_unit", pool, &memory, exact_texture_lod) {
   compute_data_master.input(compute_submit);
   compute_data_master.completion(compute_complete);
   compute_data_master.workgroup_output(compute_workgroups);
@@ -1288,12 +1295,16 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options,
 
   if (!pvrgpu::stub::g_session) {
     pvrgpu::stub::g_session = std::make_unique<pvrgpu::stub::ModelSession>(
-        options.memory_mode, options.cache_bypass);
+        options.memory_mode, options.cache_bypass, options.exact_texture_lod);
   } else if (pvrgpu::stub::g_session->memory_mode() != options.memory_mode) {
     // The caches and the DRAM backing are elaborated, so the memory mode is
     // fixed for the life of the process.  Say so rather than silently running
     // the flush against the mode the first submission asked for.
     std::cerr << "SystemC model memory mode cannot change after elaboration\n";
+    return 1;
+  } else if (pvrgpu::stub::g_session->exact_texture_lod() !=
+             options.exact_texture_lod) {
+    std::cerr << "SystemC model texture LOD mode cannot change after elaboration\n";
     return 1;
   }
 
@@ -1315,7 +1326,8 @@ int pvrgpu::stub::RunConfiguredCompute(
   }
   if (!g_session) {
     g_session = std::make_unique<ModelSession>(
-        dispatch->memory_mode, dispatch->memory_mode == MemoryMode::kBypass);
+        dispatch->memory_mode, dispatch->memory_mode == MemoryMode::kBypass,
+        false);
   } else if (g_session->memory_mode() != dispatch->memory_mode) {
     if (error)
       *error = "SystemC model memory mode cannot change after elaboration";

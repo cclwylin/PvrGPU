@@ -199,6 +199,8 @@ bool SameTextureSampleRequest(const TextureSampleRequest &left,
          left.lod_bias == right.lod_bias &&
          left.lod_bias_present == right.lod_bias_present &&
          left.gather == right.gather &&
+         left.shadow_reference == right.shadow_reference &&
+         left.shadow_compare == right.shadow_compare &&
          left.data_request == right.data_request &&
          left.quad_lane == right.quad_lane &&
          left.shader_stage == right.shader_stage && left.gather <= 1 &&
@@ -1267,6 +1269,9 @@ void UscCluster::Run() {
             request.lod_bias = execution.texture_request.lod_bias;
             request.lod_bias_present = execution.texture_request.lod_bias_present;
             request.gather = execution.texture_request.gather;
+            request.shadow_reference =
+                execution.texture_request.shadow_reference;
+            request.shadow_compare = execution.texture_request.shadow_compare;
             request.data_request = execution.texture_request.data_request;
             request.texture_address_lo =
                 execution.texture_request.texture_address_lo;

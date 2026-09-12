@@ -132,7 +132,9 @@ void SizeQueries(){
 }
 }
 int main(int argc,char **argv){try{
-  static_assert(kPcoMaximumTextureDescriptorSets==12&&kPcoMaximumVertexSharedCount==96&&kPcoMaximumFragmentSharedCount==256);
+  static_assert(kPcoMaximumTextureDescriptorSets==16&&
+                kPcoMaximumVertexSharedCount==384&&
+                kPcoMaximumFragmentSharedCount==384);
   if(argc!=1&&argc!=3)return 2;
   if(argc==3)for(unsigned i=0;i<2;++i){std::ifstream f(argv[i+1],std::ios::binary);Check(bool(f),"fixture file exists");std::vector<uint8_t>b((std::istreambuf_iterator<char>(f)),{});Check(b==(i?test::CubeArray601Fixture():test::CubeArray600Fixture()),"pinned genuine bytes exactly match");}
   Run(false);Run(true);TwelveTextures();SizeQueries();std::cout<<"CubeArray ISS: "<<checks<<" checks PASS\n";return 0;

@@ -72,9 +72,15 @@ std::uint32_t ClampIndex(std::int64_t index, std::uint32_t extent) {
   return static_cast<std::uint32_t>(index);
 }
 
-void RequireCoordinate(float coordinate, std::uint32_t extent) {
-  if (!std::isfinite(coordinate) || extent == 0)
-    throw std::runtime_error("TextureUnit coordinate/extent is invalid");
+float TextureAddressCoordinate(float coordinate, std::uint32_t extent) {
+  if (extent == 0)
+    throw std::runtime_error("TextureUnit address extent is invalid");
+  // A non-finite GLSL texture coordinate has no defined sampled value.  Keep
+  // the raw shader/request bits intact, but choose texel zero at the final
+  // address boundary so NaN/Inf can neither abort the draw nor become an
+  // out-of-allocation integer conversion.  Cube addressing applies the same
+  // bounded policy in ProjectCubeDirection.
+  return std::isfinite(coordinate) ? coordinate : 0.0F;
 }
 
 } // namespace
@@ -92,7 +98,7 @@ float TextureFastLog2(float x) {
 
 TextureLodSelection SelectTextureLod(
     float rho_squared, const RogueTextureSamplerDescriptor &sampler,
-    std::uint32_t mip_count) {
+    std::uint32_t mip_count, bool exact_lod) {
   if (mip_count == 0)
     throw std::runtime_error("TextureUnit implicit LOD state is invalid");
   if (rho_squared < 0.0F || !std::isfinite(rho_squared))
@@ -117,12 +123,17 @@ TextureLodSelection SelectTextureLod(
   // and an exact log2 shifts the blended alpha across the 0.021 threshold on
   // ~1.6% of the covered pixels (Draw 185 first mismatch).  An exact log2
   // only silences dEQP's mipmap_linear QualityWarning; the llvmpipe reference
-  // remains the byte-exact oracle for capture replay.  Level selection still
+  // remains the byte-exact oracle for capture replay. Exact mode is therefore
+  // selected explicitly by conformance/hardware runs, while serialized replay
+  // retains fast-log2. Level selection still
   // rounds this LOD, so the mip-nearest and magnification decisions are
   // unchanged at the powers of two both log2 variants resolve exactly.
   float lambda = min_lod;
-  if (rho_squared > 0.0F)
-    lambda = std::clamp(TextureFastLog2(rho_squared) * 0.5F, min_lod, max_lod);
+  if (rho_squared > 0.0F) {
+    const float log2_rho_squared =
+        exact_lod ? std::log2(rho_squared) : TextureFastLog2(rho_squared);
+    lambda = std::clamp(log2_rho_squared * 0.5F, min_lod, max_lod);
+  }
   result.lambda = lambda;
   result.minified = lambda > 0.0F;
   const std::uint32_t last_level_u4_6 = (mip_count - 1U) * 64U;
@@ -133,10 +144,11 @@ TextureLodSelection SelectTextureLod(
 
 TextureLodSelection SelectTextureBiasedLod(
     float rho_squared, float bias, const RogueTextureSamplerDescriptor &sampler,
-    std::uint32_t mip_count) {
+    std::uint32_t mip_count, bool exact_lod) {
   // Retain the ordinary descriptor/rho validation. Do not add bias to its
   // clamped result: e.g. rho=0.5, bias=2 must select lambda=1, not 2.
-  TextureLodSelection result = SelectTextureLod(rho_squared, sampler, mip_count);
+  TextureLodSelection result =
+      SelectTextureLod(rho_squared, sampler, mip_count, exact_lod);
   const float min_lod = sampler.min_lod_u4_6 / 64.0F;
   const float max_lod = sampler.max_lod_u4_6 / 64.0F;
   if (std::isnan(bias)) bias = 0.0F;
@@ -148,8 +160,13 @@ TextureLodSelection SelectTextureBiasedLod(
   } else {
     // lp_build_lod_selector: lod = fast_log2(rho^2) * 0.5, then the shader
     // bias is a separate FAdd before the sampler LOD clamps.
-    lambda = rho_squared == 0.0F ? min_lod :
-        std::clamp(TextureFastLog2(rho_squared) * 0.5F + bias, min_lod, max_lod);
+    if (rho_squared == 0.0F) {
+      lambda = min_lod;
+    } else {
+      const float log2_rho_squared =
+          exact_lod ? std::log2(rho_squared) : TextureFastLog2(rho_squared);
+      lambda = std::clamp(log2_rho_squared * 0.5F + bias, min_lod, max_lod);
+    }
   }
   result.lambda = lambda;
   result.minified = lambda > 0.0F;
@@ -312,7 +329,7 @@ std::uint32_t ComputeTextureNearestRepeat(float coordinate,
                                           std::uint32_t extent,
                                           TextureWrapMode wrap,
                                           std::int32_t texel_offset) {
-  RequireCoordinate(coordinate, extent);
+  coordinate = TextureAddressCoordinate(coordinate, extent);
   const float extent_f = static_cast<float>(extent);
   switch (wrap) {
   case TextureWrapMode::kRepeat:
@@ -336,7 +353,7 @@ TextureLinearAxis ComputeTextureLinearRepeat(float coordinate,
                                              TextureWrapMode wrap,
                                              float round_threshold,
                                              std::int32_t texel_offset) {
-  RequireCoordinate(coordinate, extent);
+  coordinate = TextureAddressCoordinate(coordinate, extent);
   if (!std::isfinite(round_threshold) || round_threshold < 0.0F ||
       round_threshold > 1.0F) {
     throw std::runtime_error("TextureUnit linear round threshold is invalid");
@@ -434,7 +451,7 @@ std::uint32_t ComputeTextureFloatNearest(float coordinate,
                                          std::uint32_t extent,
                                          TextureWrapMode wrap,
                                          std::int32_t texel_offset) {
-  RequireCoordinate(coordinate, extent);
+  coordinate = TextureAddressCoordinate(coordinate, extent);
   const float extent_f = static_cast<float>(extent);
   switch (wrap) {
   case TextureWrapMode::kRepeat:
@@ -459,7 +476,7 @@ TextureFloatAxis ComputeTextureFloatLinear(float coordinate,
                                            std::uint32_t extent,
                                            TextureWrapMode wrap,
                                            std::int32_t texel_offset) {
-  RequireCoordinate(coordinate, extent);
+  coordinate = TextureAddressCoordinate(coordinate, extent);
   const float extent_f = static_cast<float>(extent);
   TextureFloatAxis result;
   switch (wrap) {

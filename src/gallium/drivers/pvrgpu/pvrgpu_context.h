@@ -28,7 +28,8 @@
 #define PVRGPU_MAX_RENDER_TARGETS 4u
 
 /* Shared-register words one lowered draw carries per stage. */
-#define PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS 256u
+#define PVRGPU_COLOR_PRIMITIVE_UNIFORM_DWORDS \
+   PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE
 
 struct pvrgpu_array_primitive_draw;
 struct blitter_context;

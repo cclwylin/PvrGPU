@@ -456,12 +456,15 @@ bool UsesFragmentQuadLanes(const PipelineState &state) {
 bool UsesShaderVaryings(const PipelineState &state) {
   if (!IsDriverPcoTrianglesCase(state.functional_case))
     return UsesShaderVaryings(state.functional_case);
-  // Texture and derivative shaders can use gl_FragCoord or constants with
-  // no user varying. Their declared position coefficient set still traverses
-  // ParameterBuffer/PDS; an empty linkage is not an absent position plane.
+  // Derivative shaders may have no user varying but still declare the
+  // reciprocal-W position coefficient used by their quad program.  Texture
+  // sampling alone does not imply a coefficient: a shader can sample from a
+  // constant/uniform coordinate with a zero-dword fragment input ABI.  Such a
+  // shader still gets quad lanes through UsesFragmentQuadLanes(), but must not
+  // make ParameterBuffer/PDS demand a nonexistent varying payload.
   return state.varying_output_count != 0 ||
          state.fragment_varying_count != 0 ||
-         UsesTextureSampling(state, ShaderStage::kFragment) ||
+         state.fragment_pco_abi.coefficients != 0 ||
          state.fragment_program_summary.uses_derivatives != 0;
 }
 
@@ -523,8 +526,18 @@ std::uint32_t VaryingCoefficientDwordCount(FunctionalCase functional_case) {
 std::uint32_t VaryingCoefficientDwordCount(const PipelineState &state) {
   if (!IsDriverPcoTrianglesCase(state.functional_case))
     return VaryingCoefficientDwordCount(state.functional_case);
+  const bool legacy_position =
+      state.fragment_position_count == kCoefficientSetDwordCount &&
+      state.fragment_position_uses_z == 0 &&
+      state.fragment_position_uses_w == 0;
   if (!UsesShaderVaryings(state) || state.fragment_position_start != 0 ||
-      state.fragment_position_count != kCoefficientSetDwordCount ||
+      state.fragment_position_uses_z > 1 ||
+      state.fragment_position_uses_w > 1 ||
+      (!legacy_position &&
+       state.fragment_position_count != kCoefficientSetDwordCount *
+           (state.fragment_position_uses_z + state.fragment_position_uses_w)) ||
+      state.fragment_position_count > 2 * kCoefficientSetDwordCount ||
+      (state.fragment_position_count % kCoefficientSetDwordCount) != 0 ||
       state.fragment_varying_start != state.fragment_position_count ||
       state.fragment_varying_count >
           std::numeric_limits<std::uint32_t>::max() -
@@ -627,6 +640,8 @@ bool IsExactVaryingBinding(const PipelineState &state,
   const std::uint32_t binding_count = VaryingVectorCount(state);
   if (state.driver_varying_bindings_explicit) {
     const auto coefficient_count = state.fragment_pco_abi.coefficients / 4;
+    const auto position_coefficient_count =
+        state.fragment_position_count / kCoefficientSetDwordCount;
     const auto output_dwords = HasPoolHandle(state.tessellation_state)
         ? state.tessellation_output_dwords : HasPoolHandle(state.geometry_code)
         ? state.geometry_pco_abi.vertex_outputs : state.vertex_pco_abi.vertex_outputs;
@@ -651,9 +666,11 @@ bool IsExactVaryingBinding(const PipelineState &state,
         binding.vertex_output_base >= state.varying_output_start &&
         binding.vertex_output_base <= output_dwords &&
         binding.component_count <= output_dwords - binding.vertex_output_base &&
-        binding.coefficient_set_base >= 1 && binding.coefficient_set_base <= coefficient_count &&
+        binding.coefficient_set_base >= position_coefficient_count &&
+        binding.coefficient_set_base <= coefficient_count &&
         binding.component_count <= coefficient_count - binding.coefficient_set_base &&
-        binding.w_coefficient_set == 0 &&
+        binding.w_coefficient_set ==
+            (state.fragment_position_uses_z ? 1 : 0) &&
         (binding.interpolation == InterpolationMode::kSmooth || binding.interpolation == InterpolationMode::kFlat) &&
         !binding.reserved[0] && !binding.reserved[1];
     if (!valid && out_refusal) *out_refusal = "explicit_varying_binding";

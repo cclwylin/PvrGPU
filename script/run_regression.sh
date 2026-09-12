@@ -110,6 +110,9 @@ fi
 if [[ -f "${REPO_DIR}/config/local.env" ]]; then
     saved_build_dir="${PVRGPU_BUILD_DIR:-}"
     saved_mesa_prefix="${PVRGPU_MESA_PVRGPU_PREFIX:-}"
+    saved_systemc_api_lib="${PVRGPU_SYSTEMC_API_LIB:-}"
+    saved_systemc_bridge="${PVRGPU_SYSTEMC_BRIDGE:-}"
+    saved_rdc_player="${PVRGPU_RDC_PLAYER:-}"
     set -a
     # shellcheck disable=SC1091
     source "${REPO_DIR}/config/local.env"
@@ -119,6 +122,15 @@ if [[ -f "${REPO_DIR}/config/local.env" ]]; then
     fi
     if [[ -n "${saved_mesa_prefix}" ]]; then
         PVRGPU_MESA_PVRGPU_PREFIX="${saved_mesa_prefix}"
+    fi
+    if [[ -n "${saved_systemc_api_lib}" ]]; then
+        PVRGPU_SYSTEMC_API_LIB="${saved_systemc_api_lib}"
+    fi
+    if [[ -n "${saved_systemc_bridge}" ]]; then
+        PVRGPU_SYSTEMC_BRIDGE="${saved_systemc_bridge}"
+    fi
+    if [[ -n "${saved_rdc_player}" ]]; then
+        PVRGPU_RDC_PLAYER="${saved_rdc_player}"
     fi
 fi
 PVRGPU_BUILD_DIR="${PVRGPU_BUILD_DIR:-${REPO_DIR}/build}"

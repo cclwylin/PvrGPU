@@ -1108,7 +1108,8 @@ pvrgpu_cmd_validate_uniform_buffers(
       const uint64_t end = (uint64_t)abi->uniform_buffer_descriptor_start +
                            4u * blocks;
       if (blocks > PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
-          shared_count != abi->shareds || shared_count > (stage == 0 ? 96 : 256) ||
+          shared_count != abi->shareds ||
+          shared_count > PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE ||
           (shared_count && !shared) || end > shared_count ||
           (abi->uniform_buffer_descriptor_start & 3u) ||
           (!blocks && abi->uniform_buffer_descriptor_start !=
@@ -1336,7 +1337,9 @@ pvrgpu_cmd_validate_draw_pco_triangles(
    if (geometry && (!cmd->geometry_pco || !cmd->geometry_shared ||
        cmd->geometry_pco_size > UINT32_MAX ||
        cmd->geometry_shared_count != cmd->geometry_pco_abi.shareds ||
-       cmd->geometry_shared_count < 4 || cmd->geometry_shared_count > 256 ||
+       cmd->geometry_shared_count < 4 ||
+       cmd->geometry_shared_count >
+          PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE ||
        cmd->geometry_pco_abi.temps > 256 || cmd->geometry_pco_abi.vertex_inputs != 2 ||
        cmd->geometry_pco_abi.coefficients || cmd->geometry_pco_abi.entry_offset ||
        cmd->geometry_pco_abi.uniform_buffer_descriptor_count > 15 ||
@@ -1557,7 +1560,8 @@ pvrgpu_cmd_validate_draw_pco_triangles(
    const bool vertex_stage_invalid =
       (!color_layout && cmd->vertex_pco_abi.temps == 0) ||
       cmd->vertex_pco_abi.temps > 256 ||
-      cmd->vertex_pco_abi.shareds > 96 ||
+      cmd->vertex_pco_abi.shareds >
+         PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE ||
       cmd->vertex_pco_abi.coefficients != 0 ||
       /*
        * Shared registers hold texture descriptors first and push constants
@@ -1577,7 +1581,9 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       (!ideas_position_layout && !color_layout &&
        cmd->fragment_pco_abi.temps == 0)      ? "fs temps is zero" :
       cmd->fragment_pco_abi.temps > 256       ? "fs temps > 256" :
-      cmd->fragment_pco_abi.shareds > 256     ? "fs shareds > 256" :
+      cmd->fragment_pco_abi.shareds >
+         PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE
+                                             ? "fs shareds exceed transport" :
       cmd->fragment_pco_abi.vertex_inputs != 0  ? "fs vertex_inputs != 0" :
       cmd->fragment_pco_abi.vertex_outputs != 0 ? "fs vertex_outputs != 0" :
       /*
@@ -1621,6 +1627,8 @@ pvrgpu_cmd_validate_draw_pco_triangles(
        cmd->varying_output_start !=
           cmd->position_output_count + cmd->point_size_output_count) ||
       cmd->fragment_position_start != 0 ||
+      cmd->fragment_position_uses_z > 1 ||
+      cmd->fragment_position_uses_w > 1 ||
       (cmd->fragment_varying_count != 0 &&
        cmd->fragment_varying_start != cmd->fragment_position_count) ||
       cmd->fragment_pco_abi.coefficients !=
@@ -1644,7 +1652,9 @@ pvrgpu_cmd_validate_draw_pco_triangles(
     */
    const bool color_layout_invalid =
       (color_layout && states_own_attributes &&
-       (cmd->fragment_position_count != 4 ||
+       (cmd->fragment_position_count !=
+           4u * (cmd->fragment_position_uses_z +
+                 cmd->fragment_position_uses_w) ||
         cmd->fragment_varying_count > cmd->varying_output_count * 4u ||
         (cmd->fragment_varying_count & 3u) != 0)) ||
       (color_layout && !states_own_attributes &&
@@ -2330,6 +2340,8 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->position_output_count = cmd->position_output_count;
    out->fragment_position_start = cmd->fragment_position_start;
    out->fragment_position_count = cmd->fragment_position_count;
+   out->fragment_position_uses_z = cmd->fragment_position_uses_z;
+   out->fragment_position_uses_w = cmd->fragment_position_uses_w;
    out->varying_output_start = cmd->varying_output_start;
    out->varying_output_count = cmd->varying_output_count;
    out->fragment_varying_start = cmd->fragment_varying_start;
@@ -2573,6 +2585,7 @@ pvrgpu_write_draw_pco_triangles_command(
       "vertex_pco_abi=%u,%u,%u,%u,%u,%u,%u,%u\n"
       "fragment_pco_abi=%u,%u,%u,%u,%u,%u,%u,%u\n"
       "position_linkage=%u,%u,%u,%u\n"
+      "fragment_position_components=%u,%u\n"
       "varying_linkage=%u,%u,%u,%u\n"
       "viewport_scale_bits=%u,%u,%u\n"
       "viewport_translate_bits=%u,%u,%u\n"
@@ -2608,6 +2621,8 @@ pvrgpu_write_draw_pco_triangles_command(
       cmd->position_output_count,
       cmd->fragment_position_start,
       cmd->fragment_position_count,
+      cmd->fragment_position_uses_z,
+      cmd->fragment_position_uses_w,
       cmd->varying_output_start,
       cmd->varying_output_count,
       cmd->fragment_varying_start,

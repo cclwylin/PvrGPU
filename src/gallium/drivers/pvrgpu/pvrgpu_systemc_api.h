@@ -10,9 +10,11 @@
 extern "C" {
 #endif
 
-/* API-v33 appends explicit polygon-offset raster state to each physical draw.
+/* API-v33 appended explicit polygon-offset raster state to each physical draw.
+ * API-v34 appends the exact Z/reciprocal-W position coefficient selection.
+ * API-v35 raises the graphics texture/shared transport to the GLES3 minimum.
  * Old versioned consumers must not guess at the longer command envelope. */
-#define PVRGPU_SYSTEMC_API_VERSION 33u
+#define PVRGPU_SYSTEMC_API_VERSION 35u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE 15u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES (64u * 1024u)
 /*
@@ -596,6 +598,10 @@ struct pvrgpu_systemc_driver_command {
    uint32_t polygon_offset_units_bits;
    uint32_t polygon_offset_clamp_bits;
    uint32_t polygon_offset_units_unscaled;
+   /* API-v34: exact meaning and ordering of position coefficient sets.
+    * Z, when present, occupies the first set; reciprocal-W follows it. */
+   uint32_t fragment_position_uses_z;
+   uint32_t fragment_position_uses_w;
 };
 
 struct pvrgpu_systemc_submit_info {

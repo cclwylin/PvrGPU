@@ -6842,6 +6842,8 @@ pvrgpu_init_refract_systemc_draw(
    command->position_output_count = binary->position_output_count;
    command->fragment_position_start = binary->fragment_position_start;
    command->fragment_position_count = binary->fragment_position_count;
+   command->fragment_position_uses_z = binary->fragment_position_uses_z;
+   command->fragment_position_uses_w = binary->fragment_position_uses_w;
    command->varying_output_start = binary->varying_output_start;
    command->varying_output_count = binary->varying_output_count;
    command->fragment_varying_start = binary->fragment_varying_start;
@@ -7162,6 +7164,8 @@ pvrgpu_init_shadow_systemc_draw(
    command->position_output_count = binary->position_output_count;
    command->fragment_position_start = binary->fragment_position_start;
    command->fragment_position_count = binary->fragment_position_count;
+   command->fragment_position_uses_z = binary->fragment_position_uses_z;
+   command->fragment_position_uses_w = binary->fragment_position_uses_w;
    command->varying_output_start = binary->varying_output_start;
    command->varying_output_count = binary->varying_output_count;
    command->fragment_varying_start = binary->fragment_varying_start;
@@ -8844,6 +8848,8 @@ pvrgpu_init_terrain_systemc_draw(
    command->position_output_count = binary->position_output_count;
    command->fragment_position_start = binary->fragment_position_start;
    command->fragment_position_count = binary->fragment_position_count;
+   command->fragment_position_uses_z = binary->fragment_position_uses_z;
+   command->fragment_position_uses_w = binary->fragment_position_uses_w;
    command->varying_output_start = binary->varying_output_start;
    command->varying_output_count = binary->varying_output_count;
    command->fragment_varying_start = binary->fragment_varying_start;
@@ -9246,6 +9252,8 @@ pvrgpu_emit_draw_pco_triangles_command(
    command.position_output_count = binary.position_output_count;
    command.fragment_position_start = binary.fragment_position_start;
    command.fragment_position_count = binary.fragment_position_count;
+   command.fragment_position_uses_z = binary.fragment_position_uses_z;
+   command.fragment_position_uses_w = binary.fragment_position_uses_w;
    /* The compiled program states which PIXOUT lanes each attachment expects.
     * The model reads a native fragment program's mask as an explicit
     * contract, so a command that leaves it zero states a depth-only draw and
@@ -9420,6 +9428,8 @@ pvrgpu_emit_lit_mesh_command(
    command.position_output_count = binary.position_output_count;
    command.fragment_position_start = binary.fragment_position_start;
    command.fragment_position_count = binary.fragment_position_count;
+   command.fragment_position_uses_z = binary.fragment_position_uses_z;
+   command.fragment_position_uses_w = binary.fragment_position_uses_w;
    command.varying_output_start = binary.varying_output_start;
    command.varying_output_count = binary.varying_output_count;
    command.fragment_varying_start = binary.fragment_varying_start;
@@ -9794,6 +9804,32 @@ pvrgpu_sequence_texture_addrmode(uint32_t capsule_wrap)
    }
 }
 
+static unsigned
+pvrgpu_texture_lod_to_u4_6(float lod)
+{
+   if (!isfinite(lod))
+      lod = lod > 0.0f ? 1023.0f / 64.0f : 0.0f;
+   lod = CLAMP(lod, 0.0f, 1023.0f / 64.0f);
+   return (unsigned)lrintf(lod * 64.0f);
+}
+
+static bool
+pvrgpu_set_texture_descriptor_lod_window(uint32_t descriptor[20],
+                                         unsigned min_lod_u4_6,
+                                         unsigned max_lod_u4_6)
+{
+   if (!descriptor || min_lod_u4_6 > max_lod_u4_6 ||
+       max_lod_u4_6 > 1023U)
+      return false;
+   descriptor[8] =
+      (descriptor[8] & ~(UINT32_C(0x3ff) << 13U)) |
+      (min_lod_u4_6 << 13U);
+   descriptor[16] =
+      (descriptor[16] & ~(UINT32_C(0x3ff) << 13U)) |
+      (min_lod_u4_6 << 13U);
+   return true;
+}
+
 /*
  * The format a sampled view presents to the shader.  Mesa decompresses an
  * RGB-only compressed image (ETC1/ETC2 RGB8) to RGBA8 and gives the view an
@@ -9839,12 +9875,11 @@ pvrgpu_stage_texture_query_only(const struct pvrgpu_context *ctx,
 }
 
 static bool
-pvrgpu_nearest_shadow_sampler_supported(const struct pipe_sampler_view *view,
-                                       const struct pipe_sampler_state *sampler)
+pvrgpu_shadow_sampler_supported(const struct pipe_sampler_view *view,
+                                const struct pipe_sampler_state *sampler)
 {
-   /* A scalar native sample followed by a shader compare is precisely a
-    * nearest shadow lookup. Linear PCF needs comparison of individual taps,
-    * not comparison of interpolated depths; keep that unsupported explicitly. */
+   /* TextureUnit implements the image and mip filters for depth resources;
+    * the native shader performs the comparison using descriptor word 12. */
    return view && sampler &&
       (view->target == PIPE_TEXTURE_2D ||
        view->target == PIPE_TEXTURE_2D_ARRAY ||
@@ -9854,9 +9889,9 @@ pvrgpu_nearest_shadow_sampler_supported(const struct pipe_sampler_view *view,
       util_format_has_depth(util_format_description(view->format)) &&
       sampler->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE &&
       sampler->compare_func <= PIPE_FUNC_ALWAYS &&
-      sampler->min_img_filter == PIPE_TEX_FILTER_NEAREST &&
-      sampler->mag_img_filter == PIPE_TEX_FILTER_NEAREST &&
-      (sampler->min_mip_filter == PIPE_TEX_MIPFILTER_NEAREST ||
+      sampler->min_img_filter <= PIPE_TEX_FILTER_LINEAR &&
+      sampler->mag_img_filter <= PIPE_TEX_FILTER_LINEAR &&
+      (sampler->min_mip_filter <= PIPE_TEX_MIPFILTER_LINEAR ||
        sampler->min_mip_filter == PIPE_TEX_MIPFILTER_NONE);
 }
 
@@ -9871,8 +9906,10 @@ pvrgpu_set_generic_texture_compare_metadata(const struct pipe_sampler_view *view
     * PIPE_FUNC and Rogue use NEVER/LESS/EQUAL/LEQUAL/GREATER/NOTEQUAL/GEQUAL/ALWAYS.
     * A canonical float snapshot of UNORM depth still clamps the reference. */
    descriptor[7] = sampler->compare_mode != PIPE_TEX_COMPARE_NONE &&
-      util_format_has_depth(util_format_description(view->format)) &&
-      !util_format_is_float(view->format) ? UINT32_C(1) << 8 : 0;
+      util_format_has_depth(util_format_description(view->format))
+         ? (UINT32_C(1) << 9) |
+              (!util_format_is_float(view->format) ? UINT32_C(1) << 8 : 0)
+         : 0;
    descriptor[12] = sampler->compare_mode != PIPE_TEX_COMPARE_NONE ?
       sampler->compare_func : 0;
 }
@@ -10059,19 +10096,33 @@ pvrgpu_capture_generic_sequence_texture(
       format == PIPE_FORMAT_R11G11B10_FLOAT ||
       format == PIPE_FORMAT_R9G9B9E5_FLOAT;
    const struct util_format_description *format_desc = util_format_description(format);
+   const bool depth_stencil_view = format == PIPE_FORMAT_Z24_UNORM_S8_UINT;
+   const unsigned expected_swizzle_g =
+      depth_stencil_view ? PIPE_SWIZZLE_0 : PIPE_SWIZZLE_Y;
+   const unsigned expected_swizzle_b =
+      depth_stencil_view ? PIPE_SWIZZLE_0 : PIPE_SWIZZLE_Z;
+   const unsigned expected_swizzle_a =
+      (depth_stencil_view || format == PIPE_FORMAT_R8G8B8X8_UNORM ||
+       three_channel_view) ? PIPE_SWIZZLE_1 : PIPE_SWIZZLE_W;
+   const bool descriptor_native_swizzle =
+      view->swizzle_r == PIPE_SWIZZLE_X &&
+      view->swizzle_g == expected_swizzle_g &&
+      view->swizzle_b == expected_swizzle_b &&
+      view->swizzle_a == expected_swizzle_a;
    /* Depth queries and non-D24S8 depth samples use the exact unpacked float
     * datapath, including Z16 and packed depth-only formats. No depth compare
     * is performed while taking this immutable resource snapshot. */
    const bool float_depth_view = util_format_has_depth(format_desc) &&
       (format != PIPE_FORMAT_Z24_UNORM_S8_UINT || cube_array_depth_view);
    const bool canonical_float_view = float_depth_view || (!integer_view &&
-      (!packed_colour_view || util_format_is_float(format)) &&
       format_desc->colorspace != UTIL_FORMAT_COLORSPACE_ZS &&
       format_desc->block.width == 1 && format_desc->block.height == 1 &&
-      format != PIPE_FORMAT_R8G8B8A8_UNORM &&
-      format != PIPE_FORMAT_B8G8R8A8_UNORM &&
-      format != PIPE_FORMAT_R8G8B8X8_UNORM &&
-      format != PIPE_FORMAT_R8G8B8A8_SRGB);
+      (((!packed_colour_view || util_format_is_float(format)) &&
+       format != PIPE_FORMAT_R8G8B8A8_UNORM &&
+       format != PIPE_FORMAT_B8G8R8A8_UNORM &&
+       format != PIPE_FORMAT_R8G8B8X8_UNORM &&
+       format != PIPE_FORMAT_R8G8B8A8_SRGB) ||
+       (!astc_view && !descriptor_native_swizzle)));
    const bool canonical_view = integer_view || canonical_float_view;
    const enum pipe_format storage_format = integer_view ?
       (util_format_is_pure_uint(format) ? PIPE_FORMAT_R32G32B32A32_UINT :
@@ -10144,20 +10195,8 @@ pvrgpu_capture_generic_sequence_texture(
     * view asking for anything else would be sampled through the wrong one, so
     * decline it instead of ignoring the request.
     */
-   const bool depth_stencil_view = format == PIPE_FORMAT_Z24_UNORM_S8_UINT;
-   const unsigned expected_swizzle_g =
-      depth_stencil_view ? PIPE_SWIZZLE_0 : PIPE_SWIZZLE_Y;
-   const unsigned expected_swizzle_b =
-      depth_stencil_view ? PIPE_SWIZZLE_0 : PIPE_SWIZZLE_Z;
-   const unsigned expected_swizzle_a =
-      (depth_stencil_view || format == PIPE_FORMAT_R8G8B8X8_UNORM ||
-       three_channel_view) ?
-         PIPE_SWIZZLE_1 : PIPE_SWIZZLE_W;
    /* sRGB carries the identity swizzle, exactly as RGBA8 does. */
-   if (!canonical_view && (view->swizzle_r != PIPE_SWIZZLE_X ||
-       view->swizzle_g != expected_swizzle_g ||
-       view->swizzle_b != expected_swizzle_b ||
-       view->swizzle_a != expected_swizzle_a)) {
+   if (!canonical_view && !descriptor_native_swizzle) {
       *reason = "view_swizzle";
       return false;
    }
@@ -10175,9 +10214,23 @@ pvrgpu_capture_generic_sequence_texture(
         state->compare_mode != PIPE_TEX_COMPARE_NONE &&
         !pvrgpu_stage_texture_query_only(ctx, stage, slot) &&
         (!(stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_FRAGMENT) ||
-         !pvrgpu_nearest_shadow_sampler_supported(view, state)))) {
+         !pvrgpu_shadow_sampler_supported(view, state)))) {
+      if (!shadow_gather && state->compare_mode != PIPE_TEX_COMPARE_NONE) {
+         pvrgpu_counter_eventf(
+            "shadow_sampler_reject_detail",
+            "slot=%u stage=%u target=%u samples=%u storage_samples=%u "
+            "format=%s depth=%u compare_mode=%u compare_func=%u "
+            "filters=%u,%u,%u",
+            slot, stage, view ? view->target : 0,
+            view && view->texture ? view->texture->nr_samples : 0,
+            view && view->texture ? view->texture->nr_storage_samples : 0,
+            view ? util_format_name(view->format) : "none",
+            view ? util_format_has_depth(util_format_description(view->format)) : 0,
+            state->compare_mode, state->compare_func, state->min_img_filter,
+            state->mag_img_filter, state->min_mip_filter);
+      }
       *reason = shadow_gather ? "shadow_gather_sampler_state" :
-                               "shadow_sampler_state_requires_nearest_2d";
+                               "shadow_sampler_state";
       return false;
    }
    if (!multisample_view &&
@@ -10324,9 +10377,22 @@ pvrgpu_capture_generic_sequence_texture(
     * makes every fragment look magnified and take the magnification filter,
     * which shows whenever min and mag differ.  0.25 in U4.6 is 16.
     */
-   destination->max_lod_u4_6 =
-      state->min_mip_filter == PIPE_TEX_MIPFILTER_NONE ?
-         16U : (mip_count - 1U) * 64U;
+   if (state->min_mip_filter == PIPE_TEX_MIPFILTER_NONE) {
+      destination->max_lod_u4_6 = 16U;
+   } else {
+      /* MAX_LEVEL already limits destination->mip_count through the sampler
+       * view.  It is not MAX_LOD: keep the independent sampler LOD window so
+       * a minified footprint clamped to the last available image still uses
+       * the minification filter. */
+      destination->min_lod_u4_6 =
+         pvrgpu_texture_lod_to_u4_6(state->min_lod);
+      destination->max_lod_u4_6 =
+         pvrgpu_texture_lod_to_u4_6(state->max_lod);
+      /* Gallium permits an inverted user window.  Its clamp applies MAX_LOD
+       * last, so collapse the hardware interval at that endpoint. */
+      if (destination->min_lod_u4_6 > destination->max_lod_u4_6)
+         destination->min_lod_u4_6 = destination->max_lod_u4_6;
+   }
 
    /* MS fetch has no sampler object state. NNCOORDS/SNO in the shader
     * select integer texels and one sample; neutral sampler words are merely
@@ -10456,7 +10522,8 @@ pvrgpu_capture_fragment_images(const struct pvrgpu_context *ctx,
             stage == MESA_SHADER_TESS_CTRL ? ctx->tcs :
             stage == MESA_SHADER_TESS_EVAL ? ctx->tes :
             stage == MESA_SHADER_GEOMETRY ? ctx->gs : ctx->fs;
-         const unsigned active = shader && shader->nir ? shader->nir->info.num_textures : 0;
+         const unsigned active = shader && shader->nir ?
+            BITSET_LAST_BIT(shader->nir->info.textures_used) : 0;
          for (unsigned texture = 0; texture < MIN2(active, ctx->num_sampler_views[stage]); ++texture)
             if (ctx->sampler_views[stage][texture] &&
                 ctx->sampler_views[stage][texture]->texture == view->resource)
@@ -11880,11 +11947,16 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
       pvrgpu_stage_uniform_dwords(ctx, MESA_SHADER_FRAGMENT);
    /* Gallium keeps unused sampler views bound when programs change.  Only
     * the descriptors the active shader addresses belong in its PCO ABI. */
-   const unsigned fragment_texture_count = ctx->fs->nir->info.num_textures;
-   const unsigned geometry_texture_count = ctx->gs ? ctx->gs->nir->info.num_textures : 0;
-   const unsigned vertex_texture_count = ctx->vs->nir->info.num_textures;
-   const unsigned control_texture_count = has_tessellation ? ctx->tcs->nir->info.num_textures : 0;
-   const unsigned evaluation_texture_count = has_tessellation ? ctx->tes->nir->info.num_textures : 0;
+   const unsigned fragment_texture_count =
+      BITSET_LAST_BIT(ctx->fs->nir->info.textures_used);
+   const unsigned geometry_texture_count = ctx->gs ?
+      BITSET_LAST_BIT(ctx->gs->nir->info.textures_used) : 0;
+   const unsigned vertex_texture_count =
+      BITSET_LAST_BIT(ctx->vs->nir->info.textures_used);
+   const unsigned control_texture_count = has_tessellation ?
+      BITSET_LAST_BIT(ctx->tcs->nir->info.textures_used) : 0;
+   const unsigned evaluation_texture_count = has_tessellation ?
+      BITSET_LAST_BIT(ctx->tes->nir->info.textures_used) : 0;
 
    char error[512] = {0};
    if (!ctx->pco_compiler) {
@@ -12334,6 +12406,8 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    command.position_output_count = binary.position_output_count;
    command.fragment_position_start = binary.fragment_position_start;
    command.fragment_position_count = binary.fragment_position_count;
+   command.fragment_position_uses_z = binary.fragment_position_uses_z;
+   command.fragment_position_uses_w = binary.fragment_position_uses_w;
    command.varying_output_start = binary.varying_output_start;
    command.varying_output_count = binary.varying_output_count;
    command.fragment_varying_start = binary.fragment_varying_start;
@@ -12670,6 +12744,9 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
              captured->max_lod_u4_6,
              captured->layers,
              pvrgpu_sequence_texture_addrmode(captured->wrap_w)) ||
+          !pvrgpu_set_texture_descriptor_lod_window(
+             &shared_words[descriptor_start], captured->min_lod_u4_6,
+             captured->max_lod_u4_6) ||
           !pvrgpu_pco_set_texture_sample_count(
              &shared_words[descriptor_start], captured->sample_count)) {
          pvrgpu_counter_eventf("draw_array_primitive_record_error",
@@ -13179,6 +13256,8 @@ pvrgpu_emit_texture_pco_command(
    command.position_output_count = binary.position_output_count;
    command.fragment_position_start = binary.fragment_position_start;
    command.fragment_position_count = binary.fragment_position_count;
+   command.fragment_position_uses_z = binary.fragment_position_uses_z;
+   command.fragment_position_uses_w = binary.fragment_position_uses_w;
    command.varying_output_start = binary.varying_output_start;
    command.varying_output_count = binary.varying_output_count;
    command.fragment_varying_start = binary.fragment_varying_start;
@@ -13381,6 +13460,8 @@ pvrgpu_emit_ideas_pco_command(
    command.position_output_count = binary->position_output_count;
    command.fragment_position_start = binary->fragment_position_start;
    command.fragment_position_count = binary->fragment_position_count;
+   command.fragment_position_uses_z = binary->fragment_position_uses_z;
+   command.fragment_position_uses_w = binary->fragment_position_uses_w;
    command.varying_output_start = binary->varying_output_start;
    command.varying_output_count = binary->varying_output_count;
    command.fragment_varying_start = binary->fragment_varying_start;
@@ -13887,7 +13968,8 @@ pvrgpu_draw_is_lowerable_array_primitive(
    }
    /* Extended pre-raster pipelines reserve a separate VS ABI. Keep their
     * existing gate until that pipeline also allocates VS descriptors. */
-   const unsigned vertex_texture_count = ctx->vs->nir->info.num_textures;
+   const unsigned vertex_texture_count =
+      BITSET_LAST_BIT(ctx->vs->nir->info.textures_used);
    if (vertex_texture_count != 0 && (ctx->gs || ctx->tcs || ctx->tes)) {
       *reason = "extended_vertex_texture";
       if (detail && detail_size) {
@@ -13896,10 +13978,14 @@ pvrgpu_draw_is_lowerable_array_primitive(
       }
       return false;
    }
-   const unsigned fragment_texture_count = ctx->fs->nir->info.num_textures;
-   const unsigned geometry_texture_count = ctx->gs ? ctx->gs->nir->info.num_textures : 0;
-   const unsigned control_texture_count = ctx->tcs ? ctx->tcs->nir->info.num_textures : 0;
-   const unsigned evaluation_texture_count = ctx->tes ? ctx->tes->nir->info.num_textures : 0;
+   const unsigned fragment_texture_count =
+      BITSET_LAST_BIT(ctx->fs->nir->info.textures_used);
+   const unsigned geometry_texture_count = ctx->gs ?
+      BITSET_LAST_BIT(ctx->gs->nir->info.textures_used) : 0;
+   const unsigned control_texture_count = ctx->tcs ?
+      BITSET_LAST_BIT(ctx->tcs->nir->info.textures_used) : 0;
+   const unsigned evaluation_texture_count = ctx->tes ?
+      BITSET_LAST_BIT(ctx->tes->nir->info.textures_used) : 0;
    if (fragment_texture_count > PVRGPU_PCO_MAX_TEXTURES ||
        geometry_texture_count > PVRGPU_PCO_MAX_TEXTURES ||
        vertex_texture_count > PVRGPU_PCO_MAX_TEXTURES ||
@@ -16225,6 +16311,8 @@ pvrgpu_launch_grid(struct pipe_context *pipe,
              captured->mip_filter, pvrgpu_sequence_texture_addrmode(captured->wrap_u),
              pvrgpu_sequence_texture_addrmode(captured->wrap_v), captured->max_lod_u4_6,
              captured->layers, pvrgpu_sequence_texture_addrmode(captured->wrap_w)) ||
+          !pvrgpu_set_texture_descriptor_lod_window(
+             descriptor, captured->min_lod_u4_6, captured->max_lod_u4_6) ||
           !pvrgpu_pco_set_texture_sample_count(descriptor, captured->sample_count))
          goto fail;
       if (captured->texture_kind == 1U) {

@@ -87,7 +87,7 @@ static_assert(std::is_trivially_copyable_v<PcoTemporaryMask>);
  * transported shared-register span are independent bounds.  The captured
  * terrain main draw transports 56 VS push DWORDs plus two descriptors (96
  * total), and 64 FS push DWORDs plus five descriptors (164 total). The
- * descriptor bound is derived from the fragment transport's 256 DWORDs.
+ * descriptor bound is derived from the graphics transport's 384 DWORDs.
  * Stage-specific prefixes and shared budgets still apply. These are current
  * public workload/transport gates, not Rogue hardware-file limits. */
 inline constexpr std::size_t kPcoTextureDescriptorDwordCount = 20;
@@ -98,12 +98,15 @@ inline constexpr std::size_t kPcoMaximumTextureDescriptorSets =
  * continuation per resident lane: their static SMP count is not continuation
  * depth and must not inherit this vertex-only program bound. */
 inline constexpr std::size_t kPcoMaximumVertexTextureSampleInstructions = 9;
-inline constexpr std::size_t kPcoMaximumVertexSharedCount = 96;
-inline constexpr std::size_t kPcoMaximumFragmentSharedCount = 256;
+inline constexpr std::size_t kPcoMaximumVertexSharedCount =
+    PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE;
+inline constexpr std::size_t kPcoMaximumFragmentSharedCount =
+    PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE;
 inline constexpr std::size_t kPcoMaximumSharedCount =
     kPcoMaximumFragmentSharedCount;
-static_assert(kPcoMaximumTextureDescriptorSets ==
-              kPcoMaximumFragmentSharedCount / kPcoTextureDescriptorDwordCount);
+static_assert(kPcoMaximumTextureDescriptorSets *
+                  kPcoTextureDescriptorDwordCount <=
+              kPcoMaximumFragmentSharedCount);
 inline constexpr std::size_t kPcoConditionalsVertexSharedCount = 16;
 inline constexpr std::size_t kPcoConditionalsFragmentSharedCount = 4;
 inline constexpr std::size_t kPcoFillTexNearestCoefficientCount = 12;
@@ -301,6 +304,9 @@ enum class PcoWriteTarget : std::uint8_t {
   kTemporary,
   // PCO register allocation reuses dead vertex-input registers for ALU values.
   kVertexInput,
+  // Address registers used by native indexed SH references above SH255.
+  kIndex0,
+  kIndex1,
 };
 
 enum class PcoIterationMode : std::uint8_t {
@@ -429,6 +435,11 @@ struct PcoInstruction {
   std::uint8_t texture_lod_bias = 0;
   // SMP CHAN1/RAWDATA: four component-0 taps, not a filtered RGBA texel.
   std::uint8_t texture_gather = 0;
+  // The driver leaves an unreachable compare-op==255 select after SMP so the
+  // decoded binary retains this lane's Dref. TextureUnit consumes Dref and
+  // performs compare-before-filter PCF; the select then passes that result.
+  std::uint8_t texture_shadow_compare = 0;
+  PcoRegisterRef texture_shadow_reference{};
   std::uint8_t data_request = 0;
   PcoIterationMode iteration_mode = PcoIterationMode::kPixel;
   std::uint8_t perspective = 0;
@@ -603,6 +614,8 @@ struct PcoTextureRequest {
   std::uint32_t lod_bias = 0;
   std::uint8_t lod_bias_present = 0;
   std::uint8_t gather = 0;
+  std::uint32_t shadow_reference = 0;
+  std::uint8_t shadow_compare = 0;
 };
 
 /* Complete lane-local vertex state captured immediately after an SMP request.
@@ -675,6 +688,7 @@ struct PcoVertexExecutionContext {
 struct PcoFragmentContinuation {
   std::array<std::uint32_t, kPcoTemporaryCount> temporaries{};
   PcoTemporaryMask temporary_written_mask{};
+  std::array<std::uint32_t, 2> index_registers{};
   std::uint32_t program_binary_size = 0;
   std::uint32_t program_instruction_count = 0;
   std::uint64_t program_signature = 0;
@@ -683,6 +697,7 @@ struct PcoFragmentContinuation {
   std::uint8_t pending_component_count = 0;
   std::uint8_t data_request = 0;
   std::uint8_t valid = 0;
+  std::uint8_t index_register_valid_mask = 0;
   // Zero is the original SMP/WDF checkpoint; one is a quad derivative.
   std::uint8_t kind = 0;
   std::array<std::uint32_t, kPcoPixelOutputCount> pixel_outputs{};

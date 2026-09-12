@@ -54,6 +54,9 @@ array_coordinate_fragment(unsigned kind)
    nir_store_var(&b, out, value, 15);
    nir_jump(&b, nir_jump_return);
    nir_shader_gather_info(b.shader, b.impl);
+   /* These synthetic texture instructions use fixed indices without deref
+    * sources; mirror the resource bitmap carried by linked Mesa NIR. */
+   BITSET_SET(b.shader->info.textures_used, 0);
    return b.shader;
 }
 
@@ -120,6 +123,8 @@ many_textures_fragment(unsigned textures, unsigned last_uniform_slot)
    nir_store_var(&b, out, sum, 15);
    nir_jump(&b, nir_jump_return);
    nir_shader_gather_info(b.shader, b.impl);
+   for (unsigned slot = 0; slot < textures; ++slot)
+      BITSET_SET(b.shader->info.textures_used, slot);
    b.shader->info.num_ubos = 1;
    require(b.shader->info.num_textures == textures, "every declared texture is used");
    return b.shader;
@@ -156,8 +161,11 @@ compile_many_textures(struct pvrgpu_pco_compiler *compiler, unsigned textures,
       require(binary.fragment.cb0_word_map.count == (packed ? push_words : 0) &&
               binary.fragment.cb0_word_map.source_dwords == (packed ? uniform_words : 0),
               "only formerly overflowing CB0 uses driver-private word packing");
-      require(binary.fragment.abi.shareds <= 256 && binary.vertex.abi.shareds <= 96,
-              "physical fragment/vertex bank capacities stay unchanged");
+      require(binary.fragment.abi.shareds <=
+                 PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE &&
+              binary.vertex.abi.shareds <=
+                 PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE,
+              "graphics stages stay inside the public shared transport");
       save_stage(fixture_number, "vs", &binary.vertex);
       save_stage(fixture_number, "fs", &binary.fragment);
    }
@@ -306,8 +314,12 @@ int main(void)
 {
    require(PVRGPU_PCO_MAX_TEXTURES == PVRGPU_SYSTEMC_MAX_PCO_TEXTURES_PER_STAGE,
            "compiler and transport use the same descriptor cap");
-   require(PVRGPU_PCO_MAX_TEXTURES == 12 && 12 * 20 <= 256 && 13 * 20 > 256,
-           "descriptor cap comes from physical shared-register capacity");
+   require(PVRGPU_PCO_MAX_TEXTURES == 16 &&
+              16 * 20 <=
+                 PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE &&
+              17 * 20 <=
+                 PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE,
+           "descriptor cap carries the GLES3 sixteen-unit minimum");
    glsl_type_singleton_init_or_ref();
    cube_array_descriptor_tests();
 #ifdef PVRGPU_MANY_TEXTURES_DIRECT_HELPER
@@ -321,12 +333,13 @@ int main(void)
    compile_many_textures(compiler, 9, 56, 13, 240, NULL, 609);
    compile_many_textures(compiler, 12, 8, 1, 252, NULL, 612);
    compile_many_textures(compiler, 12, 12, 2, 256, NULL, 613);
-   compile_many_textures(compiler, 13, 8, 1, 0, "texture count is unsupported", 0);
-   /* Sparse high-slot loads now pack their seven live words without losing
-    * any descriptor or changing the previously fitting 609/612/613 bytes.
-    * Genuine >256 live-word rejection is in packed_uniforms cases 901-903. */
-   compile_many_textures(compiler, 12, 16, 3, 251, NULL, 614);
-   compile_many_textures(compiler, 12, 56, 13, 251, NULL, 615);
+   compile_many_textures(compiler, 16, 8, 1, 332, NULL, 616);
+   compile_many_textures(compiler, 17, 8, 1, 0, "texture count is unsupported", 0);
+   /* These formerly overflowing 256-DWORD cases now fit the 384-DWORD
+    * transport without packing. The current SH383/384/fallback edges are
+    * covered by packed_uniforms. */
+   compile_many_textures(compiler, 12, 16, 3, 260, NULL, 614);
+   compile_many_textures(compiler, 12, 56, 13, 300, NULL, 615);
    pvrgpu_pco_compiler_destroy(compiler);
    glsl_type_singleton_decref();
    printf("many texture compiler PASS: %u checks\n", checks);

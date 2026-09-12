@@ -1974,6 +1974,8 @@ void Submitter::RunJob() {
           command.fragment_position_start;
       state.fragment_position_count =
           command.fragment_position_count;
+      state.fragment_position_uses_z = command.fragment_position_uses_z;
+      state.fragment_position_uses_w = command.fragment_position_uses_w;
       state.varying_output_start =
           command.varying_output_start;
       state.varying_output_count =
@@ -2504,7 +2506,8 @@ void Submitter::RunJob() {
     state.vertex_attribute_bindings = StoreNewArray(pool_, bindings);
     if (shader_varyings) {
       if (varying_count == 0 &&
-          VaryingCoefficientDwordCount(state) != kCoefficientSetDwordCount)
+          VaryingCoefficientDwordCount(state) !=
+              state.fragment_position_count)
         throw std::runtime_error("Submitter varying count is invalid");
       std::vector<ShaderVaryingBinding> linkages;
       linkages.reserve(varying_count);
@@ -2514,7 +2517,8 @@ void Submitter::RunJob() {
           const auto &b = command.varying_bindings.at(varying);
           linkage.vertex_output_base = static_cast<std::uint16_t>(b.output_dword);
           linkage.coefficient_set_base = static_cast<std::uint16_t>(b.coefficient_dword / 4);
-          linkage.w_coefficient_set = 0;
+          linkage.w_coefficient_set = static_cast<std::uint16_t>(
+              command.fragment_position_uses_z ? 1U : 0U);
           linkage.component_count = static_cast<std::uint8_t>(b.num_components);
         } else if (driver_pco_triangles) {
           const std::uint32_t component_offset =

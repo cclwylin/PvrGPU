@@ -205,6 +205,8 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    caps->max_texture_3d_levels = 9;
    caps->max_texture_array_layers = 256;
    caps->max_texture_cube_levels = 13;
+   /* GLES 3.x requires GL_MAX_TEXTURE_LOD_BIAS to be at least 2.0. */
+   caps->max_texture_lod_bias = 2.0f;
    caps->max_render_targets = 8;
    caps->max_constant_buffer_size = 64 * 1024;
    caps->constant_buffer_offset_alignment = 16;

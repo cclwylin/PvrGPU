@@ -274,6 +274,8 @@ struct pvrgpu_draw_pco_triangles_command {
    uint32_t position_output_count;
    uint32_t fragment_position_start;
    uint32_t fragment_position_count;
+   uint32_t fragment_position_uses_z;
+   uint32_t fragment_position_uses_w;
    uint32_t varying_output_start;
    uint32_t varying_output_count;
    uint32_t fragment_varying_start;

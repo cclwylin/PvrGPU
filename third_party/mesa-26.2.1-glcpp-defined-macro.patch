@@ -1,0 +1,42 @@
+diff --git a/src/compiler/glsl/glcpp/glcpp-parse.y b/src/compiler/glsl/glcpp/glcpp-parse.y
+index 67ff935..ed0f559 100644
+--- a/src/compiler/glsl/glcpp/glcpp-parse.y
++++ b/src/compiler/glsl/glcpp/glcpp-parse.y
+@@ -2020,2 +2020,6 @@ _glcpp_parser_expand_node(glcpp_parser_t *parser, token_node_t *node,
+-   /* We only expand identifiers */
+-   if (token->type != IDENTIFIER) {
++   /* Outside #if/#elif, a token spelled `defined` is an ordinary macro name.
++    * The lexer gives it a dedicated token so conditionals can recognize the
++    * operator; in ordinary expansion it must still be able to name a macro. */
++   const bool ordinary_defined_macro =
++      token->type == DEFINED && mode == EXPANSION_MODE_IGNORE_DEFINED;
++   if (token->type != IDENTIFIER && !ordinary_defined_macro) {
+@@ -2026 +2030 @@ _glcpp_parser_expand_node(glcpp_parser_t *parser, token_node_t *node,
+-   identifier = token->value.str;
++   identifier = ordinary_defined_macro ? "defined" : token->value.str;
+@@ -2056 +2060 @@ _glcpp_parser_expand_node(glcpp_parser_t *parser, token_node_t *node,
+-      str = linear_strdup(parser->linalloc, token->value.str);
++      str = linear_strdup(parser->linalloc, identifier);
+@@ -2184,4 +2187,0 @@ _glcpp_parser_expand_token_list(glcpp_parser_t *parser, token_list_t *list,
+-         if (mode == EXPANSION_MODE_EVALUATE_DEFINED) {
+-            _glcpp_parser_evaluate_defined_in_list (parser, expansion);
+-         }
+-
+@@ -2193 +2193,3 @@ _glcpp_parser_expand_token_list(glcpp_parser_t *parser, token_list_t *list,
+-         _parser_active_list_push(parser, node->token->value.str, last->next);
++         const char *active_identifier =
++            node->token->type == DEFINED ? "defined" : node->token->value.str;
++         _parser_active_list_push(parser, active_identifier, last->next);
+@@ -2213,0 +2216,5 @@ _glcpp_parser_expand_token_list(glcpp_parser_t *parser, token_list_t *list,
++         /* A macro can produce the `defined` operator.  Evaluate it only
++          * after splicing, while its following argument still exists in the
++          * complete token list and has not itself been macro-expanded. */
++         if (mode == EXPANSION_MODE_EVALUATE_DEFINED)
++            _glcpp_parser_evaluate_defined_in_list (parser, list);
+@@ -2271,3 +2278,3 @@ _check_for_reserved_macro_name(glcpp_parser_t *parser, YYLTYPE *loc,
+-   if (strcmp(identifier, "defined") == 0) {
+-      glcpp_error (loc, parser, "\"defined\" cannot be used as a macro name");
+-   }
++   /* `defined` is an operator only while evaluating a #if/#elif expression,
++    * not a reserved macro identifier.  GLES3 conformance deliberately
++    * defines and expands a macro with this spelling before evaluation. */

@@ -52,6 +52,23 @@ run_one_case() {
                                         env=env, capture_output=True, text=True, check=True)
                 self.assertEqual(result.stdout, expected)
 
+    def test_default_texture_lod_mode_is_exact_and_preserves_override(self) -> None:
+        line = next(line for line in RUNNER.read_text().splitlines()
+                    if line.startswith("export PVRGPU_TEXTURE_LOD_MODE="))
+        for value, expected in ((None, "exact"), ("", "exact"),
+                                ("exact", "exact"),
+                                ("llvmpipe", "llvmpipe")):
+            with self.subTest(value=value):
+                env = dict(os.environ)
+                env.pop("PVRGPU_TEXTURE_LOD_MODE", None)
+                if value is not None:
+                    env["PVRGPU_TEXTURE_LOD_MODE"] = value
+                result = subprocess.run(
+                    ["bash", "-c", line +
+                     '\nprintf "%s" "$PVRGPU_TEXTURE_LOD_MODE"'],
+                    env=env, capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

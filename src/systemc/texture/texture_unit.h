@@ -91,26 +91,30 @@ bool DriverPcoTextureDescriptorClassSupported(
 TextureImplicitLod ComputeTextureImplicitLod(
     const std::array<std::array<float, 2>, 4>& coordinates,
     const RogueTextureImageDescriptor& image,
-    const RogueTextureSamplerDescriptor& sampler);
+    const RogueTextureSamplerDescriptor& sampler,
+    bool exact_lod = false);
 TextureImplicitLod ComputeTextureExplicitLod(
     float level, const RogueTextureImageDescriptor &image,
     const RogueTextureSamplerDescriptor &sampler);
 TextureImplicitLod ComputeTexture3DImplicitLod(
     const std::array<std::array<float, 3>, 4> &coordinates,
     std::uint32_t depth, const RogueTextureImageDescriptor &image,
-    const RogueTextureSamplerDescriptor &sampler);
+    const RogueTextureSamplerDescriptor &sampler,
+    bool exact_lod = false);
 TextureImplicitLod ApplyTextureLodBias(
     const TextureImplicitLod &implicit, float bias,
     const RogueTextureImageDescriptor &image,
     const RogueTextureSamplerDescriptor &sampler,
-    bool undefined_cube_footprint = false);
+    bool undefined_cube_footprint = false,
+    bool exact_lod = false);
 // Cube directions use a common-face projection for implicit derivatives.
 // Undefined nonfinite footprints select minimum LOD, retaining raw derivative
 // fields for diagnostics; actual cube texel addressing is separately bounded.
 TextureImplicitLod ComputeTextureCubeImplicitLod(
     const std::array<std::array<float, 3>, 4> &directions,
     const RogueTextureImageDescriptor &image,
-    const RogueTextureSamplerDescriptor &sampler);
+    const RogueTextureSamplerDescriptor &sampler,
+    bool exact_lod = false);
 
 class TextureUnit final : public sc_core::sc_module {
  public:
@@ -160,7 +164,7 @@ class TextureUnit final : public sc_core::sc_module {
       upload_response{"upload_response"};
 
   TextureUnit(sc_core::sc_module_name name, MemoryPool& pool,
-              GpuMemorySystem *memory = nullptr);
+              GpuMemorySystem *memory = nullptr, bool exact_lod = false);
 
  private:
   void Run();
@@ -179,6 +183,7 @@ class TextureUnit final : public sc_core::sc_module {
 
   MemoryPool& pool_;
   GpuMemorySystem *memory_;
+  const bool exact_lod_;
   // All six shader-stage descriptor-set namespaces are independent. Residency is kept
   // within one PipelineState (including all of its SMP continuation rounds)
   // and reset when the next physical draw receives a new state handle.

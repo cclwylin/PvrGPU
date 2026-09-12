@@ -55,6 +55,21 @@ bool ParseMemoryMode(const char *text, MemoryMode *mode) {
   return false;
 }
 
+bool ParseTextureLodMode(const char *text, bool *exact) {
+  if (!text || !exact)
+    return false;
+  const std::string value(text);
+  if (value == "llvmpipe") {
+    *exact = false;
+    return true;
+  }
+  if (value == "exact") {
+    *exact = true;
+    return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 bool ParseOptions(int argc, char** argv, Options* options) {
@@ -64,11 +79,14 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       std::cout << "Usage: " << argv[0]
                 << " [--frames N] [--width N] [--height N] [--case NAME]"
                    " [--outdir PATH] [--memory-mode direct|bypass|cache]"
+                   " [--texture-lod-mode llvmpipe|exact]"
                    " [--cache-bypass on|off]"
                    " [--driver-command PATH]\n"
                    "  --memory-mode cache   Run SLC/DRAM simulation (default)\n"
                    "  --memory-mode bypass  Bypass cache but retain DRAM timing\n"
                    "  --memory-mode direct  Direct DRAM backing access (fast)\n"
+                   "  --texture-lod-mode exact     Conformance/hardware LOD math\n"
+                   "  --texture-lod-mode llvmpipe Capture/Play-compatible LOD math (default)\n"
                    "  --cache-bypass on|off Legacy alias for bypass|cache\n"
                    "  --driver-command PATH Ingest one pvrgpu.driver-command.v1 command\n";
       std::exit(0);
@@ -100,6 +118,12 @@ bool ParseOptions(int argc, char** argv, Options* options) {
         return false;
       }
       options->cache_bypass = options->memory_mode == MemoryMode::kBypass;
+    } else if (arg == "--texture-lod-mode") {
+      if (!ParseTextureLodMode(value, &options->exact_texture_lod)) {
+        std::cerr << "Invalid value for --texture-lod-mode: " << value
+                  << " (expected llvmpipe or exact)\n";
+        return false;
+      }
     } else if (arg == "--cache-bypass") {
       if (!ParseOnOff(value, &options->cache_bypass)) {
         std::cerr << "Invalid value for --cache-bypass: " << value

@@ -134,6 +134,16 @@ PBE independently maps shader NaNs to zero for normalized color conversion and
 clamps infinities to the UNORM endpoints; raw float/integer attachments retain
 their typed transport. Shader arithmetic itself is not rewritten.
 
+Implicit mip LOD has two explicit elaboration modes. `PVRGPU_TEXTURE_LOD_MODE=exact`
+uses `std::log2(rho^2) * 0.5` for conformance and future hardware/performance
+runs; `llvmpipe` uses the reference renderer's piecewise-linear fast-log2 for
+byte-exact Capture/Play comparison. The bridge defaults to `llvmpipe`, while
+`script/run_deqp_dynamic.sh` defaults to `exact`; either may be overridden
+explicitly. A mode is fixed when the SystemC session elaborates and cannot be
+changed between submissions in the same process. This setting changes only LOD
+math—descriptors, texture bytes, shader values, and expected images are not
+rewritten.
+
 Fragment USC register contexts and saved continuations have a bounded host
 working set of 256 complete quads. The scheduler runs every task, preserves
 global lane identity across texture FIFOs and writes results to the original

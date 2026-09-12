@@ -44,7 +44,7 @@ void VerifyGuardedPreviousVersionCommand(
   // API-v22 added alpha-to-sample state after the uniform-buffer list.
   // Reconstruct the aligned API-v21 byte extent, not a zeroed
   // current-size command whose readable tail would hide the invalid access.
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 33U,
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 35U,
                 "update the frozen API-v21 guard-page fixture on ABI changes");
   constexpr std::size_t kApi21Tail =
       offsetof(pvrgpu_systemc_driver_command, uniform_buffer_count) +
@@ -395,8 +395,8 @@ void VerifySequenceExternalTextureAllocation() {
 
 int main() {
   using namespace pvrgpu::stub;
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 33U,
-                "native sequence bridge test requires API-v33");
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 35U,
+                "native sequence bridge test requires API-v35");
   static_assert(PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS == 15U);
   static_assert(kDriverPcoMaximumTextureMipLevels == 15U);
   static_assert(kMaximumTextureMipLevels == 15U);
@@ -674,6 +674,7 @@ int main() {
     draw.varying_output_count = 1;
     draw.fragment_position_start = 0;
     draw.fragment_position_count = 4;
+    draw.fragment_position_uses_w = 1;
     draw.fragment_varying_start = 4;
     draw.fragment_varying_count = 4;
     draw.depth_format = kDriverPcoDepthFormatZ24X8Unorm;

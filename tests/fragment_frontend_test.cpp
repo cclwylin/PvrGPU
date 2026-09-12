@@ -40,12 +40,14 @@ int sc_main(int, char **) {
     derivative_layout.functional_case = FunctionalCase::kDriverPcoTriangles;
     derivative_layout.position_output_count = 4;
     derivative_layout.fragment_position_count = 4;
+    derivative_layout.fragment_position_uses_w = 1;
     derivative_layout.fragment_varying_start = 4;
     derivative_layout.fragment_pco_abi.coefficients = 4;
-    Check(!UsesShaderVaryings(derivative_layout) &&
+    Check(UsesShaderVaryings(derivative_layout) &&
               !UsesFragmentQuadLanes(derivative_layout) &&
-              VaryingCoefficientDwordCount(derivative_layout) == 0,
-          "legacy no-texture/no-derivative route changed");
+              VaryingVectorCount(derivative_layout) == 0 &&
+              VaryingCoefficientDwordCount(derivative_layout) == 4,
+          "position-only fragment coefficient route changed");
     derivative_layout.fragment_program_summary.uses_derivatives = 1;
     Check(UsesShaderVaryings(derivative_layout) &&
               UsesFragmentQuadLanes(derivative_layout) &&
@@ -53,6 +55,14 @@ int sc_main(int, char **) {
               VaryingCoefficientSetCount(derivative_layout) == 1 &&
               VaryingCoefficientDwordCount(derivative_layout) == 4,
           "derivative-only shader lost its declared position plane");
+    auto depth_and_reciprocal_w_layout = derivative_layout;
+    depth_and_reciprocal_w_layout.fragment_position_count = 8;
+    depth_and_reciprocal_w_layout.fragment_varying_start = 8;
+    depth_and_reciprocal_w_layout.fragment_pco_abi.coefficients = 8;
+    depth_and_reciprocal_w_layout.fragment_position_uses_z = 1;
+    Check(VaryingCoefficientSetCount(depth_and_reciprocal_w_layout) == 2 &&
+              VaryingCoefficientDwordCount(depth_and_reciprocal_w_layout) == 8,
+          "combined fragment depth and reciprocal-W planes lost their ABI layout");
     for (unsigned mutation = 0; mutation < 4; ++mutation) {
       auto invalid = derivative_layout;
       if (mutation == 0) invalid.fragment_position_start = 1;

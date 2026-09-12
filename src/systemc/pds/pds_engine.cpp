@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -95,8 +96,27 @@ void PdsEngine::Run() {
                   : HasPoolHandle(state.parameter_coefficients);
       if (!HasPoolHandle(state.shader_varying_bindings) ||
           (has_rasterizable_geometry && !has_coefficients)) {
-        throw std::runtime_error(
-            "PDS varying case has no linkage/coefficient payload");
+        std::ostringstream detail;
+        detail << "PDS varying case has no linkage/coefficient payload"
+               << "; linkage="
+               << HasPoolHandle(state.shader_varying_bindings)
+               << " rasterizable=" << has_rasterizable_geometry
+               << " coefficient_handle="
+               << HasPoolHandle(state.parameter_coefficients)
+               << " coefficient_address="
+               << state.parameter_coefficients_gpu_address
+               << " coefficient_bytes=" << state.parameter_coefficients_bytes
+               << " coefficient_sets="
+               << state.counters.parameter_coefficient_sets
+               << " parameter_count=" << parameters.size()
+               << " varying_vectors=" << VaryingVectorCount(state)
+               << " fragment_position_dwords="
+               << state.fragment_position_count
+               << " fragment_varying_dwords="
+               << state.fragment_varying_count
+               << " fragment_abi_coefficients="
+               << state.fragment_pco_abi.coefficients;
+        throw std::runtime_error(detail.str());
       }
       const std::vector<ShaderVaryingBinding> bindings =
           LoadArray<ShaderVaryingBinding>(pool_,
@@ -104,7 +124,8 @@ void PdsEngine::Run() {
       const std::uint32_t varying_count =
           VaryingVectorCount(state);
       if ((varying_count == 0 &&
-           VaryingCoefficientDwordCount(state) != kCoefficientSetDwordCount) ||
+           VaryingCoefficientDwordCount(state) !=
+               state.fragment_position_count) ||
           bindings.size() != varying_count) {
         throw std::runtime_error(
             "PDS varying linkage count is invalid");

@@ -481,7 +481,8 @@ void ParameterBuffer::Run() {
       const std::uint32_t varying_count =
           VaryingVectorCount(state);
       if ((varying_count == 0 &&
-           VaryingCoefficientDwordCount(state) != kCoefficientSetDwordCount) ||
+           VaryingCoefficientDwordCount(state) !=
+               state.fragment_position_count) ||
           varying_bindings.size() != varying_count) {
         throw std::runtime_error(
             "ParameterBuffer varying linkage count is invalid");
@@ -657,10 +658,35 @@ void ParameterBuffer::Run() {
               state.functional_case ==
                   FunctionalCase::kDriverTexturedTriangles ||
               IsDriverPcoTrianglesCase(state.functional_case);
-          coefficients[coefficient_base] =
-              llvmpipe_driver_plane
-                  ? BuildLlvmPipeDriverPlane(triangle, reciprocal_w)
-                  : BuildPlane(triangle, reciprocal_w);
+          bool position_uses_z = false;
+          bool position_uses_w = true;
+          if (IsDriverPcoTrianglesCase(state.functional_case)) {
+            position_uses_z = state.fragment_position_uses_z != 0;
+            position_uses_w = state.fragment_position_uses_w != 0;
+            /* Captures before API v34 exposed one position set and documented
+             * it as reciprocal-W. Keep those files replayable. */
+            if (!position_uses_z && !position_uses_w &&
+                state.fragment_position_count == kCoefficientSetDwordCount)
+              position_uses_w = true;
+            if (state.fragment_position_uses_z > 1 ||
+                state.fragment_position_uses_w > 1 ||
+                state.fragment_position_count !=
+                    kCoefficientSetDwordCount *
+                        ((position_uses_z ? 1U : 0U) +
+                         (position_uses_w ? 1U : 0U))) {
+              throw std::runtime_error(
+                  "ParameterBuffer position coefficient ABI is invalid");
+            }
+          }
+          std::size_t position_index = coefficient_base;
+          if (position_uses_z)
+            coefficients[position_index++] =
+                BuildLlvmPipeDriverPlane(triangle, triangle.window_z);
+          if (position_uses_w)
+            coefficients[position_index++] =
+                llvmpipe_driver_plane
+                    ? BuildLlvmPipeDriverPlane(triangle, reciprocal_w)
+                    : BuildPlane(triangle, reciprocal_w);
 
           for (const ShaderVaryingBinding &binding : varying_bindings) {
             for (std::uint8_t component = 0;

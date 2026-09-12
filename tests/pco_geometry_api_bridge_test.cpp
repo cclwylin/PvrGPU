@@ -141,7 +141,7 @@ void VerifyBinaryStages() {
 }
 
 void VerifyPreviousVersionGuard(Submission &submit) {
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 33);
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 35);
   constexpr auto previous_size = offsetof(pvrgpu_systemc_driver_command, geometry_pco);
   static_assert(previous_size % alignof(pvrgpu_systemc_driver_command) == 0);
 #if defined(_WIN32)
