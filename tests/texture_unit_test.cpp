@@ -915,6 +915,8 @@ class TextureMemoryResponder final : public sc_core::sc_module {
                 request.operation == MemoryOperation::kRead &&
                 request.client == MemoryClient::kTextureCache &&
                 request.payload_format == MemoryPayloadFormat::kLinearBytes &&
+                request.response_route !=
+                    pvrgpu::stub::MemoryResponseRoute::kNone &&
                 !HasPoolHandle(request.payload),
             "FIFO tap address and request identity");
       MemoryTxn response = request;

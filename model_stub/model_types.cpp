@@ -249,7 +249,12 @@ std::ostream& operator<<(std::ostream& stream, const MemoryTxn& txn) {
   return stream << "MemoryTxn(frame=" << txn.pipeline.frame
                 << ", state=" << txn.pipeline.state
                 << ", payload=" << txn.payload << ", address="
-                << txn.address << ", bytes=" << txn.bytes << ')';
+                << txn.address << ", bytes=" << txn.bytes
+                << ", request_id=" << txn.request_id
+                << ", response_route="
+                << static_cast<unsigned>(txn.response_route)
+                << ", batch_control="
+                << static_cast<unsigned>(txn.batch_control) << ')';
 }
 
 std::ostream& operator<<(std::ostream& stream, const CounterTxn& txn) {

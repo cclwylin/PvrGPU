@@ -174,6 +174,28 @@ namespace {
 
 constexpr std::uint32_t kPcoBufferTextureRowElements = 8192U;
 
+class ScopedPoolAllocation final {
+public:
+  ScopedPoolAllocation(MemoryPool &pool, std::size_t bytes) : pool_(&pool) {
+    if (bytes != 0)
+      handle_ = pool.Allocate(bytes);
+  }
+
+  ~ScopedPoolAllocation() {
+    if (HasPoolHandle(handle_))
+      pool_->Release(handle_);
+  }
+
+  ScopedPoolAllocation(const ScopedPoolAllocation &) = delete;
+  ScopedPoolAllocation &operator=(const ScopedPoolAllocation &) = delete;
+
+  PoolHandle handle() const noexcept { return handle_; }
+
+private:
+  MemoryPool *pool_;
+  PoolHandle handle_{};
+};
+
 std::uint32_t DebugFragmentCoordinate(const char *name,
                                       std::uint32_t fallback) {
   const char *value = DiagnosticEnvironment(name);
@@ -1258,31 +1280,35 @@ TextureUnit::TextureUnit(sc_core::sc_module_name name, MemoryPool &pool,
 }
 
 void TextureUnit::SampleRun() {
-  SampleRunForStage(ShaderStage::kFragment, sample_input, sample_output);
+  SampleRunForStage(ShaderStage::kFragment, sample_input, sample_output,
+                    fragment_cache_response);
 }
 
 void TextureUnit::VertexSampleRun() {
   SampleRunForStage(ShaderStage::kVertex, vertex_sample_input,
-                    vertex_sample_output);
+                    vertex_sample_output, vertex_cache_response);
 }
 
 void TextureUnit::GeometrySampleRun() {
   SampleRunForStage(ShaderStage::kGeometry, geometry_sample_input,
-                    geometry_sample_output);
+                    geometry_sample_output, geometry_cache_response);
 }
 
 void TextureUnit::ComputeSampleRun() {
-  SampleRunForStage(ShaderStage::kCompute, compute_sample_input, compute_sample_output);
+  SampleRunForStage(ShaderStage::kCompute, compute_sample_input,
+                    compute_sample_output, compute_cache_response);
 }
 
 void TextureUnit::TessellationControlSampleRun() {
   SampleRunForStage(ShaderStage::kTessellationControl, tessellation_control_sample_input,
-                   tessellation_control_sample_output);
+                    tessellation_control_sample_output,
+                    tessellation_control_cache_response);
 }
 
 void TextureUnit::TessellationEvaluationSampleRun() {
   SampleRunForStage(ShaderStage::kTessellationEvaluation, tessellation_evaluation_sample_input,
-                   tessellation_evaluation_sample_output);
+                    tessellation_evaluation_sample_output,
+                    tessellation_evaluation_cache_response);
 }
 
 void TextureUnit::SampleRunForStage(
@@ -1290,11 +1316,19 @@ void TextureUnit::SampleRunForStage(
     sc_core::sc_port<sc_core::sc_fifo_in_if<PipelineTxn>, 0,
                      sc_core::SC_ZERO_OR_MORE_BOUND> &sample_input_port,
     sc_core::sc_port<sc_core::sc_fifo_out_if<PipelineTxn>, 0,
-                     sc_core::SC_ZERO_OR_MORE_BOUND> &sample_output_port) {
+                     sc_core::SC_ZERO_OR_MORE_BOUND> &sample_output_port,
+    sc_core::sc_port<sc_core::sc_fifo_in_if<MemoryTxn>, 0,
+                     sc_core::SC_ZERO_OR_MORE_BOUND> &cache_response_port) {
   if (sample_input_port.size() == 0 || sample_output_port.size() == 0)
     return;
+  if (cache_response_port.size() != 0 && cache_response.size() != 0) {
+    throw std::runtime_error(
+        "TextureUnit has both routed and legacy cache response ports");
+  }
+  auto &selected_cache_response =
+      cache_response_port.size() != 0 ? cache_response_port : cache_response;
   if ((!memory_ || texture_memory_path_ == TextureMemoryPath::kCached) &&
-      (cache_request.size() == 0 || cache_response.size() == 0))
+      (cache_request.size() == 0 || selected_cache_response.size() == 0))
     return;
   if (!memory_ &&
       (upload_request.size() == 0 || upload_response.size() == 0))
@@ -1308,6 +1342,20 @@ void TextureUnit::SampleRunForStage(
     const bool compute_stage = shader_stage == ShaderStage::kCompute;
     const bool control_stage = shader_stage == ShaderStage::kTessellationControl;
     const bool evaluation_stage = shader_stage == ShaderStage::kTessellationEvaluation;
+    const MemoryResponseRoute response_route =
+        vertex_stage
+            ? MemoryResponseRoute::kTextureVertex
+            : fragment_stage
+                  ? MemoryResponseRoute::kTextureFragment
+                  : compute_stage
+                        ? MemoryResponseRoute::kTextureCompute
+                        : geometry_stage
+                              ? MemoryResponseRoute::kTextureGeometry
+                              : control_stage
+                                    ? MemoryResponseRoute::
+                                          kTextureTessellationControl
+                                    : MemoryResponseRoute::
+                                          kTextureTessellationEvaluation;
     const bool tessellation_stage = control_stage || evaluation_stage;
     const std::size_t stage_index = control_stage ? 4U : evaluation_stage ? 5U :
         compute_stage ? 3U : vertex_stage ? 0U : geometry_stage ? 2U : 1U;
@@ -2044,6 +2092,13 @@ void TextureUnit::SampleRunForStage(
 
     std::vector<TextureSampleResponse> responses;
     responses.reserve(requests.size());
+    const bool batched_cached_path =
+        memory_ && texture_memory_path_ == TextureMemoryPath::kCached;
+    // One caller-owned result slot is reused after each ordered member reply.
+    // TCU never retains it beyond that reply, so a whole lane batch needs one
+    // allocation instead of one allocation per physical texel tap.
+    ScopedPoolAllocation cached_texel_scratch(
+        pool_, batched_cached_path ? 16U : 0U);
     const bool debug_fragment =
         fragment_stage &&
         DiagnosticEnvironment("PVRGPU_SEQUENCE_DEBUG_FRAGMENT") != nullptr;
@@ -2363,8 +2418,21 @@ void TextureUnit::SampleRunForStage(
           memory_request.operation = MemoryOperation::kRead;
           memory_request.client = MemoryClient::kTextureCache;
           memory_request.payload_format = MemoryPayloadFormat::kLinearBytes;
+          memory_request.response_route = response_route;
+          if (batched_cached_path) {
+            memory_request.payload = cached_texel_scratch.handle();
+            memory_request.batch_control =
+                MemoryBatchControl::kTextureMember;
+          }
           cache_request->write(memory_request);
-          const MemoryTxn memory_response = cache_response->read();
+          const MemoryTxn memory_response = selected_cache_response->read();
+          const bool response_payload_matches =
+              batched_cached_path
+                  ? (memory_response.payload.slot ==
+                         memory_request.payload.slot &&
+                     memory_response.payload.generation ==
+                         memory_request.payload.generation)
+                  : HasPoolHandle(memory_response.payload);
           if (memory_response.pipeline.frame !=
                   memory_request.pipeline.frame ||
               memory_response.pipeline.sequence !=
@@ -2380,14 +2448,27 @@ void TextureUnit::SampleRunForStage(
               memory_response.operation != MemoryOperation::kRead ||
               memory_response.payload_format !=
                   MemoryPayloadFormat::kLinearBytes ||
-              !HasPoolHandle(memory_response.payload)) {
+              memory_response.response_route != response_route ||
+              memory_response.batch_control !=
+                  memory_request.batch_control ||
+              !response_payload_matches) {
             throw std::runtime_error("TextureUnit TCU response mismatch");
           }
-          fifo_payload =
-              LoadArray<std::uint8_t>(pool_, memory_response.payload);
-          pool_.Release(memory_response.payload);
-          payload = fifo_payload.data();
-          payload_size = fifo_payload.size();
+          if (batched_cached_path) {
+            const std::vector<std::uint8_t> &scratch =
+                pool_.Read(memory_response.payload);
+            if (scratch.size() != 16U)
+              throw std::runtime_error(
+                  "TextureUnit TCU scratch response has invalid size");
+            payload = scratch.data();
+            payload_size = fetch_bytes;
+          } else {
+            fifo_payload =
+                LoadArray<std::uint8_t>(pool_, memory_response.payload);
+            pool_.Release(memory_response.payload);
+            payload = fifo_payload.data();
+            payload_size = fifo_payload.size();
+          }
         }
         if (payload_size != fetch_bytes)
           throw std::runtime_error("TextureUnit TCU texel size mismatch");
@@ -3085,6 +3166,39 @@ void TextureUnit::SampleRunForStage(
     if (texel_fetch_count != expected_texel_fetches) {
       throw std::runtime_error(
           "TextureUnit sample batch has invalid texel traffic");
+    }
+
+    if (batched_cached_path) {
+      MemoryTxn batch_end;
+      batch_end.pipeline = txn;
+      // For an end transaction request_id is the expected member count, and
+      // payload echoes the batch's borrowed scratch token. This makes a
+      // missing/extra member or cross-batch response fail closed at the TCU.
+      batch_end.payload = cached_texel_scratch.handle();
+      batch_end.request_id = texel_fetch_count;
+      batch_end.operation = MemoryOperation::kRead;
+      batch_end.client = MemoryClient::kTextureCache;
+      batch_end.payload_format = MemoryPayloadFormat::kLinearBytes;
+      batch_end.response_route = response_route;
+      batch_end.batch_control = MemoryBatchControl::kTextureEnd;
+      cache_request->write(batch_end);
+      const MemoryTxn batch_ack = selected_cache_response->read();
+      if (batch_ack.pipeline.frame != batch_end.pipeline.frame ||
+          batch_ack.pipeline.sequence != batch_end.pipeline.sequence ||
+          batch_ack.pipeline.state.slot != batch_end.pipeline.state.slot ||
+          batch_ack.pipeline.state.generation !=
+              batch_end.pipeline.state.generation ||
+          batch_ack.request_id != batch_end.request_id ||
+          batch_ack.address != 0 || batch_ack.bytes != 0 ||
+          batch_ack.client != MemoryClient::kTextureCache ||
+          batch_ack.operation != MemoryOperation::kRead ||
+          batch_ack.payload_format != MemoryPayloadFormat::kLinearBytes ||
+          batch_ack.response_route != response_route ||
+          batch_ack.batch_control != MemoryBatchControl::kTextureEnd ||
+          batch_ack.payload.slot != batch_end.payload.slot ||
+          batch_ack.payload.generation != batch_end.payload.generation) {
+        throw std::runtime_error("TextureUnit TCU batch-end response mismatch");
+      }
     }
 
     state = LoadPipelineState(pool_, txn.state);

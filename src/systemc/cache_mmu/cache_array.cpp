@@ -361,6 +361,62 @@ std::uint64_t CacheArray::Flush(const CacheLineWrite &lower_write) {
   return flushed;
 }
 
+std::uint64_t CacheArray::FlushRange(
+    std::uint64_t address, std::size_t bytes,
+    const CacheLineWrite &lower_write) {
+  if (bytes == 0 || bypass_)
+    return 0;
+  if (bytes - 1 > std::numeric_limits<std::uint64_t>::max() - address)
+    throw std::overflow_error("CacheArray flush range overflows");
+
+  const std::uint64_t line_bytes = config_.line_size_bytes;
+  const std::uint64_t first_line = address - address % line_bytes;
+  const std::uint64_t final_address = address + bytes - 1;
+  const std::uint64_t final_line =
+      final_address - final_address % line_bytes;
+  std::uint64_t flushed = 0;
+  const auto write_back = [&](std::uint64_t line_address, Line &line) {
+    if (!line.dirty)
+      return;
+    WriteLower(line_address, line.data, lower_write);
+    line.dirty = false;
+    ++stats_.writebacks;
+    ++flushed;
+  };
+  const std::uint64_t range_lines =
+      (final_line - first_line) / line_bytes + 1U;
+  if (range_lines > line_count_) {
+    // A large render target may cover many times the physical SLC capacity.
+    // Inspect each resident tag once instead of walking every absent address
+    // in that virtual range.
+    for (std::size_t bank = 0; bank < config_.banks; ++bank) {
+      for (std::size_t set = 0; set < sets_per_bank_; ++set) {
+        auto &cache_set = sets_[bank * sets_per_bank_ + set];
+        for (Line &line : cache_set) {
+          if (!line.valid)
+            continue;
+          const std::uint64_t line_address =
+              ReconstructAddress(line.tag, bank, set);
+          if (line_address >= first_line && line_address <= final_line)
+            write_back(line_address, line);
+        }
+      }
+    }
+    return flushed;
+  }
+
+  for (std::uint64_t line_address = first_line;; line_address += line_bytes) {
+    const AddressFields fields = DecodeAddress(line_address);
+    const std::size_t way = FindWay(fields);
+    if (way != CacheLineAccess::kNoCacheIndex)
+      write_back(line_address,
+                 sets_[fields.bank * sets_per_bank_ + fields.set][way]);
+    if (line_address == final_line)
+      break;
+  }
+  return flushed;
+}
+
 void CacheArray::InvalidateAll() noexcept {
   for (auto &set : sets_) {
     for (Line &line : set) {

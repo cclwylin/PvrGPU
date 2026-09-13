@@ -55,6 +55,7 @@
 #include "shader/usc_cluster.h"
 #include "shader/usc_slot.h"
 #include "submitter.h"
+#include "texture/texture_response_router.h"
 #include "texture/texture_unit.h"
 
 #include <systemc>
@@ -769,6 +770,7 @@ private:
   MmuBif mmu_bif{"mmu_bif"};
   MixedCache mixed_cache{"mixed_cache", pool, cache_bypass_};
   TextureCache texture_cache{"texture_cache", pool, false, &memory};
+  TextureResponseRouter texture_response_router{"texture_response_router"};
   UscL2Cache usc_l2_cache{"usc_l2_cache", pool, cache_bypass_};
   OnChipFabric on_chip_fabric{"on_chip_fabric"};
   MemFabric mem_fabric{"mem_fabric"};
@@ -837,8 +839,20 @@ private:
 
   sc_core::sc_fifo<MemoryTxn> texture_unit_to_tcu{
       "texture_unit_to_tcu", ModelFifoDepth()};
-  sc_core::sc_fifo<MemoryTxn> tcu_to_texture_unit{
-      "tcu_to_texture_unit", ModelFifoDepth()};
+  sc_core::sc_fifo<MemoryTxn> tcu_to_texture_response_router{
+      "tcu_to_texture_response_router", ModelFifoDepth()};
+  sc_core::sc_fifo<MemoryTxn> texture_response_to_vertex{
+      "texture_response_to_vertex", ModelFifoDepth()};
+  sc_core::sc_fifo<MemoryTxn> texture_response_to_fragment{
+      "texture_response_to_fragment", ModelFifoDepth()};
+  sc_core::sc_fifo<MemoryTxn> texture_response_to_compute{
+      "texture_response_to_compute", ModelFifoDepth()};
+  sc_core::sc_fifo<MemoryTxn> texture_response_to_geometry{
+      "texture_response_to_geometry", ModelFifoDepth()};
+  sc_core::sc_fifo<MemoryTxn> texture_response_to_tessellation_control{
+      "texture_response_to_tessellation_control", ModelFifoDepth()};
+  sc_core::sc_fifo<MemoryTxn> texture_response_to_tessellation_evaluation{
+      "texture_response_to_tessellation_evaluation", ModelFifoDepth()};
 
   sc_core::sc_fifo<MemoryTxn> idle_mcu_input{"idle_mcu_input",
                                              ModelFifoDepth()};
@@ -911,7 +925,16 @@ ModelSession::ModelSession(MemoryMode memory_mode, bool cache_bypass,
   texture_cache.input(idle_tcu_input);
   texture_cache.output(idle_tcu_output);
   texture_cache.sample_input(texture_unit_to_tcu);
-  texture_cache.sample_output(tcu_to_texture_unit);
+  texture_cache.sample_output(tcu_to_texture_response_router);
+  texture_response_router.input(tcu_to_texture_response_router);
+  texture_response_router.vertex_output(texture_response_to_vertex);
+  texture_response_router.fragment_output(texture_response_to_fragment);
+  texture_response_router.compute_output(texture_response_to_compute);
+  texture_response_router.geometry_output(texture_response_to_geometry);
+  texture_response_router.tessellation_control_output(
+      texture_response_to_tessellation_control);
+  texture_response_router.tessellation_evaluation_output(
+      texture_response_to_tessellation_evaluation);
   usc_l2_cache.input(idle_usc_l2_input);
   usc_l2_cache.output(idle_usc_l2_output);
 
@@ -981,7 +1004,14 @@ ModelSession::ModelSession(MemoryMode memory_mode, bool cache_bypass,
   texture_unit.tessellation_evaluation_sample_input(evaluation_to_texture_samples);
   texture_unit.tessellation_evaluation_sample_output(texture_samples_to_evaluation);
   texture_unit.cache_request(texture_unit_to_tcu);
-  texture_unit.cache_response(tcu_to_texture_unit);
+  texture_unit.vertex_cache_response(texture_response_to_vertex);
+  texture_unit.fragment_cache_response(texture_response_to_fragment);
+  texture_unit.compute_cache_response(texture_response_to_compute);
+  texture_unit.geometry_cache_response(texture_response_to_geometry);
+  texture_unit.tessellation_control_cache_response(
+      texture_response_to_tessellation_control);
+  texture_unit.tessellation_evaluation_cache_response(
+      texture_response_to_tessellation_evaluation);
   texture_unit.input(fragment_cluster_to_texture);
   texture_unit.output(texture_to_pbe);
   pbe.input(texture_to_pbe);

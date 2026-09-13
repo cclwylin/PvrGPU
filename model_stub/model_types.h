@@ -970,8 +970,38 @@ enum class MemoryPayloadFormat : std::uint8_t {
   kCacheLineWrites = 1,
 };
 
+// Identifies the sole consumer of a memory response. Texture requests from
+// independent shader-stage TPU workers share one ordered request path through
+// the TCU, but their responses must never race on one FIFO reader. The route
+// travels with the request through TCU/SLC/DRAM and is consumed by the response
+// router on the return path.
+enum class MemoryResponseRoute : std::uint8_t {
+  kNone = 0,
+  kTextureVertex,
+  kTextureFragment,
+  kTextureCompute,
+  kTextureGeometry,
+  kTextureTessellationControl,
+  kTextureTessellationEvaluation,
+};
+
+// Optional transaction grouping used by the active texture path. Members are
+// still serviced in FIFO order, but their cache/memory accounting and delay
+// are committed once by the matching end transaction. This removes per-texel
+// PipelineState copies and response allocations without changing cache access
+// order or total modeled cycles. kNone preserves the standalone/legacy memory
+// transaction contract.
+enum class MemoryBatchControl : std::uint8_t {
+  kNone = 0,
+  kTextureMember,
+  kTextureEnd,
+};
+
 // FIFO-visible memory transaction. Bulk data remains in MemoryPool and only
-// its generation-checked handle crosses a SystemC module boundary.
+// its generation-checked handle crosses a SystemC module boundary. A normal
+// read response payload is receiver-owned. For kTextureMember/kTextureEnd the
+// payload is instead a borrowed, TPU-owned 16-byte scratch token: every hop
+// echoes it and only the TPU releases it after the end acknowledgement.
 struct MemoryTxn {
   PipelineTxn pipeline;
   PoolHandle payload;
@@ -983,7 +1013,9 @@ struct MemoryTxn {
   MemoryOperation operation = MemoryOperation::kRead;
   MemoryClient client = MemoryClient::kFramebuffer;
   MemoryPayloadFormat payload_format = MemoryPayloadFormat::kLinearBytes;
-  std::uint8_t reserved[5]{};
+  MemoryResponseRoute response_route = MemoryResponseRoute::kNone;
+  MemoryBatchControl batch_control = MemoryBatchControl::kNone;
+  std::uint8_t reserved[3]{};
 };
 
 std::ostream &operator<<(std::ostream &stream, const MemoryTxn &txn);

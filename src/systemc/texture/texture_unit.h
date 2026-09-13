@@ -162,6 +162,29 @@ class TextureUnit final : public sc_core::sc_module {
   sc_core::sc_port<sc_core::sc_fifo_in_if<MemoryTxn>, 0,
                    sc_core::SC_ZERO_OR_MORE_BOUND>
       cache_response{"cache_response"};
+  // Production wiring gives every shader-stage worker its own return FIFO.
+  // `cache_response` above remains as a single-stage compatibility port for
+  // focused TextureUnit tests and legacy standalone harnesses.
+  sc_core::sc_port<sc_core::sc_fifo_in_if<MemoryTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND>
+      vertex_cache_response{"vertex_cache_response"};
+  sc_core::sc_port<sc_core::sc_fifo_in_if<MemoryTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND>
+      fragment_cache_response{"fragment_cache_response"};
+  sc_core::sc_port<sc_core::sc_fifo_in_if<MemoryTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND>
+      compute_cache_response{"compute_cache_response"};
+  sc_core::sc_port<sc_core::sc_fifo_in_if<MemoryTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND>
+      geometry_cache_response{"geometry_cache_response"};
+  sc_core::sc_port<sc_core::sc_fifo_in_if<MemoryTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND>
+      tessellation_control_cache_response{
+          "tessellation_control_cache_response"};
+  sc_core::sc_port<sc_core::sc_fifo_in_if<MemoryTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND>
+      tessellation_evaluation_cache_response{
+          "tessellation_evaluation_cache_response"};
   sc_core::sc_port<sc_core::sc_fifo_out_if<MemoryTxn>, 0,
                    sc_core::SC_ZERO_OR_MORE_BOUND>
       upload_request{"upload_request"};
@@ -187,7 +210,9 @@ class TextureUnit final : public sc_core::sc_module {
       sc_core::sc_port<sc_core::sc_fifo_in_if<PipelineTxn>, 0,
                        sc_core::SC_ZERO_OR_MORE_BOUND> &sample_input_port,
       sc_core::sc_port<sc_core::sc_fifo_out_if<PipelineTxn>, 0,
-                       sc_core::SC_ZERO_OR_MORE_BOUND> &sample_output_port);
+                       sc_core::SC_ZERO_OR_MORE_BOUND> &sample_output_port,
+      sc_core::sc_port<sc_core::sc_fifo_in_if<MemoryTxn>, 0,
+                       sc_core::SC_ZERO_OR_MORE_BOUND> &cache_response_port);
 
   MemoryPool& pool_;
   GpuMemorySystem *memory_;

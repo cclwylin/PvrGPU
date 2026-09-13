@@ -4,7 +4,9 @@
 // 4-bank、4-way array 採 write-back、write-allocate 與 true LRU。
 // FIFO 只傳 MemoryTxn；bulk texture data 留在 MemoryPool。SampleRun 處理
 // active TPU line reads：TCU miss 透過 SLC/DRAM 取回 64-byte line，填入
-// cache 後把 response handle 回傳 TPU；Run 仍保留給通用/cache unit 測試。
+// cache 後把結果寫入 TPU 借出的 16-byte batch scratch；batch end 才一次
+// 結算 PipelineState 與總延遲。Legacy request 仍回傳 TCU 配置的 response
+// handle；Run 保留給通用/cache unit 測試。
 #pragma once
 
 #include "cache_mmu/cache_array.h"
@@ -12,6 +14,8 @@
 #include "memory/gpu_memory_system.h"
 
 #include <systemc>
+
+#include <array>
 
 namespace pvrgpu::stub {
 
@@ -51,6 +55,18 @@ private:
   GpuMemorySystem *memory_;
   CacheArray cache_;
   CacheStats last_delta_;
+
+  struct PendingSampleBatch {
+    bool active = false;
+    PipelineTxn pipeline;
+    PoolHandle scratch;
+    std::uint64_t member_count = 0;
+    std::uint64_t service_cycles = 0;
+    CacheStats tcu;
+    MemoryAccessStats lower;
+  };
+  std::array<PendingSampleBatch, 6> pending_sample_batches_{};
+  sc_core::sc_time sample_service_ready_{sc_core::SC_ZERO_TIME};
 };
 
 } // namespace pvrgpu::stub

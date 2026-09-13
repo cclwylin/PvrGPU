@@ -125,6 +125,14 @@ public:
   // value is the number of dirty lines written by this call.
   std::uint64_t Flush(const CacheLineWrite &lower_write = {});
 
+  // Write back only dirty lines intersecting [address, address + bytes), and
+  // leave every matching line clean and resident.  Unlike InvalidateRange(),
+  // this is modeled GPU-side resource-barrier maintenance: writebacks update
+  // the lifetime statistics and are returned to the caller for lower-level
+  // traffic/timing accounting.  It performs no ordinary line access.
+  std::uint64_t FlushRange(std::uint64_t address, std::size_t bytes,
+                           const CacheLineWrite &lower_write = {});
+
   // Switching bypass on flushes dirty lines and invalidates every line.  This
   // prevents stale cache contents when bypass is later switched off.  Returns
   // the number of dirty lines written during the transition.

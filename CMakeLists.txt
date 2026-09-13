@@ -603,6 +603,19 @@ target_link_libraries(systemc-api-bridge-test PRIVATE
 pvrgpu_target_warnings(systemc-api-bridge-test)
 add_test(NAME systemc-api-bridge-unit COMMAND systemc-api-bridge-test)
 
+add_executable(systemc-api-texture-cache-coherence-test
+    tests/systemc_api_texture_cache_coherence_test.cpp
+)
+target_include_directories(systemc-api-texture-cache-coherence-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/gallium/drivers/pvrgpu"
+)
+target_link_libraries(systemc-api-texture-cache-coherence-test PRIVATE
+    pvrgpu-systemc-bridge
+)
+pvrgpu_target_warnings(systemc-api-texture-cache-coherence-test)
+add_test(NAME systemc-api-texture-cache-coherence-unit
+    COMMAND systemc-api-texture-cache-coherence-test)
+
 add_executable(systemc-readback-flush-test
     tests/systemc_readback_flush_test.cpp
 )
@@ -1130,6 +1143,27 @@ target_include_directories(cache-controller-test PRIVATE
 target_link_libraries(cache-controller-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(cache-controller-test)
 add_test(NAME cache-controller-unit COMMAND cache-controller-test)
+
+add_executable(texture-cached-pipeline-test
+    tests/texture_cached_pipeline_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/cache_mmu/texture_cache.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/glbench_texture_fixture.cpp
+    src/systemc/common/pipeline_state.cpp
+    src/systemc/texture/astc_decoder.cpp
+    src/systemc/texture/texture_filter.cpp
+    src/systemc/texture/texture_unit.cpp
+)
+target_include_directories(texture-cached-pipeline-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(texture-cached-pipeline-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(texture-cached-pipeline-test)
+add_test(NAME texture-cached-pipeline-unit COMMAND texture-cached-pipeline-test)
 
 add_executable(texture-unit-test
     tests/texture_unit_test.cpp

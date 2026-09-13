@@ -77,6 +77,13 @@ class GpuMemorySystem final {
                                    std::size_t bytes, MemoryClient client);
   MemoryAccessStats Write(std::uint64_t address, const void *source,
                           std::size_t bytes, MemoryClient client);
+  // Resource-barrier maintenance for consumers that deliberately bypass the
+  // SLC (notably the default short texture path).  In cache mode this commits
+  // only dirty SLC lines intersecting the resource, leaving them resident and
+  // returning the real writeback traffic once per barrier.  Other modes are
+  // already backing-coherent and return no traffic.
+  MemoryAccessStats MaterializeRange(std::uint64_t address,
+                                     std::size_t bytes);
   MemoryReadResult Readback(std::uint64_t address, std::size_t bytes,
                             MemoryClient client);
   MemoryAccessStats Flush();

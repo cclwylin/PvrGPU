@@ -365,6 +365,22 @@ MemoryAccessStats GpuMemorySystem::Write(std::uint64_t address,
   return result;
 }
 
+MemoryAccessStats GpuMemorySystem::MaterializeRange(std::uint64_t address,
+                                                     std::size_t bytes) {
+  MemoryAccessStats result;
+  if (bytes == 0 || mode_ != MemoryMode::kCache)
+    return result;
+  const CacheLineWrite write_lower = [&](std::uint64_t line_address,
+                                         const CacheLineData &data) {
+    backing_.Write(line_address, data.data(), data.size());
+    AddDramWrite(result, data.size());
+  };
+  const CacheStats before = slc_.stats();
+  (void)slc_.FlushRange(address, bytes, write_lower);
+  result.slc = slc_.stats() - before;
+  return result;
+}
+
 MemoryReadResult GpuMemorySystem::Readback(std::uint64_t address,
                                            std::size_t bytes,
                                            MemoryClient client) {

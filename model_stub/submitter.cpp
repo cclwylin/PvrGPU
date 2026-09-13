@@ -45,6 +45,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace pvrgpu::stub {
@@ -1584,6 +1585,37 @@ void Submitter::RunJob() {
       if (!memory_)
         throw std::runtime_error(
             "Submitter PCO sequence requires unified GPU memory");
+      // The short texture route intentionally bypasses the SLC for every
+      // texel.  Commit a GPU-produced resource once at this command's
+      // dependency barrier, before either validation or sampling reads the
+      // authoritative backing.  Repeated descriptor views of the exact same
+      // resource share the maintenance operation; doing this in TextureUnit
+      // would incorrectly flush on every tap.
+      std::vector<std::pair<std::uint64_t, std::size_t>>
+          materialized_texture_resources;
+      const auto materialize_short_texture =
+          [&](const DriverPcoSampledTexture &texture,
+              std::uint64_t address) {
+            if (options_.texture_memory_path != TextureMemoryPath::kShort)
+              return;
+            if (texture.declared_bytes_size == 0 ||
+                texture.declared_bytes_size >
+                    std::numeric_limits<std::size_t>::max()) {
+              throw std::runtime_error(
+                  "Submitter sampled resource barrier range is invalid");
+            }
+            const auto range = std::make_pair(
+                address,
+                static_cast<std::size_t>(texture.declared_bytes_size));
+            if (std::find(materialized_texture_resources.begin(),
+                          materialized_texture_resources.end(), range) !=
+                materialized_texture_resources.end()) {
+              return;
+            }
+            sequence_dependency_stats +=
+                memory_->MaterializeRange(range.first, range.second);
+            materialized_texture_resources.push_back(range);
+          };
       for (const DriverPcoSampledTexture &texture :
            command.sampled_textures) {
         const std::uint32_t samples = texture.sample_count ? texture.sample_count : 1U;
@@ -1613,6 +1645,7 @@ void Submitter::RunJob() {
             DriverPcoTextureSource::kPreviousColorAttachment) {
           const std::uint64_t address = sequence_color_addresses.at(
               texture.producer_command_index);
+          materialize_short_texture(texture, address);
           sequence_dependency_stats +=
               MaterializeSequenceColorMipChain(*memory_, texture, address);
           DebugSequenceResourceHashes(*memory_, submission, texture, address);
@@ -1620,6 +1653,7 @@ void Submitter::RunJob() {
                    DriverPcoTextureSource::kPreviousDepthAttachment) {
           const std::uint64_t address = sequence_depth_addresses.at(
               texture.producer_command_index);
+          materialize_short_texture(texture, address);
           if (!memory_->backing().Contains(
                   address,
                   static_cast<std::size_t>(texture.declared_bytes_size))) {

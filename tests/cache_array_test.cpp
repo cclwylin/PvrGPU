@@ -183,6 +183,49 @@ void TestWriteAllocateEvictionAndFlush() {
         "second flush does not rewrite clean lines");
 }
 
+void TestLargeRangeFlushScansResidentTags() {
+  CacheArray cache({"range-flush", 128, 16, 2, 1});
+  const CacheLineData outside = Pattern(16, 0x11);
+  const CacheLineData inside = Pattern(16, 0x55);
+  const CacheLineData final_boundary = Pattern(16, 0xa7);
+  (void)cache.WriteLine(0, outside);
+  (void)cache.WriteLine(32, inside);
+  (void)cache.WriteLine(144, final_boundary);
+
+  std::vector<std::pair<std::uint64_t, CacheLineData>> writes;
+  const auto write = [&](std::uint64_t address, const CacheLineData &data) {
+    writes.emplace_back(address, data);
+  };
+  const CacheStats before = cache.stats();
+  // [20, 145) intersects nine lines, more than this cache's eight resident
+  // lines. This selects the resident-tag scan rather than the address walk.
+  Check(cache.FlushRange(20, 125, write) == 2,
+        "large range flush writes two dirty resident lines");
+  Check(writes.size() == 2 &&
+            std::find(writes.begin(), writes.end(),
+                      std::make_pair(UINT64_C(32), inside)) != writes.end() &&
+            std::find(writes.begin(), writes.end(),
+                      std::make_pair(UINT64_C(144), final_boundary)) !=
+                writes.end(),
+        "resident scan reconstructs interior and final-boundary addresses");
+  const CacheStats after = cache.stats();
+  Check(after.writebacks == before.writebacks + 2 &&
+            after.line_accesses == before.line_accesses &&
+            after.read_accesses == before.read_accesses &&
+            after.write_accesses == before.write_accesses &&
+            after.hits == before.hits && after.misses == before.misses,
+        "range maintenance adds only writeback counters");
+  Check(cache.ReadLine(32).hit && cache.ReadLine(144).hit,
+        "large range flush leaves matching clean lines resident");
+  Check(cache.FlushRange(20, 125, write) == 0 && writes.size() == 2,
+        "repeating a large range does not rewrite clean lines");
+  Check(cache.ReadLine(0).hit && cache.Flush(write) == 1 &&
+            writes.back().first == 0 && writes.back().second == outside,
+        "dirty resident outside the range remains untouched");
+  ExpectFailure([&] { (void)cache.FlushRange(UINT64_MAX - 3, 8, write); },
+                "wrapping flush range");
+}
+
 void TestBypass() {
   CacheArray cache({"bypass", 64, 16, 2, 1}, true);
   std::uint64_t reads = 0;
@@ -362,6 +405,7 @@ int main() {
     TestBankMappingAndRangeDelta();
     TestTrueLru();
     TestWriteAllocateEvictionAndFlush();
+    TestLargeRangeFlushScansResidentTags();
     TestBypass();
     TestLineValidationAndResetStats();
     TestReadLineInto(false);

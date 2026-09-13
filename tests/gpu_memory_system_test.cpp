@@ -195,6 +195,62 @@ void TestFramebufferReadback() {
         "readback leaves authoritative backing populated");
 }
 
+void TestRangeMaterializationForShortTexturePath() {
+  constexpr std::uint64_t kAddress = UINT64_C(0x42000000);
+  GpuMemorySystem memory(MemoryMode::kCache);
+  const auto initial = Pattern(256, 0x19);
+  const auto first = Pattern(128, 0x71);
+  const auto second = Pattern(128, 0xc3);
+  memory.HostWrite(kAddress, initial.data(), initial.size());
+  (void)memory.Write(kAddress, first.data(), first.size(),
+                     MemoryClient::kFragmentImage);
+  (void)memory.Write(kAddress + 128, second.data(), second.size(),
+                     MemoryClient::kFramebuffer);
+
+  std::array<std::uint8_t, 16> direct{};
+  const auto stale = memory.ReadDirectInto(
+      kAddress + 24, direct.data(), direct.size(),
+      MemoryClient::kTextureCache);
+  Check(std::equal(direct.begin(), direct.end(), initial.begin() + 24) &&
+            stale.direct_read_bytes == direct.size(),
+        "short texture read exposes why a dirty resource needs a barrier");
+
+  const auto barrier = memory.MaterializeRange(kAddress + 24, direct.size());
+  Check(barrier.slc.writebacks == 1 &&
+            barrier.slc.line_accesses == 0 &&
+            barrier.dram_write_transactions == 1 &&
+            barrier.dram_write_bytes == 128 && barrier.dram_cycles == 1 &&
+            barrier.slc_cycles == 0,
+        "resource barrier writes exactly one intersecting dirty SLC line");
+  (void)memory.ReadDirectInto(kAddress + 24, direct.data(), direct.size(),
+                              MemoryClient::kTextureCache);
+  Check(std::equal(direct.begin(), direct.end(), first.begin() + 24),
+        "short texture read observes the materialized GPU store");
+
+  const auto resident = memory.Read(kAddress + 24, direct.size(),
+                                    MemoryClient::kTextureCache);
+  Check(resident.stats.slc.hits == 1 &&
+            resident.stats.dram_read_transactions == 0,
+        "range materialization leaves the clean SLC line resident");
+  const auto repeated =
+      memory.MaterializeRange(kAddress + 24, direct.size());
+  Check(Stats(repeated) == Stats(MemoryAccessStats{}),
+        "repeated descriptor views do not duplicate barrier traffic");
+
+  (void)memory.ReadDirectInto(kAddress + 128, direct.data(), direct.size(),
+                              MemoryClient::kTextureCache);
+  Check(std::equal(direct.begin(), direct.end(), initial.begin() + 128),
+        "range barrier does not globally flush a neighboring resource");
+  const auto neighbor = memory.MaterializeRange(kAddress + 128, 1);
+  Check(neighbor.slc.writebacks == 1 &&
+            neighbor.dram_write_transactions == 1,
+        "neighboring resource materializes at its own barrier");
+  (void)memory.ReadDirectInto(kAddress + 128, direct.data(), direct.size(),
+                              MemoryClient::kTextureCache);
+  Check(std::equal(direct.begin(), direct.end(), second.begin()),
+        "neighboring short texture becomes coherent after its barrier");
+}
+
 void TestFreshPartialStores(MemoryMode mode) {
   constexpr std::uint64_t kAddress = UINT64_C(0x800010000);
   GpuMemorySystem memory(mode);
@@ -426,6 +482,7 @@ int main() {
     TestBypass();
     TestCacheAndFlush();
     TestFramebufferReadback();
+    TestRangeMaterializationForShortTexturePath();
     TestFreshPartialStores(MemoryMode::kDirect);
     TestFreshPartialStores(MemoryMode::kBypass);
     TestFreshPartialStores(MemoryMode::kCache);
