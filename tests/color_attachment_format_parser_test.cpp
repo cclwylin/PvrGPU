@@ -50,14 +50,16 @@ int main(){
     const auto list=rgba+","+rgb10+","+bgr10+","+rgba;
     auto mixed=parse("color_attachment_format_count=4\ncolor_attachment_formats="+list+"\n",true);
     Check(mixed.color_attachment_formats==std::vector<std::string>{rgba,rgb10,bgr10,rgba},"exact owned ordered vector");
+    parse("color_attachment_format_count=4\ncolor_attachment_formats="+
+          rgba+",PIPE_FORMAT_R8_SNORM,PIPE_FORMAT_R16G16_FLOAT,PIPE_FORMAT_R11G11B10_FLOAT\n",
+          true);
     for(const std::string &count:{"0","1","3","5","-1","4294967296","four"})
       parse("color_attachment_format_count="+count+"\ncolor_attachment_formats="+list+"\n",false);
     parse("color_attachment_format_count=4\n",false);
     parse("color_attachment_formats="+list+"\n",false);
     for(const std::string &bad:{std::string{},list+",",","+list,rgba+",,"+bgr10+","+rgba,
          rgb10+","+rgb10+","+bgr10+","+rgba,rgba+","+rgb10+","+bgr10,
-         list+","+rgba,rgba+",PIPE_FORMAT_R32_UINT,"+bgr10+","+rgba,
-         rgba+",PIPE_FORMAT_R8G8B8A8_SRGB,"+bgr10+","+rgba,
+         list+","+rgba,rgba+",PIPE_FORMAT_R9G9B9E5_FLOAT,"+bgr10+","+rgba,
          rgba+", "+rgb10+","+bgr10+","+rgba})
       parse("color_attachment_format_count=4\ncolor_attachment_formats="+bad+"\n",false);
     parse("color_attachment_format_count=4\ncolor_attachment_formats="+list+"\ncolor_attachment_format_count=4\n",false);

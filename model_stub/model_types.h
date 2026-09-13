@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -130,9 +131,11 @@ struct DriverPcoSampledTexture {
   std::uint32_t normalized_coordinates = 0;
   std::uint32_t min_lod_u4_6 = 0;
   std::uint32_t max_lod_u4_6 = 0;
-  // 0=2D, 1=2DArray, 2=3D, 3=Cube, 4=CubeArray. CubeArray layers=6*cubes.
+  // 0=2D, 1=2DArray, 2=3D, 3=Cube, 4=CubeArray, 5=Buffer.
   std::uint32_t texture_kind = 0;
   std::uint32_t layers = 1;
+  // Exact logical texel count for Buffer; zero for image dimensions.
+  std::uint32_t buffer_elements = 0;
   // 每個 pixel 內依 sample 順序交錯；舊單 sample payload 保持原樣。
   std::uint32_t sample_count = 1;
 };
@@ -543,6 +546,17 @@ struct DriverCommand {
   std::uint32_t blend_destination_rgb_factor = 0;
   std::uint32_t blend_source_alpha_factor = 1;
   std::uint32_t blend_destination_alpha_factor = 0;
+  // A zero count preserves the legacy scalar state for every render target.
+  // Otherwise these arrays carry independent state for each active target.
+  std::uint32_t render_target_state_count = 0;
+  std::array<std::uint32_t, 4> color_masks{};
+  std::array<std::uint32_t, 4> blend_enables{};
+  std::array<std::uint32_t, 4> blend_rgb_equations{};
+  std::array<std::uint32_t, 4> blend_alpha_equations{};
+  std::array<std::uint32_t, 4> blend_source_rgb_factors{};
+  std::array<std::uint32_t, 4> blend_destination_rgb_factors{};
+  std::array<std::uint32_t, 4> blend_source_alpha_factors{};
+  std::array<std::uint32_t, 4> blend_destination_alpha_factors{};
   // glBlendColor as IEEE-754 float bit patterns R,G,B,A; read only when a
   // CONSTANT_* blend factor selects it.
   std::uint32_t blend_constant_color_bits[4] = {0, 0, 0, 0};
@@ -639,30 +653,101 @@ inline bool IsNormalizedFourByteColorFormat(std::string_view format) {
          format == "PIPE_FORMAT_B10G10R10A2_UNORM";
 }
 
+inline bool IsIntegerColorAttachmentTransportFormat(std::string_view format) {
+  return format == "PIPE_FORMAT_R8_UINT" ||
+         format == "PIPE_FORMAT_R8G8_UINT" ||
+         format == "PIPE_FORMAT_R8G8B8A8_UINT" ||
+         format == "PIPE_FORMAT_R16_UINT" ||
+         format == "PIPE_FORMAT_R16G16_UINT" ||
+         format == "PIPE_FORMAT_R16G16B16A16_UINT" ||
+         format == "PIPE_FORMAT_R32_UINT" ||
+         format == "PIPE_FORMAT_R32G32_UINT" ||
+         format == "PIPE_FORMAT_R32G32B32A32_UINT" ||
+         format == "PIPE_FORMAT_R10G10B10A2_UINT" ||
+         format == "PIPE_FORMAT_B10G10R10A2_UINT" ||
+         format == "PIPE_FORMAT_R8_SINT" ||
+         format == "PIPE_FORMAT_R8G8_SINT" ||
+         format == "PIPE_FORMAT_R8G8B8A8_SINT" ||
+         format == "PIPE_FORMAT_R16_SINT" ||
+         format == "PIPE_FORMAT_R16G16_SINT" ||
+         format == "PIPE_FORMAT_R16G16B16A16_SINT" ||
+         format == "PIPE_FORMAT_R32_SINT" ||
+         format == "PIPE_FORMAT_R32G32_SINT" ||
+         format == "PIPE_FORMAT_R32G32B32A32_SINT";
+}
+
 inline bool IsColorAttachmentTransportFormat(std::string_view format) {
   return IsNormalizedFourByteColorFormat(format) ||
+         format == "PIPE_FORMAT_R8_UNORM" ||
+         format == "PIPE_FORMAT_R8G8_UNORM" ||
+         format == "PIPE_FORMAT_R8G8B8X8_UNORM" ||
+         format == "PIPE_FORMAT_B8G8R8X8_UNORM" ||
+         format == "PIPE_FORMAT_R5G6B5_UNORM" ||
+         format == "PIPE_FORMAT_B5G6R5_UNORM" ||
+         format == "PIPE_FORMAT_R16_UNORM" ||
+         format == "PIPE_FORMAT_R16G16_UNORM" ||
+         format == "PIPE_FORMAT_R16G16B16A16_UNORM" ||
+         format == "PIPE_FORMAT_R32G32B32A32_UNORM" ||
+         format == "PIPE_FORMAT_R8_SNORM" ||
+         format == "PIPE_FORMAT_R8G8_SNORM" ||
+         format == "PIPE_FORMAT_R8G8B8A8_SNORM" ||
+         format == "PIPE_FORMAT_R16_SNORM" ||
+         format == "PIPE_FORMAT_R16G16_SNORM" ||
+         format == "PIPE_FORMAT_R16G16B16A16_SNORM" ||
+         format == "PIPE_FORMAT_R11G11B10_FLOAT" ||
+         format == "PIPE_FORMAT_R16_FLOAT" ||
+         format == "PIPE_FORMAT_R16G16_FLOAT" ||
+         format == "PIPE_FORMAT_R16G16B16A16_FLOAT" ||
+         format == "PIPE_FORMAT_R32_FLOAT" ||
+         format == "PIPE_FORMAT_R32G32_FLOAT" ||
          format == "PIPE_FORMAT_R8G8B8A8_SRGB" ||
          format == "PIPE_FORMAT_B8G8R8A8_SRGB" ||
-         format == "PIPE_FORMAT_R32_UINT" ||
-         format == "PIPE_FORMAT_R32_SINT" ||
-         format == "PIPE_FORMAT_R32G32_UINT" ||
-         format == "PIPE_FORMAT_R32G32_SINT" ||
-         format == "PIPE_FORMAT_R32G32B32A32_UINT" ||
-         format == "PIPE_FORMAT_R32G32B32A32_SINT" ||
+         IsIntegerColorAttachmentTransportFormat(format) ||
          format == "PIPE_FORMAT_R32G32B32A32_FLOAT";
 }
 
+inline bool IsCanonicalFloatColorAttachmentTransportFormat(
+    std::string_view format) {
+  return IsColorAttachmentTransportFormat(format) &&
+         format != "PIPE_FORMAT_R32G32B32A32_UNORM" &&
+         !IsIntegerColorAttachmentTransportFormat(format) &&
+         format != "PIPE_FORMAT_R8G8B8A8_UNORM" &&
+         format != "PIPE_FORMAT_R10G10B10A2_UNORM" &&
+         format != "PIPE_FORMAT_B10G10R10A2_UNORM" &&
+         format != "PIPE_FORMAT_R8G8B8A8_SRGB" &&
+         format != "PIPE_FORMAT_B8G8R8A8_SRGB" &&
+         format != "PIPE_FORMAT_R32_UINT" &&
+         format != "PIPE_FORMAT_R32_SINT" &&
+         format != "PIPE_FORMAT_R32G32_UINT" &&
+         format != "PIPE_FORMAT_R32G32_SINT" &&
+         format != "PIPE_FORMAT_R32G32B32A32_UINT" &&
+         format != "PIPE_FORMAT_R32G32B32A32_SINT" &&
+         format != "PIPE_FORMAT_R32G32B32A32_FLOAT";
+}
+
+inline bool IsCanonicalFloat64ColorAttachmentTransportFormat(
+    std::string_view format) {
+  return format == "PIPE_FORMAT_R32G32B32A32_UNORM";
+}
+
 inline std::uint8_t DriverColorAttachmentRawDwords(std::string_view format) {
-  if (format == "PIPE_FORMAT_R32_UINT" ||
+  if (!IsIntegerColorAttachmentTransportFormat(format))
+    return 0;
+  if (format == "PIPE_FORMAT_R8_UINT" ||
+      format == "PIPE_FORMAT_R16_UINT" ||
+      format == "PIPE_FORMAT_R32_UINT" ||
+      format == "PIPE_FORMAT_R8_SINT" ||
+      format == "PIPE_FORMAT_R16_SINT" ||
       format == "PIPE_FORMAT_R32_SINT")
     return 1;
-  if (format == "PIPE_FORMAT_R32G32_UINT" ||
+  if (format == "PIPE_FORMAT_R8G8_UINT" ||
+      format == "PIPE_FORMAT_R16G16_UINT" ||
+      format == "PIPE_FORMAT_R32G32_UINT" ||
+      format == "PIPE_FORMAT_R8G8_SINT" ||
+      format == "PIPE_FORMAT_R16G16_SINT" ||
       format == "PIPE_FORMAT_R32G32_SINT")
     return 2;
-  if (format == "PIPE_FORMAT_R32G32B32A32_UINT" ||
-      format == "PIPE_FORMAT_R32G32B32A32_SINT")
-    return 4;
-  return 0;
+  return 4;
 }
 
 inline bool DriverColorAttachmentIsFloat32(std::string_view format) {
@@ -676,6 +761,10 @@ inline bool DriverColorAttachmentIsSrgb(std::string_view format) {
 
 inline std::uint32_t DriverColorAttachmentBytesPerPixel(
     std::string_view format) {
+  if (IsCanonicalFloat64ColorAttachmentTransportFormat(format))
+    return 4U * sizeof(double);
+  if (IsCanonicalFloatColorAttachmentTransportFormat(format))
+    return 16U;
   const auto raw = DriverColorAttachmentRawDwords(format);
   return raw ? 4U * raw : DriverColorAttachmentIsFloat32(format) ? 16U : 4U;
 }
@@ -723,6 +812,15 @@ inline std::vector<std::string> EffectiveDriverColorAttachmentFormats(
   return std::vector<std::string>(command.render_target_count ?
                                      command.render_target_count : 1U,
                                  command.format);
+}
+
+inline std::uint32_t DriverColorAttachmentMaximumBytesPerPixel(
+    const DriverCommand &command) {
+  std::uint32_t maximum = 0;
+  for (const auto &format : EffectiveDriverColorAttachmentFormats(command))
+    maximum = std::max(maximum,
+                       DriverColorAttachmentBytesPerPixel(format));
+  return maximum;
 }
 
 /*

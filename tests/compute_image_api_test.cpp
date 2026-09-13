@@ -185,7 +185,7 @@ void RejectBoundaries(unsigned mode) {
 
 int main(int argc, char **argv) {
   try {
-    static_assert(PVRGPU_SYSTEMC_COMPUTE_API_VERSION == 6);
+    static_assert(PVRGPU_SYSTEMC_COMPUTE_API_VERSION == 7);
     const unsigned mode = argc > 1 ? static_cast<unsigned>(std::stoul(argv[1])) : 0;
     Check(mode <= 2, "image memory mode");
     for (unsigned epoch = 0; epoch < 2; ++epoch)

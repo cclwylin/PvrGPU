@@ -983,12 +983,11 @@ void DebugSequenceAttachments(const MemoryPool &pool,
         "JsonReporter attachment debug has no DRAM framebuffer");
   const std::vector<std::uint8_t> color =
       LoadArray<std::uint8_t>(pool, state.dram_framebuffer);
-  // An integer attachment stores a dword per channel, so a pixel here is 4, 8
-  // or 16 bytes.  The RGB tallies and the sampled words below therefore read
-  // the pixel's first four bytes, which are a colour only on a UNORM8
-  // attachment and its first channel on an integer one.
-  const std::size_t debug_bytes_per_pixel = ColorAttachmentBytesPerPixel(
-      state.color_attachment_raw_dwords, state.color_attachment_float32);
+  // Transport width is format-specific (4/8/16/32 bytes). The legacy RGB
+  // tallies and sampled words below inspect the first four bytes: a complete
+  // color for packed four-byte formats, otherwise only a transport prefix.
+  const std::size_t debug_bytes_per_pixel =
+      ColorAttachmentBytesPerPixel(state, 0);
   const std::uint64_t expected_color_bytes =
       static_cast<std::uint64_t>(state.width) * state.height *
       state.raster_state.sample_count * state.attachment_layers * debug_bytes_per_pixel;
@@ -2641,9 +2640,15 @@ static std::vector<std::string> ReportedColorAttachmentFormats(
       targets != (command.render_target_count ? command.render_target_count : 1U))
     throw std::runtime_error("JsonReporter color attachment format ownership mismatch");
   const auto formats = EffectiveDriverColorAttachmentFormats(command);
-  for (std::uint32_t target = 0; target < targets; ++target)
-    if (ColorAttachmentPackedUnorm(state, target) != PackedUnormFormatFromName(formats[target]))
+  for (std::uint32_t target = 0; target < targets; ++target) {
+    ColorAttachmentCodec expected_codec{};
+    if (!ColorAttachmentCodecFromName(formats[target], &expected_codec) ||
+        ColorAttachmentPackedUnorm(state, target) !=
+            PackedUnormFormatFromName(formats[target]) ||
+        !ColorAttachmentCodecEqual(
+            ColorAttachmentCodecForTarget(state, target), expected_codec))
       throw std::runtime_error("JsonReporter color attachment codec mismatch");
+  }
   return formats;
 }
 

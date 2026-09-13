@@ -262,26 +262,13 @@ FrontFaceWinding FrontFaceFromDriverCommand(std::uint32_t front_ccw,
  * widens the framebuffer past four bytes a pixel.
  */
 std::uint32_t ColorAttachmentRawDwords(const std::string &format) {
-  if (format == "PIPE_FORMAT_R32_UINT" || format == "PIPE_FORMAT_R32_SINT")
-    return 1U;
-  if (format == "PIPE_FORMAT_R32G32_UINT" ||
-      format == "PIPE_FORMAT_R32G32_SINT") {
-    return 2U;
-  }
-  if (format == "PIPE_FORMAT_R32G32B32A32_UINT" ||
-      format == "PIPE_FORMAT_R32G32B32A32_SINT") {
-    return 4U;
-  }
-  return 0U;
+  return DriverColorAttachmentRawDwords(format);
 }
 
 /* The colour formats a generic PCO draw may target: eight-bit UNORM, or one,
  * two or four raw 32-bit integer channels of either signedness. */
 bool DriverPcoColorAttachmentFormatSupported(const std::string &format) {
-  return format == "PIPE_FORMAT_R8G8B8A8_UNORM" ||
-         PackedUnormFormatFromName(format) != PackedUnormFormat::kNone ||
-         format == "PIPE_FORMAT_R32G32B32A32_FLOAT" ||
-         ColorAttachmentRawDwords(format) != 0U;
+  return IsColorAttachmentTransportFormat(format);
 }
 
 bool PcoSingleDrawResolutionSupported(const DriverCommand &command) {
@@ -1605,7 +1592,7 @@ void Submitter::RunJob() {
             (static_cast<std::size_t>(texture.descriptor_set) + 1U) *
                 kPcoTextureDescriptorDwordCount +
                 DriverTextureDescriptorStart(texture.stage);
-        if (texture.texture_kind > 4U ||
+        if (texture.texture_kind > 5U ||
             (texture.texture_kind == 4U &&
              texture.source != DriverPcoTextureSource::kExternalPayload))
           throw std::runtime_error("Submitter cube array requires external storage");
@@ -1677,10 +1664,10 @@ void Submitter::RunJob() {
     state.cache_bypass = options_.cache_bypass ? 1U : 0U;
     /*
      * Establish the stored pixel width before resolving sequence LOADs.  An
-     * aliased integer attachment can be 8 or 16 bytes per pixel; deriving its
-     * readback size from the zero-initialized state made the Submitter fetch
-     * only four bytes per pixel, then the PBE (after this field was populated
-     * below) correctly rejected the truncated LOAD.
+     * aliased attachment can use a 4/8/16/32-byte format-specific transport;
+     * deriving its readback size from the zero-initialized state made the
+     * Submitter fetch only four bytes per pixel, then the PBE (after this field
+     * was populated below) correctly rejected the truncated LOAD.
      */
     if (driver_pco_triangles_command) {
       state.color_attachment_raw_dwords =
@@ -1688,6 +1675,10 @@ void Submitter::RunJob() {
       state.color_attachment_float32 =
           command.format == "PIPE_FORMAT_R32G32B32A32_FLOAT" ? 1U : 0U;
       state.color_is_srgb = DriverColorAttachmentIsSrgb(command.format) ? 1U : 0U;
+      if (!ColorAttachmentCodecFromName(command.format,
+                                        &state.color_attachment_codec))
+        throw std::runtime_error(
+            "Submitter color attachment codec is unsupported");
     }
     // Clear-only commands use the same physical packed storage as draws.
     state.color_attachment_packed_unorm = PackedUnormFormatFromName(command.format);
@@ -1713,6 +1704,10 @@ void Submitter::RunJob() {
           DriverColorAttachmentIsFloat32(format) ? 1U : 0U;
       state.color_attachment_srgb_per_target[target] =
           DriverColorAttachmentIsSrgb(format) ? 1U : 0U;
+      if (!ColorAttachmentCodecFromName(
+              format, &state.color_attachment_codecs[target]))
+        throw std::runtime_error(
+            "Submitter per-target color attachment codec is unsupported");
     }
     ValidateColorAttachmentFormats(state);
     const std::uint64_t stored_pixels =
@@ -2190,6 +2185,31 @@ void Submitter::RunJob() {
       for (std::size_t channel = 0; channel < 4; ++channel) {
         state.raster_state.blend.constant_color_bits[channel] =
             command.blend_constant_color_bits[channel];
+      }
+      state.raster_state.render_target_state_count =
+          static_cast<std::uint8_t>(command.render_target_state_count);
+      for (std::size_t target = 0;
+           target < command.render_target_state_count; ++target) {
+        BlendState &blend = state.raster_state.target_blend[target];
+        state.raster_state.target_color_mask[target] =
+            static_cast<std::uint8_t>(command.color_masks[target]);
+        blend.enable = static_cast<std::uint8_t>(command.blend_enables[target]);
+        blend.rgb_equation =
+            static_cast<BlendEquation>(command.blend_rgb_equations[target]);
+        blend.alpha_equation =
+            static_cast<BlendEquation>(command.blend_alpha_equations[target]);
+        blend.source_rgb_factor = static_cast<BlendFactor>(
+            command.blend_source_rgb_factors[target]);
+        blend.destination_rgb_factor = static_cast<BlendFactor>(
+            command.blend_destination_rgb_factors[target]);
+        blend.source_alpha_factor = static_cast<BlendFactor>(
+            command.blend_source_alpha_factors[target]);
+        blend.destination_alpha_factor = static_cast<BlendFactor>(
+            command.blend_destination_alpha_factors[target]);
+        for (std::size_t channel = 0; channel < 4; ++channel) {
+          blend.constant_color_bits[channel] =
+              command.blend_constant_color_bits[channel];
+        }
       }
       state.raster_state.face_cull.enable = command.cull_face == 0 ? 0U : 1U;
       state.raster_state.face_cull.mode =
@@ -3000,6 +3020,7 @@ void Submitter::RunJob() {
           resource.layer_count =
               static_cast<std::uint16_t>(texture.layers == 0U ? 1U
                                                               : texture.layers);
+          resource.buffer_elements = texture.buffer_elements;
           resource.dimension_type =
               texture.texture_kind == 1U
                   ? TextureDimensionType::k2DArray
@@ -3009,6 +3030,8 @@ void Submitter::RunJob() {
                   ? TextureDimensionType::kCube
               : texture.texture_kind == 4U
                   ? TextureDimensionType::kCubeArray
+              : texture.texture_kind == 5U
+                  ? TextureDimensionType::kBuffer
                   : TextureDimensionType::k2D;
           resource.format =
               texture.format == "PIPE_FORMAT_R32G32B32A32_UINT"
@@ -3145,6 +3168,26 @@ void Submitter::RunJob() {
                 (words.at(base + 7U) & ~UINT32_C(0x300)) != 0U ||
                 words.at(base + 12U) > 7U)
               throw std::runtime_error("Submitter cube array descriptor face stride/mode mismatch");
+          }
+          if (resource.dimension_type == TextureDimensionType::kBuffer) {
+            ValidateTextureBufferLayout(resource);
+            const auto &words = DriverTextureShared(command, texture.stage);
+            const std::size_t base =
+                DriverTextureDescriptorStart(texture.stage) +
+                texture.descriptor_set * kPcoTextureDescriptorDwordCount;
+            std::array<std::uint32_t, 4> image_words{};
+            std::copy_n(words.begin() + base, 4, image_words.begin());
+            ValidateTextureSingleLevelDimensions(image_words, resource);
+            if (words.at(base + 4U) != resource.byte_size ||
+                words.at(base + 5U) != resource.buffer_elements ||
+                words.at(base + 6U) != 0U ||
+                (words.at(base + 7U) & ~UINT32_C(0x300)) != 0U ||
+                words.at(base + 12U) != 0U)
+              throw std::runtime_error(
+                  "Submitter typed buffer descriptor metadata mismatch");
+          } else if (texture.buffer_elements != 0U) {
+            throw std::runtime_error(
+                "Submitter non-buffer texture has a logical element count");
           }
           if (resource.sample_count > 1U) {
             if (resource.block_width != 1U || resource.block_height != 1U ||

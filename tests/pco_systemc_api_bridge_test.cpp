@@ -44,7 +44,7 @@ void VerifyGuardedPreviousVersionCommand(
   // API-v22 added alpha-to-sample state after the uniform-buffer list.
   // Reconstruct the aligned API-v21 byte extent, not a zeroed
   // current-size command whose readable tail would hide the invalid access.
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 38U,
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 39U,
                 "update the frozen API-v21 guard-page fixture on ABI changes");
   constexpr std::size_t kApi21Tail =
       offsetof(pvrgpu_systemc_driver_command, uniform_buffer_count) +
@@ -395,7 +395,7 @@ void VerifySequenceExternalTextureAllocation() {
 
 int main() {
   using namespace pvrgpu::stub;
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 38U,
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 39U,
                 "native sequence bridge test requires API-v35");
   static_assert(PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS == 15U);
   static_assert(kDriverPcoMaximumTextureMipLevels == 15U);
@@ -814,6 +814,32 @@ int main() {
         make_sequence_draw(), make_sequence_draw()};
     draws[0].*field = 2;
     expect_sequence_rejected(draws, "alpha_to_", "non-boolean alpha-to-sample state");
+  }
+  {
+    std::array<pvrgpu_systemc_driver_command, 2> draws = {
+        make_sequence_draw(), make_sequence_draw()};
+    draws[0].render_target_state_count = 2;
+    expect_sequence_rejected(draws, "render_target_state",
+                             "target state count/attachment mismatch");
+  }
+  {
+    std::array<pvrgpu_systemc_driver_command, 2> draws = {
+        make_sequence_draw(), make_sequence_draw()};
+    draws[0].render_target_state_count = 1;
+    draws[0].color_masks[0] = draws[0].color_mask;
+    draws[0].blend_enables[0] = draws[0].blend_enable;
+    draws[0].blend_rgb_equations[0] = draws[0].blend_rgb_equation;
+    draws[0].blend_alpha_equations[0] = draws[0].blend_alpha_equation;
+    draws[0].blend_source_rgb_factors[0] =
+        PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ZERO;
+    draws[0].blend_destination_rgb_factors[0] =
+        draws[0].blend_destination_rgb_factor;
+    draws[0].blend_source_alpha_factors[0] =
+        draws[0].blend_source_alpha_factor;
+    draws[0].blend_destination_alpha_factors[0] =
+        draws[0].blend_destination_alpha_factor;
+    expect_sequence_rejected(draws, "render_target_state",
+                             "noncanonical disabled target blend state");
   }
   for (const auto field : {
            &pvrgpu_systemc_driver_command::polygon_offset_enable,

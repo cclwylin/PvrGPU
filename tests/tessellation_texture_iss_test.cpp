@@ -235,7 +235,7 @@ void ExtendedTextureClasses() {
   for (auto stage : {ShaderStage::kTessellationControl,
                      ShaderStage::kTessellationEvaluation}) {
     const auto abi = Abi(stage);
-    for (unsigned texture_class = 0; texture_class < 3; ++texture_class) {
+    for (unsigned texture_class = 0; texture_class < 4; ++texture_class) {
       auto program = Program(stage, false);
       auto &sample = program.instructions[0];
       auto task = Task(stage, abi, 1);
@@ -254,11 +254,18 @@ void ExtendedTextureClasses() {
         task.lanes[0].temporary_written.set(2);
         task.lanes[0].temporary_written.set(3);
         task.lanes[0].temporary_written.set(4);
-      } else {
+      } else if (texture_class == 2) {
         sample.texture_shadow_compare = 1;
         sample.texture_shadow_reference = {PcoRegisterBank::kTemporary, 2};
         task.shared[descriptor + 7] |= UINT32_C(0x200);
         task.shared[descriptor + 12] = 3;
+      } else {
+        // PCO lowers samplerBuffer to an exact 8192-wide 2D integer fetch.
+        sample.texture_non_normalized_coords = 1;
+        sample.texture_lod_replace = 1;
+        task.lanes[0].temporaries[0] = 37;
+        task.lanes[0].temporaries[1] = 0;
+        task.lanes[0].temporaries[2] = 0;
       }
       ValidateTessellationProgram(program, abi);
       Samples samples;
@@ -278,10 +285,15 @@ void ExtendedTextureClasses() {
                   request.texture_address_lo == 0x76543210U &&
                   request.texture_address_hi == 0x00000089U,
               "array sample preserves the complete native TAO address");
-      } else {
+      } else if (texture_class == 2) {
         Check(request.shadow_compare == 1 &&
                   request.shadow_reference == task.lanes[0].temporaries[2],
               "shadow sample preserves the native Dref marker source");
+      } else {
+        Check(request.dimension == 2 && request.normalized == 0 &&
+                  request.explicit_lod_present && request.explicit_lod == 0 &&
+                  request.coordinates[0] == 37 && request.coordinates[1] == 0,
+              "samplerBuffer preserves exact integer texel coordinates and LOD zero");
       }
     }
   }
@@ -329,7 +341,7 @@ void Mutations() {
       [](auto &i) { i.source1.index += 20; i.source2.index += 20; },
       [](auto &i) { i.source2.bank = PcoRegisterBank::kTemporary; }, [](auto &i) { ++i.source2.index; },
       [](auto &i) { i.texture_dimension = 1; }, [](auto &i) { i.texture_fcnorm = 2; },
-      [](auto &i) { i.texture_non_normalized_coords = 1; },
+      [](auto &i) { i.texture_non_normalized_coords = 1; i.texture_lod_replace = 0; },
       [](auto &i) { i.texture_sample_index_present = 1; }, [](auto &i) { i.texture_spatial_offset_present = 1; },
       [](auto &i) { i.texture_shadow_compare = 2; },
       [](auto &i) { i.texture_shadow_reference = {PcoRegisterBank::kTemporary, 2}; },
@@ -488,6 +500,22 @@ void CompilerFixtures() {
         if (mutation == 1) bad[sample->binary_offset + 1] |= 128; // reserved extended backend
         if (mutation == 2) bad[sample->binary_offset + 1] &= ~12U; // CHAN1 is not ordinary count4
         Reject([&] { DecodeTessellationPcoProgram(program->summary.stage, bad); }, "SMP");
+      }
+      if (sample->texture_lod_replace) {
+        auto fetch_bytes = original;
+        fetch_bytes[sample->binary_offset + 2] |= 0x08U;
+        const auto fetch = DecodeTessellationPcoProgram(
+            program->summary.stage, fetch_bytes);
+        const auto fetch_sample = std::find_if(
+            fetch.instructions.begin(), fetch.instructions.end(),
+            [](const PcoInstruction &i) {
+              return i.opcode == PcoOpcode::kTextureSample;
+            });
+        Check(fetch_sample != fetch.instructions.end() &&
+                  fetch_sample->texture_non_normalized_coords == 1 &&
+                  fetch_sample->texture_lod_replace == 1 &&
+                  fetch_sample->texture_dimension == 2,
+              "tessellation decoder admits the samplerBuffer texel-fetch SMP form");
       }
     }
     for (unsigned epoch : {0U, 1U, 3U}) {

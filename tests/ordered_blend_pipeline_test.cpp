@@ -96,6 +96,7 @@ int sc_main(int, char **) {
         pool, std::vector<TilePrimitiveRef>{{0, 0, 1}, {1, 0, 2}});
     state.fragment_code = StoreNewArray(
         pool, FillSolidRedHalfAlphaFragmentPcoBinary());
+    state.fragment_output_mask[0] = 0x0f;
     state.drawlist_stats =
         StoreNewArray(pool, std::vector<DrawListStats>{{}});
     state.counters.drawlists = 1;

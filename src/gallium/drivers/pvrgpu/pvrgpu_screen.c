@@ -23,7 +23,7 @@ static const nir_shader_compiler_options pvrgpu_nir_options = {
 };
 
 /*
- * OpenGL ES 3.0 / 3.1 advertisement.
+ * OpenGL ES 3.0 / 3.1 / 3.2 advertisement.
  *
  * Mesa derives the reported ES version from screen caps and format support
  * (see _mesa_compute_version -> compute_version_es2 and st_init_extensions).
@@ -67,7 +67,10 @@ pvrgpu_init_single_shader_caps(struct pipe_screen *screen,
        * (st_init_limits), which is the arrangement drivers without dedicated
        * atomic hardware use.
        */
-      caps->max_shader_buffers = 16;
+      /* Mesa reserves half of this shared namespace for emulated atomic
+       * counter buffers.  Thirty-two physical slots therefore expose the ES
+       * limit of sixteen SSBOs without reducing the atomic-counter limit. */
+      caps->max_shader_buffers = 32;
       caps->max_shader_images = 8;
    }
    caps->supported_irs =
@@ -207,7 +210,19 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    caps->max_texture_cube_levels = 13;
    /* GLES 3.x requires GL_MAX_TEXTURE_LOD_BIAS to be at least 2.0. */
    caps->max_texture_lod_bias = 2.0f;
-   caps->max_render_targets = 8;
+   caps->max_render_targets = PVRGPU_SYSTEMC_MAX_RENDER_TARGETS;
+   /* Per-target colour masks are carried by the MRT command, and advanced
+    * blend equations use the coherent framebuffer-fetch lowering. */
+   caps->indep_blend_enable = true;
+   caps->indep_blend_func = true;
+   caps->fbfetch = caps->max_render_targets;
+   caps->fbfetch_coherent = true;
+   /* Bounds are checked when resources are snapshotted and again by the
+    * model-side storage/image accessors. */
+   caps->robust_buffer_access_behavior = true;
+   caps->texture_buffer_objects = true;
+   caps->max_texel_buffer_elements = 65536;
+   caps->texture_buffer_offset_alignment = 16;
    caps->max_constant_buffer_size = 64 * 1024;
    caps->constant_buffer_offset_alignment = 16;
    caps->max_vertex_attrib_stride = 2048;
@@ -244,7 +259,7 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    caps->max_geometry_total_output_components = 1024;
    caps->glsl_feature_level = 400;
    caps->glsl_feature_level_compatibility = 400;
-   caps->essl_feature_level = 310;
+   caps->essl_feature_level = 320;
 
    if (!pvrgpu_es3_enabled())
       return;
@@ -261,15 +276,6 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    caps->fragment_shader_texture_lod = true;
    caps->seamless_cube_map = true;
    caps->occlusion_query = true;
-   /*
-    * indep_blend_enable is deliberately left off.  Mesa only needs it for
-    * ES 3.2 (EXT_draw_buffers2 / ARB_draw_buffers_blend), which is out of
-    * reach anyway, and the model has no per-render-target blend state to
-    * back it.  Advertising it made st_atom_blend set independent_blend_enable
-    * on a depth-only pass -- num_cb == 0 takes the promotion path and then
-    * leaves rt[0] untouched -- which is state the model cannot describe.
-    */
-
    /* ES 3.1 gates that are not compute. */
    caps->max_texture_gather_components = 4;
    caps->image_store_formatted = true;
@@ -587,6 +593,24 @@ pvrgpu_is_supported_vertex_format(enum pipe_format format)
 }
 
 static bool
+pvrgpu_is_supported_buffer_sampler_format(enum pipe_format format)
+{
+   const struct util_format_description *description =
+      util_format_description(format);
+   const struct util_format_unpack_description *unpack =
+      util_format_unpack_description(format);
+   const unsigned texel_bytes = util_format_get_blocksize(format);
+
+   return description && unpack && unpack->unpack_rgba && texel_bytes &&
+          texel_bytes <= 16 &&
+          description->layout == UTIL_FORMAT_LAYOUT_PLAIN &&
+          description->colorspace == UTIL_FORMAT_COLORSPACE_RGB &&
+          description->block.width == 1 && description->block.height == 1 &&
+          description->block.depth == 1 &&
+          !util_format_is_depth_or_stencil(format);
+}
+
+static bool
 pvrgpu_is_supported_texture_target(enum pipe_texture_target target)
 {
    switch (target) {
@@ -643,6 +667,9 @@ pvrgpu_is_format_supported(struct pipe_screen *screen,
          PIPE_BIND_VERTEX_BUFFER |
          PIPE_BIND_INDEX_BUFFER |
          PIPE_BIND_CONSTANT_BUFFER |
+         PIPE_BIND_SHADER_BUFFER |
+         PIPE_BIND_SAMPLER_VIEW |
+         PIPE_BIND_SHADER_IMAGE |
          PIPE_BIND_STREAM_OUTPUT |
          PIPE_BIND_QUERY_BUFFER |
          PIPE_BIND_COMMAND_ARGS_BUFFER;
@@ -650,14 +677,22 @@ pvrgpu_is_format_supported(struct pipe_screen *screen,
          goto out;
       if (bind & ~supported_buffer_binds)
          goto out;
-      if (bind & (PIPE_BIND_STREAM_OUTPUT |
-                  PIPE_BIND_QUERY_BUFFER |
-                  PIPE_BIND_COMMAND_ARGS_BUFFER))
-         supported = format == PIPE_FORMAT_NONE ||
-                     format == PIPE_FORMAT_R8_UNORM ||
-                     pvrgpu_is_supported_vertex_format(format);
-      else
-         supported = pvrgpu_is_supported_vertex_format(format);
+      supported = true;
+      if ((bind & PIPE_BIND_SAMPLER_VIEW) &&
+          !pvrgpu_is_supported_buffer_sampler_format(format))
+         supported = false;
+      if ((bind & PIPE_BIND_SHADER_IMAGE) &&
+          !pvrgpu_is_supported_shader_image_format(format))
+         supported = false;
+      if ((bind & (PIPE_BIND_VERTEX_BUFFER | PIPE_BIND_INDEX_BUFFER |
+                   PIPE_BIND_CONSTANT_BUFFER)) &&
+          !pvrgpu_is_supported_vertex_format(format))
+         supported = false;
+      if ((bind & (PIPE_BIND_STREAM_OUTPUT | PIPE_BIND_QUERY_BUFFER |
+                   PIPE_BIND_COMMAND_ARGS_BUFFER)) &&
+          format != PIPE_FORMAT_NONE && format != PIPE_FORMAT_R8_UNORM &&
+          !pvrgpu_is_supported_vertex_format(format))
+         supported = false;
       goto out;
    }
 
@@ -682,6 +717,9 @@ pvrgpu_is_format_supported(struct pipe_screen *screen,
             PIPE_BIND_BLENDABLE;
       }
       if (bind & ~supported_binds)
+         goto out;
+      if ((bind & PIPE_BIND_SHADER_IMAGE) &&
+          !pvrgpu_is_supported_shader_image_format(format))
          goto out;
       supported = true;
       goto out;

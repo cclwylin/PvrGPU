@@ -217,7 +217,7 @@ bool PrepareComputeDispatch(
     const auto &binding = source.bindings[index];
     if (binding.kind > PVRGPU_SYSTEMC_COMPUTE_STORAGE_BUFFER ||
         binding.resource_index >= source.resource_count ||
-        (binding.access & ~3U) != 0)
+        (binding.access & ~3U) != 0 || !binding.bytes_size)
       return fail("invalid compute buffer binding");
     const bool uniform = binding.kind == PVRGPU_SYSTEMC_COMPUTE_UNIFORM_BUFFER;
     const auto count = uniform ? stage.uniform_buffer_descriptor_count
@@ -244,9 +244,6 @@ bool PrepareComputeDispatch(
         (uniform && (binding.access & 2U) != 0))
       return fail("compute binding permissions do not cover shader accesses");
   }
-  if ((abi.uniform_buffer_used_mask & ~present_ubos) != 0 ||
-      (abi.storage_buffer_used_mask & ~present_ssbos) != 0)
-    return fail("compute shader uses an unbound buffer");
   std::uint32_t present_images = 0;
   for (std::size_t index = 0; index < source.image_count; ++index) {
     const auto &binding = source.images[index];
@@ -492,7 +489,69 @@ bool RawFloatVerticesAreFinite(const std::uint8_t *data,
 // first_index + index_count; a non-indexed one carries no index payload.
 // One to four colour attachments; zero is read as the single-target default.
 bool DriverPcoRenderTargetCountIsValid(std::uint32_t render_target_count) {
-  return render_target_count <= 4U;
+  return render_target_count <= PVRGPU_SYSTEMC_MAX_RENDER_TARGETS;
+}
+
+bool BlendStateValuesAreValid(std::uint32_t enable,
+                              std::uint32_t rgb_equation,
+                              std::uint32_t alpha_equation,
+                              std::uint32_t source_rgb_factor,
+                              std::uint32_t destination_rgb_factor,
+                              std::uint32_t source_alpha_factor,
+                              std::uint32_t destination_alpha_factor) {
+  if (enable > 1 ||
+      rgb_equation > PVRGPU_SYSTEMC_PCO_BLEND_EQUATION_MAX ||
+      alpha_equation > PVRGPU_SYSTEMC_PCO_BLEND_EQUATION_MAX ||
+      source_rgb_factor >
+          PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA ||
+      destination_rgb_factor >
+          PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA ||
+      source_alpha_factor >
+          PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA ||
+      destination_alpha_factor >
+          PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA)
+    return false;
+  return enable != 0 ||
+         (rgb_equation == PVRGPU_SYSTEMC_PCO_BLEND_EQUATION_ADD &&
+          alpha_equation == PVRGPU_SYSTEMC_PCO_BLEND_EQUATION_ADD &&
+          source_rgb_factor == PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE &&
+          destination_rgb_factor == PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ZERO &&
+          source_alpha_factor == PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE &&
+          destination_alpha_factor == PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ZERO);
+}
+
+bool DriverPcoTargetStatesAreValid(
+    const pvrgpu_systemc_driver_command &source) {
+  if (source.render_target_state_count == 0)
+    return true;
+  const std::uint32_t targets =
+      source.render_target_count == 0 ? 1U : source.render_target_count;
+  if (source.render_target_state_count != targets ||
+      targets > PVRGPU_SYSTEMC_MAX_RENDER_TARGETS)
+    return false;
+  for (std::uint32_t target = 0; target < targets; ++target) {
+    if (source.color_masks[target] > 0x0f ||
+        !BlendStateValuesAreValid(
+            source.blend_enables[target],
+            source.blend_rgb_equations[target],
+            source.blend_alpha_equations[target],
+            source.blend_source_rgb_factors[target],
+            source.blend_destination_rgb_factors[target],
+            source.blend_source_alpha_factors[target],
+            source.blend_destination_alpha_factors[target]))
+      return false;
+  }
+  return source.color_mask == source.color_masks[0] &&
+         source.blend_enable == source.blend_enables[0] &&
+         source.blend_rgb_equation == source.blend_rgb_equations[0] &&
+         source.blend_alpha_equation == source.blend_alpha_equations[0] &&
+         source.blend_source_rgb_factor == source.blend_source_rgb_factors[0] &&
+         source.blend_destination_rgb_factor ==
+             source.blend_destination_rgb_factors[0] &&
+         source.blend_source_alpha_factor ==
+             source.blend_source_alpha_factors[0] &&
+         source.blend_destination_alpha_factor ==
+             source.blend_destination_alpha_factors[0];
 }
 
 bool DriverPcoIndexPayloadIsValid(
@@ -1015,6 +1074,27 @@ void CopyPcoPayloadFields(
   destination->blend_source_alpha_factor = source.blend_source_alpha_factor;
   destination->blend_destination_alpha_factor =
       source.blend_destination_alpha_factor;
+  destination->render_target_state_count = source.render_target_state_count;
+  std::copy_n(source.color_masks, PVRGPU_SYSTEMC_MAX_RENDER_TARGETS,
+              destination->color_masks.begin());
+  std::copy_n(source.blend_enables, PVRGPU_SYSTEMC_MAX_RENDER_TARGETS,
+              destination->blend_enables.begin());
+  std::copy_n(source.blend_rgb_equations, PVRGPU_SYSTEMC_MAX_RENDER_TARGETS,
+              destination->blend_rgb_equations.begin());
+  std::copy_n(source.blend_alpha_equations, PVRGPU_SYSTEMC_MAX_RENDER_TARGETS,
+              destination->blend_alpha_equations.begin());
+  std::copy_n(source.blend_source_rgb_factors,
+              PVRGPU_SYSTEMC_MAX_RENDER_TARGETS,
+              destination->blend_source_rgb_factors.begin());
+  std::copy_n(source.blend_destination_rgb_factors,
+              PVRGPU_SYSTEMC_MAX_RENDER_TARGETS,
+              destination->blend_destination_rgb_factors.begin());
+  std::copy_n(source.blend_source_alpha_factors,
+              PVRGPU_SYSTEMC_MAX_RENDER_TARGETS,
+              destination->blend_source_alpha_factors.begin());
+  std::copy_n(source.blend_destination_alpha_factors,
+              PVRGPU_SYSTEMC_MAX_RENDER_TARGETS,
+              destination->blend_destination_alpha_factors.begin());
   std::copy_n(source.blend_constant_color_bits, 4,
               destination->blend_constant_color_bits);
   destination->dither = source.dither;
@@ -1639,6 +1719,7 @@ bool CopyPcoTrianglePayload(
       source.alpha_to_coverage_dither > 1 ||
       // The PBE honours a partial write mask, so any four-bit mask is valid.
       source.color_mask > 0x0f || source.blend_enable > 1 ||
+      !DriverPcoTargetStatesAreValid(source) ||
       // Dither is cosmetic and never applied; either state is valid.
       source.dither > 1;
   const bool ideas_raster_invalid =
@@ -1737,18 +1818,7 @@ bool CopyPcoSequenceDraw(
   // The colour formats the PBE can write a draw into: four UNORM8 channels
   // (linear or sRGB-encoded), or one, two or four raw 32-bit integer channels.
   if (!source.format ||
-      (std::string_view(source.format) != "PIPE_FORMAT_R8G8B8A8_UNORM" &&
-       std::string_view(source.format) != "PIPE_FORMAT_R10G10B10A2_UNORM" &&
-       std::string_view(source.format) != "PIPE_FORMAT_B10G10R10A2_UNORM" &&
-       std::string_view(source.format) != "PIPE_FORMAT_R8G8B8A8_SRGB" &&
-       std::string_view(source.format) != "PIPE_FORMAT_B8G8R8A8_SRGB" &&
-       std::string_view(source.format) != "PIPE_FORMAT_R32_UINT" &&
-       std::string_view(source.format) != "PIPE_FORMAT_R32G32_UINT" &&
-       std::string_view(source.format) != "PIPE_FORMAT_R32G32B32A32_UINT" &&
-       std::string_view(source.format) != "PIPE_FORMAT_R32_SINT" &&
-       std::string_view(source.format) != "PIPE_FORMAT_R32G32_SINT" &&
-       std::string_view(source.format) != "PIPE_FORMAT_R32G32B32A32_SINT" &&
-       std::string_view(source.format) != "PIPE_FORMAT_R32G32B32A32_FLOAT")) {
+      !pvrgpu::stub::IsColorAttachmentTransportFormat(source.format)) {
     return refuse(std::string("format=") +
                   (source.format ? source.format : "<none>"));
   }
@@ -2068,6 +2138,15 @@ bool CopyPcoSequenceDraw(
       source.depth_attachment_source_command_index ==
           PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR ||
       source.depth_attachment_source_command_index < ordinal;
+  std::uint32_t maximum_color_bytes_per_pixel =
+      pvrgpu::stub::DriverColorAttachmentBytesPerPixel(source.format);
+  for (std::uint32_t target = 0;
+       target < source.color_attachment_format_count; ++target) {
+    maximum_color_bytes_per_pixel = std::max(
+        maximum_color_bytes_per_pixel,
+        pvrgpu::stub::DriverColorAttachmentBytesPerPixel(
+            source.color_attachment_formats[target]));
+  }
   // Name the field that is unsupported: "raster/resource state is invalid"
   // covers two dozen conditions and gives no way to tell which feature a
   // capture actually needs.
@@ -2122,17 +2201,15 @@ bool CopyPcoSequenceDraw(
                source.framebuffer_height * (source.raster_samples ? source.raster_samples : 1U) *
                (source.framebuffer_layers ? source.framebuffer_layers : 1U) *
                std::max<std::uint32_t>(
-                   (std::string_view(source.format) == "PIPE_FORMAT_R32G32B32A32_UINT" ||
-                    std::string_view(source.format) == "PIPE_FORMAT_R32G32B32A32_SINT" ||
-                    std::string_view(source.format) == "PIPE_FORMAT_R32G32B32A32_FLOAT") ? 16U :
-                   (std::string_view(source.format) == "PIPE_FORMAT_R32G32_UINT" ||
-                    std::string_view(source.format) == "PIPE_FORMAT_R32G32_SINT") ? 8U : 4U,
+                   maximum_color_bytes_per_pixel,
                    depth_format_supported && source.depth_format ?
                        pvrgpu::stub::DepthAttachmentBytesPerPixel(source.depth_format) : 0U) >
            pvrgpu::stub::kDriverPcoSequenceAttachmentStride)
     nested_reason = "framebuffer_attachment_extent";
   else if (source.color_mask > 0x0f)
     nested_reason = "color_mask";
+  else if (!DriverPcoTargetStatesAreValid(source))
+    nested_reason = "render_target_state";
   else if (source.blend_enable > 1 || !blend_enums_valid ||
            !disabled_blend_is_canonical)
     nested_reason = "blend";
@@ -2603,7 +2680,7 @@ bool CopyPcoSequenceTexture(
   const std::uint32_t samples = source.sample_count ? source.sample_count : 1U;
   if (samples != 1U && samples != 2U && samples != 4U && samples != 8U)
     return reject("sample count");
-  if (source.texture_kind > 4U || source.layers > UINT16_MAX ||
+  if (source.texture_kind > 5U || source.layers > UINT16_MAX ||
       (source.texture_kind == 0U && source.layers > 1U))
     return reject("dimension/layer count");
   if (source.texture_kind == 4U &&
@@ -2611,6 +2688,38 @@ bool CopyPcoSequenceTexture(
        !source.layers || source.layers % 6U || source.layers / 6U > 2048U ||
        samples != 1U || block_width != 1U || block_height != 1U))
     return reject("whole-cube uncompressed single-sample array");
+  if (source.texture_kind == 5U) {
+    const std::uint32_t elements = source.buffer_elements;
+    const std::uint32_t expected_width =
+        std::min<std::uint32_t>(elements, 8192U);
+    const std::uint32_t expected_height =
+        elements == 0U ? 0U : (elements + 8191U) / 8192U;
+    const bool canonical_format =
+        format == "PIPE_FORMAT_R32G32B32A32_UINT" ||
+        format == "PIPE_FORMAT_R32G32B32A32_SINT" ||
+        format == "PIPE_FORMAT_R32G32B32A32_FLOAT";
+    if (source.source != PVRGPU_SYSTEMC_PCO_TEXTURE_EXTERNAL_PAYLOAD ||
+        !canonical_format ||
+        source.layers != 1U || !elements || elements > 65536U ||
+        samples != 1U || source.mip_count != 1U || block_width != 1U ||
+        block_height != 1U || source.mip[0].width != expected_width ||
+        source.mip[0].height != expected_height ||
+        source.mip[0].row_pitch != expected_width * block_bytes ||
+        source.mip[0].offset != 0U ||
+        source.declared_bytes_size !=
+            static_cast<std::uint64_t>(source.mip[0].row_pitch) *
+                expected_height ||
+        source.min_filter != PVRGPU_SYSTEMC_PCO_TEXTURE_FILTER_NEAREST ||
+        source.mag_filter != PVRGPU_SYSTEMC_PCO_TEXTURE_FILTER_NEAREST ||
+        source.mip_filter != PVRGPU_SYSTEMC_PCO_TEXTURE_MIP_FILTER_NONE ||
+        source.wrap_u != PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_EDGE ||
+        source.wrap_v != PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_EDGE ||
+        source.wrap_w != PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_EDGE ||
+        source.min_lod_u4_6 != 0U || source.max_lod_u4_6 != 0U)
+      return reject("typed buffer layout");
+  } else if (source.buffer_elements != 0U) {
+    return reject("non-buffer element count");
+  }
   if (samples > 1U &&
       (source.source != PVRGPU_SYSTEMC_PCO_TEXTURE_EXTERNAL_PAYLOAD ||
        source.texture_kind > 1U || source.mip_count != 1U ||
@@ -2797,6 +2906,7 @@ bool CopyPcoSequenceTexture(
     resource.mip_count = source.mip_count;
     resource.sample_count = samples;
     resource.layer_count = source.layers ? source.layers : 1U;
+    resource.buffer_elements = source.buffer_elements;
     resource.dimension_type = static_cast<pvrgpu::stub::TextureDimensionType>(source.texture_kind);
     resource.descriptor_set = source.descriptor_set;
     resource.binding = source.binding;
@@ -2826,6 +2936,7 @@ bool CopyPcoSequenceTexture(
   texture.max_lod_u4_6 = source.max_lod_u4_6;
   texture.texture_kind = source.texture_kind;
   texture.layers = source.layers == 0U ? 1U : source.layers;
+  texture.buffer_elements = source.buffer_elements;
   texture.sample_count = samples;
   *destination = std::move(texture);
   return true;
@@ -2999,7 +3110,7 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
       const bool tessellation_texture = texture.stage == pvrgpu::stub::DriverPcoShaderStage::kTessellationControl ||
           texture.stage == pvrgpu::stub::DriverPcoShaderStage::kTessellationEvaluation;
       if (tessellation_texture &&
-          (texture.texture_kind > 4U || texture.sample_count != 1 ||
+          (texture.texture_kind > 5U || texture.sample_count != 1 ||
            !texture.normalized_coordinates ||
            shared.at(image_word1 + 11U) > 7U)) {
         *error = "SystemC API tessellation texture requires normalized native single-sample state";
@@ -3837,7 +3948,7 @@ extern "C" int pvrgpu_systemc_flush_readback(
   }
   if (!readback->pixels || readback->width == 0 || readback->height == 0 ||
       readback->width > 4096 || readback->height > 4096 ||
-      readback->bytes_per_pixel == 0 || readback->bytes_per_pixel > 16) {
+      readback->bytes_per_pixel == 0 || readback->bytes_per_pixel > 32) {
     CopyError(error, error_size, "missing SystemC API readback destination");
     return 2;
   }

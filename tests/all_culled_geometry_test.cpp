@@ -5,6 +5,9 @@
  * Set Simulator）→ClipCull event-driven FIFO 路徑。測試 1023-index segment
  * 的 aggregate clipmask fast/slow 選擇與 GLES GL_BACK/GL_CCW face cull；
  * expected setup counts 跨多尺寸變化，避免 case-name counter shortcut。
+ * 32..96 的 swath-order segment 皆含 clipmask，因此 backface 在
+ * generic clip path 進入 fixed setup 前即被剔除；唯有 128x128
+ * 全部 clean segment 會保留 non-rasterizable setup slots。
  */
 #include "common/functional_types.h"
 #include "common/pipeline_state.h"
@@ -43,10 +46,10 @@ struct ViewportExpectation {
 
 constexpr std::array<ViewportExpectation, 6> kExpectations = {{
     {32, 0},
-    {48, 4092},
-    {64, 5456},
-    {80, 6479},
-    {96, 7843},
+    {48, 0},
+    {64, 0},
+    {80, 0},
+    {96, 0},
     {128, 32768},
 }};
 

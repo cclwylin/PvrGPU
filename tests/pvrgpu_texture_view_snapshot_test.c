@@ -153,7 +153,7 @@ test_view(enum pipe_texture_target target, enum pipe_format format,
       CHECK(bytes == NULL && !strcmp(reason, expected)); \
    } while (0)
       sampler.state.compare_mode = PIPE_TEX_COMPARE_R_TO_TEXTURE;
-      REJECT_CUBE("cube_array_layout_or_sampler");
+      REJECT_CUBE("shadow_sampler_state");
       sampler.state.compare_mode = PIPE_TEX_COMPARE_NONE;
       sampler.state.unnormalized_coords = true;
       REJECT_CUBE("sampler_state");
@@ -185,11 +185,20 @@ test_view(enum pipe_texture_target target, enum pipe_format format,
       view.format = format;
       for (unsigned s = 0; s < MESA_SHADER_STAGES; ++s) {
          if (s == MESA_SHADER_FRAGMENT) continue;
+         uint32_t api_stage = 0;
+         const bool mapped = pvrgpu_systemc_shader_stage_from_mesa(s, &api_stage);
          ctx.sampler_views[s][0] = &view;
          ctx.samplers[s][0] = &sampler;
-         CHECK(!pvrgpu_capture_generic_sequence_texture(&ctx, s, 0, 0,
-                                                        &captured, &bytes, &reason));
-         CHECK(bytes == NULL);
+         const bool accepted = pvrgpu_capture_generic_sequence_texture(
+            &ctx, s, 0, 0, &captured, &bytes, &reason);
+         CHECK(accepted == mapped);
+         if (mapped) {
+            CHECK(bytes != NULL && captured.stage == api_stage);
+            free(bytes);
+            bytes = NULL;
+         } else {
+            CHECK(bytes == NULL && !strcmp(reason, "arguments"));
+         }
       }
 #undef REJECT_CUBE
    }
@@ -250,6 +259,7 @@ static void test_cube_array_depth_views(void)
       view.u.tex.last_level = 3;
       struct pvrgpu_sampler_state sampler = {0};
       sampler.state.min_mip_filter = PIPE_TEX_MIPFILTER_NEAREST;
+      sampler.state.compare_func = PIPE_FUNC_LEQUAL;
       sampler.state.wrap_s = sampler.state.wrap_t = sampler.state.wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE;
       struct pvrgpu_context ctx = {0};
       ctx.sampler_views[MESA_SHADER_FRAGMENT][4] = &view;
@@ -311,9 +321,26 @@ static void test_cube_array_depth_views(void)
                CHECK(descriptor[7] == 0 && descriptor[12] == 0);
                free(bytes); bytes = NULL;
                sampler.state.compare_mode = PIPE_TEX_COMPARE_R_TO_TEXTURE;
-               CHECK(!pvrgpu_capture_generic_sequence_texture(&ctx, MESA_SHADER_FRAGMENT,
-                  4, 4, &captured, &bytes, &reason));
-               CHECK(bytes == NULL && !strcmp(reason, "cube_array_layout_or_sampler"));
+               if (s < 2) {
+                  CHECK(pvrgpu_capture_generic_sequence_texture(
+                     &ctx, MESA_SHADER_FRAGMENT, 4, 4, &captured, &bytes,
+                     &reason));
+                  CHECK(bytes != NULL);
+                  memset(descriptor, 0, sizeof(descriptor));
+                  pvrgpu_set_generic_texture_compare_metadata(
+                     &view, &sampler.state, descriptor);
+                  CHECK(descriptor[7] == ((UINT32_C(1) << 9) |
+                        (!util_format_is_float(formats[f]) ?
+                           UINT32_C(1) << 8 : 0)));
+                  CHECK(descriptor[12] == PIPE_FUNC_LEQUAL);
+                  free(bytes); bytes = NULL;
+               } else {
+                  CHECK(!pvrgpu_capture_generic_sequence_texture(
+                     &ctx, MESA_SHADER_FRAGMENT, 4, 4, &captured, &bytes,
+                     &reason));
+                  CHECK(bytes == NULL && !strcmp(reason,
+                                                 "shadow_sampler_state"));
+               }
                sampler.state.compare_mode = PIPE_TEX_COMPARE_NONE;
                view.format = PIPE_FORMAT_S8_UINT;
                CHECK(!pvrgpu_capture_generic_sequence_texture(&ctx, MESA_SHADER_FRAGMENT,
@@ -381,7 +408,9 @@ static void test_shadow_metadata(void)
                uint32_t descriptor[20] = {0};
                pvrgpu_set_generic_texture_compare_metadata(&view, &sampler.state, descriptor);
                CHECK(descriptor[12] == compare);
-               CHECK(descriptor[7] == (formats[f] == PIPE_FORMAT_Z32_FLOAT ? 0 : 0x100));
+               CHECK(descriptor[7] == ((UINT32_C(1) << 9) |
+                     (!util_format_is_float(formats[f]) ?
+                        UINT32_C(1) << 8 : 0)));
             }
          }
          for (unsigned filter = 0; filter < 3; ++filter) {
@@ -391,9 +420,19 @@ static void test_shadow_metadata(void)
             sampler.state.min_img_filter = filter == 0 ? PIPE_TEX_FILTER_LINEAR : PIPE_TEX_FILTER_NEAREST;
             sampler.state.mag_img_filter = filter == 1 ? PIPE_TEX_FILTER_LINEAR : PIPE_TEX_FILTER_NEAREST;
             sampler.state.min_mip_filter = filter == 2 ? PIPE_TEX_MIPFILTER_LINEAR : PIPE_TEX_MIPFILTER_NEAREST;
-            CHECK(!pvrgpu_capture_generic_sequence_texture(&ctx, stage, 0, 0,
+            CHECK(pvrgpu_capture_generic_sequence_texture(&ctx, stage, 0, 0,
                   &captured, &bytes, &reason));
-            CHECK(bytes == NULL && !strcmp(reason, "shadow_sampler_state_requires_nearest_2d"));
+            CHECK(bytes != NULL);
+            CHECK(captured.min_filter == (filter == 0 ?
+                  PVRGPU_SYSTEMC_PCO_TEXTURE_FILTER_LINEAR :
+                  PVRGPU_SYSTEMC_PCO_TEXTURE_FILTER_NEAREST));
+            CHECK(captured.mag_filter == (filter == 1 ?
+                  PVRGPU_SYSTEMC_PCO_TEXTURE_FILTER_LINEAR :
+                  PVRGPU_SYSTEMC_PCO_TEXTURE_FILTER_NEAREST));
+            CHECK(captured.mip_filter == (filter == 2 ?
+                  PVRGPU_SYSTEMC_PCO_TEXTURE_MIP_FILTER_LINEAR :
+                  PVRGPU_SYSTEMC_PCO_TEXTURE_MIP_FILTER_NONE));
+            free(bytes);
          }
          sampler.state.min_img_filter = sampler.state.mag_img_filter = PIPE_TEX_FILTER_NEAREST;
          sampler.state.min_mip_filter = PIPE_TEX_MIPFILTER_NEAREST;
@@ -500,7 +539,9 @@ static void test_shadow_gather_snapshot(void)
                   uint32_t descriptor[20] = {0};
                   pvrgpu_set_generic_texture_compare_metadata(&view, &sampler.state, descriptor);
                   CHECK(descriptor[12] == compare);
-                  CHECK(descriptor[7] == (formats[f] == PIPE_FORMAT_Z32_FLOAT ? 0 : 0x100));
+                  CHECK(descriptor[7] == ((UINT32_C(1) << 9) |
+                        (!util_format_is_float(formats[f]) ?
+                           UINT32_C(1) << 8 : 0)));
                   const uint8_t retained = bytes[0];
                   resource.data[0] ^= 1;
                   CHECK(bytes[0] == retained);
@@ -509,8 +550,10 @@ static void test_shadow_gather_snapshot(void)
                }
             }
          }
-         /* Linear state must remain refused unless the actual FS proves this
-          * exact sampler has only supported gathers. No blanket promotion. */
+         /* Ordinary shadow sampling may use fixed-function compare-before-
+          * filter PCF (descriptor word 7 bit 9), including linear filters.
+          * A shader that actually issues gather still needs the stricter
+          * gather-only contract because it consumes four unfiltered depths. */
          sampler.state.min_img_filter = sampler.state.mag_img_filter = PIPE_TEX_FILTER_LINEAR;
          for (unsigned negative = 0; negative < 15; ++negative) {
             sampler.state.min_img_filter = sampler.state.mag_img_filter =
@@ -533,11 +576,30 @@ static void test_shadow_gather_snapshot(void)
             struct pvrgpu_systemc_pco_sequence_texture captured = {0};
             uint8_t *bytes = NULL;
             const char *reason = NULL;
-            CHECK(!pvrgpu_shadow_gather_sampler_supported(&ctx,
-               MESA_SHADER_FRAGMENT, slot, &view, &sampler.state));
-            CHECK(!pvrgpu_capture_generic_sequence_texture(&ctx,
-               MESA_SHADER_FRAGMENT, slot, 0, &captured, &bytes, &reason));
-            CHECK(bytes == NULL && captured.bytes == NULL && reason != NULL);
+            const bool uses_shadow_gather = ctx.fs &&
+               pvrgpu_pco_fragment_has_shadow_gather(ctx.fs->nir, slot);
+            const bool gather_supported =
+               pvrgpu_shadow_gather_sampler_supported(&ctx,
+                  MESA_SHADER_FRAGMENT, slot, &view, &sampler.state);
+            const bool ordinary_supported = !uses_shadow_gather &&
+               pvrgpu_shadow_sampler_supported(&view, &sampler.state);
+            const bool expected = gather_supported || ordinary_supported;
+            CHECK(pvrgpu_capture_generic_sequence_texture(&ctx,
+               MESA_SHADER_FRAGMENT, slot, 0, &captured, &bytes, &reason) ==
+               expected);
+            if (expected) {
+               CHECK(bytes != NULL && captured.bytes == bytes);
+               uint32_t descriptor[20] = {0};
+               pvrgpu_set_generic_texture_compare_metadata(
+                  &view, &sampler.state, descriptor);
+               CHECK(descriptor[7] == ((UINT32_C(1) << 9) |
+                     (!util_format_is_float(formats[f]) ?
+                        UINT32_C(1) << 8 : 0)));
+               CHECK(descriptor[12] == sampler.state.compare_func);
+               free(bytes);
+            } else {
+               CHECK(bytes == NULL && captured.bytes == NULL && reason != NULL);
+            }
          }
          ctx.fs = &fs;
          resource.base.nr_samples = 0;
@@ -685,6 +747,93 @@ test_mrt_initial_snapshot(unsigned samples)
       free(resources[target].data);
 }
 
+static void
+test_canonical_color_initial_snapshot(enum pipe_format format,
+                                      const float color[4])
+{
+   struct pvrgpu_resource resource = {0};
+   struct pvrgpu_context ctx = {0};
+   struct pvrgpu_array_primitive_draw recorded = {0};
+   union pipe_color_union packed = {0};
+   memcpy(packed.f, color, sizeof(packed.f));
+   resource.base.target = PIPE_TEXTURE_2D;
+   resource.base.format = format;
+   resource.base.width0 = resource.base.height0 = resource.base.depth0 = 1;
+   resource.base.array_size = 1;
+   resource.level_count = 1;
+   resource.level_strides[0] = util_format_get_stride(format, 1);
+   resource.level_layer_strides[0] = resource.level_strides[0];
+   resource.size = resource.level_strides[0];
+   resource.data = calloc(1, resource.size);
+   CHECK(resource.data != NULL);
+   util_format_pack_rgba(format, resource.data, &packed, 1);
+   ctx.framebuffer.width = ctx.framebuffer.height = 1;
+   ctx.framebuffer.nr_cbufs = 1;
+   ctx.framebuffer.cbufs[0] = (struct pipe_surface){
+      .texture = &resource.base, .format = format,
+      .first_layer = 0, .last_layer = 0};
+   recorded.command.format = pvrgpu_command_format_for_surface(format);
+   recorded.command.render_target_count = 1;
+   CHECK(pvrgpu_color_format_uses_canonical_float(recorded.command.format));
+   CHECK(pvrgpu_capture_initial_color_attachment(&ctx, &recorded));
+   CHECK(recorded.command.initial_color_attachment_bytes_size == 16);
+   union pipe_color_union expected = {0};
+   util_format_unpack_rgba(format, &expected, resource.data, 1);
+   CHECK(!memcmp(recorded.initial_color_attachment_bytes, expected.f,
+                 sizeof(expected.f)));
+   CHECK(expected.f[0] < 0.0f || format != PIPE_FORMAT_R8_SNORM);
+   CHECK(expected.f[3] == 1.0f);
+   free(recorded.initial_color_attachment_bytes);
+   free(resource.data);
+}
+
+static void
+test_unorm32_color_initial_snapshot(void)
+{
+   static const uint32_t native[4] = {
+      UINT32_C(0x01000001), UINT32_C(0x80000001),
+      UINT32_C(0xfffffffe), UINT32_C(0x12345679)};
+   struct pvrgpu_resource resource = {0};
+   struct pvrgpu_context ctx = {0};
+   struct pvrgpu_array_primitive_draw recorded = {0};
+   resource.base.target = PIPE_TEXTURE_2D;
+   resource.base.format = PIPE_FORMAT_R32G32B32A32_UNORM;
+   resource.base.width0 = resource.base.height0 = resource.base.depth0 = 1;
+   resource.base.array_size = 1;
+   resource.level_count = 1;
+   resource.level_strides[0] = sizeof(native);
+   resource.level_layer_strides[0] = sizeof(native);
+   resource.size = sizeof(native);
+   resource.data = malloc(resource.size);
+   CHECK(resource.data != NULL);
+   memcpy(resource.data, native, sizeof(native));
+   ctx.framebuffer.width = ctx.framebuffer.height = 1;
+   ctx.framebuffer.nr_cbufs = 1;
+   ctx.framebuffer.cbufs[0] = (struct pipe_surface){
+      .texture = &resource.base,
+      .format = PIPE_FORMAT_R32G32B32A32_UNORM,
+      .first_layer = 0,
+      .last_layer = 0};
+   recorded.command.format = pvrgpu_command_format_for_surface(
+      PIPE_FORMAT_R32G32B32A32_UNORM);
+   recorded.command.render_target_count = 1;
+   CHECK(pvrgpu_color_format_uses_canonical_double(recorded.command.format));
+   CHECK(!pvrgpu_color_format_uses_canonical_float(recorded.command.format));
+   CHECK(pvrgpu_capture_initial_color_attachment(&ctx, &recorded));
+   CHECK(recorded.command.initial_color_attachment_bytes_size ==
+         4u * sizeof(double));
+   for (unsigned component = 0; component < 4; ++component) {
+      double canonical;
+      memcpy(&canonical,
+             recorded.initial_color_attachment_bytes +
+                component * sizeof(canonical),
+             sizeof(canonical));
+      CHECK(canonical == (double)native[component] / 4294967295.0);
+   }
+   free(recorded.initial_color_attachment_bytes);
+   free(resource.data);
+}
+
 static void test_color_transport_bounds(void)
 {
    struct pvrgpu_context ctx = {0};
@@ -706,7 +855,7 @@ static void test_color_transport_bounds(void)
       }
       if (count) {
          ctx.framebuffer.cbufs[count - 1].texture = NULL;
-         CHECK(!pvrgpu_framebuffer_color_transport_is_bounded(&ctx));
+         CHECK(pvrgpu_framebuffer_color_transport_is_bounded(&ctx) == (count <= 4));
       }
    }
 }
@@ -727,6 +876,19 @@ int main(void)
    test_shadow_gather_snapshot();
    test_mrt_initial_snapshot(1);
    test_mrt_initial_snapshot(4);
+   {
+      const float snorm[4] = {-0.5f, 0.75f, 0.25f, 0.125f};
+      const float unorm16[4] = {0.50001f, 0.75f, 0.25f, 0.125f};
+      const float half[4] = {1.0006f, 7.0f, 8.0f, 9.0f};
+      test_canonical_color_initial_snapshot(PIPE_FORMAT_R8_SNORM, snorm);
+      test_canonical_color_initial_snapshot(PIPE_FORMAT_R8_UNORM, unorm16);
+      test_canonical_color_initial_snapshot(PIPE_FORMAT_R8G8_UNORM, unorm16);
+      test_canonical_color_initial_snapshot(PIPE_FORMAT_R5G6B5_UNORM,
+                                            unorm16);
+      test_canonical_color_initial_snapshot(PIPE_FORMAT_R16_UNORM, unorm16);
+      test_canonical_color_initial_snapshot(PIPE_FORMAT_R16_FLOAT, half);
+      test_unorm32_color_initial_snapshot();
+   }
    printf("texture view snapshot: PASS (%u checks)\n", snapshot_checks);
    return 0;
 }

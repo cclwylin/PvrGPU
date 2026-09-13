@@ -44,12 +44,17 @@ void TestMode(MemoryMode mode) {
   UscUniformBufferMemory::Read(&fragment, address + 16, 4, output.data());
   Check(std::equal(output.begin(), output.end(), words.begin() + 4),
         "fragment range is independent");
-  Reject([&] { UscUniformBufferMemory::Read(&vertex, address + 16, 1, output.data()); },
-         "another stage's same-page memory is forbidden");
-  Reject([&] { UscUniformBufferMemory::Read(&fragment, address, 1, output.data()); },
-         "preceding stage range is forbidden");
-  Reject([&] { UscUniformBufferMemory::Read(&adjacent, address + 12, 2, output.data()); },
-         "one LD cannot cross adjacent block ranges");
+  output.fill(0xccccccccU);
+  UscUniformBufferMemory::Read(&vertex, address + 16, 1, output.data());
+  Check(output[0] == 0,
+        "another stage's same-page memory is a robust zero load");
+  output.fill(0xccccccccU);
+  UscUniformBufferMemory::Read(&fragment, address, 1, output.data());
+  Check(output[0] == 0, "an address before the stage range loads zero");
+  output.fill(0xccccccccU);
+  UscUniformBufferMemory::Read(&adjacent, address + 12, 2, output.data());
+  Check(output[0] == words[3] && output[1] == 0,
+        "a vector preserves its in-range DWORD without crossing blocks");
   Reject([&] { UscUniformBufferMemory::Read(&vertex, address + 1, 1, output.data()); },
          "unaligned LD is rejected");
   Reject([&] { UscUniformBufferMemory::Read(&vertex, address, 0, output.data()); },
@@ -73,9 +78,11 @@ void TestMode(MemoryMode mode) {
   Reject([&] { UscUniformBufferMemory invalid(&memory, mode, {{UINT64_MAX - 3, 16, 0, 0}}); },
          "resource address overflow is rejected");
   UscUniformBufferMemory empty(&memory, mode, {});
-  Reject([&] { UscUniformBufferMemory::Read(&empty, address, 1, output.data()); },
-         "unbound slot cannot read allocated DRAM");
-  Check(empty.stats().dram_read_transactions == 0, "rejected LD does not issue traffic");
+  output.fill(0xccccccccU);
+  UscUniformBufferMemory::Read(&empty, address, 1, output.data());
+  Check(output[0] == 0, "an unbound UBO loads zero");
+  Check(empty.stats().dram_read_transactions == 0,
+        "robust zero LD does not issue traffic");
   const auto &stats = vertex.stats();
   if (mode == MemoryMode::kDirect) {
     Check(stats.direct_read_bytes == 20 && MemoryAccessDelayCycles(stats) == 0,
@@ -110,8 +117,12 @@ void TestMode(MemoryMode mode) {
     if (count < 16)
       Check(wide_output[count] == 0, "LD writes only its declared response span");
   }
-  Reject([&] { UscUniformBufferMemory::Read(&wide, wide_address + 4, 16, wide_output.data()); },
-         "16-DWORD load still obeys the exact bound range");
+  wide_output.fill(0xccccccccU);
+  UscUniformBufferMemory::Read(&wide, wide_address + 4, 16,
+                               wide_output.data());
+  Check(std::equal(wide_output.begin(), wide_output.begin() + 15,
+                   wide_words.begin() + 1) && wide_output[15] == 0,
+        "16-DWORD load zero-fills only its out-of-range tail");
 }
 } // namespace
 

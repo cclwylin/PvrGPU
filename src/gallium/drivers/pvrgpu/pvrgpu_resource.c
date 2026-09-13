@@ -2,6 +2,7 @@
 
 #include "pvrgpu_resource.h"
 #include "pvrgpu_cmd.h"
+#include "pvrgpu_color_formats.h"
 #include "pvrgpu_context.h"
 #include "pvrgpu_counter.h"
 #include "pvrgpu_msaa.h"
@@ -1064,7 +1065,8 @@ static bool
 pvrgpu_resource_readback_transport_is_srgb(enum pipe_format format)
 {
    return format == PIPE_FORMAT_R8G8B8A8_SRGB ||
-          format == PIPE_FORMAT_B8G8R8A8_SRGB;
+          format == PIPE_FORMAT_B8G8R8A8_SRGB ||
+          format == PIPE_FORMAT_A8B8G8R8_SRGB;
 }
 
 /*
@@ -1113,6 +1115,9 @@ pvrgpu_resource_readback_format_is_supported(enum pipe_format format)
 
    const enum pipe_format pack_format =
       pvrgpu_resource_readback_pack_format(format);
+   const char *transport = pvrgpu_command_format_for_surface(format);
+   if (pvrgpu_color_format_uses_canonical_double(transport))
+      return format == PIPE_FORMAT_R32G32B32A32_UNORM;
    const struct util_format_pack_description *pack =
       util_format_pack_description(pack_format);
    if (!pack)
@@ -1122,7 +1127,8 @@ pvrgpu_resource_readback_format_is_supported(enum pipe_format format)
       return pack->pack_rgba_uint != NULL;
    if (util_format_is_pure_sint(format))
       return pack->pack_rgba_sint != NULL;
-   if (util_format_is_float(format))
+   if (pvrgpu_color_format_uses_canonical_float(transport) ||
+       util_format_is_float(format))
       return pack->pack_rgba_float != NULL;
    return pack->pack_rgba_8unorm != NULL;
 }
@@ -1137,11 +1143,32 @@ pvrgpu_resource_readback_format_is_supported(enum pipe_format format)
 static unsigned
 pvrgpu_resource_readback_bytes_per_pixel(enum pipe_format format)
 {
+   if (pvrgpu_color_format_uses_canonical_double(
+          pvrgpu_command_format_for_surface(format)))
+      return 4u * sizeof(double);
+   if (pvrgpu_color_format_uses_canonical_float(
+          pvrgpu_command_format_for_surface(format)))
+      return 4u * sizeof(float);
    if (util_format_is_float(format))
       return 4u * sizeof(float);
    const unsigned raw_channels =
       pvrgpu_resource_readback_raw_channels(format);
    return raw_channels ? raw_channels * sizeof(uint32_t) : 4u;
+}
+
+static uint32_t
+pvrgpu_resource_canonical_double_to_unorm32(double value)
+{
+   if (!(value > 0.0))
+      return 0;
+   if (value >= 1.0)
+      return UINT32_MAX;
+   const double scaled = value * 4294967295.0;
+   uint64_t rounded = (uint64_t)scaled;
+   const double fraction = scaled - (double)rounded;
+   if (fraction > 0.5 || (fraction == 0.5 && (rounded & 1u)))
+      ++rounded;
+   return (uint32_t)MIN2(rounded, UINT32_MAX);
 }
 
 /*
@@ -1164,6 +1191,23 @@ pvrgpu_resource_readback_store_row(enum pipe_format format,
       memcpy(destination, source_row, (size_t)width * sizeof(uint32_t));
       return;
    }
+   if (pvrgpu_color_format_uses_canonical_double(
+          pvrgpu_command_format_for_surface(format))) {
+      for (unsigned x = 0; x < width; ++x) {
+         for (unsigned component = 0; component < 4; ++component) {
+            double canonical;
+            memcpy(&canonical,
+                   source_row + ((size_t)x * 4u + component) * sizeof(canonical),
+                   sizeof(canonical));
+            const uint32_t native =
+               pvrgpu_resource_canonical_double_to_unorm32(canonical);
+            memcpy(destination +
+                      ((size_t)x * 4u + component) * sizeof(native),
+                   &native, sizeof(native));
+         }
+      }
+      return;
+   }
    const enum pipe_format pack_format =
       pvrgpu_resource_readback_pack_format(format);
    const struct util_format_pack_description *pack =
@@ -1171,7 +1215,9 @@ pvrgpu_resource_readback_store_row(enum pipe_format format,
    const unsigned raw_channels =
       pvrgpu_resource_readback_raw_channels(format);
 
-   if (util_format_is_float(format)) {
+   if (pvrgpu_color_format_uses_canonical_float(
+          pvrgpu_command_format_for_surface(format)) ||
+       util_format_is_float(format)) {
       pack->pack_rgba_float(destination,
                             util_format_get_stride(pack_format, width),
                             (const float *)source_row,

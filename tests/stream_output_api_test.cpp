@@ -56,6 +56,7 @@ struct Fixture {
     draw.fragment_pco_abi = {4,0,0,4,4,0,4,0,0,0};
     draw.position_output_count = draw.varying_output_start = 4;
     draw.fragment_position_count = draw.fragment_varying_start = 4;
+    draw.fragment_position_uses_w = 1;
     draw.fragment_output_mask[0] = 15;
     draw.viewport_scale_bits[0] = draw.viewport_scale_bits[1] = 0x41000000;
     draw.viewport_scale_bits[2] = 0x3f000000;

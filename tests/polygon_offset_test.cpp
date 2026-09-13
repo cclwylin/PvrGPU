@@ -120,9 +120,14 @@ void RunCase(Modules &modules, const OffsetCase &test, std::uint64_t sequence) {
   state.stage = PipelineStage::kTiled;
   state.counters.c_primitives = state.counters.setup_triangles = 1;
   state.position_output_count = 4;
+  state.varying_output_start = 4;
   state.fragment_position_count = 4;
+  state.fragment_position_uses_w = 1;
+  state.fragment_varying_start = 4;
   state.vertex_pco_abi.vertex_outputs = 4;
   state.fragment_pco_abi.coefficients = 4;
+  state.shader_varying_bindings =
+      StoreNewArray(modules.pool, std::vector<ShaderVaryingBinding>{});
   state.raster_state.depth.test_enable = 1;
   state.raster_state.depth.write_enable = 1;
   state.raster_state.depth.compare_op = DepthCompareOp::kAlways;
@@ -155,6 +160,9 @@ void RunCase(Modules &modules, const OffsetCase &test, std::uint64_t sequence) {
   triangle.window_z[0] = 0.171875F;
   triangle.window_z[1] = 0.234375F;
   triangle.window_z[2] = 0.296875F;
+  triangle.reciprocal_w[0] = 1.0F;
+  triangle.reciprocal_w[1] = 1.0F;
+  triangle.reciprocal_w[2] = 1.0F;
   state.raster_triangles =
       StoreNewArray(modules.pool, std::vector<RasterTriangle>{triangle});
   state.raster_vertex_outputs =

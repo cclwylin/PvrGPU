@@ -29,7 +29,10 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # fixture statically checks these request/response/continuation ABI sizes;
 # usc-fragment-residency-test independently guards the 256 complete-quad cap.
 # BIAS grew only the request from 120 to 128 bytes (+8192 at full residency).
-TEXTURE_RESIDENT_HOST_BYTES = 256 * 4 * (128 + 40 + 1448)
+TEXTURE_RESIDENT_HOST_BYTES = 256 * 4 * (128 + 40 + 1464)
+# One live PipelineState now carries the common plus four per-target native
+# colour codec records.  Structure alignment makes the exact pool delta 32 B.
+COLOR_ATTACHMENT_CODEC_STATE_BYTES = 32
 
 
 def verify_tessellation_stage_connections() -> None:
@@ -872,10 +875,11 @@ def fill_texture_quad_work(case_name: str) -> dict[str, int]:
     triangle 1 under the top-left rule. None of these outer edges is on a
     pixel center, including after 8-bit subpixel quantization.
 
-    A primitive's nonempty 2x2 quad executes all four lanes for SMP/derivatives.
-    The adjacent empty child of a touched 4x2 half-stamp is masked dispatch
-    padding, not functional shader work. Keep the former stamp counts below
-    as an independent regression check on the enumeration itself.
+    Fragment work is issued in 4x2 half-stamps.  Once either 2x2 child is
+    touched, both child quads execute all four lanes for SMP/derivatives; the
+    uncovered child lanes are helpers and do not increase ps_invocations.
+    Derive issued work from half-stamps while retaining the independently
+    covered-quad counts below as a raster-enumeration regression check.
     """
     profiles = {
         "fill_tex_nearest": (0x3F800000, 4096, 544, 1056, 1),
@@ -884,7 +888,9 @@ def fill_texture_quad_work(case_name: str) -> dict[str, int]:
         "fill_tex_trilinear_linear_04": (0x3F420C4A, 2304, 312, 600, 8),
         "fill_tex_trilinear_linear_05": (0x3F350481, 2116, 311, 598, 8),
     }
-    bits, expected_pixels, old_stamps, expected_quads, taps = profiles[case_name]
+    bits, expected_pixels, expected_half_stamps, expected_covered_quads, taps = (
+        profiles[case_name]
+    )
     scale = struct.unpack("<f", struct.pack("<I", bits))[0]
     low, high = (1 - scale) * 32, (1 + scale) * 32
     low_subpixel = math.floor(low * 256 + 0.5)
@@ -900,23 +906,27 @@ def fill_texture_quad_work(case_name: str) -> dict[str, int]:
     quads = {(primitive, x // 2, y // 2) for primitive, x, y in coverage}
     half_stamps = {(primitive, x // 4, y // 2) for primitive, x, y in coverage}
     assert (len(coverage), len(half_stamps), len(quads)) == (
-        expected_pixels, old_stamps, expected_quads
+        expected_pixels, expected_half_stamps, expected_covered_quads
     ), f"{case_name}: independent raster coverage changed"
-    lanes = len(quads) * 4
+    issued_quads = len(half_stamps) * 2
+    issued_lanes = issued_quads * 4
     return {
         "ps_invocations": len(coverage),
-        "usc_groups": len(quads) + 1,  # One independent vertex group.
-        "texture_requests": lanes,  # One encoded SMP per shader lane.
-        "texel_fetches": lanes * taps,
-        "fs_alu_instructions": lanes * 19,
-        "fs_tex_instructions": lanes,
-        "pds_coefficient_tasks": len(quads),
-        "pds_douti_issues": len(quads) * 2,
-        "usc_coefficient_load_bytes": len(quads) * 12 * 4,
+        "usc_groups": issued_quads + 1,  # One independent vertex group.
+        "texture_requests": issued_lanes,  # One encoded SMP per shader lane.
+        "texel_fetches": issued_lanes * taps,
+        "fs_alu_instructions": issued_lanes * 19,
+        "fs_tex_instructions": issued_lanes,
+        "pds_coefficient_tasks": issued_quads,
+        "pds_douti_issues": issued_quads * 2,
+        "usc_coefficient_load_bytes": issued_quads * 12 * 4,
+        # Four fixed memory-delay cycles follow the functional frontend cost
+        # of base 5 plus one batch per 128 issued lanes.
+        "fragment_frontend_cycles": 9 + (issued_lanes + 127) // 128,
         # Vertex + fragment stages: base 2 twice + one vertex slot batch;
         # base 4 twice + one vertex cluster batch (reference_uarch.h).
-        "usc_slot_cycles": 5 + (len(quads) + 1) // 2,
-        "usc_cluster_cycles": 9 + (len(quads) + 3) // 4,
+        "usc_slot_cycles": 5 + (issued_quads + 1) // 2,
+        "usc_cluster_cycles": 9 + (issued_quads + 3) // 4,
     }
 
 
@@ -1723,10 +1733,13 @@ def verify_triangle_setup_all_culled(
         "ia_primitives": 32768,
         "vs_invocations": 21144,
         "c_invocations": 32768,
-        "c_primitives": 5456,
+        # Every 1023-index swath segment contains a nonzero clipmask at
+        # 64x64.  The generic clip path rejects its backfaces before fixed
+        # setup, so an all-back-facing draw emits no setup slots.
+        "c_primitives": 0,
         "ps_invocations": 0,
         "drawlists": 1,
-        "setup_triangles": 5456,
+        "setup_triangles": 0,
         "texel_fetches": 0,
         "texture_requests": 0,
         "tiles_binned": 4,
@@ -1865,10 +1878,12 @@ def verify_triangle_setup_half_culled(
         "ia_primitives": 32768,
         "vs_invocations": 21144,
         "c_invocations": 32768,
-        "c_primitives": 6797,
+        # All swath segments take the generic clip path; only the 2044
+        # front-facing visible cells (two triangles each) reach setup.
+        "c_primitives": 4088,
         "ps_invocations": 2044,
         "drawlists": 1,
-        "setup_triangles": 6797,
+        "setup_triangles": 4088,
         "texel_fetches": 0,
         "texture_requests": 0,
         "tiles_binned": 4,
@@ -3027,6 +3042,7 @@ def verify_fill_tex_nearest(executable: Path, output_dir: Path) -> None:
         "uarch_provenance": "assumed",
         "timing_provenance": "uncalibrated",
         "cache_bypass": False,
+        "texture_lod_mode": "llvmpipe",
         "cache_policy": "set-associative-write-back-write-allocate-true-lru",
         "framebuffer_source": "dram-readback",
         "dram_fixed_latency_cycles": 1,
@@ -3129,17 +3145,20 @@ def verify_fill_tex_nearest(executable: Path, output_dir: Path) -> None:
     # Fixed-fixture, assumed-uArch unified-memory regression baseline. Work
     # counts come from the independent coverage oracle above, not this run.
     expected_modeled = {
-        "virtual_gpu_cycles": 15031,
+        "virtual_gpu_cycles": 15440,
         "tiler_cycles": 62,
-        "renderer_cycles": 14944,
+        "renderer_cycles": 15353,
         "usc_groups": work["usc_groups"],
         "texture_requests": work["texture_requests"],
         "fifo_stall_events": 0,
         "pool_bytes_in_flight": 0,
         # At most 256 complete quads have live FIFO payloads. The request,
-        # response and continuation span totals 1616 bytes per resident lane;
+        # response and continuation span totals 1632 bytes per resident lane;
         # all geometry/coverage/coefficients remain allocated for the draw.
-        "pool_high_water_bytes": 1369590 + TEXTURE_RESIDENT_HOST_BYTES,
+        "pool_high_water_bytes": (
+            1381622 + TEXTURE_RESIDENT_HOST_BYTES +
+            COLOR_ATTACHMENT_CODEC_STATE_BYTES
+        ),
         "vdm_cycles": 9,
         "vertex_fetch_cycles": 9,
         "vertex_attribute_fetches": 8,
@@ -3164,8 +3183,10 @@ def verify_fill_tex_nearest(executable: Path, output_dir: Path) -> None:
         "usc_coefficient_load_bytes": work["usc_coefficient_load_bytes"],
         "tile_scheduler_cycles": 9,
         "isp_cycles": 78,
-        "fragment_frontend_cycles": 42,
-        "texture_cycles": 13696,
+        "fragment_frontend_cycles": work["fragment_frontend_cycles"],
+        # One SLC hit and two functional cycles per added nearest request;
+        # the fixture's 1024 miss-delay cycles are unchanged.
+        "texture_cycles": work["texture_requests"] * 3 + 1024,
         "pbe_cycles": 44,
         "pixel_data_master_transactions": 1,
         "pixel_data_master_bytes": 16384,
@@ -3178,15 +3199,15 @@ def verify_fill_tex_nearest(executable: Path, output_dir: Path) -> None:
         "tcu_writebacks": 0,
         "tcu_bypassed": 0,
         "tcu_cycles": 0,
-        "slc_line_accesses": 4374,
-        "slc_read_accesses": 4241,
+        "slc_line_accesses": work["texel_fetches"] + 17 + 133,
+        "slc_read_accesses": work["texel_fetches"] + 17,
         "slc_write_accesses": 133,
-        "slc_hits": 3215,
+        "slc_hits": work["texel_fetches"] + 17 + 133 - 1159,
         "slc_misses": 1159,
         "slc_evictions": 0,
         "slc_writebacks": 133,
         "slc_bypassed": 0,
-        "slc_cycles": 4374,
+        "slc_cycles": work["texel_fetches"] + 17 + 133,
         "dram_read_transactions": 1027,
         "dram_write_transactions": 133,
         "dram_read_bytes": 147712,
@@ -3346,6 +3367,7 @@ def verify_fill_tex_bilinear(executable: Path, output_dir: Path) -> None:
         "uarch_provenance": "assumed",
         "timing_provenance": "uncalibrated",
         "cache_bypass": False,
+        "texture_lod_mode": "llvmpipe",
         "cache_policy": "set-associative-write-back-write-allocate-true-lru",
         "framebuffer_source": "dram-readback",
         "dram_fixed_latency_cycles": 1,
@@ -3450,15 +3472,18 @@ def verify_fill_tex_bilinear(executable: Path, output_dir: Path) -> None:
     # Fixed-fixture, assumed-uArch unified-memory regression baseline. Work
     # counts come from the independent coverage oracle above, not this run.
     expected_modeled = {
-        "virtual_gpu_cycles": 28727,
+        "virtual_gpu_cycles": 29520,
         "tiler_cycles": 62,
-        "renderer_cycles": 28640,
+        "renderer_cycles": 29433,
         "usc_groups": work["usc_groups"],
         "texture_requests": work["texture_requests"],
         "fifo_stall_events": 0,
         "pool_bytes_in_flight": 0,
         # Invariant geometry/coverage storage plus bounded resident FIFO data.
-        "pool_high_water_bytes": 1369590 + TEXTURE_RESIDENT_HOST_BYTES,
+        "pool_high_water_bytes": (
+            1381622 + TEXTURE_RESIDENT_HOST_BYTES +
+            COLOR_ATTACHMENT_CODEC_STATE_BYTES
+        ),
         "vdm_cycles": 9,
         "vertex_fetch_cycles": 9,
         "vertex_attribute_fetches": 8,
@@ -3483,8 +3508,10 @@ def verify_fill_tex_bilinear(executable: Path, output_dir: Path) -> None:
         "usc_coefficient_load_bytes": work["usc_coefficient_load_bytes"],
         "tile_scheduler_cycles": 9,
         "isp_cycles": 78,
-        "fragment_frontend_cycles": 42,
-        "texture_cycles": 27392,
+        "fragment_frontend_cycles": work["fragment_frontend_cycles"],
+        # Four texels plus the functional issue cost contribute six cycles
+        # per request; the fixture's miss-delay term remains 2048 cycles.
+        "texture_cycles": work["texture_requests"] * 6 + 2048,
         "pbe_cycles": 44,
         "pixel_data_master_transactions": 1,
         "pixel_data_master_bytes": 16384,
@@ -3497,15 +3524,15 @@ def verify_fill_tex_bilinear(executable: Path, output_dir: Path) -> None:
         "tcu_writebacks": 0,
         "tcu_bypassed": 0,
         "tcu_cycles": 0,
-        "slc_line_accesses": 17046,
-        "slc_read_accesses": 16913,
+        "slc_line_accesses": work["texel_fetches"] + 17 + 133,
+        "slc_read_accesses": work["texel_fetches"] + 17,
         "slc_write_accesses": 133,
-        "slc_hits": 14863,
+        "slc_hits": work["texel_fetches"] + 17 + 133 - 2183,
         "slc_misses": 2183,
         "slc_evictions": 0,
         "slc_writebacks": 133,
         "slc_bypassed": 0,
-        "slc_cycles": 17046,
+        "slc_cycles": work["texel_fetches"] + 17 + 133,
         "dram_read_transactions": 2051,
         "dram_write_transactions": 133,
         "dram_read_bytes": 278784,
@@ -3644,6 +3671,7 @@ def verify_fill_tex_trilinear_linear_01(
         "uarch_provenance": "assumed",
         "timing_provenance": "uncalibrated",
         "cache_bypass": False,
+        "texture_lod_mode": "llvmpipe",
         "cache_policy": "set-associative-write-back-write-allocate-true-lru",
         "framebuffer_source": "dram-readback",
         "dram_fixed_latency_cycles": 1,
@@ -3749,14 +3777,17 @@ def verify_fill_tex_trilinear_linear_01(
     # Fixed-fixture, assumed-uArch unified-memory regression baseline. Work
     # counts come from the independent coverage oracle above, not this run.
     expected_modeled = {
-        "virtual_gpu_cycles": 38591,
+        "virtual_gpu_cycles": 42260,
         "tiler_cycles": 62,
-        "renderer_cycles": 38504,
+        "renderer_cycles": 42173,
         "usc_groups": work["usc_groups"],
         "texture_requests": work["texture_requests"],
         "fifo_stall_events": 0,
         "pool_bytes_in_flight": 0,
-        "pool_high_water_bytes": 1205694 + TEXTURE_RESIDENT_HOST_BYTES,
+        "pool_high_water_bytes": (
+            1238374 + TEXTURE_RESIDENT_HOST_BYTES +
+            COLOR_ATTACHMENT_CODEC_STATE_BYTES
+        ),
         "vdm_cycles": 9,
         "vertex_fetch_cycles": 9,
         "vertex_attribute_fetches": 8,
@@ -3781,8 +3812,10 @@ def verify_fill_tex_trilinear_linear_01(
         "usc_coefficient_load_bytes": work["usc_coefficient_load_bytes"],
         "tile_scheduler_cycles": 9,
         "isp_cycles": 71,
-        "fragment_frontend_cycles": 39,
-        "texture_cycles": 37360,
+        "fragment_frontend_cycles": work["fragment_frontend_cycles"],
+        # Eight trilinear texels plus two functional issue cycles per lane;
+        # the stable texture miss-delay term is 160 cycles.
+        "texture_cycles": work["texture_requests"] * 10 + 160,
         "pbe_cycles": 44,
         "pixel_data_master_transactions": 1,
         "pixel_data_master_bytes": 16384,
@@ -3795,15 +3828,15 @@ def verify_fill_tex_trilinear_linear_01(
         "tcu_writebacks": 0,
         "tcu_bypassed": 0,
         "tcu_cycles": 0,
-        "slc_line_accesses": 29910,
-        "slc_read_accesses": 29777,
+        "slc_line_accesses": work["texel_fetches"] + 17 + 133,
+        "slc_read_accesses": work["texel_fetches"] + 17,
         "slc_write_accesses": 133,
-        "slc_hits": 29615,
+        "slc_hits": work["texel_fetches"] + 17 + 133 - 295,
         "slc_misses": 295,
         "slc_evictions": 0,
         "slc_writebacks": 133,
         "slc_bypassed": 0,
-        "slc_cycles": 29910,
+        "slc_cycles": work["texel_fetches"] + 17 + 133,
         "dram_read_transactions": 163,
         "dram_write_transactions": 133,
         "dram_read_bytes": 37120,
@@ -3897,11 +3930,11 @@ def verify_fill_tex_trilinear_linear_01(
     assert Path(artifact_field).resolve() == artifact.resolve()
     png_width, png_height, pixels = decode_rgba8_png(artifact)
     assert (png_width, png_height) == (64, 64)
-    # Trilinear output moves with the mip blend weight, which is the
-    # fractional LOD.  This is the exact-log2 LOD's image; the piecewise-linear
-    # one produced 156199bd..., differing by at most 6/255 in R and G.
+    # Standalone Capture/Play defaults to llvmpipe-compatible fast-log2 LOD;
+    # conformance explicitly selects exact mode.  The exact-log2 image is
+    # 9fd73dea..., differing by at most 6/255 in R and G.
     assert hashlib.sha256(pixels).hexdigest() == (
-        "9fd73deaeb0fbf005f0178ed611ecd274d5467e85c6f5cfc6ca1cc9d189e8150"
+        "156199bdeca6c5d5f20d69e09a9b145c6f65fbc215e7f04d87f4ba0eb7cf8a15"
     )
     assert [path.name for path in output_dir.rglob("*.png")] == [artifact.name]
     assert not [
@@ -3921,14 +3954,17 @@ def verify_fill_tex_trilinear_linear_04_or_05(
     profiles = {
         "fill_tex_trilinear_linear_04": {
             "mode": "systemc-functional-fill-texture-trilinear-linear-04",
-            "virtual_time_ns": 25086,
+            "virtual_time_ns": 26065,
             "ps_invocations": 2304,
             "texel_fetches": quad_work["fill_tex_trilinear_linear_04"]["texel_fetches"],
-            "virtual_gpu_cycles": 25111,
-            "renderer_cycles": 25024,
+            "virtual_gpu_cycles": 26090,
+            "renderer_cycles": 26003,
             "usc_groups": quad_work["fill_tex_trilinear_linear_04"]["usc_groups"],
             "texture_requests": quad_work["fill_tex_trilinear_linear_04"]["texture_requests"],
-            "pool_high_water_bytes": 777174 + TEXTURE_RESIDENT_HOST_BYTES,
+            "pool_high_water_bytes": (
+                786358 + TEXTURE_RESIDENT_HOST_BYTES +
+                COLOR_ATTACHMENT_CODEC_STATE_BYTES
+            ),
             "fs_alu_instructions": quad_work["fill_tex_trilinear_linear_04"]["fs_alu_instructions"],
             "usc_slot_cycles": quad_work["fill_tex_trilinear_linear_04"]["usc_slot_cycles"],
             "usc_cluster_cycles": quad_work["fill_tex_trilinear_linear_04"]["usc_cluster_cycles"],
@@ -3936,32 +3972,35 @@ def verify_fill_tex_trilinear_linear_04_or_05(
             "pds_douti_issues": quad_work["fill_tex_trilinear_linear_04"]["pds_douti_issues"],
             "usc_coefficient_load_bytes": quad_work["fill_tex_trilinear_linear_04"]["usc_coefficient_load_bytes"],
             "isp_cycles": 50,
-            "fragment_frontend_cycles": 28,
-            "texture_cycles": 24160,
+            "fragment_frontend_cycles": quad_work["fill_tex_trilinear_linear_04"]["fragment_frontend_cycles"],
+            "texture_cycles": quad_work["fill_tex_trilinear_linear_04"]["texture_requests"] * 10 + 160,
             "tcu_hits": 0,
-            # As in _01, the trilinear output moves with the fractional LOD.
-            # The piecewise-linear LOD produced dd2cdfb3..., differing by at
-            # most 8/255 in R and G.  _05 below is unchanged: its LOD lands
-            # where both log2 forms agree.
+            # As in _01, standalone Capture/Play uses the llvmpipe-compatible
+            # fast-log2 weight.  Exact mode produces c03348a1..., differing by
+            # at most 8/255 in R and G.  _05 below is unchanged because both
+            # log2 forms agree at its LOD.
             "decoded_rgba_sha256": (
-                "c03348a18c9f1ebe2a22f73a539c0aa6"
-                "76061dd8a44ec53cb939e1892fe96de8"
+                "dd2cdfb3e08f66cadf3a509f5156fc2db"
+                "0f77d2721a95ee8f48a221f0ddf3795"
             ),
-            "slc_line_accesses": 19350,
-            "slc_read_accesses": 19217,
-            "slc_hits": 19055,
-            "slc_cycles": 19350,
+            "slc_line_accesses": quad_work["fill_tex_trilinear_linear_04"]["texel_fetches"] + 17 + 133,
+            "slc_read_accesses": quad_work["fill_tex_trilinear_linear_04"]["texel_fetches"] + 17,
+            "slc_hits": quad_work["fill_tex_trilinear_linear_04"]["texel_fetches"] + 17 + 133 - 295,
+            "slc_cycles": quad_work["fill_tex_trilinear_linear_04"]["texel_fetches"] + 17 + 133,
         },
         "fill_tex_trilinear_linear_05": {
             "mode": "systemc-functional-fill-texture-trilinear-linear-05",
-            "virtual_time_ns": 25003,
+            "virtual_time_ns": 25982,
             "ps_invocations": 2116,
             "texel_fetches": quad_work["fill_tex_trilinear_linear_05"]["texel_fetches"],
-            "virtual_gpu_cycles": 25028,
-            "renderer_cycles": 24941,
+            "virtual_gpu_cycles": 26007,
+            "renderer_cycles": 25920,
             "usc_groups": quad_work["fill_tex_trilinear_linear_05"]["usc_groups"],
             "texture_requests": quad_work["fill_tex_trilinear_linear_05"]["texture_requests"],
-            "pool_high_water_bytes": 731342 + TEXTURE_RESIDENT_HOST_BYTES,
+            "pool_high_water_bytes": (
+                740526 + TEXTURE_RESIDENT_HOST_BYTES +
+                COLOR_ATTACHMENT_CODEC_STATE_BYTES
+            ),
             "fs_alu_instructions": quad_work["fill_tex_trilinear_linear_05"]["fs_alu_instructions"],
             "usc_slot_cycles": quad_work["fill_tex_trilinear_linear_05"]["usc_slot_cycles"],
             "usc_cluster_cycles": quad_work["fill_tex_trilinear_linear_05"]["usc_cluster_cycles"],
@@ -3969,17 +4008,17 @@ def verify_fill_tex_trilinear_linear_04_or_05(
             "pds_douti_issues": quad_work["fill_tex_trilinear_linear_05"]["pds_douti_issues"],
             "usc_coefficient_load_bytes": quad_work["fill_tex_trilinear_linear_05"]["usc_coefficient_load_bytes"],
             "isp_cycles": 48,
-            "fragment_frontend_cycles": 28,
-            "texture_cycles": 24080,
+            "fragment_frontend_cycles": quad_work["fill_tex_trilinear_linear_05"]["fragment_frontend_cycles"],
+            "texture_cycles": quad_work["fill_tex_trilinear_linear_05"]["texture_requests"] * 10 + 160,
             "tcu_hits": 0,
             "decoded_rgba_sha256": (
                 "8ae271f3365079dd453d043f14a14a4d"
                 "79222a79a2bedf66d5ba8602fe0dd6ee"
             ),
-            "slc_line_accesses": 19286,
-            "slc_read_accesses": 19153,
-            "slc_hits": 18991,
-            "slc_cycles": 19286,
+            "slc_line_accesses": quad_work["fill_tex_trilinear_linear_05"]["texel_fetches"] + 17 + 133,
+            "slc_read_accesses": quad_work["fill_tex_trilinear_linear_05"]["texel_fetches"] + 17,
+            "slc_hits": quad_work["fill_tex_trilinear_linear_05"]["texel_fetches"] + 17 + 133 - 295,
+            "slc_cycles": quad_work["fill_tex_trilinear_linear_05"]["texel_fetches"] + 17 + 133,
         },
     }
     assert case_name in profiles, f"unsupported trilinear profile {case_name}"
@@ -4017,6 +4056,7 @@ def verify_fill_tex_trilinear_linear_04_or_05(
         "uarch_provenance": "assumed",
         "timing_provenance": "uncalibrated",
         "cache_bypass": False,
+        "texture_lod_mode": "llvmpipe",
         "cache_policy": "set-associative-write-back-write-allocate-true-lru",
         "framebuffer_source": "dram-readback",
         "dram_fixed_latency_cycles": 1,
@@ -4148,7 +4188,7 @@ def verify_fill_tex_trilinear_linear_04_or_05(
         "usc_coefficient_load_bytes": profile["usc_coefficient_load_bytes"],
         "tile_scheduler_cycles": 9,
         "isp_cycles": profile["isp_cycles"],
-        "fragment_frontend_cycles": 28,
+        "fragment_frontend_cycles": profile["fragment_frontend_cycles"],
         "texture_cycles": profile["texture_cycles"],
         "pbe_cycles": 44,
         "pixel_data_master_transactions": 1,
@@ -4193,6 +4233,7 @@ def verify_fill_tex_trilinear_linear_04_or_05(
         "pbe_color_reads": 0,
         "pbe_blended_fragments": 0,
         "pbe_fragment_writes": profile["ps_invocations"],
+        "occlusion_samples_passed": profile["ps_invocations"],
         "pbe_pixels_written": 4096,
         "functional_frame": 1,
     }
@@ -4205,6 +4246,7 @@ def verify_fill_tex_trilinear_linear_04_or_05(
         "gs_emitted_vertices", "gs_input_write_bytes", "gs_input_read_bytes",
         "tcs_invocations",
         "tcs_alu_instructions",
+        "tcs_tex_instructions",
         "tcs_memory_instructions",
         "tcs_load_instructions",
         "tcs_store_instructions",
@@ -4213,6 +4255,7 @@ def verify_fill_tex_trilinear_linear_04_or_05(
         "tcs_output_write_bytes",
         "tcs_output_read_bytes",
         "tes_alu_instructions",
+        "tes_tex_instructions",
         "tes_memory_instructions",
         "tes_load_instructions",
         "tes_patch_read_bytes",

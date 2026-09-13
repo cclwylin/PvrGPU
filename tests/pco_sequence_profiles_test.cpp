@@ -77,13 +77,14 @@ void TestGenericPackedUnormFormatGates() {
     Check(!DriverPcoSequenceSupported(options, &error) &&
               error == "generic PCO sequence draw is not the colour layout",
           "packed UNORM physical format did not reach actual payload validation");
+    options.driver_command.format = "PIPE_FORMAT_R10G10B10A2_UINT";
     options.driver_commands[0].format = "PIPE_FORMAT_R10G10B10A2_UINT";
     Check(!DriverPcoSequenceSupported(options, &error) &&
-              error == "generic PCO sequence draw envelope is invalid",
-          "unsupported packed integer storage escaped the physical format gate");
+              error == "generic PCO sequence draw is not the colour layout",
+          "packed integer storage did not reach actual payload validation");
   }
   for (const char *format : {"", "PIPE_FORMAT_UNKNOWN",
-                             "PIPE_FORMAT_R10G10B10A2_UINT",
+                             "PIPE_FORMAT_R9G9B9E5_FLOAT",
                              "PIPE_FORMAT_B10G10R10A2_SNORM"}) {
     Options options = SequenceEnvelope("generic.packed.format-test", 3, 2);
     options.driver_command.format = format;

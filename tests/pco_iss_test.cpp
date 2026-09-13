@@ -1565,11 +1565,19 @@ void TestDecodeAndExecuteExtendedFloatModifiers() {
               : op == 1 ? 1.0F / std::sqrt(input)
               : op == 2 ? std::log2(input) : std::exp2(input);
           const auto actual = execute(decoded, stage);
-          Check(std::isnan(expected)
+          if (!(std::isnan(expected)
                     ? (actual & UINT32_C(0x7fffffff)) > UINT32_C(0x7f800000)
-                    : actual == FloatBits(expected),
-                "VS/FS unary ABS/NEG preserve signed zero, infinity, NaN "
-                "and subnormals");
+                    : actual == FloatBits(expected))) {
+            std::ostringstream detail;
+            detail << "VS/FS unary ABS/NEG mismatch stage="
+                   << (stage == ShaderStage::kVertex ? "vertex" : "fragment")
+                   << " op=" << op << " modifier=" << modifier
+                   << " input=0x" << std::hex << input_bits
+                   << " modified=0x" << modified_bits
+                   << " expected=0x" << FloatBits(expected)
+                   << " actual=0x" << actual;
+            Check(false, detail.str());
+          }
           if (input_bits == FloatBits(-4.0F)) {
             binary[16] |= 0x04U;
             ExpectFailure([&] { (void)Decode(stage, finish(binary, stage)); },
@@ -3808,6 +3816,10 @@ c1 a0 00 00 41 ff 57 92 00 9c 0e 80 40 a0 41 10
   context.shared_count = 20;
   for (std::size_t index = 0; index < context.shared_count; ++index)
     context.shared_registers[index] = static_cast<std::uint32_t>(0x200 + index);
+  // This real SMP is not a shadow lookup.  Word 7 carries the descriptor's
+  // explicit Dref marker, so keep the otherwise synthetic register pattern
+  // from accidentally setting bit 9 and contradicting the decoded instruction.
+  context.shared_registers[7] &= ~UINT32_C(0x200);
 
   const auto suspended =
       ExecuteFragment(fragment.summary, fragment.instructions, context);
@@ -4568,14 +4580,32 @@ void TestDecodeAndExecuteTerrainLogicalXnor() {
                 .opcode == PcoOpcode::kBitwiseXnor,
         "Terrain LOGICAL.XNOR decodes with another destination");
 
+  // Byte 20 is the visible XNOR operand.  sc0 is just as encodable here as
+  // the captured t14, so this mutation is another valid program rather than
+  // malformed input.
+  auto other_xnor_source = fragment_binary;
+  other_xnor_source[20] = 0x00;
+  const auto other_source_decoded =
+      Decode(ShaderStage::kFragment, other_xnor_source);
+  Check(other_source_decoded.instructions[1].opcode ==
+            PcoOpcode::kBitwiseXnor &&
+            other_source_decoded.instructions[1].source.bank ==
+                PcoRegisterBank::kSpecial &&
+            other_source_decoded.instructions[1].source.index == 0,
+        "Terrain LOGICAL.XNOR decodes with another visible source");
+
   for (const std::pair<std::size_t, std::uint8_t> mutation : {
            std::pair<std::size_t, std::uint8_t>{14, 0x00},
            {15, 0x47}, {16, 0x03}, {17, 0x81}, {18, 0x41},
-           {19, 0x01}, {20, 0x00}, {21, 0x01}, {23, 0xfe}}) {
+           {19, 0x01}, {21, 0x01}, {23, 0xfe}}) {
     auto malformed = fragment_binary;
     malformed[mutation.first] = mutation.second;
+    std::ostringstream description;
+    description << "Terrain LOGICAL.XNOR near-neighbor mutation offset="
+                << mutation.first << " value=0x" << std::hex
+                << static_cast<unsigned>(mutation.second);
     ExpectFailure([&] { (void)Decode(ShaderStage::kFragment, malformed); },
-                  "Terrain LOGICAL.XNOR near-neighbor mutation");
+                  description.str());
   }
   /* O_LOGICAL has no shader-stage field.  Put the same canonical XNOR phase
    * in a vertex envelope and export its temporary so both the stage dispatch
@@ -5892,11 +5922,15 @@ c5 42 08 40 00 00 40 ff 36 82 00 c0 c6 42 08 41
       Decode(ShaderStage::kVertex, shared_file_last);
   Check(shared_file_last_decoded.instructions[0].source.index == 95,
         "generic VS decoder accepts the last modeled terrain SH95");
-  auto shared_overflow = vertex_binary;
-  shared_overflow[4] = 0xa0;
-  shared_overflow[5] = 0x09;
-  ExpectFailure([&] { (void)Decode(ShaderStage::kVertex, shared_overflow); },
-                "generic VS shared source exceeds terrain transport SH95");
+  auto shared_next = vertex_binary;
+  shared_next[4] = 0xa0;
+  shared_next[5] = 0x09;
+  const auto shared_next_decoded =
+      Decode(ShaderStage::kVertex, shared_next);
+  Check(shared_next_decoded.instructions[0].source.bank ==
+                PcoRegisterBank::kShared &&
+            shared_next_decoded.instructions[0].source.index == 96,
+        "generic VS decoder accepts SH96 in the expanded graphics transport");
   auto long_fmul_mux = vertex_binary;
   long_fmul_mux[0x130] = 0xa0;
   ExpectFailure([&] { (void)Decode(ShaderStage::kVertex, long_fmul_mux); },
@@ -7435,10 +7469,9 @@ void TestLoweredPowSpecialValues() {
 
   instructions[0].immediate = FloatBits(0.36F);
   const auto tiny_pow = ExecuteFragment(summary, instructions);
-  Check((tiny_pow.pixel_outputs[0] & UINT32_C(0x7f800000)) == 0 &&
-            (tiny_pow.pixel_outputs[0] & UINT32_C(0x007fffff)) != 0 &&
+  Check(tiny_pow.pixel_outputs[0] == FloatBits(0.0F) &&
             tiny_pow.pixel_outputs[1] == FloatBits(0.1F),
-        "lowered fpow carries a subnormal FEXP result through FMUL/FADD");
+        "lowered fpow flushes a subnormal FEXP result like llvmpipe FTZ");
 
   instructions[1].source_count = 2;
   ExpectFailure([&] { (void)ExecuteFragment(summary, instructions); },

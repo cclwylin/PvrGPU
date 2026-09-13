@@ -17,14 +17,6 @@ namespace {
 bool Inside(std::uint64_t address,std::uint64_t bytes,std::uint64_t base,std::uint64_t size) {
   return address>=base && address-base<=size && bytes<=size-(address-base);
 }
-bool Permitted(const std::vector<TessellationBufferRange> &ranges,
-               std::uint64_t address, std::uint64_t bytes,
-               std::uint32_t access) {
-  return std::any_of(ranges.begin(), ranges.end(), [&](const auto &range) {
-    return (range.access & access) == access &&
-           Inside(address, bytes, range.gpu_address, range.bytes);
-  });
-}
 class OwnedPayload {
  public:
   OwnedPayload(MemoryPool &pool,std::size_t bytes):pool_(pool),handle_(pool.Allocate(bytes)) {}
@@ -42,7 +34,6 @@ struct EvaluationMemory {
   UscUniformBufferMemory &uniforms;
   UscShaderBufferMemory &storage;
   CounterTxn &counters;
-  const std::vector<TessellationBufferRange> &buffers;
   std::uint64_t patch_address,patch_bytes;
   std::function<void(const PcoTextureRequest &, std::uint32_t *)> sample{};
   static void Sample(void *opaque, const PcoTextureRequest &request, std::uint32_t *response) {
@@ -56,7 +47,10 @@ struct EvaluationMemory {
       throw std::runtime_error("TES LD destination/count/alignment is invalid");
     const auto bytes=count*sizeof(std::uint32_t);
     const bool patch=Inside(address,bytes,self.patch_address,self.patch_bytes);
-    const bool storage=Permitted(self.buffers,address,bytes,1U);
+    const bool storage=self.storage.OwnsAddress(address);
+    if(storage) {
+      UscShaderBufferMemory::Read(&self.storage,address,count,destination);return;
+    }
     if(!patch && !storage) {
       UscUniformBufferMemory::Read(&self.uniforms,address,count,destination);return;
     }
@@ -70,14 +64,9 @@ struct EvaluationMemory {
   static void Write(void *opaque,std::uint64_t address,std::uint32_t count,
                     const std::uint32_t *source) {
     auto &self=*static_cast<EvaluationMemory*>(opaque);
-    const auto bytes=count*sizeof(std::uint32_t);
-    if(!source || !count || count>16 || address%4 ||
-       !Permitted(self.buffers,address,bytes,2U))
-      throw std::runtime_error("TES ST exceeds its storage-buffer ranges");
-    const auto write=self.memory.Write(address,source,bytes,
-                                       MemoryClient::kTessellationEvaluation);
-    ApplyMemoryAccessStats(self.counters,write);
-    WaitForCycles(MemoryAccessDelayCycles(write));
+    if(!source || !count || count>16 || address%4)
+      throw std::runtime_error("TES ST shape is invalid");
+    UscShaderBufferMemory::Write(&self.storage,address,count,source);
   }
   static std::uint32_t Atomic32(void *opaque, PcoOpcode operation,
                                 std::uint64_t address,
@@ -183,7 +172,7 @@ void TessellationEvaluationShader::Execute(PipelineState &state, const PipelineT
     shared[0]=static_cast<std::uint32_t>(patch.output_address);
     shared[1]=static_cast<std::uint32_t>(patch.output_address>>32U);
     shared[2]=t.patch_stride_dwords*4;shared[3]=0;
-    EvaluationMemory context{*memory_,uniforms,storage_memory,state.counters,storage_buffers,
+    EvaluationMemory context{*memory_,uniforms,storage_memory,state.counters,
                              patch.output_address,t.patch_stride_dwords*4};
     context.sample = [this, &state, &txn](const PcoTextureRequest &request, std::uint32_t *response) {
       SampleTessellationTexture(pool_, state, txn, ShaderStage::kTessellationEvaluation, request,

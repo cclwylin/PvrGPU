@@ -172,6 +172,8 @@ MemoryAccessStats MaterializeSequenceColorMipChain(
 
 namespace {
 
+constexpr std::uint32_t kPcoBufferTextureRowElements = 8192U;
+
 std::uint32_t DebugFragmentCoordinate(const char *name,
                                       std::uint32_t fallback) {
   const char *value = DiagnosticEnvironment(name);
@@ -588,7 +590,8 @@ bool ComputeTextureTexelOffset(
       resource.block_width != 1 || resource.block_height != 1 ||
       (resource.dimension_type != TextureDimensionType::k2D &&
        resource.dimension_type != TextureDimensionType::k2DArray &&
-       resource.dimension_type != TextureDimensionType::k3D) ||
+       resource.dimension_type != TextureDimensionType::k3D &&
+       resource.dimension_type != TextureDimensionType::kBuffer) ||
       (resource.dimension_type == TextureDimensionType::k2D && resource.layer_count != 1) ||
       resource.format == TextureFormat::kAstcLdr || resource.format == TextureFormat::kAstcLdrSrgb)
     throw std::runtime_error("TextureUnit invalid non-MS texelFetch metadata");
@@ -611,6 +614,16 @@ bool ComputeTextureTexelOffset(
   if (!std::isfinite(x) || !std::isfinite(y) || x < 0 || y < 0 ||
       x >= mip.width || y >= mip.height || std::floor(x) != x || std::floor(y) != y)
     return false;
+  if (resource.dimension_type == TextureDimensionType::kBuffer) {
+    if (array_layer != 0U || index != 0U ||
+        x >= static_cast<float>(kPcoBufferTextureRowElements))
+      return false;
+    const std::uint64_t element =
+        static_cast<std::uint64_t>(y) * kPcoBufferTextureRowElements +
+        static_cast<std::uint64_t>(x);
+    if (element >= resource.buffer_elements)
+      return false;
+  }
   unsigned slice = array_layer;
   if (resource.dimension_type == TextureDimensionType::k3D) {
     const float z = BitsFloat(request.coordinates[2]);
@@ -661,6 +674,39 @@ void ValidateTextureCubeArrayLayout(const TextureResource &resource) {
   }
 }
 
+void ValidateTextureBufferLayout(const TextureResource &resource) {
+  const bool canonical_format =
+      resource.format == TextureFormat::kRgba32Uint ||
+      resource.format == TextureFormat::kRgba32Sint ||
+      resource.format == TextureFormat::kRgba32Float;
+  const std::uint32_t expected_width =
+      std::min(resource.buffer_elements, kPcoBufferTextureRowElements);
+  const std::uint32_t expected_height =
+      resource.buffer_elements == 0U
+          ? 0U
+          : (resource.buffer_elements + kPcoBufferTextureRowElements - 1U) /
+                kPcoBufferTextureRowElements;
+  const std::uint64_t expected_pitch =
+      static_cast<std::uint64_t>(expected_width) * 16U;
+  const std::uint64_t expected_bytes = expected_pitch * expected_height;
+  const TextureMipLevel &base = resource.mip[0];
+  if (resource.dimension_type != TextureDimensionType::kBuffer ||
+      !canonical_format || resource.buffer_elements == 0U ||
+      resource.buffer_elements > 65536U || resource.layer_count != 1U ||
+      resource.sample_count != 1U || resource.mip_count != 1U ||
+      resource.block_width != 1U || resource.block_height != 1U ||
+      base.width != expected_width || base.height != expected_height ||
+      base.row_pitch_bytes != expected_pitch || base.offset_bytes != 0U ||
+      resource.byte_size != expected_bytes) {
+    throw std::runtime_error("TextureUnit invalid typed buffer layout");
+  }
+  for (unsigned level = 1; level < kMaximumTextureMipLevels; ++level) {
+    const TextureMipLevel &mip = resource.mip[level];
+    if (mip.width || mip.height || mip.row_pitch_bytes || mip.offset_bytes)
+      throw std::runtime_error("TextureUnit typed buffer unused mip is nonzero");
+  }
+}
+
 std::uint32_t TextureCubeArrayBaseFace(const TextureResource &resource,
                                       std::uint64_t image_address,
                                       std::uint64_t sample_address) {
@@ -683,6 +729,14 @@ void ValidateTextureSingleLevelDimensions(
     if (ExtractBits(ReadU64(words, 0), 0, 2) != 1U ||
         ExtractBits(ReadU64(words, 2), 4, 14) + 1U != resource.layer_count / 6U)
       throw std::runtime_error("TextureUnit raw cube count disagrees with physical faces");
+    return;
+  }
+  if (resource.dimension_type == TextureDimensionType::kBuffer) {
+    ValidateTextureBufferLayout(resource);
+    if (ExtractBits(ReadU64(words, 0), 0, 2) != 4U ||
+        resource.layer_count != 1U)
+      throw std::runtime_error(
+          "TextureUnit raw buffer TEXTYPE disagrees with physical layout");
     return;
   }
   if (resource.mip_count != 1U && resource.dimension_type != TextureDimensionType::k2DArray)
@@ -1392,10 +1446,17 @@ void TextureUnit::SampleRunForStage(
         kFillTexNearestSharedDwordCount;
     const TextureResource &resource = resources[descriptor_set];
     const SamplerState &sampler = samplers[descriptor_set];
+    const bool buffer_resource =
+        resource.dimension_type == TextureDimensionType::kBuffer;
     const bool cube_array_resource =
         resource.dimension_type == TextureDimensionType::kCubeArray;
     const bool cube_resource = cube_array_resource ||
         resource.dimension_type == TextureDimensionType::kCube;
+    if (buffer_resource)
+      ValidateTextureBufferLayout(resource);
+    else if (resource.buffer_elements != 0U)
+      throw std::runtime_error(
+          "TextureUnit non-buffer texture has a logical element count");
     if (cube_array_resource) {
       ValidateTextureCubeArrayLayout(resource);
       if (!driver_pco)
@@ -1413,7 +1474,8 @@ void TextureUnit::SampleRunForStage(
           resource.dimension_type == TextureDimensionType::k2DArray ||
           resource.dimension_type == TextureDimensionType::k3D ||
           resource.dimension_type == TextureDimensionType::kCube ||
-          resource.dimension_type == TextureDimensionType::kCubeArray;
+          resource.dimension_type == TextureDimensionType::kCubeArray ||
+          buffer_resource;
       const std::uint8_t expected_dimension =
           (resource.dimension_type == TextureDimensionType::k3D ||
            resource.dimension_type == TextureDimensionType::kCube ||
@@ -1428,7 +1490,10 @@ void TextureUnit::SampleRunForStage(
       for (const auto &request : requests) {
         if (request.gather || request.lod_bias_present || request.lod_bias ||
             request.dimension != expected_dimension ||
-            request.coordinate_count != 2 || !request.normalized ||
+            request.coordinate_count != 2 ||
+            request.normalized != (buffer_resource ? 0U : 1U) ||
+            (buffer_resource &&
+             (!request.explicit_lod_present || request.explicit_lod != 0U)) ||
             request.sample_index_present || request.sample_index ||
             request.spatial_offsets[0] || request.spatial_offsets[1] || request.spatial_offsets[2])
           throw std::runtime_error("TextureUnit unsupported tessellation sample mode");
@@ -1506,12 +1571,19 @@ void TextureUnit::SampleRunForStage(
                            resource.mip[0].height
                      : resource.byte_size)
               ? "word4 is not the image layer size"
-          : shared[descriptor_base + 5U] != 0   ? "word5 is not zero"
+          : shared[descriptor_base + 5U] !=
+                (buffer_resource ? resource.buffer_elements : 0U)
+              ? (buffer_resource ? "word5 is not the buffer element count"
+                                 : "word5 is not zero")
           : shared[descriptor_base + 6U] != 0   ? "word6 is not zero"
           // Public PCO software metadata: word7 bit8 clamps UNORM Dref and
           // bit9 requests fixed-function PCF; word12 is the compare op.
+          : (buffer_resource && shared[descriptor_base + 7U] != 0U)
+              ? "buffer word7 is not zero"
           : (shared[descriptor_base + 7U] & ~UINT32_C(0x300)) != 0
               ? "word7 has unsupported pack metadata"
+          : buffer_resource && shared[descriptor_base + 12U] != 0U
+              ? "buffer word12 is not zero"
           : shared[descriptor_base + 12U] > 7  ? "word12 compare operation is invalid"
           : shared[descriptor_base + 13U] != 0  ? "word13 is not zero"
           : shared[descriptor_base + 14U] != 0  ? "word14 is not zero"
@@ -1620,6 +1692,18 @@ void TextureUnit::SampleRunForStage(
     const bool explicit_lod = requests.front().explicit_lod_present != 0;
     const bool biased_lod = requests.front().lod_bias_present != 0;
     const bool direct_fetch = multisample_fetch || texel_fetch;
+    if (buffer_resource &&
+        (!driver_pco || gather || shadow_compare || !texel_fetch ||
+         !explicit_lod || image.mip_count != 1U || image.sample_count != 1U ||
+         sampler.base_mip_level != 0U ||
+         decoded_sampler.min_filter != TextureFilter::kNearest ||
+         decoded_sampler.mag_filter != TextureFilter::kNearest ||
+         decoded_sampler.wrap_u != TextureWrapMode::kClampToEdge ||
+         decoded_sampler.wrap_v != TextureWrapMode::kClampToEdge ||
+         decoded_sampler.wrap_w != TextureWrapMode::kClampToEdge ||
+         decoded_sampler.normalized_coordinates != 1U)) {
+      throw std::runtime_error("TextureUnit unsupported typed buffer state");
+    }
     if (shadow_compare &&
         (!driver_pco || gather || direct_fetch ||
          (image.format != TextureFormat::kZ24UnormS8Uint &&

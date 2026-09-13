@@ -102,11 +102,12 @@ extern "C" void check_native_fragment_image(const std::uint8_t *bytes,
               "image atomic result or untouched backing padding is wrong");
     }
     Require(adapter.atomics() == 12 * image_count, "native image atomic count is wrong");
+    const auto before_oob_atomic = adapter.atomics();
+    Require(UscShaderImageMemory::Atomic32(
+                &adapter, PcoOpcode::kAtomicAdd32, address + 24, 1) == 0 &&
+                adapter.atomics() == before_oob_atomic,
+            "padding outside image view was not a robust zero/no-op atomic");
     bool rejected = false;
-    try { UscShaderImageMemory::Atomic32(&adapter, PcoOpcode::kAtomicAdd32, address + 24, 1); }
-    catch (const std::runtime_error &) { rejected = true; }
-    Require(rejected, "padding outside image view accepted an atomic");
-    rejected = false;
     context.memory_side_effects_enabled = 2;
     try { ExecuteFragmentPco(program.summary, program.instructions, context); }
     catch (const std::runtime_error &) { rejected = true; }

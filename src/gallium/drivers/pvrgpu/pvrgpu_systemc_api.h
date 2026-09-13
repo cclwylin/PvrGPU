@@ -18,8 +18,9 @@ extern "C" {
  * API-v37 adds alias-preserving TCS/TES storage-buffer snapshots and bindings.
  * API-v38 extends the same bounded storage-buffer contract to every graphics
  * stage, with one whole-resource snapshot shared by all aliased stage views.
+ * API-v39 carries independent colour mask and blend state for four targets.
  * Old versioned consumers must not guess at the longer command envelope. */
-#define PVRGPU_SYSTEMC_API_VERSION 38u
+#define PVRGPU_SYSTEMC_API_VERSION 39u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE 15u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES (64u * 1024u)
 /*
@@ -341,7 +342,7 @@ struct pvrgpu_systemc_pco_sequence_texture {
    uint32_t min_lod_u4_6;
    uint32_t max_lod_u4_6;
    /*
-    * 0=2D, 1=2DArray, 2=3D, 3=Cube, 4=CubeArray. For CubeArray, layers is
+    * 0=2D, 1=2DArray, 2=3D, 3=Cube, 4=CubeArray, 5=Buffer. For CubeArray, layers is
     * the physical face count 6*N (not N); every mip retains all square faces
     * in cube-major, GL face order. Only whole-cube views, external block1x1
     * single-sample fragment textures are supported. Native TAO selects a cube
@@ -350,6 +351,10 @@ struct pvrgpu_systemc_pco_sequence_texture {
     */
    uint32_t texture_kind;
    uint32_t layers;
+   /* Exact logical texel count for kind=Buffer; zero for every image kind.
+    * Buffer payloads use PCO's 8192-wide 2D physical layout, so the padded
+    * rectangle alone cannot recover textureSize(). */
+   uint32_t buffer_elements;
    /* 0 等同 1；支援 1/2/4/8。MS 資料採 pixel-interleaved samples，
     * 僅外部 payload、2D/2D-array、單一 mip；row_pitch 包含全部 samples。 */
    uint32_t sample_count;
@@ -577,11 +582,14 @@ struct pvrgpu_systemc_driver_command {
     * API-v19 optional initial contents; API-v30 extends the same byte buffer
     * to all effective render_target_count color attachments in target order.
     * The source index must be ATTACHMENT_NEW_CLEAR. Rows are tightly packed in
-    * the command format's model transport: RGBA8 is four bytes per pixel;
-    * R32, RG32 and RGBA32 integer targets are four, eight and sixteen bytes.
+    * the command format's model transport: established RGBA8 and packed
+    * 10/10/10/2 UNORM formats are four bytes per pixel; integer targets use
+    * one 32-bit dword per logical component (four, eight or sixteen bytes).
+    * Canonical normalized, SNORM and floating-point formats use RGBA32F
+    * (sixteen bytes), except exact RGBA32_UNORM, which uses RGBA64F (32 bytes).
     * Each target contains every layer, pixel and sample before the next
     * target. API-v36 lets the explicit format vector select each target's
-    * canonical 4/8/16-byte transport; all share the framebuffer extent.
+    * canonical 4/8/16/32-byte transport; all share the framebuffer extent.
     * Supply every target completely, or leave both fields zero.
     * Submission deep-copies these bytes.  The model imports them into DRAM
     * and performs a PBE LOAD before rasterizing the draw.
@@ -643,8 +651,9 @@ struct pvrgpu_systemc_driver_command {
    /* API-v31, extended by API-v36: optional independent storage codecs.
     * Zero count and four NULL entries preserve homogeneous `format`.
     * Otherwise count equals effective render_target_count (at most four),
-    * target zero equals `format`, and each active entry is a canonical RGBA8,
-    * sRGB, packed 10/10/10/2, R32/RG32/RGBA32 integer, or RGBA32F transport.
+    * target zero equals `format`, and each active entry names the exact logical
+    * format whose transport is packed four-byte color, raw integer dwords,
+    * canonical RGBA32F, or exact RGBA64F for RGBA32_UNORM.
     * Inactive entries must be NULL. Initial contents stay target-major native
     * bytes; shared blend/color-mask state is unchanged. */
    uint32_t color_attachment_format_count;
@@ -666,6 +675,19 @@ struct pvrgpu_systemc_driver_command {
    uint32_t primitive_restart_index;
    /* API-v38 append-only tail. NULL means no graphics storage buffers. */
    const struct pvrgpu_systemc_graphics_shader_buffers *graphics_buffers;
+   /* API-v39 independent draw-buffer state.  Zero count is the legacy
+    * contract: the scalar color_mask/blend_* fields apply to every target.
+    * Otherwise count equals the effective render_target_count and scalar
+    * fields duplicate target zero for backward-compatible tracing. */
+   uint32_t render_target_state_count;
+   uint32_t color_masks[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
+   uint32_t blend_enables[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
+   uint32_t blend_rgb_equations[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
+   uint32_t blend_alpha_equations[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
+   uint32_t blend_source_rgb_factors[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
+   uint32_t blend_destination_rgb_factors[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
+   uint32_t blend_source_alpha_factors[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
+   uint32_t blend_destination_alpha_factors[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
 };
 
 struct pvrgpu_systemc_submit_info {
@@ -687,9 +709,10 @@ typedef int (*pvrgpu_systemc_submit_driver_command_fn)(
 /*
  * A readback of whatever the submitted work left in the model's DRAM.
  *
- * `pixels` is the caller's RGBA8 destination and `pixels_size` its capacity in
- * bytes; the model fills it only when its own framebuffer is exactly
- * `width` x `height`.  `pixels_written` says whether it did, which is how a
+ * `pixels` is the caller's format-specific model-transport destination and
+ * `pixels_size` its capacity in bytes; the model fills it only when its own
+ * framebuffer is exactly `width` x `height`. `pixels_written` says whether it
+ * did, which is how a
  * caller tells "nothing was pending" from "the model drew something".
  */
 struct pvrgpu_systemc_readback_info {
@@ -697,10 +720,12 @@ struct pvrgpu_systemc_readback_info {
    uint32_t width;
    uint32_t height;
    /*
-    * The stored width of one pixel.  Four for a UNORM8 attachment; an integer
-    * attachment stores one 32-bit channel per dword, so RG32UI is eight and
-    * RGBA32UI sixteen.  The model refuses a readback whose pixel width is not
-    * the one it rendered rather than reinterpreting the bytes.
+    * The stored width of one pixel. Established RGBA8 and packed 10/10/10/2
+    * UNORM are four bytes. Integer formats store one 32-bit dword per logical
+    * component, canonical normalized/SNORM/float formats use sixteen-byte
+    * RGBA32F, and exact RGBA32_UNORM uses 32-byte RGBA64F. The model refuses a
+    * readback whose pixel width is not the one it rendered rather than
+    * reinterpreting the bytes.
     */
    uint32_t bytes_per_pixel;
    /*

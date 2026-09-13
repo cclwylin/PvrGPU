@@ -50,7 +50,12 @@ void Run(MemoryPool &pool, GpuMemorySystem &memory,
   }
   const unsigned lanes = abi.local_size[0];
   Check((lanes <= 32) == (!sleep && !wake), "native cross-task sleep/wakeup absent");
-  if (fault == 1) abi.shared_memory_bytes -= 4; // Fault while barrier owns MUTEX.
+  if (fault == 1) {
+    // The final barrier DWORD becomes a robust zero/no-op access. The shader
+    // must not fault at the memory boundary; its now-unresolvable native
+    // MUTEX wait is detected as a deadlock instead.
+    abi.shared_memory_bytes -= 4;
+  }
   constexpr std::uint64_t address = UINT64_C(0x1000000000000);
   std::vector<std::uint32_t> poison(groups * lanes, 0xa5c3e17b);
   memory.HostWrite(address, poison.data(), poison.size() * 4);
@@ -77,8 +82,11 @@ void Run(MemoryPool &pool, GpuMemorySystem &memory,
   const auto final = Load<ComputeDispatchState>(pool, handle);
   if (fault) {
     Check(final.failed != 0, "shared fault/deadlock was silently accepted");
-    Check(std::string(final.error.data()).find(fault == 1 ? "permitted views" : "deadlocked") !=
-             std::string::npos, "shared fault failed for unrelated reason");
+    const std::string diagnostic(final.error.data());
+    const char *expected = "deadlocked";
+    if (diagnostic.find(expected) == std::string::npos)
+      throw std::runtime_error("shared fault failed for unrelated reason: " +
+                               diagnostic);
   } else {
     if (final.failed) throw std::runtime_error(final.error.data());
     Check(final.stats.workgroups == groups && final.stats.invocations == groups * lanes,

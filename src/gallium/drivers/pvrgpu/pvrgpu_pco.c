@@ -2,6 +2,7 @@
 
 #include "pvrgpu_pco.h"
 #include "pvrgpu_counter.h"
+#include "pvrgpu_screen.h"
 
 #include "common/pvr_device_info.h"
 #include "nir/nir.h"
@@ -45,7 +46,85 @@ struct pvrgpu_pco_compiler {
    /* Owned for the compiler's whole lifetime: shaders retain this pointer
     * through preprocess, linking, lowering and instruction selection. */
    nir_shader_compiler_options nir_options;
+   bool robust_buffer_access;
 };
+
+static bool
+pvrgpu_lower_robust_buffer_access(nir_builder *b,
+                                  nir_intrinsic_instr *intr,
+                                  void *unused)
+{
+   (void)unused;
+   const bool load = intr->intrinsic == nir_intrinsic_load_ubo ||
+                     intr->intrinsic == nir_intrinsic_load_ssbo;
+   const bool store = intr->intrinsic == nir_intrinsic_store_ssbo;
+   const bool atomic = intr->intrinsic == nir_intrinsic_ssbo_atomic ||
+                       intr->intrinsic == nir_intrinsic_ssbo_atomic_swap;
+   if (!load && !store && !atomic)
+      return false;
+
+   /* PCO's generic robust pass redirects an invalid load to offset zero. That
+    * keeps the hardware access inside its originating descriptor, but GL's
+    * robust contract is better represented by zero/no-op. Wrap every
+    * already-scalarized DWORD and atomic in an overflow-safe descriptor-size
+    * predicate; PCO still applies its own defensive address rewrite below. */
+   const unsigned resource_src = store ? 1U : 0U;
+   const unsigned offset_src = store ? 2U : 1U;
+   const unsigned access_size = atomic ? 4U : load
+      ? intr->def.num_components * (intr->def.bit_size / 8U)
+      : util_last_bit(nir_intrinsic_write_mask(intr)) *
+           (nir_src_bit_size(intr->src[0]) / 8U);
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *size = intr->intrinsic == nir_intrinsic_load_ubo
+      ? nir_get_ubo_size(b, 32, intr->src[resource_src].ssa)
+      : nir_get_ssbo_size(b, 32, intr->src[resource_src].ssa);
+   nir_def *offset = intr->src[offset_src].ssa;
+   nir_def *last = nir_iadd_imm(b, offset, access_size - 1U);
+   nir_def *valid = nir_iand(b, nir_uge(b, last, offset),
+                             nir_ult(b, last, size));
+   nir_def *safe_offset =
+      nir_bcsel(b, valid, offset, nir_imm_int(b, 0));
+
+   nir_if *guard = nir_push_if(b, valid);
+   nir_intrinsic_instr *clone = nir_instr_as_intrinsic(
+      nir_instr_clone(b->shader, &intr->instr));
+   clone->src[offset_src] = nir_src_for_ssa(safe_offset);
+   nir_builder_instr_insert(b, &clone->instr);
+   nir_def *zero = NULL;
+   if (load || atomic) {
+      nir_push_else(b, guard);
+      zero = nir_imm_zero(b, intr->def.num_components, intr->def.bit_size);
+   }
+   nir_pop_if(b, guard);
+   if (load || atomic)
+      nir_def_rewrite_uses(&intr->def, nir_if_phi(b, &clone->def, zero));
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+/* PCO's robust pass inserts the descriptor-size predicate while the NIR
+ * still identifies the originating view.  That is essential here: once the
+ * native USC callback receives only an absolute address, an out-of-range
+ * access through view A can otherwise look like an in-range access to an
+ * adjacent view B.  Null descriptors use the same predicate and therefore
+ * never reach the modeled memory services. */
+static void
+pvrgpu_pco_lower_nir(struct pvrgpu_pco_compiler *compiler,
+                     nir_shader *nir,
+                     pco_data *data)
+{
+   data->common.robust_buffer_access = compiler->robust_buffer_access;
+   data->common.null_descriptor = compiler->robust_buffer_access;
+   if (compiler->robust_buffer_access) {
+      /* Scalarizing buffer IO gives vector tails independent DWORD bounds:
+       * valid low components survive while OOB loads/stores are zero/no-op. */
+      nir_lower_io_to_scalar(nir, nir_var_mem_ubo | nir_var_mem_ssbo,
+                             NULL, NULL);
+      nir_shader_intrinsics_pass(nir, pvrgpu_lower_robust_buffer_access,
+                                 nir_metadata_none, NULL);
+   }
+   pco_lower_nir(compiler->pco, nir, data);
+}
 
 /*
  * The sin/cos arithmetic below is adapted from Mesa's
@@ -3953,6 +4032,15 @@ struct pvrgpu_pco_compiler *pvrgpu_pco_compiler_create(char *error,
    return compiler;
 }
 
+void
+pvrgpu_pco_compiler_set_robust_buffer_access(
+   struct pvrgpu_pco_compiler *compiler,
+   bool enabled)
+{
+   if (compiler)
+      compiler->robust_buffer_access = enabled;
+}
+
 void pvrgpu_pco_compiler_destroy(struct pvrgpu_pco_compiler *compiler)
 {
    if (!compiler)
@@ -4079,8 +4167,8 @@ bool pvrgpu_pco_compile_conditionals(struct pvrgpu_pco_compiler *compiler,
    pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
    pco_rev_link_nir(compiler->pco, vs, fs);
 
-   pco_lower_nir(compiler->pco, vs, &vertex_data);
-   pco_lower_nir(compiler->pco, fs, &fragment_data);
+   pvrgpu_pco_lower_nir(compiler, vs, &vertex_data);
+   pvrgpu_pco_lower_nir(compiler, fs, &fragment_data);
    pco_postprocess_nir(compiler->pco, vs, &vertex_data);
    pco_postprocess_nir(compiler->pco, fs, &fragment_data);
 
@@ -4937,6 +5025,71 @@ pvrgpu_native_cube_array(const nir_tex_instr *tex,
           lod == (tex->op != nir_texop_tex);
 }
 
+/* Pinned PCO implements samplerBuffer as one immutable typed buffer view.
+ * txf converts the scalar element index to the public 8192-wide 2D texture
+ * layout, while txs reads the exact logical element count from image
+ * descriptor metadata.  Neither operation consumes API sampler state. */
+static bool
+pvrgpu_native_buffer_texture(const nir_tex_instr *tex,
+                             unsigned texture_count)
+{
+   const bool size = tex->op == nir_texop_txs;
+   const bool fetch = tex->op == nir_texop_txf;
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_BUF || tex->is_array ||
+       tex->is_shadow || tex->is_sparse || tex->array_is_lowered_cube ||
+       tex->embedded_sampler || tex->texture_non_uniform ||
+       tex->sampler_non_uniform || tex->offset_non_uniform ||
+       (!size && !fetch) || tex->def.bit_size != 32 ||
+       tex->def.num_components != (size ? 1U : 4U) ||
+       tex->coord_components != (size ? 0U : 1U) ||
+       (size ? (tex->dest_type != nir_type_int32 &&
+                tex->dest_type != nir_type_uint32)
+             : (tex->dest_type != nir_type_float32 &&
+                tex->dest_type != nir_type_int32 &&
+                tex->dest_type != nir_type_uint32)) ||
+       tex->texture_index >= texture_count)
+      return false;
+
+   unsigned coordinates = 0;
+   for (unsigned source = 0; source < tex->num_srcs; ++source) {
+      const nir_tex_src *src = &tex->src[source];
+      switch (src->src_type) {
+      case nir_tex_src_coord:
+         if (!fetch || ++coordinates != 1 || !src->src.ssa ||
+             src->src.ssa->bit_size != 32 ||
+             src->src.ssa->num_components != 1)
+            return false;
+         break;
+      case nir_tex_src_texture_deref:
+      case nir_tex_src_sampler_deref:
+      case nir_tex_src_backend1:
+      case nir_tex_src_backend2:
+         break;
+      case nir_tex_src_lod:
+         /* Mesa keeps the explicit integer LOD-zero source on both txs and
+          * txf even though a buffer has exactly one level.  PCO reads word5
+          * for txs and emits PPLOD.REPLACE for the fetch. */
+         if ((!size && !fetch) || !src->src.ssa ||
+             src->src.ssa->bit_size != 32 ||
+             src->src.ssa->num_components != 1 ||
+             !nir_src_is_const(src->src) || nir_src_as_uint(src->src) != 0U)
+            return false;
+         break;
+      case nir_tex_src_texture_offset:
+      case nir_tex_src_sampler_offset:
+         /* Bounded dynamically-uniform opaque-array indexing is cloned to
+          * static descriptor selections before final PCO lowering. */
+         if (!src->src.ssa || src->src.ssa->bit_size != 32 ||
+             src->src.ssa->num_components != 1)
+            return false;
+         break;
+      default:
+         return false;
+      }
+   }
+   return coordinates == (fetch ? 1U : 0U);
+}
+
 bool
 pvrgpu_pco_fragment_has_shadow_gather(const struct nir_shader *nir,
                                     unsigned slot)
@@ -5160,6 +5313,8 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                   tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && tex->is_array;
                const bool native_cube_array = cube_array &&
                   pvrgpu_native_cube_array(tex, expected_stage, texture_count);
+               const bool buffer_texture =
+                  pvrgpu_native_buffer_texture(tex, texture_count);
                if (cube_array && !native_cube_array)
                   return pvrgpu_pco_fail(error, error_size,
                      "color primitive CubeArray requires bounded native tex/txl or size query without offsets");
@@ -5197,7 +5352,7 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                    tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE);
                const bool gather = pvrgpu_native_fragment_gather(
                   tex, expected_stage, texture_count);
-               if (texture_count == 0 || (!ordinary_sample && !multisample && !texel_fetch && !size_query && !gather) ||
+               if (texture_count == 0 || (!ordinary_sample && !multisample && !texel_fetch && !size_query && !gather && !buffer_texture) ||
                    (tex->is_shadow && !size_query && !gather &&
                     !(ordinary_sample &&
                       (tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
@@ -5230,7 +5385,9 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                      error_size,
                      "color primitive contains an unsupported texture "
                      "operation (op=%s dim=%s array=%u shadow=%u "
-                     "texture_index=%u sampler_index=%u bound_textures=%u); "
+                     "texture_index=%u sampler_index=%u bound_textures=%u "
+                     "coord_components=%u result=%ux%u dest_type=%u "
+                     "sources=%u sparse=%u embedded=%u nonuniform=%u/%u/%u); "
                      "the lowering covers non-shadow tex/txl/txd and size queries on 2D/3D/cube, fragment-only txb with scalar f32 bias on 2D/3D/cube, fixed-function 2D/2D-array/cube shadow sampling, txf on 2D/3D, or "
                      "txf_ms/txs/texture_samples on MS, or fragment 2D f32 component0 tg4 without offsets at base LOD with a bound texture",
                      op_name,
@@ -5239,7 +5396,17 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                      tex->is_shadow ? 1u : 0u,
                      tex->texture_index,
                      tex->sampler_index,
-                     texture_count);
+                     texture_count,
+                     tex->coord_components,
+                     tex->def.num_components,
+                     tex->def.bit_size,
+                     (unsigned)tex->dest_type,
+                     tex->num_srcs,
+                     tex->is_sparse ? 1u : 0u,
+                     tex->embedded_sampler ? 1u : 0u,
+                     tex->texture_non_uniform ? 1u : 0u,
+                     tex->sampler_non_uniform ? 1u : 0u,
+                     tex->offset_non_uniform ? 1u : 0u);
                }
                break;
             }
@@ -5929,16 +6096,51 @@ pvrgpu_restore_depth_feedback_no_discard(nir_builder *b,
  * unit as a descriptor set: pinned PCO has only four sets. Units beyond the
  * first three use additional bindings in the last set. Set zero retains its
  * single texture binding, so its UBO bindings remain independent. */
+struct pvrgpu_generic_texture_index_state {
+   unsigned texture_count;
+   unsigned array_end[PVRGPU_PCO_MAX_TEXTURES];
+   char *error;
+   size_t error_size;
+   bool failed;
+};
+
+static void
+pvrgpu_collect_generic_texture_array_bounds(
+   nir_shader *nir, struct pvrgpu_generic_texture_index_state *state)
+{
+   for (unsigned unit = 0; unit < PVRGPU_PCO_MAX_TEXTURES; ++unit)
+      state->array_end[unit] = state->texture_count;
+
+   /* nir_lower_samplers represents a dynamically indexed combined sampler
+    * array as a static base plus texture/sampler offsets.  Its variables are
+    * still the authoritative declaration bounds: textures_used only says
+    * which units the whole stage may access and can include unrelated,
+    * differently typed samplers after this array.
+    */
+   nir_foreach_variable_with_modes (var, nir, nir_var_uniform) {
+      const struct glsl_type *element = var->type;
+      unsigned elements = 1;
+      if (glsl_type_is_array(element)) {
+         elements = glsl_get_aoa_size(element);
+         while (glsl_type_is_array(element))
+            element = glsl_get_array_element(element);
+      }
+      if (!glsl_type_is_sampler(element))
+         continue;
+
+      const unsigned base = var->data.binding;
+      if (!elements || base >= state->texture_count ||
+          elements > state->texture_count - base)
+         continue;
+      state->array_end[base] = base + elements;
+   }
+}
+
 static bool
 pvrgpu_lower_generic_texture_index(nir_builder *b, nir_tex_instr *tex,
                                    void *cb_data)
 {
-   struct {
-      unsigned texture_count;
-      char *error;
-      size_t error_size;
-      bool failed;
-   } *state = cb_data;
+   struct pvrgpu_generic_texture_index_state *state = cb_data;
    int texture_offset =
       nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
    int sampler_offset =
@@ -5960,7 +6162,8 @@ pvrgpu_lower_generic_texture_index(nir_builder *b, nir_tex_instr *tex,
    if (texture_offset >= 0 && nir_src_is_const(tex->src[texture_offset].src)) {
       const uint64_t unit = (uint64_t)tex->texture_index +
          nir_src_as_uint(tex->src[texture_offset].src);
-      if (unit >= state->texture_count) {
+      if (tex->texture_index >= state->texture_count ||
+          unit >= state->array_end[tex->texture_index]) {
          state->failed = true;
          pvrgpu_pco_fail(state->error, state->error_size,
                          "generic texture index is out of range");
@@ -5974,7 +6177,8 @@ pvrgpu_lower_generic_texture_index(nir_builder *b, nir_tex_instr *tex,
    if (sampler_offset >= 0 && nir_src_is_const(tex->src[sampler_offset].src)) {
       const uint64_t unit = (uint64_t)tex->sampler_index +
          nir_src_as_uint(tex->src[sampler_offset].src);
-      if (unit >= state->texture_count) {
+      if (tex->sampler_index >= state->texture_count ||
+          unit >= state->array_end[tex->sampler_index]) {
          state->failed = true;
          pvrgpu_pco_fail(state->error, state->error_size,
                          "generic sampler index is out of range");
@@ -6013,7 +6217,28 @@ pvrgpu_lower_generic_texture_index(nir_builder *b, nir_tex_instr *tex,
    nir_def *selected =
       nir_imm_zero(b, tex->def.num_components, tex->def.bit_size);
    bool candidate = false;
-   for (unsigned unit = 0; unit < state->texture_count; ++unit) {
+   unsigned candidate_end = state->texture_count;
+   if (texture_index) {
+      if (tex->texture_index >= state->texture_count) {
+         state->failed = true;
+         pvrgpu_pco_fail(state->error, state->error_size,
+                         "generic texture array base is out of range");
+         return false;
+      }
+      candidate_end = MIN2(candidate_end,
+                           state->array_end[tex->texture_index]);
+   }
+   if (sampler_index) {
+      if (tex->sampler_index >= state->texture_count) {
+         state->failed = true;
+         pvrgpu_pco_fail(state->error, state->error_size,
+                         "generic sampler array base is out of range");
+         return false;
+      }
+      candidate_end = MIN2(candidate_end,
+                           state->array_end[tex->sampler_index]);
+   }
+   for (unsigned unit = 0; unit < candidate_end; ++unit) {
       if ((texture_index && unit < tex->texture_index) ||
           (sampler_index && unit < tex->sampler_index))
          continue;
@@ -6060,16 +6285,15 @@ static bool
 pvrgpu_lower_generic_texture_indices(nir_shader *nir, unsigned texture_count,
                                      char *error, size_t error_size)
 {
-   struct {
-      unsigned texture_count;
-      char *error;
-      size_t error_size;
-      bool failed;
-   } state = {
+   if (!nir || texture_count > PVRGPU_PCO_MAX_TEXTURES)
+      return pvrgpu_pco_fail(error, error_size,
+                             "generic texture count exceeds the native ABI");
+   struct pvrgpu_generic_texture_index_state state = {
       .texture_count = texture_count,
       .error = error,
       .error_size = error_size,
    };
+   pvrgpu_collect_generic_texture_array_bounds(nir, &state);
    nir_shader_tex_pass(nir, pvrgpu_lower_generic_texture_index,
                        nir_metadata_control_flow, &state);
    return !state.failed;
@@ -6393,29 +6617,6 @@ pvrgpu_compute_atomic_op_supported(nir_atomic_op op)
    }
 }
 
-static bool
-pvrgpu_compute_image_format_supported(enum pipe_format format)
-{
-   switch (format) {
-   case PIPE_FORMAT_R32_UINT: case PIPE_FORMAT_R32_SINT: case PIPE_FORMAT_R32_FLOAT:
-   case PIPE_FORMAT_R32G32_UINT: case PIPE_FORMAT_R32G32_SINT: case PIPE_FORMAT_R32G32_FLOAT:
-   case PIPE_FORMAT_R32G32B32A32_UINT: case PIPE_FORMAT_R32G32B32A32_SINT:
-   case PIPE_FORMAT_R32G32B32A32_FLOAT:
-   case PIPE_FORMAT_R16G16B16A16_UINT: case PIPE_FORMAT_R16G16B16A16_SINT:
-   case PIPE_FORMAT_R16G16B16A16_FLOAT: case PIPE_FORMAT_R16G16B16A16_UNORM:
-   case PIPE_FORMAT_R16G16B16A16_SNORM:
-   case PIPE_FORMAT_R16G16_UINT: case PIPE_FORMAT_R16G16_SINT:
-   case PIPE_FORMAT_R16G16_FLOAT: case PIPE_FORMAT_R16G16_UNORM:
-   case PIPE_FORMAT_R16G16_SNORM:
-   case PIPE_FORMAT_R8G8B8A8_UINT: case PIPE_FORMAT_R8G8B8A8_SINT:
-   case PIPE_FORMAT_R8G8B8A8_UNORM: case PIPE_FORMAT_R8G8B8A8_SNORM:
-   case PIPE_FORMAT_R10G10B10A2_UINT: case PIPE_FORMAT_R10G10B10A2_UNORM:
-   case PIPE_FORMAT_R11G11B10_FLOAT:
-      return true;
-   default: return false;
-   }
-}
-
 /* Validate before preprocessing: only static workgroups and supported memory
  * scopes enter native lowering. Multi-task rendezvous become real PCO task
  * MUTEX control and private workgroup DMA below. */
@@ -6519,7 +6720,10 @@ pvrgpu_validate_compute_nir(const nir_shader *nir,
                   tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && tex->is_array &&
                   pvrgpu_native_cube_array(tex, MESA_SHADER_COMPUTE,
                                            nir->info.num_textures);
-               if ((tex->op != nir_texop_tex && tex->op != nir_texop_txl &&
+               const bool buffer_texture = pvrgpu_native_buffer_texture(
+                  tex, nir->info.num_textures);
+               if (!buffer_texture &&
+                   ((tex->op != nir_texop_tex && tex->op != nir_texop_txl &&
                     tex->op != nir_texop_txf && tex->op != nir_texop_txs) ||
                    (tex->sampler_dim != GLSL_SAMPLER_DIM_2D &&
                     tex->sampler_dim != GLSL_SAMPLER_DIM_3D &&
@@ -6527,15 +6731,17 @@ pvrgpu_validate_compute_nir(const nir_shader *nir,
                    (tex->is_array && tex->sampler_dim != GLSL_SAMPLER_DIM_2D &&
                     !native_cube_array) ||
                    tex->texture_index >= nir->info.num_textures ||
-                   tex->sampler_index != tex->texture_index)
+                   tex->sampler_index != tex->texture_index))
                   return pvrgpu_pco_fail(error, error_size, "compute texture requires a bounded native sampler set and operation");
-               for (unsigned s = 0; s < tex->num_srcs; ++s)
-                  if (tex->src[s].src_type != nir_tex_src_coord &&
-                      tex->src[s].src_type != nir_tex_src_lod &&
-                      tex->src[s].src_type != nir_tex_src_comparator &&
-                      tex->src[s].src_type != nir_tex_src_texture_deref &&
-                      tex->src[s].src_type != nir_tex_src_sampler_deref)
-                     return pvrgpu_pco_fail(error, error_size, "compute texture source requires native coordinates, LOD and static sampler dereferences");
+               if (!buffer_texture) {
+                  for (unsigned s = 0; s < tex->num_srcs; ++s)
+                     if (tex->src[s].src_type != nir_tex_src_coord &&
+                         tex->src[s].src_type != nir_tex_src_lod &&
+                         tex->src[s].src_type != nir_tex_src_comparator &&
+                         tex->src[s].src_type != nir_tex_src_texture_deref &&
+                         tex->src[s].src_type != nir_tex_src_sampler_deref)
+                        return pvrgpu_pco_fail(error, error_size, "compute texture source requires native coordinates, LOD and static sampler dereferences");
+               }
                continue;
             }
             switch (instr->type) {
@@ -6562,13 +6768,18 @@ pvrgpu_validate_compute_nir(const nir_shader *nir,
                   const bool size = intr->intrinsic == nir_intrinsic_image_size;
                   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
                   const enum pipe_format format = nir_intrinsic_format(intr);
-                  const unsigned dimensions = dim == GLSL_SAMPLER_DIM_3D ||
+                  const unsigned dimensions = dim == GLSL_SAMPLER_DIM_BUF ? 1 :
+                     dim == GLSL_SAMPLER_DIM_3D ||
                      nir_intrinsic_image_array(intr) ? 3 : 2;
-                  if ((dim != GLSL_SAMPLER_DIM_2D && dim != GLSL_SAMPLER_DIM_3D &&
+                  if ((dim != GLSL_SAMPLER_DIM_BUF &&
+                       dim != GLSL_SAMPLER_DIM_2D &&
+                       dim != GLSL_SAMPLER_DIM_3D &&
                        dim != GLSL_SAMPLER_DIM_CUBE) ||
+                      (dim == GLSL_SAMPLER_DIM_BUF &&
+                       nir_intrinsic_image_array(intr)) ||
                       (dim == GLSL_SAMPLER_DIM_3D && nir_intrinsic_image_array(intr)) ||
                       nir_intrinsic_range_base(intr) ||
-                      (!size && !pvrgpu_compute_image_format_supported(format)) ||
+                      (!size && !pvrgpu_is_supported_shader_image_format(format)) ||
                       ((atom || swap) && format != PIPE_FORMAT_R32_UINT &&
                        format != PIPE_FORMAT_R32_SINT && format != PIPE_FORMAT_R32_FLOAT) ||
                       ((atom || swap) && format == PIPE_FORMAT_R32_FLOAT &&
@@ -6880,12 +7091,15 @@ pvrgpu_lower_native_images(nir_shader *nir, unsigned descriptor_start,
             b.cursor = nir_before_instr(instr);
             nir_def *dimensions = nir_load_preamble(&b, 2, 32, .base = descriptor + 4);
             const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+            const bool buffer = dim == GLSL_SAMPLER_DIM_BUF;
             const bool layered = dim == GLSL_SAMPLER_DIM_3D ||
                dim == GLSL_SAMPLER_DIM_CUBE || nir_intrinsic_image_array(intr);
             nir_def *depth = layered ? nir_load_preamble(&b, 1, 32,
                                                          .base = descriptor + 2) : NULL;
             if (size) {
-               if (intr->def.num_components == 3)
+               if (buffer)
+                  dimensions = nir_channel(&b, dimensions, 0);
+               else if (intr->def.num_components == 3)
                   dimensions = nir_vec3(&b, nir_channel(&b, dimensions, 0),
                      nir_channel(&b, dimensions, 1),
                      dim == GLSL_SAMPLER_DIM_CUBE ? nir_udiv_imm(&b, depth, 6) : depth);
@@ -6894,10 +7108,11 @@ pvrgpu_lower_native_images(nir_shader *nir, unsigned descriptor_start,
                continue;
             }
             nir_def *x = nir_channel(&b, intr->src[1].ssa, 0);
-            nir_def *y = nir_channel(&b, intr->src[1].ssa, 1);
-            nir_def *inside = nir_iand(&b,
-               nir_ult(&b, x, nir_channel(&b, dimensions, 0)),
-               nir_ult(&b, y, nir_channel(&b, dimensions, 1)));
+            nir_def *y = buffer ? NULL : nir_channel(&b, intr->src[1].ssa, 1);
+            nir_def *inside = nir_ult(&b, x, nir_channel(&b, dimensions, 0));
+            if (!buffer)
+               inside = nir_iand(&b, inside,
+                                  nir_ult(&b, y, nir_channel(&b, dimensions, 1)));
             nir_def *z = layered ? nir_channel(&b, intr->src[1].ssa, 2) : NULL;
             if (layered) inside = nir_iand(&b, inside, nir_ult(&b, z, depth));
             /* Unsigned comparisons reject negative signed coordinates too.
@@ -6909,8 +7124,9 @@ pvrgpu_lower_native_images(nir_shader *nir, unsigned descriptor_start,
             const enum pipe_format format = nir_intrinsic_format(intr);
             const unsigned texel_bytes = util_format_get_blocksize(format);
             const unsigned words = texel_bytes / 4;
-            nir_def *offset = nir_iadd(&b, nir_imul(&b, y, stride),
-                                       nir_imul_imm(&b, x, texel_bytes));
+            nir_def *offset = nir_imul_imm(&b, x, texel_bytes);
+            if (!buffer)
+               offset = nir_iadd(&b, nir_imul(&b, y, stride), offset);
             if (layered) {
                nir_def *layer_stride = nir_load_preamble(&b, 1, 32,
                                                           .base = descriptor + 3);
@@ -7380,7 +7596,7 @@ pvrgpu_pco_compile_compute(struct pvrgpu_pco_compiler *compiler,
       fprintf(stderr, "=== pvrgpu: compute NIR before pco_lower_nir ===\n");
       nir_print_shader(nir, stderr);
    }
-   pco_lower_nir(compiler->pco, nir, &data);
+   pvrgpu_pco_lower_nir(compiler, nir, &data);
    nir_shader_intrinsics_pass(nir, pvrgpu_lower_shadow_compare_transport,
                                nir_metadata_control_flow, NULL);
    pco_postprocess_nir(compiler->pco, nir, &data);
@@ -7843,16 +8059,19 @@ pvrgpu_validate_geometry_nir(const nir_shader *nir, char *error, size_t error_si
                const nir_tex_instr *tex = nir_instr_as_tex(instr);
                const bool cube_array =
                   tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && tex->is_array;
-               if ((cube_array && !pvrgpu_native_cube_array(
+               const bool buffer_texture = pvrgpu_native_buffer_texture(
+                  tex, BITSET_LAST_BIT(nir->info.textures_used));
+               if (!buffer_texture &&
+                   ((cube_array && !pvrgpu_native_cube_array(
                                       tex, MESA_SHADER_GEOMETRY,
                                       BITSET_LAST_BIT(nir->info.textures_used))) ||
                    (!cube_array &&
                     (tex->op != nir_texop_tex ||
                      (tex->sampler_dim != GLSL_SAMPLER_DIM_2D &&
-                      tex->sampler_dim != GLSL_SAMPLER_DIM_3D &&
+                     tex->sampler_dim != GLSL_SAMPLER_DIM_3D &&
                       tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE))) ||
                    tex->texture_index != tex->sampler_index ||
-                   tex->texture_index >= BITSET_LAST_BIT(nir->info.textures_used))
+                   tex->texture_index >= BITSET_LAST_BIT(nir->info.textures_used)))
                   return pvrgpu_pco_fail(error, error_size,
                      "geometry texture operation requires bounded 2D/3D/cube implicit-LOD sampling");
                break;
@@ -8091,7 +8310,7 @@ pvrgpu_pco_compile_geometry(struct pvrgpu_pco_compiler *compiler,
       fprintf(stderr, "=== pvrgpu: genuine Geometry NIR before native lowering ===\n");
       nir_print_shader(nir, stderr);
    }
-   pco_lower_nir(compiler->pco, nir, &data);
+   pvrgpu_pco_lower_nir(compiler, nir, &data);
    nir_shader_intrinsics_pass(nir, pvrgpu_lower_shadow_compare_transport,
                               nir_metadata_control_flow, NULL);
    pco_postprocess_nir(compiler->pco, nir, &data);
@@ -8247,6 +8466,8 @@ pvrgpu_validate_tessellation_texture(const nir_shader *nir, const nir_tex_instr 
     * 2D-array and CubeArray layer selection through TAO, while the native
     * marker carries depth comparison independently of the shader stage. */
    const unsigned texture_count = BITSET_LAST_BIT(nir->info.textures_used);
+   if (pvrgpu_native_buffer_texture(tex, texture_count))
+      return true;
    const bool cube_array =
       tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && tex->is_array;
    if (cube_array) {
@@ -8773,7 +8994,7 @@ pvrgpu_compile_tessellation_stage(struct pvrgpu_pco_compiler *compiler,
       goto fail;
    }
    if (getenv("PVRGPU_DEBUG_PCO_NIR")) nir_print_shader(nir, stderr);
-   pco_lower_nir(compiler->pco, nir, &data);
+   pvrgpu_pco_lower_nir(compiler, nir, &data);
    nir_shader_intrinsics_pass(nir, pvrgpu_lower_shadow_compare_transport,
                               nir_metadata_control_flow, NULL);
    pco_postprocess_nir(compiler->pco, nir, &data);
@@ -9175,8 +9396,8 @@ pvrgpu_compile_extended_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
    nir_shader_intrinsics_pass(fs, pvrgpu_lower_fragment_depth_feedback,
                                nir_metadata_control_flow, &depth_feedback);
    fd.fs.uses.depth_feedback = depth_feedback;
-   pco_lower_nir(compiler->pco, vs, &vd);
-   pco_lower_nir(compiler->pco, fs, &fd);
+   pvrgpu_pco_lower_nir(compiler, vs, &vd);
+   pvrgpu_pco_lower_nir(compiler, fs, &fd);
    nir_shader_intrinsics_pass(vs, pvrgpu_lower_shadow_compare_transport,
                               nir_metadata_control_flow, NULL);
    nir_shader_intrinsics_pass(fs, pvrgpu_lower_shadow_compare_transport,
@@ -9939,7 +10160,7 @@ bool pvrgpu_pco_compile_color_triangle(
    pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=rev_link");
    pco_rev_link_nir(compiler->pco, vs, fs);
    pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=lower_vs");
-   pco_lower_nir(compiler->pco, vs, &vertex_data);
+   pvrgpu_pco_lower_nir(compiler, vs, &vertex_data);
    pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=lower_fs");
    struct pvrgpu_feedback_state feedback = {.mem = compile_mem_ctx};
    nir_shader_intrinsics_pass(fs, pvrgpu_lower_generic_fragment_feedback,
@@ -9958,7 +10179,7 @@ bool pvrgpu_pco_compile_color_triangle(
       nir_print_shader(vs, stderr);
       fflush(stderr);
    }
-   pco_lower_nir(compiler->pco, fs, &fragment_data);
+   pvrgpu_pco_lower_nir(compiler, fs, &fragment_data);
    pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=postprocess_vs");
    nir_shader_intrinsics_pass(vs, pvrgpu_lower_shadow_compare_transport,
                                nir_metadata_control_flow, NULL);
@@ -12963,8 +13184,8 @@ bool pvrgpu_pco_compile_lit_mesh(
    pvrgpu_pco_preprocess_nir(compiler, fs);
    pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
    pco_rev_link_nir(compiler->pco, vs, fs);
-   pco_lower_nir(compiler->pco, vs, &vertex_data);
-   pco_lower_nir(compiler->pco, fs, &fragment_data);
+   pvrgpu_pco_lower_nir(compiler, vs, &vertex_data);
+   pvrgpu_pco_lower_nir(compiler, fs, &fragment_data);
    pco_postprocess_nir(compiler->pco, vs, &vertex_data);
    pco_postprocess_nir(compiler->pco, fs, &fragment_data);
 
@@ -13155,8 +13376,8 @@ bool pvrgpu_pco_compile_texture(
    pvrgpu_pco_preprocess_nir(compiler, fs);
    pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
    pco_rev_link_nir(compiler->pco, vs, fs);
-   pco_lower_nir(compiler->pco, vs, &vertex_data);
-   pco_lower_nir(compiler->pco, fs, &fragment_data);
+   pvrgpu_pco_lower_nir(compiler, vs, &vertex_data);
+   pvrgpu_pco_lower_nir(compiler, fs, &fragment_data);
    pco_postprocess_nir(compiler->pco, vs, &vertex_data);
    pco_postprocess_nir(compiler->pco, fs, &fragment_data);
 
@@ -13387,8 +13608,8 @@ bool pvrgpu_pco_compile_refract(
    pvrgpu_pco_preprocess_nir(compiler, fs);
    pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
    pco_rev_link_nir(compiler->pco, vs, fs);
-   pco_lower_nir(compiler->pco, vs, &vertex_data);
-   pco_lower_nir(compiler->pco, fs, &fragment_data);
+   pvrgpu_pco_lower_nir(compiler, vs, &vertex_data);
+   pvrgpu_pco_lower_nir(compiler, fs, &fragment_data);
    pco_postprocess_nir(compiler->pco, vs, &vertex_data);
    pco_postprocess_nir(compiler->pco, fs, &fragment_data);
 
@@ -13604,8 +13825,8 @@ bool pvrgpu_pco_compile_shadow(
    pvrgpu_pco_preprocess_nir(compiler, fs);
    pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
    pco_rev_link_nir(compiler->pco, vs, fs);
-   pco_lower_nir(compiler->pco, vs, &vertex_data);
-   pco_lower_nir(compiler->pco, fs, &fragment_data);
+   pvrgpu_pco_lower_nir(compiler, vs, &vertex_data);
+   pvrgpu_pco_lower_nir(compiler, fs, &fragment_data);
    pco_postprocess_nir(compiler->pco, vs, &vertex_data);
    pco_postprocess_nir(compiler->pco, fs, &fragment_data);
 
@@ -16891,8 +17112,8 @@ bool pvrgpu_pco_compile_terrain(
    pvrgpu_pco_preprocess_nir(compiler, fs);
    pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
    pco_rev_link_nir(compiler->pco, vs, fs);
-   pco_lower_nir(compiler->pco, vs, &vertex_data);
-   pco_lower_nir(compiler->pco, fs, &fragment_data);
+   pvrgpu_pco_lower_nir(compiler, vs, &vertex_data);
+   pvrgpu_pco_lower_nir(compiler, fs, &fragment_data);
    pco_postprocess_nir(compiler->pco, vs, &vertex_data);
    pco_postprocess_nir(compiler->pco, fs, &fragment_data);
 
@@ -17451,8 +17672,8 @@ bool pvrgpu_pco_compile_ideas(
    pvrgpu_pco_preprocess_nir(compiler, fs);
    pco_link_nir(compiler->pco, vs, fs, &vertex_data, &fragment_data);
    pco_rev_link_nir(compiler->pco, vs, fs);
-   pco_lower_nir(compiler->pco, vs, &vertex_data);
-   pco_lower_nir(compiler->pco, fs, &fragment_data);
+   pvrgpu_pco_lower_nir(compiler, vs, &vertex_data);
+   pvrgpu_pco_lower_nir(compiler, fs, &fragment_data);
    pco_postprocess_nir(compiler->pco, vs, &vertex_data);
    pco_postprocess_nir(compiler->pco, fs, &fragment_data);
 

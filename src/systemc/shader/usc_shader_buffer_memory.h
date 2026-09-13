@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -72,6 +73,20 @@ public:
         });
   }
 
+  // The native memory callback carries an absolute address, not a descriptor
+  // slot.  Starting in a range is therefore the best available discriminator
+  // for routing a vector whose trailing DWORDs may be robustly out of bounds.
+  bool StartsIn(std::uint64_t address, std::uint32_t access) const {
+    return SelectRange(address, access) != ranges_.end();
+  }
+
+  bool OwnsAddress(std::uint64_t address) const {
+    return std::any_of(ranges_.begin(), ranges_.end(), [&](const auto &range) {
+      return address >= range.gpu_address &&
+             address - range.gpu_address < range.bytes;
+    });
+  }
+
   static void Read(void *user_data, std::uint64_t address,
                    std::uint32_t dword_count, std::uint32_t *destination) {
     if (!user_data)
@@ -113,17 +128,59 @@ public:
   std::uint64_t atomics() const noexcept { return atomics_; }
 
 private:
+  using RangeIterator = std::vector<ShaderBufferRange>::const_iterator;
+
+  RangeIterator SelectRange(std::uint64_t address, std::uint32_t access) const {
+    RangeIterator selected = ranges_.end();
+    std::uint64_t selected_remaining = 0;
+    for (auto range = ranges_.begin(); range != ranges_.end(); ++range) {
+      if ((range->access & access) != access || address < range->gpu_address)
+        continue;
+      const std::uint64_t offset = address - range->gpu_address;
+      if (offset >= range->bytes)
+        continue;
+      const std::uint64_t remaining = range->bytes - offset;
+      if (selected == ranges_.end() || remaining > selected_remaining) {
+        selected = range;
+        selected_remaining = remaining;
+      }
+    }
+    return selected;
+  }
+
+  std::size_t ValidPrefixBytes(std::uint64_t address, std::size_t bytes,
+                               std::uint32_t access) const {
+    const auto range = SelectRange(address, access);
+    if (range == ranges_.end())
+      return 0;
+    const std::uint64_t remaining =
+        range->bytes - (address - range->gpu_address);
+    return static_cast<std::size_t>(
+        std::min<std::uint64_t>(bytes, remaining - remaining % 4U));
+  }
+
+  void RejectPermissionMismatch(std::uint64_t address,
+                                std::uint32_t access,
+                                const char *operation) const {
+    if (OwnsAddress(address) && !StartsIn(address, access))
+      throw std::runtime_error(std::string("USC shader-buffer ") + operation +
+                               " is not permitted by its stage view");
+  }
+
   void ReadDwords(std::uint64_t address, std::uint32_t dword_count,
                   std::uint32_t *destination) {
     if (!destination || !dword_count || dword_count > 16 || (address & 3U))
       throw std::runtime_error("USC shader-buffer load shape is invalid");
     const auto bytes = static_cast<std::size_t>(dword_count) * 4U;
-    if (!Contains(address, bytes, 1U))
-      throw std::runtime_error("USC shader-buffer load exceeds its stage view");
-    const auto read = memory_->Read(address, bytes, client_);
-    if (read.data.size() != bytes)
+    std::fill_n(destination, dword_count, 0U);
+    RejectPermissionMismatch(address, 1U, "load");
+    const auto valid_bytes = ValidPrefixBytes(address, bytes, 1U);
+    if (valid_bytes == 0)
+      return;
+    const auto read = memory_->Read(address, valid_bytes, client_);
+    if (read.data.size() != valid_bytes)
       throw std::runtime_error("USC shader-buffer load returned incomplete data");
-    std::memcpy(destination, read.data.data(), bytes);
+    std::memcpy(destination, read.data.data(), valid_bytes);
     stats_ += read.stats;
   }
 
@@ -132,18 +189,24 @@ private:
     if (!source || !dword_count || dword_count > 16 || (address & 3U))
       throw std::runtime_error("USC shader-buffer store shape is invalid");
     const auto bytes = static_cast<std::size_t>(dword_count) * 4U;
-    if (!Contains(address, bytes, 2U))
-      throw std::runtime_error("USC shader-buffer store exceeds its stage view");
+    RejectPermissionMismatch(address, 2U, "store");
+    const auto valid_bytes = ValidPrefixBytes(address, bytes, 2U);
+    if (valid_bytes == 0)
+      return;
     stats_ += memory_->Write(address,
                             reinterpret_cast<const std::uint8_t *>(source),
-                            bytes, client_);
+                            valid_bytes, client_);
   }
 
   std::uint32_t Atomic(PcoOpcode operation, std::uint64_t address,
                        std::uint32_t operand) {
-    if (!IsPcoAtomic32(operation) || (address & 3U) ||
-        !Contains(address, 4, 3U))
-      throw std::runtime_error("USC shader-buffer atomic exceeds its writable view");
+    if (!IsPcoAtomic32(operation))
+      throw std::runtime_error("USC shader-buffer atomic opcode is unsupported");
+    if (address & 3U)
+      throw std::runtime_error("USC shader-buffer atomic address is unaligned");
+    RejectPermissionMismatch(address, 3U, "atomic");
+    if (!Contains(address, 4, 3U))
+      return 0;
     const auto read = memory_->Read(address, 4, client_);
     if (read.data.size() != 4)
       throw std::runtime_error("USC shader-buffer atomic read is incomplete");

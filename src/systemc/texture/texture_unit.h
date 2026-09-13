@@ -78,6 +78,10 @@ void ValidateTextureSingleLevelDimensions(
 // Explicit whole-cube, uncompressed, single-sample layout. TAO must name an
 // exact shader-produced cube base, never a face or an approximate byte offset.
 void ValidateTextureCubeArrayLayout(const TextureResource &resource);
+
+// PCO exposes a typed buffer as a tightly packed 8192-wide 2D rectangle.  The
+// exact logical count distinguishes the padded tail of the final row.
+void ValidateTextureBufferLayout(const TextureResource &resource);
 std::uint32_t TextureCubeArrayBaseFace(const TextureResource &resource,
                                       std::uint64_t image_address,
                                       std::uint64_t sample_address);

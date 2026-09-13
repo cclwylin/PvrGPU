@@ -121,8 +121,6 @@ inline bool ValidateDriverTessellationBuffers(const DriverCommand &command,
       return reject("descriptor is not canonical before relocation");
   }
   for (unsigned stage = 0; stage < 2; ++stage) {
-    if ((storage[stage]->used_mask & ~present[stage]) != 0)
-      return reject("shader uses an unbound descriptor");
     for (unsigned slot = 0; slot < storage[stage]->descriptor_count; ++slot) {
       if (present[stage] & (UINT32_C(1) << slot)) continue;
       const auto word = storage[stage]->descriptor_start + 4U * slot;

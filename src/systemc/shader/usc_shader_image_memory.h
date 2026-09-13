@@ -75,8 +75,10 @@ private:
           return offset / image.row_stride < image.height &&
                  offset % image.row_stride < std::uint64_t{image.width} * 4;
         });
+    // Robust buffer/image addressing: an aligned, otherwise valid shader
+    // atomic outside every bound texel returns zero and has no side effect.
     if (!in_view)
-      throw std::runtime_error("USC atomic address exceeds its bound image view");
+      return 0;
     // No SystemC wait occurs between the read and write. The USC process
     // serializes each complete RMW, matching the modeled Compute DMA service.
     const auto read = memory_->Read(address, 4, MemoryClient::kFragmentImage);

@@ -140,7 +140,7 @@ enum class TestMode {
   kEightAttribute,
   kInvalidOverlap,
   kInvalidStride,
-  kInvalidOffset,
+  kRobustOffset,
 };
 
 TestMode ParseMode(int argc, char **argv) {
@@ -156,17 +156,16 @@ TestMode ParseMode(int argc, char **argv) {
     return TestMode::kInvalidOverlap;
   if (argc == 2 && std::string(argv[1]) == "invalid-stride")
     return TestMode::kInvalidStride;
-  if (argc == 2 && std::string(argv[1]) == "invalid-offset")
-    return TestMode::kInvalidOffset;
+  if (argc == 2 && std::string(argv[1]) == "robust-offset")
+    return TestMode::kRobustOffset;
   throw std::runtime_error(
       "usage: attribute-fetch-geometry-test "
-      "[one|two|four|eight|invalid-overlap|invalid-stride|invalid-offset]");
+      "[one|two|four|eight|invalid-overlap|invalid-stride|robust-offset]");
 }
 
 bool IsInvalidMode(TestMode mode) {
   return mode == TestMode::kInvalidOverlap ||
-         mode == TestMode::kInvalidStride ||
-         mode == TestMode::kInvalidOffset;
+         mode == TestMode::kInvalidStride;
 }
 
 std::size_t AttributeCount(TestMode mode) {
@@ -176,8 +175,8 @@ std::size_t AttributeCount(TestMode mode) {
     return 4;
   if (mode == TestMode::kEightAttribute)
     return 8;
-  // The fail-closed layout modes deliberately mutate case-2's second
-  // binding, so they remain two-attribute tests.
+  // The special layout modes deliberately mutate case-2's second binding,
+  // so they remain two-attribute tests.
   return 2;
 }
 
@@ -337,7 +336,7 @@ int sc_main(int argc, char **argv) {
       bindings[1].destination_register = 1;
     else if (mode == TestMode::kInvalidStride)
       bindings[1].stride_bytes = sizeof(float);
-    else if (mode == TestMode::kInvalidOffset)
+    else if (mode == TestMode::kRobustOffset)
       bindings[1].offset_bytes = 33800U - sizeof(float);
     const std::uint64_t expected_attribute_fetches =
         expected_vs_invocations * bindings.size();
@@ -493,6 +492,41 @@ int sc_main(int argc, char **argv) {
     const PipelineState result = LoadPipelineState(pool, state_handle);
     Check(result.stage == PipelineStage::kParameterBufferReady,
           "parameter-buffer completion stage");
+    if (mode == TestMode::kRobustOffset) {
+      Check(result.counters.ia_vertices == expected_ia_vertices &&
+                result.counters.vs_invocations == expected_vs_invocations &&
+                result.counters.vertex_attribute_fetches ==
+                    expected_attribute_fetches &&
+                result.counters.vertex_attribute_bytes ==
+                    expected_attribute_bytes,
+            "robust offset changed submitted vertex work accounting");
+      const std::vector<VertexLane> robust_lanes =
+          LoadArray<VertexLane>(pool, result.vertex_lanes);
+      const std::vector<VertexLaneRef> robust_refs =
+          LoadArray<VertexLaneRef>(pool, result.vertex_lane_refs);
+      bool saw_first_vertex = false;
+      for (const VertexLaneRef &ref : robust_refs) {
+        Check(ref.lane_index < robust_lanes.size(),
+              "robust offset lane reference is invalid");
+        const VertexLane &lane = robust_lanes[ref.lane_index];
+        const std::uint32_t expected_x =
+            ref.vertex_index == 0 ? FloatBits(vertices.back()) : 0U;
+        saw_first_vertex |= ref.vertex_index == 0;
+        Check(lane.vertex_input[2] == expected_x &&
+                  lane.vertex_input[3] == 0,
+              "partially or fully OOB first attribute element was not "
+              "zero-filled per component");
+      }
+      Check(saw_first_vertex,
+            "robust offset fixture did not exercise its partial first read");
+      ReleaseFunctionalPayloads(pool, result);
+      pool.Release(state_handle);
+      Check(pool.bytes_in_flight() == 0 &&
+                pool.allocations() == pool.releases(),
+            "robust offset cleanup balances shared VBO ownership");
+      std::cout << "attribute_fetch_geometry_test: PASS (robust-offset)\n";
+      return 0;
+    }
     Check(result.counters.ia_vertices == expected_ia_vertices &&
               result.counters.ia_primitives == expected_ia_primitives &&
               result.counters.vs_invocations == expected_vs_invocations &&

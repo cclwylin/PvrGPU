@@ -84,7 +84,7 @@ struct InvocationContext {
       ApplyMemoryAccessStats(self.counters, read.stats);
       self.counters.gs_input_read_bytes += bytes;
       WaitForCycles(MemoryAccessDelayCycles(read.stats));
-    } else if (self.buffers.Contains(address, bytes, 1U)) {
+    } else if (self.buffers.OwnsAddress(address)) {
       UscShaderBufferMemory::Read(&self.buffers, address, count, destination);
     } else {
       UscUniformBufferMemory::Read(&self.uniforms, address, count, destination);

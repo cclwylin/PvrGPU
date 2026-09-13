@@ -171,13 +171,16 @@ void ValidateSample(const PcoInstruction &i, ShaderStage stage,
       ((i.texture_address_offset || i.texture_lod_replace || i.texture_lod_bias) ? 1U : 0U) +
       (i.texture_address_offset ? 2U : 0U) +
       ((i.texture_sample_index_present || i.texture_spatial_offset_present) ? 1U : 0U);
+  const bool texel_fetch = i.texture_non_normalized_coords &&
+      i.texture_lod_replace && i.texture_dimension == 2 &&
+      !i.texture_address_offset;
   if (i.opcode != PcoOpcode::kTextureSample || i.repeat_count != 1 ||
       i.source_count != 3 || i.data_request || i.component_count != kPcoTextureResponseCount ||
       i.end_group || i.target != PcoWriteTarget::kTemporary ||
       !HasCanonicalTextureLodMode(i) || i.texture_lod_bias || i.texture_gather ||
       (i.texture_dimension != 2 && i.texture_dimension != 3) ||
       i.texture_fcnorm > 1 || i.texture_address_offset > 1 ||
-      i.texture_non_normalized_coords ||
+      (i.texture_non_normalized_coords && !texel_fetch) ||
       i.texture_sample_index_present || i.texture_spatial_offset_present ||
       i.texture_shadow_compare > 1 ||
       (!i.texture_shadow_compare &&

@@ -148,7 +148,6 @@ CasePayload MakeCase(MemoryPool &pool, std::size_t sample_count,
                      std::uint64_t sequence,
                      std::size_t descriptor_count = 0,
                      std::size_t push_constant_count = 0,
-                     bool empty_push_at_descriptor_end = false,
                      std::size_t coefficient_dword_count = 8) {
   if (descriptor_count == 0)
     descriptor_count = sample_count;
@@ -244,20 +243,19 @@ CasePayload MakeCase(MemoryPool &pool, std::size_t sample_count,
       static_cast<std::uint32_t>(coefficient_dword_count);
   state.fragment_pco_abi.shareds =
       static_cast<std::uint32_t>(shared.size());
-  if (push_constant_count != 0 || empty_push_at_descriptor_end) {
-    state.fragment_pco_abi.push_constant_start =
-        static_cast<std::uint32_t>(
-            descriptor_count *
-            pvrgpu::stub::kPcoTextureDescriptorDwordCount);
-    state.fragment_pco_abi.push_constant_count =
-        static_cast<std::uint32_t>(push_constant_count);
-  }
+  state.fragment_pco_abi.push_constant_start =
+      static_cast<std::uint32_t>(
+          descriptor_count *
+          pvrgpu::stub::kPcoTextureDescriptorDwordCount);
+  state.fragment_pco_abi.push_constant_count =
+      static_cast<std::uint32_t>(push_constant_count);
   state.position_output_start = 0;
   state.position_output_count = 4;
   state.varying_output_start = 4;
   state.varying_output_count = coefficient_dword_count > 4 ? 1 : 0;
   state.fragment_position_start = 0;
   state.fragment_position_count = 4;
+  state.fragment_position_uses_w = 1;
   state.fragment_varying_start = 4;
   state.fragment_varying_count =
       static_cast<std::uint32_t>(coefficient_dword_count - 4U);
@@ -435,6 +433,7 @@ CasePayload MakeVertexCase(MemoryPool &pool, std::uint64_t sequence) {
   state.vertex_pco_abi.vertex_inputs = 2;
   state.vertex_pco_abi.vertex_outputs = 4;
   state.vertex_pco_abi.shareds = 40;
+  state.vertex_pco_abi.push_constant_start = 40;
   state.vertex_sampled_texture_count = 2;
   state.vertex_groups = 1;
   state.counters.drawlists = 1;
@@ -802,7 +801,7 @@ public:
         slot_("slot", pool_, ShaderStage::kFragment),
         cluster_("cluster", pool_, ShaderStage::kFragment),
         responder_("responder", pool_, query ? 0 : 1, 1, false, !query) {
-    payload_ = MakeCase(pool_, 1, array ? 202 : 201, 1, query ? 0 : 4, true, 4);
+    payload_ = MakeCase(pool_, 1, array ? 202 : 201, 1, query ? 0 : 4, 4);
     auto state = LoadPipelineState(pool_, payload_.state);
     const auto program = Decode(ShaderStage::kFragment,
         pvrgpu::stub::test::MultisampleTextureFixture(query ? (array ? 19 : 18) :
@@ -941,7 +940,7 @@ public:
                            TextureControlFlowCase mode)
       : sc_module(name), mode_(mode),
         cluster_("cluster", pool_, ShaderStage::kFragment) {
-    payload_ = MakeCase(pool_, 2, 300, 2, 0, false, 4);
+    payload_ = MakeCase(pool_, 2, 300, 2, 0, 4);
     auto state = LoadPipelineState(pool_, payload_.state);
     const auto straight = MakeTextureProgram(2, 2);
     std::vector<PcoInstruction> program{straight[0], straight[1]};
@@ -1217,7 +1216,7 @@ public:
   explicit DerivativeQuadHarness(sc_core::sc_module_name name)
       : sc_module(name), slot_("slot", pool_, ShaderStage::kFragment),
         cluster_("cluster", pool_, ShaderStage::kFragment) {
-    payload_ = MakeCase(pool_, 1, 250, 1, 0, false, 4);
+    payload_ = MakeCase(pool_, 1, 250, 1, 0, 4);
     auto state = LoadPipelineState(pool_, payload_.state);
     std::vector<PcoInstruction> instructions(7);
     for (std::size_t pc = 0; pc < instructions.size(); ++pc) {
@@ -1280,6 +1279,7 @@ public:
     pool_.Release(state.fragment_shared_registers);
     state.fragment_shared_registers = {};
     state.fragment_pco_abi.shareds = 0;
+    state.fragment_pco_abi.push_constant_start = 0;
     state.sampled_texture_count = 0;
     // Derivative-only driver fragments retain the same position-CF4 contract
     // as texture fragments, even when these instructions only read specials.
@@ -1343,7 +1343,8 @@ private:
 // Unlike the original single-lane fixtures, this is a complete 2x2 quad. It
 // traverses real USC FIFO/MemoryPool continuations for every native request.
 CasePayload MakeQuadSequence(MemoryPool &pool, unsigned samples, bool loop) {
-  auto payload = MakeCase(pool, loop ? 1 : samples, 401, 1, loop ? 4 : 0, false, 4);
+  auto payload = MakeCase(pool, loop ? 1 : samples, 401, 1,
+                          loop ? 4 : 0, 4);
   auto state = LoadPipelineState(pool, payload.state);
   if (loop) {
     const auto decoded = Decode(ShaderStage::kFragment, TextureUniformLoopPcoBinary());
@@ -1627,8 +1628,8 @@ int sc_main(int argc, char **argv) {
     Check(!DriverPcoTextureSharedLayoutSupported(terrain_d4_fragment_abi, 1),
           "Terrain D4 empty push range rejects start after prefix end");
     terrain_d4_fragment_abi.push_constant_start = 0;
-    Check(DriverPcoTextureSharedLayoutSupported(terrain_d4_fragment_abi, 1),
-          "legacy descriptor-only empty push range remains accepted");
+    Check(!DriverPcoTextureSharedLayoutSupported(terrain_d4_fragment_abi, 1),
+          "descriptor-only layouts reject noncanonical empty push start");
 
     DriverPcoStageAbi mixed_abi;
     mixed_abi.shareds = 32;
@@ -1656,12 +1657,15 @@ int sc_main(int argc, char **argv) {
     Check(!DriverPcoTextureSharedLayoutSupported(mixed_abi, 1),
           "push constants cannot overlap UBO descriptors");
     mixed_abi.push_constant_start = 28;
-    mixed_abi.push_constant_count = 228;
-    mixed_abi.shareds = 256;
+    mixed_abi.push_constant_count =
+        PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE -
+        mixed_abi.push_constant_start;
+    mixed_abi.shareds =
+        PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE;
     Check(DriverPcoTextureSharedLayoutSupported(mixed_abi, 1),
-          "256 DWORD shared-register endpoint remains representable");
-    mixed_abi.push_constant_count = 229;
-    mixed_abi.shareds = 257;
+          "maximum shared-register endpoint remains representable");
+    ++mixed_abi.push_constant_count;
+    ++mixed_abi.shareds;
     Check(!DriverPcoTextureSharedLayoutSupported(mixed_abi, 1),
           "shared-register file overflow is rejected");
 
@@ -1670,7 +1674,7 @@ int sc_main(int argc, char **argv) {
     MemoryPool five_pool;
     MemoryPool nine_pool;
     MemoryPool vertex_pool;
-    const CasePayload one = MakeCase(one_pool, 1, 1, 1, 0, true, 12);
+    const CasePayload one = MakeCase(one_pool, 1, 1, 1, 0, 12);
     const CasePayload three = MakeCase(three_pool, 3, 2);
     const CasePayload five = MakeCase(five_pool, 5, 3, 5, 64);
     const CasePayload nine = MakeCase(nine_pool, 9, 4, 1);

@@ -291,6 +291,21 @@ TestStateHandles MakeMrtState(MemoryPool &pool, std::uint32_t sequence,
   state.raster_state.clear_color[3] = 0.0F;
   state.raster_state.blend.enable = 0;
   state.raster_state.color_mask = 0x0f;
+  state.raster_state.render_target_state_count =
+      static_cast<std::uint8_t>(render_target_count);
+  for (std::uint32_t target = 0; target < render_target_count; ++target) {
+    state.raster_state.target_blend[target] = state.raster_state.blend;
+    state.raster_state.target_color_mask[target] = 0x0f;
+  }
+  // Four deliberately different states catch accidental broadcast of RT0:
+  // red-only, green+alpha, blend source away, and ordinary full write.
+  state.raster_state.target_color_mask[0] = 0x01;
+  state.raster_state.target_color_mask[1] = 0x0a;
+  state.raster_state.target_blend[2].enable = 1;
+  state.raster_state.target_blend[2].source_rgb_factor = BlendFactor::kZero;
+  state.raster_state.target_blend[2].destination_rgb_factor = BlendFactor::kOne;
+  state.raster_state.target_blend[2].source_alpha_factor = BlendFactor::kZero;
+  state.raster_state.target_blend[2].destination_alpha_factor = BlendFactor::kOne;
   const std::vector<FragmentInvocation> invocations = {invocation};
   const std::vector<FragmentOutput> outputs = {output};
   state.fragment_invocations = StoreNewArray(pool, invocations);
@@ -475,16 +490,19 @@ int sc_main(int, char **) {
       Check(attachment0.size() == 4 && attachment1.size() == 4 &&
                 attachment2.size() == 4 && attachment3.size() == 4,
             "every MRT attachment was resolved");
-      Check(attachment0[0] == 64 && attachment0[3] == 64,
-            "MRT attachment 0 colour");
-      Check(attachment1[0] == 128 && attachment1[3] == 128,
-            "MRT attachment 1 colour");
-      Check(attachment2[0] == 191 && attachment2[3] == 191,
-            "MRT attachment 2 colour");
+      Check(attachment0 == std::vector<std::uint8_t>({64, 0, 0, 0}),
+            "MRT attachment 0 red-only mask");
+      Check(attachment1 == std::vector<std::uint8_t>({0, 128, 0, 128}),
+            "MRT attachment 1 green/alpha mask");
+      Check(attachment2 == std::vector<std::uint8_t>({0, 0, 0, 0}),
+            "MRT attachment 2 independent blend factors");
       Check(attachment3[0] == 255 && attachment3[3] == 255,
             "MRT attachment 3 colour");
       Check(resolved.counters.pbe_pixels_written == 4,
             "MRT pixel writes counted per attachment");
+      Check(resolved.counters.pbe_color_reads == 1 &&
+                resolved.counters.pbe_blended_fragments == 1,
+            "MRT blend counters count only enabled targets");
       pool.Release(resolved.pbe_framebuffer);
       pool.Release(resolved.extra_pbe_framebuffer[0]);
       pool.Release(resolved.extra_pbe_framebuffer[1]);

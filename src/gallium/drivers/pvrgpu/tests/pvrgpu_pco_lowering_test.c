@@ -3198,15 +3198,22 @@ static void test_multisample_texture_lowering(struct pvrgpu_pco_compiler *compil
             components > 3 ? nir_channel(&fb, value, 3) : nir_imm_float(&fb, 1));
          nir_store_var(&fb, out, rgba, 15);
          nir_shader_gather_info(fb.shader, nir_shader_get_entrypoint(fb.shader));
+         BITSET_SET(fb.shader->info.textures_used, 0);
          fb.shader->info.num_textures = 1;
          struct pvrgpu_pco_graphics_binary binary;
          char error[512] = {0};
          const enum pipe_format attribute = PIPE_FORMAT_R32G32B32A32_FLOAT;
          if (!pvrgpu_pco_compile_color_triangle(compiler, vb.shader, fb.shader,
-               &attribute, false, true, 1, 0, 0, 1, 1, &binary, error, sizeof(error)))
+               &attribute, false, true, 1, 0, 0, 1, 1, &binary, error, sizeof(error))) {
+            fprintf(stderr, "multisample lowering array=%u op=%u: ", array, op);
             fail(error);
-         if (!binary.fragment.size || binary.fragment_position_count != 4)
-            fail("multisample fragment lost native code or position ABI");
+         }
+         /* gl_FragCoord.xy comes directly from the raster coordinates; only
+          * z/w consume position interpolation coefficients.  The size and
+          * sample-query variants do not read position at all.
+          */
+         if (!binary.fragment.size || binary.fragment_position_count != 0)
+            fail("multisample fragment lost native code or minimal position ABI");
          pvrgpu_pco_graphics_binary_finish(&binary);
          ralloc_free(fb.shader);
       }

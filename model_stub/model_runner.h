@@ -26,8 +26,8 @@ struct ModelFramebuffer {
   std::vector<ModelStreamOutputReadback> stream_outputs;
   std::vector<ModelShaderImageReadback> shader_images;
   std::vector<std::uint8_t> pixels;
-  // Colour attachments past the first, in target order.  Each is the same
-  // width, height and pixel width as `pixels`.
+  // Colour attachments past the first, in target order. Each has the same
+  // width and height as `pixels`; its transport width may differ by format.
   std::vector<std::vector<std::uint8_t>> extra;
   // Actual transport identities in target order; bytes-per-pixel alone
   // cannot distinguish RGBA8 from either packed 10/10/10/2 layout.
@@ -35,8 +35,8 @@ struct ModelFramebuffer {
   bool color_formats_explicit = false;
   std::uint32_t width = 0;
   std::uint32_t height = 0;
-  // Four while the attachment packs UNORM8 channels; an integer attachment
-  // stores one 32-bit channel per dword and is 8 or 16 bytes wide.
+  // Transport width for target zero: 4 for packed color, 4/8/16 for raw
+  // integer dwords, 16 for canonical RGBA32F, or 32 for exact RGBA64F.
   std::uint32_t bytes_per_pixel = 4;
   std::vector<std::uint32_t> bytes_per_pixel_per_target;
   // Samples are stored next to each other within each pixel, without resolve.
@@ -47,7 +47,7 @@ struct ModelFramebuffer {
 
   bool valid() const {
     return width != 0 && height != 0 && width <= 4096 && height <= 4096 &&
-           bytes_per_pixel != 0 && bytes_per_pixel <= 16 &&
+           bytes_per_pixel != 0 && bytes_per_pixel <= 32 &&
            sample_count != 0 && sample_count <= 16 &&
            layer_count != 0 && layer_count <= 256 &&
            (bytes_per_pixel_per_target.empty() ||

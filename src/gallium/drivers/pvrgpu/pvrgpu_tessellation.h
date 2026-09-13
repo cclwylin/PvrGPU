@@ -131,8 +131,6 @@ pvrgpu_tessellation_payload_error_with_graphics(
       const struct pvrgpu_systemc_storage_buffer_abi *storage =
          stage ? &t->evaluation_storage : &t->control_storage;
       const uint32_t *shared = stage ? t->evaluation_shared : t->control_shared;
-      if (storage->used_mask & ~present[stage])
-         return "tessellation shader uses an unbound storage buffer";
       for (unsigned slot = 0; slot < storage->descriptor_count; ++slot) {
          if (present[stage] & (UINT32_C(1) << slot))
             continue;

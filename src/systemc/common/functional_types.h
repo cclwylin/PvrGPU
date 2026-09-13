@@ -411,6 +411,9 @@ struct BlendState {
   std::uint32_t constant_color_bits[4] = {0, 0, 0, 0};
 };
 
+// Colour attachments one fragment shader can write in a single pass.
+inline constexpr std::size_t kMaxRenderTargets = 4;
+
 // GLES face-cull state is independent from triangle setup.  When enabled,
 // the API defaults are GL_BACK and GL_CCW: clockwise triangles are back
 // facing and are removed after homogeneous clipping.
@@ -449,6 +452,11 @@ struct RasterState {
   DepthState depth;
   StencilState stencil;
   BlendState blend;
+  // Count zero is the legacy broadcast state above.  A nonzero count selects
+  // the matching entry for each render target.
+  std::uint8_t render_target_state_count = 0;
+  BlendState target_blend[kMaxRenderTargets]{};
+  std::uint8_t target_color_mask[kMaxRenderTargets]{};
   FaceCullState face_cull;
   ScissorState scissor;
   // Width a line or point rasterizes at, in device pixels.  GLES guarantees
@@ -503,6 +511,31 @@ struct RasterState {
   // GL top edge into the bottom one.  Only the horizontal-edge tie moves.
   std::uint8_t bottom_edge_rule = 0;
 };
+
+inline const BlendState &BlendStateForTarget(const RasterState &state,
+                                             std::size_t target) {
+  return state.render_target_state_count > target
+             ? state.target_blend[target]
+             : state.blend;
+}
+
+inline std::uint8_t ColorMaskForTarget(const RasterState &state,
+                                       std::size_t target) {
+  return state.render_target_state_count > target
+             ? state.target_color_mask[target]
+             : state.color_mask;
+}
+
+inline bool AnyBlendEnabled(const RasterState &state) {
+  if (state.render_target_state_count == 0)
+    return state.blend.enable != 0;
+  for (std::size_t target = 0; target < state.render_target_state_count;
+       ++target) {
+    if (state.target_blend[target].enable != 0)
+      return true;
+  }
+  return false;
+}
 
 inline bool RasterRequiresLateDepthStencil(const RasterState &state) {
   // Alpha-to-coverage can remove samples after shading. Neither opaque HSR
@@ -673,6 +706,8 @@ enum class TextureDimensionType : std::uint8_t {
   kCube = 3,
   // Physical layers are complete six-face cubes; native TAO selects the cube.
   kCubeArray = 4,
+  // A typed buffer is physically exposed as PCO's 8192-wide 2D texel grid.
+  kBuffer = 5,
 };
 
 enum class TextureFilter : std::uint8_t {
@@ -715,6 +750,8 @@ struct TextureResource {
   // this at one.
   TextureDimensionType dimension_type = TextureDimensionType::k2D;
   std::uint16_t layer_count = 1;
+  // Exact logical texel count; the final physical row can contain padding.
+  std::uint32_t buffer_elements = 0;
   // MS images keep actual samples pixel-interleaved: (x * sample_count +
   // sample) * bytes_per_texel. No resolved/duplicated single-sample plane.
   std::uint8_t sample_count = 1;
@@ -982,6 +1019,9 @@ struct FragmentShaderLane {
   // normalized facing just like covered invocations; they do not guess from
   // coverage or the coefficient-plane orientation.
   std::uint8_t front_facing = 1;
+  // Helpers have no FragmentInvocation to recover this from. Use the former
+  // two-byte alignment hole so the serialized lane ABI remains 64 bytes.
+  std::uint16_t layer = 0;
   float depth = 0.0f;
   float barycentric[3]{};
 };
@@ -1055,13 +1095,16 @@ struct TextureSampleRequest {
   // Native SMP REPLACE float word. NNCOORDS distinguishes texelFetch from
   // normalized textureLod; neither consumes implicit quad derivatives.
   std::uint32_t explicit_lod = 0;
-  std::uint8_t explicit_lod_present = 0;
   // Raw fragment SMP BIAS/PPLOD payload, added to implicit lambda before
   // sampler clamps. Preserve NaN/Inf bits until the fixed-function boundary.
   std::uint32_t lod_bias = 0;
-  std::uint8_t lod_bias_present = 0;
   // Per-lane depth reference for fixed-function compare-before-filter PCF.
   std::uint32_t shadow_reference = 0;
+  // Keep scalar presence flags together after their DWORD payloads.  These
+  // requests cross several bounded FIFOs, and avoiding alignment holes keeps
+  // the established 128-byte request envelope intact.
+  std::uint8_t explicit_lod_present = 0;
+  std::uint8_t lod_bias_present = 0;
   std::uint8_t shadow_compare = 0;
 };
 
@@ -1071,9 +1114,6 @@ struct TextureSampleResponse {
   std::uint64_t request_id = 0;
   ShaderStage shader_stage = ShaderStage::kFragment;
 };
-
-// Colour attachments one fragment shader can write in a single pass.
-inline constexpr std::size_t kMaxRenderTargets = 4;
 
 struct FragmentOutput {
   std::uint32_t x = 0;

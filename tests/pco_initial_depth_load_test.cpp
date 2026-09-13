@@ -115,6 +115,7 @@ struct Fixture {
     draw.varying_output_start = 4;
     draw.varying_output_count = 4;
     draw.fragment_position_count = 4;
+    draw.fragment_position_uses_w = 1;
     draw.fragment_varying_start = 4;
     draw.fragment_varying_count = 16;
     draw.fragment_output_mask[0] = 0x0f;
@@ -193,6 +194,7 @@ void VerifyContinuity(const std::filesystem::path &root, unsigned format, unsign
     fixture.draw.fragment_shared = depth_shared.data();
     fixture.draw.fragment_shared_count = depth_shared.size();
     fixture.draw.fragment_pco_abi.shareds = depth_shared.size();
+    fixture.draw.fragment_pco_abi.push_constant_count = depth_shared.size();
   }
   const auto original = fixture.initial;
   for (unsigned pass = 0; pass < 2; ++pass) {

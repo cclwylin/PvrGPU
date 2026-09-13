@@ -8,7 +8,7 @@ bring-up seam: small enough to debug quickly, strict enough to prevent fake
 passes, and close enough to Gallium state that the driver can grow phase by
 phase.
 
-## Current contracts: graphics API 33 and compute API 6
+## Current contracts: graphics API 39 and compute API 7
 
 Native fragment control flow supports relative group-boundary branches and
 ST/EF/SM/LT/END execution masks. The compiler admits fragment `break`, including
@@ -29,9 +29,19 @@ control-only. Static binary opcode histograms are separately reported and are
 not multiplied to manufacture loop execution counts.
 
 The numbered sections below describe the features at their introduction.
-Current callers must use graphics version **33** and independent compute
-version **6**; both entry points reject older versions before reading new
+Current callers must use graphics version **39** and independent compute
+version **7**; both entry points reject older versions before reading new
 tails. They must be rebuilt with the matching headers and runtime together.
+
+Graphics APIs 34–38 add exact position-coefficient selection, the GLES3
+texture/shared transport minimum, primitive restart plus per-target format and
+occlusion metadata, and alias-preserving shader-buffer snapshots for
+tessellation and then every graphics stage. API 39 appends independent color
+masks and blend equations/factors for up to four render targets; a zero target
+state count retains the legacy scalar state. Compute API 7 extends sampled
+texture records with the exact logical `buffer_elements` count used by
+`samplerBuffer` `textureSize` and bounds checks when its physical 8192-wide
+storage rectangle contains padding.
 
 Graphics API 28 introduced native sample-frequency state described below.
 API 29 adds immutable fragment-image view snapshots and the explicit
@@ -568,7 +578,7 @@ Each physical draw snapshots three boolean fields: `alpha_to_coverage`,
 them and copy them into the draw's `RasterState`; they are not context-global
 values read after a deferred draw. Both top-level and nested old-version
 commands are rejected before accessing their new tail. Current callers use
-graphics API 33 and the independent compute API 6, as described above.
+graphics API 39 and the independent compute API 7, as described above.
 
 The model adapts Mesa 26.2.1 llvmpipe's pixel-frequency alpha-to-coverage
 algorithm: sample s survives when the original DATA0 alpha is greater than
@@ -669,12 +679,15 @@ the normal PBE LOAD path before executing the shaders.
 
 The payload requires `ATTACHMENT_NEW_CLEAR` and the complete tightly packed
 framebuffer extent. API v30 concatenates every bound color target in target-major
-order (then layer, pixel, sample); all targets use the command's common format.
-RGBA8 transport uses 4 bytes per pixel;
-integer R32, RG32 and RGBA32 transport uses 4, 8 and 16. Floating-point color
-targets use 16-byte RGBA32F transport, preserving negative values and HDR.
-Native formats are unpacked/packed by the driver. Each target must fit its
-16 MiB attachment slot. `PIPE_FORMAT_R10G10B10A2_UNORM` and
+order (then layer, pixel, sample); API v36 lets each target select its own format.
+Established RGBA8 and packed 10/10/10/2 UNORM transports use 4 bytes per pixel.
+Integer transports use one 32-bit dword per logical component, so they use 4,
+8, or 16 bytes regardless of the native channel width. Other normalized,
+SNORM, and floating-point targets use canonical 16-byte RGBA32F transport,
+preserving negative values and HDR; exact `R32G32B32A32_UNORM` uses 32-byte
+RGBA64F so every native 32-bit code round-trips. Native formats are quantized
+and unpacked/packed by the driver and PBE. Each target must fit its 16 MiB
+attachment slot. `PIPE_FORMAT_R10G10B10A2_UNORM` and
 `PIPE_FORMAT_B10G10R10A2_UNORM` use their actual four-byte packed storage:
 LOAD, per-fragment PBE blending and DRAM readback preserve all ten RGB bits
 and both alpha bits. PBE blends normalized floating-point inputs/destinations,
@@ -682,7 +695,6 @@ then clamps and rounds each written channel to nearest-even after every
 fragment; channel masks retain untouched packed bits. Sampler descriptors
 select RGB/BGR order when a rendered attachment is sampled. PNG conversion
 is display-only and never feeds the driver readback or subsequent draws.
-Other normalized targets still use RGBA8 transport.
 Every MRT attachment keeps its own LOAD contents across sequence aliases and
 synchronous Gallium flush/readback boundaries; partial target payloads fail closed.
 

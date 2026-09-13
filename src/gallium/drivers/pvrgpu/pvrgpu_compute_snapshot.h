@@ -154,15 +154,17 @@ pvrgpu_compute_snapshot_add_image(struct pvrgpu_compute_snapshot *snapshot,
 {
    if (!snapshot || !reason) return false;
    *reason = "compute_image_view";
+   const bool buffer_image = image && image->resource &&
+                             image->resource->target == PIPE_BUFFER;
    if (!image || !image->resource || slot >= PVRGPU_SYSTEMC_COMPUTE_MAX_IMAGES ||
        snapshot->image_count >= PVRGPU_SYSTEMC_COMPUTE_MAX_IMAGES ||
        (access & ~3U) || (image->access & access) != access ||
-       (image->resource->target != PIPE_TEXTURE_2D &&
+       (!buffer_image && image->resource->target != PIPE_TEXTURE_2D &&
         image->resource->target != PIPE_TEXTURE_3D &&
         image->resource->target != PIPE_TEXTURE_CUBE &&
         image->resource->target != PIPE_TEXTURE_2D_ARRAY &&
         image->resource->target != PIPE_TEXTURE_CUBE_ARRAY) ||
-       !image->resource->width0 || !image->resource->height0 ||
+       !image->resource->width0 || (!buffer_image && !image->resource->height0) ||
        image->resource->nr_samples > 1 || image->resource->nr_storage_samples > 1)
       return false;
    const unsigned texel_bytes = util_format_get_blocksize(image->format);
@@ -170,13 +172,66 @@ pvrgpu_compute_snapshot_add_image(struct pvrgpu_compute_snapshot *snapshot,
    if ((texel_bytes != 4 && texel_bytes != 8 && texel_bytes != 16) ||
        format->layout != UTIL_FORMAT_LAYOUT_PLAIN ||
        format->block.width != 1 || format->block.height != 1 ||
-       texel_bytes != util_format_get_blocksize(image->resource->format))
+       (!buffer_image &&
+        texel_bytes != util_format_get_blocksize(image->resource->format)))
       return false;
    struct pvrgpu_resource *resource = pvrgpu_resource(image->resource);
-   const unsigned level = image->u.tex.level;
    if (!resource->data || !resource->size ||
        resource->size > PVRGPU_SYSTEMC_COMPUTE_MAX_RESOURCE_BYTES ||
-       level >= resource->level_count || level > image->resource->last_level ||
+       resource->size < image->resource->width0)
+      return false;
+   if (buffer_image) {
+      const uint64_t offset = image->u.buf.offset;
+      const uint64_t extent = image->u.buf.size;
+      if (!extent || (offset & 15U) || extent % texel_bytes ||
+          offset > image->resource->width0 ||
+          extent > image->resource->width0 - offset ||
+          offset > resource->size || extent > resource->size - offset)
+         return false;
+      size_t index = snapshot->resource_count;
+      for (size_t i = 0; i < snapshot->resource_count; ++i) {
+         if (snapshot->owners[i] == image->resource) {
+            index = i;
+            if (snapshot->resources[i].bytes_size != resource->size)
+               return false;
+            break;
+         }
+      }
+      if (index == snapshot->resource_count) {
+         if (index >= PVRGPU_SYSTEMC_COMPUTE_MAX_RESOURCES)
+            return false;
+         size_t total = resource->size;
+         for (size_t i = 0; i < snapshot->resource_count; ++i) {
+            if (snapshot->resources[i].bytes_size >
+                PVRGPU_SYSTEMC_COMPUTE_MAX_RESOURCE_BYTES - total)
+               return false;
+            total += snapshot->resources[i].bytes_size;
+         }
+         uint8_t *copy = malloc(resource->size);
+         if (!copy)
+            return false;
+         memcpy(copy, resource->data, resource->size);
+         snapshot->resources[index] =
+            (struct pvrgpu_systemc_compute_resource){copy, resource->size};
+         pipe_resource_reference(&snapshot->owners[index], image->resource);
+         ++snapshot->resource_count;
+      }
+      snapshot->images[snapshot->image_count++] =
+         (struct pvrgpu_systemc_compute_image_binding){
+            .slot = slot, .resource_index = index, .access = access,
+            .format = image->format == PIPE_FORMAT_R32_UINT ?
+               PVRGPU_SYSTEMC_COMPUTE_IMAGE_R32UI :
+               PVRGPU_SYSTEMC_COMPUTE_IMAGE_RAW,
+            .offset = offset, .bytes_size = extent,
+            .width = extent / texel_bytes, .height = 1,
+            .row_stride_bytes = extent, .depth = 1,
+            .layer_stride_bytes = extent, .texel_bytes = texel_bytes,
+         };
+      *reason = NULL;
+      return true;
+   }
+   const unsigned level = image->u.tex.level;
+   if (level >= resource->level_count || level > image->resource->last_level ||
        level >= PIPE_MAX_TEXTURE_LEVELS || level >= 32)
       return false;
    const unsigned width = MAX2(1U, image->resource->width0 >> level);

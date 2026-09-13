@@ -582,6 +582,15 @@ inline int PixelOutputFromSpecialIndex(std::uint16_t index) {
   }
   return -1;
 }
+
+inline bool IsFragmentPixelOutputRegister(std::uint16_t index) {
+  return PixelOutputFromSpecialIndex(index) >= 0;
+}
+
+bool RegisterReadsFragmentPixelInput(const PcoRegisterRef &source) {
+  return source.bank == PcoRegisterBank::kSpecial &&
+         IsFragmentPixelOutputRegister(source.index);
+}
 inline constexpr std::uint16_t kSpecialConstantZero = 0;
 inline constexpr std::uint16_t kSpecialConstantOne = 64;
 inline constexpr std::uint16_t kSpecialConstantTwo = 65;
@@ -821,7 +830,8 @@ GroupHeader DecodeHeader(const std::vector<std::uint8_t> &binary,
 
 PcoRegisterRef DecodeOneLowerSource(const std::vector<std::uint8_t> &binary,
                                     std::size_t group_end,
-                                    std::size_t &cursor) {
+                                    std::size_t &cursor,
+                                    bool allow_fragment_pixel_input = false) {
   if (cursor >= group_end)
     DecodeError(cursor, "missing lower source encoding");
 
@@ -855,7 +865,9 @@ PcoRegisterRef DecodeOneLowerSource(const std::vector<std::uint8_t> &binary,
 
   if (source.bank == PcoRegisterBank::kSpecial) {
     if (!IsSupportedSpecialConstant(source.index) &&
-        !IsFragmentSpecialRegister(source.index)) {
+        !IsFragmentSpecialRegister(source.index) &&
+        !(allow_fragment_pixel_input &&
+          IsFragmentPixelOutputRegister(source.index))) {
       DecodeError(source_offset,
                   "unsupported public special-constant register");
     }
@@ -901,11 +913,14 @@ struct TwoLowerSources {
   PcoRegisterRef source1{};
 };
 
-void ValidateGenericSource(PcoRegisterRef source, std::size_t offset) {
+void ValidateGenericSource(PcoRegisterRef source, std::size_t offset,
+                           bool allow_fragment_pixel_input = false) {
   switch (source.bank) {
   case PcoRegisterBank::kSpecial:
     if (!IsSupportedSpecialConstant(source.index) &&
-        !IsFragmentSpecialRegister(source.index))
+        !IsFragmentSpecialRegister(source.index) &&
+        !(allow_fragment_pixel_input &&
+          IsFragmentPixelOutputRegister(source.index)))
       DecodeError(offset, "unsupported public special-constant register");
     return;
   case PcoRegisterBank::kTemporary:
@@ -948,7 +963,8 @@ TwoLowerSources DecodeTwoLowerSources(
     std::size_t &cursor, bool expect_is0_source1 = false,
     bool allow_internal_true_source1 = false,
     bool *is0_selects_source1 = nullptr,
-    bool allow_compute_instance_source1 = false) {
+    bool allow_compute_instance_source1 = false,
+    bool allow_fragment_pixel_input = false) {
   const std::size_t source_offset = cursor;
   if (group_end - cursor < 2)
     DecodeError(cursor, "truncated two-source lower encoding");
@@ -1029,7 +1045,9 @@ TwoLowerSources DecodeTwoLowerSources(
     }
     if (bank == PcoRegisterBank::kSpecial) {
       if (!IsSupportedSpecialConstant(index) &&
-          !IsFragmentSpecialRegister(index)) {
+          !IsFragmentSpecialRegister(index) &&
+          !(allow_fragment_pixel_input &&
+            IsFragmentPixelOutputRegister(index))) {
         DecodeError(offset, "unsupported two-source special constant");
       }
       return;
@@ -1119,7 +1137,7 @@ bool IsIndexedTextureDescriptorPair(const PcoRegisterRef &texture,
 
 ThreeLowerSources DecodeThreeLowerSources(
     const std::vector<std::uint8_t> &binary, std::size_t group_end,
-    std::size_t &cursor) {
+    std::size_t &cursor, bool allow_fragment_pixel_input = false) {
   const std::size_t source_offset = cursor;
   if (group_end - cursor < 4)
     DecodeError(cursor, "truncated three-source lower encoding");
@@ -1174,9 +1192,11 @@ ThreeLowerSources DecodeThreeLowerSources(
       (ext2 ? (((byte4 >> 5U) & 3U) << 6U) : 0U) |
       (encoded_bytes == 6 ? (((byte5 >> 3U) & 7U) << 8U) : 0U));
 
-  ValidateGenericSource(source0, source_offset);
-  ValidateGenericSource(source1, source_offset + 1);
-  ValidateGenericSource(source2, source_offset + 3);
+  ValidateGenericSource(source0, source_offset, allow_fragment_pixel_input);
+  ValidateGenericSource(source1, source_offset + 1,
+                        allow_fragment_pixel_input);
+  ValidateGenericSource(source2, source_offset + 3,
+                        allow_fragment_pixel_input);
   const std::uint8_t input_selector = static_cast<std::uint8_t>(
       ((byte2 >> 5U) & 3U) |
       (encoded_bytes >= 5 && (byte4 & 0x10U) != 0 ? 4U : 0U));
@@ -2589,16 +2609,20 @@ PcoInstruction DecodeGenericSimpleAluGroup(
   PcoRegisterRef source0{};
   PcoRegisterRef source1{};
   PcoRegisterRef source2{};
+  const bool allow_fragment_pixel_input = stage == ShaderStage::kFragment;
   if (source_count == 1) {
-    source0 = DecodeOneLowerSource(binary, group_end, cursor);
+    source0 = DecodeOneLowerSource(binary, group_end, cursor,
+                                   allow_fragment_pixel_input);
   } else if (source_count == 2) {
     const TwoLowerSources sources =
-        DecodeTwoLowerSources(binary, group_end, cursor);
+        DecodeTwoLowerSources(binary, group_end, cursor, false, false, nullptr,
+                              false, allow_fragment_pixel_input);
     source0 = sources.source0;
     source1 = sources.source1;
   } else {
     const ThreeLowerSources sources =
-        DecodeThreeLowerSources(binary, group_end, cursor);
+        DecodeThreeLowerSources(binary, group_end, cursor,
+                                allow_fragment_pixel_input);
     if (sources.input_selector != 0)
       DecodeError(header.offset,
                   "P0 scalar ALU requires embedded is0=s0");
@@ -2612,10 +2636,17 @@ PcoInstruction DecodeGenericSimpleAluGroup(
     DecodeError(cursor - 1, "unsupported scalar ALU ISS selection");
   const DecodedDestination destination =
       DecodeGenericDestination(binary, group_end, cursor);
-  if (header.output_load_check !=
-      (destination.target == PcoWriteTarget::kPixelOutput)) {
+  const bool touches_pixel_output =
+      destination.target == PcoWriteTarget::kPixelOutput ||
+      (source_count > 0 && RegisterReadsFragmentPixelInput(source0)) ||
+      (source_count > 1 && RegisterReadsFragmentPixelInput(source1)) ||
+      (source_count > 2 && RegisterReadsFragmentPixelInput(source2));
+  if (stage != ShaderStage::kFragment && touches_pixel_output)
     DecodeError(header.offset,
-                "output-load-check does not match the ALU destination");
+                "only a fragment ALU may read or write PIXOUT");
+  if (header.output_load_check != touches_pixel_output) {
+    DecodeError(header.offset,
+                "output-load-check does not match the ALU PIXOUT access");
   }
   if ((stage == ShaderStage::kVertex || IsNativeTaskStage(stage)) &&
       destination.target != PcoWriteTarget::kTemporary &&
@@ -2631,7 +2662,8 @@ PcoInstruction DecodeGenericSimpleAluGroup(
   }
   if (destination.target == PcoWriteTarget::kPixelOutput &&
       source0.bank == PcoRegisterBank::kSpecial &&
-      !IsSupportedSpecialConstant(source0.index)) {
+      !IsSupportedSpecialConstant(source0.index) &&
+      !IsFragmentPixelOutputRegister(source0.index)) {
     // A constant colour output can be any special constant the file holds:
     // the PBE clamps the written value into the attachment's range, so a
     // constant above one or below zero is as valid a source as 0, 1 or 1/2.
@@ -6724,7 +6756,8 @@ void ValidateFragmentProgram(
     const auto require_source = [&](const PcoRegisterRef &source) {
       if (source.bank == PcoRegisterBank::kSpecial) {
         if (!IsSupportedSpecialConstant(source.index) &&
-            !IsFragmentSpecialRegister(source.index))
+            !IsFragmentSpecialRegister(source.index) &&
+            !IsFragmentPixelOutputRegister(source.index))
           DecodeError(instruction.binary_offset,
                       "invalid generic fragment special source");
         return;
@@ -8283,7 +8316,13 @@ std::uint32_t FloatLog2Bits(std::uint32_t val_bits) {
 
   float val = 0.0f;
   std::memcpy(&val, &val_bits, sizeof(val));
-  const float result_val = LlvmpipeLog2(val);
+  /* The approximation extracts an IEEE exponent directly, so a subnormal's
+   * zero exponent field would otherwise be treated as -127 regardless of its
+   * leading mantissa bit.  Scale subnormals into the normal range first and
+   * remove that exact power-of-two offset from the result. */
+  const float result_val = exponent == 0
+      ? LlvmpipeLog2(std::ldexp(val, 23)) - 23.0F
+      : LlvmpipeLog2(val);
   std::uint32_t result_bits = 0;
   std::memcpy(&result_bits, &result_val, sizeof(result_bits));
   return result_bits;
@@ -8301,6 +8340,14 @@ std::uint32_t FloatExp2Bits(std::uint32_t val_bits) {
       return kCanonicalQuietNan;
     return sign ? UINT32_C(0) : kPositiveInfinity;
   }
+  /* llvmpipe executes this f32 path with denormals-as-zero on its SSE/NEON
+   * shader backends.  Preserve the sign while classifying the input, but both
+   * smallest finite encodings therefore reach fexp2 as +/-0 and return 1.0.
+   * Letting a negative subnormal enter the polynomial makes floor(-tiny)=-1
+   * while the fractional subtraction rounds to 1.0, outside its [0,1) fit,
+   * and spuriously returns the predecessor of 1.0. */
+  if (exponent == 0 && fraction != 0)
+    return UINT32_C(0x3f800000);
   float val = 0.0f;
   std::memcpy(&val, &val_bits, sizeof(val));
   float result_val = LlvmpipeExp2(val);
@@ -8648,6 +8695,32 @@ void ValidateExecutionEnvelope(const PcoProgramSummary &summary,
 }
 
 } // namespace
+
+bool PcoFragmentProgramReadsPixelInput(
+    const std::vector<PcoInstruction> &instructions) {
+  const auto phase_reads = [](const PcoPhaseOperation &phase) {
+    return (phase.source_count > 0 &&
+            RegisterReadsFragmentPixelInput(phase.source)) ||
+           (phase.source_count > 1 &&
+            RegisterReadsFragmentPixelInput(phase.source1)) ||
+           (phase.source_count > 2 &&
+            RegisterReadsFragmentPixelInput(phase.source2));
+  };
+  return std::any_of(instructions.begin(), instructions.end(),
+                     [&](const PcoInstruction &instruction) {
+    return (instruction.source_count > 0 &&
+            RegisterReadsFragmentPixelInput(instruction.source)) ||
+           (instruction.source_count > 1 &&
+            RegisterReadsFragmentPixelInput(instruction.source1)) ||
+           (instruction.source_count > 2 &&
+            RegisterReadsFragmentPixelInput(instruction.source2)) ||
+           (instruction.source_count > 3 &&
+            RegisterReadsFragmentPixelInput(instruction.source3)) ||
+           (instruction.phase_composed &&
+            (phase_reads(instruction.phase0) ||
+             phase_reads(instruction.phase1)));
+  });
+}
 
 void AnnotatePcoTextureMetadataForTesting(
     std::vector<PcoInstruction> &instructions) {
@@ -9220,17 +9293,21 @@ PcoDecodedProgram DecodeTessellationPcoProgram(
     auto instruction = sample ? DecodeTextureSampleGroup(binary, header, index, control ? 8 : 4) :
         control ? DecodeNativeTaskGroup(stage, binary, header, index) :
                   DecodeNativeRasterTaskGroup(stage, binary, header, index);
+    const bool texel_fetch = sample &&
+        instruction.texture_non_normalized_coords &&
+        instruction.texture_lod_replace && instruction.texture_dimension == 2 &&
+        !instruction.texture_address_offset;
     if (sample &&
         ((instruction.texture_dimension != 2 && instruction.texture_dimension != 3) ||
          instruction.texture_fcnorm > 1 || instruction.texture_address_offset > 1 ||
-         instruction.texture_non_normalized_coords ||
+         (instruction.texture_non_normalized_coords && !texel_fetch) ||
          instruction.texture_sample_index_present ||
          instruction.texture_spatial_offset_present ||
          (instruction.texture_lod_bias &&
           !instruction.texture_address_offset) ||
          instruction.texture_gather ||
          !HasCanonicalTextureLodMode(instruction)))
-      DecodeError(offset, "tessellation SMP requires normalized native 2D/3D ordinary or explicit LOD");
+      DecodeError(offset, "tessellation SMP requires normalized native 2D/3D sampling or a 2D texel fetch");
     instruction.exec_cnd = header.exec_cnd;
     instruction.end_group = header.end;
     if (instruction.target == PcoWriteTarget::kPixelOutput ||
@@ -9413,15 +9490,19 @@ PcoDecodedProgram DecodePcoProgram(ShaderStage stage,
       }) ? 1U : 0U;
   // A shader that can kill its own fragment has not decided whether the pixel
   // is covered until it has run, so opaque early HSR must not award the pixel
-  // to it beforehand. Read that off the program rather than trusting the
-  // submitter to declare it.
+  // to it beforehand.  A framebuffer-fetch shader likewise needs every
+  // overlapping fragment in API order: rejecting the older owner would also
+  // remove the destination value consumed by the later shader invocation.
+  // Read both properties off the program rather than trusting the submitter to
+  // declare them.
   if (std::any_of(decoded.instructions.begin(), decoded.instructions.end(),
                   [](const PcoInstruction &instruction) {
                     return instruction.opcode == PcoOpcode::kDiscard ||
                            instruction.opcode == PcoOpcode::kAlphaFeedback ||
                            instruction.opcode == PcoOpcode::kDepthFeedback ||
                            IsPcoAtomic32(instruction.opcode);
-                  })) {
+                  }) ||
+      PcoFragmentProgramReadsPixelInput(decoded.instructions)) {
     decoded.summary.early_hsr_safe = 0;
   }
   return decoded;
@@ -10835,7 +10916,8 @@ static bool ValidateFragmentExecutionProgram(
                             instruction.opcode == PcoOpcode::kAlphaFeedback ||
                             instruction.opcode == PcoOpcode::kDepthFeedback ||
                             IsPcoAtomic32(instruction.opcode);
-                   })) {
+                   }) &&
+      !PcoFragmentProgramReadsPixelInput(instructions)) {
     ExecuteError("fragment program is HSR-unsafe without feedback/memory side effects");
   }
   return std::any_of(instructions.begin(), instructions.end(),
@@ -11094,6 +11176,11 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
   }
 
   PcoFragmentExecution result;
+  // Fragment PIXOUT is a mutable hardware register file.  Seed it from the
+  // destination attachment while leaving written_mask clear: later stores in
+  // this invocation immediately become visible to another PIXOUT source, and
+  // only actual exports are committed by PBE.
+  result.pixel_outputs = context.pixel_inputs;
   const std::vector<std::uint32_t> no_vertex_inputs;
   std::array<std::uint32_t, kPcoTemporaryCount> temporaries{};
   PcoTemporaryMask temporary_written_mask{};
@@ -11378,6 +11465,15 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
     }
     if (source.bank == PcoRegisterBank::kSpecial && IsFragmentSpecialRegister(source.index))
       return ReadFragmentSpecial(context, source.index);
+    if (source.bank == PcoRegisterBank::kSpecial) {
+      const int pixel_output = PixelOutputFromSpecialIndex(source.index);
+      if (pixel_output >= 0) {
+        const auto output = static_cast<std::size_t>(pixel_output);
+        if ((context.pixel_input_mask & (UINT16_C(1) << output)) == 0)
+          ExecuteError("fragment PIXOUT source is absent from the framebuffer input");
+        return result.pixel_outputs[output];
+      }
+    }
     return ReadSource(source, no_vertex_inputs, temporaries,
                       temporary_written_mask, 0, ShaderStage::kFragment);
   };
@@ -12080,6 +12176,12 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
             ExecuteError("fragment coordinate registers cannot be repeated");
           return ReadFragmentSpecial(context, source.index);
         }
+        if (source.bank == PcoRegisterBank::kSpecial &&
+            IsFragmentPixelOutputRegister(source.index)) {
+          if (repeat != 0)
+            ExecuteError("fragment PIXOUT registers cannot be repeated");
+          return read_fragment_source(source);
+        }
         return ReadSource(source, no_vertex_inputs, temporaries,
                           temporary_written_mask, repeat,
                           ShaderStage::kFragment);
@@ -12405,7 +12507,8 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
     }
     if (instruction.source.bank == PcoRegisterBank::kSpecial) {
       if (!IsSupportedSpecialConstant(instruction.source.index) &&
-          !IsFragmentSpecialRegister(instruction.source.index)) {
+          !IsFragmentSpecialRegister(instruction.source.index) &&
+          !IsFragmentPixelOutputRegister(instruction.source.index)) {
         ExecuteError("fragment MBYP special source is outside the gate");
       }
     } else if (instruction.source.bank == PcoRegisterBank::kTemporary) {
@@ -12435,11 +12538,7 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
     result.pixel_outputs[output] =
         instruction.source.bank == PcoRegisterBank::kCoefficient
             ? context.coefficients[instruction.source.index]
-            : instruction.source.bank == PcoRegisterBank::kSpecial &&
-              IsFragmentSpecialRegister(instruction.source.index)
-            ? ReadFragmentSpecial(context, instruction.source.index)
-            : ReadSource(instruction.source, no_vertex_inputs, temporaries,
-                         temporary_written_mask, 0, ShaderStage::kFragment);
+            : read_fragment_source(instruction.source);
     result.written_mask |= static_cast<std::uint16_t>(1U << output);
     if (trace) {
       std::cerr << "pco-fragment-trace pc=" << pc << " off="

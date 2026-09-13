@@ -255,6 +255,105 @@ reject_nonuniform_shadow_compute(struct pvrgpu_pco_compiler *compiler)
    ralloc_free(nir);
 }
 
+#ifdef PVRGPU_MANY_TEXTURES_DIRECT_HELPER
+static void
+mixed_sampler_array_bound_test(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, pco_nir_options(),
+      "bounded_sampler_array_before_trailing_cube");
+   b.shader->info.workgroup_size[0] = 1;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+
+   const struct glsl_type *sampler2d = glsl_sampler_type(
+      GLSL_SAMPLER_DIM_2D, false, false, GLSL_TYPE_FLOAT);
+   nir_variable *array = nir_variable_create(
+      b.shader, nir_var_uniform, glsl_array_type(sampler2d, 2, 0),
+      "bounded_images");
+   array->data.binding = 0;
+   nir_variable *cube = nir_variable_create(
+      b.shader, nir_var_uniform,
+      glsl_sampler_type(GLSL_SAMPLER_DIM_CUBE, false, false,
+                        GLSL_TYPE_FLOAT),
+      "trailing_cube");
+   cube->data.binding = 2;
+
+   nir_def *index = nir_load_uniform(
+      &b, 1, 32, nir_imm_int(&b, 0),
+      .base = 0, .range = 1, .dest_type = nir_type_int32);
+   nir_tex_instr *dynamic = nir_tex_instr_create(b.shader, 3);
+   dynamic->op = nir_texop_tex;
+   dynamic->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   dynamic->coord_components = 2;
+   dynamic->dest_type = nir_type_float32;
+   dynamic->src[0] = nir_tex_src_for_ssa(
+      nir_tex_src_coord, nir_imm_vec2(&b, 0.25F, 0.75F));
+   dynamic->src[1] = nir_tex_src_for_ssa(nir_tex_src_texture_offset, index);
+   dynamic->src[2] = nir_tex_src_for_ssa(nir_tex_src_sampler_offset, index);
+   nir_def_init(&dynamic->instr, &dynamic->def, 4, 32);
+   nir_builder_instr_insert(&b, &dynamic->instr);
+
+   nir_tex_instr *static_cube = nir_tex_instr_create(b.shader, 1);
+   static_cube->op = nir_texop_tex;
+   static_cube->sampler_dim = GLSL_SAMPLER_DIM_CUBE;
+   static_cube->coord_components = 3;
+   static_cube->texture_index = static_cube->sampler_index = 2;
+   static_cube->dest_type = nir_type_float32;
+   static_cube->src[0] = nir_tex_src_for_ssa(
+      nir_tex_src_coord, nir_imm_vec3(&b, 1.0F, 0.0F, 0.0F));
+   nir_def_init(&static_cube->instr, &static_cube->def, 4, 32);
+   nir_builder_instr_insert(&b, &static_cube->instr);
+   nir_store_ssbo(&b, nir_fadd(&b, &dynamic->def, &static_cube->def),
+                  nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                  .write_mask = 15, .align_mul = 16);
+   nir_jump(&b, nir_jump_return);
+   nir_shader_gather_info(b.shader, b.impl);
+   for (unsigned unit = 0; unit < 3; ++unit) {
+      BITSET_SET(b.shader->info.textures_used, unit);
+      BITSET_SET(b.shader->info.samplers_used, unit);
+   }
+
+   char error[512] = {0};
+   require(!pvrgpu_lower_generic_texture_indices(
+              b.shader, PVRGPU_PCO_MAX_TEXTURES + 1, error, sizeof(error)) &&
+              strstr(error, "texture count exceeds"),
+           "over-limit sampler count is rejected before array-bound collection");
+   memset(error, 0, sizeof(error));
+   require(pvrgpu_lower_generic_texture_indices(b.shader, 3, error,
+                                                sizeof(error)),
+           error);
+   unsigned samples = 0;
+   unsigned array_mask = 0;
+   bool cube_seen = false;
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            const nir_tex_instr *tex = nir_instr_as_tex(instr);
+            ++samples;
+            if (tex->sampler_dim == GLSL_SAMPLER_DIM_2D) {
+               require(tex->texture_index == tex->sampler_index &&
+                          tex->texture_index < 2,
+                       "dynamic sampler array did not cross its declared extent");
+               array_mask |= 1U << tex->texture_index;
+            } else if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE) {
+               require(tex->texture_index == 2 && tex->sampler_index == 2,
+                       "trailing cube binding retained its static unit");
+               cube_seen = true;
+            } else {
+               require(false, "mixed sampler bound test saw another dimension");
+            }
+         }
+      }
+   }
+   require(samples == 3 && array_mask == 3 && cube_seen,
+           "dynamic sampler expansion is bounded to two declared elements");
+   ralloc_free(b.shader);
+}
+#endif
+
 static void
 cube_array_descriptor_tests(void)
 {
@@ -419,6 +518,7 @@ int main(void)
    cube_array_descriptor_tests();
 #ifdef PVRGPU_MANY_TEXTURES_DIRECT_HELPER
    cube_array_admission_tests();
+   mixed_sampler_array_bound_test();
 #endif
    char error[2048] = {0};
    struct pvrgpu_pco_compiler *compiler = pvrgpu_pco_compiler_create(error, sizeof(error));

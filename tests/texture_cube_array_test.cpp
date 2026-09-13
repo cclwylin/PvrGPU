@@ -146,7 +146,10 @@ struct Harness {
       if (negative == "end-address") { const auto a=resource.gpu_address+18U*8U*8U*4U; requests[0].texture_address_lo=static_cast<std::uint32_t>(a);requests[0].texture_address_hi=a>>32; }
       if (negative == "word4") shared[4] *= 6;
       if (negative == "raw-depth") shared[2] += 1U << 4;
-      if (negative == "shadow") shared[12] = 3;
+      // Compare operations 0..7 are now valid for cube-array shadow
+      // sampling.  Keep this as a negative descriptor-boundary test by using
+      // the first value outside that architectural range.
+      if (negative == "shadow") shared[12] = 8;
     }
     PipelineState state;
     state.sequence = batches; state.memory_mode = memory.mode();
@@ -268,6 +271,7 @@ int sc_main(int argc, char **argv) {
        (message.find("TextureUnit unsupported cube array sample mode")!=std::string::npos||
         message.find("TextureUnit cube array TAO")!=std::string::npos||
         message.find("word4 is not the image layer size")!=std::string::npos||
+        message.find("word12 compare operation is invalid")!=std::string::npos||
         message.find("raw cube count")!=std::string::npos||
         message.find("cube array requires ordinary")!=std::string::npos)){
       std::cout<<"CubeArray TPU refused "<<negative<<": "<<message<<" PASS\n";return 0;

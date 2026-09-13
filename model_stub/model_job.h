@@ -110,7 +110,7 @@ struct ModelJob {
                           bool color_formats_explicit = false,
                           std::vector<std::uint32_t> bytes_per_pixel_per_target = {}) {
     if (!width || !height || width > 4096 || height > 4096 ||
-        bytes_per_pixel > 16 || sample_count > 16 || layer_count > 256)
+        bytes_per_pixel > 32 || sample_count > 16 || layer_count > 256)
       return;
     if ((!color_formats.empty() || color_formats_explicit) &&
         color_formats.size() != extra.size() + 1U)
@@ -131,7 +131,7 @@ struct ModelJob {
       const std::uint64_t target_expected =
           static_cast<std::uint64_t>(width) * height * target_bpp *
           sample_count * layer_count;
-      if (target_bpp == 0 || target_bpp > 16 ||
+      if (target_bpp == 0 || target_bpp > 32 ||
           static_cast<std::uint64_t>(extra[target - 1].size()) != target_expected)
         return;
     }

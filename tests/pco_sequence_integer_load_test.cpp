@@ -116,6 +116,7 @@ pvrgpu_systemc_driver_command MakeDraw(
   draw.varying_output_start = 4;
   draw.varying_output_count = 4;
   draw.fragment_position_count = 4;
+  draw.fragment_position_uses_w = 1;
   draw.fragment_varying_start = 4;
   draw.fragment_varying_count = 16;
   draw.fragment_output_mask[0] = (1U << channels) - 1U;

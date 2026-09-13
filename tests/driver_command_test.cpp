@@ -254,6 +254,43 @@ int main() {
           "wrong PCO audit-metadata command payload"))
     return failed;
 
+  // PCO draws use the complete in-process colour-attachment transport
+  // contract.  Legacy replay commands retain their historical format set.
+  const std::filesystem::path pco_exact_format =
+      TempFile("pco-exact-format.txt");
+  std::string pco_exact_format_text = pco_text;
+  if (!ReplaceOnce(&pco_exact_format_text,
+                   "format=PIPE_FORMAT_R8G8B8A8_UNORM",
+                   "format=PIPE_FORMAT_R8_UINT"))
+    return 1;
+  WriteText(pco_exact_format, pco_exact_format_text);
+  error.clear();
+  if (int failed = Expect(
+          LoadDriverCommand(pco_exact_format.string(), &command, &error) &&
+              command.format == "PIPE_FORMAT_R8_UINT",
+          "PCO parser rejected an exact native integer transport: " + error))
+    return failed;
+
+  const std::filesystem::path legacy_exact_format =
+      TempFile("legacy-exact-format.txt");
+  WriteText(legacy_exact_format,
+            "schema=pvrgpu.driver-command.v1\n"
+            "producer=pvrgpu-gallium-driver\n"
+            "command=clear_color\n"
+            "case=phase1.clear.r8ui\n"
+            "frame=1\n"
+            "width=8\n"
+            "height=4\n"
+            "format=PIPE_FORMAT_R8_UINT\n"
+            "clear_color_bits=0,0,0,1\n");
+  error.clear();
+  if (int failed = Expect(
+          !LoadDriverCommand(legacy_exact_format.string(), &command, &error) &&
+              error.find("unsupported driver command format") !=
+                  std::string::npos,
+          "legacy parser accepted an exact PCO-only transport"))
+    return failed;
+
   // An indexed PCO draw carries its index payload; the loader keeps the
   // fields verbatim so vertex fetch can walk the real index buffer.
   // A generic draw states its attribute ABI instead of relying on a pinned
@@ -807,6 +844,8 @@ int main() {
   std::filesystem::remove(quad);
   std::filesystem::remove(textured);
   std::filesystem::remove(pco);
+  std::filesystem::remove(pco_exact_format);
+  std::filesystem::remove(legacy_exact_format);
   std::filesystem::remove(pco_counters);
   std::filesystem::remove(bad_pco);
   std::filesystem::remove(bad_pco_linkage);

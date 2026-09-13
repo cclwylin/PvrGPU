@@ -93,6 +93,45 @@ static nir_shader *image_shader(unsigned kind, bool dereference_images)
    return b.shader;
 }
 
+static nir_shader *buffer_image_shader(unsigned kind)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+      pco_nir_options(), "native_image_buffer");
+   b.shader->info.internal = false;
+   b.shader->info.workgroup_size[0] = 4;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   nir_def *index = nir_load_local_invocation_index(&b);
+   nir_def *zero = nir_imm_int(&b, 0);
+   nir_def *sample = nir_undef(&b, 1, 32);
+   if (kind == 0) {
+      nir_def *value = nir_image_load(&b, 4, 32, zero, index, sample, zero,
+         .image_dim = GLSL_SAMPLER_DIM_BUF,
+         .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+         .dest_type = nir_type_float32);
+      nir_image_store(&b, nir_imm_int(&b, 1), index, sample, value, zero,
+         .image_dim = GLSL_SAMPLER_DIM_BUF,
+         .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+         .src_type = nir_type_float32);
+   } else if (kind == 1) {
+      nir_def *old = nir_image_atomic(&b, 32, zero, index, sample,
+         nir_imm_int(&b, 0x55), .image_dim = GLSL_SAMPLER_DIM_BUF,
+         .format = PIPE_FORMAT_R32_SINT, .atomic_op = nir_atomic_op_ior);
+      nir_store_ssbo(&b, old, zero, nir_imul_imm(&b, index, 4),
+                     .write_mask = 1, .align_mul = 4);
+   } else {
+      nir_def *size = nir_image_size(&b, 1, 32, zero, zero,
+         .image_dim = GLSL_SAMPLER_DIM_BUF,
+         .format = PIPE_FORMAT_R32G32B32A32_FLOAT);
+      nir_store_ssbo(&b, size, zero, nir_imul_imm(&b, index, 4),
+                     .write_mask = 1, .align_mul = 4);
+   }
+   nir_shader_gather_info(b.shader, b.impl);
+   b.shader->info.num_images = kind == 0 ? 2 : 1;
+   b.shader->info.num_ssbos = kind == 0 ? 0 : 1;
+   return b.shader;
+}
+
 int main(int argc, char **argv)
 {
    glsl_type_singleton_init_or_ref();
@@ -233,8 +272,24 @@ int main(int argc, char **argv)
       pvrgpu_pco_compute_binary_finish(&native);
       ralloc_free(b.shader);
    }
+   for (unsigned kind = 0; kind < 3; ++kind) {
+      nir_shader *nir = buffer_image_shader(kind);
+      struct pvrgpu_pco_compute_binary native = {0};
+      check(pvrgpu_pco_compile_compute(compiler, nir, 0, &native,
+                                       error, sizeof(error)), error);
+      const uint32_t expected_used = kind == 0 ? 3 : 1;
+      const uint32_t expected_read = kind == 0 ? 1 : kind == 1 ? 1 : 0;
+      const uint32_t expected_write = kind == 0 ? 2 : kind == 1 ? 1 : 0;
+      check(native.data && native.size &&
+            native.abi.image_used_mask == expected_used &&
+            native.abi.image_read_mask == expected_read &&
+            native.abi.image_write_mask == expected_write,
+            "native buffer image load/store, atomic and size programs");
+      pvrgpu_pco_compute_binary_finish(&native);
+      ralloc_free(nir);
+   }
    pvrgpu_pco_compiler_destroy(compiler);
    glsl_type_singleton_decref();
-   puts("native image compiler: PASS 14 R32UI + 96 format/layered + 21 atomic programs and 9 rejected inputs");
+   puts("native image compiler: PASS 14 R32UI + 96 format/layered + 21 atomic + 3 buffer-image programs and 9 rejected inputs");
    return 0;
 }

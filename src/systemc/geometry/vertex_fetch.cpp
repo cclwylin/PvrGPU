@@ -39,6 +39,25 @@ struct VertexInputState {
   std::uint64_t bytes_per_vertex = 0;
 };
 
+struct ResolvedVertexIndex {
+  std::uint32_t value = 0;
+  bool can_address_vertex_buffer = true;
+};
+
+ResolvedVertexIndex ResolveIndexedVertex(std::uint32_t index,
+                                         std::int32_t base_vertex) {
+  const std::int64_t resolved =
+      static_cast<std::int64_t>(index) + base_vertex;
+  /*
+   * EXT_draw_elements_base_vertex defines a nonnegative result in the
+   * 32-bit unsigned domain, including wrap on overflow.  A negative result
+   * is undefined at the draw API but, in a robust context, still must not
+   * escape the referenced VBO or terminate execution.  Preserve its low bits
+   * as lane identity while explicitly suppressing every per-vertex read.
+   */
+  return {static_cast<std::uint32_t>(resolved), resolved >= 0};
+}
+
 VertexInputState LoadVertexInputState(const MemoryPool &pool,
                                       const PipelineState &state,
                                       GpuMemorySystem *memory,
@@ -102,7 +121,10 @@ VertexInputState LoadVertexInputState(const MemoryPool &pool,
 
   std::array<std::uint8_t, kPcoVertexInputRegisterCount> occupied{};
   for (const VertexAttributeBinding &binding : input.bindings) {
+    const std::size_t component_bytes =
+        GetComponentTypeBytes(binding.component_type);
     if (binding.buffer_index >= input.resources.size() ||
+        component_bytes == 0 ||
         binding.source_components == 0 || binding.source_components > 4 ||
         binding.destination_components < binding.source_components ||
         binding.destination_components > 4) {
@@ -125,16 +147,12 @@ VertexInputState LoadVertexInputState(const MemoryPool &pool,
     }
     const std::uint64_t element_bytes =
         static_cast<std::uint64_t>(binding.source_components) *
-        GetComponentTypeBytes(binding.component_type);
+        component_bytes;
     if (binding.stride_bytes < element_bytes)
       throw std::runtime_error("VertexFetch attribute stride is too small");
-    const VertexBufferResource &resource =
-        input.resources[binding.buffer_index];
-    if (static_cast<std::uint64_t>(binding.offset_bytes) + element_bytes >
-        resource.byte_size) {
-      throw std::runtime_error(
-          "VertexFetch first attribute element exceeds its VBO");
-    }
+    // Do not require element zero to fit. A legal vertex pointer may begin
+    // outside a short allocation; MakeLane applies robust bounds per
+    // component for the actual vertex/instance index.
     if (element_bytes >
         std::numeric_limits<std::uint64_t>::max() - input.bytes_per_vertex) {
       throw std::overflow_error("VertexFetch byte counter overflow");
@@ -149,38 +167,50 @@ std::uint32_t ReadComponentAsInteger(const std::vector<std::uint8_t>& buffer, st
 
 VertexLane MakeLane(std::uint32_t vertex_index,
                     const VertexInputState &input,
-                    std::uint32_t instance_id = 0) {
+                    std::uint32_t instance_id = 0,
+                    bool vertex_index_can_address = true) {
   VertexLane lane;
   for (const VertexAttributeBinding &binding : input.bindings) {
     std::uint32_t active_index = vertex_index;
+    bool active_index_can_address = vertex_index_can_address;
     if (binding.instance_divisor != 0) {
       active_index = instance_id / binding.instance_divisor;
+      active_index_can_address = true;
     }
     const std::uint64_t stride_offset =
         static_cast<std::uint64_t>(active_index) * binding.stride_bytes;
     const std::uint64_t source_offset =
         stride_offset + binding.offset_bytes;
     const std::size_t component_bytes = GetComponentTypeBytes(binding.component_type);
-    const std::uint64_t source_bytes =
-        static_cast<std::uint64_t>(binding.source_components) * component_bytes;
     const std::vector<std::uint8_t> &buffer =
         input.buffers[binding.buffer_index];
-    if (source_offset > buffer.size() ||
-        source_bytes > buffer.size() - source_offset) {
-      throw std::runtime_error(
-          "VertexFetch resolved attribute exceeds its VBO");
-    }
     for (std::uint32_t component = 0;
          component < binding.destination_components; ++component) {
       std::uint32_t value = component == 3 ? FloatBits(1.0F) : 0U;
       if (component < binding.source_components) {
-        const std::size_t component_offset = static_cast<std::size_t>(
-            source_offset + component * component_bytes);
-        if (binding.integer) {
-          value = ReadComponentAsInteger(buffer, component_offset, binding.component_type);
+        const std::uint64_t component_offset =
+            source_offset + component * component_bytes;
+        /*
+         * Robustness is component-granular: an element may straddle the end
+         * of a VBO.  Retain every complete in-range component and return zero
+         * for each component whose bytes are not wholly owned by that VBO.
+         * Missing declared components still use the ordinary GLES z=0/w=1
+         * materialization above.
+         */
+        if (active_index_can_address && component_offset <= buffer.size() &&
+            component_bytes <= buffer.size() - component_offset) {
+          const auto offset = static_cast<std::size_t>(component_offset);
+          if (binding.integer) {
+            value = ReadComponentAsInteger(buffer, offset,
+                                           binding.component_type);
+          } else {
+            const float fval = ReadComponentAsFloat(
+                buffer, offset, binding.component_type,
+                binding.normalized != 0);
+            value = FloatBits(fval);
+          }
         } else {
-          float fval = ReadComponentAsFloat(buffer, component_offset, binding.component_type, binding.normalized != 0);
-          value = FloatBits(fval);
+          value = 0;
         }
       }
       lane.vertex_input[binding.destination_register + component] = value;
@@ -470,19 +500,23 @@ void VertexFetch::Run() {
         if (occurrence % vertices_per_instance == 0)
           std::fill(cache.begin(), cache.end(), CacheEntry{});
         const std::uint32_t instance = occurrence / vertices_per_instance;
-        const std::int64_t resolved = driver_pco_indexed
-            ? std::int64_t{indices[state.draw.first_index + occurrence]} +
-                  state.draw.base_vertex
-            : std::int64_t{state.draw.first_vertex} + occurrence;
-        if (resolved < 0 || std::uint64_t(resolved) > UINT32_MAX)
-          throw std::runtime_error("VertexFetch geometry resolved vertex is invalid");
-        const auto index = static_cast<std::uint32_t>(resolved);
+        const ResolvedVertexIndex resolved = driver_pco_indexed
+            ? ResolveIndexedVertex(
+                  indices[state.draw.first_index + occurrence],
+                  state.draw.base_vertex)
+            : ResolvedVertexIndex{
+                  static_cast<std::uint32_t>(
+                      std::uint64_t{state.draw.first_vertex} + occurrence),
+                  std::uint64_t{state.draw.first_vertex} + occurrence <=
+                      UINT32_MAX};
+        const auto index = resolved.value;
         auto &entry = cache[index % cache.size()];
         if (!entry.valid || entry.vertex_index != index) {
           if (lanes.size() >= UINT32_MAX)
             throw std::overflow_error("VertexFetch geometry lane count exceeds uint32");
           entry = {index, static_cast<std::uint32_t>(lanes.size()), true};
-          lanes.push_back(MakeLane(index, vertex_input, instance));
+          lanes.push_back(MakeLane(index, vertex_input, instance,
+                                   resolved.can_address_vertex_buffer));
         }
         refs.push_back({entry.lane_index, index});
       }
@@ -538,19 +572,21 @@ void VertexFetch::Run() {
            ++vertex) {
         const std::uint64_t resolved =
             static_cast<std::uint64_t>(state.draw.first_vertex) + vertex;
-        if (resolved > std::numeric_limits<std::uint32_t>::max())
-          throw std::overflow_error("VertexFetch vertex index exceeds uint32");
         const std::uint32_t vertex_index =
             static_cast<std::uint32_t>(resolved);
         std::uint32_t lane_index = static_cast<std::uint32_t>(lanes.size());
         if (source_vertices.empty()) {
-          lanes.push_back(MakeLane(vertex_index, vertex_input));
+          lanes.push_back(MakeLane(
+              vertex_index, vertex_input, 0,
+              resolved <= std::numeric_limits<std::uint32_t>::max()));
         } else {
           const auto reused = source_lane.find(source_vertices[vertex]);
           if (reused != source_lane.end()) {
             lane_index = reused->second;
           } else {
-            lanes.push_back(MakeLane(vertex_index, vertex_input));
+            lanes.push_back(MakeLane(
+                vertex_index, vertex_input, 0,
+                resolved <= std::numeric_limits<std::uint32_t>::max()));
             source_lane.emplace(source_vertices[vertex], lane_index);
           }
         }
@@ -626,7 +662,9 @@ void VertexFetch::Run() {
         expanded_indices_32 = indices;
       }
 
-      const std::uint64_t index_end = state.draw.index_count;
+      const std::uint64_t index_end =
+          static_cast<std::uint64_t>(state.draw.first_index) +
+          state.draw.index_count;
       if (kReferenceUarch.index_segment_max_indices == 0 ||
           kReferenceUarch.index_segment_max_indices % 3 != 0 ||
           kReferenceUarch.post_transform_cache_slots == 0) {
@@ -647,17 +685,9 @@ void VertexFetch::Run() {
             kReferenceUarch.post_transform_cache_slots);
         const std::size_t segment_end = occurrence + segment_count;
         for (; occurrence < segment_end; ++occurrence) {
-          const std::int64_t resolved =
-              static_cast<std::int64_t>(expanded_indices_32[occurrence]) +
-              state.draw.base_vertex;
-          if (resolved < 0 ||
-              static_cast<std::uint64_t>(resolved) >
-                  std::numeric_limits<std::uint32_t>::max()) {
-            throw std::runtime_error(
-                "VertexFetch resolved index exceeds the modeled range");
-          }
-          const std::uint32_t vertex_index =
-              static_cast<std::uint32_t>(resolved);
+          const ResolvedVertexIndex resolved = ResolveIndexedVertex(
+              expanded_indices_32[occurrence], state.draw.base_vertex);
+          const std::uint32_t vertex_index = resolved.value;
           CacheEntry &entry = cache[vertex_index % cache.size()];
           if (!entry.valid || entry.vertex_index != vertex_index) {
             if (lanes.size() >= std::numeric_limits<std::uint32_t>::max())
@@ -666,7 +696,9 @@ void VertexFetch::Run() {
             entry.vertex_index = vertex_index;
             entry.lane_index = static_cast<std::uint32_t>(lanes.size());
             entry.valid = true;
-            lanes.push_back(MakeLane(vertex_index, vertex_input));
+            lanes.push_back(MakeLane(
+                vertex_index, vertex_input, 0,
+                resolved.can_address_vertex_buffer));
           }
           lane_refs.push_back({entry.lane_index, vertex_index});
         }

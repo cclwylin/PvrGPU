@@ -236,8 +236,6 @@ inline bool ValidateDriverGraphicsShaderBuffers(const DriverCommand &command,
   for (std::size_t stage = 0; stage < kGraphicsShaderStageCount; ++stage) {
     const auto &storage = command.graphics_storage[stage];
     const auto &shared = GraphicsStageShared(command, stage);
-    if (storage.used_mask & ~present[stage])
-      return reject("shader uses an unbound descriptor");
     for (unsigned slot = 0; slot < storage.descriptor_count; ++slot) {
       if (present[stage] & (UINT32_C(1) << slot))
         continue;

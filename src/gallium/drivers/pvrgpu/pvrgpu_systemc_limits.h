@@ -15,5 +15,7 @@
 /* Keep a 64-DWORD suffix for UBO descriptors or packed live uniforms used by
  * otherwise valid sixteen-texture shaders. */
 #define PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE 384u
+/* Public draw/PBE transport has four independent PIXOUT attachment lanes. */
+#define PVRGPU_SYSTEMC_MAX_RENDER_TARGETS 4u
 
 #endif

@@ -507,7 +507,11 @@ bool LoadDriverCommand(const std::string &path, DriverCommand *command,
     *error = "driver command case must not be empty";
     return false;
   }
-  if (!IsSupportedDriverCommandFormat(parsed.format)) {
+  const bool format_supported =
+      parsed.command == kDrawPcoTrianglesCommand
+          ? IsColorAttachmentTransportFormat(parsed.format)
+          : IsSupportedDriverCommandFormat(parsed.format);
+  if (!format_supported) {
     *error = "unsupported driver command format: " + parsed.format;
     return false;
   }

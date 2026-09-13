@@ -346,6 +346,15 @@ struct pvrgpu_draw_pco_triangles_command {
    uint32_t attachment_clear_count;
    uint32_t color_attachment_format_count;
    const char *color_attachment_formats[4];
+   uint32_t render_target_state_count;
+   uint32_t color_masks[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
+   uint32_t blend_enables[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
+   uint32_t blend_rgb_equations[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
+   uint32_t blend_alpha_equations[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
+   uint32_t blend_source_rgb_factors[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
+   uint32_t blend_destination_rgb_factors[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
+   uint32_t blend_source_alpha_factors[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
+   uint32_t blend_destination_alpha_factors[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
 };
 
 struct pvrgpu_systemc_driver_command;

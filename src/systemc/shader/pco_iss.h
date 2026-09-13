@@ -800,6 +800,12 @@ struct PcoFragmentExecution {
 struct PcoFragmentExecutionContext {
   std::array<std::uint32_t, kPcoMaximumVaryingCoefficientCount>
       coefficients{};
+  // Destination colour as seen at fragment invocation entry.  The public
+  // PCO backend represents framebuffer fetches as reads from the PIXOUT
+  // hardware-register file; keep those immutable inputs separate from the
+  // output file populated by this invocation.
+  std::array<std::uint32_t, kPcoPixelOutputCount> pixel_inputs{};
+  std::uint16_t pixel_input_mask = 0;
   std::uint32_t sample_x = 0;
   std::uint32_t sample_y = 0;
   // PIXEL coefficient coordinates above never change under sample shading.
@@ -880,6 +886,11 @@ CountPcoInstructions(const std::vector<PcoInstruction> &instructions,
  * subset, including malformed register ranges and non-canonical phase forms. */
 PcoDecodedProgram DecodePcoProgram(ShaderStage stage,
                                    const std::vector<std::uint8_t> &binary);
+
+// True when a decoded fragment program reads the immutable destination-colour
+// PIXOUT register file (the native representation of framebuffer fetch).
+bool PcoFragmentProgramReadsPixelInput(
+    const std::vector<PcoInstruction> &instructions);
 
 /* Separate compute decoder and pure per-group ALU semantics. These never
  * construct a graphics context or call a VS/FS executor. Phase operands are

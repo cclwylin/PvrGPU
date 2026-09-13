@@ -190,23 +190,7 @@ pvrgpu_cmd_primitive_width_is_valid(uint32_t bits)
 static bool
 pvrgpu_cmd_format_supported(const char *format)
 {
-   return format &&
-          (strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8_SRGB) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_BGRA8_SRGB) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBX8) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_BGRX8) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R5G6B5) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_B5G6R5) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R10G10B10A2) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_B10G10R10A2) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R32UI) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RG32UI) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32UI) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_R32I) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RG32I) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32I) == 0 ||
-           strcmp(format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32F) == 0);
+   return pvrgpu_is_explicit_color_format(format);
 }
 
 /*
@@ -1304,8 +1288,6 @@ pvrgpu_cmd_validate_graphics_buffers(
    for (unsigned stage = 0; stage < 5; ++stage) {
       const struct pvrgpu_systemc_storage_buffer_abi *storage =
          &buffers->storage[stage];
-      if (storage->used_mask & ~present[stage])
-         goto invalid;
       for (unsigned slot = 0; slot < storage->descriptor_count; ++slot) {
          if (present[stage] & (UINT32_C(1) << slot))
             continue;
@@ -1355,19 +1337,7 @@ pvrgpu_cmd_validate_draw_pco_triangles(
     * packed RGB10_A2/BGRA10_A2, or canonical integer/float channels. Other
     * formats may be describable in a clear capsule without a native PBE store.
     */
-   const bool format_ok =
-      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8) == 0 ||
-      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8_SRGB) == 0 ||
-      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_BGRA8_SRGB) == 0 ||
-      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGB10_A2) == 0 ||
-      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_BGRA10_A2) == 0 ||
-      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_R32UI) == 0 ||
-      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RG32UI) == 0 ||
-      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32UI) == 0 ||
-      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_R32I) == 0 ||
-      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RG32I) == 0 ||
-      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32I) == 0 ||
-      strcmp(cmd->format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32F) == 0;
+   const bool format_ok = pvrgpu_is_explicit_color_format(cmd->format);
    if (!resolution_ok || !format_ok) {
       /*
        * Say which half of the requirement failed and with what.  A
@@ -2481,6 +2451,24 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->color_attachment_format_count = cmd->color_attachment_format_count;
    memcpy(out->color_attachment_formats, cmd->color_attachment_formats,
           sizeof(out->color_attachment_formats));
+   out->render_target_state_count = cmd->render_target_state_count;
+   memcpy(out->color_masks, cmd->color_masks, sizeof(out->color_masks));
+   memcpy(out->blend_enables, cmd->blend_enables,
+          sizeof(out->blend_enables));
+   memcpy(out->blend_rgb_equations, cmd->blend_rgb_equations,
+          sizeof(out->blend_rgb_equations));
+   memcpy(out->blend_alpha_equations, cmd->blend_alpha_equations,
+          sizeof(out->blend_alpha_equations));
+   memcpy(out->blend_source_rgb_factors, cmd->blend_source_rgb_factors,
+          sizeof(out->blend_source_rgb_factors));
+   memcpy(out->blend_destination_rgb_factors,
+          cmd->blend_destination_rgb_factors,
+          sizeof(out->blend_destination_rgb_factors));
+   memcpy(out->blend_source_alpha_factors, cmd->blend_source_alpha_factors,
+          sizeof(out->blend_source_alpha_factors));
+   memcpy(out->blend_destination_alpha_factors,
+          cmd->blend_destination_alpha_factors,
+          sizeof(out->blend_destination_alpha_factors));
    out->vertex_attribute_count = cmd->vertex_attribute_count;
    for (uint32_t attribute = 0;
         attribute < PVRGPU_ARRAY_SIZE(cmd->vertex_attribute_components);

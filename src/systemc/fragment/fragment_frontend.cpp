@@ -126,7 +126,7 @@ void FragmentFrontend::Run() {
       const std::size_t pixel_index =
           (static_cast<std::size_t>(parameter.key.layer) * state.height + candidate.y) * state.width + candidate.x;
       if (pixel_seen[pixel_index] != 0) {
-        if (!state.raster_state.blend.enable &&
+        if (!AnyBlendEnabled(state.raster_state) &&
             !RasterRequiresLateDepthStencil(state.raster_state) &&
             !state.raster_state.shader_writes_memory &&
             !state.raster_state.shader_may_discard && state.fragment_early_hsr_safe &&
@@ -299,6 +299,7 @@ void FragmentFrontend::Run() {
               shader_lane.y = y;
               shader_lane.primitive_id = parameter.key.api_primitive_id;
               shader_lane.parameter_index = parameter_index;
+              shader_lane.layer = parameter.key.layer;
               shader_lane.submit_ordinal = parameter.key.submit_ordinal;
               shader_lane.quad_id = quad.quad_id;
               shader_lane.quad_lane = lane;

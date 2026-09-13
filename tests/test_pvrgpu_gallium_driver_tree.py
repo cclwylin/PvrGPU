@@ -10,6 +10,73 @@ DRIVER_ROOT = PROJECT_ROOT / "src" / "gallium" / "drivers" / "pvrgpu"
 
 
 class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
+    def test_robust_context_reaches_pco_descriptor_bounds_lowering(self) -> None:
+        context = (DRIVER_ROOT / "pvrgpu_context.c").read_text(encoding="utf-8")
+        context_header = (DRIVER_ROOT / "pvrgpu_context.h").read_text(
+            encoding="utf-8"
+        )
+        compiler = (DRIVER_ROOT / "pvrgpu_pco.c").read_text(encoding="utf-8")
+        compiler_header = (DRIVER_ROOT / "pvrgpu_pco.h").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("bool robust_buffer_access;", context_header)
+        self.assertIn("flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS", context)
+        self.assertIn("pvrgpu_context_create_pco_compiler(ctx", context)
+        self.assertNotIn(
+            "ctx->pco_compiler = pvrgpu_pco_compiler_create", context
+        )
+        self.assertIn(
+            "pvrgpu_pco_compiler_set_robust_buffer_access", compiler_header
+        )
+        self.assertIn(
+            "data->common.robust_buffer_access = compiler->robust_buffer_access;",
+            compiler,
+        )
+        self.assertIn(
+            "data->common.null_descriptor = compiler->robust_buffer_access;",
+            compiler,
+        )
+        self.assertIn("pvrgpu_lower_robust_buffer_access", compiler)
+        self.assertIn("nir_metadata_none, NULL", compiler)
+        self.assertIn(
+            "nir_var_mem_ubo | nir_var_mem_ssbo", compiler
+        )
+        # The only raw PCO call is inside the wrapper that sets both flags;
+        # every compilation path must pass through that wrapper.
+        self.assertEqual(compiler.count("pco_lower_nir(compiler->pco"), 1)
+        self.assertGreaterEqual(compiler.count("pvrgpu_pco_lower_nir(compiler"), 2)
+
+    def test_texture_barrier_materializes_pending_framebuffer_writes(self) -> None:
+        context = (DRIVER_ROOT / "pvrgpu_context.c").read_text(encoding="utf-8")
+        start = context.index("static void\npvrgpu_texture_barrier")
+        end = context.index("static void\npvrgpu_memory_barrier", start)
+        barrier = context[start:end]
+
+        self.assertIn("pvrgpu_flush_current_color_attachments(pipe);", barrier)
+        self.assertIn('pvrgpu_counter_eventf("texture_barrier"', barrier)
+        self.assertIn("ctx->base.texture_barrier = pvrgpu_texture_barrier;", context)
+
+    def test_shader_image_format_capability_uses_compiler_contract(self) -> None:
+        screen = (DRIVER_ROOT / "pvrgpu_screen.c").read_text(encoding="utf-8")
+        compiler = (DRIVER_ROOT / "pvrgpu_pco.c").read_text(encoding="utf-8")
+        header = (DRIVER_ROOT / "pvrgpu_screen.h").read_text(encoding="utf-8")
+
+        name = "pvrgpu_is_supported_shader_image_format"
+        contract = f"{name}(format)"
+        self.assertIn(name, header)
+        self.assertGreaterEqual(screen.count(contract), 2)
+        self.assertIn(contract, compiler)
+        self.assertNotIn("pvrgpu_compute_image_format_supported", compiler)
+        # Packed/one-byte vertex formats must not accidentally make an image
+        # capability query succeed when snapshot/compiler admission rejects it.
+        buffer_branch = screen[
+            screen.index("if (target == PIPE_BUFFER)") :
+            screen.index("if (!pvrgpu_is_supported_texture_target", screen.index("if (target == PIPE_BUFFER)"))
+        ]
+        self.assertIn("PIPE_BIND_SHADER_IMAGE", buffer_branch)
+        self.assertIn(contract, buffer_branch)
+
     def test_pending_clears_retire_after_initial_load_and_framebuffer_change(self) -> None:
         context = (DRIVER_ROOT / "pvrgpu_context.c").read_text(encoding="utf-8")
         capture = context.index("!pvrgpu_capture_initial_depth_attachment(ctx, recorded)")
@@ -255,7 +322,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("full_depth_clear_resource", context_header)
         self.assertIn("pvrgpu_note_full_depth_clear_one", clear)
         self.assertIn("pvrgpu_invalidate_full_depth_clear_for_resource", resource)
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 38u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 39u", systemc_api)
         for field in (
             "const uint8_t *raw_vertex_data;",
             "size_t raw_vertex_data_size;",
@@ -318,13 +385,21 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("pvrgpu_counter_eventf(\"fence_finish\"", screen)
         self.assertIn("caps->blend_equation_separate = true", screen)
         self.assertIn("caps->shareable_shaders = false", screen)
-        self.assertIn("caps->essl_feature_level = 310", screen)
+        self.assertIn("caps->essl_feature_level = 320", screen)
+        self.assertIn("caps->max_shader_buffers = 32", screen)
+        self.assertIn("caps->texture_buffer_objects = true", screen)
+        self.assertIn("caps->indep_blend_enable = true", screen)
+        self.assertIn("caps->indep_blend_func = true", screen)
+        self.assertIn("caps->robust_buffer_access_behavior = true", screen)
+        self.assertIn("caps->fbfetch = caps->max_render_targets", screen)
         self.assertIn("caps->glsl_feature_level = 400", screen)
         self.assertIn("caps->glsl_feature_level_compatibility = 400", screen)
         self.assertIn("caps->max_texture_3d_levels = 9", screen)
         self.assertIn("caps->max_texture_array_layers = 256", screen)
         self.assertIn("caps->max_texture_lod_bias = 2.0f", screen)
-        self.assertIn("caps->max_render_targets = 8", screen)
+        self.assertIn(
+            "caps->max_render_targets = PVRGPU_SYSTEMC_MAX_RENDER_TARGETS", screen
+        )
         self.assertIn("caps->max_viewports = PIPE_MAX_VIEWPORTS", screen)
         self.assertIn("caps->max_varyings = 32", screen)
         self.assertIn("MESA_SHADER_GEOMETRY", screen)
@@ -359,6 +434,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("PIPE_BIND_VERTEX_BUFFER", screen)
         self.assertIn("PIPE_BIND_INDEX_BUFFER", screen)
         self.assertIn("PIPE_BIND_CONSTANT_BUFFER", screen)
+        self.assertIn("PIPE_BIND_SHADER_BUFFER", screen)
         self.assertIn("PIPE_FORMAT_R8_UINT", screen)
         self.assertIn("PIPE_FORMAT_R32G32_FLOAT", screen)
         self.assertIn("PIPE_FORMAT_Z24_UNORM_S8_UINT", screen)
@@ -368,6 +444,11 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("pvrgpu_draw_is_observable_indexed_triangle", context)
         self.assertIn("u_upload_create_default(&ctx->base)", context)
         self.assertIn("ctx->base.const_uploader = ctx->base.stream_uploader", context)
+        self.assertIn(
+            "command.sample_frequency = ctx->min_samples > 1 ||\n"
+            "      ctx->fs->nir->info.fs.uses_fbfetch_output ||",
+            context,
+        )
         self.assertIn("u_upload_destroy(ctx->base.stream_uploader)", context)
         self.assertIn("pvrgpu_counter_eventf(\"draw_triangles\"", context)
         self.assertIn("pvrgpu_counter_eventf(\"draw_indexed_triangles\"", context)
@@ -806,7 +887,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 38u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 39u", systemc_api)
         for field in (
             "uint32_t vertex_stride;",
             "uint32_t position_output_start;",
@@ -944,7 +1025,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 38u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 39u", systemc_api)
         self.assertIn("command=draw_pco_triangles", command)
         self.assertIn("pvrgpu_write_draw_pco_triangles_command", command_header)
         self.assertIn("PVRGPU_DRAW_PCO_TRIANGLES_VERTEX_COUNT 6144u", command_header)

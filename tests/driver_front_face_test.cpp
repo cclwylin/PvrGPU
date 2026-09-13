@@ -57,12 +57,15 @@ PipelineState MakeState(MemoryPool &pool, std::uint64_t sequence,
   state.draw.vertex_count = 3;
   state.vertex_pco_abi.vertex_outputs = 4;
   state.position_output_count = 4;
+  state.varying_output_start = 4;
   state.fragment_position_count = 4;
   state.fragment_varying_start = 4;
   state.fragment_pco_abi.temps = 1;
   state.fragment_pco_abi.coefficients = 4;
   state.fragment_output_mask[0] = 0xf;
   state.fragment_code = StoreNewArray(pool, Tess0FragmentPco());
+  state.shader_varying_bindings =
+      StoreNewArray(pool, std::vector<ShaderVaryingBinding>{});
   state.drawlist_stats = StoreNewArray(pool, std::vector<DrawListStats>{{}});
   auto &raster = state.raster_state;
   raster.face_cull.front_face = winding;

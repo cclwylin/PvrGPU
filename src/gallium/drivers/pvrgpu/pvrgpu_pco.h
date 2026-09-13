@@ -402,6 +402,10 @@ enum pvrgpu_pco_terrain_profile {
 struct pvrgpu_pco_compiler *pvrgpu_pco_compiler_create(char *error,
                                                        size_t error_size);
 
+void pvrgpu_pco_compiler_set_robust_buffer_access(
+   struct pvrgpu_pco_compiler *compiler,
+   bool enabled);
+
 void pvrgpu_pco_compiler_destroy(struct pvrgpu_pco_compiler *compiler);
 
 /*

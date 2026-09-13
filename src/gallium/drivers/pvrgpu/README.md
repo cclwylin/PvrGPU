@@ -120,8 +120,11 @@ Current status:
   increment the atomic instruction counter. Memory-only fences and execution
   barriers within one 32-lane task are supported by the serial, lockstep path.
   Shared/image memory, multi-task workgroup barriers, float/64-bit atomics and
-  indirect/variable dispatch remain explicitly rejected. OOB views fail closed;
-  this does not implement llvmpipe's robust zero/no-op behavior.
+  indirect/variable dispatch remain explicitly rejected. Robust contexts run
+  PCO's descriptor-size/null-descriptor lowering before native translation;
+  model memory services additionally zero-fill OOB buffer loads, discard OOB
+  stores, and return zero/no-op for OOB atomics, per DWORD for vector tails.
+  Malformed request shapes and binding-permission mismatches still fail closed.
   CAS normalizes the cloned NIR's coherent access bit. Residual sparse SSBO
   store masks are rejected instead of overwriting unselected components.
   The focused SSBO atomic (48) and atomic-counter (298) CTS cases are all Pass,

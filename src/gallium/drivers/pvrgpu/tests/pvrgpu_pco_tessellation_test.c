@@ -57,6 +57,27 @@ static nir_def *sample_texture(nir_builder *b, nir_def *coord, nir_def *lod)
    return &tex->def;
 }
 
+static nir_def *sample_buffer_texture(nir_builder *b, nir_def *index)
+{
+   nir_variable *sampler = nir_variable_create(b->shader, nir_var_uniform,
+      glsl_sampler_type(GLSL_SAMPLER_DIM_BUF, false, false, GLSL_TYPE_FLOAT),
+      "buffer_image");
+   sampler->data.descriptor_set = sampler->data.binding = 0;
+   b->shader->info.num_textures = 1;
+   BITSET_SET(b->shader->info.textures_used, 0);
+   nir_tex_instr *tex = nir_tex_instr_create(b->shader, 2);
+   tex->op = nir_texop_txf;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_BUF;
+   tex->coord_components = 1;
+   tex->dest_type = nir_type_float32;
+   tex->texture_index = tex->sampler_index = 0;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, index);
+   tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(b, 0));
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(b, &tex->instr);
+   return &tex->def;
+}
+
 static nir_shader *make_texture_vertex(void)
 {
    nir_builder b = nir_builder_init_simple_shader(
@@ -92,7 +113,10 @@ static nir_shader *make_control(unsigned kind)
       level = nir_load_ubo(&b, 1, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
          .align_mul = 4, .align_offset = 0, .range = 16);
    }
-   if (kind >= 5) {
+   if (kind == 7) {
+      level = nir_channel(&b, sample_buffer_texture(
+         &b, nir_load_invocation_id(&b)), 0);
+   } else if (kind >= 5) {
       nir_def *id = nir_u2f32(&b, nir_load_invocation_id(&b));
       nir_def *coord = nir_vec2(&b, nir_fadd(&b, nir_fmul_imm(&b, id, .25f),
          nir_imm_float(&b, .125f)), nir_imm_float(&b, .5f));
@@ -170,7 +194,10 @@ static nir_shader *make_evaluation(unsigned kind)
          nir_imul_imm(&b, nir_iand_imm(&b, nir_load_primitive_id(&b), 3), 4),
          .align_mul = 4, .align_offset = 0, .range = 16));
    }
-   if (kind >= 5) {
+   if (kind == 7) {
+      color_value = nir_fmul(&b, color_value, sample_buffer_texture(
+         &b, nir_load_primitive_id(&b)));
+   } else if (kind >= 5) {
       nir_def *lod = kind == 6 ? nir_u2f32(&b, nir_load_primitive_id(&b)) : NULL;
       color_value = nir_fmul(&b, color_value,
          sample_texture(&b, nir_channels(&b, coord, 3), lod));
@@ -549,7 +576,7 @@ int main(void)
    test_tessellation_geometry_link(compiler);
    test_stream_output_layout(compiler);
    test_storage_buffers(compiler);
-   for (unsigned kind = 0; kind < 7; ++kind) {
+   for (unsigned kind = 0; kind < 8; ++kind) {
       nir_shader *vs = make_vertex(kind != 0), *tcs = make_control(kind), *tes = make_evaluation(kind), *fs = make_fragment();
       struct pvrgpu_pco_tessellation_pipeline_binary binary = {0};
       enum pipe_format format = PIPE_FORMAT_R32G32B32A32_FLOAT;

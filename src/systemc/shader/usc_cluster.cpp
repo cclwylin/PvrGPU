@@ -8,11 +8,13 @@
 // and completion is event-driven.
 #include "shader/usc_cluster.h"
 
+#include "common/color_attachment_formats.h"
 #include "common/functional_types.h"
 #include "common/diagnostics.h"
 #include "common/centroid.h"
 #include "common/pipeline_state.h"
 #include "common/msaa.h"
+#include "fragment/framebuffer_fetch_commit.h"
 #include "graphics_shader_buffers.h"
 #include "shader/pco_iss.h"
 #include "shader/usc_uniform_buffer_memory.h"
@@ -20,6 +22,7 @@
 #include "shader/usc_shader_buffer_memory.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -44,8 +47,7 @@ struct UscGraphicsReadMemory {
     if (!user_data || !dword_count)
       throw std::runtime_error("USC graphics load has no memory context");
     auto &memory = *static_cast<UscGraphicsReadMemory *>(user_data);
-    const auto bytes = static_cast<std::size_t>(dword_count) * 4U;
-    if (memory.storage && memory.storage->Contains(address, bytes, 1U))
+    if (memory.storage && memory.storage->OwnsAddress(address))
       return UscShaderBufferMemory::Read(memory.storage, address, dword_count,
                                          destination);
     UscUniformBufferMemory::Read(memory.uniform, address, dword_count,
@@ -73,7 +75,7 @@ struct UscGraphicsAtomicMemory {
     if (!user_data)
       throw std::runtime_error("USC graphics atomic has no memory context");
     auto &memory = *static_cast<UscGraphicsAtomicMemory *>(user_data);
-    if (memory.storage && memory.storage->Contains(address, 4U, 3U))
+    if (memory.storage && memory.storage->OwnsAddress(address))
       return UscShaderBufferMemory::Atomic32(memory.storage, operation,
                                              address, operand);
     return UscShaderImageMemory::Atomic32(memory.image, operation, address,
@@ -121,6 +123,226 @@ std::uint32_t FloatBits(float value) {
   static_assert(sizeof(bits) == sizeof(value));
   std::memcpy(&bits, &value, sizeof(bits));
   return bits;
+}
+
+std::uint8_t ColorStateToUnorm8(float value) {
+  if (!std::isfinite(value))
+    throw std::runtime_error(
+        "fragment framebuffer input cannot convert non-finite clear state");
+  const float scaled = std::clamp(value, 0.0F, 1.0F) * 255.0F;
+  return static_cast<std::uint8_t>(std::floor(scaled + 0.5F));
+}
+
+FramebufferFetchCommitStorage PrepareFragmentPixelInputs(
+    const MemoryPool &pool, const PipelineState &state, bool needed) {
+  FramebufferFetchCommitStorage input;
+  if (!needed)
+    return input;
+
+  input.enabled = true;
+  input.render_target_count = ValidateColorAttachmentFormats(state);
+  const std::uint64_t pixel_count =
+      static_cast<std::uint64_t>(state.width) * state.height *
+      state.attachment_layers;
+  if (pixel_count > std::numeric_limits<std::size_t>::max() /
+                        state.raster_state.sample_count)
+    throw std::overflow_error("fragment framebuffer input size overflow");
+  input.stored_samples = static_cast<std::size_t>(pixel_count) *
+                         state.raster_state.sample_count;
+  for (std::uint32_t target = 0; target < input.render_target_count;
+       ++target) {
+    const std::size_t bytes_per_pixel =
+        ColorAttachmentBytesPerPixel(state, target);
+    if (input.stored_samples >
+        std::numeric_limits<std::size_t>::max() / bytes_per_pixel)
+      throw std::overflow_error("fragment framebuffer target size overflow");
+    const std::size_t target_bytes =
+        input.stored_samples * bytes_per_pixel;
+    if (target_bytes > std::numeric_limits<std::size_t>::max() -
+                           input.target_offsets[target])
+      throw std::overflow_error("fragment framebuffer aggregate size overflow");
+    input.target_offsets[target + 1] =
+        input.target_offsets[target] + target_bytes;
+  }
+
+  if (state.color_attachment_load_enable > 1 ||
+      (state.color_attachment_load_enable != 0) !=
+          HasPoolHandle(state.color_attachment_load) ||
+      (!state.color_attachment_load_enable &&
+       state.color_attachment_load_bytes != 0)) {
+    throw std::runtime_error(
+        "fragment framebuffer input LOAD state is invalid");
+  }
+  if (state.color_attachment_load_enable) {
+    input.bytes = LoadArray<std::uint8_t>(pool, state.color_attachment_load);
+    if (state.color_attachment_load_bytes !=
+            input.target_offsets[input.render_target_count] ||
+        input.bytes.size() != state.color_attachment_load_bytes) {
+      throw std::runtime_error(
+          "fragment framebuffer input LOAD byte count mismatch");
+    }
+    return input;
+  }
+
+  // Standalone model commands may begin directly from clear state.  Encode it
+  // into the same target-major storage PBE uses so a fetch observes the
+  // attachment's quantization, not the unconverted API value.
+  input.bytes.assign(input.target_offsets[input.render_target_count], 0);
+  for (std::uint32_t target = 0; target < input.render_target_count;
+       ++target) {
+    const auto packed = ColorAttachmentPackedUnorm(state, target);
+    const auto raw_dwords = ColorAttachmentRawDwords(state, target);
+    const bool float32 = ColorAttachmentFloat32(state, target) != 0;
+    const auto &codec = ColorAttachmentCodecForTarget(state, target);
+    const std::size_t bytes_per_pixel =
+        ColorAttachmentBytesPerPixel(state, target);
+    for (std::size_t sample = 0; sample < input.stored_samples; ++sample) {
+      std::uint8_t *destination =
+          input.bytes.data() + input.target_offsets[target] +
+          sample * bytes_per_pixel;
+      if (ColorAttachmentCodecIsCanonical(codec)) {
+        std::array<float, 4> clear{};
+        std::copy_n(state.raster_state.clear_color, 4, clear.begin());
+        PbeWriteCanonicalColor(codec, destination, clear);
+      } else if (packed != PackedUnormFormat::kNone) {
+        std::array<float, 4> clear{};
+        std::copy_n(state.raster_state.clear_color, 4, clear.begin());
+        const std::uint32_t word = PackUnormColor(clear, packed);
+        std::memcpy(destination, &word, sizeof(word));
+      } else if (float32) {
+        std::memcpy(destination, state.raster_state.clear_color,
+                    bytes_per_pixel);
+      } else if (raw_dwords) {
+        for (std::size_t component = 0; component < raw_dwords; ++component) {
+          std::uint32_t raw = 0;
+          std::memcpy(&raw, &state.raster_state.clear_color[component],
+                      sizeof(raw));
+          if (ColorAttachmentCodecIsInteger(codec))
+            raw = PbeCanonicalIntegerComponent(codec, component, raw);
+          std::memcpy(destination + component * sizeof(raw), &raw,
+                      sizeof(raw));
+        }
+      } else {
+        for (std::size_t component = 0; component < 4; ++component)
+          destination[component] =
+              ColorStateToUnorm8(state.raster_state.clear_color[component]);
+      }
+    }
+  }
+  return input;
+}
+
+void PrepareFragmentCommitOrdering(const MemoryPool &pool,
+                                   const PipelineState &state,
+                                   FramebufferFetchCommitStorage &input) {
+  if (!input.enabled)
+    return;
+  input.committed.assign(input.stored_samples, 0);
+  input.last_submit_ordinal.assign(input.stored_samples, 0);
+  input.late_depth_stencil =
+      RasterRequiresLateDepthStencil(state.raster_state);
+  if (!input.late_depth_stencil)
+    return;
+  if (!HasPoolHandle(state.isp_depth_attachment))
+    throw std::runtime_error(
+        "fragment framebuffer feedback has no late depth state");
+  input.late_depth =
+      LoadArray<std::uint32_t>(pool, state.isp_depth_attachment);
+  if (input.late_depth.size() != input.stored_samples)
+    throw std::runtime_error(
+        "fragment framebuffer feedback late depth size is invalid");
+  if (DepthAttachmentHasStencil(state.depth_attachment_format)) {
+    input.late_stencil =
+        LoadArray<std::uint8_t>(pool, state.isp_stencil_attachment);
+    if (input.late_stencil.size() != input.stored_samples)
+      throw std::runtime_error(
+          "fragment framebuffer feedback late stencil size is invalid");
+  }
+}
+
+void SetFragmentPixelInputs(PcoFragmentExecutionContext &context,
+                            const PipelineState &state,
+                            const FramebufferFetchCommitStorage &input,
+                            std::uint32_t x, std::uint32_t y,
+                            std::uint32_t sample, std::uint32_t layer) {
+  if (!input.enabled)
+    return;
+  const unsigned lanes = input.render_target_count * 4U;
+  context.pixel_input_mask = static_cast<std::uint16_t>((1U << lanes) - 1U);
+  for (std::uint32_t target = 0; target < input.render_target_count;
+       ++target) {
+    std::uint32_t *destination =
+        context.pixel_inputs.data() + target * 4U;
+    const auto raw_dwords = ColorAttachmentRawDwords(state, target);
+    if (raw_dwords) {
+      const auto defaults = PbeReadRawIntegerColorForShader(raw_dwords);
+      std::copy(defaults.begin(), defaults.end(), destination);
+    } else {
+      destination[0] = 0;
+      destination[1] = 0;
+      destination[2] = 0;
+      destination[3] = FloatBits(1.0F);
+    }
+  }
+  // Helper lanes just outside the viewport have no defined destination
+  // colour.  Leave their canonical (0,0,0,1) value while still supplying the
+  // register file so derivative/texture residency can complete.
+  if (x >= state.width || y >= state.height ||
+      layer >= state.attachment_layers ||
+      sample >= state.raster_state.sample_count)
+    return;
+
+  const std::size_t stored_index =
+      ((static_cast<std::size_t>(layer) * state.height + y) * state.width + x) *
+          state.raster_state.sample_count +
+      sample;
+  for (std::uint32_t target = 0; target < input.render_target_count;
+       ++target) {
+    const auto packed = ColorAttachmentPackedUnorm(state, target);
+    const auto raw_dwords = ColorAttachmentRawDwords(state, target);
+    const bool float32 = ColorAttachmentFloat32(state, target) != 0;
+    const bool srgb = ColorAttachmentSrgb(state, target) != 0;
+    const auto &codec = ColorAttachmentCodecForTarget(state, target);
+    const std::size_t bytes_per_pixel =
+        ColorAttachmentBytesPerPixel(state, target);
+    const std::uint8_t *source =
+        input.bytes.data() + input.target_offsets[target] +
+        stored_index * bytes_per_pixel;
+    std::uint32_t *destination =
+        context.pixel_inputs.data() + target * 4U;
+    if (ColorAttachmentCodecIsCanonical(codec)) {
+      const auto color = PbeReadCanonicalColorForShader(codec, source);
+      for (std::size_t component = 0; component < color.size(); ++component)
+        destination[component] = FloatBits(color[component]);
+    } else if (packed != PackedUnormFormat::kNone) {
+      std::uint32_t word = 0;
+      std::memcpy(&word, source, sizeof(word));
+      const auto color = UnpackUnormColor(word, packed);
+      for (std::size_t component = 0; component < 4; ++component)
+        destination[component] = FloatBits(color[component]);
+    } else if (float32) {
+      std::memcpy(destination, source, 4U * sizeof(std::uint32_t));
+    } else if (raw_dwords) {
+      const auto color =
+          PbeReadRawIntegerColorForShader(raw_dwords, source);
+      std::copy(color.begin(), color.end(), destination);
+    } else {
+      for (std::size_t component = 0; component < 4; ++component) {
+        const float value = srgb && component < 3
+                                ? SrgbChannelToLinear(source[component])
+                                : static_cast<float>(source[component]) /
+                                      255.0F;
+        destination[component] = FloatBits(value);
+      }
+    }
+  }
+}
+
+void UpdateFragmentPixelInputs(FramebufferFetchCommitStorage &input,
+                               const PipelineState &state,
+                               const FragmentInvocation &invocation,
+                               const FragmentOutput &output) {
+  (void)CommitFramebufferFetchFragment(input, state, invocation, output);
 }
 
 std::uint64_t CheckedInstructionTotal(std::uint64_t per_invocation,
@@ -791,6 +1013,12 @@ void UscCluster::Run() {
       // its ISA and validates its own continuation and memory responses.
       const PcoPreparedFragmentProgram fragment_program(fragment_summary,
                                                        instructions);
+      const bool fragment_reads_pixel_input =
+          PcoFragmentProgramReadsPixelInput(instructions);
+      FramebufferFetchCommitStorage framebuffer_inputs =
+          PrepareFragmentPixelInputs(pool_, state,
+                                     fragment_reads_pixel_input);
+      PrepareFragmentCommitOrdering(pool_, state, framebuffer_inputs);
       const auto fragment_program_identity_valid = [&] {
         const auto &summary = state.fragment_program_summary;
         return state.fragment_instructions.slot == fragment_program_handle.slot &&
@@ -857,6 +1085,9 @@ void UscCluster::Run() {
         PcoFragmentExecutionContext raster_context;
         if (context)
           raster_context = *context;
+        SetFragmentPixelInputs(raster_context, state, framebuffer_inputs,
+                               invocation.x, invocation.y,
+                               invocation.sample_id, invocation.layer);
         SetFragmentFacingContext(raster_context, invocation.front_facing);
         context = &raster_context;
         if (IsDriverPcoTrianglesCase(state.functional_case)) {
@@ -941,6 +1172,9 @@ void UscCluster::Run() {
         StoreFragmentPixelOutputs(fragment_output, execution.pixel_outputs,
                                   execution.written_mask,
                                   state.render_target_count);
+        if (fragment_reads_pixel_input)
+          UpdateFragmentPixelInputs(framebuffer_inputs, state, invocation,
+                                    fragment_output);
         outputs[invocation_index] = fragment_output;
         output_written[invocation_index] = 1;
         record_fragment_execution(execution);
@@ -1034,13 +1268,19 @@ void UscCluster::Run() {
         // completion; this is not a shader-work limit or a claim about physical
         // Rogue occupancy. Output indices and external FIFO lane IDs stay
         // global.
-        constexpr std::size_t kResidentQuadLimit = 256;
+        /* A framebuffer-fetch quad must publish its completed color before a
+         * later overlapping primitive is allowed to seed PIXOUT.  Limiting
+         * residency to one quad also drains any texture continuation before
+         * the next quad is initialized; ordinary shaders retain the bounded
+         * 256-quad batch. */
+        const std::size_t resident_quad_limit =
+            fragment_reads_pixel_input ? 1U : 256U;
         std::vector<std::uint8_t> visited_quads(all_quads.size(), 0);
         std::vector<std::uint8_t> visited_lanes(all_shader_lanes.size(), 0);
         for (std::size_t task_begin = 0; task_begin < all_tasks.size();
-             task_begin += kResidentQuadLimit) {
+             task_begin += resident_quad_limit) {
           const std::size_t task_end =
-              std::min(task_begin + kResidentQuadLimit, all_tasks.size());
+              std::min(task_begin + resident_quad_limit, all_tasks.size());
           std::vector<std::uint32_t> global_lane_indices;
           std::vector<FragmentQuad> quads;
           std::vector<UscFragmentTask> tasks;
@@ -1242,6 +1482,9 @@ void UscCluster::Run() {
             StoreFragmentPixelOutputs(fragment_output, execution.pixel_outputs,
                                       execution.written_mask,
                                       state.render_target_count);
+            if (fragment_reads_pixel_input)
+              UpdateFragmentPixelInputs(framebuffer_inputs, state, invocation,
+                                        fragment_output);
             outputs[invocation_index] = fragment_output;
             output_written[invocation_index] = 1;
           };
@@ -1437,6 +1680,7 @@ void UscCluster::Run() {
                   shader_lane.sample_id != quad.sample_id ||
                   shader_lane.quad_lane != lane ||
                   shader_lane.parameter_index != quad.parameter_index ||
+                  shader_lane.layer >= state.attachment_layers ||
                   shader_lane.submit_ordinal != quad.submit_ordinal ||
                   shader_lane.front_facing > 1 ||
                   shader_lane.helper !=
@@ -1450,9 +1694,11 @@ void UscCluster::Run() {
               quad_front_facing = shader_lane.front_facing;
               if (!shader_lane.helper &&
                   (shader_lane.visible_invocation_index >= invocations.size() ||
+                   invocations[shader_lane.visible_invocation_index].layer !=
+                       shader_lane.layer ||
                    invocations[shader_lane.visible_invocation_index].front_facing !=
                        shader_lane.front_facing))
-                throw std::runtime_error("texture fragment USC visible facing identity mismatch");
+                throw std::runtime_error("texture fragment USC visible identity mismatch");
               // The strict driver profile carries llvmpipe's coefficients,
               // whose origin already includes its half-pixel setup offset.
               const float interpolation_offset =
@@ -1476,6 +1722,9 @@ void UscCluster::Run() {
               context.image_memory_user_data = &graphics_atomic_memory;
               context.memory_side_effects_enabled = shader_lane.helper ? 0 : 1;
               SetFragmentFacingContext(context, shader_lane.front_facing);
+              SetFragmentPixelInputs(
+                  context, state, framebuffer_inputs, shader_lane.x,
+                  shader_lane.y, shader_lane.sample_id, shader_lane.layer);
               lane_contexts[shader_lane_index] = context;
               lane_context_initialized[shader_lane_index] = 1;
               if (debug_fragment && shader_lane.x == debug_x &&

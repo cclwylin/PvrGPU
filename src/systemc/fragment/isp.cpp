@@ -205,7 +205,7 @@ void Isp::Run() {
       throw std::runtime_error("ISP memory mode mismatch");
     if (!IsRasterFunctionalCase(state.functional_case))
       throw std::runtime_error("ISP received an unsupported case");
-    bool opaque_early_hsr = state.raster_state.blend.enable == 0;
+    bool opaque_early_hsr = !AnyBlendEnabled(state.raster_state);
     // If the fragment shader may discard, we cannot perform opaque early HSR because
     // a front-most fragment might be discarded later, revealing fragments behind it.
     // Likewise, if early HSR is not safe, we disable early culling.

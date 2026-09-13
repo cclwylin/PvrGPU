@@ -23,15 +23,6 @@ constexpr char kDriverCommandProducer[] = "pvrgpu-gallium-driver";
 constexpr char kDrawPcoTriangles[] = "draw_pco_triangles";
 constexpr char kDrawPcoSequence[] = "draw_pco_sequence";
 constexpr char kRgba8[] = "PIPE_FORMAT_R8G8B8A8_UNORM";
-constexpr char kRgba8Srgb[] = "PIPE_FORMAT_R8G8B8A8_SRGB";
-constexpr char kBgra8Srgb[] = "PIPE_FORMAT_B8G8R8A8_SRGB";
-constexpr char kR32Ui[] = "PIPE_FORMAT_R32_UINT";
-constexpr char kRg32Ui[] = "PIPE_FORMAT_R32G32_UINT";
-constexpr char kRgba32Ui[] = "PIPE_FORMAT_R32G32B32A32_UINT";
-constexpr char kR32I[] = "PIPE_FORMAT_R32_SINT";
-constexpr char kRg32I[] = "PIPE_FORMAT_R32G32_SINT";
-constexpr char kRgba32I[] = "PIPE_FORMAT_R32G32B32A32_SINT";
-constexpr char kRgba32F[] = "PIPE_FORMAT_R32G32B32A32_FLOAT";
 
 // The colour formats the PBE can write a generic draw into: four UNORM8
 // channels, or one, two or four raw 32-bit integer channels.  dEQP's shader
@@ -40,11 +31,7 @@ constexpr char kRgba32F[] = "PIPE_FORMAT_R32G32B32A32_FLOAT";
 // every one of them.  A signed result takes the matching SINT format, whose
 // stored pixel is the same raw dword per channel.
 bool IsGenericDrawFormat(const std::string &format) {
-  return format == kRgba8 || format == kRgba8Srgb || format == kBgra8Srgb ||
-         PackedUnormFormatFromName(format) != PackedUnormFormat::kNone ||
-         format == kR32Ui || format == kRg32Ui || format == kRgba32Ui ||
-         format == kR32I || format == kRg32I || format == kRgba32I ||
-         format == kRgba32F;
+  return IsColorAttachmentTransportFormat(format);
 }
 constexpr char kRgbx8[] = "PIPE_FORMAT_R8G8B8X8_UNORM";
 constexpr char kZ32[] = "PIPE_FORMAT_Z32_UNORM";
@@ -1229,8 +1216,7 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
       return Reject(error, "generic PCO sequence draw envelope is invalid");
     }
     const std::uint64_t color_bpp =
-        draw.format == kRgba32Ui || draw.format == kRgba32I || draw.format == kRgba32F ? 16U :
-        draw.format == kRg32Ui || draw.format == kRg32I ? 8U : 4U;
+        DriverColorAttachmentMaximumBytesPerPixel(draw);
     if ((draw.raster_samples && (draw.raster_samples > 16 ||
          (draw.raster_samples & (draw.raster_samples - 1)))) ||
         static_cast<std::uint64_t>(draw.framebuffer_width) * draw.framebuffer_height *

@@ -2,7 +2,8 @@
 // 縮寫：非縮寫（頂點擷取）。
 // 功能：把 IEEE-754 vertex attribute 原始位元放入 PCO VTXIN register bank；
 // float2→vec4 的 GLES z=0/w=1 default 只做 register materialization，不算
-// VBO traffic。目前所有 indexed raster case 依 reference uArch 分段，使用
+// VBO traffic；動態越界的 source component 以 robust zero materialize，不讀取
+// VBO 外記憶體。目前所有 indexed raster case 依 reference uArch 分段，使用
 // direct-mapped post-transform cache 做真實 reuse；每個 index occurrence 都
 // 產生 VertexLaneRef，cache miss 才新增 USC（Unified Shading Cluster）lane。
 // resource/binding 與 lane bulk data 留在 MemoryPool；bounded FIFO

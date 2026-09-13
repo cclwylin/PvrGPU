@@ -47,7 +47,7 @@ void Reject(Mutation mutation, const char *reason) {
   std::string error;
   if (ValidateDriverUniformBuffers(command, &error) ||
       error.find(reason) == std::string::npos)
-    Fail(reason);
+    Fail((std::string(reason) + ": " + error).c_str());
 }
 }  // namespace
 
@@ -142,14 +142,17 @@ int main() {
   Reject([](auto &c) { c.vertex_shared[6] = 4; }, "not canonical");
   Reject([](auto &c) { c.vertex_shared[7] = 4; }, "not canonical");
   Reject([](auto &c) { c.vertex_shared[2] = 4; }, "not canonical");
-  Reject([](auto &c) { c.vertex_shared.pop_back(); }, "layout");
-  Reject([](auto &c) { c.fragment_pco_abi.uniform_buffer_descriptor_start = 20; }, "layout");
-  Reject([](auto &c) { c.fragment_pco_abi.push_constant_start = 40; }, "layout");
+  Reject([](auto &c) { c.vertex_shared.pop_back(); }, "descriptor range");
+  Reject([](auto &c) { c.fragment_pco_abi.uniform_buffer_descriptor_start = 20; },
+         "descriptor range");
+  Reject([](auto &c) { c.fragment_pco_abi.push_constant_start = 40; },
+         "descriptor range");
   Reject([](auto &c) { c.fragment_pco_abi.uniform_buffer_descriptor_count = UINT32_MAX; },
-         "range");
+         "descriptor range");
   Reject([](auto &c) { c.fragment_pco_abi.uniform_buffer_descriptor_start = UINT32_MAX; },
-         "layout");
-  Reject([](auto &c) { c.fragment_pco_abi.push_constant_count = UINT32_MAX; }, "layout");
+         "descriptor range");
+  Reject([](auto &c) { c.fragment_pco_abi.push_constant_count = UINT32_MAX; },
+         "descriptor range");
   const auto old_draw = Fixture();
   auto new_draw = old_draw;
   new_draw.uniform_buffers[0].bytes[0] = 77;

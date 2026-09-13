@@ -25,8 +25,8 @@ using namespace pvrgpu::stub;
 // sizes and the independently tested 256-quad residency cap, not run counters.
 static_assert(sizeof(TextureSampleRequest)==128);
 static_assert(sizeof(TextureSampleResponse)==40);
-static_assert(sizeof(PcoFragmentContinuation)==1448);
-static_assert(sizeof(PcoInstruction)==144);
+static_assert(sizeof(PcoFragmentContinuation)==1464);
+static_assert(sizeof(PcoInstruction)==152);
 unsigned checks = 0, batches = 0;
 void Check(bool value, const char *why) { ++checks; if (!value) throw std::runtime_error(why); }
 uint32_t Bits(float x) { uint32_t bits; std::memcpy(&bits,&x,4); return bits; }
@@ -220,7 +220,8 @@ struct Harness {
     PipelineState s; s.width=s.height=8; s.sequence=batches; s.memory_mode=memory.mode();
     s.functional_case=FunctionalCase::kDriverPcoTriangles; s.stage=PipelineStage::kFragmentIssued;
     s.fragment_program_summary=p.decoded.summary; s.fragment_pco_abi=p.abi;
-    s.fragment_position_count=4; s.fragment_varying_start=4;s.fragment_varying_count=12;
+    s.fragment_position_count=4;s.fragment_position_uses_w=1;
+    s.fragment_varying_start=4;s.fragment_varying_count=12;
     s.position_output_count=4;s.varying_output_start=4;s.varying_output_count=3;
     s.sampled_texture_count=kind==3?2:1;s.active_fragment_invocations=invocations.size();s.fragment_shader_lane_count=4;
     s.fragment_groups=1;s.counters.drawlists=1;

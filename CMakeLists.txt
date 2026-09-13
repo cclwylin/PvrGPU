@@ -442,6 +442,17 @@ target_include_directories(pco-iss-test PRIVATE
 pvrgpu_target_warnings(pco-iss-test)
 add_test(NAME pco-iss-unit COMMAND pco-iss-test)
 
+add_executable(pco-framebuffer-fetch-test
+    tests/pco_framebuffer_fetch_test.cpp
+    src/systemc/shader/pco_iss.cpp
+)
+target_include_directories(pco-framebuffer-fetch-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(pco-framebuffer-fetch-test)
+add_test(NAME pco-framebuffer-fetch-unit COMMAND pco-framebuffer-fetch-test)
+
 add_executable(pco-prepared-fragment-test
     tests/pco_prepared_fragment_test.cpp
     src/systemc/shader/pco_iss.cpp
@@ -708,6 +719,21 @@ target_include_directories(geometry-frontend-test PRIVATE
 target_link_libraries(geometry-frontend-test PRIVATE pvrgpu-systemc-bridge PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(geometry-frontend-test)
 add_test(NAME geometry-frontend-unit COMMAND geometry-frontend-test)
+
+add_executable(robust-vertex-fetch-test
+    tests/robust_vertex_fetch_test.cpp
+)
+target_include_directories(robust-vertex-fetch-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc")
+target_link_libraries(robust-vertex-fetch-test PRIVATE
+    pvrgpu-systemc-bridge PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(robust-vertex-fetch-test)
+foreach(robust_vertex_fetch_mode IN ITEMS direct indexed-negative indexed-wrap
+                                          reject-index-range)
+    add_test(NAME robust-vertex-fetch-${robust_vertex_fetch_mode}-unit
+        COMMAND robust-vertex-fetch-test ${robust_vertex_fetch_mode})
+endforeach()
 
 add_executable(point-restart-test tests/point_restart_test.cpp)
 target_include_directories(point-restart-test PRIVATE "${CMAKE_SOURCE_DIR}/src")
@@ -1460,6 +1486,22 @@ target_link_libraries(pbe-blend-test PRIVATE PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(pbe-blend-test)
 add_test(NAME pbe-blend-unit COMMAND pbe-blend-test)
 
+add_executable(framebuffer-fetch-commit-test
+    tests/framebuffer_fetch_commit_test.cpp
+    model_stub/memory_pool.cpp
+    model_stub/model_types.cpp
+    src/systemc/common/functional_types.cpp
+    src/systemc/common/pipeline_state.cpp
+)
+target_include_directories(framebuffer-fetch-commit-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+target_link_libraries(framebuffer-fetch-commit-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(framebuffer-fetch-commit-test)
+add_test(NAME framebuffer-fetch-commit-unit COMMAND framebuffer-fetch-commit-test)
+
 add_executable(pbe-packed-unorm-test
     tests/pbe_packed_unorm_test.cpp
     model_stub/memory_pool.cpp
@@ -1811,8 +1853,8 @@ add_test(
     COMMAND attribute-fetch-geometry-test invalid-stride
 )
 add_test(
-    NAME vertex-input-offset-fail-closed
-    COMMAND attribute-fetch-geometry-test invalid-offset
+    NAME vertex-input-offset-robust-unit
+    COMMAND attribute-fetch-geometry-test robust-offset
 )
 
 add_executable(varyings-shader-one-pipeline-test
@@ -2147,6 +2189,7 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME build-renderdoc-snapshot-test
         COMMAND "${CMAKE_COMMAND}" -E env
                 "PYTHONDONTWRITEBYTECODE=1"
+                "PVRGPU_SNAPSHOT_TEST_CXX=${CMAKE_CXX_COMPILER}"
                 "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/test_build_renderdoc_snapshot.py")
     add_test(NAME inspect-drawlist-snapshot-test
         COMMAND "${CMAKE_COMMAND}" -E env
@@ -2180,6 +2223,6 @@ if(Python3_Interpreter_FOUND)
     set_tests_properties(
         counter-protocol-tests
         PROPERTIES ENVIRONMENT
-            "PYTHONDONTWRITEBYTECODE=1;PYTHONPATH=${CMAKE_SOURCE_DIR}/tools"
+            "PYTHONDONTWRITEBYTECODE=1;PYTHONPATH=${CMAKE_SOURCE_DIR}/tools;CXX=${CMAKE_CXX_COMPILER};PVRGPU_SNAPSHOT_TEST_CXX=${CMAKE_CXX_COMPILER}"
     )
 endif()

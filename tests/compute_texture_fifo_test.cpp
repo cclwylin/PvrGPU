@@ -198,6 +198,135 @@ void Run(MemoryPool &pool, GpuMemorySystem &memory,
   Check(pool.allocations() == pool.releases() && pool.bytes_in_flight() == 0,
         "compute texture retained a pool payload");
 }
+
+void RunBuffer(MemoryPool &pool, GpuMemorySystem &memory,
+               sc_core::sc_fifo<ComputeDispatchTxn> &input,
+               sc_core::sc_fifo<ComputeDispatchTxn> &output,
+               unsigned epoch, unsigned sequence) {
+  constexpr unsigned kind = 304;
+  constexpr std::uint32_t row_elements = 8192;
+  constexpr std::uint32_t elements = 16385;
+  constexpr std::uint32_t rows = 3;
+  constexpr std::uint32_t texel_bytes = 16;
+  constexpr std::uint64_t texture_address = UINT64_C(0x3100000000);
+  constexpr std::uint64_t output_address = UINT64_C(0x1000000000000);
+  const auto abi = ComputeTexturePcoAbi(kind);
+  const auto &binary = ComputeTexturePcoFixture(kind);
+  const auto decoded = DecodeComputePcoProgram(binary);
+  ValidateComputeProgram(decoded, abi);
+  Check(std::count_if(decoded.instructions.begin(), decoded.instructions.end(),
+      [](const auto &i) { return i.opcode == PcoOpcode::kTextureSample; }) == 1,
+      "samplerBuffer fixture did not encode one native SMP");
+
+  std::vector<std::uint8_t> bytes(
+      static_cast<std::size_t>(row_elements) * rows * texel_bytes, UINT8_C(0xa5));
+  const std::array<std::uint32_t, 4> indices{{0, 8192, 16384, 24576}};
+  std::array<std::array<float, 4>, 4> fetched{};
+  for (unsigned lane = 0; lane < 3; ++lane) {
+    for (unsigned component = 0; component < 4; ++component)
+      fetched[lane][component] =
+          static_cast<float>(100U * epoch + 10U * lane + component) + 0.25F;
+    std::memcpy(bytes.data() +
+                    static_cast<std::size_t>(indices[lane]) * texel_bytes,
+                fetched[lane].data(), texel_bytes);
+  }
+  memory.HostWrite(texture_address, bytes.data(), bytes.size());
+  const std::array<std::uint32_t, 16> poison{};
+  memory.HostWrite(output_address, poison.data(), sizeof(poison));
+
+  std::vector<std::uint32_t> shared(abi.stage.shareds, 0);
+  const auto set64 = [&](unsigned offset, std::uint64_t value) {
+    shared[offset] = static_cast<std::uint32_t>(value);
+    shared[offset + 1] = static_cast<std::uint32_t>(value >> 32U);
+  };
+  set64(0, UINT64_C(4) | (UINT64_C(3) << 5U) |
+               (UINT64_C(2) << 8U) | (UINT64_C(1) << 11U) |
+               (UINT64_C(61) << 27U) |
+               (static_cast<std::uint64_t>(row_elements - 1U) << 34U) |
+               (static_cast<std::uint64_t>(rows - 1U) << 48U));
+  set64(2, static_cast<std::uint64_t>(row_elements - 1U) |
+               (UINT64_C(1) << 60U) |
+               ((texture_address >> 2U) << 16U));
+  shared[4] = bytes.size();
+  shared[5] = elements;
+  const std::uint64_t sampler_word =
+      UINT64_C(4095) | (UINT64_C(2) << 33U) |
+      (UINT64_C(2) << 41U) | (UINT64_C(2) << 56U);
+  set64(8, sampler_word);
+  set64(16, sampler_word | (UINT64_C(1) << 36U) |
+                    (UINT64_C(1) << 38U));
+  set64(20, output_address);
+  shared[22] = sizeof(poison);
+
+  TextureResource resource;
+  resource.gpu_address = texture_address;
+  resource.byte_size = bytes.size();
+  resource.mip_count = 1;
+  resource.format = TextureFormat::kRgba32Float;
+  resource.dimension_type = TextureDimensionType::kBuffer;
+  resource.layer_count = 1;
+  resource.buffer_elements = elements;
+  resource.mip[0] = {row_elements, rows, row_elements * texel_bytes, 0};
+  SamplerState sampler;
+  sampler.wrap_u = sampler.wrap_v = TextureWrapMode::kClampToEdge;
+
+  PipelineState texture;
+  texture.memory_mode = memory.mode();
+  texture.compute_pco_abi = abi.stage;
+  texture.compute_sampled_texture_count = 1;
+  texture.compute_shared_registers = StoreNewArray(pool, shared);
+  texture.compute_texture_resources =
+      StoreNewArray(pool, std::vector<TextureResource>{resource});
+  texture.compute_sampler_states =
+      StoreNewArray(pool, std::vector<SamplerState>{sampler});
+  ComputeDispatchState dispatch;
+  dispatch.abi = abi;
+  dispatch.grid = {1, 1, 1};
+  dispatch.sequence = sequence;
+  dispatch.code = StoreNewArray(pool, binary);
+  dispatch.shared_registers = texture.compute_shared_registers;
+  dispatch.texture_state = Store(pool, texture);
+  dispatch.buffer_ranges = StoreNewArray(pool, std::vector<ComputeBufferRange>{
+      {output_address, sizeof(poison), kComputeAccessWrite, 0, 1}});
+  const auto handle = Store(pool, dispatch);
+  Check(input.nb_write({handle, sequence}),
+        "samplerBuffer dispatch FIFO was not empty");
+  ComputeDispatchTxn done;
+  bool received = false;
+  while (!(received = output.nb_read(done)) && sc_core::sc_pending_activity())
+    sc_core::sc_start(sc_core::sc_time_to_pending_activity());
+  Check(received && done.sequence == sequence,
+        "samplerBuffer compute dispatch failed to complete");
+  const auto final = Load<ComputeDispatchState>(pool, handle);
+  if (final.failed)
+    throw std::runtime_error(final.error.data());
+  Check(final.stats.invocations == 4,
+        "samplerBuffer compute invocation count mismatch");
+  const auto complete_texture = LoadPipelineState(pool, dispatch.texture_state);
+  Check(complete_texture.compute_texture_request_count == 4 &&
+            complete_texture.compute_texel_fetch_count == 3,
+        "samplerBuffer request/OOB fetch counters mismatch");
+
+  const auto readback = memory.Readback(output_address, sizeof(poison),
+                                        MemoryClient::kComputeReadback);
+  std::array<float, 16> actual{};
+  std::memcpy(actual.data(), readback.data.data(), sizeof(actual));
+  for (unsigned lane = 0; lane < 4; ++lane) {
+    for (unsigned component = 0; component < 4; ++component) {
+      const float expected = fetched[lane][component] +
+                             static_cast<float>(elements);
+      Check(std::fabs(actual[4U * lane + component] - expected) < 0.000001F,
+            "samplerBuffer textureSize/row split/OOB result mismatch");
+    }
+  }
+  for (const auto h : {dispatch.code, dispatch.shared_registers,
+                       dispatch.buffer_ranges, dispatch.texture_state,
+                       texture.compute_texture_resources,
+                       texture.compute_sampler_states, handle})
+    pool.Release(h);
+  Check(pool.allocations() == pool.releases() && pool.bytes_in_flight() == 0,
+        "samplerBuffer compute retained a pool payload");
+}
 } // namespace
 
 int sc_main(int argc, char **argv) {
@@ -226,6 +355,8 @@ int sc_main(int argc, char **argv) {
       for (unsigned shape = 0; shape < 4; ++shape)
         for (unsigned format = 0; format < 4; ++format)
           Run(pool,memory,input,done,shape,format,epoch,++sequence);
+    for (unsigned epoch = 0; epoch < 2; ++epoch)
+      RunBuffer(pool, memory, input, done, epoch, ++sequence);
     Check(samples.num_available() == 0 && sampled.num_available() == 0,
           "compute texture FIFO did not drain");
     std::cout << "compute texture native FIFO: PASS " << checks << " checks\n";

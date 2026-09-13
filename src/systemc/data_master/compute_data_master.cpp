@@ -43,11 +43,15 @@ bool SameHandle(PoolHandle a, PoolHandle b) {
   return a.slot == b.slot && a.generation == b.generation;
 }
 
-void ValidateMemoryAccess(const ComputeMemoryTxn &txn,
-                          const std::vector<ComputeBufferRange> &ranges) {
+struct ValidatedMemoryAccess {
+  std::size_t valid_bytes = 0;
+};
+
+ValidatedMemoryAccess ValidateMemoryAccess(
+    const ComputeMemoryTxn &txn,
+    const std::vector<ComputeBufferRange> &ranges) {
   if (txn.bytes == 0 || txn.bytes > 16U * sizeof(std::uint32_t) ||
-      txn.bytes % sizeof(std::uint32_t) != 0 || txn.address % 4U != 0 ||
-      txn.address > std::numeric_limits<std::uint64_t>::max() - txn.bytes)
+      txn.bytes % sizeof(std::uint32_t) != 0 || txn.address % 4U != 0)
     throw std::runtime_error("compute memory access has invalid size/alignment");
   std::uint32_t required = 0;
   if (txn.operation == ComputeMemoryOperation::kRead)
@@ -63,14 +67,30 @@ void ValidateMemoryAccess(const ComputeMemoryTxn &txn,
   }
   else
     throw std::runtime_error("compute memory operation is unsupported");
+  bool starts_in_a_view = false;
+  std::uint64_t maximum_remaining = 0;
   for (const auto &range : ranges) {
-    if ((range.access & required) != required || txn.address < range.gpu_address)
+    if (txn.address < range.gpu_address)
       continue;
     const std::uint64_t offset = txn.address - range.gpu_address;
-    if (offset <= range.bytes && txn.bytes <= range.bytes - offset)
-      return;
+    if (offset >= range.bytes)
+      continue;
+    starts_in_a_view = true;
+    if ((range.access & required) == required)
+      maximum_remaining = std::max(maximum_remaining, range.bytes - offset);
   }
-  throw std::runtime_error("compute memory access is outside permitted views");
+  // A request against a bound view with the wrong access mask is a malformed
+  // shader/ABI contract, not dynamic OOB.  Keep rejecting it (including an
+  // atomic whose read/write permissions are split across aliases).
+  if (maximum_remaining == 0 && starts_in_a_view)
+    throw std::runtime_error("compute memory access is not permitted by its bound view");
+
+  // Dynamic addresses outside every view are robust: reads are zero-filled,
+  // stores are discarded and atomics return zero.  A vector beginning inside
+  // a view retains its in-range DWORD prefix and suppresses only the tail.
+  const std::uint64_t aligned_remaining = maximum_remaining & ~UINT64_C(3);
+  return {static_cast<std::size_t>(
+      std::min<std::uint64_t>(txn.bytes, aligned_remaining))};
 }
 
 std::uint32_t AtomicValue(ComputeMemoryOperation operation, std::uint32_t old,
@@ -207,26 +227,38 @@ void ComputeDataMaster::MemoryRun() {
         if (state.abi.shared_memory_bytes)
           ranges.push_back({kComputeSharedAddress, state.abi.shared_memory_bytes,
                             kComputeAccessRead | kComputeAccessWrite, 0, 2});
-        ValidateMemoryAccess(request, ranges);
+        const auto access = ValidateMemoryAccess(request, ranges);
         if (request.operation == ComputeMemoryOperation::kRead) {
           if (HasPoolHandle(request.payload))
             throw std::runtime_error("compute read request unexpectedly owns bytes");
-          const auto read = memory_.Read(request.address, request.bytes,
-                                          MemoryClient::kComputeShader);
-          stats = read.stats;
-          response.payload = StoreNewArray(pool_, read.data);
+          std::vector<std::uint8_t> result(request.bytes, 0);
+          if (access.valid_bytes != 0) {
+            const auto read = memory_.Read(request.address, access.valid_bytes,
+                                            MemoryClient::kComputeShader);
+            if (read.data.size() != access.valid_bytes)
+              throw std::runtime_error("compute read returned incomplete data");
+            std::copy(read.data.begin(), read.data.end(), result.begin());
+            stats = read.stats;
+          }
+          response.payload = StoreNewArray(pool_, result);
         } else if (request.operation == ComputeMemoryOperation::kWrite) {
           const auto &bytes = pool_.Read(request.payload);
           if (bytes.size() != request.bytes)
             throw std::runtime_error("compute store payload size mismatch");
-          stats = memory_.Write(request.address, bytes.data(), bytes.size(),
-                                 MemoryClient::kComputeShader);
+          if (access.valid_bytes != 0)
+            stats = memory_.Write(request.address, bytes.data(),
+                                  access.valid_bytes,
+                                  MemoryClient::kComputeShader);
         } else {
           const auto &operand_bytes = pool_.Read(request.payload);
           if (operand_bytes.size() != sizeof(std::uint32_t))
             throw std::runtime_error("compute atomic operand payload size mismatch");
           std::uint32_t operand = 0;
           std::memcpy(&operand, operand_bytes.data(), sizeof(operand));
+          if (access.valid_bytes == 0) {
+            response.payload =
+                StoreNewArray(pool_, std::vector<std::uint32_t>{0});
+          } else {
           // This service thread owns the whole RMW. Neither memory operation
           // yields; FIFO requests and other SystemC processes cannot interleave
           // between this read and write. Both are real modeled memory accesses.
@@ -239,6 +271,7 @@ void ComputeDataMaster::MemoryRun() {
           stats += memory_.Write(request.address, &value, sizeof(value),
                                    MemoryClient::kComputeShader);
           response.payload = StoreNewArray(pool_, std::vector<std::uint32_t>{old});
+          }
         }
       }
     } catch (const std::exception &error) {

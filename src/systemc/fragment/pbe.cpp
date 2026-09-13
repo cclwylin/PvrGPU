@@ -9,6 +9,8 @@
 #include "common/functional_types.h"
 #include "common/color_attachment_formats.h"
 #include "common/msaa.h"
+#include "fragment/pbe_color_commit.h"
+#include "fragment/pbe_depth_stencil_commit.h"
 
 #include <algorithm>
 #include <array>
@@ -18,302 +20,6 @@
 #include <limits>
 #include <stdexcept>
 #include <vector>
-
-namespace {
-
-float BitsFloat(std::uint32_t bits) {
-  float value = 0.0f;
-  static_assert(sizeof(value) == sizeof(bits));
-  std::memcpy(&value, &bits, sizeof(value));
-  return value;
-}
-
-template <typename T>
-bool LateDepthPass(pvrgpu::stub::DepthCompareOp operation, T incoming, T stored) {
-  using pvrgpu::stub::DepthCompareOp;
-  switch (operation) {
-  case DepthCompareOp::kNever: return false;
-  case DepthCompareOp::kLess: return incoming < stored;
-  case DepthCompareOp::kEqual: return incoming == stored;
-  case DepthCompareOp::kLessOrEqual: return incoming <= stored;
-  case DepthCompareOp::kGreater: return incoming > stored;
-  case DepthCompareOp::kNotEqual: return incoming != stored;
-  case DepthCompareOp::kGreaterOrEqual: return incoming >= stored;
-  case DepthCompareOp::kAlways: return true;
-  }
-  throw std::runtime_error("PBE late depth comparison is invalid");
-}
-
-bool TestLateDepthStencil(pvrgpu::stub::PipelineState &state,
-                          const pvrgpu::stub::FragmentInvocation &invocation,
-                          float shader_depth, std::size_t sample_index,
-                          std::vector<std::uint32_t> &depth,
-                          std::vector<std::uint8_t> &stencil) {
-  using namespace pvrgpu::stub;
-  const StencilState &stencil_state = state.raster_state.stencil;
-  const StencilFaceState &face = invocation.front_facing
-      ? stencil_state.front : stencil_state.back;
-  bool stencil_passes = true;
-  if (stencil_state.test_enable && !stencil.empty()) {
-    ++state.counters.stencil_tested_fragments;
-    const auto mask = static_cast<std::uint8_t>(face.value_mask);
-    stencil_passes = StencilPass(face.compare_op,
-        static_cast<std::uint8_t>(face.reference & mask),
-        static_cast<std::uint8_t>(stencil[sample_index] & mask));
-    if (!stencil_passes)
-      ++state.counters.stencil_rejected_fragments;
-  }
-  bool passes = stencil_passes;
-  std::uint32_t encoded = 0;
-  if (stencil_passes && state.raster_state.depth.test_enable) {
-    ++state.counters.depth_tested_fragments;
-    // GLES restricts the shader's final depth to [0,1] before native-format
-    // conversion, as llvmpipe's late-Z lp_build_depth_clamp path does.
-    if (std::isnan(shader_depth))
-      throw std::runtime_error("PBE shader depth is NaN");
-    shader_depth = std::clamp(shader_depth, 0.0F, 1.0F);
-    if (state.depth_attachment_format == 0) {
-      std::memcpy(&encoded, &shader_depth, sizeof(encoded));
-      passes = LateDepthPass(state.raster_state.depth.compare_op,
-                             shader_depth, BitsFloat(depth[sample_index]));
-    } else {
-      encoded = EncodeDepthAttachmentUnorm(shader_depth, state.depth_attachment_format);
-      passes = LateDepthPass(state.raster_state.depth.compare_op,
-                             encoded, depth[sample_index]);
-    }
-    if (!passes)
-      ++state.counters.depth_rejected_fragments;
-  }
-  if (stencil_state.test_enable && !stencil.empty()) {
-    const StencilOp operation = !stencil_passes ? face.fail_op
-        : passes ? face.pass_op : face.depth_fail_op;
-    const auto write_mask = static_cast<std::uint8_t>(face.write_mask);
-    const std::uint8_t old = stencil[sample_index];
-    const std::uint8_t updated = ApplyStencilOp(
-        operation, old, static_cast<std::uint8_t>(face.reference));
-    stencil[sample_index] = static_cast<std::uint8_t>(
-        (old & ~write_mask) | (updated & write_mask));
-    if (stencil[sample_index] != old)
-      ++state.counters.stencil_written_fragments;
-  }
-  if (passes && state.raster_state.depth.test_enable &&
-      state.raster_state.depth.write_enable) {
-    depth[sample_index] = encoded;
-    ++state.counters.depth_written_fragments;
-  }
-  return passes;
-}
-
-float ClampShaderUnorm(float value) {
-  // GLES 3.1 section 2.3.4.2 clamps floating-point colors before UNORM
-  // conversion. Mesa util/u_math.h float_to_ubyte also maps NaN to zero.
-  // This is a fixed-function conversion policy, not an ISS value rewrite:
-  // +Inf saturates to one, -Inf to zero, and finite arithmetic is unchanged.
-  return std::isnan(value) ? 0.0F : std::clamp(value, 0.0F, 1.0F);
-}
-
-std::uint8_t FloatValueToUnorm8(float value) {
-  const float clamped = ClampShaderUnorm(value);
-  const float scaled = clamped * 255.0F;
-  // The Gallivm/Mesa RGBA8 store path uses the UNORM conversion
-  // floor(value * 255 + 0.5), including exact half-way values.  This is not
-  // IEEE round-to-nearest-even: for example the real Shadow PIXOUT value
-  // 0.3f scales to exactly 76.5f and must serialize as 77, not 76.
-  const std::uint32_t rounded =
-      static_cast<std::uint32_t>(std::floor(scaled + 0.5F));
-  return static_cast<std::uint8_t>(std::min<std::uint32_t>(rounded, 255U));
-}
-
-std::uint8_t FloatBitsToUnorm8(std::uint32_t raw_bits) {
-  return FloatValueToUnorm8(BitsFloat(raw_bits));
-}
-
-std::uint8_t FiniteStateToUnorm8(float value) {
-  // Clear/blend-constant state retains its existing validation contract;
-  // accepting nonfinite shader results must not relax command metadata.
-  if (!std::isfinite(value))
-    throw std::runtime_error("PBE cannot convert non-finite UNORM state");
-  return FloatValueToUnorm8(value);
-}
-
-std::uint8_t FactorToUnorm8(pvrgpu::stub::BlendFactor factor,
-                            const std::array<std::uint8_t, 4> &source,
-                            const std::array<std::uint8_t, 4> &destination,
-                            const std::array<std::uint8_t, 4> &constant,
-                            std::size_t component) {
-  using pvrgpu::stub::BlendFactor;
-  switch (factor) {
-  case BlendFactor::kZero:
-    return 0;
-  case BlendFactor::kOne:
-    return 255;
-  case BlendFactor::kSourceAlpha:
-    return source[3];
-  case BlendFactor::kOneMinusSourceAlpha:
-    return static_cast<std::uint8_t>(255U - source[3]);
-  case BlendFactor::kSourceColor:
-    return source[component];
-  case BlendFactor::kOneMinusSourceColor:
-    return static_cast<std::uint8_t>(255U - source[component]);
-  case BlendFactor::kDestinationColor:
-    return destination[component];
-  case BlendFactor::kOneMinusDestinationColor:
-    return static_cast<std::uint8_t>(255U - destination[component]);
-  case BlendFactor::kDestinationAlpha:
-    return destination[3];
-  case BlendFactor::kOneMinusDestinationAlpha:
-    return static_cast<std::uint8_t>(255U - destination[3]);
-  case BlendFactor::kSourceAlphaSaturate:
-    // GLES: f = min(As, 1 - Ad) for the colour components, exactly 1 for the
-    // alpha component.
-    return component == 3
-               ? static_cast<std::uint8_t>(255U)
-               : std::min<std::uint8_t>(
-                     source[3],
-                     static_cast<std::uint8_t>(255U - destination[3]));
-  case BlendFactor::kConstantColor:
-    return constant[component];
-  case BlendFactor::kOneMinusConstantColor:
-    return static_cast<std::uint8_t>(255U - constant[component]);
-  case BlendFactor::kConstantAlpha:
-    return constant[3];
-  case BlendFactor::kOneMinusConstantAlpha:
-    return static_cast<std::uint8_t>(255U - constant[3]);
-  }
-  throw std::runtime_error("PBE received an unsupported blend factor");
-}
-
-std::uint8_t BlendEquationUnorm8(pvrgpu::stub::BlendEquation equation,
-                                 std::uint8_t source, std::uint8_t destination,
-                                 std::uint8_t source_factor,
-                                 std::uint8_t destination_factor) {
-  using pvrgpu::stub::BlendEquation;
-  if (equation == BlendEquation::kMin) {
-    return std::min(source, destination);
-  }
-  if (equation == BlendEquation::kMax) {
-    return std::max(source, destination);
-  }
-
-  const std::int32_t term1 = static_cast<std::int32_t>(source) * source_factor;
-  const std::int32_t term2 = static_cast<std::int32_t>(destination) * destination_factor;
-  std::int32_t result = 0;
-
-  if (equation == BlendEquation::kAdd) {
-    result = (term1 + term2 + 127) / 255;
-  } else if (equation == BlendEquation::kSubtract) {
-    result = (term1 - term2 + 127) / 255;
-  } else if (equation == BlendEquation::kReverseSubtract) {
-    result = (term2 - term1 + 127) / 255;
-  } else {
-    throw std::runtime_error("PBE received an unsupported blend equation in calculation");
-  }
-
-  return static_cast<std::uint8_t>(std::clamp(result, 0, 255));
-}
-
-// The linear-domain blend factor, for an sRGB attachment whose blending GLES
-// performs in linear space.  The values are already linear: colour channels
-// decoded from the stored sRGB destination and taken straight from the shader's
-// linear source, alpha and the (linear) blend constant unchanged.
-float FactorToFloat(pvrgpu::stub::BlendFactor factor,
-                    const std::array<float, 4> &source,
-                    const std::array<float, 4> &destination,
-                    const std::array<float, 4> &constant,
-                    std::size_t component) {
-  using pvrgpu::stub::BlendFactor;
-  switch (factor) {
-  case BlendFactor::kZero:
-    return 0.0F;
-  case BlendFactor::kOne:
-    return 1.0F;
-  case BlendFactor::kSourceAlpha:
-    return source[3];
-  case BlendFactor::kOneMinusSourceAlpha:
-    return 1.0F - source[3];
-  case BlendFactor::kSourceColor:
-    return source[component];
-  case BlendFactor::kOneMinusSourceColor:
-    return 1.0F - source[component];
-  case BlendFactor::kDestinationColor:
-    return destination[component];
-  case BlendFactor::kOneMinusDestinationColor:
-    return 1.0F - destination[component];
-  case BlendFactor::kDestinationAlpha:
-    return destination[3];
-  case BlendFactor::kOneMinusDestinationAlpha:
-    return 1.0F - destination[3];
-  case BlendFactor::kSourceAlphaSaturate:
-    return component == 3 ? 1.0F
-                          : std::min(source[3], 1.0F - destination[3]);
-  case BlendFactor::kConstantColor:
-    return constant[component];
-  case BlendFactor::kOneMinusConstantColor:
-    return 1.0F - constant[component];
-  case BlendFactor::kConstantAlpha:
-    return constant[3];
-  case BlendFactor::kOneMinusConstantAlpha:
-    return 1.0F - constant[3];
-  }
-  throw std::runtime_error("PBE received an unsupported blend factor");
-}
-
-float BlendEquationFloat(pvrgpu::stub::BlendEquation equation, float source,
-                         float destination, float source_factor,
-                         float destination_factor) {
-  using pvrgpu::stub::BlendEquation;
-  if (equation == BlendEquation::kMin)
-    return std::min(source, destination);
-  if (equation == BlendEquation::kMax)
-    return std::max(source, destination);
-  const float term1 = source * source_factor;
-  const float term2 = destination * destination_factor;
-  float result = 0.0F;
-  if (equation == BlendEquation::kAdd)
-    result = term1 + term2;
-  else if (equation == BlendEquation::kSubtract)
-    result = term1 - term2;
-  else if (equation == BlendEquation::kReverseSubtract)
-    result = term2 - term1;
-  else
-    throw std::runtime_error("PBE received an unsupported blend equation in calculation");
-  // Floating-point attachments retain values outside [0,1].  A normalized
-  // attachment performs its clamp when the result is encoded for storage.
-  return result;
-}
-
-void ValidateBlendState(const pvrgpu::stub::BlendState &blend) {
-  using pvrgpu::stub::BlendEquation;
-  if (!blend.enable)
-    return;
-  if (blend.rgb_equation != BlendEquation::kAdd &&
-      blend.rgb_equation != BlendEquation::kSubtract &&
-      blend.rgb_equation != BlendEquation::kReverseSubtract &&
-      blend.rgb_equation != BlendEquation::kMin &&
-      blend.rgb_equation != BlendEquation::kMax) {
-    throw std::runtime_error("PBE received an unsupported RGB blend equation");
-  }
-  if (blend.alpha_equation != BlendEquation::kAdd &&
-      blend.alpha_equation != BlendEquation::kSubtract &&
-      blend.alpha_equation != BlendEquation::kReverseSubtract &&
-      blend.alpha_equation != BlendEquation::kMin &&
-      blend.alpha_equation != BlendEquation::kMax) {
-    throw std::runtime_error("PBE received an unsupported alpha blend equation");
-  }
-  const std::array<pvrgpu::stub::BlendFactor, 4> factors = {
-      blend.source_rgb_factor,
-      blend.destination_rgb_factor,
-      blend.source_alpha_factor,
-      blend.destination_alpha_factor,
-  };
-  const std::array<std::uint8_t, 4> dummy_source{};
-  const std::array<std::uint8_t, 4> dummy_dest{};
-  const std::array<std::uint8_t, 4> dummy_constant{};
-  for (const pvrgpu::stub::BlendFactor factor : factors)
-    (void)FactorToUnorm8(factor, dummy_source, dummy_dest, dummy_constant, 0);
-}
-
-} // namespace
 
 namespace pvrgpu::stub {
 
@@ -332,7 +38,15 @@ void Pbe::Run() {
         !HasPoolHandle(state.fragment_invocations)) {
       throw std::runtime_error("PBE received no supported fragment results");
     }
-    ValidateBlendState(state.raster_state.blend);
+    ValidatePbeBlendState(state.raster_state.blend);
+    if (state.raster_state.render_target_state_count > kMaxRenderTargets)
+      throw std::runtime_error("PBE render-target state count is invalid");
+    for (std::size_t target = 0;
+         target < state.raster_state.render_target_state_count; ++target) {
+      ValidatePbeBlendState(state.raster_state.target_blend[target]);
+      if (state.raster_state.target_color_mask[target] > 0x0f)
+        throw std::runtime_error("PBE render-target color mask is invalid");
+    }
 
     const std::uint64_t pixel_count =
         static_cast<std::uint64_t>(state.width) * state.height * state.attachment_layers;
@@ -343,6 +57,9 @@ void Pbe::Run() {
     const std::size_t stored_samples =
         static_cast<std::size_t>(pixel_count) * sample_count;
     const std::uint32_t render_target_count = ValidateColorAttachmentFormats(state);
+    if (state.raster_state.render_target_state_count != 0 &&
+        state.raster_state.render_target_state_count != render_target_count)
+      throw std::runtime_error("PBE render-target state/attachment count mismatch");
     std::array<std::size_t, kMaxRenderTargets> target_bytes{};
     std::array<std::size_t, kMaxRenderTargets + 1> target_offsets{};
     for (std::uint32_t target = 0; target < render_target_count; ++target) {
@@ -392,6 +109,7 @@ void Pbe::Run() {
       const auto packed_format = ColorAttachmentPackedUnorm(state, target);
       const auto raw_dwords = ColorAttachmentRawDwords(state, target);
       const bool float32 = ColorAttachmentFloat32(state, target) != 0;
+      const auto &codec = ColorAttachmentCodecForTarget(state, target);
       const auto bytes_per_pixel = ColorAttachmentBytesPerPixel(state, target);
       std::vector<std::uint8_t> &attachment = framebuffers[target];
       if (state.color_attachment_load_enable != 0) {
@@ -400,7 +118,14 @@ void Pbe::Run() {
         continue;
       }
       attachment.assign(target_bytes[target], 0);
-      if (packed_format != PackedUnormFormat::kNone) {
+      if (ColorAttachmentCodecIsCanonical(codec)) {
+        std::array<float, 4> clear{};
+        std::copy_n(state.raster_state.clear_color, 4, clear.begin());
+        PbeWriteCanonicalColor(codec, attachment.data(), clear);
+        for (std::size_t pixel = 1; pixel < stored_samples; ++pixel)
+          std::memcpy(attachment.data() + pixel * bytes_per_pixel,
+                      attachment.data(), bytes_per_pixel);
+      } else if (packed_format != PackedUnormFormat::kNone) {
         std::array<float, 4> clear{};
         std::copy_n(state.raster_state.clear_color, 4, clear.begin());
         const std::uint32_t word =
@@ -420,6 +145,9 @@ void Pbe::Run() {
         for (std::size_t channel = 0; channel < channels; ++channel) {
           std::memcpy(&raw[channel], &state.raster_state.clear_color[channel],
                       sizeof(raw[channel]));
+          if (ColorAttachmentCodecIsInteger(codec))
+            raw[channel] =
+                PbeCanonicalIntegerComponent(codec, channel, raw[channel]);
         }
         for (std::size_t pixel = 0; pixel < stored_samples; ++pixel) {
           std::memcpy(attachment.data() + pixel * bytes_per_pixel, raw.data(),
@@ -429,7 +157,8 @@ void Pbe::Run() {
         for (std::size_t pixel = 0; pixel < stored_samples; ++pixel) {
           for (std::size_t component = 0; component < 4; ++component) {
             attachment[pixel * bytes_per_pixel + component] =
-                FiniteStateToUnorm8(state.raster_state.clear_color[component]);
+                PbeFiniteStateToUnorm8(
+                    state.raster_state.clear_color[component]);
           }
         }
       }
@@ -517,233 +246,54 @@ void Pbe::Run() {
       if (state.raster_state.alpha_to_coverage &&
           (state.fragment_output_mask[0] & output.written_mask[0] & 8U) != 0) {
         coverage &= RasterAlphaCoverageMask(
-            sample_count, BitsFloat(output.pixel_output[3]), output.x, output.y,
+            sample_count, PbeFloatFromBits(output.pixel_output[3]), output.x,
+            output.y,
             state.raster_state.alpha_to_coverage_dither != 0,
             state.raster_state.multisample_enable != 0);
       }
-      if (state.raster_state.alpha_to_one) {
-        for (std::uint32_t target = 0; target < render_target_count; ++target)
-          if ((state.fragment_output_mask[target] & output.written_mask[target] &
-               8U) != 0)
-            output.pixel_output[target * 4 + 3] = UINT32_C(0x3f800000);
-      }
       for (std::uint32_t sample = 0; sample < sample_count; ++sample) {
-      if ((coverage & (1U << sample)) == 0)
-        continue;
-      const std::size_t stored_index = pixel_index * sample_count + sample;
-      if (late_depth_stencil) {
-        ++late_tested_samples;
-        const float incoming_depth = state.raster_state.shader_writes_depth
-            ? output.depth : invocation.sample_depth[sample];
-        if (!TestLateDepthStencil(state, invocation, incoming_depth, stored_index,
-                                  late_depth, late_stencil))
+        if ((coverage & (1U << sample)) == 0)
           continue;
-      }
-      if (written_map[stored_index] != 0) {
-        if (!state.raster_state.blend.enable && !late_depth_stencil &&
-            !state.raster_state.shader_writes_memory &&
-            !state.raster_state.shader_may_discard && state.fragment_early_hsr_safe)
-          throw std::runtime_error("PBE attempted to shade one opaque owner twice");
-        if (output.submit_ordinal < last_submit_ordinal[stored_index])
-          throw std::runtime_error("PBE blended fragments lost API order");
-      }
-      ++written_map[stored_index];
-      last_submit_ordinal[stored_index] = output.submit_ordinal;
-      for (std::uint32_t target = 0; target < render_target_count; ++target) {
-      // A native FS may genuinely have no output for this attachment.
-      // Preserve its pixels; no default color export or blend is fabricated.
-      if (explicit_output_masks && state.fragment_output_mask[target] == 0)
-        continue;
-      const auto packed_format = ColorAttachmentPackedUnorm(state, target);
-      const bool packed_unorm = packed_format != PackedUnormFormat::kNone;
-      const auto raw_dwords = ColorAttachmentRawDwords(state, target);
-      const bool float32 = ColorAttachmentFloat32(state, target) != 0;
-      const bool srgb = ColorAttachmentSrgb(state, target) != 0;
-      const auto bytes_per_pixel = ColorAttachmentBytesPerPixel(state, target);
-      const std::size_t byte_offset = stored_index * bytes_per_pixel;
-      std::vector<std::uint8_t> &framebuffer = framebuffers[target];
-      if (float32 || packed_unorm) {
-        std::array<float, 4> source{};
-        std::array<float, 4> destination{};
-        std::memcpy(source.data(), &output.pixel_output[target * 4],
-                    sizeof(source));
-        std::uint32_t packed_destination = 0;
-        if (packed_unorm) {
-          for (float &component : source)
-            component = ClampShaderUnorm(component);
-          std::memcpy(&packed_destination, framebuffer.data() + byte_offset, 4);
-          destination = UnpackUnormColor(packed_destination, packed_format);
-        } else {
-          std::memcpy(destination.data(), framebuffer.data() + byte_offset,
-                      sizeof(destination));
-        }
-        std::array<float, 4> result = source;
-        if (state.raster_state.blend.enable) {
-          const BlendState &blend = state.raster_state.blend;
-          std::array<float, 4> constant{};
-          for (std::size_t component = 0; component < 4; ++component)
-            constant[component] = std::clamp(
-                BitsFloat(blend.constant_color_bits[component]), 0.0F, 1.0F);
-          for (std::size_t component = 0; component < 4; ++component) {
-            const BlendFactor source_factor = component == 3
-                ? blend.source_alpha_factor : blend.source_rgb_factor;
-            const BlendFactor destination_factor = component == 3
-                ? blend.destination_alpha_factor : blend.destination_rgb_factor;
-            const BlendEquation equation = component == 3
-                ? blend.alpha_equation : blend.rgb_equation;
-            result[component] = BlendEquationFloat(
-                equation, source[component], destination[component],
-                FactorToFloat(source_factor, source, destination, constant,
-                              component),
-                FactorToFloat(destination_factor, source, destination, constant,
-                              component));
-          }
-        }
-        if (packed_unorm) {
-          // Quantize after every fragment, before any later destination LOAD.
-          // Masked channels retain their original packed bits, not a recode.
-          const std::uint32_t word = PackUnormColor(result,
-              packed_format, packed_destination,
-              state.raster_state.color_mask);
-          std::memcpy(framebuffer.data() + byte_offset, &word, sizeof(word));
-          continue;
-        }
-        for (std::size_t component = 0; component < 4; ++component) {
-          if ((state.raster_state.color_mask & (1U << component)) != 0) {
-            std::memcpy(framebuffer.data() + byte_offset + component * 4U,
-                        &result[component], sizeof(float));
-          }
-        }
-        continue;
-      }
-      if (raw_dwords != 0) {
-        /*
-         * A 32-bit integer attachment stores the shader's PIXOUT lanes
-         * verbatim, one dword per channel it holds.  UNORM8 conversion would
-         * quantise a value that was never a colour, and GLES forbids blending
-         * on an integer format, so this path writes and returns.
-         */
-        const std::size_t channels = raw_dwords;
-        for (std::size_t channel = 0; channel < channels; ++channel) {
-          if ((state.raster_state.color_mask & (1U << channel)) == 0)
+        const std::size_t stored_index = pixel_index * sample_count + sample;
+        if (late_depth_stencil) {
+          ++late_tested_samples;
+          const float incoming_depth = state.raster_state.shader_writes_depth
+                                           ? output.depth
+                                           : invocation.sample_depth[sample];
+          if (!CommitPbeLateDepthStencil(
+                  state, invocation, incoming_depth, stored_index, late_depth,
+                  late_stencil, &state.counters))
             continue;
-          const std::uint32_t raw = output.pixel_output[target * 4 + channel];
-          std::memcpy(framebuffer.data() + byte_offset +
-                          channel * sizeof(raw),
-                      &raw, sizeof(raw));
         }
-        continue;
-      }
-      if (srgb) {
-        /*
-         * GLES blends an sRGB colour buffer in linear space with no toggle.
-         * The shader source is already linear; decode the stored sRGB
-         * destination to linear, blend (or pass the source through) there, and
-         * re-encode on write.  Alpha never passes through the sRGB transfer.
-         */
-        std::array<float, 4> source_linear{};
-        for (std::size_t component = 0; component < 4; ++component) {
-          source_linear[component] = ClampShaderUnorm(
-              BitsFloat(output.pixel_output[target * 4 + component]));
+        if (written_map[stored_index] != 0) {
+          if (!AnyBlendEnabled(state.raster_state) && !late_depth_stencil &&
+              !state.raster_state.shader_writes_memory &&
+              !state.raster_state.shader_may_discard &&
+              state.fragment_early_hsr_safe) {
+            throw std::runtime_error(
+                "PBE attempted to shade one opaque owner twice");
+          }
+          if (output.submit_ordinal < last_submit_ordinal[stored_index])
+            throw std::runtime_error("PBE blended fragments lost API order");
         }
-        std::array<float, 4> result_linear = source_linear;
-        if (state.raster_state.blend.enable) {
-          const BlendState &blend = state.raster_state.blend;
-          std::array<float, 4> dest_linear{};
-          for (std::size_t component = 0; component < 3; ++component) {
-            dest_linear[component] =
-                SrgbChannelToLinear(framebuffer[byte_offset + component]);
-          }
-          dest_linear[3] =
-              static_cast<float>(framebuffer[byte_offset + 3]) / 255.0F;
-          std::array<float, 4> constant_linear{};
-          for (std::size_t component = 0; component < 4; ++component) {
-            constant_linear[component] = std::clamp(
-                BitsFloat(blend.constant_color_bits[component]), 0.0F, 1.0F);
-          }
-          for (std::size_t component = 0; component < 4; ++component) {
-            const BlendFactor source_factor =
-                component == 3 ? blend.source_alpha_factor
-                               : blend.source_rgb_factor;
-            const BlendFactor destination_factor =
-                component == 3 ? blend.destination_alpha_factor
-                               : blend.destination_rgb_factor;
-            const BlendEquation equation = component == 3
-                                               ? blend.alpha_equation
-                                               : blend.rgb_equation;
-            const float sf = FactorToFloat(source_factor, source_linear,
-                                           dest_linear, constant_linear,
-                                           component);
-            const float df = FactorToFloat(destination_factor, source_linear,
-                                           dest_linear, constant_linear,
-                                           component);
-            result_linear[component] = BlendEquationFloat(
-                equation, source_linear[component], dest_linear[component], sf,
-                df);
-          }
-        }
-        for (std::size_t component = 0; component < 4; ++component) {
-          if ((state.raster_state.color_mask & (1U << component)) == 0)
+        ++written_map[stored_index];
+        last_submit_ordinal[stored_index] = output.submit_ordinal;
+        for (std::uint32_t target = 0; target < render_target_count; ++target) {
+          // A native FS may genuinely have no output for this attachment.
+          // Preserve its pixels; no default color export or blend is fabricated.
+          if (explicit_output_masks && state.fragment_output_mask[target] == 0)
             continue;
-          framebuffer[byte_offset + component] =
-              component == 3
-                  ? FloatValueToUnorm8(result_linear[3])
-                  : LinearChannelToSrgbUnorm8(
-                        ClampShaderUnorm(result_linear[component]));
+          const std::size_t byte_offset =
+              stored_index * ColorAttachmentBytesPerPixel(state, target);
+          CommitPbeColorSample(state, output, target,
+                               framebuffers[target].data() + byte_offset);
         }
-        continue;
-      }
-      std::array<std::uint8_t, 4> source{};
-      for (std::size_t component = 0; component < 4; ++component) {
-        source[component] =
-            FloatBitsToUnorm8(output.pixel_output[target * 4 + component]);
-      }
-
-      if (state.raster_state.blend.enable) {
-        const BlendState &blend = state.raster_state.blend;
-        std::array<std::uint8_t, 4> destination_color{};
-        for (std::size_t component = 0; component < 4; ++component) {
-          destination_color[component] = framebuffer[byte_offset + component];
-        }
-        std::array<std::uint8_t, 4> constant_color{};
-        for (std::size_t component = 0; component < 4; ++component) {
-          constant_color[component] =
-              FiniteStateToUnorm8(BitsFloat(blend.constant_color_bits[component]));
-        }
-        for (std::size_t component = 0; component < 4; ++component) {
-          const BlendFactor source_factor =
-              component == 3 ? blend.source_alpha_factor
-                             : blend.source_rgb_factor;
-          const BlendFactor destination_factor =
-              component == 3 ? blend.destination_alpha_factor
-                             : blend.destination_rgb_factor;
-          const BlendEquation equation =
-              component == 3 ? blend.alpha_equation
-                             : blend.rgb_equation;
-          const std::uint8_t sf = FactorToUnorm8(source_factor, source, destination_color, constant_color, component);
-          const std::uint8_t df = FactorToUnorm8(destination_factor, source, destination_color, constant_color, component);
-
-          const std::uint8_t blended_val = BlendEquationUnorm8(
-              equation, source[component], destination_color[component], sf, df);
-
-          if ((state.raster_state.color_mask & (1U << component)) != 0) {
-            framebuffer[byte_offset + component] = blended_val;
-          }
-        }
-      } else {
-        for (std::size_t component = 0; component < 4; ++component) {
-          if ((state.raster_state.color_mask & (1U << component)) != 0) {
-            framebuffer[byte_offset + component] = source[component];
-          }
-        }
-      }
-      }
       }
     }
     const std::uint64_t pixels_touched = static_cast<std::uint64_t>(
         std::count_if(written_map.begin(), written_map.end(),
                       [](std::uint32_t writes) { return writes != 0; }));
-    if ((!state.raster_state.blend.enable && !late_depth_stencil && sample_count == 1 &&
+    if ((!AnyBlendEnabled(state.raster_state) && !late_depth_stencil && sample_count == 1 &&
          !state.raster_state.shader_writes_memory && !state.raster_state.shader_may_discard &&
          state.fragment_early_hsr_safe &&
          pixels_touched != state.active_fragment_invocations) ||
@@ -778,17 +328,16 @@ void Pbe::Run() {
       const std::uint32_t stored_channel_mask =
           raw_dwords != 0 ? (1U << raw_dwords) - 1U : 0x0fU;
       writable_targets +=
-          (state.raster_state.color_mask & stored_channel_mask) != 0;
-      blendable_targets += raw_dwords == 0;
+          (ColorMaskForTarget(state.raster_state, target) & stored_channel_mask) != 0;
+      blendable_targets +=
+          raw_dwords == 0 && BlendStateForTarget(state.raster_state, target).enable;
     }
     state.counters.pbe_pixels_written = stored_samples * render_target_count;
     state.counters.pbe_fragment_writes = sample_owners * writable_targets;
     // Integer attachments bypass the blend equation even if API blend state
     // is enabled. A masked floating/UNORM output still runs that equation in
     // this model, but does not produce a color write when all lanes are off.
-    const std::uint64_t blended_colors = state.raster_state.blend.enable
-                                             ? sample_owners * blendable_targets
-                                             : 0;
+    const std::uint64_t blended_colors = sample_owners * blendable_targets;
     state.counters.pbe_color_reads = blended_colors;
     state.counters.pbe_blended_fragments = blended_colors;
     const std::uint64_t blend_cycles =

@@ -16,20 +16,11 @@ namespace {
 bool Inside(std::uint64_t address,std::uint64_t bytes,std::uint64_t base,std::uint64_t size) {
   return address>=base && address-base<=size && bytes<=size-(address-base);
 }
-bool Permitted(const std::vector<TessellationBufferRange> &ranges,
-               std::uint64_t address, std::uint64_t bytes,
-               std::uint32_t access) {
-  return std::any_of(ranges.begin(), ranges.end(), [&](const auto &range) {
-    return (range.access & access) == access &&
-           Inside(address, bytes, range.gpu_address, range.bytes);
-  });
-}
 struct ControlMemory {
   GpuMemorySystem &memory;
   UscUniformBufferMemory &uniforms;
   UscShaderBufferMemory &storage;
   CounterTxn &counters;
-  const std::vector<TessellationBufferRange> &buffers;
   std::uint64_t input_address,input_bytes,output_address,output_bytes;
   std::uint32_t level_written_mask=0;
   std::function<void(const PcoTextureRequest &, std::uint32_t *)> sample{};
@@ -45,7 +36,10 @@ struct ControlMemory {
     const auto bytes=count*sizeof(std::uint32_t);
     const bool input=Inside(address,bytes,self.input_address,self.input_bytes);
     const bool output=Inside(address,bytes,self.output_address,self.output_bytes);
-    const bool storage=Permitted(self.buffers,address,bytes,1U);
+    const bool storage=self.storage.OwnsAddress(address);
+    if(storage) {
+      UscShaderBufferMemory::Read(&self.storage,address,count,destination); return;
+    }
     if(!input && !output && !storage) {
       UscUniformBufferMemory::Read(&self.uniforms,address,count,destination); return;
     }
@@ -61,9 +55,12 @@ struct ControlMemory {
     auto &self=*static_cast<ControlMemory*>(opaque);
     const auto bytes=count*sizeof(std::uint32_t);
     const bool output=Inside(address,bytes,self.output_address,self.output_bytes);
-    const bool storage=Permitted(self.buffers,address,bytes,2U);
-    if(!source || !count || count>16 || address%4 || (!output && !storage))
-      throw std::runtime_error("TCS ST exceeds its output patch/storage-buffer ranges");
+    if(!source || !count || count>16 || address%4)
+      throw std::runtime_error("TCS ST shape is invalid");
+    if(!output) {
+      UscShaderBufferMemory::Write(&self.storage,address,count,source);
+      return;
+    }
     const auto write=self.memory.Write(address,source,bytes,MemoryClient::kTessellationControl);
     ApplyMemoryAccessStats(self.counters,write);
     if(output) {
@@ -175,7 +172,7 @@ void TessellationControlShader::Execute(PipelineState &state, const PipelineTxn 
       task=MakeTessellationControlTask(t.control_abi,shared,patch.primitive_id,
                                        patch.input_vertices,t.output_vertices,
                                        &storage_abi);
-      ControlMemory context{*memory_,uniforms,storage_memory,state.counters,storage_buffers,
+      ControlMemory context{*memory_,uniforms,storage_memory,state.counters,
                              t.input_address,input_words*4,
                              patch.output_address,t.patch_stride_dwords*4};
       context.sample = [this, &state, &txn](const PcoTextureRequest &request, std::uint32_t *response) {

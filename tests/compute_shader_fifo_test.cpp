@@ -201,10 +201,22 @@ void AtomicServiceAllOps(MemoryPool &pool, GpuMemorySystem &memory,
       Check(requests.nb_write(request), "invalid atomic FIFO was not empty");
       sc_core::sc_start(sc_core::sc_time(1,sc_core::SC_US));
       ComputeMemoryTxn response;
-      Check(responses.nb_read(response) && response.failed && response.request_id == id,
-            "invalid atomic request did not fail closed");
-      Check(!pool.Read(response.payload).empty() && !pool.Read(response.payload).back(),
-            "atomic error did not own a terminated message");
+      const bool robust_oob = fault == 1;
+      Check(responses.nb_read(response) && response.request_id == id &&
+                (response.failed == 0) == robust_oob,
+            "invalid/OOB atomic request returned the wrong status");
+      if (robust_oob) {
+        const auto &bytes = pool.Read(response.payload);
+        std::uint32_t old = UINT32_MAX;
+        Check(bytes.size() == sizeof(old),
+              "OOB atomic response is not exactly one DWORD");
+        std::memcpy(&old, bytes.data(), sizeof(old));
+        Check(old == 0, "OOB atomic did not return robust zero");
+      } else {
+        Check(!pool.Read(response.payload).empty() &&
+                  !pool.Read(response.payload).back(),
+              "atomic error did not own a terminated message");
+      }
       pool.Release(response.payload);
       const auto stored = memory.Readback(address,4,MemoryClient::kComputeReadback);
       std::uint32_t actual = 0; std::memcpy(&actual,stored.data.data(),sizeof(actual));
@@ -321,7 +333,8 @@ void RunNativeCas(MemoryPool &pool, GpuMemorySystem &memory,
   state = Load<ComputeDispatchState>(pool,handle);
   if (fault) {
     Check(state.failed && std::string(state.error.data()).find(fault == 1 ?
-              "END leaves a MUTEX" : "outside permitted views") != std::string::npos,
+              "END leaves a MUTEX" :
+              "not permitted by its bound view") != std::string::npos,
           "malformed CAS failed for an unrelated reason or silently succeeded");
   } else {
     Check(!state.failed,state.error.data());
@@ -506,7 +519,7 @@ void UnpredicatedFence() {
 void RunCopy(MemoryPool &pool, GpuMemorySystem &memory,
               sc_core::sc_fifo<ComputeDispatchTxn> &input,
               sc_core::sc_fifo<ComputeDispatchTxn> &completion,
-              unsigned local_count, unsigned fixture, bool fault,
+              unsigned local_count, unsigned fixture, bool robust_oob,
               std::uint64_t sequence) {
   constexpr std::uint64_t address = UINT64_C(0x1000000000000);
   std::array<std::uint32_t, 40> original{};
@@ -526,7 +539,8 @@ void RunCopy(MemoryPool &pool, GpuMemorySystem &memory,
   state.shared_registers = StoreNewArray(pool, shared);
   state.buffer_ranges = StoreNewArray(pool, std::vector<ComputeBufferRange>{
       {address, bytes, kComputeAccessRead, 0, 1},
-      {destination, fault ? bytes - 4U : bytes, kComputeAccessWrite, 1, 1}});
+      {destination, robust_oob ? bytes - 4U : bytes,
+       kComputeAccessWrite, 1, 1}});
   const auto handle = pool.Allocate(sizeof(state));
   Store(pool, handle, state);
   const ComputeDispatchTxn submitted{handle, sequence};
@@ -538,17 +552,15 @@ void RunCopy(MemoryPool &pool, GpuMemorySystem &memory,
             done.state.generation == handle.generation,
         "compute completion did not preserve dispatch ownership");
   state = Load<ComputeDispatchState>(pool, handle);
-  Check((state.failed != 0) == fault,
-        state.failed ? state.error.data() : "out-of-range ST unexpectedly succeeded");
-  if (fault) {
-    Check(std::string(state.error.data()).find("outside permitted views") != std::string::npos,
-          "fault did not originate at the modeled memory permission boundary");
-  } else {
+  Check(!state.failed, state.error.data());
+  {
     const auto readback = memory.Readback(address, sizeof(original), MemoryClient::kComputeReadback);
     std::array<std::uint32_t,40> actual{};
     std::memcpy(actual.data(), readback.data.data(), sizeof(actual));
+    const unsigned written_lanes = local_count - (robust_oob ? 1U : 0U);
     for (unsigned i = 0; i < actual.size(); ++i)
-      Check(actual[i] == (i >= 1 && i <= local_count ? original[i-1] : original[i]),
+      Check(actual[i] == (i >= 1 && i <= written_lanes ? original[i-1]
+                                                           : original[i]),
             "overlapping copy violated task lockstep or native tail-lane masking");
     Check(state.stats.workgroups == 1 && state.stats.invocations == local_count &&
               state.stats.load_instructions == local_count &&
@@ -557,9 +569,11 @@ void RunCopy(MemoryPool &pool, GpuMemorySystem &memory,
     Check(state.counters.vs_invocations == 0 && state.counters.ps_invocations == 0,
           "compute dispatch was incorrectly counted as graphics execution");
     if (memory.mode() == MemoryMode::kDirect)
-      Check(state.stats.direct_read_bytes == bytes && state.stats.direct_write_bytes == bytes &&
+      Check(state.stats.direct_read_bytes == bytes &&
+                state.stats.direct_write_bytes ==
+                    bytes - (robust_oob ? 4U : 0U) &&
                 state.stats.dram_read_bytes == 0 && state.stats.dram_write_bytes == 0,
-            "direct compute memory counters are not actual LD/ST bytes");
+            "direct compute memory counters include a suppressed OOB DWORD");
     else
       Check(state.stats.direct_read_bytes == 0 && state.stats.direct_write_bytes == 0 &&
                 state.stats.dram_read_bytes != 0,
@@ -706,6 +720,101 @@ void RunNativeAtomic(MemoryPool &pool, GpuMemorySystem &memory,
         "native atomic dispatch leaked request/response or task ownership");
 }
 
+void RobustMemoryService(MemoryPool &pool, GpuMemorySystem &memory,
+                         sc_core::sc_fifo<ComputeMemoryTxn> &requests,
+                         sc_core::sc_fifo<ComputeMemoryTxn> &responses) {
+  constexpr std::uint64_t address = UINT64_C(0x1000000001000);
+  const std::array<std::uint32_t, 4> initial{
+      11, 22, 33, UINT32_C(0xfeedface)};
+  memory.HostWrite(address, initial.data(), sizeof(initial));
+  ComputeDispatchState state;
+  state.buffer_ranges = StoreNewArray(pool, std::vector<ComputeBufferRange>{
+      {address, 12, kComputeAccessRead | kComputeAccessWrite, 0, 1}});
+  const auto handle = pool.Allocate(sizeof(state));
+  Store(pool, handle, state);
+  std::uint64_t id = 8000;
+  const auto submit = [&](ComputeMemoryOperation operation,
+                          std::uint64_t target, std::uint32_t bytes,
+                          std::vector<std::uint32_t> payload = {}) {
+    ComputeMemoryTxn request;
+    request.state = handle;
+    request.request_id = ++id;
+    request.operation = operation;
+    request.address = target;
+    request.bytes = bytes;
+    if (operation != ComputeMemoryOperation::kRead)
+      request.payload = StoreNewArray(pool, payload);
+    Check(requests.nb_write(request), "robust memory request FIFO was not empty");
+    sc_core::sc_start(sc_core::sc_time(1, sc_core::SC_US));
+    ComputeMemoryTxn response;
+    Check(responses.nb_read(response) && !response.failed &&
+              response.request_id == id,
+          "robust memory request failed or lost identity");
+    return response;
+  };
+
+  auto response = submit(ComputeMemoryOperation::kRead, address + 8, 8);
+  {
+    const auto &bytes = pool.Read(response.payload);
+    std::array<std::uint32_t, 2> words{};
+    Check(bytes.size() == sizeof(words),
+          "partial robust read response has the wrong extent");
+    std::memcpy(words.data(), bytes.data(), sizeof(words));
+    Check(words[0] == initial[2] && words[1] == 0,
+          "partial robust read did not preserve/zero its DWORDs");
+  }
+  pool.Release(response.payload);
+
+  response = submit(ComputeMemoryOperation::kRead, address + 12, 4);
+  {
+    const auto &bytes = pool.Read(response.payload);
+    std::uint32_t word = UINT32_MAX;
+    Check(bytes.size() == sizeof(word),
+          "fully OOB robust read response has the wrong extent");
+    std::memcpy(&word, bytes.data(), sizeof(word));
+    Check(word == 0, "fully OOB robust read did not return zero");
+  }
+  pool.Release(response.payload);
+
+  response = submit(ComputeMemoryOperation::kWrite, address + 8, 8,
+                    {UINT32_C(0x01020304), UINT32_C(0xaabbccdd)});
+  Check(!HasPoolHandle(response.payload),
+        "robust write invented response bytes");
+  response = submit(ComputeMemoryOperation::kWrite, address + 12, 4,
+                    {UINT32_C(0x55667788)});
+  Check(!HasPoolHandle(response.payload),
+        "fully OOB robust write invented response bytes");
+
+  response = submit(ComputeMemoryOperation::kAtomicAdd32, address + 12, 4,
+                    {9});
+  {
+    const auto &bytes = pool.Read(response.payload);
+    std::uint32_t old = UINT32_MAX;
+    Check(bytes.size() == sizeof(old),
+          "OOB atomic response has the wrong extent");
+    std::memcpy(&old, bytes.data(), sizeof(old));
+    Check(old == 0, "OOB atomic did not return zero");
+  }
+  pool.Release(response.payload);
+
+  const auto readback = memory.Readback(
+      address, sizeof(initial), MemoryClient::kComputeReadback);
+  std::array<std::uint32_t, 4> actual{};
+  std::memcpy(actual.data(), readback.data.data(), sizeof(actual));
+  Check(actual[0] == initial[0] && actual[1] == initial[1] &&
+            actual[2] == UINT32_C(0x01020304) && actual[3] == initial[3],
+        "partial/OOB compute operations touched bytes beyond the bound view");
+  state = Load<ComputeDispatchState>(pool, handle);
+  if (memory.mode() == MemoryMode::kDirect)
+    Check(state.stats.direct_read_bytes == 4 &&
+              state.stats.direct_write_bytes == 4,
+          "OOB compute operations issued modeled memory traffic");
+  pool.Release(state.buffer_ranges);
+  pool.Release(handle);
+  Check(pool.allocations() == pool.releases() && !pool.bytes_in_flight(),
+        "robust compute memory requests leaked FIFO payloads");
+}
+
 void AtomicServiceErrors(MemoryPool &pool, GpuMemorySystem &memory,
                           sc_core::sc_fifo<ComputeMemoryTxn> &requests,
                           sc_core::sc_fifo<ComputeMemoryTxn> &responses) {
@@ -752,7 +861,7 @@ void AtomicServiceErrors(MemoryPool &pool, GpuMemorySystem &memory,
     Check(requests.nb_write(make(101+invalid,target,invalid == 2 ? 8 : 4,1)),
           "atomic invalid-request FIFO was not empty");
     sc_core::sc_start(sc_core::sc_time(1,sc_core::SC_US));
-    receive(101+invalid,true,0);
+    receive(101+invalid,invalid != 1,0);
   }
   // Keep response 1 in its depth-one FIFO while request 2 completes its RMW
   // and blocks on response backpressure. Neither response may be duplicated.
@@ -806,6 +915,7 @@ int sc_main(int argc, char **argv) {
     RunNativeLoop(pool, memory, input, completion, true, 7);
     RunNativeAtomic(pool, memory, input, completion, false, 8);
     RunNativeAtomic(pool, memory, input, completion, true, 9);
+    RobustMemoryService(pool, memory, requests, responses);
     AtomicServiceErrors(pool, memory, requests, responses);
     AtomicServiceAllOps(pool, memory, requests, responses);
     MutexServiceOwnership(pool, requests, responses);

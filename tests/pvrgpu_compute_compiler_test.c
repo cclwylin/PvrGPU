@@ -277,6 +277,50 @@ static unsigned test_masked_stores(struct pvrgpu_pco_compiler *compiler,
    return cases;
 }
 
+static nir_shader *
+make_buffer_texture_shader(bool invalid_lod)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+      pco_nir_options(), "native_compute_sampler_buffer");
+   b.shader->info.workgroup_size[0] = 4;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   nir_def *index = nir_load_local_invocation_index(&b);
+   nir_def *zero = nir_imm_int(&b, 0);
+
+   nir_tex_instr *size = nir_tex_instr_create(b.shader, 1);
+   size->op = nir_texop_txs;
+   size->sampler_dim = GLSL_SAMPLER_DIM_BUF;
+   size->coord_components = 0;
+   size->dest_type = nir_type_int32;
+   size->texture_index = size->sampler_index = 0;
+   size->src[0] = nir_tex_src_for_ssa(nir_tex_src_lod, zero);
+   nir_def_init(&size->instr, &size->def, 1, 32);
+   nir_builder_instr_insert(&b, &size->instr);
+
+   nir_tex_instr *fetch = nir_tex_instr_create(b.shader, 2);
+   fetch->op = nir_texop_txf;
+   fetch->sampler_dim = GLSL_SAMPLER_DIM_BUF;
+   fetch->coord_components = 1;
+   fetch->dest_type = nir_type_float32;
+   fetch->texture_index = fetch->sampler_index = 0;
+   /* Exercise the physical 8192-wide row split as well as logical OOB in the
+    * runtime fixture: lanes address elements 0, 8192, 16384 and 24576. */
+   fetch->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord,
+                                      nir_imul_imm(&b, index, 8192));
+   fetch->src[1] = nir_tex_src_for_ssa(
+      nir_tex_src_lod, invalid_lod ? nir_imm_int(&b, 1) : zero);
+   nir_def_init(&fetch->instr, &fetch->def, 4, 32);
+   nir_builder_instr_insert(&b, &fetch->instr);
+
+   nir_def *value = nir_fadd(&b, &fetch->def, nir_i2f32(&b, &size->def));
+   nir_store_ssbo(&b, value, zero, nir_imul_imm(&b, index, 16),
+                  .write_mask = 15, .align_mul = 16);
+   nir_shader_gather_info(b.shader, b.impl);
+   b.shader->info.num_textures = b.shader->info.num_ssbos = 1;
+   BITSET_SET(b.shader->info.textures_used, 0);
+   return b.shader;
+}
+
 int main(int argc, char **argv)
 {
    glsl_type_singleton_init_or_ref();
@@ -434,6 +478,32 @@ int main(int argc, char **argv)
       pvrgpu_pco_compute_binary_finish(&binary);
       ralloc_free(b.shader);
    }
+   {
+      nir_shader *nir = make_buffer_texture_shader(false);
+      check(pvrgpu_pco_compile_compute(compiler, nir, 16, &binary,
+                                       error, sizeof(error)), error);
+      check(binary.abi.sampled_texture_count == 1,
+            "samplerBuffer keeps one compute sampled descriptor");
+      check(binary.abi.stage.uniform_buffer_descriptor_start == 20,
+            "samplerBuffer keeps the UBO descriptor after sampled state");
+      check(binary.abi.storage_buffer_descriptor_start == 20,
+            "samplerBuffer keeps the SSBO descriptor after sampled state");
+      check(binary.abi.stage.push_constant_start == 24,
+            "samplerBuffer keeps CB0 after its SSBO descriptor");
+      check(binary.abi.stage.shareds == 24,
+            "samplerBuffer keeps the complete compute SMP/SSBO ABI");
+      save_binary(argc > 1 ? argv[1] : NULL, 304, &binary);
+      pvrgpu_pco_compute_binary_finish(&binary);
+      ralloc_free(nir);
+
+      nir = make_buffer_texture_shader(true);
+      error[0] = 0;
+      check(!pvrgpu_pco_compile_compute(compiler, nir, 16, &binary,
+                                        error, sizeof(error)) && error[0] &&
+            !binary.data && !binary.size,
+            "samplerBuffer nonzero LOD remains fail-closed");
+      ralloc_free(nir);
+   }
    for (unsigned ubos = 0; ubos < 2; ++ubos) {
       nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
          pco_nir_options(), "native_large_cb0_dma");
@@ -573,6 +643,7 @@ int main(int argc, char **argv)
    const unsigned masked_cases = test_masked_stores(compiler, argc > 1 ? argv[1] : NULL);
    pvrgpu_pco_compiler_destroy(compiler);
    glsl_type_singleton_decref();
-   printf("native compute compiler tests: PASS (including %u masked-store programs)\n", masked_cases);
+   printf("native compute compiler tests: PASS (including samplerBuffer and %u masked-store programs)\n",
+          masked_cases);
    return 0;
 }

@@ -1,7 +1,8 @@
 // Module：Vdm。
 // 縮寫：VDM = Vertex Data Master（公開 Imagination register 文件之用語）。
 // 功能：fail-closed 驗證 non-indexed Fill.Solid 或 generic uint16 indexed
-// triangle-list draw；VBO capacity 由 MemoryPool resource/binding tables 推導，
+// triangle-list draw；vertex resource/binding tables 以 fail-closed 方式驗證，
+// 而合法 draw 的動態越界 attribute 由 VertexFetch 以 robust zero 處理。
 // IA counters 由實際 draw/index occurrence/primitive 數量產生。FIFO 僅移交
 // MemoryPool state handle，完成採 event-driven wait。
 #include "geometry/vdm.h"
@@ -100,9 +101,9 @@ std::uint64_t ValidateGeometryInput(const MemoryPool &pool,
   return cursor;
 }
 
-std::uint64_t ValidateVertexInputState(const MemoryPool &pool,
-                                       const PipelineState &state,
-                                       const GpuMemorySystem *memory) {
+void ValidateVertexInputState(const MemoryPool &pool,
+                              const PipelineState &state,
+                              const GpuMemorySystem *memory) {
   if (!HasPoolHandle(state.vertex_buffer_resources) ||
       !HasPoolHandle(state.vertex_attribute_bindings)) {
     throw std::runtime_error("VDM received no vertex buffer/binding tables");
@@ -114,7 +115,7 @@ std::uint64_t ValidateVertexInputState(const MemoryPool &pool,
                                         state.vertex_attribute_bindings);
   if ((HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state)) && state.driver_describes_attributes &&
       state.vertex_pco_abi.vertex_inputs == 0 && resources.empty() && bindings.empty())
-    return state.draw.vertex_count;
+    return;
   if (resources.empty() || bindings.empty())
     throw std::runtime_error("VDM received an empty vertex input layout");
 
@@ -147,10 +148,11 @@ std::uint64_t ValidateVertexInputState(const MemoryPool &pool,
     }
   }
 
-  std::uint64_t vertex_capacity = std::numeric_limits<std::uint64_t>::max();
-  bool has_vertex_binding = false;
   for (const VertexAttributeBinding &binding : bindings) {
+    const std::size_t component_bytes =
+        GetComponentTypeBytes(binding.component_type);
     if (binding.buffer_index >= resources.size() ||
+        component_bytes == 0 ||
         binding.source_components == 0 || binding.source_components > 4 ||
         binding.destination_components < binding.source_components ||
         binding.destination_components > 4) {
@@ -158,30 +160,13 @@ std::uint64_t ValidateVertexInputState(const MemoryPool &pool,
     }
     const std::uint64_t element_bytes =
         static_cast<std::uint64_t>(binding.source_components) *
-        GetComponentTypeBytes(binding.component_type);
+        component_bytes;
     if (binding.stride_bytes < element_bytes)
       throw std::runtime_error("VDM vertex binding stride is too small");
-    const VertexBufferResource &resource = resources[binding.buffer_index];
-    const std::uint64_t first_element_end =
-        static_cast<std::uint64_t>(binding.offset_bytes) + element_bytes;
-    if (first_element_end > resource.byte_size)
-      throw std::runtime_error("VDM vertex binding starts outside its VBO");
-
-    // Instanced attributes scale with instance_count, not vertex_count
-    if (binding.instance_divisor != 0) {
-      continue;
-    }
-    has_vertex_binding = true;
-
-    const std::uint64_t capacity =
-        1U + (resource.byte_size - first_element_end) / binding.stride_bytes;
-    vertex_capacity = std::min(vertex_capacity, capacity);
+    // The pointer offset may legally start at or beyond the current VBO
+    // allocation.  It is a dynamic robust-access case, not malformed command
+    // metadata; VertexFetch returns zero for every unavailable component.
   }
-  if (has_vertex_binding && (vertex_capacity == 0 ||
-      vertex_capacity == std::numeric_limits<std::uint64_t>::max())) {
-    throw std::runtime_error("VDM vertex input capacity is invalid");
-  }
-  return has_vertex_binding ? vertex_capacity : std::numeric_limits<std::uint64_t>::max();
 }
 
 } // namespace
@@ -203,8 +188,7 @@ void Vdm::Run() {
     if (memory_ && state.memory_mode != memory_->mode())
       throw std::runtime_error("VDM memory mode mismatch");
     ValidateDrawList(pool_, state.drawlist_stats);
-    const std::uint64_t vertex_capacity =
-        ValidateVertexInputState(pool_, state, memory_);
+    ValidateVertexInputState(pool_, state, memory_);
     MemoryAccessStats memory_stats;
 
     const bool driver_pco_triangles =
@@ -278,11 +262,12 @@ void Vdm::Run() {
             " vertices=" + std::to_string(state.draw.vertex_count) +
             " indices=" + std::to_string(state.draw.index_count) + ")");
       }
-      const std::uint64_t vertex_end =
-          static_cast<std::uint64_t>(state.draw.first_vertex) +
-          state.draw.vertex_count;
-      if (vertex_end > vertex_capacity)
-        throw std::runtime_error("VDM direct vertex range exceeds its VBO");
+      /*
+       * A valid draw may name vertices beyond an enabled attribute's VBO.
+       * GL_KHR_robust_buffer_access_behavior makes those dynamic attribute
+       * reads robust; it does not turn the draw command into malformed VDM
+       * metadata.  VertexFetch therefore owns the per-component bounds check.
+       */
       state.counters.ia_vertices = state.draw.vertex_count;
       state.counters.ia_primitives =
           tessellation_enabled ? 0U : geometry_enabled ? ValidateGeometryInput(pool_, state, state.draw.vertex_count)
@@ -361,21 +346,12 @@ void Vdm::Run() {
             current_segment.clear();
           }
         } else {
-          const std::int64_t resolved =
-              static_cast<std::int64_t>(idx) + state.draw.base_vertex;
-          if (resolved < 0 ||
-              static_cast<std::uint64_t>(resolved) >= vertex_capacity) {
-            // Say which index, from where, against what -- the numbers are the
-            // whole diagnosis, and without them this abort names no field.
-            throw std::runtime_error(
-                "VDM resolved index is outside the vertex input capacity: "
-                "index=" + std::to_string(idx) +
-                " base_vertex=" + std::to_string(state.draw.base_vertex) +
-                " resolved=" + std::to_string(resolved) +
-                " capacity=" + std::to_string(vertex_capacity) +
-                " occurrence=" + std::to_string(occurrence) +
-                " index_count=" + std::to_string(state.draw.index_count));
-          }
+          /*
+           * Keep command validation separate from dynamic vertex addressing.
+           * Negative/out-of-VBO effective indices are robust reads, while a
+           * first_index/index_count range outside the captured EBO above is
+           * malformed transport and remains a hard failure.
+           */
           current_segment.push_back(idx);
           ia_vertices++;
         }

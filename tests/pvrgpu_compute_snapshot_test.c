@@ -281,6 +281,74 @@ test_layered_image_reinterpretation(void)
 }
 
 static void
+test_buffer_image_views(void)
+{
+   uint8_t bytes[256], original[256];
+   for (unsigned i = 0; i < sizeof(bytes); ++i)
+      original[i] = bytes[i] = (uint8_t)(19U * i + 5U);
+   struct pvrgpu_resource resource;
+   init_buffer(&resource, bytes, sizeof(bytes));
+   struct pipe_image_view view = {
+      .resource = &resource.base,
+      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+      .access = PIPE_IMAGE_ACCESS_READ_WRITE,
+   };
+   view.u.buf.offset = 32;
+   view.u.buf.size = 64;
+   struct pvrgpu_compute_snapshot snapshot = {0};
+   const char *reason = NULL;
+   CHECK(pvrgpu_compute_snapshot_add_image(&snapshot, 1, 3, &view, &reason));
+   CHECK(snapshot.resource_count == 1 && snapshot.image_count == 1 &&
+         resource.base.reference.count == 2);
+   CHECK(snapshot.images[0].offset == 32 &&
+         snapshot.images[0].bytes_size == 64 &&
+         snapshot.images[0].width == 16 && snapshot.images[0].height == 1 &&
+         snapshot.images[0].depth == 1 &&
+         snapshot.images[0].row_stride_bytes == 64 &&
+         snapshot.images[0].layer_stride_bytes == 64 &&
+         snapshot.images[0].texel_bytes == 4);
+
+   /* A differently typed view of the same BO shares one snapshot. */
+   view.format = PIPE_FORMAT_R32G32B32A32_UINT;
+   view.u.buf.offset = 128;
+   view.u.buf.size = 64;
+   CHECK(pvrgpu_compute_snapshot_add_image(&snapshot, 3, 1, &view, &reason));
+   CHECK(snapshot.resource_count == 1 && snapshot.image_count == 2 &&
+         snapshot.images[1].resource_index == 0 &&
+         snapshot.images[1].width == 4 &&
+         snapshot.images[1].texel_bytes == 16);
+   memset(snapshot.resources[0].bytes, 0x5a, sizeof(bytes));
+   pvrgpu_compute_snapshot_writeback(&snapshot);
+   for (unsigned i = 0; i < sizeof(bytes); ++i)
+      CHECK(bytes[i] == (i >= 32 && i < 96 ? 0x5a : original[i]));
+   CHECK(resource.driver_writes_model_cannot_reproduce);
+   pvrgpu_compute_snapshot_finish(&snapshot);
+   CHECK(resource.base.reference.count == 1);
+
+   resource.driver_writes_model_cannot_reproduce = false;
+   const struct pvrgpu_resource valid = resource;
+   const struct pipe_image_view valid_view = view;
+   for (unsigned bad = 0; bad < 9; ++bad) {
+      resource = valid;
+      view = valid_view;
+      view.resource = &resource.base;
+      if (bad == 0) view.access = PIPE_IMAGE_ACCESS_READ;
+      if (bad == 1) view.u.buf.offset = 252;
+      if (bad == 2) view.u.buf.size = 129;
+      if (bad == 3) view.u.buf.size = 63;
+      if (bad == 4) view.u.buf.offset = 2;
+      if (bad == 5) view.format = PIPE_FORMAT_R8_UNORM;
+      if (bad == 6) resource.size = 128;
+      if (bad == 7) view.u.buf.size = 0;
+      if (bad == 8) view.u.buf.offset = 4;
+      CHECK(!pvrgpu_compute_snapshot_add_image(&snapshot, 0, 2,
+                                                &view, &reason));
+      CHECK(snapshot.resource_count == 0 && snapshot.image_count == 0 &&
+            resource.base.reference.count == 1);
+   }
+}
+
+static void
 test_indirect_grid(void)
 {
    uint32_t words[] = {0xabcdef, 7, 8, 9, 0x123456};
@@ -318,6 +386,7 @@ int main(void)
    test_aggregate_limit_before_allocation();
    test_image_views_and_padding();
    test_layered_image_reinterpretation();
+   test_buffer_image_views();
    test_indirect_grid();
    printf("compute snapshot checks=%u failures=%u\n", checks, failures);
    return failures ? 1 : 0;

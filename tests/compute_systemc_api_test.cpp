@@ -125,7 +125,7 @@ void GuardedVersion() {
 
 void GuardedOldStats(unsigned mode) {
 #if !defined(_WIN32)
-  static_assert(PVRGPU_SYSTEMC_COMPUTE_API_VERSION == 6);
+  static_assert(PVRGPU_SYSTEMC_COMPUTE_API_VERSION == 7);
   // API v1 had thirteen uint64_t counters. Its caller may allocate exactly
   // that much: rejecting v1 must happen before clearing the larger stats.
   constexpr std::size_t old_stats_size = 13U * sizeof(std::uint64_t);
@@ -183,9 +183,18 @@ void InvalidEnvelopes(unsigned mode) {
     Check(stats.workgroups == 1 && stats.invocations == 30 &&
           stats.memory_instructions == 0, "shared legal boundary invented shader accesses");
   }
-  auto invalid = Fixture(1, mode);
-  Reject(invalid, "shader resource masks reference absent bindings");
-  invalid = Fixture(0, mode);
+  auto unbound = Fixture(1, mode);
+  const auto unbound_stats = Run(unbound);
+  Check(unbound_stats.invocations == 30 &&
+            unbound_stats.load_instructions == 30 &&
+            unbound_stats.store_instructions == 30 &&
+            unbound_stats.atomic_instructions == 0 &&
+            unbound_stats.direct_read_bytes == 0 &&
+            unbound_stats.direct_write_bytes == 0 &&
+            unbound_stats.dram_read_bytes == 0 &&
+            unbound_stats.dram_write_bytes == 0,
+        "used unbound compute buffers did not execute as robust null holes");
+  auto invalid = Fixture(0, mode);
   invalid.abi.storage_buffer_read_mask = 1;
   Reject(invalid, "read mask is not a subset of used mask");
   // Describe deliberately unreadable extents; the aggregate limit must be
@@ -261,12 +270,22 @@ void CopyAndAlias(unsigned mode, unsigned kind) {
             "modeled compute must report real DRAM traffic");
   }
 
-  // A late lane fault may change model DRAM, but must not partially publish a
-  // failed dispatch into the caller's BO. Completion must still drain FIFOs.
-  const auto before = backing;
+  // A valid last-lane store outside its bound view is suppressed without
+  // failing the dispatch or discarding preceding in-range stores.
   views[1].bytes_size = 116;
-  Reject(dispatch, "last-lane output exceeds its writable view");
-  Check(backing == before, "failed compute dispatch partially committed host bytes");
+  backing[69] = UINT32_C(0x13579bdf);
+  const auto before = backing;
+  const auto robust = Run(dispatch);
+  Check(robust.invocations == 30 && robust.store_instructions == 30,
+        "robust scalar OOB store changed native instruction accounting");
+  for (unsigned i = 0; i < backing.size(); ++i) {
+    const auto expected = i >= 40 && i < 69 ? before[4 + i - 40] : before[i];
+    Check(backing[i] == expected,
+          "robust scalar store did not preserve the in-range prefix/guard");
+  }
+  if (mode == 0)
+    Check(robust.direct_write_bytes == 116,
+          "suppressed scalar OOB store was counted as direct traffic");
   views[1].bytes_size = 120;
   (void)Run(dispatch);
 }
@@ -303,9 +322,21 @@ void WideVectorCopy(unsigned mode, unsigned kind) {
       Check(backing[i] == expected, "wide-vector copy corrupted data or a guard word");
     }
     views[1].bytes_size -= 4U;
-    const auto guarded = backing;
-    Reject(dispatch, "wide-vector final component exceeds writable view");
-    Check(backing == guarded, "failed vector access published partial host bytes");
+    backing[output_start + words - 1U] = UINT32_C(0x13579bdf);
+    const auto robust_before = backing;
+    const auto robust = Run(dispatch);
+    Check(robust.invocations == 30 && robust.store_instructions == 30,
+          "robust vector tail changed native instruction accounting");
+    for (unsigned i = 0; i < backing.size(); ++i) {
+      const auto expected = i >= output_start && i < output_start + words - 1U
+          ? robust_before[input_start + i - output_start]
+          : robust_before[i];
+      Check(backing[i] == expected,
+            "partial robust vector store did not preserve its DWORD prefix/guard");
+    }
+    if (mode == 0)
+      Check(robust.direct_write_bytes == (words - 1U) * 4U,
+            "suppressed vector tail was counted as direct traffic");
     views[1].bytes_size += 4U;
   }
   (void)Run(dispatch); // Recover cleanly after the final out-of-range vector.
@@ -453,18 +484,39 @@ void AtomicAddAndAlias(unsigned mode, unsigned kind) {
     }
 
     // Restrict the counter view before narrowing the output, so the broad RW
-    // alias cannot legitimately grant the final output store another view.
+    // alias cannot grant the final output store another view. The RMWs still
+    // complete; only the last return-value store is discarded.
     views[0].bytes_size = 4;
     views[1].bytes_size = (lanes - 1U) * 4U;
+    *counter = UINT32_C(0x22334455);
+    old_values[lanes - 1U] = UINT32_C(0x13579bdf);
     const auto before0 = backing0;
     const auto before1 = backing1;
-    Reject(dispatch, "last atomic result store exceeds every writable view");
-    Check(backing0 == before0 && backing1 == before1,
-          "late atomic fault partially committed counter or output BO bytes");
+    std::uint32_t expected_counter = *counter;
+    for (unsigned lane = 0; lane < lanes; ++lane)
+      expected_counter += kind == 11 ? push[4] + lane : 1U;
+    const auto robust = Run(dispatch);
+    Check(*counter == expected_counter &&
+              old_values[lanes - 1U] == UINT32_C(0x13579bdf) &&
+              robust.atomic_instructions == lanes &&
+              robust.store_instructions == lanes,
+          "robust atomic result OOB did not preserve RMWs/suppress its store");
+    for (unsigned index = 0; index < backing0.size(); ++index)
+      if (index != 4 && !(layout && index >= 40 && index < 40 + lanes - 1U))
+        Check(backing0[index] == before0[index],
+              "robust atomic result changed a same-BO guard word");
+    for (unsigned index = 0; index < backing1.size(); ++index)
+      if (index < 4 || index >= 4 + lanes - 1U)
+        Check(backing1[index] == before1[index],
+              "robust atomic result changed a separate-BO guard word");
+    if (mode == 0)
+      Check(robust.direct_write_bytes ==
+                lanes * 4U + (lanes - 1U) * 4U,
+            "suppressed atomic result store was counted as direct traffic");
     views[0].bytes_size = counter_view_size;
     views[1].bytes_size = lanes * 4U;
-    // Reusing the same session proves failed RMW/output requests and pool
-    // payloads were drained; fresh host input replaces any dirty model bytes.
+    // Reusing the same session proves robust OOB requests and pool payloads
+    // were drained; fresh host input replaces any dirty model bytes.
     run_and_verify();
   }
 }
@@ -615,14 +667,36 @@ void AtomicOperationsAndAlias(unsigned mode, unsigned kind) {
     run_and_verify(0x7fffffffU, 2);
 
     // The broad alias must not hide an intentionally insufficient output view.
+    // Its last operand load returns zero and its last result store is dropped;
+    // all other native operations remain valid and the dispatch completes.
     views[0].bytes_size = 4;
     views[1].bytes_size = (lanes - 1U) * 4U;
+    const unsigned counter_index = views[0].offset / 4U;
+    const unsigned output_index = views[1].offset / 4U;
+    auto *robust_output = layout ? &backing0[output_index]
+                                 : &backing1[output_index];
+    robust_output[lanes - 1U] = UINT32_C(0x13579bdf);
     auto before0 = backing0;
     auto before1 = backing1;
-    Reject(dispatch, "atomic operand/result exceeds every allowed view");
-    Check(backing0 == before0 && backing1 == before1,
-          "failed atomic operation partially published caller BO bytes");
+    const auto robust = Run(dispatch);
+    Check(robust.invocations == lanes &&
+              robust.load_instructions >= lanes &&
+              robust.store_instructions >= lanes &&
+              robust_output[lanes - 1U] == UINT32_C(0x13579bdf),
+          "robust atomic operand/result OOB failed or changed its guard");
+    for (unsigned index = 0; index < backing0.size(); ++index)
+      if (index != counter_index &&
+          !(layout && index >= output_index &&
+            index < output_index + lanes - 1U))
+        Check(backing0[index] == before0[index],
+              "robust atomic operation changed a same-BO guard word");
+    for (unsigned index = 0; index < backing1.size(); ++index)
+      if (index < output_index || index >= output_index + lanes - 1U)
+        Check(backing1[index] == before1[index],
+              "robust atomic operation changed a separate-BO guard word");
     views[1].bytes_size = lanes * 4U;
+    before0 = backing0;
+    before1 = backing1;
     // RMW requires one view with both rights; read-only or write-only views
     // cannot silently turn it into a plain LD/ST or acquire missing access.
     for (unsigned access : {1U, 2U}) {
@@ -645,7 +719,8 @@ int main(int argc, char **argv) {
     GuardedOldStats(mode);
     InvalidEnvelopes(mode);
     auto invalid = Fixture(0, mode);
-    invalid.abi.stage.shareds = 257;
+    invalid.abi.stage.shareds =
+        PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE + 1U;
     Reject(invalid, "oversized shared-register file");
     invalid = Fixture(0, mode);
     invalid.block[0] = 4;

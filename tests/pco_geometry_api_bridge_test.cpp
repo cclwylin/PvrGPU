@@ -142,7 +142,7 @@ void VerifyBinaryStages() {
 }
 
 void VerifyPreviousVersionGuard(Submission &submit) {
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 38);
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 39);
   constexpr auto previous_size = offsetof(pvrgpu_systemc_driver_command, geometry_pco);
   static_assert(previous_size % alignof(pvrgpu_systemc_driver_command) == 0);
 #if defined(_WIN32)
@@ -431,7 +431,8 @@ void VerifyAcceptedNativePipeline(Fixture &fixture, Submission &submit,
                                  "\"pbe_fragment_writes\":0", "\"memory_mode\":\"cache\"",
                                  "\"nop\":1", "\"fs_alu_instructions\":0"})
       Check(json.find(evidence) != std::string::npos, std::string("empty FS produces no color access: ") + evidence);
-    Check(json.find(zero_emit ? "\"ps_invocations\":0" : "\"ps_invocations\":1") != std::string::npos,
+    Check(json.find(zero_emit ? "\"fs\":{\"invocations\":0"
+                              : "\"fs\":{\"invocations\":1") != std::string::npos,
           "empty FS executes for emitted geometry, not for zero-Emit GS");
   }
   std::filesystem::remove_all(root);

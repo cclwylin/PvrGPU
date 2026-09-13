@@ -9,8 +9,10 @@ extern "C" {
 #endif
 
 /* Independent, synchronous compute ABI. No graphics command or framebuffer
- * carries compute results. Check version before reading any later field. */
-#define PVRGPU_SYSTEMC_COMPUTE_API_VERSION 6u
+ * carries compute results. Check version before reading any later field.
+ * API-v7 extends each sampled-texture record with the exact logical element
+ * count required by samplerBuffer textureSize and padded texel addressing. */
+#define PVRGPU_SYSTEMC_COMPUTE_API_VERSION 7u
 #define PVRGPU_SYSTEMC_COMPUTE_MAX_SHARED_BYTES (32u * 1024u)
 #define PVRGPU_SYSTEMC_COMPUTE_MAX_IMAGES 32u
 #define PVRGPU_SYSTEMC_COMPUTE_IMAGE_DESCRIPTOR_DWORDS 8u

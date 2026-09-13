@@ -10,6 +10,7 @@
 #include "model_types.h"
 #include "shader/pco_iss.h"
 
+#include <array>
 #include <cstdint>
 
 namespace pvrgpu::stub {
@@ -66,6 +67,25 @@ inline std::uint32_t ExpectedPixelOutputMask(
   }
   return expected != 0 || allow_empty ? expected : 0x0fU;
 }
+
+// Native fixed/floating-point colour formats which cannot use the legacy
+// RGBA8/RGBA32F transport without losing precision or absent-channel defaults.
+enum class ColorAttachmentNumberFormat : std::uint8_t {
+  kLegacy = 0,
+  kUnorm,
+  kSnorm,
+  kFloat16,
+  kUnsignedFloat,
+  kFloat32,
+  kUint,
+  kSint,
+};
+
+struct ColorAttachmentCodec {
+  ColorAttachmentNumberFormat number = ColorAttachmentNumberFormat::kLegacy;
+  std::uint8_t component_mask = 0;
+  std::array<std::uint8_t, 4> component_bits{};
+};
 
 struct PipelineState {
   std::uint32_t width = 0;
@@ -253,6 +273,13 @@ struct PipelineState {
   std::array<std::uint8_t, kMaxRenderTargets> color_attachment_raw_dwords_per_target{};
   std::array<std::uint8_t, kMaxRenderTargets> color_attachment_float32_per_target{};
   std::array<std::uint8_t, kMaxRenderTargets> color_attachment_srgb_per_target{};
+  // Exact native precision/component-presence contract. Normalized/floating
+  // codecs use canonical float storage; integer codecs retain raw dwords but
+  // apply their native range on every clear/commit. kLegacy leaves established
+  // transports byte-identical.
+  ColorAttachmentCodec color_attachment_codec{};
+  std::array<ColorAttachmentCodec, kMaxRenderTargets>
+      color_attachment_codecs{};
   // The UNORM8 colour attachment stores sRGB-encoded bytes: the PBE encodes the
   // shader's linear PIXOUT on write and, when blending, decodes the stored
   // destination to linear, blends there and re-encodes.  Zero is a plain linear

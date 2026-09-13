@@ -65,6 +65,7 @@ int main() {
         output.width = 4; output.height = 3; output.pixels.resize(48);
         output.extra.resize(targets - 1, std::vector<std::uint8_t>(48));
         output.color_formats = names; output.color_formats_explicit = true;
+        output.bytes_per_pixel_per_target.assign(targets, 4);
         for (unsigned target = 0; target < targets; ++target) {
           Check(output.ColorFormatMatches(target,names[target].c_str()), "explicit readback exact identity");
           Check(!output.ColorFormatMatches(target,nullptr), "explicit readback missing identity");
@@ -75,12 +76,48 @@ int main() {
         output.color_formats_explicit = false;
         Check(output.ColorFormatMatches(0,nullptr), "legacy missing identity accepted");
         Check(output.ColorFormatMatches(0,names[0].c_str()), "legacy supplied identity checked");
-        output.color_formats_explicit = true; output.bytes_per_pixel = 16;
+        output.color_formats_explicit = true;
+        output.bytes_per_pixel_per_target[0] = 16;
         Check(!output.ColorFormatMatches(0,names[0].c_str()), "explicit fixed4B transport");
       }
     }
     auto a = Command({formats[0],formats[1],formats[2],formats[0]});
-    for (const auto *invalid : {"", "UNKNOWN", "PIPE_FORMAT_R8G8B8A8_SRGB", "PIPE_FORMAT_R32_UINT", "PIPE_FORMAT_R32G32B32A32_FLOAT"}) {
+    auto canonical = Command({formats[0], "PIPE_FORMAT_R8_SNORM",
+                              "PIPE_FORMAT_R16G16_FLOAT",
+                              "PIPE_FORMAT_R11G11B10_FLOAT"});
+    Check(DriverColorAttachmentFormatsAreValid(canonical),
+          "canonical native precision vector");
+    Check(DriverColorAttachmentBytesPerPixel(
+              canonical.color_attachment_formats[1]) == 16 &&
+              DriverColorAttachmentBytesPerPixel(
+                  canonical.color_attachment_formats[2]) == 16 &&
+              DriverColorAttachmentBytesPerPixel(
+                  canonical.color_attachment_formats[3]) == 16,
+          "canonical native formats use RGBA32F transport");
+    auto exact_integer = Command({"PIPE_FORMAT_R8_UINT",
+                                  "PIPE_FORMAT_R16G16_SINT",
+                                  "PIPE_FORMAT_R10G10B10A2_UINT",
+                                  "PIPE_FORMAT_R32G32B32A32_UINT"});
+    Check(DriverColorAttachmentFormatsAreValid(exact_integer),
+          "native integer codec vector");
+    Check(DriverColorAttachmentBytesPerPixel(
+              "PIPE_FORMAT_R32G32B32A32_UNORM") == 32,
+          "RGBA32_UNORM exact transport width");
+    Check(DriverColorAttachmentMaximumBytesPerPixel(
+              Command({formats[0], "PIPE_FORMAT_R32G32B32A32_UNORM"})) == 32,
+          "mixed MRT extent ignored a wide later target");
+    ModelFramebuffer wide;
+    wide.width = wide.height = wide.sample_count = wide.layer_count = 1;
+    wide.bytes_per_pixel = 32;
+    wide.pixels.resize(32);
+    wide.color_formats = {"PIPE_FORMAT_R32G32B32A32_UNORM"};
+    wide.color_formats_explicit = true;
+    wide.bytes_per_pixel_per_target = {32};
+    Check(wide.valid() &&
+              wide.ColorFormatMatches(0,
+                  "PIPE_FORMAT_R32G32B32A32_UNORM"),
+          "RGBA32_UNORM 32-byte model framebuffer contract");
+    for (const auto *invalid : {"", "UNKNOWN", "PIPE_FORMAT_R9G9B9E5_FLOAT"}) {
       auto bad = a; bad.color_attachment_formats[1] = invalid;
       Check(!DriverColorAttachmentFormatsAreValid(bad), "unsupported mix");
       ModelFramebuffer output; output.extra.resize(3); output.color_formats = bad.color_attachment_formats; output.color_formats_explicit = true;

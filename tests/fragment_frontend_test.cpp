@@ -22,6 +22,7 @@ using namespace pvrgpu::stub;
 
 static_assert(sizeof(FragmentShaderLane) == 64);
 static_assert(offsetof(FragmentShaderLane, front_facing) == 41);
+static_assert(offsetof(FragmentShaderLane, layer) == 42);
 static_assert(offsetof(FragmentShaderLane, depth) == 44);
 
 void Check(bool condition, const std::string &message) {
@@ -144,10 +145,12 @@ int sc_main(int, char **) {
     multisample.functional_case = FunctionalCase::kFillTexNearest;
     multisample.stage = PipelineStage::kVisibilityReady;
     multisample.raster_state.sample_count = 16;
+    multisample.attachment_layers = 2;
     multisample.active_fragment_invocations = 2;
     std::vector<ParameterTriangle> parameters(2, parameter);
     parameters[1].key.api_primitive_id = 8;
     parameters[1].key.submit_ordinal = 2;
+    parameters[1].key.layer = 1;
     parameters[1].front_facing = 1;
     std::vector<FragmentCandidate> visible(2, rejected);
     for (std::uint32_t primitive = 0; primitive < 2; ++primitive) {
@@ -181,6 +184,9 @@ int sc_main(int, char **) {
       Check(msaa_invocations[primitive].front_facing == parameters[primitive].front_facing &&
                 msaa_lanes[primitive].front_facing == parameters[primitive].front_facing,
             "front/back multisample primitives retain distinct normalized facing");
+      Check(msaa_invocations[primitive].layer == parameters[primitive].key.layer &&
+                msaa_lanes[primitive].layer == parameters[primitive].key.layer,
+            "covered shader lanes retain their layered framebuffer identity");
     }
     ReleaseFunctionalPayloads(pool, msaa_result);
     pool.Release(msaa_handle);
@@ -306,6 +312,7 @@ int sc_main(int, char **) {
       PipelineState fixture;
       fixture.width = width;
       fixture.height = height;
+      fixture.attachment_layers = 2;
       fixture.sequence = fixture_sequence++;
       fixture.functional_case = FunctionalCase::kDriverPcoTriangles;
       fixture.stage = PipelineStage::kVisibilityReady;
@@ -363,6 +370,8 @@ int sc_main(int, char **) {
           Check(work.x == quad_x + lane % 2 && work.y == quad_y + lane / 2 &&
                     work.quad_lane == lane && work.quad_id == wanted.quad_id &&
                     work.parameter_index == wanted.parameter_index &&
+                    work.layer ==
+                        fixture_parameters[wanted.parameter_index].key.layer &&
                     work.sample_id == wanted.sample_id && work.helper == !covered &&
                     work.primitive_id == fixture_parameters[wanted.parameter_index].key.api_primitive_id &&
                     work.submit_ordinal == quad.submit_ordinal,
@@ -377,6 +386,7 @@ int sc_main(int, char **) {
             Check(work.x < width && work.y < height &&
                       visible_work.x == work.x && visible_work.y == work.y &&
                       visible_work.parameter_index == work.parameter_index &&
+                      visible_work.layer == work.layer &&
                       visible_work.sample_id == work.sample_id &&
                       work.sample_mask == visible_work.sample_mask &&
                       (!sample_frequency || work.sample_mask == (1U << work.sample_id)),

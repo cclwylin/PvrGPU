@@ -40,6 +40,19 @@
 
 #define PVRGPU_ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
 
+static struct pvrgpu_pco_compiler *
+pvrgpu_context_create_pco_compiler(struct pvrgpu_context *ctx,
+                                   char *error,
+                                   size_t error_size)
+{
+   struct pvrgpu_pco_compiler *compiler =
+      pvrgpu_pco_compiler_create(error, error_size);
+   if (compiler)
+      pvrgpu_pco_compiler_set_robust_buffer_access(
+         compiler, ctx->robust_buffer_access);
+   return compiler;
+}
+
 struct pvrgpu_indexed_quad_observation {
    unsigned viewport_width;
    unsigned viewport_height;
@@ -803,6 +816,51 @@ pvrgpu_command_format_for_surface(enum pipe_format format)
       return PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8_SRGB;
    case PIPE_FORMAT_B8G8R8A8_SRGB:
       return PVRGPU_DRIVER_COMMAND_FORMAT_BGRA8_SRGB;
+   case PIPE_FORMAT_A8B8G8R8_SRGB:
+      return PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8_SRGB;
+   case PIPE_FORMAT_R8_UNORM:
+   case PIPE_FORMAT_R8G8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_R5G6B5_UNORM:
+   case PIPE_FORMAT_B5G6R5_UNORM:
+   case PIPE_FORMAT_R16_UNORM:
+   case PIPE_FORMAT_R16G16_UNORM:
+   case PIPE_FORMAT_R16G16B16A16_UNORM:
+   case PIPE_FORMAT_R32G32B32A32_UNORM:
+   case PIPE_FORMAT_R8_SNORM:
+   case PIPE_FORMAT_R8G8_SNORM:
+   case PIPE_FORMAT_R8G8B8A8_SNORM:
+   case PIPE_FORMAT_R16_SNORM:
+   case PIPE_FORMAT_R16G16_SNORM:
+   case PIPE_FORMAT_R16G16B16A16_SNORM:
+   case PIPE_FORMAT_R11G11B10_FLOAT:
+   case PIPE_FORMAT_R16_FLOAT:
+   case PIPE_FORMAT_R16G16_FLOAT:
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+   case PIPE_FORMAT_R32_FLOAT:
+   case PIPE_FORMAT_R32G32_FLOAT:
+   case PIPE_FORMAT_R8_UINT:
+   case PIPE_FORMAT_R8G8_UINT:
+   case PIPE_FORMAT_R8G8B8A8_UINT:
+   case PIPE_FORMAT_R16_UINT:
+   case PIPE_FORMAT_R16G16_UINT:
+   case PIPE_FORMAT_R16G16B16A16_UINT:
+   case PIPE_FORMAT_R32_UINT:
+   case PIPE_FORMAT_R32G32_UINT:
+   case PIPE_FORMAT_R32G32B32A32_UINT:
+   case PIPE_FORMAT_R10G10B10A2_UINT:
+   case PIPE_FORMAT_B10G10R10A2_UINT:
+   case PIPE_FORMAT_R8_SINT:
+   case PIPE_FORMAT_R8G8_SINT:
+   case PIPE_FORMAT_R8G8B8A8_SINT:
+   case PIPE_FORMAT_R16_SINT:
+   case PIPE_FORMAT_R16G16_SINT:
+   case PIPE_FORMAT_R16G16B16A16_SINT:
+   case PIPE_FORMAT_R32_SINT:
+   case PIPE_FORMAT_R32G32_SINT:
+   case PIPE_FORMAT_R32G32B32A32_SINT:
+      return util_format_name(format);
    case PIPE_FORMAT_R10G10B10A2_UNORM:
       return PVRGPU_DRIVER_COMMAND_FORMAT_RGB10_A2;
    case PIPE_FORMAT_B10G10R10A2_UNORM:
@@ -866,8 +924,13 @@ pvrgpu_framebuffer_color_transport_is_bounded(const struct pvrgpu_context *ctx)
       return false;
    for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target) {
       const struct pipe_surface *surface = &ctx->framebuffer.cbufs[target];
-      if (!surface->texture ||
-          !pvrgpu_is_explicit_color_format(
+      /* Gallium keeps nr_cbufs at the highest active draw-buffer index plus
+       * one, so GL_NONE may leave a legal hole inside this range.  The model
+       * carries a masked RGBA8 dummy slice for that slot; only real surfaces
+       * need a native-to-transport format check. */
+      if (!surface->texture)
+         continue;
+      if (!pvrgpu_is_explicit_color_format(
              pvrgpu_command_format_for_surface(surface->format)))
          return false;
    }
@@ -6509,7 +6572,8 @@ pvrgpu_compile_refract_observation(
 
    char error[512] = { 0 };
    if (!ctx->pco_compiler) {
-      ctx->pco_compiler = pvrgpu_pco_compiler_create(error, sizeof(error));
+      ctx->pco_compiler =
+         pvrgpu_context_create_pco_compiler(ctx, error, sizeof(error));
       if (!ctx->pco_compiler) {
          pvrgpu_counter_eventf("draw_pco_refract_compile_error",
                                "profile=%u stage=compiler_create reason=%s",
@@ -6759,6 +6823,41 @@ pvrgpu_systemc_shader_stage_from_mesa(mesa_shader_stage source,
 }
 
 static bool
+pvrgpu_translate_systemc_blend_state(
+   unsigned rgb_equation,
+   unsigned source_rgb_factor,
+   unsigned destination_rgb_factor,
+   unsigned alpha_equation,
+   unsigned source_alpha_factor,
+   unsigned destination_alpha_factor,
+   uint32_t *out_rgb_equation,
+   uint32_t *out_source_rgb_factor,
+   uint32_t *out_destination_rgb_factor,
+   uint32_t *out_alpha_equation,
+   uint32_t *out_source_alpha_factor,
+   uint32_t *out_destination_alpha_factor)
+{
+   if (!out_rgb_equation || !out_source_rgb_factor ||
+       !out_destination_rgb_factor || !out_alpha_equation ||
+       !out_source_alpha_factor || !out_destination_alpha_factor ||
+       !pvrgpu_systemc_blend_equation_from_pipe(
+          rgb_equation, out_rgb_equation) ||
+       !pvrgpu_systemc_blend_equation_from_pipe(
+          alpha_equation, out_alpha_equation) ||
+       !pvrgpu_systemc_blend_factor_from_pipe(
+          source_rgb_factor, out_source_rgb_factor) ||
+       !pvrgpu_systemc_blend_factor_from_pipe(
+          destination_rgb_factor, out_destination_rgb_factor) ||
+       !pvrgpu_systemc_blend_factor_from_pipe(
+          source_alpha_factor, out_source_alpha_factor) ||
+       !pvrgpu_systemc_blend_factor_from_pipe(
+          destination_alpha_factor,
+          out_destination_alpha_factor))
+      return false;
+   return true;
+}
+
+static bool
 pvrgpu_init_systemc_blend_state(
    struct pvrgpu_systemc_driver_command *command,
    bool enable,
@@ -6770,21 +6869,71 @@ pvrgpu_init_systemc_blend_state(
    unsigned destination_alpha_factor)
 {
    if (!command ||
-       !pvrgpu_systemc_blend_equation_from_pipe(
-          rgb_equation, &command->blend_rgb_equation) ||
-       !pvrgpu_systemc_blend_equation_from_pipe(
-          alpha_equation, &command->blend_alpha_equation) ||
-       !pvrgpu_systemc_blend_factor_from_pipe(
-          source_rgb_factor, &command->blend_source_rgb_factor) ||
-       !pvrgpu_systemc_blend_factor_from_pipe(
-          destination_rgb_factor, &command->blend_destination_rgb_factor) ||
-       !pvrgpu_systemc_blend_factor_from_pipe(
-          source_alpha_factor, &command->blend_source_alpha_factor) ||
-       !pvrgpu_systemc_blend_factor_from_pipe(
-          destination_alpha_factor,
+       !pvrgpu_translate_systemc_blend_state(
+          rgb_equation, source_rgb_factor, destination_rgb_factor,
+          alpha_equation, source_alpha_factor, destination_alpha_factor,
+          &command->blend_rgb_equation,
+          &command->blend_source_rgb_factor,
+          &command->blend_destination_rgb_factor,
+          &command->blend_alpha_equation,
+          &command->blend_source_alpha_factor,
           &command->blend_destination_alpha_factor))
       return false;
    command->blend_enable = enable;
+   return true;
+}
+
+static bool
+pvrgpu_init_systemc_render_target_states(
+   const struct pvrgpu_context *ctx,
+   struct pvrgpu_systemc_driver_command *command)
+{
+   if (!ctx || !command || command->render_target_count == 0 ||
+       command->render_target_count > PVRGPU_SYSTEMC_MAX_RENDER_TARGETS)
+      return false;
+
+   command->render_target_state_count = command->render_target_count;
+   for (unsigned target = 0; target < command->render_target_count; ++target) {
+      const bool active = target < ctx->framebuffer.nr_cbufs &&
+                          ctx->framebuffer.cbufs[target].texture;
+      const unsigned state_target =
+         ctx->blend && ctx->blend->state.independent_blend_enable ? target : 0;
+      const struct pipe_rt_blend_state *rt =
+         ctx->blend && state_target <= ctx->blend->state.max_rt
+            ? &ctx->blend->state.rt[state_target]
+            : ctx->blend ? &ctx->blend->state.rt[0] : NULL;
+      const bool enabled = active && rt && rt->blend_enable;
+
+      command->color_masks[target] =
+         active ? pvrgpu_rt_colormask(ctx, target) : 0;
+      command->blend_enables[target] = enabled;
+      if (!pvrgpu_translate_systemc_blend_state(
+             enabled ? rt->rgb_func : PIPE_BLEND_ADD,
+             enabled ? rt->rgb_src_factor : PIPE_BLENDFACTOR_ONE,
+             enabled ? rt->rgb_dst_factor : PIPE_BLENDFACTOR_ZERO,
+             enabled ? rt->alpha_func : PIPE_BLEND_ADD,
+             enabled ? rt->alpha_src_factor : PIPE_BLENDFACTOR_ONE,
+             enabled ? rt->alpha_dst_factor : PIPE_BLENDFACTOR_ZERO,
+             &command->blend_rgb_equations[target],
+             &command->blend_source_rgb_factors[target],
+             &command->blend_destination_rgb_factors[target],
+             &command->blend_alpha_equations[target],
+             &command->blend_source_alpha_factors[target],
+             &command->blend_destination_alpha_factors[target]))
+         return false;
+   }
+
+   /* Keep the pre-v39 scalar view exact for diagnostics and old code paths. */
+   command->color_mask = command->color_masks[0];
+   command->blend_enable = command->blend_enables[0];
+   command->blend_rgb_equation = command->blend_rgb_equations[0];
+   command->blend_alpha_equation = command->blend_alpha_equations[0];
+   command->blend_source_rgb_factor = command->blend_source_rgb_factors[0];
+   command->blend_destination_rgb_factor =
+      command->blend_destination_rgb_factors[0];
+   command->blend_source_alpha_factor = command->blend_source_alpha_factors[0];
+   command->blend_destination_alpha_factor =
+      command->blend_destination_alpha_factors[0];
    return true;
 }
 
@@ -7484,7 +7633,8 @@ pvrgpu_compile_shadow_observation(
 
    char error[512] = { 0 };
    if (!ctx->pco_compiler) {
-      ctx->pco_compiler = pvrgpu_pco_compiler_create(error, sizeof(error));
+      ctx->pco_compiler =
+         pvrgpu_context_create_pco_compiler(ctx, error, sizeof(error));
       if (!ctx->pco_compiler) {
          pvrgpu_counter_eventf("draw_pco_shadow_compile_error",
                                "profile=%u stage=compiler_create reason=%s",
@@ -7610,7 +7760,8 @@ pvrgpu_compile_terrain_pco_binary(
 
    char error[512] = { 0 };
    if (!ctx->pco_compiler) {
-      ctx->pco_compiler = pvrgpu_pco_compiler_create(error, sizeof(error));
+      ctx->pco_compiler =
+         pvrgpu_context_create_pco_compiler(ctx, error, sizeof(error));
       if (!ctx->pco_compiler) {
          pvrgpu_counter_eventf("draw_pco_terrain_compile_error",
                                "pass=%u profile=%u stage=compiler_create "
@@ -9190,7 +9341,7 @@ pvrgpu_emit_draw_pco_triangles_command(
    char error[512] = {0};
    if (!ctx->pco_compiler) {
       ctx->pco_compiler =
-         pvrgpu_pco_compiler_create(error, sizeof(error));
+         pvrgpu_context_create_pco_compiler(ctx, error, sizeof(error));
       if (!ctx->pco_compiler) {
          pvrgpu_counter_eventf("draw_pco_triangles_command_error",
                                "stage=compiler_create reason=%s",
@@ -9366,7 +9517,8 @@ pvrgpu_emit_lit_mesh_command(
 
    char error[512] = {0};
    if (!ctx->pco_compiler) {
-      ctx->pco_compiler = pvrgpu_pco_compiler_create(error, sizeof(error));
+      ctx->pco_compiler =
+         pvrgpu_context_create_pco_compiler(ctx, error, sizeof(error));
       if (!ctx->pco_compiler) {
          pvrgpu_counter_eventf("draw_pco_lit_mesh_command_error",
                                "stage=compiler_create reason=%s",
@@ -9887,6 +10039,7 @@ pvrgpu_shadow_sampler_supported(const struct pipe_sampler_view *view,
        view->target == PIPE_TEXTURE_CUBE_ARRAY) &&
       view->texture && view->texture->nr_samples <= 1 &&
       view->texture->nr_storage_samples <= 1 &&
+      view->swizzle_r == PIPE_SWIZZLE_X &&
       util_format_has_depth(util_format_description(view->format)) &&
       sampler->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE &&
       sampler->compare_func <= PIPE_FUNC_ALWAYS &&
@@ -9913,6 +10066,130 @@ pvrgpu_set_generic_texture_compare_metadata(const struct pipe_sampler_view *view
          : 0;
    descriptor[12] = sampler->compare_mode != PIPE_TEX_COMPARE_NONE ?
       sampler->compare_func : 0;
+}
+
+#define PVRGPU_BUFFER_TEXTURE_ROW_ELEMENTS 8192U
+
+static bool
+pvrgpu_capture_generic_buffer_texture(
+   const struct pvrgpu_context *ctx,
+   mesa_shader_stage stage,
+   unsigned slot,
+   unsigned descriptor_set,
+   struct pvrgpu_systemc_pco_sequence_texture *destination,
+   uint8_t **out_bytes,
+   const char **reason)
+{
+   uint32_t api_stage;
+   if (!ctx || !destination || !out_bytes || !reason ||
+       slot >= PVRGPU_PCO_MAX_TEXTURES ||
+       !pvrgpu_systemc_shader_stage_from_mesa(stage, &api_stage)) {
+      if (reason) *reason = "arguments";
+      return false;
+   }
+   const struct pipe_sampler_view *view = ctx->sampler_views[stage][slot];
+   if (!view || !view->texture || view->target != PIPE_BUFFER ||
+       view->texture->target != PIPE_BUFFER ||
+       view->texture->nr_samples > 1 ||
+       view->texture->nr_storage_samples > 1) {
+      *reason = "buffer_view";
+      return false;
+   }
+   const enum pipe_format format = view->format;
+   const struct util_format_description *description =
+      util_format_description(format);
+   const struct util_format_unpack_description *unpack =
+      util_format_unpack_description(format);
+   const unsigned texel_bytes = util_format_get_blocksize(format);
+   if (!description || !unpack || !unpack->unpack_rgba || !texel_bytes ||
+       texel_bytes > 16 || description->layout != UTIL_FORMAT_LAYOUT_PLAIN ||
+       description->colorspace != UTIL_FORMAT_COLORSPACE_RGB ||
+       description->block.width != 1 || description->block.height != 1 ||
+       description->block.depth != 1 ||
+       util_format_is_depth_or_stencil(format)) {
+      *reason = "buffer_view_format";
+      return false;
+   }
+   const struct pvrgpu_resource *resource = pvrgpu_resource(view->texture);
+   const uint64_t offset = view->u.buf.offset;
+   const uint64_t extent = view->u.buf.size;
+   if (!resource || !resource->data || extent < texel_bytes ||
+       (offset & 15U) != 0U ||
+       offset > view->texture->width0 ||
+       extent > view->texture->width0 - offset ||
+       offset > resource->size || extent > resource->size - offset) {
+      *reason = "buffer_view_range";
+      return false;
+   }
+   /* Texture-buffer ranges expose only complete texels.  The ES extension
+    * deliberately permits a final partial texel (for example, an RGBA8 view
+    * of 513 bytes has 128 elements); never snapshot those trailing bytes. */
+   const uint64_t elements64 = extent / texel_bytes;
+   if (!elements64 || elements64 > 65536U) {
+      *reason = "buffer_view_elements";
+      return false;
+   }
+   const unsigned elements = (unsigned)elements64;
+   const unsigned width = MIN2(elements, PVRGPU_BUFFER_TEXTURE_ROW_ELEMENTS);
+   const unsigned height = DIV_ROUND_UP(elements,
+                                        PVRGPU_BUFFER_TEXTURE_ROW_ELEMENTS);
+   const enum pipe_format storage_format = util_format_is_pure_integer(format)
+      ? (util_format_is_pure_uint(format) ? PIPE_FORMAT_R32G32B32A32_UINT
+                                          : PIPE_FORMAT_R32G32B32A32_SINT)
+      : PIPE_FORMAT_R32G32B32A32_FLOAT;
+   const uint64_t row_pitch64 = (uint64_t)width * 16U;
+   const uint64_t storage_size64 = row_pitch64 * height;
+   if (!row_pitch64 || storage_size64 > UINT32_MAX) {
+      *reason = "buffer_view_storage";
+      return false;
+   }
+   uint8_t *bytes = calloc(1, (size_t)storage_size64);
+   if (!bytes) {
+      *reason = "allocation";
+      return false;
+   }
+   const unsigned swizzle[4] = {view->swizzle_r, view->swizzle_g,
+                                view->swizzle_b, view->swizzle_a};
+   const bool integer = util_format_is_pure_integer(format);
+   for (unsigned element = 0; element < elements; ++element) {
+      uint32_t rgba[4] = {0, 0, 0,
+                          integer ? 1U : UINT32_C(0x3f800000)};
+      uint32_t result[4];
+      util_format_unpack_rgba(format, rgba,
+         resource->data + offset + (uint64_t)element * texel_bytes, 1);
+      for (unsigned channel = 0; channel < 4; ++channel)
+         result[channel] = swizzle[channel] < 4 ? rgba[swizzle[channel]] :
+            swizzle[channel] == PIPE_SWIZZLE_1
+               ? (integer ? 1U : UINT32_C(0x3f800000)) : 0U;
+      memcpy(bytes + (size_t)element * 16U, result, sizeof(result));
+   }
+
+   memset(destination, 0, sizeof(*destination));
+   destination->source = PVRGPU_SYSTEMC_PCO_TEXTURE_EXTERNAL_PAYLOAD;
+   destination->stage = api_stage;
+   destination->descriptor_set = descriptor_set;
+   destination->format = util_format_name(storage_format);
+   destination->bytes = bytes;
+   destination->bytes_size = (size_t)storage_size64;
+   destination->declared_bytes_size = (size_t)storage_size64;
+   destination->mip_count = 1;
+   destination->mip[0].width = width;
+   destination->mip[0].height = height;
+   destination->mip[0].row_pitch = (uint32_t)row_pitch64;
+   destination->min_filter = PVRGPU_SYSTEMC_PCO_TEXTURE_FILTER_NEAREST;
+   destination->mag_filter = PVRGPU_SYSTEMC_PCO_TEXTURE_FILTER_NEAREST;
+   destination->mip_filter = PVRGPU_SYSTEMC_PCO_TEXTURE_MIP_FILTER_NONE;
+   destination->wrap_u = PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_EDGE;
+   destination->wrap_v = PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_EDGE;
+   destination->wrap_w = PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_EDGE;
+   destination->normalized_coordinates = 1;
+   destination->texture_kind = 5;
+   destination->layers = 1;
+   destination->buffer_elements = elements;
+   destination->sample_count = 1;
+   *out_bytes = bytes;
+   *reason = NULL;
+   return true;
 }
 
 static bool
@@ -9971,6 +10248,9 @@ pvrgpu_capture_generic_sequence_texture(
       ctx->sampler_views[stage][slot];
    const struct pvrgpu_sampler_state *sampler =
       ctx->samplers[stage][slot];
+   if (view && view->texture && view->target == PIPE_BUFFER)
+      return pvrgpu_capture_generic_buffer_texture(
+         ctx, stage, slot, descriptor_set, destination, out_bytes, reason);
    if (!view || !view->texture || !sampler) {
       *reason = "binding";
       return false;
@@ -10561,6 +10841,14 @@ pvrgpu_capture_graphics_buffers(
             continue;
          const struct pipe_shader_buffer *binding =
             &ctx->shader_buffers[stage->stage][slot];
+         uint32_t *descriptor = stage->shared +
+            compiled->descriptor_start + 4u * slot;
+         descriptor[0] = descriptor[1] = descriptor[2] = descriptor[3] = 0;
+         /* Robust PCO NIR tests the descriptor size before issuing memory
+          * traffic. Preserve an unbound/zero-length slot as a canonical null
+          * descriptor instead of failing the whole draw snapshot. */
+         if (!binding->buffer || !binding->buffer_size)
+            continue;
          uint32_t access = 0;
          if (compiled->read_mask & bit)
             access |= PVRGPU_SYSTEMC_SHADER_BUFFER_READ;
@@ -10588,9 +10876,6 @@ pvrgpu_capture_graphics_buffers(
                .offset = captured->offset,
                .bytes_size = captured->bytes_size,
             };
-         uint32_t *descriptor = stage->shared +
-            compiled->descriptor_start + 4u * slot;
-         descriptor[0] = descriptor[1] = descriptor[3] = 0;
          descriptor[2] = captured->bytes_size;
       }
    }
@@ -10796,15 +11081,34 @@ pvrgpu_capture_initial_color_target(
    const unsigned width = framebuffer_width * MAX2(1, recorded->command.raster_samples);
    const unsigned height = ctx->framebuffer.height;
    const unsigned capture_layers = MAX2(1, recorded->command.framebuffer_layers);
+   const char *transport_format = pvrgpu_color_format_at(
+      recorded->command.format,
+      recorded->command.color_attachment_format_count,
+      recorded->command.color_attachment_formats, target);
    if (pvrgpu_color_formats_error(recorded->command.format,
           recorded->command.render_target_count,
           recorded->command.color_attachment_format_count,
           recorded->command.color_attachment_formats) ||
-       strcmp(pvrgpu_color_format_at(recorded->command.format,
-          recorded->command.color_attachment_format_count,
-          recorded->command.color_attachment_formats, target),
+       strcmp(transport_format,
           pvrgpu_command_format_for_surface(surface->format)))
       return false;
+   if (!texture) {
+      /* An inactive draw-buffer slot has no application storage to LOAD or
+       * write back, but target-major transport still needs a correctly sized
+       * slice so later active locations retain their indices.  NONE maps to
+       * the canonical four-byte RGBA8 dummy format above. */
+      if (strcmp(transport_format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA8) ||
+          width == 0 || height == 0 ||
+          height > SIZE_MAX / width / 4u / capture_layers)
+         return false;
+      const size_t size = (size_t)width * height * 4u * capture_layers;
+      uint8_t *pixels = calloc(1, size);
+      if (!pixels)
+         return false;
+      *out_pixels = pixels;
+      *out_size = size;
+      return true;
+   }
    if (!texture || !resource->data || width == 0 || height == 0 ||
        surface->level >= resource->level_count ||
        surface->level >= PIPE_MAX_TEXTURE_LEVELS ||
@@ -10827,27 +11131,34 @@ pvrgpu_capture_initial_color_target(
       return false;
 
    const bool integer = util_format_is_pure_integer(surface->format);
-   const bool float32 = util_format_is_float(surface->format);
+   const bool canonical_double =
+      pvrgpu_color_format_uses_canonical_double(transport_format);
+   const bool canonical_float =
+      pvrgpu_color_format_uses_canonical_float(transport_format);
+   const bool float_transport = canonical_float ||
+      !strcmp(transport_format, PVRGPU_DRIVER_COMMAND_FORMAT_RGBA32F);
    const bool packed10 = surface->format == PIPE_FORMAT_R10G10B10A2_UNORM ||
                          surface->format == PIPE_FORMAT_B10G10R10A2_UNORM;
    const unsigned components = util_format_get_nr_components(surface->format);
    const unsigned raw_channels = !integer ? 0u : components <= 2 ? components : 4u;
-   const unsigned bytes_per_pixel = float32 ? 16u :
+   const unsigned bytes_per_pixel = canonical_double ? 4u * sizeof(double) :
+      float_transport ? 4u * sizeof(float) :
       raw_channels ? raw_channels * 4u : 4u;
-   if (width > UINT_MAX / 16u || height > SIZE_MAX / width ||
+   if (width > UINT_MAX / bytes_per_pixel || height > SIZE_MAX / width ||
        (size_t)width * height > SIZE_MAX / bytes_per_pixel / capture_layers)
       return false;
 
    /* sRGB model storage already contains encoded bytes, as on readback. */
    const enum pipe_format unpack_format =
       surface->format == PIPE_FORMAT_R8G8B8A8_SRGB ||
-      surface->format == PIPE_FORMAT_B8G8R8A8_SRGB
+      surface->format == PIPE_FORMAT_B8G8R8A8_SRGB ||
+      surface->format == PIPE_FORMAT_A8B8G8R8_SRGB
          ? util_format_linear(surface->format)
          : surface->format;
    const struct util_format_unpack_description *unpack =
       util_format_unpack_description(unpack_format);
-   if (!unpack || (!packed10 &&
-       ((integer || float32) ? (!unpack->unpack_rgba && !unpack->unpack_rgba_rect)
+   if (!unpack || (!packed10 && !canonical_double &&
+       ((integer || float_transport) ? (!unpack->unpack_rgba && !unpack->unpack_rgba_rect)
                 : (!unpack->unpack_rgba_8unorm &&
                    !unpack->unpack_rgba_8unorm_rect))))
       return false;
@@ -10877,7 +11188,21 @@ pvrgpu_capture_initial_color_target(
           * format for blending; routing LOAD through 4ub loses low RGB bits.
           * memcpy also accepts unaligned resource offsets and row pitches. */
          memcpy(destination, source + (size_t)y * stride, row_bytes);
-      } else if (float32) {
+      } else if (canonical_double) {
+         const uint8_t *native_row = source + (size_t)y * stride;
+         for (unsigned x = 0; x < width; ++x) {
+            for (unsigned component = 0; component < 4; ++component) {
+               uint32_t native;
+               memcpy(&native,
+                      native_row + ((size_t)x * 4u + component) * sizeof(native),
+                      sizeof(native));
+               const double canonical = (double)native / 4294967295.0;
+               memcpy(destination +
+                         ((size_t)x * 4u + component) * sizeof(canonical),
+                      &canonical, sizeof(canonical));
+            }
+         }
+      } else if (float_transport) {
          util_format_read_4(unpack_format, destination, width * 16u,
                             source, stride, 0, y, width, 1);
       } else if (integer) {
@@ -11654,6 +11979,13 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    }
    const bool has_tessellation = ctx->tcs && ctx->tes;
    const bool current_images = ctx->fs && ctx->fs->nir && ctx->fs->nir->info.num_images;
+   /* Colour is different from external image/SSBO/SO snapshots below.  Every
+    * recorded draw already chains its attachment LOAD to ordinal - 1, and the
+    * model's coherent framebuffer-fetch shadow commits in API order.  Keeping
+    * a fetch draw in the same sequence is therefore both the required
+    * visibility path and essential while an RDC replay is still incomplete:
+    * such a replay deliberately cannot be submitted early. BlendBarrier
+    * remains the explicit boundary for non-coherent fetch. */
    const bool preceding_images = ctx->array_primitive_draw_count &&
       ctx->array_primitive_draws[ctx->array_primitive_draw_count - 1]->command.fragment_image_count;
    const bool current_graphics_buffers =
@@ -12209,7 +12541,8 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
 
    char error[512] = {0};
    if (!ctx->pco_compiler) {
-      ctx->pco_compiler = pvrgpu_pco_compiler_create(error, sizeof(error));
+      ctx->pco_compiler =
+         pvrgpu_context_create_pco_compiler(ctx, error, sizeof(error));
       if (!ctx->pco_compiler) {
          pvrgpu_counter_eventf("draw_color_triangle_pco_command_error",
                                "stage=compiler_create reason=%s",
@@ -12405,6 +12738,7 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
     * keeps all sample IDs/coverage unique. Sample-mask stores also execute
     * per sample so native feedback can suppress just that sample. */
    command.sample_frequency = ctx->min_samples > 1 ||
+      ctx->fs->nir->info.fs.uses_fbfetch_output ||
       ctx->fs->nir->info.fs.uses_sample_shading ||
       ctx->fs->nir->info.fs.uses_sample_qualifier ||
       BITSET_TEST(ctx->fs->nir->info.system_values_read, SYSTEM_VALUE_SAMPLE_ID) ||
@@ -12443,9 +12777,18 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    command.height = command_viewport_height;
    /* The attachment's own format, not an assumed RGBA8. */
    command.format = pvrgpu_command_format_for_framebuffer(ctx);
-   /* The colour the surface was actually cleared to, not an assumed black. */
-   memcpy(command.clear_color_bits, ctx->color_clear_bits,
-          sizeof(command.clear_color_bits));
+   /* The colour the surface was actually cleared to, not an assumed black.
+    * A leading GL_NONE slot has no surface or clear value of its own.  Its
+    * transport is a masked RGBA8 dummy and the first draw LOADs every real
+    * attachment below, so give that dummy a finite canonical clear instead
+    * of reusing raw integer bits from an attachment that was just detached. */
+   if (ctx->framebuffer.nr_cbufs &&
+       ctx->framebuffer.cbufs[0].texture) {
+      memcpy(command.clear_color_bits, ctx->color_clear_bits,
+             sizeof(command.clear_color_bits));
+   } else {
+      command.clear_color_bits[3] = UINT32_C(0x3f800000);
+   }
    command.raw_vertex_data = (const uint8_t *)interleaved;
    command.raw_vertex_data_size =
       (size_t)packed_vertex_count * packed_words * sizeof(uint32_t);
@@ -13110,6 +13453,8 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
          pvrgpu_array_primitive_draw_destroy(&recorded);
          return false;
       }
+      if (captured->texture_kind == 5U)
+         shared_words[descriptor_start + 5U] = captured->buffer_elements;
       if (captured->texture_kind == 4U) {
          const struct pipe_sampler_view *view = ctx->sampler_views[stage][texture];
          pvrgpu_counter_eventf("draw_array_primitive_texture_snapshot",
@@ -13128,9 +13473,11 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
                view->swizzle_r, view->swizzle_g, view->swizzle_b, view->swizzle_a,
                ctx->samplers[stage][texture]->state.compare_mode);
       }
-      pvrgpu_set_generic_texture_compare_metadata(
-         ctx->sampler_views[stage][texture], &ctx->samplers[stage][texture]->state,
-         &shared_words[descriptor_start]);
+      if (captured->texture_kind != 5U)
+         pvrgpu_set_generic_texture_compare_metadata(
+            ctx->sampler_views[stage][texture],
+            &ctx->samplers[stage][texture]->state,
+            &shared_words[descriptor_start]);
       ++recorded->texture_count;
     }
    }
@@ -13170,8 +13517,13 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
       fragment_shared_count ? recorded->fragment_shared_words : NULL;
    pvrgpu_pco_triangles_command_to_systemc(&command, &recorded->command);
    recorded->command.raster_samples = MAX2(1, ctx->framebuffer.samples);
-   const struct pipe_surface *layer_surface = ctx->framebuffer.nr_cbufs ?
-      &ctx->framebuffer.cbufs[0] : &ctx->framebuffer.zsbuf;
+   const struct pipe_surface *layer_surface = &ctx->framebuffer.zsbuf;
+   for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target) {
+      if (ctx->framebuffer.cbufs[target].texture) {
+         layer_surface = &ctx->framebuffer.cbufs[target];
+         break;
+      }
+   }
    if (layer_surface->texture && layer_surface->last_layer > layer_surface->first_layer)
       recorded->command.framebuffer_layers =
          (unsigned)layer_surface->last_layer - layer_surface->first_layer + 1;
@@ -13317,27 +13669,9 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
        * an enabled blend has an equation worth translating, and one the model
        * cannot express is a reason to decline the draw.
        */
-      const struct pipe_rt_blend_state *rt =
-         ctx->blend ? &ctx->blend->state.rt[0] : NULL;
-      const bool blending = ctx->framebuffer.nr_cbufs && rt && rt->blend_enable;
-      if (!pvrgpu_init_systemc_blend_state(
-             &recorded->command,
-             blending,
-             blending ? rt->rgb_func : PIPE_BLEND_ADD,
-             blending ? rt->rgb_src_factor : PIPE_BLENDFACTOR_ONE,
-             blending ? rt->rgb_dst_factor : PIPE_BLENDFACTOR_ZERO,
-             blending ? rt->alpha_func : PIPE_BLEND_ADD,
-             blending ? rt->alpha_src_factor : PIPE_BLENDFACTOR_ONE,
-             blending ? rt->alpha_dst_factor : PIPE_BLENDFACTOR_ZERO)) {
+      if (!pvrgpu_init_systemc_render_target_states(ctx, &recorded->command)) {
          pvrgpu_counter_eventf("draw_array_primitive_record_error",
-                               "stage=blend reason=unsupported_equation "
-                               "rgb=%u,%u,%u alpha=%u,%u,%u",
-                               blending ? rt->rgb_func : 0,
-                               blending ? rt->rgb_src_factor : 0,
-                               blending ? rt->rgb_dst_factor : 0,
-                               blending ? rt->alpha_func : 0,
-                               blending ? rt->alpha_src_factor : 0,
-                               blending ? rt->alpha_dst_factor : 0);
+                               "stage=blend reason=unsupported_target_state");
          pvrgpu_array_primitive_draw_destroy(&recorded);
          return false;
       }
@@ -13526,7 +13860,8 @@ pvrgpu_emit_texture_pco_command(
 
    char error[512] = { 0 };
    if (!ctx->pco_compiler) {
-      ctx->pco_compiler = pvrgpu_pco_compiler_create(error, sizeof(error));
+      ctx->pco_compiler =
+         pvrgpu_context_create_pco_compiler(ctx, error, sizeof(error));
       if (!ctx->pco_compiler) {
          pvrgpu_counter_eventf("draw_pco_texture_command_error",
                                "stage=compiler_create reason=%s",
@@ -13701,7 +14036,8 @@ pvrgpu_emit_ideas_pco_command(
 
    char error[512] = { 0 };
    if (!ctx->pco_compiler) {
-      ctx->pco_compiler = pvrgpu_pco_compiler_create(error, sizeof(error));
+      ctx->pco_compiler =
+         pvrgpu_context_create_pco_compiler(ctx, error, sizeof(error));
       if (!ctx->pco_compiler) {
          pvrgpu_counter_eventf("draw_pco_ideas_command_error",
                                "stage=compiler_create reason=%s",
@@ -14351,6 +14687,8 @@ pvrgpu_draw_is_lowerable_array_primitive(
           view->texture->target != PIPE_TEXTURE_2D_ARRAY &&
           view->texture->target != PIPE_TEXTURE_3D &&
           view->texture->target != PIPE_TEXTURE_CUBE &&
+          !(view->texture->target == PIPE_BUFFER &&
+            view->target == PIPE_BUFFER) &&
           !(view->texture->target == PIPE_TEXTURE_CUBE_ARRAY &&
             view->target == PIPE_TEXTURE_CUBE_ARRAY)) {
          *reason = "texture_target";
@@ -14380,7 +14718,7 @@ pvrgpu_draw_is_lowerable_array_primitive(
          }
          return false;
       }
-      if (!ctx->samplers[stage][texture]) {
+      if (!ctx->samplers[stage][texture] && view->target != PIPE_BUFFER) {
          *reason = "texture_sampler_missing";
          if (detail && detail_size)
             snprintf(detail, detail_size, "slot=%u", texture);
@@ -14393,10 +14731,8 @@ pvrgpu_draw_is_lowerable_array_primitive(
       }
     }
    }
-   /*
-    * One to four colour attachments, every one present and sharing the
-    * format the capsule states for the pass.
-    */
+   /* One to four colour locations. GL_NONE holes are represented by masked
+    * dummy slices; every bound attachment must have an explicit transport. */
    if (ctx->framebuffer.nr_cbufs == 0 && !ctx->framebuffer.zsbuf.texture) {
       *reason = "no_attachment";
       return false;
@@ -14411,8 +14747,9 @@ pvrgpu_draw_is_lowerable_array_primitive(
       return false;
    }
    for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target) {
-      if (!ctx->framebuffer.cbufs[target].texture ||
-          !pvrgpu_is_explicit_color_format(pvrgpu_command_format_for_surface(
+      if (!ctx->framebuffer.cbufs[target].texture)
+         continue;
+      if (!pvrgpu_is_explicit_color_format(pvrgpu_command_format_for_surface(
              ctx->framebuffer.cbufs[target].format))) {
          *reason = "mixed_render_targets";
          return false;
@@ -16520,7 +16857,8 @@ pvrgpu_launch_grid(struct pipe_context *pipe,
       pvrgpu_pco_compute_binary_finish(&compute->binary);
       reason = "compute_compile";
       if (!ctx->pco_compiler)
-         ctx->pco_compiler = pvrgpu_pco_compiler_create(error, sizeof(error));
+         ctx->pco_compiler =
+            pvrgpu_context_create_pco_compiler(ctx, error, sizeof(error));
       if (!ctx->pco_compiler ||
           !pvrgpu_pco_compile_compute(ctx->pco_compiler, compute->nir,
              uniform_dwords, &compute->binary, error, sizeof(error)))
@@ -16561,6 +16899,8 @@ pvrgpu_launch_grid(struct pipe_context *pipe,
       const struct pipe_constant_buffer *binding =
          &ctx->constant_buffers[MESA_SHADER_COMPUTE][
             abi->cb0_uniform_buffer_slot == block + 1 ? 0 : block + 1];
+      if ((!binding->buffer && !binding->user_buffer) || !binding->buffer_size)
+         continue;
       if (!pvrgpu_compute_snapshot_add(&snapshot,
              PVRGPU_SYSTEMC_COMPUTE_UNIFORM_BUFFER, block,
              PVRGPU_SYSTEMC_COMPUTE_ACCESS_READ,
@@ -16574,6 +16914,8 @@ pvrgpu_launch_grid(struct pipe_context *pipe,
          continue;
       const struct pipe_shader_buffer *binding =
          &ctx->shader_buffers[MESA_SHADER_COMPUTE][slot];
+      if (!binding->buffer || !binding->buffer_size)
+         continue;
       uint32_t access = 0;
       if (abi->storage_buffer_read_mask & bit)
          access |= PVRGPU_SYSTEMC_COMPUTE_ACCESS_READ;
@@ -16650,9 +16992,12 @@ pvrgpu_launch_grid(struct pipe_context *pipe,
          reason = "compute_cube_array_texture_descriptor";
          goto fail;
       }
-      pvrgpu_set_generic_texture_compare_metadata(
-         ctx->sampler_views[MESA_SHADER_COMPUTE][slot],
-         &ctx->samplers[MESA_SHADER_COMPUTE][slot]->state, descriptor);
+      if (captured->texture_kind == 5U)
+         descriptor[5] = captured->buffer_elements;
+      else
+         pvrgpu_set_generic_texture_compare_metadata(
+            ctx->sampler_views[MESA_SHADER_COMPUTE][slot],
+            &ctx->samplers[MESA_SHADER_COMPUTE][slot]->state, descriptor);
    }
    struct pvrgpu_systemc_compute_dispatch dispatch = {0};
    dispatch.version = PVRGPU_SYSTEMC_COMPUTE_API_VERSION;
@@ -16774,6 +17119,16 @@ pvrgpu_set_shader_images(struct pipe_context *pipe,
 }
 
 static void
+pvrgpu_texture_barrier(struct pipe_context *pipe, unsigned flags)
+{
+   /* SystemC submissions are synchronous, but recorded graphics may not have
+    * reached the resource backing yet.  Materialize the current attachments
+    * so framebuffer-fetch and a following draw observe every prior write. */
+   pvrgpu_flush_current_color_attachments(pipe);
+   pvrgpu_counter_eventf("texture_barrier", "flags=0x%x synchronous=1", flags);
+}
+
+static void
 pvrgpu_memory_barrier(struct pipe_context *pipe, unsigned flags)
 {
    /* Compute returns only after model writes have been materialized. Pending
@@ -16787,12 +17142,13 @@ pvrgpu_create_context(struct pipe_screen *screen, void *priv,
                       unsigned flags)
 {
    (void)priv;
-   (void)flags;
    struct pvrgpu_context *ctx = CALLOC_STRUCT(pvrgpu_context);
    if (!ctx)
       return NULL;
 
    ctx->base.screen = screen;
+   ctx->robust_buffer_access =
+      (flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS) != 0;
    /* GL's initial depth clear value is 1.0; the context is calloc'd to zero. */
    ctx->depth_clear_bits = UINT32_C(0x3f800000);
    ctx->base.destroy = pvrgpu_destroy;
@@ -16821,6 +17177,7 @@ pvrgpu_create_context(struct pipe_screen *screen, void *priv,
    ctx->base.launch_grid = pvrgpu_launch_grid;
    ctx->base.set_shader_buffers = pvrgpu_set_shader_buffers;
    ctx->base.set_shader_images = pvrgpu_set_shader_images;
+   ctx->base.texture_barrier = pvrgpu_texture_barrier;
    ctx->base.memory_barrier = pvrgpu_memory_barrier;
    ctx->blitter = util_blitter_create(&ctx->base);
    if (!ctx->blitter) {

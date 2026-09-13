@@ -4,8 +4,10 @@
  * mixed-winding uint16 index bytes，再走完整 event-driven
  * VDM（Vertex Data Master）→VertexFetch→PCO（PowerVR Compiler Output）
  * ISS（Instruction Set Simulator）→ClipCull→Tiler→ParameterBuffer 路徑。
- * 測試不執行 fragment shader；6797 setup 與 2044 visible cell expectation
+ * 測試不執行 fragment shader；4088 setup（2044 visible cells x 2）
  * 都由 index/winding、segment clip/cull 及 24.8 setup 資料計算。
+ * 64x64 swath-order segment 皆含 clipmask，所以 backface 在 generic
+ * clip path 進入 fixed setup 前即被剔除。
  */
 #include "common/functional_types.h"
 #include "common/glbench_triangle_fixture.h"
@@ -40,10 +42,11 @@ constexpr std::uint32_t kWidth = 64;
 constexpr std::uint32_t kHeight = 64;
 constexpr std::uint32_t kExpectedPrimitiveCount = 32768;
 constexpr std::uint32_t kExpectedVertexInvocations = 21144;
-constexpr std::uint32_t kExpectedSetupTriangles = 6797;
 constexpr std::uint32_t kExpectedVisibleCells = 2044;
 constexpr std::uint32_t kExpectedRasterizableTriangles =
     2 * kExpectedVisibleCells;
+constexpr std::uint32_t kExpectedSetupTriangles =
+    kExpectedRasterizableTriangles;
 
 void Check(bool condition, const std::string &message) {
   if (!condition)

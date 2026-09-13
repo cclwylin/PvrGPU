@@ -42,7 +42,7 @@ const char *ExpectedFailure(const std::string &mode) {
   if (mode == "facing-noncanonical" || mode == "helper-facing-mismatch")
     return "texture fragment USC lost shader-lane identity";
   if (mode == "visible-facing-mismatch")
-    return "texture fragment USC visible facing identity mismatch";
+    return "texture fragment USC visible identity mismatch";
   if (mode == "continuation-facing" || mode == "continuation-facing-valid")
     return "texture fragment USC response ordering is invalid";
   if (mode == "duplicate-task" || mode == "task-out-of-range")
@@ -185,8 +185,10 @@ public:
     state.fragment_program_summary.early_hsr_safe = atomics ? 0 : 1;
     state.fragment_program_summary.uses_derivatives = 1;
     state.fragment_pco_abi.temps = 25; state.fragment_pco_abi.shareds = 40;
+    state.fragment_pco_abi.push_constant_start = 40;
     state.fragment_pco_abi.coefficients = 8;
     state.position_output_count = state.fragment_position_count = 4;
+    state.fragment_position_uses_w = 1;
     state.varying_output_start = state.fragment_varying_start = 4;
     state.varying_output_count = 1; state.fragment_varying_count = 4;
     state.sampled_texture_count = 2;

@@ -149,6 +149,13 @@ void TestTransportContract() {
   const auto fixture = Fixture();
   Check(ValidateDriverGraphicsShaderBuffers(fixture, &error), error.c_str());
 
+  auto unbound = fixture;
+  unbound.graphics_buffer_bindings.erase(
+      unbound.graphics_buffer_bindings.begin());
+  unbound.vertex_shared[2] = 0;
+  Check(ValidateDriverGraphicsShaderBuffers(unbound, &error),
+        "a used but unbound graphics SSBO remains a canonical null hole");
+
   auto size_only = fixture;
   size_only.graphics_storage[0].read_mask = 0;
   size_only.graphics_storage[0].write_mask = 0;
@@ -238,11 +245,11 @@ void TestFiveStageAtomicCallbacks() {
       UscShaderBufferMemory::Atomic32(&read_only, PcoOpcode::kAtomicCompSwap,
                                       address, 1);
     }, "compare-swap cannot enter the one-operand graphics ABI");
-    Reject([&] {
-      std::uint32_t output = 0;
-      UscShaderBufferMemory::Read(&read_only, address + sizeof(words), 1,
-                                  &output);
-    }, "stage view bounds are enforced");
+    std::uint32_t robust_output = 0xccccccccU;
+    UscShaderBufferMemory::Read(&read_only, address + sizeof(words), 1,
+                                &robust_output);
+    Check(robust_output == 0,
+          "an SSBO address outside the stage view loads zero");
 
     UscShaderBufferMemory write_only(
         &memory, mode, {resource}, {{address, sizeof(words), 2, 0}},
@@ -253,6 +260,40 @@ void TestFiveStageAtomicCallbacks() {
     }, "write-only stage view blocks shader loads");
     const std::uint32_t replacement = UINT32_C(0x11223344);
     UscShaderBufferMemory::Write(&write_only, address + 4, 1, &replacement);
+
+    // A native vec load/store is bounded per DWORD.  Preserve the prefix at
+    // the end of the selected view, suppress its tail, and do not touch the
+    // adjacent bytes in the backing BO.  OOB atomics return zero and perform
+    // no RMW or traffic.
+    std::array<std::uint32_t, 4> robust_words{1, 2, 3, 0xfeedfaceU};
+    GpuMemorySystem robust_memory(mode);
+    robust_memory.HostWrite(address, robust_words.data(), sizeof(robust_words));
+    const ShaderBufferResource robust_resource{
+        UINT64_C(0xdef), address, sizeof(robust_words), 3, 0, {0, 1}};
+    UscShaderBufferMemory robust_buffers(
+        &robust_memory, mode, {robust_resource}, {{address, 12, 3, 0}},
+        MemoryClient::kFragmentShader);
+    std::array<std::uint32_t, 2> vector{0xccccccccU, 0xccccccccU};
+    UscShaderBufferMemory::Read(&robust_buffers, address + 8, 2,
+                                vector.data());
+    Check(vector[0] == 3 && vector[1] == 0,
+          "partial SSBO load preserves its in-range DWORD and zeroes its tail");
+    const std::array<std::uint32_t, 2> vector_store{
+        UINT32_C(0x01020304), UINT32_C(0xaabbccdd)};
+    UscShaderBufferMemory::Write(&robust_buffers, address + 8, 2,
+                                 vector_store.data());
+    Check(UscShaderBufferMemory::Atomic32(
+              &robust_buffers, PcoOpcode::kAtomicAdd32, address + 12, 9) == 0 &&
+              robust_buffers.atomics() == 0,
+          "OOB SSBO atomic returns zero without executing an RMW");
+    const auto robust_readback = robust_buffers.Readback(robust_resource);
+    std::array<std::uint32_t, 4> robust_actual{};
+    std::memcpy(robust_actual.data(), robust_readback.data(),
+                sizeof(robust_actual));
+    Check(robust_actual[0] == 1 && robust_actual[1] == 2 &&
+              robust_actual[2] == vector_store[0] &&
+              robust_actual[3] == robust_words[3],
+          "partial/OOB SSBO operations touched bytes beyond the bound view");
 
     struct AtomicCase {
       PcoOpcode opcode;

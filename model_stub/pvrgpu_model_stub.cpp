@@ -47,6 +47,7 @@
 #include "pds/pds_engine.h"
 #include "pds/vertex_pds_engine.h"
 #include "shader/pco_decoder.h"
+#include "shader/pco_iss.h"
 #include "shader/compute_shader.h"
 #include "shader/geometry_shader.h"
 #include "shader/tessellation_control_shader.h"
@@ -301,6 +302,28 @@ int AnnounceModelConfiguration(pvrgpu::stub::Options &options) {
   const bool is_driver_pco_varying =
       is_driver_pco_triangles &&
       options.driver_command.varying_output_count != 0;
+  const std::size_t reported_target_state_count = std::min<std::size_t>(
+      first_draw.render_target_state_count, first_draw.blend_enables.size());
+  const bool driver_blended = first_draw.render_target_state_count != 0
+      ? std::any_of(first_draw.blend_enables.begin(),
+                    first_draw.blend_enables.begin() +
+                        reported_target_state_count,
+                    [](std::uint32_t enabled) { return enabled != 0; })
+      : first_draw.blend_enable != 0;
+  const bool reported_blend = options.driver_command.enabled
+      ? driver_blended : is_blended;
+  bool fragment_hsr_safe = true;
+  if (is_driver_pco_triangles) {
+    fragment_hsr_safe =
+        DecodePcoProgram(ShaderStage::kFragment, first_draw.fragment_pco)
+            .summary.early_hsr_safe != 0;
+  }
+  const bool effective_early_hsr =
+      !reported_blend && fragment_hsr_safe &&
+      first_draw.fragment_image_write_mask == 0 &&
+      first_draw.graphics_storage[1].write_mask == 0 &&
+      first_draw.alpha_to_coverage == 0 &&
+      first_draw.alpha_to_coverage_dither == 0;
   const bool is_triangle_setup = IsTriangleSetupFamily(functional_case);
   const bool is_triangle_setup_all_culled =
       functional_case == FunctionalCase::kTriangleSetupAllCulled;
@@ -498,19 +521,19 @@ int AnnounceModelConfiguration(pvrgpu::stub::Options &options) {
             << ",\"framebuffer_source\":\"dram-readback\""
             << ",\"blend_state\":{"
             << "\"enabled\":"
-            << (is_blended ? "true" : "false")
+            << (reported_blend ? "true" : "false")
             << ",\"rgb_equation\":\"add\""
             << ",\"alpha_equation\":\"add\""
             << ",\"source_rgb_factor\":\""
-            << (is_blended ? "source-alpha" : "one") << "\""
+            << (reported_blend ? "source-alpha" : "one") << "\""
             << ",\"destination_rgb_factor\":\""
-            << (is_blended ? "one-minus-source-alpha" : "zero") << "\""
+            << (reported_blend ? "one-minus-source-alpha" : "zero") << "\""
             << ",\"source_alpha_factor\":\""
-            << (is_blended ? "source-alpha" : "one") << "\""
+            << (reported_blend ? "source-alpha" : "one") << "\""
             << ",\"destination_alpha_factor\":\""
-            << (is_blended ? "one-minus-source-alpha" : "zero") << "\"}"
+            << (reported_blend ? "one-minus-source-alpha" : "zero") << "\"}"
             << ",\"effective_early_hsr\":"
-            << (is_blended ? "false" : "true")
+            << (effective_early_hsr ? "true" : "false")
             << ",\"face_cull_state\":{"
             << "\"enabled\":"
               << ((RequiresBackCcwFaceCull(functional_case) ||

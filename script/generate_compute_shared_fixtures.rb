@@ -5,7 +5,7 @@ abort 'usage: generate_compute_shared_fixtures.rb compiler-artifact-dir output.h
 abort 'third argument must be images or textures (omit it for shared fixtures)' if ARGV.size == 3 && !%w[images textures].include?(ARGV[2])
 images = ARGV[2] == 'images'
 textures = ARGV[2] == 'textures'
-first, last = textures ? [300, 303] : images ? [32, 38] : [24, 30]
+first, last = textures ? [300, 304] : images ? [32, 38] : [24, 30]
 stem = textures ? 'ComputeTexturePco' : images ? 'ComputeImagePco' : 'ComputeSharedPco'
 origin = images ? 'actual compute compiler NIR tests' : 'pvrgpu_compute_compiler_test.c'
 lines = ["// Generated from #{origin}, native gx6250 PCO.",

@@ -58,6 +58,8 @@ bool pvrgpu_expand_instanced_connected_indices(
 
 struct pvrgpu_context {
    struct pipe_context base;
+   /* Mirrors PIPE_CONTEXT_ROBUST_BUFFER_ACCESS into every lazy PCO compile. */
+   bool robust_buffer_access;
    /* Mesa's shader blitter is used for operations which are GPU work on the
     * reference driver, notably render-to-texture mipmap generation. */
    struct blitter_context *blitter;

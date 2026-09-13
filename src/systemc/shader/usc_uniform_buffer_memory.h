@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
-#include <sstream>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -59,34 +58,35 @@ private:
                   std::uint32_t *destination) {
     // Native LD_IMMBL encodes a positive wrapped 4-bit burst: 1..16 DWORDs.
     // Mesa may coalesce adjacent NIR vector loads into the larger bursts.
-    if (!memory_ || !destination || dword_count == 0 || dword_count > 16 ||
+    if (!destination || dword_count == 0 || dword_count > 16 ||
         address % sizeof(std::uint32_t))
       throw std::runtime_error("USC UBO load service/destination/alignment/count is invalid");
-    const std::size_t bytes = dword_count * sizeof(std::uint32_t);
-    // Check the exact API-bound range, not DRAM's coarser page allocation.
-    // A read cannot bridge adjacent buffers or reach another shader stage.
-    const bool in_range = std::any_of(
-        resources_.begin(), resources_.end(), [&](const auto &range) {
-          if (address < range.gpu_address)
-            return false;
-          const std::uint64_t offset = address - range.gpu_address;
-          return offset <= range.bytes && bytes <= range.bytes - offset;
+    std::fill_n(destination, dword_count, 0U);
+
+    // The callback carries an absolute address rather than the originating
+    // descriptor slot.  Select the one stage-local view containing the first
+    // DWORD, then bound the burst to that view.  This preserves robust
+    // per-DWORD results at the end of a UBO without letting a vector load
+    // bridge into an adjacent bound block.  An entirely unbound address is a
+    // successful zero load and issues no modeled memory traffic.
+    const auto range = std::find_if(
+        resources_.begin(), resources_.end(), [&](const auto &candidate) {
+          return address >= candidate.gpu_address &&
+                 address - candidate.gpu_address < candidate.bytes;
         });
-    if (!in_range) {
-      std::ostringstream message;
-      message << "USC UBO load exceeds its stage bound buffer range: address=0x"
-              << std::hex << address << std::dec << " bytes=" << bytes;
-      for (const auto &range : resources_)
-        message << " [block=" << range.block_index << " address=0x" << std::hex
-                << range.gpu_address << std::dec << " bytes=" << range.bytes
-                << ']';
-      throw std::runtime_error(message.str());
-    }
-    const MemoryReadResult read =
-        memory_->Read(address, bytes, MemoryClient::kUniformBuffer);
-    if (read.data.size() != bytes)
+    if (range == resources_.end())
+      return;
+    const std::uint64_t offset = address - range->gpu_address;
+    const std::size_t valid_dwords = std::min<std::size_t>(
+        dword_count, static_cast<std::size_t>((range->bytes - offset) / 4U));
+    if (valid_dwords == 0)
+      return;
+    const std::size_t valid_bytes = valid_dwords * sizeof(std::uint32_t);
+    const MemoryReadResult read = memory_->Read(
+        address, valid_bytes, MemoryClient::kUniformBuffer);
+    if (read.data.size() != valid_bytes)
       throw std::runtime_error("USC UBO load returned an incomplete memory response");
-    std::memcpy(destination, read.data.data(), bytes);
+    std::memcpy(destination, read.data.data(), valid_bytes);
     stats_ += read.stats;
   }
 

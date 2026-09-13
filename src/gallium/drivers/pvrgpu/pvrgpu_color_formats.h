@@ -8,6 +8,42 @@ static inline int
 pvrgpu_is_explicit_color_format(const char *format)
 {
    return format && (!strcmp(format, "PIPE_FORMAT_R8G8B8A8_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R8_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R8G8_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R8G8B8X8_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_B8G8R8X8_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R5G6B5_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_B5G6R5_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R16_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R16G16_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R16G16B16A16_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R32G32B32A32_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R8_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R8G8_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R8G8B8A8_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R16_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R16G16_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R16G16B16A16_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R10G10B10A2_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_B10G10R10A2_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R8_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R8G8_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R8G8B8A8_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R16_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R16G16_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R16G16B16A16_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R8_SNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R8G8_SNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R8G8B8A8_SNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R16_SNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R16G16_SNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R16G16B16A16_SNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R11G11B10_FLOAT") ||
+                     !strcmp(format, "PIPE_FORMAT_R16_FLOAT") ||
+                     !strcmp(format, "PIPE_FORMAT_R16G16_FLOAT") ||
+                     !strcmp(format, "PIPE_FORMAT_R16G16B16A16_FLOAT") ||
+                     !strcmp(format, "PIPE_FORMAT_R32_FLOAT") ||
+                     !strcmp(format, "PIPE_FORMAT_R32G32_FLOAT") ||
                      !strcmp(format, "PIPE_FORMAT_R8G8B8A8_SRGB") ||
                      !strcmp(format, "PIPE_FORMAT_B8G8R8A8_SRGB") ||
                      !strcmp(format, "PIPE_FORMAT_R10G10B10A2_UNORM") ||
@@ -19,6 +55,57 @@ pvrgpu_is_explicit_color_format(const char *format)
                      !strcmp(format, "PIPE_FORMAT_R32G32B32A32_UINT") ||
                      !strcmp(format, "PIPE_FORMAT_R32G32B32A32_SINT") ||
                      !strcmp(format, "PIPE_FORMAT_R32G32B32A32_FLOAT"));
+}
+
+static inline int
+pvrgpu_color_format_uses_integer_codec(const char *format)
+{
+   return format && (!strcmp(format, "PIPE_FORMAT_R8_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R8G8_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R8G8B8A8_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R16_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R16G16_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R16G16B16A16_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R32_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R32G32_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R32G32B32A32_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R10G10B10A2_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_B10G10R10A2_UINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R8_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R8G8_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R8G8B8A8_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R16_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R16G16_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R16G16B16A16_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R32_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R32G32_SINT") ||
+                     !strcmp(format, "PIPE_FORMAT_R32G32B32A32_SINT"));
+}
+
+static inline int
+pvrgpu_color_format_uses_canonical_float(const char *format)
+{
+   return pvrgpu_is_explicit_color_format(format) &&
+          !pvrgpu_color_format_uses_integer_codec(format) &&
+          strcmp(format, "PIPE_FORMAT_R32G32B32A32_UNORM") &&
+          strcmp(format, "PIPE_FORMAT_R8G8B8A8_UNORM") &&
+          strcmp(format, "PIPE_FORMAT_R8G8B8A8_SRGB") &&
+          strcmp(format, "PIPE_FORMAT_B8G8R8A8_SRGB") &&
+          strcmp(format, "PIPE_FORMAT_R10G10B10A2_UNORM") &&
+          strcmp(format, "PIPE_FORMAT_B10G10R10A2_UNORM") &&
+          strcmp(format, "PIPE_FORMAT_R32_UINT") &&
+          strcmp(format, "PIPE_FORMAT_R32_SINT") &&
+          strcmp(format, "PIPE_FORMAT_R32G32_UINT") &&
+          strcmp(format, "PIPE_FORMAT_R32G32_SINT") &&
+          strcmp(format, "PIPE_FORMAT_R32G32B32A32_UINT") &&
+          strcmp(format, "PIPE_FORMAT_R32G32B32A32_SINT") &&
+          strcmp(format, "PIPE_FORMAT_R32G32B32A32_FLOAT");
+}
+
+static inline int
+pvrgpu_color_format_uses_canonical_double(const char *format)
+{
+   return format && !strcmp(format, "PIPE_FORMAT_R32G32B32A32_UNORM");
 }
 
 static inline const char *
