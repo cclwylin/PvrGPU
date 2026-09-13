@@ -3,6 +3,7 @@
 #include "common/tessellation_state.h"
 #include "memory/gpu_memory_system.h"
 #include "shader/tessellation_iss.h"
+#include "shader/usc_shader_buffer_memory.h"
 #include "shader/usc_uniform_buffer_memory.h"
 #include <algorithm>
 #include <cstring>
@@ -26,6 +27,7 @@ bool Permitted(const std::vector<TessellationBufferRange> &ranges,
 struct ControlMemory {
   GpuMemorySystem &memory;
   UscUniformBufferMemory &uniforms;
+  UscShaderBufferMemory &storage;
   CounterTxn &counters;
   const std::vector<TessellationBufferRange> &buffers;
   std::uint64_t input_address,input_bytes,output_address,output_bytes;
@@ -71,6 +73,13 @@ struct ControlMemory {
     }
     WaitForCycles(MemoryAccessDelayCycles(write));
   }
+  static std::uint32_t Atomic32(void *opaque, PcoOpcode operation,
+                                std::uint64_t address,
+                                std::uint32_t operand) {
+    auto &self = *static_cast<ControlMemory *>(opaque);
+    return UscShaderBufferMemory::Atomic32(&self.storage, operation, address,
+                                           operand);
+  }
 };
 }
 
@@ -98,9 +107,16 @@ void TessellationControlShader::Execute(PipelineState &state, const PipelineTxn 
      t.output_address>UINT64_MAX-std::uint64_t{kTessellationMaxPatches}*kTessellationPatchAddressStride ||
      HasPoolHandle(t.control_instructions))
     throw std::runtime_error("TCS phase/patch/address/layout contract is invalid");
+  const bool generic_storage = HasPoolHandle(state.graphics_buffer_resources) ||
+      state.graphics_storage[3].descriptor_start ||
+      state.graphics_storage[3].descriptor_count ||
+      state.graphics_storage[3].used_mask || state.graphics_storage[3].read_mask ||
+      state.graphics_storage[3].write_mask;
+  const DriverStorageBufferAbi &storage_abi = generic_storage
+      ? state.graphics_storage[3] : t.control_storage;
   const auto program=DecodeTessellationPcoProgram(ShaderStage::kTessellationControl,
       LoadArray<std::uint8_t>(pool_,t.control_code));
-  ValidateTessellationProgram(program,t.control_abi,&t.control_storage);
+  ValidateTessellationProgram(program,t.control_abi,&storage_abi);
   t.control_summary=program.summary;
   t.control_instructions=StoreNewArray(pool_,program.instructions);
   StoreArray(pool_,state.tessellation_state,records);
@@ -115,9 +131,18 @@ void TessellationControlShader::Execute(PipelineState &state, const PipelineTxn 
   UscUniformBufferMemory uniforms(memory_,state.memory_mode,
       HasPoolHandle(t.control_uniform_buffers)?LoadArray<UniformBufferResource>(pool_,t.control_uniform_buffers):
                                               std::vector<UniformBufferResource>{});
-  const auto storage_buffers = HasPoolHandle(t.control_buffer_ranges)
-      ? LoadArray<TessellationBufferRange>(pool_, t.control_buffer_ranges)
+  const PoolHandle storage_resources_handle = generic_storage
+      ? state.graphics_buffer_resources : t.buffer_resources;
+  const PoolHandle storage_ranges_handle = generic_storage
+      ? state.graphics_buffer_ranges[3] : t.control_buffer_ranges;
+  auto storage_resources = HasPoolHandle(storage_resources_handle)
+      ? LoadArray<ShaderBufferResource>(pool_, storage_resources_handle)
+      : std::vector<ShaderBufferResource>{};
+  const auto storage_buffers = HasPoolHandle(storage_ranges_handle)
+      ? LoadArray<ShaderBufferRange>(pool_, storage_ranges_handle)
       : std::vector<TessellationBufferRange>{};
+  UscShaderBufferMemory storage_memory(memory_, state.memory_mode,
+      storage_resources, storage_buffers, MemoryClient::kTessellationControl);
   TessellationExecutionStats execution;
   const auto task_handle=pool_.Allocate(sizeof(TessellationTaskState));
   try {
@@ -149,15 +174,17 @@ void TessellationControlShader::Execute(PipelineState &state, const PipelineTxn 
       auto &task=*reinterpret_cast<TessellationTaskState*>(pool_.Write(task_handle).data());
       task=MakeTessellationControlTask(t.control_abi,shared,patch.primitive_id,
                                        patch.input_vertices,t.output_vertices,
-                                       &t.control_storage);
-      ControlMemory context{*memory_,uniforms,state.counters,storage_buffers,
+                                       &storage_abi);
+      ControlMemory context{*memory_,uniforms,storage_memory,state.counters,storage_buffers,
                              t.input_address,input_words*4,
                              patch.output_address,t.patch_stride_dwords*4};
       context.sample = [this, &state, &txn](const PcoTextureRequest &request, std::uint32_t *response) {
         SampleTessellationTexture(pool_, state, txn, ShaderStage::kTessellationControl, request,
                                   response, texture_request_output, texture_response_input);
       };
-      const TessellationMemoryCallbacks callbacks{&context,ControlMemory::Read,ControlMemory::Write,ControlMemory::Sample};
+      const TessellationMemoryCallbacks callbacks{
+          &context, ControlMemory::Read, ControlMemory::Write,
+          ControlMemory::Atomic32, ControlMemory::Sample};
       while(!task.ended)StepTessellationTask(program,t.control_abi,task,callbacks,execution);
       const auto required=t.domain==TessellationDomain::kQuads?63U:
                           t.domain==TessellationDomain::kTriangles?23U:3U;
@@ -169,7 +196,9 @@ void TessellationControlShader::Execute(PipelineState &state, const PipelineTxn 
   } catch(...) { pool_.Release(task_handle);throw; }
   pool_.Release(task_handle);
   ApplyMemoryAccessStats(state.counters,uniforms.stats());
+  ApplyMemoryAccessStats(state.counters,storage_memory.stats());
   WaitForCycles(MemoryAccessDelayCycles(uniforms.stats()));
+  WaitForCycles(MemoryAccessDelayCycles(storage_memory.stats()));
   state.counters.pco_decode_cycles+=program.summary.group_count;
   state.counters.pco_instructions+=program.summary.instruction_count;
   state.counters.usc_groups+=execution.groups;

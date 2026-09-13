@@ -130,7 +130,8 @@ int main(int argc, char **argv)
          expected_ubos = 2; expected_count = 376; expected_start = 8; rescued = true; break;
       case 6: current = "size-query-keeps-ubo-packed"; v.size_ubo = true; packed = true;
          expected_ubos = 1; expected_count = 4; expected_start = 4; rescued = true; break;
-      case 7: current = "dynamic-binding-keeps-all"; v.load_ubo = true; v.indirect_ubo = true; success = false; break;
+      case 7: current = "dynamic-binding-keeps-all"; v.load_ubo = true; v.indirect_ubo = true; packed = true;
+         expected_ubos = 1; expected_count = 4; expected_start = 4; rescued = true; break;
       case 8: current = "already-fitting-dead-ubo-unchanged"; v.bound = 380; v.base = 0;
          expected_ubos = 1; expected_count = 380; expected_start = 4; break;
       case 9: current = "already-fitting-live-ubo-unchanged"; v.bound = 380; v.base = 0; v.load_ubo = true;

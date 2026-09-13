@@ -94,6 +94,32 @@ void TestGenericPackedUnormFormatGates() {
   }
 }
 
+void TestGenericCombinedTessellationGeometryTopology() {
+  Options options = SequenceEnvelope("generic.combined.tessellation-geometry",
+                                     16, 16);
+  auto draw = options.driver_command;
+  draw.command = "draw_pco_triangles";
+  draw.primitive_mode = 14;
+  draw.vertex_count = 6;
+  draw.instance_count = 1;
+  // The profile gate only needs owned executable markers here.  Native
+  // binary/ABI validation belongs to the API boundary that precedes it.
+  draw.tessellation.control_pco = {1};
+  draw.tessellation.vertices_per_instance = 3;
+  draw.geometry_pco = {1};
+  draw.geometry_shared.assign(4, 0);
+  draw.geometry_pco_abi.shareds = 4;
+  draw.geometry_pco_abi.push_constant_start = 4;
+  draw.geometry_pco_abi.uniform_buffer_descriptor_start = 4;
+  draw.geometry_vertices_per_instance = 3;
+  options.driver_commands = {draw};
+
+  std::string error;
+  if (!DriverPcoSequenceSupported(options, &error))
+    throw std::runtime_error(
+        "generic five-stage PATCHES draw was rejected: " + error);
+}
+
 void TestProfileCardinalityDispatch() {
   struct Case {
     const char *name;
@@ -364,6 +390,7 @@ int main() {
     TestRejectsNonSequenceAndClearsStaleError();
     TestRejectsUnknownProfile();
     TestGenericPackedUnormFormatGates();
+    TestGenericCombinedTessellationGeometryTopology();
     TestProfileCardinalityDispatch();
     TestUnsupportedResolutionFailsClosed();
     TestLogicalCountersByResolution();

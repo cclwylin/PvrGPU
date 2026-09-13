@@ -63,6 +63,7 @@ struct Fixture {
     draw.fragment_pco_abi = {1,0,0,4,0,0,0,0,0,0};
     draw.position_output_count = draw.varying_output_start = 4;
     draw.fragment_position_count = draw.fragment_varying_start = 4;
+    draw.fragment_position_uses_w = 1;
     draw.fragment_output_mask[0] = 15;
     draw.viewport_scale_bits[0] = draw.viewport_scale_bits[1] = 0x41000000;
     draw.viewport_scale_bits[2] = 0x3f000000;
@@ -81,7 +82,7 @@ struct Fixture {
 
 int main(int argc, char **argv) {
   try {
-    static_assert(PVRGPU_SYSTEMC_API_VERSION == 37);
+    static_assert(PVRGPU_SYSTEMC_API_VERSION == 38);
     const bool incomplete_patch = argc > 2 && std::string(argv[2]) == "incomplete";
     const auto nonce = std::chrono::high_resolution_clock::now().time_since_epoch().count();
     const auto root = std::filesystem::temp_directory_path() / ("pvrgpu-tess-api25-" + std::to_string(nonce));

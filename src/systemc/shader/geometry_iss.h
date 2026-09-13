@@ -18,6 +18,7 @@ struct GeometryTaskState {
   std::uint64_t outputs_written = 0;
   std::uint64_t steps = 0;
   std::uint32_t instruction_index = 0;
+  PcoWriteTarget pending_target = PcoWriteTarget::kNone;
   std::uint32_t pending_output = 0;
   std::uint32_t pending_count = 0;
   std::uint32_t predicate = 0;
@@ -40,6 +41,7 @@ struct GeometryExecutionStats {
 struct GeometryExecutionCallbacks {
   void *user_data = nullptr;
   PcoMemoryReadCallback read = nullptr;
+  PcoMemoryAtomic32Callback atomic32 = nullptr;
   void (*emit)(void *, const std::uint32_t *, std::uint32_t, std::uint64_t) = nullptr;
   void (*cut)(void *) = nullptr;
   void (*finish)(void *) = nullptr;
@@ -47,10 +49,12 @@ struct GeometryExecutionCallbacks {
 };
 
 void ValidateGeometryProgram(const PcoDecodedProgram &program,
-                              const DriverPcoStageAbi &abi);
+                             const DriverPcoStageAbi &abi,
+                             const DriverStorageBufferAbi *storage = nullptr);
 GeometryTaskState MakeGeometryTask(const DriverPcoStageAbi &abi,
     const std::vector<std::uint32_t> &shared, std::uint32_t primitive_id,
-    std::uint32_t invocation_id);
+    std::uint32_t invocation_id,
+    const DriverStorageBufferAbi *storage = nullptr);
 void StepGeometryTask(const PcoDecodedProgram &program,
     const DriverPcoStageAbi &abi, GeometryTaskState &task,
     const GeometryExecutionCallbacks &callbacks, GeometryExecutionStats &stats);

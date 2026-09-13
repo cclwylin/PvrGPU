@@ -35,7 +35,7 @@ struct TessellationPatch {
   std::uint32_t reserved = 0;
 };
 
-struct TessellationBufferResource {
+struct ShaderBufferResource {
   std::uint64_t resource_token = 0;
   std::uint64_t gpu_address = 0;
   std::uint64_t bytes = 0;
@@ -44,12 +44,15 @@ struct TessellationBufferResource {
   PoolHandle readback;
 };
 
-struct TessellationBufferRange {
+struct ShaderBufferRange {
   std::uint64_t gpu_address = 0;
   std::uint64_t bytes = 0;
   std::uint32_t access = 0;
   std::uint32_t slot = 0;
 };
+
+using TessellationBufferResource = ShaderBufferResource;
+using TessellationBufferRange = ShaderBufferRange;
 
 struct TessellationState {
   PoolHandle control_code;
@@ -97,8 +100,8 @@ struct TessellationState {
 };
 
 static_assert(std::is_trivially_copyable_v<TessellationPatch>);
-static_assert(std::is_trivially_copyable_v<TessellationBufferResource>);
-static_assert(std::is_trivially_copyable_v<TessellationBufferRange>);
+static_assert(std::is_trivially_copyable_v<ShaderBufferResource>);
+static_assert(std::is_trivially_copyable_v<ShaderBufferRange>);
 static_assert(std::is_trivially_copyable_v<TessellationState>);
 
 } // namespace pvrgpu::stub

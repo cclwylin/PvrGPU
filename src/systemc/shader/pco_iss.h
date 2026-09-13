@@ -600,6 +600,8 @@ inline bool HasCanonicalDerivativeMode(const PcoInstruction &i) {
       (i.derivative_fine == 1 &&
        (i.opcode == PcoOpcode::kDerivativeX || i.opcode == PcoOpcode::kDerivativeY));
 }
+bool HasCanonicalPcoAtomic32(const PcoInstruction &instruction,
+                             bool allow_vertex_registers = false);
 
 /* Stored directly in PipelineState; no owning container appears here. */
 struct PcoProgramSummary {
@@ -718,6 +720,7 @@ struct PcoVertexExecutionContext {
   std::uint16_t shared_count = 0;
   std::uint8_t texture_response_valid = 0;
   PcoMemoryReadCallback memory_read = nullptr;
+  PcoMemoryAtomic32Callback memory_atomic32 = nullptr;
   void *memory_user_data = nullptr;
 };
 
@@ -885,6 +888,12 @@ PcoDecodedProgram DecodeComputePcoProgram(const std::vector<std::uint8_t> &binar
 PcoDecodedProgram DecodeGeometryPcoProgram(const std::vector<std::uint8_t> &binary);
 PcoDecodedProgram DecodeTessellationPcoProgram(
     ShaderStage stage, const std::vector<std::uint8_t> &binary);
+/* Re-run the decoder's conservative texture metadata recovery on semantic
+ * instructions.  This narrow hook lets regression fixtures prove register
+ * spans and control-flow barriers without inventing otherwise-valid binary
+ * encodings solely to exercise the reverse data-flow scan. */
+void AnnotatePcoTextureMetadataForTesting(
+    std::vector<PcoInstruction> &instructions);
 bool PcoSpecialConstantBits(std::uint16_t index, std::uint32_t *bits);
 struct PcoCarryBorrowResult {
   std::uint32_t low = 0;
@@ -922,7 +931,8 @@ PcoVertexExecution ResumeVertexPco(
     const PcoVertexContinuation &continuation,
     const std::array<std::uint32_t, kPcoTextureResponseCount> &texture_response,
     PcoMemoryReadCallback memory_read = nullptr,
-    void *memory_user_data = nullptr);
+    void *memory_user_data = nullptr,
+    PcoMemoryAtomic32Callback memory_atomic32 = nullptr);
 
 PcoFragmentExecution
 ExecuteFragmentPco(const PcoProgramSummary &summary,
@@ -1003,9 +1013,11 @@ inline PcoVertexExecution ResumeVertex(
     const std::vector<PcoInstruction> &instructions,
     const PcoVertexContinuation &continuation,
     const std::array<std::uint32_t, kPcoTextureResponseCount> &texture_response,
-    PcoMemoryReadCallback memory_read = nullptr, void *memory_user_data = nullptr) {
+    PcoMemoryReadCallback memory_read = nullptr, void *memory_user_data = nullptr,
+    PcoMemoryAtomic32Callback memory_atomic32 = nullptr) {
   return ResumeVertexPco(summary, instructions, continuation,
-                         texture_response, memory_read, memory_user_data);
+                         texture_response, memory_read, memory_user_data,
+                         memory_atomic32);
 }
 
 inline PcoFragmentExecution

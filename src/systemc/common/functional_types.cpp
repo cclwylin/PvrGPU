@@ -642,9 +642,10 @@ bool IsExactVaryingBinding(const PipelineState &state,
     const auto coefficient_count = state.fragment_pco_abi.coefficients / 4;
     const auto position_coefficient_count =
         state.fragment_position_count / kCoefficientSetDwordCount;
-    const auto output_dwords = HasPoolHandle(state.tessellation_state)
-        ? state.tessellation_output_dwords : HasPoolHandle(state.geometry_code)
-        ? state.geometry_pco_abi.vertex_outputs : state.vertex_pco_abi.vertex_outputs;
+    const auto output_dwords = HasPoolHandle(state.geometry_code)
+        ? state.geometry_pco_abi.vertex_outputs
+        : HasPoolHandle(state.tessellation_state)
+        ? state.tessellation_output_dwords : state.vertex_pco_abi.vertex_outputs;
     if (HasPoolHandle(state.geometry_code) &&
         binding.interpolation != InterpolationMode::kFlat) {
       for (const auto &range : {
@@ -712,9 +713,10 @@ bool IsExactVaryingBinding(const PipelineState &state,
   else if (state.fragment_varying_count !=
            components * kCoefficientSetDwordCount)
     refusal = "fragment_varying_count";
-  else if ((HasPoolHandle(state.tessellation_state)
-                ? state.tessellation_output_dwords : HasPoolHandle(state.geometry_code)
+  else if ((HasPoolHandle(state.geometry_code)
                 ? state.geometry_pco_abi.vertex_outputs
+                : HasPoolHandle(state.tessellation_state)
+                ? state.tessellation_output_dwords
                 : state.vertex_pco_abi.vertex_outputs) !=
            ActiveVertexOutputDwordCount(state))
     refusal = "vertex_outputs";
@@ -930,6 +932,11 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
     for (const auto &image : LoadArray<ShaderImageResource>(pool, state.fragment_image_resources))
       release_unique(image.readback);
   }
+  if (HasPoolHandle(state.graphics_buffer_resources)) {
+    for (const auto &resource :
+         LoadArray<ShaderBufferResource>(pool, state.graphics_buffer_resources))
+      release_unique(resource.readback);
+  }
   const PoolHandle handles[] = {
       state.drawlist_stats,
       state.vertex_buffer_resources,
@@ -940,6 +947,12 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
       state.stream_output_bindings,
       state.stream_output_targets,
       state.fragment_image_resources,
+      state.graphics_buffer_resources,
+      state.graphics_buffer_ranges[0],
+      state.graphics_buffer_ranges[1],
+      state.graphics_buffer_ranges[2],
+      state.graphics_buffer_ranges[3],
+      state.graphics_buffer_ranges[4],
       state.geometry_input_primitives,
       state.geometry_primitives,
       state.geometry_code,

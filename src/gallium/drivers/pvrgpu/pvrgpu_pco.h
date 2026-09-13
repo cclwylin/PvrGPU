@@ -72,6 +72,16 @@ struct pvrgpu_pco_uniform_word_map {
    uint32_t source_words[256];
 };
 
+/* Driver-only stage-local storage-buffer capture plan. Four shared DWORDs
+ * describe each block: base low/high, byte size and dynamic byte offset. */
+struct pvrgpu_pco_storage_buffer_abi {
+   uint32_t descriptor_start;
+   uint32_t descriptor_count;
+   uint32_t used_mask;
+   uint32_t read_mask;
+   uint32_t write_mask;
+};
+
 struct pvrgpu_pco_owned_binary {
    uint8_t *data;
    size_t size;
@@ -82,6 +92,7 @@ struct pvrgpu_pco_owned_binary {
     * ordinary read-only DMA descriptor path instead of the shared register
     * file.  The slot is always appended after the shader's real UBOs. */
    uint32_t cb0_uniform_buffer_slot;
+   struct pvrgpu_pco_storage_buffer_abi storage;
 };
 
 /* Compute has its own transport contract; it is never a graphics stage.
@@ -325,6 +336,29 @@ bool pvrgpu_pco_compile_tessellation_pipeline(
    unsigned attribute_count,
    unsigned fragment_texture_count,
    struct pvrgpu_pco_tessellation_pipeline_binary *out,
+   char *error, size_t error_size);
+
+/* Compile the complete VS -> TCS -> TES -> GS -> FS chain.  Tessellation
+ * owns the VS/TCS/TES/FS binaries and the TES output layout; geometry owns
+ * the GS binary and its final raster-facing output layout. */
+bool pvrgpu_pco_compile_tessellation_geometry_pipeline(
+   struct pvrgpu_pco_compiler *compiler,
+   const struct nir_shader *vertex_nir,
+   const struct nir_shader *control_nir,
+   const struct nir_shader *evaluation_nir,
+   const struct nir_shader *geometry_nir,
+   const struct nir_shader *fragment_nir,
+   const enum pipe_format *attribute_formats,
+   unsigned render_target_count,
+   unsigned vertex_uniform_dwords,
+   unsigned control_uniform_dwords,
+   unsigned evaluation_uniform_dwords,
+   unsigned geometry_uniform_dwords,
+   unsigned fragment_uniform_dwords,
+   unsigned attribute_count,
+   unsigned fragment_texture_count,
+   struct pvrgpu_pco_tessellation_pipeline_binary *tessellation,
+   struct pvrgpu_pco_geometry_binary *geometry,
    char *error, size_t error_size);
 void pvrgpu_pco_tessellation_pipeline_binary_finish(
    struct pvrgpu_pco_tessellation_pipeline_binary *binary);

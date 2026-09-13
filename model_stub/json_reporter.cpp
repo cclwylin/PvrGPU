@@ -184,6 +184,7 @@ struct VertexPcoEvidence {
   std::uint64_t ubfe = 0;
   std::uint64_t add64_32 = 0;
   std::uint64_t ld = 0;
+  std::uint64_t atomic32 = 0;
   std::uint64_t smp = 0;
   std::uint64_t wdf = 0;
   // Vertex programs use the same native P0/CND/BR control-flow encoding as
@@ -448,6 +449,18 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
     case PcoOpcode::kBufferLoad:
       ++evidence.ld;
       break;
+    case PcoOpcode::kAtomicAdd32:
+    case PcoOpcode::kAtomicUnsignedMin32:
+    case PcoOpcode::kAtomicUnsignedMax32:
+    case PcoOpcode::kAtomicSignedMin32:
+    case PcoOpcode::kAtomicSignedMax32:
+    case PcoOpcode::kAtomicAnd32:
+    case PcoOpcode::kAtomicOr32:
+    case PcoOpcode::kAtomicXor32:
+    case PcoOpcode::kAtomicExchange32:
+    case PcoOpcode::kAtomicSub32:
+      ++evidence.atomic32;
+      break;
     case PcoOpcode::kBranch:
       ++evidence.branch;
       break;
@@ -489,7 +502,7 @@ VertexPcoEvidence BuildVertexPcoEvidence(const MemoryPool &pool,
       evidence.frcp + evidence.frsq + evidence.flog2 + evidence.fexp2 +
       evidence.pck_f16 + evidence.unpck_f16 + evidence.unpck_int +
       evidence.f2i + evidence.imadd32 + evidence.imadd64_high + evidence.ubfe + evidence.smp +
-      evidence.wdf + evidence.add64_32 + evidence.ld + evidence.branch +
+      evidence.wdf + evidence.add64_32 + evidence.ld + evidence.atomic32 + evidence.branch +
       evidence.cnd + evidence.tstz;
   if (opcode_total != instructions.size()) {
     throw std::runtime_error(
@@ -828,6 +841,7 @@ void AppendVertexPcoEvidence(const MemoryPool &pool,
   PVRGPU_ADD_VERTEX_EVIDENCE(ubfe);
   PVRGPU_ADD_VERTEX_EVIDENCE(add64_32);
   PVRGPU_ADD_VERTEX_EVIDENCE(ld);
+  PVRGPU_ADD_VERTEX_EVIDENCE(atomic32);
   PVRGPU_ADD_VERTEX_EVIDENCE(smp);
   PVRGPU_ADD_VERTEX_EVIDENCE(wdf);
   PVRGPU_ADD_VERTEX_EVIDENCE(branch);
@@ -2088,6 +2102,8 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
     std::cout << ",\"add64_32\":" << vertex_pco.add64_32;
   if (vertex_pco.ld != 0)
     std::cout << ",\"ld\":" << vertex_pco.ld;
+  if (vertex_pco.atomic32 != 0)
+    std::cout << ",\"atomic32\":" << vertex_pco.atomic32;
   if (vertex_pco.movi != 0)
     std::cout << ",\"movi\":" << vertex_pco.movi;
   if (vertex_pco.fneg != 0)
@@ -2439,6 +2455,31 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
 }
 
 void PublishStreamOutputs(ModelJob &job, const MemoryPool &pool, const PipelineState &state) {
+  if (HasPoolHandle(state.graphics_buffer_resources)) {
+    for (const auto &resource : LoadArray<ShaderBufferResource>(
+             pool, state.graphics_buffer_resources)) {
+      if (!(resource.access & 2U))
+        continue;
+      if (!resource.resource_token || !HasPoolHandle(resource.readback))
+        throw std::runtime_error(
+            "JsonReporter graphics storage buffer has no modeled readback");
+      ModelShaderImageReadback result;
+      result.resource_token = resource.resource_token;
+      result.bytes = LoadArray<std::uint8_t>(pool, resource.readback);
+      if (result.bytes.size() != resource.bytes)
+        throw std::runtime_error(
+            "JsonReporter graphics storage-buffer readback extent mismatch");
+      const auto prior = std::find_if(
+          job.shader_images.begin(), job.shader_images.end(),
+          [&](const auto &entry) {
+            return entry.resource_token == result.resource_token;
+          });
+      if (prior == job.shader_images.end())
+        job.shader_images.push_back(std::move(result));
+      else
+        *prior = std::move(result);
+    }
+  }
   if (HasPoolHandle(state.tessellation_state)) {
     const auto tess = LoadArray<TessellationState>(pool, state.tessellation_state);
     if (tess.size() != 1)

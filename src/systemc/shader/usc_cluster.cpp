@@ -13,9 +13,11 @@
 #include "common/centroid.h"
 #include "common/pipeline_state.h"
 #include "common/msaa.h"
+#include "graphics_shader_buffers.h"
 #include "shader/pco_iss.h"
 #include "shader/usc_uniform_buffer_memory.h"
 #include "shader/usc_shader_image_memory.h"
+#include "shader/usc_shader_buffer_memory.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -31,40 +33,68 @@
 
 namespace pvrgpu::stub {
 
+namespace {
+
+struct UscGraphicsReadMemory {
+  UscUniformBufferMemory *uniform = nullptr;
+  UscShaderBufferMemory *storage = nullptr;
+
+  static void Read(void *user_data, std::uint64_t address,
+                   std::uint32_t dword_count, std::uint32_t *destination) {
+    if (!user_data || !dword_count)
+      throw std::runtime_error("USC graphics load has no memory context");
+    auto &memory = *static_cast<UscGraphicsReadMemory *>(user_data);
+    const auto bytes = static_cast<std::size_t>(dword_count) * 4U;
+    if (memory.storage && memory.storage->Contains(address, bytes, 1U))
+      return UscShaderBufferMemory::Read(memory.storage, address, dword_count,
+                                         destination);
+    UscUniformBufferMemory::Read(memory.uniform, address, dword_count,
+                                 destination);
+  }
+
+  static std::uint32_t Atomic32(void *user_data, PcoOpcode operation,
+                                std::uint64_t address,
+                                std::uint32_t operand) {
+    if (!user_data)
+      throw std::runtime_error("USC graphics atomic has no memory context");
+    auto &memory = *static_cast<UscGraphicsReadMemory *>(user_data);
+    return UscShaderBufferMemory::Atomic32(memory.storage, operation, address,
+                                           operand);
+  }
+};
+
+struct UscGraphicsAtomicMemory {
+  UscShaderBufferMemory *storage = nullptr;
+  UscShaderImageMemory *image = nullptr;
+
+  static std::uint32_t Atomic32(void *user_data, PcoOpcode operation,
+                                std::uint64_t address,
+                                std::uint32_t operand) {
+    if (!user_data)
+      throw std::runtime_error("USC graphics atomic has no memory context");
+    auto &memory = *static_cast<UscGraphicsAtomicMemory *>(user_data);
+    if (memory.storage && memory.storage->Contains(address, 4U, 3U))
+      return UscShaderBufferMemory::Atomic32(memory.storage, operation,
+                                             address, operand);
+    return UscShaderImageMemory::Atomic32(memory.image, operation, address,
+                                           operand);
+  }
+};
+
+} // namespace
+
 bool DriverPcoTextureSharedLayoutSupported(
     const DriverPcoStageAbi &abi, std::uint32_t descriptor_set_count,
-    std::uint32_t image_descriptor_count) {
+    std::uint32_t image_descriptor_count,
+    const DriverStorageBufferAbi *storage) {
   if (descriptor_set_count == 0 ||
       descriptor_set_count > kPcoMaximumTextureDescriptorSets) {
     return false;
   }
-  std::uint64_t descriptor_shared_dwords =
-      static_cast<std::uint64_t>(descriptor_set_count) *
-      kPcoTextureDescriptorDwordCount;
-  if (abi.uniform_buffer_descriptor_count > kMaximumUniformBuffersPerStage ||
-      (abi.uniform_buffer_descriptor_count == 0 &&
-       abi.uniform_buffer_descriptor_start != 0) ||
-      (abi.uniform_buffer_descriptor_count != 0 &&
-       abi.uniform_buffer_descriptor_start != descriptor_shared_dwords))
-    return false;
-  descriptor_shared_dwords +=
-      static_cast<std::uint64_t>(abi.uniform_buffer_descriptor_count) *
-      kUniformBufferDescriptorDwordCount;
-  if (image_descriptor_count > 32) return false;
-  descriptor_shared_dwords += 8U * image_descriptor_count;
-  if (abi.shareds > kPcoMaximumFragmentSharedCount)
-    return false;
-  if (abi.push_constant_count == 0) {
-    return abi.shareds == descriptor_shared_dwords &&
-           ((abi.uniform_buffer_descriptor_count == 0 &&
-             abi.push_constant_start == 0) ||
-            abi.push_constant_start == descriptor_shared_dwords);
-  }
-  const std::uint64_t push_end =
-      static_cast<std::uint64_t>(abi.push_constant_start) +
-      abi.push_constant_count;
-  return abi.push_constant_start == descriptor_shared_dwords &&
-         push_end == abi.shareds;
+  const DriverStorageBufferAbi empty_storage{};
+  return ResolveDriverGraphicsDescriptorLayout(
+      abi, 0, descriptor_set_count, image_descriptor_count,
+      storage ? *storage : empty_storage);
 }
 
 namespace {
@@ -331,11 +361,32 @@ void UscCluster::Run() {
         HasPoolHandle(uniform_resources)
             ? LoadArray<UniformBufferResource>(pool_, uniform_resources)
             : std::vector<UniformBufferResource>{});
+    std::vector<ShaderBufferResource> graphics_buffer_resources =
+        HasPoolHandle(state.graphics_buffer_resources)
+            ? LoadArray<ShaderBufferResource>(pool_,
+                                               state.graphics_buffer_resources)
+            : std::vector<ShaderBufferResource>{};
+    const std::size_t graphics_stage =
+        stage_ == ShaderStage::kVertex ? 0U : 1U;
+    std::vector<ShaderBufferRange> graphics_buffer_ranges =
+        HasPoolHandle(state.graphics_buffer_ranges[graphics_stage])
+            ? LoadArray<ShaderBufferRange>(
+                  pool_, state.graphics_buffer_ranges[graphics_stage])
+            : std::vector<ShaderBufferRange>{};
+    UscShaderBufferMemory graphics_buffer_memory(
+        memory_, state.memory_mode, graphics_buffer_resources,
+        graphics_buffer_ranges,
+        stage_ == ShaderStage::kVertex ? MemoryClient::kVertexShader
+                                       : MemoryClient::kFragmentShader);
+    UscGraphicsReadMemory graphics_read_memory{&uniform_memory,
+                                                &graphics_buffer_memory};
     std::vector<ShaderImageResource> image_resources =
         stage_ == ShaderStage::kFragment && HasPoolHandle(state.fragment_image_resources)
             ? LoadArray<ShaderImageResource>(pool_, state.fragment_image_resources)
             : std::vector<ShaderImageResource>{};
     UscShaderImageMemory image_memory(memory_, state.memory_mode, image_resources);
+    UscGraphicsAtomicMemory graphics_atomic_memory{&graphics_buffer_memory,
+                                                    &image_memory};
 
     const std::uint64_t groups = stage_ == ShaderStage::kVertex
                                      ? state.vertex_groups
@@ -359,8 +410,9 @@ void UscCluster::Run() {
       if (lanes.size() != state.counters.vs_invocations)
         throw std::runtime_error("vertex USC lane count mismatch");
       PcoVertexExecutionContext vertex_context;
-      vertex_context.memory_read = UscUniformBufferMemory::Read;
-      vertex_context.memory_user_data = &uniform_memory;
+      vertex_context.memory_read = UscGraphicsReadMemory::Read;
+      vertex_context.memory_atomic32 = UscGraphicsReadMemory::Atomic32;
+      vertex_context.memory_user_data = &graphics_read_memory;
       const bool vertex_texture_case =
           UsesTextureSampling(state, ShaderStage::kVertex);
       const bool driver_pco =
@@ -399,7 +451,8 @@ void UscCluster::Run() {
             state.vertex_sampled_texture_count;
         const bool shared_layout_valid =
             DriverPcoTextureSharedLayoutSupported(
-                state.vertex_pco_abi, descriptor_set_count);
+                state.vertex_pco_abi, descriptor_set_count, 0,
+                &state.graphics_storage[0]);
         const std::size_t sample_instruction_count =
             static_cast<std::size_t>(std::count_if(
                 instructions.begin(), instructions.end(),
@@ -655,7 +708,8 @@ void UscCluster::Run() {
                       texture_response.begin());
             const PcoVertexExecution execution = ResumeVertexPco(
                 state.vertex_program_summary, instructions, saved,
-                texture_response, UscUniformBufferMemory::Read, &uniform_memory);
+                texture_response, UscGraphicsReadMemory::Read,
+                &graphics_read_memory, UscGraphicsReadMemory::Atomic32);
             queue_suspension(lane_index, execution, next_requests,
                              next_continuations, next_queued);
           }
@@ -807,8 +861,8 @@ void UscCluster::Run() {
         context = &raster_context;
         if (IsDriverPcoTrianglesCase(state.functional_case)) {
           raster_context.raster_sample_count = state.raster_state.sample_count;
-          raster_context.memory_atomic32 = UscShaderImageMemory::Atomic32;
-          raster_context.image_memory_user_data = &image_memory;
+          raster_context.memory_atomic32 = UscGraphicsAtomicMemory::Atomic32;
+          raster_context.image_memory_user_data = &graphics_atomic_memory;
           raster_context.memory_side_effects_enabled = 1;
           raster_context.sample_x = FloatBits(static_cast<float>(invocation.x));
           raster_context.sample_y = FloatBits(static_cast<float>(invocation.y));
@@ -912,7 +966,8 @@ void UscCluster::Run() {
                 : (!has_fragment_texture ||
                    DriverPcoTextureSharedLayoutSupported(
                        state.fragment_pco_abi, descriptor_set_count,
-                       state.fragment_image_descriptor_count));
+                       state.fragment_image_descriptor_count,
+                       &state.graphics_storage[1]));
         const std::uint32_t expected_coefficient_dwords =
             VaryingCoefficientDwordCount(state);
         const std::size_t sample_instruction_count =
@@ -1348,8 +1403,8 @@ void UscCluster::Run() {
             }
             PcoFragmentExecutionContext context;
             context.raster_sample_count = state.raster_state.sample_count;
-            context.memory_read = UscUniformBufferMemory::Read;
-            context.memory_user_data = &uniform_memory;
+            context.memory_read = UscGraphicsReadMemory::Read;
+            context.memory_user_data = &graphics_read_memory;
             if (driver_pco_texture ||
                 state.functional_case ==
                     FunctionalCase::kDriverTexturedTriangles)
@@ -1417,8 +1472,8 @@ void UscCluster::Run() {
               SetFragmentSampleContext(
                   context, shader_lane.sample_id, shader_lane.sample_mask,
                   state.raster_state.sample_frequency != 0);
-              context.memory_atomic32 = UscShaderImageMemory::Atomic32;
-              context.image_memory_user_data = &image_memory;
+              context.memory_atomic32 = UscGraphicsAtomicMemory::Atomic32;
+              context.image_memory_user_data = &graphics_atomic_memory;
               context.memory_side_effects_enabled = shader_lane.helper ? 0 : 1;
               SetFragmentFacingContext(context, shader_lane.front_facing);
               lane_contexts[shader_lane_index] = context;
@@ -1731,8 +1786,8 @@ void UscCluster::Run() {
           const FragmentInvocation &invocation = invocations[index];
           PcoFragmentExecutionContext context;
           context.raster_sample_count = state.raster_state.sample_count;
-          context.memory_read = UscUniformBufferMemory::Read;
-          context.memory_user_data = &uniform_memory;
+          context.memory_read = UscGraphicsReadMemory::Read;
+          context.memory_user_data = &graphics_read_memory;
           context.sample_x = FloatBits(static_cast<float>(invocation.x) + 0.5F);
           context.sample_y =
               FloatBits(static_cast<float>(invocation.y) + 0.5F);
@@ -1808,8 +1863,8 @@ void UscCluster::Run() {
           }
           PcoFragmentExecutionContext context;
           context.raster_sample_count = state.raster_state.sample_count;
-          context.memory_read = UscUniformBufferMemory::Read;
-          context.memory_user_data = &uniform_memory;
+          context.memory_read = UscGraphicsReadMemory::Read;
+          context.memory_user_data = &graphics_read_memory;
           if (task.coefficient_dword_count > context.coefficients.size() ||
               task.coefficient_dword_count >
                   std::numeric_limits<std::uint8_t>::max()) {
@@ -1895,6 +1950,38 @@ void UscCluster::Run() {
       state.stage = PipelineStage::kFragmentShaded;
     }
 
+    if (state.graphics_storage[graphics_stage].write_mask != 0) {
+      std::vector<std::uint8_t> touched(graphics_buffer_resources.size(), 0);
+      for (const auto &range : graphics_buffer_ranges) {
+        if (!(range.access & 2U))
+          continue;
+        for (std::size_t index = 0; index < graphics_buffer_resources.size();
+             ++index) {
+          const auto &resource = graphics_buffer_resources[index];
+          if (range.gpu_address >= resource.gpu_address &&
+              range.gpu_address - resource.gpu_address <= resource.bytes &&
+              range.bytes <= resource.bytes -
+                                 (range.gpu_address - resource.gpu_address)) {
+            touched[index] = 1;
+            break;
+          }
+        }
+      }
+      for (std::size_t index = 0; index < graphics_buffer_resources.size();
+           ++index) {
+        if (!touched[index])
+          continue;
+        auto &resource = graphics_buffer_resources[index];
+        const auto bytes = graphics_buffer_memory.Readback(resource);
+        if (HasPoolHandle(resource.readback))
+          StoreArray(pool_, resource.readback, bytes);
+        else
+          resource.readback = StoreNewArray(pool_, bytes);
+      }
+      StoreArray(pool_, state.graphics_buffer_resources,
+                 graphics_buffer_resources);
+    }
+
     std::uint64_t cycles =
         groups == 0
             ? 0
@@ -1905,8 +1992,11 @@ void UscCluster::Run() {
     // accounting once to the latest state, after all shader lanes complete.
     ApplyMemoryAccessStats(state.counters, uniform_memory.stats());
     ApplyMemoryAccessStats(state.counters, image_memory.stats());
+    ApplyMemoryAccessStats(state.counters, graphics_buffer_memory.stats());
     AddInstructionCounter(cycles, MemoryAccessDelayCycles(image_memory.stats()));
     AddInstructionCounter(cycles, MemoryAccessDelayCycles(uniform_memory.stats()));
+    AddInstructionCounter(cycles,
+                          MemoryAccessDelayCycles(graphics_buffer_memory.stats()));
     state.counters.usc_groups += groups;
     state.counters.usc_cluster_cycles += cycles;
     if (stage_ == ShaderStage::kVertex)

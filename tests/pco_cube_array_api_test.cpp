@@ -50,6 +50,7 @@ struct Fixture {
     draw.vertex_pco_abi={4,4,4,0,0,0,0,0,0,0};draw.fragment_pco_abi={20,0,0,4,28,20,8,0,0,0};
     draw.fragment_shared=shared.data();draw.fragment_shared_count=shared.size();draw.sampled_texture_count=1;
     draw.position_output_count=draw.fragment_position_count=4;
+    draw.fragment_position_uses_w=1;
     draw.varying_output_start=draw.fragment_varying_start=4;draw.varying_bindings=&empty_binding;
     draw.fragment_output_mask[0]=15;
     const std::array<uint32_t,3> viewport{Bits(2),Bits(2),Bits(.5F)};
@@ -81,7 +82,7 @@ void Negatives(const std::filesystem::path&root){
       case 1:f.texture.layers=17;why="whole-cube";break;
       case 2:f.texture.layers=12294;why="whole-cube";break;
       case 3:f.texture.sample_count=4;why="whole-cube";break;
-      case 4:f.texture.stage=PVRGPU_SYSTEMC_PCO_SHADER_STAGE_VERTEX;why="whole-cube";break;
+      case 4:f.texture.stage=PVRGPU_SYSTEMC_PCO_SHADER_STAGE_COMPUTE;why="stage";break;
       case 5:f.texture.source=PVRGPU_SYSTEMC_PCO_TEXTURE_PREVIOUS_COLOR_ATTACHMENT;why="whole-cube";break;
       case 6:f.texture.mip[0].height=2;break;
       case 7:f.texture.mip[0].row_pitch=8;break;
@@ -91,9 +92,9 @@ void Negatives(const std::filesystem::path&root){
       case 11:f.shared[2]+=1<<4;break;
       case 12:f.shared[4]*=6;break;
       case 13:f.shared[0]=(f.shared[0]&~7U)|4U;break;
-      case 14:f.shared[7]=0x100;break;
-      case 15:f.shared[12]=3;break;
-      case 16:f.texture.descriptor_set=12;why="descriptor set";break;
+      case 14:f.shared[7]=0x400;break;
+      case 15:f.shared[12]=8;break;
+      case 16:f.texture.descriptor_set=16;why="descriptor set";break;
       case 17:f.logical.version=31;why="version";break;
       case 18:f.draw.version=31;why="version";break;
       case 19:f.texture.descriptor_set=1;why="stage-dense";break;
@@ -165,7 +166,7 @@ void NativeTwelve(const std::filesystem::path&root){
 }
 }
 int main(){try{
-  static_assert(PVRGPU_SYSTEMC_API_VERSION==37&&PVRGPU_SYSTEMC_MAX_PCO_TEXTURES_PER_STAGE==16);
+  static_assert(PVRGPU_SYSTEMC_API_VERSION==38&&PVRGPU_SYSTEMC_MAX_PCO_TEXTURES_PER_STAGE==16);
   static_assert(sizeof(void*)!=8||sizeof(pvrgpu_systemc_pco_sequence_texture)==352,"API32 retains texture struct size");
   const auto root=std::filesystem::temp_directory_path()/("pvrgpu-cube-array-api-"+std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
   Negatives(root);Native(root);NativeTwelve(root);std::cout<<"CubeArray API32: "<<checks<<" checks PASS; artifacts="<<root<<'\n';return 0;

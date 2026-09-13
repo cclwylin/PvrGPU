@@ -1292,7 +1292,10 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
                           assembled % draw.geometry_vertices_per_instance == 0;
     }
     if (!draw.tessellation.control_pco.empty()) {
-      topology_assembles = draw.primitive_mode == 14 && draw.geometry_pco.empty() &&
+      // PATCHES describes the input assembler -> TCS/TES edge.  A geometry
+      // shader after TES does not change that source topology; it consumes
+      // the primitives produced by TES rather than replacing tessellation.
+      topology_assembles = draw.primitive_mode == 14 &&
           draw.tessellation.vertices_per_instance != 0 &&
           assembled % draw.tessellation.vertices_per_instance == 0;
     }

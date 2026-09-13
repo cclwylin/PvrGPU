@@ -151,4 +151,15 @@ if with_tests
     ),
     suite : ['compiler', 'pvrgpu'],
   )
+  test(
+    'pvrgpu_pco_helper_invocation',
+    executable(
+      'pvrgpu_pco_helper_invocation_test',
+      files('tests/pvrgpu_pco_helper_invocation_test.c'),
+      include_directories : [inc_gallium_aux, inc_gallium, inc_imagination, inc_include, inc_src],
+      link_with : [libpvrgpu, libpowervr_compiler, libpowervr_common],
+      dependencies : [idep_nir, idep_mesautil],
+    ),
+    suite : ['compiler', 'pvrgpu'],
+  )
 endif

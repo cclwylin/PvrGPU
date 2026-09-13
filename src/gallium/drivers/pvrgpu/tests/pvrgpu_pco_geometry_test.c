@@ -38,6 +38,61 @@ static nir_shader *make_vertex(void)
    return b.shader;
 }
 
+static nir_shader *make_texture_vertex(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, pco_nir_options(), "geometry_texture_vs");
+   nir_variable *in = variable(b.shader, nir_var_shader_in,
+      glsl_vec4_type(), "position", VERT_ATTRIB_GENERIC0);
+   nir_variable *out = variable(b.shader, nir_var_shader_out,
+      glsl_vec4_type(), "gl_Position", VARYING_SLOT_POS);
+   nir_def *position = nir_load_var(&b, in);
+   nir_tex_instr *sample = nir_tex_instr_create(b.shader, 2);
+   sample->op = nir_texop_tex;
+   sample->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   sample->is_shadow = true;
+   sample->is_new_style_shadow = true;
+   sample->coord_components = 2;
+   sample->dest_type = nir_type_float32;
+   sample->texture_index = sample->sampler_index = 0;
+   sample->src[0] = nir_tex_src_for_ssa(
+      nir_tex_src_coord, nir_channels(&b, position, 0x3));
+   sample->src[1] = nir_tex_src_for_ssa(
+      nir_tex_src_comparator, nir_channel(&b, position, 2));
+   nir_def_init(&sample->instr, &sample->def, 1, 32);
+   nir_builder_instr_insert(&b, &sample->instr);
+   nir_def *sample4 = nir_vec4(&b, &sample->def, &sample->def,
+      &sample->def, nir_imm_float(&b, 1.0f));
+   nir_def *ubo = nir_load_ubo(&b, 4, 32, nir_imm_int(&b, 0),
+      nir_imm_int(&b, 0), .align_mul = 16, .align_offset = 0, .range = 16);
+   nir_store_var(&b, out,
+      nir_fadd(&b, position, nir_fadd(&b, sample4, ubo)), 15);
+   nir_jump(&b, nir_jump_return);
+   nir_shader_gather_info(b.shader, b.impl);
+   b.shader->info.num_textures = 1;
+   b.shader->info.num_ubos = 1;
+   BITSET_SET(b.shader->info.textures_used, 0);
+   return b.shader;
+}
+
+static nir_shader *make_storage_vertex(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, pco_nir_options(), "geometry_storage_vs");
+   nir_variable *in = variable(b.shader, nir_var_shader_in,
+      glsl_vec4_type(), "position", VERT_ATTRIB_GENERIC0);
+   nir_variable *out = variable(b.shader, nir_var_shader_out,
+      glsl_vec4_type(), "gl_Position", VARYING_SLOT_POS);
+   nir_def *value = nir_load_ssbo(&b, 4, 32, nir_imm_int(&b, 0),
+      nir_imm_int(&b, 0), .align_mul = 4, .align_offset = 0);
+   nir_store_var(&b, out,
+      nir_fadd(&b, nir_load_var(&b, in), nir_u2f32(&b, value)), 15);
+   nir_jump(&b, nir_jump_return);
+   b.shader->info.num_ssbos = 1;
+   nir_shader_gather_info(b.shader, b.impl);
+   return b.shader;
+}
+
 static nir_shader *make_geometry(unsigned kind)
 {
    static const unsigned primitives[] = {MESA_PRIM_POINTS, MESA_PRIM_TRIANGLES,
@@ -101,6 +156,53 @@ static nir_shader *make_fragment(void)
    return b.shader;
 }
 
+static nir_shader *make_shadow_fragment(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, pco_nir_options(), "geometry_shadow_fs");
+   nir_variable *out = variable(b.shader, nir_var_shader_out,
+      glsl_vec4_type(), "fragmentColor", FRAG_RESULT_DATA0);
+   nir_tex_instr *sample = nir_tex_instr_create(b.shader, 2);
+   sample->op = nir_texop_tex;
+   sample->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   sample->is_shadow = true;
+   sample->is_new_style_shadow = true;
+   sample->coord_components = 2;
+   sample->dest_type = nir_type_float32;
+   sample->texture_index = sample->sampler_index = 0;
+   sample->src[0] = nir_tex_src_for_ssa(
+      nir_tex_src_coord, nir_imm_vec2(&b, 0.25f, 0.75f));
+   sample->src[1] = nir_tex_src_for_ssa(
+      nir_tex_src_comparator, nir_imm_float(&b, 0.5f));
+   nir_def_init(&sample->instr, &sample->def, 1, 32);
+   nir_builder_instr_insert(&b, &sample->instr);
+   nir_store_var(&b, out, nir_vec4(&b, &sample->def, &sample->def,
+      &sample->def, nir_imm_float(&b, 1.0f)), 15);
+   nir_jump(&b, nir_jump_return);
+   nir_shader_gather_info(b.shader, b.impl);
+   b.shader->info.num_textures = 1;
+   BITSET_SET(b.shader->info.textures_used, 0);
+   return b.shader;
+}
+
+static nir_shader *make_atomic_fragment(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, pco_nir_options(), "geometry_atomic_fs");
+   nir_variable *out = variable(b.shader, nir_var_shader_out,
+      glsl_vec4_type(), "fragmentColor", FRAG_RESULT_DATA0);
+   nir_def *old = nir_ssbo_atomic(&b, 32, nir_imm_int(&b, 0),
+      nir_imm_int(&b, 0), nir_imm_int(&b, 1),
+      .atomic_op = nir_atomic_op_iadd);
+   nir_def *value = nir_u2f32(&b, old);
+   nir_store_var(&b, out, nir_vec4(&b, value, value, value,
+                                   nir_imm_float(&b, 1.0f)), 15);
+   nir_jump(&b, nir_jump_return);
+   b.shader->info.num_ssbos = 1;
+   nir_shader_gather_info(b.shader, b.impl);
+   return b.shader;
+}
+
 static nir_shader *make_texture_geometry(void)
 {
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_GEOMETRY,
@@ -148,6 +250,8 @@ static nir_shader *make_texture_geometry(void)
    nir_end_primitive(&b, .stream_id = 0);
    nir_jump(&b, nir_jump_return);
    nir_shader_gather_info(b.shader, b.impl);
+   BITSET_SET(b.shader->info.textures_used, 0);
+   BITSET_SET(b.shader->info.textures_used, 1);
    return b.shader;
 }
 
@@ -328,12 +432,73 @@ int main(void)
    char error[512] = {0};
    struct pvrgpu_pco_compiler *compiler = pvrgpu_pco_compiler_create(error, sizeof(error));
    require(compiler != NULL, error);
+   {
+      nir_shader *vs = make_storage_vertex();
+      nir_shader *gs = make_geometry(0);
+      nir_shader *fs = make_atomic_fragment();
+      const enum pipe_format format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      struct pvrgpu_pco_geometry_pipeline_binary pipeline = {0};
+      require(pvrgpu_pco_compile_geometry_pipeline(
+         compiler, vs, gs, fs, &format, 1, 0, 0, 0, 1, 0,
+         &pipeline, error, sizeof(error)), error);
+      require(pipeline.graphics.vertex.storage.descriptor_start == 0 &&
+              pipeline.graphics.vertex.storage.descriptor_count == 1 &&
+              pipeline.graphics.vertex.storage.used_mask == 1 &&
+              pipeline.graphics.vertex.storage.read_mask == 1 &&
+              pipeline.graphics.vertex.storage.write_mask == 0 &&
+              pipeline.graphics.vertex.abi.uniform_buffer_descriptor_start == 0 &&
+              pipeline.graphics.vertex.abi.push_constant_start == 4 &&
+              pipeline.graphics.vertex.abi.shareds == 4,
+              "extended Geometry VS storage descriptor layout");
+      require(pipeline.graphics.fragment.storage.descriptor_start == 0 &&
+              pipeline.graphics.fragment.storage.descriptor_count == 1 &&
+              pipeline.graphics.fragment.storage.used_mask == 1 &&
+              pipeline.graphics.fragment.storage.read_mask == 1 &&
+              pipeline.graphics.fragment.storage.write_mask == 1 &&
+              pipeline.graphics.fragment.abi.uniform_buffer_descriptor_start == 0 &&
+              pipeline.graphics.fragment.abi.push_constant_start == 4 &&
+              pipeline.graphics.fragment.abi.shareds == 4,
+              "extended Geometry FS atomic descriptor layout");
+      require(pipeline.graphics.vertex.data &&
+              pipeline.graphics.fragment.data &&
+              pipeline.geometry.shader.data,
+              "extended storage pipeline emitted all native stages");
+      pvrgpu_pco_geometry_pipeline_binary_finish(&pipeline);
+      ralloc_free(vs); ralloc_free(gs); ralloc_free(fs);
+   }
    struct pvrgpu_pco_geometry_layout input = {0}, output = {0};
    input.count[VARYING_SLOT_POS] = output.count[VARYING_SLOT_POS] = 4;
    input.stride_dwords = 4;
    output.start[VARYING_SLOT_VAR0] = 4;
    output.count[VARYING_SLOT_VAR0] = 4;
    output.stride_dwords = 8;
+   {
+      nir_shader *vs = make_texture_vertex();
+      nir_shader *gs = make_geometry(0);
+      nir_shader *fs = make_shadow_fragment();
+      const enum pipe_format format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      struct pvrgpu_pco_geometry_pipeline_binary pipeline = {0};
+      require(pvrgpu_pco_compile_geometry_pipeline(
+         compiler, vs, gs, fs, &format, 1, 0, 0, 0, 1, 1,
+         &pipeline, error, sizeof(error)), error);
+      require(pipeline.graphics.vertex.abi.uniform_buffer_descriptor_start == 20 &&
+              pipeline.graphics.vertex.abi.uniform_buffer_descriptor_count == 1 &&
+              pipeline.graphics.vertex.abi.push_constant_start == 24 &&
+              pipeline.graphics.vertex.abi.push_constant_count == 0 &&
+              pipeline.graphics.vertex.abi.shareds == 24,
+              "extended Geometry shadow VS texture/UBO descriptor prefix overlaps");
+      require(pipeline.graphics.fragment.abi.uniform_buffer_descriptor_start == 0 &&
+              pipeline.graphics.fragment.abi.uniform_buffer_descriptor_count == 0 &&
+              pipeline.graphics.fragment.abi.push_constant_start == 20 &&
+              pipeline.graphics.fragment.abi.push_constant_count == 0 &&
+              pipeline.graphics.fragment.abi.shareds == 20,
+              "extended Geometry shadow FS texture descriptor prefix overlaps");
+      require(pipeline.graphics.vertex.data && pipeline.graphics.vertex.size &&
+              pipeline.graphics.fragment.data && pipeline.graphics.fragment.size,
+              "extended Geometry shadow/scalar VS/FS has no native executable");
+      pvrgpu_pco_geometry_pipeline_binary_finish(&pipeline);
+      ralloc_free(vs); ralloc_free(gs); ralloc_free(fs);
+   }
    for (unsigned kind = 0; kind < 8; ++kind) {
       nir_shader *gs = make_geometry(kind);
       struct pvrgpu_pco_geometry_layout target = output;
@@ -547,11 +712,13 @@ int main(void)
            "adjacent-stage linking changed Geometry sampler/UBO/CB0 mapping");
    pvrgpu_pco_geometry_pipeline_binary_finish(&texture_pipeline);
    ralloc_free(texture_vs);ralloc_free(texture_fs);
-   require(!pvrgpu_pco_compile_geometry(compiler,textured,&input,&output,256,
-      &texture_binary,error,sizeof(error)) && strstr(error,"exceed"),
-      "Geometry textures plus CB0 overflow did not fail closed");
-   require(!texture_binary.shader.data && !texture_binary.shader.size,
-      "failed texture descriptor compile retained executable bytes");
+   require(pvrgpu_pco_compile_geometry(compiler,textured,&input,&output,256,
+      &texture_binary,error,sizeof(error)),error);
+   require(texture_binary.shader.abi.push_constant_start==48 &&
+           texture_binary.shader.abi.push_constant_count==256 &&
+           texture_binary.shader.abi.shareds==304,
+      "Geometry maximum CB0 no longer fits below the 384-DWORD transport limit");
+   pvrgpu_pco_geometry_binary_finish(&texture_binary);
    nir_foreach_function_impl(impl,textured) {
       nir_foreach_block(block,impl) {
          nir_foreach_instr(instr,block) {
@@ -579,6 +746,7 @@ int main(void)
    require(!pvrgpu_pco_compile_geometry(compiler,bad,&input,&output,0,&binary,error,sizeof(error)) && strstr(error,"overlaps"), "overlapping Geometry outputs did not fail closed");
    output.start[VARYING_SLOT_VAR0] = 4;
    bad->info.num_textures = PVRGPU_PCO_MAX_TEXTURES + 1;
+   BITSET_SET(bad->info.textures_used, PVRGPU_PCO_MAX_TEXTURES);
    require(!pvrgpu_pco_compile_geometry(compiler,bad,&input,&output,0,&binary,error,sizeof(error)) && strstr(error,"resource"), "Geometry texture extent did not fail closed");
    require(!binary.shader.data && !binary.shader.size, "failed Geometry compile retained owned bytes");
    ralloc_free(bad);

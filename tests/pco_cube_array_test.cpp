@@ -38,7 +38,10 @@ void Run(bool explicit_lod){
   const auto it=std::find_if(p.instructions.begin(),p.instructions.end(),[](const auto&i){return i.opcode==PcoOpcode::kTextureSample;});
   Check(it!=p.instructions.end(),"genuine native SMP exists");const size_t index=it-p.instructions.begin();
   const auto &s=*it;
-  Check(s.texture_dimension==3&&s.texture_address_offset==1&&s.texture_lod_replace==explicit_lod&&s.texture_gather==0&&s.source2.index==8,"genuine dimension3 TAO and sampler payload");
+  Check(s.texture_dimension==3&&s.texture_address_offset==1&&
+        s.texture_lod_replace==explicit_lod&&!s.texture_lod_bias&&
+        s.texture_gather==0&&s.source2.index==8,
+        "genuine dimension3 TAO and sampler payload");
   const PcoPreparedFragmentProgram prepared(p.summary,p.instructions);
   const std::array<uint32_t,4> response{Bits(.125F),Bits(.25F),Bits(.5F),Bits(1.F)};
   for(float layer:{-100.F,-.5F,0.F,.49F,.5F,1.5F,2.5F,2.F,100.F})
@@ -61,7 +64,7 @@ void Run(bool explicit_lod){
     if(mutation==1)i.texture_address_offset=2;
     if(mutation==2)i.source.index=252; // six-word source must not wrap TEMP.
     if(mutation==3)i.texture_gather=1;
-    if(mutation==4){i.source1.index=240;i.source2.index=248;} // descriptor13.
+    if(mutation==4){i.source1.index=320;i.source2.index=328;} // descriptor16 exceeds the 0..15 ABI.
     Reject([&]{PcoPreparedFragmentProgram invalid(b.summary,b.instructions);},"malformed CubeArray semantic contract refused");
   }
   auto c=Context(1,0);auto first=ExecuteFragmentPco(prepared,c);

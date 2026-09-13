@@ -165,16 +165,24 @@ void ValidateSample(const PcoInstruction &i, ShaderStage stage,
   ValidateAbi(stage, abi, storage);
   const auto first_descriptor = stage == ShaderStage::kTessellationControl ? 8U : 4U;
   // TCS/TES system memory descriptors precede the same 20-DWORD combined
-  // image/sampler sets used by other stages. This initial task-stage contract
-  // is normalized 2D ordinary/explicit-LOD sampling, not derivatives or TAO.
-  const auto payload_count = 2U + i.texture_lod_replace;
+  // image/sampler sets used by other stages. Array selection is native TAO;
+  // depth comparison is the descriptor-backed marker attached by the decoder.
+  const auto payload_count = i.texture_dimension +
+      ((i.texture_address_offset || i.texture_lod_replace || i.texture_lod_bias) ? 1U : 0U) +
+      (i.texture_address_offset ? 2U : 0U) +
+      ((i.texture_sample_index_present || i.texture_spatial_offset_present) ? 1U : 0U);
   if (i.opcode != PcoOpcode::kTextureSample || i.repeat_count != 1 ||
       i.source_count != 3 || i.data_request || i.component_count != kPcoTextureResponseCount ||
       i.end_group || i.target != PcoWriteTarget::kTemporary ||
       !HasCanonicalTextureLodMode(i) || i.texture_lod_bias || i.texture_gather ||
-      i.texture_dimension != 2 || i.texture_fcnorm != 1 ||
-      i.texture_address_offset || i.texture_non_normalized_coords ||
+      (i.texture_dimension != 2 && i.texture_dimension != 3) ||
+      i.texture_fcnorm > 1 || i.texture_address_offset > 1 ||
+      i.texture_non_normalized_coords ||
       i.texture_sample_index_present || i.texture_spatial_offset_present ||
+      i.texture_shadow_compare > 1 ||
+      (!i.texture_shadow_compare &&
+       (i.texture_shadow_reference.bank != PcoRegisterBank::kSpecial ||
+        i.texture_shadow_reference.index != 0)) ||
       i.source.bank != PcoRegisterBank::kTemporary ||
       !Fits(i.source.index, payload_count, abi.temps) ||
       !Fits(i.output_index, kPcoTextureResponseCount, abi.temps) ||
@@ -183,18 +191,28 @@ void ValidateSample(const PcoInstruction &i, ShaderStage stage,
       !Fits(i.source1.index, kPcoTextureDescriptorDwordCount, abi.uniform_buffer_descriptor_start) ||
       i.source2.bank != PcoRegisterBank::kShared || i.source2.index != i.source1.index + 8)
     Fail("native SMP source/response/descriptor layout is invalid");
+  if (i.texture_shadow_compare)
+    ValidateSource(i.texture_shadow_reference, 0, abi);
 }
 PcoTextureRequest SampleRequest(const PcoInstruction &i,
                                const DriverPcoStageAbi &abi,
                                const TessellationTaskState &task,
                                unsigned lane_index) {
-  ValidateSample(i, task.stage, abi);
+  ValidateSample(i, task.stage, abi, &task.storage_abi);
   PcoTextureRequest request;
-  for (unsigned component = 0; component < 2; ++component)
-    request.coordinates[component] = Read(i.source, component, abi, task, lane_index);
+  unsigned next = 0;
+  for (unsigned component = 0; component < i.texture_dimension; ++component)
+    request.coordinates[component] = Read(i.source, next++, abi, task, lane_index);
   request.explicit_lod_present = i.texture_lod_replace;
   if (i.texture_lod_replace)
-    request.explicit_lod = Read(i.source, 2, abi, task, lane_index);
+    request.explicit_lod = Read(i.source, next++, abi, task, lane_index);
+  if (i.texture_address_offset) {
+    if (!i.texture_lod_replace &&
+        (Read(i.source, next++, abi, task, lane_index) & UINT32_C(0x7fffffff)))
+      Fail("native SMP TAO requires zero LOD bias");
+    request.texture_address_lo = Read(i.source, next++, abi, task, lane_index);
+    request.texture_address_hi = Read(i.source, next++, abi, task, lane_index);
+  }
   for (unsigned word = 0; word < 4; ++word) {
     request.texture_state[word] = task.shared[i.source1.index + word];
     request.sampler_state[word] = task.shared[i.source2.index + word];
@@ -203,10 +221,22 @@ PcoTextureRequest SampleRequest(const PcoInstruction &i,
   request.descriptor_set = static_cast<std::uint8_t>(
       (i.source1.index - first_descriptor) / kPcoTextureDescriptorDwordCount);
   request.component_count = kPcoTextureResponseCount;
-  request.coordinate_count = request.dimension = 2;
-  request.normalized = 1;
+  request.coordinate_count = 2;
+  request.dimension = i.texture_dimension;
+  request.normalized = !i.texture_non_normalized_coords;
   request.fcnorm = i.texture_fcnorm;
   request.data_request = i.data_request;
+  const bool descriptor_shadow =
+      (task.shared[i.source1.index + 7U] & UINT32_C(0x200)) != 0;
+  if (descriptor_shadow != (i.texture_shadow_compare != 0))
+    Fail("shadow descriptor and native Dref marker disagree");
+  if (descriptor_shadow) {
+    if (task.shared[i.source1.index + 12U] > 7U)
+      Fail("shadow descriptor compare operation is invalid");
+    request.shadow_reference = Read(i.texture_shadow_reference, 0, abi, task,
+                                    lane_index);
+    request.shadow_compare = 1;
+  }
   return request;
 }
 TessellationTaskState MakeTask(ShaderStage stage, const DriverPcoStageAbi &abi,
@@ -252,23 +282,30 @@ void ValidateTessellationProgram(const PcoDecodedProgram &program,
       Fail("invalid unary bitwise ALU metadata");
     const bool load = i.opcode == PcoOpcode::kBufferLoad;
     const bool store = i.opcode == PcoOpcode::kBufferStore;
+    const bool atomic = IsPcoAtomic32(i.opcode);
     const bool sample = i.opcode == PcoOpcode::kTextureSample;
     const bool wdf = i.opcode == PcoOpcode::kWaitDataFence;
     const bool mask = i.opcode == PcoOpcode::kConditionalMask;
     const bool branch = i.opcode == PcoOpcode::kBranch;
     const bool export_vertex = IsWrite(i.opcode) || IsEmit(i.opcode);
-    if (!IsAlu(i.opcode) && !load && !store && !sample && !wdf && !mask && !branch &&
+    if (!IsAlu(i.opcode) && !load && !store && !atomic && !sample && !wdf && !mask && !branch &&
         !export_vertex && i.opcode != PcoOpcode::kNop)
       Fail("opcode requires unimplemented tessellation functionality");
     if (control && export_vertex)
       Fail("TCS UVSW is outside this stage contract");
-    if (pending && !wdf) Fail("native LD/ST/SMP is not followed by WDF");
+    if (pending && !wdf) Fail("native LD/ST/atomic/SMP is not followed by WDF");
     if (load || store) {
       if (i.repeat_count != 1 || i.source_count != (load ? 2 : 3) ||
           i.data_request || !i.component_count || i.component_count > 16 ||
           i.memory_cache_mode > (load ? 1U : 2U) || i.end_group ||
-          i.target != (load ? PcoWriteTarget::kTemporary : PcoWriteTarget::kNone))
+          (load ? (i.target != PcoWriteTarget::kTemporary &&
+                   i.target != PcoWriteTarget::kVertexInput)
+                : i.target != PcoWriteTarget::kNone))
         Fail("invalid native LD/ST metadata");
+      pending = true;
+    } else if (atomic) {
+      if (!HasCanonicalPcoAtomic32(i, true) || i.end_group)
+        Fail("invalid native atomic32 metadata");
       pending = true;
     } else if (sample) {
       ValidateSample(i, program.summary.stage, abi, storage);
@@ -410,7 +447,9 @@ void StepTessellationTask(const PcoDecodedProgram &program,
       if (lane.pending_operation || Selected(i,lane)) ++stats.instructions;
       if (lane.pending_operation == 1 || lane.pending_operation == 3)
         for (unsigned c = 0; c < lane.pending_count; ++c)
-          Write(PcoWriteTarget::kTemporary,lane.pending_output+c,lane.pending_words[c],abi,lane);
+          Write(lane.pending_target, lane.pending_output+c,
+                lane.pending_words[c],abi,lane);
+      lane.pending_target = PcoWriteTarget::kNone;
       lane.pending_operation = lane.pending_count = 0;
     }
   } else if (i.opcode == PcoOpcode::kBranch) {
@@ -479,6 +518,7 @@ void StepTessellationTask(const PcoDecodedProgram &program,
         if (!memory.read) Fail("native LD has no modeled memory callback");
         memory.read(memory.user_data,address,i.component_count,lane.pending_words.data());
         lane.pending_output = i.output_index; lane.pending_count = i.component_count;
+        lane.pending_target = i.target;
         lane.pending_operation = 1; ++stats.load_instructions;
       } else {
         if (!memory.write)
@@ -491,12 +531,28 @@ void StepTessellationTask(const PcoDecodedProgram &program,
       ++stats.memory_instructions;
       continue;
     }
+    if (IsPcoAtomic32(i.opcode)) {
+      if (!memory.atomic32)
+        Fail("native atomic32 has no modeled memory callback");
+      const auto address = Read(i.source,0,abi,task,index) |
+          (std::uint64_t{Read(i.source1,0,abi,task,index)} << 32U);
+      const auto operand = Read(i.source2,0,abi,task,index);
+      lane.pending_words[0] =
+          memory.atomic32(memory.user_data, i.opcode, address, operand);
+      lane.pending_output = i.output_index;
+      lane.pending_count = 1;
+      lane.pending_target = i.target;
+      lane.pending_operation = 1;
+      ++stats.memory_instructions;
+      continue;
+    }
     if (i.opcode == PcoOpcode::kTextureSample) {
       if (!memory.sample) Fail("native SMP has no TextureUnit request callback");
       const auto request = SampleRequest(i, abi, task, index);
       memory.sample(memory.user_data, request, lane.pending_words.data());
       lane.pending_output = i.output_index;
       lane.pending_count = kPcoTextureResponseCount;
+      lane.pending_target = i.target;
       lane.pending_operation = 3;
       ++stats.texture_instructions;
       continue;

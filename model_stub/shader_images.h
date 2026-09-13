@@ -1,5 +1,6 @@
 #pragma once
 
+#include "graphics_shader_buffers.h"
 #include "model_types.h"
 #include <algorithm>
 #include <array>
@@ -16,9 +17,11 @@ inline bool ValidateDriverShaderImages(const DriverCommand &command, std::string
   };
   const auto count = command.fragment_image_descriptor_count;
   const auto used = command.fragment_image_read_mask | command.fragment_image_write_mask;
+  DriverGraphicsDescriptorLayout layout;
   if (command.fragment_early_tests > 1 || count > kMaximumFragmentImages ||
       command.fragment_images.size() > kMaximumFragmentImages ||
-      (count < 32 && (used >> count)))
+      (count < 32 && (used >> count)) ||
+      !ResolveDriverGraphicsDescriptorLayout(command, 1, &layout))
     return reject("descriptor count/masks/early-test flag is invalid");
   if (!count)
     return command.fragment_images.empty() && !command.fragment_image_descriptor_start && !used
@@ -26,11 +29,9 @@ inline bool ValidateDriverShaderImages(const DriverCommand &command, std::string
   const auto &abi = command.fragment_pco_abi;
   const auto &shared = command.fragment_shared;
   const std::size_t start = command.fragment_image_descriptor_start;
-  if (start != command.fragment_sampled_texture_count * 20U +
-                   abi.uniform_buffer_descriptor_count * 4U ||
+  if (start != layout.image_start ||
       start > shared.size() || count * 8U > shared.size() - start ||
-      abi.push_constant_start != start + count * 8U || shared.size() != abi.shareds ||
-      abi.push_constant_count != shared.size() - abi.push_constant_start)
+      shared.size() != abi.shareds)
     return reject("texture/UBO/image/CB0 shared layout is inconsistent");
   std::array<const DriverShaderImage *, kMaximumFragmentImages> images{};
   for (const auto &image : command.fragment_images) {

@@ -56,6 +56,25 @@ static nir_def *sample_texture(nir_builder *b, nir_def *coord, nir_def *lod)
    nir_builder_instr_insert(b, &tex->instr);
    return &tex->def;
 }
+
+static nir_shader *make_texture_vertex(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, pco_nir_options(), "tess_texture_vs");
+   nir_variable *in = variable(b.shader, nir_var_shader_in,
+      glsl_vec4_type(), "position", VERT_ATTRIB_GENERIC0);
+   nir_variable *out = variable(b.shader, nir_var_shader_out,
+      glsl_vec4_type(), "gl_Position", VARYING_SLOT_POS);
+   nir_def *position = nir_load_var(&b, in);
+   nir_def *sample = sample_texture(
+      &b, nir_channels(&b, position, 0x3), NULL);
+   nir_store_var(&b, out, nir_fadd(&b, position, sample), 15);
+   nir_jump(&b, nir_jump_return);
+   nir_shader_gather_info(b.shader, b.impl);
+   b.shader->info.num_textures = 1;
+   BITSET_SET(b.shader->info.textures_used, 0);
+   return b.shader;
+}
 static nir_shader *make_control(unsigned kind)
 {
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_TESS_CTRL, pco_nir_options(), "tess_fixture_tcs");
@@ -193,6 +212,133 @@ static nir_shader *make_fragment(void)
    nir_jump(&b, nir_jump_return);
    nir_shader_gather_info(b.shader, b.impl);
    return b.shader;
+}
+
+enum {
+   TES_GS_LOCATION = VARYING_SLOT_VAR0 + 2,
+   GS_FS_LOCATION = VARYING_SLOT_VAR0 + 7,
+};
+
+static nir_shader *make_combined_evaluation(void)
+{
+   nir_shader *tes = make_evaluation(0);
+   nir_foreach_shader_out_variable(var, tes) {
+      if (var->data.location == VARYING_SLOT_VAR0) {
+         var->data.location = TES_GS_LOCATION;
+      }
+   }
+   nir_shader_gather_info(tes, nir_shader_get_entrypoint(tes));
+   return tes;
+}
+
+static nir_shader *make_combined_geometry(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_GEOMETRY, pco_nir_options(), "tess_geometry_fixture_gs");
+   b.shader->info.internal = false;
+   b.shader->info.gs.input_primitive = MESA_PRIM_TRIANGLES;
+   b.shader->info.gs.output_primitive = MESA_PRIM_TRIANGLE_STRIP;
+   b.shader->info.gs.vertices_in = 3;
+   b.shader->info.gs.vertices_out = 3;
+   b.shader->info.gs.invocations = 1;
+   nir_variable *positions = variable(b.shader, nir_var_shader_in,
+      glsl_array_type(glsl_vec4_type(), 3, 0), "gl_in_position",
+      VARYING_SLOT_POS);
+   nir_variable *values = variable(b.shader, nir_var_shader_in,
+      glsl_array_type(glsl_vec4_type(), 3, 0), "tes_to_gs",
+      TES_GS_LOCATION);
+   nir_variable *position = variable(b.shader, nir_var_shader_out,
+      glsl_vec4_type(), "gl_Position", VARYING_SLOT_POS);
+   nir_variable *value = variable(b.shader, nir_var_shader_out,
+      glsl_vec4_type(), "gs_to_fs", GS_FS_LOCATION);
+   value->data.always_active_io = true;
+   for (unsigned vertex = 0; vertex < 3; ++vertex) {
+      nir_store_var(&b, position, nir_load_deref(&b,
+         nir_build_deref_array_imm(&b, nir_build_deref_var(&b, positions),
+                                   vertex)), 15);
+      nir_store_var(&b, value, nir_load_deref(&b,
+         nir_build_deref_array_imm(&b, nir_build_deref_var(&b, values),
+                                   vertex)), 15);
+      nir_emit_vertex(&b, .stream_id = 0);
+   }
+   nir_end_primitive(&b, .stream_id = 0);
+   nir_jump(&b, nir_jump_return);
+   nir_shader_gather_info(b.shader, b.impl);
+   return b.shader;
+}
+
+static nir_shader *make_combined_fragment(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, pco_nir_options(), "tess_geometry_fixture_fs");
+   nir_variable *in = variable(b.shader, nir_var_shader_in,
+      glsl_vec4_type(), "gs_to_fs", GS_FS_LOCATION);
+   in->data.always_active_io = true;
+   nir_variable *out = variable(b.shader, nir_var_shader_out,
+      glsl_vec4_type(), "fragmentColor", FRAG_RESULT_DATA0);
+   nir_store_var(&b, out, nir_load_var(&b, in), 15);
+   nir_jump(&b, nir_jump_return);
+   nir_shader_gather_info(b.shader, b.impl);
+   return b.shader;
+}
+
+static void test_tessellation_geometry_link(struct pvrgpu_pco_compiler *compiler)
+{
+   nir_shader *vs = make_vertex(false), *tcs = make_control(0);
+   nir_shader *tes = make_combined_evaluation();
+   nir_shader *gs = make_combined_geometry();
+   nir_shader *fs = make_combined_fragment();
+   const uint64_t tes_outputs = tes->info.outputs_written;
+   const uint64_t gs_outputs = gs->info.outputs_written;
+   struct pvrgpu_pco_tessellation_pipeline_binary tessellation = {0};
+   struct pvrgpu_pco_geometry_binary geometry = {0};
+   char error[512] = {0};
+   require(pvrgpu_pco_compile_tessellation_geometry_pipeline(
+      compiler, vs, tcs, tes, gs, fs, NULL, 1,
+      0, 0, 0, 0, 0, 0, 0, &tessellation, &geometry,
+      error, sizeof(error)), error);
+   require(tes->info.outputs_written == tes_outputs &&
+           gs->info.outputs_written == gs_outputs,
+           "five-stage linking does not mutate caller NIR");
+   require(tessellation.output.count[TES_GS_LOCATION] == 4 &&
+           tessellation.output.count[GS_FS_LOCATION] == 0,
+           "TES keeps its own sparse output namespace");
+   require(geometry.abi.input.stride_dwords ==
+              tessellation.output.stride_dwords &&
+           geometry.abi.input.start[TES_GS_LOCATION] ==
+              tessellation.output.start[TES_GS_LOCATION] &&
+           geometry.abi.input.count[TES_GS_LOCATION] == 4,
+           "GS primitive input consumes the linked TES layout");
+   require(geometry.abi.output.count[TES_GS_LOCATION] == 0 &&
+           geometry.abi.output.count[GS_FS_LOCATION] == 4,
+           "GS owns an independent raster output namespace");
+   require(tessellation.graphics.vertex_output_count[TES_GS_LOCATION] == 0 &&
+           tessellation.graphics.vertex_output_count[GS_FS_LOCATION] == 4 &&
+           tessellation.graphics.vertex_output_start[GS_FS_LOCATION] ==
+              geometry.abi.output.start[GS_FS_LOCATION],
+           "raster metadata describes final GS output, not TES output");
+   require(tessellation.graphics.explicit_varying_bindings &&
+           tessellation.graphics.varying_binding_count == 1 &&
+           tessellation.graphics.varying_bindings[0].output_dword ==
+              geometry.abi.output.start[GS_FS_LOCATION] &&
+           tessellation.graphics.varying_bindings[0].num_components == 4,
+           "FS coefficients bind directly to the final GS location");
+   require(tessellation.graphics.point_size_output_count == 0 &&
+           tessellation.graphics.point_size_output_start == 0,
+           "absent final-GS point size has a canonical empty range");
+   require(tessellation.graphics.vertex.data &&
+           tessellation.control.shader.data &&
+           tessellation.evaluation.shader.data && geometry.shader.data &&
+           tessellation.graphics.fragment.data,
+           "five-stage compiler publishes every native stage");
+   pvrgpu_pco_geometry_binary_finish(&geometry);
+   pvrgpu_pco_tessellation_pipeline_binary_finish(&tessellation);
+   require(!geometry.shader.data && !tessellation.graphics.vertex.data &&
+           !tessellation.control.shader.data &&
+           !tessellation.evaluation.shader.data,
+           "five-stage owners finish independently without retaining bytes");
+   ralloc_free(vs); ralloc_free(tcs); ralloc_free(tes);
+   ralloc_free(gs); ralloc_free(fs);
 }
 
 static void test_storage_buffers(struct pvrgpu_pco_compiler *compiler)
@@ -352,7 +498,7 @@ static void test_texture_admission(struct pvrgpu_pco_compiler *compiler)
          case 8: tex->coord_components = 3; break;
          case 9: tex->def.num_components = 3; break;
          case 10: tex->def.bit_size = 16; break;
-         case 11: tex->dest_type = nir_type_uint32; break;
+         case 11: tex->dest_type = nir_type_bool32; break;
          case 12: tex->sampler_index = 1; break;
          case 13: tex->texture_index = tex->sampler_index = 1; break;
          case 14: tex->src[1].src_type = nir_tex_src_bias; break;
@@ -380,6 +526,27 @@ int main(void)
    char error[512] = {0};
    struct pvrgpu_pco_compiler *compiler = pvrgpu_pco_compiler_create(error, sizeof(error));
    require(compiler != NULL, error);
+   {
+      nir_shader *vs = make_texture_vertex();
+      nir_shader *tcs = make_control(1);
+      nir_shader *tes = make_evaluation(1);
+      nir_shader *fs = make_fragment();
+      enum pipe_format format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      struct pvrgpu_pco_tessellation_pipeline_binary binary = {0};
+      require(pvrgpu_pco_compile_tessellation_pipeline(
+         compiler, vs, tcs, tes, fs, &format, 1, 0, 0, 0, 0, 1, 0,
+         &binary, error, sizeof(error)), error);
+      require(binary.graphics.vertex.abi.uniform_buffer_descriptor_count == 0 &&
+              binary.graphics.vertex.abi.push_constant_start == 20 &&
+              binary.graphics.vertex.abi.push_constant_count == 0 &&
+              binary.graphics.vertex.abi.shareds == 20,
+              "extended tessellation VS texture descriptor prefix is missing");
+      require(binary.graphics.vertex.data && binary.graphics.vertex.size,
+              "extended tessellation texture VS has no native executable");
+      pvrgpu_pco_tessellation_pipeline_binary_finish(&binary);
+      ralloc_free(vs); ralloc_free(tcs); ralloc_free(tes); ralloc_free(fs);
+   }
+   test_tessellation_geometry_link(compiler);
    test_stream_output_layout(compiler);
    test_storage_buffers(compiler);
    for (unsigned kind = 0; kind < 7; ++kind) {

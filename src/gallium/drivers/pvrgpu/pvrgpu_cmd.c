@@ -1114,6 +1114,9 @@ pvrgpu_cmd_validate_uniform_buffers(
           (abi->uniform_buffer_descriptor_start & 3u) ||
           (!blocks && abi->uniform_buffer_descriptor_start !=
               native_base) ||
+          (abi->push_constant_count &&
+           (uint64_t)abi->push_constant_start +
+              abi->push_constant_count != shared_count) ||
           (blocks && abi->push_constant_count &&
            end > abi->push_constant_start))
          goto invalid;
@@ -1149,6 +1152,173 @@ pvrgpu_cmd_validate_uniform_buffers(
 invalid:
    pvrgpu_cmd_error(error, error_size,
                    "invalid PCO uniform-buffer snapshot or descriptor window");
+   return false;
+}
+
+static bool
+pvrgpu_cmd_validate_graphics_buffers(
+   const struct pvrgpu_systemc_driver_command *cmd,
+   const uint32_t texture_counts[5],
+   char *error,
+   size_t error_size)
+{
+   const struct pvrgpu_systemc_graphics_shader_buffers *buffers =
+      cmd ? cmd->graphics_buffers : NULL;
+   if (!buffers)
+      return true;
+   if (buffers->resource_count > PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_RESOURCES ||
+       buffers->binding_count > PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BINDINGS ||
+       ((buffers->resource_count != 0) != (buffers->resources != NULL)) ||
+       ((buffers->binding_count != 0) != (buffers->bindings != NULL)))
+      goto invalid;
+   const struct pvrgpu_systemc_pco_stage_abi zero_abi = {0};
+   const struct pvrgpu_systemc_pco_stage_abi *abis[5] = {
+      &cmd->vertex_pco_abi, &cmd->fragment_pco_abi, &cmd->geometry_pco_abi,
+      cmd->tessellation ? &cmd->tessellation->control_abi : &zero_abi,
+      cmd->tessellation ? &cmd->tessellation->evaluation_abi : &zero_abi,
+   };
+   const uint32_t *shared[5] = {
+      cmd->vertex_shared, cmd->fragment_shared, cmd->geometry_shared,
+      cmd->tessellation ? cmd->tessellation->control_shared : NULL,
+      cmd->tessellation ? cmd->tessellation->evaluation_shared : NULL,
+   };
+   const size_t shared_count[5] = {
+      cmd->vertex_shared_count, cmd->fragment_shared_count,
+      cmd->geometry_shared_count,
+      cmd->tessellation ? cmd->tessellation->control_shared_count : 0,
+      cmd->tessellation ? cmd->tessellation->evaluation_shared_count : 0,
+   };
+   for (unsigned stage = 0; stage < 5; ++stage) {
+      const struct pvrgpu_systemc_storage_buffer_abi *storage =
+         &buffers->storage[stage];
+      const struct pvrgpu_systemc_pco_stage_abi *abi = abis[stage];
+      const uint32_t texture_count = texture_counts ? texture_counts[stage] : 0u;
+      const bool fragment_images =
+         stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT &&
+         (cmd->fragment_image_descriptor_count ||
+          cmd->fragment_image_descriptor_start ||
+          cmd->fragment_image_read_mask || cmd->fragment_image_write_mask);
+      const bool empty = !texture_count && !fragment_images &&
+         !storage->descriptor_start && !storage->descriptor_count &&
+         !storage->used_mask && !storage->read_mask && !storage->write_mask &&
+         !shared_count[stage] &&
+         memcmp(abi, &zero_abi, sizeof(*abi)) == 0;
+      if (empty)
+         continue;
+      const uint32_t mask = storage->descriptor_count >= 32 ? UINT32_MAX :
+         storage->descriptor_count ?
+            (UINT32_C(1) << storage->descriptor_count) - 1 : 0;
+      const uint32_t system_dwords = stage ==
+            PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_CONTROL ? 8u :
+         (stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_GEOMETRY ||
+          stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION) ? 4u : 0u;
+      const uint64_t texture_end =
+         (uint64_t)system_dwords + 20u * texture_count;
+      const uint32_t expected_uniform_start =
+         abi->uniform_buffer_descriptor_count || system_dwords
+            ? (uint32_t)texture_end : 0u;
+      uint64_t descriptor_end =
+         texture_end + 4u * abi->uniform_buffer_descriptor_count;
+      if (stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT) {
+         const uint32_t image_mask = cmd->fragment_image_descriptor_count >= 32
+            ? UINT32_MAX : cmd->fragment_image_descriptor_count
+               ? (UINT32_C(1) << cmd->fragment_image_descriptor_count) - 1 : 0;
+         if (cmd->fragment_image_descriptor_count > 32 ||
+             (cmd->fragment_image_read_mask & ~image_mask) ||
+             (cmd->fragment_image_write_mask & ~image_mask) ||
+             (cmd->fragment_image_descriptor_count
+                ? cmd->fragment_image_descriptor_start != descriptor_end
+                : cmd->fragment_image_descriptor_start ||
+                     cmd->fragment_image_read_mask ||
+                     cmd->fragment_image_write_mask))
+            goto invalid;
+         descriptor_end += 8u * cmd->fragment_image_descriptor_count;
+      }
+      const uint64_t storage_end = descriptor_end +
+         4u * storage->descriptor_count;
+      if (abi->uniform_buffer_descriptor_start != expected_uniform_start ||
+          storage->descriptor_count > 32 ||
+          (storage->used_mask & ~mask) ||
+          ((storage->read_mask | storage->write_mask) & ~storage->used_mask) ||
+          (!storage->descriptor_count &&
+           (storage->descriptor_start || storage->used_mask ||
+            storage->read_mask || storage->write_mask)) ||
+          (storage->descriptor_count &&
+           storage->descriptor_start != descriptor_end) ||
+          storage->descriptor_start > shared_count[stage] ||
+          (uint64_t)storage->descriptor_count * 4u >
+             shared_count[stage] - storage->descriptor_start ||
+          storage_end > shared_count[stage] ||
+          abi->push_constant_start != storage_end ||
+          (uint64_t)abi->push_constant_start + abi->push_constant_count !=
+             shared_count[stage] ||
+          (shared_count[stage] && !shared[stage]))
+         goto invalid;
+   }
+   uint64_t total = 0;
+   for (unsigned index = 0; index < buffers->resource_count; ++index) {
+      const struct pvrgpu_systemc_shader_buffer_resource *resource =
+         &buffers->resources[index];
+      if (!resource->resource_token || !resource->bytes ||
+          !resource->bytes_size ||
+          resource->bytes_size > PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BYTES - total)
+         goto invalid;
+      total += resource->bytes_size;
+      for (unsigned prior = 0; prior < index; ++prior)
+         if (buffers->resources[prior].resource_token == resource->resource_token)
+            goto invalid;
+   }
+   uint32_t present[5] = {0};
+   for (unsigned index = 0; index < buffers->binding_count; ++index) {
+      const struct pvrgpu_systemc_shader_buffer_binding *binding =
+         &buffers->bindings[index];
+      if (binding->stage >= 5 ||
+          binding->resource_index >= buffers->resource_count)
+         goto invalid;
+      const struct pvrgpu_systemc_storage_buffer_abi *storage =
+         &buffers->storage[binding->stage];
+      const struct pvrgpu_systemc_shader_buffer_resource *resource =
+         &buffers->resources[binding->resource_index];
+      if (binding->slot >= storage->descriptor_count ||
+          !(storage->used_mask & (UINT32_C(1) << binding->slot)) ||
+          (binding->access & ~3u) ||
+          (binding->offset & 3u) || !binding->bytes_size ||
+          binding->bytes_size > UINT32_MAX ||
+          binding->offset > resource->bytes_size ||
+          binding->bytes_size > resource->bytes_size - binding->offset)
+         goto invalid;
+      const uint32_t bit = UINT32_C(1) << binding->slot;
+      if (present[binding->stage] & bit)
+         goto invalid;
+      present[binding->stage] |= bit;
+      const unsigned required = ((storage->read_mask & bit) ? 1u : 0u) |
+                                ((storage->write_mask & bit) ? 2u : 0u);
+      if (binding->access != required)
+         goto invalid;
+      const unsigned word = storage->descriptor_start + 4u * binding->slot;
+      if (shared[binding->stage][word] || shared[binding->stage][word + 1] ||
+          shared[binding->stage][word + 2] != binding->bytes_size ||
+          shared[binding->stage][word + 3])
+         goto invalid;
+   }
+   for (unsigned stage = 0; stage < 5; ++stage) {
+      const struct pvrgpu_systemc_storage_buffer_abi *storage =
+         &buffers->storage[stage];
+      if (storage->used_mask & ~present[stage])
+         goto invalid;
+      for (unsigned slot = 0; slot < storage->descriptor_count; ++slot) {
+         if (present[stage] & (UINT32_C(1) << slot))
+            continue;
+         const unsigned word = storage->descriptor_start + 4u * slot;
+         if (shared[stage][word] || shared[stage][word + 1] ||
+             shared[stage][word + 2] || shared[stage][word + 3])
+            goto invalid;
+      }
+   }
+   return true;
+invalid:
+   pvrgpu_cmd_error(error, error_size,
+                    "invalid graphics shader-buffer snapshot or descriptor window");
    return false;
 }
 
@@ -1319,14 +1489,24 @@ pvrgpu_cmd_validate_draw_pco_triangles(
    const bool geometry = cmd->geometry_pco_size != 0;
    struct pvrgpu_draw_pco_stage_abi tess_raster_abi = {0};
    if (cmd->tessellation) {
-      const char *reason = pvrgpu_tessellation_payload_error(cmd->tessellation);
-      if (reason || geometry || cmd->primitive_mode != 14 ||
+      const char *reason = pvrgpu_tessellation_payload_error_with_graphics(
+         cmd->tessellation, cmd->graphics_buffers);
+      if (reason || cmd->primitive_mode != 14 ||
           cmd->tessellation->input_stride_dwords != cmd->vertex_pco_abi.vertex_outputs ||
           (cmd->indexed ? cmd->index_count : cmd->vertex_count) % cmd->tessellation->vertices_per_instance) {
          pvrgpu_cmd_error(error, error_size, reason ? reason : "tessellation stage/topology/input linkage");
          return false;
       }
       memcpy(&tess_raster_abi, &cmd->tessellation->evaluation_abi, sizeof(tess_raster_abi));
+      const uint32_t tessellation_primitive_vertices =
+         cmd->tessellation->point_mode ? 1u :
+         cmd->tessellation->domain == 2u ? 2u : 3u;
+      if (geometry && cmd->geometry_input_primitive_vertices !=
+                         tessellation_primitive_vertices) {
+         pvrgpu_cmd_error(error, error_size,
+                          "tessellation-to-geometry primitive linkage");
+         return false;
+      }
       reason = pvrgpu_tessellation_draw_extent_error(cmd->tessellation,
           cmd->indexed ? cmd->index_count : cmd->vertex_count);
       if (reason) {
@@ -1336,6 +1516,19 @@ pvrgpu_cmd_validate_draw_pco_triangles(
    }
    const struct pvrgpu_draw_pco_stage_abi *raster_abi = geometry
       ? &cmd->geometry_pco_abi : cmd->tessellation ? &tess_raster_abi : &cmd->vertex_pco_abi;
+   const struct pvrgpu_systemc_storage_buffer_abi *geometry_storage =
+      geometry && cmd->graphics_buffers
+         ? &cmd->graphics_buffers->storage[
+              PVRGPU_SYSTEMC_PCO_SHADER_STAGE_GEOMETRY]
+         : NULL;
+   const uint64_t geometry_uniform_end =
+      (uint64_t)cmd->geometry_pco_abi.uniform_buffer_descriptor_start +
+      4u * cmd->geometry_pco_abi.uniform_buffer_descriptor_count;
+   const uint64_t geometry_push_start =
+      geometry_storage && geometry_storage->descriptor_count
+         ? (uint64_t)geometry_storage->descriptor_start +
+              4u * geometry_storage->descriptor_count
+         : geometry_uniform_end;
    if (geometry && (!cmd->geometry_pco || !cmd->geometry_shared ||
        cmd->geometry_pco_size > UINT32_MAX ||
        cmd->geometry_shared_count != cmd->geometry_pco_abi.shareds ||
@@ -1349,16 +1542,17 @@ pvrgpu_cmd_validate_draw_pco_triangles(
        cmd->geometry_pco_abi.uniform_buffer_descriptor_start < 4 ||
        cmd->geometry_pco_abi.uniform_buffer_descriptor_start > 4 + 8 * 20 ||
        (cmd->geometry_pco_abi.uniform_buffer_descriptor_start - 4) % 20 != 0 ||
-       cmd->geometry_pco_abi.push_constant_start !=
-          cmd->geometry_pco_abi.uniform_buffer_descriptor_start +
-             4u * cmd->geometry_pco_abi.uniform_buffer_descriptor_count ||
+       (geometry_storage && geometry_storage->descriptor_count > 32) ||
+       cmd->geometry_pco_abi.push_constant_start != geometry_push_start ||
        (uint64_t)cmd->geometry_pco_abi.push_constant_start +
           cmd->geometry_pco_abi.push_constant_count != cmd->geometry_pco_abi.shareds ||
        cmd->geometry_pco_abi.vertex_outputs < 4 || cmd->geometry_pco_abi.vertex_outputs > 64 ||
        (cmd->geometry_input_primitive_vertices != 1 && cmd->geometry_input_primitive_vertices != 2 &&
         cmd->geometry_input_primitive_vertices != 3 && cmd->geometry_input_primitive_vertices != 4 &&
         cmd->geometry_input_primitive_vertices != 6) ||
-       cmd->geometry_input_stride_dwords != cmd->vertex_pco_abi.vertex_outputs ||
+       cmd->geometry_input_stride_dwords !=
+          (cmd->tessellation ? tess_raster_abi.vertex_outputs
+                             : cmd->vertex_pco_abi.vertex_outputs) ||
        cmd->geometry_max_vertices > 256 || !cmd->geometry_invocations || cmd->geometry_invocations > 32 ||
        !cmd->geometry_vertices_per_instance ||
        (cmd->geometry_output_primitive != 0 && cmd->geometry_output_primitive != 3 &&
@@ -1625,7 +1819,10 @@ pvrgpu_cmd_validate_draw_pco_triangles(
    const bool fragment_stage_invalid = fragment_stage_refusal != NULL;
    struct pvrgpu_systemc_driver_command uniform_api;
    pvrgpu_pco_triangles_command_to_systemc(cmd, &uniform_api);
-   if (!pvrgpu_cmd_validate_uniform_buffers(&uniform_api, error, error_size))
+   if (!pvrgpu_cmd_validate_uniform_buffers(&uniform_api, error, error_size) ||
+       !pvrgpu_cmd_validate_graphics_buffers(
+          &uniform_api, cmd->sampled_texture_count_by_stage,
+          error, error_size))
       return false;
    /*
     * Position occupies the first outputs, gl_PointSize the next one when the
@@ -2321,6 +2518,7 @@ pvrgpu_pco_triangles_command_to_systemc(
    out->fragment_pco_size = cmd->fragment_pco_size;
    out->geometry_pco = cmd->geometry_pco;
    out->tessellation = cmd->tessellation;
+   out->graphics_buffers = cmd->graphics_buffers;
    out->geometry_pco_size = cmd->geometry_pco_size;
    out->geometry_shared = cmd->geometry_shared;
    out->geometry_shared_count = cmd->geometry_shared_count;
@@ -2753,6 +2951,7 @@ pvrgpu_write_draw_pco_sequence_command(
       pvrgpu_cmd_error(error, error_size, color_error);
       return false;
    }
+   uint32_t texture_cursor = 0;
    for (uint32_t ordinal = 0;
         ordinal < cmd->pco_sequence_command_count;
         ++ordinal) {
@@ -2777,7 +2976,28 @@ pvrgpu_write_draw_pco_sequence_command(
          pvrgpu_cmd_error(error, error_size, color_error);
          return false;
       }
+      if (nested->sampled_texture_count >
+          cmd->pco_sequence_texture_count - texture_cursor) {
+         pvrgpu_cmd_error(error, error_size,
+                          "nested PCO texture slice exceeds the sequence payload");
+         return false;
+      }
+      uint32_t stage_texture_counts[5] = {0};
+      for (uint32_t index = 0; index < nested->sampled_texture_count; ++index) {
+         const uint32_t stage =
+            cmd->pco_sequence_textures[texture_cursor + index].stage;
+         if (stage >= 5) {
+            pvrgpu_cmd_error(error, error_size,
+                             "nested PCO texture stage is invalid");
+            return false;
+         }
+         ++stage_texture_counts[stage];
+      }
+      texture_cursor += nested->sampled_texture_count;
       if (!pvrgpu_cmd_validate_uniform_buffers(nested, error, error_size))
+         return false;
+      if (!pvrgpu_cmd_validate_graphics_buffers(
+             nested, stage_texture_counts, error, error_size))
          return false;
       has_uniform_buffers = has_uniform_buffers ||
          nested->vertex_pco_abi.uniform_buffer_descriptor_count ||
@@ -2788,6 +3008,11 @@ pvrgpu_write_draw_pco_sequence_command(
          nested->initial_depth_attachment_bytes ||
          nested->initial_depth_attachment_bytes_size != 0 ||
          nested->raster_samples > 1;
+   }
+   if (texture_cursor != cmd->pco_sequence_texture_count) {
+      pvrgpu_cmd_error(error, error_size,
+                       "PCO sequence texture payload has no owning draw");
+      return false;
    }
 
    FILE *file = fopen(path, "w");

@@ -16,8 +16,10 @@ extern "C" {
  * API-v36 transports indexed primitive restart, per-target canonical colour
  * formats/byte widths, and native occlusion sample statistics.
  * API-v37 adds alias-preserving TCS/TES storage-buffer snapshots and bindings.
+ * API-v38 extends the same bounded storage-buffer contract to every graphics
+ * stage, with one whole-resource snapshot shared by all aliased stage views.
  * Old versioned consumers must not guess at the longer command envelope. */
-#define PVRGPU_SYSTEMC_API_VERSION 37u
+#define PVRGPU_SYSTEMC_API_VERSION 38u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE 15u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES (64u * 1024u)
 /*
@@ -95,8 +97,8 @@ enum pvrgpu_systemc_pco_shader_stage {
 #define PVRGPU_SYSTEMC_SHADER_BUFFER_READ 1u
 #define PVRGPU_SYSTEMC_SHADER_BUFFER_WRITE 2u
 
-/* Whole backing snapshots preserve aliases shared by TCS and TES. A binding
- * names one stage-local descriptor/view; descriptor words are
+/* Whole backing snapshots preserve aliases across every graphics stage. A
+ * binding names one stage-local descriptor/view; descriptor words are
  * [0, 0, bytes_size, 0] before model relocation. */
 struct pvrgpu_systemc_shader_buffer_resource {
    uint64_t resource_token;
@@ -119,6 +121,18 @@ struct pvrgpu_systemc_storage_buffer_abi {
    uint32_t used_mask;
    uint32_t read_mask;
    uint32_t write_mask;
+};
+
+/* API-v38 stage-neutral graphics storage. `storage` is indexed by the five
+ * graphics values of pvrgpu_systemc_pco_shader_stage (VS, FS, GS, TCS, TES).
+ * Resources are unique by resource_token across every stage; bindings name
+ * bounded views into those shared whole-resource snapshots. */
+struct pvrgpu_systemc_graphics_shader_buffers {
+   struct pvrgpu_systemc_storage_buffer_abi storage[5];
+   const struct pvrgpu_systemc_shader_buffer_resource *resources;
+   uint32_t resource_count;
+   const struct pvrgpu_systemc_shader_buffer_binding *bindings;
+   uint32_t binding_count;
 };
 
 /* Immutable patch pipeline. Domain: triangles=0, quads=1, isolines=2;
@@ -650,6 +664,8 @@ struct pvrgpu_systemc_driver_command {
     * index before baseVertex. Disabled draws require both fields to be zero. */
    uint32_t primitive_restart_enable;
    uint32_t primitive_restart_index;
+   /* API-v38 append-only tail. NULL means no graphics storage buffers. */
+   const struct pvrgpu_systemc_graphics_shader_buffers *graphics_buffers;
 };
 
 struct pvrgpu_systemc_submit_info {

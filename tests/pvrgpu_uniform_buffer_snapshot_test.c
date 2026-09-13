@@ -381,6 +381,210 @@ test_compiled_ubo_prefix(void)
    CHECK(count == 0);
 }
 
+static void
+test_graphics_shader_buffer_api(void)
+{
+   uint8_t bytes[16] = {0};
+   uint32_t banks[5][32] = {{0}};
+   const unsigned prefix[5] = {0, 0, 4, 8, 4};
+   struct pvrgpu_systemc_shader_buffer_resource resources[2] = {{
+      .resource_token = UINT64_C(0xabc),
+      .bytes = bytes,
+      .bytes_size = sizeof(bytes),
+   }};
+   struct pvrgpu_systemc_shader_buffer_binding bindings[5] = {0};
+   struct pvrgpu_systemc_graphics_shader_buffers graphics = {
+      .resources = resources,
+      .resource_count = 1,
+      .bindings = bindings,
+      .binding_count = 5,
+   };
+   for (unsigned stage = 0; stage < 5; ++stage) {
+      graphics.storage[stage] = (struct pvrgpu_systemc_storage_buffer_abi){
+         .descriptor_start = prefix[stage], .descriptor_count = 1,
+         .used_mask = 1, .read_mask = 1,
+         .write_mask = 1,
+      };
+      banks[stage][prefix[stage] + 2] = sizeof(bytes);
+      bindings[stage] = (struct pvrgpu_systemc_shader_buffer_binding){
+         .stage = stage, .access = PVRGPU_SYSTEMC_SHADER_BUFFER_READ |
+                                  PVRGPU_SYSTEMC_SHADER_BUFFER_WRITE,
+         .bytes_size = sizeof(bytes),
+      };
+   }
+   struct pvrgpu_systemc_tessellation tess = {0};
+   tess.control_shared = banks[3];
+   tess.control_shared_count = 12;
+   tess.control_abi.uniform_buffer_descriptor_start = 8;
+   tess.control_abi.shareds = tess.control_abi.push_constant_start = 12;
+   tess.evaluation_shared = banks[4];
+   tess.evaluation_shared_count = 8;
+   tess.evaluation_abi.uniform_buffer_descriptor_start = 4;
+   tess.evaluation_abi.shareds = tess.evaluation_abi.push_constant_start = 8;
+   struct pvrgpu_systemc_driver_command cmd = {0};
+   cmd.vertex_shared = banks[0]; cmd.vertex_shared_count = 4;
+   cmd.fragment_shared = banks[1]; cmd.fragment_shared_count = 4;
+   cmd.geometry_shared = banks[2]; cmd.geometry_shared_count = 8;
+   cmd.vertex_pco_abi.shareds = cmd.vertex_pco_abi.push_constant_start = 4;
+   cmd.fragment_pco_abi.shareds = cmd.fragment_pco_abi.push_constant_start = 4;
+   cmd.geometry_pco_abi.uniform_buffer_descriptor_start = 4;
+   cmd.geometry_pco_abi.shareds = cmd.geometry_pco_abi.push_constant_start = 8;
+   cmd.tessellation = &tess;
+   cmd.graphics_buffers = &graphics;
+   char error[256] = {0};
+   CHECK(pvrgpu_cmd_validate_graphics_buffers(&cmd, NULL, error, sizeof(error)));
+
+   graphics.storage[0].read_mask = graphics.storage[0].write_mask = 0;
+   bindings[0].access = 0;
+   CHECK(pvrgpu_cmd_validate_graphics_buffers(&cmd, NULL, error, sizeof(error)));
+   bindings[0].access = PVRGPU_SYSTEMC_SHADER_BUFFER_WRITE;
+   CHECK(!pvrgpu_cmd_validate_graphics_buffers(&cmd, NULL, error, sizeof(error)));
+   bindings[0].access = 0;
+   graphics.storage[0].read_mask = graphics.storage[0].write_mask = 1;
+   bindings[0].access = PVRGPU_SYSTEMC_SHADER_BUFFER_READ |
+                        PVRGPU_SYSTEMC_SHADER_BUFFER_WRITE;
+
+   /* One whole-resource token is deliberately shared by all five stages. */
+   bindings[4].access = PVRGPU_SYSTEMC_SHADER_BUFFER_READ;
+   CHECK(!pvrgpu_cmd_validate_graphics_buffers(&cmd, NULL, error, sizeof(error)));
+   bindings[4].access = PVRGPU_SYSTEMC_SHADER_BUFFER_READ |
+                        PVRGPU_SYSTEMC_SHADER_BUFFER_WRITE;
+   resources[1] = resources[0];
+   graphics.resource_count = 2;
+   CHECK(!pvrgpu_cmd_validate_graphics_buffers(&cmd, NULL, error, sizeof(error)));
+   graphics.resource_count = 1;
+   bindings[2].offset = 4;
+   CHECK(!pvrgpu_cmd_validate_graphics_buffers(&cmd, NULL, error, sizeof(error)));
+   bindings[2].offset = 0;
+   banks[1][2] = sizeof(bytes) - 4;
+   CHECK(!pvrgpu_cmd_validate_graphics_buffers(&cmd, NULL, error, sizeof(error)));
+   banks[1][2] = sizeof(bytes);
+   CHECK(pvrgpu_cmd_validate_graphics_buffers(&cmd, NULL, error, sizeof(error)));
+
+   /* With no UBOs the UBO start remains zero, but storage still follows the
+    * actual per-stage texture prefix rather than the empty UBO field. */
+   uint32_t texture_counts[5] = {1, 0, 0, 0, 0};
+   memset(banks[0], 0, sizeof(banks[0]));
+   banks[0][22] = sizeof(bytes);
+   graphics.storage[0].descriptor_start = 20;
+   cmd.vertex_shared_count = 24;
+   cmd.vertex_pco_abi.shareds = cmd.vertex_pco_abi.push_constant_start = 24;
+   CHECK(pvrgpu_cmd_validate_graphics_buffers(
+      &cmd, texture_counts, error, sizeof(error)));
+
+   /* FS descriptors order texture, empty UBO, image, then storage. */
+   texture_counts[0] = 0;
+   texture_counts[1] = 1;
+   memset(banks[0], 0, sizeof(banks[0]));
+   banks[0][2] = sizeof(bytes);
+   graphics.storage[0].descriptor_start = 0;
+   cmd.vertex_shared_count = 4;
+   cmd.vertex_pco_abi.shareds = cmd.vertex_pco_abi.push_constant_start = 4;
+   memset(banks[1], 0, sizeof(banks[1]));
+   banks[1][30] = sizeof(bytes);
+   graphics.storage[1].descriptor_start = 28;
+   cmd.fragment_image_descriptor_start = 20;
+   cmd.fragment_image_descriptor_count = 1;
+   cmd.fragment_shared_count = 32;
+   cmd.fragment_pco_abi.shareds =
+      cmd.fragment_pco_abi.push_constant_start = 32;
+   CHECK(pvrgpu_cmd_validate_graphics_buffers(
+      &cmd, texture_counts, error, sizeof(error)));
+
+   /* Stages without an executable, shared bank, or storage metadata stay
+    * completely empty.  A single-stage payload must not acquire the native
+    * GS/TCS/TES system prefix merely because the outer v38 capsule exists. */
+   memset(graphics.storage, 0, sizeof(graphics.storage));
+   memset(bindings, 0, sizeof(bindings));
+   memset(banks, 0, sizeof(banks));
+   memset(texture_counts, 0, sizeof(texture_counts));
+   memset(&cmd.vertex_pco_abi, 0, sizeof(cmd.vertex_pco_abi));
+   memset(&cmd.fragment_pco_abi, 0, sizeof(cmd.fragment_pco_abi));
+   memset(&cmd.geometry_pco_abi, 0, sizeof(cmd.geometry_pco_abi));
+   cmd.vertex_shared = cmd.fragment_shared = cmd.geometry_shared = NULL;
+   cmd.vertex_shared_count = cmd.fragment_shared_count =
+      cmd.geometry_shared_count = 0;
+   cmd.fragment_image_descriptor_start = 0;
+   cmd.fragment_image_descriptor_count = 0;
+   cmd.tessellation = NULL;
+   graphics.binding_count = 1;
+   graphics.storage[0] = (struct pvrgpu_systemc_storage_buffer_abi){
+      .descriptor_start = 0, .descriptor_count = 1,
+      .used_mask = 1, .read_mask = 1,
+   };
+   bindings[0] = (struct pvrgpu_systemc_shader_buffer_binding){
+      .stage = PVRGPU_SYSTEMC_PCO_SHADER_STAGE_VERTEX,
+      .access = PVRGPU_SYSTEMC_SHADER_BUFFER_READ,
+      .bytes_size = sizeof(bytes),
+   };
+   banks[0][2] = sizeof(bytes);
+   cmd.vertex_shared = banks[0];
+   cmd.vertex_shared_count = 4;
+   cmd.vertex_pco_abi.shareds = cmd.vertex_pco_abi.push_constant_start = 4;
+   CHECK(pvrgpu_cmd_validate_graphics_buffers(
+      &cmd, texture_counts, error, sizeof(error)));
+
+   graphics.storage[1] = graphics.storage[0];
+   memset(&graphics.storage[0], 0, sizeof(graphics.storage[0]));
+   bindings[0].stage = PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT;
+   cmd.vertex_shared = NULL;
+   cmd.vertex_shared_count = 0;
+   memset(&cmd.vertex_pco_abi, 0, sizeof(cmd.vertex_pco_abi));
+   cmd.fragment_shared = banks[0];
+   cmd.fragment_shared_count = 4;
+   cmd.fragment_pco_abi.shareds =
+      cmd.fragment_pco_abi.push_constant_start = 4;
+   CHECK(pvrgpu_cmd_validate_graphics_buffers(
+      &cmd, texture_counts, error, sizeof(error)));
+}
+
+static void
+test_uniform_storage_alias_gate(void)
+{
+   uint8_t bytes[16] = {0};
+   struct pvrgpu_resource uniform_resource = {0};
+   struct pvrgpu_resource other_resource = {0};
+   uniform_resource.base.target = other_resource.base.target = PIPE_BUFFER;
+   uniform_resource.data = other_resource.data = bytes;
+   uniform_resource.size = other_resource.size = sizeof(bytes);
+   struct pipe_constant_buffer uniforms[2] = {0};
+   uniforms[1] = (struct pipe_constant_buffer){
+      .buffer = &uniform_resource.base,
+      .buffer_size = sizeof(bytes),
+   };
+   struct pvrgpu_compute_snapshot storage = {0};
+   storage.resource_count = 1;
+   storage.binding_count = 1;
+   storage.owners[0] = &other_resource.base;
+   storage.bindings[0] = (struct pvrgpu_systemc_compute_binding){
+      .kind = PVRGPU_SYSTEMC_COMPUTE_STORAGE_BUFFER,
+      .resource_index = 0,
+      .access = PVRGPU_SYSTEMC_COMPUTE_ACCESS_WRITE,
+      .bytes_size = sizeof(bytes),
+   };
+   CHECK(pvrgpu_uniform_buffers_disjoint_from_writable_snapshot(
+      uniforms, 1, 0, &storage));
+
+   storage.owners[0] = &uniform_resource.base;
+   storage.bindings[0].access = PVRGPU_SYSTEMC_COMPUTE_ACCESS_READ;
+   CHECK(pvrgpu_uniform_buffers_disjoint_from_writable_snapshot(
+      uniforms, 1, 0, &storage));
+   storage.bindings[0].access |= PVRGPU_SYSTEMC_COMPUTE_ACCESS_WRITE;
+   CHECK(!pvrgpu_uniform_buffers_disjoint_from_writable_snapshot(
+      uniforms, 1, 0, &storage));
+
+   uniforms[1].buffer = NULL;
+   uniforms[1].user_buffer = bytes;
+   CHECK(pvrgpu_uniform_buffers_disjoint_from_writable_snapshot(
+      uniforms, 1, 0, &storage));
+
+   uniforms[0].user_buffer = NULL;
+   uniforms[0].buffer = &uniform_resource.base;
+   uniforms[0].buffer_size = sizeof(bytes);
+   CHECK(!pvrgpu_uniform_buffers_disjoint_from_writable_snapshot(
+      uniforms, 1, 1, &storage));
+}
+
 int main(void)
 {
    test_compiled_ubo_prefix();
@@ -388,6 +592,8 @@ int main(void)
    test_ranges_limits_and_raw_bytes();
    test_geometry_sampler_descriptor_prefix();
    test_tessellation_sampler_descriptor_prefix();
+   test_graphics_shader_buffer_api();
+   test_uniform_storage_alias_gate();
    printf("UBO snapshot/descriptor tests: %u checks, %u failures\n", checks, failures);
    return failures != 0;
 }

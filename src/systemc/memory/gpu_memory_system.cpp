@@ -104,6 +104,8 @@ void GpuMemorySystem::ValidateClient(MemoryClient client) {
   case MemoryClient::kStreamOutput:
   case MemoryClient::kFragmentImage:
   case MemoryClient::kShaderImageReadback:
+  case MemoryClient::kVertexShader:
+  case MemoryClient::kFragmentShader:
     return;
   case MemoryClient::kMixedCache:
   case MemoryClient::kUscL2:

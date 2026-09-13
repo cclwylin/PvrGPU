@@ -15,18 +15,23 @@
 using namespace pvrgpu::stub;
 namespace {
 unsigned checks = 0;
+unsigned rejection_attempts = 0;
 void Check(bool ok, const char *message) {
   ++checks;
   if (!ok) throw std::runtime_error(message);
 }
-template<class F> void Reject(F fn, const char *expected) {
+template<class F> void Reject(F fn, const char *expected,
+                              const std::string &context = {}) {
+  const auto attempt = ++rejection_attempts;
   try { fn(); }
   catch (const std::runtime_error &error) {
     Check(std::string(error.what()).find(expected) != std::string::npos,
           "rejection must name the intended tessellation guard");
     return;
   }
-  throw std::runtime_error("missing expected tessellation rejection");
+  throw std::runtime_error("missing expected tessellation rejection #" +
+                           std::to_string(attempt) + " (" + expected + ")" +
+                           (context.empty() ? std::string{} : ": " + context));
 }
 std::uint32_t Bits(float value) {
   std::uint32_t bits;
@@ -85,13 +90,16 @@ PcoDecodedProgram Program(ShaderStage stage, bool lod, unsigned descriptor = 0) 
   if (stage == ShaderStage::kTessellationEvaluation) program.summary.vertex_output_mask = 15;
   return program;
 }
-TessellationTaskState Task(ShaderStage stage, const DriverPcoStageAbi &abi, unsigned lanes) {
+TessellationTaskState Task(ShaderStage stage, const DriverPcoStageAbi &abi,
+                           unsigned lanes,
+                           const DriverStorageBufferAbi *storage = nullptr) {
   std::vector<std::uint32_t> shared(abi.shareds);
   for (unsigned i = System(stage); i < abi.shareds; ++i) shared[i] = 0x4d000000 + i;
   std::array<std::array<std::uint32_t, 3>, 32> coordinates{};
   auto task = stage == ShaderStage::kTessellationControl ?
-      MakeTessellationControlTask(abi, shared, 17, 3, lanes) :
-      MakeTessellationEvaluationTask(abi, shared, 17, 3, coordinates.data(), lanes);
+      MakeTessellationControlTask(abi, shared, 17, 3, lanes, storage) :
+      MakeTessellationEvaluationTask(abi, shared, 17, 3, coordinates.data(),
+                                     lanes, storage);
   for (unsigned i = 0; i < lanes; ++i) {
     task.lanes[i].temporaries[0] = Bits(float(i + 1) / 32);
     task.lanes[i].temporaries[1] = Bits(-float(i + 1) / 16);
@@ -114,6 +122,32 @@ struct Samples {
     std::copy(response.begin(), response.end(), words);
   }
 };
+void TextureWithStorageAbi() {
+  for (auto stage : {ShaderStage::kTessellationControl,
+                     ShaderStage::kTessellationEvaluation}) {
+    auto abi = Abi(stage);
+    DriverStorageBufferAbi storage;
+    storage.descriptor_start = abi.push_constant_start;
+    storage.descriptor_count = 1;
+    storage.used_mask = storage.read_mask = 1;
+    abi.push_constant_start += 4;
+    abi.shareds += 4;
+    const auto program = Program(stage, false);
+    ValidateTessellationProgram(program, abi, &storage);
+    auto task = Task(stage, abi, 1, &storage);
+    Samples samples;
+    TessellationMemoryCallbacks callbacks{&samples, nullptr, nullptr, nullptr,
+                                           Samples::Sample};
+    TessellationExecutionStats stats;
+    StepTessellationTask(program, abi, task, callbacks, stats);
+    Check(samples.requests.size() == 1 && stats.texture_instructions == 1,
+          "texture request validates against the task's adjacent storage ABI");
+    StepTessellationTask(program, abi, task, callbacks, stats);
+    Check(task.lanes[0].pending_operation == 0 &&
+              task.lanes[0].temporary_written.test(4),
+          "texture response with storage descriptors reaches WDF");
+  }
+}
 void RequestsAndFence() {
   for (auto stage : {ShaderStage::kTessellationControl, ShaderStage::kTessellationEvaluation})
     for (bool lod : {false, true}) for (unsigned textures : {1U, 8U})
@@ -187,7 +221,8 @@ void Predication() {
         expected += selected[lane];
       }
       Samples samples;
-      TessellationMemoryCallbacks cb{&samples, nullptr, nullptr, Samples::Sample};
+      TessellationMemoryCallbacks cb{&samples, nullptr, nullptr, nullptr,
+                                     Samples::Sample};
       TessellationExecutionStats stats;
       StepTessellationTask(program, abi, task, cb, stats);
       Check(samples.requests.size() == expected && stats.texture_instructions == expected, "inactive/predicate-false lanes never sample");
@@ -195,6 +230,61 @@ void Predication() {
       for (unsigned lane = 0; lane < 7; ++lane) for (unsigned c = 4; c < 8; ++c)
         Check(task.lanes[lane].temporary_written.test(c) == selected[lane], "WDF writes only lanes that really issued SMP");
     }
+}
+void ExtendedTextureClasses() {
+  for (auto stage : {ShaderStage::kTessellationControl,
+                     ShaderStage::kTessellationEvaluation}) {
+    const auto abi = Abi(stage);
+    for (unsigned texture_class = 0; texture_class < 3; ++texture_class) {
+      auto program = Program(stage, false);
+      auto &sample = program.instructions[0];
+      auto task = Task(stage, abi, 1);
+      const unsigned descriptor = System(stage);
+      if (texture_class == 0) {
+        // 3D/Cube responses use raw integer mode for integer samplers too.
+        sample.texture_dimension = 3;
+        sample.texture_fcnorm = 0;
+      } else if (texture_class == 1) {
+        // Array and CubeArray select their layer/cube with the native TAO
+        // payload: zero AUTO-LOD bias followed by an exact 64-bit base.
+        sample.texture_address_offset = 1;
+        task.lanes[0].temporaries[2] = 0;
+        task.lanes[0].temporaries[3] = 0x76543210U;
+        task.lanes[0].temporaries[4] = 0x00000089U;
+        task.lanes[0].temporary_written.set(2);
+        task.lanes[0].temporary_written.set(3);
+        task.lanes[0].temporary_written.set(4);
+      } else {
+        sample.texture_shadow_compare = 1;
+        sample.texture_shadow_reference = {PcoRegisterBank::kTemporary, 2};
+        task.shared[descriptor + 7] |= UINT32_C(0x200);
+        task.shared[descriptor + 12] = 3;
+      }
+      ValidateTessellationProgram(program, abi);
+      Samples samples;
+      TessellationMemoryCallbacks cb{&samples, nullptr, nullptr, nullptr,
+                                     Samples::Sample};
+      TessellationExecutionStats stats;
+      StepTessellationTask(program, abi, task, cb, stats);
+      Check(samples.requests.size() == 1 && stats.texture_instructions == 1,
+            "extended tessellation sample issues one native request");
+      const auto &request = samples.requests[0];
+      if (texture_class == 0) {
+        Check(request.dimension == 3 && request.fcnorm == 0 &&
+                  request.coordinates[2] == task.lanes[0].temporaries[2],
+              "3D/Cube integer sample preserves W coordinate and FCNORM");
+      } else if (texture_class == 1) {
+        Check(request.dimension == 2 &&
+                  request.texture_address_lo == 0x76543210U &&
+                  request.texture_address_hi == 0x00000089U,
+              "array sample preserves the complete native TAO address");
+      } else {
+        Check(request.shadow_compare == 1 &&
+                  request.shadow_reference == task.lanes[0].temporaries[2],
+              "shadow sample preserves the native Dref marker source");
+      }
+    }
+  }
 }
 void HighTemporaryBoundary() {
   for (auto stage : {ShaderStage::kTessellationControl, ShaderStage::kTessellationEvaluation}) {
@@ -210,7 +300,9 @@ void HighTemporaryBoundary() {
       task.lanes[0].temporaries[kPcoTemporaryCount - 3 + c] = task.lanes[0].temporaries[c];
       task.lanes[0].temporary_written.set(kPcoTemporaryCount - 3 + c);
     }
-    Samples samples; TessellationMemoryCallbacks cb{&samples, nullptr, nullptr, Samples::Sample};
+    Samples samples;
+    TessellationMemoryCallbacks cb{&samples, nullptr, nullptr, nullptr,
+                                   Samples::Sample};
     TessellationExecutionStats stats;
     while (!task.ended) StepTessellationTask(program, abi, task, cb, stats);
     Check(samples.requests.size() == 1, "full TEMP file boundary request uses one real callback");
@@ -236,20 +328,25 @@ void Mutations() {
       [](auto &i) { --i.source1.index; }, [](auto &i) { ++i.source1.index; },
       [](auto &i) { i.source1.index += 20; i.source2.index += 20; },
       [](auto &i) { i.source2.bank = PcoRegisterBank::kTemporary; }, [](auto &i) { ++i.source2.index; },
-      [](auto &i) { i.texture_dimension = 3; }, [](auto &i) { i.texture_fcnorm = 2; },
-      [](auto &i) { i.texture_fcnorm = 0; },
-      [](auto &i) { i.texture_address_offset = 1; }, [](auto &i) { i.texture_non_normalized_coords = 1; },
+      [](auto &i) { i.texture_dimension = 1; }, [](auto &i) { i.texture_fcnorm = 2; },
+      [](auto &i) { i.texture_non_normalized_coords = 1; },
       [](auto &i) { i.texture_sample_index_present = 1; }, [](auto &i) { i.texture_spatial_offset_present = 1; },
+      [](auto &i) { i.texture_shadow_compare = 2; },
+      [](auto &i) { i.texture_shadow_reference = {PcoRegisterBank::kTemporary, 2}; },
     };
-    for (const auto &mutate : mutations) {
+    for (std::size_t mutation = 0; mutation < mutations.size(); ++mutation) {
       auto program = original;
-      mutate(program.instructions[0]);
-      Reject([&] { ValidateTessellationProgram(program, abi); }, "native SMP source/response/descriptor layout");
+      mutations[mutation](program.instructions[0]);
+      const auto context = "SMP metadata mutation " + std::to_string(mutation);
+      Reject([&] { ValidateTessellationProgram(program, abi); },
+             "native SMP source/response/descriptor layout", context);
       auto task = Task(stage, abi, 1);
       Samples samples;
-      TessellationMemoryCallbacks cb{&samples, nullptr, nullptr, Samples::Sample};
+      TessellationMemoryCallbacks cb{&samples, nullptr, nullptr, nullptr,
+                                     Samples::Sample};
       TessellationExecutionStats stats;
-      Reject([&] { StepTessellationTask(program, abi, task, cb, stats); }, "native SMP source/response/descriptor layout");
+      Reject([&] { StepTessellationTask(program, abi, task, cb, stats); },
+             "native SMP source/response/descriptor layout", context);
       Check(samples.requests.empty(), "invalid native metadata must fail before callback");
     }
     for (const auto &mutate : std::vector<std::function<void(PcoInstruction &)>>{
@@ -261,7 +358,11 @@ void Mutations() {
       auto task = Task(stage, abi, 1); TessellationExecutionStats stats;
       Reject([&] { StepTessellationTask(program, abi, task, {}, stats); }, "texture LOD mode");
     }
-    for (unsigned descriptor : {System(stage) - 1, System(stage) + 1, System(stage) + 180}) {
+    const auto too_many_descriptors =
+        System(stage) + 20U *
+            (static_cast<unsigned>(kPcoMaximumTextureDescriptorSets) + 1U);
+    for (unsigned descriptor : {System(stage) - 1, System(stage) + 1,
+                                too_many_descriptors}) {
       auto bad = abi;
       bad.uniform_buffer_descriptor_start = descriptor;
       bad.push_constant_start = descriptor + 4;
@@ -277,7 +378,9 @@ void Mutations() {
     for (unsigned c = 0; c < 3; ++c) {
       auto task = Task(stage, abi, 1);
       task.lanes[0].temporary_written.words[0] &= ~(UINT64_C(1) << c);
-      Samples samples; TessellationMemoryCallbacks cb{&samples, nullptr, nullptr, Samples::Sample};
+      Samples samples;
+      TessellationMemoryCallbacks cb{&samples, nullptr, nullptr, nullptr,
+                                     Samples::Sample};
       TessellationExecutionStats stats;
       Reject([&] { StepTessellationTask(original, abi, task, cb, stats); }, "TEMP read before write");
       Check(samples.requests.empty(), "missing UV/LOD fails before callback");
@@ -286,13 +389,17 @@ void Mutations() {
     Reject([&] { StepTessellationTask(original, abi, task, {}, stats); }, "no TextureUnit request callback");
     for (bool bad_count : {false, true}) {
       task = Task(stage, abi, 1); stats = {};
-      Samples samples; TessellationMemoryCallbacks cb{&samples, nullptr, nullptr, Samples::Sample};
+      Samples samples;
+      TessellationMemoryCallbacks cb{&samples, nullptr, nullptr, nullptr,
+                                     Samples::Sample};
       StepTessellationTask(original, abi, task, cb, stats);
       if (bad_count) task.lanes[0].pending_count = 3; else task.lanes[0].pending_output = 5;
       Reject([&] { StepTessellationTask(original, abi, task, cb, stats); }, "pending response span");
     }
     task = Task(stage, abi, 1); stats = {};
-    Samples samples; TessellationMemoryCallbacks cb{&samples, nullptr, nullptr, Samples::Sample};
+    Samples samples;
+    TessellationMemoryCallbacks cb{&samples, nullptr, nullptr, nullptr,
+                                   Samples::Sample};
     StepTessellationTask(original, abi, task, cb, stats);
     task.lanes[0].pending_operation = 4;
     Reject([&] { StepTessellationTask(original, abi, task, cb, stats); }, "unknown pending memory operation");
@@ -375,12 +482,11 @@ void CompilerFixtures() {
       Check(sample->source1.index == (is_control ? 8 : 4) && sample->source2.index == (is_control ? 16 : 12),
             "true compiler stage-local descriptor namespace");
       const auto &original = is_control ? kTessTextureTcs : tes_bytes;
-      for (unsigned mutation = 0; mutation < 4; ++mutation) {
+      for (unsigned mutation = 0; mutation < 3; ++mutation) {
         auto bad = original;
         if (mutation == 0) bad[sample->binary_offset] |= 8; // unsupported DRC1
         if (mutation == 1) bad[sample->binary_offset + 1] |= 128; // reserved extended backend
         if (mutation == 2) bad[sample->binary_offset + 1] &= ~12U; // CHAN1 is not ordinary count4
-        if (mutation == 3) bad[sample->binary_offset] &= ~16U; // raw/integer response is outside initial FCNORM contract
         Reject([&] { DecodeTessellationPcoProgram(program->summary.stage, bad); }, "SMP");
       }
     }
@@ -393,7 +499,9 @@ void CompilerFixtures() {
       for (unsigned c = 8; c < shared.size(); ++c) shared[c] = 0x5a000000 + c;
       const auto task_shared = shared;
       auto task = MakeTessellationControlTask(tcs, shared, epoch, 3, 3);
-      TessellationMemoryCallbacks cb{&memory, CompilerMemory::Read, CompilerMemory::Write, CompilerMemory::Sample};
+      TessellationMemoryCallbacks cb{&memory, CompilerMemory::Read,
+                                     CompilerMemory::Write, nullptr,
+                                     CompilerMemory::Sample};
       TessellationExecutionStats stats;
       while (!task.ended) StepTessellationTask(control, tcs, task, cb, stats);
       Check(stats.texture_instructions == 3 && memory.requests.size() == 3, "true TCS issues one SMP per output invocation");
@@ -447,7 +555,8 @@ void CompilerFixtures() {
 } // namespace
 int main() {
   try {
-    RequestsAndFence(); Predication(); HighTemporaryBoundary(); Mutations(); CompilerFixtures();
+    RequestsAndFence(); TextureWithStorageAbi(); Predication(); ExtendedTextureClasses();
+    HighTemporaryBoundary(); Mutations(); CompilerFixtures();
     std::cout << "native tessellation texture ISS decoded-unit and true-compiler fixtures: PASS " << checks << " checks\n";
     return 0;
   } catch (const std::exception &error) {

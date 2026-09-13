@@ -73,6 +73,7 @@ struct Fixture {
     draw.fragment_pco_abi = {1,0,0,4,0,0,0,0,0,0};
     draw.position_output_count = draw.varying_output_start = 4;
     draw.fragment_position_count = draw.fragment_varying_start = 4;
+    draw.fragment_position_uses_w = 1;
     draw.fragment_output_mask[0] = 15;
     draw.viewport_scale_bits[0] = draw.viewport_scale_bits[1] = 0x41000000;
     draw.viewport_scale_bits[2] = 0x3f000000;
@@ -106,8 +107,7 @@ struct Fixture {
     }
   }
   void Geometry() {
-    // A separate real GS envelope exercises public UBO stage 2. Combining GS
-    // with TCS/TES is deliberately unsupported, not a legal five-stage draw.
+    // A separate real GS envelope exercises public UBO stage 2.
     draw.tessellation = nullptr; draw.primitive_mode = 0;
     draw.geometry_pco = gs.data(); draw.geometry_pco_size = gs.size();
     draw.geometry_shared = shared[2].data(); draw.geometry_shared_count = 4;
@@ -214,7 +214,7 @@ class GuardedBytes {
 };
 
 void VerifyVersions(Submission &submit) {
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 37);
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 38);
   constexpr auto previous_size = offsetof(pvrgpu_systemc_driver_command, tessellation);
   static_assert(previous_size % alignof(pvrgpu_systemc_driver_command) == 0);
   GuardedBytes previous(previous_size);
@@ -263,10 +263,24 @@ void VerifyVersions(Submission &submit) {
                 "version=32 expected=" +
                     std::to_string(PVRGPU_SYSTEMC_API_VERSION),
                 "API32 short nested command before API33 tail");
+  GuardedBytes api37(offsetof(pvrgpu_systemc_driver_command,
+                              graphics_buffers));
+  const std::uint32_t api37_version = 37;
+  std::memcpy(api37.data(), &api37_version, sizeof(api37_version));
+  const auto &old37 =
+      *reinterpret_cast<const pvrgpu_systemc_driver_command *>(api37.data());
+  info = submit.info;
+  info.command = &old37;
+  submit.Call(info, "command version",
+              "API37 short command before API38 graphics-buffer tail");
+  submit.Reject(old37,
+                "version=37 expected=" +
+                    std::to_string(PVRGPU_SYSTEMC_API_VERSION),
+                "API37 short nested command before API38 tail");
   GuardedBytes complete(sizeof(pvrgpu_systemc_driver_command));
   std::memcpy(complete.data(), &fixture.draw, sizeof(fixture.draw));
   submit.Reject(*reinterpret_cast<const pvrgpu_systemc_driver_command *>(complete.data()),
-                kLateGate, "full API33 command reads no byte beyond its tail");
+                kLateGate, "full current command reads no byte beyond its tail");
   GuardedBytes payload(sizeof(pvrgpu_systemc_tessellation));
   std::memcpy(payload.data(), &fixture.tess, sizeof(fixture.tess));
   full = fixture.draw;
@@ -340,8 +354,27 @@ void VerifyMetadata(Submission &submit) {
     Probe(submit, [&](auto &f) { f.tess.control_barrier_count = value; }, kLateGate,
           "barrier count is compiler diagnostic metadata, not patch allocation");
   Probe(submit, [](auto &f) { f.draw.primitive_mode = 4; }, kLink, "Tessellation requires PATCHES");
-  Probe(submit, [](auto &f) { f.draw.geometry_pco = f.gs.data(); f.draw.geometry_pco_size = f.gs.size(); },
-        kLink, "GS plus Tessellation is explicitly unsupported");
+  Probe(submit, [](auto &f) {
+    f.draw.geometry_pco = f.gs.data(); f.draw.geometry_pco_size = f.gs.size();
+    f.draw.geometry_shared = f.shared[2].data(); f.draw.geometry_shared_count = 4;
+    f.draw.geometry_pco_abi = {4,2,8,0,4,4,0,0,4,0};
+    f.draw.geometry_input_primitive_vertices = 1;
+    f.draw.geometry_max_vertices = f.draw.geometry_invocations = 1;
+    f.draw.geometry_input_stride_dwords = 4;
+    f.draw.geometry_vertices_per_instance = 1;
+    f.tess.point_mode = 1;
+  }, kLateGate, "GS plus Tessellation is a legal five-stage envelope");
+  Probe(submit, [](auto &f) {
+    f.draw.geometry_pco = f.gs.data(); f.draw.geometry_pco_size = f.gs.size();
+    f.draw.geometry_shared = f.shared[2].data(); f.draw.geometry_shared_count = 4;
+    f.draw.geometry_pco_abi = {4,2,8,0,4,4,0,0,4,0};
+    f.draw.geometry_input_primitive_vertices = 1;
+    f.draw.geometry_max_vertices = f.draw.geometry_invocations = 1;
+    f.draw.geometry_input_stride_dwords = 4;
+    f.draw.geometry_vertices_per_instance = 1;
+    f.tess.point_mode = 0;
+  }, "tessellation-to-geometry primitive linkage",
+     "triangle-domain TES cannot feed a point-input GS");
   Probe(submit, [](auto &f) { f.draw.vertex_pco_abi.vertex_outputs = 8; }, kLink, "VS/TCS input stride linkage");
   Probe(submit, [](auto &f) { f.tess.vertices_per_instance = 2; }, kLink, "incomplete transported instance span");
   Probe(submit, [](auto &f) { f.draw.render_target_count = 2; }, "geometry MRT", "Tessellation MRT fail-closed");

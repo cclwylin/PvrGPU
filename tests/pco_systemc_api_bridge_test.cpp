@@ -44,7 +44,7 @@ void VerifyGuardedPreviousVersionCommand(
   // API-v22 added alpha-to-sample state after the uniform-buffer list.
   // Reconstruct the aligned API-v21 byte extent, not a zeroed
   // current-size command whose readable tail would hide the invalid access.
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 37U,
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 38U,
                 "update the frozen API-v21 guard-page fixture on ABI changes");
   constexpr std::size_t kApi21Tail =
       offsetof(pvrgpu_systemc_driver_command, uniform_buffer_count) +
@@ -395,7 +395,7 @@ void VerifySequenceExternalTextureAllocation() {
 
 int main() {
   using namespace pvrgpu::stub;
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 37U,
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 38U,
                 "native sequence bridge test requires API-v35");
   static_assert(PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS == 15U);
   static_assert(kDriverPcoMaximumTextureMipLevels == 15U);
@@ -580,6 +580,91 @@ int main() {
   command.version = PVRGPU_SYSTEMC_API_VERSION;
   error.fill(0);
   VerifyGuardedPreviousVersionCommand(info);
+
+  {
+    std::uint8_t byte = 0;
+    pvrgpu_systemc_shader_buffer_resource resources[2]{};
+    resources[0] = {UINT64_C(1), &byte, 1};
+    pvrgpu_systemc_shader_buffer_binding binding{};
+    binding.stage = 256;
+    pvrgpu_systemc_graphics_shader_buffers graphics{};
+    graphics.resources = resources;
+    graphics.resource_count = 1;
+    graphics.bindings = &binding;
+    graphics.binding_count = 1;
+    command.graphics_buffers = &graphics;
+    const auto saved_color_source =
+        command.color_attachment_source_command_index;
+    const auto saved_depth_source =
+        command.depth_attachment_source_command_index;
+    const auto saved_varying_output_start = command.varying_output_start;
+    const auto saved_blend_rgb_equation = command.blend_rgb_equation;
+    const auto saved_blend_alpha_equation = command.blend_alpha_equation;
+    const auto saved_blend_source_rgb_factor =
+        command.blend_source_rgb_factor;
+    const auto saved_blend_destination_rgb_factor =
+        command.blend_destination_rgb_factor;
+    const auto saved_blend_source_alpha_factor =
+        command.blend_source_alpha_factor;
+    const auto saved_blend_destination_alpha_factor =
+        command.blend_destination_alpha_factor;
+    command.color_attachment_source_command_index =
+        PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR;
+    command.depth_attachment_source_command_index =
+        PVRGPU_SYSTEMC_ATTACHMENT_NEW_CLEAR;
+    command.varying_output_start = command.position_output_count;
+    command.blend_rgb_equation = PVRGPU_SYSTEMC_PCO_BLEND_EQUATION_ADD;
+    command.blend_alpha_equation = PVRGPU_SYSTEMC_PCO_BLEND_EQUATION_ADD;
+    command.blend_source_rgb_factor = PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE;
+    command.blend_destination_rgb_factor = PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ZERO;
+    command.blend_source_alpha_factor = PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ONE;
+    command.blend_destination_alpha_factor =
+        PVRGPU_SYSTEMC_PCO_BLEND_FACTOR_ZERO;
+    pvrgpu_systemc_driver_command sequence{};
+    sequence.version = PVRGPU_SYSTEMC_API_VERSION;
+    sequence.schema = command.schema;
+    sequence.producer = command.producer;
+    sequence.command = "draw_pco_sequence";
+    sequence.case_name = command.case_name;
+    sequence.format = command.format;
+    sequence.frame = command.frame;
+    sequence.framebuffer_width = sequence.width = command.framebuffer_width;
+    sequence.framebuffer_height = sequence.height = command.framebuffer_height;
+    sequence.pco_sequence_commands = &command;
+    sequence.pco_sequence_command_count = 1;
+    info.command = &sequence;
+    error.fill(0);
+    if (pvrgpu_systemc_submit_driver_command(&info, error.data(),
+                                             error.size()) == 0 ||
+        std::string(error.data()).find("binding stage") == std::string::npos)
+      Fail("out-of-range graphics-buffer stage was truncated into VS");
+
+    const std::size_t half =
+        PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BYTES / 2U + 1U;
+    resources[0] = {UINT64_C(1), &byte, half};
+    resources[1] = {UINT64_C(2), &byte, half};
+    graphics.resource_count = 2;
+    graphics.bindings = nullptr;
+    graphics.binding_count = 0;
+    error.fill(0);
+    if (pvrgpu_systemc_submit_driver_command(&info, error.data(),
+                                             error.size()) == 0 ||
+        std::string(error.data()).find("backing snapshot") ==
+            std::string::npos)
+      Fail("aggregate graphics-buffer payload was copied before its bound");
+    command.graphics_buffers = nullptr;
+    command.color_attachment_source_command_index = saved_color_source;
+    command.depth_attachment_source_command_index = saved_depth_source;
+    command.varying_output_start = saved_varying_output_start;
+    command.blend_rgb_equation = saved_blend_rgb_equation;
+    command.blend_alpha_equation = saved_blend_alpha_equation;
+    command.blend_source_rgb_factor = saved_blend_source_rgb_factor;
+    command.blend_destination_rgb_factor = saved_blend_destination_rgb_factor;
+    command.blend_source_alpha_factor = saved_blend_source_alpha_factor;
+    command.blend_destination_alpha_factor =
+        saved_blend_destination_alpha_factor;
+    info.command = &command;
+  }
 
   set_pco_resolution(640, 480);
   if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) ==

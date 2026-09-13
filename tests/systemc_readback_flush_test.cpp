@@ -167,6 +167,13 @@ void RequireOpaqueColor(
 }  // namespace
 
 int main(int argc, char **argv) {
+#if defined(_WIN32)
+  if (_putenv_s("PVRGPU_TEXTURE_LOD_MODE", "exact") != 0)
+#else
+  if (setenv("PVRGPU_TEXTURE_LOD_MODE", "exact", 1) != 0)
+#endif
+    Fail("cannot configure exact texture LOD mode");
+
   const auto nonce =
       std::chrono::high_resolution_clock::now().time_since_epoch().count();
   g_test_root = std::filesystem::temp_directory_path() /

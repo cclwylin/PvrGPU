@@ -695,7 +695,8 @@ target_include_directories(pco-decoder-boundary-test PRIVATE
     "${CMAKE_SOURCE_DIR}/src/systemc")
 target_link_libraries(pco-decoder-boundary-test PRIVATE pvrgpu-systemc-bridge PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(pco-decoder-boundary-test)
-foreach(pco_decoder_boundary IN ITEMS valid reject65 reject65-point-size)
+foreach(pco_decoder_boundary IN ITEMS valid reject65 reject65-point-size
+                                      fragment-storage-atomic)
     add_test(NAME pco-decoder-boundary-${pco_decoder_boundary}
         COMMAND pco-decoder-boundary-test ${pco_decoder_boundary})
 endforeach()
@@ -1322,6 +1323,19 @@ target_include_directories(usc-uniform-buffer-memory-test PRIVATE
 )
 pvrgpu_target_warnings(usc-uniform-buffer-memory-test)
 add_test(NAME usc-uniform-buffer-memory-unit COMMAND usc-uniform-buffer-memory-test)
+
+add_executable(graphics-shader-buffer-test
+    tests/graphics_shader_buffer_test.cpp
+    src/systemc/shader/pco_iss.cpp
+    src/systemc/shader/geometry_iss.cpp
+)
+target_include_directories(graphics-shader-buffer-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc"
+)
+pvrgpu_target_warnings(graphics-shader-buffer-test)
+add_test(NAME graphics-shader-buffer-unit COMMAND graphics-shader-buffer-test)
 
 add_executable(uniform-buffer-contract-test
     tests/uniform_buffer_contract_test.cpp

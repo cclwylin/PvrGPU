@@ -4341,10 +4341,16 @@ static bool pvrgpu_color_primitive_allowed_intrinsic(nir_intrinsic_op op)
    case nir_intrinsic_load_barycentric_at_offset:
    case nir_intrinsic_load_sample_id:
    case nir_intrinsic_load_sample_mask_in:
+   case nir_intrinsic_load_helper_invocation:
    case nir_intrinsic_load_sample_pos:
    case nir_intrinsic_load_sample_pos_from_id:
    case nir_intrinsic_load_ubo:
    case nir_intrinsic_get_ubo_size:
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_get_ssbo_size:
+   case nir_intrinsic_store_ssbo:
+   case nir_intrinsic_ssbo_atomic:
+   case nir_intrinsic_ssbo_atomic_swap:
    case nir_intrinsic_load_uniform:
    case nir_intrinsic_load_deref:
    case nir_intrinsic_store_deref:
@@ -4379,6 +4385,115 @@ static bool pvrgpu_color_primitive_allowed_intrinsic(nir_intrinsic_op op)
    default:
       return false;
    }
+}
+
+static bool pvrgpu_compute_atomic_op_supported(nir_atomic_op op);
+
+/* Validate the common native graphics SSBO subset both before preprocessing
+ * (when a constant binding may still be an SSA expression) and afterwards
+ * (when exact stage-local masks are recorded for capture and relocation). */
+static bool
+pvrgpu_validate_graphics_storage_buffers(
+   const nir_shader *nir, struct pvrgpu_pco_storage_buffer_abi *out,
+   bool validate_bindings, const char *stage, char *error, size_t error_size)
+{
+   if (out) {
+      memset(out, 0, sizeof(*out));
+      out->descriptor_count = nir->info.num_ssbos;
+   }
+   nir_foreach_function_impl(impl, (nir_shader *)nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            bool read = false, write = false, atomic = false;
+            unsigned binding_source = 0, offset_source = 0;
+            const nir_def *value = NULL;
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_ssbo:
+               read = true;
+               offset_source = 1;
+               value = &intr->def;
+               break;
+            case nir_intrinsic_get_ssbo_size:
+               value = &intr->def;
+               break;
+            case nir_intrinsic_store_ssbo:
+               return pvrgpu_pco_fail(
+                  error, error_size,
+                  "%s SSBO stores are outside the native graphics subset",
+                  stage);
+            case nir_intrinsic_ssbo_atomic_swap:
+               return pvrgpu_pco_fail(
+                  error, error_size,
+                  "%s SSBO compare-exchange is outside the native graphics subset",
+                  stage);
+            case nir_intrinsic_ssbo_atomic: {
+               if (!pvrgpu_compute_atomic_op_supported(
+                      nir_intrinsic_atomic_op(intr)) ||
+                   intr->def.bit_size != 32 || intr->def.num_components != 1 ||
+                   intr->src[2].ssa->bit_size != 32 ||
+                   intr->src[2].ssa->num_components != 1)
+                  return pvrgpu_pco_fail(
+                     error, error_size,
+                     "%s SSBO atomic requires a supported scalar 32-bit integer operation",
+                     stage);
+               atomic = read = write = true;
+               offset_source = 1;
+               value = &intr->def;
+               break;
+            }
+            default:
+               continue;
+            }
+            if (!value || value->bit_size != 32 || !value->num_components ||
+                value->num_components > 16 ||
+                !nir_num_components_valid(value->num_components) ||
+                (intr->intrinsic == nir_intrinsic_get_ssbo_size &&
+                 value->num_components != 1))
+               return pvrgpu_pco_fail(
+                  error, error_size,
+                  "%s SSBO access requires a valid vector of up to 16 32-bit components",
+                  stage);
+            if ((read || write) &&
+                (intr->src[offset_source].ssa->bit_size != 32 ||
+                 intr->src[offset_source].ssa->num_components != 1))
+               return pvrgpu_pco_fail(
+                  error, error_size,
+                  "%s SSBO byte offset must be scalar 32-bit", stage);
+            if (write && !atomic && validate_bindings &&
+                nir_intrinsic_write_mask(intr) !=
+                   BITFIELD_MASK(value->num_components))
+               return pvrgpu_pco_fail(
+                  error, error_size,
+                  "%s SSBO store requires a full component write mask", stage);
+            const nir_src binding = intr->src[binding_source];
+            if (binding.ssa->bit_size != 32 ||
+                binding.ssa->num_components != 1)
+               return pvrgpu_pco_fail(
+                  error, error_size,
+                  "%s requires scalar 32-bit SSBO bindings", stage);
+            if (!validate_bindings)
+               continue;
+            if (!nir_src_is_const(binding) || nir_src_as_uint(binding) >= 32)
+               return pvrgpu_pco_fail(
+                  error, error_size,
+                  "%s requires a static SSBO binding below 32", stage);
+            const unsigned slot = nir_src_as_uint(binding);
+            const uint32_t bit = UINT32_C(1) << slot;
+            if (out) {
+               out->descriptor_count = MAX2(out->descriptor_count, slot + 1);
+               out->used_mask |= bit;
+               if (read)
+                  out->read_mask |= bit;
+               if (write)
+                  out->write_mask |= bit;
+            }
+         }
+      }
+   }
+   return true;
 }
 
 /* Match the raw-integer attributes appended by the generic draw packer.
@@ -4748,30 +4863,36 @@ pvrgpu_native_fragment_gather(const nir_tex_instr *tex,
 }
 
 /* Native CubeArray transports xyz plus PCO's software-selected cube address.
- * Keep this new path to ordinary fragment tex/txl and its existing size query;
- * gradients, offsets, shadow/gather and indirect bindings need separate
- * transport contracts. This only inspects the cloned instruction. */
+ * The address override selects an array element while the three coordinates
+ * still select a face. This is a stage-independent SMP contract: descriptor
+ * indexing is bounded by pvrgpu_lower_generic_texture_indices(), and shadow
+ * comparison is carried by the same marker/descriptor metadata as 2D/Cube.
+ * Keep gradients, offsets and gather fail-closed. */
 static bool
-pvrgpu_native_fragment_cube_array(const nir_tex_instr *tex,
-                                  mesa_shader_stage stage,
-                                  unsigned texture_count)
+pvrgpu_native_cube_array(const nir_tex_instr *tex,
+                         mesa_shader_stage stage,
+                         unsigned texture_count)
 {
+   (void)stage;
    const bool query = tex->op == nir_texop_txs;
-   if (stage != MESA_SHADER_FRAGMENT ||
-       tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE || !tex->is_array ||
+   const bool shadow = tex->is_shadow && !query;
+   const bool integer = tex->dest_type == nir_type_int32 ||
+                        tex->dest_type == nir_type_uint32;
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE || !tex->is_array ||
        (tex->op != nir_texop_tex && tex->op != nir_texop_txl && !query) ||
-       tex->is_shadow || tex->is_sparse || tex->array_is_lowered_cube ||
+       tex->is_sparse || tex->array_is_lowered_cube || tex->embedded_sampler ||
+       tex->texture_non_uniform || tex->sampler_non_uniform ||
        tex->def.bit_size != 32 ||
-       tex->def.num_components != (query ? 3 : 4) ||
+       tex->def.num_components != (query ? 3 : shadow ? 1 : 4) ||
        (query ? (tex->dest_type != nir_type_int32 && tex->dest_type != nir_type_uint32)
-              : tex->dest_type != nir_type_float32) ||
+              : (!shadow && !integer && tex->dest_type != nir_type_float32) ||
+                (shadow && tex->dest_type != nir_type_float32)) ||
        tex->coord_components != (query ? 0 : 4))
       return false;
-   unsigned texture, sampler;
-   if (!pvrgpu_static_texture_slots(tex, &texture, &sampler) ||
-       texture >= texture_count || (!query && texture != sampler))
+   if (tex->texture_index >= texture_count ||
+       (!query && tex->texture_index != tex->sampler_index))
       return false;
-   bool coord = false, lod = false;
+   bool coord = false, lod = false, comparator = false;
    for (unsigned i = 0; i < tex->num_srcs; ++i) {
       const nir_tex_src *src = &tex->src[i];
       switch (src->src_type) {
@@ -4781,6 +4902,13 @@ pvrgpu_native_fragment_cube_array(const nir_tex_instr *tex,
             return false;
          coord = true;
          break;
+      case nir_tex_src_comparator:
+         if (!shadow || comparator || !src->src.ssa ||
+             src->src.ssa->bit_size != 32 ||
+             src->src.ssa->num_components != 1)
+            return false;
+         comparator = true;
+         break;
       case nir_tex_src_lod:
          if (tex->op == nir_texop_tex || lod || !src->src.ssa ||
              src->src.ssa->bit_size != 32 || src->src.ssa->num_components != 1)
@@ -4789,12 +4917,24 @@ pvrgpu_native_fragment_cube_array(const nir_tex_instr *tex,
          break;
       case nir_tex_src_texture_deref:
       case nir_tex_src_sampler_deref:
-         break; /* The shared resolver proved plain static bindings. */
+         /* The bounded descriptor-index lowering validates and clones these
+          * before they reach PCO's static shared-register packer. */
+         break;
+      case nir_tex_src_texture_offset:
+      case nir_tex_src_sampler_offset:
+         /* Generic opaque-array indexing is admitted before its bounded
+          * clone-and-select lowering runs.  Accept only the exact scalar
+          * index representation that lowering proves and removes. */
+         if (!src->src.ssa || src->src.ssa->bit_size != 32 ||
+             src->src.ssa->num_components != 1)
+            return false;
+         break;
       default:
          return false;
       }
    }
-   return coord == !query && lod == (tex->op != nir_texop_tex);
+   return coord == !query && comparator == shadow &&
+          lod == (tex->op != nir_texop_tex);
 }
 
 bool
@@ -4946,12 +5086,15 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                              "color primitive %s exceeds 15 uniform buffers (%u)",
                              stage_name, nir->info.num_ubos);
    }
-   if (nir->info.num_ssbos != 0) {
+   if (nir->info.num_ssbos > 32) {
       return pvrgpu_pco_fail(error, error_size,
-                             "color primitive %s reads %u shader storage "
-                             "buffer(s)",
+                             "color primitive %s exceeds 32 shader storage "
+                             "buffers (%u)",
                              stage_name, nir->info.num_ssbos);
    }
+   if (!pvrgpu_validate_graphics_storage_buffers(
+          nir, NULL, false, stage_name, error, error_size))
+      return false;
    if (nir->info.num_images != 0) {
       return pvrgpu_pco_fail(error, error_size,
                              "color primitive %s uses %u image(s)",
@@ -5013,10 +5156,13 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                break;
             case nir_instr_type_tex: {
                const nir_tex_instr *tex = nir_instr_as_tex(instr);
-               if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && tex->is_array &&
-                   !pvrgpu_native_fragment_cube_array(tex, expected_stage, texture_count))
+               const bool cube_array =
+                  tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && tex->is_array;
+               const bool native_cube_array = cube_array &&
+                  pvrgpu_native_cube_array(tex, expected_stage, texture_count);
+               if (cube_array && !native_cube_array)
                   return pvrgpu_pco_fail(error, error_size,
-                     "color primitive CubeArray requires bounded fragment non-shadow tex/txl or size query without offsets");
+                     "color primitive CubeArray requires bounded native tex/txl or size query without offsets");
                /* Multisample fetch is native SMP.NNCOORDS.SNO; size/sample
                 * queries are descriptor reads lowered by pinned PCO. Array
                 * layers are selected by its real address-override sequence. */
@@ -5056,7 +5202,7 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                     !(ordinary_sample &&
                       (tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
                        (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE &&
-                        !tex->is_array)))) ||
+                        !tex->is_array) || native_cube_array))) ||
                    (ordinary_sample && tex->texture_index != tex->sampler_index) ||
                    tex->texture_index >= texture_count) {
                   const char *op_name = pvrgpu_nir_texop_name(tex->op);
@@ -5112,7 +5258,8 @@ static bool pvrgpu_validate_color_primitive_nir(const nir_shader *nir,
                      stage_name);
                const bool native_fragment_image = expected_stage == MESA_SHADER_FRAGMENT &&
                   (intr->intrinsic == nir_intrinsic_load_preamble ||
-                   intr->intrinsic == nir_intrinsic_global_atomic_2x32);
+                   intr->intrinsic == nir_intrinsic_global_atomic_2x32 ||
+                   intr->intrinsic == nir_intrinsic_load_savmsk_vm_pco);
                const bool native_fragment_face = expected_stage == MESA_SHADER_FRAGMENT &&
                   intr->intrinsic == nir_intrinsic_load_face_ccw_pco;
                if (!native_fragment_image && !native_fragment_face &&
@@ -5783,6 +5930,152 @@ pvrgpu_restore_depth_feedback_no_discard(nir_builder *b,
  * first three use additional bindings in the last set. Set zero retains its
  * single texture binding, so its UBO bindings remain independent. */
 static bool
+pvrgpu_lower_generic_texture_index(nir_builder *b, nir_tex_instr *tex,
+                                   void *cb_data)
+{
+   struct {
+      unsigned texture_count;
+      char *error;
+      size_t error_size;
+      bool failed;
+   } *state = cb_data;
+   int texture_offset =
+      nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
+   int sampler_offset =
+      nir_tex_instr_src_index(tex, nir_tex_src_sampler_offset);
+   if (texture_offset < 0 && sampler_offset < 0)
+      return false;
+   if (!state->texture_count || tex->texture_non_uniform ||
+       tex->sampler_non_uniform) {
+      state->failed = true;
+      pvrgpu_pco_fail(state->error, state->error_size,
+         "generic sampler index requires a bounded dynamically-uniform texture array");
+      return false;
+   }
+
+   bool progress = false;
+   /* Constant opaque indices need no speculative sample. Canonicalize them
+    * first so PCO sees the same static Gallium unit as a literal sampler. */
+   texture_offset = nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
+   if (texture_offset >= 0 && nir_src_is_const(tex->src[texture_offset].src)) {
+      const uint64_t unit = (uint64_t)tex->texture_index +
+         nir_src_as_uint(tex->src[texture_offset].src);
+      if (unit >= state->texture_count) {
+         state->failed = true;
+         pvrgpu_pco_fail(state->error, state->error_size,
+                         "generic texture index is out of range");
+         return false;
+      }
+      tex->texture_index = unit;
+      nir_tex_instr_remove_src(tex, texture_offset);
+      progress = true;
+   }
+   sampler_offset = nir_tex_instr_src_index(tex, nir_tex_src_sampler_offset);
+   if (sampler_offset >= 0 && nir_src_is_const(tex->src[sampler_offset].src)) {
+      const uint64_t unit = (uint64_t)tex->sampler_index +
+         nir_src_as_uint(tex->src[sampler_offset].src);
+      if (unit >= state->texture_count) {
+         state->failed = true;
+         pvrgpu_pco_fail(state->error, state->error_size,
+                         "generic sampler index is out of range");
+         return false;
+      }
+      tex->sampler_index = unit;
+      nir_tex_instr_remove_src(tex, sampler_offset);
+      progress = true;
+   }
+
+   texture_offset = nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
+   sampler_offset = nir_tex_instr_src_index(tex, nir_tex_src_sampler_offset);
+   if (texture_offset < 0 && sampler_offset < 0)
+      return progress;
+   nir_def *texture_index = texture_offset >= 0 ?
+      tex->src[texture_offset].src.ssa : NULL;
+   nir_def *sampler_index = sampler_offset >= 0 ?
+      tex->src[sampler_offset].src.ssa : NULL;
+   if ((texture_index && (texture_index->bit_size != 32 ||
+                          texture_index->num_components != 1)) ||
+       (sampler_index && (sampler_index->bit_size != 32 ||
+                          sampler_index->num_components != 1))) {
+      state->failed = true;
+      pvrgpu_pco_fail(state->error, state->error_size,
+                      "generic sampler index must be a scalar 32-bit value");
+      return false;
+   }
+
+   /* Public PCO can address only a compile-time descriptor binding. GLES
+    * opaque-array indices are dynamically uniform, so sample every bounded
+    * unit and select the requested result in native ALU. All array elements
+    * are bound by Gallium and sampling is side-effect free. This preserves
+    * invocation-dependent uniform indices without teaching the descriptor
+    * translator an unmodeled dynamically-indexed shared-register range. */
+   b->cursor = nir_before_instr(&tex->instr);
+   nir_def *selected =
+      nir_imm_zero(b, tex->def.num_components, tex->def.bit_size);
+   bool candidate = false;
+   for (unsigned unit = 0; unit < state->texture_count; ++unit) {
+      if ((texture_index && unit < tex->texture_index) ||
+          (sampler_index && unit < tex->sampler_index))
+         continue;
+      nir_def *condition = nir_imm_true(b);
+      if (texture_index)
+         condition = nir_iand(b, condition,
+            nir_ieq_imm(b, texture_index, unit - tex->texture_index));
+      if (sampler_index)
+         condition = nir_iand(b, condition,
+            nir_ieq_imm(b, sampler_index, unit - tex->sampler_index));
+
+      nir_tex_instr *sample =
+         nir_instr_as_tex(nir_instr_clone(b->shader, &tex->instr));
+      nir_def_init(&sample->instr, &sample->def,
+                   tex->def.num_components, tex->def.bit_size);
+      if (texture_index)
+         sample->texture_index = unit;
+      if (sampler_index)
+         sample->sampler_index = unit;
+      nir_builder_instr_insert(b, &sample->instr);
+      /* A cloned instruction's sources join the SSA use lists only when the
+       * clone is inserted. Remove offset sources after that insertion so NIR
+       * can unlink them safely. */
+      for (int source = (int)sample->num_srcs - 1; source >= 0; --source) {
+         if (sample->src[source].src_type == nir_tex_src_texture_offset ||
+             sample->src[source].src_type == nir_tex_src_sampler_offset)
+            nir_tex_instr_remove_src(sample, source);
+      }
+      selected = nir_bcsel(b, condition, &sample->def, selected);
+      candidate = true;
+   }
+   if (!candidate) {
+      state->failed = true;
+      pvrgpu_pco_fail(state->error, state->error_size,
+                      "generic sampler array has no bounded descriptor unit");
+      return false;
+   }
+   nir_def_rewrite_uses(&tex->def, selected);
+   nir_instr_remove(&tex->instr);
+   return true;
+}
+
+static bool
+pvrgpu_lower_generic_texture_indices(nir_shader *nir, unsigned texture_count,
+                                     char *error, size_t error_size)
+{
+   struct {
+      unsigned texture_count;
+      char *error;
+      size_t error_size;
+      bool failed;
+   } state = {
+      .texture_count = texture_count,
+      .error = error,
+      .error_size = error_size,
+   };
+   nir_shader_tex_pass(nir, pvrgpu_lower_generic_texture_index,
+                       nir_metadata_control_flow, &state);
+   return !state.failed;
+}
+
+static bool
 pvrgpu_init_generic_texture_descriptors(pco_data *data,
                                         unsigned texture_count,
                                         unsigned first_dword, void *mem,
@@ -5827,6 +6120,9 @@ static bool
 pvrgpu_pack_generic_texture_bindings(nir_shader *nir, unsigned texture_count,
                                      char *error, size_t error_size)
 {
+   if (!pvrgpu_lower_generic_texture_indices(nir, texture_count,
+                                             error, error_size))
+      return false;
    const unsigned last_set = PVR_MAX_DESCRIPTOR_SETS - 1;
    /* Gallium supplies unit indices, not Vulkan descriptor references. Keep
     * them intact through generic NIR preprocessing, which also uses them as
@@ -5880,6 +6176,68 @@ pvrgpu_pack_generic_texture_bindings(nir_shader *nir, unsigned texture_count,
    return true;
 }
 
+/* Public PCO resolves a buffer descriptor while translating NIR, so its
+ * load/get-size path cannot consume a run-time block index. GLES permits a
+ * dynamically-uniform index into an array of uniform blocks. Materialize the
+ * bounded choice in ordinary NIR: issue one side-effect-free read/query per
+ * declared block and select the requested result in native ALU. The fallback
+ * zero is only observable for an out-of-range GLSL index, whose result is
+ * otherwise undefined, and avoids ever constructing an invalid descriptor. */
+static bool
+pvrgpu_lower_dynamic_uniform_buffer_indices(nir_shader *nir,
+                                             char *error,
+                                             size_t error_size)
+{
+   const unsigned count = nir->info.num_ubos;
+   if (count > 15)
+      return pvrgpu_pco_fail(error, error_size, "UBO block count exceeds ABI");
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      bool progress = false;
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_ubo &&
+                intr->intrinsic != nir_intrinsic_get_ubo_size)
+               continue;
+            if (!count || intr->src[0].ssa->bit_size != 32 ||
+                intr->src[0].ssa->num_components != 1 ||
+                intr->def.bit_size != 32 ||
+                !nir_num_components_valid(intr->def.num_components) ||
+                intr->def.num_components > 16 ||
+                (intr->intrinsic == nir_intrinsic_get_ubo_size &&
+                 intr->def.num_components != 1))
+               return pvrgpu_pco_fail(error, error_size,
+                                      "UBO requires a bounded scalar 32-bit block and 32-bit load");
+            if (nir_src_is_const(intr->src[0]))
+               continue;
+
+            b.cursor = nir_before_instr(instr);
+            nir_def *index = intr->src[0].ssa;
+            nir_def *selected =
+               nir_imm_zero(&b, intr->def.num_components, intr->def.bit_size);
+            for (unsigned candidate = 0; candidate < count; ++candidate) {
+               nir_def *condition = nir_ieq_imm(&b, index, candidate);
+               nir_def *static_block = nir_imm_int(&b, candidate);
+               nir_intrinsic_instr *clone = nir_instr_as_intrinsic(
+                  nir_instr_clone(nir, &intr->instr));
+               clone->src[0] = nir_src_for_ssa(static_block);
+               nir_builder_instr_insert(&b, &clone->instr);
+               selected = nir_bcsel(&b, condition, &clone->def, selected);
+            }
+            nir_def_rewrite_uses(&intr->def, selected);
+            nir_instr_remove(instr);
+            progress = true;
+         }
+      }
+      nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+   return true;
+}
+
 /* Gallium's stage-local UBO index is not PCO's Vulkan descriptor reference.
  * Keep block bytes in modeled memory and translate only the binding metadata.
  * Set 0/binding 0 remains the texture unit; UBO i uses binding i+1. */
@@ -5889,6 +6247,8 @@ pvrgpu_lower_generic_uniform_buffers(nir_shader *nir, pco_data *data,
                                      char *error, size_t error_size)
 {
    const unsigned count = nir->info.num_ubos;
+   if (!pvrgpu_lower_dynamic_uniform_buffer_indices(nir, error, error_size))
+      return false;
    if (!count)
       return true;
    if (count > 15)
@@ -5965,7 +6325,7 @@ pvrgpu_lower_generic_storage_buffers(nir_shader *nir, pco_data *data,
       rzalloc_array(mem, pco_binding_data, first_binding + descriptor_count);
    if (!bindings)
       return pvrgpu_pco_fail(error, error_size,
-                             "allocating tessellation SSBO descriptor ABI");
+                             "allocating graphics SSBO descriptor ABI");
    if (set->binding_count)
       memcpy(bindings, set->bindings,
              MIN2(set->binding_count, first_binding) * sizeof(*bindings));
@@ -5995,6 +6355,10 @@ pvrgpu_lower_generic_storage_buffers(nir_shader *nir, pco_data *data,
                break;
             case nir_intrinsic_store_ssbo:
                source = 1;
+               break;
+            case nir_intrinsic_ssbo_atomic:
+            case nir_intrinsic_ssbo_atomic_swap:
+               source = 0;
                break;
             default:
                continue;
@@ -6131,7 +6495,8 @@ pvrgpu_validate_compute_nir(const nir_shader *nir,
       abi->local_size[dim] = size;
    }
    if (nir->info.shared_size > 32 * 1024 || nir->scratch_size ||
-       nir->info.num_images > 32 || nir->info.num_textures > PVR_MAX_DESCRIPTOR_SETS)
+       nir->info.num_images > 32 ||
+       nir->info.num_textures > PVRGPU_PCO_MAX_TEXTURES)
       return pvrgpu_pco_fail(error, error_size,
                             "compute shared exceeds 32 KiB or scratch/texture/image extent is unsupported");
    if (nir->info.num_ubos > 15 || nir->info.num_ssbos > 32)
@@ -6150,18 +6515,24 @@ pvrgpu_validate_compute_nir(const nir_shader *nir,
          nir_foreach_instr(instr, block) {
             if (instr->type == nir_instr_type_tex) {
                const nir_tex_instr *tex = nir_instr_as_tex(instr);
+               const bool native_cube_array =
+                  tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && tex->is_array &&
+                  pvrgpu_native_cube_array(tex, MESA_SHADER_COMPUTE,
+                                           nir->info.num_textures);
                if ((tex->op != nir_texop_tex && tex->op != nir_texop_txl &&
                     tex->op != nir_texop_txf && tex->op != nir_texop_txs) ||
                    (tex->sampler_dim != GLSL_SAMPLER_DIM_2D &&
                     tex->sampler_dim != GLSL_SAMPLER_DIM_3D &&
                     tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE) ||
-                   (tex->is_array && tex->sampler_dim != GLSL_SAMPLER_DIM_2D) ||
-                   tex->is_shadow || tex->texture_index >= nir->info.num_textures ||
+                   (tex->is_array && tex->sampler_dim != GLSL_SAMPLER_DIM_2D &&
+                    !native_cube_array) ||
+                   tex->texture_index >= nir->info.num_textures ||
                    tex->sampler_index != tex->texture_index)
                   return pvrgpu_pco_fail(error, error_size, "compute texture requires a bounded native sampler set and operation");
                for (unsigned s = 0; s < tex->num_srcs; ++s)
                   if (tex->src[s].src_type != nir_tex_src_coord &&
                       tex->src[s].src_type != nir_tex_src_lod &&
+                      tex->src[s].src_type != nir_tex_src_comparator &&
                       tex->src[s].src_type != nir_tex_src_texture_deref &&
                       tex->src[s].src_type != nir_tex_src_sampler_deref)
                      return pvrgpu_pco_fail(error, error_size, "compute texture source requires native coordinates, LOD and static sampler dereferences");
@@ -6673,18 +7044,9 @@ pvrgpu_lower_compute_buffers(nir_shader *nir, pco_data *data,
    const unsigned first_buffer_binding = textures ? 1 : 0;
    const unsigned count = ubos + abi->storage_buffer_descriptor_count +
                           (abi->shared_memory_bytes != 0);
-   for (unsigned texture = 0; texture < textures; ++texture) {
-      pco_descriptor_set_data *set = &data->common.desc_sets[texture];
-      set->binding_count = 1;
-      set->bindings = rzalloc_array(mem, pco_binding_data, 1);
-      if (!set->bindings)
-         return pvrgpu_pco_fail(error, error_size, "allocating compute sampler descriptor");
-      const unsigned start = 20 * texture;
-      set->range = (pco_range){.start = start, .count = 20};
-      set->used = true;
-      set->bindings[0].range = (pco_range){.start = start, .count = 20, .stride = 20};
-      set->bindings[0].used = set->bindings[0].is_img_smp = true;
-   }
+   if (!pvrgpu_init_generic_texture_descriptors(data, textures, 0, mem,
+                                                 error, error_size))
+      return false;
    if (count) {
       pco_descriptor_set_data *set = &data->common.desc_sets[0];
       set->bindings = rzalloc_array(mem, pco_binding_data, count + first_buffer_binding);
@@ -6954,7 +7316,9 @@ pvrgpu_pco_compile_compute(struct pvrgpu_pco_compiler *compiler,
    compute_options.lower_pack_32_2x16_split = true;
    nir->options = &compute_options;
    pco_data data = {0};
-   if (!pvrgpu_lower_compute_image_derefs(nir, error, error_size) ||
+   if (!pvrgpu_lower_generic_texture_indices(nir, nir->info.num_textures,
+                                             error, error_size) ||
+       !pvrgpu_lower_compute_image_derefs(nir, error, error_size) ||
        !pvrgpu_validate_compute_nir(nir, &abi, false, error, error_size))
       goto fail;
    const unsigned cb0_slot = uniform_dwords > 256 ? nir->info.num_ubos + 1 : 0;
@@ -6965,7 +7329,8 @@ pvrgpu_pco_compile_compute(struct pvrgpu_pco_compiler *compiler,
    pvrgpu_pco_preprocess_nir(compiler, nir);
    memset(&abi, 0, sizeof(abi));
    abi.cb0_uniform_buffer_slot = cb0_slot;
-   if (!pvrgpu_lower_ssbo_store_masks(nir, "compute", error, error_size) ||
+   if (!pvrgpu_lower_dynamic_uniform_buffer_indices(nir, error, error_size) ||
+       !pvrgpu_lower_ssbo_store_masks(nir, "compute", error, error_size) ||
        !pvrgpu_validate_compute_nir(nir, &abi, true, error, error_size))
       goto fail;
 
@@ -7002,7 +7367,9 @@ pvrgpu_pco_compile_compute(struct pvrgpu_pco_compiler *compiler,
    }
    pvrgpu_lower_compute_images(nir, &abi);
    if (!pvrgpu_lower_compute_shared(nir, &abi, error, error_size) ||
-       !pvrgpu_lower_compute_buffers(nir, &data, &abi, mem, error, error_size))
+       !pvrgpu_lower_compute_buffers(nir, &data, &abi, mem, error, error_size) ||
+       !pvrgpu_pack_generic_texture_bindings(nir, abi.sampled_texture_count,
+                                             error, error_size))
       goto fail;
    const unsigned prefix = data.common.shareds;
    if (prefix + (uniform_loads ? uniform_dwords : 0) > 256) {
@@ -7014,7 +7381,11 @@ pvrgpu_pco_compile_compute(struct pvrgpu_pco_compiler *compiler,
       nir_print_shader(nir, stderr);
    }
    pco_lower_nir(compiler->pco, nir, &data);
+   nir_shader_intrinsics_pass(nir, pvrgpu_lower_shadow_compare_transport,
+                               nir_metadata_control_flow, NULL);
    pco_postprocess_nir(compiler->pco, nir, &data);
+   nir_shader_intrinsics_pass(nir, pvrgpu_widen_scalar_texture_result,
+                               nir_metadata_control_flow, NULL);
    /* All shared bytes and barriers must use the private descriptor/native
     * MUTEX lowering above, never an unmodeled coefficient store or spill. */
    if (nir->info.shared_size || nir->scratch_size || data.cs.global_shmem) {
@@ -7447,10 +7818,13 @@ pvrgpu_validate_geometry_nir(const nir_shader *nir, char *error, size_t error_si
       return pvrgpu_pco_fail(error, error_size, "geometry output primitive is unsupported");
    if (nir->info.gs.active_stream_mask & ~1u)
       return pvrgpu_pco_fail(error, error_size, "geometry only supports vertex stream zero");
-   if (BITSET_LAST_BIT(nir->info.textures_used) > PVRGPU_PCO_MAX_TEXTURES || nir->info.num_images || nir->info.num_ssbos ||
+   if (BITSET_LAST_BIT(nir->info.textures_used) > PVRGPU_PCO_MAX_TEXTURES || nir->info.num_images || nir->info.num_ssbos > 32 ||
        nir->info.shared_size || nir->scratch_size || nir->info.num_ubos > 15)
       return pvrgpu_pco_fail(error, error_size,
-         "geometry resource extent or image/SSBO/shared/scratch resources are not implemented");
+         "geometry resource extent or image/shared/scratch resources are not implemented");
+   if (!pvrgpu_validate_graphics_storage_buffers(
+          nir, NULL, false, "geometry", error, error_size))
+      return false;
    unsigned functions = 0;
    nir_foreach_function_impl(impl, (nir_shader *)nir) {
       if (!impl->function->is_entrypoint || ++functions != 1)
@@ -7467,14 +7841,20 @@ pvrgpu_validate_geometry_nir(const nir_shader *nir, char *error, size_t error_si
                break;
             case nir_instr_type_tex: {
                const nir_tex_instr *tex = nir_instr_as_tex(instr);
-               if (tex->op != nir_texop_tex || tex->is_shadow ||
-                   (tex->sampler_dim != GLSL_SAMPLER_DIM_2D &&
-                    tex->sampler_dim != GLSL_SAMPLER_DIM_3D &&
-                    tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE) ||
+               const bool cube_array =
+                  tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && tex->is_array;
+               if ((cube_array && !pvrgpu_native_cube_array(
+                                      tex, MESA_SHADER_GEOMETRY,
+                                      BITSET_LAST_BIT(nir->info.textures_used))) ||
+                   (!cube_array &&
+                    (tex->op != nir_texop_tex ||
+                     (tex->sampler_dim != GLSL_SAMPLER_DIM_2D &&
+                      tex->sampler_dim != GLSL_SAMPLER_DIM_3D &&
+                      tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE))) ||
                    tex->texture_index != tex->sampler_index ||
                    tex->texture_index >= BITSET_LAST_BIT(nir->info.textures_used))
                   return pvrgpu_pco_fail(error, error_size,
-                     "geometry texture operation requires bound non-shadow 2D/3D/cube implicit-LOD sampling");
+                     "geometry texture operation requires bounded 2D/3D/cube implicit-LOD sampling");
                break;
             }
             case nir_instr_type_intrinsic: {
@@ -7488,6 +7868,11 @@ pvrgpu_validate_geometry_nir(const nir_shader *nir, char *error, size_t error_si
                case nir_intrinsic_load_uniform:
                case nir_intrinsic_load_ubo:
                case nir_intrinsic_get_ubo_size:
+               case nir_intrinsic_load_ssbo:
+               case nir_intrinsic_get_ssbo_size:
+               case nir_intrinsic_store_ssbo:
+               case nir_intrinsic_ssbo_atomic:
+               case nir_intrinsic_ssbo_atomic_swap:
                case nir_intrinsic_load_primitive_id:
                case nir_intrinsic_load_invocation_id:
                   break;
@@ -7668,7 +8053,10 @@ pvrgpu_pco_compile_geometry(struct pvrgpu_pco_compiler *compiler,
       pvrgpu_pco_fail(error, error_size, "geometry preprocessing requires unimplemented scratch/shared memory");
       goto fail;
    }
-   if (!pvrgpu_lower_geometry_dynamic_uniforms(nir, uniform_dwords, error, error_size))
+   if (!pvrgpu_lower_ssbo_store_masks(nir, "geometry", error, error_size) ||
+       !pvrgpu_validate_graphics_storage_buffers(
+          nir, &out->shader.storage, true, "geometry", error, error_size) ||
+       !pvrgpu_lower_geometry_dynamic_uniforms(nir, uniform_dwords, error, error_size))
       goto fail;
    const unsigned uniform_loads = pvrgpu_count_uniform_loads(nir);
    if (uniform_loads && !pvrgpu_lower_uniform_slots_to_push_constants(
@@ -7684,7 +8072,15 @@ pvrgpu_pco_compile_geometry(struct pvrgpu_pco_compiler *compiler,
       goto fail;
    data.common.vtxins = 2;
    if (!pvrgpu_lower_generic_uniform_buffers(nir, &data, ubo_start, mem, error, error_size)) goto fail;
-   const unsigned prefix = ubo_start + 4 * nir->info.num_ubos;
+   const unsigned storage_start = ubo_start + 4 * nir->info.num_ubos;
+   if (out->shader.storage.descriptor_count)
+      out->shader.storage.descriptor_start = storage_start;
+   if (!pvrgpu_lower_generic_storage_buffers(
+          nir, &data, out->shader.storage.descriptor_count,
+          storage_start, mem, error, error_size))
+      goto fail;
+   const unsigned prefix = storage_start +
+                           4 * out->shader.storage.descriptor_count;
    if (prefix + (uniform_loads ? uniform_dwords : 0) >
        PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE) {
       pvrgpu_pco_fail(error, error_size,
@@ -7696,7 +8092,11 @@ pvrgpu_pco_compile_geometry(struct pvrgpu_pco_compiler *compiler,
       nir_print_shader(nir, stderr);
    }
    pco_lower_nir(compiler->pco, nir, &data);
+   nir_shader_intrinsics_pass(nir, pvrgpu_lower_shadow_compare_transport,
+                              nir_metadata_control_flow, NULL);
    pco_postprocess_nir(compiler->pco, nir, &data);
+   nir_shader_intrinsics_pass(nir, pvrgpu_widen_scalar_texture_result,
+                              nir_metadata_control_flow, NULL);
    data.common.push_consts.range = (pco_range){
       .start = prefix, .count = uniform_loads ? uniform_dwords : 0,
    };
@@ -7843,48 +8243,81 @@ pvrgpu_validate_tessellation_texture(const nir_shader *nir, const nir_tex_instr 
 {
    /* TCS/TES have no fragment derivatives. PCO lowers ordinary texture()
     * in these stages to base-LOD sampling; textureLod() supplies a real,
-    * possibly dynamic scalar LOD. Keep gather/offset/shadow/array operations
-    * fail-closed until their complete stage-local contracts are implemented. */
-   if ((tex->op != nir_texop_tex && tex->op != nir_texop_txl) ||
-       tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_array || tex->is_shadow ||
-       tex->is_sparse || tex->texture_non_uniform || tex->sampler_non_uniform ||
-       tex->coord_components != 2 || tex->def.num_components != 4 ||
-       tex->def.bit_size != 32 || tex->dest_type != nir_type_float32 ||
-       tex->texture_index != tex->sampler_index ||
-       tex->texture_index >= BITSET_LAST_BIT(nir->info.textures_used))
+    * possibly dynamic scalar LOD. The generic texture packer implements
+    * 2D-array and CubeArray layer selection through TAO, while the native
+    * marker carries depth comparison independently of the shader stage. */
+   const unsigned texture_count = BITSET_LAST_BIT(nir->info.textures_used);
+   const bool cube_array =
+      tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && tex->is_array;
+   if (cube_array) {
+      if (pvrgpu_native_cube_array(tex, nir->info.stage, texture_count))
+         return true;
       return pvrgpu_pco_fail(error, error_size,
-         "tessellation texture requires static non-shadow 2D float32 texture/textureLod");
-   unsigned coordinates = 0, lods = 0, texture_refs = 0, sampler_refs = 0;
+         "tessellation CubeArray texture requires bounded native coordinates, comparison and optional scalar LOD");
+   }
+   const bool supported_dimension =
+      tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
+      tex->sampler_dim == GLSL_SAMPLER_DIM_3D ||
+      tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+   const unsigned coordinates =
+      (tex->sampler_dim == GLSL_SAMPLER_DIM_2D ? 2U : 3U) +
+      (tex->is_array ? 1U : 0U);
+   const bool integer = tex->dest_type == nir_type_int32 ||
+                        tex->dest_type == nir_type_uint32;
+   if ((tex->op != nir_texop_tex && tex->op != nir_texop_txl) ||
+       !supported_dimension ||
+       tex->is_sparse || tex->embedded_sampler ||
+       tex->texture_non_uniform || tex->sampler_non_uniform ||
+       tex->array_is_lowered_cube || tex->coord_components != coordinates ||
+       tex->def.num_components != (tex->is_shadow ? 1 : 4) ||
+       tex->def.bit_size != 32 ||
+       (tex->is_shadow ? tex->dest_type != nir_type_float32
+                       : (!integer && tex->dest_type != nir_type_float32)) ||
+       tex->texture_index != tex->sampler_index ||
+       tex->texture_index >= texture_count)
+      return pvrgpu_pco_fail(error, error_size,
+         "tessellation texture requires bounded native 2D/3D/cube texture/textureLod");
+   unsigned coordinate_sources = 0, lods = 0, comparators = 0;
    for (unsigned source = 0; source < tex->num_srcs; ++source) {
       const nir_tex_src *src = &tex->src[source];
       switch (src->src_type) {
       case nir_tex_src_coord:
-         if (++coordinates != 1 || src->src.ssa->bit_size != 32 ||
-             src->src.ssa->num_components != 2) goto unsupported;
+         if (++coordinate_sources != 1 || src->src.ssa->bit_size != 32 ||
+             src->src.ssa->num_components != coordinates) goto unsupported;
          break;
       case nir_tex_src_lod:
          if (++lods != 1 || tex->op != nir_texop_txl ||
              src->src.ssa->bit_size != 32 || src->src.ssa->num_components != 1)
             goto unsupported;
          break;
-      case nir_tex_src_texture_deref:
-      case nir_tex_src_sampler_deref: {
-         nir_deref_instr *deref = nir_def_as_deref(src->src.ssa);
-         unsigned *count = src->src_type == nir_tex_src_texture_deref ?
-            &texture_refs : &sampler_refs;
-         if (++*count != 1 || deref->deref_type != nir_deref_type_var ||
-             deref->var->data.descriptor_set != 0 ||
-             deref->var->data.binding != tex->texture_index)
+      case nir_tex_src_comparator:
+         if (++comparators != 1 || !tex->is_shadow ||
+             src->src.ssa->bit_size != 32 || src->src.ssa->num_components != 1)
             goto unsupported;
          break;
-      }
+      case nir_tex_src_texture_deref:
+      case nir_tex_src_sampler_deref:
+         /* The generic bounded-index pass validates the deref tree and
+          * materializes one static native sample per possible binding. */
+         break;
+      case nir_tex_src_texture_offset:
+      case nir_tex_src_sampler_offset:
+         /* The first admission pass sees dynamically-uniform opaque-array
+          * offsets.  The bounded clone-and-select pass removes them before
+          * the final native validation and PCO translation. */
+         if (!src->src.ssa || src->src.ssa->bit_size != 32 ||
+             src->src.ssa->num_components != 1)
+            goto unsupported;
+         break;
       default: goto unsupported;
       }
    }
-   if (coordinates == 1 && lods == (tex->op == nir_texop_txl)) return true;
+   if (coordinate_sources == 1 && lods == (tex->op == nir_texop_txl) &&
+       comparators == tex->is_shadow)
+      return true;
 unsupported:
    return pvrgpu_pco_fail(error, error_size,
-      "tessellation texture source requires vec2 coordinates and optional scalar explicit LOD");
+      "tessellation texture source requires native coordinates, optional comparison and scalar explicit LOD");
 }
 
 /* Validate the native buffer subset independently from shader IO. The first
@@ -7904,7 +8337,7 @@ pvrgpu_validate_tessellation_buffers(
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-            bool read = false, write = false;
+            bool read = false, write = false, atomic = false;
             unsigned binding_source = 0, offset_source = 0;
             const nir_def *value = NULL;
             switch (intr->intrinsic) {
@@ -7922,6 +8355,24 @@ pvrgpu_validate_tessellation_buffers(
                offset_source = 2;
                value = intr->src[0].ssa;
                break;
+            case nir_intrinsic_ssbo_atomic_swap:
+               return pvrgpu_pco_fail(
+                  error, error_size,
+                  "tessellation SSBO compare-exchange is outside the native graphics subset");
+            case nir_intrinsic_ssbo_atomic: {
+               if (!pvrgpu_compute_atomic_op_supported(
+                      nir_intrinsic_atomic_op(intr)) ||
+                   intr->def.bit_size != 32 || intr->def.num_components != 1 ||
+                   intr->src[2].ssa->bit_size != 32 ||
+                   intr->src[2].ssa->num_components != 1)
+                  return pvrgpu_pco_fail(
+                     error, error_size,
+                     "tessellation SSBO atomic requires a supported scalar 32-bit integer operation");
+               atomic = read = write = true;
+               offset_source = 1;
+               value = &intr->def;
+               break;
+            }
             default:
                continue;
             }
@@ -7937,7 +8388,7 @@ pvrgpu_validate_tessellation_buffers(
                  intr->src[offset_source].ssa->num_components != 1))
                return pvrgpu_pco_fail(error, error_size,
                   "tessellation SSBO byte offset must be scalar 32-bit");
-            if (write && validate_bindings &&
+            if (write && !atomic && validate_bindings &&
                 nir_intrinsic_write_mask(intr) !=
                    BITFIELD_MASK(value->num_components))
                return pvrgpu_pco_fail(error, error_size,
@@ -8018,6 +8469,8 @@ pvrgpu_validate_tessellation_nir(const nir_shader *nir, mesa_shader_stage stage,
                case nir_intrinsic_load_ubo: case nir_intrinsic_get_ubo_size:
                case nir_intrinsic_load_ssbo: case nir_intrinsic_store_ssbo:
                case nir_intrinsic_get_ssbo_size:
+               case nir_intrinsic_ssbo_atomic:
+               case nir_intrinsic_ssbo_atomic_swap:
                case nir_intrinsic_load_primitive_id: case nir_intrinsic_load_invocation_id:
                case nir_intrinsic_load_patch_vertices_in: case nir_intrinsic_load_tess_coord:
                case nir_intrinsic_load_tess_level_outer: case nir_intrinsic_load_tess_level_inner:
@@ -8321,7 +8774,11 @@ pvrgpu_compile_tessellation_stage(struct pvrgpu_pco_compiler *compiler,
    }
    if (getenv("PVRGPU_DEBUG_PCO_NIR")) nir_print_shader(nir, stderr);
    pco_lower_nir(compiler->pco, nir, &data);
+   nir_shader_intrinsics_pass(nir, pvrgpu_lower_shadow_compare_transport,
+                              nir_metadata_control_flow, NULL);
    pco_postprocess_nir(compiler->pco, nir, &data);
+   nir_shader_intrinsics_pass(nir, pvrgpu_widen_scalar_texture_result,
+                              nir_metadata_control_flow, NULL);
    data.common.push_consts.range = (pco_range){.start = prefix, .count = uniforms ? uniform_dwords : 0};
    data.common.shareds = prefix + data.common.push_consts.range.count;
    if (nir->info.stage != source->info.stage || nir->scratch_size || data.common.scratch ||
@@ -8341,6 +8798,14 @@ pvrgpu_compile_tessellation_stage(struct pvrgpu_pco_compiler *compiler,
    }
    if (getenv("PVRGPU_DEBUG_PCO_NIR")) pco_print_shader(shader, stderr, control ? "native TCS" : "native TES");
    if (!pvrgpu_copy_pco_stage(shader, false, &out->shader, error, error_size)) goto fail;
+   out->shader.storage = (struct pvrgpu_pco_storage_buffer_abi){
+      .descriptor_start = out->storage_buffer_descriptor_count
+                             ? out->storage_buffer_descriptor_start : 0,
+      .descriptor_count = out->storage_buffer_descriptor_count,
+      .used_mask = out->storage_buffer_used_mask,
+      .read_mask = out->storage_buffer_read_mask,
+      .write_mask = out->storage_buffer_write_mask,
+   };
    out->shader.abi.vertex_outputs = control ? 0 : pipeline->output.stride_dwords;
    out->shader.abi.uniform_buffer_descriptor_start = ubo_start;
    out->shader.abi.uniform_buffer_descriptor_count = source->info.num_ubos;
@@ -8369,8 +8834,12 @@ pvrgpu_compile_extended_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
                                     char *error, size_t error_size,
                                     const nir_shader *control_nir,
                                     unsigned control_uniform_dwords,
-                                    struct pvrgpu_pco_tessellation_pipeline_binary *tess)
+                                    struct pvrgpu_pco_tessellation_pipeline_binary *tess,
+                                    const nir_shader *final_geometry_nir,
+                                    unsigned final_geometry_uniform_dwords)
 {
+   const unsigned vertex_texture_count = vertex_nir ?
+      BITSET_LAST_BIT(vertex_nir->info.textures_used) : 0;
    if (error && error_size) error[0] = '\0';
    if (!out) return pvrgpu_pco_fail(error, error_size, "missing geometry pipeline output");
    memset(out, 0, sizeof(*out));
@@ -8382,23 +8851,49 @@ pvrgpu_compile_extended_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
        (attribute_count && !attribute_formats) || attribute_count > PVRGPU_PCO_MAX_VERTEX_ATTRIBUTES ||
        !render_target_count || render_target_count > 8 ||
        fragment_texture_count > PVRGPU_PCO_MAX_TEXTURES ||
-       vertex_uniform_dwords > 256 || geometry_uniform_dwords > 256 || fragment_uniform_dwords > 256)
+       vertex_texture_count > PVRGPU_PCO_MAX_TEXTURES ||
+       vertex_uniform_dwords > 256 || geometry_uniform_dwords > 256 ||
+       final_geometry_uniform_dwords > 256 || fragment_uniform_dwords > 256 ||
+       (final_geometry_nir && !tess))
       return pvrgpu_pco_fail(error, error_size, "invalid Geometry pipeline stage/binding/count input");
    if (tess ? (!pvrgpu_validate_tessellation_nir(control_nir, MESA_SHADER_TESS_CTRL, error, error_size) ||
                !pvrgpu_validate_tessellation_nir(geometry_nir, MESA_SHADER_TESS_EVAL, error, error_size)) :
               !pvrgpu_validate_geometry_nir(geometry_nir, error, error_size)) return false;
+   if (final_geometry_nir &&
+       !pvrgpu_validate_geometry_nir(final_geometry_nir, error, error_size))
+      return false;
+   if (final_geometry_nir) {
+      const unsigned input_primitive = geometry_nir->info.tess.point_mode ?
+         MESA_PRIM_POINTS :
+         geometry_nir->info.tess._primitive_mode == TESS_PRIMITIVE_ISOLINES ?
+            MESA_PRIM_LINES : MESA_PRIM_TRIANGLES;
+      const unsigned input_vertices = geometry_nir->info.tess.point_mode ? 1 :
+         geometry_nir->info.tess._primitive_mode == TESS_PRIMITIVE_ISOLINES ?
+            2 : 3;
+      if (final_geometry_nir->info.gs.input_primitive != input_primitive ||
+          final_geometry_nir->info.gs.vertices_in != input_vertices)
+         return pvrgpu_pco_fail(error, error_size,
+                                "tessellation-to-geometry primitive linkage");
+   }
    void *mem = ralloc_context(compiler->mem_ctx);
    nir_shader *vs = mem ? nir_shader_clone(mem, vertex_nir) : NULL;
    nir_shader *gs = mem ? nir_shader_clone(mem, geometry_nir) : NULL;
+   nir_shader *final_gs = final_geometry_nir && mem ?
+      nir_shader_clone(mem, final_geometry_nir) : NULL;
    nir_shader *fs = mem ? nir_shader_clone(mem, fragment_nir) : NULL;
    nir_shader *tcs = tess && mem ? nir_shader_clone(mem, control_nir) : NULL;
-   if (!vs || !gs || !fs || (tess && !tcs)) {
+   if (!vs || !gs || !fs || (tess && !tcs) ||
+       (final_geometry_nir && !final_gs)) {
       ralloc_free(mem);
       return pvrgpu_pco_fail(error, error_size, "allocating Geometry pipeline NIR clones");
    }
    vs->options = gs->options = fs->options = &compiler->nir_options;
    vs->info.internal = fs->info.internal = true;
    gs->info.internal = false;
+   if (final_gs) {
+      final_gs->options = &compiler->nir_options;
+      final_gs->info.internal = false;
+   }
    if (!pvrgpu_prune_unbound_fragment_outputs(fs, render_target_count, error, error_size))
       goto fail;
    if (!pvrgpu_lower_fragment_front_face(fs, error, error_size))
@@ -8413,6 +8908,13 @@ pvrgpu_compile_extended_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
    NIR_PASS(_, gs, nir_lower_global_vars_to_local);
    NIR_PASS(_, gs, nir_split_var_copies);
    NIR_PASS(_, gs, nir_lower_var_copies);
+   if (final_gs) {
+      NIR_PASS(_, final_gs, nir_lower_system_values);
+      NIR_PASS(_, final_gs, nir_lower_returns);
+      NIR_PASS(_, final_gs, nir_lower_global_vars_to_local);
+      NIR_PASS(_, final_gs, nir_split_var_copies);
+      NIR_PASS(_, final_gs, nir_lower_var_copies);
+   }
    if (tcs) {
       tcs->options = &compiler->nir_options;
       tcs->info.internal = false;
@@ -8425,7 +8927,7 @@ pvrgpu_compile_extended_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
       NIR_PASS(_, gs, nir_lower_tess_level_array_vars_to_vec);
    }
    pvrgpu_pco_preprocess_nir(compiler, fs);
-   pco_data vd = {0}, gd = {0}, fd = {0};
+   pco_data vd = {0}, gd = {0}, final_gd = {0}, fd = {0};
    /* Link real adjacent stages independently. In particular, VS outputs must
     * not be linked directly to FS across a Geometry stage. */
    /* Gallium already linked TES exports, including TF-only outputs. A second
@@ -8433,9 +8935,20 @@ pvrgpu_compile_extended_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
     * invalidating Gallium's stream-output register ordinals. Retain those
     * original output locations; the native layout below owns physical UVSW
     * placement and supplies an explicit TES-to-FS coefficient map. */
-   if (!tess)
+   if (final_gs) {
+      pco_link_nir(compiler->pco, final_gs, fs, &final_gd, &fd);
+      pco_rev_link_nir(compiler->pco, final_gs, fs);
+      /* Gallium has already linked TES and GS. The generic PCO forward linker
+       * scalarizes and compacts a TES producer as though it were an ordinary
+       * vertex stage, corrupting native TES output vectors. Preserve logical
+       * TES/GS locations and let the shared physical layout below link them. */
+      pco_rev_link_nir(compiler->pco, gs, final_gs);
+   } else if (!tess) {
       pco_link_nir(compiler->pco, gs, fs, &gd, &fd);
-   pco_rev_link_nir(compiler->pco, gs, fs);
+      pco_rev_link_nir(compiler->pco, gs, fs);
+   } else {
+      pco_rev_link_nir(compiler->pco, gs, fs);
+   }
    if (tcs) {
       pco_data cd = {0};
       pco_link_nir(compiler->pco, tcs, gs, &cd, &gd);
@@ -8449,18 +8962,32 @@ pvrgpu_compile_extended_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
    }
    nir_shader_gather_info(vs, nir_shader_get_entrypoint(vs));
    nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
+   if (final_gs)
+      nir_shader_gather_info(final_gs, nir_shader_get_entrypoint(final_gs));
    nir_shader_gather_info(fs, nir_shader_get_entrypoint(fs));
-   struct pvrgpu_pco_geometry_layout input, output;
+   struct pvrgpu_pco_geometry_layout input, pre_output, final_output;
    if (!pvrgpu_geometry_allocate_layout(vs, &input, error, error_size) ||
-       !pvrgpu_geometry_allocate_layout(gs, &output, error, error_size)) goto fail;
-   if (((tcs ? tcs : gs)->info.inputs_read & ~(vs->info.outputs_written | BITFIELD64_BIT(VARYING_SLOT_POS))) ||
-       (fs->info.inputs_read & ~(gs->info.outputs_written | BITFIELD64_BIT(VARYING_SLOT_POS)))) {
+       !pvrgpu_geometry_allocate_layout(gs, &pre_output, error, error_size) ||
+       (final_gs && !pvrgpu_geometry_allocate_layout(final_gs, &final_output,
+                                                      error, error_size)))
+      goto fail;
+   const struct pvrgpu_pco_geometry_layout *raster_output =
+      final_gs ? &final_output : &pre_output;
+   if (((tcs ? tcs : gs)->info.inputs_read &
+          ~(vs->info.outputs_written | BITFIELD64_BIT(VARYING_SLOT_POS))) ||
+       (tcs && (gs->info.inputs_read &
+          ~(tcs->info.outputs_written | BITFIELD64_BIT(VARYING_SLOT_POS)))) ||
+       (final_gs && (final_gs->info.inputs_read &
+          ~(gs->info.outputs_written | BITFIELD64_BIT(VARYING_SLOT_POS)))) ||
+       (fs->info.inputs_read &
+          ~((final_gs ? final_gs : gs)->info.outputs_written |
+            BITFIELD64_BIT(VARYING_SLOT_POS)))) {
       pvrgpu_pco_fail(error, error_size, "Geometry pipeline consumer reads an unwritten interface location");
       goto fail;
    }
    if (tess) {
       tess->input = input;
-      tess->output = output;
+      tess->output = pre_output;
       tess->output_vertices = tcs->info.tess.tcs_vertices_out;
       tess->primitive_mode = gs->info.tess._primitive_mode;
       tess->spacing = gs->info.tess.spacing;
@@ -8497,7 +9024,8 @@ pvrgpu_compile_extended_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
    const uint64_t vs_varyings = vs->info.outputs_written &
       ~(BITFIELD64_BIT(VARYING_SLOT_POS) | BITFIELD64_BIT(VARYING_SLOT_PSIZ));
    if (!pvrgpu_validate_color_primitive_nir(vs, MESA_SHADER_VERTEX, true, render_target_count,
-          vertex_inputs, vs_varyings, input.count[VARYING_SLOT_PSIZ] != 0, 0, error, error_size) ||
+          vertex_inputs, vs_varyings, input.count[VARYING_SLOT_PSIZ] != 0,
+          vertex_texture_count, error, error_size) ||
        !pvrgpu_validate_color_primitive_nir(fs, MESA_SHADER_FRAGMENT, true, render_target_count,
           0, fs->info.inputs_read, false, fragment_texture_count, error, error_size)) goto fail;
    for (unsigned location = 0; location < 64; ++location) {
@@ -8516,14 +9044,14 @@ pvrgpu_compile_extended_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
    }
    out->graphics.explicit_varying_bindings = true;
    for (unsigned location = 0; location < 64; ++location) {
-      out->graphics.vertex_output_start[location] = output.start[location];
-      out->graphics.vertex_output_count[location] = output.count[location];
+      out->graphics.vertex_output_start[location] = raster_output->start[location];
+      out->graphics.vertex_output_count[location] = raster_output->count[location];
    }
    out->graphics.varying_flat_mask = 0;
    for (unsigned i = 0; i < 34; ++i) {
       const unsigned location = i == 33 ? VARYING_SLOT_LAYER :
          i == 32 ? VARYING_SLOT_PRIMITIVE_ID : VARYING_SLOT_VAR0 + i;
-      if (location >= 64 || !output.count[location]) continue;
+      if (location >= 64 || !raster_output->count[location]) continue;
       const bool read = (fs->info.inputs_read & BITFIELD64_BIT(location)) != 0;
       if (!read) continue;
       if (varying_slots >= PVRGPU_PCO_MAX_VARYINGS) {
@@ -8543,14 +9071,14 @@ pvrgpu_compile_extended_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
        * PrimitiveID). Only actual FS inputs receive coefficients, with an
        * explicit physical-DWORD map instead of a packed-vec4 assumption. */
       const unsigned components = fragment_components[location];
-      if (!components || components > output.count[location]) {
+      if (!components || components > raster_output->count[location]) {
          pvrgpu_pco_fail(error, error_size, "last-stage fragment input exceeds its producer output");
          goto fail;
       }
       fd.fs.varyings[location] = (pco_range){.start = next_coefficient, .count = components * 4};
       out->graphics.varying_bindings[out->graphics.varying_binding_count++] =
             (struct pvrgpu_pco_varying_binding){
-               .output_dword = output.start[location],
+               .output_dword = raster_output->start[location],
                .num_components = components,
                .coefficient_dword = next_coefficient,
                .flat = flat,
@@ -8568,14 +9096,52 @@ pvrgpu_compile_extended_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
           vertex_uniform_dwords, vs_uniforms, "Geometry pipeline VS", error, error_size)) ||
        (fs_uniforms && !pvrgpu_lower_uniform_slots_to_push_constants(fs,
           fragment_uniform_dwords, fs_uniforms, "Geometry pipeline FS", error, error_size))) goto fail;
-   if (!pvrgpu_init_generic_texture_descriptors(&fd, fragment_texture_count,
+   const unsigned vertex_texture_dwords =
+      vertex_texture_count * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS;
+   if (!pvrgpu_init_generic_texture_descriptors(&vd, vertex_texture_count,
+                                                 0, mem, error, error_size) ||
+       !pvrgpu_pack_generic_texture_bindings(vs, vertex_texture_count,
+                                              error, error_size) ||
+       !pvrgpu_init_generic_texture_descriptors(&fd, fragment_texture_count,
                                                  0, mem, error, error_size) ||
        !pvrgpu_pack_generic_texture_bindings(fs, fragment_texture_count,
                                               error, error_size)) goto fail;
    const unsigned texture_dwords = fragment_texture_count * 20;
    const unsigned vs_ubos = vs->info.num_ubos, fs_ubos = fs->info.num_ubos;
-   if (!pvrgpu_lower_generic_uniform_buffers(vs, &vd, 0, mem, error, error_size) ||
+   if (!pvrgpu_lower_generic_uniform_buffers(vs, &vd, vertex_texture_dwords,
+                                              mem, error, error_size) ||
        !pvrgpu_lower_generic_uniform_buffers(fs, &fd, texture_dwords, mem, error, error_size)) goto fail;
+   unsigned vs_descriptor_dwords = vertex_texture_dwords + 4 * vs_ubos;
+   unsigned fs_descriptor_dwords = texture_dwords + 4 * fs_ubos;
+   if (!pvrgpu_lower_ssbo_store_masks(vs, "Geometry pipeline VS", error,
+                                      error_size) ||
+       !pvrgpu_lower_ssbo_store_masks(fs, "Geometry pipeline FS", error,
+                                      error_size) ||
+       !pvrgpu_validate_graphics_storage_buffers(
+          vs, &out->graphics.vertex.storage, true,
+          "Geometry pipeline VS", error, error_size) ||
+       !pvrgpu_validate_graphics_storage_buffers(
+          fs, &out->graphics.fragment.storage, true,
+          "Geometry pipeline FS", error, error_size))
+      goto fail;
+   if (out->graphics.vertex.storage.descriptor_count)
+      out->graphics.vertex.storage.descriptor_start = vs_descriptor_dwords;
+   if (!pvrgpu_lower_generic_storage_buffers(
+          vs, &vd, out->graphics.vertex.storage.descriptor_count,
+          out->graphics.vertex.storage.descriptor_start, mem,
+          error, error_size))
+      goto fail;
+   vs_descriptor_dwords +=
+      4 * out->graphics.vertex.storage.descriptor_count;
+   if (out->graphics.fragment.storage.descriptor_count)
+      out->graphics.fragment.storage.descriptor_start = fs_descriptor_dwords;
+   if (!pvrgpu_lower_generic_storage_buffers(
+          fs, &fd, out->graphics.fragment.storage.descriptor_count,
+          out->graphics.fragment.storage.descriptor_start, mem,
+          error, error_size))
+      goto fail;
+   fs_descriptor_dwords +=
+      4 * out->graphics.fragment.storage.descriptor_count;
    fd.fs.z_replicate = ~0u;
    fd.fs.rasterization_samples = 1;
    static const enum pipe_format formats[] = {
@@ -8611,18 +9177,30 @@ pvrgpu_compile_extended_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
    fd.fs.uses.depth_feedback = depth_feedback;
    pco_lower_nir(compiler->pco, vs, &vd);
    pco_lower_nir(compiler->pco, fs, &fd);
+   nir_shader_intrinsics_pass(vs, pvrgpu_lower_shadow_compare_transport,
+                              nir_metadata_control_flow, NULL);
+   nir_shader_intrinsics_pass(fs, pvrgpu_lower_shadow_compare_transport,
+                              nir_metadata_control_flow, NULL);
    pco_postprocess_nir(compiler->pco, vs, &vd);
    pco_postprocess_nir(compiler->pco, fs, &fd);
-   if ((vs_uniforms && !pvrgpu_allocate_generic_push_constants_after(&vd, 4 * vs_ubos,
+   nir_shader_intrinsics_pass(vs, pvrgpu_widen_scalar_texture_result,
+                              nir_metadata_control_flow, NULL);
+   nir_shader_intrinsics_pass(fs, pvrgpu_widen_scalar_texture_result,
+                              nir_metadata_control_flow, NULL);
+   if ((vs_uniforms && !pvrgpu_allocate_generic_push_constants_after(&vd,
+          vs_descriptor_dwords,
           vertex_uniform_dwords,
           PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE,
           "Geometry VS", error, error_size)) ||
-       (fs_uniforms && !pvrgpu_allocate_generic_push_constants_after(&fd, texture_dwords + 4 * fs_ubos,
+       (fs_uniforms && !pvrgpu_allocate_generic_push_constants_after(&fd,
+          fs_descriptor_dwords,
           fragment_uniform_dwords,
           PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE,
           "Geometry FS", error, error_size))) goto fail;
-   if (!vd.common.push_consts.range.count) vd.common.push_consts.range.start = 4 * vs_ubos;
-   if (!fd.common.push_consts.range.count) fd.common.push_consts.range.start = texture_dwords + 4 * fs_ubos;
+   if (!vd.common.push_consts.range.count)
+      vd.common.push_consts.range.start = vs_descriptor_dwords;
+   if (!fd.common.push_consts.range.count)
+      fd.common.push_consts.range.start = fs_descriptor_dwords;
    if (depth_feedback)
       nir_shader_intrinsics_pass(fs, pvrgpu_restore_depth_feedback_no_discard, nir_metadata_control_flow, NULL);
    if (vd.common.shareds > PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE ||
@@ -8648,23 +9226,30 @@ pvrgpu_compile_extended_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
              tess, &tess->control, error, error_size) ||
           !pvrgpu_compile_tessellation_stage(compiler, gs, geometry_uniform_dwords,
              tess, &tess->evaluation, error, error_size)) goto fail;
-   } else if (!pvrgpu_pco_compile_geometry(compiler, gs, &input, &output,
+      if (final_gs && !pvrgpu_pco_compile_geometry(
+             compiler, final_gs, &pre_output, raster_output,
+             final_geometry_uniform_dwords, &out->geometry,
+             error, error_size))
+         goto fail;
+   } else if (!pvrgpu_pco_compile_geometry(compiler, gs, &input, raster_output,
                  geometry_uniform_dwords, &out->geometry, error, error_size)) goto fail;
-   out->graphics.vertex.abi.uniform_buffer_descriptor_start = 0;
+   out->graphics.vertex.abi.uniform_buffer_descriptor_start =
+      vs_ubos ? vertex_texture_dwords : 0;
    out->graphics.vertex.abi.uniform_buffer_descriptor_count = vs_ubos;
    out->graphics.fragment.abi.uniform_buffer_descriptor_start = fs_ubos ? texture_dwords : 0;
    out->graphics.fragment.abi.uniform_buffer_descriptor_count = fs_ubos;
    out->graphics.position_output_start = 0;
    out->graphics.position_output_count = 4;
-   out->graphics.point_size_output_count = output.count[VARYING_SLOT_PSIZ];
+   out->graphics.point_size_output_count = raster_output->count[VARYING_SLOT_PSIZ];
    out->graphics.point_size_output_start = out->graphics.point_size_output_count ?
-      output.start[VARYING_SLOT_PSIZ] : 0;
+      raster_output->start[VARYING_SLOT_PSIZ] : 0;
    out->graphics.fragment_position_start = 0;
    out->graphics.fragment_position_count = 4;
    out->graphics.fragment_position_uses_w = 1;
-   out->graphics.varying_output_start = 4 + output.count[VARYING_SLOT_PSIZ];
+   out->graphics.varying_output_start =
+      4 + raster_output->count[VARYING_SLOT_PSIZ];
    out->graphics.varying_output_count =
-      output.stride_dwords - out->graphics.varying_output_start;
+      raster_output->stride_dwords - out->graphics.varying_output_start;
    out->graphics.fragment_varying_start = 4;
    out->graphics.fragment_varying_count = varying_count * 4;
    out->graphics.fragment_texture_descriptor_count = fragment_texture_count;
@@ -8687,7 +9272,7 @@ pvrgpu_pco_compile_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
 {
    return pvrgpu_compile_extended_geometry_pipeline(compiler, vs, gs, fs, formats,
       targets, vs_uniforms, gs_uniforms, fs_uniforms, attributes, textures, out,
-      error, error_size, NULL, 0, NULL);
+      error, error_size, NULL, 0, NULL, NULL, 0);
 }
 
 void
@@ -8715,12 +9300,55 @@ pvrgpu_pco_compile_tessellation_pipeline(struct pvrgpu_pco_compiler *compiler,
    struct pvrgpu_pco_geometry_pipeline_binary adjacent = {0};
    if (!pvrgpu_compile_extended_geometry_pipeline(compiler, vs, tes, fs, formats,
           targets, vs_uniforms, tes_uniforms, fs_uniforms, attributes, textures,
-          &adjacent, error, error_size, tcs, tcs_uniforms, out)) {
+          &adjacent, error, error_size, tcs, tcs_uniforms, out, NULL, 0)) {
       pvrgpu_pco_tessellation_pipeline_binary_finish(out);
       return false;
    }
    out->graphics = adjacent.graphics;
    return true;
+}
+
+bool
+pvrgpu_pco_compile_tessellation_geometry_pipeline(
+   struct pvrgpu_pco_compiler *compiler,
+   const nir_shader *vs, const nir_shader *tcs, const nir_shader *tes,
+   const nir_shader *gs, const nir_shader *fs,
+   const enum pipe_format *formats, unsigned targets,
+   unsigned vs_uniforms, unsigned tcs_uniforms, unsigned tes_uniforms,
+   unsigned gs_uniforms, unsigned fs_uniforms, unsigned attributes,
+   unsigned textures,
+   struct pvrgpu_pco_tessellation_pipeline_binary *tessellation,
+   struct pvrgpu_pco_geometry_binary *geometry,
+   char *error, size_t error_size)
+{
+   if (!tessellation || !geometry) {
+      return pvrgpu_pco_fail(
+         error, error_size,
+         "tessellation Geometry pipeline requires bounded stage outputs");
+   }
+   memset(tessellation, 0, sizeof(*tessellation));
+   memset(geometry, 0, sizeof(*geometry));
+   if (!gs)
+      return pvrgpu_pco_fail(
+         error, error_size,
+         "tessellation Geometry pipeline requires bounded stage outputs");
+
+   struct pvrgpu_pco_geometry_pipeline_binary adjacent = {0};
+   if (!pvrgpu_compile_extended_geometry_pipeline(
+          compiler, vs, tes, fs, formats, targets, vs_uniforms,
+          tes_uniforms, fs_uniforms, attributes, textures, &adjacent,
+          error, error_size, tcs, tcs_uniforms, tessellation,
+          gs, gs_uniforms))
+      goto fail;
+   tessellation->graphics = adjacent.graphics;
+   *geometry = adjacent.geometry;
+   memset(&adjacent, 0, sizeof(adjacent));
+   return true;
+
+fail:
+   pvrgpu_pco_geometry_binary_finish(geometry);
+   pvrgpu_pco_tessellation_pipeline_binary_finish(tessellation);
+   return false;
 }
 
 bool pvrgpu_pco_compile_color_triangle(
@@ -8868,10 +9496,11 @@ bool pvrgpu_pco_compile_color_triangle(
       topology_uses_point_size &&
       (vs->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_PSIZ)) != 0;
    if (vs->info.num_ubos > 15 || fs->info.num_ubos > 15 ||
+       vs->info.num_ssbos > 32 || fs->info.num_ssbos > 32 ||
        fs->info.num_images > 32) {
       ralloc_free(compile_mem_ctx);
       return pvrgpu_pco_fail(error, error_size,
-         "color primitive UBO/image descriptor inventory is unsupported");
+         "color primitive UBO/SSBO/image descriptor inventory is unsupported");
    }
    /* Fit CB0 before fragment images become fixed SH preamble loads.  When a
     * large default-uniform array needs the DMA path, appending its UBO slot
@@ -8883,14 +9512,15 @@ bool pvrgpu_pco_compile_color_triangle(
    uint32_t fragment_cb0_uniform_buffer_slot = 0;
    const char *shared_budget_stage = NULL;
    if (!pvrgpu_fit_color_shared_budget(vs,
-          expected_stage_textures_vs * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS,
+          expected_stage_textures_vs * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS +
+             vs->info.num_ssbos * 4,
           PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE,
           true, &vertex_uniform_dwords, &vertex_word_map,
           &vertex_cb0_uniform_buffer_slot, error, error_size)) {
       shared_budget_stage = "fitting vertex CB0";
    } else if (!pvrgpu_fit_color_shared_budget(fs,
           texture_count * PVRGPU_TEXTURE_DESCRIPTOR_DWORDS +
-             fs->info.num_images * 8,
+             fs->info.num_images * 8 + fs->info.num_ssbos * 4,
           PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE,
           fs->info.num_images == 0,
           &fragment_uniform_dwords, &fragment_word_map,
@@ -9048,6 +9678,7 @@ bool pvrgpu_pco_compile_color_triangle(
       varying_component_total += varying_components[slot];
 
    unsigned frag_coord_mask = 0;
+   bool fragment_uses_derivatives = false;
    nir_foreach_function_impl (impl, fs) {
       nir_foreach_block (block, impl) {
          nir_foreach_instr (instr, block) {
@@ -9071,12 +9702,20 @@ bool pvrgpu_pco_compile_color_triangle(
                frag_coord_mask |=
                   nir_def_components_read(&intr->def) <<
                   nir_intrinsic_component(intr);
+            } else if (intr->intrinsic == nir_intrinsic_ddx ||
+                       intr->intrinsic == nir_intrinsic_ddy ||
+                       intr->intrinsic == nir_intrinsic_ddx_fine ||
+                       intr->intrinsic == nir_intrinsic_ddy_fine ||
+                       intr->intrinsic == nir_intrinsic_ddx_coarse ||
+                       intr->intrinsic == nir_intrinsic_ddy_coarse) {
+               fragment_uses_derivatives = true;
             }
          }
       }
    }
    const bool position_uses_z = (frag_coord_mask & BITFIELD_BIT(2)) != 0;
-   bool position_uses_w = (frag_coord_mask & BITFIELD_BIT(3)) != 0;
+   bool position_uses_w = fragment_uses_derivatives ||
+                          (frag_coord_mask & BITFIELD_BIT(3)) != 0;
    for (unsigned slot = 0; slot < varying_slots; ++slot)
       position_uses_w |= varying_read_by_fragment[slot] && !varying_flat[slot];
    const unsigned position_coefficient_count =
@@ -9170,7 +9809,8 @@ bool pvrgpu_pco_compile_color_triangle(
    }
    const unsigned vertex_ubo_count = vs->info.num_ubos;
    const unsigned fragment_ubo_count = fs->info.num_ubos;
-   const unsigned vertex_descriptor_dwords = vertex_texture_dwords + vertex_ubo_count * 4;
+   unsigned vertex_descriptor_dwords =
+      vertex_texture_dwords + vertex_ubo_count * 4;
    const unsigned fragment_ubo_start = descriptor_dwords;
    if (!pvrgpu_lower_generic_uniform_buffers(vs, &vertex_data, vertex_texture_dwords,
                                               compile_mem_ctx, error, error_size) ||
@@ -9182,7 +9822,6 @@ bool pvrgpu_pco_compile_color_triangle(
    }
    descriptor_dwords += fragment_ubo_count * 4;
    descriptor_dwords += out->fragment_image_descriptor_count * 8;
-   fragment_data.common.shareds = descriptor_dwords;
    fragment_data.fs.z_replicate = ~0U;
    fragment_data.fs.rasterization_samples = 1;
    /*
@@ -9247,6 +9886,40 @@ bool pvrgpu_pco_compile_color_triangle(
    pvrgpu_pco_preprocess_nir(compiler, vs);
    pvrgpu_counter_eventf("pco_color_triangle_stage", "stage=preprocess_fs");
    pvrgpu_pco_preprocess_nir(compiler, fs);
+   if (!pvrgpu_lower_ssbo_store_masks(vs, "color primitive VS", error,
+                                      error_size) ||
+       !pvrgpu_lower_ssbo_store_masks(fs, "color primitive FS", error,
+                                      error_size) ||
+       !pvrgpu_validate_graphics_storage_buffers(
+          vs, &out->vertex.storage, true, "color primitive VS", error,
+          error_size) ||
+       !pvrgpu_validate_graphics_storage_buffers(
+          fs, &out->fragment.storage, true, "color primitive FS", error,
+          error_size)) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+   if (out->vertex.storage.descriptor_count)
+      out->vertex.storage.descriptor_start = vertex_descriptor_dwords;
+   if (!pvrgpu_lower_generic_storage_buffers(
+          vs, &vertex_data, out->vertex.storage.descriptor_count,
+          out->vertex.storage.descriptor_start, compile_mem_ctx, error,
+          error_size)) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+   vertex_descriptor_dwords += out->vertex.storage.descriptor_count * 4;
+   if (out->fragment.storage.descriptor_count)
+      out->fragment.storage.descriptor_start = descriptor_dwords;
+   if (!pvrgpu_lower_generic_storage_buffers(
+          fs, &fragment_data, out->fragment.storage.descriptor_count,
+          out->fragment.storage.descriptor_start, compile_mem_ctx, error,
+          error_size)) {
+      ralloc_free(compile_mem_ctx);
+      return false;
+   }
+   descriptor_dwords += out->fragment.storage.descriptor_count * 4;
+   fragment_data.common.shareds = descriptor_dwords;
    if (!pvrgpu_pack_generic_texture_bindings(vs, expected_stage_textures_vs,
                                               error, error_size) ||
        !pvrgpu_pack_generic_texture_bindings(fs, texture_count, error, error_size)) {

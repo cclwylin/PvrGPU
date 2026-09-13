@@ -272,6 +272,12 @@ unsigned TextureDataCount(const PcoInstruction &i) {
 }
 
 void ValidateSample(const PcoInstruction &i, const ComputePcoAbi &abi) {
+  const bool shadow_reference_bank =
+      i.texture_shadow_reference.bank == PcoRegisterBank::kSpecial ||
+      i.texture_shadow_reference.bank == PcoRegisterBank::kTemporary ||
+      i.texture_shadow_reference.bank == PcoRegisterBank::kVertexInput ||
+      i.texture_shadow_reference.bank == PcoRegisterBank::kCoefficient ||
+      i.texture_shadow_reference.bank == PcoRegisterBank::kShared;
   if (i.repeat_count != 1 || i.source_count != 3 || i.data_request ||
       i.component_count != 4 || i.end_group || i.target != PcoWriteTarget::kTemporary ||
       i.source.bank != PcoRegisterBank::kTemporary ||
@@ -284,7 +290,11 @@ void ValidateSample(const PcoInstruction &i, const ComputePcoAbi &abi) {
       !Fits(i.output_index, 4, abi.stage.temps) ||
       i.source1.bank != PcoRegisterBank::kShared || i.source1.index % 20 ||
       !Fits(i.source1.index, 20, 20 * abi.sampled_texture_count) ||
-      i.source2.bank != PcoRegisterBank::kShared || i.source2.index != i.source1.index + 8)
+      i.source2.bank != PcoRegisterBank::kShared || i.source2.index != i.source1.index + 8 ||
+      i.texture_shadow_compare > 1 ||
+      (i.texture_shadow_compare ? !shadow_reference_bank :
+       (i.texture_shadow_reference.bank != PcoRegisterBank::kSpecial ||
+        i.texture_shadow_reference.index != 0)))
     Fail("native SMP source/response/descriptor layout is invalid");
 }
 
@@ -308,6 +318,17 @@ PcoTextureRequest SampleRequest(const PcoInstruction &i, const ComputePcoAbi &ab
   for (unsigned c = 0; c < 4; ++c) {
     request.texture_state[c] = task.shared[i.source1.index + c];
     request.sampler_state[c] = task.shared[i.source2.index + c];
+  }
+  const bool descriptor_shadow =
+      (task.shared[i.source1.index + 7U] & UINT32_C(0x200)) != 0;
+  if (descriptor_shadow != (i.texture_shadow_compare != 0))
+    Fail("native compute shadow descriptor and Dref marker disagree");
+  if (descriptor_shadow) {
+    if (task.shared[i.source1.index + 12U] > 7U)
+      Fail("native compute shadow compare operation is invalid");
+    request.shadow_reference =
+        Read(i.texture_shadow_reference, 0, abi, task, lane);
+    request.shadow_compare = 1;
   }
   request.descriptor_set = i.source1.index / 20;
   request.component_count = 4;
@@ -377,6 +398,8 @@ void ValidateComputeProgram(const PcoDecodedProgram &program,
       pending = true;
     } else if (sample) {
       ValidateSample(instruction, abi);
+      if (instruction.texture_shadow_compare)
+        ValidateSource(instruction.texture_shadow_reference, 0, abi);
       pending = true;
     } else if (wdf) {
       if (!pending || instruction.data_request != 0 || instruction.exec_cnd != 0)

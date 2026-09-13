@@ -2,6 +2,7 @@
 #ifndef PVRGPU_UNIFORM_BUFFER_H
 #define PVRGPU_UNIFORM_BUFFER_H
 
+#include "pvrgpu_compute_snapshot.h"
 #include "pvrgpu_resource.h"
 #include "pvrgpu_systemc_api.h"
 #include "pipe/p_state.h"
@@ -20,6 +21,48 @@ pvrgpu_uniform_buffer_prefix_count_valid(unsigned declared_blocks,
    return declared_blocks <= PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE &&
       compiled_blocks <= declared_blocks &&
       (allow_unused_suffix || compiled_blocks == declared_blocks);
+}
+
+/* The v38 graphics SSBO capsule owns one whole-resource snapshot, whereas
+ * the legacy UBO ABI owns a separate bound-range copy without a resource
+ * token.  Until that legacy ABI can express aliases, reject only aliases
+ * that a shader may modify: duplicating two read-only views is harmless, but
+ * a writable SSBO followed by a UBO load would otherwise observe stale data.
+ * User buffers have no pipe_resource identity and are deliberately excluded. */
+static inline bool
+pvrgpu_uniform_buffers_disjoint_from_writable_snapshot(
+   const struct pipe_constant_buffer *bindings, uint32_t active_blocks,
+   uint32_t cb0_uniform_buffer_slot,
+   const struct pvrgpu_compute_snapshot *snapshot)
+{
+   if (!snapshot || active_blocks == 0)
+      return true;
+   if (!bindings ||
+       active_blocks > PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE ||
+       (cb0_uniform_buffer_slot &&
+        cb0_uniform_buffer_slot != active_blocks) ||
+       snapshot->binding_count > PVRGPU_SYSTEMC_COMPUTE_MAX_BINDINGS ||
+       snapshot->resource_count > PVRGPU_SYSTEMC_COMPUTE_MAX_RESOURCES)
+      return false;
+   for (uint32_t block = 0; block < active_blocks; ++block) {
+      const uint32_t gallium_slot =
+         cb0_uniform_buffer_slot == block + 1 ? 0 : block + 1;
+      const struct pipe_constant_buffer *uniform = &bindings[gallium_slot];
+      if (!uniform->buffer || uniform->user_buffer)
+         continue;
+      for (size_t index = 0; index < snapshot->binding_count; ++index) {
+         const struct pvrgpu_systemc_compute_binding *storage =
+            &snapshot->bindings[index];
+         if (!(storage->access & PVRGPU_SYSTEMC_COMPUTE_ACCESS_WRITE))
+            continue;
+         if (storage->resource_index >= snapshot->resource_count ||
+             !snapshot->owners[storage->resource_index])
+            return false;
+         if (snapshot->owners[storage->resource_index] == uniform->buffer)
+            return false;
+      }
+   }
+   return true;
 }
 
 /* Snapshot one already-selected Gallium constant-buffer range. The stage's

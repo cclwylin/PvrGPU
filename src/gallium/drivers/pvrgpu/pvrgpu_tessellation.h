@@ -6,7 +6,9 @@
 /* Shared producer/consumer boundary validation, before copying owned bytes.
  * This checks declared resources, not a shader name or tessellated result. */
 static inline const char *
-pvrgpu_tessellation_payload_error(const struct pvrgpu_systemc_tessellation *t)
+pvrgpu_tessellation_payload_error_with_graphics(
+   const struct pvrgpu_systemc_tessellation *t,
+   const struct pvrgpu_systemc_graphics_shader_buffers *graphics)
 {
    if (!t)
       return "missing tessellation payload";
@@ -26,8 +28,12 @@ pvrgpu_tessellation_payload_error(const struct pvrgpu_systemc_tessellation *t)
       return "tessellation domain/spacing/winding/point mode";
    for (unsigned stage = 0; stage < 2; ++stage) {
       const struct pvrgpu_systemc_pco_stage_abi *a = stage ? &t->evaluation_abi : &t->control_abi;
-      const struct pvrgpu_systemc_storage_buffer_abi *storage =
+      const struct pvrgpu_systemc_storage_buffer_abi *legacy_storage =
          stage ? &t->evaluation_storage : &t->control_storage;
+      const struct pvrgpu_systemc_storage_buffer_abi *storage = graphics ?
+         &graphics->storage[stage ?
+            PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_EVALUATION :
+            PVRGPU_SYSTEMC_PCO_SHADER_STAGE_TESS_CONTROL] : legacy_storage;
       const uint32_t *shared = stage ? t->evaluation_shared : t->control_shared;
       const uint32_t count = stage ? t->evaluation_shared_count : t->control_shared_count;
       const uint32_t descriptors = stage ? 4u : 8u;
@@ -61,6 +67,18 @@ pvrgpu_tessellation_payload_error(const struct pvrgpu_systemc_tessellation *t)
          if (shared[word])
             return "tessellation patch descriptor must be unrelocated";
    }
+   if (graphics &&
+       (t->control_storage.descriptor_start ||
+        t->control_storage.descriptor_count || t->control_storage.used_mask ||
+        t->control_storage.read_mask || t->control_storage.write_mask ||
+        t->evaluation_storage.descriptor_start ||
+        t->evaluation_storage.descriptor_count ||
+        t->evaluation_storage.used_mask || t->evaluation_storage.read_mask ||
+        t->evaluation_storage.write_mask || t->buffer_resource_count ||
+        t->buffer_resources || t->buffer_binding_count || t->buffer_bindings))
+      return "tessellation storage must use only the outer graphics capsule";
+   if (graphics)
+      return NULL;
    if (t->buffer_resource_count > PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_RESOURCES ||
        t->buffer_binding_count > PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BINDINGS ||
        ((t->buffer_resource_count != 0) != (t->buffer_resources != NULL)) ||
@@ -124,6 +142,12 @@ pvrgpu_tessellation_payload_error(const struct pvrgpu_systemc_tessellation *t)
       }
    }
    return NULL;
+}
+
+static inline const char *
+pvrgpu_tessellation_payload_error(const struct pvrgpu_systemc_tessellation *t)
+{
+   return pvrgpu_tessellation_payload_error_with_graphics(t, NULL);
 }
 
 /* Call after the payload validator, before copying/allocating input storage. */

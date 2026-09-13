@@ -419,6 +419,9 @@ struct DriverCommand {
   std::vector<std::uint32_t> fragment_shared;
   std::vector<std::uint32_t> geometry_shared;
   DriverTessellation tessellation;
+  std::array<DriverStorageBufferAbi, 5> graphics_storage{};
+  std::vector<DriverShaderBufferResource> graphics_buffer_resources;
+  std::vector<DriverShaderBufferBinding> graphics_buffer_bindings;
   DriverStreamOutput stream_output;
   std::vector<DriverShaderImage> fragment_images;
   std::uint32_t fragment_image_descriptor_start = 0;
@@ -837,6 +840,8 @@ enum class MemoryClient : std::uint8_t {
   kStreamOutput = 18,
   kFragmentImage = 19,
   kShaderImageReadback = 20,
+  kVertexShader = 21,
+  kFragmentShader = 22,
 };
 
 enum class MemoryPayloadFormat : std::uint8_t {

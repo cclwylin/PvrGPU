@@ -82,6 +82,7 @@ struct Fixture {
     draw.fragment_shared = shared.data(); draw.fragment_shared_count = shared.size();
     draw.position_output_count = draw.varying_output_start = 4;
     draw.fragment_position_count = draw.fragment_pco_abi.coefficients;
+    draw.fragment_position_uses_w = 1;
     draw.fragment_varying_start = draw.fragment_pco_abi.coefficients;
     draw.varying_bindings = &no_varyings;
     draw.fragment_output_mask[0] = 15;
@@ -176,6 +177,67 @@ struct Api {
   }
 };
 
+struct SizeOnlyGraphicsBuffer {
+  std::array<std::uint32_t, 4> shared{0, 0, 256, 0};
+  pvrgpu_systemc_shader_buffer_resource resource{};
+  pvrgpu_systemc_shader_buffer_binding binding{};
+  pvrgpu_systemc_graphics_shader_buffers graphics{};
+
+  void Attach(Fixture &fixture, std::uint64_t token) {
+    shared[2] = static_cast<std::uint32_t>(fixture.backing.size());
+    resource = {token, fixture.backing.data(), fixture.backing.size()};
+    binding = {PVRGPU_SYSTEMC_PCO_SHADER_STAGE_VERTEX, 0, 0, 0, 0,
+               fixture.backing.size()};
+    graphics.storage[PVRGPU_SYSTEMC_PCO_SHADER_STAGE_VERTEX] = {0, 1, 1, 0, 0};
+    graphics.resources = &resource;
+    graphics.resource_count = 1;
+    graphics.bindings = &binding;
+    graphics.binding_count = 1;
+    fixture.draw.vertex_shared = shared.data();
+    fixture.draw.vertex_shared_count = shared.size();
+    fixture.draw.vertex_pco_abi.shareds = shared.size();
+    fixture.draw.vertex_pco_abi.push_constant_start = shared.size();
+    fixture.draw.vertex_pco_abi.push_constant_count = 0;
+    fixture.draw.vertex_pco_abi.uniform_buffer_descriptor_start = 0;
+    fixture.draw.vertex_pco_abi.uniform_buffer_descriptor_count = 0;
+    fixture.draw.graphics_buffers = &graphics;
+  }
+};
+
+void RejectGraphicsImageTokenAliases(Api &api) {
+  constexpr std::uint64_t token = UINT64_C(0x9a00b00c);
+  {
+    Fixture first, second;
+    first.images[0].resource_token = token + 1;
+    second.images[0].resource_token = token;
+    second.draw.color_attachment_source_command_index = 0;
+    SizeOnlyGraphicsBuffer buffer;
+    buffer.Attach(first, token);
+    std::array<pvrgpu_systemc_driver_command, 2> draws{first.draw, second.draw};
+    Check(api.Submit(draws.data(), draws.size()) == 2 &&
+              std::string(api.error.data()).find(
+                  "fragment image aliases a graphics buffer") !=
+                  std::string::npos,
+          std::string("graphics-to-image token alias gate: ") +
+              api.error.data());
+  }
+  {
+    Fixture first, second;
+    first.images[0].resource_token = token;
+    second.images[0].resource_token = token + 1;
+    second.draw.color_attachment_source_command_index = 0;
+    SizeOnlyGraphicsBuffer buffer;
+    buffer.Attach(second, token);
+    std::array<pvrgpu_systemc_driver_command, 2> draws{first.draw, second.draw};
+    Check(api.Submit(draws.data(), draws.size()) == 2 &&
+              std::string(api.error.data()).find(
+                  "graphics buffer aliases a fragment image") !=
+                  std::string::npos,
+          std::string("image-to-graphics token alias gate: ") +
+              api.error.data());
+  }
+}
+
 void RejectBoundaries(Api &api) {
   for (unsigned bad = 0; bad < 25; ++bad) {
     Fixture f(3);
@@ -219,6 +281,7 @@ void RejectBoundaries(Api &api) {
   Check(api.Submit(&first.draw) == 2 && api.error[0],
         "logical sequence wrapper cannot silently discard an image payload");
   api.sequence.fragment_images = nullptr; api.sequence.fragment_image_count = 0;
+  RejectGraphicsImageTokenAliases(api);
 #if !defined(_WIN32)
   // Version is the only field known before validating the ABI. An old or
   // future caller may not own storage for any of the API29 tail fields.

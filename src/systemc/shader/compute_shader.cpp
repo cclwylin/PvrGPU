@@ -71,6 +71,8 @@ void ComputeShader::SampleTexture(void *context, const PcoTextureRequest &issued
   request.data_request = issued.data_request;
   request.explicit_lod = issued.explicit_lod;
   request.explicit_lod_present = issued.explicit_lod_present;
+  request.shadow_reference = issued.shadow_reference;
+  request.shadow_compare = issued.shadow_compare;
   state.texture_sample_requests = StoreNewArray(self.pool_, std::vector<TextureSampleRequest>{request});
   state.stage = PipelineStage::kComputeTexturePending;
   StorePipelineState(self.pool_, dispatch.texture_state, state);
@@ -99,6 +101,8 @@ void ComputeShader::SampleTexture(void *context, const PcoTextureRequest &issued
       requests[0].dimension != request.dimension || requests[0].normalized != request.normalized ||
       requests[0].fcnorm != request.fcnorm || requests[0].coordinate_count != request.coordinate_count ||
       requests[0].component_count != request.component_count || requests[0].data_request != request.data_request ||
+      requests[0].shadow_reference != request.shadow_reference ||
+      requests[0].shadow_compare != request.shadow_compare ||
       responses[0].shader_stage != ShaderStage::kCompute ||
       responses[0].shader_lane_index || responses[0].request_id)
     throw std::runtime_error("compute SMP completion ordering/payload mismatch");

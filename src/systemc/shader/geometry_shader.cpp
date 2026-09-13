@@ -3,6 +3,7 @@
 #include "common/geometry_emission.h"
 #include "memory/gpu_memory_system.h"
 #include "shader/geometry_iss.h"
+#include "shader/usc_shader_buffer_memory.h"
 #include "shader/usc_uniform_buffer_memory.h"
 
 #include <algorithm>
@@ -53,12 +54,15 @@ bool SameSample(const TextureSampleRequest &a, const TextureSampleRequest &b) {
       a.normalized == b.normalized && a.fcnorm == b.fcnorm && a.data_request == b.data_request &&
       a.sample_index == b.sample_index && a.sample_index_present == b.sample_index_present &&
       a.explicit_lod == b.explicit_lod && a.explicit_lod_present == b.explicit_lod_present &&
+      a.shadow_reference == b.shadow_reference &&
+      a.shadow_compare == b.shadow_compare &&
       !a.lod_bias && !b.lod_bias && !a.lod_bias_present && !b.lod_bias_present &&
       a.gather == 0 && b.gather == 0;
 }
 struct InvocationContext {
   GpuMemorySystem &memory;
   UscUniformBufferMemory &uniforms;
+  UscShaderBufferMemory &buffers;
   GeometryEmissionBuffer &emission;
   CounterTxn &counters;
   std::uint64_t input_address, input_bytes, required_mask;
@@ -80,7 +84,18 @@ struct InvocationContext {
       ApplyMemoryAccessStats(self.counters, read.stats);
       self.counters.gs_input_read_bytes += bytes;
       WaitForCycles(MemoryAccessDelayCycles(read.stats));
-    } else UscUniformBufferMemory::Read(&self.uniforms, address, count, destination);
+    } else if (self.buffers.Contains(address, bytes, 1U)) {
+      UscShaderBufferMemory::Read(&self.buffers, address, count, destination);
+    } else {
+      UscUniformBufferMemory::Read(&self.uniforms, address, count, destination);
+    }
+  }
+  static std::uint32_t Atomic32(void *opaque, PcoOpcode operation,
+                                std::uint64_t address,
+                                std::uint32_t operand) {
+    auto &self = *static_cast<InvocationContext *>(opaque);
+    return UscShaderBufferMemory::Atomic32(&self.buffers, operation, address,
+                                           operand);
   }
   static void Emit(void *opaque, const std::uint32_t *words, std::uint32_t count, std::uint64_t mask) {
     auto &self = *static_cast<InvocationContext *>(opaque);
@@ -122,6 +137,8 @@ void GeometryShader::Sample(PipelineState &state, const PipelineTxn &txn,
   request.sample_index_present = issued.sample_index_present;
   request.explicit_lod = issued.explicit_lod;
   request.explicit_lod_present = issued.explicit_lod_present;
+  request.shadow_reference = issued.shadow_reference;
+  request.shadow_compare = issued.shadow_compare;
   if (issued.lod_bias_present || issued.lod_bias)
     throw std::runtime_error("geometry SMP shader LOD bias is unsupported");
   if (issued.gather)
@@ -158,7 +175,8 @@ void GeometryShader::Execute(PipelineState &state, const PipelineTxn &txn) {
     throw std::runtime_error("geometry pipeline state/register/memory contract is invalid");
   const auto topology = OutputTopology(state.geometry_output_topology);
   const auto program = DecodeGeometryPcoProgram(LoadArray<std::uint8_t>(pool_, state.geometry_code));
-  ValidateGeometryProgram(program, state.geometry_pco_abi);
+  ValidateGeometryProgram(program, state.geometry_pco_abi,
+                          &state.graphics_storage[2]);
   if (HasPoolHandle(state.geometry_instructions)) pool_.Release(state.geometry_instructions);
   state.geometry_instructions = {};
   state.geometry_program_summary = program.summary;
@@ -174,6 +192,15 @@ void GeometryShader::Execute(PipelineState &state, const PipelineTxn &txn) {
   UscUniformBufferMemory uniforms(memory_, state.memory_mode,
       HasPoolHandle(state.geometry_uniform_buffer_resources) ?
           LoadArray<UniformBufferResource>(pool_, state.geometry_uniform_buffer_resources) : std::vector<UniformBufferResource>{});
+  auto graphics_buffer_resources = HasPoolHandle(state.graphics_buffer_resources)
+      ? LoadArray<ShaderBufferResource>(pool_, state.graphics_buffer_resources)
+      : std::vector<ShaderBufferResource>{};
+  const auto graphics_buffer_ranges = HasPoolHandle(state.graphics_buffer_ranges[2])
+      ? LoadArray<ShaderBufferRange>(pool_, state.graphics_buffer_ranges[2])
+      : std::vector<ShaderBufferRange>{};
+  UscShaderBufferMemory graphics_buffers(memory_, state.memory_mode,
+      graphics_buffer_resources, graphics_buffer_ranges,
+      MemoryClient::kGeometryShader);
   const auto stride = state.geometry_pco_abi.vertex_outputs;
   OwnedPayload snapshots(pool_, static_cast<std::size_t>(state.geometry_max_vertices) * stride * 4);
   OwnedPayload masks(pool_, static_cast<std::size_t>(state.geometry_max_vertices) * sizeof(std::uint64_t));
@@ -212,17 +239,21 @@ void GeometryShader::Execute(PipelineState &state, const PipelineTxn &txn) {
     shared[2] = input_words * sizeof(std::uint32_t); shared[3] = 0;
     for (unsigned invocation = 0; invocation < state.geometry_invocations; ++invocation) {
       auto &task = *task_payload.data<GeometryTaskState>();
-      task = MakeGeometryTask(state.geometry_pco_abi, shared, primitive.primitive_id, invocation);
+      task = MakeGeometryTask(state.geometry_pco_abi, shared,
+                              primitive.primitive_id, invocation,
+                              &state.graphics_storage[2]);
       GeometryEmissionBuffer emission({snapshots.data<std::uint32_t>(),
           static_cast<std::size_t>(state.geometry_max_vertices) * stride, masks.data<std::uint64_t>(),
           state.geometry_max_vertices, strips.data<GeometryStripRange>(), state.geometry_max_vertices},
           state.geometry_max_vertices, stride);
-      InvocationContext context{*memory_, uniforms, emission, state.counters, state.geometry_input_buffer_gpu_address,
+      InvocationContext context{*memory_, uniforms, graphics_buffers, emission,
+          state.counters, state.geometry_input_buffer_gpu_address,
           input_words * sizeof(std::uint32_t), required_mask, state.geometry_max_vertices,
           [this, &state, &txn](const PcoTextureRequest &request, std::uint32_t *response) {
             Sample(state, txn, request, response);
           }};
       const GeometryExecutionCallbacks callbacks{&context, InvocationContext::Read,
+          InvocationContext::Atomic32,
           InvocationContext::Emit, InvocationContext::Cut, InvocationContext::Finish, InvocationContext::Sample};
       while (!task.ended) StepGeometryTask(program, state.geometry_pco_abi, task, callbacks, execution);
       ++state.counters.gs_invocations;
@@ -247,7 +278,22 @@ void GeometryShader::Execute(PipelineState &state, const PipelineTxn &txn) {
     }
   }
   ApplyMemoryAccessStats(state.counters, uniforms.stats());
+  if (state.graphics_storage[2].write_mask != 0) {
+    for (auto &resource : graphics_buffer_resources) {
+      if (!(resource.access & 2U))
+        continue;
+      const auto bytes = graphics_buffers.Readback(resource);
+      if (HasPoolHandle(resource.readback))
+        StoreArray(pool_, resource.readback, bytes);
+      else
+        resource.readback = StoreNewArray(pool_, bytes);
+    }
+    StoreArray(pool_, state.graphics_buffer_resources,
+               graphics_buffer_resources);
+  }
+  ApplyMemoryAccessStats(state.counters, graphics_buffers.stats());
   WaitForCycles(MemoryAccessDelayCycles(uniforms.stats()));
+  WaitForCycles(MemoryAccessDelayCycles(graphics_buffers.stats()));
   state.counters.pco_decode_cycles += program.summary.group_count;
   state.counters.pco_instructions += program.summary.instruction_count;
   state.counters.usc_groups += execution.instructions;

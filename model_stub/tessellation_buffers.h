@@ -33,8 +33,28 @@ inline bool ValidateDriverTessellationBuffers(const DriverCommand &command,
       tess.buffer_bindings.size() > kMaximumTessellationBufferBindings)
     return reject("resource or binding count exceeds the transport bound");
 
+  const bool generic = !command.graphics_buffer_resources.empty() ||
+      !command.graphics_buffer_bindings.empty() ||
+      std::any_of(command.graphics_storage.begin(),
+                  command.graphics_storage.end(), [](const auto &storage) {
+                    return storage.descriptor_start || storage.descriptor_count ||
+                           storage.used_mask || storage.read_mask ||
+                           storage.write_mask;
+                  });
+  if (generic &&
+      (!tess.buffer_resources.empty() || !tess.buffer_bindings.empty() ||
+       tess.control_storage.descriptor_start ||
+       tess.control_storage.descriptor_count || tess.control_storage.used_mask ||
+       tess.control_storage.read_mask || tess.control_storage.write_mask ||
+       tess.evaluation_storage.descriptor_start ||
+       tess.evaluation_storage.descriptor_count ||
+       tess.evaluation_storage.used_mask || tess.evaluation_storage.read_mask ||
+       tess.evaluation_storage.write_mask))
+    return reject("legacy and outer graphics capsules overlap");
+
   const std::array<const DriverStorageBufferAbi *, 2> storage{
-      &tess.control_storage, &tess.evaluation_storage};
+      generic ? &command.graphics_storage[3] : &tess.control_storage,
+      generic ? &command.graphics_storage[4] : &tess.evaluation_storage};
   const std::array<const DriverPcoStageAbi *, 2> abi{
       &tess.control_abi, &tess.evaluation_abi};
   const std::array<const std::vector<std::uint32_t> *, 2> shared{
@@ -57,6 +77,8 @@ inline bool ValidateDriverTessellationBuffers(const DriverCommand &command,
         a.push_constant_start != storage_start + 4U * s.descriptor_count)
       return reject("descriptor layout or use masks are invalid");
   }
+  if (generic)
+    return true;
 
   std::uint64_t total = 0;
   for (std::size_t index = 0; index < tess.buffer_resources.size(); ++index) {

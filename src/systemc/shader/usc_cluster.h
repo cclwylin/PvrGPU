@@ -23,7 +23,8 @@ class GpuMemorySystem;
 // UBO layouts always use the canonical prefix end, even for an empty suffix.
 bool DriverPcoTextureSharedLayoutSupported(
     const DriverPcoStageAbi &abi, std::uint32_t descriptor_set_count,
-    std::uint32_t image_descriptor_count = 0);
+    std::uint32_t image_descriptor_count = 0,
+    const DriverStorageBufferAbi *storage = nullptr);
 
 class UscCluster final : public sc_core::sc_module {
 public:

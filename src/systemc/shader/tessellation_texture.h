@@ -17,14 +17,22 @@ inline bool SameTessellationSample(const TextureSampleRequest &a, const TextureS
       std::equal(std::begin(a.texture_state), std::end(a.texture_state), std::begin(b.texture_state)) &&
       std::equal(std::begin(a.sampler_state), std::end(a.sampler_state), std::begin(b.sampler_state)) &&
       a.shader_stage == b.shader_stage && a.descriptor_set == b.descriptor_set &&
-      a.coordinate_count == 2 && a.component_count == 4 && a.dimension == 2 &&
-      a.binding == 0 && a.normalized == 1 && a.fcnorm == 1 && a.data_request == 0 &&
+      a.coordinate_count == b.coordinate_count &&
+      a.component_count == b.component_count && a.dimension == b.dimension &&
+      a.binding == b.binding && a.normalized == b.normalized &&
+      a.fcnorm == b.fcnorm && a.data_request == b.data_request &&
       a.shader_lane_index == 0 && a.request_id == 0 && a.quad_id == 0 && a.quad_lane == 0 && a.sample_id == 0 &&
-      a.texture_address_lo == 0 && a.texture_address_hi == 0 &&
-      a.sample_index == 0 && a.sample_index_present == 0 && a.gather == 0 &&
-      a.spatial_offsets[0] == 0 && a.spatial_offsets[1] == 0 && a.spatial_offsets[2] == 0 &&
+      a.texture_address_lo == b.texture_address_lo &&
+      a.texture_address_hi == b.texture_address_hi &&
+      a.sample_index == b.sample_index &&
+      a.sample_index_present == b.sample_index_present &&
+      a.gather == b.gather &&
+      std::equal(std::begin(a.spatial_offsets), std::end(a.spatial_offsets),
+                 std::begin(b.spatial_offsets)) &&
       a.explicit_lod == b.explicit_lod && a.explicit_lod_present == b.explicit_lod_present &&
-      a.lod_bias == 0 && a.lod_bias_present == 0;
+      a.lod_bias == b.lod_bias && a.lod_bias_present == b.lod_bias_present &&
+      a.shadow_reference == b.shadow_reference &&
+      a.shadow_compare == b.shadow_compare;
 }
 
 // A selected native task lane blocks on one real TPU transaction. The ISS
@@ -40,24 +48,35 @@ inline void SampleTessellationTexture(MemoryPool &pool, PipelineState &state,
       state.stage != PipelineStage::kVertexShaded ||
       HasPoolHandle(state.texture_sample_requests) || HasPoolHandle(state.texture_sample_responses))
     throw std::runtime_error("tessellation SMP FIFO/state ownership mismatch");
-  if (issued.coordinate_count != 2 || issued.component_count != 4 || issued.dimension != 2 ||
-      issued.normalized != 1 || issued.fcnorm != 1 || issued.binding || issued.data_request ||
-      issued.coordinates[2] || issued.texture_address_lo || issued.texture_address_hi ||
+  if (issued.coordinate_count != 2 || issued.component_count != 4 ||
+      (issued.dimension != 2 && issued.dimension != 3) ||
+      issued.normalized != 1 || issued.fcnorm > 1 || issued.binding || issued.data_request ||
       issued.sample_index || issued.sample_index_present || issued.gather ||
       issued.spatial_offsets[0] || issued.spatial_offsets[1] || issued.spatial_offsets[2] ||
       issued.lod_bias || issued.lod_bias_present || issued.explicit_lod_present > 1 ||
-      (!issued.explicit_lod_present && issued.explicit_lod))
+      (!issued.explicit_lod_present && issued.explicit_lod) ||
+      issued.shadow_compare > 1 ||
+      (!issued.shadow_compare && issued.shadow_reference))
     throw std::runtime_error("unsupported tessellation SMP request class");
   TextureSampleRequest request;
   request.shader_stage = stage;
   std::copy_n(issued.coordinates.begin(), 3, request.coordinates);
   std::copy_n(issued.texture_state.begin(), 4, request.texture_state);
   std::copy_n(issued.sampler_state.begin(), 4, request.sampler_state);
-  request.coordinate_count = 2; request.component_count = 4; request.dimension = 2;
-  request.normalized = 1; request.fcnorm = 1;
+  request.texture_address_lo = issued.texture_address_lo;
+  request.texture_address_hi = issued.texture_address_hi;
+  request.coordinate_count = issued.coordinate_count;
+  request.component_count = issued.component_count;
+  request.dimension = issued.dimension;
+  request.normalized = issued.normalized;
+  request.fcnorm = issued.fcnorm;
+  request.binding = issued.binding;
+  request.data_request = issued.data_request;
   request.descriptor_set = issued.descriptor_set;
   request.explicit_lod = issued.explicit_lod;
   request.explicit_lod_present = issued.explicit_lod_present;
+  request.shadow_reference = issued.shadow_reference;
+  request.shadow_compare = issued.shadow_compare;
   const auto pending = control ? PipelineStage::kTessellationControlTexturePending : PipelineStage::kTessellationEvaluationTexturePending;
   const auto ready = control ? PipelineStage::kTessellationControlTextureSamplesReady : PipelineStage::kTessellationEvaluationTextureSamplesReady;
   state.texture_sample_requests = StoreNewArray(pool, std::vector<TextureSampleRequest>{request});

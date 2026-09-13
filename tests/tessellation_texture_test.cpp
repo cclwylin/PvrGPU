@@ -74,7 +74,7 @@ struct Client : sc_core::sc_module {
         resources.push_back(resource); samplers.push_back(sampler);
       }
       if (mode == "reject-descriptor") abi.uniform_buffer_descriptor_start -= 1;
-      if (mode == "reject-shadow") shared[prefix + 12] = 1;
+      if (mode == "reject-shadow") shared[prefix + 12] = 8;
       if (mode == "reject-count") state.tessellation_control_sampled_texture_count = 1;
       (stage == 0 ? tess.control_shared : tess.evaluation_shared) = StoreNewArray(pool, shared);
       (stage == 0 ? tess.control_texture_resources : tess.evaluation_texture_resources) = StoreNewArray(pool, resources);
@@ -175,7 +175,8 @@ int sc_main(int argc, char **argv) {
         mode == "reject-count" ? "resource/request count mismatch" :
         mode == "reject-descriptor" || mode == "reject-shadow" ? "tessellation descriptor/state mismatch" :
         mode == "reject-stage" ? "FIFO/state ownership mismatch" :
-        mode == "reject-gather" || mode == "reject-dimension" ? "unsupported tessellation SMP request class" : "";
+        mode == "reject-gather" ? "unsupported tessellation SMP request class" :
+        mode == "reject-dimension" ? "unsupported tessellation sample mode" : "";
     if (expected.empty() || error.find(expected) == std::string::npos) {
       std::cerr << error << '\n'; return 1;
     }

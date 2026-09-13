@@ -1398,9 +1398,8 @@ void TextureUnit::SampleRunForStage(
         resource.dimension_type == TextureDimensionType::kCube;
     if (cube_array_resource) {
       ValidateTextureCubeArrayLayout(resource);
-      if (!driver_pco || !fragment_stage || shared.at(descriptor_base + 7U) != 0 ||
-          shared.at(descriptor_base + 12U) != 0)
-        throw std::runtime_error("TextureUnit cube array requires ordinary fragment sampling");
+      if (!driver_pco)
+        throw std::runtime_error("TextureUnit cube array requires native PCO sampling");
       for (const auto &request : requests)
         if (request.gather || !request.normalized || request.sample_index_present ||
             request.lod_bias_present || request.lod_bias ||
@@ -1409,14 +1408,28 @@ void TextureUnit::SampleRunForStage(
     }
     if (tessellation_stage) {
       const auto &abi = control_stage ? tessellation.control_abi : tessellation.evaluation_abi;
+      const bool supported_dimension =
+          resource.dimension_type == TextureDimensionType::k2D ||
+          resource.dimension_type == TextureDimensionType::k2DArray ||
+          resource.dimension_type == TextureDimensionType::k3D ||
+          resource.dimension_type == TextureDimensionType::kCube ||
+          resource.dimension_type == TextureDimensionType::kCubeArray;
+      const std::uint8_t expected_dimension =
+          (resource.dimension_type == TextureDimensionType::k3D ||
+           resource.dimension_type == TextureDimensionType::kCube ||
+           resource.dimension_type == TextureDimensionType::kCubeArray)
+              ? 3U
+              : 2U;
       if (abi.uniform_buffer_descriptor_start != descriptor_start + descriptor_count * kFillTexNearestSharedDwordCount ||
-          resource.dimension_type != TextureDimensionType::k2D || resource.layer_count != 1 || resource.sample_count != 1 ||
-          !sampler.normalized_coordinates || shared.at(descriptor_base + 12U) != 0)
+          !supported_dimension || resource.sample_count != 1 ||
+          !sampler.normalized_coordinates ||
+          shared.at(descriptor_base + 12U) > 7U)
         throw std::runtime_error("TextureUnit tessellation descriptor/state mismatch");
       for (const auto &request : requests) {
         if (request.gather || request.lod_bias_present || request.lod_bias ||
-            request.dimension != 2 || request.coordinate_count != 2 || !request.normalized || request.fcnorm != 1 ||
-            request.texture_address_lo || request.texture_address_hi || request.sample_index_present || request.sample_index ||
+            request.dimension != expected_dimension ||
+            request.coordinate_count != 2 || !request.normalized ||
+            request.sample_index_present || request.sample_index ||
             request.spatial_offsets[0] || request.spatial_offsets[1] || request.spatial_offsets[2])
           throw std::runtime_error("TextureUnit unsupported tessellation sample mode");
       }
@@ -1614,7 +1627,8 @@ void TextureUnit::SampleRunForStage(
           image.format != TextureFormat::kRgba32Float) ||
          (resource.dimension_type != TextureDimensionType::k2D &&
           resource.dimension_type != TextureDimensionType::k2DArray &&
-          resource.dimension_type != TextureDimensionType::kCube) ||
+          resource.dimension_type != TextureDimensionType::kCube &&
+          resource.dimension_type != TextureDimensionType::kCubeArray) ||
          shadow_compare_op > 7U)) {
       throw std::runtime_error("TextureUnit unsupported shadow compare state");
     }

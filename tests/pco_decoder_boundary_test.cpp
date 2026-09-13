@@ -2,6 +2,7 @@
 // Exercise the actual FIFO decoder's VTXOUT layout envelope, not only the
 // standalone ISA decoder. Undefined intervening exports remain legal.
 #include "common/pipeline_state.h"
+#include "common/tessellation_state.h"
 #include "shader/pco_decoder.h"
 #include "shader/pco_iss.h"
 
@@ -67,6 +68,50 @@ PipelineTxn Make(MemoryPool &pool, unsigned outputs, bool point_size) {
   txn.state = pool.Allocate(sizeof(state)); StorePipelineState(pool, txn.state, state);
   return txn;
 }
+
+std::vector<std::uint8_t> FragmentAtomicBinary() {
+  std::vector<std::uint8_t> bytes;
+  const auto append = [&](std::initializer_list<std::uint8_t> group) {
+    bytes.insert(bytes.end(), group.begin(), group.end());
+  };
+  const auto move = [&](std::uint32_t value, std::uint8_t temporary) {
+    append({0x86, 0x92, 0x40, 0x13,
+            static_cast<std::uint8_t>(value),
+            static_cast<std::uint8_t>(value >> 8U),
+            static_cast<std::uint8_t>(value >> 16U),
+            static_cast<std::uint8_t>(value >> 24U),
+            0x00, 0x00, static_cast<std::uint8_t>(0x40U + temporary),
+            0xff});
+  };
+  constexpr std::uint64_t address = UINT64_C(0x12345678000);
+  move(static_cast<std::uint32_t>(address), 1);
+  move(static_cast<std::uint32_t>(address >> 32U), 2);
+  move(7, 3);
+  append({0x65, 0xa0, 0x00, 0xe5, 0x00, 0x03, 0x41, 0x42, 0x00,
+          0xff});
+  append({0x02, 0x80, 0x6a, 0xff});
+  append({0x04, 0x80, 0xee, 0x00, 0xf2, 0xff, 0xff, 0xff});
+  return bytes;
+}
+
+PipelineTxn MakeFragmentStorageAtomic(MemoryPool &pool) {
+  PipelineState state;
+  state.functional_case = FunctionalCase::kDriverPcoTriangles;
+  state.stage = PipelineStage::kParameterBufferReady;
+  state.fragment_code = StoreNewArray(pool, FragmentAtomicBinary());
+  state.drawlist_stats = StoreNewArray(pool, std::vector<DrawListStats>(1));
+  state.raster_state.shader_writes_memory = 1;
+  state.graphics_storage[1] = {0, 1, 1, 1, 1};
+  state.graphics_buffer_resources =
+      StoreNewArray(pool, std::vector<ShaderBufferResource>(1));
+  state.graphics_buffer_ranges[1] =
+      StoreNewArray(pool, std::vector<ShaderBufferRange>(1));
+  PipelineTxn txn;
+  txn.sequence = 1;
+  txn.state = pool.Allocate(sizeof(state));
+  StorePipelineState(pool, txn.state, state);
+  return txn;
+}
 void Retire(MemoryPool &pool, PipelineTxn txn) {
   ReleaseFunctionalPayloads(pool, LoadPipelineState(pool, txn.state));
   pool.Release(txn.state);
@@ -76,13 +121,33 @@ void Retire(MemoryPool &pool, PipelineTxn txn) {
 int sc_main(int argc, char **argv) {
   try {
     const std::string mode = argc > 1 ? argv[1] : "valid";
-    Check(mode == "valid" || mode == "reject65" || mode == "reject65-point-size",
+    Check(mode == "valid" || mode == "reject65" ||
+              mode == "reject65-point-size" ||
+              mode == "fragment-storage-atomic",
           "recognized boundary test mode");
     MemoryPool pool;
-    PcoDecoder decoder("vertex_decoder", pool, ShaderStage::kVertex);
+    const bool fragment_storage_atomic = mode == "fragment-storage-atomic";
+    PcoDecoder decoder(fragment_storage_atomic ? "fragment_decoder"
+                                               : "vertex_decoder",
+                       pool, fragment_storage_atomic ? ShaderStage::kFragment
+                                                     : ShaderStage::kVertex);
     sc_core::sc_fifo<PipelineTxn> input("input", 1), output("output", 1);
     decoder.input(input); decoder.output(output);
-    if (mode != "valid") {
+    if (fragment_storage_atomic) {
+      const auto txn = MakeFragmentStorageAtomic(pool);
+      Check(input.nb_write(txn),
+            "fragment storage atomic enters the actual decoder FIFO");
+      sc_core::sc_start(sc_core::sc_time(1, sc_core::SC_US));
+      PipelineTxn done;
+      Check(output.nb_read(done) && done.sequence == txn.sequence,
+            "fragment storage atomic decoder completion retains sequence");
+      const auto state = LoadPipelineState(pool, done.state);
+      Check(state.stage == PipelineStage::kFragmentDecoded &&
+                HasPoolHandle(state.fragment_instructions) &&
+                state.fragment_program_summary.instruction_count == 6,
+            "fragment storage backing is an observable native atomic contract");
+      Retire(pool, done);
+    } else if (mode != "valid") {
       const auto txn = Make(pool, 65, mode == "reject65-point-size");
       Check(input.nb_write(txn), "invalid metadata enters actual decoder FIFO");
       bool rejected = false;

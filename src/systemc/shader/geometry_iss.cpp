@@ -13,8 +13,20 @@ namespace {
 bool Fits(std::uint32_t first, std::uint32_t count, std::uint32_t limit) {
   return first <= limit && count <= limit - first;
 }
-void ValidateAbi(const DriverPcoStageAbi &abi) {
+void ValidateAbi(const DriverPcoStageAbi &abi,
+                 const DriverStorageBufferAbi *storage) {
   const auto descriptors = abi.uniform_buffer_descriptor_start;
+  const auto uniform_end =
+      descriptors + 4U * abi.uniform_buffer_descriptor_count;
+  const auto storage_count = storage ? storage->descriptor_count : 0U;
+  const auto storage_start = storage && storage_count
+                                 ? storage->descriptor_start
+                                 : uniform_end;
+  const auto storage_mask = storage_count >= 32U
+                                ? UINT32_MAX
+                                : storage_count
+                                      ? (UINT32_C(1) << storage_count) - 1U
+                                      : 0U;
   if (abi.temps > kPcoTemporaryCount || abi.vertex_inputs < 2 ||
       abi.vertex_inputs > kPcoVertexInputCount ||
       abi.vertex_outputs < 4 || abi.vertex_outputs > kPcoVertexOutputCount || abi.coefficients ||
@@ -22,7 +34,15 @@ void ValidateAbi(const DriverPcoStageAbi &abi) {
       abi.uniform_buffer_descriptor_count > 15 ||
       descriptors < 4 || (descriptors - 4) % kPcoTextureDescriptorDwordCount ||
       (descriptors - 4) / kPcoTextureDescriptorDwordCount > kPcoMaximumTextureDescriptorSets ||
-      abi.push_constant_start != descriptors + 4 * abi.uniform_buffer_descriptor_count ||
+      (storage &&
+       (storage_count > 32U ||
+        (storage->descriptor_start &&
+         storage->descriptor_start != uniform_end) ||
+        (storage_count && storage->descriptor_start != uniform_end) ||
+        (storage->used_mask & ~storage_mask) ||
+        ((storage->read_mask | storage->write_mask) &
+         ~storage->used_mask))) ||
+      abi.push_constant_start != storage_start + 4U * storage_count ||
       !Fits(abi.push_constant_start, abi.push_constant_count, abi.shareds) ||
       std::uint64_t{abi.push_constant_start} + abi.push_constant_count != abi.shareds)
     Fail("register or primitive/UBO/push ABI is invalid");
@@ -143,9 +163,10 @@ bool Condition(unsigned condition, const GeometryTaskState &task) {
 }
 
 unsigned TextureDataCount(const PcoInstruction &i) {
-  return i.texture_dimension + ((i.texture_address_offset || i.texture_lod_replace) ? 1U : 0U) +
+  return i.texture_dimension +
+         ((i.texture_address_offset || i.texture_lod_replace || i.texture_lod_bias) ? 1U : 0U) +
          (i.texture_address_offset ? 2U : 0U) +
-         (i.texture_sample_index_present ? 1U : 0U);
+         ((i.texture_sample_index_present || i.texture_spatial_offset_present) ? 1U : 0U);
 }
 void ValidateSample(const PcoInstruction &i, const DriverPcoStageAbi &abi) {
   // The first four GS shared words describe its primitive input buffer.
@@ -158,6 +179,10 @@ void ValidateSample(const PcoInstruction &i, const DriverPcoStageAbi &abi) {
       i.texture_address_offset > 1 || i.texture_fcnorm > 1 ||
       i.texture_non_normalized_coords > 1 || i.texture_sample_index_present > 1 ||
       i.texture_lod_replace > 1 || i.texture_spatial_offset_present != 0 ||
+      i.texture_shadow_compare > 1 ||
+      (!i.texture_shadow_compare &&
+       (i.texture_shadow_reference.bank != PcoRegisterBank::kSpecial ||
+        i.texture_shadow_reference.index != 0)) ||
       (i.texture_non_normalized_coords && !i.texture_sample_index_present && !i.texture_lod_replace) ||
       (i.texture_sample_index_present && (!i.texture_non_normalized_coords ||
          i.texture_lod_replace || i.texture_dimension != 2)) ||
@@ -170,6 +195,8 @@ void ValidateSample(const PcoInstruction &i, const DriverPcoStageAbi &abi) {
       i.source2.bank != PcoRegisterBank::kShared ||
       i.source2.index != i.source1.index + 8)
     Fail("native SMP source/response/descriptor layout is invalid");
+  if (i.texture_shadow_compare)
+    ValidateSource(i.texture_shadow_reference, 0, abi);
 }
 PcoTextureRequest SampleRequest(const PcoInstruction &i,
                                const DriverPcoStageAbi &abi,
@@ -210,13 +237,24 @@ PcoTextureRequest SampleRequest(const PcoInstruction &i,
   request.sample_index_present = i.texture_sample_index_present;
   request.fcnorm = i.texture_fcnorm;
   request.data_request = i.data_request;
+  const bool descriptor_shadow =
+      (task.shared[i.source1.index + 7U] & UINT32_C(0x200)) != 0;
+  if (descriptor_shadow != (i.texture_shadow_compare != 0))
+    Fail("shadow descriptor and native Dref marker disagree");
+  if (descriptor_shadow) {
+    if (task.shared[i.source1.index + 12U] > 7U)
+      Fail("shadow descriptor compare operation is invalid");
+    request.shadow_reference = Read(i.texture_shadow_reference, 0, abi, task);
+    request.shadow_compare = 1;
+  }
   return request;
 }
 } // namespace
 
 void ValidateGeometryProgram(const PcoDecodedProgram &program,
-                             const DriverPcoStageAbi &abi) {
-  ValidateAbi(abi);
+                             const DriverPcoStageAbi &abi,
+                             const DriverStorageBufferAbi *storage) {
+  ValidateAbi(abi, storage);
   if (program.summary.stage != ShaderStage::kGeometry || program.instructions.empty() ||
       !program.summary.ends_task || program.summary.pixel_output_mask ||
       program.summary.writes_depth || program.summary.instruction_count != program.instructions.size())
@@ -237,19 +275,29 @@ void ValidateGeometryProgram(const PcoDecodedProgram &program,
           i.target != PcoWriteTarget::kVertexInput)))
       Fail("invalid unary bitwise ALU metadata");
     const bool load = i.opcode == PcoOpcode::kBufferLoad;
+    const bool atomic = IsPcoAtomic32(i.opcode);
     const bool sample = i.opcode == PcoOpcode::kTextureSample;
     const bool wdf = i.opcode == PcoOpcode::kWaitDataFence;
     const bool mask = i.opcode == PcoOpcode::kConditionalMask;
     const bool branch = i.opcode == PcoOpcode::kBranch;
     if (!IsAlu(i.opcode) && !IsWrite(i.opcode) && !IsEmit(i.opcode) && !IsCut(i.opcode) &&
-        !IsEnd(i.opcode) && !load && !sample && !wdf && !mask && !branch && i.opcode != PcoOpcode::kNop)
+        !IsEnd(i.opcode) && !load && !atomic && !sample && !wdf && !mask &&
+        !branch && i.opcode != PcoOpcode::kNop)
       Fail("opcode requires unimplemented geometry functionality");
     if (pending && !wdf) Fail("native memory request is not followed by WDF");
     if (load) {
       if (i.repeat_count != 1 || i.source_count != 2 || i.data_request ||
           !i.component_count || i.component_count > 16 || i.memory_cache_mode > 1 ||
-          i.end_group || i.target != PcoWriteTarget::kTemporary)
+          i.end_group ||
+          (i.target != PcoWriteTarget::kTemporary &&
+           i.target != PcoWriteTarget::kVertexInput))
         Fail("invalid native LD metadata");
+      pending = true;
+    } else if (atomic) {
+      if (!HasCanonicalPcoAtomic32(i, true) || i.end_group ||
+          (i.target != PcoWriteTarget::kTemporary &&
+           i.target != PcoWriteTarget::kVertexInput))
+        Fail("invalid native atomic32 metadata");
       pending = true;
     } else if (sample) {
       ValidateSample(i, abi);
@@ -278,7 +326,8 @@ void ValidateGeometryProgram(const PcoDecodedProgram &program,
     if (i.target == PcoWriteTarget::kPixelOutput ||
         (i.target == PcoWriteTarget::kVertexOutput && !IsWrite(i.opcode)))
       Fail("non-UVSW graphics export in geometry program");
-    const auto count = (load || sample) ? i.component_count : i.repeat_count;
+    const auto count = (load || atomic || sample) ? i.component_count
+                                                   : i.repeat_count;
     if ((i.target == PcoWriteTarget::kTemporary && !Fits(i.output_index, count, abi.temps)) ||
         (i.target == PcoWriteTarget::kVertexInput && !Fits(i.output_index, count, abi.vertex_inputs)) ||
         (i.target == PcoWriteTarget::kVertexOutput && !Fits(i.output_index, count, abi.vertex_outputs)))
@@ -318,8 +367,8 @@ void ValidateGeometryProgram(const PcoDecodedProgram &program,
 
 GeometryTaskState MakeGeometryTask(const DriverPcoStageAbi &abi,
     const std::vector<std::uint32_t> &shared, std::uint32_t primitive_id,
-    std::uint32_t invocation_id) {
-  ValidateAbi(abi);
+    std::uint32_t invocation_id, const DriverStorageBufferAbi *storage) {
+  ValidateAbi(abi, storage);
   if (shared.size() != abi.shareds || shared[3]) Fail("shared payload disagrees with geometry ABI");
   GeometryTaskState task;
   std::copy(shared.begin(), shared.end(), task.shared.begin());
@@ -344,8 +393,10 @@ void StepGeometryTask(const PcoDecodedProgram &program,
   if (i.opcode == PcoOpcode::kWaitDataFence) {
     if (task.pending_count || Selected(i, task)) ++stats.instructions;
     for (unsigned component = 0; component < task.pending_count; ++component)
-      Write(PcoWriteTarget::kTemporary, task.pending_output + component,
+      Write(task.pending_target, task.pending_output + component,
             task.pending_words[component], abi, task);
+    task.pending_target = PcoWriteTarget::kNone;
+    task.pending_output = 0;
     task.pending_count = 0;
   } else if (i.opcode == PcoOpcode::kBranch) {
     const bool take = i.branch_condition == 1 ? !task.execution_predicate :
@@ -385,12 +436,26 @@ void StepGeometryTask(const PcoDecodedProgram &program,
       const auto address = Read(i.source, 0, abi, task) |
           (static_cast<std::uint64_t>(Read(i.source1, 0, abi, task)) << 32U);
       cb.read(cb.user_data, address, i.component_count, task.pending_words.data());
-      task.pending_output = i.output_index; task.pending_count = i.component_count;
+      task.pending_target = i.target;
+      task.pending_output = i.output_index;
+      task.pending_count = i.component_count;
       ++stats.load_instructions; ++stats.memory_instructions;
+    } else if (IsPcoAtomic32(i.opcode)) {
+      if (!cb.atomic32) Fail("native atomic32 has no modeled memory callback");
+      const auto address = Read(i.source, 0, abi, task) |
+          (static_cast<std::uint64_t>(Read(i.source1, 0, abi, task)) << 32U);
+      const auto operand = Read(i.source2, 0, abi, task);
+      task.pending_words[0] =
+          cb.atomic32(cb.user_data, i.opcode, address, operand);
+      task.pending_target = i.target;
+      task.pending_output = i.output_index;
+      task.pending_count = 1;
+      ++stats.memory_instructions;
     } else if (i.opcode == PcoOpcode::kTextureSample) {
       if (!cb.sample) Fail("native SMP has no TextureUnit request callback");
       const auto request = SampleRequest(i, abi, task);
       cb.sample(cb.user_data, request, task.pending_words.data());
+      task.pending_target = i.target;
       task.pending_output = i.output_index;
       task.pending_count = kPcoTextureResponseCount;
       ++stats.texture_instructions;

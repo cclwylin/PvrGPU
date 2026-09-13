@@ -16,6 +16,7 @@
 #include "uniform_buffers.h"
 #include "texture_stages.h"
 #include "shader_images.h"
+#include "graphics_shader_buffers.h"
 #include "tessellation_buffers.h"
 #include "common/geometry_emission.h"
 #include "common/tessellation_state.h"
@@ -1575,7 +1576,7 @@ void Submitter::RunJob() {
   std::vector<std::uint64_t> sequence_depth_addresses(submission_count, 0);
   std::vector<std::pair<const DriverShaderImage *, std::uint64_t>> sequence_image_storage;
   std::vector<std::pair<const DriverShaderBufferResource *, std::uint64_t>>
-      sequence_tessellation_buffer_storage;
+      sequence_graphics_buffer_storage;
   DriverPcoExternalTextureAllocation sequence_external_allocation;
   if (driver_pco_sequence_command &&
       !ResolveSequenceAttachmentAddresses(options_.driver_commands,
@@ -1606,9 +1607,8 @@ void Submitter::RunJob() {
                 DriverTextureDescriptorStart(texture.stage);
         if (texture.texture_kind > 4U ||
             (texture.texture_kind == 4U &&
-             (texture.stage != DriverPcoShaderStage::kFragment ||
-              texture.source != DriverPcoTextureSource::kExternalPayload)))
-          throw std::runtime_error("Submitter cube array requires external fragment storage");
+             texture.source != DriverPcoTextureSource::kExternalPayload))
+          throw std::runtime_error("Submitter cube array requires external storage");
         if ((texture.stage != DriverPcoShaderStage::kVertex &&
              texture.stage != DriverPcoShaderStage::kFragment &&
              texture.stage != DriverPcoShaderStage::kGeometry &&
@@ -1664,7 +1664,9 @@ void Submitter::RunJob() {
     if (command.sample_frequency > 1)
       throw std::runtime_error("Submitter sample frequency is invalid");
     state.raster_state.sample_frequency = command.sample_frequency;
-    state.raster_state.shader_writes_memory = command.fragment_image_write_mask != 0;
+    state.raster_state.shader_writes_memory =
+        command.fragment_image_write_mask != 0 ||
+        command.graphics_storage[1].write_mask != 0;
     state.raster_state.shader_early_tests = command.fragment_early_tests;
     state.raster_state.multisample_enable = driver_pco_triangles_command ?
         (command.multisample ? 1 : 0) : 1;
@@ -1930,7 +1932,7 @@ void Submitter::RunJob() {
       if (!command.tessellation.control_pco.empty()) {
         const auto &source = command.tessellation;
         const auto count = command.indexed ? command.index_count : command.vertex_count;
-        if (!memory_ || !command.geometry_pco.empty() || command.primitive_mode != 14 ||
+        if (!memory_ || command.primitive_mode != 14 ||
             !source.input_vertices || source.input_vertices > kTessellationTaskWidth ||
             !source.vertices_per_instance || count % source.vertices_per_instance ||
             count > kTessellationMaxPatches * kTessellationTaskWidth)
@@ -1994,7 +1996,13 @@ void Submitter::RunJob() {
         state.geometry_layer_output_count = command.geometry_layer_output_count;
         state.geometry_primitive_id_output_start = command.geometry_primitive_id_output_start;
         state.geometry_primitive_id_output_count = command.geometry_primitive_id_output_count;
-        state.geometry_input_primitives = StoreNewArray(pool_, GeometryInputsFor(command));
+        /* A standalone GS consumes primitives assembled from the API draw.
+         * In a combined pipeline TES publishes the generated domain
+         * primitives after evaluation instead, so no patch-input metadata
+         * may be fabricated here. */
+        if (command.tessellation.control_pco.empty())
+          state.geometry_input_primitives =
+              StoreNewArray(pool_, GeometryInputsFor(command));
       }
       state.position_output_start =
           command.position_output_start;
@@ -2628,14 +2636,22 @@ void Submitter::RunJob() {
       std::vector<std::uint32_t> evaluation_shared = command.tessellation.evaluation_shared;
       std::vector<UniformBufferResource> control_uniform_buffers;
       std::vector<UniformBufferResource> evaluation_uniform_buffers;
+      std::vector<ShaderBufferResource> graphics_buffer_resources;
+      std::array<std::vector<ShaderBufferRange>, 5> graphics_buffer_ranges;
       std::vector<TessellationBufferResource> tessellation_buffer_resources;
       std::array<std::vector<TessellationBufferRange>, 2>
           tessellation_buffer_ranges;
       std::string uniform_error;
       if (!ValidateDriverUniformBuffers(command, &uniform_error) ||
           !ValidateDriverShaderImages(command, &uniform_error) ||
+          !ValidateDriverGraphicsShaderBuffers(command, &uniform_error) ||
           !ValidateDriverTessellationBuffers(command, &uniform_error))
         throw std::runtime_error(uniform_error);
+      if (!command.graphics_buffer_resources.empty() &&
+          (!command.tessellation.buffer_resources.empty() ||
+           !command.tessellation.buffer_bindings.empty()))
+        throw std::runtime_error(
+            "Submitter graphics and legacy tessellation buffers overlap");
       state.fragment_image_descriptor_start = command.fragment_image_descriptor_start;
       state.fragment_image_descriptor_count = command.fragment_image_descriptor_count;
       state.fragment_image_read_mask = command.fragment_image_read_mask;
@@ -2653,6 +2669,14 @@ void Submitter::RunJob() {
           resource.height = image.height; resource.depth = image.depth;
           resource.row_stride = image.row_stride; resource.layer_stride = image.layer_stride;
           resource.texel_bytes = image.texel_bytes;
+          const auto buffer_alias = std::find_if(
+              sequence_graphics_buffer_storage.begin(),
+              sequence_graphics_buffer_storage.end(), [&](const auto &prior) {
+                return prior.first->resource_token == image.resource_token;
+              });
+          if (buffer_alias != sequence_graphics_buffer_storage.end())
+            throw std::runtime_error(
+                "Submitter fragment image aliases a graphics buffer");
           const auto alias = std::find_if(sequence_image_storage.begin(), sequence_image_storage.end(),
               [&](const auto &prior) { return prior.first->resource_token == image.resource_token; });
           if (alias != sequence_image_storage.end()) {
@@ -2719,6 +2743,83 @@ void Submitter::RunJob() {
         if (!geometry_uniform_buffers.empty())
           state.geometry_uniform_buffer_resources = StoreNewArray(pool_, geometry_uniform_buffers);
       }
+      if (!command.graphics_buffer_resources.empty()) {
+        if (!driver_pco_sequence_command || !memory_)
+          throw std::runtime_error(
+              "Submitter graphics storage buffers require sequence GPU memory");
+        graphics_buffer_resources.resize(
+            command.graphics_buffer_resources.size());
+        for (std::size_t index = 0;
+             index < command.graphics_buffer_resources.size(); ++index) {
+          const auto &source = command.graphics_buffer_resources[index];
+          auto &resource = graphics_buffer_resources[index];
+          resource.resource_token = source.resource_token;
+          resource.bytes = source.bytes.size();
+          const auto image_alias = std::find_if(
+              sequence_image_storage.begin(), sequence_image_storage.end(),
+              [&](const auto &prior) {
+                return prior.first->resource_token == source.resource_token;
+              });
+          if (image_alias != sequence_image_storage.end())
+            throw std::runtime_error(
+                "Submitter graphics buffer aliases a fragment image");
+          const auto alias = std::find_if(
+              sequence_graphics_buffer_storage.begin(),
+              sequence_graphics_buffer_storage.end(), [&](const auto &prior) {
+                return prior.first->resource_token == source.resource_token;
+              });
+          if (alias != sequence_graphics_buffer_storage.end()) {
+            if (alias->first->bytes != source.bytes)
+              throw std::runtime_error(
+                  "Submitter graphics buffer changed without a sequence boundary");
+            resource.gpu_address = alias->second;
+          } else {
+            if (sequence_graphics_buffer_storage.size() >=
+                kDriverSequenceAddressSlots * kMaximumGraphicsBufferResources)
+              throw std::runtime_error(
+                  "Submitter graphics buffer address slots exhausted");
+            resource.gpu_address = kTessellationBufferGpuAddressBase +
+                sequence_graphics_buffer_storage.size() *
+                    kTessellationBufferResourceAddressStride;
+            memory_->HostWrite(resource.gpu_address, source.bytes.data(),
+                               source.bytes.size());
+            sequence_graphics_buffer_storage.emplace_back(&source,
+                                                            resource.gpu_address);
+          }
+          resource.readback = StoreNewArray(pool_, source.bytes);
+        }
+        for (const auto &binding : command.graphics_buffer_bindings) {
+          const auto stage = static_cast<std::size_t>(binding.stage);
+          auto &resource =
+              graphics_buffer_resources.at(binding.resource_index);
+          const auto address = resource.gpu_address + binding.offset;
+          const auto &storage = command.graphics_storage.at(stage);
+          auto &shared = stage == 0 ? vertex_shared_words
+                       : stage == 1 ? fragment_shared
+                       : stage == 2 ? geometry_shared
+                       : stage == 3 ? control_shared : evaluation_shared;
+          const auto bit = UINT32_C(1) << binding.slot;
+          const auto access =
+              ((storage.read_mask & bit) ? 1U : 0U) |
+              ((storage.write_mask & bit) ? 2U : 0U);
+          const auto word = storage.descriptor_start + 4U * binding.slot;
+          shared.at(word) = static_cast<std::uint32_t>(address);
+          shared.at(word + 1U) = static_cast<std::uint32_t>(address >> 32U);
+          resource.access |= access;
+          graphics_buffer_ranges.at(stage).push_back(
+              {address, binding.bytes_size, access, binding.slot});
+        }
+        state.graphics_buffer_resources =
+            StoreNewArray(pool_, graphics_buffer_resources);
+        for (std::size_t stage = 0; stage < graphics_buffer_ranges.size();
+             ++stage)
+          if (!graphics_buffer_ranges[stage].empty())
+            state.graphics_buffer_ranges[stage] =
+                StoreNewArray(pool_, graphics_buffer_ranges[stage]);
+      }
+      for (std::size_t stage = 0; stage < command.graphics_storage.size();
+           ++stage)
+        state.graphics_storage[stage] = command.graphics_storage[stage];
       if (!command.tessellation.buffer_resources.empty()) {
         if (!driver_pco_sequence_command || !memory_ ||
             !HasPoolHandle(state.tessellation_state))
@@ -2741,27 +2842,27 @@ void Submitter::RunJob() {
             throw std::runtime_error(
                 "Submitter tessellation buffer aliases a fragment image");
           const auto alias = std::find_if(
-              sequence_tessellation_buffer_storage.begin(),
-              sequence_tessellation_buffer_storage.end(), [&](const auto &prior) {
+              sequence_graphics_buffer_storage.begin(),
+              sequence_graphics_buffer_storage.end(), [&](const auto &prior) {
                 return prior.first->resource_token == source.resource_token;
               });
-          if (alias != sequence_tessellation_buffer_storage.end()) {
+          if (alias != sequence_graphics_buffer_storage.end()) {
             if (alias->first->bytes != source.bytes)
               throw std::runtime_error(
                   "Submitter tessellation buffer changed without a sequence boundary");
             resource.gpu_address = alias->second;
           } else {
-            if (sequence_tessellation_buffer_storage.size() >=
+            if (sequence_graphics_buffer_storage.size() >=
                 kDriverSequenceAddressSlots * kMaximumTessellationBufferResources)
               throw std::runtime_error(
                   "Submitter tessellation buffer address slots exhausted");
             resource.gpu_address = kTessellationBufferGpuAddressBase +
-                sequence_tessellation_buffer_storage.size() *
+                sequence_graphics_buffer_storage.size() *
                     kTessellationBufferResourceAddressStride;
             memory_->HostWrite(resource.gpu_address, source.bytes.data(),
                                source.bytes.size());
-            sequence_tessellation_buffer_storage.emplace_back(&source,
-                                                                resource.gpu_address);
+            sequence_graphics_buffer_storage.emplace_back(&source,
+                                                           resource.gpu_address);
           }
           resource.readback = StoreNewArray(pool_, source.bytes);
         }
@@ -3033,13 +3134,16 @@ void Submitter::RunJob() {
               throw std::runtime_error("Submitter cube array face count is invalid");
             ValidateTextureCubeArrayLayout(resource);
             const auto &words = DriverTextureShared(command, texture.stage);
-            const std::size_t base = texture.descriptor_set * kPcoTextureDescriptorDwordCount;
+            const std::size_t base =
+                DriverTextureDescriptorStart(texture.stage) +
+                texture.descriptor_set * kPcoTextureDescriptorDwordCount;
             std::array<std::uint32_t, 4> image_words{};
             std::copy_n(words.begin() + base, 4, image_words.begin());
             ValidateTextureSingleLevelDimensions(image_words, resource);
             if (words.at(base + 4U) !=
                   static_cast<std::uint64_t>(resource.mip[0].row_pitch_bytes) * resource.mip[0].height ||
-                words.at(base + 7U) || words.at(base + 12U))
+                (words.at(base + 7U) & ~UINT32_C(0x300)) != 0U ||
+                words.at(base + 12U) > 7U)
               throw std::runtime_error("Submitter cube array descriptor face stride/mode mismatch");
           }
           if (resource.sample_count > 1U) {

@@ -104,6 +104,8 @@ static void add_textures(nir_shader *fs, unsigned count, unsigned targets,
          }
          nir_shader_gather_info(fs, impl);
          fs->info.num_textures = count;
+         for (unsigned unit = 0; unit < count; ++unit)
+            BITSET_SET(fs->info.textures_used, unit);
          return;
       }
    }
@@ -170,11 +172,11 @@ static void test_shared_register_limits(struct pvrgpu_pco_compiler *compiler)
    } cases[] = {
       {4, 100, 0, 0, 1, 4, 120, 0, 0},
       {80, 4, 4, 0, 1, 96, 24, 0, 0},
-      {84, 4, 4, 0, 1, 20, 24, 0, 0},
-      {4, 224, 0, 3, 1, 4, 256, 0, 0},
-      {4, 228, 0, 3, 1, 4, 36, 0, 0},
-      {4, 96, 0, 0, 8, 4, 256, 0, 0},
-      {4, 100, 0, 0, 8, 4, 164, 0, 0},
+      {369, 4, 4, 0, 1, 20, 24, 0, 0},
+      {4, 352, 0, 3, 1, 4, 384, 0, 0},
+      {4, 353, 0, 3, 1, 4, 36, 0, 0},
+      {4, 224, 0, 0, 8, 4, 384, 0, 0},
+      {4, 225, 0, 0, 8, 4, 164, 0, 0},
    };
    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
       nir_shader *vs = shader(true, cases[i].vs_blocks, true);
@@ -187,6 +189,17 @@ static void test_shared_register_limits(struct pvrgpu_pco_compiler *compiler)
          1, cases[i].textures, &binary, error, sizeof(error));
       check(accepted,
             "shared register pressure rejected a valid full or packed CB0 program");
+      if (binary.vertex.abi.shareds != cases[i].vs_shared ||
+          binary.fragment.abi.shareds != cases[i].fs_shared ||
+          binary.vertex.cb0_word_map.count != cases[i].vs_map ||
+          binary.fragment.cb0_word_map.count != cases[i].fs_map) {
+         fprintf(stderr,
+                 "shared budget case %u: VS shared/map=%u/%u, FS shared/map=%u/%u\n",
+                 i, binary.vertex.abi.shareds,
+                 binary.vertex.cb0_word_map.count,
+                 binary.fragment.abi.shareds,
+                 binary.fragment.cb0_word_map.count);
+      }
       check(binary.vertex.abi.shareds == cases[i].vs_shared &&
             binary.fragment.abi.shareds == cases[i].fs_shared,
             "accepted stage has an incorrect full/packed shared span");

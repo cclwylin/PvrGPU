@@ -4,6 +4,7 @@
 #include "common/tessellation_state.h"
 #include "memory/gpu_memory_system.h"
 #include "shader/tessellation_iss.h"
+#include "shader/usc_shader_buffer_memory.h"
 #include "shader/usc_uniform_buffer_memory.h"
 #include <algorithm>
 #include <cstring>
@@ -39,6 +40,7 @@ class OwnedPayload {
 struct EvaluationMemory {
   GpuMemorySystem &memory;
   UscUniformBufferMemory &uniforms;
+  UscShaderBufferMemory &storage;
   CounterTxn &counters;
   const std::vector<TessellationBufferRange> &buffers;
   std::uint64_t patch_address,patch_bytes;
@@ -77,6 +79,13 @@ struct EvaluationMemory {
     ApplyMemoryAccessStats(self.counters,write);
     WaitForCycles(MemoryAccessDelayCycles(write));
   }
+  static std::uint32_t Atomic32(void *opaque, PcoOpcode operation,
+                                std::uint64_t address,
+                                std::uint32_t operand) {
+    auto &self = *static_cast<EvaluationMemory *>(opaque);
+    return UscShaderBufferMemory::Atomic32(&self.storage, operation, address,
+                                           operand);
+  }
 };
 std::uint32_t Bits(float value){std::uint32_t bits;std::memcpy(&bits,&value,4);return bits;}
 }
@@ -100,12 +109,20 @@ void TessellationEvaluationShader::Execute(PipelineState &state, const PipelineT
      state.position_output_count!=4 || state.position_output_start>60 ||
      t.domain_address>UINT64_MAX-kTessellationMaxDrawPoints*sizeof(TessellationDomainPoint) ||
      t.output_address>UINT64_MAX-std::uint64_t{kTessellationMaxPatches}*kTessellationPatchAddressStride ||
-     HasPoolHandle(t.evaluation_instructions) || HasPoolHandle(state.geometry_code) ||
+     HasPoolHandle(t.evaluation_instructions) ||
+     HasPoolHandle(state.geometry_input_primitives) ||
      HasPoolHandle(state.geometry_primitives))
     throw std::runtime_error("TES phase/address/register/ownership contract is invalid");
+  const bool generic_storage = HasPoolHandle(state.graphics_buffer_resources) ||
+      state.graphics_storage[4].descriptor_start ||
+      state.graphics_storage[4].descriptor_count ||
+      state.graphics_storage[4].used_mask || state.graphics_storage[4].read_mask ||
+      state.graphics_storage[4].write_mask;
+  const DriverStorageBufferAbi &storage_abi = generic_storage
+      ? state.graphics_storage[4] : t.evaluation_storage;
   const auto program=DecodeTessellationPcoProgram(ShaderStage::kTessellationEvaluation,
       LoadArray<std::uint8_t>(pool_,t.evaluation_code));
-  ValidateTessellationProgram(program,t.evaluation_abi,&t.evaluation_storage);
+  ValidateTessellationProgram(program,t.evaluation_abi,&storage_abi);
   t.evaluation_summary=program.summary;
   t.evaluation_instructions=StoreNewArray(pool_,program.instructions);
   StoreArray(pool_,state.tessellation_state,records);
@@ -121,19 +138,36 @@ void TessellationEvaluationShader::Execute(PipelineState &state, const PipelineT
     throw std::runtime_error("TES domain storage exceeds draw bound");
   const auto point_count=point_bytes/sizeof(TessellationDomainPoint);
   const auto primitive_size=t.point_mode?1U:t.domain==TessellationDomain::kIsolines?2U:3U;
+  const bool geometry_enabled=HasPoolHandle(state.geometry_code);
+  if (geometry_enabled &&
+      (state.geometry_input_primitive_vertices!=primitive_size ||
+       state.geometry_input_stride_dwords!=t.evaluation_abi.vertex_outputs))
+    throw std::runtime_error("TES-to-GS primitive/layout linkage is invalid");
   const auto required_mask=UINT64_C(15)<<state.position_output_start;
   UscUniformBufferMemory uniforms(memory_,state.memory_mode,
       HasPoolHandle(t.evaluation_uniform_buffers)?LoadArray<UniformBufferResource>(pool_,t.evaluation_uniform_buffers):
                                                  std::vector<UniformBufferResource>{});
-  const auto storage_buffers = HasPoolHandle(t.evaluation_buffer_ranges)
-      ? LoadArray<TessellationBufferRange>(pool_, t.evaluation_buffer_ranges)
+  const PoolHandle storage_resources_handle = generic_storage
+      ? state.graphics_buffer_resources : t.buffer_resources;
+  const PoolHandle storage_ranges_handle = generic_storage
+      ? state.graphics_buffer_ranges[4] : t.evaluation_buffer_ranges;
+  auto storage_resources = HasPoolHandle(storage_resources_handle)
+      ? LoadArray<ShaderBufferResource>(pool_, storage_resources_handle)
+      : std::vector<ShaderBufferResource>{};
+  const auto storage_buffers = HasPoolHandle(storage_ranges_handle)
+      ? LoadArray<ShaderBufferRange>(pool_, storage_ranges_handle)
       : std::vector<TessellationBufferRange>{};
+  UscShaderBufferMemory storage_memory(memory_, state.memory_mode,
+      storage_resources, storage_buffers,
+      MemoryClient::kTessellationEvaluation);
   OwnedPayload task_payload(pool_,sizeof(TessellationTaskState));
   std::vector<VertexLane> lanes;
   std::vector<VertexLaneRef> refs;
   std::vector<GeometryRasterPrimitive> primitives;
+  std::vector<GeometryInputPrimitive> geometry_inputs;
   lanes.reserve(point_count);refs.reserve(indices.size()/primitive_size*3);
   primitives.reserve(indices.size()/primitive_size);
+  geometry_inputs.reserve(indices.size()/primitive_size);
   TessellationExecutionStats execution;
   std::size_t consumed_indices=0;
   for(const auto &patch:patches) {
@@ -149,7 +183,7 @@ void TessellationEvaluationShader::Execute(PipelineState &state, const PipelineT
     shared[0]=static_cast<std::uint32_t>(patch.output_address);
     shared[1]=static_cast<std::uint32_t>(patch.output_address>>32U);
     shared[2]=t.patch_stride_dwords*4;shared[3]=0;
-    EvaluationMemory context{*memory_,uniforms,state.counters,storage_buffers,
+    EvaluationMemory context{*memory_,uniforms,storage_memory,state.counters,storage_buffers,
                              patch.output_address,t.patch_stride_dwords*4};
     context.sample = [this, &state, &txn](const PcoTextureRequest &request, std::uint32_t *response) {
       SampleTessellationTexture(pool_, state, txn, ShaderStage::kTessellationEvaluation, request,
@@ -157,6 +191,7 @@ void TessellationEvaluationShader::Execute(PipelineState &state, const PipelineT
     };
     const TessellationMemoryCallbacks callbacks{&context,EvaluationMemory::Read,
                                                  EvaluationMemory::Write,
+                                                 EvaluationMemory::Atomic32,
                                                  EvaluationMemory::Sample};
     for(unsigned first=0;first<patch.point_count;first+=kTessellationTaskWidth) {
       const auto count=std::min(kTessellationTaskWidth,patch.point_count-first);
@@ -176,7 +211,7 @@ void TessellationEvaluationShader::Execute(PipelineState &state, const PipelineT
       auto &task=*task_payload.data<TessellationTaskState>();
       task=MakeTessellationEvaluationTask(t.evaluation_abi,shared,patch.primitive_id,
                                           t.output_vertices,coordinates.data(),count,
-                                          &t.evaluation_storage);
+                                          &storage_abi);
       while(!task.ended)StepTessellationTask(program,t.evaluation_abi,task,callbacks,execution);
       for(unsigned index=0;index<count;++index) {
         const auto &result=task.lanes[index];
@@ -189,6 +224,22 @@ void TessellationEvaluationShader::Execute(PipelineState &state, const PipelineT
       state.counters.ds_invocations+=count;
     }
     for(unsigned index=0;index<patch.index_count;index+=primitive_size) {
+      if (geometry_enabled) {
+        GeometryInputPrimitive primitive;
+        primitive.primitive_id=static_cast<std::uint32_t>(geometry_inputs.size());
+        primitive.instance_id=patch.instance_id;
+        primitive.vertex_count=static_cast<std::uint8_t>(primitive_size);
+        for(unsigned c=0;c<primitive_size;++c) {
+          const auto local=indices[patch.index_start+index+c];
+          if(local>=patch.point_count)
+            throw std::runtime_error("TES generated index exceeds its patch point range");
+          const auto vertex=patch.point_start+local;
+          primitive.vertex_indices[c]=static_cast<std::uint32_t>(refs.size());
+          refs.push_back({vertex,vertex});
+        }
+        geometry_inputs.push_back(primitive);
+        continue;
+      }
       GeometryRasterPrimitive primitive;
       primitive.refs.vertex_count=static_cast<std::uint8_t>(primitive_size);
       primitive.refs.provoking_vertex=static_cast<std::uint8_t>(primitive_size-1);
@@ -205,25 +256,21 @@ void TessellationEvaluationShader::Execute(PipelineState &state, const PipelineT
   }
   if(lanes.size()!=point_count || consumed_indices!=indices.size())
     throw std::runtime_error("TES patch descriptors do not own the entire domain storage");
-  if (HasPoolHandle(t.buffer_resources)) {
-    auto resources = LoadArray<TessellationBufferResource>(pool_, t.buffer_resources);
-    for (auto &resource : resources) {
+  if (HasPoolHandle(storage_resources_handle)) {
+    for (auto &resource : storage_resources) {
       if (!(resource.access & 2U)) continue;
       if (!resource.resource_token || !resource.gpu_address || !resource.bytes ||
           !HasPoolHandle(resource.readback))
         throw std::runtime_error("TES writable storage buffer has no readback backing");
-      const auto read = memory_->Read(resource.gpu_address, resource.bytes,
-                                      MemoryClient::kTessellationEvaluation);
-      if (read.data.size() != resource.bytes)
-        throw std::runtime_error("TES storage buffer readback extent mismatch");
-      StoreArray(pool_, resource.readback, read.data);
-      ApplyMemoryAccessStats(state.counters, read.stats);
-      WaitForCycles(MemoryAccessDelayCycles(read.stats));
+      const auto bytes = storage_memory.Readback(resource);
+      StoreArray(pool_, resource.readback, bytes);
     }
-    StoreArray(pool_, t.buffer_resources, resources);
+    StoreArray(pool_, storage_resources_handle, storage_resources);
   }
   ApplyMemoryAccessStats(state.counters,uniforms.stats());
+  ApplyMemoryAccessStats(state.counters,storage_memory.stats());
   WaitForCycles(MemoryAccessDelayCycles(uniforms.stats()));
+  WaitForCycles(MemoryAccessDelayCycles(storage_memory.stats()));
   state.counters.pco_decode_cycles+=program.summary.group_count;
   state.counters.pco_instructions+=program.summary.instruction_count;
   state.counters.usc_groups+=execution.groups;state.counters.usc_cluster_cycles+=execution.groups;
@@ -245,13 +292,14 @@ void TessellationEvaluationShader::Execute(PipelineState &state, const PipelineT
   }
   OwnedPayload new_lanes(pool_,lanes.size()*sizeof(VertexLane));
   OwnedPayload new_refs(pool_,refs.size()*sizeof(VertexLaneRef));
-  OwnedPayload new_primitives(pool_,primitives.size()*sizeof(GeometryRasterPrimitive));
   if(!lanes.empty())std::memcpy(new_lanes.data<VertexLane>(),lanes.data(),lanes.size()*sizeof(VertexLane));
   if(!refs.empty())std::memcpy(new_refs.data<VertexLaneRef>(),refs.data(),refs.size()*sizeof(VertexLaneRef));
-  if(!primitives.empty())std::memcpy(new_primitives.data<GeometryRasterPrimitive>(),primitives.data(),primitives.size()*sizeof(GeometryRasterPrimitive));
   pool_.Release(state.vertex_lanes);pool_.Release(state.vertex_lane_refs);
   state.vertex_lanes=new_lanes.Publish();state.vertex_lane_refs=new_refs.Publish();
-  state.geometry_primitives=new_primitives.Publish();
+  if(geometry_enabled)
+    state.geometry_input_primitives=StoreNewArray(pool_,geometry_inputs);
+  else
+    state.geometry_primitives=StoreNewArray(pool_,primitives);
   for(auto *handle:{&state.vertex_indices,&state.expanded_source_vertices}) {
     if(HasPoolHandle(*handle))pool_.Release(*handle);*handle={};
   }

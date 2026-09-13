@@ -18,6 +18,9 @@ test_all_owned_fields(void)
    struct pvrgpu_systemc_pco_sequence_texture textures[2] = {{0}};
    struct pvrgpu_systemc_pco_uniform_buffer ubo[5] = {{0}};
    struct pvrgpu_systemc_shader_image images[2] = {{0}};
+   struct pvrgpu_systemc_shader_buffer_resource buffers[2] = {{0}};
+   struct pvrgpu_systemc_shader_buffer_binding bindings[2] = {{0}};
+   struct pvrgpu_systemc_graphics_shader_buffers graphics = {0};
    struct pvrgpu_systemc_stream_output_target targets[2] = {{0}};
    struct pvrgpu_systemc_stream_output so = {0};
    uint64_t bytes = UINT64_MAX;
@@ -53,13 +56,21 @@ test_all_owned_fields(void)
    images[1].bytes_size = 83;
    draw.fragment_images = images;
    draw.fragment_image_count = 2;
+   buffers[0] = (struct pvrgpu_systemc_shader_buffer_resource){107, &byte, 101};
+   buffers[1] = (struct pvrgpu_systemc_shader_buffer_resource){109, &byte, 103};
+   graphics.resources = buffers;
+   graphics.resource_count = 2;
+   graphics.bindings = bindings;
+   graphics.binding_count = 2;
+   draw.graphics_buffers = &graphics;
    targets[0].bytes = targets[1].bytes = &byte;
    targets[0].bytes_size = 89;
    targets[1].bytes_size = 97;
    so.targets = targets; so.target_count = 2;
    draw.stream_output = &so;
    const uint64_t expected = 11+13+17+19+23+29+43+47 +
-      4*(31+37+41+53+59) + 61+67 + 71+72+73+74+75 + 79+83 + 89+97;
+      4*(31+37+41+53+59) + 61+67 + 71+72+73+74+75 + 79+83 +
+      101+103 + 89+97;
    CHECK(pvrgpu_pco_draw_payload_bytes(&draw, textures, 2, &bytes) && bytes == expected);
    /* Attachment aliases have metadata extent, but no owned input byte vector. */
    textures[1].source = PVRGPU_SYSTEMC_PCO_TEXTURE_PREVIOUS_COLOR_ATTACHMENT;
@@ -84,6 +95,21 @@ test_all_owned_fields(void)
    CHECK(!pvrgpu_pco_draw_payload_bytes(&draw, textures, 1, &bytes));
    draw.fragment_images = images; so.targets = NULL;
    CHECK(!pvrgpu_pco_draw_payload_bytes(&draw, textures, 1, &bytes));
+   so.targets = targets;
+   graphics.resources = NULL;
+   CHECK(!pvrgpu_pco_draw_payload_bytes(&draw, textures, 1, &bytes));
+   graphics.resources = buffers;
+   graphics.resource_count = UINT32_MAX;
+   CHECK(!pvrgpu_pco_draw_payload_bytes(&draw, textures, 1, &bytes));
+   graphics.resource_count = 2;
+   graphics.bindings = NULL;
+   CHECK(!pvrgpu_pco_draw_payload_bytes(&draw, textures, 1, &bytes));
+   graphics.bindings = bindings;
+   buffers[0].bytes = NULL;
+   CHECK(!pvrgpu_pco_draw_payload_bytes(&draw, textures, 1, &bytes));
+   buffers[0].bytes = &byte;
+   buffers[0].bytes_size = PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BYTES + 1U;
+   CHECK(!pvrgpu_pco_draw_payload_bytes(&draw, textures, 1, &bytes));
    CHECK(!pvrgpu_pco_draw_payload_bytes(NULL, NULL, 0, &bytes));
    CHECK(!pvrgpu_pco_draw_payload_bytes(&draw, textures, UINT32_MAX, &bytes));
 }
@@ -101,6 +127,19 @@ test_overflow_and_retry_boundaries(void)
    draw.vertex_pco_size = 1;
    if (SIZE_MAX == UINT64_MAX)
       CHECK(!pvrgpu_pco_draw_payload_bytes(&draw, NULL, 0, &bytes));
+   uint8_t byte = 0;
+   struct pvrgpu_systemc_shader_buffer_resource resources[2] = {
+      {1, &byte, PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BYTES},
+      {2, &byte, 1},
+   };
+   struct pvrgpu_systemc_graphics_shader_buffers graphics = {
+      .resources = resources,
+      .resource_count = 2,
+   };
+   draw = (struct pvrgpu_systemc_driver_command){0};
+   draw.graphics_buffers = &graphics;
+   CHECK(pvrgpu_pco_draw_payload_bytes(&draw, NULL, 0, &bytes) &&
+         bytes == PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BYTES + 1U);
    const uint64_t limit = PVRGPU_SYSTEMC_MAX_PCO_SEQUENCE_PAYLOAD_BYTES;
    CHECK(limit == UINT64_C(536870912));
    CHECK(pvrgpu_payload_decide(0, limit, 0, true, limit) == PVRGPU_PAYLOAD_FITS);

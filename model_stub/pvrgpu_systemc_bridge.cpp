@@ -4,6 +4,7 @@
 #include "texture_stages.h"
 #include "shader_images.h"
 #include "tessellation_buffers.h"
+#include "graphics_shader_buffers.h"
 #include "texture/astc_decoder.h"
 #include "texture/texture_unit.h"
 #include "pco_sequence_profiles.h"
@@ -818,6 +819,55 @@ void CopyPcoPayloadFields(
     COPY_TESS(control_barrier_count); COPY_TESS(domain); COPY_TESS(spacing);
     COPY_TESS(clockwise); COPY_TESS(point_mode);
 #undef COPY_TESS
+  }
+  destination->graphics_storage = {};
+  destination->graphics_buffer_resources.clear();
+  destination->graphics_buffer_bindings.clear();
+  if (source.graphics_buffers) {
+    const auto &buffers = *source.graphics_buffers;
+    if (buffers.resource_count > PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_RESOURCES ||
+        buffers.binding_count > PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BINDINGS ||
+        ((buffers.resource_count != 0) != (buffers.resources != nullptr)) ||
+        ((buffers.binding_count != 0) != (buffers.bindings != nullptr)))
+      throw std::runtime_error(
+          "SystemC API graphics storage buffer count/pointer mismatch");
+    for (std::size_t stage = 0; stage < destination->graphics_storage.size();
+         ++stage) {
+      const auto &storage = buffers.storage[stage];
+      destination->graphics_storage[stage] = {
+          storage.descriptor_start, storage.descriptor_count,
+          storage.used_mask, storage.read_mask, storage.write_mask};
+    }
+    std::uint64_t graphics_resource_bytes = 0;
+    for (unsigned index = 0; index < buffers.resource_count; ++index) {
+      const auto &resource = buffers.resources[index];
+      if (!resource.resource_token || !resource.bytes || !resource.bytes_size ||
+          resource.bytes_size > PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BYTES -
+                                    graphics_resource_bytes)
+        throw std::runtime_error(
+            "SystemC API graphics storage backing snapshot is invalid");
+      graphics_resource_bytes += resource.bytes_size;
+    }
+    for (unsigned index = 0; index < buffers.binding_count; ++index)
+      if (buffers.bindings[index].stage >= 5U)
+        throw std::runtime_error(
+            "SystemC API graphics storage binding stage is invalid");
+    destination->graphics_buffer_resources.reserve(buffers.resource_count);
+    for (unsigned index = 0; index < buffers.resource_count; ++index) {
+      const auto &resource = buffers.resources[index];
+      pvrgpu::stub::DriverShaderBufferResource copy;
+      copy.resource_token = resource.resource_token;
+      copy.bytes.assign(resource.bytes, resource.bytes + resource.bytes_size);
+      destination->graphics_buffer_resources.push_back(std::move(copy));
+    }
+    destination->graphics_buffer_bindings.reserve(buffers.binding_count);
+    for (unsigned index = 0; index < buffers.binding_count; ++index) {
+      const auto &binding = buffers.bindings[index];
+      destination->graphics_buffer_bindings.push_back({
+          static_cast<pvrgpu::stub::DriverPcoShaderStage>(binding.stage),
+          binding.slot, binding.resource_index, binding.access, binding.offset,
+          binding.bytes_size});
+    }
   }
   if (source.geometry_pco_size != 0) {
     destination->geometry_pco.assign(source.geometry_pco,
@@ -1713,12 +1763,19 @@ bool CopyPcoSequenceDraw(
   const bool geometry = source.geometry_pco_size != 0;
   const bool tessellation = source.tessellation != nullptr;
   if (tessellation) {
-    if (const char *reason = pvrgpu_tessellation_payload_error(source.tessellation))
+    if (const char *reason = pvrgpu_tessellation_payload_error_with_graphics(
+            source.tessellation, source.graphics_buffers))
       return refuse(reason);
-    if (geometry || source.primitive_mode != 14 ||
+    if (source.primitive_mode != 14 ||
         source.tessellation->input_stride_dwords != source.vertex_pco_abi.vertex_outputs ||
         (source.indexed ? source.index_count : source.vertex_count) % source.tessellation->vertices_per_instance)
       return refuse("tessellation stage/topology/input linkage");
+    const std::uint32_t tessellation_primitive_vertices =
+        source.tessellation->point_mode ? 1U
+        : source.tessellation->domain == 2U ? 2U : 3U;
+    if (geometry && source.geometry_input_primitive_vertices !=
+                        tessellation_primitive_vertices)
+      return refuse("tessellation-to-geometry primitive linkage");
     if (const char *reason = pvrgpu_tessellation_draw_extent_error(source.tessellation,
           source.indexed ? source.index_count : source.vertex_count))
       return refuse(reason);
@@ -1762,6 +1819,17 @@ bool CopyPcoSequenceDraw(
   }
   if (geometry) {
     const auto &gs = source.geometry_pco_abi;
+    const auto *storage = source.graphics_buffers
+        ? &source.graphics_buffers->storage[
+              PVRGPU_SYSTEMC_PCO_SHADER_STAGE_GEOMETRY]
+        : nullptr;
+    const std::uint64_t uniform_end =
+        std::uint64_t{gs.uniform_buffer_descriptor_start} +
+        4U * gs.uniform_buffer_descriptor_count;
+    const std::uint64_t push_start = storage && storage->descriptor_count
+        ? std::uint64_t{storage->descriptor_start} +
+              4U * storage->descriptor_count
+        : uniform_end;
     const uint32_t inputs = source.geometry_input_primitive_vertices;
     if (!source.geometry_pco || !source.geometry_shared ||
         source.geometry_pco_size > pvrgpu::stub::kDriverPcoMaximumBinaryBytes ||
@@ -1773,11 +1841,14 @@ bool CopyPcoSequenceDraw(
         (gs.uniform_buffer_descriptor_start - 4U) % pvrgpu::stub::kPcoTextureDescriptorDwordCount != 0 ||
         (gs.uniform_buffer_descriptor_start - 4U) / pvrgpu::stub::kPcoTextureDescriptorDwordCount >
             pvrgpu::stub::kPcoMaximumTextureDescriptorSets ||
-        gs.push_constant_start != gs.uniform_buffer_descriptor_start + 4U * gs.uniform_buffer_descriptor_count ||
+        (storage && storage->descriptor_count > 32U) ||
+        gs.push_constant_start != push_start ||
         uint64_t(gs.push_constant_start) + gs.push_constant_count != gs.shareds ||
         source.geometry_shared_count != gs.shareds || gs.shareds < 4 ||
         (inputs != 1 && inputs != 2 && inputs != 3 && inputs != 4 && inputs != 6) ||
-        source.geometry_input_stride_dwords != source.vertex_pco_abi.vertex_outputs ||
+        source.geometry_input_stride_dwords !=
+            (tessellation ? source.tessellation->evaluation_abi.vertex_outputs
+                          : source.vertex_pco_abi.vertex_outputs) ||
         source.geometry_input_stride_dwords < 4 ||
         source.geometry_input_stride_dwords > 64 ||
         source.geometry_max_vertices > 256 || source.geometry_invocations == 0 ||
@@ -2163,6 +2234,10 @@ bool CopyCommand(const pvrgpu_systemc_driver_command &source,
     *error = "unsupported SystemC API command version";
     return false;
   }
+  if (source.graphics_buffers) {
+    *error = "SystemC API graphics storage buffers require a nested PCO draw";
+    return false;
+  }
   if (source.fragment_images || source.fragment_image_count ||
       source.fragment_image_descriptor_start || source.fragment_image_descriptor_count ||
       source.fragment_image_read_mask || source.fragment_image_write_mask || source.fragment_early_tests) {
@@ -2342,6 +2417,13 @@ std::uint64_t CommandOwnedPayloadBytes(
     if (resource.bytes.size() >
         std::numeric_limits<std::uint64_t>::max() - byte_vectors)
       throw std::overflow_error("SystemC API tessellation buffer payload size overflow");
+    byte_vectors += resource.bytes.size();
+  }
+  for (const auto &resource : command.graphics_buffer_resources) {
+    if (resource.bytes.size() >
+        std::numeric_limits<std::uint64_t>::max() - byte_vectors)
+      throw std::overflow_error(
+          "SystemC API graphics storage buffer payload size overflow");
     byte_vectors += resource.bytes.size();
   }
   const std::uint64_t dword_count =
@@ -2525,11 +2607,10 @@ bool CopyPcoSequenceTexture(
       (source.texture_kind == 0U && source.layers > 1U))
     return reject("dimension/layer count");
   if (source.texture_kind == 4U &&
-      (source.stage != PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT ||
-       source.source != PVRGPU_SYSTEMC_PCO_TEXTURE_EXTERNAL_PAYLOAD ||
+      (source.source != PVRGPU_SYSTEMC_PCO_TEXTURE_EXTERNAL_PAYLOAD ||
        !source.layers || source.layers % 6U || source.layers / 6U > 2048U ||
        samples != 1U || block_width != 1U || block_height != 1U))
-    return reject("whole-cube uncompressed single-sample fragment array");
+    return reject("whole-cube uncompressed single-sample array");
   if (samples > 1U &&
       (source.source != PVRGPU_SYSTEMC_PCO_TEXTURE_EXTERNAL_PAYLOAD ||
        source.texture_kind > 1U || source.mip_count != 1U ||
@@ -2783,6 +2864,9 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
   std::uint64_t payload_bytes = 0;
   bool saw_stream_output = false;
   std::unordered_map<std::uint64_t, const pvrgpu::stub::DriverShaderImage *> image_snapshots;
+  std::unordered_map<std::uint64_t,
+                     const pvrgpu::stub::DriverShaderBufferResource *>
+      graphics_buffer_snapshots;
   for (std::size_t ordinal = 0;
        ordinal < source.pco_sequence_command_count; ++ordinal) {
     pvrgpu::stub::DriverCommand command;
@@ -2914,10 +2998,11 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
           pvrgpu::stub::DriverTextureDescriptorStart(texture.stage);
       const bool tessellation_texture = texture.stage == pvrgpu::stub::DriverPcoShaderStage::kTessellationControl ||
           texture.stage == pvrgpu::stub::DriverPcoShaderStage::kTessellationEvaluation;
-      if (tessellation_texture && (texture.texture_kind != 0 || texture.layers != 1 ||
-          texture.sample_count != 1 || !texture.normalized_coordinates ||
-          shared.at(image_word1 + 11U) != 0)) {
-        *error = "SystemC API tessellation texture requires normalized nonshadow single-sample 2D";
+      if (tessellation_texture &&
+          (texture.texture_kind > 4U || texture.sample_count != 1 ||
+           !texture.normalized_coordinates ||
+           shared.at(image_word1 + 11U) > 7U)) {
+        *error = "SystemC API tessellation texture requires normalized native single-sample state";
         return false;
       }
       const std::uint32_t descriptor_samples = 1U << (shared.at(image_word1) >> 30U);
@@ -2931,8 +3016,9 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
             static_cast<std::uint64_t>(texture.mip[0].row_pitch_bytes) * texture.mip[0].height;
         if ((shared.at(base) & 7U) != 1U ||
             ((shared.at(base + 2U) >> 4U) & 2047U) + 1U != texture.layers / 6U ||
-            shared.at(base + 4U) != face_stride || shared.at(base + 7U) ||
-            shared.at(base + 12U)) {
+            shared.at(base + 4U) != face_stride ||
+            (shared.at(base + 7U) & ~UINT32_C(0x300)) != 0U ||
+            shared.at(base + 12U) > 7U) {
           *error = "SystemC API cube array descriptor cube count/face stride/mode mismatch";
           return false;
         }
@@ -2985,12 +3071,32 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
     }
     if (!pvrgpu::stub::ValidateDriverUniformBuffers(command, error) ||
         !pvrgpu::stub::ValidateDriverShaderImages(command, error) ||
-        !pvrgpu::stub::ValidateDriverTessellationBuffers(command, error))
+        !pvrgpu::stub::ValidateDriverTessellationBuffers(command, error) ||
+        !pvrgpu::stub::ValidateDriverGraphicsShaderBuffers(command, error))
       return false;
     for (const auto &image : command.fragment_images) {
+      if (graphics_buffer_snapshots.count(image.resource_token)) {
+        *error =
+            "SystemC API fragment image aliases a graphics buffer";
+        return false;
+      }
       const auto [entry, inserted] = image_snapshots.emplace(image.resource_token, &image);
       if (!inserted && entry->second->bytes != image.bytes) {
         *error = "SystemC API fragment image snapshot changed within one sequence";
+        return false;
+      }
+    }
+    for (const auto &buffer : command.graphics_buffer_resources) {
+      if (image_snapshots.count(buffer.resource_token)) {
+        *error =
+            "SystemC API graphics buffer aliases a fragment image";
+        return false;
+      }
+      const auto [entry, inserted] =
+          graphics_buffer_snapshots.emplace(buffer.resource_token, &buffer);
+      if (!inserted && entry->second->bytes != buffer.bytes) {
+        *error =
+            "SystemC API graphics buffer snapshot changed within one sequence";
         return false;
       }
     }
@@ -3291,6 +3397,11 @@ extern "C" int pvrgpu_systemc_submit_compute(
   try {
     pvrgpu::stub::ModelComputeDispatch prepared;
     std::string diagnostic;
+    pvrgpu::stub::Options session_options;
+    if (!SetTextureLodModeFromEnvironment(&session_options, &diagnostic)) {
+      CopyError(error, error_size, diagnostic);
+      return 2;
+    }
     if (!PrepareComputeDispatch(*dispatch, &prepared, &diagnostic)) {
       CopyError(error, error_size, diagnostic);
       return 2;
@@ -3311,7 +3422,7 @@ extern "C" int pvrgpu_systemc_submit_compute(
     }
     pvrgpu::stub::ModelComputeStats result;
     const int status = pvrgpu::stub::RunConfiguredCompute(
-        &prepared, &result, &diagnostic);
+        &prepared, &result, session_options.exact_texture_lod, &diagnostic);
     if (status != 0) {
       CopyError(error, error_size, diagnostic);
       return status;

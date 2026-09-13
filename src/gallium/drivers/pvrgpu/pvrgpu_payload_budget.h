@@ -40,6 +40,15 @@ pvrgpu_pco_draw_payload_bytes(
        (draw->uniform_buffer_count && !draw->uniform_buffers) ||
        draw->fragment_image_count > PVRGPU_SYSTEMC_MAX_SHADER_IMAGES ||
        (draw->fragment_image_count && !draw->fragment_images) ||
+       (draw->graphics_buffers &&
+        (draw->graphics_buffers->resource_count >
+            PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_RESOURCES ||
+         draw->graphics_buffers->binding_count >
+            PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BINDINGS ||
+         ((draw->graphics_buffers->resource_count != 0) !=
+            (draw->graphics_buffers->resources != NULL)) ||
+         ((draw->graphics_buffers->binding_count != 0) !=
+            (draw->graphics_buffers->bindings != NULL)))) ||
        (draw->stream_output &&
         (draw->stream_output->target_count > PVRGPU_SYSTEMC_MAX_STREAM_OUTPUT_BUFFERS ||
          (draw->stream_output->target_count && !draw->stream_output->targets))))
@@ -82,6 +91,18 @@ pvrgpu_pco_draw_payload_bytes(
    for (unsigned i = 0; i < draw->fragment_image_count; ++i)
       if (!pvrgpu_payload_add(&total, draw->fragment_images[i].bytes_size))
          return false;
+   if (draw->graphics_buffers) {
+      const struct pvrgpu_systemc_graphics_shader_buffers *buffers =
+         draw->graphics_buffers;
+      for (unsigned i = 0; i < buffers->resource_count; ++i) {
+         const struct pvrgpu_systemc_shader_buffer_resource *resource =
+            &buffers->resources[i];
+         if (!resource->bytes || !resource->bytes_size ||
+             resource->bytes_size > PVRGPU_SYSTEMC_MAX_SHADER_BUFFER_BYTES ||
+             !pvrgpu_payload_add(&total, resource->bytes_size))
+            return false;
+      }
+   }
    if (draw->stream_output)
       for (unsigned i = 0; i < draw->stream_output->target_count; ++i)
          if (!pvrgpu_payload_add(&total, draw->stream_output->targets[i].bytes_size))

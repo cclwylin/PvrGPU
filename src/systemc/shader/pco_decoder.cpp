@@ -266,9 +266,18 @@ void PcoDecoder::Run() {
       state.raster_state.shader_writes_depth = decoded.summary.writes_depth;
       const bool native_atomic = std::any_of(decoded.instructions.begin(), decoded.instructions.end(),
           [](const PcoInstruction &instruction) { return IsPcoAtomic32(instruction.opcode); });
+      const bool fragment_image_atomic_contract =
+          state.fragment_image_write_mask != 0 &&
+          HasPoolHandle(state.fragment_image_resources);
+      const bool fragment_storage_atomic_contract =
+          state.graphics_storage[1].write_mask != 0 &&
+          HasPoolHandle(state.graphics_buffer_resources) &&
+          HasPoolHandle(state.graphics_buffer_ranges[1]);
       if (native_atomic && (!state.raster_state.shader_writes_memory ||
-          !state.fragment_image_write_mask || !HasPoolHandle(state.fragment_image_resources)))
-        throw std::runtime_error("fragment native atomic lacks an observable image side-effect contract");
+          (!fragment_image_atomic_contract &&
+           !fragment_storage_atomic_contract)))
+        throw std::runtime_error(
+            "fragment native atomic lacks an observable memory side-effect contract");
       // Visibility feedback may reject a fragment after shader execution;
       // defer depth/stencil writes until PBE observes the native result.
       state.raster_state.shader_may_discard = std::any_of(

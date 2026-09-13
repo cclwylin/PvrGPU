@@ -17,6 +17,7 @@ struct TessellationLaneState {
   std::uint64_t outputs_written = 0;
   std::uint32_t pending_output = 0;
   std::uint32_t pending_count = 0;
+  PcoWriteTarget pending_target = PcoWriteTarget::kNone;
   std::uint32_t pending_operation = 0; // 0=none, 1=LD, 2=ST, 3=SMP
   std::uint32_t predicate = 0;
   std::uint32_t execution_predicate = 1;
@@ -46,6 +47,7 @@ struct TessellationMemoryCallbacks {
   void *user_data = nullptr;
   PcoMemoryReadCallback read = nullptr;
   void (*write)(void *, std::uint64_t, std::uint32_t, const std::uint32_t *) = nullptr;
+  PcoMemoryAtomic32Callback atomic32 = nullptr;
   void (*sample)(void *, const PcoTextureRequest &, std::uint32_t *) = nullptr;
 };
 

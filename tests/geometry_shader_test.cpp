@@ -18,9 +18,11 @@ using namespace pvrgpu::stub;
 namespace {
 unsigned checks=0;
 void Check(bool yes,const char *reason) { ++checks; if(!yes) throw std::runtime_error(reason); }
-template<class Fn> void Reject(Fn fn) {
+template<class Fn> void Reject(Fn fn,
+                               const char *reason = "unlabelled mutation") {
   try { fn(); } catch(const std::exception &) { ++checks; return; }
-  throw std::runtime_error("expected fail-closed native GS rejection");
+  throw std::runtime_error(std::string("expected fail-closed native GS rejection: ") +
+                           reason);
 }
 std::uint32_t FloatBits(float value) { std::uint32_t bits; std::memcpy(&bits,&value,4); return bits; }
 void RejectFragmentOnlyBias() {
@@ -349,6 +351,38 @@ void PureNative() {
     if(field==4) bad.push_back(0);
     Reject([&]{DecodeGeometryPcoProgram(bad);});
   }
+  // Turn the fixture's first four-DWORD TEMP response into the extended
+  // VTXIN0..3 encoding emitted by register allocation under higher pressure.
+  // The group grows by two bytes; its header length is measured in words.
+  auto vtxin_response = binary;
+  ++vtxin_response[0];
+  vtxin_response[9] = 0x80;
+  vtxin_response.insert(vtxin_response.begin() + 10, {0x04, 0x00});
+  auto vtxin_program = DecodeGeometryPcoProgram(vtxin_response);
+  Check(vtxin_program.instructions[0].opcode == PcoOpcode::kBufferLoad &&
+            vtxin_program.instructions[0].target ==
+                PcoWriteTarget::kVertexInput &&
+            vtxin_program.instructions[0].output_index == 0 &&
+            vtxin_program.instructions[0].component_count == 4,
+        "native GS LD accepts a bounded register-allocated VTXIN response");
+  auto out_of_range = vtxin_response;
+  out_of_range[9] = 0xbf;  // vi63 plus a four-DWORD response.
+  Reject([&] { DecodeGeometryPcoProgram(out_of_range); });
+  Reject([&] { ValidateGeometryProgram(vtxin_program, abi); });
+  auto vtxin_abi = abi;
+  vtxin_abi.vertex_inputs = 4;
+  unsigned remapped_reads = 0;
+  for (auto &instruction : vtxin_program.instructions) {
+    if (instruction.target == PcoWriteTarget::kVertexOutput &&
+        instruction.source.bank == PcoRegisterBank::kTemporary &&
+        instruction.source.index < 4) {
+      instruction.source.bank = PcoRegisterBank::kVertexInput;
+      ++remapped_reads;
+    }
+  }
+  Check(remapped_reads == 4,
+        "VTXIN response fixture routes all four loaded words to UVSW");
+  ValidateGeometryProgram(vtxin_program, vtxin_abi);
   struct Record {
     std::array<std::uint32_t,4> input{}, output{};
     unsigned reads=0,emits=0,cuts=0,ends=0;
@@ -366,15 +400,40 @@ void PureNative() {
   };
   cb.cut=[](void *opaque){++static_cast<Record*>(opaque)->cuts;};
   cb.finish=[](void *opaque){++static_cast<Record*>(opaque)->ends;};
+  record = {};
+  record.input = {UINT32_C(0x3f800000), UINT32_C(0x40000000),
+                  UINT32_C(0x40400000), UINT32_C(0x40800000)};
+  auto vtxin_task =
+      MakeGeometryTask(vtxin_abi, {0x1000, 0x80, 16, 0}, 19, 7);
+  GeometryExecutionStats vtxin_stats;
+  StepGeometryTask(vtxin_program, vtxin_abi, vtxin_task, cb, vtxin_stats);
+  Check(vtxin_task.pending_target == PcoWriteTarget::kVertexInput &&
+            vtxin_task.pending_count == 4 &&
+            !vtxin_task.temporary_written.test(0) && record.reads == 1,
+        "GS LD retains its VTXIN response bank until WDF");
+  StepGeometryTask(vtxin_program, vtxin_abi, vtxin_task, cb, vtxin_stats);
+  Check(vtxin_task.pending_target == PcoWriteTarget::kNone &&
+            !vtxin_task.pending_count &&
+            (vtxin_task.inputs_written & UINT64_C(0xf)) == UINT64_C(0xf) &&
+            !vtxin_task.temporary_written.test(0),
+        "WDF commits the whole native LD response to VTXIN only");
+  while (!vtxin_task.ended)
+    StepGeometryTask(vtxin_program, vtxin_abi, vtxin_task, cb, vtxin_stats);
+  Check(record.output == record.input && record.emits == 1 &&
+            record.cuts == 1 && record.ends == 1 &&
+            vtxin_stats.instructions == 9,
+        "VTXIN-backed native GS load reaches the exact UVSW export");
   for(unsigned epoch=0;epoch<31;++epoch) {
     record={}; for(unsigned i=0;i<4;++i) record.input[i]=(epoch*0x1234567U+i*0x1020304U)^0x80000000U;
     auto task=MakeGeometryTask(abi,{0x1000,0x80,16,0},19,7);
     GeometryExecutionStats stats;
     Check(task.inputs[0]==19&&task.inputs[1]==7,"GS true primitive/invocation system values");
     StepGeometryTask(program,abi,task,cb,stats);
-    Check(task.pending_count==4&&!task.temporary_written.test(0)&&record.reads==1,"LD result remains pending before WDF");
+    Check(task.pending_target==PcoWriteTarget::kTemporary&&task.pending_count==4&&
+        !task.temporary_written.test(0)&&record.reads==1,"LD result remains pending before WDF");
     StepGeometryTask(program,abi,task,cb,stats);
-    Check(!task.pending_count&&task.temporary_written.contains_range(0,4),"WDF commits true LD response");
+    Check(task.pending_target==PcoWriteTarget::kNone&&!task.pending_count&&
+        task.temporary_written.contains_range(0,4),"WDF commits true LD response");
     while(!task.ended) StepGeometryTask(program,abi,task,cb,stats);
     Check(record.output==record.input&&record.reads==1&&record.emits==1&&record.cuts==1&&record.ends==1,
         "native GS exact raw export/event conservation");
@@ -415,9 +474,10 @@ void SampleExecution() {
   for (const auto &i : native.instructions) if (i.opcode == PcoOpcode::kTextureSample) {
     Check(i.source1.index == 4 + native_samples * 20 && i.source2.index == 12 + native_samples * 20,
           "genuine GS binary decodes SH4/SH24 texture sets independently");
-    auto bad = GeometryTextureNativeFixture();
-    bad[i.binary_offset + 1] |= 3U;
-    Reject([&] { DecodeGeometryPcoProgram(bad); });
+    auto bad = native;
+    bad.instructions[&i - native.instructions.data()].source_count = 2;
+    Reject([&] { ValidateGeometryProgram(bad, GeometryTextureNativeAbi()); },
+           "decoded texture source-count mutation");
     ++native_samples;
   }
   Check(native_samples == 2, "native GS compiler fixture retains both true SMP instructions");
@@ -449,6 +509,10 @@ void SampleExecution() {
   for (unsigned set : {0U, 1U}) for (unsigned dimension : {2U, 3U}) {
     std::vector<std::uint32_t> shared(44);
     for (unsigned word = 4; word < shared.size(); ++word) shared[word] = 0x01020300U + word;
+    for (unsigned descriptor = 4; descriptor < 44; descriptor += 20) {
+      shared[descriptor + 7] = 0;
+      shared[descriptor + 12] = 0;
+    }
     auto task = MakeGeometryTask(abi, shared, 5, 7);
     for (unsigned c = 4; c < 8; ++c) {
       task.temporaries[c] = FloatBits(0.125F * (c - 3)); task.temporary_written.set(c);
@@ -477,13 +541,47 @@ void SampleExecution() {
     Check(stats.texture_instructions == 1 && !stats.memory_instructions && !stats.load_instructions,
           "GS SMP instruction accounting is separate from primitive LD");
     task = MakeGeometryTask(abi, shared, 0, 0);
-    Reject([&] { StepGeometryTask(program, abi, task, cb, stats); });
+    Reject([&] { StepGeometryTask(program, abi, task, cb, stats); },
+           "unwritten texture coordinate");
     sample.exec_cnd = 1; task.predicate = 0; record.calls = 0;
     StepGeometryTask(program, abi, task, cb, stats);
     StepGeometryTask(program, abi, task, cb, stats);
     Check(!record.calls && !task.pending_count && !task.temporary_written.test(0),
           "predicated-away GS SMP neither reads unwritten coords nor requests memory");
     sample.exec_cnd = 0;
+  }
+  {
+    std::vector<std::uint32_t> shared(44);
+    sample.source1 = {PcoRegisterBank::kShared, 4};
+    sample.source2 = {PcoRegisterBank::kShared, 12};
+    sample.texture_dimension = 2;
+    sample.texture_fcnorm = 1;
+    sample.texture_shadow_compare = 1;
+    sample.texture_shadow_reference = {PcoRegisterBank::kTemporary, 6};
+    shared[11] = UINT32_C(0x200);
+    shared[16] = 3;
+    auto task = MakeGeometryTask(abi, shared, 0, 0);
+    for (unsigned index = 4; index <= 6; ++index) {
+      task.temporaries[index] = 0x3e000000U + index;
+      task.temporary_written.set(index);
+    }
+    ValidateGeometryProgram(program, abi);
+    GeometryExecutionStats stats;
+    record.calls = 0;
+    StepGeometryTask(program, abi, task, cb, stats);
+    Check(record.calls == 1 && record.request.shadow_compare == 1 &&
+              record.request.shadow_reference == task.temporaries[6],
+          "GS shadow SMP preserves descriptor-backed native Dref metadata");
+    shared[11] = 0;
+    auto mismatch = MakeGeometryTask(abi, shared, 0, 0);
+    for (unsigned index = 4; index <= 6; ++index) {
+      mismatch.temporaries[index] = task.temporaries[index];
+      mismatch.temporary_written.set(index);
+    }
+    Reject([&] { StepGeometryTask(program, abi, mismatch, cb, stats); },
+           "shadow descriptor/marker mismatch");
+    sample.texture_shadow_compare = 0;
+    sample.texture_shadow_reference = {};
   }
   for (unsigned mutation = 0; mutation < 13; ++mutation) {
     auto bad = program;
@@ -503,11 +601,14 @@ void SampleExecution() {
       case 11: s.repeat_count = 2; break;
       case 12: bad.instructions[1].opcode = PcoOpcode::kNop; break;
     }
-    Reject([&] { ValidateGeometryProgram(bad, abi); });
+    Reject([&] { ValidateGeometryProgram(bad, abi); },
+           "texture metadata mutation");
   }
-  for (unsigned start : {0U, 3U, 5U, 20U, 184U}) {
+  for (unsigned start : {0U, 3U, 5U, 20U,
+                         static_cast<unsigned>(kPcoMaximumSharedCount + 1U)}) {
     auto bad = abi; bad.uniform_buffer_descriptor_start = bad.push_constant_start = bad.shareds = start;
-    Reject([&] { ValidateGeometryProgram(program, bad); });
+    Reject([&] { ValidateGeometryProgram(program, bad); },
+           "texture descriptor ABI mutation");
   }
 }
 

@@ -107,6 +107,12 @@ struct PipelineState {
   std::uint32_t fragment_image_write_mask = 0;
   std::uint32_t fragment_images_complete = 0;
   std::uint64_t fragment_image_atomics = 0;
+  /* API-v38 alias-preserving graphics storage shared by VS/FS/GS/TCS/TES.
+   * One resource table owns whole backing snapshots; each stage gets an exact
+   * bounded view table and descriptor ABI. */
+  PoolHandle graphics_buffer_resources;
+  PoolHandle graphics_buffer_ranges[5]{};
+  DriverStorageBufferAbi graphics_storage[5]{};
   // GS inputs retain complete API primitives (including adjacency). Native
   // emission produces new lanes and explicit primitive identities; neither
   // is inferred from a VS lane's single emitted flag.

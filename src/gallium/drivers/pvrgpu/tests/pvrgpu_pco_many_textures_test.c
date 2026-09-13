@@ -176,6 +176,85 @@ compile_many_textures(struct pvrgpu_pco_compiler *compiler, unsigned textures,
    pvrgpu_pco_graphics_binary_finish(&binary); ralloc_free(vs); ralloc_free(fs);
 }
 
+static nir_shader *
+indexed_shadow_compute(bool dynamic, bool non_uniform)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+      pco_nir_options(), "indexed_shadow_sampler_array");
+   b.shader->info.workgroup_size[0] = 1;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   nir_def *index = dynamic ?
+      nir_load_uniform(&b, 1, 32, nir_imm_int(&b, 0),
+                       .base = 0, .range = 1, .dest_type = nir_type_int32) :
+      nir_imm_int(&b, 7);
+   nir_tex_instr *tex = nir_tex_instr_create(b.shader, 4);
+   tex->op = nir_texop_tex;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->is_array = true;
+   tex->is_shadow = true;
+   tex->coord_components = 3;
+   tex->texture_non_uniform = tex->sampler_non_uniform = non_uniform;
+   tex->dest_type = nir_type_float32;
+   tex->src[0] = nir_tex_src_for_ssa(
+      nir_tex_src_coord, nir_imm_vec3(&b, .25f, .75f, 1.0f));
+   tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_comparator,
+                                      nir_imm_float(&b, .5f));
+   tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_texture_offset, index);
+   tex->src[3] = nir_tex_src_for_ssa(nir_tex_src_sampler_offset, index);
+   nir_def_init(&tex->instr, &tex->def, 1, 32);
+   nir_builder_instr_insert(&b, &tex->instr);
+   nir_store_ssbo(&b, &tex->def, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                  .write_mask = 1, .align_mul = 4);
+   nir_jump(&b, nir_jump_return);
+   nir_shader_gather_info(b.shader, b.impl);
+   b.shader->info.num_textures = 8;
+   b.shader->info.num_ssbos = 1;
+   for (unsigned slot = 0; slot < 8; ++slot) {
+      BITSET_SET(b.shader->info.textures_used, slot);
+      BITSET_SET(b.shader->info.samplers_used, slot);
+   }
+   return b.shader;
+}
+
+static void
+compile_indexed_shadow_compute(struct pvrgpu_pco_compiler *compiler,
+                               bool dynamic)
+{
+   nir_shader *nir = indexed_shadow_compute(dynamic, false);
+   char *before = nir_shader_as_str(nir, NULL);
+   const struct shader_info info = nir->info;
+   struct pvrgpu_pco_compute_binary binary = {0};
+   char error[2048] = {0};
+   require(pvrgpu_pco_compile_compute(compiler, nir, dynamic ? 1 : 0,
+                                      &binary, error, sizeof(error)), error);
+   require(binary.abi.sampled_texture_count == 8 &&
+           binary.abi.stage.uniform_buffer_descriptor_start == 160 &&
+           binary.abi.storage_buffer_descriptor_start == 160 &&
+           binary.abi.stage.shareds >= 164 &&
+           binary.abi.stage.shareds <= 256,
+           "indexed compute sampler uses eight packed descriptors before SSBO/CB0");
+   char *after = nir_shader_as_str(nir, NULL);
+   require(!strcmp(before, after) && !memcmp(&info, &nir->info, sizeof(info)),
+           "indexed sampler compilation leaves caller NIR and metadata unchanged");
+   ralloc_free(before);
+   ralloc_free(after);
+   pvrgpu_pco_compute_binary_finish(&binary);
+   ralloc_free(nir);
+}
+
+static void
+reject_nonuniform_shadow_compute(struct pvrgpu_pco_compiler *compiler)
+{
+   nir_shader *nir = indexed_shadow_compute(true, true);
+   struct pvrgpu_pco_compute_binary binary = {0};
+   char error[2048] = {0};
+   require(!pvrgpu_pco_compile_compute(compiler, nir, 1, &binary,
+                                       error, sizeof(error)) &&
+           strstr(error, "dynamically-uniform") && !binary.data,
+           "genuinely nonuniform sampler indexing remains fail-closed");
+   ralloc_free(nir);
+}
+
 static void
 cube_array_descriptor_tests(void)
 {
@@ -253,7 +332,9 @@ cube_array_descriptor_tests(void)
 static void
 cube_array_admission_tests(void)
 {
-   for (unsigned kind = 0; kind < 23; ++kind) {
+   for (unsigned kind = 0; kind < 21; ++kind) {
+      if (kind == 7 || kind == 17)
+         continue; /* Integer result and bounded dynamic index are supported. */
       nir_shader *s = array_coordinate_fragment(1);
       nir_tex_instr *tex = NULL;
       nir_foreach_function_impl(impl, s)
@@ -285,10 +366,8 @@ cube_array_admission_tests(void)
       case 18: nir_tex_instr_add_src(tex, nir_tex_src_sampler_handle, nir_imm_int64(&b, 0)); break;
       case 19: nir_tex_instr_add_src(tex, nir_tex_src_lod, tex->src[1].src.ssa); break;
       case 20: nir_tex_instr_remove_src(tex, 1); break;
-      case 21: stage = MESA_SHADER_VERTEX; break;
-      case 22: stage = MESA_SHADER_COMPUTE; break;
       }
-      require(!pvrgpu_native_fragment_cube_array(tex, stage, 1), "CubeArray unproven shape refused directly");
+      require(!pvrgpu_native_cube_array(tex, stage, 1), "CubeArray unproven shape refused directly");
       ralloc_free(s); /* Never pass malformed fixture definitions to an optimizer. */
    }
    nir_shader *s = array_coordinate_fragment(1);
@@ -297,14 +376,30 @@ cube_array_admission_tests(void)
       nir_foreach_block(block, impl)
          nir_foreach_instr(instr, block)
             if (instr->type == nir_instr_type_tex) tex = nir_instr_as_tex(instr);
-   require(pvrgpu_native_fragment_cube_array(tex, MESA_SHADER_FRAGMENT, 1), "explicit LOD shape supported");
+   for (unsigned stage = MESA_SHADER_VERTEX; stage <= MESA_SHADER_COMPUTE; ++stage)
+      require(pvrgpu_native_cube_array(tex, stage, 1),
+              "explicit LOD CubeArray shape is stage-independent");
+   tex->dest_type = nir_type_uint32;
+   require(pvrgpu_native_cube_array(tex, MESA_SHADER_GEOMETRY, 1),
+           "integer CubeArray response shape supported");
+   tex->dest_type = nir_type_float32;
+   nir_builder dynamic_builder = nir_builder_at(nir_before_instr(&tex->instr));
+   nir_def *dynamic_index = nir_load_instance_id(&dynamic_builder);
+   nir_tex_instr_add_src(tex, nir_tex_src_texture_offset, dynamic_index);
+   nir_tex_instr_add_src(tex, nir_tex_src_sampler_offset, dynamic_index);
+   require(pvrgpu_native_cube_array(tex, MESA_SHADER_FRAGMENT, 1),
+           "bounded dynamically-uniform CubeArray offsets admitted before expansion");
+   for (int source = (int)tex->num_srcs - 1; source >= 0; --source)
+      if (tex->src[source].src_type == nir_tex_src_texture_offset ||
+          tex->src[source].src_type == nir_tex_src_sampler_offset)
+         nir_tex_instr_remove_src(tex, source);
    nir_tex_instr_remove_src(tex, 1); tex->op = nir_texop_tex;
-   require(pvrgpu_native_fragment_cube_array(tex, MESA_SHADER_FRAGMENT, 1), "implicit LOD shape supported");
+   require(pvrgpu_native_cube_array(tex, MESA_SHADER_FRAGMENT, 1), "implicit LOD shape supported");
    nir_builder b = nir_builder_at(nir_before_instr(&tex->instr));
    nir_tex_instr_remove_src(tex, 0); tex->op = nir_texop_txs;
    tex->coord_components = 0; tex->dest_type = nir_type_int32; tex->def.num_components = 3;
    nir_tex_instr_add_src(tex, nir_tex_src_lod, nir_imm_int(&b, 0));
-   require(pvrgpu_native_fragment_cube_array(tex, MESA_SHADER_FRAGMENT, 1), "existing CubeArray size query preserved");
+   require(pvrgpu_native_cube_array(tex, MESA_SHADER_FRAGMENT, 1), "existing CubeArray size query preserved");
    ralloc_free(s);
 }
 #endif
@@ -328,6 +423,9 @@ int main(void)
    char error[2048] = {0};
    struct pvrgpu_pco_compiler *compiler = pvrgpu_pco_compiler_create(error, sizeof(error));
    require(compiler != NULL, error);
+   compile_indexed_shadow_compute(compiler, false);
+   compile_indexed_shadow_compute(compiler, true);
+   reject_nonuniform_shadow_compute(compiler);
    for (unsigned kind = 0; kind < 4; ++kind)
       compile_array_coordinate_fixture(compiler, kind);
    compile_many_textures(compiler, 9, 56, 13, 240, NULL, 609);

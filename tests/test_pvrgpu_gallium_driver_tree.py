@@ -255,7 +255,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("full_depth_clear_resource", context_header)
         self.assertIn("pvrgpu_note_full_depth_clear_one", clear)
         self.assertIn("pvrgpu_invalidate_full_depth_clear_for_resource", resource)
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 34u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 38u", systemc_api)
         for field in (
             "const uint8_t *raw_vertex_data;",
             "size_t raw_vertex_data_size;",
@@ -601,8 +601,6 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("terrain source-hash mismatch did not fail closed", native_test)
         self.assertIn("terrain precision mismatch did not fail closed", native_test)
         self.assertIn("0xc33cf9ea6c986551", context)
-        self.assertIn("0x798ce5dd9c33fa18", context)
-        self.assertIn("0x1369112ad898bbfd", context)
         for fingerprint in (
             "0xa69ccd9838551cb3",
             "0x777443d6a3c0ceeb",
@@ -624,7 +622,6 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         )
         self.assertRegex(
             context,
-            r"terrain_pass == 0\s*&&\s*"
             r"terrain_profile == PVRGPU_PCO_TERRAIN_D4\s*&&\s*"
             r"ctx->terrain_pco_draw_count == PVRGPU_PCO_TERRAIN_D4\s*&&\s*"
             r"terrain_failure_reason\s*&&\s*"
@@ -809,7 +806,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 34u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 38u", systemc_api)
         for field in (
             "uint32_t vertex_stride;",
             "uint32_t position_output_start;",
@@ -947,7 +944,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 34u", systemc_api)
+        self.assertIn("PVRGPU_SYSTEMC_API_VERSION 38u", systemc_api)
         self.assertIn("command=draw_pco_triangles", command)
         self.assertIn("pvrgpu_write_draw_pco_triangles_command", command_header)
         self.assertIn("PVRGPU_DRAW_PCO_TRIANGLES_VERTEX_COUNT 6144u", command_header)

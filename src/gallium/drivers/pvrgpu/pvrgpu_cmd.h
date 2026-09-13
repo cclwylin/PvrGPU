@@ -246,6 +246,9 @@ struct pvrgpu_draw_pco_triangles_command {
    uint32_t uniform_buffer_count;
 
    uint32_t sampled_texture_count;
+   /* Internal validation metadata. The public sequence payload keeps one
+    * flat texture array and reconstructs these five stage counts from it. */
+   uint32_t sampled_texture_count_by_stage[5];
    const uint8_t *sampled_texture_bytes;
    size_t sampled_texture_bytes_size;
    uint32_t sampled_texture_width;
@@ -272,6 +275,7 @@ struct pvrgpu_draw_pco_triangles_command {
    uint32_t geometry_primitive_id_output_start;
    uint32_t geometry_primitive_id_output_count;
    const struct pvrgpu_systemc_tessellation *tessellation;
+   const struct pvrgpu_systemc_graphics_shader_buffers *graphics_buffers;
    uint32_t position_output_start;
    uint32_t position_output_count;
    uint32_t fragment_position_start;

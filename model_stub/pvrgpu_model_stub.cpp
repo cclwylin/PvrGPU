@@ -1320,7 +1320,7 @@ int pvrgpu::stub::RunConfiguredModel(pvrgpu::stub::Options options,
 
 int pvrgpu::stub::RunConfiguredCompute(
     ModelComputeDispatch *dispatch, ModelComputeStats *stats,
-    std::string *error) {
+    bool exact_texture_lod, std::string *error) {
   if (!dispatch || !stats) {
     if (error)
       *error = "missing compute dispatch or result";
@@ -1329,10 +1329,14 @@ int pvrgpu::stub::RunConfiguredCompute(
   if (!g_session) {
     g_session = std::make_unique<ModelSession>(
         dispatch->memory_mode, dispatch->memory_mode == MemoryMode::kBypass,
-        false);
+        exact_texture_lod);
   } else if (g_session->memory_mode() != dispatch->memory_mode) {
     if (error)
       *error = "SystemC model memory mode cannot change after elaboration";
+    return 2;
+  } else if (g_session->exact_texture_lod() != exact_texture_lod) {
+    if (error)
+      *error = "SystemC model texture LOD mode cannot change after elaboration";
     return 2;
   }
   return g_session->RunCompute(dispatch, stats, error);

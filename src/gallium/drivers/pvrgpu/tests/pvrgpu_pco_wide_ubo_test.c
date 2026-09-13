@@ -101,6 +101,62 @@ static nir_shader *make_wide_geometry(void)
 }
 
 #ifdef PVRGPU_WIDE_UBO_DIRECT_HELPER
+static void test_dynamic_block_selection(void)
+{
+   for (unsigned size_query = 0; size_query < 2; ++size_query) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_TESS_CTRL,
+         pco_nir_options(), "dynamic_ubo_block_selection");
+      b.shader->info.num_ubos = 4;
+      nir_def *block = nir_load_invocation_id(&b);
+      nir_def *original = size_query ? nir_get_ubo_size(&b, 32, block) :
+         nir_load_ubo(&b, 4, 32, block, nir_imm_int(&b, 16),
+                      .align_mul = 16, .align_offset = 0, .range = 64);
+      nir_def *consumer = nir_iadd_imm(&b, original, 1);
+      require(!nir_def_is_unused(original) && consumer != NULL,
+              "dynamic UBO result starts with an observable SSA consumer");
+      pco_data data = {0};
+      void *mem = ralloc_context(NULL);
+      char error[512] = {0};
+      require(pvrgpu_lower_generic_uniform_buffers(b.shader, &data, 8,
+                                                   mem, error, sizeof(error)),
+              error);
+      nir_validate_shader(b.shader, "after dynamic UBO descriptor selection");
+
+      unsigned clones = 0, descriptors = 0;
+      nir_foreach_function_impl(impl, b.shader) {
+         nir_foreach_block(nblock, impl) {
+            nir_foreach_instr(instr, nblock) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != (size_query ? nir_intrinsic_get_ubo_size :
+                                                   nir_intrinsic_load_ubo))
+                  continue;
+               require(intr->src[0].ssa->num_components == 2 &&
+                       intr->src[0].ssa->bit_size == 32 &&
+                       nir_src_is_const(intr->src[0]),
+                       "every cloned UBO operation has a static packed descriptor");
+               const unsigned packed = nir_src_comp_as_uint(intr->src[0], 0);
+               require(!(packed & 0xffff) && (packed >> 16) >= 1 &&
+                       (packed >> 16) <= 4 &&
+                       nir_src_comp_as_uint(intr->src[0], 1) == 0,
+                       "cloned UBO descriptor maps block i to set0 binding i+1");
+               descriptors |= 1u << ((packed >> 16) - 1);
+               ++clones;
+            }
+         }
+      }
+      require(clones == 4 && descriptors == 0xf,
+              "dynamic UBO block expands to each bounded descriptor exactly once");
+      require(nir_def_is_unused(original),
+              "dynamic UBO operation has no remaining result uses");
+      require(data.common.shareds == 24 && data.common.desc_sets[0].binding_count == 5,
+              "dynamic UBO expansion preserves complete four-block descriptor ABI");
+      ralloc_free(mem);
+      ralloc_free(b.shader);
+   }
+}
+
 static void test_helper_shapes(void)
 {
    static const unsigned widths[] = {0,1,2,3,4,5,6,7,8,9,15,16,17,32};
@@ -122,17 +178,36 @@ static void test_helper_shapes(void)
             pco_data data = {0};
             void *mem = ralloc_context(NULL);
             char error[512] = {0};
-            const bool expected = !invalid && nir_num_components_valid(widths[w]) &&
+            const bool expected = (invalid == 0 || invalid == 3) &&
+               nir_num_components_valid(widths[w]) &&
                widths[w] <= 16 && (!size_query || widths[w] == 1);
             const bool ok = pvrgpu_lower_generic_uniform_buffers(b.shader, &data,
                8, mem, error, sizeof(error));
             require(ok == expected, "UBO exact width/bit/static-block helper admission");
-            if (ok) {
+            if (ok && invalid == 0) {
                nir_intrinsic_instr *intr = nir_instr_as_intrinsic(nir_def_instr(result));
                require(intr->src[0].ssa->num_components == 2 &&
                        nir_src_comp_as_uint(intr->src[0], 0) == 0x10000 &&
                        data.common.shareds == 12,
                        "only descriptor identity is lowered, with stage prefix intact");
+            } else if (ok) {
+               unsigned clones = 0;
+               nir_foreach_function_impl(impl, b.shader) {
+                  nir_foreach_block(block, impl) {
+                     nir_foreach_instr(instr, block) {
+                        if (instr->type != nir_instr_type_intrinsic) continue;
+                        nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+                        if (intr->intrinsic != (size_query ? nir_intrinsic_get_ubo_size :
+                                                           nir_intrinsic_load_ubo)) continue;
+                        require(intr->src[0].ssa->num_components == 2 &&
+                                nir_src_comp_as_uint(intr->src[0], 0) == 0x10000,
+                                "dynamic singleton UBO is cloned onto static descriptor0");
+                        ++clones;
+                     }
+                  }
+               }
+               require(clones == 1 && nir_def_is_unused(result),
+                       "dynamic singleton UBO source is replaced, not passed to PCO");
             } else {
                require(error[0] != '\0', "malformed UBO shape/block gives named refusal");
             }
@@ -205,7 +280,10 @@ int main(int argc, char **argv)
    ralloc_free(vs); ralloc_free(tcs); ralloc_free(tes); ralloc_free(fs); ralloc_free(gs);
    }
 #ifdef PVRGPU_WIDE_UBO_DIRECT_HELPER
-   if (!old) test_helper_shapes();
+   if (!old) {
+      test_dynamic_block_selection();
+      test_helper_shapes();
+   }
 #endif
    pvrgpu_pco_compiler_destroy(compiler);
    glsl_type_singleton_decref();

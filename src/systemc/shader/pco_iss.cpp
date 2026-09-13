@@ -2310,15 +2310,17 @@ void TrackVertexInputUsage(const PcoInstruction &instruction,
   }
   if (instruction.target != PcoWriteTarget::kVertexInput)
     return;
-  const std::uint8_t span = instruction.opcode == PcoOpcode::kBufferLoad
-      ? instruction.component_count : instruction.repeat_count;
+  const bool deferred = instruction.opcode == PcoOpcode::kBufferLoad ||
+                        IsPcoAtomic32(instruction.opcode);
+  const std::uint8_t span = deferred ? instruction.component_count
+                                     : instruction.repeat_count;
   if (span == 0 || static_cast<std::size_t>(instruction.output_index) + span >
                        kPcoVertexInputCount)
     DecodeError(instruction.binary_offset, "vertex-input destination exceeds the USC file");
   std::uint64_t mask = 0;
   for (std::uint8_t component = 0; component < span; ++component)
     mask |= UINT64_C(1) << (instruction.output_index + component);
-  if (instruction.opcode == PcoOpcode::kBufferLoad)
+  if (deferred)
     pending_inputs |= mask;
   else
     written_inputs |= mask;
@@ -4503,7 +4505,8 @@ PcoInstruction DecodeGenericMultiplyHigh(ShaderStage stage,
 PcoInstruction DecodeComputePredicate(const std::vector<std::uint8_t> &binary,
                                       const GroupHeader &header,
                                       std::uint16_t group_index);
-PcoInstruction DecodeComputeAtomic32(const std::vector<std::uint8_t> &binary,
+PcoInstruction DecodeComputeAtomic32(ShaderStage stage,
+                                     const std::vector<std::uint8_t> &binary,
                                      const GroupHeader &header,
                                      std::uint16_t group_index);
 PcoInstruction DecodeComputeControl(const std::vector<std::uint8_t> &binary,
@@ -4578,7 +4581,8 @@ PcoInstruction DecodeFragmentGroup(const std::vector<std::uint8_t> &binary,
   }
   if (header.operation_origin == 2) {
     if (binary[header.offset + 3] == 0xe5U)
-      return DecodeComputeAtomic32(binary, header, group_index);
+      return DecodeComputeAtomic32(ShaderStage::kFragment, binary, header,
+                                   group_index);
     if (binary[header.offset + 3] >> 5U == 0b001)
       return DecodeFragmentSaveVisibilityMaskGroup(binary, header, group_index);
     if (binary[header.offset + 3] >> 5U == 0b100)
@@ -4996,6 +5000,9 @@ PcoInstruction DecodeVertexGroup(const std::vector<std::uint8_t> &binary,
   if (header.operation_origin == 1)
     return DecodeGenericPackGroup(ShaderStage::kVertex, binary, header,
                                   group_index);
+  if (header.operation_origin == 2 && binary[header.offset + 3] == 0xe5U)
+    return DecodeComputeAtomic32(ShaderStage::kVertex, binary, header,
+                                 group_index);
   if (header.operation_origin == 2 &&
       binary[header.offset + 3] >> 5U == kBackendOpDma)
     return (binary[header.offset + 3] & 7U) == 1U
@@ -5142,9 +5149,10 @@ PcoInstruction DecodeComputeStore(const std::vector<std::uint8_t> &binary,
   return out;
 }
 
-PcoInstruction DecodeComputeAtomic32(const std::vector<std::uint8_t> &binary,
-                                       const GroupHeader &header,
-                                       std::uint16_t group_index) {
+PcoInstruction DecodeComputeAtomic32(ShaderStage stage,
+                                     const std::vector<std::uint8_t> &binary,
+                                     const GroupHeader &header,
+                                     std::uint16_t group_index) {
   const std::size_t end = header.offset + header.total_bytes;
   std::size_t cursor = header.offset + 3;
   // Mesa I_ATOMIC maps addr+data to s0, old-value destination to s3. Unlike
@@ -5174,12 +5182,27 @@ PcoInstruction DecodeComputeAtomic32(const std::vector<std::uint8_t> &binary,
   }
   const auto address_data = DecodeOneLowerSource(binary, end, cursor);
   const auto destination = DecodeOneLowerSource(binary, end, cursor);
-  if (address_data.bank != PcoRegisterBank::kTemporary ||
-      destination.bank != PcoRegisterBank::kTemporary ||
-      static_cast<std::size_t>(address_data.index) + 3 > kPcoTemporaryCount ||
-      destination.index >= kPcoTemporaryCount ||
+  const bool allow_vertex_registers =
+      stage == ShaderStage::kVertex || IsNativeTaskStage(stage);
+  const std::size_t address_limit =
+      address_data.bank == PcoRegisterBank::kTemporary
+          ? kPcoTemporaryCount
+          : allow_vertex_registers &&
+                    address_data.bank == PcoRegisterBank::kVertexInput
+                ? kPcoVertexInputCount
+                : 0U;
+  const std::size_t destination_limit =
+      destination.bank == PcoRegisterBank::kTemporary
+          ? kPcoTemporaryCount
+          : allow_vertex_registers &&
+                    destination.bank == PcoRegisterBank::kVertexInput
+                ? kPcoVertexInputCount
+                : 0U;
+  if (static_cast<std::size_t>(address_data.index) + 3 > address_limit ||
+      destination.index >= destination_limit ||
       cursor >= end || binary[cursor++] != 0)
-    DecodeError(cursor, "compute atomic requires bounded TEMP operands and unused ISS");
+    DecodeError(cursor,
+                "atomic requires bounded stage register operands and unused ISS");
   ValidateAlignmentPadding(binary, header.offset, cursor, end);
   PcoInstruction out;
   out.opcode = opcode;
@@ -5187,7 +5210,9 @@ PcoInstruction DecodeComputeAtomic32(const std::vector<std::uint8_t> &binary,
   out.source1 = {address_data.bank, static_cast<std::uint16_t>(address_data.index + 1)};
   out.source2 = {address_data.bank, static_cast<std::uint16_t>(address_data.index + 2)};
   out.source_count = 3;
-  out.target = PcoWriteTarget::kTemporary;
+  out.target = destination.bank == PcoRegisterBank::kVertexInput
+                   ? PcoWriteTarget::kVertexInput
+                   : PcoWriteTarget::kTemporary;
   out.output_index = destination.index;
   out.component_count = 1;
   out.data_request = 0;
@@ -5330,14 +5355,24 @@ PcoInstruction DecodeNativeTaskGroup(ShaderStage stage,
   if (header.operation_origin == 2) {
     if (stage == ShaderStage::kCompute && (op >> 5U) == kBackendOpDma && (op & 7U) == 4)
       return DecodeTextureSampleGroup(binary, header, group_index);
-    if (op == 0xf1) return DecodeBufferLoadGroup(binary, header, group_index, true,
-                                                stage == ShaderStage::kGeometry ||
-                                                stage == ShaderStage::kTessellationControl ||
-                                                stage == ShaderStage::kTessellationEvaluation);
+    if (op == 0xf1) {
+      const bool native_graphics_address =
+          stage == ShaderStage::kGeometry ||
+          stage == ShaderStage::kTessellationControl ||
+          stage == ShaderStage::kTessellationEvaluation;
+      // Register allocation may place an LD response in dead VTXIN registers
+      // in any native pre-raster task, just as it does for an ordinary VS.
+      // GS/TCS/TES executors defer and commit that response at WDF into their
+      // stage-local writable input register file.
+      return DecodeBufferLoadGroup(binary, header, group_index, true,
+                                   native_graphics_address,
+                                   native_graphics_address);
+    }
     if (op == 0xf2) return DecodeComputeStore(binary, header, group_index,
                                               stage == ShaderStage::kTessellationControl);
     if (op == 0xe0) return DecodeComputeIdf(binary, header, group_index);
-    if (op == 0xe5) return DecodeComputeAtomic32(binary, header, group_index);
+    if (op == 0xe5)
+      return DecodeComputeAtomic32(stage, binary, header, group_index);
     DecodeError(header.offset, "compute backend operation is not implemented");
   }
   if (header.operation_origin == 0) {
@@ -5431,48 +5466,320 @@ bool IsDescriptorMetadataSource(const PcoRegisterRef &reference,
          (descriptor.index >> 3U) + dword;
 }
 
+bool SameRegister(const PcoRegisterRef &left, const PcoRegisterRef &right) {
+  return left.bank == right.bank && left.index == right.index;
+}
+
+bool IsTextureAnnotationControlBarrier(PcoOpcode opcode) {
+  return opcode == PcoOpcode::kBranch ||
+         opcode == PcoOpcode::kBranchConditional ||
+         opcode == PcoOpcode::kConditionalMask;
+}
+
+bool RegisterFallsInSpan(const PcoRegisterRef &base, std::uint8_t span,
+                         const PcoRegisterRef &reference) {
+  return span != 0 && base.bank == reference.bank &&
+         reference.index >= base.index &&
+         reference.index - base.index < span;
+}
+
+PcoRegisterRef DestinationRegister(const PcoInstruction &instruction) {
+  if (instruction.target == PcoWriteTarget::kTemporary)
+    return {PcoRegisterBank::kTemporary, instruction.output_index};
+  if (instruction.target == PcoWriteTarget::kVertexInput)
+    return {PcoRegisterBank::kVertexInput, instruction.output_index};
+  return {};
+}
+
+bool ReadsRegister(const PcoInstruction &instruction,
+                   const PcoRegisterRef &reference) {
+  const std::array<PcoRegisterRef, 4> sources{
+      instruction.source, instruction.source1, instruction.source2,
+      instruction.source3};
+  for (unsigned index = 0; index < instruction.source_count; ++index) {
+    const PcoRegisterRef source = sources[index];
+    const bool stepped_bank = source.bank == PcoRegisterBank::kTemporary ||
+                              source.bank == PcoRegisterBank::kVertexInput;
+    const std::uint8_t span = stepped_bank &&
+            !PcoOpcodeRepeatsOverLanes(instruction.opcode)
+        ? instruction.repeat_count
+        : 1U;
+    if (RegisterFallsInSpan(source, span, reference))
+      return true;
+  }
+  return false;
+}
+
+bool WritesRegister(const PcoInstruction &instruction,
+                    const PcoRegisterRef &reference) {
+  const PcoRegisterRef destination = DestinationRegister(instruction);
+  const std::uint8_t primary_span =
+      instruction.opcode == PcoOpcode::kTextureSample
+          ? 4U
+          : instruction.opcode == PcoOpcode::kBufferLoad ||
+              IsPcoAtomic32(instruction.opcode)
+                ? instruction.component_count
+                : instruction.repeat_count;
+  if (RegisterFallsInSpan(destination, primary_span, reference))
+    return true;
+  const bool has_secondary_destination =
+      instruction.opcode == PcoOpcode::kIntegerAdd64_32 ||
+      IsPcoCarryBorrow(instruction.opcode);
+  const PcoRegisterBank secondary_bank =
+      instruction.output_target1 == PcoWriteTarget::kTemporary
+          ? PcoRegisterBank::kTemporary
+          : instruction.output_target1 == PcoWriteTarget::kVertexInput
+                ? PcoRegisterBank::kVertexInput
+                : PcoRegisterBank::kSpecial;
+  return has_secondary_destination &&
+         instruction.output_target1 != PcoWriteTarget::kNone &&
+         secondary_bank == reference.bank &&
+         instruction.output_index1 == reference.index;
+}
+
+bool IsReadableShadowReference(const PcoRegisterRef &reference) {
+  return reference.bank == PcoRegisterBank::kSpecial ||
+         reference.bank == PcoRegisterBank::kTemporary ||
+         reference.bank == PcoRegisterBank::kVertexInput ||
+         reference.bank == PcoRegisterBank::kCoefficient ||
+         reference.bank == PcoRegisterBank::kShared;
+}
+
+bool ReadsDescriptorMetadata(const PcoInstruction &instruction,
+                             const PcoRegisterRef &descriptor,
+                             std::uint16_t dword) {
+  const std::array<PcoRegisterRef, 4> sources{
+      instruction.source, instruction.source1, instruction.source2,
+      instruction.source3};
+  for (unsigned index = 0; index < instruction.source_count; ++index)
+    if (IsDescriptorMetadataSource(sources[index], descriptor, dword))
+      return true;
+  return false;
+}
+
+bool ResolveShadowReferenceAtSample(
+    const std::vector<PcoInstruction> &instructions, std::size_t first,
+    std::size_t last, const PcoRegisterRef &descriptor,
+    PcoRegisterRef *reference) {
+  if (!reference || !IsReadableShadowReference(*reference))
+    return false;
+  if (reference->bank != PcoRegisterBank::kTemporary &&
+      reference->bank != PcoRegisterBank::kVertexInput)
+    return true;
+  for (std::size_t index = last; index > first; --index) {
+    const std::size_t writer_index = index - 1U;
+    const auto &instruction = instructions[writer_index];
+    if (IsTextureAnnotationControlBarrier(instruction.opcode))
+      return false;
+    if (!WritesRegister(instruction, *reference))
+      continue;
+    /* PCO materializes `descriptor_unorm ? clamp(Dref) : Dref` after WDF.
+     * The select's condition is sourced from image metadata word 7. Its
+     * false arm is the unclamped Dref that was live at SMP; TextureUnit
+     * applies the same descriptor-controlled clamp before comparison. */
+    if (instruction.opcode == PcoOpcode::kTestConditionalSelect) {
+      bool descriptor_condition = false;
+      for (std::size_t dependency = first; dependency < writer_index;
+           ++dependency) {
+        if (WritesRegister(instructions[dependency], instruction.source) &&
+            ReadsDescriptorMetadata(instructions[dependency], descriptor, 7U)) {
+          descriptor_condition = true;
+          break;
+        }
+      }
+      if (descriptor_condition &&
+          IsReadableShadowReference(instruction.source2)) {
+        *reference = instruction.source2;
+        continue;
+      }
+    }
+    /* A register-coalesced in-place transform still has the old value at
+     * SMP. A new definition that does not read that register did not. */
+    if (ReadsRegister(instruction, *reference))
+      continue;
+    if (instruction.opcode == PcoOpcode::kFloatAdd &&
+        IsRegister(instruction.source1, PcoRegisterBank::kSpecial, 0) &&
+        IsReadableShadowReference(instruction.source)) {
+      *reference = instruction.source;
+      continue;
+    }
+    return false;
+  }
+  for (std::size_t index = first; index < last; ++index) {
+    const auto &instruction = instructions[index];
+    if (IsTextureAnnotationControlBarrier(instruction.opcode))
+      return false;
+    if (WritesRegister(instruction, *reference) &&
+        !ReadsRegister(instruction, *reference))
+      return false;
+  }
+  return true;
+}
+
+bool RegisterHoldsShadowMarkerBefore(
+    const std::vector<PcoInstruction> &instructions, std::size_t before,
+    const PcoRegisterRef &reference) {
+  if (reference.bank != PcoRegisterBank::kTemporary &&
+      reference.bank != PcoRegisterBank::kVertexInput)
+    return false;
+  while (before != 0) {
+    const auto &instruction = instructions[--before];
+    if (IsTextureAnnotationControlBarrier(instruction.opcode))
+      return false;
+    if (!WritesRegister(instruction, reference))
+      continue;
+    return instruction.opcode == PcoOpcode::kMoveImmediate &&
+           instruction.repeat_count == 1 &&
+           SameRegister(DestinationRegister(instruction), reference) &&
+           instruction.immediate == 255U;
+  }
+  return false;
+}
+
+/* Mesa uses the public BIAS+PPLOD encoding for two distinct TAO payloads:
+ * a real fragment bias, and a compiler-inserted integer zero needed only to
+ * keep the address pair aligned when the source operation has implicit LOD.
+ * The SMP bits do not distinguish them.  Preserve a real dynamic bias, but
+ * recognize the latter from the final straight-line definition of its PPLOD
+ * TEMP.  Execution will still require that annotated padding to be zero. */
+void AnnotateImplicitTaoLodPadding(
+    std::vector<PcoInstruction> &instructions) {
+  for (std::size_t sample_index = 0; sample_index < instructions.size();
+       ++sample_index) {
+    auto &sample = instructions[sample_index];
+    if (sample.opcode != PcoOpcode::kTextureSample ||
+        !sample.texture_address_offset || !sample.texture_lod_bias ||
+        sample.texture_lod_replace ||
+        sample.source.bank != PcoRegisterBank::kTemporary)
+      continue;
+    const PcoRegisterRef padding{
+        PcoRegisterBank::kTemporary,
+        static_cast<std::uint16_t>(sample.source.index +
+                                   sample.texture_dimension)};
+    for (std::size_t writer_index = sample_index; writer_index != 0;) {
+      const auto &writer = instructions[--writer_index];
+      if (IsTextureAnnotationControlBarrier(writer.opcode))
+        break;
+      if (!WritesRegister(writer, padding))
+        continue;
+      const bool exact_destination =
+          writer.repeat_count == 1 &&
+          SameRegister(DestinationRegister(writer), padding);
+      std::uint32_t constant = UINT32_MAX;
+      const bool bypassed_zero =
+          writer.opcode == PcoOpcode::kMoveBypass &&
+          writer.source_count == 1 &&
+          writer.source.bank == PcoRegisterBank::kSpecial &&
+          PcoSpecialConstantBits(writer.source.index, &constant) &&
+          constant == 0;
+      const bool immediate_zero =
+          writer.opcode == PcoOpcode::kMoveImmediate &&
+          writer.source_count == 0 && writer.immediate == 0;
+      if (exact_destination && (bypassed_zero || immediate_zero))
+        sample.texture_lod_bias = 0;
+      break;
+    }
+  }
+}
+
 /* pvrgpu_lower_shadow_compare_transport deliberately leaves this canonical
  * compare-op==255 select behind each shadow SMP. It is a binary-level Dref
  * transport contract: recognize every operand relationship, then annotate
  * only the SMP. The ALU remains executable and passes the TPU's PCF result. */
 void AnnotateShadowSamples(std::vector<PcoInstruction> &instructions) {
-  for (std::size_t index = 0; index + 9U < instructions.size(); ++index) {
+  for (std::size_t index = 0; index + 1U < instructions.size(); ++index) {
     PcoInstruction &sample = instructions[index];
     if (sample.opcode != PcoOpcode::kTextureSample ||
         instructions[index + 1U].opcode != PcoOpcode::kWaitDataFence)
       continue;
-    const auto &reference_copy = instructions[index + 2U];
-    const auto &marker = instructions[index + 7U];
-    const auto &marker_test = instructions[index + 8U];
-    const auto &pass_select = instructions[index + 9U];
-    const bool match =
-        reference_copy.opcode == PcoOpcode::kFloatAdd &&
-        reference_copy.target == PcoWriteTarget::kTemporary &&
-        IsRegister(reference_copy.source1, PcoRegisterBank::kSpecial, 0) &&
-        marker.opcode == PcoOpcode::kMoveImmediate &&
-        marker.target == PcoWriteTarget::kTemporary && marker.immediate == 255U &&
-        marker_test.opcode == PcoOpcode::kBooleanCompare &&
-        marker_test.output_index == marker.output_index &&
-        IsDescriptorMetadataSource(marker_test.source, sample.source1, 12U) &&
-        IsRegister(marker_test.source1, PcoRegisterBank::kTemporary,
-                   marker.output_index) &&
-        pass_select.opcode == PcoOpcode::kTestConditionalSelect &&
-        pass_select.target == PcoWriteTarget::kTemporary &&
-        /* The source selected by the impossible op==255 arm is the final
-         * Dref. For UNORM depth PCO inserts the required clamp between the
-         * transport copy and this select, while RA may also coalesce the copy.
-         * The marker comparison and the other arm's exact SMP destination
-         * make this a fail-closed identification of that transformed value. */
-        pass_select.source1.bank == PcoRegisterBank::kTemporary &&
-        IsRegister(pass_select.source2, PcoRegisterBank::kTemporary,
-                   sample.output_index);
-    if (!match)
-      continue;
-    sample.texture_shadow_compare = 1;
-    /* This source is live when SMP issues. Any UNORM clamp materialized after
-     * WDF is mirrored by TextureUnit from descriptor bit 8; reading the
-     * select's later temporary here would capture an unrelated pre-SMP value. */
-    sample.texture_shadow_reference = reference_copy.source;
+    /* Preserve the original long lowering shape. Its post-WDF FADD creates
+     * a new temporary, so the source of that copy -- rather than the later
+     * select operand -- is the value that was live when SMP issued. */
+    if (index + 9U < instructions.size()) {
+      const auto &reference_copy = instructions[index + 2U];
+      const auto &marker = instructions[index + 7U];
+      const auto &marker_test = instructions[index + 8U];
+      const auto &pass_select = instructions[index + 9U];
+      const PcoRegisterRef copied_reference =
+          DestinationRegister(reference_copy);
+      bool straight_line_reference = true;
+      for (std::size_t middle = index + 3U; middle < index + 7U;
+           ++middle) {
+        if (IsTextureAnnotationControlBarrier(instructions[middle].opcode) ||
+            WritesRegister(instructions[middle], copied_reference)) {
+          straight_line_reference = false;
+          break;
+        }
+      }
+      if (reference_copy.opcode == PcoOpcode::kFloatAdd &&
+          reference_copy.target == PcoWriteTarget::kTemporary &&
+          IsRegister(reference_copy.source1, PcoRegisterBank::kSpecial, 0) &&
+          straight_line_reference &&
+          marker.opcode == PcoOpcode::kMoveImmediate &&
+          marker.target == PcoWriteTarget::kTemporary &&
+          marker.immediate == 255U &&
+          marker_test.opcode == PcoOpcode::kBooleanCompare &&
+          marker_test.output_index == marker.output_index &&
+          IsDescriptorMetadataSource(marker_test.source, sample.source1, 12U) &&
+          IsRegister(marker_test.source1, PcoRegisterBank::kTemporary,
+                     marker.output_index) &&
+          pass_select.opcode == PcoOpcode::kTestConditionalSelect &&
+          pass_select.target == PcoWriteTarget::kTemporary &&
+          SameRegister(pass_select.source1, copied_reference) &&
+          IsRegister(pass_select.source2, PcoRegisterBank::kTemporary,
+                     sample.output_index)) {
+        sample.texture_shadow_compare = 1;
+        sample.texture_shadow_reference = reference_copy.source;
+        continue;
+      }
+    }
+    const std::size_t scan_end =
+        std::min(instructions.size(), index + 18U);
+    for (std::size_t test_index = index + 2U;
+         test_index + 1U < scan_end; ++test_index) {
+      const auto &marker_test = instructions[test_index];
+      if (marker_test.opcode == PcoOpcode::kTextureSample ||
+          IsTextureAnnotationControlBarrier(marker_test.opcode))
+        break;
+      const auto &pass_select = instructions[test_index + 1U];
+      const PcoRegisterRef predicate_register =
+          DestinationRegister(marker_test);
+      PcoRegisterRef marker_register{};
+      bool marker_operand_order = false;
+      if (IsDescriptorMetadataSource(marker_test.source, sample.source1, 12U)) {
+        marker_register = marker_test.source1;
+        marker_operand_order = true;
+      } else if (IsDescriptorMetadataSource(marker_test.source1,
+                                             sample.source1, 12U)) {
+        marker_register = marker_test.source;
+        marker_operand_order = true;
+      }
+      PcoRegisterRef shadow_reference = pass_select.source1;
+      const bool match =
+          marker_test.opcode == PcoOpcode::kBooleanCompare &&
+          marker_test.comparison_test_op == kTstOpEqual &&
+          (marker_test.comparison_test_type == kTstTypeU32 ||
+           marker_test.comparison_test_type == kTstTypeS32) &&
+          IsReadableShadowReference(predicate_register) &&
+          marker_operand_order &&
+          RegisterHoldsShadowMarkerBefore(instructions, test_index,
+                                          marker_register) &&
+          pass_select.opcode == PcoOpcode::kTestConditionalSelect &&
+          SameRegister(pass_select.source, predicate_register) &&
+          IsRegister(pass_select.source2, PcoRegisterBank::kTemporary,
+                     sample.output_index) &&
+          ResolveShadowReferenceAtSample(
+              instructions, index + 2U, test_index + 1U,
+              sample.source1, &shadow_reference);
+      if (!match)
+        continue;
+      sample.texture_shadow_compare = 1;
+      /* The impossible arm's source is either already live at SMP or is
+       * transformed in place afterwards. In both cases reading the same
+       * register when the request issues yields the original Dref. */
+      sample.texture_shadow_reference = shadow_reference;
+      break;
+    }
   }
 }
 
@@ -5702,10 +6009,8 @@ bool HasCanonicalTextureFields(const PcoInstruction &instruction) {
          instruction.texture_lod_replace <= 1 &&
          instruction.texture_shadow_compare <= 1 &&
          (instruction.texture_shadow_compare
-              ? (instruction.texture_shadow_reference.bank ==
-                    PcoRegisterBank::kTemporary ||
-                 instruction.texture_shadow_reference.bank ==
-                    PcoRegisterBank::kVertexInput)
+              ? IsReadableShadowReference(
+                    instruction.texture_shadow_reference)
               : IsDefaultUnusedRegister(
                     instruction.texture_shadow_reference)) &&
          HasCanonicalTextureLodMode(instruction, true) &&
@@ -5881,23 +6186,43 @@ bool HasCanonicalBufferLoad(const PcoInstruction &instruction,
          HasDefaultControlFields(instruction);
 }
 
-bool HasCanonicalFragmentAtomic32(const PcoInstruction &instruction) {
+bool HasCanonicalAtomic32(const PcoInstruction &instruction,
+                          bool allow_vertex_registers) {
+  const auto register_limit = [&](PcoRegisterBank bank) -> std::size_t {
+    if (bank == PcoRegisterBank::kTemporary)
+      return kPcoTemporaryCount;
+    if (allow_vertex_registers && bank == PcoRegisterBank::kVertexInput)
+      return kPcoVertexInputCount;
+    return 0;
+  };
+  const auto destination_limit = [&](PcoWriteTarget target) -> std::size_t {
+    if (target == PcoWriteTarget::kTemporary)
+      return kPcoTemporaryCount;
+    if (allow_vertex_registers && target == PcoWriteTarget::kVertexInput)
+      return kPcoVertexInputCount;
+    return 0;
+  };
+  const std::size_t source_limit = register_limit(instruction.source.bank);
   return IsPcoAtomic32(instruction.opcode) &&
-         instruction.target == PcoWriteTarget::kTemporary &&
+         destination_limit(instruction.target) != 0 &&
          instruction.source_count == 3 && instruction.repeat_count == 1 &&
          instruction.component_count == 1 && instruction.data_request == 0 &&
-         instruction.source.bank == PcoRegisterBank::kTemporary &&
-         instruction.source1.bank == PcoRegisterBank::kTemporary &&
-         instruction.source2.bank == PcoRegisterBank::kTemporary &&
+         source_limit != 0 &&
+         instruction.source1.bank == instruction.source.bank &&
+         instruction.source2.bank == instruction.source.bank &&
          instruction.source1.index == instruction.source.index + 1U &&
          instruction.source2.index == instruction.source.index + 2U &&
-         instruction.source2.index < kPcoTemporaryCount &&
-         instruction.output_index < kPcoTemporaryCount &&
+         instruction.source2.index < source_limit &&
+         instruction.output_index < destination_limit(instruction.target) &&
          instruction.end_group == 0 && instruction.immediate == 0 &&
          instruction.address_offset_signed == 0 &&
          HasDefaultNonFitrpFields(instruction) &&
          HasCanonicalUnusedSources(instruction) &&
          HasDefaultControlFields(instruction);
+}
+
+bool HasCanonicalFragmentAtomic32(const PcoInstruction &instruction) {
+  return HasCanonicalAtomic32(instruction, false);
 }
 
 void ValidateVertexTemporaryProgram(
@@ -6017,12 +6342,14 @@ void ValidateVertexTemporaryProgram(
     }
 
     if (instruction.opcode == PcoOpcode::kTextureSample ||
-        instruction.opcode == PcoOpcode::kBufferLoad) {
+        instruction.opcode == PcoOpcode::kBufferLoad ||
+        IsPcoAtomic32(instruction.opcode)) {
       uses_temporary_program = true;
       request_pending = true;
       pending_target = instruction.target;
       pending_output = instruction.output_index;
-      pending_components = instruction.component_count;
+      pending_components = IsPcoAtomic32(instruction.opcode)
+                               ? 1U : instruction.component_count;
       continue;
     }
     if (instruction.opcode == PcoOpcode::kWaitDataFence) {
@@ -6119,6 +6446,12 @@ void ValidateVertexTemporaryProgram(
     if (instruction.opcode == PcoOpcode::kBufferLoad) {
       if (!HasCanonicalBufferLoad(instruction, true))
         DecodeError(instruction.binary_offset, "invalid generic vertex LD");
+      continue;
+    }
+    if (IsPcoAtomic32(instruction.opcode)) {
+      if (!HasCanonicalAtomic32(instruction, true))
+        DecodeError(instruction.binary_offset,
+                    "invalid generic vertex 32-bit atomic");
       continue;
     }
     if (instruction.opcode == PcoOpcode::kTextureSample) {
@@ -8316,6 +8649,17 @@ void ValidateExecutionEnvelope(const PcoProgramSummary &summary,
 
 } // namespace
 
+void AnnotatePcoTextureMetadataForTesting(
+    std::vector<PcoInstruction> &instructions) {
+  AnnotateImplicitTaoLodPadding(instructions);
+  AnnotateShadowSamples(instructions);
+}
+
+bool HasCanonicalPcoAtomic32(const PcoInstruction &instruction,
+                             bool allow_vertex_registers) {
+  return HasCanonicalAtomic32(instruction, allow_vertex_registers);
+}
+
 const std::vector<std::uint8_t> &FillSolidVertexPcoBinary() {
   return kFillSolidVertexBinary;
 }
@@ -8793,6 +9137,8 @@ PcoDecodedProgram DecodeComputePcoProgram(const std::vector<std::uint8_t> &binar
       DecodeError(group_offsets[index], "compute branch does not name a group boundary");
     instruction.branch_target_index = static_cast<std::uint16_t>(found - group_offsets.begin());
   }
+  AnnotateImplicitTaoLodPadding(out.instructions);
+  AnnotateShadowSamples(out.instructions);
   out.summary.group_count = CheckedU32(out.instructions.size(), "compute group count");
   out.summary.instruction_count = out.summary.group_count;
   return out;
@@ -8845,6 +9191,8 @@ PcoDecodedProgram DecodeGeometryPcoProgram(const std::vector<std::uint8_t> &bina
       DecodeError(offsets[index], "geometry branch does not name a group boundary");
     instruction.branch_target_index = static_cast<std::uint16_t>(found - offsets.begin());
   }
+  AnnotateImplicitTaoLodPadding(out.instructions);
+  AnnotateShadowSamples(out.instructions);
   out.summary.group_count = CheckedU32(out.instructions.size(), "geometry group count");
   out.summary.instruction_count = out.summary.group_count;
   return out;
@@ -8872,10 +9220,17 @@ PcoDecodedProgram DecodeTessellationPcoProgram(
     auto instruction = sample ? DecodeTextureSampleGroup(binary, header, index, control ? 8 : 4) :
         control ? DecodeNativeTaskGroup(stage, binary, header, index) :
                   DecodeNativeRasterTaskGroup(stage, binary, header, index);
-    if (sample && (instruction.texture_dimension != 2 || instruction.texture_fcnorm != 1 || instruction.texture_address_offset ||
-        instruction.texture_non_normalized_coords || instruction.texture_sample_index_present ||
-        instruction.texture_spatial_offset_present || instruction.texture_lod_bias || instruction.texture_gather))
-      DecodeError(offset, "tessellation SMP requires FCNORM normalized 2D ordinary or explicit LOD");
+    if (sample &&
+        ((instruction.texture_dimension != 2 && instruction.texture_dimension != 3) ||
+         instruction.texture_fcnorm > 1 || instruction.texture_address_offset > 1 ||
+         instruction.texture_non_normalized_coords ||
+         instruction.texture_sample_index_present ||
+         instruction.texture_spatial_offset_present ||
+         (instruction.texture_lod_bias &&
+          !instruction.texture_address_offset) ||
+         instruction.texture_gather ||
+         !HasCanonicalTextureLodMode(instruction)))
+      DecodeError(offset, "tessellation SMP requires normalized native 2D/3D ordinary or explicit LOD");
     instruction.exec_cnd = header.exec_cnd;
     instruction.end_group = header.end;
     if (instruction.target == PcoWriteTarget::kPixelOutput ||
@@ -8914,6 +9269,8 @@ PcoDecodedProgram DecodeTessellationPcoProgram(
       DecodeError(offsets[index], "tessellation branch is not a group boundary");
     instruction.branch_target_index = static_cast<std::uint16_t>(found - offsets.begin());
   }
+  AnnotateImplicitTaoLodPadding(out.instructions);
+  AnnotateShadowSamples(out.instructions);
   out.summary.group_count = CheckedU32(out.instructions.size(), "tessellation group count");
   out.summary.instruction_count = out.summary.group_count;
   return out;
@@ -9015,6 +9372,7 @@ PcoDecodedProgram DecodePcoProgram(ShaderStage stage,
       DecodeError(group_offsets[index], "fragment branch target is not a native group boundary");
     instruction.branch_target_index = static_cast<std::uint16_t>(found - group_offsets.begin());
   }
+  AnnotateImplicitTaoLodPadding(decoded.instructions);
   AnnotateShadowSamples(decoded.instructions);
   if (stage == ShaderStage::kVertex)
     ValidateVertexTemporaryProgram(decoded.instructions);
@@ -9174,10 +9532,20 @@ PcoVertexExecution ExecuteVertexPco(
       for (std::size_t index = 0;
            index < continuation.resume_instruction_index; ++index) {
         const auto &prior = instructions[index];
-        if (prior.target != PcoWriteTarget::kVertexInput)
-          continue;
-        for (std::uint8_t repeat = 0; repeat < prior.repeat_count; ++repeat)
-          overwritten_inputs |= UINT64_C(1) << (prior.output_index + repeat);
+        if (prior.target == PcoWriteTarget::kVertexInput) {
+          const std::uint8_t span =
+              prior.opcode == PcoOpcode::kBufferLoad ||
+                      IsPcoAtomic32(prior.opcode)
+                  ? prior.component_count
+                  : prior.repeat_count;
+          for (std::uint8_t component = 0; component < span; ++component)
+            overwritten_inputs |=
+                UINT64_C(1) << (prior.output_index + component);
+        }
+        if ((prior.opcode == PcoOpcode::kIntegerAdd64_32 ||
+             IsPcoCarryBorrow(prior.opcode)) &&
+            prior.output_target1 == PcoWriteTarget::kVertexInput)
+          overwritten_inputs |= UINT64_C(1) << prior.output_index1;
       }
       // The continuation carries the current register file. Only inputs
       // not yet overwritten by the shader must still match the caller.
@@ -9208,7 +9576,8 @@ PcoVertexExecution ExecuteVertexPco(
          index + 1 < continuation.resume_instruction_index; ++index) {
       const PcoInstruction &prior = instructions[index];
       if (prior.opcode == PcoOpcode::kTextureSample ||
-          prior.opcode == PcoOpcode::kBufferLoad) {
+          prior.opcode == PcoOpcode::kBufferLoad ||
+          IsPcoAtomic32(prior.opcode)) {
         if (expected_request_pending)
           ExecuteError("overlapping DRC0 requests precede vertex continuation");
         expected_request_pending = true;
@@ -9431,7 +9800,8 @@ PcoVertexExecution ExecuteVertexPco(
            (instruction.exec_cnd == 1 ? predicate : !predicate));
       if (!selected) {
         if (instruction.opcode == PcoOpcode::kBufferLoad ||
-            instruction.opcode == PcoOpcode::kTextureSample) {
+            instruction.opcode == PcoOpcode::kTextureSample ||
+            IsPcoAtomic32(instruction.opcode)) {
           if (drc0_pending)
             ExecuteError("inactive vertex request overlaps DRC0");
           drc0_pending = true;
@@ -9605,6 +9975,31 @@ PcoVertexExecution ExecuteVertexPco(
       pending_target = instruction.target;
       pending_output_index = instruction.output_index;
       pending_component_count = instruction.component_count;
+      continue;
+    }
+    if (IsPcoAtomic32(instruction.opcode)) {
+      if (drc0_pending || !HasCanonicalPcoAtomic32(instruction, true) ||
+          context.memory_atomic32 == nullptr)
+        ExecuteError(
+            "vertex atomic requires an available modeled memory service");
+      const std::uint64_t low = ReadSource(
+          instruction.source, effective_vertex_inputs, temporaries,
+          temporary_written_mask, 0, ShaderStage::kVertex);
+      const std::uint64_t high = ReadSource(
+          instruction.source1, effective_vertex_inputs, temporaries,
+          temporary_written_mask, 0, ShaderStage::kVertex);
+      const std::uint64_t address = low | (high << 32U);
+      if (address & 3U)
+        ExecuteError("vertex atomic address is unaligned");
+      pending[0] = context.memory_atomic32(
+          context.memory_user_data, instruction.opcode, address,
+          ReadSource(instruction.source2, effective_vertex_inputs,
+                     temporaries, temporary_written_mask, 0,
+                     ShaderStage::kVertex));
+      drc0_pending = true;
+      pending_target = instruction.target;
+      pending_output_index = instruction.output_index;
+      pending_component_count = 1;
       continue;
     }
     if (IsPcoCarryBorrow(instruction.opcode)) {
@@ -10324,13 +10719,15 @@ PcoVertexExecution ResumeVertexPco(
     const std::vector<PcoInstruction> &instructions,
     const PcoVertexContinuation &continuation,
     const std::array<std::uint32_t, kPcoTextureResponseCount> &texture_response,
-    PcoMemoryReadCallback memory_read, void *memory_user_data) {
+    PcoMemoryReadCallback memory_read, void *memory_user_data,
+    PcoMemoryAtomic32Callback memory_atomic32) {
   PcoVertexExecutionContext context;
   context.texture_response = texture_response;
   context.continuation = continuation;
   context.texture_response_valid = 1;
   context.memory_read = memory_read;
   context.memory_user_data = memory_user_data;
+  context.memory_atomic32 = memory_atomic32;
   return ExecuteVertexPco(summary, instructions, {}, context);
 }
 
