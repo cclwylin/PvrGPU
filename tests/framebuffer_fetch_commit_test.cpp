@@ -129,6 +129,8 @@ void SetCodec(PipelineState &state, const char *format) {
   const std::size_t expected_bytes =
       ColorAttachmentCodecUsesFloat64Storage(state.color_attachment_codec)
           ? 4U * sizeof(double)
+      : ColorAttachmentCodecUsesUnorm8Storage(state.color_attachment_codec)
+          ? 4U
           : 4U * sizeof(float);
   Check(ColorAttachmentBytesPerPixel(state, 0) == expected_bytes,
         "canonical codec selected the wrong transport width");
@@ -427,27 +429,80 @@ void TestNormalizedMidpointsRoundToEven() {
         "R8_SNORM negative midpoint did not round to even");
 }
 
-void TestMissingComponentsAndFloat16Quantization() {
+void TestUnorm8StorageMatchesGallivm() {
   for (const char *format : {"PIPE_FORMAT_R8_UNORM",
                              "PIPE_FORMAT_R8G8_UNORM",
+                             "PIPE_FORMAT_R8G8B8X8_UNORM",
                              "PIPE_FORMAT_R5G6B5_UNORM"}) {
     PipelineState state = BaseState();
     SetCodec(state, format);
-    auto storage = CanonicalStorage(state, {0.0F, 0.0F, 0.0F, 1.0F});
+    auto storage = Storage(state, {0, 0, 0, 255});
     const auto invocation = Invocation(1);
     const auto output = Output(invocation, {0.25F, 0.5F, 0.75F, 0.125F});
     Check(CommitFramebufferFetchFragment(storage, state, invocation, output) ==
               1,
           std::string(format) + " fragment did not commit");
-    const auto pixel = CanonicalPixel(storage);
     const auto mask = state.color_attachment_codec.component_mask;
-    if (!(mask & 0x2))
-      Check(pixel[1] == 0.0F, std::string(format) + " default G is not zero");
-    if (!(mask & 0x4))
-      Check(pixel[2] == 0.0F, std::string(format) + " default B is not zero");
-    Check(pixel[3] == 1.0F,
-          std::string(format) + " default alpha is not one");
+    const bool rgb565 = state.color_attachment_codec.component_bits[0] == 5;
+    // RGBA8 first (64, 128, 191), then RGB565 truncates to codes 8/32/23
+    // and bit-replicates them back to 66/130/189.
+    const std::array<std::uint8_t, 3> expected =
+        rgb565 ? std::array<std::uint8_t, 3>{66, 130, 189}
+               : std::array<std::uint8_t, 3>{64, 128, 191};
+    for (std::size_t component = 0; component < 3; ++component)
+      Check(storage.bytes[component] ==
+                (mask & (1U << component) ? expected[component] : 0),
+            std::string(format) + " stored channel " +
+                std::to_string(component) + " is wrong");
+    Check(storage.bytes[3] == 255,
+          std::string(format) + " missing alpha is not stored as one");
+
+    const auto shader = PbeReadCanonicalColorForShader(
+        state.color_attachment_codec, storage.bytes.data());
+    if (rgb565)
+      Check(shader[0] == 8.0F / 31.0F && shader[1] == 32.0F / 63.0F &&
+                shader[2] == 23.0F / 31.0F && shader[3] == 1.0F,
+            "RGB565 fetch did not decode native codes");
+    else
+      Check(shader[0] == 64.0F / 255.0F &&
+                shader[1] == (mask & 0x2 ? 128.0F / 255.0F : 0.0F) &&
+                shader[3] == 1.0F,
+            std::string(format) + " fetch did not decode stored bytes");
   }
+
+  // Clears pack the float colour directly to the native code.
+  PipelineState state = BaseState();
+  SetCodec(state, "PIPE_FORMAT_B5G6R5_UNORM");
+  std::array<std::uint8_t, 4> cleared{};
+  PbeWriteCanonicalColor(state.color_attachment_codec, cleared.data(),
+                         {0.5F, 0.5F, 0.25F, 0.0F});
+  Check(cleared == std::array<std::uint8_t, 4>{132, 130, 66, 255},
+        "RGB565 clear did not round to the native code");
+
+  // Blending reads the bit-replicated destination in eight bits.
+  state.raster_state.blend.enable = 1;
+  state.raster_state.blend.rgb_equation = BlendEquation::kAdd;
+  state.raster_state.blend.alpha_equation = BlendEquation::kAdd;
+  state.raster_state.blend.source_rgb_factor = BlendFactor::kSourceAlpha;
+  state.raster_state.blend.destination_rgb_factor =
+      BlendFactor::kOneMinusSourceAlpha;
+  state.raster_state.blend.source_alpha_factor = BlendFactor::kOne;
+  state.raster_state.blend.destination_alpha_factor = BlendFactor::kZero;
+  auto storage = Storage(state, cleared);
+  const auto invocation = Invocation(1);
+  const auto output = Output(invocation, {1.0F, 0.0F, 1.0F, 0.5F});
+  Check(CommitFramebufferFetchFragment(storage, state, invocation, output) ==
+            1,
+        "blended RGB565 fragment did not commit");
+  // R: (255*128 + 132*127 + 127) / 255 = 194 -> code 24 -> 198.
+  // G: (0 + 130*127 + 127) / 255 = 65 -> code 16 -> 65.
+  // B: (255*128 + 66*127 + 127) / 255 = 161 -> code 20 -> 165.
+  Check(std::equal(storage.bytes.begin(), storage.bytes.end(),
+                   std::array<std::uint8_t, 4>{198, 65, 165, 255}.begin()),
+        "blended RGB565 did not truncate an RGBA8 blend");
+}
+
+void TestMissingComponentsAndFloat16Quantization() {
 
   PipelineState state = BaseState();
   SetCodec(state, "PIPE_FORMAT_R16_FLOAT");
@@ -522,6 +577,7 @@ int main() {
     TestUnorm32ExactTransportAndMaskedCommit();
     TestIntegerNativeCommitAndFetchDefaults();
     TestNormalizedMidpointsRoundToEven();
+    TestUnorm8StorageMatchesGallivm();
     TestMissingComponentsAndFloat16Quantization();
     std::cout << "framebuffer-fetch commit tests passed\n";
     return 0;

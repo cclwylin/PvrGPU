@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Actual TextureUnit sample-index reads, not resolves or prepared shader
 // results. Independent raw Rogue descriptors, byte-addressed backing storage,
-// VS/FS FIFOs, typed extrema, layer/sample rebinding, OOB guards and all three
-// modeled memory modes are checked. Existing texture_unit_test retains the
-// normalized/filtering regressions.
+// VS/FS FIFOs, typed extrema, layer/sample rebinding, OOB guards, and the fixed
+// default short path under all three global memory modes are checked. Existing
+// texture_unit_test retains the normalized/filtering regressions.
 #include "common/pipeline_state.h"
 #include "memory/gpu_memory_system.h"
 #include "texture/texture_unit.h"
@@ -478,15 +478,14 @@ struct Harness {
       Check(std::equal(expected[index].begin(), expected[index].end(), actual[index].rgba),
             "exact sample/layer/channel values (not sample zero or resolve)");
     }
-    if (memory.mode() == MemoryMode::kDirect)
-      Check(final.counters.memory_direct_read_bytes == valid_reads * bpp &&
-            final.counters.dram_read_bytes == 0, "direct actual read byte count");
-    else if (memory.mode() == MemoryMode::kBypass)
-      Check(final.counters.dram_read_bytes == valid_reads * bpp &&
-            final.counters.memory_direct_read_bytes == 0, "bypass actual read byte count");
-    else
-      Check(final.counters.dram_read_bytes > 0 && final.counters.memory_direct_read_bytes == 0,
-            "cache mode actual backing reads");
+    Check(final.counters.memory_direct_read_bytes == valid_reads * bpp &&
+              final.counters.tcu_line_accesses == 0 &&
+              final.counters.tcu_read_accesses == 0 &&
+              final.counters.slc_line_accesses == 0 &&
+              final.counters.slc_read_accesses == 0 &&
+              final.counters.dram_read_transactions == 0 &&
+              final.counters.dram_read_bytes == 0,
+          "default short path counts actual sample bytes without cache traffic");
     Check(memory.Readback(resource.gpu_address, bytes.size(), MemoryClient::kFramebufferReadback).data == bytes,
           "read-only sampling preserves all storage and backing sentinels");
     ReleaseFunctionalPayloads(pool, final);

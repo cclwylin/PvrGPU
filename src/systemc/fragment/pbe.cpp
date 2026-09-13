@@ -154,11 +154,13 @@ void Pbe::Run() {
                       channels * sizeof(std::uint32_t));
         }
       } else {
+        const bool srgb = ColorAttachmentSrgb(state, target) != 0;
         for (std::size_t pixel = 0; pixel < stored_samples; ++pixel) {
           for (std::size_t component = 0; component < 4; ++component) {
+            const float value = state.raster_state.clear_color[component];
             attachment[pixel * bytes_per_pixel + component] =
-                PbeFiniteStateToUnorm8(
-                    state.raster_state.clear_color[component]);
+                srgb ? PbeFiniteStateToUnorm8(value)
+                     : PbeClearStateToUnorm8(value);
           }
         }
       }

@@ -349,12 +349,12 @@ void RunMixed(MemoryPool &pool, sc_core::sc_fifo<PipelineTxn> &input,
     AddFragment(scenario, colors, codes, 1, 0, 1, 5);
     Run(pool, input, output, scenario);
   }
-  // One source value simultaneously exercises different codec tie rules:
-  // RGBA8 rounds half upward; packed10/2 uses nearest-even.
+  // One source value simultaneously exercises both of llvmpipe's codec
+  // paths: RGBA8 quantizes in eight bits, packed10/2 truncates a 16-bit code.
   auto boundary = NewMixedScenario(0, true, 1, 1);
   const Color values{0.5F, 0.5F / 1023, 1.5F / 1023, 0.5F};
   AddFragment(boundary, std::vector<Color>(4, values),
-      {{128,0,0,128}, {512,0,2,2}, {512,0,2,2}, {128,0,0,128}});
+      {{128,0,0,128}, {512,0,1,2}, {512,0,1,2}, {128,0,0,128}});
   Run(pool, input, output, boundary);
   for (unsigned targets = 1; targets < 4; ++targets) {
     auto bounded = NewMixedScenario(0, true, 1, 1);
@@ -389,6 +389,8 @@ PreciseColor RgbAndAlpha(Rgb rgb, long double alpha) {
 // fractions; destinations are the exact rational values of selected codes.
 // New cases deliberately avoid quantizer halfway boundaries (covered above)
 // so long-double oracle arithmetic cannot hide a float rounding discrepancy.
+// The algebra bounds llvmpipe's integer result; the exact expectation comes
+// from LlvmpipeBlendCodes below.
 Codes BlendOracleCodes(const PreciseColor &result, const std::string &name) {
   Codes codes{};
   for (unsigned c = 0; c < 4; ++c) {
@@ -397,6 +399,70 @@ Codes BlendOracleCodes(const PreciseColor &result, const std::string &name) {
     Check(std::fabs(scaled - (std::floor(scaled) + 0.5L)) > 1.0L / 1024,
           name + " independent oracle must stay away from halfway");
     codes[c] = static_cast<std::uint32_t>(std::floor(scaled + 0.5L));
+  }
+  return codes;
+}
+
+// llvmpipe's 16-bit AoS blend for 10:10:10:2, written independently of the
+// PBE helpers: dyadic sources scale to round(x * 65535), destination codes
+// bit-replicate, factors multiply with exact rounding of a*b/65535, terms
+// saturate, and results truncate (RGB) or rescale with rounding (alpha).
+Codes LlvmpipeBlendCodes(const BlendState &blend, const PreciseColor &source,
+                         const Codes &destination_codes,
+                         const PreciseColor &constant) {
+  const auto scale = [](long double value) {
+    const long double scaled = std::clamp(value, 0.0L, 1.0L) * 65535.0L;
+    Check(std::fabs(scaled - (std::floor(scaled) + 0.5L)) > 1.0L / 64,
+          "llvmpipe oracle source must stay away from a 16-bit halfway");
+    return static_cast<std::uint64_t>(std::floor(scaled + 0.5L));
+  };
+  std::array<std::uint64_t, 4> s{}, d{}, k{};
+  for (unsigned c = 0; c < 4; ++c) {
+    s[c] = scale(source[c]);
+    k[c] = scale(constant[c]);
+    d[c] = c == 3 ? destination_codes[3] * 0x5555U
+                  : (destination_codes[c] << 6) | (destination_codes[c] >> 4);
+  }
+  const auto factor = [&](BlendFactor f, unsigned c) -> std::uint64_t {
+    switch (f) {
+    case BlendFactor::kZero: return 0;
+    case BlendFactor::kOne: return 65535;
+    case BlendFactor::kSourceAlpha: return s[3];
+    case BlendFactor::kOneMinusSourceAlpha: return 65535 - s[3];
+    case BlendFactor::kSourceColor: return s[c];
+    case BlendFactor::kOneMinusSourceColor: return 65535 - s[c];
+    case BlendFactor::kDestinationColor: return d[c];
+    case BlendFactor::kOneMinusDestinationColor: return 65535 - d[c];
+    case BlendFactor::kDestinationAlpha: return d[3];
+    case BlendFactor::kOneMinusDestinationAlpha: return 65535 - d[3];
+    case BlendFactor::kSourceAlphaSaturate:
+      return c == 3 ? 65535 : std::min<std::uint64_t>(s[3], 65535 - d[3]);
+    case BlendFactor::kConstantColor: return k[c];
+    case BlendFactor::kOneMinusConstantColor: return 65535 - k[c];
+    case BlendFactor::kConstantAlpha: return k[3];
+    case BlendFactor::kOneMinusConstantAlpha: return 65535 - k[3];
+    }
+    throw std::runtime_error("llvmpipe oracle factor");
+  };
+  const auto times = [](std::uint64_t a, std::uint64_t b) {
+    return (2 * a * b + 65535) / 131070;
+  };
+  Codes codes{};
+  for (unsigned c = 0; c < 4; ++c) {
+    const bool alpha = c == 3;
+    const BlendEquation equation = alpha ? blend.alpha_equation : blend.rgb_equation;
+    const std::uint64_t a = times(s[c], factor(alpha ? blend.source_alpha_factor : blend.source_rgb_factor, c));
+    const std::uint64_t b = times(d[c], factor(alpha ? blend.destination_alpha_factor : blend.destination_rgb_factor, c));
+    std::uint64_t value = 0;
+    switch (equation) {
+    case BlendEquation::kAdd: value = std::min<std::uint64_t>(a + b, 65535); break;
+    case BlendEquation::kSubtract: value = a > b ? a - b : 0; break;
+    case BlendEquation::kReverseSubtract: value = b > a ? b - a : 0; break;
+    case BlendEquation::kMin: value = std::min(s[c], d[c]); break;
+    case BlendEquation::kMax: value = std::max(s[c], d[c]); break;
+    }
+    codes[c] = static_cast<std::uint32_t>(
+        alpha ? (((value >> 2) * 3) + 8192) >> 14 : value >> 6);
   }
   return codes;
 }
@@ -531,7 +597,12 @@ void RunBlendEquationMatrix(MemoryPool &pool,
       const auto &d = destinations[target];
       const PreciseColor destination{d[0] / 1023.0L, d[1] / 1023.0L,
                                      d[2] / 1023.0L, d[3] / 3.0L};
-      result_codes.push_back(BlendOracleCodes(test.oracle(source, destination, constant), test.name));
+      const Codes algebra = BlendOracleCodes(test.oracle(source, destination, constant), test.name);
+      const Codes llvmpipe = LlvmpipeBlendCodes(blend, source, d, constant);
+      for (unsigned c = 0; c < 4; ++c)
+        Check(llvmpipe[c] + 1 >= algebra[c] && llvmpipe[c] <= algebra[c] + 1,
+              std::string(test.name) + " llvmpipe integer blend strays from GL algebra");
+      result_codes.push_back(llvmpipe);
     }
     AddFragment(scenario, std::vector<Color>(4, shader_color), result_codes);
     Run(pool, input, output, scenario);
@@ -592,28 +663,36 @@ int sc_main(int argc, char **argv) {
 
       const float nan = std::numeric_limits<float>::quiet_NaN();
       const float inf = std::numeric_limits<float>::infinity();
+      // llvmpipe stores 10:10:10:2 through a 16-bit code: RGB truncates it
+      // (1.5/1023 -> 1, 1022.5/1023 -> 1023) and alpha rescales with rounding.
       const std::vector<std::pair<Color, Codes>> boundaries = {
-        {{0.5F, 0.5F / 1023, 1.5F / 1023, 0.5F}, {512, 0, 2, 2}},
-        {{2.5F / 1023, 3.5F / 1023, 1022.5F / 1023, 1.0F / 6}, {2, 4, 1022, 0}},
+        {{0.5F, 0.5F / 1023, 1.5F / 1023, 0.5F}, {512, 0, 1, 2}},
+        {{2.5F / 1023, 3.5F / 1023, 1022.5F / 1023, 1.0F / 6}, {2, 3, 1023, 0}},
         {{0.4999F, 0.5001F, -1, 0.4999F}, {511, 512, 0, 1}},
         {{nan, inf, -inf, nan}, {0, 1023, 0, 0}},
-        {{0.0003F, 0.0006F, 0.9999F, 1.1F}, {0, 1, 1023, 3}},
+        {{0.0003F, 0.0006F, 0.9999F, 1.1F}, {0, 0, 1023, 3}},
       };
       for (const auto &[color, codes] : boundaries) {
         auto scenario = NewScenario(format, "finite/nonfinite precision boundary");
         AddFragment(scenario, {color}, {codes});
         Run(pool, input, output, scenario);
       }
-      for (float increment : {0.49F, 0.51F, 1.0F}) {
+      // Additive blending happens on bit-replicated 16-bit codes, so a
+      // sub-code increment survives only where the destination's replicated
+      // low bits carry (blue 513) and each fragment re-reads the stored code.
+      const std::vector<std::pair<float, std::array<Codes, 2>>> increments = {
+        {0.49F, {{{1, 5, 513, 0}, {1, 5, 513, 0}}}},
+        {0.51F, {{{1, 5, 514, 1}, {1, 5, 515, 2}}}},
+        {1.0F, {{{2, 6, 514, 1}, {3, 7, 515, 2}}}},
+      };
+      for (const auto &[increment, results] : increments) {
         auto scenario = NewScenario(format, "per-fragment additive quantization", 1, 1);
         scenario.state.raster_state.blend.enable = 1;
         const Codes initial{1, 5, 513, 0};
         scenario.initial[0] = scenario.expected[0] = Word(initial, format);
         const Color color{increment / 1023, increment / 1023, increment / 1023, increment / 3};
-        for (unsigned fragment = 1; fragment <= 2; ++fragment) {
-          const unsigned add = increment < 0.5F ? 0 : fragment;
-          AddFragment(scenario, {color}, {{initial[0] + add, initial[1] + add, initial[2] + add, add}});
-        }
+        for (const Codes &result : results)
+          AddFragment(scenario, {color}, {result});
         Run(pool, input, output, scenario);
       }
       auto blend = NewScenario(format, "float source before blend and clamp", 1, 1);
@@ -621,7 +700,7 @@ int sc_main(int argc, char **argv) {
       blend.state.raster_state.blend.source_rgb_factor = BlendFactor::kSourceAlpha;
       blend.state.raster_state.blend.destination_rgb_factor = BlendFactor::kZero;
       blend.state.raster_state.blend.destination_alpha_factor = BlendFactor::kZero;
-      AddFragment(blend, {{1.4F / 1023, 2.6F / 1023, 3.4F / 1023, 0.5F}}, {{1, 1, 2, 2}});
+      AddFragment(blend, {{1.4F / 1023, 2.6F / 1023, 3.4F / 1023, 0.5F}}, {{0, 1, 1, 2}});
       Run(pool, input, output, blend);
       auto clamp = NewScenario(format, "source clamp before blend", 1, 1);
       clamp.state.raster_state.blend = blend.state.raster_state.blend;

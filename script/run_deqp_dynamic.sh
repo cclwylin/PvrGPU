@@ -42,6 +42,7 @@
 #   PVRGPU_SYSTEMC_API_LIB      libpvrgpu_systemc_bridge.dylib
 #   PVRGPU_BUILD_DIR            PvrGPU build directory (bridge fallback)
 #   PVRGPU_OUTPUT_ROOT          run output root
+#   PVRGPU_TEXTURE_MEMORY_PATH  short (default) or cached
 #   PVRGPU_DEQP_PROJECT_DIR     dEQP project (default: <repo>/../dEQP)
 #   PVRGPU_DEQP_BUILD_DIR       dEQP CMake build dir (default: from that
 #                               project's out/deqp-build-<arch>.env)
@@ -71,6 +72,7 @@ opt_archive_dir=""
 opt_mesa_prefix="${PVRGPU_MESA_PVRGPU_PREFIX:-}"
 opt_systemc_lib="${PVRGPU_SYSTEMC_API_LIB:-}"
 opt_output_dir="${OUTPUT_DIR:-}"
+opt_texture_memory_path="${PVRGPU_TEXTURE_MEMORY_PATH:-}"
 opt_gl_config="rgba8888d24s8ms0"
 opt_surface_type="pbuffer"
 opt_width="256"
@@ -101,6 +103,9 @@ Options:
       --mesa-prefix DIR      Mesa prefix with the PCO/pvrgpu driver
       --systemc-lib PATH     PvrGPU SystemC bridge dylib
       --output-dir DIR       run output directory
+      --texture-memory-path PATH
+                             short (default) or cached; cached requires
+                             PVRGPU_MODEL_MEMORY_MODE=cache
       --gl-config NAME       --deqp-gl-config-name value ('' to omit)
       --surface-type TYPE    pbuffer|fbo|window (default: pbuffer)
       --size WxH             surface size (default: 256x256)
@@ -132,6 +137,13 @@ while (($# > 0)); do
         --mesa-prefix)      [[ $# -ge 2 ]] || die "missing value for $1"; opt_mesa_prefix="$2"; shift 2 ;;
         --systemc-lib)      [[ $# -ge 2 ]] || die "missing value for $1"; opt_systemc_lib="$2"; shift 2 ;;
         --output-dir)       [[ $# -ge 2 ]] || die "missing value for $1"; opt_output_dir="$2"; shift 2 ;;
+        --texture-memory-path)
+                            [[ $# -ge 2 ]] || die "missing value for $1"
+                            case "$2" in
+                                short|cached) opt_texture_memory_path="$2" ;;
+                                *) die "texture memory path must be short or cached" ;;
+                            esac
+                            shift 2 ;;
         --gl-config)        [[ $# -ge 2 ]] || die "missing value for $1"; opt_gl_config="$2"; shift 2 ;;
         --surface-type)     [[ $# -ge 2 ]] || die "missing value for $1"; opt_surface_type="$2"; shift 2 ;;
         --log-images)       [[ $# -ge 2 ]] || die "missing value for $1"; opt_log_images="$2"; shift 2 ;;
@@ -188,6 +200,15 @@ if [[ -f "${REPO_DIR}/config/local.env" ]]; then
     saved_systemc_lib="${opt_systemc_lib}"
     saved_build_dir="${PVRGPU_BUILD_DIR:-}"
     saved_output_root="${PVRGPU_OUTPUT_ROOT:-}"
+    saved_runtime_names=()
+    saved_runtime_values=()
+    for variable in PVRGPU_MODEL_MEMORY_MODE PVRGPU_TEXTURE_MEMORY_PATH \
+        PVRGPU_TEXTURE_LOD_MODE; do
+        if declare -p "${variable}" >/dev/null 2>&1; then
+            saved_runtime_names+=("${variable}")
+            saved_runtime_values+=("${!variable}")
+        fi
+    done
     set -a
     # shellcheck disable=SC1091
     source "${REPO_DIR}/config/local.env"
@@ -196,6 +217,9 @@ if [[ -f "${REPO_DIR}/config/local.env" ]]; then
     [[ -n "${saved_systemc_lib}" ]] && opt_systemc_lib="${saved_systemc_lib}"
     [[ -n "${saved_build_dir}" ]] && PVRGPU_BUILD_DIR="${saved_build_dir}"
     [[ -n "${saved_output_root}" ]] && PVRGPU_OUTPUT_ROOT="${saved_output_root}"
+    for ((index=0; index<${#saved_runtime_names[@]}; index++)); do
+        export "${saved_runtime_names[index]}=${saved_runtime_values[index]}"
+    done
     [[ -z "${opt_mesa_prefix}" ]] && opt_mesa_prefix="${PVRGPU_MESA_PVRGPU_PREFIX:-}"
     [[ -z "${opt_systemc_lib}" ]] && opt_systemc_lib="${PVRGPU_SYSTEMC_API_LIB:-}"
 fi
@@ -422,6 +446,18 @@ export MESA_SHADER_CACHE_DISABLE="${MESA_SHADER_CACHE_DISABLE:-true}"
 # Compute and graphics share one elaborated SystemC memory system. Keep the
 # default explicit in every run, while preserving an intentional override.
 export PVRGPU_MODEL_MEMORY_MODE="${PVRGPU_MODEL_MEMORY_MODE:-cache}"
+# Texture sampling defaults to the fast architectural short path. Select
+# cached explicitly to model TPU -> TCU -> SLC -> DRAM.
+[[ -n "${opt_texture_memory_path}" ]] && \
+    PVRGPU_TEXTURE_MEMORY_PATH="${opt_texture_memory_path}"
+export PVRGPU_TEXTURE_MEMORY_PATH="${PVRGPU_TEXTURE_MEMORY_PATH:-short}"
+case "${PVRGPU_TEXTURE_MEMORY_PATH}" in
+    short) ;;
+    cached)
+        [[ "${PVRGPU_MODEL_MEMORY_MODE}" == "cache" ]] || \
+            die "--texture-memory-path cached requires PVRGPU_MODEL_MEMORY_MODE=cache" ;;
+    *) die "texture memory path must be short or cached" ;;
+esac
 # Conformance runs model the hardware-quality LOD selector. Capture/Play does
 # not use this runner and retains the bridge default, llvmpipe-compatible LOD,
 # so byte-exact serialized replay remains stable.
@@ -445,7 +481,7 @@ if ((opt_print_env)); then
     for name in DYLD_LIBRARY_PATH LIBGL_DRIVERS_PATH EGL_PLATFORM GALLIUM_DRIVER \
                 MESA_LOADER_DRIVER_OVERRIDE LIBGL_ALWAYS_SOFTWARE \
                 MESA_SHADER_CACHE_DISABLE PVRGPU_MODEL_MEMORY_MODE \
-                PVRGPU_TEXTURE_LOD_MODE \
+                PVRGPU_TEXTURE_MEMORY_PATH PVRGPU_TEXTURE_LOD_MODE \
                 PVRGPU_DEQP_LIVE PVRGPU_SYSTEMC_API_LIB; do
         info "  ${name}=${!name}"
     done
@@ -594,6 +630,7 @@ for one_case in "${cases[@]}"; do
         echo "mesa_pco_prefix=${mesa_prefix}"
         echo "systemc_api_lib=${systemc_lib}"
         echo "memory_mode=${PVRGPU_MODEL_MEMORY_MODE}"
+        echo "texture_memory_path=${PVRGPU_TEXTURE_MEMORY_PATH}"
         echo "texture_lod_mode=${PVRGPU_TEXTURE_LOD_MODE}"
         echo "host_arch=${host_arch}"
         echo "output_dir=${case_dir}"

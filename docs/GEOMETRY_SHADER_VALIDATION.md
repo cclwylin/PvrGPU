@@ -49,7 +49,7 @@ Frozen runtime SHA-256：
 - `dEQP-GLES31.functional.geometry_shading.basic.output_vary_by_texture`
 - `dEQP-GLES31.functional.geometry_shading.instanced.invocation_output_vary_by_texture`
 
-GS 原生 `SMP` 經獨立 GeometryShader／TextureUnit FIFO 執行，不屬於 memory/export 指令計數。每例實測 4 次 GS invocation、static TEX 1／executed TEX 4、4 次 texture request／texel fetch、144 個 emitted vertices、138 個 primitives；DrawList 與 `gs_tex_instructions` aggregate 相符。採樣以 `MemoryClient::kTextureCache` 讀 modeled GPU memory；目前 unified memory path 計入 SLC／DRAM，不冒稱獨立 `tcu_*` cache 命中。
+GS 原生 `SMP` 經獨立 GeometryShader／TextureUnit FIFO 執行，不屬於 memory/export 指令計數。每例實測 4 次 GS invocation、static TEX 1／executed TEX 4、4 次 texture request／texel fetch、144 個 emitted vertices、138 個 primitives；DrawList 與 `gs_tex_instructions` aggregate 相符。採樣讀取同一份 authoritative GPU-memory backing；目前預設 `texture_memory_path=short` 以 `memory_direct_read_bytes` 記錄 payload 且 `tcu_*` 維持零，顯式 `cached` 才經 TCU→SLC→DRAM，並由 hello 的 `texture_memory_path`／`texture_cache_simulated` 揭露所用拓撲。
 
 原失敗原因是 JsonReporter 仍禁止 GS executed TEX 非零，導致模型拒絕讀回，並非已證實的採樣或迴圈數學錯誤。修正完整加入 GS TEX producer、TCU request accounting、DrawList aggregate、JSON 與 protocol cross-check；未啟用 GS 時任何殘留 static/dynamic 統計仍拒絕，合法零 invocation／零 Emit 不被誤判。每例皆有 262,144 bytes DRAM framebuffer readback、49 allocations／49 releases、0 leaks，無 model／query error。
 

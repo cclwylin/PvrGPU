@@ -52,6 +52,68 @@ run_one_case() {
                                         env=env, capture_output=True, text=True, check=True)
                 self.assertEqual(result.stdout, expected)
 
+    def test_default_texture_memory_path_is_short_and_preserves_override(self) -> None:
+        line = next(line for line in RUNNER.read_text().splitlines()
+                    if line.startswith("export PVRGPU_TEXTURE_MEMORY_PATH="))
+        for value, expected in ((None, "short"), ("", "short"),
+                                ("short", "short"), ("cached", "cached")):
+            with self.subTest(value=value):
+                env = dict(os.environ)
+                env.pop("PVRGPU_TEXTURE_MEMORY_PATH", None)
+                if value is not None:
+                    env["PVRGPU_TEXTURE_MEMORY_PATH"] = value
+                result = subprocess.run(
+                    ["bash", "-c", line +
+                     '\nprintf "%s" "$PVRGPU_TEXTURE_MEMORY_PATH"'],
+                    env=env, capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout, expected)
+
+    def test_texture_memory_path_cli_rejects_empty_and_invalid_values(self) -> None:
+        for value in ("", "invalid"):
+            with self.subTest(value=value):
+                result = subprocess.run(
+                    [RUNNER, "--texture-memory-path", value],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "texture memory path must be short or cached",
+                    result.stderr,
+                )
+
+    def test_texture_memory_path_environment_wins_over_local_env(self) -> None:
+        source = RUNNER.read_text()
+        start = source.index('if [[ -f "${REPO_DIR}/config/local.env" ]]')
+        end = source.index('\nPVRGPU_BUILD_DIR=', start)
+        config_block = source[start:end]
+        with tempfile.TemporaryDirectory(prefix="pvrgpu-runner-config-") as root:
+            config = Path(root) / "config"
+            config.mkdir()
+            (config / "local.env").write_text(
+                "PVRGPU_TEXTURE_MEMORY_PATH=short\n"
+                "PVRGPU_MODEL_MEMORY_MODE=cache\n"
+                "PVRGPU_TEXTURE_LOD_MODE=exact\n"
+            )
+            shell = (
+                'opt_mesa_prefix=""; opt_systemc_lib=""\n'
+                + config_block
+                + '\nprintf "%s|%s|%s" "$PVRGPU_TEXTURE_MEMORY_PATH" '
+                  '"$PVRGPU_MODEL_MEMORY_MODE" "$PVRGPU_TEXTURE_LOD_MODE"\n'
+            )
+            env = dict(
+                os.environ,
+                REPO_DIR=root,
+                PVRGPU_TEXTURE_MEMORY_PATH="cached",
+                PVRGPU_MODEL_MEMORY_MODE="cache",
+                PVRGPU_TEXTURE_LOD_MODE="llvmpipe",
+            )
+            result = subprocess.run(
+                ["bash", "-c", shell], env=env, capture_output=True,
+                text=True, check=True
+            )
+            self.assertEqual(result.stdout, "cached|cache|llvmpipe")
+
     def test_default_texture_lod_mode_is_exact_and_preserves_override(self) -> None:
         line = next(line for line in RUNNER.read_text().splitlines()
                     if line.startswith("export PVRGPU_TEXTURE_LOD_MODE="))

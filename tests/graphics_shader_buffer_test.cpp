@@ -128,6 +128,20 @@ void TestDescriptorLayoutPermutations() {
   Check(!ResolveDriverGraphicsDescriptorLayout(abi, 0, 1, 1, storage),
         "VS/FS zero-UBO descriptor start remains canonically zero");
 
+  abi = {};
+  storage = {};
+  abi.shareds = 20;
+  Check(ResolveDriverGraphicsDescriptorLayout(abi, 0, 1, 0, storage,
+                                               &layout) &&
+            layout.texture_end == 20 && layout.storage_end == 20,
+        "PCO {0,0} push range after a texture prefix is an empty window");
+  abi.shareds = 60;
+  Check(ResolveDriverGraphicsDescriptorLayout(abi, 0, 3, 0, storage),
+        "PCO {0,0} push range after three textures is an empty window");
+  abi.shareds = 24;
+  Check(!ResolveDriverGraphicsDescriptorLayout(abi, 0, 1, 0, storage),
+        "PCO {0,0} push range cannot leave shared words past the prefix");
+
   abi.uniform_buffer_descriptor_start = 24;
   storage = {28, 1, 1, 1, 0};
   abi.uniform_buffer_descriptor_count = 1;
@@ -140,6 +154,27 @@ void TestDescriptorLayoutPermutations() {
   bad_storage.used_mask = 2;
   Check(!ResolveDriverGraphicsDescriptorLayout(abi, 4, 1, 0, bad_storage),
         "storage masks stay within the descriptor count");
+}
+
+void TestLegacyFragmentTextureLayout() {
+  // glmark2 texture: draw_pco_triangles with one legacy fragment texture, its
+  // 20-dword descriptor as the whole FS shared bank and no push constants.
+  DriverCommand command;
+  command.sampled_texture_count = 1;
+  command.fragment_shared.assign(20, 0);
+  command.fragment_pco_abi.temps = 8;
+  command.fragment_pco_abi.coefficients = 16;
+  command.fragment_pco_abi.shareds = 20;
+  DriverGraphicsDescriptorLayout layout;
+  Check(ResolveDriverGraphicsDescriptorLayout(command, 1, &layout) &&
+            layout.texture_end == 20 && layout.storage_end == 20,
+        "legacy fragment texture reserves its descriptor prefix");
+  std::string error;
+  Check(ValidateDriverUniformBuffers(command, &error), error.c_str());
+
+  command.sampled_texture_count = 0;
+  Check(!ResolveDriverGraphicsDescriptorLayout(command, 1),
+        "untextured FS cannot carry a descriptor-sized shared bank");
 }
 
 void TestTransportContract() {
@@ -861,6 +896,7 @@ void TestVertexAtomicBeforeTextureContinuation() {
 
 int main() {
   TestDescriptorLayoutPermutations();
+  TestLegacyFragmentTextureLayout();
   TestTransportContract();
   TestFiveStageAtomicCallbacks();
   TestFiveStageRawAtomicExecution();

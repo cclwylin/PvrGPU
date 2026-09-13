@@ -56,7 +56,14 @@ inline std::uint32_t GraphicsStageTextureCount(const DriverCommand &command,
                                                std::size_t stage) {
   switch (stage) {
   case 0: return command.vertex_sampled_texture_count;
-  case 1: return command.fragment_sampled_texture_count;
+  case 1:
+    // Legacy draw_pco_triangles carries its single fragment texture in
+    // sampled_texture_count; per-stage counts exist only with sequence
+    // textures.  Match Submitter's fragment texture-count selection.
+    return command.fragment_sampled_texture_count != 0 ||
+                   !command.sampled_textures.empty()
+               ? command.fragment_sampled_texture_count
+               : command.sampled_texture_count;
   case 2: return command.geometry_sampled_texture_count;
   case 3: return command.tessellation_control_sampled_texture_count;
   case 4: return command.tessellation_evaluation_sampled_texture_count;
@@ -89,6 +96,14 @@ inline bool ResolveDriverGraphicsDescriptorLayout(
       abi.uniform_buffer_descriptor_count || system_dwords
           ? static_cast<std::uint32_t>(texture_end)
           : 0U;
+  /* PCO copies an absent push-constant range verbatim as {0, 0}, so a stage
+   * with texture/UBO/image/storage descriptors and no push constants arrives
+   * with start zero rather than storage_end.  That window is still empty only
+   * when the shared bank ends exactly at the descriptor prefix. */
+  const bool empty_push_window =
+      abi.push_constant_start == 0 && abi.push_constant_count == 0;
+  const std::uint64_t push_constant_start =
+      empty_push_window ? storage_end : abi.push_constant_start;
   if (storage_end > PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE ||
       abi.shareds > PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE ||
       abi.uniform_buffer_descriptor_start != expected_uniform_start ||
@@ -98,9 +113,9 @@ inline bool ResolveDriverGraphicsDescriptorLayout(
                  storage.read_mask || storage.write_mask) ||
       (storage.used_mask & ~storage_mask) ||
       ((storage.read_mask | storage.write_mask) & ~storage.used_mask) ||
-      abi.push_constant_start != storage_end ||
-      abi.push_constant_start > abi.shareds ||
-      abi.push_constant_count != abi.shareds - abi.push_constant_start)
+      push_constant_start != storage_end ||
+      push_constant_start > abi.shareds ||
+      abi.push_constant_count != abi.shareds - push_constant_start)
     return false;
   if (resolved) {
     resolved->texture_end = static_cast<std::uint32_t>(texture_end);

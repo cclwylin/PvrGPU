@@ -114,19 +114,20 @@ struct Client : sc_core::sc_module {
           const auto taps = state.counters.texel_fetches - before.texel_fetches;
           Check(state.counters.texture_requests == before.texture_requests + 1 && (taps == 4 || taps == 8),
                 "SMP request/tap accounting mismatch");
-          if (memory.mode() == MemoryMode::kDirect)
-            Check(state.counters.memory_direct_read_bytes - before.memory_direct_read_bytes == 16 * taps,
-                  "SMP bypassed complete direct texel reads");
-          else if (memory.mode() == MemoryMode::kBypass)
-            Check(state.counters.dram_read_bytes - before.dram_read_bytes == 16 * taps &&
-                  state.counters.dram_read_transactions - before.dram_read_transactions == taps,
-                  "SMP bypass mode did not issue each real texel read");
-          else {
-            Check(state.counters.slc_read_accesses - before.slc_read_accesses == taps,
-                  "SMP cache lookup count mismatch");
-            if (round == 1) Check(state.counters.dram_read_bytes == before.dram_read_bytes,
-                                  "warm repeated texture unexpectedly reread DRAM");
-          }
+          // TextureUnit defaults to the independent fast short path in every
+          // global memory mode. The active TCU/SLC route is exercised by the
+          // dedicated cached-topology integration test, where its FIFO ports
+          // are bound to TextureCache.
+          Check(state.counters.memory_direct_read_bytes -
+                        before.memory_direct_read_bytes ==
+                    16 * taps &&
+                    state.counters.tcu_line_accesses ==
+                        before.tcu_line_accesses &&
+                    state.counters.slc_read_accesses ==
+                        before.slc_read_accesses &&
+                    state.counters.dram_read_transactions ==
+                        before.dram_read_transactions,
+                "default short SMP path did not bypass TCU/SLC to DRAM backing");
           Check((stage == 0 ? state.tessellation_control_texture_request_count : state.tessellation_evaluation_texture_request_count) ==
                   state.counters.texture_requests && state.fragment_texture_request_count == 0 &&
                   state.geometry_texture_request_count == 0 && state.vertex_texture_request_count == 0,

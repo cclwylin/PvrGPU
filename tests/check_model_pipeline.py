@@ -120,13 +120,21 @@ def verify_memory_path(
     message: dict[str, object],
     *,
     cache_bypass: bool,
+    texture_memory_path: str = "short",
     warm_slc: bool = False,
     framebuffer_bytes: int = FRAMEBUFFER_BYTES,
 ) -> None:
     expected_mode = "bypass" if cache_bypass else "cache"
+    assert texture_memory_path in {"short", "cached"}
+    if texture_memory_path == "cached":
+        assert expected_mode == "cache", "cached texture path requires global cache"
     assert hello.get("cache_bypass") is cache_bypass
     assert hello.get("memory_mode") == expected_mode
     assert hello.get("cache_simulated") is (expected_mode == "cache")
+    assert hello.get("texture_memory_path") == texture_memory_path
+    assert hello.get("texture_cache_simulated") is (
+        texture_memory_path == "cached"
+    )
     assert hello.get("framebuffer_source") == "dram-readback"
     assert hello.get("dram_fixed_latency_cycles") == 1
     values = message.get("counters")
@@ -142,7 +150,7 @@ def verify_memory_path(
             f"memory path: {field}={values.get(field)!r}, expected {expected}"
         )
 
-    for field in (
+    tcu_fields = (
         "tcu_line_accesses",
         "tcu_read_accesses",
         "tcu_hits",
@@ -151,12 +159,29 @@ def verify_memory_path(
         "tcu_writebacks",
         "tcu_bypassed",
         "tcu_cycles",
-    ):
-        assert values.get(field) == 0, (
-            f"unified memory path: {field}={values.get(field)!r}, expected 0"
-        )
-
-    assert values.get("memory_direct_read_bytes") == 0
+    )
+    has_texel_traffic = values.get("texel_fetches", 0) != 0
+    if texture_memory_path == "short":
+        for field in tcu_fields:
+            assert values.get(field) == 0, (
+                f"short texture path: {field}={values.get(field)!r}, expected 0"
+            )
+        assert (values.get("memory_direct_read_bytes", 0) > 0) is has_texel_traffic
+    else:
+        assert values["tcu_line_accesses"] == values["tcu_read_accesses"]
+        assert values["tcu_hits"] + values["tcu_misses"] == values[
+            "tcu_line_accesses"
+        ]
+        assert values["tcu_writebacks"] == 0
+        assert values["tcu_bypassed"] == 0
+        assert values["tcu_cycles"] == values["tcu_line_accesses"]
+        assert values["tcu_evictions"] <= values["tcu_misses"]
+        if has_texel_traffic:
+            assert values["tcu_line_accesses"] >= values["texel_fetches"]
+        else:
+            assert all(values.get(field) == 0 for field in tcu_fields)
+        assert values.get("memory_direct_read_bytes") == 0
+        assert values["slc_read_accesses"] >= values["tcu_misses"]
     assert values.get("memory_direct_write_bytes") == 0
     assert values["dram_read_transactions"] > 0
     assert values["dram_write_transactions"] > 0
@@ -204,6 +229,7 @@ def invoke_case(
     *,
     frames: int,
     memory_mode: str | None = None,
+    texture_memory_path: str | None = None,
     cache_bypass: str | None = None,
     width: int = WIDTH,
     height: int = HEIGHT,
@@ -224,6 +250,8 @@ def invoke_case(
     ]
     if memory_mode is not None:
         arguments.extend(("--memory-mode", memory_mode))
+    if texture_memory_path is not None:
+        arguments.extend(("--texture-memory-path", texture_memory_path))
     if cache_bypass is not None:
         arguments.extend(("--cache-bypass", cache_bypass))
     return subprocess.run(
@@ -3082,6 +3110,8 @@ def verify_fill_tex_nearest(executable: Path, output_dir: Path) -> None:
         "command_source": "builtin-glbench-fixture",
         "timing_provenance": "uncalibrated",
         "cache_bypass": False,
+        "texture_memory_path": "short",
+        "texture_cache_simulated": False,
         "framebuffer_source": "dram-readback",
     }
     for field, expected in expected_provenance.items():
@@ -3232,6 +3262,8 @@ def verify_fill_tex_nearest(executable: Path, output_dir: Path) -> None:
         "functional_frame": 1,
     }
     for field, expected in expected_modeled.items():
+        if field in UNIFIED_MEMORY_EXACT_SKIP:
+            continue
         assert values.get(field) == expected, (
             f"{case_name}: {field}={values.get(field)!r}, expected {expected}"
         )
@@ -3322,6 +3354,100 @@ def verify_fill_tex_nearest(executable: Path, output_dir: Path) -> None:
     png_width, png_height, pixels = decode_rgba8_png(artifact)
     assert (png_width, png_height) == (64, 64)
     assert pixels == fill_tex_nearest_golden_pixels()
+    assert [path.name for path in output_dir.rglob("*.png")] == [artifact.name]
+    assert not [
+        path
+        for path in output_dir.rglob("*")
+        if path.is_file() and path.name.endswith(".part")
+    ]
+
+    verify_cached_texture_replay(
+        executable,
+        output_dir.with_name(f"{output_dir.name}-cached"),
+        case_name=case_name,
+        short_message=message,
+        short_pixels=pixels,
+    )
+
+
+def verify_cached_texture_replay(
+    executable: Path,
+    output_dir: Path,
+    *,
+    case_name: str,
+    short_message: dict[str, object],
+    short_pixels: bytes,
+) -> None:
+    """The detailed texture hierarchy must preserve the short-path image."""
+    completed = invoke_case(
+        executable,
+        case_name,
+        output_dir,
+        frames=1,
+        cache_bypass="off",
+        texture_memory_path="cached",
+        width=64,
+        height=64,
+        timeout=30,
+    )
+    assert completed.returncode == 0, (
+        f"{case_name} cached model run failed:\n" + process_details(completed)
+    )
+
+    messages = json_messages(completed)
+    hello = [message for message in messages if message.get("type") == "hello"]
+    counters = [
+        message for message in messages if message.get("type") == "counter"
+    ]
+    done = [message for message in messages if message.get("type") == "done"]
+    assert len(hello) == len(counters) == len(done) == 1
+
+    message = counters[0]
+    assert message.get("texture_memory_path") == "cached"
+    assert message.get("texture_cache_simulated") is True
+    verify_memory_path(
+        hello[0],
+        message,
+        cache_bypass=False,
+        texture_memory_path="cached",
+        framebuffer_bytes=64 * 64 * 4,
+    )
+
+    values = message.get("counters")
+    short_values = short_message.get("counters")
+    assert isinstance(values, dict) and isinstance(short_values, dict)
+    for field in (
+        "ps_invocations",
+        "texel_fetches",
+        "texture_requests",
+        "fs_tex_instructions",
+        "fragment_candidates",
+        "pbe_fragment_writes",
+        "pbe_pixels_written",
+        "pixel_data_master_bytes",
+        "framebuffer_dram_readback_bytes",
+    ):
+        assert values.get(field) == short_values.get(field), (
+            f"{case_name} cached {field}={values.get(field)!r}, "
+            f"short path reported {short_values.get(field)!r}"
+        )
+    assert values["tcu_line_accesses"] > 0
+    assert values["tcu_misses"] > 0
+
+    done_message = done[0]
+    assert done_message.get("pool_leaks") == 0
+    assert done_message.get("pool_bytes_in_flight") == 0
+    assert done_message.get("pool_allocations") == done_message.get(
+        "pool_releases"
+    )
+
+    artifact = output_dir / f"{case_name}_sample_000001.png"
+    artifact_field = message.get("artifact_png")
+    assert isinstance(artifact_field, str)
+    assert Path(artifact_field).resolve() == artifact.resolve()
+    png_width, png_height, pixels = decode_rgba8_png(artifact)
+    assert (png_width, png_height) == (64, 64)
+    assert pixels == short_pixels, "cached texture path changed the rendered image"
     assert [path.name for path in output_dir.rglob("*.png")] == [artifact.name]
     assert not [
         path
@@ -3557,6 +3683,8 @@ def verify_fill_tex_bilinear(executable: Path, output_dir: Path) -> None:
         "functional_frame": 1,
     }
     for field, expected in expected_modeled.items():
+        if field in UNIFIED_MEMORY_EXACT_SKIP:
+            continue
         assert values.get(field) == expected, (
             f"{case_name}: {field}={values.get(field)!r}, expected {expected}"
         )
@@ -3863,6 +3991,8 @@ def verify_fill_tex_trilinear_linear_01(
         "functional_frame": 1,
     }
     for field, expected in expected_modeled.items():
+        if field in UNIFIED_MEMORY_EXACT_SKIP:
+            continue
         assert values.get(field) == expected, (
             f"{case_name}: {field}={values.get(field)!r}, expected {expected}"
         )
@@ -4238,6 +4368,8 @@ def verify_fill_tex_trilinear_linear_04_or_05(
         "functional_frame": 1,
     }
     for field, expected in expected_values.items():
+        if field in UNIFIED_MEMORY_EXACT_SKIP:
+            continue
         assert values.get(field) == expected, (
             f"{case_name}: {field}={values.get(field)!r}, expected {expected}"
         )
@@ -4343,8 +4475,11 @@ def verify_cache_bypass_options(executable: Path) -> None:
     )
     assert help_result.returncode == 0, process_details(help_result)
     assert "--memory-mode direct|bypass|cache" in help_result.stdout
+    assert "--texture-memory-path short|cached" in help_result.stdout
     assert "--cache-bypass on|off" in help_result.stdout
     assert "Run SLC/DRAM simulation (default)" in help_result.stdout
+    assert "TPU to DRAM short path (default)" in help_result.stdout
+    assert "TPU to TCU to SLC to DRAM" in help_result.stdout
 
     invalid = subprocess.run(
         [str(executable), "--cache-bypass", "enabled"],
@@ -4365,6 +4500,51 @@ def verify_cache_bypass_options(executable: Path) -> None:
     )
     assert missing.returncode != 0, "missing cache bypass value was accepted"
     assert "Missing value after --cache-bypass" in missing.stderr
+
+    invalid_texture_path = subprocess.run(
+        [str(executable), "--texture-memory-path", "fast"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert invalid_texture_path.returncode != 0, (
+        "invalid texture memory path was accepted"
+    )
+    assert "expected short or cached" in invalid_texture_path.stderr
+
+    missing_texture_path = subprocess.run(
+        [str(executable), "--texture-memory-path"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert missing_texture_path.returncode != 0, (
+        "missing texture memory path was accepted"
+    )
+    assert "Missing value after --texture-memory-path" in missing_texture_path.stderr
+
+    for memory_arguments in (
+        ("--memory-mode", "direct"),
+        ("--memory-mode", "bypass"),
+        ("--cache-bypass", "on"),
+    ):
+        for arguments in (
+            ("--texture-memory-path", "cached", *memory_arguments),
+            (*memory_arguments, "--texture-memory-path", "cached"),
+        ):
+            incompatible = subprocess.run(
+                [str(executable), *arguments],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            assert incompatible.returncode != 0, (
+                "cached texture path accepted without cache memory mode"
+            )
+            assert "requires --memory-mode cache" in incompatible.stderr
 
 
 def main() -> int:

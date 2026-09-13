@@ -82,11 +82,26 @@ pvrgpu_color_format_uses_integer_codec(const char *format)
                      !strcmp(format, "PIPE_FORMAT_R32G32B32A32_SINT"));
 }
 
+/* UNORM formats of at most eight bits per channel travel as logical RGBA8:
+ * the model keeps each native code bit-replicated to a byte, which Mesa's
+ * 8unorm pack/unpack round-trips exactly. */
+static inline int
+pvrgpu_color_format_uses_unorm8_transport(const char *format)
+{
+   return format && (!strcmp(format, "PIPE_FORMAT_R8_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R8G8_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R8G8B8X8_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_B8G8R8X8_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_R5G6B5_UNORM") ||
+                     !strcmp(format, "PIPE_FORMAT_B5G6R5_UNORM"));
+}
+
 static inline int
 pvrgpu_color_format_uses_canonical_float(const char *format)
 {
    return pvrgpu_is_explicit_color_format(format) &&
           !pvrgpu_color_format_uses_integer_codec(format) &&
+          !pvrgpu_color_format_uses_unorm8_transport(format) &&
           strcmp(format, "PIPE_FORMAT_R32G32B32A32_UNORM") &&
           strcmp(format, "PIPE_FORMAT_R8G8B8A8_UNORM") &&
           strcmp(format, "PIPE_FORMAT_R8G8B8A8_SRGB") &&

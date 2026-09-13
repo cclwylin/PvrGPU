@@ -1290,6 +1290,40 @@ bool SetTextureLodModeFromEnvironment(pvrgpu::stub::Options *options,
   return false;
 }
 
+bool SetTextureMemoryPathFromEnvironment(pvrgpu::stub::Options *options,
+                                         std::string *error) {
+  if (!options || !error)
+    return false;
+  const char *value = std::getenv("PVRGPU_TEXTURE_MEMORY_PATH");
+  const std::string_view path = value && value[0] ? value : "short";
+  if (path == "short") {
+    options->texture_memory_path =
+        pvrgpu::stub::TextureMemoryPath::kShort;
+    return true;
+  }
+  if (path == "cached") {
+    options->texture_memory_path =
+        pvrgpu::stub::TextureMemoryPath::kCached;
+    return true;
+  }
+  *error =
+      "invalid PVRGPU_TEXTURE_MEMORY_PATH (expected short or cached)";
+  return false;
+}
+
+bool TextureMemoryPathMatchesMemoryMode(
+    const pvrgpu::stub::Options &options, std::string *error) {
+  if (options.texture_memory_path !=
+          pvrgpu::stub::TextureMemoryPath::kCached ||
+      options.memory_mode == pvrgpu::stub::MemoryMode::kCache) {
+    return true;
+  }
+  if (error) {
+    *error = "cached texture memory path requires memory mode cache";
+  }
+  return false;
+}
+
 bool CopyTextureSidecarBytes(
     const pvrgpu_systemc_driver_command &source,
     std::vector<std::uint8_t> *destination, std::string *error) {
@@ -3517,6 +3551,12 @@ extern "C" int pvrgpu_systemc_submit_compute(
       CopyError(error, error_size, diagnostic);
       return 2;
     }
+    session_options.memory_mode = prepared.memory_mode;
+    if (!SetTextureMemoryPathFromEnvironment(&session_options, &diagnostic) ||
+        !TextureMemoryPathMatchesMemoryMode(session_options, &diagnostic)) {
+      CopyError(error, error_size, diagnostic);
+      return 2;
+    }
     // A pending draw must finish before compute begins on the shared memory
     // service. The driver materializes attachment resources before snapshotting.
     const int pending = FlushPendingSubmitLocked(nullptr, &diagnostic);
@@ -3533,7 +3573,8 @@ extern "C" int pvrgpu_systemc_submit_compute(
     }
     pvrgpu::stub::ModelComputeStats result;
     const int status = pvrgpu::stub::RunConfiguredCompute(
-        &prepared, &result, session_options.exact_texture_lod, &diagnostic);
+        &prepared, &result, session_options.exact_texture_lod,
+        session_options.texture_memory_path, &diagnostic);
     if (status != 0) {
       CopyError(error, error_size, diagnostic);
       return status;
@@ -3650,6 +3691,11 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
     CopyError(error, error_size, message);
     return 2;
   }
+  if (!SetTextureMemoryPathFromEnvironment(&options, &message) ||
+      !TextureMemoryPathMatchesMemoryMode(options, &message)) {
+    CopyError(error, error_size, message);
+    return 2;
+  }
   const bool pco_sequence =
       info->command->command &&
       std::string_view(info->command->command) == "draw_pco_sequence";
@@ -3691,6 +3737,8 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
         g_pending_submit.options.output_dir == info->outdir &&
         g_pending_submit.options.emit_png == options.emit_png &&
         g_pending_submit.options.memory_mode == options.memory_mode &&
+        g_pending_submit.options.texture_memory_path ==
+            options.texture_memory_path &&
         g_pending_submit.options.exact_texture_lod ==
             options.exact_texture_lod &&
         CommandsShareSequenceTarget(g_pending_submit.options.driver_command,

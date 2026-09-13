@@ -1240,8 +1240,14 @@ TextureImplicitLod ApplyTextureLodBias(
 }
 
 TextureUnit::TextureUnit(sc_core::sc_module_name name, MemoryPool &pool,
-                         GpuMemorySystem *memory, bool exact_lod)
-    : sc_module(name), pool_(pool), memory_(memory), exact_lod_(exact_lod) {
+                         GpuMemorySystem *memory, bool exact_lod,
+                         TextureMemoryPath texture_memory_path)
+    : sc_module(name), pool_(pool), memory_(memory), exact_lod_(exact_lod),
+      texture_memory_path_(texture_memory_path) {
+  if (texture_memory_path != TextureMemoryPath::kShort &&
+      texture_memory_path != TextureMemoryPath::kCached) {
+    throw std::invalid_argument("TextureUnit received invalid memory path");
+  }
   SC_THREAD(Run);
   SC_THREAD(SampleRun);
   SC_THREAD(VertexSampleRun);
@@ -1287,9 +1293,11 @@ void TextureUnit::SampleRunForStage(
                      sc_core::SC_ZERO_OR_MORE_BOUND> &sample_output_port) {
   if (sample_input_port.size() == 0 || sample_output_port.size() == 0)
     return;
+  if ((!memory_ || texture_memory_path_ == TextureMemoryPath::kCached) &&
+      (cache_request.size() == 0 || cache_response.size() == 0))
+    return;
   if (!memory_ &&
-      (cache_request.size() == 0 || cache_response.size() == 0 ||
-       upload_request.size() == 0 || upload_response.size() == 0))
+      (upload_request.size() == 0 || upload_response.size() == 0))
     return;
   while (true) {
     const PipelineTxn txn = sample_input_port->read();
@@ -2339,8 +2347,9 @@ void TextureUnit::SampleRunForStage(
         std::vector<std::uint8_t> fifo_payload;
         const std::uint8_t *payload = nullptr;
         std::size_t payload_size = 0;
-        if (memory_) {
-          memory_stats += memory_->ReadInto(
+        if (memory_ &&
+            texture_memory_path_ == TextureMemoryPath::kShort) {
+          memory_stats += memory_->ReadDirectInto(
               texel_address, inline_payload.data(), fetch_bytes,
               MemoryClient::kTextureCache);
           payload = inline_payload.data();

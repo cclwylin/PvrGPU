@@ -5,6 +5,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace pvrgpu::stub {
 namespace {
@@ -84,6 +85,11 @@ GpuMemorySystem::GpuMemorySystem(MemoryMode mode)
   }
 }
 
+void GpuMemorySystem::SetTextureCacheInvalidator(
+    CacheInvalidationCallback invalidator) {
+  texture_cache_invalidator_ = std::move(invalidator);
+}
+
 void GpuMemorySystem::ValidateClient(MemoryClient client) {
   switch (client) {
   case MemoryClient::kFramebuffer:
@@ -133,6 +139,8 @@ void GpuMemorySystem::HostWrite(std::uint64_t address, const void *source,
                                 std::size_t bytes) {
   if (!source && bytes != 0)
     throw std::invalid_argument("GpuMemorySystem host source is null");
+  if (texture_cache_invalidator_)
+    texture_cache_invalidator_(address, bytes);
   /*
    * The model now outlives a single flush, so the SLC can still hold lines
    * covering the range the host is about to replace.  Left resident they
@@ -261,6 +269,21 @@ MemoryAccessStats GpuMemorySystem::ReadInto(std::uint64_t address,
   return result;
 }
 
+MemoryAccessStats GpuMemorySystem::ReadDirectInto(
+    std::uint64_t address, void *destination, std::size_t bytes,
+    MemoryClient client) {
+  ValidateClient(client);
+  if (bytes == 0)
+    throw std::invalid_argument("GpuMemorySystem direct read is empty");
+  if (!destination)
+    throw std::invalid_argument("GpuMemorySystem direct read destination is null");
+  const std::vector<std::uint8_t> data = backing_.Read(address, bytes);
+  std::memcpy(destination, data.data(), bytes);
+  MemoryAccessStats result;
+  result.direct_read_bytes = bytes;
+  return result;
+}
+
 MemoryAccessStats GpuMemorySystem::Write(std::uint64_t address,
                                          const void *source,
                                          std::size_t bytes,
@@ -270,6 +293,8 @@ MemoryAccessStats GpuMemorySystem::Write(std::uint64_t address,
     throw std::invalid_argument("GpuMemorySystem write source is null");
   if (bytes == 0)
     throw std::invalid_argument("GpuMemorySystem write is empty");
+  if (texture_cache_invalidator_)
+    texture_cache_invalidator_(address, bytes);
   const auto *input = static_cast<const std::uint8_t *>(source);
   MemoryAccessStats result;
   if (mode_ == MemoryMode::kDirect) {

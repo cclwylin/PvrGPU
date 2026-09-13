@@ -55,6 +55,21 @@ bool ParseMemoryMode(const char *text, MemoryMode *mode) {
   return false;
 }
 
+bool ParseTextureMemoryPath(const char *text, TextureMemoryPath *path) {
+  if (!text || !path)
+    return false;
+  const std::string value(text);
+  if (value == "short") {
+    *path = TextureMemoryPath::kShort;
+    return true;
+  }
+  if (value == "cached") {
+    *path = TextureMemoryPath::kCached;
+    return true;
+  }
+  return false;
+}
+
 bool ParseTextureLodMode(const char *text, bool *exact) {
   if (!text || !exact)
     return false;
@@ -79,12 +94,15 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       std::cout << "Usage: " << argv[0]
                 << " [--frames N] [--width N] [--height N] [--case NAME]"
                    " [--outdir PATH] [--memory-mode direct|bypass|cache]"
+                   " [--texture-memory-path short|cached]"
                    " [--texture-lod-mode llvmpipe|exact]"
                    " [--cache-bypass on|off]"
                    " [--driver-command PATH]\n"
                    "  --memory-mode cache   Run SLC/DRAM simulation (default)\n"
                    "  --memory-mode bypass  Bypass cache but retain DRAM timing\n"
                    "  --memory-mode direct  Direct DRAM backing access (fast)\n"
+                   "  --texture-memory-path short   TPU to DRAM short path (default)\n"
+                   "  --texture-memory-path cached TPU to TCU to SLC to DRAM\n"
                    "  --texture-lod-mode exact     Conformance/hardware LOD math\n"
                    "  --texture-lod-mode llvmpipe Capture/Play-compatible LOD math (default)\n"
                    "  --cache-bypass on|off Legacy alias for bypass|cache\n"
@@ -118,6 +136,12 @@ bool ParseOptions(int argc, char** argv, Options* options) {
         return false;
       }
       options->cache_bypass = options->memory_mode == MemoryMode::kBypass;
+    } else if (arg == "--texture-memory-path") {
+      if (!ParseTextureMemoryPath(value, &options->texture_memory_path)) {
+        std::cerr << "Invalid value for --texture-memory-path: " << value
+                  << " (expected short or cached)\n";
+        return false;
+      }
     } else if (arg == "--texture-lod-mode") {
       if (!ParseTextureLodMode(value, &options->exact_texture_lod)) {
         std::cerr << "Invalid value for --texture-lod-mode: " << value
@@ -137,6 +161,12 @@ bool ParseOptions(int argc, char** argv, Options* options) {
       return false;
     }
   }
+  if (options->texture_memory_path == TextureMemoryPath::kCached &&
+      options->memory_mode != MemoryMode::kCache) {
+    std::cerr << "--texture-memory-path cached requires --memory-mode cache "
+                 "and is incompatible with cache bypass\n";
+    return false;
+  }
   return true;
 }
 
@@ -148,6 +178,16 @@ const char *MemoryModeName(MemoryMode mode) {
     return "bypass";
   case MemoryMode::kCache:
     return "cache";
+  }
+  return "invalid";
+}
+
+const char *TextureMemoryPathName(TextureMemoryPath path) {
+  switch (path) {
+  case TextureMemoryPath::kShort:
+    return "short";
+  case TextureMemoryPath::kCached:
+    return "cached";
   }
   return "invalid";
 }

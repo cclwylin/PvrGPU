@@ -39,8 +39,8 @@ name or the explicit protocol/version pair:
 
 Supported MVP message types are:
 
-- `hello`: backend, renderer, profile, fidelity, calibration, cache-bypass
-  configuration and warnings;
+- `hello`: backend, renderer, profile, fidelity, calibration, global-memory and
+  texture-memory topology configuration, and warnings;
 - `counter`: one record/frame with a flat `counters` object;
 - `done`: terminal summary and resource-leak counts;
 - `error`: producer-side failure.
@@ -58,7 +58,9 @@ metadata, not a numeric counter:
   "source": "pvrgpu-systemc",
   "cache_bypass": false,
   "memory_mode": "cache",
-  "cache_simulated": true
+  "cache_simulated": true,
+  "texture_memory_path": "short",
+  "texture_cache_simulated": false
 }
 ```
 
@@ -68,6 +70,13 @@ cache/DRAM traffic. `bypass` skips cache lookup/allocation but still reports DRA
 transactions. `cache` is the default and simulates the shared SLC. The legacy
 `cache_bypass` boolean is still emitted for compatibility and is true only in
 `bypass` mode.
+
+`texture_memory_path` is an independent topology selector. `short` is the
+default: the functional TPU reads the authoritative backing directly and
+reports those payload bytes in `memory_direct_read_bytes`, even when the global
+memory mode is `cache` or `bypass`. `cached` routes TPU reads through the
+read-only TCU, then the shared SLC and DRAM; it requires global `memory_mode`
+`cache`. `texture_cache_simulated` is true exactly for the latter topology.
 
 Example sample:
 
@@ -301,10 +310,11 @@ bilinear filtering performs four. A multisample `SMP` selects one stored
 sample, without filtering or resolving; an out-of-bounds decoded coordinate
 or sample index performs no memory read. Helper-lane requests may also be
 suppressed. The DrawList texture count therefore remains shader-level work;
-`texel_fetches` counts actual fetches. TCU access counters describe the legacy
-TCU FIFO path, not every texture access: the unified-memory path records its
-actual SLC/DRAM traffic, or direct-memory accesses in direct mode. They must
-not be inferred from `texel_fetches` in those modes.
+`texel_fetches` counts actual fetches. On the `short` texture path, TCU counters
+remain zero and the payload contributes to `memory_direct_read_bytes`. On the
+`cached` path, each fetch touches at least one TCU line; a deliberately
+cross-line wide texel can touch more than one, so TCU line accesses must not be
+derived by assuming equality with `texel_fetches`.
 
 ### Vertex-input counter meanings
 
@@ -505,14 +515,14 @@ sample-color counts; these are not shader instruction cycles.
 
 | Field | Unit | Meaning |
 |---|---|---|
-| `tcu_line_accesses` | lines | Legacy TCU cache-line access attempts; unified-memory model runs texture traffic through shared SLC and leaves TCU counters zero |
-| `tcu_read_accesses` | lines | Legacy TCU cache-line read accesses issued by TextureUnit |
-| `tcu_hits` | lines | Legacy texture reads satisfied by resident TCU lines |
-| `tcu_misses` | lines | Legacy texture reads that require an SLC fill |
-| `tcu_evictions` | lines | Legacy valid TCU lines displaced by replacement |
-| `tcu_writebacks` | lines | Legacy dirty TCU lines written to SLC |
-| `tcu_bypassed` | lines | Legacy texture lines forwarded without TCU lookup or allocation |
-| `tcu_cycles` | cycles | Legacy event-driven TCU service cycles |
+| `tcu_line_accesses` | lines | TCU cache-line lookups on the `cached` texture path; zero on `short` |
+| `tcu_read_accesses` | lines | Read-only TCU line accesses issued by TextureUnit; equal to `tcu_line_accesses` |
+| `tcu_hits` | lines | Texture lines satisfied by resident TCU lines |
+| `tcu_misses` | lines | Texture lines that require a shared-SLC fill |
+| `tcu_evictions` | lines | Valid TCU lines displaced by replacement |
+| `tcu_writebacks` | lines | Dirty TCU writebacks; always zero because the texture cache is read-only |
+| `tcu_bypassed` | lines | Texture lines forwarded without lookup; zero for both supported texture topologies because `short` bypasses the TCU module entirely |
+| `tcu_cycles` | cycles | Event-driven TCU service cycles; equal to `tcu_line_accesses` on `cached` |
 | `pixel_data_master_transactions` | transactions | Framebuffer writeback transactions issued by the PBE writeback boundary |
 | `pixel_data_master_bytes` | bytes | Framebuffer payload bytes issued by PixelDM |
 | `pixel_data_master_cycles` | cycles | Event-driven PixelDM service cycles |
@@ -530,16 +540,19 @@ sample-color counts; these are not shader instruction cycles.
 | `dram_read_bytes` | bytes | Payload bytes returned by modeled DRAM |
 | `dram_write_bytes` | bytes | Payload bytes committed by modeled DRAM |
 | `dram_cycles` | cycles | Fixed-latency DRAM service cycles |
-| `memory_direct_read_bytes` | bytes | Fast functional reads from the authoritative DRAM backing (`direct` mode only) |
+| `memory_direct_read_bytes` | bytes | Fast functional reads from the authoritative backing: all reads in global `direct` mode plus texture payload reads on `texture_memory_path=short` |
 | `memory_direct_write_bytes` | bytes | Fast functional writes to the authoritative DRAM backing (`direct` mode only) |
 | `framebuffer_dram_readback_bytes` | bytes | Final framebuffer bytes fetched from DRAM for PNG publication |
 
-The unified memory route keeps texture, vertex, index, parameter, and
-framebuffer persistent data in one DRAM backing. In `cache` mode GPU clients
-access that data through the shared SLC and dirty lines are flushed before final
-framebuffer readback. In `bypass` mode cache lookup/allocation is skipped while
-DRAM transactions are still modeled. In `direct` mode modules access the same
-authoritative backing directly for speed.
+The unified backing keeps texture, vertex, index, parameter, and framebuffer
+persistent data in one authoritative DRAM image. Global `memory_mode=cache`
+routes ordinary GPU clients through the shared SLC and flushes dirty lines
+before final framebuffer readback. `bypass` skips global SLC lookup/allocation
+while retaining modeled DRAM transactions, and `direct` accesses the backing
+without modeled cache/DRAM transactions. Texture payload reads are the explicit
+exception controlled by `texture_memory_path`: `short` accesses that same
+backing directly, while `cached` inserts TCU and then uses the global cached
+SLC/DRAM route. TCU hits do not create SLC or DRAM traffic; TCU misses do.
 With cache active, every 128-byte SLC writeback line is one request and final
 PNG readback is one exact-size bulk request; bypass uses one bulk write plus
 the same independent readback request. The PNG must be published only after

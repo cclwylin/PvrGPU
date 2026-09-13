@@ -29,6 +29,8 @@ HELLO_METADATA_FIELDS: tuple[str, ...] = (
     "cache_bypass",
     "memory_mode",
     "cache_simulated",
+    "texture_memory_path",
+    "texture_cache_simulated",
 )
 
 STANDARD_COUNTER_FIELDS: tuple[str, ...] = (
@@ -665,6 +667,42 @@ def parse_jsonl_line(line: str | bytes) -> dict[str, Any]:
         raise CounterProtocolError(
             "hello.cache_simulated must be a JSON boolean"
         )
+    if (
+        message.get("type") == "hello"
+        and "texture_memory_path" in message
+        and message["texture_memory_path"] not in {"short", "cached"}
+    ):
+        raise CounterProtocolError(
+            "hello.texture_memory_path must be short or cached"
+        )
+    if (
+        message.get("type") == "hello"
+        and "texture_cache_simulated" in message
+        and not isinstance(message["texture_cache_simulated"], bool)
+    ):
+        raise CounterProtocolError(
+            "hello.texture_cache_simulated must be a JSON boolean"
+        )
+    if message.get("type") == "hello":
+        if (
+            "texture_memory_path" in message
+            and "texture_cache_simulated" in message
+            and message["texture_cache_simulated"]
+            is not (message["texture_memory_path"] == "cached")
+        ):
+            raise CounterProtocolError(
+                "hello.texture_cache_simulated does not match "
+                "hello.texture_memory_path"
+            )
+        if (
+            message.get("texture_memory_path") == "cached"
+            and "memory_mode" in message
+            and message["memory_mode"] != "cache"
+        ):
+            raise CounterProtocolError(
+                "hello.texture_memory_path cached requires "
+                "hello.memory_mode cache"
+            )
     return message
 
 

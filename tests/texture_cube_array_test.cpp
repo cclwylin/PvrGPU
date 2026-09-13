@@ -198,15 +198,14 @@ struct Harness {
         ++checks;
       }
     }
-    if (memory.mode() == MemoryMode::kDirect)
-      Check(final.counters.memory_direct_read_bytes == reads * 4 && final.counters.dram_read_bytes == 0,
-            "cube direct memory fetch bytes");
-    else if (memory.mode() == MemoryMode::kBypass)
-      Check(final.counters.dram_read_bytes == reads * 4 && final.counters.memory_direct_read_bytes == 0,
-            "cube bypass memory fetch bytes");
-    else
-      Check(final.counters.dram_read_bytes > 0 && final.counters.memory_direct_read_bytes == 0,
-            "cube cache performs backing memory reads");
+    Check(final.counters.memory_direct_read_bytes == reads * 4 &&
+              final.counters.tcu_line_accesses == 0 &&
+              final.counters.tcu_read_accesses == 0 &&
+              final.counters.slc_line_accesses == 0 &&
+              final.counters.slc_read_accesses == 0 &&
+              final.counters.dram_read_transactions == 0 &&
+              final.counters.dram_read_bytes == 0,
+          "default cube-array short path counts bytes without cache traffic");
     Check(memory.Readback(resource.gpu_address, bytes.size(), MemoryClient::kFramebufferReadback).data == bytes,
           "cube fetch leaves storage and guard bytes intact");
     ReleaseFunctionalPayloads(pool, final); pool.Release(handle);

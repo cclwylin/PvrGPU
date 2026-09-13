@@ -102,6 +102,7 @@ int RunConfiguredModel(Options options,
 // ComputeShader modules. Writable raw resources are published on success.
 int RunConfiguredCompute(ModelComputeDispatch *dispatch,
                           ModelComputeStats *stats, bool exact_texture_lod,
+                          TextureMemoryPath texture_memory_path,
                           std::string *error);
 
 /*

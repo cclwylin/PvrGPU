@@ -223,9 +223,12 @@ FramebufferFetchCommitStorage PrepareFragmentPixelInputs(
                       sizeof(raw));
         }
       } else {
+        const bool srgb = ColorAttachmentSrgb(state, target) != 0;
         for (std::size_t component = 0; component < 4; ++component)
           destination[component] =
-              ColorStateToUnorm8(state.raster_state.clear_color[component]);
+              srgb ? ColorStateToUnorm8(state.raster_state.clear_color[component])
+                   : PbeClearStateToUnorm8(
+                         state.raster_state.clear_color[component]);
       }
     }
   }

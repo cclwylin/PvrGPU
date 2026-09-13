@@ -119,12 +119,77 @@ void SetDisablePng(const char *value) {
     Fail("cannot configure PNG output fixture");
 }
 
+void SetTextureMemoryPath(const char *value) {
+#if defined(_WIN32)
+  if (_putenv_s("PVRGPU_TEXTURE_MEMORY_PATH", value ? value : "") != 0)
+#else
+  if ((value ? setenv("PVRGPU_TEXTURE_MEMORY_PATH", value, 1)
+             : unsetenv("PVRGPU_TEXTURE_MEMORY_PATH")) != 0)
+#endif
+    Fail("cannot configure texture memory path fixture");
+}
+
 std::string CounterPayload(const std::string &report) {
   const auto start = report.find("\"counters\":{");
   const auto end = report.find('\n', start);
   if (start == std::string::npos || end == std::string::npos)
     Fail("missing complete counter and DrawList payload");
   return report.substr(start, end - start);
+}
+
+void TestTextureMemoryPathSnapshot(pvrgpu_systemc_submit_info info) {
+  const auto folder = g_test_root / "texture-path-snapshot";
+  std::filesystem::create_directory(folder);
+  const std::string jsonl = (folder / "model.jsonl").string();
+  const std::string stderr_path = (folder / "model.stderr.log").string();
+  const std::string outdir = folder.string();
+  info.jsonl_path = jsonl.c_str();
+  info.stderr_path = stderr_path.c_str();
+  info.outdir = outdir.c_str();
+
+  SetTextureMemoryPath("short");
+  std::array<char, 512> error{};
+  if (pvrgpu_systemc_submit_driver_command(&info, error.data(), error.size()) !=
+      0) {
+    Fail("texture path snapshot submission failed: " +
+         std::string(error.data()));
+  }
+
+  // The job is still deferred. Its topology must be the enum captured above,
+  // not the process environment in effect when readback starts the model.
+  SetTextureMemoryPath("cached");
+  std::array<std::uint8_t, 24> pixels{};
+  pvrgpu_systemc_readback_info readback{};
+  readback.version = PVRGPU_SYSTEMC_API_VERSION;
+  readback.width = 3;
+  readback.height = 2;
+  readback.bytes_per_pixel = 4;
+  readback.pixels = pixels.data();
+  readback.pixels_size = pixels.size();
+  if (pvrgpu_systemc_flush_readback(&readback, error.data(), error.size()) != 0 ||
+      readback.pixels_written != 1) {
+    Fail("texture path snapshot readback failed: " +
+         std::string(error.data()));
+  }
+  SetTextureMemoryPath(nullptr);
+
+  const std::string report = ReadText(jsonl);
+  if (report.find("\"texture_memory_path\":\"short\"") ==
+          std::string::npos ||
+      report.find("\"texture_memory_path\":\"cached\"") !=
+          std::string::npos ||
+      report.find("\"texture_cache_simulated\":false") ==
+          std::string::npos) {
+    Fail("deferred submit did not preserve the short texture path snapshot");
+  }
+  for (const char *field : {"tcu_line_accesses", "tcu_read_accesses",
+                            "tcu_hits", "tcu_misses", "tcu_evictions",
+                            "tcu_writebacks", "tcu_bypassed", "tcu_cycles"}) {
+    if (report.find(std::string("\"") + field + "\":0") ==
+        std::string::npos) {
+      Fail(std::string("short texture path reported non-idle ") + field);
+    }
+  }
 }
 
 void TestPngOutput(pvrgpu_systemc_submit_info info) {
@@ -281,6 +346,7 @@ void TestPackedClearReadback() {
 
 int main() {
   SetDisablePng(nullptr);
+  SetTextureMemoryPath(nullptr);
   const auto nonce = std::chrono::high_resolution_clock::now()
                          .time_since_epoch()
                          .count();
@@ -381,6 +447,7 @@ int main() {
 
   // Register the verifier before the bridge's first submit registers its
   // deferred flusher; preserve the original atexit ordering contract below.
+  TestTextureMemoryPathSnapshot(info);
   TestPngOutput(info);
   TestPackedClearReadback();
 

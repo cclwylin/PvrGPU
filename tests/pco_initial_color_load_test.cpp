@@ -489,8 +489,12 @@ void VerifyUniformBufferRejections(const std::filesystem::path &root) {
   reject([](auto &, auto &, auto &s) { s[2] = 12; }, "ubo-size-mismatch");
   reject([](auto &, auto &, auto &s) { s[0] = 128; }, "ubo-prepatched-address");
   reject([](auto &, auto &, auto &s) { s[3] = 4; }, "ubo-dynamic-offset");
-  reject([](auto &d, auto &, auto &) { d.fragment_pco_abi.push_constant_start = 0; },
-         "ubo-push-overlap");
+  // {start=0,count=0} is PCO's encoding of an absent push range, so the
+  // overlap must be a real push window covering the UBO descriptor.
+  reject([](auto &d, auto &, auto &) {
+    d.fragment_pco_abi.push_constant_start = 0;
+    d.fragment_pco_abi.push_constant_count = 4;
+  }, "ubo-push-overlap");
 }
 
 void VerifyDeferredUniformBuffers(const std::filesystem::path &root,

@@ -1518,12 +1518,51 @@ void ValidateMemoryPath(const Options &options, const PipelineState &state,
         "JsonReporter DRAM cycles do not match its transaction count");
   }
 
-  if (counters.tcu_line_accesses != 0 || counters.tcu_read_accesses != 0 ||
-      counters.tcu_hits != 0 || counters.tcu_misses != 0 ||
-      counters.tcu_evictions != 0 || counters.tcu_writebacks != 0 ||
-      counters.tcu_bypassed != 0 || counters.tcu_cycles != 0) {
-    throw std::runtime_error(
-        "JsonReporter TCU counters should be idle under unified memory");
+  const bool has_texel_traffic = counters.texel_fetches != 0;
+  const bool tcu_idle =
+      counters.tcu_line_accesses == 0 && counters.tcu_read_accesses == 0 &&
+      counters.tcu_hits == 0 && counters.tcu_misses == 0 &&
+      counters.tcu_evictions == 0 && counters.tcu_writebacks == 0 &&
+      counters.tcu_bypassed == 0 && counters.tcu_cycles == 0;
+  if (options.texture_memory_path == TextureMemoryPath::kShort) {
+    if (!tcu_idle) {
+      throw std::runtime_error(
+          "JsonReporter TCU counters should be idle on the short texture "
+          "memory path");
+    }
+    /* The short TPU path intentionally reads the authoritative backing
+     * directly, independently of the global framebuffer/SSBO memory mode. */
+    if (options.memory_mode != MemoryMode::kDirect &&
+        ((has_texel_traffic && counters.memory_direct_read_bytes == 0) ||
+         (!has_texel_traffic && counters.memory_direct_read_bytes != 0) ||
+         counters.memory_direct_write_bytes != 0)) {
+      throw std::runtime_error(
+          "JsonReporter short texture memory-path direct-byte mismatch");
+    }
+  } else if (options.texture_memory_path == TextureMemoryPath::kCached) {
+    if (options.memory_mode != MemoryMode::kCache || options.cache_bypass) {
+      throw std::runtime_error(
+          "JsonReporter cached texture path requires active global cache "
+          "mode");
+    }
+    if (counters.tcu_line_accesses != counters.tcu_read_accesses ||
+        counters.tcu_hits + counters.tcu_misses !=
+            counters.tcu_line_accesses ||
+        counters.tcu_writebacks != 0 || counters.tcu_bypassed != 0 ||
+        counters.tcu_cycles != counters.tcu_line_accesses ||
+        counters.tcu_evictions > counters.tcu_misses ||
+        (has_texel_traffic &&
+         counters.tcu_line_accesses < counters.texel_fetches) ||
+        (!has_texel_traffic && !tcu_idle)) {
+      throw std::runtime_error(
+          "JsonReporter cached TCU read-only invariant mismatch");
+    }
+    if (counters.slc_read_accesses < counters.tcu_misses) {
+      throw std::runtime_error(
+          "JsonReporter cached TCU misses did not reach the shared SLC");
+    }
+  } else {
+    throw std::runtime_error("JsonReporter unknown texture memory path");
   }
 
   if (options.memory_mode == MemoryMode::kDirect) {
@@ -1544,7 +1583,8 @@ void ValidateMemoryPath(const Options &options, const PipelineState &state,
     return;
   }
 
-  if (counters.memory_direct_read_bytes != 0 ||
+  if ((options.texture_memory_path == TextureMemoryPath::kCached &&
+       counters.memory_direct_read_bytes != 0) ||
       counters.memory_direct_write_bytes != 0 ||
       counters.dram_read_transactions == 0 ||
       counters.dram_write_transactions == 0 ||
@@ -2054,6 +2094,12 @@ void EmitCounter(const Options &options, const CounterTxn &counters,
             << (options.cache_bypass ? "true" : "false")
             << ",\"memory_mode\":\""
             << MemoryModeName(options.memory_mode) << "\""
+            << ",\"texture_memory_path\":\""
+            << TextureMemoryPathName(options.texture_memory_path) << "\""
+            << ",\"texture_cache_simulated\":"
+            << (options.texture_memory_path == TextureMemoryPath::kCached
+                    ? "true"
+                    : "false")
             << ",\"texture_lod_mode\":\""
             << (options.exact_texture_lod ? "exact" : "llvmpipe") << "\""
             << ",\"cache_simulated\":"

@@ -9,6 +9,7 @@
 
 #include "cache_mmu/cache_array.h"
 #include "common/pipeline_state.h"
+#include "memory/gpu_memory_system.h"
 
 #include <systemc>
 
@@ -32,18 +33,22 @@ public:
       lower_response{"lower_response"};
 
   TextureCache(sc_core::sc_module_name name, MemoryPool &pool,
-               bool cache_bypass = false);
+               bool cache_bypass = false,
+               GpuMemorySystem *memory = nullptr);
+  ~TextureCache() override;
 
   const CacheStats &stats() const noexcept { return cache_.stats(); }
   const CacheStats &last_delta() const noexcept { return last_delta_; }
   bool cache_bypass() const noexcept { return cache_.bypass(); }
   std::uint64_t SetCacheBypass(bool bypass);
+  void InvalidateRange(std::uint64_t address, std::size_t bytes);
 
 private:
   void Run();
   void SampleRun();
 
   MemoryPool &pool_;
+  GpuMemorySystem *memory_;
   CacheArray cache_;
   CacheStats last_delta_;
 };

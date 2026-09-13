@@ -1,6 +1,6 @@
 # PvrGPU Speed Tune
 
-更新日期：2026-09-10。
+更新日期：2026-09-13。
 
 目的：以量測決定 simulator 的效能優化順序，在不改變 native shader、GPU 工作量、memory/cache 語意及最後畫面的前提下，減少 host CPU 的額外成本。
 
@@ -63,7 +63,7 @@
 - 跨 cache line 讀取、位址 overflow、缺頁、錯誤回傳與既有例外順序。
 - ASTC／壓縮格式、特殊格式及不同 memory mode 的正確行為。
 
-不可透過快取最終取樣答案、略過 SLC 或合併原本分開的 GPU 存取，來取得不同工作量的「加速」。這一項改動範圍相對集中，適合作為新版 profile 後的第一個實作候選。
+模型現在明確區分兩種 topology：`PVRGPU_TEXTURE_MEMORY_PATH=short` 是預設的快速功能路徑（TPU 直接讀 authoritative DRAM backing），`cached` 則是完整的 TPU → TCU → SLC → DRAM 路徑。效能比較必須記錄此設定；不可把 short 與 cached 的時間或 cache counters 當成同一工作量直接比較。
 
 ## 4. 第二個候選：減少 USC 暫停／恢復的資料搬運
 
@@ -103,7 +103,7 @@ Continuation 包含 temporary registers 與 loop state；execution context 還�
 
 - **Compute task 搬運**：每個 instruction group 目前 `ReadPod → StepComputeTask → WritePod` 搬移整份 task。若新版 profile 仍顯示此處顯著，再研究穩定的 resident task storage；公平排程、mutex／barrier 可見性及 checkpoint 狀態必須保留。
 - **JIT／SIMD**：在剩餘 ISS 成本有明確量測後再決定範圍。需保留指令語意、浮點精度、動態 counters、memory 邊界與同步，不能先承諾整個 frame 幾倍加速。
-- **完整 Texture Cache → L2 路徑**：屬於模型精度與架構完善，與 host 效能優化分開驗證。目前實際 texture 讀取使用共享 GpuMemorySystem／SLC／DRAM backing，不是完整的獨立 Texture Cache、USC-L2 模組鏈。補齊硬體層次不等於 simulator 一定更快。
+- **完整 texture cache 路徑**：已可用 `PVRGPU_TEXTURE_MEMORY_PATH=cached` 選擇 TPU → TCU → shared SLC → DRAM；預設 `short` 保留給快速 functional simulation。USC-L2、MSHR 與 fabric contention 仍是後續模型精度工作。
 
 ## 7. 每輪優化流程與完成門檻
 

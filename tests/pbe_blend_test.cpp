@@ -469,6 +469,7 @@ int sc_main(int, char **) {
     CheckResult(pool, single, {128, 0, 127, 191}, 1);
     CheckResult(pool, red_green, {64, 128, 63, 159}, 2);
     CheckResult(pool, green_red, {128, 64, 63, 159}, 2);
+    // Shader outputs store half up (see PbeFloatToUnorm8), including 0.3f.
     CheckResult(pool, ties, {77, 1, 3, 4}, 1, false);
     CheckResult(pool, subtract_test, {255, 0, 0, 191}, 1);
     CheckResult(pool, colormask_test, {255, 0, 0, 255}, 1, false);

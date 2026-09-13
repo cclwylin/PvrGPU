@@ -143,6 +143,21 @@ inline bool ColorAttachmentCodecUsesFloat64Storage(
          codec.component_bits == std::array<std::uint8_t, 4>{32, 32, 32, 32};
 }
 
+// UNORM attachments of at most eight bits per channel store the four bytes
+// Gallium's eight-bit blend reads back: each native code bit-replicated to
+// eight bits, a missing colour channel zero and a missing alpha 255.  One
+// 1080p RGB565 target then fits a sequence attachment slot, and a draw
+// quantizes through the same RGBA8 datapath llvmpipe uses.
+inline bool ColorAttachmentCodecUsesUnorm8Storage(
+    const ColorAttachmentCodec &codec) {
+  if (codec.number != ColorAttachmentNumberFormat::kUnorm)
+    return false;
+  for (std::size_t component = 0; component < 4; ++component)
+    if (codec.component_bits[component] > 8)
+      return false;
+  return true;
+}
+
 inline bool ColorAttachmentCodecIsValid(const ColorAttachmentCodec &codec) {
   if (codec.number == ColorAttachmentNumberFormat::kLegacy)
     return codec.component_mask == 0 &&
@@ -298,6 +313,8 @@ inline std::size_t ColorAttachmentBytesPerPixel(const PipelineState &state,
   const auto &codec = ColorAttachmentCodecForTarget(state, target);
   if (ColorAttachmentCodecUsesFloat64Storage(codec))
     return 4U * sizeof(double);
+  if (ColorAttachmentCodecUsesUnorm8Storage(codec))
+    return 4U;
   if (ColorAttachmentCodecIsCanonical(codec))
     return 4U * sizeof(float);
   return ColorAttachmentBytesPerPixel(ColorAttachmentRawDwords(state, target),

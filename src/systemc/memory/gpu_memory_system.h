@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -46,6 +47,9 @@ struct MemoryReadResult {
 
 class GpuMemorySystem final {
  public:
+  using CacheInvalidationCallback =
+      std::function<void(std::uint64_t, std::size_t)>;
+
   explicit GpuMemorySystem(MemoryMode mode);
 
   MemoryMode mode() const noexcept { return mode_; }
@@ -65,11 +69,22 @@ class GpuMemorySystem final {
   // payload. Direct/bypass and cold fills retain the backing's owned Read.
   MemoryAccessStats ReadInto(std::uint64_t address, void *destination,
                              std::size_t bytes, MemoryClient client);
+  // Texture short path. It reads the same authoritative DRAM backing as the
+  // modeled hierarchy, but deliberately performs no SLC lookup or modeled
+  // DRAM wait. The exact transferred bytes remain visible in the existing
+  // direct-read counter.
+  MemoryAccessStats ReadDirectInto(std::uint64_t address, void *destination,
+                                   std::size_t bytes, MemoryClient client);
   MemoryAccessStats Write(std::uint64_t address, const void *source,
                           std::size_t bytes, MemoryClient client);
   MemoryReadResult Readback(std::uint64_t address, std::size_t bytes,
                             MemoryClient client);
   MemoryAccessStats Flush();
+
+  // The active TCU is a separate SystemC controller but shares this memory's
+  // authoritative backing. Registering its maintenance callback makes host
+  // uploads and GPU stores invalidate texture lines before replacement.
+  void SetTextureCacheInvalidator(CacheInvalidationCallback invalidator);
 
  private:
   static void ValidateClient(MemoryClient client);
@@ -79,6 +94,7 @@ class GpuMemorySystem final {
   MemoryMode mode_;
   DramAddressSpace backing_;
   CacheArray slc_;
+  CacheInvalidationCallback texture_cache_invalidator_;
 };
 
 template <typename T>

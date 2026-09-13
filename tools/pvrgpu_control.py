@@ -299,9 +299,9 @@ class MainWindow(QMainWindow):
         self.cache_bypass_combo.addItem("Off · cache model enabled", "off")
         self.cache_bypass_combo.addItem("On · fast bypass", "on")
         self.cache_bypass_combo.setToolTip(
-            "Off runs the complete cache model (default). On bypasses cache "
-            "lookup and allocation to speed up functional simulation; DRAM "
-            "access remains active."
+            "Controls the shared GPU memory cache independently of the "
+            "texture path below. Off keeps the cache model enabled (default); "
+            "On bypasses its lookup and allocation while DRAM remains active."
         )
         self.cache_bypass_combo.currentIndexChanged.connect(
             self._refresh_runtime_label
@@ -309,33 +309,51 @@ class MainWindow(QMainWindow):
         controls_grid.addWidget(self.cache_bypass_label, 3, 0)
         controls_grid.addWidget(self.cache_bypass_combo, 3, 1, 1, 4)
 
+        self.texture_memory_path_label = QLabel("Texture memory path")
+        self.texture_memory_path_combo = QComboBox()
+        self.texture_memory_path_combo.addItem(
+            "Short · TPU → DRAM (default, fast)", "short"
+        )
+        self.texture_memory_path_combo.addItem(
+            "Full cache · TPU → TCU → SLC → DRAM", "cached"
+        )
+        self.texture_memory_path_combo.setToolTip(
+            "Short bypasses the modeled TCU and SLC for texture reads. "
+            "Full cache routes texture reads through both cache levels."
+        )
+        self.texture_memory_path_combo.currentIndexChanged.connect(
+            self._texture_memory_path_changed
+        )
+        controls_grid.addWidget(self.texture_memory_path_label, 4, 0)
+        controls_grid.addWidget(self.texture_memory_path_combo, 4, 1, 1, 4)
+
         self.runtime_label = QLabel()
         self.runtime_label.setWordWrap(True)
         self.runtime_label.setObjectName("runtimeLabel")
-        controls_grid.addWidget(self.runtime_label, 4, 0, 1, 5)
+        controls_grid.addWidget(self.runtime_label, 5, 0, 1, 5)
 
         self.runner_edit = QLineEdit()
         self.runner_browse = QPushButton("Browse")
         self.runner_browse.clicked.connect(self._browse_runner)
-        controls_grid.addWidget(QLabel("Runner"), 5, 0)
-        controls_grid.addWidget(self.runner_edit, 5, 1, 1, 3)
-        controls_grid.addWidget(self.runner_browse, 5, 4)
+        controls_grid.addWidget(QLabel("Runner"), 6, 0)
+        controls_grid.addWidget(self.runner_edit, 6, 1, 1, 3)
+        controls_grid.addWidget(self.runner_browse, 6, 4)
 
         self.mesa_edit = QLineEdit()
         self.mesa_browse = QPushButton("Browse")
         self.mesa_browse.clicked.connect(self._browse_mesa)
-        controls_grid.addWidget(QLabel("Mesa prefix"), 6, 0)
-        controls_grid.addWidget(self.mesa_edit, 6, 1, 1, 3)
-        controls_grid.addWidget(self.mesa_browse, 6, 4)
+        controls_grid.addWidget(QLabel("Mesa prefix"), 7, 0)
+        controls_grid.addWidget(self.mesa_edit, 7, 1, 1, 3)
+        controls_grid.addWidget(self.mesa_browse, 7, 4)
 
         self.output_edit = QLineEdit(
             os.environ.get("PVRGPU_OUTPUT_ROOT", str(WORK_ROOT / "out" / "runs"))
         )
         output_browse = QPushButton("Browse")
         output_browse.clicked.connect(self._browse_output)
-        controls_grid.addWidget(QLabel("Output root"), 7, 0)
-        controls_grid.addWidget(self.output_edit, 7, 1, 1, 3)
-        controls_grid.addWidget(output_browse, 7, 4)
+        controls_grid.addWidget(QLabel("Output root"), 8, 0)
+        controls_grid.addWidget(self.output_edit, 8, 1, 1, 3)
+        controls_grid.addWidget(output_browse, 8, 4)
 
         button_row = QHBoxLayout()
         self.start_button = QPushButton("Start")
@@ -355,7 +373,7 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self.open_button)
         button_row.addStretch()
         button_row.addWidget(self.quit_button)
-        controls_grid.addLayout(button_row, 8, 0, 1, 5)
+        controls_grid.addLayout(button_row, 9, 0, 1, 5)
         root_layout.addWidget(controls)
 
         cards = QHBoxLayout()
@@ -474,6 +492,15 @@ class MainWindow(QMainWindow):
         cache_bypass = str(self.settings.value("cache_bypass", "off")).lower()
         cache_index = self.cache_bypass_combo.findData(cache_bypass)
         self.cache_bypass_combo.setCurrentIndex(max(0, cache_index))
+        texture_memory_path = str(
+            self.settings.value("texture_memory_path", "short")
+        ).lower()
+        texture_path_index = self.texture_memory_path_combo.findData(
+            texture_memory_path
+        )
+        self.texture_memory_path_combo.setCurrentIndex(
+            max(0, texture_path_index)
+        )
         case_name = str(self.settings.value("case", "fill_solid"))
         for index in range(self.case_combo.count()):
             if self.case_combo.itemData(index)[1] == case_name:
@@ -488,13 +515,21 @@ class MainWindow(QMainWindow):
         self.settings.setValue(
             "cache_bypass", self.cache_bypass_combo.currentData()
         )
+        self.settings.setValue(
+            "texture_memory_path", self.texture_memory_path_combo.currentData()
+        )
         self.settings.setValue("case", self.case_combo.currentData()[1])
 
     def _backend_changed(self) -> None:
         backend = str(self.backend_combo.currentData())
-        cache_control_enabled = backend == "pvrgpu"
+        cached_texture_path = (
+            self.texture_memory_path_combo.currentData() == "cached"
+        )
+        cache_control_enabled = backend == "pvrgpu" and not cached_texture_path
         self.cache_bypass_label.setEnabled(cache_control_enabled)
         self.cache_bypass_combo.setEnabled(cache_control_enabled)
+        self.texture_memory_path_label.setEnabled(backend == "pvrgpu")
+        self.texture_memory_path_combo.setEnabled(backend == "pvrgpu")
         if backend == "llvmpipe":
             runner = os.environ.get("PVRGPU_GLBENCH_RUNNER", "")
             mesa = os.environ.get("PVRGPU_LLVMPIPE_MESA_PREFIX", "")
@@ -522,13 +557,34 @@ class MainWindow(QMainWindow):
                 self.mesa_browse.setEnabled(False)
         self._refresh_runtime_label()
 
+    def _texture_memory_path_changed(self) -> None:
+        cached = self.texture_memory_path_combo.currentData() == "cached"
+        if cached:
+            off_index = self.cache_bypass_combo.findData("off")
+            if off_index >= 0:
+                self.cache_bypass_combo.setCurrentIndex(off_index)
+        cache_control_enabled = (
+            self.backend_combo.currentData() == "pvrgpu" and not cached
+        )
+        self.cache_bypass_label.setEnabled(cache_control_enabled)
+        self.cache_bypass_combo.setEnabled(cache_control_enabled)
+        self._refresh_runtime_label()
+
     def _refresh_runtime_label(self) -> None:
         backend = str(self.backend_combo.currentData())
         cache_bypass = str(self.cache_bypass_combo.currentData() or "off")
         cache_mode = (
-            "cache bypass ON (fast simulation)"
+            "shared-cache bypass ON"
             if cache_bypass == "on"
-            else "cache bypass OFF (cache model enabled)"
+            else "shared-cache bypass OFF"
+        )
+        texture_memory_path = str(
+            self.texture_memory_path_combo.currentData() or "short"
+        )
+        texture_path_mode = (
+            "texture full cache TPU → TCU → SLC → DRAM"
+            if texture_memory_path == "cached"
+            else "texture short path TPU → DRAM (default, fast)"
         )
         runner_ready = _resolved_path(self.runner_edit.text()).is_file()
         mesa_text = self.mesa_edit.text().strip()
@@ -544,7 +600,8 @@ class MainWindow(QMainWindow):
 
         if runner_ready and mesa_ready:
             self.runtime_label.setText(
-                f"NATIVE · GLBench → Mesa → pvrgpu · {cache_mode}"
+                f"NATIVE · GLBench → Mesa → pvrgpu · {cache_mode} · "
+                f"{texture_path_mode}"
             )
             return
 
@@ -553,7 +610,8 @@ class MainWindow(QMainWindow):
         if case_name in SYSTEMC_FUNCTIONAL_CASES:
             self.runtime_label.setText(
                 "MOD · SystemC functional raster rendering with "
-                f"modelled counters and DRAM-readback PNG · {cache_mode}. "
+                "modelled counters and DRAM-readback PNG · "
+                f"{cache_mode} · {texture_path_mode}. "
                 "Configure native runner/prefix to enable GLBench → Mesa → pvrgpu."
             )
         else:
@@ -645,10 +703,22 @@ class MainWindow(QMainWindow):
         environment = QProcessEnvironment.systemEnvironment()
         environment.insert("PVRGPU_BACKEND", backend)
         cache_bypass = str(self.cache_bypass_combo.currentData() or "off")
+        texture_memory_path = str(
+            self.texture_memory_path_combo.currentData() or "short"
+        )
         if backend == "pvrgpu":
             environment.insert("PVRGPU_CACHE_BYPASS", cache_bypass)
+            environment.insert(
+                "PVRGPU_MODEL_MEMORY_MODE",
+                "bypass" if cache_bypass == "on" else "cache",
+            )
+            environment.insert(
+                "PVRGPU_TEXTURE_MEMORY_PATH", texture_memory_path
+            )
         else:
             environment.remove("PVRGPU_CACHE_BYPASS")
+            environment.remove("PVRGPU_MODEL_MEMORY_MODE")
+            environment.remove("PVRGPU_TEXTURE_MEMORY_PATH")
         if backend == "llvmpipe" or native_pvrgpu:
             driver = "llvmpipe" if backend == "llvmpipe" else "pvrgpu"
             environment.insert("EGL_PLATFORM", "surfaceless")
@@ -680,6 +750,7 @@ class MainWindow(QMainWindow):
                 "--case", case_name,
                 "--outdir", str(png_dir),
                 "--cache-bypass", cache_bypass,
+                "--texture-memory-path", texture_memory_path,
             ]
 
         self.process.setProcessEnvironment(environment)

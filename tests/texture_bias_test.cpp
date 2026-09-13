@@ -259,14 +259,14 @@ struct Harness {
           throw std::runtime_error("actual mip color differs from independent bias oracle");
         } ++checks;
       }
-    if(memory.mode()==MemoryMode::kDirect)
-      Check(s.counters.memory_direct_read_bytes==reads*4&&s.counters.dram_read_bytes==0,
-            "BIAS direct mode must count real texel bytes");
-    else if(memory.mode()==MemoryMode::kBypass)
-      Check(s.counters.dram_read_bytes==reads*4&&s.counters.memory_direct_read_bytes==0,
-            "BIAS bypass mode must count real texel bytes");
-    else Check(s.counters.dram_read_bytes>0&&s.counters.memory_direct_read_bytes==0,
-               "BIAS cache must issue real backing reads");
+    Check(s.counters.memory_direct_read_bytes==reads*4&&
+              s.counters.tcu_line_accesses==0&&
+              s.counters.tcu_read_accesses==0&&
+              s.counters.slc_line_accesses==0&&
+              s.counters.slc_read_accesses==0&&
+              s.counters.dram_read_transactions==0&&
+              s.counters.dram_read_bytes==0,
+          "default BIAS short path counts texel bytes without cache traffic");
     Check(memory.Readback(r.gpu_address,bytes.size(),MemoryClient::kFramebufferReadback).data==bytes,
           "BIAS sampling changed texture/guards");
     ReleaseFunctionalPayloads(pool,s);pool.Release(handle);

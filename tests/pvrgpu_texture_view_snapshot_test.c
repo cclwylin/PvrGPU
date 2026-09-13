@@ -774,6 +774,21 @@ test_canonical_color_initial_snapshot(enum pipe_format format,
       .first_layer = 0, .last_layer = 0};
    recorded.command.format = pvrgpu_command_format_for_surface(format);
    recorded.command.render_target_count = 1;
+   if (pvrgpu_color_format_uses_unorm8_transport(recorded.command.format)) {
+      /* API-v40: bit-replicated RGBA8 with native missing-channel defaults. */
+      CHECK(!pvrgpu_color_format_uses_canonical_float(recorded.command.format));
+      CHECK(pvrgpu_capture_initial_color_attachment(&ctx, &recorded));
+      CHECK(recorded.command.initial_color_attachment_bytes_size == 4);
+      uint8_t expected8[4] = {0};
+      util_format_unpack_description(format)->unpack_rgba_8unorm(
+         expected8, resource.data, 1);
+      CHECK(!memcmp(recorded.initial_color_attachment_bytes, expected8,
+                    sizeof(expected8)));
+      CHECK(expected8[3] == 255);
+      free(recorded.initial_color_attachment_bytes);
+      free(resource.data);
+      return;
+   }
    CHECK(pvrgpu_color_format_uses_canonical_float(recorded.command.format));
    CHECK(pvrgpu_capture_initial_color_attachment(&ctx, &recorded));
    CHECK(recorded.command.initial_color_attachment_bytes_size == 16);

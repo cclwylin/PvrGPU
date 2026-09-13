@@ -1627,42 +1627,35 @@ void CheckEventPaths(pvrgpu::stub::MemoryMode memory_mode) {
   Check(integer_final_state.counters.texel_fetches == 2 &&
             integer_responses.size() == 2,
         "two integer requests execute two physical texel reads");
-  const auto check_tap_memory = [memory_mode](
+  const auto check_tap_memory = [](
       const pvrgpu::stub::CounterTxn &counters, std::uint64_t taps,
       std::uint64_t tap_bytes, std::uint64_t requests, bool tiler_stage) {
-    const bool cached = memory_mode == pvrgpu::stub::MemoryMode::kCache;
-    const bool direct = memory_mode == pvrgpu::stub::MemoryMode::kDirect;
-    const bool bypass = memory_mode == pvrgpu::stub::MemoryMode::kBypass;
-    // These taps occupy one cold 128-byte SLC line. The warm reads must
-    // remain modeled accesses, not memoized texture answers; direct and
-    // bypass retain their different traffic accounting.
-    Check(counters.slc_line_accesses == (cached ? taps : 0) &&
-              counters.slc_read_accesses == (cached ? taps : 0) &&
-              counters.slc_misses == (cached ? 1U : 0U) &&
-              counters.slc_hits == (cached ? taps - 1U : 0U) &&
-              counters.slc_bypassed == (bypass ? taps : 0) &&
-              counters.slc_cycles ==
-                  (cached ? taps * pvrgpu::stub::kMemorySlcLookupCycles : 0) &&
-              counters.dram_read_transactions ==
-                  (cached ? 1U : bypass ? taps : 0) &&
-              counters.dram_read_bytes ==
-                  (cached ? 128U : bypass ? taps * tap_bytes : 0) &&
-              counters.dram_cycles ==
-                  (cached ? 1U : bypass ? taps : 0) *
-                      pvrgpu::stub::kMemoryDramRequestCycles &&
-              counters.memory_direct_read_bytes ==
-                  (direct ? taps * tap_bytes : 0) &&
+    // TextureUnit's fixed default is the short TPU -> authoritative DRAM
+    // route. Global direct/cache/bypass mode must not silently change that
+    // topology; the explicit cached-path integration is covered by the TCU
+    // controller test.
+    Check(counters.tcu_line_accesses == 0 &&
+              counters.tcu_read_accesses == 0 &&
+              counters.tcu_hits == 0 && counters.tcu_misses == 0 &&
+              counters.tcu_cycles == 0 &&
+              counters.slc_line_accesses == 0 &&
+              counters.slc_read_accesses == 0 &&
+              counters.slc_misses == 0 && counters.slc_hits == 0 &&
+              counters.slc_bypassed == 0 && counters.slc_cycles == 0 &&
+              counters.dram_read_transactions == 0 &&
+              counters.dram_read_bytes == 0 && counters.dram_cycles == 0 &&
+              counters.memory_direct_read_bytes == taps * tap_bytes &&
               counters.slc_write_accesses == 0 &&
               counters.slc_evictions == 0 && counters.slc_writebacks == 0 &&
               counters.dram_write_transactions == 0 &&
               counters.dram_write_bytes == 0,
-          "inline TPU reads preserve cold/warm/direct/bypass tap accounting");
-    const auto cycles = requests * pvrgpu::stub::kReferenceUarch.texture_bypass_cycles +
-                        counters.slc_cycles + counters.dram_cycles;
+          "short TPU reads bypass TCU/SLC timing and count exact payload bytes");
+    const auto cycles =
+        requests * pvrgpu::stub::kReferenceUarch.texture_bypass_cycles;
     Check(counters.texture_cycles == cycles &&
               counters.tiler_cycles == (tiler_stage ? cycles : 0) &&
               counters.renderer_cycles == (tiler_stage ? 0 : cycles),
-          "inline reads retain modeled delay and texture cycle stage routing");
+          "short TPU reads retain functional delay and stage routing");
   };
   check_tap_memory(integer_final_state.counters, 2, 16, 2, false);
   for (std::size_t lane = 0; lane < integer_responses.size(); ++lane) {

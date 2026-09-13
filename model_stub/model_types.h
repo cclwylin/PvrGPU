@@ -27,6 +27,16 @@ enum class MemoryMode : std::uint8_t {
 
 const char *MemoryModeName(MemoryMode mode);
 
+// Texture sampling has an independent topology selector.  The fast default
+// keeps the functional TPU but reads the authoritative DRAM backing directly;
+// the detailed path inserts the modeled TCU and shared SLC before DRAM.
+enum class TextureMemoryPath : std::uint8_t {
+  kShort = 0,
+  kCached = 1,
+};
+
+const char *TextureMemoryPathName(TextureMemoryPath path);
+
 struct DriverPcoStageAbi {
   std::uint32_t temps = 0;
   std::uint32_t vertex_inputs = 0;
@@ -632,6 +642,7 @@ struct Options {
   // counters/validation remain enabled when this is false.
   bool emit_png = true;
   MemoryMode memory_mode = MemoryMode::kCache;
+  TextureMemoryPath texture_memory_path = TextureMemoryPath::kShort;
   // Exact log2 is the conformance/hardware-mode LOD selector. Capture/Play
   // leaves this false to reproduce llvmpipe's observable fast-log2 weights.
   bool exact_texture_lod = false;
@@ -706,9 +717,21 @@ inline bool IsColorAttachmentTransportFormat(std::string_view format) {
          format == "PIPE_FORMAT_R32G32B32A32_FLOAT";
 }
 
+// UNORM formats of at most eight bits per channel are stored as four
+// bit-replicated bytes (see ColorAttachmentCodecUsesUnorm8Storage).
+inline bool IsUnorm8ColorAttachmentTransportFormat(std::string_view format) {
+  return format == "PIPE_FORMAT_R8_UNORM" ||
+         format == "PIPE_FORMAT_R8G8_UNORM" ||
+         format == "PIPE_FORMAT_R8G8B8X8_UNORM" ||
+         format == "PIPE_FORMAT_B8G8R8X8_UNORM" ||
+         format == "PIPE_FORMAT_R5G6B5_UNORM" ||
+         format == "PIPE_FORMAT_B5G6R5_UNORM";
+}
+
 inline bool IsCanonicalFloatColorAttachmentTransportFormat(
     std::string_view format) {
   return IsColorAttachmentTransportFormat(format) &&
+         !IsUnorm8ColorAttachmentTransportFormat(format) &&
          format != "PIPE_FORMAT_R32G32B32A32_UNORM" &&
          !IsIntegerColorAttachmentTransportFormat(format) &&
          format != "PIPE_FORMAT_R8G8B8A8_UNORM" &&

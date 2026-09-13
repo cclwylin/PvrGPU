@@ -19,8 +19,10 @@ extern "C" {
  * API-v38 extends the same bounded storage-buffer contract to every graphics
  * stage, with one whole-resource snapshot shared by all aliased stage views.
  * API-v39 carries independent colour mask and blend state for four targets.
+ * API-v40 stores UNORM colour of at most eight bits per channel as four
+ * bit-replicated RGBA8 bytes instead of sixteen-byte RGBA32F.
  * Old versioned consumers must not guess at the longer command envelope. */
-#define PVRGPU_SYSTEMC_API_VERSION 39u
+#define PVRGPU_SYSTEMC_API_VERSION 40u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE 15u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES (64u * 1024u)
 /*
@@ -720,10 +722,12 @@ struct pvrgpu_systemc_readback_info {
    uint32_t width;
    uint32_t height;
    /*
-    * The stored width of one pixel. Established RGBA8 and packed 10/10/10/2
-    * UNORM are four bytes. Integer formats store one 32-bit dword per logical
-    * component, canonical normalized/SNORM/float formats use sixteen-byte
-    * RGBA32F, and exact RGBA32_UNORM uses 32-byte RGBA64F. The model refuses a
+    * The stored width of one pixel. Established RGBA8, packed 10/10/10/2
+    * UNORM and API-v40 UNORM formats of at most eight bits per channel (R8,
+    * RG8, RGBX8, BGRX8, RGB565; bit-replicated RGBA8) are four bytes. Integer
+    * formats store one 32-bit dword per logical component, other canonical
+    * normalized/SNORM/float formats use sixteen-byte RGBA32F, and exact
+    * RGBA32_UNORM uses 32-byte RGBA64F. The model refuses a
     * readback whose pixel width is not the one it rendered rather than
     * reinterpreting the bytes.
     */

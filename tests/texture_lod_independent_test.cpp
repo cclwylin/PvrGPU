@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Actual FIFO/cache/DRAM sampling with incomplete derivative quads. The sampler
+// Actual TPU short-path sampling with incomplete derivative quads. The sampler
 // proves base-level selection; no missing coordinates or texture values exist.
 #include "common/pipeline_state.h"
 #include "memory/gpu_memory_system.h"
@@ -80,9 +80,11 @@ struct Harness {
     }
     const unsigned taps=count*(linear?4:1);
     Check(final.counters.texture_requests==count&&final.counters.texel_fetches==taps,"all original nearest/bilinear taps counted once");
-    if(memory.mode()==MemoryMode::kDirect)Check(final.counters.memory_direct_read_bytes==taps*4&&final.counters.dram_read_bytes==0,"direct actual texture read bytes");
-    else if(memory.mode()==MemoryMode::kBypass)Check(final.counters.dram_read_bytes==taps*4&&final.counters.memory_direct_read_bytes==0,"bypass actual texture read bytes");
-    else Check(final.counters.dram_read_bytes>0&&final.counters.slc_read_accesses==taps,"unified cache and backing remain on native path");
+    Check(final.counters.memory_direct_read_bytes==taps*4&&
+          final.counters.tcu_line_accesses==0&&final.counters.tcu_read_accesses==0&&
+          final.counters.slc_line_accesses==0&&final.counters.slc_read_accesses==0&&
+          final.counters.dram_read_transactions==0&&final.counters.dram_read_bytes==0,
+          "default short path counts actual texture bytes without cache traffic");
     Check(memory.Readback(resource.gpu_address,bytes.size(),MemoryClient::kFramebufferReadback).data==bytes,"mips and guard bytes unchanged");
     ReleaseFunctionalPayloads(pool,final);pool.Release(handle);Check(pool.bytes_in_flight()==0&&pool.allocations()==pool.releases(),"pool resources balanced");
   }

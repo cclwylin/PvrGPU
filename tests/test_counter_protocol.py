@@ -9,6 +9,7 @@ import unittest
 from counter_protocol import (
     ALL_COUNTER_FIELDS,
     COUNTER_INFO,
+    HELLO_METADATA_FIELDS,
     MODEL_COUNTER_FIELDS,
     CounterProtocolError,
     counter_record_from_message,
@@ -130,11 +131,27 @@ class CounterProtocolTests(unittest.TestCase):
         accepted = parse_jsonl_line(
             '{"schema":"pvrgpu.counter.v1","type":"hello",'
             '"cache_bypass":false,"memory_mode":"cache",'
-            '"cache_simulated":true}'
+            '"cache_simulated":true,"texture_memory_path":"short",'
+            '"texture_cache_simulated":false}'
         )
         self.assertIs(accepted["cache_bypass"], False)
         self.assertEqual(accepted["memory_mode"], "cache")
         self.assertIs(accepted["cache_simulated"], True)
+        self.assertEqual(accepted["texture_memory_path"], "short")
+        self.assertIs(accepted["texture_cache_simulated"], False)
+        self.assertTrue(
+            {"texture_memory_path", "texture_cache_simulated"}.issubset(
+                HELLO_METADATA_FIELDS
+            )
+        )
+        cached = parse_jsonl_line(
+            '{"schema":"pvrgpu.counter.v1","type":"hello",'
+            '"memory_mode":"cache","cache_simulated":true,'
+            '"texture_memory_path":"cached",'
+            '"texture_cache_simulated":true}'
+        )
+        self.assertEqual(cached["texture_memory_path"], "cached")
+        self.assertIs(cached["texture_cache_simulated"], True)
         with self.assertRaises(CounterProtocolError):
             parse_jsonl_line(
                 '{"schema":"pvrgpu.counter.v1","type":"hello",'
@@ -150,6 +167,64 @@ class CounterProtocolTests(unittest.TestCase):
                 '{"schema":"pvrgpu.counter.v1","type":"hello",'
                 '"cache_simulated":"yes"}'
             )
+        with self.assertRaises(CounterProtocolError):
+            parse_jsonl_line(
+                '{"schema":"pvrgpu.counter.v1","type":"hello",'
+                '"texture_memory_path":"direct"}'
+            )
+        with self.assertRaises(CounterProtocolError):
+            parse_jsonl_line(
+                '{"schema":"pvrgpu.counter.v1","type":"hello",'
+                '"texture_cache_simulated":"yes"}'
+            )
+        for path, simulated in (("short", True), ("cached", False)):
+            with self.subTest(path=path, simulated=simulated), self.assertRaises(
+                CounterProtocolError
+            ):
+                parse_jsonl_line(
+                    json.dumps(
+                        {
+                            "schema": "pvrgpu.counter.v1",
+                            "type": "hello",
+                            "texture_memory_path": path,
+                            "texture_cache_simulated": simulated,
+                        }
+                    )
+                )
+        for memory_mode in ("direct", "bypass"):
+            with self.subTest(memory_mode=memory_mode), self.assertRaises(
+                CounterProtocolError
+            ):
+                parse_jsonl_line(
+                    json.dumps(
+                        {
+                            "schema": "pvrgpu.counter.v1",
+                            "type": "hello",
+                            "memory_mode": memory_mode,
+                            "texture_memory_path": "cached",
+                            "texture_cache_simulated": True,
+                        }
+                    )
+                )
+
+        # Older producers may omit any of the related metadata. Validate a
+        # relationship only when both sides needed for that relationship exist.
+        for partial in (
+            {"texture_memory_path": "cached"},
+            {"texture_cache_simulated": True},
+            {"memory_mode": "bypass"},
+        ):
+            with self.subTest(partial=partial):
+                parsed = parse_jsonl_line(
+                    json.dumps(
+                        {
+                            "schema": "pvrgpu.counter.v1",
+                            "type": "hello",
+                            **partial,
+                        }
+                    )
+                )
+                self.assertTrue(partial.items() <= parsed.items())
 
     def test_memory_path_counter_catalog_is_complete(self) -> None:
         memory_fields = {

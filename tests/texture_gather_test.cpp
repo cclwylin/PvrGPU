@@ -15,7 +15,6 @@
 #include <iostream>
 #include <limits>
 #include <map>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -283,8 +282,6 @@ void Run(const std::string &mode) {
   texture.output(output);
   texture.sample_input(requests);
   texture.sample_output(responses);
-  std::set<std::uint64_t> resident_lines;
-
   const auto batch = [&](const std::vector<Point> &points, bool gather) {
     std::vector<TextureSampleRequest> values(points.size());
     for (std::size_t i = 0; i < points.size(); ++i) {
@@ -417,56 +414,26 @@ void Run(const std::string &mode) {
     Check(after.texture_requests - before.texture_requests == points.size() &&
           after.texel_fetches - before.texel_fetches == taps,
           "four actual texel reads per gather / one ordinary nearest read");
-    if (memory_mode == MemoryMode::kDirect) {
-      Check(after.memory_direct_read_bytes - before.memory_direct_read_bytes == taps * texel_bytes &&
-            after.slc_line_accesses == 0 && after.dram_read_transactions == 0,
-            "direct mode records each complete texel byte transfer");
-    } else if (memory_mode == MemoryMode::kBypass) {
-      Check(after.dram_read_bytes - before.dram_read_bytes == taps * texel_bytes &&
-            after.dram_read_transactions - before.dram_read_transactions == taps &&
-            after.slc_line_accesses == 0 && after.memory_direct_read_bytes == 0,
-            "bypass mode records four separate complete texel DRAM transactions");
-    } else {
-      std::uint64_t misses = 0;
-      for (std::size_t point_index = 0; point_index < points.size(); ++point_index) {
-        const auto &point = points[point_index];
-        const auto xs = ReferenceAxis(point[0], width, gather);
-        const auto ys = ReferenceAxis(point[1], height, gather);
-        for (unsigned tap = 0; tap < (gather ? 4U : 1U); ++tap) {
-          const auto x = xs[tap & 1U];
-          const auto y = ys[tap >> 1U];
-          const auto line = (base + (point_index % layers) * layer_stride +
-              (y * width + x) * texel_bytes) / SlcCacheConfig().line_size_bytes;
-          if (resident_lines.insert(line).second) ++misses;
-        }
-      }
-      Check(after.slc_read_accesses - before.slc_read_accesses == taps &&
-            after.slc_line_accesses - before.slc_line_accesses == taps &&
-            after.slc_misses - before.slc_misses == misses &&
-            after.slc_hits - before.slc_hits == taps - misses &&
-            after.dram_read_transactions - before.dram_read_transactions == misses &&
-            after.dram_read_bytes - before.dram_read_bytes == misses * SlcCacheConfig().line_size_bytes &&
-            after.memory_direct_read_bytes == 0,
-            "exact cache-line footprint and DRAM traffic across complete texels");
-    }
+    Check(after.memory_direct_read_bytes - before.memory_direct_read_bytes ==
+                  taps * texel_bytes &&
+              after.tcu_line_accesses - before.tcu_line_accesses == 0 &&
+              after.tcu_read_accesses - before.tcu_read_accesses == 0 &&
+              after.slc_line_accesses - before.slc_line_accesses == 0 &&
+              after.slc_read_accesses - before.slc_read_accesses == 0 &&
+              after.dram_read_transactions - before.dram_read_transactions ==
+                  0 &&
+              after.dram_read_bytes - before.dram_read_bytes == 0,
+          "default short path records exact texel bytes without cache traffic");
     Check(state.fragment_texture_request_count == after.texture_requests &&
           state.fragment_texel_fetch_count == after.texel_fetches,
           "fragment counters preserve logical versus physical traffic");
   };
 
-  // Four duplicated taps are four cache lookups, including in the warm pass.
+  // Repeated taps remain separate direct payload reads on the default short
+  // path; they are never memoized texture answers.
   batch({{{-1.0F, -1.0F}}}, true);
   if (negative) return;
-  Check(memory_mode != MemoryMode::kCache ||
-        (state.counters.slc_misses == 1 && state.counters.slc_hits == 3 &&
-        state.counters.dram_read_transactions == 1 &&
-        state.counters.dram_read_bytes == SlcCacheConfig().line_size_bytes),
-        "cold duplicate taps: one DRAM cache-line fill, three real hits");
   batch({{{-1.0F, -1.0F}}}, true);
-  Check(memory_mode != MemoryMode::kCache ||
-        (state.counters.slc_misses == 1 && state.counters.slc_hits == 7 &&
-        state.counters.dram_read_transactions == 1),
-        "warm duplicate taps: four hits, no DRAM read");
   const std::vector<Point> points = {
       {{0.5F, 0.5F}}, {{0.0F, 0.5F}}, {{1.0F, 0.5F}},
       {{0.5F, 0.0F}}, {{0.5F, 1.0F}}, {{0.0F, 0.0F}},
@@ -487,10 +454,7 @@ void Run(const std::string &mode) {
       {{0.5F, std::nextafter(0.875F, 1.0F)}},
   };
   batch(points, true);
-  const auto reads = state.counters.dram_read_transactions;
   batch(points, true);
-  Check(memory_mode != MemoryMode::kCache || state.counters.dram_read_transactions == reads,
-        "warm full footprint matrix issues no new DRAM reads");
   if (!min_linear && !mag_linear && configuration != "lod-window")
     batch(points, false);  // Same descriptor binding returns ordinary RGBA.
   ReleaseFunctionalPayloads(pool, state);

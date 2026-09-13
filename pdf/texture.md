@@ -1,7 +1,7 @@
 # PvrGPU Texture Processing Unit (TPU) — Block Diagram, Data Path & Pseudocode
 
 本文件以 block diagram、data path flow 及 pseudocode 形式詳述 `src/systemc/texture/`（包含 `texture_unit.h` 與 `texture_unit.cpp`）之 PowerVR TPU (Texture Processing Unit) 模擬架構與執行行為。
-TPU 負責解析 Rogue 硬體紋理與取樣器描述符（Image/Sampler Descriptors）、計算正規化座標定址（Repeat/Clamp/MirroredRepeat）、評估 2×2 Quad 隱式導數與 Mipmap LOD、執行 Nearest / 4-tap Bilinear / 8-tap Trilinear 紋理過濾，並透過 TCU (Texture Cache Unit) / DRAM 擷取 Texel 資料交回 USC 著色器叢集。
+TPU 負責解析 Rogue 硬體紋理與取樣器描述符（Image/Sampler Descriptors）、計算正規化座標定址（Repeat/Clamp/MirroredRepeat）、評估 2×2 Quad 隱式導數與 Mipmap LOD、執行 Nearest / 4-tap Bilinear / 8-tap Trilinear 紋理過濾，並將 Texel 資料交回 USC 著色器叢集。`texture_memory_path=short`（預設）使用 TPU → authoritative DRAM backing 快速路徑；`cached` 使用 TPU → TCU → SLC → DRAM 完整路徑。
 
 ---
 
@@ -44,12 +44,12 @@ TPU 負責解析 Rogue 硬體紋理與取樣器描述符（Image/Sampler Descrip
 |   * Trilinear (8 taps, 雙層雙線性 + Mip 權重三線性插值)   |
 +-----------------------------------------------------------+
             |
-            | 發出 Texel 讀取請求 (4 bytes per texel)
+            | 發出 Texel／block 讀取請求 (1/2/4/8/16 bytes)
             v  sc_port<MemoryTxn> (cache_request / TCU)
 +-----------------------------------------------------------+
 | ④ Memory Hierarchy (TCU -> SLC -> DRAM)                  |
-| - 首次採樣自動執行 Texture Preloading                     |
-| - 依據計算之 Texel GPU Address 讀取 RGBA8/RGBX8 像素資料  |
+| - 與其他 GPU clients 共用 authoritative DRAM backing      |
+| - 依據計算之 Texel GPU Address 讀取支援格式／ASTC block    |
 | - 回傳 MemoryTxn response                                 |
 +-----------------------------------------------------------+
             |
@@ -100,10 +100,11 @@ TPU 負責解析 Rogue 硬體紋理與取樣器描述符（Image/Sampler Descrip
 +---------------------------------------------------------------------+
 | ③ TPU::SampleRun() — Texel 讀取 (TCU / DRAM)                        |
 | Texel Address = Image.GPU_Address + Mip.Offset + y*Pitch + x*4      |
-| IF memory_system (Direct Model):                                    |
-|   memory_->Read(address, 4, MemoryClient::kTextureCache)            |
-| ELSE (SystemC Transaction):                                         |
-|   cache_request->write(MemoryTxn(kRead, address, 4))                |
+| IF texture_memory_path == short (default):                          |
+|   memory_->ReadDirectInto(address, 1/2/4/8/16 bytes)                |
+| ELSE cached:                                                        |
+|   cache_request->write(MemoryTxn(kRead, address, bytes))            |
+|   TCU miss -> shared SLC -> authoritative DRAM backing              |
 |   cache_response->read()                                            |
 +---------------------------------------------------------------------+
             |

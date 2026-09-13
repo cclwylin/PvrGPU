@@ -193,7 +193,10 @@ invocation counters remain zero. Sampled images use owned external snapshots,
 not graphics attachment producer indices, and do not alias writable image
 snapshots without an explicit shared-backing contract. Compute remains a
 separate SystemC module, as do geometry and tessellation stages. Graphics and
-compute use the same configured memory mode; live runs default to cache mode.
+compute use the same configured memory mode. Texture topology is selected
+independently with `PVRGPU_TEXTURE_MEMORY_PATH`: `short` is the default
+TPU-to-DRAM functional path; `cached` enables TPU-to-TCU-to-SLC-to-DRAM and
+requires global memory mode `cache`.
 
 The compiler calculates real image texel addresses and executes native
 LD/ST/AMO through ComputeShader's memory FIFO. It checks image-coordinate

@@ -1669,7 +1669,9 @@ void Submitter::RunJob() {
      * Submitter fetch only four bytes per pixel, then the PBE (after this field
      * was populated below) correctly rejected the truncated LOAD.
      */
-    if (driver_pco_triangles_command) {
+    // A clear-only command stores the same format-specific codec a later
+    // draw LOADs; RGB565 and RGBX8 are not RGBA8 bytes.
+    if (driver_pco_triangles_command || driver_clear_command) {
       state.color_attachment_raw_dwords =
           ColorAttachmentRawDwords(command.format);
       state.color_attachment_float32 =

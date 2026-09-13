@@ -70,8 +70,8 @@ ChromeOS GLBench（20 cases）
   維持相同 process boundary，且需要正式 Qt 6 SDK。
 - iCloud workspace 只保存 source/documentation；venv、CMake/Ninja build、Mesa/GLBench checkout、runtime output、log 與 temporary files 統一放在 `$PVRGPU_WORK_ROOT`，預設為 `$HOME/Downloads/_Codex/Working/PvrGPU`，可用 `PVRGPU_WORK_ROOT` 改址。
 - 現行 llvmpipe report 包含 14 個 Gallium pipeline statistics，加上 `drawlists`、`setup_triangles`、`texel_fetches` 三個本地 telemetry extension；UI 標示為 `REP · llvmpipe`，不宣稱硬體 cycles/cache/bandwidth。
-- `pvrgpu-model-stub` 已實作 **`fill_solid`、`fill_solid_depth_never`、`fill_solid_depth_neq` function-correct slice**，以內建 GLBench command fixture實際執行 `VDM → VertexFetch → vertex PCO decode/USC ISS → ClipCull → Tiler → ParameterBuffer → fragment PCO decode → TileScheduler → ISP/HSR/depth → FragmentFrontend → USC ISS → TPU bypass → PBE → PixelDataMaster → SLC → DramModel → JsonReporter`。PBE 只產生 pre-memory RGBA；PNG writer 只能讀 `DramModel` backing 所建立的新 readback handle，不能直接讀 PBE payload。module 連線使用 bounded FIFO，bulk shader/primitive/tile/fragment/framebuffer data 均留在 generation-checked `MemoryPool`。Counter 標示 `modeled` / `MOD · PvrGPU`，timing 仍為 assumed/uncalibrated。
-- Cache 採常見的 bank-interleaved set-associative、write-back、write-allocate、true LRU：MCU/TCU 各 24 KiB、64 B line、4-way/4-bank；SLC 2 MiB、128 B line、8-way/8-bank；USC-L2 8 KiB、64 B line、4-way/1-bank。容量/line/bank來自 DXTP reference，way/policy 是本模型選定的 uArch 假設。`cache_bypass=false`（UI 顯示 Off）是預設並啟用 cache；`true` 只略過 lookup/allocation以加速模擬，仍強制走 DRAM backing/readback。
+- `pvrgpu-model-stub` 已實作 **`fill_solid`、`fill_solid_depth_never`、`fill_solid_depth_neq` function-correct slice**，以內建 GLBench command fixture實際執行 `VDM → VertexFetch → vertex PCO decode/USC ISS → ClipCull → Tiler → ParameterBuffer → fragment PCO decode → TileScheduler → ISP/HSR/depth → FragmentFrontend → USC ISS → TPU → PBE → PixelDataMaster → shared GPU memory → JsonReporter`。Texture read 另有兩條明確路徑：預設 `short` 為 `USC → TPU → DRAM backing`，`cached` 為 `USC → TPU → TCU → SLC → DRAM`。PBE 只產生 pre-memory RGBA；PNG writer 只能讀 authoritative DRAM backing 的 readback，不能直接讀 PBE payload。module 連線使用 bounded FIFO，bulk shader/primitive/tile/fragment/framebuffer data 均留在 generation-checked `MemoryPool`。Counter 標示 `modeled` / `MOD · PvrGPU`，timing 仍為 assumed/uncalibrated。
+- Cache 採常見的 bank-interleaved set-associative、write-back、write-allocate、true LRU：MCU/TCU 各 24 KiB、64 B line、4-way/4-bank；SLC 2 MiB、128 B line、8-way/8-bank；USC-L2 8 KiB、64 B line、4-way/1-bank。容量/line/bank來自 DXTP reference，way/policy 是本模型選定的 uArch 假設。全域 `memory_mode`／legacy `cache_bypass` 與 texture topology 是不同設定；`PVRGPU_TEXTURE_MEMORY_PATH=short` 是快速預設，只有 `cached` 才啟用 TCU 並要求全域 memory mode 為 `cache`。
 - Shader 已不再使用 `ShaderProgram` enum 或固定紅色 branch。Submitter 放入 Mesa 26.2.1 commit `da14d65e4499e66468094be52bff9ea0915a695e` 產生的真實 PCO bytes；`PcoDecoder` 嚴格解析 instruction group，`UscCluster` 透過 ISS 執行 raw register bits，PBE 才把 F32 `PIXOUT0..3` 轉成 RGBA8。第一版 exact subset 是 Fill.Solid 所需的 `MBYP`、`UVSW.write`、`UVSW.write.emit.endtask`、source/ISS/destination/repeat/end/padding；未知 encoding 一律 fail closed。
 - 每個 counter frame 同時輸出 per-DrawList 的 VS/FS `program` 靜態組成與 `executed` 動態 ALU/Tex/Memory 總量；後者按 PCO repeat 展開後乘以 shader invocations，不能與靜態 `pco_instructions` 混用。Memory 類別包含 `UVSW` export，單位是 instructions 而非 bytes。
 - ISP 不再以 coverage union mask 當正式介面。24.8-style fixed-point top-left rule 保證兩個 triangle 的 shared edge 只有一個 coverage owner；ordered tile primitive references、primitive identity、barycentric/depth 與每個 fragment 的 PIXOUT 一路保存到 PBE。通用回歸條件是 `fragment_candidates == ps_invocations + hsr_rejected_fragments`；Depth Never 在 ISP 將所有 candidate 拒絕，合法地形成 zero-fragment-work，PBE 再從明確 clear-color state resolve 黑色 RGBA8 framebuffer。
@@ -400,19 +400,21 @@ flowchart TB
     USC -.-> GEO[Clip/Cull + Tiler + ParameterBuffer\nACTIVE subset]
     GEO -.-> FRAG[TileScheduler + ISP + FragmentFrontend\nACTIVE subset]
     FRAG -.-> USC
-    USC -.-> TPU[TextureUnit / TPU\nACTIVE bypass]
+    USC -.-> TPU[TextureUnit / TPU\nACTIVE]
     FRAG -.-> PBE[Pbe\nACTIVE subset]
     PBE -.-> PDM
 
     USC -.-> UL2[UscL2Cache\nIMPLEMENTED-IDLE]
     UL2 -.-> MCU[MixedCache / MCU\nIMPLEMENTED-IDLE]
-    TPU -.-> TCU[TextureCache / TCU\nIMPLEMENTED-IDLE]
+    TPU -. cached .-> TCU[TextureCache / TCU\nACTIVE cached path]
+    TPU -. short .-> DRAM
     PDM -.-> FAB[OnChipFabric\nEMPTY]
     MCU -.-> FAB
     TCU -.-> FAB
     FAB -.-> MMU[MmuBif\nEMPTY]
-    MMU -.-> SLC[Slc\nACTIVE framebuffer path]
-    SLC -.-> DRAM[DramModel\nACTIVE fixed latency]
+    MMU -.-> SLC[Shared SLC\nACTIVE memory hierarchy]
+    TCU -. misses .-> SLC
+    SLC -.-> DRAM[Authoritative DRAM backing\nACTIVE fixed latency]
     DRAM -.-> MEM[MemFabric / system memory\nEMPTY transport]
     PBE -.-> IC[ImageCompression\nEMPTY]
 ```
@@ -471,12 +473,12 @@ flowchart TB
 |---|---|---|
 | USC internal L2 | 8 KiB；64 B line；4-way；1 bank | `UscL2Cache` + `CacheArray` 已實作；現行 workload traffic idle |
 | MCU L1 | 24 KiB；64 B line；4-way；4 banks | `MixedCache` + `CacheArray` 已實作；現行 workload traffic idle |
-| TCU | 24 KiB；64 B line；4-way；4 banks | `TextureCache` + `CacheArray` 已實作；現行 workload traffic idle |
-| SLC | 2 MiB；128 B line；8-way；8 banks | `Slc` active 承接 framebuffer store 與 dirty writeback |
+| TCU | 24 KiB；64 B line；4-way；4 banks | `TextureCache` + `CacheArray`；`texture_memory_path=cached` 時承接 active TPU sample FIFO，short 時刻意略過 |
+| SLC | 2 MiB；128 B line；8-way；8 banks | 共用 `GpuMemorySystem` 的 `CacheArray`；承接 global-cache clients，以及 cached texture path 的 TCU misses |
 
 `CacheArray` 保存實際 line bytes，不只計算 hit/miss；full-line store miss 可直接 write-allocate，dirty victim/flush callback 會深拷貝成 `DramLineWrite` MemoryPool records。Forced flush 只清 dirty、不 invalidate resident line，因此跨 frame 可觀察 cold miss→warm hit。尚未實作 MSHR、prefetch/coherence、bank conflict、fabric contention 或 read-response；相關 counter 仍不可宣稱完成。
 
-上述 Fill.Solid/cache baseline 的 layout checker 為 **PASS（33 個 SystemC module class）**：16 個 active GPU functional class、3 個 implemented-idle cache class、2 個 harness class、12 個空 placeholder class。當時 VS/FS 各自實例化 `PcoDecoder`、`UscSlot`、`UscCluster`，top-level 共有 21 個 executable-chain instance、3 個 implemented-idle cache instance 與 12 個 placeholder instance。後續 Compute 與其他階段擴充的即時總數以 `tests/check_systemc_module_layout.py` 為準；所有具體 module 仍遵守一個 class 對一組唯一同 stem `.h/.cpp`。
+SystemC module layout 仍由 `tests/check_systemc_module_layout.py` 驗證；所有具體 module 遵守一個 class 對一組唯一同 stem `.h/.cpp`。TCU 現在是 cached texture path 的 active controller，MCU 與 USC-L2 仍是 implemented-idle，其他 placeholder 不因名稱存在就宣稱已連線。
 
 GS / TCS / Tessellator / TES 是四個獨立邏輯 module，不代表已證實硬體中有四組專用執行核心。每個都有自己的 `.h/.cpp`、event-driven process 與 bounded POD/PoolHandle FIFO，納入 model executable、SystemC bridge 與 `ModelSession` 的初始 elaboration。GS 由 API24 引入，TCS/固定功能/TES 由 API25 引入；enabled stage 執行真實 native PCO 或固定功能細分，只有 absent stage 才原樣傳遞 transaction。完整支援邊界與實測結果見 `docs/GEOMETRY_SHADER_VALIDATION.md`、`docs/TESSELLATION_VALIDATION.md`；不得以 forwarding、host shader evaluator 或 VS/FS/CS 執行器冒充支援。
 
@@ -540,9 +542,9 @@ Submitter                                      [HARNESS]
 
 DRAM fixed latency 定義為 **每 request 1 model cycle**；多個 line request以一次 aggregate timed wait推進，不建立 clock edge或逐 line/逐 cycle polling。cache active模式的 `dram_write_bytes`包含 tail line padding，`dram_read_bytes`與 `framebuffer_dram_readback_bytes`則是 exact surface bytes。Bypass只影響 cache simulation cost，不容許 PBE→PNG捷徑。
 
-### 5.4 尚待連線的 memory hierarchy boundary
+### 5.4 Memory hierarchy boundary
 
-Framebuffer client boundary 已完成 `PBE → PixelDataMaster → SLC → DramModel`。下一階段才連 USC generic/code traffic→USC-L2/MCU、TPU texture traffic→TCU，以及 `OnChipFabric`、`MmuBif`、`MemFabric` 的 routing/translation/completion contract。這些路徑需要 read response、fill、MSHR、bank/fabric contention 與 fault/cancel ownership；在 transaction 與測試成立前，不用 idle forwarding 宣稱已連線。每條連線仍使用 bounded FIFO 傳小型 handle，bulk bytes 留在 MemoryPool，並以 next-event completion 建模。
+Framebuffer client boundary 已完成。Texture client 由獨立開關選擇 `USC → TPU → DRAM` short path，或 active `USC → TPU → TCU → SLC → DRAM` cached path；兩者共用同一份 authoritative backing，host upload 與 GPU store 會 invalidate 相交的 TCU line。尚未連線的是 USC generic/code traffic→USC-L2/MCU，以及 `OnChipFabric`、`MmuBif`、`MemFabric` 的 routing/translation/completion contract。MSHR、bank/fabric contention 與 fault/cancel ownership仍未建模，不以 idle forwarding 或假 counter 冒充完成。
 
 DXTP attachment 中的 8 USC、1 ISP/USC、tiles-in-flight、40-bit VA、memory channels 及 peak throughput 仍保留為 inactive reference。只有 §5.2.1 cache capacity/line/bank 已被明確選入 project reference configuration；way/policy 與 fixed DRAM latency 保持 `assumed/uncalibrated` provenance。
 
@@ -1120,4 +1122,4 @@ Expected failure 必須有 issue、owner、原因分類、建立日與 expiry；
 
 ---
 
-目前已越過最初的 M0/Fill.Solid bring-up：三個 state cases 已通過 llvmpipe RGBA differential；framebuffer path也已接入 PixelDataMaster、真實 SLC tag/data/writeback與 fixed-latency DRAM backing/readback，cache active/bypass兩種 PNG exact gate均通過。下一個 functional gate仍是 `fill_solid_blended`，並維持 stop-on-first-error；MCU/TCU/USC-L2雖已有 controller與 cache array，active shader/texture traffic、MMU/fabric/MSHR/contention仍必須等 transaction contract與對應測試成立後逐段接入，不以 idle module或假 counter冒充完成。
+目前已越過最初的 M0/Fill.Solid bring-up：三個 state cases 已通過 llvmpipe RGBA differential；framebuffer path也已接入真實 SLC tag/data/writeback與 authoritative DRAM backing/readback。Texture sampling 預設使用快速 short path；cached opt-in 會實際產生 TCU hit/miss，再由 miss 進入共用 SLC/DRAM。MCU/USC-L2、MMU/fabric/MSHR/contention仍必須等 transaction contract與對應測試成立後逐段接入，不以 idle module或假 counter冒充完成。

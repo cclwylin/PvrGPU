@@ -1,9 +1,11 @@
 // TextureUnit 模擬 PowerVR TPU（Texture Processing Unit，紋理處理
 // 單元）。SMP request 從 USC（Unified Shading Cluster）送入；TPU 解析
 // texture/sampler descriptor、計算 normalized repeat addressing，並做
-// nearest 或四 tap bilinear filtering。每個真實 texel read 都以 FIFO
-//（First-In, First-Out）送至 TCU（Texture Cache Unit）。TCU/SLC/DRAM
-// 回應後，TPU 將 RGBA response 交回 USC
+// nearest 或四 tap bilinear filtering。預設 short path 讓每個真實
+// texel read 直接從共用 GPU memory 的 authoritative DRAM backing 取得；
+// cached path 才會以 FIFO（First-In, First-Out）送至 TCU（Texture
+// Cache Unit），並在 TCU miss 時繼續經 SLC 到 DRAM。回應後，TPU 將
+// RGBA response 交回 USC
 // continuation，由 USC 完成 WDF/PIXOUT。Texture allocation 只在首次
 // sample 前預置到 DRAM；non-texture cases 則無 request 通過 Run。Bulk data
 // 留在 MemoryPool，FIFO 僅傳 handle/control，timing 是 event-driven。
@@ -168,7 +170,9 @@ class TextureUnit final : public sc_core::sc_module {
       upload_response{"upload_response"};
 
   TextureUnit(sc_core::sc_module_name name, MemoryPool& pool,
-              GpuMemorySystem *memory = nullptr, bool exact_lod = false);
+              GpuMemorySystem *memory = nullptr, bool exact_lod = false,
+              TextureMemoryPath texture_memory_path =
+                  TextureMemoryPath::kShort);
 
  private:
   void Run();
@@ -188,6 +192,7 @@ class TextureUnit final : public sc_core::sc_module {
   MemoryPool& pool_;
   GpuMemorySystem *memory_;
   const bool exact_lod_;
+  const TextureMemoryPath texture_memory_path_;
   // All six shader-stage descriptor-set namespaces are independent. Residency is kept
   // within one PipelineState (including all of its SMP continuation rounds)
   // and reset when the next physical draw receives a new state handle.
