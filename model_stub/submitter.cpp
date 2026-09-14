@@ -233,7 +233,8 @@ bool GenericViewportTranslateValid(const DriverCommand &command) {
   }
   if (command.depth_enable == 0)
     return true;
-  const float near_depth = z - depth_scale;
+  // Clip control ZERO_TO_ONE maps NDC z in [0, 1], not [-1, 1].
+  const float near_depth = command.clip_halfz ? z : z - depth_scale;
   const float far_depth = z + depth_scale;
   return near_depth >= 0.0F && near_depth <= 1.0F && far_depth >= 0.0F &&
          far_depth <= 1.0F;
@@ -2258,6 +2259,7 @@ void Submitter::RunJob() {
                                      command.viewport_scale_bits[1]);
       state.raster_state.bottom_edge_rule =
           static_cast<std::uint8_t>(command.bottom_edge_rule);
+      state.raster_state.clip_halfz = command.clip_halfz ? 1U : 0U;
       state.raster_state.color_mask =
           static_cast<std::uint8_t>(command.color_mask);
       state.raster_state.scissor.enable =
@@ -2646,12 +2648,16 @@ void Submitter::RunJob() {
         // provoking vertex's value.  The capsule states which are flat because
         // the model cannot tell from the linkage alone, and assuming smooth
         // made a flat integer read back as the plane's first term.
-        const bool flat = command.explicit_varying_bindings
-            ? command.varying_bindings.at(varying).flat != 0
-            : (command.varying_flat_mask & (1U << varying)) != 0;
-        linkage.interpolation = flat
-                ? InterpolationMode::kFlat
-                : InterpolationMode::kSmooth;
+        const std::uint32_t mode = command.explicit_varying_bindings
+            ? command.varying_bindings.at(varying).flat
+            : (command.varying_flat_mask & (1U << varying)) != 0 ? 1U : 0U;
+        linkage.interpolation =
+            mode == kDriverVaryingPointCoordUpperLeft
+                ? InterpolationMode::kPointCoordUpperLeft
+            : mode == kDriverVaryingPointCoordLowerLeft
+                ? InterpolationMode::kPointCoordLowerLeft
+            : mode != 0 ? InterpolationMode::kFlat
+                        : InterpolationMode::kSmooth;
         const char *linkage_refusal = nullptr;
         if (!IsExactVaryingBinding(state, linkage, varying,
                                    &linkage_refusal)) {

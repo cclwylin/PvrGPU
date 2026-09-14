@@ -85,6 +85,13 @@ inline constexpr ReferenceUarchConfig kReferenceUarch = {
     25,      // fixed submission overhead
 };
 
+// USC task stream (docs/USC_TASK_STREAM_PHASE1.md). One stream period T in
+// cycles, and the geometry output a single render may hold: the modeled
+// parameter-buffer capacity in primitives. A geometry stream that exceeds it
+// is split into partial renders.
+inline constexpr std::uint64_t kUscStreamPeriodCycles = 1;
+inline constexpr std::uint64_t kGeometryStreamCapacityPrimitives = UINT64_C(1) << 20;
+
 static_assert(kReferenceUarch.tile_width == 32 &&
               kReferenceUarch.tile_height == 32);
 static_assert(kReferenceUarch.usc_issue_lanes == 4);

@@ -6,6 +6,7 @@
 // FIFO（First-In, First-Out）傳遞 MemoryPool state handle，採單次事件延遲
 // 而非逐週期 clock。
 #include "shader/usc_slot.h"
+#include "shader/usc_task_stream.h"
 
 #include "common/functional_types.h"
 #include "common/pipeline_state.h"
@@ -152,14 +153,14 @@ void UscSlot::Run() {
 
     if (stage_ == ShaderStage::kVertex) {
       if (lanes == 0 || groups == 0 ||
-          groups != CeilDivide(lanes, kReferenceUarch.usc_issue_lanes)) {
+          groups != UscIssuePlan::ForLanes(lanes).groups) {
         throw std::runtime_error(
             "vertex USC slot received an invalid lane/group count");
       }
     } else {
       if ((lanes == 0) != (groups == 0) ||
           (lanes != 0 &&
-           (groups < CeilDivide(lanes, kReferenceUarch.usc_issue_lanes) ||
+           (groups < UscIssuePlan::ForLanes(lanes).groups ||
             groups > lanes))) {
         throw std::runtime_error(
             "fragment USC slot received an invalid lane/quad count");

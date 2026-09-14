@@ -15,6 +15,7 @@
 
 #include <systemc>
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
@@ -177,8 +178,8 @@ void RunNonFiniteFixture(const std::string &mode) {
     triangle.y[2] = 2.5f;
     scissor(1, 0, 2, 1); // The only sample lies exactly on the horizontal edge.
     state.raster_state.bottom_edge_rule = mode == "bottom-left-empty";
-    if (mode == "top-left-covered")
-      expected_error = plane_error + ":";
+    // A non-singular setup whose finite +/-FLT_MAX varyings overflow is
+    // carried as IEEE inf/NaN coefficients, as llvmpipe's setup computes it.
   } else {
     throw std::runtime_error("unknown non-finite fixture: " + mode);
   }
@@ -290,6 +291,21 @@ void RunNonFiniteFixture(const std::string &mode) {
       LoadArray<ParameterTriangle>(pool, result.parameter_triangles);
   const auto coefficients =
       LoadArray<ParameterCoefficientSet>(pool, result.parameter_coefficients);
+  if (regular_edges) {
+    Check(result.stage == PipelineStage::kParameterBufferReady &&
+              parameters.size() == 1 && parameters[0].rasterizable == 1 &&
+              parameters[0].coefficient_set_count == 5 && coefficients.size() == 5,
+          "overflowing varying keeps an active parameter triangle");
+    const auto &overflow = coefficients[parameters[0].first_coefficient_set + 3];
+    Check(!std::isfinite(BitsFloat(overflow.a)) ||
+              !std::isfinite(BitsFloat(overflow.b)) ||
+              !std::isfinite(BitsFloat(overflow.c)),
+          "overflowing varying plane carries its non-finite coefficients");
+    ReleaseFunctionalPayloads(pool, result);
+    pool.Release(handle);
+    Check(pool.bytes_in_flight() == 0, "carried fixture pool balance");
+    return;
+  }
   Check(result.stage == PipelineStage::kParameterBufferReady &&
             parameters.size() == triangles.size() &&
             result.counters.c_primitives == triangles.size() &&
@@ -340,10 +356,117 @@ void RunNonFiniteFixture(const std::string &mode) {
         "non-finite fixture MemoryPool balance");
 }
 
+// gl_PointCoord: the binding names no vertex output. A point's plane follows
+// llvmpipe's texcoord_coef (step = FIXED_ONE / snapped width, 0.5 at the
+// centre, t negated for a lower-left origin); any other primitive reads 0.
+void RunPointCoordFixture(const std::string &mode) {
+  const bool lower_left = mode == "point-coord-lower-left";
+  MemoryPool pool;
+  PipelineState state;
+  state.width = state.height = 64;
+  state.functional_case = FunctionalCase::kDriverPcoTriangles;
+  state.stage = PipelineStage::kTiled;
+  state.position_output_count = state.varying_output_start = 4;
+  state.fragment_position_count = state.fragment_varying_start = 4;
+  state.fragment_position_uses_w = 1;
+  state.fragment_varying_count = 8;
+  state.vertex_pco_abi.vertex_outputs = 4;
+  state.fragment_pco_abi.coefficients = 12;
+  state.driver_varying_bindings_explicit = 1;
+  state.driver_varying_binding_count = 1;
+  ShaderVaryingBinding binding;
+  binding.coefficient_set_base = 1;
+  binding.component_count = 2;
+  binding.interpolation = lower_left ? InterpolationMode::kPointCoordLowerLeft
+                                     : InterpolationMode::kPointCoordUpperLeft;
+
+  RasterTriangle sprite;
+  sprite.x[0] = 6.55f;
+  sprite.y[0] = 16.95f;
+  sprite.x[1] = 14.05f;
+  sprite.y[1] = 16.95f;
+  sprite.x[2] = 6.55f;
+  sprite.y[2] = 24.45f;
+  sprite.rasterizable = sprite.front_facing = 1;
+  sprite.vertex_output_stride_dwords = 4;
+  sprite.setup_vertex_order[0] = 0;
+  sprite.setup_vertex_order[1] = 1;
+  sprite.setup_vertex_order[2] = 2;
+  for (unsigned vertex = 0; vertex != 3; ++vertex) {
+    sprite.window_z[vertex] = .5f;
+    sprite.reciprocal_w[vertex] = 1.f;
+  }
+  RasterTriangle triangle = sprite;
+  sprite.point.center_x = 10.3f;
+  sprite.point.center_y = 20.7f;
+  sprite.point.half_size = 3.75f;
+  sprite.point.valid = 1;
+  triangle.first_vertex_output_dword = 12;
+  triangle.key.submit_ordinal = 1;
+  std::vector<RasterTriangle> triangles{sprite, triangle};
+  std::vector<std::uint32_t> outputs(24, FloatBits(1.f));
+  state.counters.c_primitives = state.counters.setup_triangles = 2;
+  state.raster_triangles = StoreNewArray(pool, triangles);
+  state.raster_vertex_outputs = StoreNewArray(pool, outputs);
+  state.shader_varying_bindings =
+      StoreNewArray(pool, std::vector<ShaderVaryingBinding>{binding});
+  const PoolHandle handle = pool.Allocate(sizeof(PipelineState));
+  StorePipelineState(pool, handle, state);
+  sc_core::sc_fifo<PipelineTxn> input("input", 1), output("output", 1);
+  ParameterBuffer parameter_buffer("parameter_buffer", pool);
+  parameter_buffer.input(input);
+  parameter_buffer.output(output);
+  input.write({handle, 1, 1});
+  sc_core::sc_start(sc_core::sc_time(100, sc_core::SC_NS));
+  PipelineTxn completed;
+  Check(output.nb_read(completed), "point coordinate FIFO completion");
+  const PipelineState result = LoadPipelineState(pool, handle);
+  const auto parameters =
+      LoadArray<ParameterTriangle>(pool, result.parameter_triangles);
+  const auto coefficients =
+      LoadArray<ParameterCoefficientSet>(pool, result.parameter_coefficients);
+  Check(parameters.size() == 2 && parameters[0].coefficient_set_count == 3 &&
+            parameters[1].coefficient_set_count == 3 && coefficients.size() == 6,
+        "point coordinate occupies two coefficient sets after W");
+
+  // Size 7.5 snaps to 1920/256 pixels.
+  const float step = 256.f / 1920.f;
+  const float s_origin = step * (10.3f - .5f);
+  const float t_step = lower_left ? -step : step;
+  const float t_origin = t_step * (20.7f - .5f);
+  const auto &s = coefficients[parameters[0].first_coefficient_set + 1];
+  const auto &t = coefficients[parameters[0].first_coefficient_set + 2];
+  CheckPlane(s, FloatBits(step), 0, FloatBits(float(.5 - double(s_origin))),
+             "point coordinate s plane");
+  CheckPlane(t, 0, FloatBits(t_step), FloatBits(float(.5 - double(t_origin))),
+             "point coordinate t plane");
+  // Evaluated at the pixel (x, y) whose centre is x + 0.5.
+  const auto evaluate = [](const ParameterCoefficientSet &plane, float x, float y) {
+    return BitsFloat(plane.a) * x + BitsFloat(plane.b) * y + BitsFloat(plane.c);
+  };
+  Check(std::fabs(evaluate(s, 9.8f, 20.2f) - .5f) < 1e-5f &&
+            std::fabs(evaluate(t, 9.8f, 20.2f) - .5f) < 1e-5f,
+        "the point centre reads (0.5, 0.5)");
+  Check(evaluate(t, 9.8f, 17.2f) < .5f != lower_left,
+        "t grows down the rows for an upper-left origin");
+  for (unsigned component = 1; component != 3; ++component)
+    CheckPlane(coefficients[parameters[1].first_coefficient_set + component], 0, 0,
+               FloatBits(0.f), "a primitive that is not a point reads zero");
+  ReleaseFunctionalPayloads(pool, result);
+  pool.Release(handle);
+  Check(pool.bytes_in_flight() == 0, "point coordinate fixture pool balance");
+}
+
 } // namespace
 
 int sc_main(int argc, char **argv) {
   try {
+    if (argc == 2 && std::string(argv[1]).rfind("point-coord", 0) == 0) {
+      RunPointCoordFixture(argv[1]);
+      std::cout << "parameter_buffer_perspective_test: " << argv[1]
+                << ": PASS\n";
+      return 0;
+    }
     if (argc == 2) {
       RunNonFiniteFixture(argv[1]);
       std::cout << "parameter_buffer_perspective_test: " << argv[1]

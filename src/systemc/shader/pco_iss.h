@@ -97,7 +97,9 @@ inline constexpr std::size_t kPcoMaximumTextureDescriptorSets =
  * sequence. Fragment programs instead support control flow and reuse one
  * continuation per resident lane: their static SMP count is not continuation
  * depth and must not inherit this vertex-only program bound. */
-inline constexpr std::size_t kPcoMaximumVertexTextureSampleInstructions = 9;
+// Per-lane request counters are uint8_t; a GLES2 shader may sample every one
+// of its sampler uniforms (dEQP uniform_api.random.* uses more than nine).
+inline constexpr std::size_t kPcoMaximumVertexTextureSampleInstructions = 255;
 inline constexpr std::size_t kPcoMaximumVertexSharedCount =
     PVRGPU_SYSTEMC_MAX_PCO_GRAPHICS_SHARED_DWORDS_PER_STAGE;
 inline constexpr std::size_t kPcoMaximumFragmentSharedCount =

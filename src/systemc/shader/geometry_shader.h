@@ -17,6 +17,10 @@ class GeometryShader final : public sc_core::sc_module {
                   sc_core::SC_ZERO_OR_MORE_BOUND> texture_request_output{"texture_request_output"};
   sc_core::sc_port<sc_core::sc_fifo_in_if<PipelineTxn>, 0,
                   sc_core::SC_ZERO_OR_MORE_BOUND> texture_response_input{"texture_response_input"};
+  // Partial render completion: PbeWriteBack returns a render that is not the
+  // draw's last here, so the geometry stream resumes after it has landed.
+  sc_core::sc_port<sc_core::sc_fifo_in_if<PipelineTxn>, 0,
+                  sc_core::SC_ZERO_OR_MORE_BOUND> partial_render_done{"partial_render_done"};
   GeometryShader(sc_core::sc_module_name name, MemoryPool &pool,
                   GpuMemorySystem *memory = nullptr);
 

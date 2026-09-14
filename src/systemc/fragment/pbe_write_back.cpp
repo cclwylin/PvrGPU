@@ -8,6 +8,7 @@
 #include "common/color_attachment_formats.h"
 #include "common/depth_attachment.h"
 #include "memory/gpu_memory_system.h"
+#include "shader/usc_task_stream.h"
 
 #include <limits>
 #include <stdexcept>
@@ -222,6 +223,14 @@ void PbeWriteBack::Run() {
       state.stage = PipelineStage::kFramebufferReady;
       WaitForCycles(memory_cycles);
 
+      // Partial renders: an intermediate render returns to the geometry
+      // stream; the last one folds every earlier render back in.
+      const bool return_partial_render =
+          state.partial_render.active && !state.partial_render.last;
+      if (return_partial_render && partial_render_return.size() == 0)
+        throw std::runtime_error("PbeWriteBack partial render has no return channel");
+      if (state.partial_render.active && state.partial_render.last)
+        FinishPartialRender(pool_, state);
       const auto release_sources = [&]() {
         pool_.Release(pbe_source);
         for (PoolHandle &extra : extra_sources) {
@@ -241,7 +250,10 @@ void PbeWriteBack::Run() {
         throw;
       }
       release_sources();
-      completion->write(txn);
+      if (return_partial_render)
+        partial_render_return->write(txn);
+      else
+        completion->write(txn);
       continue;
     }
 

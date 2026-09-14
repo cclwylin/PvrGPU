@@ -88,6 +88,17 @@ target_include_directories(pvrgpu-geometry-core PUBLIC "${CMAKE_SOURCE_DIR}/src/
 pvrgpu_target_warnings(pvrgpu-geometry-core)
 link_libraries(pvrgpu-geometry-core)
 
+# USC task stream (docs/USC_TASK_STREAM_PHASE1.md): stage-neutral shader
+# issue/stream/partial-render helpers shared by the shader and raster modules.
+add_library(pvrgpu-usc-stream-core STATIC src/systemc/shader/usc_task_stream.cpp)
+set_target_properties(pvrgpu-usc-stream-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(pvrgpu-usc-stream-core PUBLIC
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/systemc")
+target_link_libraries(pvrgpu-usc-stream-core PUBLIC PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(pvrgpu-usc-stream-core)
+link_libraries(pvrgpu-usc-stream-core)
+
 add_library(pvrgpu-tessellation-core STATIC
     src/systemc/common/tessellation.cpp
     src/systemc/common/tessellation_reference.cpp
@@ -639,6 +650,14 @@ target_include_directories(shader-stage-placeholders-test PRIVATE
 target_link_libraries(shader-stage-placeholders-test PRIVATE pvrgpu-systemc-bridge PkgConfig::SYSTEMC)
 pvrgpu_target_warnings(shader-stage-placeholders-test)
 add_test(NAME shader-stage-placeholders-unit COMMAND shader-stage-placeholders-test)
+
+add_executable(usc-task-stream-test tests/usc_task_stream_test.cpp
+    model_stub/memory_pool.cpp)
+target_include_directories(usc-task-stream-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/model_stub" "${CMAKE_SOURCE_DIR}/src/systemc")
+target_link_libraries(usc-task-stream-test PRIVATE PkgConfig::SYSTEMC)
+pvrgpu_target_warnings(usc-task-stream-test)
+add_test(NAME usc-task-stream-unit COMMAND usc-task-stream-test)
 
 add_executable(geometry-emission-test tests/geometry_emission_test.cpp)
 pvrgpu_target_warnings(geometry-emission-test)
@@ -2194,7 +2213,8 @@ foreach(plane_case IN ITEMS
         msaa-covered msaa-masked msaa-disabled-covered msaa-disabled-empty
         msaa-enabled-scissored msaa-2-empty msaa-4-empty msaa-8-empty
         invalid-reciprocal invalid-layout invalid-setup invalid-samples
-        invalid-multisample top-left-covered bottom-left-empty)
+        invalid-multisample top-left-covered bottom-left-empty
+        point-coord-upper-left point-coord-lower-left)
     add_test(
         NAME parameter-buffer-plane-${plane_case}
         COMMAND parameter-buffer-perspective-test ${plane_case}

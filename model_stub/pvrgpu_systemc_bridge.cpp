@@ -24,6 +24,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <thread>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -46,7 +47,6 @@ struct PendingSubmit {
   std::uint64_t submission_generation = 0;
 };
 
-PendingSubmit g_pending_submit;
 bool g_atexit_registered = false;
 
 bool IsIdeasPcoSequenceCase(const char *case_name) {
@@ -387,6 +387,19 @@ bool PcoStageAbiMatches(const Abi &actual,
          actual.uniform_buffer_descriptor_count == expected.uniform_buffer_descriptor_count;
 }
 
+// Fragment coefficient components the rasterizer supplies without a vertex
+// output (the point-sprite coordinate bindings).
+std::uint32_t PointCoordComponents(const pvrgpu_systemc_driver_command &source) {
+  std::uint32_t components = 0;
+  for (std::uint32_t i = 0; source.varying_bindings && i < source.varying_binding_count; ++i) {
+    const auto &b = source.varying_bindings[i];
+    if (b.flat == PVRGPU_SYSTEMC_VARYING_POINT_COORD_UPPER_LEFT ||
+        b.flat == PVRGPU_SYSTEMC_VARYING_POINT_COORD_LOWER_LEFT)
+      components += b.num_components;
+  }
+  return components;
+}
+
 template <typename Abi>
 bool PcoStageAbiIsBounded(const Abi &abi, bool allow_zero_temps = false,
                           bool fragment_stage = false) {
@@ -639,11 +652,13 @@ bool PcoViewportScaleMatches(const std::array<std::uint32_t, 3> &expected,
 }
 
 bool PcoViewportDepthRangeValid(const std::uint32_t scale_bits[3],
-                                const std::uint32_t translate_bits[3]) {
+                                const std::uint32_t translate_bits[3],
+                                bool clip_halfz = false) {
   float scale = 0.0F, translate = 0.0F;
   std::memcpy(&scale, &scale_bits[2], sizeof(scale));
   std::memcpy(&translate, &translate_bits[2], sizeof(translate));
-  const float near_depth = translate - scale;
+  // Clip control ZERO_TO_ONE maps NDC z in [0, 1], not [-1, 1].
+  const float near_depth = clip_halfz ? translate : translate - scale;
   const float far_depth = translate + scale;
   return std::isfinite(scale) && std::isfinite(translate) &&
          near_depth >= 0.0F && near_depth <= 1.0F &&
@@ -1691,7 +1706,8 @@ bool CopyPcoTrianglePayload(
          (source.depth_enable == 0
               ? !std::isfinite(viewport_translate[2])
               : !PcoViewportDepthRangeValid(source.viewport_scale_bits,
-                                            source.viewport_translate_bits)))
+                                            source.viewport_translate_bits,
+                                            source.clip_halfz != 0)))
       : !ViewportOffsetIsInside(source.viewport_translate_bits, source.width,
                                 source.height, source.framebuffer_width,
                                 source.framebuffer_height);
@@ -1767,7 +1783,7 @@ bool CopyPcoTrianglePayload(
       // GL_MULTISAMPLE on a single-sample attachment rasterizes as
       // single-sample; a multi-sampled attachment never reaches here.
       source.multisample > 1 || source.half_pixel_center != 1 ||
-      source.bottom_edge_rule > 1 || source.clip_halfz != 0 ||
+      source.bottom_edge_rule > 1 || source.clip_halfz > 1 ||
       source.depth_clip_near != 1 || source.depth_clip_far != 1 ||
       source.depth_clamp != 0 || source.sample_mask != UINT32_MAX ||
       source.alpha_to_coverage != 0 || source.alpha_to_one != 0 ||
@@ -1916,6 +1932,15 @@ bool CopyPcoSequenceDraw(
     std::uint32_t next_coefficient = source.fragment_position_count;
     for (std::uint32_t i = 0; i < source.varying_binding_count; ++i) {
       const auto &b = source.varying_bindings[i];
+      if (b.flat == PVRGPU_SYSTEMC_VARYING_POINT_COORD_UPPER_LEFT ||
+          b.flat == PVRGPU_SYSTEMC_VARYING_POINT_COORD_LOWER_LEFT) {
+        // Rasterizer point-sprite coordinate: no vertex output.
+        if (b.num_components != 2 || b.output_dword != 0 ||
+            b.coefficient_dword != next_coefficient)
+          return refuse("explicit point coordinate binding is invalid");
+        next_coefficient += b.num_components * 4;
+        continue;
+      }
       if (!b.num_components || b.num_components > 4 || b.flat > 1 ||
           b.output_dword < source.varying_output_start ||
           b.output_dword > raster_abi.vertex_outputs ||
@@ -2117,7 +2142,8 @@ bool CopyPcoSequenceDraw(
       source.fragment_varying_start != source.fragment_position_count ||
       // The fragment stage interpolates the varyings it reads, which may be
       // fewer than the vertex stage writes.
-      source.fragment_varying_count > source.varying_output_count * 4U ||
+      source.fragment_varying_count >
+          (source.varying_output_count + PointCoordComponents(source)) * 4U ||
       (source.fragment_varying_count & 3U) != 0 ||
       source.fragment_pco_abi.coefficients !=
           source.fragment_position_count + source.fragment_varying_count) {
@@ -2254,7 +2280,7 @@ bool CopyPcoSequenceDraw(
     nested_reason = "half_pixel_center";
   else if (source.bottom_edge_rule > 1)
     nested_reason = "bottom_edge_rule";
-  else if (source.clip_halfz != 0)
+  else if (source.clip_halfz > 1)
     nested_reason = "clip_halfz";
   else if (source.depth_clip_near != 1 || source.depth_clip_far != 1)
     nested_reason = "depth_clip";
@@ -3531,37 +3557,53 @@ void DeriveSequenceInputAssembly(pvrgpu::stub::Options *options) {
  * produced them is consumed by the first of those reads, so the attachments
  * are held here until the next submission runs and replaces them.
  */
-pvrgpu::stub::ModelFramebuffer g_last_framebuffer;
-pvrgpu::stub::ModelGraphicsStats g_last_graphics_stats;
-std::uint64_t g_last_graphics_generation = 0;
+/*
+ * One submission slot per submitting thread.  A GL context submits and reads
+ * back on the thread it is current on, so contexts current on different
+ * threads (EGL multithread sharing) must neither absorb nor replace each
+ * other's pending work, nor read each other's attachments.  Execution itself
+ * stays serialized by g_bridge_mutex on the one elaborated model.
+ */
+struct SubmitSlot {
+  PendingSubmit pending;
+  pvrgpu::stub::ModelFramebuffer last_framebuffer;
+  pvrgpu::stub::ModelGraphicsStats last_graphics_stats;
+  std::uint64_t last_graphics_generation = 0;
+};
+std::unordered_map<std::thread::id, SubmitSlot> g_submit_slots;
 
-int FlushPendingSubmitLocked(pvrgpu::stub::ModelFramebuffer *framebuffer,
+SubmitSlot &CurrentSubmitSlot() {
+  return g_submit_slots[std::this_thread::get_id()];
+}
+
+int FlushPendingSubmitLocked(SubmitSlot &slot,
+                             pvrgpu::stub::ModelFramebuffer *framebuffer,
                              std::string *error) {
-  if (!g_pending_submit.valid || g_pending_submit.executed) {
-    if (framebuffer && g_last_framebuffer.valid())
-      *framebuffer = g_last_framebuffer;
+  if (!slot.pending.valid || slot.pending.executed) {
+    if (framebuffer && slot.last_framebuffer.valid())
+      *framebuffer = slot.last_framebuffer;
     return 0;
   }
-  g_pending_submit.executed = true;
-  if (IsIdeasPcoSequenceRoot(g_pending_submit.options.driver_command) &&
-      g_pending_submit.options.driver_commands.size() !=
+  slot.pending.executed = true;
+  if (IsIdeasPcoSequenceRoot(slot.pending.options.driver_command) &&
+      slot.pending.options.driver_commands.size() !=
           pvrgpu::stub::kDriverPcoIdeasSequenceCommands) {
     if (error)
       *error = "Ideas PCO profile requires exactly 180 ordered draws";
     return 2;
   }
   try {
-    DeriveSequenceInputAssembly(&g_pending_submit.options);
+    DeriveSequenceInputAssembly(&slot.pending.options);
     pvrgpu::stub::ModelFramebuffer produced;
     const int status =
-        RunModelToFiles(g_pending_submit.options, g_pending_submit.jsonl_path,
-                        g_pending_submit.stderr_path, &produced, error);
+        RunModelToFiles(slot.pending.options, slot.pending.jsonl_path,
+                        slot.pending.stderr_path, &produced, error);
     if (status == 0) {
-      g_last_graphics_stats = produced.graphics_stats;
-      g_last_graphics_generation = g_pending_submit.submission_generation;
-      g_last_framebuffer = std::move(produced);
+      slot.last_graphics_stats = produced.graphics_stats;
+      slot.last_graphics_generation = slot.pending.submission_generation;
+      slot.last_framebuffer = std::move(produced);
       if (framebuffer)
-        *framebuffer = g_last_framebuffer;
+        *framebuffer = slot.last_framebuffer;
     }
     return status;
   } catch (const std::exception &failure) {
@@ -3578,6 +3620,11 @@ int FlushPendingSubmitLocked(pvrgpu::stub::ModelFramebuffer *framebuffer,
   return 2;
 }
 
+int FlushPendingSubmitLocked(pvrgpu::stub::ModelFramebuffer *framebuffer,
+                             std::string *error) {
+  return FlushPendingSubmitLocked(CurrentSubmitSlot(), framebuffer, error);
+}
+
 /*
  * Last resort for work nobody read back.
  *
@@ -3588,11 +3635,13 @@ int FlushPendingSubmitLocked(pvrgpu::stub::ModelFramebuffer *framebuffer,
  */
 void FlushPendingSubmitAtExit() {
   std::lock_guard<std::mutex> lock(g_bridge_mutex);
-  std::string error;
-  const int result = FlushPendingSubmitLocked(nullptr, &error);
-  if (result != 0) {
-    std::cerr << "PvrGPU SystemC API deferred flush failed: " << error
-              << '\n';
+  for (auto &entry : g_submit_slots) {
+    std::string error;
+    const int result = FlushPendingSubmitLocked(entry.second, nullptr, &error);
+    if (result != 0) {
+      std::cerr << "PvrGPU SystemC API deferred flush failed: " << error
+                << '\n';
+    }
   }
   pvrgpu::stub::ShutdownConfiguredModel();
 }
@@ -3721,6 +3770,7 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
     const pvrgpu_systemc_submit_info *info, char *error,
     std::size_t error_size) {
   std::lock_guard<std::mutex> lock(g_bridge_mutex);
+  SubmitSlot &slot = CurrentSubmitSlot();
   std::string message;
   if (!info) {
     CopyError(error, error_size, "missing SystemC API submit info");
@@ -3797,25 +3847,25 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
    * frame's work.  Only a submission still waiting to run can absorb another
    * command into its ordered sequence.
    */
-  if (g_pending_submit.valid && !g_pending_submit.executed) {
+  if (slot.pending.valid && !slot.pending.executed) {
     const bool sequence_active =
-        !g_pending_submit.options.driver_commands.empty();
+        !slot.pending.options.driver_commands.empty();
     const bool sequence_root =
-        IsIdeasPcoSequenceRoot(g_pending_submit.options.driver_command);
+        IsIdeasPcoSequenceRoot(slot.pending.options.driver_command);
     const std::string stderr_path =
         info->stderr_path && info->stderr_path[0] ? info->stderr_path : "";
     const bool compatible_sequence_member =
         (sequence_active || sequence_root) &&
-        g_pending_submit.jsonl_path == info->jsonl_path &&
-        g_pending_submit.stderr_path == stderr_path &&
-        g_pending_submit.options.output_dir == info->outdir &&
-        g_pending_submit.options.emit_png == options.emit_png &&
-        g_pending_submit.options.memory_mode == options.memory_mode &&
-        g_pending_submit.options.texture_memory_path ==
+        slot.pending.jsonl_path == info->jsonl_path &&
+        slot.pending.stderr_path == stderr_path &&
+        slot.pending.options.output_dir == info->outdir &&
+        slot.pending.options.emit_png == options.emit_png &&
+        slot.pending.options.memory_mode == options.memory_mode &&
+        slot.pending.options.texture_memory_path ==
             options.texture_memory_path &&
-        g_pending_submit.options.exact_texture_lod ==
+        slot.pending.options.exact_texture_lod ==
             options.exact_texture_lod &&
-        CommandsShareSequenceTarget(g_pending_submit.options.driver_command,
+        CommandsShareSequenceTarget(slot.pending.options.driver_command,
                                     options.driver_command);
     if ((sequence_active || sequence_root) &&
         !compatible_sequence_member) {
@@ -3827,7 +3877,7 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
 
     if (compatible_sequence_member) {
       std::vector<pvrgpu::stub::DriverCommand> &commands =
-          g_pending_submit.options.driver_commands;
+          slot.pending.options.driver_commands;
       const std::size_t existing_count =
           commands.empty() ? 1U : commands.size();
       if (existing_count >=
@@ -3849,7 +3899,7 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
       try {
         if (commands.empty()) {
           payload_bytes = CommandOwnedPayloadBytes(
-              g_pending_submit.options.driver_command);
+              slot.pending.options.driver_command);
         } else {
           for (const pvrgpu::stub::DriverCommand &command : commands) {
             const std::uint64_t bytes = CommandOwnedPayloadBytes(command);
@@ -3877,11 +3927,11 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
       }
 
       if (commands.empty())
-        commands.push_back(g_pending_submit.options.driver_command);
+        commands.push_back(slot.pending.options.driver_command);
       commands.push_back(std::move(options.driver_command));
       AdoptCapturedCounterMetadata(
-          commands.back(), &g_pending_submit.options.driver_command);
-      g_pending_submit.submission_generation = info->submission_generation;
+          commands.back(), &slot.pending.options.driver_command);
+      slot.pending.submission_generation = info->submission_generation;
       return 0;
     }
   }
@@ -3906,8 +3956,8 @@ extern "C" int pvrgpu_systemc_submit_driver_command(
   /* The attachments held from the previous flush describe work that this
    * submission replaces, so they stop being readable now rather than when
    * the new flush happens to run. */
-  g_last_framebuffer = {};
-  g_pending_submit = std::move(pending);
+  slot.last_framebuffer = {};
+  slot.pending = std::move(pending);
   return 0;
 }
 
@@ -3915,15 +3965,16 @@ extern "C" int pvrgpu_systemc_flush_graphics_stats(
     pvrgpu_systemc_graphics_stats *stats, char *error,
     std::size_t error_size) {
   std::lock_guard<std::mutex> lock(g_bridge_mutex);
+  SubmitSlot &slot = CurrentSubmitSlot();
   if (!stats || stats->version != PVRGPU_SYSTEMC_API_VERSION ||
       stats->submission_generation == 0) {
     CopyError(error, error_size, "invalid SystemC graphics statistics request");
     return 2;
   }
   const std::uint64_t requested = stats->submission_generation;
-  if (requested != g_last_graphics_generation) {
-    if (!g_pending_submit.valid || g_pending_submit.executed ||
-        g_pending_submit.submission_generation != requested) {
+  if (requested != slot.last_graphics_generation) {
+    if (!slot.pending.valid || slot.pending.executed ||
+        slot.pending.submission_generation != requested) {
       CopyError(error, error_size,
                 "SystemC graphics statistics submission ownership mismatch");
       return 2;
@@ -3936,20 +3987,20 @@ extern "C" int pvrgpu_systemc_flush_graphics_stats(
       return status;
     }
   }
-  if (requested != g_last_graphics_generation) {
+  if (requested != slot.last_graphics_generation) {
     CopyError(error, error_size, "SystemC graphics statistics were not published");
     return 2;
   }
-  stats->physical_submissions = g_last_graphics_stats.physical_submissions;
-  stats->primitives_generated = g_last_graphics_stats.primitives_generated;
-  stats->ia_primitives = g_last_graphics_stats.ia_primitives;
-  stats->gs_primitives = g_last_graphics_stats.gs_primitives;
-  stats->gs_invocations = g_last_graphics_stats.gs_invocations;
-  stats->stream_output_primitives_written = g_last_graphics_stats.stream_output_primitives_written;
+  stats->physical_submissions = slot.last_graphics_stats.physical_submissions;
+  stats->primitives_generated = slot.last_graphics_stats.primitives_generated;
+  stats->ia_primitives = slot.last_graphics_stats.ia_primitives;
+  stats->gs_primitives = slot.last_graphics_stats.gs_primitives;
+  stats->gs_invocations = slot.last_graphics_stats.gs_invocations;
+  stats->stream_output_primitives_written = slot.last_graphics_stats.stream_output_primitives_written;
   stats->stream_output_primitives_storage_needed =
-      g_last_graphics_stats.stream_output_primitives_storage_needed;
+      slot.last_graphics_stats.stream_output_primitives_storage_needed;
   stats->occlusion_samples_passed =
-      g_last_graphics_stats.occlusion_samples_passed;
+      slot.last_graphics_stats.occlusion_samples_passed;
   return 0;
 }
 
@@ -3957,6 +4008,7 @@ extern "C" int pvrgpu_systemc_flush_stream_output(
     pvrgpu_systemc_stream_output_readback *readback, char *error,
     std::size_t error_size) {
   std::lock_guard<std::mutex> lock(g_bridge_mutex);
+  SubmitSlot &slot = CurrentSubmitSlot();
   if (!readback || readback->version != PVRGPU_SYSTEMC_API_VERSION) {
     CopyError(error, error_size, "unsupported SystemC stream output readback version");
     return 2;
@@ -3967,9 +4019,9 @@ extern "C" int pvrgpu_systemc_flush_stream_output(
     CopyError(error, error_size, "invalid SystemC stream output readback request");
     return 2;
   }
-  if (readback->submission_generation != g_last_graphics_generation) {
-    if (!g_pending_submit.valid || g_pending_submit.executed ||
-        readback->submission_generation != g_pending_submit.submission_generation) {
+  if (readback->submission_generation != slot.last_graphics_generation) {
+    if (!slot.pending.valid || slot.pending.executed ||
+        readback->submission_generation != slot.pending.submission_generation) {
       CopyError(error, error_size, "SystemC stream output submission ownership mismatch");
       return 2;
     }
@@ -3980,7 +4032,7 @@ extern "C" int pvrgpu_systemc_flush_stream_output(
       return status;
     }
   }
-  for (const auto &source : g_last_framebuffer.stream_outputs) {
+  for (const auto &source : slot.last_framebuffer.stream_outputs) {
     if (source.resource_token != readback->resource_token ||
         source.target_token != readback->target_token)
       continue;
@@ -4002,6 +4054,7 @@ extern "C" int pvrgpu_systemc_flush_shader_image(
     pvrgpu_systemc_shader_image_readback *readback, char *error,
     std::size_t error_size) {
   std::lock_guard<std::mutex> lock(g_bridge_mutex);
+  SubmitSlot &slot = CurrentSubmitSlot();
   if (!readback || readback->version != PVRGPU_SYSTEMC_API_VERSION) {
     CopyError(error, error_size, "unsupported SystemC shader image readback version");
     return 2;
@@ -4012,9 +4065,9 @@ extern "C" int pvrgpu_systemc_flush_shader_image(
     CopyError(error, error_size, "invalid SystemC shader image readback request");
     return 2;
   }
-  if (readback->submission_generation != g_last_graphics_generation) {
-    if (!g_pending_submit.valid || g_pending_submit.executed ||
-        readback->submission_generation != g_pending_submit.submission_generation) {
+  if (readback->submission_generation != slot.last_graphics_generation) {
+    if (!slot.pending.valid || slot.pending.executed ||
+        readback->submission_generation != slot.pending.submission_generation) {
       CopyError(error, error_size, "SystemC shader image submission ownership mismatch");
       return 2;
     }
@@ -4025,7 +4078,7 @@ extern "C" int pvrgpu_systemc_flush_shader_image(
       return status;
     }
   }
-  for (const auto &source : g_last_framebuffer.shader_images) {
+  for (const auto &source : slot.last_framebuffer.shader_images) {
     if (source.resource_token != readback->resource_token) continue;
     if (source.bytes.size() != readback->bytes_size) {
       CopyError(error, error_size, "SystemC shader image readback extent mismatch");

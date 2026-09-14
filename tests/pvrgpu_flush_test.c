@@ -94,7 +94,9 @@ test_flush(unsigned flags, unsigned pending, unsigned mode, bool request_fence)
    CHECK(memcmp(&ctx.framebuffer, &framebuffer, sizeof(framebuffer)) == 0);
    CHECK(ctx.color_readback_generation == 41); /* No invented submission. */
    if (request_fence) {
-      CHECK(fence == (failed ? pvrgpu_failed_fence() : NULL));
+      /* Success is a non-NULL signaled token: the DRI fence helper behind
+       * eglCreateSyncKHR treats a NULL fence as failure. */
+      CHECK(fence == (failed ? pvrgpu_failed_fence() : pvrgpu_signaled_fence()));
       CHECK(screen.base.fence_finish(&screen.base, &ctx.base, fence, 0) == !failed);
       CHECK(screen.base.fence_finish(&screen.base, &ctx.base, fence,
                                      UINT64_MAX) == !failed);
@@ -119,6 +121,9 @@ test_fence_lifetime(void)
    pvrgpu_fence_reference(NULL, &failed, NULL);
    CHECK(failed == NULL && copy == pvrgpu_failed_fence());
    CHECK(!pvrgpu_fence_finish(NULL, NULL, copy, UINT64_MAX));
+   CHECK(pvrgpu_signaled_fence() != NULL &&
+         pvrgpu_signaled_fence() != pvrgpu_failed_fence() &&
+         pvrgpu_fence_finish(NULL, NULL, pvrgpu_signaled_fence(), 0));
    unsigned char unknown;
    CHECK(!pvrgpu_fence_finish(NULL, NULL,
                               (struct pipe_fence_handle *)&unknown, 0));

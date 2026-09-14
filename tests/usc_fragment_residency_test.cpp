@@ -151,7 +151,7 @@ float Sample(unsigned set, unsigned quad, unsigned lane, unsigned channel) {
   quad ^= (quad >> 4U) ^ (quad >> 8U);
   const unsigned x = (quad % 4) / 2 + (lane & 1U);
   const unsigned y = ((quad / 4) % 4) / 2 + (lane >> 1U);
-  return static_cast<float>(Color(set, 1, x, y, channel)) / 255.F;
+  return static_cast<float>(Color(set, 1, x, y, channel)) * static_cast<float>(1.0 / 255.0);
 }
 
 class Harness final : public sc_core::sc_module {

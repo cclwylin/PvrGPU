@@ -26,6 +26,9 @@ pvrgpu_create_screen(struct sw_winsys *winsys,
 struct pipe_fence_handle *
 pvrgpu_failed_fence(void);
 
+struct pipe_fence_handle *
+pvrgpu_signaled_fence(void);
+
 /*
  * What this screen can hold, as one answer.
  *

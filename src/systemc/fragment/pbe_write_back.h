@@ -23,6 +23,11 @@ class PbeWriteBack final : public sc_core::sc_module {
   sc_core::sc_port<sc_core::sc_fifo_out_if<PipelineTxn>, 0,
                    sc_core::SC_ZERO_OR_MORE_BOUND>
       completion{"completion"};
+  // A render that is not its draw's last goes back to the geometry stream
+  // (docs/USC_TASK_STREAM_PHASE1.md) instead of to the reporter.
+  sc_core::sc_port<sc_core::sc_fifo_out_if<PipelineTxn>, 0,
+                   sc_core::SC_ZERO_OR_MORE_BOUND>
+      partial_render_return{"partial_render_return"};
 
   PbeWriteBack(sc_core::sc_module_name name, MemoryPool &pool,
                GpuMemorySystem *memory = nullptr);

@@ -143,12 +143,14 @@ pvrgpu_cmd_viewport_scale_matches(const uint32_t scale_bits[3],
  * separately rounded half-difference and half-sum in pipe_viewport_state. */
 static bool
 pvrgpu_cmd_viewport_depth_range_valid(const uint32_t scale_bits[3],
-                                      const uint32_t offset_bits[3])
+                                      const uint32_t offset_bits[3],
+                                      bool clip_halfz)
 {
    float scale, offset;
    memcpy(&scale, &scale_bits[2], sizeof(scale));
    memcpy(&offset, &offset_bits[2], sizeof(offset));
-   const float near_depth = offset - scale;
+   /* Clip control ZERO_TO_ONE maps NDC z in [0, 1], not [-1, 1]. */
+   const float near_depth = clip_halfz ? offset : offset - scale;
    const float far_depth = offset + scale;
    return isfinite(scale) && isfinite(offset) &&
           near_depth >= 0.0f && near_depth <= 1.0f &&
@@ -1854,7 +1856,8 @@ pvrgpu_cmd_validate_draw_pco_triangles(
        (cmd->fragment_position_count !=
            4u * (cmd->fragment_position_uses_z +
                  cmd->fragment_position_uses_w) ||
-        cmd->fragment_varying_count > cmd->varying_output_count * 4u ||
+        cmd->fragment_varying_count >
+           (cmd->varying_output_count + cmd->fragment_point_coord_components) * 4u ||
         (cmd->fragment_varying_count & 3u) != 0)) ||
       (color_layout && !states_own_attributes &&
        (cmd->varying_output_count != 4 ||
@@ -1981,7 +1984,8 @@ pvrgpu_cmd_validate_draw_pco_triangles(
            ? (isfinite(viewport_offset[2]) &&
               isfinite(viewport_scale[2]))
            : pvrgpu_cmd_viewport_depth_range_valid(
-                cmd->viewport_scale_bits, cmd->viewport_translate_bits))) :
+                cmd->viewport_scale_bits, cmd->viewport_translate_bits,
+                cmd->clip_halfz != 0))) :
       pvrgpu_cmd_viewport_offset_is_inside(cmd->viewport_translate_bits,
                                            cmd->width,
                                            cmd->height,
@@ -2057,7 +2061,7 @@ pvrgpu_cmd_validate_draw_pco_triangles(
       raster_reason = "half_pixel_center";
    else if (cmd->bottom_edge_rule > 1)
       raster_reason = "bottom_edge_rule";
-   else if (cmd->clip_halfz != 0)
+   else if (cmd->clip_halfz > 1 || (cmd->clip_halfz && !color_layout))
       raster_reason = "clip_halfz";
    else if (cmd->depth_clip_near != 1 || cmd->depth_clip_far != 1)
       raster_reason = "depth_clip";

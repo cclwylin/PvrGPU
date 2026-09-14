@@ -384,6 +384,11 @@ struct DriverStreamOutputBinding {
   std::uint32_t stream = 0;
 };
 
+// DriverVaryingBinding::flat values past smooth (0) and flat (1): the
+// rasterizer point-sprite coordinate with an upper-left / lower-left origin.
+inline constexpr std::uint32_t kDriverVaryingPointCoordUpperLeft = 2;
+inline constexpr std::uint32_t kDriverVaryingPointCoordLowerLeft = 3;
+
 struct DriverVaryingBinding {
   std::uint32_t output_dword = 0;
   std::uint32_t num_components = 0;

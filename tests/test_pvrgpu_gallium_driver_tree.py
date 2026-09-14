@@ -167,7 +167,7 @@ class PvrGpuGalliumDriverTreeTests(unittest.TestCase):
         self.assertIn("PVRGPU_SYSTEMC_API_LIB", command)
         self.assertIn("RTLD_GLOBAL", command)
         self.assertIn("std::atexit(FlushPendingSubmitAtExit)", bridge)
-        self.assertIn("g_pending_submit = std::move(pending)", bridge)
+        self.assertIn("slot.pending = std::move(pending)", bridge)
 
     def test_indexed_quad_command_accumulates_until_lock_count(self) -> None:
         context = (DRIVER_ROOT / "pvrgpu_context.c").read_text(encoding="utf-8")

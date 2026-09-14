@@ -22,6 +22,8 @@ struct pvrgpu_shader_state {
    struct nir_shader *nir;
    const struct tgsi_token *tgsi;
    struct pipe_stream_output_info stream_output;
+   /* Lazily built clones with gl_ViewID_OVR folded to each multiview index. */
+   struct nir_shader *view_nir[8];
 };
 
 struct pvrgpu_blend_state {

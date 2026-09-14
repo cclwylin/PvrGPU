@@ -662,6 +662,17 @@ bool IsExactVaryingBinding(const PipelineState &state,
         }
       }
     }
+    if (IsPointCoordInterpolation(binding.interpolation)) {
+      const bool valid = binding_index < binding_count && binding_count <= 64 &&
+          binding.component_count == 2 && binding.vertex_output_base == 0 &&
+          binding.coefficient_set_base >= position_coefficient_count &&
+          binding.coefficient_set_base <= coefficient_count &&
+          binding.component_count <= coefficient_count - binding.coefficient_set_base &&
+          binding.w_coefficient_set == (state.fragment_position_uses_z ? 1 : 0) &&
+          !binding.reserved[0] && !binding.reserved[1];
+      if (!valid && out_refusal) *out_refusal = "explicit_point_coord_binding";
+      return valid;
+    }
     const bool valid = binding_index < binding_count && binding_count <= 64 &&
         binding.component_count >= 1 && binding.component_count <= 4 &&
         binding.vertex_output_base >= state.varying_output_start &&

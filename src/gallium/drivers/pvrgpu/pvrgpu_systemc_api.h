@@ -247,6 +247,14 @@ struct pvrgpu_systemc_shader_image {
 };
 
 #define PVRGPU_SYSTEMC_MAX_VARYING_BINDINGS 64u
+/* Binding `flat` values. 0 interpolates the vertex output, 1 carries the
+ * provoking vertex. 2 and 3 are the rasterizer point-sprite coordinate
+ * (gl_PointCoord) with an upper-left / lower-left origin: two components,
+ * output_dword 0, no vertex output; primitives that are not points read 0. */
+#define PVRGPU_SYSTEMC_VARYING_SMOOTH 0u
+#define PVRGPU_SYSTEMC_VARYING_FLAT 1u
+#define PVRGPU_SYSTEMC_VARYING_POINT_COORD_UPPER_LEFT 2u
+#define PVRGPU_SYSTEMC_VARYING_POINT_COORD_LOWER_LEFT 3u
 struct pvrgpu_systemc_varying_binding {
    uint32_t output_dword;
    uint32_t num_components;

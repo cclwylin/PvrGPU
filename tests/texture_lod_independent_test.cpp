@@ -75,7 +75,7 @@ struct Harness {
         const unsigned expected=offcenter?
           (unsigned(Texel(0,xs[i],ys[i],c))+Texel(0,(xs[i]+1)%4,ys[i],c)+Texel(0,xs[i],(ys[i]+1)%4,c)+Texel(0,(xs[i]+1)%4,(ys[i]+1)%4,c))/4:
           Texel(0,xs[i],ys[i],c);
-        Check(responses[i].rgba[c]==Bits(float(expected)/255.F),"actual nonconstant base mip sample, never other-level data");
+        Check(responses[i].rgba[c]==Bits(float(expected)*float(1.0/255.0)),"actual nonconstant base mip sample, never other-level data");
       }
     }
     const unsigned taps=count*(linear?4:1);

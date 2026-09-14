@@ -153,6 +153,10 @@ bool pvrgpu_pco_compile_compute(
 
 void pvrgpu_pco_compute_binary_finish(struct pvrgpu_pco_compute_binary *binary);
 
+/* `flat` of a binding that is the rasterizer point-sprite coordinate rather
+ * than a vertex output; the draw resolves it to the sprite origin. */
+#define PVRGPU_PCO_VARYING_POINT_COORD 2u
+
 struct pvrgpu_pco_varying_binding {
    uint32_t output_dword;
    uint32_t num_components;

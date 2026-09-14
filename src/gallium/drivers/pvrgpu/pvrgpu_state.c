@@ -514,8 +514,11 @@ pvrgpu_delete_shader_state(struct pipe_context *pipe, void *state)
 {
    (void)pipe;
    struct pvrgpu_shader_state *shader = (struct pvrgpu_shader_state *)state;
-   if (shader)
+   if (shader) {
       ralloc_free(shader->nir);
+      for (unsigned view = 0; view < ARRAY_SIZE(shader->view_nir); ++view)
+         ralloc_free(shader->view_nir[view]);
+   }
    FREE(shader);
 }
 

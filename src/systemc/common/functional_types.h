@@ -503,6 +503,9 @@ struct RasterState {
   // before shader side effects; shader depth exports cannot replace it.
   std::uint8_t shader_early_tests = 0;
   std::uint8_t depth_clamp_enable = 0;
+  // Gallium clip_halfz (GL_ZERO_TO_ONE clip control): the near clip plane is
+  // z >= 0 instead of z >= -w. Viewport z scale/offset already reflect it.
+  std::uint8_t clip_halfz = 0;
   std::uint8_t polygon_offset_enable = 0;
   std::uint8_t polygon_offset_units_unscaled = 0;
   std::uint8_t color_mask = 0x0f;
@@ -787,7 +790,17 @@ enum class InterpolationMode : std::uint8_t {
   kSmooth = 0,
   kNoPerspective,
   kFlat,
+  // Rasterizer point-sprite coordinate (gl_PointCoord), not a vertex output:
+  // two components whose plane comes from the point's centre and size, with
+  // t increasing down (upper-left origin) or up (lower-left origin) the rows.
+  kPointCoordUpperLeft,
+  kPointCoordLowerLeft,
 };
+
+inline bool IsPointCoordInterpolation(InterpolationMode mode) {
+  return mode == InterpolationMode::kPointCoordUpperLeft ||
+         mode == InterpolationMode::kPointCoordLowerLeft;
+}
 
 struct ShaderVaryingBinding {
   std::uint16_t vertex_output_base = 0;

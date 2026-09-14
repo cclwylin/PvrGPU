@@ -347,7 +347,8 @@ BuildPlane(const pvrgpu::stub::RasterTriangle &triangle,
  * and clipper fan pieces have observably different subtraction sequences. */
 pvrgpu::stub::ParameterCoefficientSet
 BuildLlvmPipeDriverPlane(const pvrgpu::stub::RasterTriangle &triangle,
-                         const float value[3]) {
+                         const float value[3],
+                         bool carry_non_finite = false) {
   // A constant attribute has no derivatives, even when the floating-point
   // area collapses while the fixed-point raster triangle remains nonzero.
   // In particular, tessellation can generate collinear edge vertices whose
@@ -391,8 +392,13 @@ BuildLlvmPipeDriverPlane(const pvrgpu::stub::RasterTriangle &triangle,
   const float origin_y = dady * y0_center;
   const float origin = origin_x + origin_y;
   const float attr0 = value[i0] - origin;
-  if (!std::isfinite(dadx) || !std::isfinite(dady) ||
-      !std::isfinite(attr0)) {
+  // A varying plane that overflows binary32 (e.g. huge but finite shader
+  // outputs over a sub-pixel triangle) is carried as IEEE inf/NaN exactly
+  // as llvmpipe's setup JIT computes it; only position planes fail closed.
+  // A singular binary32 setup area stays fail closed (placeholder or error).
+  if ((!carry_non_finite || !std::isfinite(reciprocal_area)) &&
+      (!std::isfinite(dadx) || !std::isfinite(dady) ||
+       !std::isfinite(attr0))) {
     throw NonFiniteDriverPlane(
         "ParameterBuffer produced a non-finite llvmpipe driver plane: "
         "xy=(" + std::to_string(triangle.x[i0]) + "," + std::to_string(triangle.y[i0]) +
@@ -407,6 +413,42 @@ BuildLlvmPipeDriverPlane(const pvrgpu::stub::RasterTriangle &triangle,
   coefficient.b = FloatBits(dady);
   coefficient.c = FloatBits(attr0);
   coefficient.pad = 0;
+  return coefficient;
+}
+
+// llvmpipe lp_setup_point texcoord_coef for the point-sprite coordinate: the
+// sprite spans the point's subpixel-snapped width (at least one pixel), s grows
+// along x and t along the rows (negated for a lower-left origin), and both are
+// 0.5 at the point's centre. Primitives that are not points read the zero
+// attribute draw supplies for an input no stage wrote.
+pvrgpu::stub::ParameterCoefficientSet
+BuildLlvmPipePointCoordPlane(const pvrgpu::stub::PointSprite &point,
+                             std::uint8_t component, bool lower_left) {
+  pvrgpu::stub::ParameterCoefficientSet coefficient;
+  coefficient.a = FloatBits(0.f);
+  coefficient.b = FloatBits(0.f);
+  coefficient.c = FloatBits(0.f);
+  coefficient.pad = 0;
+  if (!point.valid)
+    return coefficient;
+  const float size = 2.0F * point.half_size;
+  const long snapped = std::lrint(256.0F * size);
+  const long fixed_width = std::max(256L, snapped);
+  const float step = 256.0F / static_cast<float>(fixed_width);
+  const float x0 = point.center_x - 0.5F;
+  const float y0 = point.center_y - 0.5F;
+  float dadx = 0.0F;
+  float dady = 0.0F;
+  if (component == 0)
+    dadx = step;
+  else if (lower_left)
+    dady = -step;
+  else
+    dady = step;
+  const float origin = dadx * x0 + dady * y0;
+  coefficient.a = FloatBits(dadx);
+  coefficient.b = FloatBits(dady);
+  coefficient.c = FloatBits(static_cast<float>(0.5 - static_cast<double>(origin)));
   return coefficient;
 }
 
@@ -690,6 +732,17 @@ void ParameterBuffer::Run() {
                     : BuildPlane(triangle, reciprocal_w);
 
           for (const ShaderVaryingBinding &binding : varying_bindings) {
+            if (IsPointCoordInterpolation(binding.interpolation)) {
+              for (std::uint8_t component = 0;
+                   component < binding.component_count; ++component) {
+                coefficients[coefficient_base + binding.coefficient_set_base +
+                             component] = BuildLlvmPipePointCoordPlane(
+                    triangle.point, component,
+                    binding.interpolation ==
+                        InterpolationMode::kPointCoordLowerLeft);
+              }
+              continue;
+            }
             for (std::uint8_t component = 0;
                  component < binding.component_count; ++component) {
               float numerator[3]{};
@@ -729,7 +782,8 @@ void ParameterBuffer::Run() {
                   coefficients[coefficient_base + binding.coefficient_set_base +
                                component] =
                       llvmpipe_driver_plane
-                          ? BuildLlvmPipeDriverPlane(triangle, numerator)
+                          ? BuildLlvmPipeDriverPlane(triangle, numerator,
+                                                     /*carry_non_finite=*/true)
                           : BuildPlane(triangle, numerator);
                 } catch (const std::runtime_error &error) {
                   const std::string description =

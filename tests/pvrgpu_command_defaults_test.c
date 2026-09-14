@@ -128,7 +128,7 @@ int main(void)
       memcpy(scale_bits, scale, sizeof(scale));
       memcpy(translate_bits, translate, sizeof(translate));
       CHECK(pvrgpu_cmd_viewport_scale_matches(scale_bits, 80, 60, true));
-      CHECK(pvrgpu_cmd_viewport_depth_range_valid(scale_bits, translate_bits));
+      CHECK(pvrgpu_cmd_viewport_depth_range_valid(scale_bits, translate_bits, false));
       CHECK(pvrgpu_cmd_viewport_scale_matches(scale_bits, 80, 60, false) == (i == 0));
    }
    const float bad_depth[][2] = {
@@ -141,7 +141,7 @@ int main(void)
       uint32_t scale_bits[3], translate_bits[3];
       memcpy(scale_bits, scale, sizeof(scale));
       memcpy(translate_bits, translate, sizeof(translate));
-      CHECK(!pvrgpu_cmd_viewport_depth_range_valid(scale_bits, translate_bits));
+      CHECK(!pvrgpu_cmd_viewport_depth_range_valid(scale_bits, translate_bits, false));
    }
    CHECK(setenv("PVRGPU_SYSTEMC_API_LIB", "/test/capture-compute-api", 1) == 0);
    struct pvrgpu_systemc_compute_dispatch dispatch = {0};

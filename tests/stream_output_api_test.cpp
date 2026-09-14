@@ -123,7 +123,10 @@ int main(int argc, char **argv) {
     reject("explicit varying binding output/coefficient");
     f.draw.vertex_pco_abi.vertex_outputs = 5; f.draw.varying_output_count = 1;
     f.draw.fragment_pco_abi.coefficients = 8; f.draw.fragment_varying_count = 4;
-    varying.flat = 2; reject("explicit varying binding output/coefficient"); varying.flat = 0;
+    varying.flat = 4; reject("explicit varying binding output/coefficient"); varying.flat = 0;
+    // A point-sprite coordinate names no vertex output and has two components.
+    varying.flat = PVRGPU_SYSTEMC_VARYING_POINT_COORD_UPPER_LEFT;
+    reject("explicit point coordinate binding"); varying.flat = 0;
     varying.coefficient_dword = 8; reject("explicit varying binding output/coefficient"); varying.coefficient_dword = 4;
     f.draw.varying_binding_count = 0; reject("do not cover fragment coefficients");
 

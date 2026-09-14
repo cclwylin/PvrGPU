@@ -141,16 +141,29 @@ pvrgpu_failed_fence(void)
    return (struct pipe_fence_handle *)&failed;
 }
 
+/* Work is synchronous, so a flush that succeeded hands out this persistent
+ * signaled token.  It must not be NULL: the DRI fence helper (behind
+ * eglCreateSyncKHR / glFenceSync) treats a NULL fence as failure. */
+struct pipe_fence_handle *
+pvrgpu_signaled_fence(void)
+{
+   static unsigned char signaled;
+   return (struct pipe_fence_handle *)&signaled;
+}
+
 static void
 pvrgpu_fence_reference(struct pipe_screen *screen,
                        struct pipe_fence_handle **ptr,
                        struct pipe_fence_handle *fence)
 {
    (void)screen;
+   /* Counter protocol: has_fence names a failed or unknown handle; NULL and
+    * the signaled token are both completed work (replay audits require it). */
    pvrgpu_counter_eventf("fence_reference",
-                         "has_ptr=%u has_fence=%u",
+                         "has_ptr=%u has_fence=%u signaled=%u",
                          ptr ? 1 : 0,
-                         fence ? 1 : 0);
+                         fence && fence != pvrgpu_signaled_fence() ? 1 : 0,
+                         fence == pvrgpu_signaled_fence() ? 1 : 0);
    if (ptr)
       *ptr = fence;
 }
@@ -162,15 +175,16 @@ pvrgpu_fence_finish(struct pipe_screen *screen,
                     uint64_t timeout)
 {
    (void)screen;
-   /* Work is synchronous: only NULL denotes successful completion. The
-    * persistent failure token, and any unknown non-NULL handle, fail closed.
-    * Mesa's st_finish currently ignores this false return; callers still need
-    * the submission error diagnostics. Sync-object waits do honor it. */
-   const bool complete = fence == NULL;
+   /* Work is synchronous: NULL and the signaled token denote successful
+    * completion. The persistent failure token, and any unknown handle, fail
+    * closed. Mesa's st_finish currently ignores this false return; callers
+    * still need the submission error diagnostics. Sync-object waits do honor
+    * it. */
+   const bool complete = fence == NULL || fence == pvrgpu_signaled_fence();
    pvrgpu_counter_eventf("fence_finish",
                          "has_context=%u has_fence=%u timeout=%llu complete=%u",
                          ctx ? 1 : 0,
-                         fence ? 1 : 0,
+                         fence && fence != pvrgpu_signaled_fence() ? 1 : 0,
                          (unsigned long long)timeout,
                          complete ? 1 : 0);
    return complete;
@@ -221,6 +235,10 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    caps->max_texture_cube_levels = 13;
    /* GLES 3.x requires GL_MAX_TEXTURE_LOD_BIAS to be at least 2.0. */
    caps->max_texture_lod_bias = 2.0f;
+   /* EXT_texture_filter_anisotropic at llvmpipe's 16x: TextureUnit uses its
+    * footprint (lp_build_rho_aniso) and tap placement (lp_build_sample_aniso). */
+   caps->anisotropic_filter = true;
+   caps->max_texture_anisotropy = 16.0f;
    caps->max_render_targets = PVRGPU_SYSTEMC_MAX_RENDER_TARGETS;
    /* Per-target colour masks are carried by the MRT command, and advanced
     * blend equations use the coherent framebuffer-fetch lowering. */
@@ -248,6 +266,12 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    caps->vs_instanceid = true;
    caps->vertex_element_instance_divisor = true;
    caps->texture_multisample = true;
+   /* OES_standard_derivatives: native FDSX/FDSY, as GLES3 already uses. */
+   caps->fragment_shader_derivatives = true;
+   /* ARB/EXT_clip_control: the model clips z against [0, w] for clip_halfz. */
+   caps->clip_halfz = true;
+   /* GL_OVR_multiview/multiview2 like llvmpipe: per-view draws in the driver. */
+   caps->multiview = 2;
    caps->cube_map_array = true;
    caps->sample_shading = true;
    caps->sampler_view_target = true;
@@ -322,16 +346,17 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
    compute->max_global_size = 1u << 30;
 }
 
+/* Match llvmpipe (LP_MAX_SAMPLES 8): 1x, 4x and 8x only. The model can
+ * rasterize 2x/16x, but the advertised spec intentionally stays at the
+ * reference driver's, e.g. GL_MAX_SAMPLES 8. */
 static bool
 pvrgpu_is_supported_sample_count(unsigned sample_count)
 {
    switch (sample_count) {
    case 0:
    case 1:
-   case 2:
    case 4:
    case 8:
-   case 16:
       return true;
    default:
       return false;
@@ -669,11 +694,6 @@ pvrgpu_is_format_supported(struct pipe_screen *screen,
    if (!pvrgpu_is_supported_sample_count(sample_count) ||
        !pvrgpu_is_supported_sample_count(storage_sample_count))
       goto out;
-   /* 真 TEXSTATE SMPCNT 只有 1/2/4/8；render-only PBE 仍可用 16。 */
-   if ((bind & (PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHADER_IMAGE)) &&
-       (sample_count > 8 || storage_sample_count > 8))
-      goto out;
-
    if (target == PIPE_BUFFER) {
       if (pvrgpu_is_multisampled_request(sample_count,
                                          storage_sample_count))

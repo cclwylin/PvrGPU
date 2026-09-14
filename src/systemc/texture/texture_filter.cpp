@@ -3,6 +3,7 @@
 #include "texture/texture_filter.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -89,7 +90,78 @@ float TextureAddressCoordinate(float coordinate, std::uint32_t extent) {
   return std::isfinite(coordinate) ? coordinate : 0.0F;
 }
 
+// x86 maxps/minps, which lp_build_max/lp_build_min emit for float vectors:
+// the second operand when the comparison is unordered.
+float ArchMax(float a, float b) { return a > b ? a : b; }
+float ArchMin(float a, float b) { return a < b ? a : b; }
+
 } // namespace
+
+TextureAnisotropicFootprint ComputeTextureAnisotropicFootprint(
+    float dsdx, float dsdy, float dtdx, float dtdy,
+    std::uint32_t max_anisotropy) {
+  if (max_anisotropy < 2 || max_anisotropy > kTextureMaximumAnisotropy)
+    throw std::runtime_error("TextureUnit anisotropy is outside 2..16");
+  // lp_apply_ellipse_transform.  The epsilons are binary32 constants.
+  const float ds2dx = dsdx * dsdx;
+  const float ds2dy = dsdy * dsdy;
+  const float dt2dx = dtdx * dtdx;
+  const float dt2dy = dtdy * dtdy;
+  const float epsilon = static_cast<float>(1e-6);
+  const float epsilon2 = static_cast<float>(1e-12);
+  const bool any_zero_length =
+      ds2dx + dt2dx < epsilon2 || ds2dy + dt2dy < epsilon2;
+  const float determinant = dsdx * dtdy - dsdy * dtdx;
+  const float determinant2 = determinant * determinant;
+  const bool zero_determinant = determinant2 < epsilon2;
+  const float dot_product = dsdx * dsdy + dtdx * dtdy;
+  const bool zero_dot_product = std::fabs(dot_product) < epsilon;
+  std::array<float, 4> squared = {ds2dx, ds2dy, dt2dx, dt2dy};
+  if (!(any_zero_length || zero_determinant || zero_dot_product)) {
+    const float a = dt2dx + dt2dy;
+    const float c = ds2dx + ds2dy;
+    const float b = -2.0F * (dsdx * dtdx + dsdy * dtdy);
+    const float f = determinant2;
+    const float p = a - c;
+    const float q = a + c;
+    const float t = std::sqrt(p * p + b * b);
+    const float fp = f * (t + p);
+    const float fm = f * (t - p);
+    const float tp = t * (q + t);
+    const float tm = t * (q - t);
+    const std::array<float, 4> ellipse = {fp / tp, fm / tm, fm / tp, fp / tm};
+    // A non-finite fitted value keeps that element's plain square.
+    for (std::size_t i = 0; i < squared.size(); ++i)
+      if (std::isfinite(ellipse[i]))
+        squared[i] = ellipse[i];
+  }
+  const float rho_x2 = squared[0] + squared[2];
+  const float rho_y2 = squared[1] + squared[3];
+  const float rho_max2 = ArchMax(rho_x2, rho_y2);
+  const float rho_min2 = ArchMin(rho_x2, rho_y2);
+  const float maximum_eta2 =
+      static_cast<float>(max_anisotropy * max_anisotropy);
+  float eta2 = rho_max2 / rho_min2;
+  // lp_build_clamp_nanmin: NaN takes the minimum, then min(eta2, max).
+  eta2 = std::isnan(eta2) ? 1.0F : ArchMax(eta2, 1.0F);
+  eta2 = ArchMin(eta2, maximum_eta2);
+  TextureAnisotropicFootprint footprint;
+  const float rate = std::ceil(std::sqrt(eta2));
+  footprint.rate = static_cast<std::uint8_t>(
+      std::clamp(rate, 1.0F, static_cast<float>(kTextureMaximumAnisotropy)));
+  footprint.along_x = rho_x2 > rho_y2;
+  footprint.rho_squared = rho_max2 / eta2;
+  return footprint;
+}
+
+float TextureAnisotropicSampleOffset(std::uint32_t sample, std::uint32_t rate) {
+  if (rate == 0 || sample >= rate)
+    throw std::runtime_error("TextureUnit anisotropic sample is out of range");
+  const float n = static_cast<float>(rate);
+  const float base = n * -0.5F + 0.5F;
+  const float reciprocal = 1.0F / (n + 1.0F);
+  return (static_cast<float>(sample) + base) * reciprocal;
+}
 
 float TextureFastLog2(float x) {
   if (!(x > 0.0F) || !std::isfinite(x))
@@ -789,6 +861,13 @@ std::array<float, 4> DecodeTexelToFloat(
   return DecodeTexelToFloat(format, narrow);
 }
 
+// lp_build_unsigned_norm_to_float: an n-bit unorm field times the binary32
+// constant 1/(2^n - 1), not a division (the two differ by one ULP).
+static float UnormToFloat(std::uint32_t value, std::uint32_t maximum) {
+  return static_cast<float>(value) *
+         static_cast<float>(1.0 / static_cast<double>(maximum));
+}
+
 std::array<float, 4> DecodeTexelToFloat(
     TextureFormat format, const std::array<std::uint8_t, 8> &texel) {
   std::array<float, 4> result{};
@@ -797,11 +876,11 @@ std::array<float, 4> DecodeTexelToFloat(
   case TextureFormat::kBgra8Unorm:  // red/blue already swapped at fetch
   case TextureFormat::kAstcLdr:
     for (std::size_t component = 0; component < 4; ++component)
-      result[component] = static_cast<float>(texel[component]) / 255.0F;
+      result[component] = UnormToFloat(texel[component], 255U);
     return result;
   case TextureFormat::kRgbx8Unorm:
     for (std::size_t component = 0; component < 3; ++component)
-      result[component] = static_cast<float>(texel[component]) / 255.0F;
+      result[component] = UnormToFloat(texel[component], 255U);
     result[3] = 1.0F;
     return result;
   case TextureFormat::kRgba8Srgb:
@@ -809,7 +888,7 @@ std::array<float, 4> DecodeTexelToFloat(
     // Colour through the sRGB transfer function, alpha left linear.
     for (std::size_t component = 0; component < 3; ++component)
       result[component] = SrgbChannelToLinear(texel[component]);
-    result[3] = static_cast<float>(texel[3]) / 255.0F;
+    result[3] = UnormToFloat(texel[3], 255U);
     return result;
   case TextureFormat::kRgba8Snorm:
     // GL signed-normalized: c = max(s / (2^7 - 1), -1).
@@ -820,19 +899,19 @@ std::array<float, 4> DecodeTexelToFloat(
     return result;
   case TextureFormat::kRgb565Unorm: {
     const std::uint16_t v = LoadLe16(texel, 0);
-    result[0] = static_cast<float>((v >> 11U) & 0x1fU) / 31.0F;
-    result[1] = static_cast<float>((v >> 5U) & 0x3fU) / 63.0F;
-    result[2] = static_cast<float>(v & 0x1fU) / 31.0F;
+    result[0] = UnormToFloat((v >> 11U) & 0x1fU, 31U);
+    result[1] = UnormToFloat((v >> 5U) & 0x3fU, 63U);
+    result[2] = UnormToFloat(v & 0x1fU, 31U);
     result[3] = 1.0F;
     return result;
   }
   case TextureFormat::kRgb10A2Unorm:
   case TextureFormat::kBgr10A2Unorm: {
     const std::uint32_t v = LoadLe32(texel);
-    result[0] = static_cast<float>(v & 0x3ffU) / 1023.0F;
-    result[1] = static_cast<float>((v >> 10U) & 0x3ffU) / 1023.0F;
-    result[2] = static_cast<float>((v >> 20U) & 0x3ffU) / 1023.0F;
-    result[3] = static_cast<float>((v >> 30U) & 0x3U) / 3.0F;
+    result[0] = UnormToFloat(v & 0x3ffU, 1023U);
+    result[1] = UnormToFloat((v >> 10U) & 0x3ffU, 1023U);
+    result[2] = UnormToFloat((v >> 20U) & 0x3ffU, 1023U);
+    result[3] = UnormToFloat((v >> 30U) & 0x3U, 3U);
     if (format == TextureFormat::kBgr10A2Unorm)
       std::swap(result[0], result[2]);
     return result;

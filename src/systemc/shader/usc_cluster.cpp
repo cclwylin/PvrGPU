@@ -7,6 +7,7 @@
 // invocations. FIFO traffic carries only the MemoryPool PipelineState handle
 // and completion is event-driven.
 #include "shader/usc_cluster.h"
+#include "shader/usc_task_stream.h"
 
 #include "common/color_attachment_formats.h"
 #include "common/functional_types.h"
@@ -819,41 +820,11 @@ void UscCluster::Run() {
                 }
               }
 
-              TextureSampleRequest request;
+              // Shared USC SMP conversion; the vertex identity is the lane.
+              TextureSampleRequest request =
+                  MakeUscTextureRequest(UscStage::kVertex, issued);
               request.shader_lane_index = static_cast<std::uint32_t>(lane_index);
               request.request_id = lane_index;
-              request.shader_stage = ShaderStage::kVertex;
-              // Every coordinate the request holds: a 2D sample leaves the
-              // third zero; cube/3D use it, arrays use the TAO address.
-              for (std::size_t component = 0;
-                   component < std::size(request.coordinates); ++component)
-                request.coordinates[component] = issued.coordinates[component];
-              for (std::size_t dword = 0; dword < 4; ++dword) {
-                request.texture_state[dword] = issued.texture_state[dword];
-                request.sampler_state[dword] = issued.sampler_state[dword];
-              }
-              std::copy(issued.spatial_offsets.begin(), issued.spatial_offsets.end(),
-                        std::begin(request.spatial_offsets));
-              request.coordinate_count = issued.coordinate_count;
-              request.component_count = issued.component_count;
-              request.descriptor_set = issued.descriptor_set;
-              request.binding = issued.binding;
-              request.dimension = issued.dimension;
-              request.normalized = issued.normalized;
-              request.fcnorm = issued.fcnorm;
-              request.sample_index = issued.sample_index;
-              request.sample_index_present = issued.sample_index_present;
-              request.explicit_lod = issued.explicit_lod;
-              request.explicit_lod_present = issued.explicit_lod_present;
-              if (issued.lod_bias_present || issued.lod_bias)
-                throw std::runtime_error("vertex SMP shader LOD bias is unsupported");
-              if (issued.gather)
-                throw std::runtime_error("vertex SMP raw gather is unsupported");
-              request.shadow_reference = issued.shadow_reference;
-              request.shadow_compare = issued.shadow_compare;
-              request.data_request = issued.data_request;
-              request.texture_address_lo = issued.texture_address_lo;
-              request.texture_address_hi = issued.texture_address_hi;
               requests[lane_index] = request;
               continuations[lane_index] = execution.continuation;
               queued[lane_index] = 1;
@@ -1590,54 +1561,16 @@ void UscCluster::Run() {
 
             const FragmentShaderLane &shader_lane =
                 shader_lanes[shader_lane_index];
-            TextureSampleRequest request;
+            // Shared USC SMP conversion; TextureUnit's public batch ABI
+            // numbers requests locally in every round while lane identity
+            // stays stable across all continuations.
+            TextureSampleRequest request = MakeUscTextureRequest(
+                UscStage::kFragment, execution.texture_request);
             request.shader_lane_index = global_lane_indices[shader_lane_index];
             request.quad_id = shader_lane.quad_id;
             request.quad_lane = shader_lane.quad_lane;
             request.sample_id = shader_lane.sample_id;
-            // TextureUnit's public batch ABI numbers requests locally in every
-            // round.  Lane identity remains stable across all continuations.
             request.request_id = shader_lane_index;
-            request.shader_stage = ShaderStage::kFragment;
-            for (std::size_t component = 0;
-                 component < std::size(request.coordinates); ++component) {
-              request.coordinates[component] =
-                  execution.texture_request.coordinates[component];
-            }
-            for (std::size_t dword = 0; dword < 4; ++dword) {
-              request.texture_state[dword] =
-                  execution.texture_request.texture_state[dword];
-              request.sampler_state[dword] =
-                  execution.texture_request.sampler_state[dword];
-            }
-            std::copy(execution.texture_request.spatial_offsets.begin(),
-                      execution.texture_request.spatial_offsets.end(),
-                      std::begin(request.spatial_offsets));
-            request.coordinate_count =
-                execution.texture_request.coordinate_count;
-            request.component_count = execution.texture_request.component_count;
-            request.descriptor_set = execution.texture_request.descriptor_set;
-            request.binding = execution.texture_request.binding;
-            request.dimension = execution.texture_request.dimension;
-            request.normalized = execution.texture_request.normalized;
-            request.fcnorm = execution.texture_request.fcnorm;
-            request.sample_index = execution.texture_request.sample_index;
-            request.sample_index_present =
-                execution.texture_request.sample_index_present;
-            request.explicit_lod = execution.texture_request.explicit_lod;
-            request.explicit_lod_present =
-                execution.texture_request.explicit_lod_present;
-            request.lod_bias = execution.texture_request.lod_bias;
-            request.lod_bias_present = execution.texture_request.lod_bias_present;
-            request.gather = execution.texture_request.gather;
-            request.shadow_reference =
-                execution.texture_request.shadow_reference;
-            request.shadow_compare = execution.texture_request.shadow_compare;
-            request.data_request = execution.texture_request.data_request;
-            request.texture_address_lo =
-                execution.texture_request.texture_address_lo;
-            request.texture_address_hi =
-                execution.texture_request.texture_address_hi;
             if (debug_fragment && shader_lane.x == debug_x &&
                 shader_lane.y == debug_y && shader_lane.helper == 0) {
               std::cerr << "sequence-fragment-usc phase=suspend lane="

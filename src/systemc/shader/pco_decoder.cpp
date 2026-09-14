@@ -6,6 +6,7 @@
 // decoded DrawList program into static ALU/Tex/Memory counts. The SystemC
 // module is event-driven and its FIFO carries only the PipelineState handle.
 #include "shader/pco_decoder.h"
+#include "shader/usc_task_stream.h"
 
 #include "common/functional_types.h"
 #include "common/pipeline_state.h"
@@ -232,8 +233,7 @@ void PcoDecoder::Run() {
       }
       state.vertex_program_summary = decoded.summary;
       state.vertex_instructions = StoreNewArray(pool_, decoded.instructions);
-      state.vertex_groups = CeilDivide(state.counters.vs_invocations,
-                                       kReferenceUarch.usc_issue_lanes);
+      state.vertex_groups = UscIssuePlan::ForLanes(state.counters.vs_invocations).groups;
       state.stage = PipelineStage::kVertexDecoded;
     } else {
       /*

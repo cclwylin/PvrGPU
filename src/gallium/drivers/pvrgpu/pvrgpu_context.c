@@ -21,6 +21,7 @@
 
 #include "pipe/p_defines.h"
 #include "nir/nir.h"
+#include "nir/nir_builder.h"
 #include "util/format/u_format.h"
 #include "util/format_rgb9e5.h"
 #include "util/u_debug.h"
@@ -10075,6 +10076,11 @@ pvrgpu_set_generic_texture_compare_metadata(const struct pipe_sampler_view *view
          : 0;
    descriptor[12] = sampler->compare_mode != PIPE_TEX_COMPARE_NONE ?
       sampler->compare_func : 0;
+   /* SAMPLER_META word 13 (RSVD0) carries Gallium's integer max anisotropy;
+    * TextureUnit filters an implicit-LOD fragment sample of a 2D image with
+    * llvmpipe's footprint and tap placement. */
+   descriptor[13] = sampler->max_anisotropy > 1 ?
+      MIN2((unsigned)sampler->max_anisotropy, 16U) : 0;
 }
 
 #define PVRGPU_BUFFER_TEXTURE_ROW_ELEMENTS 8192U
@@ -10638,8 +10644,7 @@ pvrgpu_capture_generic_sequence_texture(
                                "shadow_sampler_state";
       return false;
    }
-   if (!multisample_view &&
-       (state->unnormalized_coords || state->max_anisotropy > 1)) {
+   if (!multisample_view && state->unnormalized_coords) {
       *reason = "sampler_state";
       return false;
    }
@@ -13239,6 +13244,10 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
    command.fragment_varying_start = binary.fragment_varying_start;
    command.fragment_varying_count = binary.fragment_varying_count;
    command.varying_flat_mask = binary.varying_flat_mask;
+   for (unsigned varying = 0; varying < binary.varying_binding_count; ++varying) {
+      if (binary.varying_bindings[varying].flat == PVRGPU_PCO_VARYING_POINT_COORD)
+         command.fragment_point_coord_components += binary.varying_bindings[varying].num_components;
+   }
    for (unsigned target = 0; target < 8; ++target)
       command.fragment_output_mask[target] = binary.fragment_output_mask[target];
    for (unsigned component = 0; component < 3; ++component) {
@@ -13745,16 +13754,21 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
       recorded->command.varying_binding_count = recorded->binary.varying_binding_count;
       for (unsigned varying = 0; varying < recorded->binary.varying_binding_count; ++varying) {
          const struct pvrgpu_pco_varying_binding *binding = &recorded->binary.varying_bindings[varying];
+         /* The sprite origin is rasterizer state (st_atom_rasterizer). */
+         const uint32_t flat = binding->flat != PVRGPU_PCO_VARYING_POINT_COORD ? binding->flat :
+            ctx->rasterizer && ctx->rasterizer->state.sprite_coord_mode == PIPE_SPRITE_COORD_LOWER_LEFT ?
+               PVRGPU_SYSTEMC_VARYING_POINT_COORD_LOWER_LEFT :
+               PVRGPU_SYSTEMC_VARYING_POINT_COORD_UPPER_LEFT;
          recorded->varying_bindings[varying] = (struct pvrgpu_systemc_varying_binding){
             .output_dword = binding->output_dword,
             .num_components = binding->num_components,
             .coefficient_dword = binding->coefficient_dword,
-            .flat = binding->flat,
+            .flat = flat,
          };
          pvrgpu_counter_eventf("pco_varying_linkage",
             "varying=%u output=%u components=%u coefficient=%u flat=%u",
             varying, binding->output_dword, binding->num_components,
-            binding->coefficient_dword, binding->flat);
+            binding->coefficient_dword, flat);
       }
    }
    if (!pvrgpu_capture_fragment_images(ctx, recorded)) {
@@ -15394,7 +15408,8 @@ pvrgpu_flush(struct pipe_context *pipe,
    }
    if (fence)
       pipe->screen->fence_reference(pipe->screen, fence,
-                                    failed ? pvrgpu_failed_fence() : NULL);
+                                    failed ? pvrgpu_failed_fence() :
+                                             pvrgpu_signaled_fence());
 }
 
 static void
@@ -15483,7 +15498,7 @@ pvrgpu_refuse_native_cpu_present(
 }
 
 static void
-pvrgpu_draw_vbo(struct pipe_context *pipe,
+pvrgpu_draw_vbo_view(struct pipe_context *pipe,
                 const struct pipe_draw_info *info,
                 unsigned drawid_offset,
                 const struct pipe_draw_indirect_info *indirect,
@@ -17357,6 +17372,223 @@ pvrgpu_memory_barrier(struct pipe_context *pipe, unsigned flags)
    pvrgpu_flush_current_color_attachments(pipe);
    pvrgpu_counter_eventf("memory_barrier", "flags=0x%x synchronous=1", flags);
 }
+
+/* GL_OVR_multiview, as llvmpipe's draw module does it: one ordinary draw per
+ * view bit into that view's attachment layer, with gl_ViewID_OVR folded to
+ * the view index in a cached shader clone. */
+static bool
+pvrgpu_fold_view_index(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_view_index)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def,
+      nir_imm_intN_t(b, *(const unsigned *)data, intr->def.bit_size));
+   return true;
+}
+
+static struct nir_shader *
+pvrgpu_shader_view_nir(struct pvrgpu_shader_state *shader,
+                       struct nir_shader *base, unsigned view)
+{
+   if (!base || view >= ARRAY_SIZE(shader->view_nir) ||
+       !BITSET_TEST(base->info.system_values_read, SYSTEM_VALUE_VIEW_INDEX))
+      return base;
+   if (!shader->view_nir[view]) {
+      struct nir_shader *clone = nir_shader_clone(NULL, base);
+      if (!clone)
+         return base;
+      nir_shader_intrinsics_pass(clone, pvrgpu_fold_view_index,
+                                 nir_metadata_control_flow, &view);
+      BITSET_CLEAR(clone->info.system_values_read, SYSTEM_VALUE_VIEW_INDEX);
+      shader->view_nir[view] = clone;
+   }
+   return shader->view_nir[view];
+}
+
+static void
+pvrgpu_draw_vbo_views(struct pipe_context *pipe,
+                      const struct pipe_draw_info *info,
+                      unsigned drawid_offset,
+                      const struct pipe_draw_indirect_info *indirect,
+                      const struct pipe_draw_start_count_bias *draws,
+                      unsigned num_draws)
+{
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   const uint8_t viewmask = ctx->framebuffer.viewmask;
+   if (!viewmask) {
+      pvrgpu_draw_vbo_view(pipe, info, drawid_offset, indirect, draws, num_draws);
+      return;
+   }
+   const struct pipe_framebuffer_state saved = ctx->framebuffer;
+   struct pvrgpu_shader_state *stages[] = {ctx->vs, ctx->tcs, ctx->tes, ctx->gs, ctx->fs};
+   struct nir_shader *base_nir[ARRAY_SIZE(stages)];
+   for (unsigned stage = 0; stage < ARRAY_SIZE(stages); ++stage)
+      base_nir[stage] = stages[stage] ? stages[stage]->nir : NULL;
+   /* Each view writes a different layer of the same resources. Keep every
+    * view in its own sequence, so attachment LOAD and write-back never chain
+    * one layer's result into another. */
+   pvrgpu_flush_current_color_attachments(pipe);
+   u_foreach_bit(view, viewmask) {
+      ctx->framebuffer.viewmask = 0;
+      for (unsigned target = 0; target < saved.nr_cbufs; ++target) {
+         if (!saved.cbufs[target].texture)
+            continue;
+         ctx->framebuffer.cbufs[target].first_layer =
+         ctx->framebuffer.cbufs[target].last_layer =
+            saved.cbufs[target].first_layer + view;
+      }
+      if (saved.zsbuf.texture)
+         ctx->framebuffer.zsbuf.first_layer = ctx->framebuffer.zsbuf.last_layer =
+            saved.zsbuf.first_layer + view;
+      for (unsigned stage = 0; stage < ARRAY_SIZE(stages); ++stage)
+         if (stages[stage])
+            stages[stage]->nir =
+               pvrgpu_shader_view_nir(stages[stage], base_nir[stage], view);
+      pvrgpu_draw_vbo_view(pipe, info, drawid_offset, indirect, draws, num_draws);
+      pvrgpu_flush_current_color_attachments(pipe);
+      for (unsigned stage = 0; stage < ARRAY_SIZE(stages); ++stage)
+         if (stages[stage])
+            stages[stage]->nir = base_nir[stage];
+   }
+   ctx->framebuffer = saved;
+}
+
+/* One restart-free segment in GS input order (the model's GS assembly and
+ * GLES: odd strip triangles swap their first two vertices). */
+static unsigned
+pvrgpu_restart_segment_list(enum mesa_prim mode, const uint32_t *in,
+                            unsigned count, uint32_t *out)
+{
+   unsigned n = 0;
+   switch (mode) {
+   case MESA_PRIM_POINTS:
+      for (unsigned i = 0; i < count; ++i) out[n++] = in[i];
+      break;
+   case MESA_PRIM_LINES:
+      for (unsigned i = 0; i + 1 < count; i += 2) {
+         out[n++] = in[i]; out[n++] = in[i + 1];
+      }
+      break;
+   case MESA_PRIM_LINE_STRIP:
+   case MESA_PRIM_LINE_LOOP:
+      for (unsigned i = 0; i + 1 < count; ++i) {
+         out[n++] = in[i]; out[n++] = in[i + 1];
+      }
+      if (mode == MESA_PRIM_LINE_LOOP && count >= 2) {
+         out[n++] = in[count - 1]; out[n++] = in[0];
+      }
+      break;
+   case MESA_PRIM_TRIANGLES:
+      for (unsigned i = 0; i + 2 < count; i += 3) {
+         out[n++] = in[i]; out[n++] = in[i + 1]; out[n++] = in[i + 2];
+      }
+      break;
+   case MESA_PRIM_TRIANGLE_STRIP:
+      for (unsigned i = 0; i + 2 < count; ++i) {
+         out[n++] = in[(i & 1) ? i + 1 : i];
+         out[n++] = in[(i & 1) ? i : i + 1];
+         out[n++] = in[i + 2];
+      }
+      break;
+   case MESA_PRIM_TRIANGLE_FAN:
+      for (unsigned i = 1; i + 1 < count; ++i) {
+         out[n++] = in[0]; out[n++] = in[i]; out[n++] = in[i + 1];
+      }
+      break;
+   case MESA_PRIM_LINES_ADJACENCY:
+      for (unsigned i = 0; i + 3 < count; i += 4)
+         for (unsigned v = 0; v < 4; ++v) out[n++] = in[i + v];
+      break;
+   case MESA_PRIM_TRIANGLES_ADJACENCY:
+      for (unsigned i = 0; i + 5 < count; i += 6)
+         for (unsigned v = 0; v < 6; ++v) out[n++] = in[i + v];
+      break;
+   default:
+      break;
+   }
+   return n;
+}
+
+static enum mesa_prim
+pvrgpu_restart_list_mode(enum mesa_prim mode)
+{
+   switch (mode) {
+   case MESA_PRIM_POINTS: return MESA_PRIM_POINTS;
+   case MESA_PRIM_LINES:
+   case MESA_PRIM_LINE_STRIP:
+   case MESA_PRIM_LINE_LOOP: return MESA_PRIM_LINES;
+   case MESA_PRIM_TRIANGLES:
+   case MESA_PRIM_TRIANGLE_STRIP:
+   case MESA_PRIM_TRIANGLE_FAN: return MESA_PRIM_TRIANGLES;
+   case MESA_PRIM_LINES_ADJACENCY: return MESA_PRIM_LINES_ADJACENCY;
+   case MESA_PRIM_TRIANGLES_ADJACENCY: return MESA_PRIM_TRIANGLES_ADJACENCY;
+   default: return MESA_PRIM_COUNT;
+   }
+}
+
+/* Primitive restart into a geometry shader: expand the restarted stream into
+ * the equivalent restart-free primitive list, drawn as one draw so primitive
+ * assembly order and gl_PrimitiveIDIn continue across restarts exactly as in
+ * a restart-aware assembler (llvmpipe/dEQP reference). */
+static void
+pvrgpu_draw_vbo(struct pipe_context *pipe,
+                const struct pipe_draw_info *info,
+                unsigned drawid_offset,
+                const struct pipe_draw_indirect_info *indirect,
+                const struct pipe_draw_start_count_bias *draws,
+                unsigned num_draws)
+{
+   struct pvrgpu_context *ctx = pvrgpu_context(pipe);
+   const enum mesa_prim list_mode = info ? pvrgpu_restart_list_mode(info->mode)
+                                         : MESA_PRIM_COUNT;
+   if (!info || !draws || num_draws != 1 || indirect || !info->primitive_restart ||
+       !info->index_size || !ctx->gs || ctx->tcs || ctx->tes ||
+       list_mode == MESA_PRIM_COUNT || draws[0].count == 0 ||
+       draws[0].count > (1u << 24)) {
+      pvrgpu_draw_vbo_views(pipe, info, drawid_offset, indirect, draws, num_draws);
+      return;
+   }
+   const unsigned count = draws[0].count;
+   uint32_t *stream = malloc((size_t)count * sizeof(*stream));
+   /* A fan/loop segment of n vertices yields at most 3n (or 2n) indices. */
+   uint32_t *list = malloc((size_t)count * 3u * sizeof(*list));
+   bool readable = stream && list;
+   for (unsigned j = 0; readable && j < count; ++j)
+      readable = pvrgpu_read_draw_index(info, draws[0].start, j, &stream[j]);
+   if (!readable) {
+      free(stream);
+      free(list);
+      pvrgpu_draw_vbo_views(pipe, info, drawid_offset, indirect, draws, num_draws);
+      return;
+   }
+   unsigned list_count = 0, first = 0;
+   for (unsigned j = 0; j <= count; ++j) {
+      if (j < count && stream[j] != info->restart_index)
+         continue;
+      if (j > first)
+         list_count += pvrgpu_restart_segment_list(info->mode, stream + first,
+                                                   j - first, list + list_count);
+      first = j + 1;
+   }
+   free(stream);
+   if (list_count) {
+      struct pipe_draw_info list_info = *info;
+      list_info.mode = list_mode;
+      list_info.index_size = 4;
+      list_info.has_user_indices = true;
+      list_info.index.user = list;
+      list_info.primitive_restart = false;
+      list_info.restart_index = 0;
+      list_info.index_bounds_valid = false;
+      const struct pipe_draw_start_count_bias list_draw = {
+         .start = 0, .count = list_count, .index_bias = draws[0].index_bias,
+      };
+      pvrgpu_draw_vbo_views(pipe, &list_info, drawid_offset, NULL, &list_draw, 1);
+   }
+   free(list);
+}
+
 
 struct pipe_context *
 pvrgpu_create_context(struct pipe_screen *screen, void *priv,

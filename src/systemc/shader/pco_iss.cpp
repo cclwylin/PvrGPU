@@ -760,7 +760,21 @@ struct GroupHeader {
   throw std::runtime_error(message.str());
 }
 
+// The vertex executor names the instruction it is executing, so an error
+// raised deep in a shared helper (e.g. ReadSource) still identifies it.
+thread_local const PcoInstruction *g_executing_vertex_instruction = nullptr;
+struct ExecutingVertexInstructionScope {
+  ~ExecutingVertexInstructionScope() { g_executing_vertex_instruction = nullptr; }
+};
+
 [[noreturn]] void ExecuteError(const std::string &reason) {
+  if (const auto *instruction = g_executing_vertex_instruction) {
+    g_executing_vertex_instruction = nullptr;
+    throw std::runtime_error(
+        "PCO ISS execution error: " + reason + " [vertex opcode=" +
+        std::to_string(static_cast<unsigned>(instruction->opcode)) +
+        " offset=" + std::to_string(instruction->binary_offset) + "]");
+  }
   throw std::runtime_error("PCO ISS execution error: " + reason);
 }
 
@@ -6505,20 +6519,33 @@ void ValidateVertexTemporaryProgram(
           !HasDefaultControlFields(instruction) || instruction.end_group != 0 ||
           instruction.source.bank != PcoRegisterBank::kTemporary ||
           !coordinate_range_valid ||
-          instruction.source1.bank != PcoRegisterBank::kShared ||
-          instruction.source1.index % kPcoTextureDescriptorDwordCount != 0 ||
-          instruction.source1.index / kPcoTextureDescriptorDwordCount >=
-              kPcoMaximumTextureDescriptorSets ||
-          static_cast<std::size_t>(instruction.source1.index) +
-                  kPcoTextureDescriptorDwordCount >
-              kPcoMaximumVertexSharedCount ||
-          instruction.source2.bank != PcoRegisterBank::kShared ||
-          instruction.source2.index != instruction.source1.index + 8U ||
+          // A dynamically indexed sampler array addresses its descriptor
+          // through IDX0/IDX1, exactly as the fragment stage does.
+          (!IsIndexedTextureDescriptorPair(instruction.source1,
+                                           instruction.source2, false) &&
+           (instruction.source1.bank != PcoRegisterBank::kShared ||
+            instruction.source1.index % kPcoTextureDescriptorDwordCount != 0 ||
+            instruction.source1.index / kPcoTextureDescriptorDwordCount >=
+                kPcoMaximumTextureDescriptorSets ||
+            static_cast<std::size_t>(instruction.source1.index) +
+                    kPcoTextureDescriptorDwordCount >
+                kPcoMaximumVertexSharedCount ||
+            instruction.source2.bank != PcoRegisterBank::kShared ||
+            instruction.source2.index != instruction.source1.index + 8U)) ||
           static_cast<std::size_t>(instruction.output_index) +
                   kPcoTextureResponseCount >
               kPcoTemporaryCount) {
         DecodeError(instruction.binary_offset,
-                    "invalid generic vertex 2D texture request");
+                    "invalid generic vertex 2D texture request (sample=" +
+                        std::to_string(texture_sample_count) + " coord=" +
+                        std::to_string(static_cast<unsigned>(instruction.source.bank)) + ":" +
+                        std::to_string(instruction.source.index) + "/" +
+                        std::to_string(coordinate_count) + " descriptor=" +
+                        std::to_string(static_cast<unsigned>(instruction.source1.bank)) + ":" +
+                        std::to_string(instruction.source1.index) + " state=" +
+                        std::to_string(static_cast<unsigned>(instruction.source2.bank)) + ":" +
+                        std::to_string(instruction.source2.index) + " out=" +
+                        std::to_string(instruction.output_index) + ")");
       }
       continue;
     }
@@ -9815,8 +9842,10 @@ PcoVertexExecution ExecuteVertexPco(
     return target == 0 ? std::numeric_limits<std::size_t>::max()
                        : target - 1;
   };
+  const ExecutingVertexInstructionScope executing_scope;
   for (; pc < instructions.size(); ++pc) {
     const PcoInstruction &instruction = instructions[pc];
+    g_executing_vertex_instruction = &instruction;
     if (result.executed_instruction_count ==
         std::numeric_limits<std::uint32_t>::max()) {
       ExecuteError("vertex dynamic instruction count overflow");
@@ -9942,6 +9971,28 @@ PcoVertexExecution ExecuteVertexPco(
       const bool coordinate_range_valid = coordinate_count != 0 &&
           coordinate_base <= kPcoTemporaryCount &&
           coordinate_count <= kPcoTemporaryCount - coordinate_base;
+      const auto resolve_shared = [&](const PcoRegisterRef &source,
+                                      std::size_t *resolved) {
+        if (source.bank == PcoRegisterBank::kShared) {
+          *resolved = source.index;
+          return true;
+        }
+        if (source.bank != PcoRegisterBank::kIndex0 &&
+            source.bank != PcoRegisterBank::kIndex1)
+          return false;
+        const std::size_t which =
+            source.bank == PcoRegisterBank::kIndex0 ? 0U : 1U;
+        if (!index_register_valid[which] || (source.index & 7U) != 3U)
+          return false;
+        *resolved = static_cast<std::size_t>(index_registers[which]) +
+            (source.index >> 3U);
+        return true;
+      };
+      std::size_t texture_base = 0;
+      std::size_t sampler_base = 0;
+      const bool resolved_descriptor =
+          resolve_shared(instruction.source1, &texture_base) &&
+          resolve_shared(instruction.source2, &sampler_base);
       if (drc0_pending ||
           !HasCanonicalTextureFields(instruction) ||
           instruction.target != PcoWriteTarget::kTemporary ||
@@ -9951,17 +10002,14 @@ PcoVertexExecution ExecuteVertexPco(
           instruction.source.bank != PcoRegisterBank::kTemporary ||
           !coordinate_range_valid ||
           !temporary_written_mask.contains_range(coordinate_base, coordinate_count) ||
-          instruction.source1.bank != PcoRegisterBank::kShared ||
-          instruction.source1.index % kPcoTextureDescriptorDwordCount != 0 ||
-          instruction.source1.index / kPcoTextureDescriptorDwordCount >=
+          !resolved_descriptor ||
+          texture_base % kPcoTextureDescriptorDwordCount != 0 ||
+          texture_base / kPcoTextureDescriptorDwordCount >=
               kPcoMaximumTextureDescriptorSets ||
-          static_cast<std::size_t>(instruction.source1.index) +
-                  kPcoTextureDescriptorDwordCount >
+          texture_base + kPcoTextureDescriptorDwordCount >
               effective_shared_count ||
-          instruction.source2.bank != PcoRegisterBank::kShared ||
-          instruction.source2.index != instruction.source1.index + 8U ||
-          static_cast<std::size_t>(instruction.source2.index) + 4U >
-              effective_shared_count ||
+          sampler_base != texture_base + 8U ||
+          sampler_base + 4U > effective_shared_count ||
           static_cast<std::size_t>(instruction.output_index) +
                   kPcoTextureResponseCount >
               kPcoTemporaryCount) {
@@ -9970,18 +10018,17 @@ PcoVertexExecution ExecuteVertexPco(
       SetTextureRequestData(instruction, temporaries, result.texture_request);
       for (std::size_t word = 0; word < 4; ++word) {
         result.texture_request.texture_state[word] =
-            effective_shared[instruction.source1.index + word];
+            effective_shared[texture_base + word];
         result.texture_request.sampler_state[word] =
-            effective_shared[instruction.source2.index + word];
+            effective_shared[sampler_base + word];
       }
       const bool descriptor_shadow =
-          (effective_shared[instruction.source1.index + 7U] &
-           UINT32_C(0x200)) != 0;
+          (effective_shared[texture_base + 7U] & UINT32_C(0x200)) != 0;
       if (descriptor_shadow != (instruction.texture_shadow_compare != 0))
         ExecuteError("vertex shadow descriptor and native Dref marker disagree");
       if (descriptor_shadow) {
         const std::uint32_t compare_op =
-            effective_shared[instruction.source1.index + 12U];
+            effective_shared[texture_base + 12U];
         if (compare_op > 7U)
           ExecuteError("vertex shadow descriptor compare operation is invalid");
         result.texture_request.shadow_reference = ReadSource(
@@ -9991,7 +10038,7 @@ PcoVertexExecution ExecuteVertexPco(
       }
       result.texture_request.component_count = kPcoTextureResponseCount;
       result.texture_request.descriptor_set = static_cast<std::uint8_t>(
-          instruction.source1.index / kPcoTextureDescriptorDwordCount);
+          texture_base / kPcoTextureDescriptorDwordCount);
       result.texture_request.binding = 0;
       result.texture_request.fcnorm = instruction.texture_fcnorm;
       result.texture_request.data_request = instruction.data_request;
@@ -10180,14 +10227,10 @@ PcoVertexExecution ExecuteVertexPco(
       if (instruction.output_index >= destination_limit(instruction.target) ||
           instruction.output_index1 >= destination_limit(instruction.output_target1))
         ExecuteError("ADD64_32 target exceeds its supplied register file");
+      // Shared, indexed-shared (a dynamically indexed UBO/texture descriptor
+      // address) and register sources, as every other vertex SH reader.
       const auto read = [&](const PcoRegisterRef &source) {
-        if (source.bank == PcoRegisterBank::kShared) {
-          if (source.index >= effective_shared_count)
-            ExecuteError("ADD64_32 shared source is absent");
-          return effective_shared[source.index];
-        }
-        return ReadSource(source, effective_vertex_inputs, temporaries,
-                          temporary_written_mask, 0, ShaderStage::kVertex);
+        return read_control_source(source);
       };
       const std::uint64_t base = static_cast<std::uint64_t>(read(instruction.source)) |
                                 (static_cast<std::uint64_t>(read(instruction.source1)) << 32U);
@@ -10641,32 +10684,20 @@ PcoVertexExecution ExecuteVertexPco(
           instruction.output_index >= temporaries.size()) {
         ExecuteError("invalid ALU target in vertex shader");
       }
-      const std::uint32_t src0 = ReadSource(
-          instruction.source, effective_vertex_inputs, temporaries,
-          temporary_written_mask, 0, ShaderStage::kVertex);
+      const std::uint32_t src0 = read_control_source(instruction.source);
       std::uint32_t result_val = 0;
       if (instruction.opcode == PcoOpcode::kFloatMultiply) {
-        const std::uint32_t src1 = ReadSource(
-            instruction.source1, effective_vertex_inputs, temporaries,
-            temporary_written_mask, 0, ShaderStage::kVertex);
+        const std::uint32_t src1 = read_control_source(instruction.source1);
         result_val = FloatMultiplyBits(src0, src1);
       } else if (instruction.opcode == PcoOpcode::kFloatMad) {
-        const std::uint32_t src1 = ReadSource(
-            instruction.source1, effective_vertex_inputs, temporaries,
-            temporary_written_mask, 0, ShaderStage::kVertex);
-        const std::uint32_t src2 = ReadSource(
-            instruction.source2, effective_vertex_inputs, temporaries,
-            temporary_written_mask, 0, ShaderStage::kVertex);
+        const std::uint32_t src1 = read_control_source(instruction.source1);
+        const std::uint32_t src2 = read_control_source(instruction.source2);
         result_val = FloatMadBits(src0, src1, src2);
       } else if (instruction.opcode == PcoOpcode::kFloatMin) {
-        const std::uint32_t src1 = ReadSource(
-            instruction.source1, effective_vertex_inputs, temporaries,
-            temporary_written_mask, 0, ShaderStage::kVertex);
+        const std::uint32_t src1 = read_control_source(instruction.source1);
         result_val = FloatMinBits(src0, src1);
       } else if (instruction.opcode == PcoOpcode::kFloatMax) {
-        const std::uint32_t src1 = ReadSource(
-            instruction.source1, effective_vertex_inputs, temporaries,
-            temporary_written_mask, 0, ShaderStage::kVertex);
+        const std::uint32_t src1 = read_control_source(instruction.source1);
         result_val = FloatMaxBits(src0, src1);
       } else if (instruction.opcode == PcoOpcode::kReciprocal) {
         result_val = ReciprocalBits(src0);
@@ -10682,8 +10713,7 @@ PcoVertexExecution ExecuteVertexPco(
          * fragment stage computes.  A vertex shader reaches it through
          * fcopysign, which the lowered fround_even ends on. */
         const auto read_at = [&](const PcoRegisterRef &source) {
-          return ReadSource(source, effective_vertex_inputs, temporaries,
-                            temporary_written_mask, 0, ShaderStage::kVertex);
+          return read_control_source(source);
         };
         const std::uint32_t bits = BitfieldWidth(src0);
         const std::uint32_t offset = read_at(instruction.source1) & 0x1fU;

@@ -6981,7 +6981,7 @@ void TestExecuteVertexTextureContinuations() {
                            ten_sample_pairs.begin(), ten_sample_pairs.end());
   ExpectFailure(
       [&] { (void)Decode(ShaderStage::kVertex, ten_sample_binary); },
-      "the tenth sequential vertex SMP exceeds the bounded continuation gate");
+      "one SMP past the sequential vertex bound exceeds the continuation gate");
 
   /* PCO register allocation may reuse a dead VTXIN for an ALU result.
    * Prefix FADD vi0,vi1 -> vi0 (extended destination bank 2), then let the

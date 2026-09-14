@@ -51,7 +51,15 @@ struct RogueTextureSamplerDescriptor {
   std::uint16_t min_lod_u4_6 = 0;
   std::uint16_t max_lod_u4_6 = 0;
   std::uint8_t normalized_coordinates = 1;
+  // PCO SAMPLER_META word 13 (RSVD0): the sampler's maximum anisotropy, 0
+  // when isotropic, otherwise 2..16 (Gallium's integer max_anisotropy).  Not
+  // part of SAMPLER_WORD0/1; the unit sets it for an implicit-LOD fragment
+  // sample of a two-dimensional image, the only one llvmpipe filters
+  // anisotropically.
+  std::uint8_t max_anisotropy = 0;
 };
+
+inline constexpr std::uint32_t kTextureMaximumAnisotropy = 16;
 
 // Which datapath filters a sample.  llvmpipe's `use_aos` rule
 // (lp_build_sample_soa_code): an image whose texels are plain 8-bit unorm
@@ -136,7 +144,29 @@ struct TextureImplicitLod {
   bool minified = false;
   TextureFilter image_filter = TextureFilter::kNearest;
   TextureMipMode mip_mode = TextureMipMode::kNone;
+  // Anisotropic footprint of the quad; rate 0 is an isotropic sample.
+  std::uint8_t aniso_rate = 0;
+  bool aniso_along_x = false;
 };
+
+// lp_build_rho_aniso for one quad.  The four derivatives are texel-scaled
+// (TR-TL and BL-TL of s and t, times the base extent).  lp_apply_ellipse_transform
+// fits them to the footprint ellipse first; eta^2 is the axis ratio clamped
+// to [1, max_anisotropy^2], `rate` = ceil(eta) samples along x when the x
+// footprint is the longer one, and the LOD is taken from the minor axis,
+// rho_max^2 / eta^2.
+struct TextureAnisotropicFootprint {
+  float rho_squared = 0.0F;
+  std::uint8_t rate = 1;
+  bool along_x = false;
+};
+TextureAnisotropicFootprint ComputeTextureAnisotropicFootprint(
+    float dsdx, float dsdy, float dtdx, float dtdy,
+    std::uint32_t max_anisotropy);
+
+// lp_build_sample_aniso: sample k of `rate` sits at (k + 0.5 - rate/2) /
+// (rate + 1) of the major-axis derivative from the centre.
+float TextureAnisotropicSampleOffset(std::uint32_t sample, std::uint32_t rate);
 
 // lp_build_fast_log2: floor(log2 x) - 1 + x / 2^floor(log2 x), the
 // piece-wise linear log2 that is exact at powers of two.  Requires x > 0.

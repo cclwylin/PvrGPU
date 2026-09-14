@@ -105,7 +105,8 @@ ClipVertex ReadClipVertex(const VertexLane &vertex,
   return result;
 }
 
-float PlaneDistance(const ClipVertex &vertex, std::uint32_t plane, std::uint16_t clip_dist_reg = 0) {
+float PlaneDistance(const ClipVertex &vertex, std::uint32_t plane, std::uint16_t clip_dist_reg = 0,
+                    bool clip_halfz = false) {
   if (plane >= 6) {
     return vertex.output[clip_dist_reg + (plane - 6)];
   }
@@ -123,7 +124,7 @@ float PlaneDistance(const ClipVertex &vertex, std::uint32_t plane, std::uint16_t
   case 3:
     return y + w; // bottom:  y + w >= 0
   case 4:
-    return z + w; // GL full-Z near
+    return clip_halfz ? z : z + w; // half-Z (clip control) or GL full-Z near
   case 5:
     return -z + w; // GL full-Z far
   default:
@@ -131,12 +132,13 @@ float PlaneDistance(const ClipVertex &vertex, std::uint32_t plane, std::uint16_t
   }
 }
 
-std::uint32_t ClipMask(const ClipVertex &vertex, bool depth_clamp, std::uint8_t clip_dist_mask = 0, std::uint16_t clip_dist_reg = 0) {
+std::uint32_t ClipMask(const ClipVertex &vertex, bool depth_clamp, std::uint8_t clip_dist_mask = 0, std::uint16_t clip_dist_reg = 0,
+                       bool clip_halfz = false) {
   std::uint32_t mask = 0;
   for (std::uint32_t plane = 0; plane < (depth_clamp ? 4U : 6U); ++plane) {
     // Mesa's clip test is expressed as !(dp >= 0), so boundary vertices are
     // inside and unordered NaNs fail closed as outside.
-    if (!(PlaneDistance(vertex, plane, clip_dist_reg) >= 0.0F))
+    if (!(PlaneDistance(vertex, plane, clip_dist_reg, clip_halfz) >= 0.0F))
       mask |= 1U << plane;
   }
   if (clip_dist_mask != 0) {
@@ -195,11 +197,12 @@ ClipVertex Interpolate(double t, const ClipVertex &outside,
 }
 
 std::vector<ClipVertex>
-ClipTriangle(const std::array<ClipVertex, 3> &input, bool depth_clamp, std::uint8_t clip_dist_mask = 0, std::uint16_t clip_dist_reg = 0) {
+ClipTriangle(const std::array<ClipVertex, 3> &input, bool depth_clamp, std::uint8_t clip_dist_mask = 0, std::uint16_t clip_dist_reg = 0,
+             bool clip_halfz = false) {
   const std::uint32_t masks[3] = {
-      ClipMask(input[0], depth_clamp, clip_dist_mask, clip_dist_reg),
-      ClipMask(input[1], depth_clamp, clip_dist_mask, clip_dist_reg),
-      ClipMask(input[2], depth_clamp, clip_dist_mask, clip_dist_reg)};
+      ClipMask(input[0], depth_clamp, clip_dist_mask, clip_dist_reg, clip_halfz),
+      ClipMask(input[1], depth_clamp, clip_dist_mask, clip_dist_reg, clip_halfz),
+      ClipMask(input[2], depth_clamp, clip_dist_mask, clip_dist_reg, clip_halfz)};
   const std::uint32_t union_mask = masks[0] | masks[1] | masks[2];
   if (union_mask == 0)
     return {input.begin(), input.end()};
@@ -234,12 +237,12 @@ ClipTriangle(const std::array<ClipVertex, 3> &input, bool depth_clamp, std::uint
     std::vector<ClipVertex> output;
     output.reserve(polygon.size() + 1);
     ClipVertex previous = polygon.front();
-    float previous_distance = PlaneDistance(previous, plane, clip_dist_reg);
+    float previous_distance = PlaneDistance(previous, plane, clip_dist_reg, clip_halfz);
     if (!std::isfinite(previous_distance))
       return {};
     for (std::size_t edge = 1; edge <= polygon.size(); ++edge) {
       const ClipVertex current = polygon[edge % polygon.size()];
-      const float distance = PlaneDistance(current, plane, clip_dist_reg);
+      const float distance = PlaneDistance(current, plane, clip_dist_reg, clip_halfz);
       if (!std::isfinite(distance))
         return {};
       bool different_sign = false;
@@ -459,6 +462,170 @@ bool BuildLineQuadCorners(const ClipVertex &a, const ClipVertex &b,
   return true;
 }
 
+// llvmpipe try_setup_line's aliased (non-rectangular) wide line: the segment
+// is shifted along its major axis by the diamond-exit endpoint adjustments and
+// extruded by the integer line width along the minor axis. Corners are built
+// in window space and returned as clip-space offsets of their source endpoint,
+// so the quad still clips and rasterizes like any other geometry.
+bool BuildAliasedWideLineCorners(const ClipVertex &a, const ClipVertex &b,
+                                 float scale_x, float scale_y,
+                                 float offset_x, float offset_y,
+                                 float line_width, bool bottom_edge_rule,
+                                 std::array<ClipVertex, 4> &corners) {
+  const float wa = a.output[3];
+  const float wb = b.output[3];
+  if (!(wa > 0.0F) || !(wb > 0.0F) || scale_x == 0.0F || scale_y == 0.0F)
+    return false;
+  float v1[2] = {a.output[0] / wa * scale_x + offset_x,
+                 a.output[1] / wa * scale_y + offset_y};
+  float v2[2] = {b.output[0] / wb * scale_x + offset_x,
+                 b.output[1] / wb * scale_y + offset_y};
+  const float dx = v1[0] - v2[0];
+  const float dy = v1[1] - v2[1];
+  if (!std::isfinite(dx) || !std::isfinite(dy) || dx * dx + dy * dy == 0.0F)
+    return false;
+  const auto sign = [](float x) { return x >= 0.0F; };
+  const auto fracf = [](float f) { return f - std::floor(f); };
+  float x1diff = v1[0] - std::floor(v1[0]) - 0.5F;
+  float y1diff = v1[1] - std::floor(v1[1]) - 0.5F;
+  float x2diff = v2[0] - std::floor(v2[0]) - 0.5F;
+  float y2diff = v2[1] - std::floor(v2[1]) - 0.5F;
+  const float half_width =
+      0.5F * static_cast<float>(std::lround(std::max(1.0F, line_width)));
+  float x_offset = 0.0F, y_offset = 0.0F;
+  float x_offset_end = 0.0F, y_offset_end = 0.0F;
+  bool swapped = false;
+  const ClipVertex *first = &a;
+  const ClipVertex *second = &b;
+  std::array<float, 4> cx{}, cy{};
+  if (std::fabs(dx) >= std::fabs(dy)) {
+    const float dydx = dy / dx;
+    if (y2diff == -0.5F && dy < 0.0F) y2diff = 0.5F;
+    bool draw_start, draw_end;
+    if (std::fabs(x1diff) + std::fabs(y1diff) < 0.5F) draw_start = true;
+    else if (sign(x1diff) == sign(-dx)) draw_start = false;
+    else if (sign(-y1diff) != sign(dy)) draw_start = true;
+    else {
+      const float yintersect = fracf(v1[1]) + x1diff * dydx;
+      draw_start = yintersect < 1.0F && yintersect > 0.0F;
+    }
+    if (std::fabs(x2diff) + std::fabs(y2diff) < 0.5F) draw_end = false;
+    else if (sign(x2diff) != sign(-dx)) draw_end = false;
+    else if (sign(-y2diff) == sign(dy)) draw_end = true;
+    else {
+      const float yintersect = fracf(v2[1]) + x2diff * dydx;
+      draw_end = yintersect < 1.0F && yintersect > 0.0F;
+    }
+    if (dx < 0.0F) {
+      swapped = true;
+      if ((x1diff <= 0.0F) != draw_start) {
+        x_offset_end = -x1diff - 0.5F;
+        y_offset_end = x_offset_end * dydx;
+      }
+      if ((x2diff > 0.0F) != draw_end) {
+        x_offset = -x2diff - 0.5F;
+        y_offset = x_offset * dydx;
+      }
+    } else {
+      if ((x1diff > 0.0F) != draw_start) {
+        x_offset = -x1diff + 0.5F;
+        y_offset = x_offset * dydx;
+      }
+      if ((x2diff <= 0.0F) != draw_end) {
+        x_offset_end = -x2diff + 0.5F;
+        y_offset_end = x_offset_end * dydx;
+      }
+    }
+    if (swapped) { std::swap(v1[0], v2[0]); std::swap(v1[1], v2[1]); std::swap(first, second); }
+    cx = {v1[0] + x_offset, v2[0] + x_offset_end, v2[0] + x_offset_end, v1[0] + x_offset};
+    cy = {v1[1] + y_offset - half_width, v2[1] + y_offset_end - half_width,
+          v2[1] + y_offset_end + half_width, v1[1] + y_offset + half_width};
+  } else {
+    const float dxdy = dx / dy;
+    if (x2diff == -0.5F && dx < 0.0F) x2diff = 0.5F;
+    bool draw_start, draw_end;
+    if (std::fabs(x1diff) + std::fabs(y1diff) < 0.5F) draw_start = true;
+    else if (sign(-y1diff) == sign(dy)) draw_start = false;
+    else if (sign(x1diff) != sign(-dx)) draw_start = true;
+    else {
+      const float xintersect = fracf(v1[0]) + y1diff * dxdy;
+      draw_start = xintersect < 1.0F && xintersect > 0.0F;
+    }
+    if (std::fabs(x2diff) + std::fabs(y2diff) < 0.5F) draw_end = false;
+    else if (sign(-y2diff) != sign(dy)) draw_end = false;
+    else if (sign(x2diff) == sign(-dx)) draw_end = true;
+    else {
+      const float xintersect = fracf(v2[0]) + y2diff * dxdy;
+      draw_end = xintersect < 1.0F && xintersect >= 0.0F;
+    }
+    if (dy > 0.0F) {
+      swapped = true;
+      const bool will_draw_start = bottom_edge_rule ? y1diff >= 0.0F : y1diff > 0.0F;
+      const bool will_draw_end = bottom_edge_rule ? y2diff < 0.0F : y2diff <= 0.0F;
+      if (will_draw_start != draw_start) {
+        y_offset_end = -y1diff + 0.5F;
+        x_offset_end = y_offset_end * dxdy;
+      }
+      if (will_draw_end != draw_end) {
+        y_offset = -y2diff + 0.5F;
+        x_offset = y_offset * dxdy;
+      }
+    } else {
+      const bool will_draw_start = bottom_edge_rule ? y1diff < 0.0F : y1diff <= 0.0F;
+      const bool will_draw_end = bottom_edge_rule ? y2diff >= 0.0F : y2diff > 0.0F;
+      if (will_draw_start != draw_start) {
+        y_offset = -y1diff - 0.5F;
+        x_offset = y_offset * dxdy;
+      }
+      if (will_draw_end != draw_end) {
+        y_offset_end = -y2diff - 0.5F;
+        x_offset_end = y_offset_end * dxdy;
+      }
+    }
+    if (swapped) { std::swap(v1[0], v2[0]); std::swap(v1[1], v2[1]); std::swap(first, second); }
+    cx = {v1[0] + x_offset - half_width, v2[0] + x_offset_end - half_width,
+          v2[0] + x_offset_end + half_width, v1[0] + x_offset + half_width};
+    cy = {v1[1] + y_offset, v2[1] + y_offset_end, v2[1] + y_offset_end, v1[1] + y_offset};
+  }
+  // llvmpipe's attribute planes are anchored at the original endpoints and
+  // vary only along the major axis. Give each corner the segment's own
+  // (perspective-correct) outputs at its major-axis position, then extrude
+  // it along the minor axis alone.
+  const bool x_major = std::fabs(dx) >= std::fabs(dy);
+  const float major_span = x_major ? v2[0] - v1[0] : v2[1] - v1[1];
+  if (major_span == 0.0F)
+    return false;
+  const float viewport_width = 2.0F * std::fabs(scale_x);
+  const float viewport_height = 2.0F * std::fabs(scale_y);
+  const float sign_x = scale_x < 0.0F ? -1.0F : 1.0F;
+  const float sign_y = scale_y < 0.0F ? -1.0F : 1.0F;
+  const float wf = first->output[3];
+  const float ws = second->output[3];
+  const auto on_segment = [&](float screen_t) {
+    const float denominator = screen_t * wf + (1.0F - screen_t) * ws;
+    const float t = denominator != 0.0F ? screen_t * wf / denominator : screen_t;
+    ClipVertex result = *first;
+    for (std::uint16_t component = 0; component < first->output_count; ++component) {
+      if (first->non_interpolated_mask & (UINT64_C(1) << component))
+        continue;
+      result.output[component] =
+          (1.0F - t) * first->output[component] + t * second->output[component];
+    }
+    return result;
+  };
+  const ClipVertex start = on_segment((x_major ? x_offset : y_offset) / major_span);
+  const ClipVertex finish =
+      on_segment(1.0F + (x_major ? x_offset_end : y_offset_end) / major_span);
+  for (std::size_t corner = 0; corner < 4; ++corner) {
+    const bool second_end = corner == 1 || corner == 2;
+    const float extrude = (corner == 0 || corner == 1) ? -half_width : half_width;
+    corners[corner] = OffsetClipVertexScreenPixels(
+        second_end ? finish : start, x_major ? 0.0F : extrude * sign_x,
+        x_major ? extrude * sign_y : 0.0F, viewport_width, viewport_height);
+  }
+  return true;
+}
+
 // Widens one shaded point vertex into the four corners of an axis-aligned
 // half_size_px x half_size_px screen-space square centered on it. Requires
 // positive homogeneous W for the same reason as BuildLineQuadCorners.
@@ -492,22 +659,25 @@ struct ViewportTransform {
 
 // Size a point rasterizes at.  A shader that writes gl_PointSize sizes each
 // point itself, and the capsule names the vertex output it lands in; otherwise
-// every point is the fixed size the draw stated.
+// every point is the fixed size the draw stated.  Either is clamped to the
+// advertised maximum, as llvmpipe's point setup clamps to LP_MAX_POINT_WIDTH.
+constexpr float kMaximumPointSize = 256.0F;
+
 float PointSizeFor(const pvrgpu::stub::PipelineState &state,
                    const ClipVertex &vertex) {
   const pvrgpu::stub::RasterState &raster = state.raster_state;
   if (raster.point_size_output_count == 0)
-    return raster.point_size;
+    return std::min(raster.point_size, kMaximumPointSize);
   if (raster.point_size_output_start >= vertex.output_count) {
     throw std::runtime_error(
         "ClipCull point size output is outside the vertex output span");
   }
   const float size = vertex.output[raster.point_size_output_start];
-  if (!std::isfinite(size) || size < 1.0F || size > 1024.0F) {
+  if (std::isnan(size) || size < 1.0F) {
     throw std::runtime_error(
         "ClipCull per-vertex point size is outside the supported range");
   }
-  return size;
+  return std::min(size, kMaximumPointSize);
 }
 
 ViewportTransform ResolveViewport(const pvrgpu::stub::PipelineState &state) {
@@ -665,7 +835,7 @@ RasterTriangle BuildRasterTriangle(const std::array<ClipVertex, 3> &vertices,
 
 bool IsInsideHomogeneousClip(const VertexLane &vertex,
                              std::uint16_t output_count,
-                             bool depth_clamp) {
+                             bool depth_clamp, bool clip_halfz = false) {
   const ClipVertex clip = ReadClipVertex(vertex, output_count);
   const float clip_x = clip.output[0];
   const float clip_y = clip.output[1];
@@ -678,7 +848,7 @@ bool IsInsideHomogeneousClip(const VertexLane &vertex,
                    clip_y <= clip_w;
   if (depth_clamp)
     return xy_inside;
-  return xy_inside && clip_z >= -clip_w && clip_z <= clip_w;
+  return xy_inside && clip_z >= (clip_halfz ? 0.0F : -clip_w) && clip_z <= clip_w;
 }
 
 } // namespace
@@ -698,6 +868,7 @@ void ClipCull::Run() {
     RequireStage(state.stage, PipelineStage::kVertexShaded, name());
     const bool geometry_enabled = HasPoolHandle(state.geometry_code) || HasPoolHandle(state.tessellation_state);
     const bool depth_clamp = state.raster_state.depth_clamp_enable != 0;
+    const bool clip_halfz = state.raster_state.clip_halfz != 0;
     const std::uint8_t clip_dist_mask = state.clip_distance_mask;
     const std::uint16_t clip_dist_reg = state.clip_distance_register;
     if (!IsRasterFunctionalCase(state.functional_case))
@@ -767,7 +938,7 @@ void ClipCull::Run() {
         throw std::runtime_error(
             "ClipCull direct raster lane count is invalid");
       for (const VertexLane &lane : lanes) {
-        if (!IsInsideHomogeneousClip(lane, active_vertex_output_dwords, depth_clamp)) {
+        if (!IsInsideHomogeneousClip(lane, active_vertex_output_dwords, depth_clamp, clip_halfz)) {
           throw std::runtime_error(
               "ClipCull direct raster vertex is outside homogeneous clip space");
         }
@@ -973,7 +1144,7 @@ void ClipCull::Run() {
             throw std::runtime_error(
                 "ClipCull lane reference is outside shaded lanes");
           if (ClipMask(ReadClipVertex(lanes[ref.lane_index],
-                                      active_vertex_output_dwords), depth_clamp, clip_dist_mask, clip_dist_reg) != 0)
+                                      active_vertex_output_dwords), depth_clamp, clip_dist_mask, clip_dist_reg, clip_halfz) != 0)
             generic_clip_path = true;
         }
 
@@ -1126,6 +1297,14 @@ void ClipCull::Run() {
                                          1.0F / static_cast<float>(kSubpixelScale),
                                      viewport_width_px, viewport_height_px,
                                      quad_corners)) ||
+              (source_is_line && state.raster_state.line_width > 1.0F &&
+               !(state.raster_state.sample_count > 1 &&
+                 state.raster_state.multisample_enable) &&
+               BuildAliasedWideLineCorners(
+                   vertices[0], vertices[1], viewport.scale_x, viewport.scale_y,
+                   viewport.offset_x, viewport.offset_y,
+                   state.raster_state.line_width,
+                   state.raster_state.bottom_edge_rule != 0, quad_corners)) ||
               (source_is_line &&
                BuildLineQuadCorners(vertices[0], vertices[1],
                                     state.raster_state.line_width <= 1.0F &&
@@ -1186,13 +1365,14 @@ void ClipCull::Run() {
                                          bool allow_face_cull) {
             const bool primitive_clipped = std::any_of(
                 tri.begin(), tri.end(),
-                [depth_clamp, clip_dist_mask,
-                 clip_dist_reg](const ClipVertex &vertex) {
+                [depth_clamp, clip_dist_mask, clip_dist_reg,
+                 clip_halfz](const ClipVertex &vertex) {
                   return ClipMask(vertex, depth_clamp, clip_dist_mask,
-                                  clip_dist_reg) != 0;
+                                  clip_dist_reg, clip_halfz) != 0;
                 });
             std::vector<ClipVertex> polygon =
-                ClipTriangle(tri, depth_clamp, clip_dist_mask, clip_dist_reg);
+                ClipTriangle(tri, depth_clamp, clip_dist_mask, clip_dist_reg,
+                             clip_halfz);
             // The closed homogeneous clip volume includes its apex. A
             // shader may legally output (0,0,0,0), and clipping an edge may
             // produce it too. The apex has no finite perspective projection

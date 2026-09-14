@@ -1580,8 +1580,18 @@ pvrgpu_resource_read_back_color_attachment(struct pipe_context *pipe,
                                            unsigned usage)
 {
    struct pvrgpu_context *ctx = pvrgpu_context(pipe);
-   if (!(usage & PIPE_MAP_READ) || !ctx || !resource)
+   if (!ctx || !resource)
       return;
+   /* A CPU write into a current attachment must land after the pending draws
+    * that render into it; otherwise their write-back overwrites it. */
+   if (!(usage & PIPE_MAP_READ)) {
+      if ((usage & PIPE_MAP_WRITE) && !(usage & PIPE_MAP_UNSYNCHRONIZED) &&
+          ((ctx->framebuffer.zsbuf.texture == resource &&
+            ctx->framebuffer.zsbuf.level == level) ||
+           pvrgpu_resource_color_attachment_index(ctx, resource, level) >= 0))
+         pvrgpu_flush_current_color_attachments(pipe);
+      return;
+   }
 
    if (ctx->framebuffer.zsbuf.texture == resource &&
        ctx->framebuffer.zsbuf.level == level) {
@@ -2088,6 +2098,8 @@ pvrgpu_texture_subdata(struct pipe_context *pipe,
          util_format_name(resource->format));
       return;
    }
+   pvrgpu_resource_read_back_color_attachment(pipe, resource, level,
+                                              usage | PIPE_MAP_WRITE);
    pvrgpu_invalidate_full_depth_clear_for_resource(pvrgpu_context(pipe),
                                                     resource);
 
@@ -2095,14 +2107,19 @@ pvrgpu_texture_subdata(struct pipe_context *pipe,
    const unsigned row_bytes =
       util_format_get_stride(resource->format, box->width) *
       pvrgpu_resource_storage_sample_count(resource);
+   /* Strides are per block row; compressed boxes are in texels. */
+   const unsigned block_rows =
+      util_format_get_nblocksy(resource->format, (unsigned)box->height);
    uint8_t *dst = pvrgpu->data + pvrgpu->level_offsets[level] +
                   (uintptr_t)box->z *
                      pvrgpu->level_layer_strides[level] +
-                  (uintptr_t)box->y * pvrgpu->level_strides[level] +
-                  (uintptr_t)box->x * block_size;
+                  (uintptr_t)(box->y / util_format_get_blockheight(resource->format)) *
+                     pvrgpu->level_strides[level] +
+                  (uintptr_t)(box->x / util_format_get_blockwidth(resource->format)) *
+                     block_size;
    const uint8_t *src = (const uint8_t *)data;
    for (int layer = 0; layer < box->depth; ++layer) {
-      for (int row = 0; row < box->height; ++row) {
+      for (unsigned row = 0; row < block_rows; ++row) {
          memcpy(dst + (uintptr_t)layer *
                    pvrgpu->level_layer_strides[level] +
                    (uintptr_t)row * pvrgpu->level_strides[level],
@@ -2405,6 +2422,21 @@ pvrgpu_texture_copy_formats_are_raw_compatible(enum pipe_format dst,
       util_format_description(dst);
    const struct util_format_description *src_desc =
       util_format_description(src);
+   /* Compressed view classes (e.g. RGBA/sRGB ASTC of one footprint) share
+    * the exact block encoding; CopyImageSubData copies those blocks raw. */
+   /* GLES mixed view classes pair one compressed block with one
+    * uncompressed texel of the same bit width (e.g. ASTC <-> RGBA32F). */
+   if (dst_desc && src_desc &&
+       util_format_is_compressed(dst) != util_format_is_compressed(src))
+      return dst_desc->block.depth == 1 && src_desc->block.depth == 1 &&
+             dst_desc->block.bits == src_desc->block.bits;
+   if (dst_desc && src_desc && util_format_is_compressed(dst) &&
+       util_format_is_compressed(src))
+      return dst_desc->layout == src_desc->layout &&
+             dst_desc->block.width == src_desc->block.width &&
+             dst_desc->block.height == src_desc->block.height &&
+             dst_desc->block.depth == src_desc->block.depth &&
+             dst_desc->block.bits == src_desc->block.bits;
    return pvrgpu_format_is_32bit_texture_view_class(dst) &&
           pvrgpu_format_is_32bit_texture_view_class(src) &&
           dst_desc && src_desc &&
@@ -2414,6 +2446,27 @@ pvrgpu_texture_copy_formats_are_raw_compatible(enum pipe_format dst,
           src_desc->block.height == dst_desc->block.height &&
           src_desc->block.depth == dst_desc->block.depth &&
           src_desc->block.bits == dst_desc->block.bits;
+}
+
+static bool
+pvrgpu_copy_blocks_in_bounds(const struct pipe_resource *resource,
+                             unsigned level, unsigned block_x,
+                             unsigned block_y, unsigned z, unsigned columns,
+                             unsigned rows, unsigned depth)
+{
+   const struct pvrgpu_resource *pvrgpu =
+      pvrgpu_resource((struct pipe_resource *)resource);
+   if (!pvrgpu_resource_level_valid(pvrgpu, level) ||
+       !pvrgpu_can_create_texture_target(resource))
+      return false;
+   const unsigned level_columns = util_format_get_nblocksx(resource->format,
+      pvrgpu_resource_level_width(resource, level));
+   const unsigned level_rows = util_format_get_nblocksy(resource->format,
+      pvrgpu_resource_level_height(resource, level));
+   return (uint64_t)block_x + columns <= level_columns &&
+          (uint64_t)block_y + rows <= level_rows &&
+          (uint64_t)z + depth <=
+             pvrgpu_resource_level_layer_count(resource, level);
 }
 
 static bool
@@ -2442,20 +2495,24 @@ pvrgpu_can_copy_texture_region(struct pipe_resource *dst,
        pvrgpu_resource_storage_sample_count(dst) != MAX2(1, dst->nr_samples))
       return false;
    if (src_box->width <= 0 || src_box->height <= 0 ||
-       src_box->depth <= 0)
+       src_box->depth <= 0 || src_box->x < 0 || src_box->y < 0 ||
+       src_box->z < 0)
       return false;
-   if (!pvrgpu_transfer_box_in_bounds(src, src_level, src_box))
-      return false;
-
-   const struct pipe_box dst_box = {
-      .x = (int)dstx,
-      .y = (int)dsty,
-      .z = (int)dstz,
-      .width = src_box->width,
-      .height = src_box->height,
-      .depth = src_box->depth,
-   };
-   if (!pvrgpu_transfer_box_in_bounds(dst, dst_level, &dst_box))
+   /* Count whole blocks of the source format; each lands on one block (or
+    * texel) of the destination. Compressed edge blocks may extend past the
+    * level's texel size, so bound the copy in blocks on both sides. */
+   const unsigned columns =
+      util_format_get_nblocksx(src->format, (unsigned)src_box->width);
+   const unsigned rows =
+      util_format_get_nblocksy(src->format, (unsigned)src_box->height);
+   if (!pvrgpu_copy_blocks_in_bounds(src, src_level,
+          (unsigned)src_box->x / util_format_get_blockwidth(src->format),
+          (unsigned)src_box->y / util_format_get_blockheight(src->format),
+          (unsigned)src_box->z, columns, rows, (unsigned)src_box->depth) ||
+       !pvrgpu_copy_blocks_in_bounds(dst, dst_level,
+          dstx / util_format_get_blockwidth(dst->format),
+          dsty / util_format_get_blockheight(dst->format),
+          dstz, columns, rows, (unsigned)src_box->depth))
       return false;
    if (!pvrgpu_resource(dst)->data || !pvrgpu_resource(src)->data)
       return false;
@@ -2475,27 +2532,37 @@ pvrgpu_copy_texture_region_unchecked(struct pipe_resource *dst,
    struct pvrgpu_resource *pvrgpu_dst = pvrgpu_resource(dst);
    struct pvrgpu_resource *pvrgpu_src = pvrgpu_resource(src);
    const unsigned block_size = util_format_get_blocksize(dst->format);
+   /* Level strides are per block row; compressed (ASTC/ETC) boxes are in
+    * texels, so address and count whole blocks as util_copy_box does. The
+    * source format sets the block count; a mixed copy (compressed block <->
+    * uncompressed texel) addresses each side in its own block units. */
+   const unsigned src_block_width = util_format_get_blockwidth(src->format);
+   const unsigned src_block_height = util_format_get_blockheight(src->format);
+   const unsigned block_width = util_format_get_blockwidth(dst->format);
+   const unsigned block_height = util_format_get_blockheight(dst->format);
+   const unsigned block_rows =
+      util_format_get_nblocksy(src->format, (unsigned)src_box->height);
    const unsigned row_bytes =
-      util_format_get_stride(dst->format, src_box->width) *
+      util_format_get_stride(src->format, src_box->width) *
       pvrgpu_resource_storage_sample_count(dst);
 
    for (int layer = 0; layer < src_box->depth; ++layer) {
-      for (int row = 0; row < src_box->height; ++row) {
+      for (unsigned row = 0; row < block_rows; ++row) {
          uint8_t *dst_row =
             pvrgpu_dst->data + pvrgpu_dst->level_offsets[dst_level] +
             (uintptr_t)(dstz + (unsigned)layer) *
                pvrgpu_dst->level_layer_strides[dst_level] +
-            (uintptr_t)(dsty + (unsigned)row) *
+            (uintptr_t)(dsty / block_height + row) *
                pvrgpu_dst->level_strides[dst_level] +
-            pvrgpu_msaa_texel_index(dstx, 0,
+            pvrgpu_msaa_texel_index(dstx / block_width, 0,
                pvrgpu_resource_storage_sample_count(dst)) * block_size;
          const uint8_t *src_row =
             pvrgpu_src->data + pvrgpu_src->level_offsets[src_level] +
             (uintptr_t)(src_box->z + layer) *
                pvrgpu_src->level_layer_strides[src_level] +
-            (uintptr_t)(src_box->y + row) *
+            (uintptr_t)((unsigned)src_box->y / src_block_height + row) *
                pvrgpu_src->level_strides[src_level] +
-            pvrgpu_msaa_texel_index((unsigned)src_box->x, 0,
+            pvrgpu_msaa_texel_index((unsigned)src_box->x / src_block_width, 0,
                pvrgpu_resource_storage_sample_count(src)) * block_size;
          memmove(dst_row, src_row, row_bytes);
       }
@@ -2511,8 +2578,13 @@ pvrgpu_read_texture_pixel_4ub(struct pipe_resource *resource,
                               enum pipe_format format,
                               uint8_t out[4])
 {
+   /* Diagnostic pixel probe only: compressed (e.g. ASTC) blocks have no
+    * per-pixel 8-bit unpacker, and util_format_read_4ub would call NULL. */
+   const struct util_format_unpack_description *unpack =
+      util_format_unpack_description(format);
    if (!resource || !out || util_format_is_depth_or_stencil(format) ||
-       util_format_is_pure_integer(format))
+       util_format_is_pure_integer(format) || util_format_is_compressed(format) ||
+       !unpack || !unpack->unpack_rgba_8unorm)
       return false;
 
    const struct pipe_box box = {

@@ -168,7 +168,7 @@ struct Harness {
       for (unsigned c = 0; c < 4; ++c) {
         float expected = 0;
         for (unsigned face = 0; face < 6; ++face)
-          expected += weights[face] * (static_cast<float>(Color(level, face, c, monochrome)) / 255.0F);
+          expected += weights[face] * (static_cast<float>(Color(level, face, c, monochrome)) * static_cast<float>(1.0 / 255.0));
         const float actual = Float(responses[i].rgba[c]);
         // Nearest is exact; seamless float sums may differ only in operation
         // ordering from this independently weighted constant-face oracle.

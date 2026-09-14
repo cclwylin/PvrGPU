@@ -5732,9 +5732,12 @@ static bool pvrgpu_color_primitive_varyings(const nir_shader *vs,
     * fragment stage may not read one the vertex stage does not write.
     */
    /* gl_FragCoord is rasterizer input, not a VS-to-FS varying. PCO reads
-    * the separately reserved position coefficients and native pixel coords. */
+    * the separately reserved position coefficients and native pixel coords.
+    * gl_PointCoord is likewise produced by the rasterizer's point-sprite
+    * iterator, not by the vertex stage. */
    const uint64_t fs_varyings = fs->info.inputs_read &
-                                ~BITFIELD64_BIT(VARYING_SLOT_POS);
+                                ~BITFIELD64_BIT(VARYING_SLOT_POS) &
+                                ~BITFIELD64_BIT(VARYING_SLOT_PNTC);
    if ((fs_varyings & ~vs_varyings) != 0)
       return false;
    if (vs_varyings == 0)
@@ -9404,13 +9407,35 @@ pvrgpu_compile_extended_geometry_pipeline(struct pvrgpu_pco_compiler *compiler,
       out->graphics.vertex_output_count[location] = raster_output->count[location];
    }
    out->graphics.varying_flat_mask = 0;
+   /* gl_PointCoord: the rasterizer point-sprite iterator after z/w. */
+   if (fs->info.inputs_read & BITFIELD64_BIT(VARYING_SLOT_PNTC)) {
+      nir_variable *point_coord =
+         nir_find_variable_with_location(fs, nir_var_shader_in, VARYING_SLOT_PNTC);
+      if (!point_coord || point_coord->data.location_frac ||
+          glsl_get_components(point_coord->type) != 2) {
+         pvrgpu_pco_fail(error, error_size, "Geometry pipeline point coordinate input is unsupported");
+         goto fail;
+      }
+      fd.fs.varyings[VARYING_SLOT_PNTC] = (pco_range){.start = next_coefficient, .count = 2 * 4};
+      fd.fs.uses.pntc = true;
+      out->graphics.varying_bindings[out->graphics.varying_binding_count++] =
+            (struct pvrgpu_pco_varying_binding){
+               .output_dword = 0,
+               .num_components = 2,
+               .coefficient_dword = next_coefficient,
+               .flat = PVRGPU_PCO_VARYING_POINT_COORD,
+            };
+      next_coefficient += 2 * 4;
+      varying_count += 2;
+   }
    for (unsigned i = 0; i < 34; ++i) {
       const unsigned location = i == 33 ? VARYING_SLOT_LAYER :
          i == 32 ? VARYING_SLOT_PRIMITIVE_ID : VARYING_SLOT_VAR0 + i;
       if (location >= 64 || !raster_output->count[location]) continue;
       const bool read = (fs->info.inputs_read & BITFIELD64_BIT(location)) != 0;
       if (!read) continue;
-      if (varying_slots >= PVRGPU_PCO_MAX_VARYINGS) {
+      if (varying_slots >= PVRGPU_PCO_MAX_VARYINGS ||
+          out->graphics.varying_binding_count >= PVRGPU_PCO_MAX_VARYINGS) {
          pvrgpu_pco_fail(error, error_size, "Geometry output exceeds the linked varying slot ABI");
          goto fail;
       }
@@ -10106,6 +10131,39 @@ bool pvrgpu_pco_compile_color_triangle(
    unsigned vertex_output = 4;
    unsigned fragment_coefficient = position_coefficient_count;
    /*
+    * gl_PointCoord is the rasterizer's point-sprite iterator.  As in the pvr
+    * pipeline it takes the coefficient set right after z/w; PCO iterates it
+    * without perspective (pco_rev_link_nir) and the model computes the plane
+    * from the point's centre and size.  The origin is draw state, resolved
+    * when the draw is recorded.
+    */
+   unsigned fragment_point_coord_components = 0;
+   if (fs->info.inputs_read & BITFIELD64_BIT(VARYING_SLOT_PNTC)) {
+      nir_variable *point_coord =
+         nir_find_variable_with_location(fs, nir_var_shader_in, VARYING_SLOT_PNTC);
+      if (!point_coord || point_coord->data.location_frac ||
+          glsl_get_components(point_coord->type) != 2 ||
+          varying_slots >= PVRGPU_PCO_MAX_VARYINGS) {
+         ralloc_free(compile_mem_ctx);
+         return pvrgpu_pco_fail(error, error_size,
+                                "color primitive point coordinate input is unsupported");
+      }
+      fragment_data.fs.varyings[VARYING_SLOT_PNTC] = (pco_range){
+         .start = fragment_coefficient,
+         .count = 2 * 4,
+      };
+      fragment_data.fs.uses.pntc = true;
+      out->varying_bindings[out->varying_binding_count++] =
+         (struct pvrgpu_pco_varying_binding){
+            .output_dword = 0,
+            .num_components = 2,
+            .coefficient_dword = fragment_coefficient,
+            .flat = PVRGPU_PCO_VARYING_POINT_COORD,
+         };
+      fragment_coefficient += 2 * 4;
+      fragment_point_coord_components = 2;
+   }
+   /*
     * A point draw whose shader sizes each point writes gl_PointSize; give it
     * the output immediately after position so the capsule can name one index
     * and the rasterizer can read it per vertex.
@@ -10430,7 +10488,8 @@ bool pvrgpu_pco_compile_color_triangle(
    out->varying_output_start = 4 + out->point_size_output_count;
    out->varying_output_count = varying_component_total;
    out->fragment_varying_start = position_coefficient_count;
-   out->fragment_varying_count = fragment_varying_total * 4;
+   out->fragment_varying_count =
+      (fragment_varying_total + fragment_point_coord_components) * 4;
    out->varying_flat_mask = 0;
    for (unsigned slot = 0; slot < varying_slots; ++slot) {
       if (varying_flat[slot])

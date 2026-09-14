@@ -298,7 +298,7 @@ struct Harness {
               for (unsigned channel = 0; channel < 4; ++channel) {
                 const auto byte = static_cast<std::uint8_t>(index * 13 + channel * 17 + epoch);
                 bytes[index * bpp + channel] = byte;
-                value[channel] = FloatBits(static_cast<float>(byte) / 255.0F);
+                value[channel] = FloatBits(static_cast<float>(byte) * static_cast<float>(1.0 / 255.0));
               }
             }
             expected.push_back(value);
@@ -385,7 +385,7 @@ struct Harness {
         std::array<std::uint32_t,4> value{};
         for (unsigned c=0;c<4;++c) {
           const auto b=static_cast<std::uint8_t>(level*71+layer*31+x*13+y*17+c*29+epoch);
-          bytes[offset+c]=b; value[c]=FloatBits(b/255.0F);
+          bytes[offset+c]=b; value[c]=FloatBits(b*static_cast<float>(1.0/255.0));
         }
         TextureSampleRequest q;
         q.shader_lane_index=q.request_id=requests.size();

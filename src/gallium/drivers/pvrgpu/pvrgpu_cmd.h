@@ -287,6 +287,9 @@ struct pvrgpu_draw_pco_triangles_command {
    uint32_t fragment_varying_start;
    uint32_t fragment_varying_count;
    uint32_t varying_flat_mask;
+   /* Fragment coefficient components of the rasterizer point-sprite
+    * coordinate, which has no vertex output (0 or 2). */
+   uint32_t fragment_point_coord_components;
    uint32_t fragment_output_mask[8];
 
    uint32_t viewport_scale_bits[3];

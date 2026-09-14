@@ -4,6 +4,7 @@
 // rounding rule -- never from a captured image.
 #include "texture/texture_filter.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 
+using pvrgpu::stub::ComputeTextureAnisotropicFootprint;
 using pvrgpu::stub::ComputeTextureFloatLinear;
 using pvrgpu::stub::ComputeTextureFloatNearest;
 using pvrgpu::stub::ComputeTextureLinearRepeat;
@@ -23,6 +25,7 @@ using pvrgpu::stub::SelectTextureFilterDatapath;
 using pvrgpu::stub::SelectTextureLevels;
 using pvrgpu::stub::SelectTextureBiasedLod;
 using pvrgpu::stub::SelectTextureLod;
+using pvrgpu::stub::TextureAnisotropicSampleOffset;
 using pvrgpu::stub::TextureBytesPerTexel;
 using pvrgpu::stub::TextureFastLog2;
 using pvrgpu::stub::TextureFilter;
@@ -506,10 +509,55 @@ void CheckSpatialOffsets() {
   }
 }
 
+// lp_build_rho_aniso / lp_apply_ellipse_transform / lp_build_sample_aniso.
+void CheckAnisotropicFootprint() {
+  // Axis-aligned 4:1: the dot product is zero, so the plain squares are the
+  // footprint.  Four samples along x; the LOD comes from the minor axis.
+  const auto axis = ComputeTextureAnisotropicFootprint(4.0F, 0.0F, 0.0F, 1.0F, 16);
+  Check(axis.rate == 4 && axis.along_x && axis.rho_squared == 1.0F,
+        "aniso: 4:1 along x samples four times at the minor-axis LOD");
+  const auto tall = ComputeTextureAnisotropicFootprint(1.0F, 0.0F, 0.0F, 3.0F, 16);
+  Check(tall.rate == 3 && !tall.along_x && tall.rho_squared == 1.0F,
+        "aniso: 1:3 along y samples three times");
+  // eta^2 clamps to max_anisotropy^2; rho_min^2 grows to rho_max^2 / eta^2.
+  const auto clamped = ComputeTextureAnisotropicFootprint(32.0F, 0.0F, 0.0F, 1.0F, 4);
+  Check(clamped.rate == 4 && clamped.rho_squared == 64.0F,
+        "aniso: a 32:1 footprint clamps to 4 samples at rho^2 1024/16");
+  const auto sixteen = ComputeTextureAnisotropicFootprint(32.0F, 0.0F, 0.0F, 1.0F, 16);
+  Check(sixteen.rate == 16 && sixteen.rho_squared == 4.0F,
+        "aniso: 16x clamps 1024 to 256");
+  // A degenerate quad (both lengths zero) is isotropic: NaN eta^2 -> 1.
+  const auto flat = ComputeTextureAnisotropicFootprint(0.0F, 0.0F, 0.0F, 0.0F, 16);
+  Check(flat.rate == 1 && flat.rho_squared == 0.0F, "aniso: zero footprint");
+  // A sheared footprint goes through the ellipse fit.
+  const float dsdx = 3.0F, dsdy = -1.0F, dtdx = 1.0F, dtdy = 2.0F;
+  const float a = dtdx * dtdx + dtdy * dtdy, c = dsdx * dsdx + dsdy * dsdy;
+  const float b = -2.0F * (dsdx * dtdx + dsdy * dtdy);
+  const float det = dsdx * dtdy - dsdy * dtdx, f = det * det;
+  const float p = a - c, q = a + c, t = std::sqrt(p * p + b * b);
+  const float rho_x2 = f * (t + p) / (t * (q + t)) + f * (t - p) / (t * (q + t));
+  const float rho_y2 = f * (t - p) / (t * (q - t)) + f * (t + p) / (t * (q - t));
+  const float major = std::max(rho_x2, rho_y2), minor = std::min(rho_x2, rho_y2);
+  const float eta2 = std::min(std::max(major / minor, 1.0F), 256.0F);
+  const auto sheared = ComputeTextureAnisotropicFootprint(dsdx, dsdy, dtdx, dtdy, 16);
+  Check(sheared.rate == static_cast<std::uint8_t>(std::ceil(std::sqrt(eta2))) &&
+            sheared.along_x == (rho_x2 > rho_y2) &&
+            sheared.rho_squared == major / eta2,
+        "aniso: sheared footprint uses the fitted ellipse");
+  Check(TextureAnisotropicSampleOffset(0, 4) == (0.0F + (4.0F * -0.5F + 0.5F)) * (1.0F / 5.0F) &&
+            TextureAnisotropicSampleOffset(3, 4) == (3.0F + (4.0F * -0.5F + 0.5F)) * (1.0F / 5.0F) &&
+            TextureAnisotropicSampleOffset(0, 1) == 0.0F,
+        "aniso: sample offsets (k + 0.5 - N/2) / (N + 1)");
+  bool threw = false;
+  try { (void)ComputeTextureAnisotropicFootprint(1, 0, 0, 1, 1); } catch (const std::exception &) { threw = true; }
+  Check(threw, "aniso: an isotropic sampler has no footprint");
+}
+
 } // namespace
 
 int main() {
   CheckLog2AndLod();
+  CheckAnisotropicFootprint();
   CheckLevelSelection();
   CheckDatapathSelection();
   CheckFixedPointAxes();

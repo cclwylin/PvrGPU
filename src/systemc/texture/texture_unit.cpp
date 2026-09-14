@@ -17,6 +17,7 @@
 #include "common/pipeline_state.h"
 
 #include <algorithm>
+#include <functional>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -511,7 +512,11 @@ RogueTextureImageDescriptor DecodeRogueTextureImageDescriptor(
      * whole number of texels: ASTC 5x4 over 256 texels is 52 blocks, which is
      * 832 bytes and no texel count at all.
      */
-    descriptor.row_pitch_bytes = encoded_stride;
+    // A 2D-array word1 has no stride field (it carries the layer count), so
+    // an array/cube ASTC image is tightly packed: one row of 16-byte blocks.
+    descriptor.row_pitch_bytes = array_image
+        ? ((descriptor.width + astc_footprint.width - 1U) / astc_footprint.width) * 16U
+        : encoded_stride;
   } else if (encoded_stride == descriptor.width) {
     descriptor.row_pitch_bytes =
         encoded_stride * bytes_per_texel * descriptor.sample_count;
@@ -1029,13 +1034,20 @@ static TextureImplicitLod ComputeTextureImplicitLodImpl(
   if (rho_squared < 0.0F || (nonfinite_rho && !undefined_cube_input))
     throw std::runtime_error("TextureUnit implicit derivative rho is invalid");
 
+  // An anisotropic sampler takes its LOD from the footprint's minor axis.
+  TextureAnisotropicFootprint footprint;
+  const bool anisotropic = sampler.max_anisotropy > 1 && !nonfinite_rho;
+  if (anisotropic)
+    footprint = ComputeTextureAnisotropicFootprint(dsdx, dsdy, dtdx, dtdy,
+                                                   sampler.max_anisotropy);
   // A nonfinite cube projection has no defined footprint. The reference TPU
   // chooses the sampler's minimum LOD (rho = 0), then performs the normal
   // descriptor-driven texel reads/filtering. This is a generic undefined-input
   // policy, not a claim about a physical Rogue or exact llvmpipe NaN pixels.
   const TextureLodSelection lod =
-      SelectTextureLod(nonfinite_rho ? 0.0F : rho_squared, sampler,
-                       image.mip_count, exact_lod);
+      SelectTextureLod(nonfinite_rho ? 0.0F
+                       : anisotropic ? footprint.rho_squared : rho_squared,
+                       sampler, image.mip_count, exact_lod);
   const TextureLevelSelection levels =
       SelectTextureLevels(lod, sampler, image.mip_count);
 
@@ -1045,7 +1057,7 @@ static TextureImplicitLod ComputeTextureImplicitLodImpl(
   result.dtdx = dtdx;
   result.dsdy = dsdy;
   result.dtdy = dtdy;
-  result.rho_squared = rho_squared;
+  result.rho_squared = anisotropic ? footprint.rho_squared : rho_squared;
   result.minified = lod.minified;
   result.image_filter = levels.image_filter;
   result.mip_mode = levels.mip_mode;
@@ -1053,6 +1065,10 @@ static TextureImplicitLod ComputeTextureImplicitLodImpl(
   result.level1 = levels.level1;
   result.mip_weight_u8 = levels.mip_weight_u8;
   result.mip_weight = levels.mip_weight;
+  if (sampler.max_anisotropy > 1) {
+    result.aniso_rate = footprint.rate;
+    result.aniso_along_x = footprint.along_x;
+  }
   return result;
 }
 
@@ -1094,6 +1110,8 @@ TextureImplicitLod ComputeTextureCubeImplicitLod(
     result.level1 = levels.level1;
     result.mip_weight_u8 = levels.mip_weight_u8;
     result.mip_weight = levels.mip_weight;
+    if (sampler.max_anisotropy > 1)
+      result.aniso_rate = 1;
     return result;
   }
 
@@ -1150,16 +1168,26 @@ TextureImplicitLod ComputeTextureCubeImplicitLod(
   if (!std::isfinite(rho_squared))
     throw std::runtime_error("TextureUnit cube derivative rho is invalid");
 
+  TextureAnisotropicFootprint footprint;
+  const bool anisotropic = sampler.max_anisotropy > 1;
+  if (anisotropic)
+    footprint = ComputeTextureAnisotropicFootprint(dsdx, dsdy, dtdx, dtdy,
+                                                   sampler.max_anisotropy);
+  const float lod_rho = anisotropic ? footprint.rho_squared : rho_squared;
   const auto lod =
-      SelectTextureLod(rho_squared, sampler, image.mip_count, exact_lod);
+      SelectTextureLod(lod_rho, sampler, image.mip_count, exact_lod);
   const auto levels = SelectTextureLevels(lod, sampler, image.mip_count);
   TextureImplicitLod result;
+  if (anisotropic) {
+    result.aniso_rate = footprint.rate;
+    result.aniso_along_x = footprint.along_x;
+  }
   result.lambda = lod.lambda;
   result.dsdx = dsdx;
   result.dtdx = dtdx;
   result.dsdy = dsdy;
   result.dtdy = dtdy;
-  result.rho_squared = rho_squared;
+  result.rho_squared = lod_rho;
   result.minified = lod.minified;
   result.image_filter = levels.image_filter;
   result.mip_mode = levels.mip_mode;
@@ -1564,7 +1592,7 @@ void TextureUnit::SampleRunForStage(
         DecodeRogueTextureImageDescriptor(
             image_words, resource.format == TextureFormat::kAstcLdr ||
                              resource.format == TextureFormat::kAstcLdrSrgb);
-    const RogueTextureSamplerDescriptor decoded_sampler =
+    RogueTextureSamplerDescriptor decoded_sampler =
         DecodeRogueTextureSamplerDescriptor(sampler_words);
     // RAWDATA gather returns stored depths for the shader to compare, so a
     // shadow descriptor selects no fixed-function compare on that path.
@@ -1643,7 +1671,11 @@ void TextureUnit::SampleRunForStage(
           : buffer_resource && shared[descriptor_base + 12U] != 0U
               ? "buffer word12 is not zero"
           : shared[descriptor_base + 12U] > 7  ? "word12 compare operation is invalid"
-          : shared[descriptor_base + 13U] != 0  ? "word13 is not zero"
+          // SAMPLER_META word 13: maximum anisotropy, 0 or 2..16.
+          : (shared[descriptor_base + 13U] == 1U ||
+             shared[descriptor_base + 13U] > kTextureMaximumAnisotropy ||
+             (buffer_resource && shared[descriptor_base + 13U] != 0U))
+              ? "word13 anisotropy is invalid"
           : shared[descriptor_base + 14U] != 0  ? "word14 is not zero"
           : shared[descriptor_base + 15U] != 0  ? "word15 is not zero"
           : gather_word0 != expected_gather_word0
@@ -1854,9 +1886,32 @@ void TextureUnit::SampleRunForStage(
           (!multisample_fetch && (image.sample_count != 1U || request.sample_index != 0U)))
         throw std::runtime_error("TextureUnit invalid multisample request class");
     }
+    // llvmpipe filters anisotropically only an implicit-LOD sample of a
+    // two-dimensional image: lp_build_sample_soa_code clears aniso for an
+    // explicit LOD and for 1D/3D targets, gather reads unfiltered taps, and
+    // a non-fragment stage has no derivatives.  Anisotropic sampling is
+    // always linear and always on the binary32 datapath (use_aos is off).
+    const std::uint32_t sampler_anisotropy =
+        driver_pco ? shared[descriptor_base + 13U] : 0U;
+    const bool anisotropic =
+        sampler_anisotropy > 1U && fragment_stage && !direct_fetch &&
+        !explicit_lod && !gather && !buffer_resource &&
+        resource.dimension_type != TextureDimensionType::k3D;
+    if (anisotropic) {
+      const bool raw_depth = image.format == TextureFormat::kZ32Unorm ||
+                             image.format == TextureFormat::kZ24UnormS8Uint;
+      if (image.format == TextureFormat::kRgba32Uint ||
+          image.format == TextureFormat::kRgba32Sint ||
+          (raw_depth && !shadow_compare))
+        throw std::runtime_error(
+            "TextureUnit anisotropic filtering of integer or raw depth texels "
+            "is unsupported");
+      decoded_sampler.max_anisotropy =
+          static_cast<std::uint8_t>(sampler_anisotropy);
+    }
     const bool needs_lod =
         !direct_fetch && !explicit_lod && fragment_stage &&
-        TextureImplicitLodAffectsSelection(image, decoded_sampler);
+        (anisotropic || TextureImplicitLodAffectsSelection(image, decoded_sampler));
     const auto reject_quad_identity = [&](const char *reason,
                                           std::size_t first) {
       // Diagnostic-only inspection of existing CPU-owned payloads. Do not
@@ -2430,8 +2485,12 @@ void TextureUnit::SampleRunForStage(
             astc_image ? x / astc_footprint.width : x;
         const std::uint32_t fetch_y =
             astc_image ? y / astc_footprint.height : y;
+        // Slices are whole block rows: ceil(height / footprint) for ASTC.
         const std::uint64_t layer_stride =
-            static_cast<std::uint64_t>(mip.row_pitch_bytes) * mip.height;
+            static_cast<std::uint64_t>(mip.row_pitch_bytes) *
+            (astc_image ? (mip.height + astc_footprint.height - 1U) /
+                              astc_footprint.height
+                        : mip.height);
         const std::uint64_t texel_offset = direct_fetch ? multisample_offset :
             static_cast<std::uint64_t>(mip.offset_bytes) +
             static_cast<std::uint64_t>(selected_layer) * layer_stride +
@@ -2929,15 +2988,87 @@ void TextureUnit::SampleRunForStage(
        * the fixed-point one, the fractional LOD on the float one.  Depth
        * keeps its own 24-bit datapath.
        */
-      const bool linear_filter = lod.image_filter == TextureFilter::kLinear;
+      // Anisotropic filtering ignores the min/mag filters and always
+      // samples linearly (lp_build_sample_aniso).
+      const bool linear_filter =
+          anisotropic || lod.image_filter == TextureFilter::kLinear;
       const bool two_levels = lod.mip_mode == TextureMipMode::kLinear;
       // A seamless cube bilinear crosses faces and decodes each tap, so it
       // runs on the float datapath even for 8-bit unorm; llvmpipe likewise
       // forces the SOA path for a cube.
       const TextureFilterDatapath datapath =
-          (cube_texture && linear_filter)
+          (anisotropic || (cube_texture && linear_filter))
               ? TextureFilterDatapath::kFloat32
               : SelectTextureFilterDatapath(image.format, decoded_sampler);
+      if (anisotropic && (lod.aniso_rate == 0U ||
+                          lod.aniso_rate > kTextureMaximumAnisotropy ||
+                          request.quad_lane > 3U || index < request.quad_lane))
+        throw std::runtime_error("TextureUnit anisotropic footprint is invalid");
+      const std::uint32_t aniso_rate = anisotropic ? lod.aniso_rate : 1U;
+      // The major-axis derivative of this lane's own coordinate:
+      // lp_build_ddx/ddy difference the lane with its row/column neighbour.
+      float aniso_ds = 0.0F;
+      float aniso_dt = 0.0F;
+      if (anisotropic) {
+        const std::size_t first = index - request.quad_lane;
+        const auto lane_plane = [&](std::size_t lane) -> std::array<float, 2> {
+          const TextureSampleRequest &neighbour = requests[first + lane];
+          if (neighbour.quad_id != request.quad_id ||
+              neighbour.sample_id != request.sample_id ||
+              neighbour.quad_lane != lane)
+            throw std::runtime_error(
+                "TextureUnit anisotropic sample lost 2x2 quad identity");
+          if (cube_texture) {
+            const CubeProjection projection = ProjectCubeDirection(
+                BitsFloat(neighbour.coordinates[0]),
+                BitsFloat(neighbour.coordinates[1]),
+                BitsFloat(neighbour.coordinates[2]));
+            return {projection.u, projection.v};
+          }
+          return {BitsFloat(neighbour.coordinates[0]),
+                  BitsFloat(neighbour.coordinates[1])};
+        };
+        const std::array<std::array<float, 2>, 4> quad = {
+            lane_plane(0), lane_plane(1), lane_plane(2), lane_plane(3)};
+        const bool top = request.quad_lane < 2U;
+        const bool left = (request.quad_lane & 1U) == 0U;
+        for (std::size_t axis = 0; axis < 2; ++axis) {
+          const float derivative = lod.aniso_along_x
+              ? (top ? quad[1][axis] - quad[0][axis]
+                     : quad[3][axis] - quad[2][axis])
+              : (left ? quad[2][axis] - quad[0][axis]
+                      : quad[3][axis] - quad[1][axis]);
+          (axis == 0 ? aniso_ds : aniso_dt) = derivative;
+        }
+      }
+      // Runs one filtered sample per anisotropic tap position and averages
+      // them: the running sum in tap order, times 1/rate.
+      const auto anisotropic_average =
+          [&](const std::function<std::array<float, 4>(std::uint64_t)> &sample,
+              std::uint64_t first_tap) {
+        const float centre_s = plane_s;
+        const float centre_t = plane_t;
+        std::array<float, 4> sum{};
+        for (std::uint32_t k = 0; k < aniso_rate; ++k) {
+          const float offset = TextureAnisotropicSampleOffset(k, aniso_rate);
+          plane_s = centre_s + offset * aniso_ds;
+          plane_t = centre_t + offset * aniso_dt;
+          if (cube_texture) {
+            plane_s = std::clamp(plane_s, 0.0F, 1.0F);
+            plane_t = std::clamp(plane_t, 0.0F, 1.0F);
+          }
+          const std::array<float, 4> tap =
+              sample(first_tap + static_cast<std::uint64_t>(k) * 8U);
+          for (std::size_t component = 0; component < 4; ++component)
+            sum[component] = sum[component] + tap[component];
+        }
+        plane_s = centre_s;
+        plane_t = centre_t;
+        const float reciprocal = 1.0F / static_cast<float>(aniso_rate);
+        for (auto &component : sum)
+          component = component * reciprocal;
+        return sum;
+      };
       if (request.request_id >
           (std::numeric_limits<std::uint64_t>::max() -
            (kTextureSampleTapRequestStride - 1U)) /
@@ -2953,7 +3084,7 @@ void TextureUnit::SampleRunForStage(
       const bool volume_linear = volume_texture && linear_filter;
       expected_texel_fetches +=
           (linear_filter ? 4U : 1U) * (two_levels ? 2U : 1U) *
-          (volume_linear ? 2U : 1U);
+          (volume_linear ? 2U : 1U) * aniso_rate;
       // The third coordinate and its own depth-axis wrap (addrmode_w).
       const float volume_r =
           volume_texture ? BitsFloat(request.coordinates[2]) : 0.0F;
@@ -3062,13 +3193,16 @@ void TextureUnit::SampleRunForStage(
               compare_texel(mip, x.upper, y.upper, rid + 3U), x.weight);
           return LerpTextureFloat(lower, upper, y.weight);
         };
-        float pcf = shadow_plane(level0, tap_request_base);
-        if (two_levels) {
-          pcf = LerpTextureFloat(
-              pcf, shadow_plane(level1, tap_request_base + 4U),
-              lod.mip_weight);
-        }
-        filtered = {pcf, 0.0F, 0.0F, 1.0F};
+        const auto shadow_sample = [&](std::uint64_t rid) {
+          float pcf = shadow_plane(level0, rid);
+          if (two_levels) {
+            pcf = LerpTextureFloat(pcf, shadow_plane(level1, rid + 4U),
+                                   lod.mip_weight);
+          }
+          return std::array<float, 4>{pcf, 0.0F, 0.0F, 1.0F};
+        };
+        filtered = anisotropic ? anisotropic_average(shadow_sample, tap_request_base)
+                               : shadow_sample(tap_request_base);
       } else if (integer_texture) {
         if (linear_filter || two_levels)
           throw std::runtime_error("TextureUnit cannot linearly filter integer texels");
@@ -3171,8 +3305,11 @@ void TextureUnit::SampleRunForStage(
                 texel[component], upper[component], lod.mip_weight_u8);
           }
         }
+        // lp_build_rgba8_to_fi32_soa: the 8-bit result times binary32 1/255.
+        const float unorm8_scale = static_cast<float>(1.0 / 255.0);
         for (std::size_t component = 0; component < 4; ++component)
-          filtered[component] = static_cast<float>(texel[component]) / 255.0F;
+          filtered[component] =
+              static_cast<float>(texel[component]) * unorm8_scale;
       } else {
         const auto float_plane = [&](const TextureMipLevel &mip,
                                      std::uint64_t rid) -> std::array<float, 4> {
@@ -3264,16 +3401,21 @@ void TextureUnit::SampleRunForStage(
           selected_layer = ComputeTextureFloatNearest(volume_r, d, wrap_r, request.spatial_offsets[2]);
           return float_plane(mip, rid);
         };
-        filtered = float_level(level0, lod.level0, tap_request_base);
-        if (two_levels) {
-          const std::array<float, 4> upper =
-              float_level(level1, lod.level1,
-                          tap_request_base + (volume_texture ? 8U : 4U));
-          for (std::size_t component = 0; component < 4; ++component) {
-            filtered[component] = LerpTextureFloat(
-                filtered[component], upper[component], lod.mip_weight);
+        const auto float_sample = [&](std::uint64_t rid) {
+          std::array<float, 4> result = float_level(level0, lod.level0, rid);
+          if (two_levels) {
+            const std::array<float, 4> upper =
+                float_level(level1, lod.level1,
+                            rid + (volume_texture ? 8U : 4U));
+            for (std::size_t component = 0; component < 4; ++component) {
+              result[component] = LerpTextureFloat(
+                  result[component], upper[component], lod.mip_weight);
+            }
           }
-        }
+          return result;
+        };
+        filtered = anisotropic ? anisotropic_average(float_sample, tap_request_base)
+                               : float_sample(tap_request_base);
       }
       if (image.format == TextureFormat::kRgbx8Unorm)
         filtered[3] = 1.0F;

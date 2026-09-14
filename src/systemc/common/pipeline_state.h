@@ -87,6 +87,29 @@ struct ColorAttachmentCodec {
   std::array<std::uint8_t, 4> component_bits{};
 };
 
+// Bounded geometry output (docs/USC_TASK_STREAM_PHASE1.md). A draw whose
+// geometry stream exceeds kGeometryStreamCapacityPrimitives is rendered as a
+// sequence of partial renders on the same PipelineTxn: each completed render's
+// colour/depth becomes the next one's LOAD. The reporter only ever sees the
+// last render, with every earlier render's work folded back in.
+struct PartialRenderState {
+  std::uint32_t batch_index = 0;
+  std::uint8_t active = 0;
+  std::uint8_t last = 0;
+  std::uint8_t original_color_load_enable = 0;
+  std::uint8_t original_depth_load_enable = 0;
+  // Counters and executed fragment statistics of every completed render.
+  PoolHandle counters;
+  PoolHandle fragment_executions;
+  // The draw's own LOAD evidence; batch 0 renders with it, later batches
+  // with the chained attachments, and the reporter sees it restored.
+  PoolHandle original_color_load;
+  PoolHandle original_depth_load;
+  PoolHandle original_attachment_clears;
+  std::uint64_t original_color_load_bytes = 0;
+  std::uint64_t original_depth_load_bytes = 0;
+};
+
 struct PipelineState {
   std::uint32_t width = 0;
   std::uint32_t height = 0;
@@ -360,6 +383,7 @@ struct PipelineState {
   std::uint16_t clip_distance_register = 0;
   std::uint64_t vertex_groups = 0;
   std::uint64_t fragment_groups = 0;
+  PartialRenderState partial_render;
   CounterTxn counters;
 };
 

@@ -803,6 +803,9 @@ private:
                                                        ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> geometry_to_clip{"geometry_to_clip", ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> geometry_to_stream_output{"geometry_to_stream_output", ModelFifoDepth()};
+  // Partial render completion back to the geometry stream (one render at a
+  // time is in flight, so depth one).
+  sc_core::sc_fifo<PipelineTxn> geometry_partial_render_done{"geometry_partial_render_done", 1};
   sc_core::sc_fifo<PipelineTxn> control_to_tessellator{"control_to_tessellator", ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> tessellator_to_evaluation{"tessellator_to_evaluation", ModelFifoDepth()};
   sc_core::sc_fifo<PipelineTxn> evaluation_to_geometry{"evaluation_to_geometry", ModelFifoDepth()};
@@ -1018,6 +1021,8 @@ ModelSession::ModelSession(MemoryMode memory_mode, bool cache_bypass,
   pbe.output(pbe_to_pbe_write_back);
   pbe_write_back.input(pbe_to_pbe_write_back);
   pbe_write_back.completion(dram_to_reporter);
+  pbe_write_back.partial_render_return(geometry_partial_render_done);
+  geometry_shader.partial_render_done(geometry_partial_render_done);
   reporter.input(dram_to_reporter);
 }
 
