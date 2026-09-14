@@ -127,6 +127,11 @@ struct PipelineState {
   std::uint32_t fragment_image_write_mask = 0;
   std::uint32_t fragment_images_complete = 0;
   std::uint64_t fragment_image_atomics = 0;
+  // API-v42 read-only vertex-stage image views.
+  PoolHandle vertex_image_resources;
+  std::uint32_t vertex_image_descriptor_start = 0;
+  std::uint32_t vertex_image_descriptor_count = 0;
+  std::uint32_t vertex_image_read_mask = 0;
   /* API-v38 alias-preserving graphics storage shared by VS/FS/GS/TCS/TES.
    * One resource table owns whole backing snapshots; each stage gets an exact
    * bounded view table and descriptor ABI. */

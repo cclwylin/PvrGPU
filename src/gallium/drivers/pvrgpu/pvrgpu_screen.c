@@ -20,6 +20,10 @@ static const nir_shader_compiler_options pvrgpu_nir_options = {
     * halt, which would incorrectly remove these lanes from their quads. */
    .discard_is_demote = true,
    .max_unroll_iterations = 32,
+   /* TCS per-vertex/patch output indexing is native address arithmetic in
+    * pvrgpu_pco.c. Keeping gl_out[gl_InvocationID] indirect (as llvmpipe
+    * does) also keeps gl_InvocationID in the program resource list. */
+   .support_indirect_outputs = BITFIELD_BIT(MESA_SHADER_TESS_CTRL),
 };
 
 /*
@@ -204,6 +208,13 @@ pvrgpu_init_screen_caps(struct pipe_screen *screen)
     * 565 surface could not be asked for with a 24/8 depth-stencil.
     */
    caps->mixed_color_depth_bits = true;
+   /* The capsule carries the rasterizer line width and point size, and the
+    * model widens both into screen-space geometry; advertise llvmpipe's
+    * ranges so GL_ALIASED_LINE_WIDTH_RANGE/POINT_SIZE_RANGE agree with it. */
+   caps->max_line_width = 255.0f;
+   caps->max_line_width_aa = 255.0f;
+   caps->max_point_size = 256.0f;
+   caps->max_point_size_aa = 256.0f;
    caps->max_texture_2d_size = 4096;
    caps->max_texture_3d_levels = 9;
    caps->max_texture_array_layers = 256;
@@ -440,6 +451,10 @@ pvrgpu_is_sampler_only_format(enum pipe_format format)
    switch (format) {
    /* EXT_texture_shared_exponent */
    case PIPE_FORMAT_R9G9B9E5_FLOAT:
+   /* EXT_texture_sRGB_R8 / EXT_texture_sRGB_RG8: sampled through the
+    * canonical float snapshot, which decodes sRGB to linear per texel. */
+   case PIPE_FORMAT_R8_SRGB:
+   case PIPE_FORMAT_R8G8_SRGB:
    /* ARB_stencil_texturing (ES 3.1) */
    case PIPE_FORMAT_X24S8_UINT:
    case PIPE_FORMAT_S8X24_UINT:

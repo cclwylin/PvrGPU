@@ -1786,7 +1786,7 @@ void Submitter::RunJob() {
         // LOAD path used by attachments produced by an earlier draw.
         for (unsigned target = 0; target < state.render_target_count; ++target) {
           const auto bytes = color_bytes(target);
-          if (bytes == 0 || bytes > kDriverPcoSequenceAttachmentStride)
+          if (bytes == 0 || bytes > SequenceColorAttachmentByteLimit(target))
             throw std::runtime_error(
                 "Submitter initial color attachment byte size is invalid");
           memory_->HostWrite(color_address(target),
@@ -1804,7 +1804,7 @@ void Submitter::RunJob() {
         std::vector<std::uint8_t> all_color_load(static_cast<std::size_t>(all_color_bytes));
         for (unsigned target = 0; target < state.render_target_count; ++target) {
           const auto bytes = color_bytes(target);
-          if (bytes == 0 || bytes > kDriverPcoSequenceAttachmentStride ||
+          if (bytes == 0 || bytes > SequenceColorAttachmentByteLimit(target) ||
               !memory_->backing().Contains(color_address(target), static_cast<std::size_t>(bytes)))
             throw std::runtime_error("Submitter aliased color attachment is absent from DRAM");
           MemoryReadResult color_load = memory_->Readback(color_address(target),
@@ -1829,7 +1829,7 @@ void Submitter::RunJob() {
             static_cast<std::uint64_t>(state.width) * state.height *
             depth_bytes_per_pixel * state.raster_state.sample_count * state.attachment_layers;
         if (depth_bytes == 0 ||
-            depth_bytes > kDriverPcoSequenceAttachmentStride ||
+            depth_bytes > kDriverPcoSequenceAttachmentRegionBytes ||
             depth_bytes > std::numeric_limits<std::size_t>::max()) {
           throw std::runtime_error(
               "Submitter depth attachment byte size is invalid");
@@ -1882,7 +1882,7 @@ void Submitter::RunJob() {
           depth_bytes_per_pixel * state.raster_state.sample_count *
           state.attachment_layers;
       if (depth_bytes == 0 ||
-          depth_bytes > kDriverPcoSequenceAttachmentStride ||
+          depth_bytes > kDriverPcoSequenceAttachmentRegionBytes ||
           depth_bytes > std::numeric_limits<std::size_t>::max()) {
         throw std::runtime_error(
             "Submitter textured depth attachment byte size is invalid");
@@ -1903,7 +1903,7 @@ void Submitter::RunJob() {
           depth_bytes_per_pixel * state.raster_state.sample_count *
           state.attachment_layers;
       if (depth_bytes == 0 ||
-          depth_bytes > kDriverPcoSequenceAttachmentStride ||
+          depth_bytes > kDriverPcoSequenceAttachmentRegionBytes ||
           depth_bytes > std::numeric_limits<std::size_t>::max()) {
         throw std::runtime_error(
             "Submitter PCO depth attachment byte size is invalid");
@@ -2708,6 +2708,52 @@ void Submitter::RunJob() {
            !command.tessellation.buffer_bindings.empty()))
         throw std::runtime_error(
             "Submitter graphics and legacy tessellation buffers overlap");
+      state.vertex_image_descriptor_start = command.vertex_image_descriptor_start;
+      state.vertex_image_descriptor_count = command.vertex_image_descriptor_count;
+      state.vertex_image_read_mask = command.vertex_image_read_mask;
+      if (!command.vertex_images.empty()) {
+        if (!driver_pco_sequence_command || !memory_)
+          throw std::runtime_error("Submitter vertex images require sequence GPU memory");
+        std::vector<ShaderImageResource> resources;
+        for (const auto &image : command.vertex_images) {
+          ShaderImageResource resource;
+          resource.resource_token = image.resource_token;
+          resource.bytes = image.bytes.size(); resource.offset = image.offset;
+          resource.image_slot = image.image_slot; resource.format = image.format;
+          resource.access = image.access; resource.width = image.width;
+          resource.height = image.height; resource.depth = image.depth;
+          resource.row_stride = image.row_stride; resource.layer_stride = image.layer_stride;
+          resource.texel_bytes = image.texel_bytes;
+          const auto buffer_alias = std::find_if(
+              sequence_graphics_buffer_storage.begin(),
+              sequence_graphics_buffer_storage.end(), [&](const auto &prior) {
+                return prior.first->resource_token == image.resource_token;
+              });
+          if (buffer_alias != sequence_graphics_buffer_storage.end())
+            throw std::runtime_error(
+                "Submitter vertex image aliases a graphics buffer");
+          const auto alias = std::find_if(sequence_image_storage.begin(), sequence_image_storage.end(),
+              [&](const auto &prior) { return prior.first->resource_token == image.resource_token; });
+          if (alias != sequence_image_storage.end()) {
+            if (alias->first->bytes != image.bytes)
+              throw std::runtime_error("Submitter image resource changed without a sequence boundary");
+            resource.gpu_address = alias->second;
+          } else {
+            if (sequence_image_storage.size() >= kDriverSequenceAddressSlots * kMaximumFragmentImages)
+              throw std::runtime_error("Submitter shader image address slots exhausted");
+            resource.gpu_address = kShaderImageGpuAddressBase +
+                sequence_image_storage.size() * kMaximumFragmentImageBytes;
+            memory_->HostWrite(resource.gpu_address, image.bytes.data(), image.bytes.size());
+            sequence_image_storage.emplace_back(&image, resource.gpu_address);
+          }
+          const auto address = resource.gpu_address + resource.offset;
+          const auto word = command.vertex_image_descriptor_start + image.image_slot * 8U;
+          vertex_shared_words.at(word) = static_cast<std::uint32_t>(address);
+          vertex_shared_words.at(word + 1) = static_cast<std::uint32_t>(address >> 32);
+          resources.push_back(resource);
+        }
+        state.vertex_image_resources = StoreNewArray(pool_, resources);
+      }
       state.fragment_image_descriptor_start = command.fragment_image_descriptor_start;
       state.fragment_image_descriptor_count = command.fragment_image_descriptor_count;
       state.fragment_image_read_mask = command.fragment_image_read_mask;
@@ -3254,14 +3300,17 @@ void Submitter::RunJob() {
           sampler.mip_filter = texture.mip_filter == 0
                                    ? TextureFilter::kNearest
                                    : TextureFilter::kLinear;
-          // Capsule address modes: 0 clamp to edge, 1 repeat, 2 mirrored.
+          // Capsule address modes: 0 clamp to edge, 1 repeat, 2 mirrored,
+          // 3 clamp to border.
           const auto capsule_wrap = [](std::uint32_t value) {
             return value == 1U   ? TextureWrapMode::kRepeat
                    : value == 2U ? TextureWrapMode::kMirroredRepeat
+                   : value == 3U ? TextureWrapMode::kClampToBorder
                                  : TextureWrapMode::kClampToEdge;
           };
           sampler.wrap_u = capsule_wrap(texture.wrap_u);
           sampler.wrap_v = capsule_wrap(texture.wrap_v);
+          sampler.border_texel = texture.border_texel;
           sampler.min_lod_u4_6 =
               static_cast<std::uint16_t>(texture.min_lod_u4_6);
           sampler.max_lod_u4_6 =

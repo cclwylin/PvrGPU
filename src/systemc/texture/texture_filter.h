@@ -186,8 +186,12 @@ std::uint32_t TextureLevelTaps(const TextureLevelSelection &levels);
 TextureFilterDatapath SelectTextureFilterDatapath(
     TextureFormat format, const RogueTextureSamplerDescriptor &sampler);
 
-// Integer tap addressing shared by both datapaths.  Clamp-to-border is not
-// supported and throws.
+// A clamp-to-border tap outside the image.  The TPU reads no memory for it
+// and substitutes the binding's border texel (lp_build_sample_texel_soa).
+inline constexpr std::uint32_t kTextureBorderTexel = 0xffffffffU;
+
+// Integer tap addressing shared by both datapaths.  Clamp-to-border returns
+// kTextureBorderTexel for an index outside [0, extent).
 std::uint32_t WrapTexelIndex(std::int64_t integer, std::uint32_t extent,
                              TextureWrapMode wrap);
 
@@ -230,6 +234,15 @@ TextureFloatAxis ComputeTextureFloatLinear(float coordinate,
                                            std::uint32_t extent,
                                            TextureWrapMode wrap,
                                            std::int32_t texel_offset = 0);
+
+// lp_build_sample_wrap_linear with is_gather: the two integer taps of one
+// gather axis. Repeat and clamp-to-border share the filtered taps; clamp to
+// edge truncates coord -/+ 0.5 independently and mirrored repeat reflects the
+// two floored taps by ones' complement, exactly as llvmpipe does.
+std::array<std::uint32_t, 2> ComputeTextureGatherAxis(float coordinate,
+                                                      std::uint32_t extent,
+                                                      TextureWrapMode wrap,
+                                                      std::int32_t texel_offset = 0);
 
 // lp_build_lerp_simple on a float type: first + weight * (second - first).
 float LerpTextureFloat(float first, float second, float weight);

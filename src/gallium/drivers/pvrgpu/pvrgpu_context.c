@@ -22,6 +22,7 @@
 #include "pipe/p_defines.h"
 #include "nir/nir.h"
 #include "util/format/u_format.h"
+#include "util/format_rgb9e5.h"
 #include "util/u_debug.h"
 #include "util/u_blitter.h"
 #include "util/u_framebuffer.h"
@@ -9927,9 +9928,11 @@ pvrgpu_sequence_texture_wrap(unsigned gallium_wrap)
       return PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_EDGE;
    case PIPE_TEX_WRAP_MIRROR_REPEAT:
       return PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT;
+   case PIPE_TEX_WRAP_CLAMP_TO_BORDER:
+      return PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER;
    default:
       /* Out of range for the capsule enum, so the caller fails closed. */
-      return PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_REPEAT + 1U;
+      return PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER + 1U;
    }
 }
 
@@ -9951,6 +9954,8 @@ pvrgpu_sequence_texture_addrmode(uint32_t capsule_wrap)
       return 0U;
    case PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT:
       return 1U;
+   case PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER:
+      return 4U;
    default:
       return 2U;
    }
@@ -9988,12 +9993,16 @@ pvrgpu_set_texture_descriptor_lod_window(uint32_t descriptor[20],
  * (X,Y,Z,1) swizzle so alpha reads one; that is exactly RGBX8, which the
  * descriptor and texture unit already sample, so treat it as such rather than
  * declining the (otherwise unexpected) alpha-one swizzle on an RGBA8 image.
+ * A swizzle that still reads the stored alpha through another channel (e.g.
+ * GL_TEXTURE_SWIZZLE (BLUE, ALPHA, ZERO, ONE)) keeps RGBA8.
  */
 static enum pipe_format
 pvrgpu_effective_sampled_format(const struct pipe_sampler_view *view)
 {
    if (view && view->format == PIPE_FORMAT_R8G8B8A8_UNORM &&
-       view->swizzle_a == PIPE_SWIZZLE_1)
+       view->swizzle_a == PIPE_SWIZZLE_1 &&
+       view->swizzle_r != PIPE_SWIZZLE_W && view->swizzle_g != PIPE_SWIZZLE_W &&
+       view->swizzle_b != PIPE_SWIZZLE_W)
       return PIPE_FORMAT_R8G8B8X8_UNORM;
    return view ? view->format : PIPE_FORMAT_NONE;
 }
@@ -10193,6 +10202,104 @@ pvrgpu_capture_generic_buffer_texture(
 }
 
 static bool
+pvrgpu_gather_wrap_supported(unsigned wrap)
+{
+   return wrap == PIPE_TEX_WRAP_REPEAT ||
+          wrap == PIPE_TEX_WRAP_CLAMP_TO_EDGE ||
+          wrap == PIPE_TEX_WRAP_MIRROR_REPEAT ||
+          wrap == PIPE_TEX_WRAP_CLAMP_TO_BORDER;
+}
+
+/*
+ * The texel a clamp-to-border tap reads, in canonical storage words.
+ * llvmpipe clamps the (state-tracker translated) border colour once, by the
+ * view format's first stored channel (lp_build_clamp_border_color), replaces
+ * only the channels the format stores -- just the first for depth/stencil --
+ * and keeps the unpacked defaults for the rest (lp_build_sample_texel_soa).
+ * The view swizzle then applies exactly as it does to the canonical texels.
+ */
+static void
+pvrgpu_sampler_border_texel(const struct pipe_sampler_view *view,
+                            const struct pipe_sampler_state *state,
+                            bool integer_view, uint32_t out[4])
+{
+   const enum pipe_format format = view->format;
+   const struct util_format_description *desc = util_format_description(format);
+   double min_clamp = -INFINITY, max_clamp = INFINITY;
+   double channel_max[4] = { INFINITY, INFINITY, INFINITY, INFINITY };
+   bool signed_integer = false;
+   if (desc->layout == UTIL_FORMAT_LAYOUT_PLAIN) {
+      const int chan = util_format_is_depth_and_stencil(format) ?
+         desc->swizzle[0] : util_format_get_first_non_void_channel(format);
+      if (chan >= 0 && chan <= PIPE_SWIZZLE_W) {
+         const struct util_format_channel_description *c = &desc->channel[chan];
+         if (c->type == UTIL_FORMAT_TYPE_SIGNED) {
+            signed_integer = c->pure_integer;
+            if (c->normalized) {
+               min_clamp = -1.0;
+               max_clamp = 1.0;
+            } else if (c->pure_integer && c->size < 32) {
+               min_clamp = -(double)(1u << (c->size - 1));
+               max_clamp = (double)((1u << (c->size - 1)) - 1u);
+            }
+         } else if (c->type == UTIL_FORMAT_TYPE_UNSIGNED) {
+            if (c->normalized) {
+               min_clamp = 0.0;
+               max_clamp = 1.0;
+            } else if (c->pure_integer && c->size < 32) {
+               max_clamp = (double)((1u << c->size) - 1u);
+            }
+         }
+      }
+      if (format == PIPE_FORMAT_R10G10B10A2_UINT ||
+          format == PIPE_FORMAT_B10G10R10A2_UINT) {
+         channel_max[0] = channel_max[1] = channel_max[2] = 1023.0;
+         channel_max[3] = 3.0;
+      }
+   } else if (format == PIPE_FORMAT_R11G11B10_FLOAT) {
+      min_clamp = 0.0;
+   } else if (format == PIPE_FORMAT_R9G9B9E5_FLOAT) {
+      min_clamp = 0.0;
+      max_clamp = MAX_RGB9E5;
+   }
+
+   const bool stencil_format = util_format_has_stencil(desc);
+   uint32_t texel[4];
+   for (unsigned chan = 0; chan < 4; ++chan) {
+      const bool stored = stencil_format ? chan == 0 :
+         desc->swizzle[chan] <= PIPE_SWIZZLE_W;
+      if (!stored) {
+         texel[chan] = chan < 3 ? 0u : integer_view ? 1u : UINT32_C(0x3f800000);
+         continue;
+      }
+      if (integer_view) {
+         if (signed_integer) {
+            double v = MAX2(state->border_color.i[chan], min_clamp);
+            v = MIN2(MIN2(v, max_clamp), channel_max[chan]);
+            texel[chan] = (uint32_t)(int32_t)v;
+         } else {
+            double v = MIN2(MIN2((double)state->border_color.ui[chan], max_clamp),
+                            channel_max[chan]);
+            texel[chan] = (uint32_t)v;
+         }
+      } else {
+         float v = state->border_color.f[chan];
+         if (min_clamp > -INFINITY && !(v >= (float)min_clamp))
+            v = (float)min_clamp;
+         if (max_clamp < INFINITY && !(v <= (float)max_clamp))
+            v = (float)max_clamp;
+         memcpy(&texel[chan], &v, sizeof(v));
+      }
+   }
+   const unsigned swizzle[4] = { view->swizzle_r, view->swizzle_g,
+                                 view->swizzle_b, view->swizzle_a };
+   for (unsigned channel = 0; channel < 4; ++channel)
+      out[channel] = swizzle[channel] < 4 ? texel[swizzle[channel]] :
+         swizzle[channel] == PIPE_SWIZZLE_1 ?
+            (integer_view ? 1u : UINT32_C(0x3f800000)) : 0u;
+}
+
+static bool
 pvrgpu_shadow_gather_sampler_supported(const struct pvrgpu_context *ctx,
                                       mesa_shader_stage stage, unsigned slot,
                                       const struct pipe_sampler_view *view,
@@ -10206,19 +10313,20 @@ pvrgpu_shadow_gather_sampler_supported(const struct pvrgpu_context *ctx,
    return ctx && stage == MESA_SHADER_FRAGMENT && ctx->fs &&
       view && view->texture && sampler &&
       (view->target == PIPE_TEXTURE_2D ||
-       view->target == PIPE_TEXTURE_2D_ARRAY) &&
+       view->target == PIPE_TEXTURE_2D_ARRAY ||
+       view->target == PIPE_TEXTURE_CUBE) &&
       view->texture->nr_samples == 0 &&
       view->texture->nr_storage_samples <= 1 &&
-      view->u.tex.first_level == view->u.tex.last_level &&
       util_format_has_depth(util_format_description(view->format)) &&
       view->swizzle_r == PIPE_SWIZZLE_X &&
       sampler->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE &&
       sampler->compare_func <= PIPE_FUNC_ALWAYS &&
       sampler->min_img_filter <= PIPE_TEX_FILTER_LINEAR &&
       sampler->mag_img_filter <= PIPE_TEX_FILTER_LINEAR &&
-      sampler->min_mip_filter <= PIPE_TEX_MIPFILTER_NONE &&
-      sampler->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_EDGE &&
-      sampler->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_EDGE &&
+      /* Gather reads the view's base level only, so neither the mip filter
+       * nor further exposed levels select a tap. */
+      pvrgpu_gather_wrap_supported(sampler->wrap_s) &&
+      pvrgpu_gather_wrap_supported(sampler->wrap_t) &&
       !sampler->unnormalized_coords && sampler->max_anisotropy <= 1 &&
       pvrgpu_pco_fragment_shadow_gather_only(ctx->fs->nir, slot,
          view->target == PIPE_TEXTURE_2D_ARRAY);
@@ -10340,8 +10448,14 @@ pvrgpu_capture_generic_sequence_texture(
       *reason = "cube_array_layout_or_sampler";
       return false;
    }
-   const bool integer_view = util_format_is_pure_integer(format) &&
-                             !util_format_is_depth_or_stencil(format);
+   /* A stencil-only view of a combined depth/stencil image (X24S8, X32_S8X24,
+    * S8) samples the stencil index as an unsigned integer in red. */
+   const bool stencil_view =
+      util_format_has_stencil(util_format_description(format)) &&
+      !util_format_has_depth(util_format_description(format));
+   const bool integer_view = stencil_view ||
+                             (util_format_is_pure_integer(format) &&
+                              !util_format_is_depth_or_stencil(format));
    /*
     * A combined depth/stencil image sampled through a 2D view is depth-as-
     * texture: the app renders depth and reads it back.  Its texel is the same
@@ -10388,11 +10502,20 @@ pvrgpu_capture_generic_sequence_texture(
       view->swizzle_g == expected_swizzle_g &&
       view->swizzle_b == expected_swizzle_b &&
       view->swizzle_a == expected_swizzle_a;
+   /* A clamp-to-border tap reads one whole canonical texel, so a border
+    * sampler always takes the 32-bit-per-channel storage below. The state
+    * tracker already rewrote seamless cube wraps to clamp-to-edge. */
+   const struct pipe_sampler_state *border_state = &sampler->state;
+   const bool border_wrap = !multisample_view && !cube_view && !cube_array_view &&
+      (border_state->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
+       border_state->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
+       (volume_view && border_state->wrap_r == PIPE_TEX_WRAP_CLAMP_TO_BORDER));
    /* Depth queries and non-D24S8 depth samples use the exact unpacked float
     * datapath, including Z16 and packed depth-only formats. No depth compare
     * is performed while taking this immutable resource snapshot. */
    const bool float_depth_view = util_format_has_depth(format_desc) &&
-      (format != PIPE_FORMAT_Z24_UNORM_S8_UINT || cube_array_depth_view);
+      (format != PIPE_FORMAT_Z24_UNORM_S8_UINT || cube_array_depth_view ||
+       border_wrap);
    const bool canonical_float_view = float_depth_view || (!integer_view &&
       format_desc->colorspace != UTIL_FORMAT_COLORSPACE_ZS &&
       format_desc->block.width == 1 && format_desc->block.height == 1 &&
@@ -10401,8 +10524,12 @@ pvrgpu_capture_generic_sequence_texture(
        format != PIPE_FORMAT_B8G8R8A8_UNORM &&
        format != PIPE_FORMAT_R8G8B8X8_UNORM &&
        format != PIPE_FORMAT_R8G8B8A8_SRGB) ||
-       (!astc_view && !descriptor_native_swizzle)));
+       (!astc_view && (!descriptor_native_swizzle || border_wrap))));
    const bool canonical_view = integer_view || canonical_float_view;
+   if (border_wrap && !canonical_view) {
+      *reason = "border_storage";
+      return false;
+   }
    const enum pipe_format storage_format = integer_view ?
       (util_format_is_pure_uint(format) ? PIPE_FORMAT_R32G32B32A32_UINT :
                                          PIPE_FORMAT_R32G32B32A32_SINT) :
@@ -10577,6 +10704,11 @@ pvrgpu_capture_generic_sequence_texture(
                         row + (uintptr_t)x * native_bpp, 1);
                      memcpy(&rgba[0], &depth, sizeof(depth));
                      rgba[3] = UINT32_C(0x3f800000);
+                  } else if (stencil_view) {
+                     uint8_t stencil = 0;
+                     util_format_unpack_s_8uint(format, &stencil,
+                        row + (uintptr_t)x * native_bpp, 1);
+                     rgba[0] = stencil;
                   } else {
                      util_format_unpack_rgba(format, rgba,
                         row + (uintptr_t)x * native_bpp, 1);
@@ -10633,9 +10765,20 @@ pvrgpu_capture_generic_sequence_texture(
    // The depth-axis wrap only bites on a 3D image; a 2D or array sample never
    // reads a third coordinate, so its r wrap rides along unused.
    destination->wrap_w = pvrgpu_sequence_texture_wrap(state->wrap_r);
-   if (destination->wrap_u > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT ||
-       destination->wrap_v > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT ||
-       destination->wrap_w > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT) {
+   /* Only the axes an image addresses may select the border. */
+   if (!volume_view &&
+       destination->wrap_w == PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER)
+      destination->wrap_w = PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_EDGE;
+   if (border_wrap)
+      pvrgpu_sampler_border_texel(view, state, integer_view,
+                                  destination->border_texel);
+   if (destination->wrap_u > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER ||
+       destination->wrap_v > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER ||
+       destination->wrap_w > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER ||
+       (!border_wrap && !multisample_view &&
+        (destination->wrap_u == PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER ||
+         destination->wrap_v == PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER ||
+         destination->wrap_w == PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER))) {
       *reason = "wrap_mode";
       free(bytes);
       return false;
@@ -10739,6 +10882,7 @@ struct pvrgpu_array_primitive_draw {
    /* Snapshot utility only captures BO bytes/refs; execution is native FS USC. */
    struct pvrgpu_compute_snapshot fragment_image_snapshot;
    struct pvrgpu_systemc_shader_image fragment_images[PVRGPU_SYSTEMC_MAX_SHADER_IMAGES];
+   struct pvrgpu_systemc_shader_image vertex_images[PVRGPU_SYSTEMC_MAX_SHADER_IMAGES];
    /* All graphics stages share one backing snapshot. Aliases therefore stay
     * coherent across VS/FS/GS/TCS/TES and are copied back exactly once. */
    struct pvrgpu_compute_snapshot graphics_buffer_snapshot;
@@ -10903,43 +11047,55 @@ pvrgpu_capture_graphics_buffers(
 }
 
 static bool
-pvrgpu_capture_fragment_images(const struct pvrgpu_context *ctx,
-                                struct pvrgpu_array_primitive_draw *recorded)
+pvrgpu_capture_stage_images(const struct pvrgpu_context *ctx,
+                            struct pvrgpu_array_primitive_draw *recorded,
+                            mesa_shader_stage stage, uint32_t start,
+                            uint32_t count, uint32_t read_mask,
+                            uint32_t write_mask, uint32_t shareds,
+                            uint32_t *shared_words,
+                            struct pvrgpu_systemc_shader_image *images,
+                            uint32_t *image_count)
 {
-   const struct pvrgpu_pco_graphics_binary *binary = &recorded->binary;
-   struct pvrgpu_systemc_driver_command *command = &recorded->command;
-   command->fragment_early_tests = binary->fragment_early_tests;
-   if (!binary->fragment_image_descriptor_count) return true;
-   if (binary->fragment_image_descriptor_count > PVRGPU_SYSTEMC_MAX_SHADER_IMAGES ||
-       (uint64_t)binary->fragment_image_descriptor_start +
-          8u * binary->fragment_image_descriptor_count > binary->fragment.abi.shareds)
+   *image_count = 0;
+   if (!count) return true;
+   if (count > PVRGPU_SYSTEMC_MAX_SHADER_IMAGES ||
+       (uint64_t)start + 8u * count > shareds ||
+       (stage != MESA_SHADER_FRAGMENT && write_mask))
       return false;
+   /* One snapshot for every graphics stage: a view shared by VS and FS is
+    * copied once and addresses the same modeled backing bytes. */
    struct pvrgpu_compute_snapshot *snapshot = &recorded->fragment_image_snapshot;
-   for (unsigned slot = 0; slot < binary->fragment_image_descriptor_count; ++slot) {
-      const unsigned access = ((binary->fragment_image_read_mask >> slot) & 1) |
-         (((binary->fragment_image_write_mask >> slot) & 1) << 1);
+   for (unsigned slot = 0; slot < count; ++slot) {
+      const unsigned access = ((read_mask >> slot) & 1) |
+         (((write_mask >> slot) & 1) << 1);
       if (!access) continue;
-      const struct pipe_image_view *view = &ctx->shader_images[MESA_SHADER_FRAGMENT][slot];
-      if (!view->resource || view->resource->target != PIPE_TEXTURE_2D ||
-          view->format != PIPE_FORMAT_R32_UINT || view->u.tex.first_layer ||
-          view->u.tex.last_layer)
+      const struct pipe_image_view *view = &ctx->shader_images[stage][slot];
+      const bool writable = (access & 2) != 0;
+      if (!view->resource) return false;
+      if (writable) {
+         if (view->resource->target != PIPE_TEXTURE_2D ||
+             view->format != PIPE_FORMAT_R32_UINT || view->u.tex.first_layer ||
+             view->u.tex.last_layer)
+            return false;
+         /* Attachment/sample aliases need coherent cross-unit residency, not a
+          * second immutable copy of storage writable by this very draw. */
+         if (ctx->framebuffer.zsbuf.texture == view->resource) return false;
+         for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target)
+            if (ctx->framebuffer.cbufs[target].texture == view->resource) return false;
+         for (unsigned sampled = MESA_SHADER_VERTEX; sampled <= MESA_SHADER_FRAGMENT; ++sampled) {
+            const struct pvrgpu_shader_state *shader = sampled == MESA_SHADER_VERTEX ? ctx->vs :
+               sampled == MESA_SHADER_TESS_CTRL ? ctx->tcs :
+               sampled == MESA_SHADER_TESS_EVAL ? ctx->tes :
+               sampled == MESA_SHADER_GEOMETRY ? ctx->gs : ctx->fs;
+            const unsigned active = shader && shader->nir ?
+               BITSET_LAST_BIT(shader->nir->info.textures_used) : 0;
+            for (unsigned texture = 0; texture < MIN2(active, ctx->num_sampler_views[sampled]); ++texture)
+               if (ctx->sampler_views[sampled][texture] &&
+                   ctx->sampler_views[sampled][texture]->texture == view->resource)
+                  return false;
+         }
+      } else if (view->resource->target == PIPE_BUFFER) {
          return false;
-      /* Attachment/sample aliases need coherent cross-unit residency, not a
-       * second immutable copy of storage writable by this very draw. */
-      if (ctx->framebuffer.zsbuf.texture == view->resource) return false;
-      for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target)
-         if (ctx->framebuffer.cbufs[target].texture == view->resource) return false;
-      for (unsigned stage = MESA_SHADER_VERTEX; stage <= MESA_SHADER_FRAGMENT; ++stage) {
-         const struct pvrgpu_shader_state *shader = stage == MESA_SHADER_VERTEX ? ctx->vs :
-            stage == MESA_SHADER_TESS_CTRL ? ctx->tcs :
-            stage == MESA_SHADER_TESS_EVAL ? ctx->tes :
-            stage == MESA_SHADER_GEOMETRY ? ctx->gs : ctx->fs;
-         const unsigned active = shader && shader->nir ?
-            BITSET_LAST_BIT(shader->nir->info.textures_used) : 0;
-         for (unsigned texture = 0; texture < MIN2(active, ctx->num_sampler_views[stage]); ++texture)
-            if (ctx->sampler_views[stage][texture] &&
-                ctx->sampler_views[stage][texture]->texture == view->resource)
-               return false;
       }
       const char *reason = NULL;
       if (!pvrgpu_compute_snapshot_add_image(snapshot, slot, access, view, &reason))
@@ -10949,22 +11105,55 @@ pvrgpu_capture_fragment_images(const struct pvrgpu_context *ctx,
       const struct pvrgpu_systemc_compute_resource *resource =
          &snapshot->resources[image->resource_index];
       if (resource->bytes_size > PVRGPU_SYSTEMC_MAX_SHADER_IMAGE_BYTES) return false;
-      recorded->fragment_images[command->fragment_image_count++] =
+      images[(*image_count)++] =
          (struct pvrgpu_systemc_shader_image){
-            .image_slot = slot, .format = PVRGPU_SYSTEMC_SHADER_IMAGE_R32_UINT,
+            .image_slot = slot,
+            .format = writable ? PVRGPU_SYSTEMC_SHADER_IMAGE_R32_UINT :
+                                 PVRGPU_SYSTEMC_SHADER_IMAGE_RAW,
             .access = access, .resource_token = (uintptr_t)view->resource,
             .bytes = resource->bytes, .bytes_size = resource->bytes_size,
             .offset = image->offset, .width = image->width, .height = image->height,
             .depth = image->depth, .row_stride = image->row_stride_bytes,
             .layer_stride = image->layer_stride_bytes, .texel_bytes = image->texel_bytes,
          };
-      uint32_t *descriptor = recorded->fragment_shared_words +
-         binary->fragment_image_descriptor_start + 8u * slot;
+      uint32_t *descriptor = shared_words + start + 8u * slot;
       descriptor[0] = descriptor[1] = 0;
       descriptor[2] = image->depth; descriptor[3] = image->layer_stride_bytes;
       descriptor[4] = image->width; descriptor[5] = image->height;
       descriptor[6] = image->row_stride_bytes; descriptor[7] = image->texel_bytes;
    }
+   return true;
+}
+
+static bool
+pvrgpu_capture_fragment_images(const struct pvrgpu_context *ctx,
+                                struct pvrgpu_array_primitive_draw *recorded)
+{
+   const struct pvrgpu_pco_graphics_binary *binary = &recorded->binary;
+   struct pvrgpu_systemc_driver_command *command = &recorded->command;
+   command->fragment_early_tests = binary->fragment_early_tests;
+   if (binary->vertex_image_descriptor_count) {
+      if (!pvrgpu_capture_stage_images(ctx, recorded, MESA_SHADER_VERTEX,
+             binary->vertex_image_descriptor_start,
+             binary->vertex_image_descriptor_count,
+             binary->vertex_image_read_mask, 0, binary->vertex.abi.shareds,
+             recorded->vertex_shared_words, recorded->vertex_images,
+             &command->vertex_image_count))
+         return false;
+      command->vertex_images = command->vertex_image_count ?
+         recorded->vertex_images : NULL;
+      command->vertex_image_descriptor_start = binary->vertex_image_descriptor_start;
+      command->vertex_image_descriptor_count = binary->vertex_image_descriptor_count;
+      command->vertex_image_read_mask = binary->vertex_image_read_mask;
+   }
+   if (!binary->fragment_image_descriptor_count) return true;
+   if (!pvrgpu_capture_stage_images(ctx, recorded, MESA_SHADER_FRAGMENT,
+          binary->fragment_image_descriptor_start,
+          binary->fragment_image_descriptor_count,
+          binary->fragment_image_read_mask, binary->fragment_image_write_mask,
+          binary->fragment.abi.shareds, recorded->fragment_shared_words,
+          recorded->fragment_images, &command->fragment_image_count))
+      return false;
    command->fragment_images = recorded->fragment_images;
    command->fragment_image_descriptor_start = binary->fragment_image_descriptor_start;
    command->fragment_image_descriptor_count = binary->fragment_image_descriptor_count;
@@ -10979,11 +11168,13 @@ pvrgpu_capture_stream_output(const struct pvrgpu_context *ctx,
 {
    if (!ctx->num_stream_output_targets)
       return true;
-   /* Capture the final native pre-raster stage. GS capture remains a
-    * separate implementation; incomplete Tessellation pipelines fail closed. */
-   if (ctx->gs || (!!ctx->tcs != !!ctx->tes))
+   /* Capture the final native pre-raster stage: its exports are what the
+    * recorded binary lays out as vertex outputs. Incomplete tessellation
+    * pipelines fail closed. */
+   if (!!ctx->tcs != !!ctx->tes)
       return false;
-   const struct pvrgpu_shader_state *producer = ctx->tes ? ctx->tes : ctx->vs;
+   const struct pvrgpu_shader_state *producer =
+      ctx->gs ? ctx->gs : ctx->tes ? ctx->tes : ctx->vs;
    if (!producer || !producer->nir)
       return false;
    const struct pipe_stream_output_info *info = &producer->stream_output;
@@ -11017,7 +11208,7 @@ pvrgpu_capture_stream_output(const struct pvrgpu_context *ctx,
          };
       pvrgpu_counter_eventf("stream_output_binding",
          "stage=%s register=%u location=%u component=%u output=%u count=%u buffer=%u offset=%u",
-         ctx->tes ? "tes" : "vs", register_index, location, first,
+         ctx->gs ? "gs" : ctx->tes ? "tes" : "vs", register_index, location, first,
          recorded->stream_output_bindings[output].output_dword, count, buffer,
          info->output[output].dst_offset);
       used_buffers |= 1u << buffer;
@@ -11697,6 +11888,13 @@ pvrgpu_emit_array_primitive_sequence_command(struct pvrgpu_context *ctx)
       struct pvrgpu_array_primitive_draw *recorded = ctx->array_primitive_draws[ordinal];
       struct pvrgpu_compute_snapshot *images = &recorded->fragment_image_snapshot;
       for (unsigned resource_index = 0; resource_index < images->resource_count; ++resource_index) {
+         bool writable = false;
+         for (unsigned binding = 0; binding < images->image_count; ++binding)
+            writable |= images->images[binding].resource_index == resource_index &&
+               (images->images[binding].access & 2);
+         /* Read-only views are unchanged native bytes; the bridge tracks
+          * only fragment-writable storage for readback. */
+         if (!writable) continue;
          struct pvrgpu_systemc_shader_image_readback readback = {
             .submission_generation = ctx->color_readback_generation,
             .resource_token = (uintptr_t)images->owners[resource_index],
@@ -11978,7 +12176,9 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
       return false;
    }
    const bool has_tessellation = ctx->tcs && ctx->tes;
-   const bool current_images = ctx->fs && ctx->fs->nir && ctx->fs->nir->info.num_images;
+   const bool current_images =
+      (ctx->fs && ctx->fs->nir && ctx->fs->nir->info.num_images) ||
+      (ctx->vs && ctx->vs->nir && ctx->vs->nir->info.num_images);
    /* Colour is different from external image/SSBO/SO snapshots below.  Every
     * recorded draw already chains its attachment LOAD to ordinal - 1, and the
     * model's coherent framebuffer-fetch shadow commits in API order.  Keeping
@@ -11987,7 +12187,8 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
     * such a replay deliberately cannot be submitted early. BlendBarrier
     * remains the explicit boundary for non-coherent fetch. */
    const bool preceding_images = ctx->array_primitive_draw_count &&
-      ctx->array_primitive_draws[ctx->array_primitive_draw_count - 1]->command.fragment_image_count;
+      (ctx->array_primitive_draws[ctx->array_primitive_draw_count - 1]->command.fragment_image_count ||
+       ctx->array_primitive_draws[ctx->array_primitive_draw_count - 1]->command.vertex_image_count);
    const bool current_graphics_buffers =
       (ctx->vs && ctx->vs->nir && ctx->vs->nir->info.num_ssbos) ||
       (ctx->fs && ctx->fs->nir && ctx->fs->nir->info.num_ssbos) ||
@@ -12617,8 +12818,9 @@ pvrgpu_record_color_primitive_pco_draw_attempt(
                                   refract_profile);
          }
       } else {
-         bool multisample_target = ctx->framebuffer.zsbuf.texture &&
-            ctx->framebuffer.zsbuf.texture->nr_samples != 0;
+         bool multisample_target = (ctx->framebuffer.zsbuf.texture &&
+            ctx->framebuffer.zsbuf.texture->nr_samples != 0) ||
+            ctx->framebuffer.samples > 1;
          for (unsigned target = 0; target < ctx->framebuffer.nr_cbufs; ++target)
             multisample_target |= ctx->framebuffer.cbufs[target].texture &&
                ctx->framebuffer.cbufs[target].texture->nr_samples != 0;
@@ -14733,7 +14935,12 @@ pvrgpu_draw_is_lowerable_array_primitive(
    }
    /* One to four colour locations. GL_NONE holes are represented by masked
     * dummy slices; every bound attachment must have an explicit transport. */
-   if (ctx->framebuffer.nr_cbufs == 0 && !ctx->framebuffer.zsbuf.texture) {
+   /* A framebuffer with no attachments (GL_FRAMEBUFFER_DEFAULT_WIDTH/HEIGHT)
+    * still rasterizes and runs fragment side effects and occlusion queries.
+    * It takes the depth-only transport: one masked RGBA8 dummy slice of the
+    * framebuffer's size that is neither loaded from nor written back to. */
+   if (ctx->framebuffer.nr_cbufs == 0 && !ctx->framebuffer.zsbuf.texture &&
+       (ctx->framebuffer.width == 0 || ctx->framebuffer.height == 0)) {
       *reason = "no_attachment";
       return false;
    }
@@ -14985,7 +15192,21 @@ pvrgpu_set_framebuffer_state(struct pipe_context *pipe,
       ctx->color_readback_pending_mask = 0;
       pvrgpu_retire_materialized_attachment_clears(ctx, true, 0);
    }
+   const struct pipe_resource *previous_cbuf0 =
+      ctx->framebuffer.nr_cbufs ? ctx->framebuffer.cbufs[0].texture : NULL;
+   const enum pipe_format previous_cbuf0_format =
+      ctx->framebuffer.nr_cbufs ? ctx->framebuffer.cbufs[0].format
+                                : PIPE_FORMAT_NONE;
    util_copy_framebuffer_state(&ctx->framebuffer, state);
+   /* The recorded clear colour describes the first attachment it cleared:
+    * an integer surface's raw bits are not a float colour for the next one.
+    * Every real attachment is LOADed, so a new surface starts from the
+    * context's initial zero clear until it is cleared itself. */
+   if ((ctx->framebuffer.nr_cbufs ? ctx->framebuffer.cbufs[0].texture : NULL) !=
+          previous_cbuf0 ||
+       (ctx->framebuffer.nr_cbufs ? ctx->framebuffer.cbufs[0].format
+                                  : PIPE_FORMAT_NONE) != previous_cbuf0_format)
+      memset(ctx->color_clear_bits, 0, sizeof(ctx->color_clear_bits));
    const struct pipe_surface *zs = &ctx->framebuffer.zsbuf;
    if (!ctx->full_depth_clear_is_one ||
        !zs->texture ||

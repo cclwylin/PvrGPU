@@ -86,14 +86,21 @@ StreamOutput::StreamOutput(sc_core::sc_module_name name, MemoryPool &pool,
     : sc_module(name), pool_(pool), memory_(memory) { SC_THREAD(Run); }
 
 void StreamOutput::Execute(PipelineState &state) {
+  const bool geometry = HasPoolHandle(state.geometry_code);
   if (state.stage != PipelineStage::kVertexShaded || !memory_ ||
-      memory_->mode() != state.memory_mode || HasPoolHandle(state.geometry_code) ||
+      memory_->mode() != state.memory_mode ||
       state.draw.topology != PrimitiveTopology::kTriangleList ||
       state.stream_output_complete || state.stream_output_primitives_written ||
       state.stream_output_primitives_storage_needed)
     throw std::runtime_error("stream output pipeline stage/memory contract is invalid");
   auto output_dwords = state.vertex_pco_abi.vertex_outputs;
-  if (HasPoolHandle(state.tessellation_state)) {
+  if (geometry) {
+    // The geometry shader already replaced the lanes with its own complete
+    // output primitives (strips decomposed) in its output topology.
+    if (state.source_topology != state.geometry_output_topology)
+      throw std::runtime_error("stream output requires completed GS exports and topology");
+    output_dwords = state.geometry_pco_abi.vertex_outputs;
+  } else if (HasPoolHandle(state.tessellation_state)) {
     const auto tess = LoadArray<TessellationState>(pool_, state.tessellation_state);
     if (tess.size() != 1 || tess[0].phase != TessellationPhase::kEvaluationComplete ||
         state.tessellation_output_dwords != tess[0].evaluation_abi.vertex_outputs ||
@@ -131,7 +138,7 @@ void StreamOutput::Execute(PipelineState &state) {
   }
   for (const auto &binding : bindings) used[binding.output_buffer] = true;
 
-  // VertexFetch, or the completed TES stage, already produced ordered complete
+  // VertexFetch, the completed TES stage or the GS already produced ordered complete
   // primitive occurrences. Consume those references, not the deduplicated
   // shader lane array or padded point/line vertices. Whole-primitive preflight and
   // per-vertex cursor advancement follow Mesa draw_pt_so_emit.c semantics.

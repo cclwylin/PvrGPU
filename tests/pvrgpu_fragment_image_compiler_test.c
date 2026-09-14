@@ -84,8 +84,104 @@ static nir_shader *image_fragment(unsigned kind)
    nir_shader_gather_info(b.shader, b.impl);
    b.shader->info.num_images = kind == 3 ? 2 : 1;
    b.shader->info.num_textures = kind == 4 ? 1 : 0;
+   /* A bare txl has no sampler deref for gather_info to record. */
+   if (kind == 4) BITSET_SET(b.shader->info.textures_used, 0);
    b.shader->info.fs.early_fragment_tests = kind == 2;
    return b.shader;
+}
+
+/* Read-only imageLoad of an RGBA8 2D view in VS or FS, behind a runtime
+ * bounds branch like dEQP layout_binding.image. */
+static nir_shader *image_load_shader(mesa_shader_stage stage)
+{
+   nir_builder b = nir_builder_init_simple_shader(stage, pco_nir_options(),
+      "graphics_image_load");
+   nir_variable *input = NULL;
+   nir_def *selector;
+   if (stage == MESA_SHADER_VERTEX) {
+      input = nir_variable_create(b.shader, nir_var_shader_in,
+         glsl_vec4_type(), "position");
+      input->data.location = VERT_ATTRIB_GENERIC0;
+      selector = nir_flt_imm(&b, nir_channel(&b, nir_load_var(&b, input), 0), 0.5);
+   } else {
+      nir_def *params = nir_load_uniform(&b, 4, 32, nir_imm_int(&b, 0),
+         .range=1, .dest_type=nir_type_int32);
+      selector = nir_ieq_imm(&b, nir_channel(&b, params, 0), 0);
+   }
+   nir_def *coords = nir_vec4(&b, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+      nir_imm_int(&b, 0), nir_imm_int(&b, 0));
+   nir_push_if(&b, selector);
+   nir_def *texel = nir_image_load(&b, 4, 32, nir_imm_int(&b, 0), coords,
+      nir_undef(&b, 1, 32), nir_imm_int(&b, 0),
+      .image_dim=GLSL_SAMPLER_DIM_2D, .format=PIPE_FORMAT_R8G8B8A8_UNORM,
+      .dest_type=nir_type_float32);
+   nir_push_else(&b, NULL);
+   nir_def *black = nir_imm_vec4(&b, 0, 0, 0, 1);
+   nir_pop_if(&b, NULL);
+   nir_def *color = nir_if_phi(&b, texel, black);
+   nir_variable *output = nir_variable_create(b.shader, nir_var_shader_out,
+      glsl_vec4_type(), "color");
+   if (stage == MESA_SHADER_VERTEX) {
+      nir_variable *position = nir_variable_create(b.shader, nir_var_shader_out,
+         glsl_vec4_type(), "gl_Position");
+      position->data.location = VARYING_SLOT_POS;
+      nir_store_var(&b, position, nir_load_var(&b, input), 15);
+      output->data.location = VARYING_SLOT_VAR0;
+   } else {
+      output->data.location = FRAG_RESULT_DATA0;
+   }
+   nir_store_var(&b, output, color, 15);
+   nir_shader_gather_info(b.shader, b.impl);
+   b.shader->info.num_images = 1;
+   return b.shader;
+}
+
+static nir_shader *varying_fragment(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+      pco_nir_options(), "graphics_image_varying");
+   nir_variable *input = nir_variable_create(b.shader, nir_var_shader_in,
+      glsl_vec4_type(), "color");
+   input->data.location = VARYING_SLOT_VAR0;
+   nir_variable *output = nir_variable_create(b.shader, nir_var_shader_out,
+      glsl_vec4_type(), "out");
+   output->data.location = FRAG_RESULT_DATA0;
+   nir_store_var(&b, output, nir_load_var(&b, input), 15);
+   nir_shader_gather_info(b.shader, b.impl);
+   return b.shader;
+}
+
+static void test_read_only_graphics_images(struct pvrgpu_pco_compiler *compiler)
+{
+   char error[512] = {0};
+   const enum pipe_format format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   for (unsigned vertex = 0; vertex < 2; ++vertex) {
+      nir_shader *vs = vertex ? image_load_shader(MESA_SHADER_VERTEX) : image_vertex();
+      nir_shader *fs = vertex ? varying_fragment() : image_load_shader(MESA_SHADER_FRAGMENT);
+      if (!vertex) fs->info.fs.uses_discard = true; /* read-only views allow discard */
+      struct pvrgpu_pco_graphics_binary binary;
+      if (!pvrgpu_pco_compile_color_triangle(compiler, vs, fs, &format,
+            false, false, 1, 0, 4, 1, 0, &binary, error, sizeof(error))) {
+         fprintf(stderr, "read-only %s image: %s\n", vertex ? "vertex" : "fragment", error);
+         abort();
+      }
+      if (vertex ? (binary.vertex_image_descriptor_start != 0 ||
+                    binary.vertex_image_descriptor_count != 1 ||
+                    binary.vertex_image_read_mask != 1 ||
+                    binary.vertex.abi.shareds < 8 ||
+                    binary.fragment_image_descriptor_count != 0)
+                 : (binary.fragment_image_descriptor_start != 0 ||
+                    binary.fragment_image_descriptor_count != 1 ||
+                    binary.fragment_image_read_mask != 1 ||
+                    binary.fragment_image_write_mask != 0 ||
+                    binary.fragment.abi.shareds < 8 ||
+                    binary.vertex_image_descriptor_count != 0)) {
+         fprintf(stderr, "read-only %s image ABI mismatch\n", vertex ? "vertex" : "fragment");
+         abort();
+      }
+      pvrgpu_pco_graphics_binary_finish(&binary);
+      ralloc_free(vs); ralloc_free(fs);
+   }
 }
 
 void test_native_fragment_images(void)
@@ -157,6 +253,7 @@ void test_native_fragment_images(void)
       }
       ralloc_free(vs); ralloc_free(fs);
    }
+   test_read_only_graphics_images(compiler);
    pvrgpu_pco_compiler_destroy(compiler);
    glsl_type_singleton_decref();
 }

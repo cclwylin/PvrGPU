@@ -43,6 +43,7 @@ shadow_gather_fragment(bool array, bool shadow, unsigned slot)
    nir_store_var(&b, out, &tex->def, 15);
    nir_jump(&b, nir_jump_return);
    nir_shader_gather_info(b.shader, b.impl);
+   BITSET_SET(b.shader->info.textures_used, slot);
    return b.shader;
 }
 
@@ -103,7 +104,7 @@ shadow_gather_classifier_tests(void)
       case 15: nir_tex_instr_remove_src(tex, 1); break;
       case 16: nir_tex_instr_add_src(tex, nir_tex_src_comparator, tex->src[1].src.ssa); break;
       case 17: nir_tex_instr_add_src(tex, nir_tex_src_coord, tex->src[0].src.ssa); break;
-      case 18: nir_tex_instr_add_src(tex, nir_tex_src_offset, nir_imm_ivec2(&b, 1, 0)); break;
+      case 18: nir_tex_instr_add_src(tex, nir_tex_src_offset, nir_imm_ivec3(&b, 1, 0, 0)); break;
       case 19: nir_tex_instr_add_src(tex, nir_tex_src_lod, nir_imm_float(&b, 0)); break;
       case 20: nir_tex_instr_add_src(tex, nir_tex_src_texture_offset, nir_imm_int(&b, 0)); break;
       case 21: nir_tex_instr_add_src(tex, nir_tex_src_sampler_offset, nir_imm_int(&b, 0)); break;

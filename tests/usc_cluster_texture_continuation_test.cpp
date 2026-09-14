@@ -1627,9 +1627,11 @@ int sc_main(int argc, char **argv) {
     terrain_d4_fragment_abi.push_constant_start = 21;
     Check(!DriverPcoTextureSharedLayoutSupported(terrain_d4_fragment_abi, 1),
           "Terrain D4 empty push range rejects start after prefix end");
+    // PCO reports an unused push window as {0,0}: the empty window after the
+    // descriptor prefix, as the layout validator has accepted since API v40.
     terrain_d4_fragment_abi.push_constant_start = 0;
-    Check(!DriverPcoTextureSharedLayoutSupported(terrain_d4_fragment_abi, 1),
-          "descriptor-only layouts reject noncanonical empty push start");
+    Check(DriverPcoTextureSharedLayoutSupported(terrain_d4_fragment_abi, 1),
+          "descriptor-only layouts accept PCO's {0,0} empty push window");
 
     DriverPcoStageAbi mixed_abi;
     mixed_abi.shareds = 32;
@@ -1644,8 +1646,8 @@ int sc_main(int argc, char **argv) {
     Check(DriverPcoTextureSharedLayoutSupported(mixed_abi, 1),
           "UBO empty push suffix uses canonical prefix end");
     mixed_abi.push_constant_start = 0;
-    Check(!DriverPcoTextureSharedLayoutSupported(mixed_abi, 1),
-          "UBO layouts reject noncanonical legacy empty push start");
+    Check(DriverPcoTextureSharedLayoutSupported(mixed_abi, 1),
+          "UBO layouts accept PCO's {0,0} empty push window");
     mixed_abi.push_constant_start = 28;
     mixed_abi.push_constant_count = 4;
     mixed_abi.shareds = 32;

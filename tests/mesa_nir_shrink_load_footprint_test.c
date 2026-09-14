@@ -175,9 +175,43 @@ static void run_pipeline(void)
    ralloc_free(b.shader);
 }
 
+/* Gallium load_uniform offsets are vec4 slots: shrink may trim trailing
+ * channels but must never move the start by a byte-sized offset. */
+static void run_uniform_slot(unsigned mask, unsigned expected_components)
+{
+   ++cases_run;
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &options, "uniform slot shrink");
+   nir_def *value = nir_load_uniform(&b, 4, 32, nir_imm_int(&b, 0), .base = 2, .range = 1,
+                                     .dest_type = nir_type_float32);
+   for (unsigned c = 0; c < 4; ++c)
+      if (mask & (1u << c))
+         use(&b, value, c, c);
+   pvrgpu_test_nir_opt_shrink_vectors(b.shader, true);
+   unsigned loads = 0;
+   nir_foreach_block(block, b.impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic) continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_uniform) continue;
+         ++loads;
+         check(nir_src_is_const(intr->src[0]) && nir_src_as_uint(intr->src[0]) == 0 &&
+               nir_intrinsic_base(intr) == 2 && nir_intrinsic_range(intr) == 1,
+               "load_uniform keeps its vec4 slot address");
+         check(intr->num_components == expected_components &&
+               intr->def.num_components == expected_components,
+               "load_uniform trims only trailing channels");
+      }
+   }
+   check(loads == 1, "one load_uniform survives");
+   ralloc_free(b.shader);
+}
+
 int main(void)
 {
    glsl_type_singleton_init_or_ref();
+   run_uniform_slot(0xe, 4);  /* .yzw */
+   run_uniform_slot(0x6, 3);  /* .yz */
+   run_uniform_slot(0x3, 2);  /* .xy */
    const nir_intrinsic_op ops[] = {nir_intrinsic_load_ubo, nir_intrinsic_load_ssbo, nir_intrinsic_load_global};
    const unsigned widths[] = {2, 3, 4, 5, 8, 16};
    const unsigned bits[] = {8, 16, 32, 64};

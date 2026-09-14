@@ -1211,20 +1211,20 @@ foreach(gather_case IN ITEMS
         reject-flag reject-implicit reject-lod reject-negative-zero-lod
         reject-normalized reject-fcnorm reject-component reject-coordinate-count
         reject-coordinate-z reject-offset reject-address reject-sno reject-bias
-        reject-stage reject-nan reject-infinity reject-sampler-offset
-        reject-repeat reject-compare reject-base reject-layers reject-dimension
-        reject-format reject-red-swizzle reject-gather-descriptor
+        reject-stage reject-sampler-offset
+        reject-border-z24 reject-compare reject-base reject-layers reject-dimension
+        reject-red-swizzle reject-gather-descriptor
         reject-gather-word1 reject-image-state reject-mixed-batch
         reject-rgba-red-swizzle
         array-default array-1x1 array-odd array-linear array-direct array-bypass
         array-rgba-default array-rgba-1x1 array-rgba-odd array-rgba-linear
-        array-rgba-direct array-rgba-bypass
+        array-rgba-direct array-rgba-bypass array-mips
         compare-0 compare-1 compare-2 compare-3 compare-4 compare-5 compare-6 compare-7
         array-compare-0 array-compare-1 array-compare-2 array-compare-3
         array-compare-4 array-compare-5 array-compare-6 array-compare-7
         reject-array-stride reject-array-depth reject-array-unaligned
         reject-array-below-base reject-array-past-last reject-array-missing-address
-        reject-array-msaa reject-array-mips)
+        reject-array-msaa)
     add_test(NAME texture-gather-${gather_case}
              COMMAND texture-gather-test ${gather_case})
 endforeach()

@@ -135,7 +135,8 @@ inline bool ResolveDriverGraphicsDescriptorLayout(
   const auto &storage = command.graphics_storage[stage];
   const std::uint32_t textures = GraphicsStageTextureCount(command, stage);
   const std::uint32_t images =
-      stage == 1 ? command.fragment_image_descriptor_count : 0U;
+      stage == 1 ? command.fragment_image_descriptor_count
+      : stage == 0 ? command.vertex_image_descriptor_count : 0U;
   const bool empty = shared.empty() && !textures && !images &&
                      !storage.descriptor_count && !storage.descriptor_start &&
                      !storage.used_mask && !storage.read_mask &&
@@ -147,9 +148,11 @@ inline bool ResolveDriverGraphicsDescriptorLayout(
   if (empty) {
     if (resolved)
       *resolved = {};
-    return stage != 1 || (!command.fragment_image_descriptor_start &&
-                           !command.fragment_image_read_mask &&
-                           !command.fragment_image_write_mask);
+    return (stage != 1 || (!command.fragment_image_descriptor_start &&
+                            !command.fragment_image_read_mask &&
+                            !command.fragment_image_write_mask)) &&
+           (stage != 0 || (!command.vertex_image_descriptor_start &&
+                           !command.vertex_image_read_mask));
   }
   const std::uint32_t system_dwords =
       stage == 3 ? 8U : (stage == 2 || stage == 4 ? 4U : 0U);
@@ -161,7 +164,11 @@ inline bool ResolveDriverGraphicsDescriptorLayout(
        (images ? command.fragment_image_descriptor_start != layout.image_start
                : command.fragment_image_descriptor_start ||
                      command.fragment_image_read_mask ||
-                     command.fragment_image_write_mask)))
+                     command.fragment_image_write_mask)) ||
+      (stage == 0 &&
+       (images ? command.vertex_image_descriptor_start != layout.image_start
+               : command.vertex_image_descriptor_start ||
+                     command.vertex_image_read_mask)))
     return false;
   if (resolved)
     *resolved = layout;

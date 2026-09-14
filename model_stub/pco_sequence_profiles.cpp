@@ -1215,15 +1215,23 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
         (ordinal && draw.framebuffer_layers != options.driver_commands[ordinal-1].framebuffer_layers)) {
       return Reject(error, "generic PCO sequence draw envelope is invalid");
     }
-    const std::uint64_t color_bpp =
-        DriverColorAttachmentMaximumBytesPerPixel(draw);
+    const std::uint64_t attachment_pixels =
+        static_cast<std::uint64_t>(draw.framebuffer_width) * draw.framebuffer_height *
+        (draw.raster_samples ? draw.raster_samples : 1U) *
+        (draw.framebuffer_layers ? draw.framebuffer_layers : 1U);
+    bool attachment_too_large = draw.depth_format &&
+        attachment_pixels * DepthAttachmentBytesPerPixel(draw.depth_format) >
+            kDriverPcoSequenceAttachmentRegionBytes;
+    if (DriverColorAttachmentFormatsAreValid(draw)) {
+      const auto attachment_formats = EffectiveDriverColorAttachmentFormats(draw);
+      for (std::size_t target = 0; target < attachment_formats.size(); ++target)
+        attachment_too_large |= attachment_pixels *
+            DriverColorAttachmentBytesPerPixel(attachment_formats[target]) >
+            SequenceColorAttachmentByteLimit(static_cast<std::uint32_t>(target));
+    }
     if ((draw.raster_samples && (draw.raster_samples > 16 ||
          (draw.raster_samples & (draw.raster_samples - 1)))) ||
-        static_cast<std::uint64_t>(draw.framebuffer_width) * draw.framebuffer_height *
-            (draw.raster_samples ? draw.raster_samples : 1U) *
-            (draw.framebuffer_layers ? draw.framebuffer_layers : 1U) *
-            std::max<std::uint64_t>(color_bpp, draw.depth_format ? DepthAttachmentBytesPerPixel(draw.depth_format) : 0U) >
-                kDriverPcoSequenceAttachmentStride)
+        attachment_too_large)
       return Reject(error, "generic PCO attachment exceeds its address slot");
     // A draw either states its own attribute layout or matches the pinned
     // position/colour one.  Sampled textures are carried by the sequence, and
@@ -1310,11 +1318,12 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
       const auto formats = EffectiveDriverColorAttachmentFormats(draw);
       std::uint64_t expected_bytes = 0;
       bool target_too_large = false;
-      for (const auto &format : formats) {
+      for (std::size_t target = 0; target < formats.size(); ++target) {
         const auto target_bytes =
-            stored_pixels * DriverColorAttachmentBytesPerPixel(format);
+            stored_pixels * DriverColorAttachmentBytesPerPixel(formats[target]);
         expected_bytes += target_bytes;
-        target_too_large |= target_bytes > kDriverPcoSequenceAttachmentStride;
+        target_too_large |= target_bytes >
+            SequenceColorAttachmentByteLimit(static_cast<std::uint32_t>(target));
       }
       if (ordinal != 0 || targets > kMaxRenderTargets ||
           draw.initial_color_attachment_bytes.size() != expected_bytes ||
@@ -1343,7 +1352,7 @@ bool GenericColorSequenceSupported(const Options &options, std::string *error) {
           DepthAttachmentBytesPerPixel(draw.depth_format);
       if (ordinal != 0 || draw.depth_format == 0 ||
           draw.initial_depth_attachment_bytes.size() != expected_bytes ||
-          expected_bytes > kDriverPcoSequenceAttachmentStride)
+          expected_bytes > kDriverPcoSequenceAttachmentRegionBytes)
         return Reject(error, "generic PCO initial depth attachment is invalid");
     }
   }

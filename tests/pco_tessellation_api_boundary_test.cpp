@@ -214,7 +214,7 @@ class GuardedBytes {
 };
 
 void VerifyVersions(Submission &submit) {
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 40);
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 42);
   constexpr auto previous_size = offsetof(pvrgpu_systemc_driver_command, tessellation);
   static_assert(previous_size % alignof(pvrgpu_systemc_driver_command) == 0);
   GuardedBytes previous(previous_size);

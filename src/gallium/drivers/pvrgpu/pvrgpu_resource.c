@@ -2430,8 +2430,9 @@ pvrgpu_can_copy_texture_region(struct pipe_resource *dst,
       return false;
    if (dst->target == PIPE_BUFFER || src->target == PIPE_BUFFER)
       return false;
-   if (dst->target != src->target)
-      return false;
+   /* Every image target stores whole 2D slices per level, indexed by z (an
+    * array layer, cube face or 3D slice), so glCopyImageSubData between
+    * different targets is the same raw slice copy. */
    if (!pvrgpu_texture_copy_formats_are_raw_compatible(dst->format,
                                                        src->format))
       return false;

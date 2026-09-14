@@ -2,6 +2,7 @@
 // own process: a fail-closed SystemC exception terminates that simulation.
 // No capture data, expected-image bytes, or shader-side gather emulation.
 #include "common/pipeline_state.h"
+#include "texture/texture_filter.h"
 #include "texture/texture_unit.h"
 
 #include <systemc>
@@ -85,10 +86,38 @@ void CheckAxis() {
       {-std::numeric_limits<float>::max(), 7, 0, 0},
       {std::numeric_limits<float>::max(), 7, 6, 6},
   };
-  for (const auto &c : cases)
+  for (const auto &c : cases) {
     Check(ComputeTextureGatherClampToEdge(c.s, c.extent) ==
               std::array<std::uint32_t, 2>{{c.first, c.second}},
           "independently clamped gather axis");
+    Check(ComputeTextureGatherAxis(c.s, c.extent, TextureWrapMode::kClampToEdge) ==
+              std::array<std::uint32_t, 2>{{c.first, c.second}},
+          "sampling gather axis matches the clamp-to-edge reference");
+  }
+  // llvmpipe min_ext takes the extent for NaN; infinities clamp to an edge.
+  Check(ComputeTextureGatherAxis(std::numeric_limits<float>::quiet_NaN(), 4,
+                                 TextureWrapMode::kClampToEdge) ==
+                std::array<std::uint32_t, 2>{{3, 3}} &&
+            ComputeTextureGatherAxis(-std::numeric_limits<float>::infinity(), 4,
+                                     TextureWrapMode::kClampToEdge) ==
+                std::array<std::uint32_t, 2>{{0, 0}},
+        "non-finite clamp-to-edge gather stays on an edge texel");
+  // An offset adds in texels before the independent truncations.
+  Check(ComputeTextureGatherAxis(0.5F, 4, TextureWrapMode::kClampToEdge, 1) ==
+                std::array<std::uint32_t, 2>{{2, 3}} &&
+            ComputeTextureGatherAxis(0.5F, 4, TextureWrapMode::kClampToEdge, -4) ==
+                std::array<std::uint32_t, 2>{{0, 0}},
+        "clamp-to-edge gather offset");
+  // Repeat wraps both taps; mirrored repeat reflects -1 onto 0 and 4 onto 3.
+  Check(ComputeTextureGatherAxis(0.0F, 4, TextureWrapMode::kRepeat) ==
+                std::array<std::uint32_t, 2>{{3, 0}} &&
+            ComputeTextureGatherAxis(0.0F, 4, TextureWrapMode::kMirroredRepeat) ==
+                std::array<std::uint32_t, 2>{{0, 0}} &&
+            ComputeTextureGatherAxis(1.0F, 4, TextureWrapMode::kMirroredRepeat) ==
+                std::array<std::uint32_t, 2>{{3, 3}} &&
+            ComputeTextureGatherAxis(0.0F, 4, TextureWrapMode::kClampToBorder) ==
+                std::array<std::uint32_t, 2>{{kTextureBorderTexel, 0}},
+        "repeat, mirrored and border gather taps");
   for (float value : {std::numeric_limits<float>::quiet_NaN(),
                       std::numeric_limits<float>::infinity(),
                       -std::numeric_limits<float>::infinity()}) {
@@ -164,7 +193,7 @@ void Run(const std::string &mode) {
   const std::uint32_t texel_bytes = rgba_float ? 16U : 4U;
   const std::uint32_t layers = array ? 4U : 1U;
   const std::uint32_t samples = mode == "reject-array-msaa" ? 2U : 1U;
-  const bool mipped = mode == "reject-array-mips";
+  const bool mipped = mode == "array-mips";
   const std::uint32_t layer_stride = width * height * texel_bytes * samples;
   const std::uint32_t mip1_width = std::max(1U, width / 2U);
   const std::uint32_t mip1_height = std::max(1U, height / 2U);
@@ -241,9 +270,11 @@ void Run(const std::string &mode) {
       (static_cast<std::uint64_t>(mag_linear) << 36U) |
       (static_cast<std::uint64_t>(min_linear) << 38U) |
       (static_cast<std::uint64_t>(sampler.mip_filter == TextureFilter::kLinear) << 40U);
-  if (mode == "reject-repeat") {
-    sampler0 &= ~(UINT64_C(7) << 33U);
-    sampler.wrap_u = TextureWrapMode::kRepeat;
+  if (mode == "reject-border-z24") {
+    // A border tap replaces a whole 32-bit canonical texel; raw Z24S8
+    // storage has no border texel and must fail closed.
+    sampler0 = (sampler0 & ~(UINT64_C(7) << 33U)) | (UINT64_C(4) << 33U);
+    sampler.wrap_u = TextureWrapMode::kClampToBorder;
   }
   StoreWord(shared, 8, sampler0);
   StoreWord(shared, 16, sampler0 | (UINT64_C(1) << 36U) | (UINT64_C(1) << 38U));
@@ -257,13 +288,6 @@ void Run(const std::string &mode) {
   if (mode == "reject-base") sampler.base_mip_level = 1U;
   if (mode == "reject-layers") resource.layer_count = 2U;
   if (mode == "reject-dimension") resource.dimension_type = TextureDimensionType::k3D;
-  if (mode == "reject-format") {
-    resource.format = TextureFormat::kRgba8Unorm;
-    const std::uint64_t rgba = (image0 & ~((UINT64_C(0x7f) << 27U) |
-        (UINT64_C(0xfff) << 5U))) | (UINT64_C(12) << 27U) |
-        (UINT64_C(3) << 5U) | (UINT64_C(2) << 8U) | (UINT64_C(1) << 11U);
-    StoreWord(shared, 0, rgba);
-  }
   PipelineState state;
   state.memory_mode = memory_mode;
   state.functional_case = FunctionalCase::kDriverPcoTriangles;
@@ -307,7 +331,7 @@ void Run(const std::string &mode) {
       std::copy_n(shared.begin() + (gather ? 16 : 8), 4, r.sampler_state);
     }
     auto &r = values[0];
-    if (mode == "reject-flag") r.gather = 2;
+    if (mode == "reject-flag") r.gather = 5;
     if (mode == "reject-implicit") r.explicit_lod_present = 0;
     if (mode == "reject-lod") r.explicit_lod = FloatBits(1.0F);
     if (mode == "reject-negative-zero-lod") r.explicit_lod = 0x80000000U;
@@ -316,7 +340,7 @@ void Run(const std::string &mode) {
     if (mode == "reject-component") r.component_count = 1;
     if (mode == "reject-coordinate-count") r.coordinate_count = 3;
     if (mode == "reject-coordinate-z") r.coordinates[2] = FloatBits(1.0F);
-    if (mode == "reject-offset") r.spatial_offsets[0] = 1;
+    if (mode == "reject-offset") r.spatial_offsets[2] = 1;
     if (mode == "reject-address") r.texture_address_lo = 4;
     if (mode == "reject-array-unaligned") r.texture_address_lo += 4U;
     if (mode == "reject-array-below-base") r.texture_address_lo -= 4U;
@@ -325,8 +349,6 @@ void Run(const std::string &mode) {
     if (mode == "reject-sno") r.sample_index_present = 1;
     if (mode == "reject-bias") r.lod_bias_present = 1;
     if (mode == "reject-stage") r.shader_stage = ShaderStage::kVertex;
-    if (mode == "reject-nan") r.coordinates[0] = 0x7fc00000U;
-    if (mode == "reject-infinity") r.coordinates[1] = 0x7f800000U;
     if (mode == "reject-sampler-offset")
       std::copy_n(shared.begin() + 8, 4, r.sampler_state);
     if (mode == "reject-image-state") r.texture_state[0] ^= 1U;
@@ -355,7 +377,7 @@ void Run(const std::string &mode) {
       if (!negative) throw;
       const std::string detail = error.what();
       const std::map<std::string, std::string> specific_causes = {
-          {"reject-flag", "sample batch mixes shader stages, sets or bindings"},
+          {"reject-flag", "gather channel is out of range"},
           {"reject-stage", "sample batch mixes shader stages, sets or bindings"},
           {"reject-mixed-batch", "sample batch mixes shader stages, sets or bindings"},
           {"reject-red-swizzle", "unsupported raw Rogue image word0"},
@@ -364,11 +386,9 @@ void Run(const std::string &mode) {
           {"reject-gather-word1", "gather word1 is not zero"},
           {"reject-sampler-offset", "SMP descriptor state mismatch"},
           {"reject-image-state", "SMP descriptor state mismatch"},
-          {"reject-nan", "invalid depth gather coordinate"},
-          {"reject-infinity", "invalid depth gather coordinate"},
           {"reject-base", "structured state disagrees with raw descriptor"},
           {"reject-layers", "TEXTYPE/depth disagrees with layer metadata"},
-          {"reject-repeat", "unsupported depth gather state"},
+          {"reject-border-z24", "descriptor class is unsupported"},
           {"reject-compare", "word12 compare operation is invalid"},
           {"reject-array-stride", "word4 is not the image layer size"},
           {"reject-array-depth", "TEXTYPE/depth disagrees with layer metadata"},
@@ -376,14 +396,13 @@ void Run(const std::string &mode) {
           {"reject-array-past-last", "gather array address is not an exact valid layer"},
           {"reject-array-below-base", "array sample address is out of range"},
           {"reject-array-missing-address", "array sample address is out of range"},
-          {"reject-array-msaa", "unsupported depth gather state"},
-          {"reject-array-mips", "unsupported depth gather state"},
-          {"reject-format", "unsupported depth gather state"},
-          {"reject-dimension", "unsupported depth gather state"},
+          {"reject-array-msaa", "unsupported gather state"},
+          {"reject-dimension", "unsupported gather state"},
+          {"reject-fcnorm", "SMP request ABI mismatch"},
       };
       const auto found = specific_causes.find(mode);
       const std::string cause = found == specific_causes.end()
-          ? "unsupported depth gather request" : found->second;
+          ? "unsupported gather request" : found->second;
       Check(detail.find("TextureUnit") != std::string::npos &&
             detail.find(cause) != std::string::npos,
             "negative case rejected at expected boundary: " + mode +

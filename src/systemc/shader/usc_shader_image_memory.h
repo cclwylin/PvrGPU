@@ -18,27 +18,68 @@ namespace pvrgpu::stub {
 class UscShaderImageMemory final {
 public:
   UscShaderImageMemory(GpuMemorySystem *memory, MemoryMode mode,
-                       std::vector<ShaderImageResource> resources)
-      : memory_(memory), resources_(std::move(resources)) {
+                       std::vector<ShaderImageResource> resources,
+                       MemoryClient client = MemoryClient::kFragmentImage)
+      : memory_(memory), resources_(std::move(resources)), client_(client) {
     if ((!resources_.empty() && (!memory_ || memory_->mode() != mode)) ||
         resources_.size() > 32)
       throw std::runtime_error("USC image memory service/mode/count is invalid");
     std::uint32_t slots = 0;
     for (const auto &image : resources_) {
+      // R32UI views keep the atomic read/write contract (format 1). Raw
+      // views (format 2) are read-only native bytes the shader unpacks.
+      const bool r32 = image.format == 1 && image.access == 3 &&
+                       image.depth == 1 && image.texel_bytes == 4;
+      const bool raw = image.format == 2 && image.access == 1 && image.depth &&
+                       image.texel_bytes && image.texel_bytes <= 16 &&
+                       image.texel_bytes % 4 == 0;
       if (!image.resource_token || !image.gpu_address || image.gpu_address % 4 ||
           !image.bytes || image.bytes > UINT64_C(256) * 1024 * 1024 ||
           image.gpu_address > UINT64_MAX - image.bytes || image.image_slot >= 32 ||
-          (slots & (UINT32_C(1) << image.image_slot)) || image.format != 1 ||
-          image.access != 3 || image.depth != 1 || image.texel_bytes != 4 ||
+          (slots & (UINT32_C(1) << image.image_slot)) || (!r32 && !raw) ||
           !image.width || !image.height || image.offset % 4 || image.row_stride % 4 ||
-          std::uint64_t{image.width} * 4 > image.row_stride ||
+          std::uint64_t{image.width} * image.texel_bytes > image.row_stride ||
           image.layer_stride < std::uint64_t{image.row_stride} * image.height ||
           image.offset > image.bytes ||
-          std::uint64_t{image.height - 1} * image.row_stride +
-              std::uint64_t{image.width} * 4 > image.bytes - image.offset)
-        throw std::runtime_error("USC image view is outside its R32UI resource");
+          std::uint64_t{image.depth - 1} * image.layer_stride +
+                  std::uint64_t{image.height - 1} * image.row_stride +
+                  std::uint64_t{image.width} * image.texel_bytes >
+              image.bytes - image.offset)
+        throw std::runtime_error("USC image view is outside its resource");
       slots |= UINT32_C(1) << image.image_slot;
     }
+  }
+
+  bool OwnsAddress(std::uint64_t address) const noexcept {
+    return std::any_of(resources_.begin(), resources_.end(), [&](const auto &image) {
+      return address >= image.gpu_address &&
+             address - image.gpu_address < image.bytes;
+    });
+  }
+
+  // imageLoad of an in-bounds texel: the shader already bounds-checked the
+  // coordinate against the descriptor, so the DWORD burst lies in the view's
+  // backing snapshot.
+  static void Read(void *user_data, std::uint64_t address,
+                   std::uint32_t dword_count, std::uint32_t *destination) {
+    if (!user_data || !dword_count || !destination)
+      throw std::runtime_error("USC image load has no memory context");
+    auto &memory = *static_cast<UscShaderImageMemory *>(user_data);
+    const std::uint64_t bytes = std::uint64_t{dword_count} * 4U;
+    const bool inside = std::any_of(memory.resources_.begin(), memory.resources_.end(),
+        [&](const auto &image) {
+          return address >= image.gpu_address && address % 4 == 0 &&
+                 address - image.gpu_address <= image.bytes &&
+                 bytes <= image.bytes - (address - image.gpu_address);
+        });
+    if (!memory.memory_ || !inside)
+      throw std::runtime_error("USC image load is outside every bound view");
+    const auto read = memory.memory_->Read(address, static_cast<std::size_t>(bytes),
+                                           memory.client_);
+    if (read.data.size() != bytes)
+      throw std::runtime_error("USC image load returned incomplete data");
+    std::memcpy(destination, read.data.data(), static_cast<std::size_t>(bytes));
+    memory.stats_ += read.stats;
   }
 
   static std::uint32_t Atomic32(void *user_data, PcoOpcode operation,
@@ -69,6 +110,7 @@ private:
       throw std::runtime_error("USC image atomic operation/alignment is invalid");
     const bool in_view = std::any_of(resources_.begin(), resources_.end(),
         [&](const auto &image) {
+          if (image.format != 1) return false;
           const std::uint64_t begin = image.gpu_address + image.offset;
           if (address < begin) return false;
           const std::uint64_t offset = address - begin;
@@ -114,6 +156,7 @@ private:
 
   GpuMemorySystem *memory_;
   std::vector<ShaderImageResource> resources_;
+  MemoryClient client_ = MemoryClient::kFragmentImage;
   MemoryAccessStats stats_;
   std::uint64_t atomics_ = 0;
 };

@@ -1506,64 +1506,40 @@ PcoInstruction DecodeFragmentFitrpGroup(
                 " count=" + std::to_string(component_count) + "]");
   }
 
-  /* Public coefficient/temp source map used by the pinned varying programs:
-   * s0 selects one vec4's four A/B/C/PAD coefficient sets, s2 selects the
-   * position-W set cf0..3, and s3 selects a four-register TEMP destination.
-   * Only compiler-emitted cf4/cf20/cf36/cf52/cf68/cf84/cf100/cf116 and
-   * r0/r1/r4 encodings enter these gates; their exact pairings and ordering
-   * are checked by profiles. */
+  /* Mesa's O_FITRP maps the varying coefficient set to S0, the position-W
+   * set to S2 and the temporary destination to S3. S0..S2 use the native
+   * three-source lower layout: a coefficient index of 128 or more sets the
+   * extension byte's sA_7 (and a long encoding carries bits 10..8). S1 is
+   * unused and encodes special register 0. W is cf0 unless the fragment
+   * shader also reads gl_FragCoord.z, in which case the driver lays Z out at
+   * cf0..3 and W at cf4..7 (fragment_position_uses_z). */
   if (group_end - cursor < 6)
     DecodeError(cursor, "truncated FITRP source encoding");
-  const std::uint8_t coefficient_byte = binary[cursor++];
-  const std::uint8_t source1_byte = binary[cursor++];
-  const std::uint8_t coefficient_high_byte = binary[cursor++];
-  const std::uint8_t source3_byte = binary[cursor++];
-  /*
-   * Bit 7 of the coefficient high byte is the extended-encoding flag the
-   * other source forms use, and it inserts one more byte before the
-   * destination.  The compiler reaches for it once a program addresses enough
-   * registers; the field it carries is pinned to the single value observed so
-   * an unfamiliar one still fails closed rather than being misread.
-   */
-  const bool extended_source = (coefficient_high_byte & 0x80U) != 0;
-  if (extended_source) {
-    if (group_end - cursor < 3)
-      DecodeError(cursor, "truncated extended FITRP source encoding");
-    const std::uint8_t extended_byte = binary[cursor++];
-    if (extended_byte != 0x02U) {
-      DecodeError(cursor - 1,
-                  "FITRP extended source control is not canonical [" +
-                      std::to_string(extended_byte) + "]");
-    }
-  }
-  const std::uint16_t coefficient_index = static_cast<std::uint16_t>(
-      (coefficient_byte & 0x3fU) |
-      ((coefficient_high_byte & 0x04U) != 0 ? 0x40U : 0x00U));
-  if ((coefficient_byte & 0xc0U) != 0xc0U ||
+  const std::size_t sources_offset = cursor;
+  const ThreeLowerSources lower = DecodeThreeLowerSources(binary, group_end, cursor);
+  const std::uint16_t coefficient_index = lower.source0.index;
+  const std::uint16_t position_w_index = lower.source2.index;
+  if (lower.source0.bank != PcoRegisterBank::kCoefficient ||
       coefficient_index < 4 || (coefficient_index & 3U) != 0 ||
       static_cast<std::size_t>(coefficient_index) + component_count * 4U >
           kPcoMaximumVaryingCoefficientCount ||
-      source1_byte != 0x40U ||
-      (coefficient_high_byte & ~0x84U) != 0x10U ||
-      source3_byte != 0xc0U) {
-    DecodeError(cursor - 1,
+      lower.source1.bank != PcoRegisterBank::kSpecial ||
+      lower.source1.index != 0U || lower.input_selector != 0U ||
+      lower.source2.bank != PcoRegisterBank::kCoefficient ||
+      (position_w_index != 0U && position_w_index != 4U) ||
+      coefficient_index < position_w_index + 4U) {
+    DecodeError(sources_offset,
                 "FITRP coefficient source encoding changed [cf=" +
-                    std::to_string(coefficient_byte) +
-                    " s1=" + std::to_string(source1_byte) +
-                    " cfhi=" + std::to_string(coefficient_high_byte) +
-                    " s3=" + std::to_string(source3_byte) +
-                    " index=" + std::to_string(coefficient_index) +
+                    std::to_string(coefficient_index) +
+                    " w=" + std::to_string(position_w_index) +
+                    " s1=" + std::to_string(static_cast<unsigned>(lower.source1.bank)) +
+                    ":" + std::to_string(lower.source1.index) +
+                    " mux=" + std::to_string(lower.input_selector) +
                     " count=" + std::to_string(component_count) +
-                    " next=" +
-                    std::to_string(cursor < group_end ? binary[cursor] : 999) +
-                    "," +
-                    std::to_string(cursor + 1 < group_end ? binary[cursor + 1]
-                                                          : 999) +
-                    "," +
-                    std::to_string(cursor + 2 < group_end ? binary[cursor + 2]
-                                                          : 999) +
                     " total=" + std::to_string(header.total_bytes) + "]");
   }
+  if (group_end - cursor < 2)
+    DecodeError(cursor, "truncated FITRP destination encoding");
   const std::uint8_t destination_byte = binary[cursor++];
   const std::uint16_t destination_index = destination_byte & 0x3fU;
   if ((destination_byte & 0xc0U) != 0x40U ||
@@ -1578,7 +1554,7 @@ PcoInstruction DecodeFragmentFitrpGroup(
   instruction.opcode = PcoOpcode::kFloatInterpolatePerspective;
   instruction.target = PcoWriteTarget::kTemporary;
   instruction.source = {PcoRegisterBank::kCoefficient, coefficient_index};
-  instruction.source1 = {PcoRegisterBank::kCoefficient, 0};
+  instruction.source1 = {PcoRegisterBank::kCoefficient, position_w_index};
   instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
   instruction.group_index = group_index;
   instruction.output_index = destination_index;
@@ -1930,12 +1906,16 @@ PcoInstruction DecodeTextureSampleGroup(
     spatial_offset_present = (extension & 0x02U) != 0;
     const std::uint8_t sample_buffer_mode = (extension >> 4U) & 3U;
     gather = sample_buffer_mode == 1U;
-    // Mesa's real component-0 tg4 uses CHAN1/RAWDATA and returns four
-    // values. Other SBMODE/CHAN combinations have a different response ABI.
+    // Mesa's tg4 uses RAWDATA with CHAN(component+1): four texels of
+    // component+1 channels each, at the base level. A 2D array adds its
+    // layer address (TAO) and textureGatherOffset one spatial offset (SOO);
+    // a cube samples three coordinates and takes neither.
     if ((extension & 0x40U) != 0 || sample_buffer_mode > 1U ||
         (gather && (!fragment_bias || descriptor_start != 0 ||
-                    channel_encoding != 0 || !fcnorm || dimension != 2 ||
-                    (extension != 0x90U && extension != 0x91U) || !lod_replace)) ||
+                    (dimension != 2 && dimension != 3) ||
+                    (extension & ~0x03U) != 0x90U ||
+                    (dimension == 3 && (extension & 0x03U) != 0) ||
+                    !lod_replace)) ||
         pplod != (address_offset || lod_replace || lod_mode == 1U) ||
         /* A 2D multisample array still has a 2D TPU request: Mesa lowers the
          * array layer into the TAO address pair rather than a third coordinate. */
@@ -1945,8 +1925,11 @@ PcoInstruction DecodeTextureSampleGroup(
          lod_mode != 1U && !spatial_offset_present))
       DecodeError(cursor - 1, "unsupported SMP extension flags");
   }
-  if (channel_encoding != (gather ? 0U : 3U))
+  if (!gather && channel_encoding != 3U)
     DecodeError(header.offset + 4, "SMP channel count disagrees with sample-buffer mode");
+  // RAWDATA gather responds with four texels of channel_encoding+1 channels.
+  const std::uint8_t response_words = static_cast<std::uint8_t>(
+      gather ? 4U * (channel_encoding + 1U) : 4U);
   if (descriptor_start != 0 && spatial_offset_present)
     DecodeError(header.offset, "SMP spatial offset transport is not enabled for task-stage textures");
   /* LODM=BIAS is overloaded by Mesa's public encoding when TAO is present.
@@ -2001,7 +1984,7 @@ PcoInstruction DecodeTextureSampleGroup(
   if (response.source1.bank != PcoRegisterBank::kTemporary)
     DecodeError(cursor - 1, "SMP response is not a temporary range");
   const std::uint16_t response_base = response.source1.index;
-  if (static_cast<std::size_t>(response_base) + 4U > kPcoTemporaryCount)
+  if (static_cast<std::size_t>(response_base) + response_words > kPcoTemporaryCount)
     DecodeError(cursor - 1, "SMP response exceeds the temporary file");
   if (cursor >= group_end || binary[cursor++] != 0x00U)
     DecodeError(cursor - 1, "unsupported SMP ISS selection");
@@ -2017,7 +2000,9 @@ PcoInstruction DecodeTextureSampleGroup(
   instruction.texture_spatial_offset_present = spatial_offset_present ? 1U : 0U;
   instruction.texture_lod_replace = lod_replace ? 1U : 0U;
   instruction.texture_lod_bias = lod_bias ? 1U : 0U;
-  instruction.texture_gather = gather ? 1U : 0U;
+  // Nonzero selects gather; the value is the gathered channel plus one.
+  instruction.texture_gather =
+      gather ? static_cast<std::uint8_t>(channel_encoding + 1U) : 0U;
   instruction.target = PcoWriteTarget::kTemporary;
   instruction.source = sources.source1;
   instruction.source1 = sources.source0;
@@ -2025,7 +2010,7 @@ PcoInstruction DecodeTextureSampleGroup(
   instruction.binary_offset = CheckedU32(header.offset + 3, "PCO offset");
   instruction.group_index = group_index;
   instruction.output_index = response_base;
-  instruction.component_count = 4;
+  instruction.component_count = response_words;
   instruction.data_request = 0;
   instruction.source_count = 3;
   instruction.repeat_count = 1;
@@ -5483,6 +5468,14 @@ bool IsRegister(const PcoRegisterRef &reference, PcoRegisterBank bank,
   return reference.bank == bank && reference.index == index;
 }
 
+// FITRP's position-W coefficient set: cf0, or cf4 after a gl_FragCoord.z set,
+// always ahead of the varying it divides.
+bool IsFitrpPositionWSource(const PcoInstruction &instruction) {
+  return instruction.source1.bank == PcoRegisterBank::kCoefficient &&
+         (instruction.source1.index == 0U || instruction.source1.index == 4U) &&
+         instruction.source.index >= instruction.source1.index + 4U;
+}
+
 bool IsDescriptorMetadataSource(const PcoRegisterRef &reference,
                                 const PcoRegisterRef &descriptor,
                                 std::uint16_t dword) {
@@ -6053,6 +6046,13 @@ bool HasCanonicalTextureFields(const PcoInstruction &instruction) {
          (!instruction.texture_sample_index_present ||
           (instruction.texture_non_normalized_coords && !instruction.texture_lod_replace &&
            instruction.texture_dimension == 2));
+}
+
+// SMP writes four words; RAWDATA gather writes four texels of
+// texture_gather (component+1) channels each.
+std::size_t TextureResponseWordCount(const PcoInstruction &instruction) {
+  return instruction.texture_gather ? 4U * instruction.texture_gather
+                                    : kPcoTextureResponseCount;
 }
 
 std::size_t TextureDataDwordCount(const PcoInstruction &instruction) {
@@ -6732,9 +6732,10 @@ void ValidateVertexTemporaryProgram(
                   "vertex TEMP program is outside the public generic subset");
     }
   }
-  if (has_native_control_flow && texture_sample_count != 0)
-    DecodeError(instructions.front().binary_offset,
-                "vertex texture suspension with native control flow is unsupported");
+  // Texture suspension inside native control flow saves P0 and the
+  // execution predicate in the vertex continuation.
+  (void)has_native_control_flow;
+  (void)texture_sample_count;
 }
 
 void ValidateFragmentProgram(
@@ -6830,14 +6831,16 @@ void ValidateFragmentProgram(
       predicate_written |= instruction.writes_predicate != 0;
       continue;
     }
+    // A predicated-off LD issues no DMA request; its unconditional WDF
+    // consumes the empty DRC0 slot exactly as an inactive atomic does.
     if (instruction.exec_cnd > 3 ||
         (instruction.exec_cnd &&
          instruction.opcode != PcoOpcode::kAlphaFeedback &&
          instruction.opcode != PcoOpcode::kDepthFeedback &&
          !IsPcoAtomic32(instruction.opcode) &&
+         instruction.opcode != PcoOpcode::kBufferLoad &&
          (instruction.target != PcoWriteTarget::kTemporary ||
           instruction.opcode == PcoOpcode::kTextureSample ||
-          instruction.opcode == PcoOpcode::kBufferLoad ||
           instruction.opcode == PcoOpcode::kFloatInterpolatePerspective ||
           instruction.opcode == PcoOpcode::kFloatInterpolate ||
           instruction.opcode == PcoOpcode::kDerivativeX ||
@@ -6886,7 +6889,7 @@ void ValidateFragmentProgram(
           instruction.source_count != (perspective ? 2 : 1) || instruction.repeat_count != 1 ||
           instruction.component_count < 1 || instruction.component_count > 4 ||
           instruction.source.bank != PcoRegisterBank::kCoefficient ||
-          (perspective ? !IsRegister(instruction.source1, PcoRegisterBank::kCoefficient, 0)
+          (perspective ? !IsFitrpPositionWSource(instruction)
                        : !IsDefaultUnusedRegister(instruction.source1)) ||
           !IsDefaultUnusedRegister(instruction.source2) ||
           instruction.data_request != 0 ||
@@ -6927,7 +6930,8 @@ void ValidateFragmentProgram(
       if (request_pending || instruction.target != PcoWriteTarget::kTemporary ||
           !HasCanonicalTextureFields(instruction) ||
           instruction.source_count != 3 || instruction.repeat_count != 1 ||
-          instruction.component_count != 4 || instruction.data_request != 0 ||
+          instruction.component_count != TextureResponseWordCount(instruction) ||
+          instruction.data_request != 0 ||
           instruction.iteration_mode != PcoIterationMode::kPixel ||
           instruction.perspective != 0 || instruction.saturate != 0 ||
           instruction.immediate != 0 ||
@@ -6936,7 +6940,8 @@ void ValidateFragmentProgram(
           !coordinate_range_valid ||
           !written_mask.contains_range(coordinate_base, coordinate_count) ||
           !descriptor_pair ||
-          static_cast<std::size_t>(instruction.output_index) + 4U >
+          static_cast<std::size_t>(instruction.output_index) +
+                  instruction.component_count >
               kPcoTemporaryCount) {
         DecodeError(instruction.binary_offset,
                     "invalid generic 2D texture request");
@@ -8626,7 +8631,9 @@ void ValidateExecutionEnvelope(const PcoProgramSummary &summary,
         instruction.repeat_count > kPcoMaximumCountedGroupRepeat)
       ExecuteError("invalid decoded group repeat count");
     const std::size_t maximum_components =
-        instruction.opcode == PcoOpcode::kBufferLoad
+        (instruction.opcode == PcoOpcode::kBufferLoad ||
+         (instruction.opcode == PcoOpcode::kTextureSample &&
+          instruction.texture_gather != 0))
             ? kPcoMaximumBufferLoadDwords : kPcoTextureResponseCount;
     if (instruction.component_count == 0 ||
         instruction.component_count > maximum_components)
@@ -8841,7 +8848,9 @@ void CountPcoInstruction(PcoInstructionCounts &counts,
       ExecuteError("instruction counter received an invalid repeat count");
     const std::size_t maximum_components =
         (instruction.opcode == PcoOpcode::kBufferLoad ||
-         instruction.opcode == PcoOpcode::kBufferStore)
+         instruction.opcode == PcoOpcode::kBufferStore ||
+         (instruction.opcode == PcoOpcode::kTextureSample &&
+          instruction.texture_gather != 0))
             ? kPcoMaximumBufferLoadDwords : kPcoTextureResponseCount;
     if (instruction.component_count == 0 ||
         instruction.component_count > maximum_components) {
@@ -9532,6 +9541,12 @@ PcoVertexExecution ExecuteVertexPco(
         return instruction.opcode == PcoOpcode::kTextureSample;
       });
   const bool resuming = context.continuation.valid != 0;
+  const bool native_control_flow = std::any_of(
+      instructions.begin(), instructions.end(), [](const auto &instruction) {
+        return instruction.opcode == PcoOpcode::kBranch ||
+               instruction.opcode == PcoOpcode::kConditionalMask ||
+               instruction.writes_predicate != 0;
+      });
   if (context.texture_response_valid > 1)
     ExecuteError("vertex texture-response validity is not Boolean");
   if (resuming && !texture_program)
@@ -9603,7 +9618,12 @@ PcoVertexExecution ExecuteVertexPco(
             kPcoTemporaryCount ||
         continuation.vertex_input_count > kPcoVertexInputCount ||
         continuation.shared_count > kPcoMaximumVertexSharedCount ||
-        continuation.emitted > 1 || continuation.ended_task > 1) {
+        continuation.emitted > 1 || continuation.ended_task > 1 ||
+        continuation.predicate > 1 || continuation.predicate_valid > 1 ||
+        continuation.execution_predicate > 1 ||
+        (!continuation.predicate_valid && continuation.predicate) ||
+        (!native_control_flow &&
+         (continuation.predicate_valid || !continuation.execution_predicate))) {
       ExecuteError("invalid texture vertex continuation state");
     }
     if (!vertex_inputs.empty()) {
@@ -9701,13 +9721,18 @@ PcoVertexExecution ExecuteVertexPco(
         expected_ended_task = 1;
       }
     }
-    if (expected_request_pending ||
-        continuation.temporary_written_mask != expected_temporary_mask ||
-        continuation.output_written_mask != expected_output_mask ||
-        continuation.index_register_valid_mask !=
-            expected_index_register_valid_mask ||
-        continuation.emitted != expected_emitted ||
-        continuation.ended_task != expected_ended_task) {
+    // A linear program reaches the checkpoint through every earlier
+    // instruction, so its register masks are fixed by the program. Native
+    // control flow selects a path at run time: only the saved masks' own
+    // consistency below applies.
+    if (!native_control_flow &&
+        (expected_request_pending ||
+         continuation.temporary_written_mask != expected_temporary_mask ||
+         continuation.output_written_mask != expected_output_mask ||
+         continuation.index_register_valid_mask !=
+             expected_index_register_valid_mask ||
+         continuation.emitted != expected_emitted ||
+         continuation.ended_task != expected_ended_task)) {
       ExecuteError("texture vertex continuation masks are inconsistent");
     }
     for (std::size_t index = continuation.vertex_input_count;
@@ -9756,6 +9781,10 @@ PcoVertexExecution ExecuteVertexPco(
     pending_output_index = continuation.pending_output_index;
     pending_component_count = continuation.pending_component_count;
     drc0_pending = true;
+    predicate = continuation.predicate != 0;
+    predicate_valid = continuation.predicate_valid != 0;
+    execution_predicate = continuation.execution_predicate != 0;
+    native_steps = continuation.native_steps;
     pc = continuation.resume_instruction_index;
   }
   const auto read_control_source = [&](const PcoRegisterRef &source) {
@@ -9995,6 +10024,10 @@ PcoVertexExecution ExecuteVertexPco(
       result.continuation.index_register_valid_mask =
           (index_register_valid[0] ? 1U : 0U) |
           (index_register_valid[1] ? 2U : 0U);
+      result.continuation.predicate = predicate ? 1U : 0U;
+      result.continuation.predicate_valid = predicate_valid ? 1U : 0U;
+      result.continuation.execution_predicate = execution_predicate ? 1U : 0U;
+      result.continuation.native_steps = native_steps;
       result.continuation.valid = 1;
       result.suspended = 1;
       return result;
@@ -11226,7 +11259,8 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
     if (continuation.pending_output_index != sample.output_index ||
         continuation.pending_component_count != sample.component_count ||
         continuation.data_request != sample.data_request ||
-        continuation.pending_component_count != (derivative_resume ? 1 : kPcoTextureResponseCount) ||
+        continuation.pending_component_count !=
+            (derivative_resume ? 1U : TextureResponseWordCount(sample)) ||
         static_cast<std::size_t>(continuation.pending_output_index) +
                 continuation.pending_component_count >
             kPcoTemporaryCount) {
@@ -11392,7 +11426,23 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
       temporaries[continuation.pending_output_index] = context.derivative_response;
       temporary_written_mask.set(continuation.pending_output_index);
     } else {
-      std::copy(context.texture_response.begin(), context.texture_response.end(), pending.begin());
+      pending.fill(0);
+      const PcoInstruction *sample =
+          continuation.resume_instruction_index > 0 &&
+                  continuation.resume_instruction_index <= instructions.size()
+              ? &instructions[continuation.resume_instruction_index - 1U]
+              : nullptr;
+      if (sample && sample->opcode == PcoOpcode::kTextureSample &&
+          sample->texture_gather > 1U) {
+        // The TPU returns the gathered channel of each texel; RAWDATA lays
+        // the four texels out as channels 0..component, and the compiler's
+        // tg4 swizzle reads only the gathered channel of each.
+        const std::size_t channels = sample->texture_gather;
+        for (std::size_t tap = 0; tap < kPcoTextureResponseCount; ++tap)
+          pending[tap * channels + channels - 1U] = context.texture_response[tap];
+      } else {
+        std::copy(context.texture_response.begin(), context.texture_response.end(), pending.begin());
+      }
       pending_output_index = continuation.pending_output_index;
       pending_component_count = continuation.pending_component_count;
       drc0_pending = true;
@@ -11691,7 +11741,7 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
           static_cast<std::size_t>(instruction.source.index) +
                   instruction.component_count * 4U >
               context.coefficient_count ||
-          (perspective ? !IsRegister(instruction.source1, PcoRegisterBank::kCoefficient, 0)
+          (perspective ? !IsFitrpPositionWSource(instruction)
                        : !IsDefaultUnusedRegister(instruction.source1))) {
         ExecuteError("invalid FITR/FITRP semantics [drc=" +
                      std::to_string(drc0_pending ? 1 : 0) +
@@ -11719,7 +11769,8 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
        * boundary.  Preserve the public driver ABI's operation sequence. */
       const std::uint32_t one_over_w = perspective ? FloatDivideBits(
           UINT32_C(0x3f800000), EvaluateCoefficientPlane(
-              context, 0, instruction.iteration_mode)) : UINT32_C(0x3f800000);
+              context, instruction.source1.index, instruction.iteration_mode))
+                                                   : UINT32_C(0x3f800000);
       for (std::size_t component = 0;
            component < instruction.component_count;
            ++component) {
@@ -11815,7 +11866,7 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
           instruction.target != PcoWriteTarget::kTemporary ||
           instruction.source_count != 3 || instruction.repeat_count != 1 ||
           !HasCanonicalTextureFields(instruction) ||
-          instruction.component_count != kPcoTextureResponseCount ||
+          instruction.component_count != TextureResponseWordCount(instruction) ||
           instruction.data_request != 0 ||
           instruction.source.bank != PcoRegisterBank::kTemporary ||
           !coordinate_range_valid ||
@@ -11828,7 +11879,8 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
               (instruction.texture_gather ? 16U : 8U) ||
           texture_base + kPcoTextureDescriptorDwordCount >
               context.shared_count ||
-          static_cast<std::size_t>(instruction.output_index) + 4U >
+          static_cast<std::size_t>(instruction.output_index) +
+                  instruction.component_count >
               kPcoTemporaryCount) {
         ExecuteError("invalid generic SMP.2D.FCNORM instruction");
       }
@@ -11841,7 +11893,13 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
       }
       const bool descriptor_shadow =
           (context.shared_registers[texture_base + 7U] & UINT32_C(0x200)) != 0;
-      if (descriptor_shadow != (instruction.texture_shadow_compare != 0)) {
+      // RAWDATA gather returns stored depths; the compiler compares each tap
+      // in shader ALU, so a shadow descriptor carries no native Dref here.
+      if (instruction.texture_gather != 0 &&
+          instruction.texture_shadow_compare != 0)
+        ExecuteError("SMP raw gather cannot request a native Dref compare");
+      if (instruction.texture_gather == 0 &&
+          descriptor_shadow != (instruction.texture_shadow_compare != 0)) {
         ExecuteError(
             "shadow descriptor and native Dref marker disagree: descriptor=" +
             std::to_string(descriptor_shadow ? 1U : 0U) +
@@ -11853,7 +11911,7 @@ static PcoFragmentExecution ExecuteFragmentPcoValidated(
             std::to_string(context.shared_registers[texture_base + 12U]) +
             " base=" + std::to_string(texture_base));
       }
-      if (descriptor_shadow) {
+      if (descriptor_shadow && instruction.texture_gather == 0) {
         const std::uint32_t compare_op =
             context.shared_registers[texture_base + 12U];
         if (compare_op > 7U)

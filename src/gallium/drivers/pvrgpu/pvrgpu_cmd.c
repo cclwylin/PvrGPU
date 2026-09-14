@@ -1178,10 +1178,13 @@ pvrgpu_cmd_validate_graphics_buffers(
       const struct pvrgpu_systemc_pco_stage_abi *abi = abis[stage];
       const uint32_t texture_count = texture_counts ? texture_counts[stage] : 0u;
       const bool fragment_images =
-         stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT &&
-         (cmd->fragment_image_descriptor_count ||
-          cmd->fragment_image_descriptor_start ||
-          cmd->fragment_image_read_mask || cmd->fragment_image_write_mask);
+         (stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_FRAGMENT &&
+          (cmd->fragment_image_descriptor_count ||
+           cmd->fragment_image_descriptor_start ||
+           cmd->fragment_image_read_mask || cmd->fragment_image_write_mask)) ||
+         (stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_VERTEX &&
+          (cmd->vertex_image_descriptor_count ||
+           cmd->vertex_image_descriptor_start || cmd->vertex_image_read_mask));
       const bool empty = !texture_count && !fragment_images &&
          !storage->descriptor_start && !storage->descriptor_count &&
          !storage->used_mask && !storage->read_mask && !storage->write_mask &&
@@ -1217,6 +1220,19 @@ pvrgpu_cmd_validate_graphics_buffers(
                      cmd->fragment_image_write_mask))
             goto invalid;
          descriptor_end += 8u * cmd->fragment_image_descriptor_count;
+      }
+      if (stage == PVRGPU_SYSTEMC_PCO_SHADER_STAGE_VERTEX) {
+         const uint32_t image_mask = cmd->vertex_image_descriptor_count >= 32
+            ? UINT32_MAX : cmd->vertex_image_descriptor_count
+               ? (UINT32_C(1) << cmd->vertex_image_descriptor_count) - 1 : 0;
+         if (cmd->vertex_image_descriptor_count > 32 ||
+             (cmd->vertex_image_read_mask & ~image_mask) ||
+             (cmd->vertex_image_descriptor_count
+                ? cmd->vertex_image_descriptor_start != descriptor_end
+                : cmd->vertex_image_descriptor_start ||
+                     cmd->vertex_image_read_mask))
+            goto invalid;
+         descriptor_end += 8u * cmd->vertex_image_descriptor_count;
       }
       const uint64_t storage_end = descriptor_end +
          4u * storage->descriptor_count;

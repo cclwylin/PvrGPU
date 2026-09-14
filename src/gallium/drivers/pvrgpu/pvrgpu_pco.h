@@ -202,6 +202,10 @@ struct pvrgpu_pco_graphics_binary {
    uint32_t fragment_image_descriptor_count;
    uint32_t fragment_image_read_mask;
    uint32_t fragment_image_write_mask;
+   /* Read-only raw vertex images follow the vertex texture/UBO descriptors. */
+   uint32_t vertex_image_descriptor_start;
+   uint32_t vertex_image_descriptor_count;
+   uint32_t vertex_image_read_mask;
    bool fragment_early_tests;
 };
 

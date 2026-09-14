@@ -805,6 +805,26 @@ void CopyPcoPayloadFields(
     owned.bytes.assign(image.bytes, image.bytes + image.bytes_size);
     destination->fragment_images.push_back(std::move(owned));
   }
+  destination->vertex_images.clear();
+  destination->vertex_image_descriptor_start = source.vertex_image_descriptor_start;
+  destination->vertex_image_descriptor_count = source.vertex_image_descriptor_count;
+  destination->vertex_image_read_mask = source.vertex_image_read_mask;
+  if (source.vertex_image_count > PVRGPU_SYSTEMC_MAX_SHADER_IMAGES ||
+      ((source.vertex_image_count != 0) != (source.vertex_images != nullptr)))
+    throw std::runtime_error("SystemC API vertex image payload count/pointer mismatch");
+  for (unsigned index = 0; index < source.vertex_image_count; ++index) {
+    const auto &image = source.vertex_images[index];
+    if (!image.bytes || !image.bytes_size || image.bytes_size > PVRGPU_SYSTEMC_MAX_SHADER_IMAGE_BYTES)
+      throw std::runtime_error("SystemC API vertex image backing snapshot is invalid");
+    pvrgpu::stub::DriverShaderImage owned;
+    owned.image_slot = image.image_slot; owned.format = image.format; owned.access = image.access;
+    owned.resource_token = image.resource_token; owned.offset = image.offset;
+    owned.width = image.width; owned.height = image.height; owned.depth = image.depth;
+    owned.row_stride = image.row_stride; owned.layer_stride = image.layer_stride;
+    owned.texel_bytes = image.texel_bytes;
+    owned.bytes.assign(image.bytes, image.bytes + image.bytes_size);
+    destination->vertex_images.push_back(std::move(owned));
+  }
   destination->explicit_varying_bindings = source.varying_bindings != nullptr;
   destination->varying_bindings.clear();
   for (std::uint32_t i = 0; i < source.varying_binding_count; ++i) {
@@ -1198,10 +1218,11 @@ bool InitialColorAttachmentIsValid(
       (source.raster_samples ? source.raster_samples : 1) *
       (source.framebuffer_layers ? source.framebuffer_layers : 1);
   std::uint64_t expected = 0;
-  for (const auto &format : formats) {
+  for (std::size_t target = 0; target < formats.size(); ++target) {
     const auto target_bytes = stored_pixels *
-        pvrgpu::stub::DriverColorAttachmentBytesPerPixel(format);
-    if (target_bytes > pvrgpu::stub::kDriverPcoSequenceAttachmentStride)
+        pvrgpu::stub::DriverColorAttachmentBytesPerPixel(formats[target]);
+    if (target_bytes > pvrgpu::stub::SequenceColorAttachmentByteLimit(
+                           static_cast<std::uint32_t>(target)))
       return reject("transport exceeds attachment address slot");
     expected += target_bytes;
   }
@@ -1226,7 +1247,7 @@ bool InitialDepthAttachmentIsValid(
       (source.framebuffer_layers ? source.framebuffer_layers : 1) *
       pvrgpu::stub::DepthAttachmentBytesPerPixel(source.depth_format);
   if (expected == 0 || expected != source.initial_depth_attachment_bytes_size ||
-      expected > pvrgpu::stub::kDriverPcoSequenceAttachmentStride) {
+      expected > pvrgpu::stub::kDriverPcoSequenceAttachmentRegionBytes) {
     *error = "SystemC API initial depth attachment byte count is invalid";
     return false;
   }
@@ -1886,8 +1907,6 @@ bool CopyPcoSequenceDraw(
   }
   const auto &raster_abi = geometry ? source.geometry_pco_abi
       : tessellation ? source.tessellation->evaluation_abi : source.vertex_pco_abi;
-  if (source.stream_output && geometry)
-    return refuse("stream output from geometry shaders is not implemented");
   if (!ValidateStreamOutput(source.stream_output, raster_abi.vertex_outputs, error))
     return false;
   if (source.varying_binding_count > PVRGPU_SYSTEMC_MAX_VARYING_BINDINGS ||
@@ -2174,13 +2193,30 @@ bool CopyPcoSequenceDraw(
       source.depth_attachment_source_command_index < ordinal;
   std::uint32_t maximum_color_bytes_per_pixel =
       pvrgpu::stub::DriverColorAttachmentBytesPerPixel(source.format);
+  // The primary colour and depth planes may span several attachment slots;
+  // MRT colours past the first are one stride each.
+  std::uint32_t primary_color_bytes_per_pixel = maximum_color_bytes_per_pixel;
+  std::uint32_t extra_color_bytes_per_pixel =
+      source.color_attachment_format_count == 0 && source.render_target_count > 1
+          ? primary_color_bytes_per_pixel : 0U;
   for (std::uint32_t target = 0;
        target < source.color_attachment_format_count; ++target) {
-    maximum_color_bytes_per_pixel = std::max(
-        maximum_color_bytes_per_pixel,
+    const std::uint32_t bytes_per_pixel =
         pvrgpu::stub::DriverColorAttachmentBytesPerPixel(
-            source.color_attachment_formats[target]));
+            source.color_attachment_formats[target]);
+    maximum_color_bytes_per_pixel = std::max(maximum_color_bytes_per_pixel,
+                                             bytes_per_pixel);
+    if (target == 0)
+      primary_color_bytes_per_pixel = bytes_per_pixel;
+    else
+      extra_color_bytes_per_pixel =
+          std::max(extra_color_bytes_per_pixel, bytes_per_pixel);
   }
+  const std::uint64_t attachment_stored_pixels =
+      static_cast<std::uint64_t>(source.framebuffer_width) *
+      source.framebuffer_height *
+      (source.raster_samples ? source.raster_samples : 1U) *
+      (source.framebuffer_layers ? source.framebuffer_layers : 1U);
   // Name the field that is unsupported: "raster/resource state is invalid"
   // covers two dozen conditions and gives no way to tell which feature a
   // capture actually needs.
@@ -2231,14 +2267,14 @@ bool CopyPcoSequenceDraw(
   else if (source.framebuffer_layers > 256 ||
            (source.framebuffer_layers && source.render_target_count > 1))
     nested_reason = "framebuffer_layers";
-  else if (static_cast<std::uint64_t>(source.framebuffer_width) *
-               source.framebuffer_height * (source.raster_samples ? source.raster_samples : 1U) *
-               (source.framebuffer_layers ? source.framebuffer_layers : 1U) *
+  else if (attachment_stored_pixels *
                std::max<std::uint32_t>(
-                   maximum_color_bytes_per_pixel,
+                   primary_color_bytes_per_pixel,
                    depth_format_supported && source.depth_format ?
                        pvrgpu::stub::DepthAttachmentBytesPerPixel(source.depth_format) : 0U) >
-           pvrgpu::stub::kDriverPcoSequenceAttachmentStride)
+               pvrgpu::stub::kDriverPcoSequenceAttachmentRegionBytes ||
+           attachment_stored_pixels * extra_color_bytes_per_pixel >
+               pvrgpu::stub::kDriverPcoSequenceAttachmentStride)
     nested_reason = "framebuffer_attachment_extent";
   else if (source.color_mask > 0x0f)
     nested_reason = "color_mask";
@@ -2351,8 +2387,11 @@ bool CopyCommand(const pvrgpu_systemc_driver_command &source,
   }
   if (source.fragment_images || source.fragment_image_count ||
       source.fragment_image_descriptor_start || source.fragment_image_descriptor_count ||
-      source.fragment_image_read_mask || source.fragment_image_write_mask || source.fragment_early_tests) {
-    *error = "SystemC API fragment images/early tests require a nested PCO draw";
+      source.fragment_image_read_mask || source.fragment_image_write_mask || source.fragment_early_tests ||
+      source.vertex_images || source.vertex_image_count ||
+      source.vertex_image_descriptor_start || source.vertex_image_descriptor_count ||
+      source.vertex_image_read_mask) {
+    *error = "SystemC API shader images/early tests require a nested PCO draw";
     return false;
   }
   if (source.uniform_buffer_count || source.uniform_buffers ||
@@ -2519,10 +2558,12 @@ std::uint64_t CommandOwnedPayloadBytes(
       throw std::overflow_error("SystemC API stream output payload size overflow");
     byte_vectors += target.bytes.size();
   }
-  for (const auto &image : command.fragment_images) {
-    if (image.bytes.size() > std::numeric_limits<std::uint64_t>::max() - byte_vectors)
-      throw std::overflow_error("SystemC API fragment image payload size overflow");
-    byte_vectors += image.bytes.size();
+  for (const auto *images : {&command.vertex_images, &command.fragment_images}) {
+    for (const auto &image : *images) {
+      if (image.bytes.size() > std::numeric_limits<std::uint64_t>::max() - byte_vectors)
+        throw std::overflow_error("SystemC API shader image payload size overflow");
+      byte_vectors += image.bytes.size();
+    }
   }
   for (const auto &resource : command.tessellation.buffer_resources) {
     if (resource.bytes.size() >
@@ -2765,10 +2806,28 @@ bool CopyPcoSequenceTexture(
     return reject("mag filter");
   if (source.mip_filter > PVRGPU_SYSTEMC_PCO_TEXTURE_MIP_FILTER_LINEAR)
     return reject("mip filter");
-  if (source.wrap_u > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT)
+  const bool border_wrap =
+      source.wrap_u == PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER ||
+      source.wrap_v == PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER ||
+      (source.texture_kind == 2U &&
+       source.wrap_w == PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER);
+  if (source.wrap_u > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER)
     return reject("wrap u");
-  if (source.wrap_v > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT)
+  if (source.wrap_v > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER)
     return reject("wrap v");
+  if (source.wrap_w > PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER)
+    return reject("wrap w");
+  const std::string_view border_format =
+      source.format ? std::string_view(source.format) : std::string_view();
+  if (border_wrap &&
+      (source.texture_kind > 2U ||
+       (border_format != "PIPE_FORMAT_R32G32B32A32_FLOAT" &&
+        border_format != "PIPE_FORMAT_R32G32B32A32_UINT" &&
+        border_format != "PIPE_FORMAT_R32G32B32A32_SINT")))
+    return reject("clamp-to-border storage");
+  if (!border_wrap && (source.border_texel[0] || source.border_texel[1] ||
+                       source.border_texel[2] || source.border_texel[3]))
+    return reject("border texel without clamp-to-border");
   if (source.normalized_coordinates != 1)
     return reject("normalized coordinates");
   if (source.min_lod_u4_6 > source.max_lod_u4_6)
@@ -2863,6 +2922,8 @@ bool CopyPcoSequenceTexture(
           return pvrgpu::stub::TextureWrapMode::kRepeat;
         case PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT:
           return pvrgpu::stub::TextureWrapMode::kMirroredRepeat;
+        case PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER:
+          return pvrgpu::stub::TextureWrapMode::kClampToBorder;
         default:
           return pvrgpu::stub::TextureWrapMode::kClampToEdge;
         }
@@ -2972,6 +3033,8 @@ bool CopyPcoSequenceTexture(
   texture.layers = source.layers == 0U ? 1U : source.layers;
   texture.buffer_elements = source.buffer_elements;
   texture.sample_count = samples;
+  std::copy(std::begin(source.border_texel), std::end(source.border_texel),
+            texture.border_texel.begin());
   *destination = std::move(texture);
   return true;
 }
@@ -3219,6 +3282,17 @@ bool CopyPcoSequence(const pvrgpu_systemc_driver_command &source,
         !pvrgpu::stub::ValidateDriverTessellationBuffers(command, error) ||
         !pvrgpu::stub::ValidateDriverGraphicsShaderBuffers(command, error))
       return false;
+    for (const auto &image : command.vertex_images) {
+      if (graphics_buffer_snapshots.count(image.resource_token)) {
+        *error = "SystemC API vertex image aliases a graphics buffer";
+        return false;
+      }
+      const auto [entry, inserted] = image_snapshots.emplace(image.resource_token, &image);
+      if (!inserted && entry->second->bytes != image.bytes) {
+        *error = "SystemC API vertex image snapshot changed within one sequence";
+        return false;
+      }
+    }
     for (const auto &image : command.fragment_images) {
       if (graphics_buffer_snapshots.count(image.resource_token)) {
         *error =

@@ -142,7 +142,7 @@ void VerifyBinaryStages() {
 }
 
 void VerifyPreviousVersionGuard(Submission &submit) {
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 40);
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 42);
   constexpr auto previous_size = offsetof(pvrgpu_systemc_driver_command, geometry_pco);
   static_assert(previous_size % alignof(pvrgpu_systemc_driver_command) == 0);
 #if defined(_WIN32)
@@ -491,7 +491,7 @@ void VerifyExplicitLayerPipeline(Fixture &fixture, Submission &submit,
   binding.output_dword = 5; binding.flat = 1;
   pvrgpu_systemc_stream_output stream_output{};
   draw.stream_output = &stream_output;
-  submit.Rejected(draw, "stream output from geometry", "GS explicit mapping does not enable GS transform feedback");
+  submit.Rejected(draw, "stream output binding/target list is invalid", "GS transform feedback validates its capture list against GS exports");
   draw.stream_output = nullptr;
   Check(!std::filesystem::exists(root), "invalid GS linkage enqueues no model work");
   draw.blend_enable = 0;

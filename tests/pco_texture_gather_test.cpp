@@ -107,24 +107,53 @@ void TestNative() {
              "fragment gather reached vertex sampling");
   }
 }
+// textureGather(sampler, uv, 1): SMP.RAWDATA CHAN1 returns two channels per
+// texel (eight DWORDs), the green channel of each tap at every odd word, and
+// PCO's TG4 swizzle s*2+1 selects them in GL order.
+void TestComponentGather() {
+  const auto binary = test::TextureGatherFixture(1);
+  const auto program = DecodePcoProgram(ShaderStage::kFragment, binary);
+  const auto &i = program.instructions[Sample(program)];
+  Check(i.texture_gather == 2 && i.component_count == 8 &&
+        binary[i.binary_offset + 1] == 0x56 && i.source2.index == 16,
+        "component1 gather decodes as CHAN1 RAWDATA with eight response words");
+  const auto context = Context();
+  const PcoPreparedFragmentProgram prepared(program.summary, program.instructions);
+  const auto first = ExecuteFragmentPco(prepared, context);
+  Check(first.suspended && first.texture_request_valid &&
+        first.texture_request.gather == 2 && first.texture_request.component_count == 4,
+        "the TPU receives one four-tap request for channel 1");
+  const std::array<std::uint32_t, 4> taps{Bits(-1.5F), Bits(2.25F), Bits(8.0F), Bits(0.0625F)};
+  const auto done = ResumeFragmentPco(prepared, first.continuation, taps);
+  const std::array<unsigned, 4> order{2, 3, 1, 0};
+  for (unsigned c = 0; c < 4; ++c)
+    Check(done.pixel_outputs[c] == taps[order[c]], "component1 taps reach GL gather order");
+  Check(!done.suspended && done.written_mask == 15 && done.executed_instructions.texture == 1,
+        "component1 gather completes after one response");
+  auto bad = first.continuation;
+  bad.pending_component_count = 4;
+  Reject([&] { ResumeFragmentPco(prepared, bad, taps); },
+         "component1 continuation must keep its eight-word response width");
+}
 void TestRefusal() {
   const auto binary = test::TextureGatherFixture(0);
   const auto program = DecodePcoProgram(ShaderStage::kFragment, binary);
   const auto index = Sample(program);
   const auto offset = program.instructions[index].binary_offset;
-  Reject([&] { DecodePcoProgram(ShaderStage::kFragment, test::TextureGatherFixture(1)); },
-         "real component1 uses eight response DWORDs and must remain unsupported");
-  for (unsigned mask : {0x10U, 0x08U}) {
+  // FCNORM clear is an integer texture's raw gather and decodes.
+  for (unsigned mask : {0x08U}) {
     auto bad = binary; bad[offset] ^= mask;
-    Reject([&] { DecodePcoProgram(ShaderStage::kFragment, bad); }, "FCNORM/DRC mutation accepted");
+    Reject([&] { DecodePcoProgram(ShaderStage::kFragment, bad); }, "DRC mutation accepted");
   }
-  for (unsigned mask : {0x80U, 0x20U, 0x04U, 0x08U, 0x0cU, 0x01U, 0x02U}) {
+  // CHAN 1..3 select component 1..3 RAWDATA (TestComponentGather).
+  for (unsigned mask : {0x80U, 0x20U, 0x01U, 0x02U}) {
     auto bad = binary; bad[offset + 1] ^= mask;
     Reject([&] { DecodePcoProgram(ShaderStage::kFragment, bad); }, "EXTB/dimension/CHAN/LOD mutation accepted");
   }
-  for (unsigned mask : {0x80U, 0x40U, 0x10U, 0x20U, 0x30U, 2U, 4U, 8U}) {
+  // SOO (2) is a native textureGatherOffset and decodes.
+  for (unsigned mask : {0x80U, 0x40U, 0x10U, 0x20U, 0x30U, 4U, 8U}) {
     auto bad = binary; bad[offset + 2] ^= mask;
-    Reject([&] { DecodePcoProgram(ShaderStage::kFragment, bad); }, "PPLOD/PROJ/SBMODE/SOO/SNO/NN mutation accepted");
+    Reject([&] { DecodePcoProgram(ShaderStage::kFragment, bad); }, "PPLOD/PROJ/SBMODE/SNO/NN mutation accepted");
   }
   auto wrong_sampler = binary;
   Check(wrong_sampler[offset + 6] == 16, "fixture sampler encoding moved");
@@ -139,7 +168,7 @@ void TestRefusal() {
       case 0: i.texture_gather = 2; break;
       case 1: i.texture_gather = 0; break;
       case 2: i.texture_dimension = 3; break;
-      case 3: i.texture_fcnorm = 0; break;
+      case 3: i.texture_fcnorm = 2; break;
       case 4: i.texture_address_offset = 2; break;
       case 5: i.texture_non_normalized_coords = 1; break;
       case 6: i.texture_sample_index_present = 1; break;
@@ -188,7 +217,7 @@ int main(int argc, char **argv) {
       const std::vector<std::uint8_t> actual{std::istreambuf_iterator<char>(stream), {}};
       Check(actual == test::TextureGatherFixture(kind), "fixture differs from actual PCO output");
     }
-    TestNative(); TestRefusal();
+    TestNative(); TestComponentGather(); TestRefusal();
     std::cout << "Native component gather ISS: " << checks << " checks PASS\n";
     return 0;
   } catch (const std::exception &error) {

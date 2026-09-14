@@ -1,8 +1,17 @@
 diff --git a/src/compiler/nir/nir_opt_shrink_vectors.c b/src/compiler/nir/nir_opt_shrink_vectors.c
-index ae6bece..758581b 100644
+index ae6bece..fc04153 100644
 --- a/src/compiler/nir/nir_opt_shrink_vectors.c
 +++ b/src/compiler/nir/nir_opt_shrink_vectors.c
-@@ -111,8 +111,18 @@ shrink_dest_to_read_mask(nir_def *def, bool shrink_start)
+@@ -107,12 +107,27 @@ shrink_dest_to_read_mask(nir_def *def, bool shrink_start)
+ 
+    shrink_start &= intr && (nir_intrinsic_has_component(intr) || offset_src) &&
+                    is_only_used_by_alu(def);
++   /* A Gallium load_uniform addresses non-packed uniform storage in vec4
++    * slots (nir_lower_uniforms_to_ubo multiplies base, range and offset by
++    * 16), so a byte-sized start adjustment would select a later slot instead
++    * of a later component.  Only trim its trailing channels. */
++   shrink_start &= !intr || intr->intrinsic != nir_intrinsic_load_uniform;
+ 
     int last_bit = util_last_bit(mask);
     int first_bit = shrink_start ? (ffs(mask) - 1) : 0;
  

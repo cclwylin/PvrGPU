@@ -54,7 +54,7 @@ void Run(){
     for(unsigned n=0;n<4;++n)Check(done.pixel_outputs[n]==Bits(Compare(op,clamped,depths[order[n]])?1.F:0.F),"actual shader compare/clamp and GL tap order");
     Check(!done.suspended&&done.written_mask==15&&done.executed_instructions.texture==1&&done.native_steps==p.instructions.size(),"one request across original WDF, complete program");
   }
-  for(unsigned bit:{2U,4U,8U,0x20U,0x40U,0x80U}){auto bad=bytes;bad[483]^=bit;Reject([&]{DecodePcoProgram(ShaderStage::kFragment,bad);},"unsupported native gather extension");}
+  for(unsigned bit:{4U,8U,0x20U,0x40U,0x80U}){auto bad=bytes;bad[483]^=bit;Reject([&]{DecodePcoProgram(ShaderStage::kFragment,bad);},"unsupported native gather extension");}
   for(unsigned mutation=0;mutation<7;++mutation){auto bad=p;auto&b=bad.instructions[index];switch(mutation){case 0:b.texture_address_offset=2;break;case 1:b.texture_lod_replace=0;break;case 2:b.source.index=253;break;case 3:b.source2.index=8;break;case 4:b.component_count=8;break;case 5:b.texture_dimension=3;break;case 6:b.texture_lod_bias=1;break;}Reject([&]{PcoPreparedFragmentProgram x(bad.summary,bad.instructions);},"malformed array-gather metadata");}
   auto c=Context(1,.5,3,true);auto first=ExecuteFragmentPco(prepared,c);
   c.continuation=first.continuation;c.texture_response_valid=1;c.texture_response=taps;c.continuation.program_signature^=1;

@@ -21,8 +21,12 @@ extern "C" {
  * API-v39 carries independent colour mask and blend state for four targets.
  * API-v40 stores UNORM colour of at most eight bits per channel as four
  * bit-replicated RGBA8 bytes instead of sixteen-byte RGBA32F.
+ * API-v41 adds the clamp-to-border address mode and each texture binding's
+ * border texel.
+ * API-v42 adds read-only raw image views (any format the shader unpacks) and
+ * the vertex-stage image list.
  * Old versioned consumers must not guess at the longer command envelope. */
-#define PVRGPU_SYSTEMC_API_VERSION 40u
+#define PVRGPU_SYSTEMC_API_VERSION 42u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFERS_PER_STAGE 15u
 #define PVRGPU_SYSTEMC_MAX_UNIFORM_BUFFER_BYTES (64u * 1024u)
 /*
@@ -217,6 +221,9 @@ struct pvrgpu_systemc_stream_output {
 #define PVRGPU_SYSTEMC_MAX_SHADER_IMAGES 32u
 #define PVRGPU_SYSTEMC_MAX_SHADER_IMAGE_BYTES (256u * 1024u * 1024u)
 #define PVRGPU_SYSTEMC_SHADER_IMAGE_R32_UINT 1u
+/* API-v42: texel_bytes of native storage the shader itself packs/unpacks.
+ * Raw views are read-only; writes keep the R32_UINT atomic contract. */
+#define PVRGPU_SYSTEMC_SHADER_IMAGE_RAW 2u
 #define PVRGPU_SYSTEMC_SHADER_IMAGE_READ 1u
 #define PVRGPU_SYSTEMC_SHADER_IMAGE_WRITE 2u
 /* Whole backing-resource bytes preserve aliases and untouched padding. The
@@ -305,6 +312,10 @@ enum pvrgpu_systemc_pco_texture_wrap {
     * every GL_MIRRORED_REPEAT sampler was declined at the driver.
     */
    PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_MIRRORED_REPEAT = 2,
+   /* A tap outside the image reads border_texel.  Only 2D, 2D-array and 3D
+    * images with 32-bit-per-channel canonical storage carry it; seamless cube
+    * addressing has no border. */
+   PVRGPU_SYSTEMC_PCO_TEXTURE_WRAP_CLAMP_TO_BORDER = 3,
 };
 
 struct pvrgpu_systemc_pco_texture_mip {
@@ -360,6 +371,12 @@ struct pvrgpu_systemc_pco_sequence_texture {
    /* 0 等同 1；支援 1/2/4/8。MS 資料採 pixel-interleaved samples，
     * 僅外部 payload、2D/2D-array、單一 mip；row_pitch 包含全部 samples。 */
    uint32_t sample_count;
+   /* The texel a clamp-to-border tap reads, in the storage's channel words
+    * (binary32 bits for R32G32B32A32_FLOAT, raw values for the integer
+    * storages): the sampler border colour clamped to the view format, absent
+    * channels defaulted as unpacked texels are, then view-swizzled.  Zero
+    * when no address mode is clamp-to-border. */
+   uint32_t border_texel[4];
 };
 
 struct pvrgpu_systemc_driver_command {
@@ -690,6 +707,13 @@ struct pvrgpu_systemc_driver_command {
    uint32_t blend_destination_rgb_factors[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
    uint32_t blend_source_alpha_factors[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
    uint32_t blend_destination_alpha_factors[PVRGPU_SYSTEMC_MAX_RENDER_TARGETS];
+   /* API-v42 append-only tail: vertex-stage image views, laid out like the
+    * fragment list with VS shared-register descriptors. Read-only. */
+   const struct pvrgpu_systemc_shader_image *vertex_images;
+   uint32_t vertex_image_count;
+   uint32_t vertex_image_descriptor_start;
+   uint32_t vertex_image_descriptor_count;
+   uint32_t vertex_image_read_mask;
 };
 
 struct pvrgpu_systemc_submit_info {

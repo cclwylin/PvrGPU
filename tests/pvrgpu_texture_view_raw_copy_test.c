@@ -154,9 +154,11 @@ test_rejections(void)
                                           &rgb9.base, 0, &box));
    CHECK(!pvrgpu_can_copy_texture_region(&depth.base, 0, 0, 0, 0,
                                           &uint32.base, 0, &box));
+   /* glCopyImageSubData may copy between image targets: a cube face and a
+    * 2D-array layer are the same stored slice. */
    uint32.base.target = PIPE_TEXTURE_2D_ARRAY;
-   CHECK(!pvrgpu_can_copy_texture_region(&uint32.base, 0, 0, 0, 0,
-                                          &rgb9.base, 0, &box));
+   CHECK(pvrgpu_can_copy_texture_region(&uint32.base, 0, 0, 0, 0,
+                                         &rgb9.base, 0, &box));
    uint32.base.target = PIPE_TEXTURE_CUBE;
    box.x = 16;
    CHECK(!pvrgpu_can_copy_texture_region(&uint32.base, 0, 0, 0, 0,

@@ -836,22 +836,10 @@ RogueTextureSamplerDescriptor DecodeRogueTextureSamplerDescriptor(
    */
   const bool lod_window_runs_forwards =
       descriptor.min_lod_u4_6 <= descriptor.max_lod_u4_6;
-  const bool supported_wrap_u =
-      descriptor.wrap_u == TextureWrapMode::kRepeat ||
-      descriptor.wrap_u == TextureWrapMode::kMirroredRepeat ||
-      descriptor.wrap_u == TextureWrapMode::kClampToEdge;
-  const bool supported_wrap_v =
-      descriptor.wrap_v == TextureWrapMode::kRepeat ||
-      descriptor.wrap_v == TextureWrapMode::kMirroredRepeat ||
-      descriptor.wrap_v == TextureWrapMode::kClampToEdge;
-  // addrmode_w carries the depth-axis wrap; a 2D or array sample leaves it
-  // repeat and never reads it, a 3D sample applies it to the r coordinate.
-  const bool supported_wrap_w =
-      descriptor.wrap_w == TextureWrapMode::kRepeat ||
-      descriptor.wrap_w == TextureWrapMode::kMirroredRepeat ||
-      descriptor.wrap_w == TextureWrapMode::kClampToEdge;
+  // DecodeWrapMode admits exactly the four address modes the wrap arithmetic
+  // implements. addrmode_w carries the depth-axis wrap; a 2D or array sample
+  // leaves it repeat and never reads it, a 3D sample applies it to r.
   if (ExtractBits(word0, 0, 12) != 4095U ||
-      !supported_wrap_u || !supported_wrap_v || !supported_wrap_w ||
       ExtractBits(word0, 44, 46) != 0U ||
       ExtractBits(word0, 47, 48) != 0U ||
       descriptor.normalized_coordinates != 1U ||
@@ -923,14 +911,20 @@ bool DriverPcoTextureDescriptorClassSupported(
        sampler.mip_filter == TextureFilter::kNearest);
   const bool window_runs_forwards =
       sampler.min_lod_u4_6 <= sampler.max_lod_u4_6;
-  // An address mode the wrap arithmetic implements.
+  // An address mode the wrap arithmetic implements. A border tap reads the
+  // binding's border texel, which only has a defined meaning for the
+  // 32-bit-per-channel storage the driver supplies with it.
+  const auto supported_axis = [&](TextureWrapMode wrap) {
+    return wrap == TextureWrapMode::kClampToEdge ||
+           wrap == TextureWrapMode::kRepeat ||
+           wrap == TextureWrapMode::kMirroredRepeat ||
+           (wrap == TextureWrapMode::kClampToBorder &&
+            (image.format == TextureFormat::kRgba32Float ||
+             image.format == TextureFormat::kRgba32Uint ||
+             image.format == TextureFormat::kRgba32Sint));
+  };
   const bool supported_wrap =
-      (sampler.wrap_u == TextureWrapMode::kClampToEdge ||
-       sampler.wrap_u == TextureWrapMode::kRepeat ||
-       sampler.wrap_u == TextureWrapMode::kMirroredRepeat) &&
-      (sampler.wrap_v == TextureWrapMode::kClampToEdge ||
-       sampler.wrap_v == TextureWrapMode::kRepeat ||
-       sampler.wrap_v == TextureWrapMode::kMirroredRepeat);
+      supported_axis(sampler.wrap_u) && supported_axis(sampler.wrap_v);
 
   return decodable_format && window_runs_forwards && supported_wrap &&
          depth32_nearest_only;
@@ -1478,12 +1472,17 @@ void TextureUnit::SampleRunForStage(
     }
     const std::uint32_t descriptor_set = requests.front().descriptor_set;
     const bool gather = requests.front().gather != 0;
+    // RAWDATA gather returns channel gather-1 of each of its four texels.
+    const std::uint32_t gather_channel =
+        gather ? requests.front().gather - 1U : 0U;
     if (descriptor_set >= descriptor_count)
       throw std::runtime_error("TextureUnit descriptor set is out of range");
+    if (requests.front().gather > 4U)
+      throw std::runtime_error("TextureUnit gather channel is out of range");
     for (const TextureSampleRequest &request : requests) {
       if (request.shader_stage != shader_stage ||
           request.descriptor_set != descriptor_set || request.binding != 0 ||
-          request.gather != (gather ? 1U : 0U)) {
+          request.gather != requests.front().gather) {
         throw std::runtime_error(
             "TextureUnit sample batch mixes shader stages, sets or bindings");
       }
@@ -1567,8 +1566,11 @@ void TextureUnit::SampleRunForStage(
                              resource.format == TextureFormat::kAstcLdrSrgb);
     const RogueTextureSamplerDescriptor decoded_sampler =
         DecodeRogueTextureSamplerDescriptor(sampler_words);
+    // RAWDATA gather returns stored depths for the shader to compare, so a
+    // shadow descriptor selects no fixed-function compare on that path.
     const bool shadow_compare =
-        (shared[descriptor_base + 7U] & UINT32_C(0x200)) != 0;
+        (shared[descriptor_base + 7U] & UINT32_C(0x200)) != 0 &&
+        requests.front().gather == 0;
     const bool shadow_reference_unorm =
         (shared[descriptor_base + 7U] & UINT32_C(0x100)) != 0;
     const std::uint32_t shadow_compare_op = shared[descriptor_base + 12U];
@@ -1772,19 +1774,46 @@ void TextureUnit::SampleRunForStage(
          shadow_compare_op > 7U)) {
       throw std::runtime_error("TextureUnit unsupported shadow compare state");
     }
+    const auto gather_wrap = [](TextureWrapMode wrap) {
+      return wrap == TextureWrapMode::kRepeat ||
+             wrap == TextureWrapMode::kClampToEdge ||
+             wrap == TextureWrapMode::kMirroredRepeat ||
+             wrap == TextureWrapMode::kClampToBorder;
+    };
+    // A border tap substitutes the binding's border texel for a whole
+    // storage texel, which is exact only for 32-bit-per-channel storage.
+    // Seamless cube addressing has no border.
+    const bool border_address =
+        decoded_sampler.wrap_u == TextureWrapMode::kClampToBorder ||
+        decoded_sampler.wrap_v == TextureWrapMode::kClampToBorder ||
+        (resource.dimension_type == TextureDimensionType::k3D &&
+         decoded_sampler.wrap_w == TextureWrapMode::kClampToBorder);
+    if (border_address &&
+        (cube_resource ||
+         (image.format != TextureFormat::kRgba32Float &&
+          image.format != TextureFormat::kRgba32Uint &&
+          image.format != TextureFormat::kRgba32Sint)))
+      throw std::runtime_error(
+          "TextureUnit clamp-to-border requires non-cube 32-bit texel storage");
+    // Gather reads four unfiltered texels of the view's base level with the
+    // sampler's wrap modes; min/mag/mip filters and LOD clamps never apply.
     if (gather &&
         (!driver_pco || !fragment_stage ||
-         (image.format != TextureFormat::kZ24UnormS8Uint &&
-          image.format != TextureFormat::kRgba32Float) ||
+         image.format == TextureFormat::kAstcLdr ||
+         image.format == TextureFormat::kAstcLdrSrgb ||
          (resource.dimension_type != TextureDimensionType::k2D &&
-          resource.dimension_type != TextureDimensionType::k2DArray) ||
+          resource.dimension_type != TextureDimensionType::k2DArray &&
+          resource.dimension_type != TextureDimensionType::kCube) ||
          (resource.dimension_type == TextureDimensionType::k2D &&
-          resource.layer_count != 1U) || resource.mip_count != 1U ||
-         resource.sample_count != 1U || sampler.base_mip_level != 0U ||
-         decoded_sampler.wrap_u != TextureWrapMode::kClampToEdge ||
-         decoded_sampler.wrap_v != TextureWrapMode::kClampToEdge ||
+          resource.layer_count != 1U) ||
+         (resource.dimension_type == TextureDimensionType::kCube &&
+          resource.layer_count != 6U) ||
+         resource.sample_count != 1U ||
+         sampler.base_mip_level >= resource.mip_count ||
+         !gather_wrap(decoded_sampler.wrap_u) ||
+         !gather_wrap(decoded_sampler.wrap_v) ||
          decoded_sampler.normalized_coordinates != 1U)) {
-      throw std::runtime_error("TextureUnit unsupported depth gather state");
+      throw std::runtime_error("TextureUnit unsupported gather state");
     }
     for (const TextureSampleRequest &request : requests) {
       if (request.shadow_compare != (shadow_compare ? 1U : 0U) ||
@@ -1792,18 +1821,22 @@ void TextureUnit::SampleRunForStage(
           (!request.shadow_compare && request.shadow_reference != 0U)) {
         throw std::runtime_error("TextureUnit shadow request metadata mismatch");
       }
+      const bool cube_gather =
+          resource.dimension_type == TextureDimensionType::kCube;
       if (gather &&
-          (request.normalized != 1U || request.fcnorm != 1U ||
+          (request.normalized != 1U ||
            request.coordinate_count != 2U || request.component_count != 4U ||
-           request.dimension != 2U || request.coordinates[2] != 0U ||
+           request.dimension != (cube_gather ? 3U : 2U) ||
+           (!cube_gather && request.coordinates[2] != 0U) ||
            request.explicit_lod_present != 1U || request.explicit_lod != 0U ||
            request.sample_index_present != 0U || request.sample_index != 0U ||
            request.lod_bias_present != 0U || request.lod_bias != 0U ||
            (resource.dimension_type != TextureDimensionType::k2DArray &&
             (request.texture_address_lo != 0U || request.texture_address_hi != 0U)) ||
-           request.spatial_offsets[0] != 0 || request.spatial_offsets[1] != 0 ||
+           (cube_gather &&
+            (request.spatial_offsets[0] != 0 || request.spatial_offsets[1] != 0)) ||
            request.spatial_offsets[2] != 0)) {
-        throw std::runtime_error("TextureUnit unsupported depth gather request");
+        throw std::runtime_error("TextureUnit unsupported gather request");
       }
       if (request.sample_index_present != (multisample_fetch ? 1U : 0U) ||
           request.normalized != (direct_fetch ? 0U : 1U) ||
@@ -2240,6 +2273,7 @@ void TextureUnit::SampleRunForStage(
     const bool integer_texture = image.format == TextureFormat::kRgba32Uint ||
                                  image.format == TextureFormat::kRgba32Sint;
     std::uint64_t texel_fetch_count = 0;
+    std::uint64_t border_texel_count = 0;
     std::uint64_t expected_texel_fetches = 0;
     for (std::size_t index = 0; index < requests.size(); ++index) {
       const TextureSampleRequest &request = requests[index];
@@ -2376,7 +2410,22 @@ void TextureUnit::SampleRunForStage(
 
       const auto read_texel_bytes = [&](const TextureMipLevel &mip,
                                   std::uint32_t x, std::uint32_t y,
-                                  std::uint64_t memory_request_id) {
+                                  std::uint64_t memory_request_id)
+          -> std::array<std::uint8_t, 16> {
+        // A clamp-to-border tap issues no memory transaction: the TPU
+        // returns the binding's border colour-table entry as the texel.
+        if (x == kTextureBorderTexel || y == kTextureBorderTexel ||
+            selected_layer == kTextureBorderTexel) {
+          if (!border_address)
+            throw std::runtime_error(
+                "TextureUnit border tap without a clamp-to-border address mode");
+          if (border_texel_count == std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error("TextureUnit border tap overflow");
+          ++border_texel_count;
+          std::array<std::uint8_t, 16> border{};
+          std::memcpy(border.data(), sampler.border_texel.data(), border.size());
+          return border;
+        }
         const std::uint32_t fetch_x =
             astc_image ? x / astc_footprint.width : x;
         const std::uint32_t fetch_y =
@@ -2521,39 +2570,128 @@ void TextureUnit::SampleRunForStage(
       };
 
       if (gather) {
-        const TextureMipLevel &mip = resource.mip[0];
-        const auto x = ComputeTextureGatherClampToEdge(
-            BitsFloat(request.coordinates[0]), mip.width);
-        const auto y = ComputeTextureGatherClampToEdge(
-            BitsFloat(request.coordinates[1]), mip.height);
+        const TextureMipLevel &mip = resource.mip[sampler.base_mip_level];
         if (request.request_id >
             (std::numeric_limits<std::uint64_t>::max() - 3U) /
                 kTextureSampleTapRequestStride)
           throw std::overflow_error("TextureUnit gather request ID overflow");
         const std::uint64_t tap_base =
             request.request_id * kTextureSampleTapRequestStride;
+        // The seamless cube footprint, in binary32: floor(coordinate * extent
+        // - 0.5). Clamp non-finite and huge coordinates first so the product
+        // and the integer conversion stay defined.
+        const auto footprint = [](float coordinate, std::uint32_t extent,
+                                  std::int32_t offset) {
+          if (!std::isfinite(coordinate))
+            coordinate = 0.0F;
+          coordinate = std::clamp(coordinate, -65536.0F, 65536.0F);
+          const volatile float scaled =
+              coordinate * static_cast<float>(extent);
+          const volatile float centred = scaled - 0.5F;
+          return static_cast<std::int64_t>(std::floor(centred)) + offset;
+        };
+        const auto decode = [&](const std::array<std::uint8_t, 16> &bytes)
+            -> std::array<std::uint32_t, 4> {
+          std::array<std::uint32_t, 4> words{};
+          if (integer_texture) {
+            const auto value = DecodeTexelToInteger(image.format, bytes);
+            std::copy(value.begin(), value.end(), words.begin());
+            return words;
+          }
+          std::array<float, 4> value{};
+          if (image.format == TextureFormat::kZ24UnormS8Uint) {
+            std::array<std::uint8_t, 8> depth_bytes{};
+            std::copy_n(bytes.begin(), depth_bytes.size(), depth_bytes.begin());
+            value = {SampledDepth24ToFloat(SampledDepth24FromTexel(depth_bytes)),
+                     0.0F, 0.0F, 1.0F};
+          } else if (image.format == TextureFormat::kZ32Unorm) {
+            std::uint32_t encoded = 0;
+            std::memcpy(&encoded, bytes.data(), sizeof(encoded));
+            const float depth = static_cast<float>(
+                static_cast<double>(encoded) /
+                static_cast<double>(std::numeric_limits<std::uint32_t>::max()));
+            value = {depth, 0.0F, 0.0F, 1.0F};
+          } else {
+            value = DecodeTexelToFloat(image.format, bytes);
+            if (image.format == TextureFormat::kRgbx8Unorm)
+              value[3] = 1.0F;
+          }
+          for (std::size_t component = 0; component < words.size(); ++component)
+            words[component] = FloatBits(value[component]);
+          return words;
+        };
         TextureSampleResponse response;
         response.shader_lane_index = request.shader_lane_index;
         response.request_id = request.request_id;
         response.shader_stage = shader_stage;
-        for (std::size_t tap = 0; tap < 4U; ++tap) {
-          const auto bytes = read_texel_bytes(mip, x[tap & 1U], y[tap >> 1U],
-                                              tap_base + tap);
-          if (image.format == TextureFormat::kRgba32Float) {
-            // This is a declared identity-swizzled float view, independent
-            // of whether its producer was a depth or a color attachment.
-            // Gather returns red from each complete 16-byte texel, with no
-            // UNORM conversion, interpolation, or use of its other channels.
-            response.rgba[tap] = FloatBits(DecodeTexelToFloat(image.format, bytes)[0]);
-          } else {
-            std::array<std::uint8_t, 8> depth_bytes{};
-            std::copy_n(bytes.begin(), depth_bytes.size(), depth_bytes.begin());
-            response.rgba[tap] = FloatBits(
-                SampledDepth24ToFloat(SampledDepth24FromTexel(depth_bytes)));
-          }
-        }
         // RAWDATA order is [i0j0, i1j0, i0j1, i1j1]. The native PCO shader
-        // applies its existing [2,3,1,0] swizzle to obtain GL gather order.
+        // applies its [2,3,1,0] swizzle to obtain GL gather order.
+        if (cube_texture) {
+          // Seamless cube gather: a tap that leaves the selected face reads
+          // the neighbouring face, and the corner tap (no unique neighbour)
+          // takes the average of the other three (tcu getCubeLinearSamples).
+          const std::int32_t size = static_cast<std::int32_t>(mip.width);
+          const std::int64_t x0 = footprint(plane_s, mip.width, 0);
+          const std::int64_t y0 = footprint(plane_t, mip.height, 0);
+          const std::int32_t tap_x[4] = {static_cast<std::int32_t>(x0),
+                                         static_cast<std::int32_t>(x0 + 1),
+                                         static_cast<std::int32_t>(x0),
+                                         static_cast<std::int32_t>(x0 + 1)};
+          const std::int32_t tap_y[4] = {static_cast<std::int32_t>(y0),
+                                         static_cast<std::int32_t>(y0),
+                                         static_cast<std::int32_t>(y0 + 1),
+                                         static_cast<std::int32_t>(y0 + 1)};
+          std::array<std::array<std::uint32_t, 4>, 4> words{};
+          int corner = -1;
+          for (int tap = 0; tap < 4; ++tap) {
+            int face = 0;
+            int cs = 0;
+            int ct = 0;
+            if (RemapCubeEdgeCoords(static_cast<int>(cube_face), tap_x[tap],
+                                    tap_y[tap], size, &face, &cs, &ct)) {
+              selected_layer = cube_base_face + static_cast<std::uint32_t>(face);
+            } else {
+              corner = tap;
+              selected_layer = cube_base_face + cube_face;
+              cs = std::clamp(tap_x[tap], 0, size - 1);
+              ct = std::clamp(tap_y[tap], 0, size - 1);
+            }
+            words[tap] = decode(read_texel_bytes(
+                mip, static_cast<std::uint32_t>(cs), static_cast<std::uint32_t>(ct),
+                tap_base + static_cast<std::uint64_t>(tap)));
+          }
+          if (corner >= 0) {
+            if (integer_texture) {
+              std::int64_t sum = 0;
+              for (int tap = 0; tap < 4; ++tap)
+                if (tap != corner)
+                  sum += image.format == TextureFormat::kRgba32Sint
+                             ? static_cast<std::int64_t>(static_cast<std::int32_t>(
+                                   words[tap][gather_channel]))
+                             : static_cast<std::int64_t>(words[tap][gather_channel]);
+              words[corner][gather_channel] =
+                  static_cast<std::uint32_t>(static_cast<std::int32_t>(sum / 3));
+            } else {
+              float sum = 0.0F;
+              for (int tap = 0; tap < 4; ++tap)
+                if (tap != corner)
+                  sum += BitsFloat(words[tap][gather_channel]);
+              words[corner][gather_channel] = FloatBits(sum / 3.0F);
+            }
+          }
+          for (std::size_t tap = 0; tap < 4U; ++tap)
+            response.rgba[tap] = words[tap][gather_channel];
+        } else {
+          const std::array<std::uint32_t, 2> x = ComputeTextureGatherAxis(
+              plane_s, mip.width, decoded_sampler.wrap_u,
+              request.spatial_offsets[0]);
+          const std::array<std::uint32_t, 2> y = ComputeTextureGatherAxis(
+              plane_t, mip.height, decoded_sampler.wrap_v,
+              request.spatial_offsets[1]);
+          for (std::size_t tap = 0; tap < 4U; ++tap)
+            response.rgba[tap] = decode(read_texel_bytes(
+                mip, x[tap & 1U], y[tap >> 1U], tap_base + tap))[gather_channel];
+        }
         expected_texel_fetches += 4U;
         responses.push_back(response);
         continue;
@@ -3163,7 +3301,7 @@ void TextureUnit::SampleRunForStage(
       responses.push_back(response);
     }
 
-    if (texel_fetch_count != expected_texel_fetches) {
+    if (texel_fetch_count + border_texel_count != expected_texel_fetches) {
       throw std::runtime_error(
           "TextureUnit sample batch has invalid texel traffic");
     }

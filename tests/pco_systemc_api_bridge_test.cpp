@@ -44,7 +44,7 @@ void VerifyGuardedPreviousVersionCommand(
   // API-v22 added alpha-to-sample state after the uniform-buffer list.
   // Reconstruct the aligned API-v21 byte extent, not a zeroed
   // current-size command whose readable tail would hide the invalid access.
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 40U,
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 42U,
                 "update the frozen API-v21 guard-page fixture on ABI changes");
   constexpr std::size_t kApi21Tail =
       offsetof(pvrgpu_systemc_driver_command, uniform_buffer_count) +
@@ -395,7 +395,7 @@ void VerifySequenceExternalTextureAllocation() {
 
 int main() {
   using namespace pvrgpu::stub;
-  static_assert(PVRGPU_SYSTEMC_API_VERSION == 40U,
+  static_assert(PVRGPU_SYSTEMC_API_VERSION == 42U,
                 "native sequence bridge test requires API-v35");
   static_assert(PVRGPU_SYSTEMC_MAX_TEXTURE_MIP_LEVELS == 15U);
   static_assert(kDriverPcoMaximumTextureMipLevels == 15U);
@@ -407,7 +407,7 @@ int main() {
       "SystemC API texture ABI does not expose all 15 mip slots");
   static_assert(
       sizeof(void *) != 8U ||
-          sizeof(pvrgpu_systemc_pco_sequence_texture) == 352U,
+          sizeof(pvrgpu_systemc_pco_sequence_texture) == 368U,
       "64-bit SystemC API-v23 sequence texture ABI size changed");
   static_assert(
       std::tuple_size<decltype(DriverPcoSampledTexture{}.mip)>::value ==

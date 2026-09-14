@@ -947,6 +947,7 @@ void ReleaseFunctionalPayloads(MemoryPool &pool, const PipelineState &state) {
       state.stream_output_bindings,
       state.stream_output_targets,
       state.fragment_image_resources,
+      state.vertex_image_resources,
       state.graphics_buffer_resources,
       state.graphics_buffer_ranges[0],
       state.graphics_buffer_ranges[1],

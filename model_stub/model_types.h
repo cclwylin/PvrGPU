@@ -148,6 +148,8 @@ struct DriverPcoSampledTexture {
   std::uint32_t buffer_elements = 0;
   // 每個 pixel 內依 sample 順序交錯；舊單 sample payload 保持原樣。
   std::uint32_t sample_count = 1;
+  // Clamp-to-border texel in the storage's channel words (API v41).
+  std::array<std::uint32_t, 4> border_texel{};
 };
 
 inline constexpr DriverPcoStageAbi kConditionalsVertexPcoAbi = {
@@ -201,10 +203,12 @@ inline constexpr std::size_t kDriverPcoRefractSampledTextures = 3;
 // longer than that would place a colour attachment on top of a depth one.
 inline constexpr std::uint64_t kDriverPcoSequenceAttachmentStride =
     UINT64_C(0x01000000);
+// 256 slots per region: a primary plane may span up to 4 GiB (e.g. a
+// 4096x4096 16x no-attachment framebuffer), still inside the 40-bit address.
 inline constexpr std::uint64_t kDriverPcoSequenceColorAddressBase =
-    UINT64_C(0x50000000);
+    UINT64_C(0x1000000000);
 inline constexpr std::uint64_t kDriverPcoSequenceDepthAddressBase =
-    UINT64_C(0x60000000);
+    UINT64_C(0x1100000000);
 inline constexpr std::uint64_t kDriverPcoSequenceExternalAddressBase =
     UINT64_C(0x8000000000);
 // 外部 texture 使用獨立 512 GiB 區，仍可放入 Rogue 的 40-bit 地址。
@@ -246,6 +250,9 @@ inline bool AllocateSequenceExternalTextureAddress(
   ++allocation->texture_count;
   return true;
 }
+static_assert(kDriverPcoSequenceDepthAddressBase - kDriverPcoSequenceColorAddressBase ==
+                  kDriverPcoMaximumNestedSequenceCommands * kDriverPcoSequenceAttachmentStride,
+              "attachment regions must hold exactly the slots the PBE/depth commit validate");
 // Slots available to attachments before a region runs into the next one.  A
 // sequence may be longer than this: only an ordinal that starts a new
 // attachment consumes a slot, and the rest alias an earlier one by design.
@@ -253,11 +260,39 @@ inline constexpr std::size_t kDriverPcoSequenceAttachmentSlots =
     static_cast<std::size_t>((kDriverPcoSequenceDepthAddressBase -
                               kDriverPcoSequenceColorAddressBase) /
                              kDriverPcoSequenceAttachmentStride);
+// Header-only span sizing; an unknown format keeps one slot and is refused by
+// the depth codec (DepthAttachmentBytesPerPixel) when the plane is created.
+inline constexpr std::uint64_t SequenceDepthAttachmentSpanBytesPerPixel(
+    std::uint32_t format) {
+  return format == kDriverPcoDepthFormatZ16Unorm ? 2U :
+      format == kDriverPcoDepthFormatZ32FloatS8X24Uint ? 8U :
+      format == kDriverPcoDepthFormatZ24X8Unorm ||
+          format == kDriverPcoDepthFormatZ24UnormS8Uint ||
+          format == kDriverPcoDepthFormatZ32Unorm ||
+          format == kDriverPcoDepthFormatZ32Float ? 4U : 0U;
+}
+
+// A primary colour or depth attachment larger than one stride takes that many
+// consecutive slots, so every address stays stride-aligned and the region
+// bound still separates colour from depth.  MRT colours past the first keep a
+// single stride each (their region is indexed by the primary's first slot).
+inline constexpr std::uint64_t kDriverPcoSequenceAttachmentRegionBytes =
+    kDriverPcoSequenceDepthAddressBase - kDriverPcoSequenceColorAddressBase;
+inline constexpr std::uint64_t SequenceAttachmentSpanSlots(std::uint64_t bytes) {
+  return bytes <= kDriverPcoSequenceAttachmentStride ? 1U :
+      (bytes + kDriverPcoSequenceAttachmentStride - 1U) /
+          kDriverPcoSequenceAttachmentStride;
+}
+inline constexpr std::uint64_t SequenceColorAttachmentByteLimit(
+    std::uint32_t target) {
+  return target == 0 ? kDriverPcoSequenceAttachmentRegionBytes :
+                       kDriverPcoSequenceAttachmentStride;
+}
 // Colour attachments past the first of a multiple-render-target draw. Each
 // (command, attachment) pair owns one attachment-stride slot so no two
 // attachments of a sequence overlap in DRAM.
 inline constexpr std::uint64_t kDriverPcoMrtColorAddressBase =
-    UINT64_C(0x80000000);
+    UINT64_C(0x1200000000);
 static_assert(kDriverPcoMrtColorAddressBase - kDriverPcoSequenceDepthAddressBase >=
                   kDriverPcoSequenceDepthAddressBase - kDriverPcoSequenceColorAddressBase,
               "sequence depth region is smaller than the colour region");
@@ -442,6 +477,11 @@ struct DriverCommand {
   std::uint32_t fragment_image_read_mask = 0;
   std::uint32_t fragment_image_write_mask = 0;
   std::uint32_t fragment_early_tests = 0;
+  // API-v42 read-only vertex-stage image views.
+  std::vector<DriverShaderImage> vertex_images;
+  std::uint32_t vertex_image_descriptor_start = 0;
+  std::uint32_t vertex_image_descriptor_count = 0;
+  std::uint32_t vertex_image_read_mask = 0;
   bool explicit_varying_bindings = false;
   std::vector<DriverVaryingBinding> varying_bindings;
   std::vector<DriverPcoUniformBuffer> uniform_buffers;
@@ -872,12 +912,21 @@ inline bool ResolveSequenceAttachmentAddresses(
     const DriverCommand &draw = draws[ordinal];
     if (!DriverColorAttachmentFormatsAreValid(draw))
       return false;
+    const std::uint64_t stored_pixels =
+        static_cast<std::uint64_t>(draw.framebuffer_width) * draw.framebuffer_height *
+        (draw.raster_samples ? draw.raster_samples : 1U) *
+        (draw.framebuffer_layers ? draw.framebuffer_layers : 1U);
     if (draw.color_attachment_source_command_index == kDriverPcoNewAttachment) {
-      if (next_color_slot >= kDriverPcoSequenceAttachmentSlots)
+      const std::uint64_t span = SequenceAttachmentSpanSlots(
+          stored_pixels * DriverColorAttachmentBytesPerPixel(
+                              EffectiveDriverColorAttachmentFormats(draw)[0]));
+      if (next_color_slot >= kDriverPcoSequenceAttachmentSlots ||
+          span > kDriverPcoSequenceAttachmentSlots - next_color_slot)
         return false;
       (*color_addresses)[ordinal] = kDriverPcoSequenceColorAddressBase +
-                                    next_color_slot++ *
+                                    next_color_slot *
                                         kDriverPcoSequenceAttachmentStride;
+      next_color_slot += span;
     } else if (draw.color_attachment_source_command_index < ordinal) {
       const DriverCommand &producer = draws[draw.color_attachment_source_command_index];
       if (!DriverColorAttachmentFormatsMatch(draw, producer) ||
@@ -898,11 +947,15 @@ inline bool ResolveSequenceAttachmentAddresses(
     if (draw.depth_format == 0)
       continue;
     if (draw.depth_attachment_source_command_index == kDriverPcoNewAttachment) {
-      if (next_depth_slot >= kDriverPcoSequenceAttachmentSlots)
+      const std::uint64_t span = SequenceAttachmentSpanSlots(
+          stored_pixels * SequenceDepthAttachmentSpanBytesPerPixel(draw.depth_format));
+      if (next_depth_slot >= kDriverPcoSequenceAttachmentSlots ||
+          span > kDriverPcoSequenceAttachmentSlots - next_depth_slot)
         return false;
       (*depth_addresses)[ordinal] = kDriverPcoSequenceDepthAddressBase +
-                                    next_depth_slot++ *
+                                    next_depth_slot *
                                         kDriverPcoSequenceAttachmentStride;
+      next_depth_slot += span;
     } else if (draw.depth_attachment_source_command_index < ordinal &&
                (*depth_addresses)[draw.depth_attachment_source_command_index] !=
                    0) {

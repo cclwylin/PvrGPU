@@ -7,6 +7,7 @@
 #include "shader/usc_shader_buffer_memory.h"
 #include "shader/usc_uniform_buffer_memory.h"
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -132,7 +133,9 @@ void TessellationEvaluationShader::Execute(PipelineState &state, const PipelineT
       (state.geometry_input_primitive_vertices!=primitive_size ||
        state.geometry_input_stride_dwords!=t.evaluation_abi.vertex_outputs))
     throw std::runtime_error("TES-to-GS primitive/layout linkage is invalid");
-  const auto required_mask=UINT64_C(15)<<state.position_output_start;
+  // Only a final TES rasterizes its position. Feeding a GS, the linker keeps
+  // just the gl_Position components the GS reads, so no component is owed.
+  const auto required_mask=geometry_enabled?UINT64_C(0):UINT64_C(15)<<state.position_output_start;
   UscUniformBufferMemory uniforms(memory_,state.memory_mode,
       HasPoolHandle(t.evaluation_uniform_buffers)?LoadArray<UniformBufferResource>(pool_,t.evaluation_uniform_buffers):
                                                  std::vector<UniformBufferResource>{});
@@ -205,7 +208,11 @@ void TessellationEvaluationShader::Execute(PipelineState &state, const PipelineT
       for(unsigned index=0;index<count;++index) {
         const auto &result=task.lanes[index];
         if(!result.emitted || (result.outputs_written&required_mask)!=required_mask)
-          throw std::runtime_error("TES vertex has no complete native position emission");
+          throw std::runtime_error("TES vertex has no complete native position emission (emitted=" +
+                                   std::to_string(result.emitted) + " written=0x" +
+                                   [&]{char b[32];std::snprintf(b,sizeof b,"%llx",(unsigned long long)result.outputs_written);return std::string(b);}() +
+                                   " required=0x" +
+                                   [&]{char b[32];std::snprintf(b,sizeof b,"%llx",(unsigned long long)required_mask);return std::string(b);}() + ")");
         VertexLane lane;
         std::copy_n(result.outputs.data(),t.evaluation_abi.vertex_outputs,lane.vertex_output);
         lane.emitted=lane.ended=1;lanes.push_back(lane);

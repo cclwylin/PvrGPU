@@ -260,6 +260,43 @@ void CheckFixedPointAxes() {
   Check(LerpTextureUnorm8(200, 100, 64) == 175, "u8 lerp: 200 + (-100*64/256)");
 }
 
+void CheckBorderAxes() {
+  using pvrgpu::stub::kTextureBorderTexel;
+  using pvrgpu::stub::WrapTexelIndex;
+  Check(WrapTexelIndex(-1, 4, TextureWrapMode::kClampToBorder) == kTextureBorderTexel &&
+            WrapTexelIndex(4, 4, TextureWrapMode::kClampToBorder) == kTextureBorderTexel &&
+            WrapTexelIndex(3, 4, TextureWrapMode::kClampToBorder) == 3,
+        "border wrap keeps [0, extent) and selects the border outside it");
+  // 0.0 * 4 - 0.5 = -0.5: lower tap -1 is the border, weight 0.5.
+  const TextureFloatAxis low =
+      ComputeTextureFloatLinear(0.0F, 4, TextureWrapMode::kClampToBorder);
+  Check(low.lower == kTextureBorderTexel && low.upper == 0 && Near(low.weight, 0.5F),
+        "float linear border: the first centre blends with the border");
+  // 1.0 * 4 - 0.5 = 3.5: upper tap 4 is the border.
+  const TextureFloatAxis high =
+      ComputeTextureFloatLinear(1.0F, 4, TextureWrapMode::kClampToBorder);
+  Check(high.lower == 3 && high.upper == kTextureBorderTexel && Near(high.weight, 0.5F),
+        "float linear border: the last centre blends with the border");
+  // Offsets add in texels before the half-texel centre: 0.5 * 4 + 2 - 0.5.
+  const TextureFloatAxis offset =
+      ComputeTextureFloatLinear(0.5F, 4, TextureWrapMode::kClampToBorder, 2);
+  Check(offset.lower == 3 && offset.upper == kTextureBorderTexel && Near(offset.weight, 0.5F),
+        "float linear border applies the texel offset before wrapping");
+  Check(ComputeTextureFloatNearest(-0.01F, 4, TextureWrapMode::kClampToBorder) ==
+                kTextureBorderTexel &&
+            ComputeTextureFloatNearest(0.99F, 4, TextureWrapMode::kClampToBorder) == 3 &&
+            ComputeTextureFloatNearest(1.0F, 4, TextureWrapMode::kClampToBorder) ==
+                kTextureBorderTexel &&
+            ComputeTextureFloatNearest(0.9F, 4, TextureWrapMode::kClampToBorder, 1) ==
+                kTextureBorderTexel,
+        "float nearest border: floor(coord * extent) + offset outside the image");
+  Check(ComputeTextureFloatNearest(3.0e38F, 4, TextureWrapMode::kClampToBorder) ==
+                kTextureBorderTexel &&
+            ComputeTextureFloatLinear(-3.0e38F, 4, TextureWrapMode::kClampToBorder).upper ==
+                kTextureBorderTexel,
+        "huge border coordinates stay defined and select the border");
+}
+
 void CheckFloatAxes() {
   const TextureFloatAxis pot =
       ComputeTextureFloatLinear(0.5F, 4, TextureWrapMode::kRepeat);
@@ -477,6 +514,7 @@ int main() {
   CheckDatapathSelection();
   CheckFixedPointAxes();
   CheckFloatAxes();
+  CheckBorderAxes();
   CheckSpatialOffsets();
   CheckPackedFormatDecode();
   CheckIntegerFormatDecode();

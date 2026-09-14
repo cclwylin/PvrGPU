@@ -598,8 +598,21 @@ void CheckDescriptorAndArithmetic() {
         "a LOD window past a single-level image clamps to that level");
   mutated = DescriptorDwords(linear, 8);
   mutated[1] |= UINT32_C(4) << (41U - 32U); // addrmode_v=BORDER
+  const RogueTextureSamplerDescriptor border =
+      DecodeRogueTextureSamplerDescriptor(mutated);
+  Check(border.wrap_v == TextureWrapMode::kClampToBorder,
+        "clamp-to-border address mode decodes");
+  Check(!DriverPcoTextureDescriptorClassSupported(one_level_image, border, 1),
+        "a border tap cannot stand in for an RGBA8 storage texel");
+  RogueTextureImageDescriptor float_image = one_level_image;
+  float_image.format = TextureFormat::kRgba32Float;
+  float_image.row_pitch_bytes = 64 * 16;
+  Check(DriverPcoTextureDescriptorClassSupported(float_image, border, 1),
+        "32-bit float storage samples the border texel");
+  mutated = DescriptorDwords(linear, 8);
+  mutated[1] |= UINT32_C(5) << (41U - 32U); // reserved addrmode_v
   ExpectFailure([&] { DecodeRogueTextureSamplerDescriptor(mutated); },
-                "unsupported clamp-to-border address mode");
+                "reserved address mode");
   mutated = DescriptorDwords(linear, 8);
   mutated[1] |= UINT32_C(1) << (49U - 32U); // non-normalized coords
   ExpectFailure([&] { DecodeRogueTextureSamplerDescriptor(mutated); },

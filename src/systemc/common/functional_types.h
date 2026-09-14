@@ -288,8 +288,9 @@ struct StencilFaceState {
  * whose ordinal was 0x8000000000000000, the bits of -0.0f.
  *
  * The rest of the map, for whoever adds the next region: the GLBench texture at
- * 0x40000000, the sequence colour/depth/external attachments at 0x50000000,
- * 0x60000000 and 0x80'0000'0000 (model_types.h), and the driver's per-submission
+ * 0x40000000, the sequence colour/depth/MRT/external attachments at
+ * 0x10'0000'0000, 0x11'0000'0000, 0x12'0000'0000 and 0x80'0000'0000
+ * (model_types.h), and the driver's per-submission
  * vertex, index and texture-coordinate regions from 0x100'0000'0000 upwards
  * (submitter.cpp).  Anything new belongs above these.
  */
@@ -771,6 +772,11 @@ struct SamplerState {
   std::uint8_t descriptor_set = 0;
   std::uint8_t binding = 0;
   std::uint8_t reserved[2]{};
+  // The binding's border colour-table entry: the texel a clamp-to-border tap
+  // outside the image reads, in the storage format's decoded words (binary32
+  // bits for float storage, raw values for integer storage), already clamped
+  // to the format and swizzled like its texels.
+  std::array<std::uint32_t, 4> border_texel{};
 };
 
 // Interpolation qualifier carried by the exact VS-to-FS linkage. The binding

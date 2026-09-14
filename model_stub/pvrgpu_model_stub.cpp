@@ -1254,10 +1254,12 @@ int ModelSession::RunCompute(ModelComputeDispatch *dispatch,
         sampler.mag_filter = static_cast<TextureFilter>(captured.mag_filter);
         sampler.mip_filter = static_cast<TextureFilter>(captured.mip_filter);
         const auto wrap = [](std::uint32_t mode) {
-          return mode == 1 ? TextureWrapMode::kRepeat : mode == 2 ? TextureWrapMode::kMirroredRepeat : TextureWrapMode::kClampToEdge;
+          return mode == 1 ? TextureWrapMode::kRepeat : mode == 2 ? TextureWrapMode::kMirroredRepeat :
+                 mode == 3 ? TextureWrapMode::kClampToBorder : TextureWrapMode::kClampToEdge;
         };
         sampler.wrap_u = wrap(captured.wrap_u);
         sampler.wrap_v = wrap(captured.wrap_v);
+        sampler.border_texel = captured.border_texel;
         sampler.min_lod_u4_6 = captured.min_lod_u4_6;
         sampler.max_lod_u4_6 = captured.max_lod_u4_6;
         sampler.normalized_coordinates = captured.normalized_coordinates;

@@ -64,6 +64,12 @@ std::int64_t AddTexelOffset(std::int64_t value, std::int64_t offset) {
   return value + offset;
 }
 
+// The border modes scale without wrapping. Any address beyond +-2^30 texels
+// is outside every image, so bound it to keep the floor defined.
+float BorderScaledCoordinate(float coordinate, float extent) {
+  return std::clamp(coordinate * extent, -1073741824.0F, 1073741824.0F);
+}
+
 std::uint32_t ClampIndex(std::int64_t index, std::uint32_t extent) {
   if (index < 0)
     return 0;
@@ -322,7 +328,11 @@ std::uint32_t WrapTexelIndex(std::int64_t integer, std::uint32_t extent,
       return static_cast<std::uint32_t>(period - 1 - wrapped);
     return static_cast<std::uint32_t>(wrapped);
   }
-  throw std::runtime_error("TextureUnit clamp-to-border sampling is unsupported");
+  if (wrap == TextureWrapMode::kClampToBorder)
+    return integer < 0 || integer >= static_cast<std::int64_t>(extent)
+               ? kTextureBorderTexel
+               : static_cast<std::uint32_t>(integer);
+  throw std::runtime_error("TextureUnit wrap mode is invalid");
 }
 
 std::uint32_t ComputeTextureNearestRepeat(float coordinate,
@@ -467,8 +477,14 @@ std::uint32_t ComputeTextureFloatNearest(float coordinate,
       coordinate += static_cast<float>(texel_offset) / extent_f;
     return ClampIndex(TruncToInt64(MirrorCoordinate(coordinate) * extent_f),
                       extent);
+  case TextureWrapMode::kClampToBorder:
+    // No clamp: every index outside the image selects the border texel.
+    return WrapTexelIndex(
+        AddTexelOffset(FloorToInt64(BorderScaledCoordinate(coordinate, extent_f)),
+                       texel_offset),
+        extent, wrap);
   default:
-    throw std::runtime_error("TextureUnit clamp-to-border sampling is unsupported");
+    throw std::runtime_error("TextureUnit wrap mode is invalid");
   }
 }
 
@@ -525,9 +541,75 @@ TextureFloatAxis ComputeTextureFloatLinear(float coordinate,
     result.upper = ClampIndex(lower + 1, extent);
     return result;
   }
-  default:
-    throw std::runtime_error("TextureUnit clamp-to-border sampling is unsupported");
+  case TextureWrapMode::kClampToBorder: {
+    // coord * extent + offset - 0.5, floored, with no clamp: a tap outside
+    // the image is the border texel.
+    const float centred =
+        BorderScaledCoordinate(coordinate, extent_f) +
+        static_cast<float>(texel_offset) - 0.5F;
+    const std::int64_t lower = FloorToInt64(centred);
+    result.weight = centred - static_cast<float>(lower);
+    result.lower = WrapTexelIndex(lower, extent, wrap);
+    result.upper = WrapTexelIndex(lower + 1, extent, wrap);
+    return result;
   }
+  default:
+    throw std::runtime_error("TextureUnit wrap mode is invalid");
+  }
+}
+
+std::array<std::uint32_t, 2> ComputeTextureGatherAxis(float coordinate,
+                                                      std::uint32_t extent,
+                                                      TextureWrapMode wrap,
+                                                      std::int32_t texel_offset) {
+  if (extent == 0)
+    throw std::runtime_error("TextureUnit gather extent is invalid");
+  const float extent_f = static_cast<float>(extent);
+  switch (wrap) {
+  case TextureWrapMode::kRepeat:
+  case TextureWrapMode::kClampToBorder: {
+    const TextureFloatAxis axis =
+        ComputeTextureFloatLinear(coordinate, extent, wrap, texel_offset);
+    return {{axis.lower, axis.upper}};
+  }
+  case TextureWrapMode::kClampToEdge: {
+    // coord * extent + offset, min(extent) with NaN taking extent, max(0),
+    // then itrunc(c - 0.5) and min(itrunc(c + 0.5), extent - 1). Each
+    // binary32 rounding is materialized separately.
+    volatile float scaled = coordinate * extent_f;
+    if (texel_offset)
+      scaled = scaled + static_cast<float>(texel_offset);
+    if (!(scaled <= extent_f))
+      scaled = extent_f;
+    if (!(scaled >= 0.0F))
+      scaled = 0.0F;
+    const volatile float lower = scaled - 0.5F;
+    const volatile float upper = scaled + 0.5F;
+    const std::uint32_t upper_index = static_cast<std::uint32_t>(std::trunc(upper));
+    return {{static_cast<std::uint32_t>(std::trunc(lower)),
+             std::min(upper_index, extent - 1U)}};
+  }
+  case TextureWrapMode::kMirroredRepeat: {
+    coordinate = TextureAddressCoordinate(coordinate, extent);
+    if (texel_offset)
+      coordinate += static_cast<float>(texel_offset) / extent_f;
+    // lp_build_coord_mirror without the absolute value: 2 * (x/2 -
+    // round_even(x/2)) is negative in an odd period.
+    const volatile float half = coordinate * 0.5F;
+    const volatile float fraction = half - std::nearbyint(half);
+    const volatile float mirrored = fraction + fraction;
+    const volatile float centred = mirrored * extent_f - 0.5F;
+    const std::int64_t first = FloorToInt64(centred);
+    const auto reflect = [extent](std::int64_t index) {
+      if (index < 0)
+        index = ~index;
+      return static_cast<std::uint32_t>(
+          std::min<std::int64_t>(index, static_cast<std::int64_t>(extent) - 1));
+    };
+    return {{reflect(first), reflect(first + 1)}};
+  }
+  }
+  throw std::runtime_error("TextureUnit wrap mode is invalid");
 }
 
 float LerpTextureFloat(float first, float second, float weight) {

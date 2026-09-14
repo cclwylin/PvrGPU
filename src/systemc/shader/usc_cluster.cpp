@@ -29,6 +29,7 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -41,12 +42,16 @@ namespace {
 struct UscGraphicsReadMemory {
   UscUniformBufferMemory *uniform = nullptr;
   UscShaderBufferMemory *storage = nullptr;
+  UscShaderImageMemory *image = nullptr;
 
   static void Read(void *user_data, std::uint64_t address,
                    std::uint32_t dword_count, std::uint32_t *destination) {
     if (!user_data || !dword_count)
       throw std::runtime_error("USC graphics load has no memory context");
     auto &memory = *static_cast<UscGraphicsReadMemory *>(user_data);
+    if (memory.image && memory.image->OwnsAddress(address))
+      return UscShaderImageMemory::Read(memory.image, address, dword_count,
+                                        destination);
     if (memory.storage && memory.storage->OwnsAddress(address))
       return UscShaderBufferMemory::Read(memory.storage, address, dword_count,
                                          destination);
@@ -458,8 +463,8 @@ bool SameTextureSampleRequest(const TextureSampleRequest &left,
          left.shadow_compare == right.shadow_compare &&
          left.data_request == right.data_request &&
          left.quad_lane == right.quad_lane &&
-         left.shader_stage == right.shader_stage && left.gather <= 1 &&
-         right.gather <= 1;
+         left.shader_stage == right.shader_stage && left.gather <= 4 &&
+         right.gather <= 4;
 }
 
 bool SameVertexContinuation(const PcoVertexContinuation &left,
@@ -479,14 +484,21 @@ bool SameVertexContinuation(const PcoVertexContinuation &left,
          left.vertex_input_count == right.vertex_input_count &&
          left.shared_count == right.shared_count &&
          left.emitted == right.emitted &&
-         left.ended_task == right.ended_task && left.valid == right.valid;
+         left.ended_task == right.ended_task && left.valid == right.valid &&
+         left.index_registers == right.index_registers &&
+         left.index_register_valid_mask == right.index_register_valid_mask &&
+         left.predicate == right.predicate &&
+         left.predicate_valid == right.predicate_valid &&
+         left.execution_predicate == right.execution_predicate &&
+         left.native_steps == right.native_steps;
 }
 
 void RecordInstructionExecutions(
     CounterTxn &counters, DrawListShaderStats &stats, ShaderStage stage,
     const std::vector<PcoInstruction> &instructions,
     std::uint64_t logical_invocations, std::uint64_t execution_lanes,
-    const PcoInstructionCounts *fragment_dynamic = nullptr) {
+    const PcoInstructionCounts *fragment_dynamic = nullptr,
+    const std::uint64_t *vertex_dynamic_textures = nullptr) {
   const PcoInstructionCounts static_counts =
       CountPcoInstructions(instructions, false);
   if (stats.program_recorded != 1 ||
@@ -508,8 +520,11 @@ void RecordInstructionExecutions(
   stats.executed_alu_instructions =
       fragment_dynamic ? fragment_dynamic->alu :
           CheckedInstructionTotal(per_invocation.alu, execution_lanes);
+  if (vertex_dynamic_textures && stage != ShaderStage::kVertex)
+    throw std::runtime_error("USC vertex texture accounting reached another stage");
   stats.executed_tex_instructions =
       fragment_dynamic ? fragment_dynamic->texture :
+      vertex_dynamic_textures ? *vertex_dynamic_textures :
           CheckedInstructionTotal(per_invocation.texture, execution_lanes);
   stats.executed_memory_instructions =
       fragment_dynamic ? fragment_dynamic->memory :
@@ -603,13 +618,20 @@ void UscCluster::Run() {
         graphics_buffer_ranges,
         stage_ == ShaderStage::kVertex ? MemoryClient::kVertexShader
                                        : MemoryClient::kFragmentShader);
-    UscGraphicsReadMemory graphics_read_memory{&uniform_memory,
-                                                &graphics_buffer_memory};
+    const PoolHandle stage_image_handle = stage_ == ShaderStage::kFragment
+                                              ? state.fragment_image_resources
+                                              : state.vertex_image_resources;
     std::vector<ShaderImageResource> image_resources =
-        stage_ == ShaderStage::kFragment && HasPoolHandle(state.fragment_image_resources)
-            ? LoadArray<ShaderImageResource>(pool_, state.fragment_image_resources)
+        HasPoolHandle(stage_image_handle)
+            ? LoadArray<ShaderImageResource>(pool_, stage_image_handle)
             : std::vector<ShaderImageResource>{};
-    UscShaderImageMemory image_memory(memory_, state.memory_mode, image_resources);
+    UscShaderImageMemory image_memory(
+        memory_, state.memory_mode, image_resources,
+        stage_ == ShaderStage::kFragment ? MemoryClient::kFragmentImage
+                                         : MemoryClient::kVertexShader);
+    UscGraphicsReadMemory graphics_read_memory{&uniform_memory,
+                                                &graphics_buffer_memory,
+                                                &image_memory};
     UscGraphicsAtomicMemory graphics_atomic_memory{&graphics_buffer_memory,
                                                     &image_memory};
 
@@ -671,12 +693,16 @@ void UscCluster::Run() {
         throw std::runtime_error(
               "vertex USC non-texture case has shared registers");
       }
+      // SMP issues a control-flow texture program actually made; absent for
+      // linear programs, whose every SMP runs once per lane.
+      std::optional<std::uint64_t> vertex_executed_textures;
       if (vertex_texture_case) {
         const std::uint32_t descriptor_set_count =
             state.vertex_sampled_texture_count;
         const bool shared_layout_valid =
             DriverPcoTextureSharedLayoutSupported(
-                state.vertex_pco_abi, descriptor_set_count, 0,
+                state.vertex_pco_abi, descriptor_set_count,
+                state.vertex_image_descriptor_count,
                 &state.graphics_storage[0]);
         const std::size_t sample_instruction_count =
             static_cast<std::size_t>(std::count_if(
@@ -684,6 +710,19 @@ void UscCluster::Run() {
                 [](const PcoInstruction &instruction) {
                   return instruction.opcode == PcoOpcode::kTextureSample;
                 }));
+        // With native control flow a lane issues the samples of the path it
+        // takes (none, some, or a loop's repeats) rather than exactly one per
+        // SMP instruction. Lanes still advance in lock-step SMP rounds.
+        const bool vertex_control_flow = std::any_of(
+            instructions.begin(), instructions.end(),
+            [](const PcoInstruction &instruction) {
+              return instruction.opcode == PcoOpcode::kBranch ||
+                     instruction.opcode == PcoOpcode::kConditionalMask ||
+                     instruction.writes_predicate != 0;
+            });
+        const std::size_t lane_request_limit =
+            vertex_control_flow ? std::numeric_limits<std::uint8_t>::max()
+                                : sample_instruction_count;
         if (!driver_pco || texture_request_output.size() == 0 ||
             texture_response_input.size() == 0 || lanes.empty() ||
             descriptor_set_count == 0 ||
@@ -717,8 +756,10 @@ void UscCluster::Run() {
                   execution.emitted != 1 ||
                   execution.ended_task !=
                       state.vertex_program_summary.ends_task ||
-                  lane_request_count[lane_index] !=
-                      sample_instruction_count) {
+                  (vertex_control_flow
+                       ? lane_request_count[lane_index] > lane_request_limit
+                       : lane_request_count[lane_index] !=
+                             sample_instruction_count)) {
                 throw std::runtime_error(
                     "texture vertex USC lane did not complete exact VTXOUT");
               }
@@ -753,10 +794,10 @@ void UscCluster::Run() {
                   execution.texture_request_valid != 1 ||
                   execution.continuation.valid != 1 ||
                   execution.emitted != 0 || execution.ended_task != 0 ||
-                  lane_request_count[lane_index] >=
-                      sample_instruction_count ||
-                  lane_request_count[lane_index] >=
-                      kPcoMaximumVertexTextureSampleInstructions ||
+                  lane_request_count[lane_index] >= lane_request_limit ||
+                  (!vertex_control_flow &&
+                   lane_request_count[lane_index] >=
+                       kPcoMaximumVertexTextureSampleInstructions) ||
                   issued.descriptor_set >= descriptor_set_count ||
                   issued.binding != 0 ||
                   issued.data_request != execution.continuation.data_request) {
@@ -837,8 +878,16 @@ void UscCluster::Run() {
             queue_suspension(lane_index, execution, pending_requests,
                              pending_continuations, pending_queued);
         }
-        if (std::any_of(pending_queued.begin(), pending_queued.end(),
-                        [](std::uint8_t value) { return value != 1; })) {
+        const bool all_lanes_completed = std::all_of(
+            lane_completed.begin(), lane_completed.end(),
+            [](std::uint8_t value) { return value == 1; });
+        if (vertex_control_flow && all_lanes_completed) {
+          // Every lane took a path without a texture sample.
+          pending_requests.clear();
+          pending_continuations.clear();
+          pending_queued.clear();
+        } else if (std::any_of(pending_queued.begin(), pending_queued.end(),
+                               [](std::uint8_t value) { return value != 1; })) {
           throw std::runtime_error(
               "texture vertex USC did not issue one SMP per shader lane");
         }
@@ -973,6 +1022,12 @@ void UscCluster::Run() {
           throw std::runtime_error(
               "texture vertex USC did not complete every shader lane");
         }
+        if (vertex_control_flow) {
+          std::uint64_t issued = 0;
+          for (const std::uint8_t count : lane_request_count)
+            issued += count;
+          vertex_executed_textures = issued;
+        }
       } else {
         for (VertexLane &lane : lanes) {
           const std::vector<std::uint32_t> inputs(
@@ -996,7 +1051,10 @@ void UscCluster::Run() {
         }
       }
       RecordInstructionExecutions(state.counters, drawlists[0].vertex, stage_,
-                                  instructions, lanes.size(), lanes.size());
+                                  instructions, lanes.size(), lanes.size(),
+                                  nullptr,
+                                  vertex_executed_textures ? &*vertex_executed_textures
+                                                           : nullptr);
       StoreArray(pool_, state.vertex_lanes, lanes);
       state.stage = PipelineStage::kVertexShaded;
     } else {
@@ -1819,7 +1877,7 @@ void UscCluster::Run() {
                   request.shader_lane_index !=
                       global_lane_indices[lane_index] ||
                   request.request_id != lane_index ||
-                  request.gather > 1 ||
+                  request.gather > 4 ||
                   request.gather != pending_requests[first].gather ||
                   request.descriptor_set != descriptor_set ||
                   request.data_request !=

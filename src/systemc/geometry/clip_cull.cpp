@@ -411,13 +411,13 @@ bool IsFaceCulled(const FaceCullState &state, bool front_facing) {
 ClipVertex OffsetClipVertexScreenPixels(const ClipVertex &vertex,
                                         float delta_screen_x,
                                         float delta_screen_y,
-                                        std::uint32_t width,
-                                        std::uint32_t height) {
+                                        float width,
+                                        float height) {
   ClipVertex result = vertex;
   result.wide_raster_primitive = true;
   const float w = vertex.output[3];
-  const float delta_ndc_x = delta_screen_x * 2.0F / static_cast<float>(width);
-  const float delta_ndc_y = delta_screen_y * 2.0F / static_cast<float>(height);
+  const float delta_ndc_x = delta_screen_x * 2.0F / width;
+  const float delta_ndc_y = delta_screen_y * 2.0F / height;
   result.output[0] += delta_ndc_x * w;
   result.output[1] += delta_ndc_y * w;
   return result;
@@ -431,21 +431,20 @@ ClipVertex OffsetClipVertexScreenPixels(const ClipVertex &vertex,
 // returns false. Also returns false when the segment is too short in screen
 // space to have a well-defined perpendicular.
 bool BuildLineQuadCorners(const ClipVertex &a, const ClipVertex &b,
-                          float half_width_px, std::uint32_t width,
-                          std::uint32_t height,
+                          float half_width_px, float width, float height,
                           std::array<ClipVertex, 4> &corners) {
   const float wa = a.output[3];
   const float wb = b.output[3];
   if (!(wa > 0.0F) || !(wb > 0.0F))
     return false;
   const float screen_ax =
-      (a.output[0] / wa * 0.5F + 0.5F) * static_cast<float>(width);
+      (a.output[0] / wa * 0.5F + 0.5F) * width;
   const float screen_ay =
-      (a.output[1] / wa * 0.5F + 0.5F) * static_cast<float>(height);
+      (a.output[1] / wa * 0.5F + 0.5F) * height;
   const float screen_bx =
-      (b.output[0] / wb * 0.5F + 0.5F) * static_cast<float>(width);
+      (b.output[0] / wb * 0.5F + 0.5F) * width;
   const float screen_by =
-      (b.output[1] / wb * 0.5F + 0.5F) * static_cast<float>(height);
+      (b.output[1] / wb * 0.5F + 0.5F) * height;
   const float dx = screen_bx - screen_ax;
   const float dy = screen_by - screen_ay;
   const float length = std::sqrt(dx * dx + dy * dy);
@@ -464,7 +463,7 @@ bool BuildLineQuadCorners(const ClipVertex &a, const ClipVertex &b,
 // half_size_px x half_size_px screen-space square centered on it. Requires
 // positive homogeneous W for the same reason as BuildLineQuadCorners.
 bool BuildPointQuadCorners(const ClipVertex &p, float half_size_px,
-                           std::uint32_t width, std::uint32_t height,
+                           float width, float height,
                            std::array<ClipVertex, 4> &corners) {
   if (!(p.output[3] > 0.0F))
     return false;
@@ -1115,12 +1114,17 @@ void ClipCull::Run() {
               state.source_topology == PrimitiveTopology::kLineStrip ||
               state.source_topology == PrimitiveTopology::kLineLoop;
           std::array<ClipVertex, 4> quad_corners{};
+          // Widths and sizes are window pixels: convert through the draw's
+          // viewport extent, not the attachment's, so a sub-viewport keeps
+          // the same pixel width (llvmpipe widens after the viewport).
+          const float viewport_width_px = 2.0F * std::fabs(viewport.scale_x);
+          const float viewport_height_px = 2.0F * std::fabs(viewport.scale_y);
           const bool width_expanded =
               (source_is_point &&
                BuildPointQuadCorners(vertices[0],
                                      0.5F * PointSizeFor(state, vertices[0]) +
                                          1.0F / static_cast<float>(kSubpixelScale),
-                                     state.width, state.height,
+                                     viewport_width_px, viewport_height_px,
                                      quad_corners)) ||
               (source_is_line &&
                BuildLineQuadCorners(vertices[0], vertices[1],
@@ -1129,8 +1133,8 @@ void ClipCull::Run() {
                                               state.raster_state.multisample_enable)
                                         ? 1.0F
                                         : 0.5F * state.raster_state.line_width,
-                                    state.width,
-                                    state.height, quad_corners));
+                                    viewport_width_px,
+                                    viewport_height_px, quad_corners));
 
           // Emits one already-non-degenerate triangle through the same
           // homogeneous clip + fan-emission + fixed-setup path every

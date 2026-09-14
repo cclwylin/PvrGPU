@@ -580,12 +580,15 @@ inline bool HasCanonicalCarryBorrowShape(const PcoInstruction &i,
 inline bool HasCanonicalTextureLodMode(const PcoInstruction &i,
                                       bool allow_fragment_gather = false) {
   return (i.texture_gather == 0 ||
-          (allow_fragment_gather && i.texture_gather == 1 &&
+          (allow_fragment_gather && i.texture_gather <= 4 &&
            i.opcode == PcoOpcode::kTextureSample &&
-           i.texture_dimension == 2 && i.texture_fcnorm == 1 &&
+           (i.texture_dimension == 2 ||
+            (i.texture_dimension == 3 && !i.texture_address_offset &&
+             !i.texture_spatial_offset_present)) &&
+           i.texture_fcnorm <= 1 &&
            i.texture_lod_replace == 1 && !i.texture_lod_bias &&
            i.texture_address_offset <= 1 && !i.texture_non_normalized_coords &&
-           !i.texture_sample_index_present && !i.texture_spatial_offset_present)) &&
+           !i.texture_sample_index_present)) &&
          (i.texture_lod_replace == 0 ||
           (i.texture_lod_replace == 1 && i.opcode == PcoOpcode::kTextureSample)) &&
          (i.texture_lod_bias == 0 ||
@@ -684,6 +687,13 @@ struct PcoVertexContinuation {
   std::uint8_t ended_task = 0;
   std::uint8_t index_register_valid_mask = 0;
   std::uint8_t valid = 0;
+  // Native control-flow state at the suspension: P0, its validity and the
+  // execution predicate an execution mask last produced.  A linear program
+  // keeps the reset values.
+  std::uint8_t predicate = 0;
+  std::uint8_t predicate_valid = 0;
+  std::uint8_t execution_predicate = 1;
+  std::uint64_t native_steps = 0;
 };
 
 struct PcoVertexExecution {

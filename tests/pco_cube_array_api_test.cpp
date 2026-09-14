@@ -166,8 +166,8 @@ void NativeTwelve(const std::filesystem::path&root){
 }
 }
 int main(){try{
-  static_assert(PVRGPU_SYSTEMC_API_VERSION==40&&PVRGPU_SYSTEMC_MAX_PCO_TEXTURES_PER_STAGE==16);
-  static_assert(sizeof(void*)!=8||sizeof(pvrgpu_systemc_pco_sequence_texture)==352,"API32 retains texture struct size");
+  static_assert(PVRGPU_SYSTEMC_API_VERSION==42&&PVRGPU_SYSTEMC_MAX_PCO_TEXTURES_PER_STAGE==16);
+  static_assert(sizeof(void*)!=8||sizeof(pvrgpu_systemc_pco_sequence_texture)==368,"API32 retains texture struct size");
   const auto root=std::filesystem::temp_directory_path()/("pvrgpu-cube-array-api-"+std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
   Negatives(root);Native(root);NativeTwelve(root);std::cout<<"CubeArray API32: "<<checks<<" checks PASS; artifacts="<<root<<'\n';return 0;
 }catch(const std::exception&e){std::cerr<<"CubeArray API after "<<checks<<" checks: "<<e.what()<<'\n';return 1;}}

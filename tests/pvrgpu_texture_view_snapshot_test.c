@@ -607,16 +607,18 @@ static void test_shadow_gather_snapshot(void)
          view.swizzle_r = PIPE_SWIZZLE_X;
          CHECK(!pvrgpu_shadow_gather_sampler_supported(&ctx,
             MESA_SHADER_VERTEX, 2, &view, &sampler.state));
+         /* Gather reads the view's base level only: further exposed levels
+          * and the mip filter select no tap. */
          view.u.tex.last_level = 1;
-         CHECK(!pvrgpu_shadow_gather_sampler_supported(&ctx,
+         CHECK(pvrgpu_shadow_gather_sampler_supported(&ctx,
             MESA_SHADER_FRAGMENT, 2, &view, &sampler.state));
          view.u.tex.last_level = 0;
          resource.base.nr_samples = 1;
          CHECK(!pvrgpu_shadow_gather_sampler_supported(&ctx,
             MESA_SHADER_FRAGMENT, 2, &view, &sampler.state));
          resource.base.nr_samples = 0;
-         /* A valid two-mip backing image distinguishes gather's mandatory
-          * state check from an earlier malformed-layout rejection. */
+         /* A valid two-mip backing image: the gather snapshot keeps both
+          * exposed levels and the texture unit samples the base one. */
          resource.base.last_level = 1;
          resource.level_count = 2;
          resource.level_offsets[1] = resource.size;
@@ -636,9 +638,11 @@ static void test_shadow_gather_snapshot(void)
          struct pvrgpu_systemc_pco_sequence_texture rebased = {0};
          uint8_t *bytes = NULL;
          const char *reason = NULL;
-         CHECK(!pvrgpu_capture_generic_sequence_texture(&ctx, MESA_SHADER_FRAGMENT,
+         CHECK(pvrgpu_capture_generic_sequence_texture(&ctx, MESA_SHADER_FRAGMENT,
             2, 0, &rebased, &bytes, &reason));
-         CHECK(bytes == NULL && !strcmp(reason, "shadow_gather_sampler_state"));
+         CHECK(bytes != NULL && rebased.mip_count == 2);
+         free(bytes);
+         bytes = NULL;
          /* One exposed nonzero mip and a nonzero array view base remain
           * valid: snapshot coordinates/layers must be relative to the view. */
          view.u.tex.first_level = 1;
